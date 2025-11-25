@@ -61,17 +61,61 @@ class OrderMonitor:
 
             # Check if order was cancelled or rejected (handle first to avoid processing)
             if status == KiteOrderStatus.CANCELLED:
+                capital_released = open_order.capital_deployed
+
                 open_order.status = OrderStatus.CANCELLED
                 open_order.rejection_reason = order_details.get('status_message', 'Cancelled by user or system')
+
+                # Release capital and update signal status
+                self._release_order_capital(open_order, 0, session)
+                self._update_processed_signal_expired(open_order, session)
+
                 session.commit()
-                logger.info(f"Order {open_order.order_id} CANCELLED: {open_order.rejection_reason}")
+
+                logger.warning(
+                    f"Order {open_order.order_id} ({open_order.script}) CANCELLED: "
+                    f"{open_order.rejection_reason} | Capital released: Rs.{capital_released:.2f}"
+                )
+
+                # Send Telegram alert for manual cancellations
+                telegram.send_alert(
+                    f"⚠️ **Order Cancelled**\n\n"
+                    f"📊 *{open_order.script} ({open_order.timeframe})*\n"
+                    f"❌ Order {open_order.order_id} was cancelled\n"
+                    f"💰 Capital released: Rs.{capital_released:.2f}\n"
+                    f"Reason: {open_order.rejection_reason}",
+                    critical=False
+                )
+
                 return False
 
             elif status == KiteOrderStatus.REJECTED:
+                capital_released = open_order.capital_deployed
+
                 open_order.status = OrderStatus.REJECTED
                 open_order.rejection_reason = order_details.get('status_message', 'Rejected by exchange')
+
+                # Release capital and update signal status
+                self._release_order_capital(open_order, 0, session)
+                self._update_processed_signal_expired(open_order, session)
+
                 session.commit()
-                logger.info(f"Order {open_order.order_id} REJECTED: {open_order.rejection_reason}")
+
+                logger.warning(
+                    f"Order {open_order.order_id} ({open_order.script}) REJECTED: "
+                    f"{open_order.rejection_reason} | Capital released: Rs.{capital_released:.2f}"
+                )
+
+                # Send Telegram alert for rejections
+                telegram.send_alert(
+                    f"🔴 **Order Rejected**\n\n"
+                    f"📊 *{open_order.script} ({open_order.timeframe})*\n"
+                    f"❌ Order {open_order.order_id} rejected by exchange\n"
+                    f"💰 Capital released: Rs.{capital_released:.2f}\n"
+                    f"Reason: {open_order.rejection_reason}",
+                    critical=False
+                )
+
                 return False
 
             # Check if order has any fills (handles both partial and complete fills)
