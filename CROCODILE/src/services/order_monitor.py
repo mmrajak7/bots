@@ -693,6 +693,243 @@ class OrderMonitor:
         except Exception as e:
             logger.warning(f"Failed to update capital ledger on close: {e}")
 
+    def manage_stale_pending_orders(self, session: Optional[Session] = None) -> Dict[str, any]:
+        """
+        Auto-cancel stale pending orders to free up capital for higher-probability trades.
+
+        Stale Order Criteria (from config):
+        1. Time-based: Order pending > max_pending_hours (default: 2 hours)
+        2. Price-based: LTP moved > threshold_pct above limit price (default: 2%)
+
+        This runs every 5 minutes as part of the order monitoring workflow.
+        When cancelled: Capital released, Telegram alert sent, ProcessedSignal updated.
+
+        Returns:
+            Stats dict with:
+            - pending_checked: Total pending orders checked
+            - stale_by_time: Orders cancelled due to time
+            - stale_by_price: Orders cancelled due to price distance
+            - capital_released: Total capital freed
+            - errors: List of errors encountered
+        """
+        close_session = False
+        if session is None:
+            session = get_session()
+            close_session = True
+
+        stats = {
+            'pending_checked': 0,
+            'stale_by_time': 0,
+            'stale_by_price': 0,
+            'capital_released': 0.0,
+            'cancelled_orders': [],
+            'errors': []
+        }
+
+        try:
+            # Check if stale order management is enabled
+            pom_config = config.get('risk_management.pending_order_management', {})
+            if not pom_config.get('enabled', False):
+                logger.debug("Stale pending order management is disabled")
+                return stats
+
+            # Get config values
+            max_pending_hours = pom_config.get('max_pending_hours', 2)
+            price_cancel_enabled = pom_config.get('price_distance_cancel', {}).get('enabled', True)
+            price_threshold_pct = pom_config.get('price_distance_cancel', {}).get('threshold_pct', 2.0)
+
+            # Get all pending orders for this bot
+            pending_orders = session.query(OpenOrder).filter_by(
+                status=OrderStatus.PENDING,
+                bot_instance_id=config.get_bot_instance_id()
+            ).all()
+
+            stats['pending_checked'] = len(pending_orders)
+
+            if not pending_orders:
+                logger.debug("No pending orders to check for staleness")
+                return stats
+
+            logger.info(f"Checking {len(pending_orders)} pending orders for staleness...")
+
+            current_time = ist_now_naive()
+
+            for order in pending_orders:
+                should_cancel = False
+                cancel_reason = ""
+                cancel_type = ""
+
+                order_key = f"{order.script} {order.timeframe}"
+
+                try:
+                    # Check 1: Time-based staleness
+                    hours_pending = (current_time - order.placed_at).total_seconds() / 3600
+
+                    if hours_pending > max_pending_hours:
+                        should_cancel = True
+                        cancel_reason = f"Pending {hours_pending:.1f}h (max: {max_pending_hours}h)"
+                        cancel_type = "time"
+                        logger.info(f"  {order_key}: STALE (time) - {cancel_reason}")
+
+                    # Check 2: Price-based staleness (only if not already flagged by time)
+                    if not should_cancel and price_cancel_enabled and order.order_price:
+                        try:
+                            # Add delay before LTP fetch to respect API rate limits
+                            import time
+                            time.sleep(1.0)  # 1 second delay between LTP checks
+
+                            # Get instrument token first, then fetch LTP
+                            instrument_token = self.kite_client.get_instrument_token(order.script)
+                            current_ltp = self.kite_client.get_instrument_ltp(instrument_token)
+
+                            if current_ltp and current_ltp > 0:
+                                # Calculate distance: how far LTP is above limit price
+                                distance_pct = ((current_ltp - order.order_price) / order.order_price) * 100
+
+                                if distance_pct > price_threshold_pct:
+                                    should_cancel = True
+                                    cancel_reason = f"LTP Rs.{current_ltp:.2f} is {distance_pct:.1f}% above order @ Rs.{order.order_price:.2f} (threshold: {price_threshold_pct}%)"
+                                    cancel_type = "price"
+                                    logger.info(f"  {order_key}: STALE (price) - {cancel_reason}")
+                                else:
+                                    logger.debug(
+                                        f"  {order_key}: OK - LTP Rs.{current_ltp:.2f} "
+                                        f"({distance_pct:.1f}% from order), pending {hours_pending:.1f}h"
+                                    )
+
+                        except Exception as e:
+                            logger.warning(f"  {order_key}: Failed to get LTP for price check: {e}")
+
+                    # Cancel if stale
+                    if should_cancel:
+                        result = self._cancel_stale_order(order, cancel_reason, session)
+
+                        if result['success']:
+                            if cancel_type == "time":
+                                stats['stale_by_time'] += 1
+                            else:
+                                stats['stale_by_price'] += 1
+
+                            stats['capital_released'] += result['capital_released']
+                            stats['cancelled_orders'].append({
+                                'script': order.script,
+                                'timeframe': order.timeframe,
+                                'reason': cancel_reason,
+                                'capital': result['capital_released']
+                            })
+
+                            # Send compact Telegram alert
+                            self._send_stale_order_alert(order, cancel_reason, result['capital_released'], cancel_type)
+
+                        else:
+                            stats['errors'].append(f"{order_key}: {result.get('error', 'Unknown error')}")
+
+                except Exception as e:
+                    logger.error(f"Error checking order {order.order_id}: {e}")
+                    stats['errors'].append(f"{order_key}: {str(e)}")
+
+            # Log summary
+            total_cancelled = stats['stale_by_time'] + stats['stale_by_price']
+            if total_cancelled > 0:
+                logger.info(
+                    f"Stale order cleanup: Checked={stats['pending_checked']}, "
+                    f"Cancelled={total_cancelled} (Time={stats['stale_by_time']}, Price={stats['stale_by_price']}), "
+                    f"Capital released=Rs.{stats['capital_released']:.2f}"
+                )
+            else:
+                logger.debug(f"Stale order check: {stats['pending_checked']} orders checked, none stale")
+
+            return stats
+
+        except Exception as e:
+            logger.error(f"Error in manage_stale_pending_orders: {e}")
+            stats['errors'].append(str(e))
+            if close_session:
+                session.rollback()
+            return stats
+        finally:
+            if close_session:
+                session.close()
+
+    def _cancel_stale_order(self, order: OpenOrder, reason: str, session: Session) -> Dict:
+        """
+        Cancel a single stale pending order
+
+        Args:
+            order: OpenOrder to cancel
+            reason: Cancellation reason
+            session: Database session
+
+        Returns:
+            Dict with success status and details
+        """
+        try:
+            order_key = f"{order.script} {order.timeframe}"
+            logger.info(f"Cancelling stale order: {order_key} - {reason}")
+
+            # Get order variety from Zerodha
+            order_details = self.kite_client.get_order_status(order.order_id)
+            order_variety = order_details.get('variety', 'regular')
+            zerodha_status = order_details.get('status', '')
+
+            # Check if already cancelled/rejected on Zerodha
+            if zerodha_status in [KiteOrderStatus.CANCELLED, KiteOrderStatus.REJECTED]:
+                logger.info(f"  Order already {zerodha_status} on Zerodha - syncing status")
+                order.status = OrderStatus.CANCELLED
+                order.rejection_reason = f"Stale order (already {zerodha_status}): {reason}"
+                self._update_processed_signal_expired(order, session)
+                session.commit()
+                return {'success': True, 'capital_released': order.capital_deployed}
+
+            # Cancel on Zerodha if still open
+            if zerodha_status == KiteOrderStatus.OPEN:
+                try:
+                    self.kite_client.cancel_order(order.order_id, variety=order_variety)
+                    logger.info(f"  Order cancelled on Zerodha")
+                except Exception as e:
+                    logger.error(f"  Failed to cancel on Zerodha: {e}")
+                    return {'success': False, 'error': str(e)}
+
+            # Update database
+            capital_released = order.capital_deployed
+            order.status = OrderStatus.CANCELLED
+            order.rejection_reason = f"Auto-cancelled (stale): {reason}"
+
+            # Update ProcessedSignal
+            self._update_processed_signal_expired(order, session)
+
+            # Release capital (update tracking)
+            self._release_order_capital(order, 0, session)
+
+            session.commit()
+
+            logger.info(f"  Stale order cancelled: {order_key}, Capital released: Rs.{capital_released:.2f}")
+            return {'success': True, 'capital_released': capital_released}
+
+        except Exception as e:
+            logger.error(f"Failed to cancel stale order {order.order_id}: {e}")
+            session.rollback()
+            return {'success': False, 'error': str(e)}
+
+    def _send_stale_order_alert(self, order: OpenOrder, reason: str, capital_released: float, cancel_type: str):
+        """Send compact Telegram alert for stale order cancellation"""
+        try:
+            # Short, compact message
+            icon = "⏰" if cancel_type == "time" else "📈"
+            type_text = "Time" if cancel_type == "time" else "Price"
+
+            message = (
+                f"{icon} **Stale Order Cancelled**\n"
+                f"📊 {order.script} ({order.timeframe})\n"
+                f"❌ {type_text}: {reason}\n"
+                f"💰 Rs.{capital_released:,.0f} freed"
+            )
+
+            telegram.send_alert(message, critical=False)
+
+        except Exception as e:
+            logger.warning(f"Failed to send stale order alert: {e}")
+
     def cancel_unfulfilled_orders(self, session: Optional[Session] = None) -> Dict[str, any]:
         """
         Cancel all pending orders after market close (3:30 PM)

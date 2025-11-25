@@ -1,13 +1,19 @@
 """Order Monitoring Workflow - Every 5 Minutes (9:15 AM - 3:45 PM)
 
-This workflow performs three critical functions:
+This workflow performs four critical functions:
 1. Monitor pending entry orders for fills
 2. Check GTT status for SL hits and close positions immediately
-3. After market close (3:30 PM): Cancel unfulfilled orders and release capital
+3. Manage stale pending orders (cancel orders unlikely to fill) - NEW
+4. After market close (3:30 PM): Cancel unfulfilled orders and release capital
 
 The GTT status check is essential for real-time position management -
 it detects when stop-loss is hit and frees up position slots immediately,
 instead of waiting for Same-Day Recovery at 4 PM.
+
+The stale order management (Step 3) improves capital efficiency by:
+- Cancelling orders pending > 2 hours (configurable)
+- Cancelling orders where price moved > 2% away from limit (configurable)
+- Freeing capital for higher-probability opportunities
 """
 
 import sys
@@ -40,7 +46,7 @@ def print_workflow_banner():
     """Print a clear banner to identify workflow start in logs"""
     banner = """
 ***************************************************************
-*  ORDER MONITOR WORKFLOW - Entry Orders & GTT Status Check   *
+*  ORDER MONITOR WORKFLOW - Orders, GTT & Stale Order Check   *
 ***************************************************************"""
     logger.info(banner)
 
@@ -107,7 +113,7 @@ def monitor_orders():
             logger.info("Running AFTER market close - will include EOD order cleanup")
 
         # Part 1: Monitor pending entry orders
-        logger.info("[STEP 1/3] Checking pending entry orders...")
+        logger.info("[STEP 1/4] Checking pending entry orders...")
         order_stats = order_monitor.monitor_all_pending_orders()
 
         logger.info(
@@ -117,7 +123,7 @@ def monitor_orders():
         )
 
         # Part 2: Check GTT status for SL hits (real-time position closure)
-        logger.info("[STEP 2/3] Checking GTT status for SL hits...")
+        logger.info("[STEP 2/4] Checking GTT status for SL hits...")
         gtt_stats = order_monitor.check_gtt_triggered_positions()
 
         logger.info(
@@ -126,10 +132,29 @@ def monitor_orders():
             f"Positions closed={gtt_stats['positions_closed']}"
         )
 
-        # Part 3: EOD Order Cleanup (only after market close)
+        # Part 3: Manage stale pending orders (cancel orders unlikely to fill)
+        # Only run during market hours (not after close - EOD cleanup handles that)
+        stale_stats = None
+        if not after_market_close:
+            logger.info("[STEP 3/4] Checking for stale pending orders...")
+            stale_stats = order_monitor.manage_stale_pending_orders()
+
+            stale_cancelled = stale_stats['stale_by_time'] + stale_stats['stale_by_price']
+            if stale_cancelled > 0:
+                logger.info(
+                    f"Stale order cleanup: Cancelled={stale_cancelled} "
+                    f"(Time={stale_stats['stale_by_time']}, Price={stale_stats['stale_by_price']}), "
+                    f"Capital freed=Rs.{stale_stats['capital_released']:.2f}"
+                )
+            else:
+                logger.info(f"Stale order check: {stale_stats['pending_checked']} orders checked, none stale")
+        else:
+            logger.info("[STEP 3/4] Skipped stale order check (after market close)")
+
+        # Part 4: EOD Order Cleanup (only after market close)
         eod_stats = None
         if after_market_close:
-            logger.info("[STEP 3/3] EOD Order Cleanup - Cancelling unfulfilled orders...")
+            logger.info("[STEP 4/4] EOD Order Cleanup - Cancelling unfulfilled orders...")
             eod_stats = order_monitor.cancel_unfulfilled_orders()
 
             if eod_stats['pending_found'] > 0:
@@ -142,7 +167,7 @@ def monitor_orders():
             else:
                 logger.info("EOD Cleanup: No pending orders to cancel")
         else:
-            logger.info("[STEP 3/3] Skipped EOD cleanup (market still open)")
+            logger.info("[STEP 4/4] Skipped EOD cleanup (market still open)")
 
         # Log combined summary
         summary = (
@@ -150,6 +175,8 @@ def monitor_orders():
             f"Orders (Filled={order_stats['filled']}, Pending={order_stats['still_pending']}), "
             f"GTT (SL Hits={gtt_stats['sl_hits_detected']}, Closed={gtt_stats['positions_closed']})"
         )
+        if stale_stats and (stale_stats['stale_by_time'] + stale_stats['stale_by_price']) > 0:
+            summary += f", Stale (Cancelled={stale_stats['stale_by_time'] + stale_stats['stale_by_price']}, Freed=Rs.{stale_stats['capital_released']:.2f})"
         if eod_stats and eod_stats['pending_found'] > 0:
             summary += f", EOD (Cancelled={eod_stats['cancelled']}, Released=Rs.{eod_stats['capital_released']:.2f})"
 

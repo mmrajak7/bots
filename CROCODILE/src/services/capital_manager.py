@@ -55,6 +55,7 @@ class CapitalManager:
         self.min_position_value = config.get('trading.min_position_value', 10000)
         self.min_margin_threshold = config.get('margin.minimum_required', 50000)
         self.max_positions = config.get('risk_management.max_positions', None)  # None = unlimited
+        self.max_pending_orders = config.get('risk_management.max_pending_orders', None)  # Separate pending limit
         self.enable_slot_based_sizing = config.get('trading.enable_slot_based_sizing', True)
 
         # Bot instance identifier
@@ -71,6 +72,7 @@ class CapitalManager:
             f"Bot ID: {self.bot_instance_id}, "
             f"Test Mode: {self.test_mode}, "
             f"Max Positions: {self.max_positions if self.max_positions else 'Unlimited'}, "
+            f"Max Pending Orders: {self.max_pending_orders if self.max_pending_orders else 'Unlimited'}, "
             f"Slot-based Sizing: {self.enable_slot_based_sizing}"
         )
 
@@ -356,10 +358,11 @@ class CapitalManager:
             if self.enable_slot_based_sizing and self.max_positions is not None:
                 # Get current position count (for remaining slots calculation)
                 current_positions, pending_orders = self.get_current_position_count(session)
-                total_active = current_positions + pending_orders
 
-                # Calculate remaining slots
-                remaining_slots = self.max_positions - total_active
+                # Calculate remaining slots based on OPEN POSITIONS only
+                # Pending orders may not fill, so we don't count them for slot-based sizing
+                # This ensures better capital utilization when pending orders exist
+                remaining_slots = self.max_positions - current_positions
 
                 if remaining_slots <= 0:
                     logger.error("No remaining slots - should not reach here (limit checked earlier)")
@@ -373,7 +376,7 @@ class CapitalManager:
                 position_value = position_value_optimal * (adjusted_position_pct / self.position_size_pct)
 
                 logger.info(
-                    f"Slot-based sizing: {remaining_slots} slots remaining, "
+                    f"Slot-based sizing: {remaining_slots} slots remaining (Open={current_positions}, Pending={pending_orders}), "
                     f"Optimal=Rs.{position_value_optimal:.2f} per slot, "
                     f"After DD adjustment ({adjusted_position_pct*100:.0f}%): Rs.{position_value:.2f}"
                 )
@@ -753,7 +756,12 @@ class CapitalManager:
         pending_orders: int
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
-        Check if we can take new position based on position limit
+        Check if we can take new position based on SEPARATE position and pending order limits
+
+        NEW LOGIC (Hybrid Approach):
+        - Open positions limited by max_positions (default: 5)
+        - Pending orders limited SEPARATELY by max_pending_orders (default: 3)
+        - This allows more signals to be placed without blocking on unfilled orders
 
         Args:
             current_positions: Current open positions count
@@ -765,36 +773,45 @@ class CapitalManager:
             - rejection_reason: Reason if rejected (None if can take)
             - alert_message: Warning alert if approaching limit (None otherwise)
         """
-        # If no limit set, always allow
-        if self.max_positions is None:
-            return True, None, None
-
-        # Total active = open positions + pending orders
-        total_active = current_positions + pending_orders
-
-        # Check if at limit
-        if total_active >= self.max_positions:
-            rejection_reason = (
-                f"Position limit reached: {total_active}/{self.max_positions} "
-                f"(Open: {current_positions}, Pending: {pending_orders})"
-            )
-            logger.warning(f"Position limit hit: {rejection_reason}")
-            return False, rejection_reason, None
-
-        # Check if approaching limit (>= 80%)
-        limit_pct = (total_active / self.max_positions) * 100
-
         alert_message = None
-        if limit_pct >= 80:
-            alert_message = (
-                f"⚠️ **POSITION LIMIT WARNING**\n"
-                f"📊 Current: {total_active}/{self.max_positions} positions "
-                f"({limit_pct:.0f}% of limit)\n"
-                f"🔓 Open Positions: {current_positions}\n"
-                f"⏳ Pending Orders: {pending_orders}\n"
-                f"💡 Consider reviewing open positions before adding more"
-            )
-            logger.warning(f"Approaching position limit: {total_active}/{self.max_positions} ({limit_pct:.0f}%)")
+
+        # Check 1: Open position limit (max_positions)
+        if self.max_positions is not None:
+            if current_positions >= self.max_positions:
+                rejection_reason = (
+                    f"Open position limit reached: {current_positions}/{self.max_positions} "
+                    f"(Pending orders: {pending_orders})"
+                )
+                logger.warning(f"Open position limit hit: {rejection_reason}")
+                return False, rejection_reason, None
+
+            # Check if approaching open position limit (>= 80%)
+            position_pct = (current_positions / self.max_positions) * 100
+            if position_pct >= 80:
+                alert_message = (
+                    f"⚠️ **POSITION LIMIT WARNING**\n"
+                    f"📊 Open: {current_positions}/{self.max_positions} ({position_pct:.0f}%)\n"
+                    f"⏳ Pending: {pending_orders}"
+                    f"{f'/{self.max_pending_orders}' if self.max_pending_orders else ''}\n"
+                    f"💡 Consider reviewing positions"
+                )
+                logger.warning(f"Approaching position limit: {current_positions}/{self.max_positions}")
+
+        # Check 2: Pending order limit (max_pending_orders) - SEPARATE from positions
+        if self.max_pending_orders is not None:
+            if pending_orders >= self.max_pending_orders:
+                rejection_reason = (
+                    f"Pending order limit reached: {pending_orders}/{self.max_pending_orders} "
+                    f"(Open positions: {current_positions}/{self.max_positions if self.max_positions else '∞'})"
+                )
+                logger.warning(f"Pending order limit hit: {rejection_reason}")
+                return False, rejection_reason, None
+
+        # Both limits OK - can place new order
+        logger.debug(
+            f"Position check passed: Open={current_positions}/{self.max_positions if self.max_positions else '∞'}, "
+            f"Pending={pending_orders}/{self.max_pending_orders if self.max_pending_orders else '∞'}"
+        )
 
         return True, None, alert_message
 

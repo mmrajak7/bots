@@ -766,6 +766,20 @@ class EntryManager:
                 return False, cap_reason
 
             # ====== CRITICAL POINT: PLACING ORDER ON ZERODHA ======
+
+            # SAFETY CHECK: Never place orders after 15:29:59
+            current_time = ist_now_naive().time()
+            from datetime import time as dt_time
+            ORDER_CUTOFF_TIME = dt_time(15, 29, 59)  # 15:29:59
+
+            if current_time > ORDER_CUTOFF_TIME:
+                logger.warning(f"Order blocked - past cutoff time 15:29:59 (current: {current_time})")
+                processed_signal.processing_status = 'FAILED'
+                processed_signal.rejection_reason = f"Past order cutoff time (15:29:59), current: {current_time}"
+                processed_signal.completed_at = ist_now_naive()
+                session.commit()
+                return False, "Order blocked - market closing"
+
             processed_signal.entry_attempted = True
             session.commit()
 

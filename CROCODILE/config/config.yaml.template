@@ -168,6 +168,28 @@ risk_management:
   # - At 80% of limit (e.g., 4/5): Warning alert sent
   # - At 100% of limit: New signals rejected until position closed
 
+  # Separate Pending Order Limit (NEW - for capital efficiency)
+  # Pending orders are tracked separately from open positions
+  # This allows more signals to be placed without blocking on unfilled orders
+  max_pending_orders: 3  # Maximum pending orders allowed (separate from max_positions)
+
+  # Stale Pending Order Management (NEW - auto-cancel unproductive orders)
+  # Orders that are unlikely to fill tie up capital and block new signals
+  # Auto-cancellation frees capital for higher-probability opportunities
+  pending_order_management:
+    enabled: true  # Enable stale order auto-cancellation
+
+    # Time-based cancellation: Cancel if order pending too long
+    max_pending_hours: 2  # Cancel if pending > 2 hours (day trading window is short)
+
+    # Price-based cancellation: Cancel if price moves far from limit
+    price_distance_cancel:
+      enabled: true
+      threshold_pct: 2.0  # Cancel if LTP > 2% above ST price (low fill probability)
+
+    # Note: Checks run every 5 minutes as part of order monitoring workflow
+    # When cancelled: Capital released, Telegram alert sent, ProcessedSignal updated
+
   monthly_reset_day: 1  # Day of month to reset drawdown baseline
 
 # Same-Day Recovery (CRITICAL SAFETY NET)
