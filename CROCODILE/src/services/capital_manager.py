@@ -22,8 +22,9 @@ from typing import Dict, Tuple, Optional
 from math import floor
 from loguru import logger
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
-from src.models.database import CapitalLedger, OpenPosition, OpenOrder, OrderStatus, PositionStatus, get_session
+from src.models.database import CapitalLedger, OpenPosition, OpenOrder, ClosedPosition, OrderStatus, PositionStatus, get_session
 from src.utils.config_manager import config
 from src.utils.price_rounder import round_price
 from src.utils.timezone_helper import ist_now_naive
@@ -494,9 +495,129 @@ class CapitalManager:
             if close_session:
                 session.close()
 
+    # ========== P&L AND DRAWDOWN CALCULATION HELPERS ==========
+
+    def _calculate_realized_pnl_month(self, session: Session) -> float:
+        """
+        Calculate realized P&L for current month from closed positions.
+
+        Returns:
+            Total realized P&L (positive = profit, negative = loss)
+        """
+        today = date.today()
+        first_of_month = today.replace(day=1)
+
+        result = session.query(func.sum(ClosedPosition.net_pnl)).filter(
+            ClosedPosition.bot_instance_id == self.bot_instance_id,
+            ClosedPosition.exit_date >= first_of_month
+        ).scalar()
+
+        return float(result) if result else 0.0
+
+    def _calculate_realized_pnl_today(self, session: Session) -> float:
+        """
+        Calculate realized P&L for today from closed positions.
+
+        Returns:
+            Today's realized P&L
+        """
+        today = date.today()
+
+        result = session.query(func.sum(ClosedPosition.net_pnl)).filter(
+            ClosedPosition.bot_instance_id == self.bot_instance_id,
+            ClosedPosition.exit_date == today
+        ).scalar()
+
+        return float(result) if result else 0.0
+
+    def _calculate_unrealized_pnl(self, open_positions: list, session: Session) -> float:
+        """
+        Calculate unrealized P&L for open positions.
+
+        Uses entry_price as fallback if LTP not available (market closed).
+        During market hours, attempts to fetch current LTP.
+
+        Args:
+            open_positions: List of OpenPosition objects
+            session: Database session
+
+        Returns:
+            Total unrealized P&L
+        """
+        if not open_positions:
+            return 0.0
+
+        total_unrealized = 0.0
+
+        # Check if market is open (rough check: 9:15 AM - 3:30 PM IST)
+        now = ist_now_naive()
+        market_open = now.hour >= 9 and (now.hour < 15 or (now.hour == 15 and now.minute <= 30))
+
+        for pos in open_positions:
+            try:
+                current_price = pos.entry_price  # Default to entry (no unrealized)
+
+                if market_open:
+                    # Try to fetch LTP during market hours
+                    try:
+                        instrument_token = self.kite_client.get_instrument_token(pos.script)
+                        current_price = self.kite_client.get_instrument_ltp(instrument_token)
+                    except Exception as e:
+                        logger.debug(f"Could not fetch LTP for {pos.script}: {e}, using entry price")
+                        current_price = pos.entry_price
+
+                # Calculate unrealized P&L for this position
+                unrealized = (current_price - pos.entry_price) * pos.quantity
+                total_unrealized += unrealized
+
+            except Exception as e:
+                logger.warning(f"Error calculating unrealized P&L for {pos.script}: {e}")
+
+        return total_unrealized
+
+    def _detect_capital_allocation_change(self, session: Session) -> Tuple[bool, Optional[float], Optional[float]]:
+        """
+        Detect if allocated capital in config differs from last recorded value.
+
+        Returns:
+            (changed, old_value, new_value)
+        """
+        # Get current config value
+        current_allocated = self.allocated_capital_amount
+        if current_allocated is None:
+            return False, None, None
+
+        # Get last recorded allocated_capital from ledger
+        prev_ledger = session.query(CapitalLedger).filter(
+            CapitalLedger.bot_instance_id == self.bot_instance_id,
+            CapitalLedger.allocated_capital.isnot(None)
+        ).order_by(CapitalLedger.date.desc()).first()
+
+        if prev_ledger is None:
+            # First run, no previous record
+            return False, None, current_allocated
+
+        old_allocated = prev_ledger.allocated_capital
+
+        # Check if changed (allow small tolerance for float comparison)
+        if old_allocated and abs(current_allocated - old_allocated) > 1.0:
+            return True, old_allocated, current_allocated
+
+        return False, old_allocated, current_allocated
+
     def update_capital_ledger(self, session: Optional[Session] = None) -> CapitalLedger:
         """
         Update daily capital ledger with current state (bot-specific)
+
+        FIXED: Uses P&L-based drawdown calculation instead of Zerodha margin.
+
+        Drawdown is now calculated as:
+            Total P&L (month) = Realized P&L + Unrealized P&L
+            Drawdown % = -Total P&L / Allocated Capital (only if P&L is negative)
+
+        Capital change detection:
+            If allocated_capital in config changes, baseline is reset and
+            Telegram alert is sent.
 
         Args:
             session: Database session (optional)
@@ -512,15 +633,22 @@ class CapitalManager:
         try:
             today = date.today()
 
+            # Get allocated capital from config (THIS IS THE BASE FOR ALL CALCULATIONS)
+            allocated_capital = self.allocated_capital_amount
+            if allocated_capital is None:
+                # Fallback to Zerodha margin if no allocation configured
+                margin_data = self.fetch_margin_from_zerodha(session)
+                allocated_capital = margin_data['net']
+                logger.warning("No allocated_capital configured - using Zerodha net margin")
+            else:
+                # Still fetch margin data for account reference
+                margin_data = self.fetch_margin_from_zerodha(session)
+
             # Get or create today's ledger entry (FILTERED BY BOT)
             ledger = session.query(CapitalLedger).filter_by(
                 date=today,
                 bot_instance_id=self.bot_instance_id
             ).first()
-
-            # Fetch current margin (already respects allocation limits)
-            margin_data = self.fetch_margin_from_zerodha(session)
-            current_capital = margin_data['net']
 
             # Get open positions (FILTERED BY BOT)
             open_positions = session.query(OpenPosition).filter_by(
@@ -538,62 +666,91 @@ class CapitalManager:
 
             # Total deployed capital (by this bot)
             deployed_capital = deployed_from_positions + reserved_from_orders
-            free_capital = margin_data['available'] - deployed_capital  # Use allocated available
+            free_capital = allocated_capital - deployed_capital
             num_open = len(open_positions)
+
+            # === P&L CALCULATIONS (KEY FIX) ===
+            realized_pnl_today = self._calculate_realized_pnl_today(session)
+            realized_pnl_month = self._calculate_realized_pnl_month(session)
+            unrealized_pnl = self._calculate_unrealized_pnl(open_positions, session)
+            total_pnl_month = realized_pnl_month + unrealized_pnl
+
+            # Current capital = allocated + total P&L this month
+            current_capital = allocated_capital + total_pnl_month
+
+            # === CAPITAL CHANGE DETECTION ===
+            capital_changed, old_capital, new_capital = self._detect_capital_allocation_change(session)
+            reset_reason = None
+
+            if capital_changed:
+                reset_reason = f"Capital allocation changed: Rs.{old_capital:,.0f} → Rs.{new_capital:,.0f}"
+                logger.info(reset_reason)
+
+                # Send Telegram alert for capital change
+                from src.reporting.telegram_client import telegram
+                telegram.send_alert(
+                    f"💰 **Capital Allocation Changed**\n"
+                    f"Old: Rs.{old_capital:,.0f}\n"
+                    f"New: Rs.{new_capital:,.0f}\n"
+                    f"📊 Drawdown baseline reset to 0%",
+                    critical=False
+                )
 
             if ledger is None:
                 # Create new entry
                 ledger = CapitalLedger(
                     date=today,
                     bot_instance_id=self.bot_instance_id,
-                    opening_capital=current_capital,
+                    opening_capital=allocated_capital,  # Use allocated, not Zerodha margin
                     deployed_capital=deployed_capital,
                     free_capital=free_capital,
                     num_open_positions=num_open,
                     total_capital=current_capital,
-                    # Capital allocation tracking (NEW)
-                    allocated_capital=margin_data.get('allocated'),
-                    allocation_method=margin_data.get('allocation_method'),
+                    realized_pnl_today=realized_pnl_today,
+                    unrealized_pnl=unrealized_pnl,
+                    # Capital allocation tracking
+                    allocated_capital=allocated_capital,
+                    allocation_method='amount' if self.allocated_capital_amount else 'percent',
                     total_account_margin=margin_data['net'],
                     reserve_buffer=margin_data.get('reserve_buffer', 0)
                 )
 
-                # === Monthly Baseline Reset Logic ===
-                # Get previous ledger entry to check for month change (FILTERED BY BOT)
+                # === BASELINE RESET LOGIC ===
+                # Reset happens on: 1) First run OR 2) Month change OR 3) Capital allocation change
                 prev_ledger = session.query(CapitalLedger).filter(
                     CapitalLedger.date < today,
                     CapitalLedger.bot_instance_id == self.bot_instance_id
                 ).order_by(CapitalLedger.date.desc()).first()
 
-                # Determine if monthly baseline needs reset
-                # Reset happens on: 1) First run OR 2) Month change
-                need_monthly_reset = False
+                need_baseline_reset = False
 
                 if prev_ledger is None:
-                    # First run ever - set baseline
-                    need_monthly_reset = True
-                    logger.info("First capital ledger entry - setting monthly baseline")
+                    # First run ever
+                    need_baseline_reset = True
+                    reset_reason = "First capital ledger entry"
+                    logger.info(reset_reason)
                 elif prev_ledger.date.month != today.month or prev_ledger.date.year != today.year:
-                    # Month changed - reset baseline (handles weekends/holidays on 1st)
-                    need_monthly_reset = True
-                    logger.info(
-                        f"Month changed from {prev_ledger.date.strftime('%Y-%m')} "
-                        f"to {today.strftime('%Y-%m')} - resetting monthly baseline"
-                    )
+                    # Month changed (handles weekends/holidays on 1st)
+                    need_baseline_reset = True
+                    reset_reason = f"Month changed: {prev_ledger.date.strftime('%Y-%m')} → {today.strftime('%Y-%m')}"
+                    logger.info(reset_reason)
+                elif capital_changed:
+                    # Capital allocation changed
+                    need_baseline_reset = True
+                    # reset_reason already set above
 
-                if need_monthly_reset:
-                    # Reset baseline to current capital
-                    ledger.starting_capital_month = current_capital
+                if need_baseline_reset:
+                    # Reset baseline to ALLOCATED CAPITAL (not Zerodha margin)
+                    ledger.starting_capital_month = allocated_capital
                     ledger.monthly_drawdown_pct = 0.0
-                    logger.info(f"Monthly baseline reset: Rs.{current_capital:.2f}")
+                    logger.info(f"Monthly baseline reset to Rs.{allocated_capital:,.0f} ({reset_reason})")
                 else:
                     # Within same month - carry forward previous baseline
                     if prev_ledger and prev_ledger.starting_capital_month:
                         ledger.starting_capital_month = prev_ledger.starting_capital_month
                     else:
-                        # Fallback if no baseline found (shouldn't happen)
-                        ledger.starting_capital_month = current_capital
-                        logger.warning("No previous baseline found - using current capital")
+                        ledger.starting_capital_month = allocated_capital
+                        logger.warning("No previous baseline found - using allocated capital")
 
                 session.add(ledger)
             else:
@@ -602,39 +759,45 @@ class CapitalManager:
                 ledger.free_capital = free_capital
                 ledger.num_open_positions = num_open
                 ledger.total_capital = current_capital
-                # Update capital allocation tracking (NEW)
-                ledger.allocated_capital = margin_data.get('allocated')
-                ledger.allocation_method = margin_data.get('allocation_method')
+                ledger.realized_pnl_today = realized_pnl_today
+                ledger.unrealized_pnl = unrealized_pnl
+                # Update capital allocation tracking
+                ledger.allocated_capital = allocated_capital
+                ledger.allocation_method = 'amount' if self.allocated_capital_amount else 'percent'
                 ledger.total_account_margin = margin_data['net']
                 ledger.reserve_buffer = margin_data.get('reserve_buffer', 0)
                 ledger.updated_at = ist_now_naive()
 
-            # Calculate monthly drawdown
-            # Only show positive drawdown (losses). Gains show as 0% DD.
-            if ledger.starting_capital_month:
-                dd_pct = ((ledger.starting_capital_month - current_capital) /
-                         ledger.starting_capital_month) * 100
-                # Cap at 0 - gains don't show as negative drawdown
-                ledger.monthly_drawdown_pct = round(max(0, dd_pct), 2)
+                # Check for capital change on existing entry
+                if capital_changed:
+                    ledger.starting_capital_month = allocated_capital
+                    ledger.monthly_drawdown_pct = 0.0
+                    logger.info(f"Baseline reset due to capital change: Rs.{allocated_capital:,.0f}")
+
+            # === DRAWDOWN CALCULATION (KEY FIX) ===
+            # Drawdown = -Total P&L / Allocated Capital (only if P&L is negative)
+            if allocated_capital > 0:
+                if total_pnl_month < 0:
+                    # We have losses - calculate drawdown
+                    dd_pct = (abs(total_pnl_month) / allocated_capital) * 100
+                    ledger.monthly_drawdown_pct = round(dd_pct, 2)
+                else:
+                    # Profit or break-even - no drawdown
+                    ledger.monthly_drawdown_pct = 0.0
 
             session.commit()
 
-            # Build log message with capital allocation info
+            # Build log message
             log_msg = (
                 f"Capital ledger updated (Bot: {self.bot_instance_id}): "
-                f"Opening=Rs.{ledger.opening_capital:.2f}, "
-                f"Deployed=Rs.{deployed_capital:.2f}, "
-                f"Free=Rs.{free_capital:.2f}, "
-                f"Positions={num_open}, "
+                f"Allocated=Rs.{allocated_capital:,.0f}, "
+                f"Deployed=Rs.{deployed_capital:,.0f}, "
+                f"P&L(Month)=Rs.{total_pnl_month:+,.0f}, "
                 f"DD={ledger.monthly_drawdown_pct:.2f}%"
             )
 
-            if ledger.allocated_capital:
-                utilization_pct = (deployed_capital / ledger.allocated_capital) * 100
-                log_msg += (
-                    f", Allocated=Rs.{ledger.allocated_capital:,.0f} "
-                    f"({utilization_pct:.1f}% utilized)"
-                )
+            if num_open > 0:
+                log_msg += f", Positions={num_open}"
 
             logger.info(log_msg)
 

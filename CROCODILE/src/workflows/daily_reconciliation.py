@@ -242,10 +242,14 @@ class DailyReconciliation:
             deployed_diff = abs(calculated_deployed - ledger_deployed)
             deployed_match = deployed_diff < 100  # Rs.100 tolerance
 
+            # Use allocated_capital as the main capital figure
+            display_capital = latest_ledger.allocated_capital if latest_ledger.allocated_capital else latest_ledger.total_capital
+
             verification = {
                 'date': latest_ledger.date,
                 'opening_capital': latest_ledger.opening_capital,
-                'total_capital': latest_ledger.total_capital,
+                'total_capital': display_capital,  # Use allocated_capital for display
+                'allocated_capital': latest_ledger.allocated_capital,
                 'deployed_capital_ledger': ledger_deployed,
                 'deployed_capital_calculated': calculated_deployed,
                 'deployed_difference': deployed_diff,
@@ -361,7 +365,8 @@ class DailyReconciliation:
             if not latest_ledger:
                 return {'error': 'No capital ledger data'}
 
-            total_capital = latest_ledger.total_capital
+            # Use allocated_capital as base (not Zerodha margin)
+            total_capital = latest_ledger.allocated_capital if latest_ledger.allocated_capital else latest_ledger.total_capital
 
             # Get open positions (for this bot)
             open_positions = session.query(OpenPosition).filter_by(

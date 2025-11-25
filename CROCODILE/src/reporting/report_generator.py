@@ -135,9 +135,11 @@ class ReportGenerator:
                 report += f"⚠️ LTP fetch failed: {len(ltp_fetch_failures)} pos (P&L incomplete)\n\n"
 
             # === CAPITAL (single line) ===
-            deployed_pct = (ledger.deployed_capital / ledger.total_capital * 100) if ledger.total_capital > 0 else 0
+            # Use allocated_capital as base (not Zerodha margin or total_capital)
+            base_capital = ledger.allocated_capital if ledger.allocated_capital else ledger.total_capital
+            deployed_pct = (ledger.deployed_capital / base_capital * 100) if base_capital > 0 else 0
             report += f"💰 *CAPITAL*\n"
-            report += f"{fmt.format_currency(ledger.total_capital)} | "
+            report += f"Rs.{base_capital:,.0f} | "
             report += f"Deployed: {fmt.format_currency(ledger.deployed_capital)} ({deployed_pct:.0f}%) | "
             report += f"Free: {fmt.format_currency(ledger.free_capital)}\n\n"
 
