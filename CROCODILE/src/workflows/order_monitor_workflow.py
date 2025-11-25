@@ -1,4 +1,4 @@
-"""Order Monitoring Workflow - Every 5 Minutes (9:15 AM - 3:30 PM)
+"""Order Monitoring Workflow - Every 5 Minutes (9:15 AM - 3:45 PM)
 
 This workflow performs three critical functions:
 1. Monitor pending entry orders for fills
@@ -12,7 +12,9 @@ instead of waiting for Same-Day Recovery at 4 PM.
 
 import sys
 from pathlib import Path
-from datetime import time as dt_time
+from datetime import time as dt_time, datetime
+import calendar
+import pytz
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -23,6 +25,12 @@ from src.utils.config_manager import config
 from src.utils.timezone_helper import now_ist
 from src.services.order_monitor import order_monitor
 from src.reporting.telegram_client import telegram
+
+# Market hours (IST)
+MARKET_START_HOUR = 9
+MARKET_START_MIN = 15
+MARKET_END_HOUR = 15
+MARKET_END_MIN = 45
 
 # Market close time
 MARKET_CLOSE_TIME = dt_time(15, 30)  # 3:30 PM IST
@@ -35,6 +43,34 @@ def print_workflow_banner():
 *  ORDER MONITOR WORKFLOW - Entry Orders & GTT Status Check   *
 ***************************************************************"""
     logger.info(banner)
+
+
+def get_current_datetime():
+    """Get current IST date and time"""
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    weekday = calendar.day_name[now.weekday()]
+    curr_date = now.date()
+    curr_time = now.time()
+    return weekday, curr_date, curr_time, now
+
+
+def check_weekend(weekday):
+    """Exit if weekend"""
+    if weekday in ['Saturday', 'Sunday']:
+        logger.info(f"Weekend ({weekday}) - Exiting")
+        sys.exit(0)
+
+
+def check_market_hours(now):
+    """Check if current time is within market hours"""
+    curr_time = now.replace(second=0, microsecond=0)
+    start_time = now.replace(hour=MARKET_START_HOUR, minute=MARKET_START_MIN, second=0, microsecond=0)
+    end_time = now.replace(hour=MARKET_END_HOUR, minute=MARKET_END_MIN, second=0, microsecond=0)
+
+    if curr_time < start_time or curr_time > end_time:
+        logger.info(f"Outside market hours ({curr_time.strftime('%H:%M')}) - Exiting")
+        return False
+    return True
 
 
 def is_after_market_close() -> bool:
@@ -52,6 +88,17 @@ def monitor_orders():
     """
     print_workflow_banner()
     logger.info("Order monitoring workflow started")
+
+    # Get current date/time
+    weekday, curr_date, curr_time, now = get_current_datetime()
+    logger.info(f"Date: {curr_date} ({weekday}) | Time: {curr_time.strftime('%H:%M:%S')} IST")
+
+    # Check if weekend
+    check_weekend(weekday)
+
+    # Check market hours
+    if not check_market_hours(now):
+        sys.exit(0)
 
     try:
         # Check if after market close

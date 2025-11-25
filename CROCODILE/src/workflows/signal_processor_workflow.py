@@ -3,6 +3,8 @@
 import sys
 from pathlib import Path
 from datetime import date, datetime
+import calendar
+import pytz
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -16,6 +18,12 @@ from src.models.database import get_session, OpenOrder, OrderStatus, ProcessedSi
 from src.api.kite_trade_client import KiteTradeClient
 from src.utils.timezone_helper import ist_now_naive
 
+# Market hours (IST)
+MARKET_START_HOUR = 9
+MARKET_START_MIN = 15
+MARKET_END_HOUR = 15
+MARKET_END_MIN = 30
+
 
 def print_workflow_banner():
     """Print a clear banner to identify workflow start in logs"""
@@ -24,6 +32,34 @@ def print_workflow_banner():
 *  SIGNAL PROCESSOR WORKFLOW - Process CSV Signals & Orders   *
 ***************************************************************"""
     logger.info(banner)
+
+
+def get_current_datetime():
+    """Get current IST date and time"""
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    weekday = calendar.day_name[now.weekday()]
+    curr_date = now.date()
+    curr_time = now.time()
+    return weekday, curr_date, curr_time, now
+
+
+def check_weekend(weekday):
+    """Exit if weekend"""
+    if weekday in ['Saturday', 'Sunday']:
+        logger.info(f"Weekend ({weekday}) - Exiting")
+        sys.exit(0)
+
+
+def check_market_hours(now):
+    """Check if current time is within market hours"""
+    curr_time = now.replace(second=0, microsecond=0)
+    start_time = now.replace(hour=MARKET_START_HOUR, minute=MARKET_START_MIN, second=0, microsecond=0)
+    end_time = now.replace(hour=MARKET_END_HOUR, minute=MARKET_END_MIN, second=0, microsecond=0)
+
+    if curr_time < start_time or curr_time > end_time:
+        logger.info(f"Outside market hours ({curr_time.strftime('%H:%M')}) - Exiting")
+        return False
+    return True
 
 
 def reconcile_processing_signals():
@@ -165,6 +201,17 @@ def process_signals():
     """
     print_workflow_banner()
     logger.info("Signal processing workflow started")
+
+    # Get current date/time
+    weekday, curr_date, curr_time, now = get_current_datetime()
+    logger.info(f"Date: {curr_date} ({weekday}) | Time: {curr_time.strftime('%H:%M:%S')} IST")
+
+    # Check if weekend
+    check_weekend(weekday)
+
+    # Check market hours
+    if not check_market_hours(now):
+        sys.exit(0)
 
     try:
         # ====== STEP 1: RECONCILIATION (IDEMPOTENCY LAYER) ======
