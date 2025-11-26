@@ -294,6 +294,24 @@ def process_signals():
 
 
 if __name__ == "__main__":
+    # ===== EARLY EXIT CHECK =====
+    # Check market hours BEFORE any setup to exit gracefully if outside trading hours
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    weekday = calendar.day_name[now.weekday()]
+
+    # Exit silently on weekends
+    if weekday in ['Saturday', 'Sunday']:
+        sys.exit(0)
+
+    # Exit silently before/after market hours
+    curr_time = now.replace(second=0, microsecond=0)
+    start_time = now.replace(hour=MARKET_START_HOUR, minute=MARKET_START_MIN, second=0, microsecond=0)
+    end_time = now.replace(hour=MARKET_END_HOUR, minute=MARKET_END_MIN, second=0, microsecond=0)
+
+    if curr_time < start_time or curr_time > end_time:
+        sys.exit(0)
+    # ===== END EARLY EXIT CHECK =====
+
     # Setup logging
     logger.add(
         "logs/crocodile_{time:YYYY-MM-DD}.log",
