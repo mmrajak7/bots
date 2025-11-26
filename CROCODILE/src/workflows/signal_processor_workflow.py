@@ -242,43 +242,28 @@ def process_signals():
                 ).all()
 
                 if todays_orders:
-                    # Build detailed order table
+                    # Build compact table format
+                    total_capital = sum(o.capital_deployed for o in todays_orders)
+
                     lines = [
-                        f"<b>✅ ORDERS PLACED SUCCESSFULLY ({len(todays_orders)}/{stats['total']})</b>\n",
-                        "<pre>"
+                        f"✅ *ORDERS PLACED* ({len(todays_orders)}/{stats['total']}) | Rs.{total_capital:,.0f}",
+                        "<pre>",
+                        f"{'Script':<14} {'Type':<6} {'Qty':>4} {'Price':>8} {'Capital':>8}",
+                        "-" * 44
                     ]
 
-                    # Header
-                    lines.append(
-                        f"{'Script':<12} {'TF':<3} {'Type':<6} {'Price':>9} {'Qty':>4} {'Capital':>10}"
-                    )
-                    lines.append("-" * 50)
-
-                    total_capital = 0
-
-                    # Order rows
                     for order in todays_orders:
-                        price_str = f"Rs.{order.order_price:,.2f}"
-                        capital_str = f"Rs.{order.capital_deployed:,.2f}"
-
+                        script_tf = f"{order.script}({order.timeframe})"
+                        capital_k = order.capital_deployed / 1000
                         lines.append(
-                            f"{order.script:<12} {order.timeframe:<3} {order.order_type:<6} "
-                            f"{price_str:>9} {order.quantity:>4} {capital_str:>10}"
+                            f"{script_tf:<14} {order.order_type:<6} {order.quantity:>4} {order.order_price:>8.2f} {capital_k:>7.1f}K"
                         )
-                        total_capital += order.capital_deployed
 
                     lines.append("</pre>")
-                    lines.append(f"\n<b>Total Capital Reserved: Rs.{total_capital:,.2f}</b>")
-                    lines.append(f"\n⏳ Orders placed - monitoring for fills")
-
                     alert_msg = "\n".join(lines)
                 else:
                     # Fallback if no orders found in DB
-                    alert_msg = (
-                        f"<b>📊 New Entry Orders Placed</b>\n"
-                        f"✅ {stats['success']} signal(s) processed successfully\n"
-                        f"⏳ Orders placed - monitoring for fills"
-                    )
+                    alert_msg = f"✅ *ORDERS PLACED* | {stats['success']} signal(s) processed"
             finally:
                 session.close()
 

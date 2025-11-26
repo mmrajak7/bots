@@ -526,45 +526,30 @@ class DailyReconciliation:
             pnl = metrics.get('pnl', {})
             trends = metrics.get('trends', {})
 
-            # Determine overall status emoji
-            status = report['summary']['status']
-            status_emoji = fmt.GREEN_CIRCLE if status == 'ALL_CLEAR' else fmt.YELLOW_CIRCLE if status == 'WARNINGS' else fmt.RED_CIRCLE
-
             # === BUILD COMPACT REPORT ===
             msg = f"📋 *RECONCILIATION* | {report['date']}\n"
-            msg += fmt.THIN_LINE + "\n\n"
 
-            # Status line
-            msg += f"{status_emoji} Status: {status}\n\n"
-
-            # Positions & GTTs (single line)
+            # Status + Positions (merged into one line)
+            status = report['summary']['status']
+            status_emoji = "✅" if status == 'PASS' else "🔴"
             open_pos = pos_counts.get('db_open_positions', 0)
             closed_today = pos_counts.get('db_closed_today', 0)
             active_gtts = pos_counts.get('zerodha_active_gtts', 0)
             gtt_match = "✓" if open_pos == active_gtts else "✗"
-            msg += f"📊 *POSITIONS* Open:{open_pos} | Closed:{closed_today} | GTTs:{active_gtts} {gtt_match}\n\n"
+            msg += f"{status_emoji} {status} | Open:{open_pos} Closed:{closed_today} GTTs:{active_gtts} {gtt_match}\n"
 
-            # Capital (single line)
+            # Capital + Exposure % (merged)
             if capital and 'total_capital' in capital:
                 total = capital['total_capital']
                 deployed = capital['deployed_capital_ledger']
-                free = capital['free_capital']
-                msg += f"💰 *CAPITAL* {fmt.format_currency(total)} | "
-                msg += f"Dep:{fmt.format_currency(deployed)} | "
-                msg += f"Free:{fmt.format_currency(free)}\n\n"
-
-            # Exposure (single line)
-            if exposure and 'exposure_pct' in exposure:
-                exp_emoji = fmt.GREEN_CIRCLE if exposure['exposure_pct'] < 70 else fmt.YELLOW_CIRCLE if exposure['exposure_pct'] < 90 else fmt.RED_CIRCLE
-                msg += f"📈 *EXPOSURE* {exp_emoji} {exposure['exposure_pct']:.0f}% | "
-                msg += f"Avg:{fmt.format_currency(exposure.get('avg_position_size', 0))} | "
-                msg += f"Max:{fmt.format_currency(exposure.get('largest_position', 0))}\n\n"
+                exp_pct = exposure.get('exposure_pct', 0) if exposure else 0
+                msg += f"💰 {fmt.format_currency(total)} | Dep:{fmt.format_currency(deployed)} ({exp_pct:.0f}%)\n"
 
             # Today's P&L (if any closes)
             if pnl and pnl.get('closed_count', 0) > 0:
                 pnl_amt = pnl['total_bot_pnl']
                 pnl_emoji = fmt.pnl_emoji(pnl_amt)
-                msg += f"💵 *TODAY P&L* {pnl_emoji} {fmt.format_currency(pnl_amt, show_sign=True)} ({pnl['closed_count']} trades)\n\n"
+                msg += f"💵 Today: {pnl_emoji} {fmt.format_currency(pnl_amt, show_sign=True)} ({pnl['closed_count']} trades)\n"
 
             # 7-Day Stats (compact)
             if trends and trends.get('week_closed_count', 0) > 0:
@@ -573,30 +558,25 @@ class DailyReconciliation:
                 wr = trends.get('week_win_rate', 0)
                 avg_pnl = trends.get('week_avg_pnl', 0)
                 wr_emoji = fmt.GREEN_CIRCLE if wr >= 50 else fmt.YELLOW_CIRCLE if wr >= 40 else fmt.RED_CIRCLE
-                msg += f"📅 *7-DAY* {wr_emoji} W:{wins} L:{losses} WR:{wr:.0f}% Avg:{fmt.format_currency(avg_pnl, show_sign=True)}\n\n"
+                msg += f"📅 7D: {wr_emoji} W:{wins} L:{losses} WR:{wr:.0f}% Avg:{fmt.format_currency(avg_pnl, show_sign=True)}\n"
 
             # Discrepancies (compact)
             if report['discrepancies']:
-                msg += f"⚠️ *DISCREPANCIES* ({len(report['discrepancies'])})\n"
+                msg += f"⚠️ Discrepancies ({len(report['discrepancies'])}):\n"
                 for disc in report['discrepancies'][:2]:
-                    # Truncate long discrepancies
                     short_disc = disc[:50] + "..." if len(disc) > 50 else disc
                     msg += f"  {short_disc}\n"
                 if len(report['discrepancies']) > 2:
                     msg += f"  +{len(report['discrepancies']) - 2} more\n"
-                msg += "\n"
 
             # Anomalies (compact)
             if report['warnings']:
-                msg += f"🔶 *ANOMALIES* ({len(report['warnings'])})\n"
+                msg += f"🔶 Anomalies ({len(report['warnings'])}):\n"
                 for w in report['warnings'][:2]:
                     short_w = w[:50] + "..." if len(w) > 50 else w
                     msg += f"  {short_w}\n"
                 if len(report['warnings']) > 2:
                     msg += f"  +{len(report['warnings']) - 2} more\n"
-
-            # Footer
-            msg += fmt.THIN_LINE
 
             telegram.send_alert(msg)
 

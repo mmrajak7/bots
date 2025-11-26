@@ -128,33 +128,26 @@ class ReportGenerator:
 
             # ========== BUILD COMPACT REPORT ==========
             report = f"📊 *DAILY SUMMARY* | {today.strftime('%d %b %Y')}\n"
-            report += fmt.THIN_LINE + "\n\n"
 
             # Warning banner if LTP failures
             if ltp_fetch_failures:
-                report += f"⚠️ LTP fetch failed: {len(ltp_fetch_failures)} pos (P&L incomplete)\n\n"
+                report += f"⚠️ LTP fetch failed: {len(ltp_fetch_failures)} pos (P&L incomplete)\n"
 
-            # === CAPITAL (single line) ===
-            # Use allocated_capital as base (not Zerodha margin or total_capital)
-            base_capital = ledger.allocated_capital if ledger.allocated_capital else ledger.total_capital
-            deployed_pct = (ledger.deployed_capital / base_capital * 100) if base_capital > 0 else 0
-            report += f"💰 *CAPITAL*\n"
-            report += f"Rs.{base_capital:,.0f} | "
-            report += f"Deployed: {fmt.format_currency(ledger.deployed_capital)} ({deployed_pct:.0f}%) | "
-            report += f"Free: {fmt.format_currency(ledger.free_capital)}\n\n"
-
-            # === TODAY'S P&L (compact) ===
+            # === TODAY'S P&L (single compact line) ===
             total_pnl = ledger.realized_pnl_today + total_unrealized
             pnl_emoji = fmt.pnl_emoji(total_pnl)
-            report += f"📈 *TODAY* {pnl_emoji}\n"
-            report += f"Realized: {fmt.format_currency(ledger.realized_pnl_today, show_sign=True)} | "
-            report += f"Unrealized: {fmt.format_currency(total_unrealized, show_sign=True)}"
-            if ltp_fetch_failures:
-                report += " ⚠️"
-            report += f"\nTrades: {ledger.num_trades_today} (Entry:{ledger.num_entries_today} Exit:{ledger.num_exits_today})\n\n"
+            ltp_warn = " ⚠️" if ltp_fetch_failures else ""
+            report += f"📈 Today: {pnl_emoji} {fmt.format_currency(total_pnl, show_sign=True)} "
+            report += f"(Real:{fmt.format_currency(ledger.realized_pnl_today, show_sign=True)} "
+            report += f"Unreal:{fmt.format_currency(total_unrealized, show_sign=True)}{ltp_warn}) | "
+            report += f"Trades:{ledger.num_trades_today}\n"
+
+            # === RISK (single line) ===
+            dd_emoji = "✅" if ledger.monthly_drawdown_pct < 5 else "⚠️" if ledger.monthly_drawdown_pct < 10 else "🔴"
+            report += f"📉 Risk: {dd_emoji} DD:{ledger.monthly_drawdown_pct:.1f}%\n"
 
             # === OPEN POSITIONS (compact table) ===
-            report += f"📊 *POSITIONS* ({len(open_positions)})\n"
+            report += f"\n📊 *POSITIONS* ({len(open_positions)})\n"
             if position_details:
                 # Sort by unrealized P&L (worst first)
                 sorted_positions = sorted(position_details, key=lambda x: x.get('unrealized', 0))
@@ -172,37 +165,28 @@ class ReportGenerator:
                     report += f"   +{remaining} more ({fmt.format_currency(remaining_pnl, show_sign=True)})\n"
             else:
                 report += "No open positions\n"
-            report += "\n"
 
             # === TODAY'S ENTRIES (compact) ===
             if today_entries:
-                report += f"✅ *ENTRIES* ({len(today_entries)})\n"
+                report += f"\n✅ *ENTRIES* ({len(today_entries)})\n"
                 for entry in today_entries[:4]:
                     report += f"  {entry.script}({entry.timeframe}) {entry.quantity}@{entry.price:.0f}\n"
                 if len(today_entries) > 4:
                     report += f"  +{len(today_entries) - 4} more\n"
-                report += "\n"
 
             # === TODAY'S EXITS (compact with P&L) ===
             if today_exits:
                 total_exit_pnl = sum(e.net_pnl for e in today_exits)
                 exit_emoji = fmt.pnl_emoji(total_exit_pnl)
-                report += f"🚪 *EXITS* ({len(today_exits)}) {exit_emoji} {fmt.format_currency(total_exit_pnl, show_sign=True)}\n"
+                report += f"\n🚪 *EXITS* ({len(today_exits)}) {exit_emoji} {fmt.format_currency(total_exit_pnl, show_sign=True)}\n"
                 for exit in today_exits[:4]:
                     emoji = fmt.pnl_emoji(exit.net_pnl)
                     report += f"{emoji} {exit.script}({exit.timeframe}) @{exit.exit_price:.0f} {fmt.format_currency(exit.net_pnl, show_sign=True)} ({exit.pnl_percent:+.1f}%) {exit.days_held}d\n"
                 if len(today_exits) > 4:
                     report += f"  +{len(today_exits) - 4} more\n"
-                report += "\n"
 
-            # === RISK STATUS (single line) ===
-            dd_emoji = "✅" if ledger.monthly_drawdown_pct < 5 else "⚠️" if ledger.monthly_drawdown_pct < 10 else "🔴"
-            risk_status = "OK" if ledger.monthly_drawdown_pct < 5 else "CAUTION" if ledger.monthly_drawdown_pct < 10 else "HIGH"
-            report += f"📉 *RISK* {dd_emoji} DD:{ledger.monthly_drawdown_pct:.1f}% | Status:{risk_status}\n"
-
-            # === FOOTER ===
-            report += fmt.THIN_LINE + "\n"
-            report += f"🤖 Bot: OK | Next: {self._get_next_market_day()}"
+            # === FOOTER (compact) ===
+            report += f"\n🤖 Bot:OK | Next:{self._get_next_market_day_short()}"
 
             # === SEND SEPARATE ALERT IF LTP FETCH FAILURES ===
             # Send critical alert if multiple positions have LTP fetch failures
@@ -393,6 +377,16 @@ class ReportGenerator:
             tomorrow += timedelta(days=1)
 
         return tomorrow.strftime('%d %b %Y (%A)')
+
+    def _get_next_market_day_short(self) -> str:
+        """Get next market day in short format (skip weekends)"""
+        tomorrow = date.today() + timedelta(days=1)
+
+        # Skip weekends
+        while tomorrow.weekday() >= 5:  # 5=Saturday, 6=Sunday
+            tomorrow += timedelta(days=1)
+
+        return tomorrow.strftime('%d %b (%a)')
 
     def send_daily_report(self):
         """Generate and send daily report via Telegram"""

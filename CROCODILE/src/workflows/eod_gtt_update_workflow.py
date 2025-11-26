@@ -63,20 +63,46 @@ def update_gtt_eod():
                 "<pre>"
             ]
 
-            # Header
-            lines.append(f"{'Script':<12} {'TF':<3} {'Old SL':>9} {'New SL':>9} {'Change':>9}")
-            lines.append("-" * 50)
+            # Header: Script(TF) | Entry | New SL | Points | Risk
+            lines.append(f"{'Script':<14} {'Entry':>7} {'New SL':>7} {'Points':>7} {'Risk':>12}")
+            lines.append("-" * 52)
 
             # Update rows
             for update in stats['updates']:
-                old_sl_str = f"Rs.{update['old_sl']:.2f}"
-                new_sl_str = f"Rs.{update['new_sl']:.2f}"
-                change = update['new_sl'] - update['old_sl']
-                change_str = f"+Rs.{change:.2f}" if change >= 0 else f"Rs.{change:.2f}"
+                entry = update['entry_price']
+                new_sl = update['new_sl']
+                qty = update['quantity']
+                change = new_sl - update['old_sl']
+
+                # Script with timeframe in bracket
+                script_tf = f"{update['script']}({update['timeframe']})"
+
+                # TSL Upd. = points at risk from entry (entry - new_sl)
+                # Negative means SL is below entry (at risk), positive means SL above entry (protected)
+                points_at_risk = entry - new_sl
+                tsl_upd_str = f"-{points_at_risk:.0f}" if points_at_risk > 0 else f"+{abs(points_at_risk):.0f}"
+
+                # Risk calculation including transaction costs
+                # Turnover for risk calc = entry_value + sl_exit_value
+                entry_value = entry * qty
+                sl_exit_value = new_sl * qty
+                turnover = entry_value + sl_exit_value
+                txn_cost = turnover * 0.00111  # 0.111% of turnover
+
+                # Breakeven price = entry + (txn_cost / qty)
+                breakeven = entry * 1.00111  # Simplified: entry + ~0.111% covers both legs
+
+                if new_sl >= breakeven:
+                    # Risk-free: SL is above entry + transaction costs
+                    risk_str = "🔒"
+                else:
+                    # Risk = potential loss + transaction costs
+                    risk_rs = (entry - new_sl) * qty + txn_cost
+                    risk_pct = (risk_rs / entry_value) * 100
+                    risk_str = f"{risk_pct:.1f}% ({risk_rs:.0f})"
 
                 lines.append(
-                    f"{update['script']:<12} {update['timeframe']:<3} "
-                    f"{old_sl_str:>9} {new_sl_str:>9} {change_str:>9}"
+                    f"{script_tf:<14} {entry:>7.2f} {new_sl:>7.2f} {tsl_upd_str:>7} {risk_str:>12}"
                 )
 
             lines.append("</pre>")

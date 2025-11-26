@@ -1022,7 +1022,9 @@ class ExitManager:
                                 'script': position.script,
                                 'timeframe': position.timeframe,
                                 'old_sl': update_details['old_sl'],
-                                'new_sl': update_details['new_sl']
+                                'new_sl': update_details['new_sl'],
+                                'entry_price': position.entry_price,
+                                'quantity': position.quantity
                             })
                     else:
                         stats['failed'] += 1
