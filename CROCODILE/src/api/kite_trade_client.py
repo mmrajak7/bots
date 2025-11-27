@@ -272,14 +272,22 @@ class KiteTradeClient:
         """
         Get Last Traded Price for an instrument
 
-        Returns validated LTP with sanity checks
+        Returns validated LTP with sanity checks.
+        Falls back to last available close price if market is not open.
         """
-        # Use current day's last candle as LTP
+        # Try current day's last candle as LTP
         today = now_ist().strftime('%Y-%m-%d')
         df = self.get_historical_data(instrument_token, today, today, 'minute')
 
         if df is None or df.empty:
-            raise Exception(f"No LTP data available for instrument {instrument_token}")
+            # Market not open yet - fallback to last available close from past week
+            logger.debug(f"No intraday data for {instrument_token}, fetching last close from historical data")
+            end_date = now_ist().strftime('%Y-%m-%d')
+            start_date = (now_ist() - timedelta(days=7)).strftime('%Y-%m-%d')
+            df = self.get_historical_data(instrument_token, start_date, end_date, 'day')
+
+            if df is None or df.empty:
+                raise Exception(f"No LTP data available for instrument {instrument_token}")
 
         ltp = float(df['Close'].iloc[-1])
 
