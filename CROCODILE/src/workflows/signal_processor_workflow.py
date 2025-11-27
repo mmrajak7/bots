@@ -246,17 +246,17 @@ def process_signals():
                     total_capital = sum(o.capital_deployed for o in todays_orders)
 
                     lines = [
-                        f"✅ *ORDERS PLACED* ({len(todays_orders)}/{stats['total']}) | Rs.{total_capital:,.0f}",
+                        f"✅ *ORDERS PLACED* (+{stats['success']} => {len(todays_orders)} today) | Rs.{total_capital:,.0f}",
                         "<pre>",
-                        f"{'Script':<14} {'Type':<6} {'Qty':>4} {'Price':>8} {'Capital':>8}",
-                        "-" * 44
+                        f"{'Script':<14} {'Qty':>4} {'Price':>8} {'Capital':>8}",
+                        "-" * 38
                     ]
 
                     for order in todays_orders:
                         script_tf = f"{order.script}({order.timeframe})"
                         capital_k = order.capital_deployed / 1000
                         lines.append(
-                            f"{script_tf:<14} {order.order_type:<6} {order.quantity:>4} {order.order_price:>8.2f} {capital_k:>7.1f}K"
+                            f"{script_tf:<14} {order.quantity:>4} {order.order_price:>8.2f} {capital_k:>7.1f}K"
                         )
 
                     lines.append("</pre>")
