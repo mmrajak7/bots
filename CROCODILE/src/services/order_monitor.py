@@ -884,11 +884,28 @@ class OrderMonitor:
             # Cancel on Zerodha if still open
             if zerodha_status == KiteOrderStatus.OPEN:
                 try:
-                    self.kite_client.cancel_order(order.order_id, variety=order_variety)
-                    logger.info(f"  Order cancelled on Zerodha")
+                    cancelled = self.kite_client.cancel_order(order.order_id, variety=order_variety)
+                    if cancelled:
+                        logger.info(f"  Order cancelled and verified on Zerodha")
+                    else:
+                        logger.warning(f"  Order could not be cancelled (may be filled/rejected)")
                 except Exception as e:
-                    logger.error(f"  Failed to cancel on Zerodha: {e}")
-                    return {'success': False, 'error': str(e)}
+                    error_msg = str(e)
+                    logger.error(f"  Failed to cancel on Zerodha: {error_msg}")
+                    # Send alert if verification failed (order still OPEN)
+                    if "cancellation failed at exchange" in error_msg.lower():
+                        alert_msg = (
+                            f"🚨 STALE ORDER CANCEL FAILED\n\n"
+                            f"Order: {order.order_id}\n"
+                            f"Stock: {order.script} ({order.timeframe})\n"
+                            f"Reason: {reason}\n\n"
+                            f"⚠️ Order may still be OPEN. Cancel manually."
+                        )
+                        try:
+                            telegram.send_alert(alert_msg, critical=True)
+                        except Exception:
+                            pass
+                    return {'success': False, 'error': error_msg}
 
             # Update database
             capital_released = order.capital_deployed
@@ -1101,10 +1118,27 @@ class OrderMonitor:
                 # Cancel remaining on Zerodha (only if still OPEN)
                 if zerodha_status == KiteOrderStatus.OPEN:
                     try:
-                        self.kite_client.cancel_order(order.order_id, variety=order_variety)
-                        logger.info(f"  Cancelled remaining {unfilled_qty} shares on Zerodha")
+                        cancelled = self.kite_client.cancel_order(order.order_id, variety=order_variety)
+                        if cancelled:
+                            logger.info(f"  Cancelled remaining {unfilled_qty} shares on Zerodha")
+                        else:
+                            logger.warning(f"  Order could not be cancelled (may be filled/rejected)")
                     except Exception as e:
-                        logger.warning(f"  Failed to cancel on Zerodha (may already be done): {e}")
+                        error_msg = str(e)
+                        logger.warning(f"  Failed to cancel on Zerodha: {error_msg}")
+                        # For partial fills, still proceed (position created is the priority)
+                        if "cancellation failed at exchange" in error_msg.lower():
+                            alert_msg = (
+                                f"⚠️ PARTIAL FILL - Cancel Failed\n\n"
+                                f"Order: {order.order_id}\n"
+                                f"Stock: {order.script}\n"
+                                f"Filled: {filled_qty}/{order.quantity}\n\n"
+                                f"Remaining qty may still be OPEN. Check manually."
+                            )
+                            try:
+                                telegram.send_alert(alert_msg, critical=True)
+                            except Exception:
+                                pass
 
                 # Update order status
                 order.status = OrderStatus.FILLED  # Position was created for filled portion
@@ -1126,11 +1160,34 @@ class OrderMonitor:
                     return {'status': 'SKIPPED_AMO'}
 
                 try:
-                    self.kite_client.cancel_order(order.order_id, variety=order_variety)
-                    logger.info(f"  Order cancelled on Zerodha")
+                    # cancel_order now includes verification (verify=True by default)
+                    cancelled = self.kite_client.cancel_order(order.order_id, variety=order_variety)
+                    if cancelled:
+                        logger.info(f"  Order cancelled and verified on Zerodha")
+                    else:
+                        # Order was already filled/rejected - not actually cancelled
+                        logger.warning(f"  Order could not be cancelled (may be filled/rejected)")
                 except Exception as e:
-                    logger.error(f"  Failed to cancel order on Zerodha: {e}")
-                    return {'status': 'CANCEL_FAILED', 'error': str(e)}
+                    error_msg = str(e)
+                    logger.error(f"  Failed to cancel order on Zerodha: {error_msg}")
+
+                    # Check if this is a verification failure (order still OPEN after cancel request)
+                    if "cancellation failed at exchange" in error_msg.lower():
+                        # Send critical Telegram alert for manual intervention
+                        alert_msg = (
+                            f"🚨 ORDER CANCELLATION FAILED - MANUAL ACTION REQUIRED\n\n"
+                            f"Order: {order.order_id}\n"
+                            f"Stock: {order.script} ({order.timeframe})\n"
+                            f"Qty: {order.quantity} @ Rs.{order.order_price:.2f}\n\n"
+                            f"Error: {error_msg}\n\n"
+                            f"⚠️ Order may still be OPEN on Zerodha. Please cancel manually."
+                        )
+                        try:
+                            telegram.send_alert(alert_msg, critical=True)
+                        except Exception as tg_err:
+                            logger.error(f"  Failed to send Telegram alert: {tg_err}")
+
+                    return {'status': 'CANCEL_FAILED', 'error': error_msg}
 
             # Update database
             order.status = OrderStatus.CANCELLED

@@ -973,19 +973,20 @@ class KiteTradeClient:
         return True
 
     @critical_api_call("Cancel Regular Order")
-    def cancel_order(self, order_id: str, variety: str = "regular") -> bool:
+    def cancel_order(self, order_id: str, variety: str = "regular", verify: bool = True) -> bool:
         """
         Cancel a regular order on Zerodha
 
         Args:
             order_id: Order ID to cancel
             variety: Order variety - "regular", "amo", "co", "iceberg", "auction"
+            verify: If True, verify order status after cancellation (recommended)
 
         Returns:
-            True if cancelled successfully
+            True if cancelled successfully and verified
 
         Raises:
-            Exception: If cancellation fails
+            Exception: If cancellation fails or verification fails
         """
         url = f"{self.base_url}/oms/orders/{variety}/{order_id}"
         headers = self._get_headers()
@@ -1002,7 +1003,40 @@ class KiteTradeClient:
 
         response.raise_for_status()
 
-        logger.info(f"Order cancelled: {order_id} (variety: {variety})")
+        logger.info(f"Cancel request sent for order: {order_id} (variety: {variety})")
+
+        # Verify cancellation if requested (handles edge case where API returns 200 but exchange rejects)
+        if verify:
+            time.sleep(1)  # Brief delay for status to propagate
+            try:
+                order_status = self.get_order_status(order_id)
+                actual_status = order_status.get('status', '')
+                status_message = order_status.get('status_message', '')
+
+                if actual_status == 'CANCELLED':
+                    logger.info(f"Order cancellation verified: {order_id} is CANCELLED")
+                    return True
+                elif actual_status in ['COMPLETE', 'REJECTED']:
+                    # Order was already filled or rejected - not an error, just can't cancel
+                    logger.warning(f"Order {order_id} cannot be cancelled - status is {actual_status}")
+                    return False
+                else:
+                    # Order still OPEN or other status - cancellation may have failed at exchange level
+                    logger.error(
+                        f"Order cancellation verification FAILED: {order_id} still has status '{actual_status}'. "
+                        f"Message: {status_message}"
+                    )
+                    raise Exception(
+                        f"Order cancellation failed at exchange level. "
+                        f"Order {order_id} still {actual_status}. {status_message}"
+                    )
+            except Exception as e:
+                if "cancellation failed at exchange" in str(e):
+                    raise  # Re-raise our verification failure
+                # If we can't verify (e.g., API error), log warning but don't fail
+                logger.warning(f"Could not verify order cancellation for {order_id}: {e}")
+                return True  # Assume success since DELETE returned 200
+
         return True
 
     @standard_api_call("Get GTT Orders")
