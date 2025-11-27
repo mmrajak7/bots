@@ -80,6 +80,9 @@ class ReportGenerator:
                     unrealized = (current_ltp - pos.entry_price) * pos.quantity
                     total_unrealized += unrealized
 
+                    # Calculate age from entry_date
+                    age_days = (today - pos.entry_date).days if pos.entry_date else 0
+
                     position_details.append({
                         'script': pos.script,
                         'tf': pos.timeframe,
@@ -87,7 +90,7 @@ class ReportGenerator:
                         'qty': pos.quantity,
                         'current_ltp': current_ltp,
                         'sl': pos.current_sl,
-                        'days': pos.days_held,
+                        'days': age_days,
                         'unrealized': unrealized,
                         'ltp_failed': False
                     })
@@ -99,6 +102,9 @@ class ReportGenerator:
                     fallback_ltp = pos.entry_price
                     unrealized_fallback = 0.0  # Can't calculate without real LTP
 
+                    # Calculate age from entry_date
+                    age_days = (today - pos.entry_date).days if pos.entry_date else 0
+
                     position_details.append({
                         'script': pos.script,
                         'tf': pos.timeframe,
@@ -106,7 +112,7 @@ class ReportGenerator:
                         'qty': pos.quantity,
                         'current_ltp': fallback_ltp,
                         'sl': pos.current_sl,
-                        'days': pos.days_held,
+                        'days': age_days,
                         'unrealized': unrealized_fallback,
                         'ltp_failed': True,  # Flag for display
                         'ltp_error': str(e)[:50]  # Store error
@@ -126,67 +132,52 @@ class ReportGenerator:
                 transaction_type='ENTRY'
             ).all()
 
-            # ========== BUILD COMPACT REPORT ==========
-            report = f"📊 *DAILY SUMMARY* | {today.strftime('%d %b %Y')}\n"
+            # ========== BUILD TABLE FORMAT REPORT ==========
+            total_pnl = ledger.realized_pnl_today + total_unrealized
+
+            report = f"<b>DAILY SUMMARY</b>\n\n"
 
             # Warning banner if LTP failures
             if ltp_fetch_failures:
                 report += f"⚠️ LTP fetch failed: {len(ltp_fetch_failures)} pos (P&L incomplete)\n"
 
-            # === TODAY'S P&L (single compact line) ===
-            total_pnl = ledger.realized_pnl_today + total_unrealized
-            pnl_emoji = fmt.pnl_emoji(total_pnl)
-            ltp_warn = " ⚠️" if ltp_fetch_failures else ""
-            report += f"📈 Today: {pnl_emoji} {fmt.format_currency(total_pnl, show_sign=True)} "
-            report += f"(Real:{fmt.format_currency(ledger.realized_pnl_today, show_sign=True)} "
-            report += f"Unreal:{fmt.format_currency(total_unrealized, show_sign=True)}{ltp_warn}) | "
-            report += f"Trades:{ledger.num_trades_today}\n"
-
-            # === RISK (single line) ===
-            dd_emoji = "✅" if ledger.monthly_drawdown_pct < 5 else "⚠️" if ledger.monthly_drawdown_pct < 10 else "🔴"
-            report += f"📉 Risk: {dd_emoji} DD:{ledger.monthly_drawdown_pct:.1f}%\n"
-
-            # === OPEN POSITIONS (compact table) ===
-            report += f"\n📊 *POSITIONS* ({len(open_positions)})\n"
+            # === OPEN POSITIONS (table format) ===
+            report += f"📊 <b>POSITIONS</b> ({len(open_positions)})\n"
             if position_details:
+                # Build table with <pre> for monospace alignment
+                report += "<pre>\n"
+                report += f"{'Script':<10}{'Qty':>4}{'Entry':>6}{'LTP':>6}{'SL':>6}{'P&L':>6}{'Age':>6}\n"
+                report += "─" * 44 + "\n"
+
                 # Sort by unrealized P&L (worst first)
                 sorted_positions = sorted(position_details, key=lambda x: x.get('unrealized', 0))
                 for pos in sorted_positions[:6]:  # Show max 6
+                    script_tf = f"{pos['script']}({pos['tf']})"
+                    days = pos.get('days', 0)
+                    age_str = "Today" if days == 0 else f"{days}d"
+
                     if pos.get('ltp_failed', False):
-                        report += f"⚠️ {pos['script']}({pos['tf']}) {pos['qty']}@{pos['entry']:.0f} LTP:N/A\n"
+                        report += f"{script_tf:<10}{pos['qty']:>4}{pos['entry']:>6.0f}{'N/A':>6}{pos['sl']:>6.0f}{'N/A':>6}{age_str:>6}\n"
                     else:
-                        emoji = fmt.pnl_emoji(pos['unrealized'])
-                        pnl_str = fmt.format_currency(pos['unrealized'], show_sign=True)
-                        report += f"{emoji} {pos['script']}({pos['tf']}) {pos['qty']}@{pos['entry']:.0f} LTP:{pos['current_ltp']:.0f} SL:{pos['sl']:.0f} {pnl_str}\n"
+                        pnl_val = pos['unrealized']
+                        pnl_str = f"{pnl_val:+.0f}"
+                        report += f"{script_tf:<10}{pos['qty']:>4}{pos['entry']:>6.0f}{pos['current_ltp']:>6.0f}{pos['sl']:>6.0f}{pnl_str:>6}{age_str:>6}\n"
 
                 if len(position_details) > 6:
                     remaining = len(position_details) - 6
                     remaining_pnl = sum(p.get('unrealized', 0) for p in sorted_positions[6:])
-                    report += f"   +{remaining} more ({fmt.format_currency(remaining_pnl, show_sign=True)})\n"
+                    report += f"+{remaining} more ({fmt.format_currency(remaining_pnl, show_sign=True)})\n"
+                report += "</pre>"
             else:
                 report += "No open positions\n"
 
-            # === TODAY'S ENTRIES (compact) ===
-            if today_entries:
-                report += f"\n✅ *ENTRIES* ({len(today_entries)})\n"
-                for entry in today_entries[:4]:
-                    report += f"  {entry.script}({entry.timeframe}) {entry.quantity}@{entry.price:.0f}\n"
-                if len(today_entries) > 4:
-                    report += f"  +{len(today_entries) - 4} more\n"
-
-            # === TODAY'S EXITS (compact with P&L) ===
-            if today_exits:
-                total_exit_pnl = sum(e.net_pnl for e in today_exits)
-                exit_emoji = fmt.pnl_emoji(total_exit_pnl)
-                report += f"\n🚪 *EXITS* ({len(today_exits)}) {exit_emoji} {fmt.format_currency(total_exit_pnl, show_sign=True)}\n"
-                for exit in today_exits[:4]:
-                    emoji = fmt.pnl_emoji(exit.net_pnl)
-                    report += f"{emoji} {exit.script}({exit.timeframe}) @{exit.exit_price:.0f} {fmt.format_currency(exit.net_pnl, show_sign=True)} ({exit.pnl_percent:+.1f}%) {exit.days_held}d\n"
-                if len(today_exits) > 4:
-                    report += f"  +{len(today_exits) - 4} more\n"
-
-            # === FOOTER (compact) ===
-            report += f"\n🤖 Bot:OK | Next:{self._get_next_market_day_short()}"
+            # === FOOTER with Total ===
+            report += "\n"
+            ltp_warn = " ⚠️" if ltp_fetch_failures else ""
+            report += f"<b>Total: {fmt.format_currency(total_pnl, show_sign=True)} "
+            report += f"(Real:{fmt.format_currency(ledger.realized_pnl_today, show_sign=True)} "
+            report += f"Unreal:{fmt.format_currency(total_unrealized, show_sign=True)}{ltp_warn}) | "
+            report += f"DD:{ledger.monthly_drawdown_pct:.1f}%</b>"
 
             # === SEND SEPARATE ALERT IF LTP FETCH FAILURES ===
             # Send critical alert if multiple positions have LTP fetch failures

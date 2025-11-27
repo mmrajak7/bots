@@ -1104,16 +1104,16 @@ class SameDayRecovery:
                 logger.info("No issues found - sending success confirmation")
                 status_line = fmt.format_recovery_summary(checks_count, 0, 0, 0, fixes_count)
                 telegram.send_alert(
-                    f"*4PM Recovery* | {date_str}\n"
-                    f"{fmt.THIN_LINE}\n"
-                    f"{status_line}\n"
+                    f"<b>RECOVERY RUN</b> ✅\n"
+                    f"{status_line}\n\n"
                     f"{fmt.CHECK} All positions verified & protected"
                 )
                 return
 
             # Build consolidated alert with all findings
-            lines = [f"*4PM Recovery* | {date_str}"]
-            lines.append(fmt.THIN_LINE)
+            status_emoji = "🔴" if critical_count > 0 else "⚠️"
+            lines = [f"<b>RECOVERY RUN</b> {status_emoji}"]
+            lines.append("")
 
             # Status summary line
             status_line = fmt.format_recovery_summary(checks_count, issues_count, critical_count, warning_count, fixes_count)
@@ -1157,7 +1157,7 @@ class SameDayRecovery:
                     lines.append(f"  +{fixes_count - 3} more fixes")
 
             # Footer
-            lines.append(fmt.THIN_LINE)
+            lines.append("")
             auto_fix_status = f"{fmt.CHECK} Auto-fix ON" if self.auto_fix_enabled else f"{fmt.WARNING} Auto-fix OFF"
             lines.append(auto_fix_status)
 
