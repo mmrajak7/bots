@@ -41,6 +41,11 @@ MARKET_END_MIN = 45
 # Market close time
 MARKET_CLOSE_TIME = dt_time(15, 30)  # 3:30 PM IST
 
+# EOD Order Cleanup start time
+# Exchange doesn't allow cancellations during 15:30-15:40 post-market window
+# So we delay EOD cleanup until 15:40 when cancellations are accepted
+EOD_CLEANUP_START_TIME = dt_time(15, 40)  # 3:40 PM IST
+
 
 def print_workflow_banner():
     """Print a clear banner to identify workflow start in logs"""
@@ -83,6 +88,16 @@ def is_after_market_close() -> bool:
     """Check if current time is after market close (3:30 PM IST)"""
     current_time = now_ist().time()
     return current_time >= MARKET_CLOSE_TIME
+
+
+def is_eod_cleanup_time() -> bool:
+    """Check if current time is suitable for EOD order cleanup (3:40 PM IST onwards)
+
+    Exchange doesn't allow order cancellations during 15:30-15:40 post-market window.
+    We delay EOD cleanup until 15:40 when cancellations are accepted.
+    """
+    current_time = now_ist().time()
+    return current_time >= EOD_CLEANUP_START_TIME
 
 
 def monitor_orders():
@@ -151,9 +166,11 @@ def monitor_orders():
         else:
             logger.info("[STEP 3/4] Skipped stale order check (after market close)")
 
-        # Part 4: EOD Order Cleanup (only after market close)
+        # Part 4: EOD Order Cleanup (only after 3:40 PM when exchange allows cancellations)
+        # Exchange doesn't allow cancellations during 15:30-15:40 post-market window
         eod_stats = None
-        if after_market_close:
+        eod_cleanup_ready = is_eod_cleanup_time()
+        if eod_cleanup_ready:
             logger.info("[STEP 4/4] EOD Order Cleanup - Cancelling unfulfilled orders...")
             eod_stats = order_monitor.cancel_unfulfilled_orders()
 
@@ -166,6 +183,8 @@ def monitor_orders():
                 )
             else:
                 logger.info("EOD Cleanup: No pending orders to cancel")
+        elif after_market_close:
+            logger.info("[STEP 4/4] Skipped EOD cleanup (waiting until 15:40 for exchange to allow cancellations)")
         else:
             logger.info("[STEP 4/4] Skipped EOD cleanup (market still open)")
 
