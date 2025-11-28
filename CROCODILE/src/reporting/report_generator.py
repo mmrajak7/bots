@@ -274,12 +274,7 @@ class ReportGenerator:
                     f"Weekly report: Only {actual_days}/{expected_days} days of data available"
                 )
 
-            week_start_capital = ledgers[0].opening_capital
-            week_end_capital = ledgers[-1].total_capital
-            net_pnl = week_end_capital - week_start_capital
-            pnl_pct = (net_pnl / week_start_capital) * 100 if week_start_capital > 0 else 0
-
-            # Get week's closed trades
+            # Get week's closed trades FIRST (we need this for P&L calculation)
             weekly_trades = session.query(ClosedPosition).filter(
                 ClosedPosition.exit_date >= week_start,
                 ClosedPosition.exit_date <= week_end
@@ -294,6 +289,14 @@ class ReportGenerator:
             avg_win = sum(t.net_pnl for t in weekly_trades if t.net_pnl > 0) / winning_trades if winning_trades > 0 else 0
             avg_loss = sum(t.net_pnl for t in weekly_trades if t.net_pnl < 0) / losing_trades if losing_trades > 0 else 0
 
+            # Calculate Net P&L from REALIZED TRADES ONLY (not capital changes)
+            # Capital changes can include deposits/withdrawals which skew the numbers
+            realized_pnl = sum(t.net_pnl for t in weekly_trades)
+
+            # For reference, also get capital-based numbers (but don't use for main P&L)
+            week_start_capital = ledgers[0].opening_capital
+            week_end_capital = ledgers[-1].total_capital
+
             # Build report
             report = f"📊 *CROCODILE - WEEKLY SUMMARY*\n"
             report += f"📅 Week: {week_start.strftime('%d %b')} to {week_end.strftime('%d %b %Y')}\n"
@@ -306,12 +309,12 @@ class ReportGenerator:
 
             report += "\n"
 
-            # Weekly Performance
+            # Weekly Performance (based on realized trades, not capital changes)
             report += f"💰 *WEEKLY PERFORMANCE*\n"
-            pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
-            report += f"├─ Starting Capital: Rs.{week_start_capital:,.2f}\n"
-            report += f"├─ Ending Capital: Rs.{week_end_capital:,.2f}\n"
-            report += f"└─ Net P&L: {pnl_emoji} Rs.{net_pnl:,.2f} ({pnl_pct:.2f}%)\n\n"
+            pnl_emoji = "🟢" if realized_pnl >= 0 else "🔴"
+            report += f"├─ Realized P&L: {pnl_emoji} Rs.{realized_pnl:,.2f}\n"
+            report += f"├─ Current Capital: Rs.{week_end_capital:,.2f}\n"
+            report += f"└─ Trades Closed: {total_trades}\n\n"
 
             # Trade Statistics
             report += f"📈 *TRADE STATISTICS*\n"
@@ -333,25 +336,31 @@ class ReportGenerator:
             report += f"├─ Available Capital: Rs.{available:,.2f}\n"
             report += f"└─ Capital Utilization: {utilization:.1f}%\n\n"
 
-            # Top Performers
+            # Top Performers - Only show if there are actual winning trades
             if weekly_trades:
-                top_5 = sorted(weekly_trades, key=lambda x: x.net_pnl, reverse=True)[:5]
-                worst_5 = sorted(weekly_trades, key=lambda x: x.net_pnl)[:5]
+                # Get winning trades only for Top Performers
+                winning_trade_list = [t for t in weekly_trades if t.net_pnl > 0]
+                losing_trade_list = [t for t in weekly_trades if t.net_pnl <= 0]
 
-                report += f"🏆 *TOP PERFORMERS*\n"
-                for i, trade in enumerate(top_5, 1):
-                    report += f"{i}. {trade.script} ({trade.timeframe}): Rs.{trade.net_pnl:,.2f} ({trade.pnl_percent:.1f}%)\n"
-                report += "\n"
+                # Show Top Performers ONLY if there are winners
+                if winning_trade_list:
+                    top_5 = sorted(winning_trade_list, key=lambda x: x.net_pnl, reverse=True)[:5]
+                    report += f"🏆 *TOP PERFORMERS*\n"
+                    for i, trade in enumerate(top_5, 1):
+                        report += f"{i}. {trade.script} ({trade.timeframe}): Rs.{trade.net_pnl:,.2f} ({trade.pnl_percent:.1f}%)\n"
+                    report += "\n"
 
-                report += f"📉 *WORST PERFORMERS*\n"
-                for i, trade in enumerate(worst_5, 1):
-                    report += f"{i}. {trade.script} ({trade.timeframe}): Rs.{trade.net_pnl:,.2f} ({trade.pnl_percent:.1f}%)\n"
-                report += "\n"
+                # Show Worst Performers if there are losers
+                if losing_trade_list:
+                    worst_5 = sorted(losing_trade_list, key=lambda x: x.net_pnl)[:5]
+                    report += f"📉 *WORST PERFORMERS*\n"
+                    for i, trade in enumerate(worst_5, 1):
+                        report += f"{i}. {trade.script} ({trade.timeframe}): Rs.{trade.net_pnl:,.2f} ({trade.pnl_percent:.1f}%)\n"
+                    report += "\n"
 
             # Footer
             report += "---\n"
-            report += "🤖 Have a great weekend! 🎉\n"
-            report += f"📊 Next report: Next Friday\n"
+            report += "🤖 Have a great weekend! 🎉"
 
             return report
 
