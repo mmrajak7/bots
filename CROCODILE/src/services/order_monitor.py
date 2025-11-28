@@ -446,6 +446,13 @@ class OrderMonitor:
                 # Skip if position has no GTT ID
                 if not position.current_gtt_id:
                     logger.warning(f"{position_key}: No GTT ID - skipping status check")
+                    # Alert: Position has no SL protection!
+                    telegram.send_message(
+                        f"⚠️ *UNPROTECTED POSITION*\n"
+                        f"{position_key} has NO GTT/SL!\n"
+                        f"Entry: ₹{position.entry_price:.2f}\n"
+                        f"Qty: {position.quantity}"
+                    )
                     continue
 
                 # Check if GTT exists in Zerodha
@@ -461,6 +468,15 @@ class OrderMonitor:
                         closed = self._close_position_on_sl_hit(position, session)
                         if closed:
                             stats['positions_closed'] += 1
+                    else:
+                        # GTT missing and no sell order - position is unprotected!
+                        telegram.send_message(
+                            f"⚠️ *GTT MISSING*\n"
+                            f"{position_key}\n"
+                            f"GTT {position.current_gtt_id} not found!\n"
+                            f"No sell order detected.\n"
+                            f"Position may be UNPROTECTED!"
+                        )
                     continue
 
                 # Check GTT status
@@ -484,6 +500,13 @@ class OrderMonitor:
                     # GTT exists but not active (cancelled, disabled, etc.)
                     logger.warning(
                         f"{position_key}: GTT {position.current_gtt_id} status is '{gtt_status}' (not active)"
+                    )
+                    # Alert: GTT is not active - position may be unprotected
+                    telegram.send_message(
+                        f"⚠️ *GTT NOT ACTIVE*\n"
+                        f"{position_key}\n"
+                        f"GTT {position.current_gtt_id} status: {gtt_status}\n"
+                        f"Position may be UNPROTECTED!"
                     )
 
             # Log summary
