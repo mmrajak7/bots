@@ -519,10 +519,12 @@ class ExitManager:
         """
         try:
             # Apply buffer if retrying
+            # Zerodha requires trigger price to be > 0.25% away from LTP
+            # We use 0.3% buffer (0.25% requirement + 0.05% safety margin)
             if retry_with_buffer:
-                sl_price = sl_price * 0.998  # 0.2% buffer
+                sl_price = sl_price * 0.997  # 0.3% buffer
                 sl_price = round_price(sl_price)
-                logger.info(f"Retrying GTT with 0.2% buffer: SL=Rs.{sl_price:.2f}")
+                logger.info(f"Retrying GTT with 0.3% buffer: SL=Rs.{sl_price:.2f}")
 
             # Calculate trigger price (same as SL for LIMIT order)
             trigger_price = sl_price
@@ -568,11 +570,17 @@ class ExitManager:
         except Exception as e:
             error_str = str(e)
 
-            # Check if error is due to price being too close
-            if "too close" in error_str.lower() or "0.2%" in error_str.lower():
-                if not retry_with_buffer:
-                    logger.warning("GTT rejected - price too close, retrying with buffer")
-                    return self._place_gtt_order(script, quantity, sl_price, current_ltp, retry_with_buffer=True)
+            # Check if error is due to price being too close to LTP
+            # Zerodha error: "Trigger price was too close to the last price. (difference should be more than 0.25%)"
+            price_too_close = (
+                "too close" in error_str.lower() or
+                "0.25%" in error_str or
+                "0.2%" in error_str.lower()
+            )
+
+            if price_too_close and not retry_with_buffer:
+                logger.warning("GTT rejected - trigger price too close to LTP, retrying with 0.3% buffer")
+                return self._place_gtt_order(script, quantity, sl_price, current_ltp, retry_with_buffer=True)
 
             logger.error(f"GTT placement failed: {e}")
             return False, None, error_str
