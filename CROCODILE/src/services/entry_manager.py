@@ -14,7 +14,7 @@ from src.indicators.nifty_data_fetcher import NiftyDataFetcher
 from src.indicators.nifty_trend_filter import NiftyTrendFilter
 from src.api.kite_trade_client import KiteTradeClient
 from src.utils.config_manager import config
-from src.utils.price_rounder import round_price
+from src.utils.price_rounder import round_price, PriceRounder
 from src.reporting.telegram_client import telegram
 
 
@@ -475,7 +475,6 @@ class EntryManager:
             # === VALIDATION 4: Tick size validation ===
             # Re-round to ensure tick size compliance (handles float precision issues)
             # Use dynamic tick size based on NSE rules
-            from src.utils.price_rounder import PriceRounder
             tick_size = PriceRounder.get_nse_tick_size(st_price_rounded)
             remainder = abs(st_price_rounded % tick_size)
             # Check if remainder is close to 0 OR close to tick_size (due to float precision)
@@ -530,21 +529,66 @@ class EntryManager:
                     f"(LTP=Rs.{current_ltp:.2f} < ST=Rs.{st_price_rounded:.2f})"
                 )
 
-            # Place order via Kite API
-            order_response = self.kite_client.place_order(
-                tradingsymbol=signal.script,
-                exchange="NSE",
-                transaction_type="BUY",
-                quantity=quantity,
-                order_type=order_type,
-                price=order_price,
-                product="CNC"  # Delivery
-            )
+            # Place order via Kite API (with tick size error retry)
+            max_retries = 1
+            retry_count = 0
+            last_error = None
 
-            order_id = order_response.get('order_id')
+            while retry_count <= max_retries:
+                try:
+                    order_response = self.kite_client.place_order(
+                        tradingsymbol=signal.script,
+                        exchange="NSE",
+                        transaction_type="BUY",
+                        quantity=quantity,
+                        order_type=order_type,
+                        price=order_price,
+                        product="CNC"  # Delivery
+                    )
 
+                    order_id = order_response.get('order_id')
+
+                    if not order_id:
+                        raise Exception("No order_id in response")
+
+                    # Success - break out of retry loop
+                    break
+
+                except Exception as order_error:
+                    error_msg = str(order_error)
+                    last_error = order_error
+
+                    # Check if it's a tick size error
+                    if retry_count == 0 and "tick size" in error_msg.lower():
+                        # Extract tick size from error message
+                        # Example: "Tick size for this script is 0.10. Kindly enter price..."
+                        import re
+                        tick_match = re.search(r'tick size.*?is\s+(0\.\d+)', error_msg, re.IGNORECASE)
+
+                        if tick_match and order_type == "LIMIT":
+                            required_tick = float(tick_match.group(1))
+                            logger.warning(
+                                f"Tick size error for {signal.script}. "
+                                f"Zerodha requires {required_tick}, retrying with corrected price..."
+                            )
+
+                            # Re-round the price with correct tick size
+                            order_price = PriceRounder.round_to_tick(st_price_rounded, tick_size=required_tick)
+
+                            logger.info(
+                                f"Corrected price: Rs.{st_price_rounded:.2f} → Rs.{order_price:.2f} "
+                                f"(tick size: {required_tick})"
+                            )
+
+                            retry_count += 1
+                            continue  # Retry with corrected price
+
+                    # Not a tick size error or already retried - raise the error
+                    raise last_error
+
+            # After successful order placement
             if not order_id:
-                raise Exception("No order_id in response")
+                raise Exception("Failed to get order_id after retries")
 
             # Create OpenOrder entry
             open_order = OpenOrder(
