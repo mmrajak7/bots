@@ -474,7 +474,9 @@ class EntryManager:
 
             # === VALIDATION 4: Tick size validation ===
             # Re-round to ensure tick size compliance (handles float precision issues)
-            tick_size = 0.05
+            # Use dynamic tick size based on NSE rules
+            from src.utils.price_rounder import PriceRounder
+            tick_size = PriceRounder.get_nse_tick_size(st_price_rounded)
             remainder = abs(st_price_rounded % tick_size)
             # Check if remainder is close to 0 OR close to tick_size (due to float precision)
             is_valid_tick = (remainder < 0.001) or (abs(remainder - tick_size) < 0.001)

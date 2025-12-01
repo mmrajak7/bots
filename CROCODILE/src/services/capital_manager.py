@@ -454,7 +454,15 @@ class CapitalManager:
         try:
             # Fetch current margin from Zerodha
             margin_data = self.fetch_margin_from_zerodha()
-            total_margin = margin_data['net']
+
+            # Determine base margin (respects capital allocation if set)
+            if margin_data.get('allocated') is not None:
+                # Using capital allocation - use effective allocation as base
+                effective_allocation = margin_data['allocated'] - margin_data.get('reserve_buffer', 0)
+                base_margin = effective_allocation
+            else:
+                # Not using capital allocation - use total account margin
+                base_margin = margin_data['net']
 
             # Calculate deployed capital from open positions
             # CRITICAL: Use row-level locking to prevent race conditions
@@ -474,11 +482,11 @@ class CapitalManager:
             # Total deployed = positions + pending orders
             total_deployed = deployed_from_positions + reserved_from_orders
 
-            # Available margin = Total - Deployed
-            available_margin = total_margin - total_deployed
+            # Available margin = Base - Deployed
+            available_margin = base_margin - total_deployed
 
             logger.info(
-                f"Margin calculation: Total=Rs.{total_margin:.2f}, "
+                f"Margin calculation: Base=Rs.{base_margin:.2f}, "
                 f"Deployed (positions)=Rs.{deployed_from_positions:.2f}, "
                 f"Reserved (orders)=Rs.{reserved_from_orders:.2f}, "
                 f"Available=Rs.{available_margin:.2f}"
