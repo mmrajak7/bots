@@ -565,14 +565,19 @@ def with_retry(
             # CIRCUIT BREAKER: Record failure after all retries exhausted
             circuit_breaker.record_failure(operation_name, last_exception)
 
-            # Send Telegram alert if enabled
-            if alert_on_failure:
+            # Check if this is a recoverable tick size error (caller will handle retry)
+            is_tick_size_error = "tick size" in str(last_exception).lower()
+
+            # Send Telegram alert if enabled (skip for tick size errors - they're auto-corrected)
+            if alert_on_failure and not is_tick_size_error:
                 try:
                     # Import here to avoid circular dependency
                     from src.reporting.telegram_client import telegram
                     telegram.send_alert(error_msg, critical=critical)
                 except Exception as alert_error:
                     logger.error(f"Failed to send failure alert: {alert_error}")
+            elif is_tick_size_error:
+                logger.info(f"Tick size error detected - skipping alert (caller will auto-correct)")
 
             # Re-raise the original exception
             raise last_exception
