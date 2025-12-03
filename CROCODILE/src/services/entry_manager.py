@@ -804,12 +804,23 @@ class EntryManager:
             )
 
             if not can_take:
-                logger.warning(f"Cannot take position: {cap_reason}")
-                processed_signal.processing_status = 'FAILED'
-                processed_signal.rejection_reason = cap_reason
-                processed_signal.completed_at = ist_now_naive()
-                session.commit()
-                return False, cap_reason
+                # IMPORTANT: Distinguish between position limit (retry later) vs real errors (mark failed)
+                is_position_limit = ("position limit reached" in cap_reason.lower() or
+                                    "pending order limit reached" in cap_reason.lower())
+
+                if is_position_limit:
+                    # Position limit reached - LEAVE BLANK for retry in next cycle
+                    logger.warning(f"Position limit reached, will retry next cycle: {cap_reason}")
+                    # Don't mark as FAILED - signal stays blank and will be retried
+                    return False, cap_reason
+                else:
+                    # Real error (insufficient margin, etc.) - Mark as FAILED
+                    logger.warning(f"Cannot take position (permanent error): {cap_reason}")
+                    processed_signal.processing_status = 'FAILED'
+                    processed_signal.rejection_reason = cap_reason
+                    processed_signal.completed_at = ist_now_naive()
+                    session.commit()
+                    return False, cap_reason
 
             # ====== CRITICAL POINT: PLACING ORDER ON ZERODHA ======
 

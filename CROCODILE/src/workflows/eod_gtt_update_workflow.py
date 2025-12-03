@@ -11,6 +11,9 @@ from loguru import logger
 from src.utils.config_manager import config
 from src.services.exit_manager import exit_manager
 from src.reporting.telegram_client import telegram
+from src.models.database import ProcessedSignal, get_session
+from src.utils.timezone_helper import ist_now_naive
+from datetime import date
 
 
 def print_workflow_banner():
@@ -143,6 +146,71 @@ def update_gtt_eod():
         return False
 
 
+def cleanup_stale_signals():
+    """
+    Mark today's unprocessed blank signals as 'T' (Timeout/Stale)
+
+    Run at EOD (3:50 PM) to clean up signals that were waiting for position slots
+    but never got executed during the day.
+
+    Blank signals are those that:
+    - Were validated successfully
+    - Hit position/pending order limit
+    - Were left blank for retry
+    - Never executed by EOD
+    """
+    logger.info("=== Starting stale signal cleanup ===")
+
+    session = get_session()
+    try:
+        today = date.today()
+
+        # Find all signals from today with blank status (NULL processing_status)
+        # These are signals that were left blank for retry but never executed
+        stale_signals = session.query(ProcessedSignal).filter(
+            ProcessedSignal.date == today,
+            ProcessedSignal.processing_status.is_(None)  # Blank status
+        ).all()
+
+        if not stale_signals:
+            logger.info("No stale signals found for cleanup")
+            return {'cleaned': 0, 'signals': []}
+
+        # Mark them as 'T' (Timeout/Stale)
+        cleaned_count = 0
+        cleaned_list = []
+
+        for signal in stale_signals:
+            signal.processing_status = 'TIMEOUT'  # Mark as timeout/stale
+            signal.rejection_reason = "EOD: Signal timed out (no position slots available all day)"
+            signal.completed_at = ist_now_naive()
+            cleaned_count += 1
+            cleaned_list.append(f"{signal.script}({signal.timeframe})")
+
+        session.commit()
+
+        logger.info(f"✅ Cleaned up {cleaned_count} stale signals: {', '.join(cleaned_list)}")
+
+        # Send Telegram alert if signals were cleaned up
+        if cleaned_count > 0:
+            alert_msg = (
+                f"🧹 **EOD Stale Signal Cleanup**\n\n"
+                f"**Marked {cleaned_count} signal(s) as TIMEOUT:**\n"
+                f"{chr(10).join('• ' + s for s in cleaned_list)}\n\n"
+                f"*Reason: No position slots available all day*"
+            )
+            telegram.send_alert(alert_msg, critical=False)
+
+        return {'cleaned': cleaned_count, 'signals': cleaned_list}
+
+    except Exception as e:
+        logger.error(f"Failed to cleanup stale signals: {e}", exc_info=True)
+        session.rollback()
+        return {'cleaned': 0, 'signals': [], 'error': str(e)}
+    finally:
+        session.close()
+
+
 if __name__ == "__main__":
     # Setup logging
     logger.add(
@@ -152,5 +220,10 @@ if __name__ == "__main__":
         level=config.get('logging.level', 'INFO')
     )
 
+    # Run EOD GTT update (primary task)
     success = update_gtt_eod()
+
+    # Run stale signal cleanup (cleanup task)
+    cleanup_stale_signals()
+
     sys.exit(0 if success else 1)
