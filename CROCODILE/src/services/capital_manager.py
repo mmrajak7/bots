@@ -1,20 +1,20 @@
 """Capital Management and Position Sizing Service
 
-OPTIMIZED VERSION - Implements intelligent compounding position sizing
+FIXED ALLOCATION VERSION - Ensures consistent position sizing
 
-Key Optimizations:
-1. Position sizing: available_margin / remaining_slots (not fixed 20%)
-2. Ensures full capital deployment across max_positions slots
-3. Natural compounding: Zerodha API includes realized P&L in net margin
+Key Features:
+1. Position sizing: (allocated_capital - buffer) / max_positions
+2. Each position gets equal share of allocated capital (e.g., Rs.50,000 / 5 = Rs.10,000)
+3. Consistent sizing regardless of deployed capital or P&L
+4. Natural compounding: Zerodha API includes realized P&L in net margin
 
-With max_positions=5:
-- 0 open: 20% per position (5 slots available)
-- 1 open: 25% per position (4 slots available)
-- 2 open: 33% per position (3 slots available)
-- 3 open: 50% per position (2 slots available)
-- 4 open: 100% per position (1 slot available)
+With allocated_capital=50000, buffer=5%, max_positions=5:
+- Effective allocation: Rs.50,000 - Rs.2,500 (buffer) = Rs.47,500
+- Each position: Rs.47,500 / 5 = Rs.9,500
+- All 5 positions sized equally: Rs.9,500 each
+- Total deployment: Rs.47,500 (when all 5 positions open)
 
-Result: Full capital always deployed, exponential growth via compounding
+Result: Full capital deployment with consistent position sizes
 """
 
 from datetime import date, datetime
@@ -35,17 +35,20 @@ class CapitalManager:
     """
     Manages capital allocation, position sizing, and margin tracking
 
-    Implements OPTIMIZED position sizing:
-    - Intelligent slot-based sizing: available / remaining_slots
+    Implements FIXED ALLOCATION position sizing:
+    - Equal sizing: (allocated_capital - buffer) / max_positions
+    - Each position gets equal share of allocated capital
+    - Consistent sizing regardless of deployed capital or P&L
     - Test mode (1 qty) vs production mode
     - Margin checking and alerts
     - Daily capital ledger updates
     - Drawdown calculation with automatic position size reduction
 
-    Compounding Logic:
-    - Zerodha net margin automatically includes all realized P&L
-    - Position sizing based on available margin ensures profit reinvestment
-    - No manual P&L tracking needed - API does it naturally!
+    Capital Allocation Logic:
+    - Position size = (allocated_capital - buffer) / max_positions
+    - Example: Rs.50,000 / 5 positions = Rs.10,000 per position
+    - Ensures full capital deployment and consistent position sizes
+    - Zerodha net margin includes realized P&L for natural compounding
     """
 
     def __init__(self):
@@ -315,25 +318,24 @@ class CapitalManager:
         session: Optional[Session] = None
     ) -> Tuple[int, float, Optional[str]]:
         """
-        Calculate position size using OPTIMIZED slot-based sizing
+        Calculate position size based on allocated capital per position
 
-        OPTIMIZATION: Instead of fixed 20%, use available_margin / remaining_slots
-        This ensures full capital deployment and better compounding
+        NEW LOGIC: Position size = (allocated_capital - buffer) / max_positions
+        This ensures each position gets equal share of allocated capital,
+        regardless of how much is currently deployed or P&L realized.
 
         Args:
             entry_price: Entry price per share (rounded to 0.05)
-            available_margin: Available margin for this position
+            available_margin: Available margin for this position (used for validation only)
             session: Database session (needed for drawdown check and slot count)
 
         Returns:
             (quantity, capital_deployed, drawdown_alert_message)
 
-        Example with max_positions=5:
-        - 0 open: position_size = available / 5 = 20%
-        - 1 open: position_size = available / 4 = 25%
-        - 2 open: position_size = available / 3 = 33%
-        - 3 open: position_size = available / 2 = 50%
-        - 4 open: position_size = available / 1 = 100%
+        Example with allocated_capital=50000, buffer=5%, max_positions=5:
+        - Effective allocation: Rs.50,000 - Rs.2,500 = Rs.47,500
+        - Per position: Rs.47,500 / 5 = Rs.9,500
+        - All 5 positions get Rs.9,500 each (total Rs.47,500 deployed when all open)
         """
         # Round entry price to tick size
         entry_price_rounded = round_price(entry_price)
@@ -355,43 +357,80 @@ class CapitalManager:
             # Get drawdown-adjusted position size percentage (for drawdown reduction)
             adjusted_position_pct, dd_reason = self.get_drawdown_adjusted_position_size_pct(session)
 
-            # OPTIMIZATION: Calculate position size using slot-based logic
-            if self.enable_slot_based_sizing and self.max_positions is not None:
-                # Get current position count (for remaining slots calculation)
+            # OPTIMIZED: Calculate position size based on ALLOCATED CAPITAL
+            # Each position gets equal share: (allocated - buffer) / max_positions
+            if self.max_positions is not None and self.allocated_capital_amount is not None:
+                # Calculate effective allocation (after reserve buffer)
+                reserve_buffer = self.allocated_capital_amount * self.reserve_buffer_percent
+                effective_allocation = self.allocated_capital_amount - reserve_buffer
+
+                # FIXED FORMULA: Each position gets equal share of allocated capital
+                # This ensures full capital deployment with max_positions positions
+                position_value_base = effective_allocation / self.max_positions
+
+                # Apply drawdown adjustment if needed
+                position_value = position_value_base * (adjusted_position_pct / self.position_size_pct)
+
+                logger.info(
+                    f"Allocated capital sizing: Rs.{self.allocated_capital_amount:,.0f} allocated, "
+                    f"Rs.{reserve_buffer:,.0f} buffer, Rs.{effective_allocation:,.0f} effective, "
+                    f"{self.max_positions} max positions → Rs.{position_value_base:,.0f} per position, "
+                    f"After DD adjustment ({adjusted_position_pct*100:.0f}%): Rs.{position_value:.2f}"
+                )
+
+            elif self.enable_slot_based_sizing and self.max_positions is not None:
+                # FALLBACK: Slot-based sizing (dynamic allocation based on remaining slots)
+                # This is the old logic - kept for backward compatibility
                 current_positions, pending_orders = self.get_current_position_count(session)
 
-                # Calculate remaining slots based on OPEN POSITIONS only
-                # Pending orders may not fill, so we don't count them for slot-based sizing
-                # This ensures better capital utilization when pending orders exist
                 remaining_slots = self.max_positions - current_positions
 
                 if remaining_slots <= 0:
                     logger.error("No remaining slots - should not reach here (limit checked earlier)")
                     return 0, 0.0, None
 
-                # OPTIMIZED FORMULA: available_margin / remaining_slots
-                # This ensures full capital deployment across all slots
                 position_value_optimal = available_margin / remaining_slots
-
-                # Apply drawdown adjustment if needed
                 position_value = position_value_optimal * (adjusted_position_pct / self.position_size_pct)
 
                 logger.info(
-                    f"Slot-based sizing: {remaining_slots} slots remaining (Open={current_positions}, Pending={pending_orders}), "
+                    f"Slot-based sizing (fallback): {remaining_slots} slots remaining (Open={current_positions}, Pending={pending_orders}), "
                     f"Optimal=Rs.{position_value_optimal:.2f} per slot, "
                     f"After DD adjustment ({adjusted_position_pct*100:.0f}%): Rs.{position_value:.2f}"
                 )
 
             else:
-                # LEGACY: Fixed percentage sizing (fallback)
+                # LEGACY: Fixed percentage sizing (fallback when no allocation configured)
                 position_value = available_margin * adjusted_position_pct
-                logger.info(f"Fixed % sizing: {adjusted_position_pct*100:.0f}% of Rs.{available_margin:.2f}")
+                logger.info(f"Fixed % sizing (legacy): {adjusted_position_pct*100:.0f}% of Rs.{available_margin:.2f}")
 
             # Calculate quantity (always floor)
             quantity = floor(position_value / entry_price_rounded)
 
             # Ensure minimum position value
             capital_deployed = quantity * entry_price_rounded
+
+            # CRITICAL: Validate we have enough available margin for this position
+            if capital_deployed > available_margin:
+                logger.error(
+                    f"Insufficient available margin: need Rs.{capital_deployed:,.2f}, have Rs.{available_margin:,.2f}"
+                )
+                # Try to size position with available margin instead
+                fallback_qty = floor(available_margin / entry_price_rounded)
+                fallback_capital = fallback_qty * entry_price_rounded
+
+                if fallback_capital >= self.min_position_value:
+                    logger.warning(
+                        f"Reducing position size to fit available margin: "
+                        f"Rs.{capital_deployed:,.2f} → Rs.{fallback_capital:,.2f}"
+                    )
+                    quantity = fallback_qty
+                    capital_deployed = fallback_capital
+                else:
+                    logger.error(
+                        f"Cannot size position: available margin Rs.{available_margin:,.2f} "
+                        f"insufficient for minimum Rs.{self.min_position_value:,.2f}"
+                    )
+                    return 0, 0.0, None
 
             # Prepare alert message if position sizing was reduced due to drawdown
             dd_alert_message = None

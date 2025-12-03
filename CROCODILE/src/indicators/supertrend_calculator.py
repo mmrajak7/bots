@@ -227,32 +227,36 @@ class SuperTrendCalculator:
                 st_index = -1
                 candle_type = "current"
 
-            # Get values - always use current close for price comparison
-            latest_close = float(df_with_st['Close'].iloc[-1])
-            reference_supertrend = float(df_with_st['supertrend'].iloc[st_index])
-            reference_trend = int(df_with_st['trend'].iloc[st_index])
+            # CRITICAL: Always use current close (today's LTP) for reference
+            # But use completed candle's ST when use_completed_candle_only=True
+            latest_close = float(df_with_st['Close'].iloc[-1])  # Always today's LTP
+            reference_supertrend = float(df_with_st['supertrend'].iloc[st_index])  # Yesterday's ST if use_completed=True
+            reference_trend = int(df_with_st['trend'].iloc[st_index])  # Yesterday's trend if use_completed=True
 
-            # Verify signal: Price should be above SuperTrend (bullish)
+            # Verify signal: Only check trend direction (UP/bullish)
             # trend == -1 means UP/bullish in SuperTrend convention
-            is_valid = reference_trend == -1 and latest_close > reference_supertrend
+            # Price can be below ST (good entry!) or above ST - trend direction matters
+            is_valid = reference_trend == -1
 
             metadata = {
                 "script": script,
                 "timeframe": timeframe,
                 "signal_date": signal_date,
-                "latest_close": latest_close,
+                "close_price": latest_close,
                 "supertrend_value": reference_supertrend,
                 "trend": "UP" if reference_trend == -1 else "DOWN",
                 "candle_reference": candle_type,
+                "candle_index": st_index,
                 "use_completed_candle_only": use_completed_candle_only,
                 "calculation_time": now_ist().isoformat()
             }
 
             if is_valid:
-                logger.info(f"Signal VERIFIED for {script} ({timeframe}): Close={latest_close:.2f}, ST={reference_supertrend:.2f} [{candle_type}]")
+                price_position = "above" if latest_close > reference_supertrend else "below"
+                logger.info(f"✅ Signal VERIFIED for {script} ({timeframe}): Trend={metadata['trend']}, Close={latest_close:.2f} ({price_position} ST={reference_supertrend:.2f}) [{candle_type} candle]")
                 return True, reference_supertrend, metadata
             else:
-                logger.info(f"Signal NOT verified for {script} ({timeframe}): Close={latest_close:.2f}, ST={reference_supertrend:.2f}, Trend={metadata['trend']} [{candle_type}]")
+                logger.info(f"❌ Signal REJECTED for {script} ({timeframe}): Trend={metadata['trend']} (need UP), Close={latest_close:.2f}, ST={reference_supertrend:.2f} [{candle_type} candle]")
                 return False, None, metadata
 
         except Exception as e:
