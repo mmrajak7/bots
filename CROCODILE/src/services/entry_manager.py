@@ -741,6 +741,23 @@ class EntryManager:
             )
             return False, f"Duplicate: {dup_check['reason']}"
 
+        # ====== EARLY POSITION LIMIT CHECK (OPTIMIZATION) ======
+        # Check position limits BEFORE expensive validation work
+        # If no slots available, gracefully skip and retry later
+        current_positions, pending_orders = capital_manager.get_current_position_count(session)
+        can_take_limit, limit_reason, alert_message = capital_manager.check_position_limit(
+            current_positions, pending_orders
+        )
+
+        if not can_take_limit:
+            logger.info(
+                f"⏸️  Position limit reached for {signal.script}({signal.timeframe}), "
+                f"gracefully holding (will retry when slots free): {limit_reason}"
+            )
+            # Don't mark as PROCESSING - leave signal blank for retry in next cycle
+            # This saves expensive NIFTY filter + SuperTrend calculations
+            return False, limit_reason
+
         # ====== PHASE 1: MARK AS PROCESSING ======
         # Create record IMMEDIATELY to prevent duplicates
         from src.utils.timezone_helper import ist_now_naive
@@ -804,13 +821,14 @@ class EntryManager:
             )
 
             if not can_take:
-                # IMPORTANT: Distinguish between position limit (retry later) vs real errors (mark failed)
+                # SAFETY CHECK: This should rarely trigger since we check limits early
+                # But handles edge cases (e.g., position filled between early check and now)
                 is_position_limit = ("position limit reached" in cap_reason.lower() or
                                     "pending order limit reached" in cap_reason.lower())
 
                 if is_position_limit:
-                    # Position limit reached - LEAVE BLANK for retry in next cycle
-                    logger.warning(f"Position limit reached, will retry next cycle: {cap_reason}")
+                    # Position limit reached (edge case) - LEAVE BLANK for retry
+                    logger.warning(f"Position limit reached (safety check), will retry: {cap_reason}")
                     # Don't mark as FAILED - signal stays blank and will be retried
                     return False, cap_reason
                 else:
