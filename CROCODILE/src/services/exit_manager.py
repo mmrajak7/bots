@@ -8,7 +8,7 @@ import pandas as pd
 import time
 
 from src.models.database import (
-    OpenPosition, ClosedPosition, GTTUpdateLog, TransactionHistory,
+    OpenPosition, ClosedPosition, GTTUpdateLog, TransactionHistory, CapitalLedger,
     PositionStatus, TransactionType, get_session
 )
 from src.api.kite_trade_client import KiteTradeClient
@@ -936,6 +936,21 @@ class ExitManager:
 
             session.add(closed)
             session.add(transaction)
+
+            # Update capital ledger - free up slot and update realized P&L
+            today = date.today()
+            ledger = session.query(CapitalLedger).filter_by(date=today).first()
+            if ledger:
+                ledger.deployed_capital -= position.capital_deployed
+                ledger.free_capital += position.capital_deployed
+                ledger.num_open_positions -= 1
+                ledger.num_exits_today += 1
+                ledger.realized_pnl_today += pnl_details['net_pnl']
+                logger.info(
+                    f"Capital ledger updated: Released Rs.{position.capital_deployed:.2f}, "
+                    f"P&L: Rs.{pnl_details['net_pnl']:+.2f}, Today's realized: Rs.{ledger.realized_pnl_today:+.2f}"
+                )
+
             session.commit()
 
             logger.info(

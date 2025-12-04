@@ -1,20 +1,25 @@
 """Capital Management and Position Sizing Service
 
-FIXED ALLOCATION VERSION - Ensures consistent position sizing
+FIXED ALLOCATION VERSION - Ensures consistent position sizing with optional compounding
 
 Key Features:
-1. Position sizing: (allocated_capital - buffer) / max_positions
-2. Each position gets equal share of allocated capital (e.g., Rs.50,000 / 5 = Rs.10,000)
-3. Consistent sizing regardless of deployed capital or P&L
-4. Natural compounding: Zerodha API includes realized P&L in net margin
+1. Position sizing: (base_capital - buffer) / max_positions
+2. Each position gets equal share of capital
+3. COMPOUNDING (when enabled): base_capital = allocated_capital + realized_pnl_month
+   - Reinvests monthly profits into position sizing
+   - Example: Rs.50,000 base + Rs.5,000 profit = Rs.55,000 for sizing
+   - Creates true compounding by allocating gains to future trades
 
-With allocated_capital=50000, buffer=5%, max_positions=5:
-- Effective allocation: Rs.50,000 - Rs.2,500 (buffer) = Rs.47,500
-- Each position: Rs.47,500 / 5 = Rs.9,500
-- All 5 positions sized equally: Rs.9,500 each
-- Total deployment: Rs.47,500 (when all 5 positions open)
+Example with compounding enabled:
+- Base allocation: Rs.50,000, Monthly P&L: +Rs.5,000
+- Compounded capital: Rs.55,000
+- Each position (5 max): Rs.55,000 / 5 = Rs.11,000
 
-Result: Full capital deployment with consistent position sizes
+Example without compounding (fixed allocation):
+- Allocation: Rs.50,000, buffer=5%, max_positions=5
+- Effective: Rs.47,500, Each position: Rs.9,500
+
+Result: Full capital deployment with optional compounding
 """
 
 from datetime import date, datetime
@@ -35,20 +40,19 @@ class CapitalManager:
     """
     Manages capital allocation, position sizing, and margin tracking
 
-    Implements FIXED ALLOCATION position sizing:
-    - Equal sizing: (allocated_capital - buffer) / max_positions
-    - Each position gets equal share of allocated capital
-    - Consistent sizing regardless of deployed capital or P&L
+    Implements FIXED ALLOCATION position sizing with optional COMPOUNDING:
+    - Equal sizing: (base_capital - buffer) / max_positions
+    - When compounding enabled: base_capital = allocated + realized_pnl_month
     - Test mode (1 qty) vs production mode
     - Margin checking and alerts
     - Daily capital ledger updates
     - Drawdown calculation with automatic position size reduction
 
     Capital Allocation Logic:
-    - Position size = (allocated_capital - buffer) / max_positions
-    - Example: Rs.50,000 / 5 positions = Rs.10,000 per position
-    - Ensures full capital deployment and consistent position sizes
-    - Zerodha net margin includes realized P&L for natural compounding
+    - With compounding: base = allocated_capital + realized_pnl_month (if profit)
+    - Position size = (base_capital - buffer) / max_positions
+    - Example: Rs.50,000 + Rs.5,000 profit = Rs.55,000 / 5 = Rs.11,000 per position
+    - True compounding by reinvesting monthly gains into position sizing
     """
 
     def __init__(self):
@@ -70,6 +74,7 @@ class CapitalManager:
         self.allocated_capital_amount = cap_alloc.get('allocated_capital_amount')
         self.allocated_capital_percent = cap_alloc.get('allocated_capital_percent')
         self.reserve_buffer_percent = cap_alloc.get('reserve_buffer_percent', 0) / 100.0
+        self.enable_compounding = cap_alloc.get('enable_compounding', False)
 
         logger.info(
             f"Capital Manager initialized - "
@@ -85,7 +90,8 @@ class CapitalManager:
                 f"Capital Allocation Configured - "
                 f"Amount: {f'Rs.{self.allocated_capital_amount:,.0f}' if self.allocated_capital_amount else 'N/A'}, "
                 f"Percent: {f'{self.allocated_capital_percent}%' if self.allocated_capital_percent else 'N/A'}, "
-                f"Buffer: {self.reserve_buffer_percent * 100:.1f}%"
+                f"Buffer: {self.reserve_buffer_percent * 100:.1f}%, "
+                f"Compounding: {'ENABLED' if self.enable_compounding else 'Disabled'}"
             )
         else:
             logger.info("No capital allocation limits - using full account margin")
@@ -360,9 +366,28 @@ class CapitalManager:
             # OPTIMIZED: Calculate position size based on ALLOCATED CAPITAL
             # Each position gets equal share: (allocated - buffer) / max_positions
             if self.max_positions is not None and self.allocated_capital_amount is not None:
+                # Base capital for position sizing
+                base_capital = self.allocated_capital_amount
+
+                # COMPOUNDING: Adjust base capital by realized P&L from current month
+                # Works both ways: profits increase sizing, losses reduce sizing
+                compounding_pnl = 0.0
+                if self.enable_compounding:
+                    compounding_pnl = self._calculate_realized_pnl_month(session)
+                    # Apply P&L to base capital (positive = increase, negative = decrease)
+                    base_capital = self.allocated_capital_amount + compounding_pnl
+                    # Safety floor: never go below 20% of allocated capital
+                    min_capital = self.allocated_capital_amount * 0.2
+                    if base_capital < min_capital:
+                        logger.warning(
+                            f"Compounding capital Rs.{base_capital:,.0f} below safety floor, "
+                            f"using minimum Rs.{min_capital:,.0f}"
+                        )
+                        base_capital = min_capital
+
                 # Calculate effective allocation (after reserve buffer)
-                reserve_buffer = self.allocated_capital_amount * self.reserve_buffer_percent
-                effective_allocation = self.allocated_capital_amount - reserve_buffer
+                reserve_buffer = base_capital * self.reserve_buffer_percent
+                effective_allocation = base_capital - reserve_buffer
 
                 # FIXED FORMULA: Each position gets equal share of allocated capital
                 # This ensures full capital deployment with max_positions positions
@@ -371,12 +396,22 @@ class CapitalManager:
                 # Apply drawdown adjustment if needed
                 position_value = position_value_base * (adjusted_position_pct / self.position_size_pct)
 
-                logger.info(
-                    f"Allocated capital sizing: Rs.{self.allocated_capital_amount:,.0f} allocated, "
-                    f"Rs.{reserve_buffer:,.0f} buffer, Rs.{effective_allocation:,.0f} effective, "
-                    f"{self.max_positions} max positions → Rs.{position_value_base:,.0f} per position, "
-                    f"After DD adjustment ({adjusted_position_pct*100:.0f}%): Rs.{position_value:.2f}"
-                )
+                if self.enable_compounding and compounding_pnl != 0:
+                    pnl_sign = "+" if compounding_pnl > 0 else ""
+                    logger.info(
+                        f"COMPOUNDING sizing: Rs.{self.allocated_capital_amount:,.0f} base "
+                        f"{pnl_sign}Rs.{compounding_pnl:,.0f} P&L = Rs.{base_capital:,.0f} total, "
+                        f"Rs.{reserve_buffer:,.0f} buffer, Rs.{effective_allocation:,.0f} effective, "
+                        f"{self.max_positions} max positions → Rs.{position_value_base:,.0f} per position, "
+                        f"After DD adjustment ({adjusted_position_pct*100:.0f}%): Rs.{position_value:.2f}"
+                    )
+                else:
+                    logger.info(
+                        f"Allocated capital sizing: Rs.{self.allocated_capital_amount:,.0f} allocated, "
+                        f"Rs.{reserve_buffer:,.0f} buffer, Rs.{effective_allocation:,.0f} effective, "
+                        f"{self.max_positions} max positions → Rs.{position_value_base:,.0f} per position, "
+                        f"After DD adjustment ({adjusted_position_pct*100:.0f}%): Rs.{position_value:.2f}"
+                    )
 
             elif self.enable_slot_based_sizing and self.max_positions is not None:
                 # FALLBACK: Slot-based sizing (dynamic allocation based on remaining slots)

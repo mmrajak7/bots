@@ -662,8 +662,8 @@ class OrderMonitor:
             session.add(closed)
             session.add(transaction)
 
-            # Update capital ledger - free up the position slot
-            self._update_capital_ledger_on_close(position.capital_deployed, session)
+            # Update capital ledger - free up the position slot and update realized P&L
+            self._update_capital_ledger_on_close(position.capital_deployed, pnl_details['net_pnl'], session)
 
             session.commit()
 
@@ -694,8 +694,8 @@ class OrderMonitor:
             session.rollback()
             return False
 
-    def _update_capital_ledger_on_close(self, capital_released: float, session: Session):
-        """Update capital ledger when position is closed (free up capital and position slot)"""
+    def _update_capital_ledger_on_close(self, capital_released: float, net_pnl: float, session: Session):
+        """Update capital ledger when position is closed (free up capital, update P&L)"""
         try:
             today = date.today()
             ledger = session.query(CapitalLedger).filter_by(date=today).first()
@@ -705,9 +705,11 @@ class OrderMonitor:
                 ledger.free_capital += capital_released
                 ledger.num_open_positions -= 1
                 ledger.num_exits_today += 1
+                ledger.realized_pnl_today += net_pnl
 
                 logger.info(
                     f"Capital ledger updated on close: Released Rs.{capital_released:.2f}, "
+                    f"P&L: Rs.{net_pnl:+.2f}, Today's realized: Rs.{ledger.realized_pnl_today:+.2f}, "
                     f"Open positions: {ledger.num_open_positions}"
                 )
             else:
