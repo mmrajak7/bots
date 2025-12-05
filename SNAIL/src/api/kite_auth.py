@@ -141,16 +141,19 @@ class KiteAuthenticator:
 
         try:
             # Step 1: Get login page (establish session)
-            self._step1_get_login_page()
+            # May return request_token if already authenticated
+            request_token = self._step1_get_login_page()
 
-            # Step 2: Submit credentials
-            request_id = self._step2_submit_credentials()
+            if not request_token:
+                # Need to do full login flow
+                # Step 2: Submit credentials
+                request_id = self._step2_submit_credentials()
 
-            # Step 3: Submit TOTP
-            self._step3_submit_totp(request_id)
+                # Step 3: Submit TOTP
+                self._step3_submit_totp(request_id)
 
-            # Step 4: Authorize and get request token
-            request_token = self._step4_authorize()
+                # Step 4: Authorize and get request token
+                request_token = self._step4_authorize()
 
             # Step 5: Generate access token
             access_token = self._step5_generate_token(request_token)
@@ -167,14 +170,33 @@ class KiteAuthenticator:
             logger.error(f"Auto-login failed: {e}")
             raise KiteAuthenticationError(f"Login failed: {str(e)}")
 
-    def _step1_get_login_page(self) -> None:
-        """Step 1: Get login page to establish session cookies."""
+    def _step1_get_login_page(self) -> Optional[str]:
+        """
+        Step 1: Get login page to establish session cookies.
+
+        Returns:
+            request_token if already authenticated (redirected to callback), None otherwise
+        """
         login_url = f"{self.KITE_BASE_URL}/connect/login?v=3&api_key={self.api_key}"
 
         logger.debug("[1/5] Getting login page...")
-        # Note: allow_redirects=True here is intentional - Kite may redirect
-        # during initial page load. The localhost callback issue occurs later.
-        response = self.session.get(login_url, allow_redirects=True, timeout=30)
+        # Don't follow redirects - if already logged in, Kite redirects to callback URL
+        response = self.session.get(login_url, allow_redirects=False, timeout=30)
+
+        # Check if we got a redirect (already authenticated)
+        if response.status_code in [302, 303, 307]:
+            location = response.headers.get('Location', '')
+            if 'request_token=' in location:
+                # Already authenticated, extract token from redirect
+                parsed = urlparse(location)
+                params = parse_qs(parsed.query)
+                request_token = params.get('request_token', [None])[0]
+                if request_token:
+                    logger.info("Already authenticated, got request_token from redirect")
+                    return request_token
+            # Other redirect - follow it manually for login page
+            logger.debug(f"Following redirect to: {location[:50]}...")
+            response = self.session.get(location, allow_redirects=True, timeout=30)
 
         if response.status_code != 200:
             raise KiteAuthenticationError(
@@ -182,6 +204,7 @@ class KiteAuthenticator:
             )
 
         logger.debug("Login page loaded successfully")
+        return None
 
     def _step2_submit_credentials(self) -> str:
         """
