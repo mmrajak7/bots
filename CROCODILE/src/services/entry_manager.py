@@ -823,16 +823,22 @@ class EntryManager:
             if not can_take:
                 # SAFETY CHECK: This should rarely trigger since we check limits early
                 # But handles edge cases (e.g., position filled between early check and now)
-                is_position_limit = ("position limit reached" in cap_reason.lower() or
-                                    "pending order limit reached" in cap_reason.lower())
 
-                if is_position_limit:
-                    # Position limit reached (edge case) - LEAVE BLANK for retry
-                    logger.warning(f"Position limit reached (safety check), will retry: {cap_reason}")
+                # Check if this is a retryable condition:
+                # 1. Position/order limits - slots may free up
+                # 2. Insufficient margin - pending orders may go stale or positions may close
+                is_retryable = ("position limit reached" in cap_reason.lower() or
+                               "pending order limit reached" in cap_reason.lower() or
+                               "insufficient margin" in cap_reason.lower())
+
+                if is_retryable:
+                    # Retryable condition - LEAVE BLANK for retry next cycle
+                    # EOD cleanup will mark as 'T' (TIMEOUT) if still blank
+                    logger.warning(f"⏸️  Retryable condition, will retry next cycle: {cap_reason}")
                     # Don't mark as FAILED - signal stays blank and will be retried
                     return False, cap_reason
                 else:
-                    # Real error (insufficient margin, etc.) - Mark as FAILED
+                    # Real permanent error - Mark as FAILED
                     logger.warning(f"Cannot take position (permanent error): {cap_reason}")
                     processed_signal.processing_status = 'FAILED'
                     processed_signal.rejection_reason = cap_reason
