@@ -1,0 +1,307 @@
+# CROCODILE Trading Bot Configuration Template
+# Copy this file to config.yaml and fill in your credentials
+
+# IMPORTANT: All timestamps in this bot are in IST (Indian Standard Time)
+# Market hours: 9:15 AM - 3:30 PM IST
+# IST = UTC+5:30 (no daylight saving)
+
+# Kite API Configuration
+kite:
+  # ===================================================================
+  # SECURITY: Credentials are now loaded from .env file (RECOMMENDED)
+  # ===================================================================
+  #
+  # DO NOT store credentials in this file!
+  # Instead, create a .env file in the project root with:
+  #   ZERODHA_USER_ID=your_id
+  #   ZERODHA_PASSWORD=your_password
+  #   ZERODHA_TOTP_KEY=your_totp_key
+  #
+  # See .env.template for full setup instructions
+  #
+  # Legacy Support (LESS SECURE):
+  # If .env file is not found, the bot will fall back to credentials
+  # defined here. This is for backward compatibility only.
+  #
+  # credentials:
+  #   userid: "YOUR_ZERODHA_ID"
+  #   password: "YOUR_PASSWORD"
+  #   totp_key: "YOUR_TOTP_SECRET_KEY"
+  # ===================================================================
+
+  token_file: "data/enctoken.txt"
+  rate_limit_delay: 0.5  # seconds between API calls
+  order_tag: "croc"  # Tag to identify bot's orders (max 20 chars)
+
+# API Resilience & Retry Configuration
+api_resilience:
+  # Retry settings for API failures
+  retry:
+    max_attempts: 3  # Total attempts (1 initial + 2 retries)
+    base_delay: 1.0  # Initial delay in seconds (exponential backoff: 1s, 2s, 4s...)
+    max_delay: 16.0  # Maximum delay between retries
+    exponential_base: 2.0  # Exponential backoff multiplier
+
+  # GTT Verification (CRITICAL SAFETY FEATURE)
+  # After placing GTT, verify it actually exists in Zerodha
+  # Prevents silent failures where API returns success but GTT not created
+  gtt_verification:
+    enabled: true  # STRONGLY RECOMMENDED - disable only for debugging
+    initial_delay: 2.0  # Seconds to wait before first verification (allows Zerodha to sync GTT)
+    max_retries: 3  # Verification attempts (checks if GTT exists via get_gtt_orders)
+    retry_delays: [1.0, 3.0, 5.0]  # Exponential backoff delays between retries (seconds)
+    max_placement_attempts: 3  # Total GTT placement attempts if verification fails
+    # Flow: Place GTT → Wait initial_delay → Verify exists → If fail, wait retry_delays[n] → Retry verification
+    # If all verification attempts fail, retry entire placement → Repeat up to max_placement_attempts
+    # If all attempts fail, sends CRITICAL Telegram alert (position unprotected!)
+
+  # Alert settings after all retries exhausted
+  alerts:
+    enabled: true  # Send Telegram alert on API failure
+    critical_operations:  # Operations that trigger critical alerts
+      - "Place GTT Order"
+      - "Cancel GTT Order"
+
+  # Timeout settings
+  timeout:
+    default: 30  # Default timeout in seconds for API calls
+    historical_data: 60  # Longer timeout for historical data fetch
+
+# Instruments Cache Configuration
+instruments:
+  cache_file: "data/instruments.csv"
+  max_age_hours: 24  # Re-fetch if older than 24 hours
+
+# Telegram Configuration
+telegram:
+  bot_token: "YOUR_BOT_TOKEN"
+  chat_id: "YOUR_CHAT_ID"
+  enabled: true
+  retry_attempts: 3
+  retry_delay: 5  # seconds
+
+# Trading Configuration
+trading:
+  test_mode: 'X'  # 'X' for test mode (1 qty), '' for production (slot-based sizing)
+  position_size_pct: 20  # Base % (used for drawdown calculations and fallback)
+  enable_slot_based_sizing: true  # OPTIMIZED: Use available/remaining_slots formula
+  min_position_value: 10000  # Minimum position value in INR
+  dummy_sl_percent: 15  # Protective stop loss % until EOD update
+  price_tick_size: 0.05  # NSE tick size for price rounding
+
+  # OPTIMIZATION NOTES:
+  # - When enable_slot_based_sizing=true with max_positions=5:
+  #   Position size = available_margin / remaining_slots
+  #   Example: 0 open → 20%, 1 open → 25%, 2 open → 33%, 3 open → 50%, 4 open → 100%
+  # - This ensures full capital deployment and better compounding
+  # - Zerodha API net margin includes realized P&L (natural compounding)
+
+# Signal Processing
+signals:
+  csv_file: "data/signals.csv"
+  ignore_list_file: "data/ignore_list.csv"
+  processed_signals_retention_days: 90
+
+# Database Configuration
+database:
+  url: "sqlite:///data/trading.db"
+  echo: false  # Set to true for SQL debug logging
+  pool_size: 5
+  max_overflow: 10
+
+# Logging Configuration
+logging:
+  file_path: "logs/crocodile_{time:YYYY-MM-DD}.log"
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  rotation: "1 day"
+  retention: "45 days"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
+
+# Risk Management
+risk_management:
+  # Drawdown Protection (AUTOMATIC POSITION SIZING REDUCTION)
+  # Monthly drawdown measured from start of month capital
+  drawdown_caution: 5  # % drawdown for CAUTION level
+  drawdown_critical: 10  # % drawdown for CRITICAL level
+
+  # Automatic Actions at Each Level:
+  #
+  # Normal (DD < 5%):
+  #   - Position sizing: 20% (normal)
+  #   - No alerts
+  #
+  # CAUTION (5% <= DD < 10%):
+  #   - Position sizing: REDUCED to 10% (50% of normal)
+  #   - Telegram alert: "Position Sizing Reduced - CAUTION drawdown"
+  #   - Continue trading with reduced exposure
+  #
+  # CRITICAL (DD >= 10%):
+  #   - Position sizing: HEAVILY REDUCED to 5% (25% of normal)
+  #   - Telegram alert: "Position Sizing Reduced - CRITICAL drawdown"
+  #   - Severely limited new position exposure
+  #
+  # Example:
+  #   Starting capital: ₹20L
+  #   After losses: ₹18.5L (7.5% drawdown = CAUTION)
+  #   Next signal: Position size = ₹1.85L instead of ₹3.7L
+  #   (10% of available margin instead of 20%)
+
+  consecutive_loss_alert: 3  # Number of consecutive losses to trigger alert
+
+  # Position Limit (CRITICAL SAFETY FEATURE)
+  # Limits concurrent open positions + pending orders
+  #
+  # OPTIMIZED VALUE: 5 positions (from backtest analysis)
+  # - Provides better capital concentration than 15 positions
+  # - With slot-based sizing: ensures full capital deployment
+  # - Backtest results: 67% CAGR (vs 57% with 15 positions)
+  # - Lower max_positions = better compounding effect
+  #
+  # Recommended values:
+  # - Small accounts (₹20-25L): 5 positions (OPTIMIZED) ✅
+  # - Medium accounts (₹50L): 5-7 positions
+  # - Large accounts (₹1Cr+): 7-10 positions
+  # - Set to null for unlimited (NOT RECOMMENDED for production)
+  max_positions: 5  # OPTIMIZED: 5 positions (was 15, reduced based on backtest)
+
+  # Alert thresholds:
+  # - At 80% of limit (e.g., 4/5): Warning alert sent
+  # - At 100% of limit: New signals rejected until position closed
+
+  # Separate Pending Order Limit (NEW - for capital efficiency)
+  # Pending orders are tracked separately from open positions
+  # This allows more signals to be placed without blocking on unfilled orders
+  max_pending_orders: 3  # Maximum pending orders allowed (separate from max_positions)
+
+  # Stale Pending Order Management (NEW - auto-cancel unproductive orders)
+  # Orders that are unlikely to fill tie up capital and block new signals
+  # Auto-cancellation frees capital for higher-probability opportunities
+  pending_order_management:
+    enabled: true  # Enable stale order auto-cancellation
+
+    # Time-based cancellation: Cancel if order pending too long
+    max_pending_hours: 2  # Cancel if pending > 2 hours (day trading window is short)
+
+    # Price-based cancellation: Cancel if price moves far from limit
+    price_distance_cancel:
+      enabled: true
+      threshold_pct: 2.0  # Cancel if LTP > 2% above ST price (low fill probability)
+
+    # Note: Checks run every 5 minutes as part of order monitoring workflow
+    # When cancelled: Capital released, Telegram alert sent, ProcessedSignal updated
+
+  monthly_reset_day: 1  # Day of month to reset drawdown baseline
+
+# Same-Day Recovery (CRITICAL SAFETY NET)
+# Runs at 4:00 PM daily to catch all failures before overnight/weekend risk
+# This is the LAST LINE OF DEFENSE before positions go unprotected
+recovery:
+  auto_fix_enabled: true  # Automatically fix detected issues (recommended)
+  alert_threshold: 'any'  # 'any' = alert on all issues, 'critical_only' = only critical
+
+  # What gets checked:
+  # 1. Position-GTT Reconciliation: Every position must have active GTT
+  # 2. Missed Order Fills: Orders filled but not detected by monitoring
+  # 3. Orphan GTT Detection: GTTs without corresponding positions
+  # 4. Quantity Mismatches: GTT qty vs position qty
+
+  # Auto-fix actions (when enabled):
+  # - Missing GTT: Place new GTT for unprotected position
+  # - Orphan GTT: Cancel GTT without position
+  # - Missed fills: Alert for manual review (too risky to auto-create position)
+
+  # Example scenarios this catches:
+  # - Order fills at 3:25 PM, monitoring check misses it → Recovery at 4 PM places GTT
+  # - GTT placement fails at EOD 3:50 PM → Recovery at 4 PM retries
+  # - Network glitch causes monitoring to skip checks → Recovery detects all issues
+
+# Daily Reconciliation (AUDIT TRAIL & VERIFICATION)
+# Runs at 4:10 PM daily (after Same-Day Recovery at 4:00 PM)
+# Provides comprehensive audit trail and financial verification
+reconciliation:
+  tolerance_percent: 0.5  # P&L tolerance (0.5% difference allowed)
+  alert_on_mismatch: true  # Alert if bot calculations don't match Zerodha
+  track_history_days: 30  # Days of history to track for trends
+
+  # What gets checked:
+  # 1. Position & GTT Counts: DB vs Zerodha verification
+  # 2. Capital Ledger: Deployed capital accuracy, available margin
+  # 3. P&L Reconciliation: Bot calculations vs Zerodha reports
+  # 4. Exposure Metrics: Total deployed, exposure %, position distribution
+  # 5. Multi-Day Trends: 7-day win rate, position count trends, anomaly detection
+
+  # Anomaly Detection:
+  # - Position count spikes (>50% above 7-day average)
+  # - Low win rate (<40% over 5+ trades)
+  # - Capital ledger discrepancies (>₹100 difference)
+  # - P&L mismatches (>0.5% difference from Zerodha)
+
+  # Example Output:
+  # ✅ All Clear: Positions match, capital reconciled, no anomalies
+  # ⚠️ Warning: Win rate 35% (5 trades), position count spike detected
+  # 🚨 Critical: Capital deployed mismatch ₹5,000, P&L discrepancy ₹500
+
+# SuperTrend Configuration
+supertrend:
+  period: 10
+  multiplier: 3
+  cache_expiry_minutes: 60  # Historical data cache validity
+
+# Historical Data Lookback
+historical_data:
+  monthly_lookback_years: 3.0
+  weekly_lookback_years: 1.5
+  daily_lookback_years: 1.0
+
+# NIFTY Filter
+nifty:
+  instrument_token: "256265"  # NIFTY 50 instrument token
+
+# Transaction Costs (Zerodha - OPTIMIZED & VERIFIED)
+# Based on backtest verification against real broker data
+# Effective cost: ~0.111% of turnover (99.8% accurate vs actual)
+#
+# CHANGES from old version (which overestimated by 66%):
+# - Brokerage: ₹0 (delivery equity has ZERO brokerage, not ₹20)
+# - STT: 0.1% on TURNOVER (both buy+sell), not just sell side
+# - GST: Only on exchange charges (no brokerage to tax)
+# - SEBI: Direct percentage (simpler than per-crore calculation)
+#
+# Verified against actual trade (LICHSGFIN 11-Nov-2025):
+# - Calculated: ₹1,265.99 | Actual: ₹1,263.43 | Accuracy: 99.8% ✅
+transaction_costs:
+  brokerage_delivery: 0.0  # OPTIMIZED: ₹0 for delivery equity (was ₹20)
+  stt_percent: 0.001  # OPTIMIZED: 0.1% on turnover (both buy+sell, was sell-only)
+  exchange_charges_percent: 0.0000325  # 0.00325% of turnover (unchanged)
+  gst_percent: 0.18  # 18% on exchange charges only (unchanged rate, different base)
+  sebi_charges_percent: 0.000001  # OPTIMIZED: 0.0001% of turnover (was per-crore)
+  stamp_duty_percent: 0.00015  # 0.015% on buy side (unchanged)
+
+# Scheduled Jobs Timing
+schedule:
+  signal_processing_interval: 2  # minutes
+  order_monitoring_interval: 5  # minutes
+  manual_closure_check_times: ["11:00", "13:00", "15:00"]  # HH:MM format
+  eod_gtt_update_time: "15:50"  # 3:50 PM
+  same_day_recovery_time: "16:00"  # 4:00 PM (CRITICAL - catches all failures)
+  daily_report_time: "16:10"  # 4:10 PM
+  weekly_report_day: 5  # 1=Monday, 5=Friday
+  weekly_report_time: "16:15"  # 4:15 PM
+
+# Market Hours (IST)
+market_hours:
+  pre_market_start: "09:00"
+  market_open: "09:15"
+  market_close: "15:30"
+  post_market_end: "16:00"
+  trading_days: [1, 2, 3, 4, 5]  # Monday=1, Friday=5
+
+# Margin Check
+margin:
+  minimum_required: 10000  # Minimum margin required (alert if below)
+  # ADJUSTED: Lower threshold for testing with Rs 1L capital
+  # - Rs 1L capital × 20% = Rs 20k per position
+  # - Threshold at Rs 10k ensures buffer for testing
+  # - For Rs 5L capital: Rs 1L positions, Rs 10k still safe minimum
+  # - For Rs 25L capital: Rs 5L positions, Rs 10k still safe minimum
+  check_time: "09:00"  # When to check margin daily
