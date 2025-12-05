@@ -117,8 +117,9 @@ paths:
   # This allows CROCODILE, SNAIL, and future bots to use the same session
   token: "../data/kite_access_token.json"
 
-  # SHARED: Instruments file - same for all bots trading NSE/NFO
-  instruments: "../data/instruments.csv"
+  # SNAIL-specific: NIFTY options instruments (NFO exchange)
+  # NOT shared with CROCODILE which uses all NSE equities
+  instruments: "data/instruments.csv"
 
   # SHARED: Holiday calendar - same for all bots
   holidays: "../data/holiday_calendar.json"
