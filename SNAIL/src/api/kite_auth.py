@@ -273,49 +273,59 @@ class KiteAuthenticator:
 
     def _step4_authorize(self) -> str:
         """
-        Step 4: Authorize app and get request token.
+        Step 4: Get request token by revisiting login URL.
+
+        After successful login+TOTP, revisiting the login URL triggers
+        a redirect chain that ends with the callback URL containing
+        the request_token.
 
         Returns:
             request_token from redirect URL
         """
-        authorize_endpoint = f"{self.KITE_BASE_URL}/connect/finish"
-        payload = {
-            "api_key": self.api_key,
-            "skip_session": "true"
-        }
+        login_url = f"{self.KITE_BASE_URL}/connect/login?v=3&api_key={self.api_key}"
 
-        logger.debug("[4/5] Authorizing app...")
-        response = self.session.post(
-            authorize_endpoint,
-            data=payload,
-            allow_redirects=False,
-            timeout=30
-        )
+        logger.debug("[4/5] Getting request_token via redirect...")
 
-        if response.status_code not in [302, 303, 307]:
-            raise KiteAuthenticationError(
-                f"Authorization failed: Expected redirect, got HTTP {response.status_code}"
-            )
+        # Follow redirect chain until we find request_token
+        current_url = login_url
+        max_redirects = 10
+        request_token = None
 
-        location = response.headers.get('Location', '')
-        if not location:
-            raise KiteAuthenticationError("No redirect location in authorization response")
+        for i in range(max_redirects):
+            response = self.session.get(current_url, allow_redirects=False, timeout=30)
 
-        # Parse request_token from redirect URL
-        parsed = urlparse(location)
-        params = parse_qs(parsed.query)
-        request_token = params.get('request_token', [None])[0]
+            if response.status_code not in [301, 302, 303, 307, 308]:
+                # Not a redirect - shouldn't happen after login
+                break
+
+            location = response.headers.get('Location', '')
+            if not location:
+                break
+
+            logger.debug(f"Redirect {i+1}: {location[:60]}...")
+
+            # Check if this redirect contains the request_token
+            if 'request_token=' in location:
+                parsed = urlparse(location)
+                params = parse_qs(parsed.query)
+                request_token = params.get('request_token', [None])[0]
+                if request_token:
+                    logger.debug(f"Got request_token: {request_token[:15]}...")
+                    return request_token
+
+            # Don't follow localhost/127.0.0.1 redirects
+            if '127.0.0.1' in location or 'localhost' in location:
+                # Token should have been in the URL
+                break
+
+            # Follow this redirect
+            current_url = location
 
         if not request_token:
-            # Check for error
-            error = params.get('status', [''])[0]
-            if error:
-                raise KiteAuthenticationError(f"Authorization error: {error}")
             raise KiteAuthenticationError(
-                f"No request_token in redirect URL: {location[:100]}"
+                "Could not obtain request_token from redirect chain"
             )
 
-        logger.debug(f"Got request_token: {request_token[:15]}...")
         return request_token
 
     def _step5_generate_token(self, request_token: str) -> str:
