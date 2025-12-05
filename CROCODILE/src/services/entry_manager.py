@@ -832,10 +832,12 @@ class EntryManager:
                                "insufficient margin" in cap_reason.lower())
 
                 if is_retryable:
-                    # Retryable condition - LEAVE BLANK for retry next cycle
-                    # EOD cleanup will mark as 'T' (TIMEOUT) if still blank
+                    # Retryable condition - DELETE the PROCESSING record so signal can be retried
+                    # EOD cleanup will mark as 'T' (TIMEOUT) if still blank at end of day
                     logger.warning(f"⏸️  Retryable condition, will retry next cycle: {cap_reason}")
-                    # Don't mark as FAILED - signal stays blank and will be retried
+                    # Delete the PROCESSING record - signal will be picked up again next cycle
+                    session.delete(processed_signal)
+                    session.commit()
                     return False, cap_reason
                 else:
                     # Real permanent error - Mark as FAILED
