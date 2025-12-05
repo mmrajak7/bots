@@ -36,7 +36,7 @@ DAILY_PAYLOAD = (
     "1 day ago close >= 1 day ago supertrend( 10 , 3 ) * 1 and "
     "1 week ago close >= 1 week ago supertrend( 10 , 3 ) * 1 and "
     "daily close >= daily supertrend( 10 , 3 ) * 0.9905 and "
-    "daily close < 4999 and "
+    "daily close < 9999 and "
     "daily close > 50 "
     ") ) ) ) ) )"
 )
@@ -46,7 +46,7 @@ WEEKLY_PAYLOAD = (
     "weekly close <= weekly supertrend( 10 , 3 ) * 1.0095 and "
     "1 week ago close >= 1 week ago supertrend( 10 , 3 ) * 1 and "
     "weekly close >= weekly supertrend( 10 , 3 ) * 0.9905 and "
-    "weekly close < 4999 and "
+    "weekly close < 9999 and "
     "weekly close > 50 "
     ") ) ) ) ) )"
 )

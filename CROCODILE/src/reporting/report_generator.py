@@ -146,8 +146,8 @@ class ReportGenerator:
             if position_details:
                 # Build table with <pre> for monospace alignment
                 report += "<pre>\n"
-                report += f"{'Script':<10}{'Qty':>4}{'Entry':>6}{'LTP':>6}{'SL':>6}{'P&L':>6}{'Age':>6}\n"
-                report += "─" * 44 + "\n"
+                report += f"{'Script':<10}{'Qty':>4}{'Entry':>8}{'LTP':>8}{'SL':>8}{'P&L':>6}{'Age':>6}\n"
+                report += "─" * 50 + "\n"
 
                 # Sort by unrealized P&L (worst first)
                 sorted_positions = sorted(position_details, key=lambda x: x.get('unrealized', 0))
@@ -157,11 +157,11 @@ class ReportGenerator:
                     age_str = "Today" if days == 0 else f"{days}d"
 
                     if pos.get('ltp_failed', False):
-                        report += f"{script_tf:<10}{pos['qty']:>4}{pos['entry']:>6.0f}{'N/A':>6}{pos['sl']:>6.0f}{'N/A':>6}{age_str:>6}\n"
+                        report += f"{script_tf:<10}{pos['qty']:>4}{pos['entry']:>8.2f}{'N/A':>8}{pos['sl']:>8.2f}{'N/A':>6}{age_str:>6}\n"
                     else:
                         pnl_val = pos['unrealized']
                         pnl_str = f"{pnl_val:+.0f}"
-                        report += f"{script_tf:<10}{pos['qty']:>4}{pos['entry']:>6.0f}{pos['current_ltp']:>6.0f}{pos['sl']:>6.0f}{pnl_str:>6}{age_str:>6}\n"
+                        report += f"{script_tf:<10}{pos['qty']:>4}{pos['entry']:>8.2f}{pos['current_ltp']:>8.2f}{pos['sl']:>8.2f}{pnl_str:>6}{age_str:>6}\n"
 
                 if len(position_details) > 6:
                     remaining = len(position_details) - 6
