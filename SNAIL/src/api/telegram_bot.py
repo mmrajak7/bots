@@ -538,45 +538,30 @@ _Status check initiated..._""")
 
     def _cmd_position(self, update: TelegramUpdate, args: List[str]):
         """Handle /position command."""
-        self._send_reply("""📍 *Position Details*
-
-Checking current position...
-
-_Position query initiated..._""")
-
+        self._send_reply("📍 Checking position...")
         self._queue_response(CallbackAction.HOLD, "position_request")
 
     def _cmd_pnl(self, update: TelegramUpdate, args: List[str]):
         """Handle /pnl command."""
-        self._send_reply("""💰 *P&L Request*
-
-Calculating current P&L...
-
-_P&L query initiated..._""")
-
+        self._send_reply("💰 Calculating P&L...")
         self._queue_response(CallbackAction.HOLD, "pnl_request")
 
     def _cmd_exit(self, update: TelegramUpdate, args: List[str]):
         """Handle /exit command."""
         # Send confirmation with inline keyboard
         self.send_with_keyboard(
-            "⚠️ *Confirm Exit*\n\nAre you sure you want to exit the current position?",
+            "⚠️ *Confirm Exit?*",
             [
                 [
-                    {"text": "✅ Yes, Exit", "callback_data": "yes:exit_confirm"},
-                    {"text": "❌ No, Cancel", "callback_data": "no:exit_confirm"}
+                    {"text": "✅ Yes", "callback_data": "yes:exit_confirm"},
+                    {"text": "❌ No", "callback_data": "no:exit_confirm"}
                 ]
             ]
         )
 
     def _cmd_hold(self, update: TelegramUpdate, args: List[str]):
         """Handle /hold command."""
-        self._send_reply("""✋ *Hold Confirmed*
-
-Position will be held. Monitoring continues.
-
-_Next check in 10 minutes._""")
-
+        self._send_reply("✋ *Hold confirmed* - monitoring continues")
         self._queue_response(CallbackAction.HOLD, "manual_hold")
 
     # =========================================================================
@@ -648,23 +633,16 @@ _Next check in 10 minutes._""")
         Returns:
             Message ID if successful
         """
-        message = f"""⚠️ *STOP LOSS ADVISORY*
+        message = f"""⚠️ *STOP LOSS: {loss_percent:.0f}% of Max*
 
-🔴 *Position at {loss_percent:.0f}% of Max Loss*
+P&L: *-₹{abs(current_pnl):,.0f}*
 
-• Current P&L: -₹{abs(current_pnl):,.2f}
-
-📋 *Claude Analysis:*
-{claude_advice}
-
-*Choose your action:*"""
+📋 {claude_advice}"""
 
         keyboard = [
             [
                 {"text": "✋ HOLD", "callback_data": f"hold:stop_loss:{position_id}"},
-                {"text": "🚪 EXIT", "callback_data": f"exit:stop_loss:{position_id}"}
-            ],
-            [
+                {"text": "🚪 EXIT", "callback_data": f"exit:stop_loss:{position_id}"},
                 {"text": "🔧 ADJUST", "callback_data": f"adjust:stop_loss:{position_id}"}
             ]
         ]
@@ -701,21 +679,14 @@ _Next check in 10 minutes._""")
         Returns:
             Message ID if successful
         """
-        message = f"""⚠️ *WING APPROACH*
+        message = f"""⚠️ *WING: {proximity_percent:.0f}% to {direction.upper()}*
 
-📍 *{proximity_percent:.0f}% toward {direction.upper()} wing*
-
-📋 *Claude Analysis:*
-{claude_advice}
-
-*Choose your action:*"""
+📋 {claude_advice}"""
 
         keyboard = [
             [
                 {"text": "✋ HOLD", "callback_data": f"hold:wing_approach:{position_id}"},
-                {"text": "🚪 EXIT", "callback_data": f"exit:wing_approach:{position_id}"}
-            ],
-            [
+                {"text": "🚪 EXIT", "callback_data": f"exit:wing_approach:{position_id}"},
                 {"text": "🔧 ADJUST", "callback_data": f"adjust:wing_approach:{position_id}"}
             ]
         ]
@@ -755,20 +726,14 @@ _Next check in 10 minutes._""")
         emoji = "🟢" if current_pnl >= 0 else "🔴"
         pnl_sign = "+" if current_pnl >= 0 else ""
 
-        message = f"""📅 *FRIDAY DECISION*
+        message = f"""📅 *FRIDAY* - {emoji} P&L *{pnl_sign}₹{current_pnl:,.0f}* | DTE {dte}
 
-{emoji} *Current P&L: {pnl_sign}₹{current_pnl:,.2f}*
-• Days to Expiry: {dte}
-
-📋 *Claude Analysis:*
-{claude_advice}
-
-*Carry over weekend or exit now?*"""
+📋 {claude_advice}"""
 
         keyboard = [
             [
-                {"text": "✋ HOLD (Weekend)", "callback_data": f"hold:friday:{position_id}"},
-                {"text": "🚪 EXIT Now", "callback_data": f"exit:friday:{position_id}"}
+                {"text": "✋ HOLD", "callback_data": f"hold:friday:{position_id}"},
+                {"text": "🚪 EXIT", "callback_data": f"exit:friday:{position_id}"}
             ]
         ]
 
@@ -802,16 +767,9 @@ _Next check in 10 minutes._""")
         Returns:
             Message ID if successful
         """
-        message = f"""⚠️ *VIX WARNING*
+        message = f"""⚠️ *VIX: {current_vix:.1f}* - Hard exit at 20
 
-📈 *VIX in Warning Zone*
-• Current VIX: {current_vix:.2f}
-• Hard Exit at: 20.0
-
-📋 *Claude Analysis:*
-{claude_advice}
-
-*Choose your action:*"""
+📋 {claude_advice}"""
 
         keyboard = [
             [

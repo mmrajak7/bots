@@ -216,28 +216,13 @@ class TelegramAlerts:
         """Send trade entry alert."""
         net_credit = premium.get('net', 0)
 
-        message = f"""🟢 *TRADE ENTRY*
+        message = f"""🟢 *ENTRY: Iron Fly*
 
-*Iron Fly Opened*
+ATM {atm_strike} | Wings ±{wing_distance} | {expiry} | {lot_size}L
 
-📊 *Position Details*
-• ATM Strike: {atm_strike}
-• Wings: ±{wing_distance}
-• Expiry: {expiry}
-• Lot Size: {lot_size}
+*Premium:* CE ₹{premium.get('short_ce', 0):.1f} + PE ₹{premium.get('short_pe', 0):.1f} - Wings ₹{premium.get('long_ce', 0) + premium.get('long_pe', 0):.1f} = *₹{net_credit:.1f}*
 
-💰 *Premium*
-• Short CE: ₹{premium.get('short_ce', 0):.2f}
-• Short PE: ₹{premium.get('short_pe', 0):.2f}
-• Long CE: -₹{premium.get('long_ce', 0):.2f}
-• Long PE: -₹{premium.get('long_pe', 0):.2f}
-• *Net Credit: ₹{net_credit:.2f}*
-
-⚙️ *Risk*
-• Max Profit: ₹{max_profit:,.2f}
-• Max Loss: ₹{max_loss:,.2f}
-
-_Time: {datetime.now().strftime('%H:%M:%S')}_"""
+Max Profit ₹{max_profit:,.0f} | Max Loss ₹{max_loss:,.0f}"""
 
         return self.send(message)
 
@@ -253,17 +238,12 @@ _Time: {datetime.now().strftime('%H:%M:%S')}_"""
         emoji = "🟢" if net_pnl >= 0 else "🔴"
         pnl_sign = "+" if net_pnl >= 0 else ""
         duration = exit_time - entry_time
+        hours = int(duration.total_seconds() // 3600)
+        mins = int((duration.total_seconds() % 3600) // 60)
 
-        message = f"""{emoji} *TRADE EXIT*
+        message = f"""{emoji} *EXIT: {exit_reason.replace('_', ' ').title()}*
 
-*Position Closed*
-
-📊 *Result*
-• Net P&L: {pnl_sign}₹{net_pnl:,.2f} ({pnl_sign}{pnl_percent:.1f}%)
-• Exit Reason: {exit_reason.replace('_', ' ').title()}
-• Duration: {duration}
-
-_Time: {exit_time.strftime('%H:%M:%S')}_"""
+P&L: *{pnl_sign}₹{net_pnl:,.0f}* ({pnl_sign}{pnl_percent:.1f}%) | Duration: {hours}h {mins}m"""
 
         return self.send(message)
 
@@ -282,19 +262,14 @@ _Time: {exit_time.strftime('%H:%M:%S')}_"""
 
         if current_pnl >= 0:
             pct_of_max = (current_pnl / max_profit) * 100 if max_profit > 0 else 0
-            progress_text = f"{pct_of_max:.1f}% of max profit"
+            progress_text = f"{pct_of_max:.0f}% of max profit"
         else:
             pct_of_max = (abs(current_pnl) / max_loss) * 100 if max_loss > 0 else 0
-            progress_text = f"{pct_of_max:.1f}% of max loss"
+            progress_text = f"{pct_of_max:.0f}% of max loss"
 
-        message = f"""{emoji} *P&L Update*
+        message = f"""{emoji} *P&L: {pnl_sign}₹{current_pnl:,.0f}* ({pnl_sign}{pnl_percent:.1f}%) - {progress_text}
 
-• Current P&L: {pnl_sign}₹{current_pnl:,.2f} ({pnl_sign}{pnl_percent:.1f}%)
-• Progress: {progress_text}
-• NIFTY: {nifty_spot:,.2f}
-• VIX: {vix:.2f}
-
-_Time: {datetime.now().strftime('%H:%M:%S')}_"""
+NIFTY {nifty_spot:,.0f} | VIX {vix:.1f}"""
 
         return self.send(message)
 
@@ -307,26 +282,16 @@ _Time: {datetime.now().strftime('%H:%M:%S')}_"""
         claude_advice: Optional[str] = None
     ) -> bool:
         """Send stop loss advisory alert."""
-        advice_section = ""
+        message = f"""⚠️ *STOP LOSS: {loss_pct_of_max:.0f}% of Max Loss*
+
+P&L: *-₹{abs(current_pnl):,.0f}* | NIFTY {nifty_spot:,.0f} | Wing {distance_to_wing:.0f}pts away"""
+
         if claude_advice:
-            advice_section = f"""
-📋 *Claude Analysis:*
-{claude_advice}
+            message += f"""
 
-_Reply with: EXIT, HOLD, or ADJUST_
-"""
-        else:
-            advice_section = "\n_Awaiting Claude analysis..._\n"
+📋 *Claude:* {claude_advice}
 
-        message = f"""⚠️ *STOP LOSS ADVISORY*
-
-🔴 *Position at {loss_pct_of_max:.0f}% of Max Loss*
-
-• Current P&L: -₹{abs(current_pnl):,.2f}
-• NIFTY: {nifty_spot:,.2f}
-• Distance to Wing: {distance_to_wing:.0f} pts
-{advice_section}
-_Time: {datetime.now().strftime('%H:%M:%S')}_"""
+_Reply: EXIT / HOLD / ADJUST_"""
 
         return self.send(message)
 
@@ -339,25 +304,16 @@ _Time: {datetime.now().strftime('%H:%M:%S')}_"""
         claude_advice: Optional[str] = None
     ) -> bool:
         """Send wing approach alert."""
-        advice_section = ""
+        message = f"""⚠️ *WING APPROACH: {wing_proximity:.0f}% to {direction.upper()}*
+
+NIFTY {nifty_spot:,.0f} | {distance_to_wing:.0f}pts to wing"""
+
         if claude_advice:
-            advice_section = f"""
-📋 *Claude Analysis:*
-{claude_advice}
+            message += f"""
 
-_Reply with: EXIT, HOLD, or ADJUST_
-"""
-        else:
-            advice_section = "\n_Awaiting Claude analysis..._\n"
+📋 *Claude:* {claude_advice}
 
-        message = f"""⚠️ *WING APPROACH*
-
-📍 *{wing_proximity:.0f}% toward {direction.upper()} wing*
-
-• NIFTY: {nifty_spot:,.2f}
-• Distance to Wing: {distance_to_wing:.0f} pts
-{advice_section}
-_Time: {datetime.now().strftime('%H:%M:%S')}_"""
+_Reply: EXIT / HOLD / ADJUST_"""
 
         return self.send(message)
 
@@ -370,40 +326,22 @@ _Time: {datetime.now().strftime('%H:%M:%S')}_"""
         """Send VIX warning alert."""
         direction = "↑" if vix_change > 0 else "↓"
 
-        advice_section = ""
+        message = f"""⚠️ *VIX WARNING: {current_vix:.1f}* {direction} ({vix_change:+.1f}) - Hard exit at 20"""
+
         if claude_advice:
-            advice_section = f"""
-📋 *Claude Analysis:*
-{claude_advice}
+            message += f"""
 
-_Reply with: EXIT or HOLD_
-"""
-        else:
-            advice_section = "\n_Awaiting Claude analysis..._\n"
+📋 *Claude:* {claude_advice}
 
-        message = f"""⚠️ *VIX WARNING*
-
-📈 *VIX in Warning Zone (16.5-20)*
-
-• Current VIX: {current_vix:.2f} {direction} ({vix_change:+.2f})
-• Hard Exit Threshold: 20
-{advice_section}
-_Time: {datetime.now().strftime('%H:%M:%S')}_"""
+_Reply: EXIT / HOLD_"""
 
         return self.send(message)
 
     def send_vix_hard_exit(self, current_vix: float) -> bool:
         """Send VIX hard exit alert."""
-        message = f"""🚨 *VIX HARD EXIT TRIGGERED*
+        message = f"""🚨 *VIX HARD EXIT* - VIX {current_vix:.1f} > 20
 
-❌ *VIX > 20 - Auto-Exit Executing*
-
-• Current VIX: {current_vix:.2f}
-• Threshold: 20.0
-
-Closing position immediately...
-
-_Time: {datetime.now().strftime('%H:%M:%S')}_"""
+Auto-closing position..."""
 
         return self.send(message)
 
@@ -417,29 +355,19 @@ _Time: {datetime.now().strftime('%H:%M:%S')}_"""
         claude_advice: Optional[str] = None
     ) -> bool:
         """Send gap detection alert."""
-        priority = "🚨 CRITICAL" if is_beyond_wing else "⚠️ SIGNIFICANT"
-        status = "BEYOND WING - MAX LOSS" if is_beyond_wing else "Within position range"
+        priority = "🚨" if is_beyond_wing else "⚠️"
+        status = "BEYOND WING" if is_beyond_wing else "Within range"
 
-        message = f"""{priority}: *GAP AT OPEN*
+        message = f"""{priority} *GAP {gap_direction.upper()}: {gap_percent:.1%}* - {status}
 
-📊 *Gap Details*
-• Previous Close: {previous_close:,.2f}
-• Today's Open: {day_open:,.2f}
-• Gap: {gap_percent:.1%} {gap_direction.upper()}
-
-⚠️ *Position Status: {status}*"""
+Prev {previous_close:,.0f} → Open {day_open:,.0f}"""
 
         if claude_advice:
             message += f"""
 
-📋 *Claude Analysis:*
-{claude_advice}
+📋 *Claude:* {claude_advice}
 
-_Reply with: EXIT or HOLD_"""
-
-        message += f"""
-
-_Time: {datetime.now().strftime('%H:%M:%S')}_"""
+_Reply: EXIT / HOLD_"""
 
         return self.send(message)
 
@@ -454,20 +382,15 @@ _Time: {datetime.now().strftime('%H:%M:%S')}_"""
         """Send Friday exit decision alert."""
         emoji = "🟢" if current_pnl >= 0 else "🔴"
         pnl_sign = "+" if current_pnl >= 0 else ""
+        events = weekend_events if weekend_events else "None"
 
         message = f"""📅 *FRIDAY DECISION*
 
-{emoji} *Current P&L: {pnl_sign}₹{current_pnl:,.2f} ({pnl_sign}{pnl_percent:.1f}%)*
+{emoji} P&L: *{pnl_sign}₹{current_pnl:,.0f}* ({pnl_sign}{pnl_percent:.1f}%) | DTE {dte} | Events: {events}
 
-• Days to Expiry: {dte}
-• Weekend Events: {weekend_events or 'None known'}
+📋 *Claude:* {claude_advice}
 
-📋 *Claude Analysis:*
-{claude_advice}
-
-_Reply with: EXIT or HOLD_
-
-_Time: {datetime.now().strftime('%H:%M:%S')}_"""
+_Reply: EXIT / HOLD_"""
 
         return self.send(message)
 
@@ -480,15 +403,7 @@ _Time: {datetime.now().strftime('%H:%M:%S')}_"""
         """Send error alert."""
         message = f"""🚨 *SNAIL ERROR*
 
-⚠️ *Error Detected*
-
-```
-Error: {error[:200]}
-Module: {module}
-Function: {function}
-```
-
-_Time: {datetime.now().strftime('%H:%M:%S')}_"""
+`{module}.{function}`: {error[:150]}"""
 
         return self.send(message)
 
@@ -503,17 +418,11 @@ _Time: {datetime.now().strftime('%H:%M:%S')}_"""
         """Send daily summary alert."""
         emoji = "🟢" if total_pnl >= 0 else "🔴"
         pnl_sign = "+" if total_pnl >= 0 else ""
+        pos_text = position_status if position_status else ('Active' if has_position else 'None')
 
-        message = f"""📊 *SNAIL Daily Summary*
-_{date_str}_
+        message = f"""📊 *SNAIL Daily Summary* - {date_str}
 
-{emoji} *Day P&L: {pnl_sign}₹{total_pnl:,.2f}*
-
-• Trades: {trades}
-• Position: {'Active' if has_position else 'None'}"""
-
-        if position_status:
-            message += f"\n• Status: {position_status}"
+{emoji} P&L: *{pnl_sign}₹{total_pnl:,.0f}* | Trades: {trades} | Position: {pos_text}"""
 
         return self.send(message)
 
@@ -531,24 +440,13 @@ _{date_str}_
         cooldown_ok = "✅" if entry_conditions.get('cooldown_ok') else "❌"
         margin_ok = "✅" if entry_conditions.get('margin_ok') else "❌"
 
-        message = f"""🌅 *SNAIL Morning Summary*
+        message = f"""🌅 *SNAIL Morning*
 
-📈 *Market Status*
-• NIFTY: {nifty_spot:,.2f}
-• VIX: {vix:.2f}
+NIFTY {nifty_spot:,.0f} | VIX {vix:.1f} | Margin ₹{margin_available:,.0f}
 
-💰 *Account*
-• Margin Available: ₹{margin_available:,.0f}
+Entry: VIX {vix_ok} DTE {dte_ok} Cooldown {cooldown_ok} Margin {margin_ok}
 
-📋 *Entry Conditions*
-• VIX (10-16): {vix_ok}
-• DTE ≥ 6: {dte_ok}
-• Cooldown: {cooldown_ok}
-• Margin: {margin_ok}
-
-📍 *Position: {'Active' if has_position else 'None'}*
-
-_Time: {datetime.now().strftime('%H:%M:%S')}_"""
+Position: *{'Active' if has_position else 'None'}*"""
 
         return self.send(message)
 

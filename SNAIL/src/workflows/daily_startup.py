@@ -689,8 +689,10 @@ class DailyStartup:
             elif 'margin' in check.name.lower():
                 entry_conditions['margin_ok'] = check.passed
 
-        # Get margin (estimate from config or use 0)
-        margin_available = self.trading_config.get('capital', {}).get('max_capital', 0)
+        # Get actual margin from market data
+        margin_available = 0
+        if startup_result.market_data:
+            margin_available = startup_result.market_data.get('available_margin', 0)
 
         self.telegram.send_morning_summary(
             nifty_spot=nifty_spot,
