@@ -1,0 +1,45 @@
+# =============================================================================
+# SNAIL Requirements for Raspberry Pi
+# =============================================================================
+# Minimal dependencies for production deployment
+# Install: pip install -r requirements_pi.txt
+# =============================================================================
+
+# Core - Trading
+kiteconnect==5.0.1
+anthropic==0.72.0
+requests==2.32.4
+
+# Logging
+loguru==0.7.3
+
+# Data Processing
+pandas==2.0.3
+numpy==1.24.4
+
+# Configuration
+PyYAML==6.0.2
+python-dotenv==1.0.1
+
+# Authentication (TOTP generation)
+pyotp==2.9.0
+
+# Scheduling
+APScheduler==3.11.0
+
+# Type hints and validation
+pydantic==2.10.6
+typing_extensions==4.13.2
+
+# Date/Time handling
+python-dateutil==2.9.0.post0
+pytz==2025.2
+tzlocal==5.2
+
+# HTTP
+urllib3>=1.26.0
+certifi>=2020.4.0
+
+# Async support
+anyio>=3.0.0
+sniffio>=1.0.0
