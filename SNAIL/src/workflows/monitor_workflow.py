@@ -770,6 +770,17 @@ _Fetching P&L data..._"""
         logger.info("Stopping monitor workflow...")
         self._running = False
 
+    def run_once(self) -> None:
+        """
+        Run a single monitoring iteration.
+
+        Used for cron-based monitoring instead of continuous loop.
+        """
+        logger.info("Running single monitor iteration")
+        self._stats = MonitorLoopStats(start_time=datetime.now())
+        self._single_iteration()
+        logger.info("Monitor iteration complete")
+
     def get_stats(self) -> Dict[str, Any]:
         """
         Get monitoring statistics.

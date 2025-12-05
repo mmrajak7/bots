@@ -267,6 +267,16 @@ def cmd_summary(args):
     return 0
 
 
+def cmd_monitor(args):
+    """Run a single monitoring iteration (for cron)."""
+    from src.workflows.monitor_workflow import MonitorWorkflow
+
+    monitor = MonitorWorkflow()
+    monitor.run_once()
+
+    return 0
+
+
 def cmd_test(args):
     """Run system tests."""
     print("\n" + "=" * 60)
@@ -455,6 +465,9 @@ Commands:
     summary_parser.add_argument('--weekly', action='store_true', help='Weekly summary')
     summary_parser.add_argument('--send', action='store_true', help='Send to Telegram')
 
+    # Monitor command (single iteration for cron)
+    monitor_parser = subparsers.add_parser('monitor', help='Run single monitor iteration')
+
     # Test command
     test_parser = subparsers.add_parser('test', help='Run tests')
 
@@ -480,6 +493,7 @@ Commands:
         'exit': cmd_exit,
         'status': cmd_status,
         'summary': cmd_summary,
+        'monitor': cmd_monitor,
         'test': cmd_test,
         'init': cmd_init,
     }
