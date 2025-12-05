@@ -177,6 +177,28 @@ class TelegramAlerts:
         logger.error(f"Failed to send message after {max_retries} attempts")
         return False
 
+    def test_connection(self) -> bool:
+        """
+        Test Telegram connection by calling getMe API.
+
+        Returns:
+            True if connection works
+        """
+        try:
+            url = f"{self.TELEGRAM_API}{self.bot_token}/getMe"
+            response = requests.get(url, timeout=self.DEFAULT_TIMEOUT)
+
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("ok"):
+                    logger.debug(f"Telegram connected: @{data['result'].get('username')}")
+                    return True
+
+            return False
+        except Exception as e:
+            logger.error(f"Telegram connection test failed: {e}")
+            return False
+
     # =========================================================================
     # SPECIALIZED ALERTS
     # =========================================================================
