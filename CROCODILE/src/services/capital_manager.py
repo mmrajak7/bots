@@ -1030,17 +1030,10 @@ class CapitalManager:
                 logger.warning(f"Open position limit hit: {rejection_reason}")
                 return False, rejection_reason, None
 
-            # Check if approaching open position limit (>= 80%)
+            # Approaching position limit (>= 80%) - log only, no Telegram alert
             position_pct = (current_positions / self.max_positions) * 100
             if position_pct >= 80:
-                alert_message = (
-                    f"⚠️ **POSITION LIMIT WARNING**\n"
-                    f"📊 Open: {current_positions}/{self.max_positions} ({position_pct:.0f}%)\n"
-                    f"⏳ Pending: {pending_orders}"
-                    f"{f'/{self.max_pending_orders}' if self.max_pending_orders else ''}\n"
-                    f"💡 Consider reviewing positions"
-                )
-                logger.warning(f"Approaching position limit: {current_positions}/{self.max_positions}")
+                logger.debug(f"Approaching position limit: {current_positions}/{self.max_positions}")
 
         # Check 2: Pending order limit (max_pending_orders) - SEPARATE from positions
         if self.max_pending_orders is not None:
