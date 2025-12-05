@@ -1,0 +1,26 @@
+[Unit]
+Description=SNAIL Telegram Polling Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/bots/SNAIL
+Environment="PATH=/home/pi/bots/SNAIL/venv/bin"
+Environment="PYTHONPATH=/home/pi/bots/SNAIL"
+ExecStart=/home/pi/bots/SNAIL/venv/bin/python scripts/telegram_poller.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/home/pi/bots/SNAIL/logs/telegram_service.log
+StandardError=append:/home/pi/bots/SNAIL/logs/telegram_service_error.log
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+You are a trading advisor for an Iron Fly position on NIFTY. VIX has entered the warning zone.
+
+POSITION DETAILS:
+- Entry Date: {entry_date}
+- ATM Strike: {atm_strike}
+- Wing Distance: {wing_distance}
+- Expiry: {expiry_date} ({dte} days remaining)
+- Entry VIX: {entry_vix}
+
+CURRENT STATUS:
+- NIFTY Spot: {nifty_spot}
+- Current VIX: {current_vix}
+- VIX Change: {vix_change} ({vix_change_pct}%)
+- Current P&L: ₹{current_pnl} ({pnl_percent}%)
+- Time: {time}
+
+VIX THRESHOLDS:
+- Entry Range: 10-16
+- Warning Zone: 16.5-20
+- Hard Exit: > 20
+
+VIX is currently at {current_vix}, which is in the WARNING ZONE.
+
+ANALYSIS REQUEST:
+1. Is this VIX spike event-driven or sentiment-driven?
+2. What is causing the volatility increase?
+3. Is VIX likely to stabilize, continue rising, or reverse?
+4. Given the position's P&L, is early exit warranted?
+
+RESPOND WITH:
+- HOLD if VIX spike is temporary and likely to reverse
+- EXIT if VIX is likely to breach 20 or position risk is elevated
+
+Format: [DECISION]: [Reasoning about VIX trend and position risk]

@@ -1,0 +1,695 @@
+"""
+SNAIL Exit Manager
+
+Manages Iron Fly position exit including profit target, stop loss, and manual exits.
+
+@file        exit_manager.py
+@description Iron Fly exit management service
+@author      SNAIL Development Team
+@created     2025-12-04
+@version     1.0.0
+@references  TECHNICAL_DESIGN_REFERENCE.md Section 4.2
+"""
+
+from datetime import datetime, date, timedelta
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass
+from enum import Enum
+from loguru import logger
+
+from src.api.kite_client import SNAILKiteClient, Quote, get_kite_client
+from src.api.telegram_alerts import TelegramAlerts, get_telegram
+from src.api.claude_client import SNAILClaudeClient, MarketContext, ClaudeDecision, get_claude_client
+from src.utils.symbol_builder import build_iron_fly_instruments
+from src.utils.order_helpers import execute_iron_fly_exit, IronFlyOrders, OrderExecutionError, verify_position
+from src.utils.calculations import calculate_position_pnl, calculate_transaction_charges
+from src.utils.db import (
+    get_db_session,
+    Position,
+    PositionLeg,
+    get_active_position,
+    get_position_legs,
+    update_position_status,
+    save_order,
+    Order,
+    set_cooldown
+)
+from src.utils.config import get_trading_config, load_config
+
+
+# =============================================================================
+# ENUMS
+# =============================================================================
+
+class ExitReason(Enum):
+    """Reasons for position exit."""
+    PROFIT_TARGET = "profit_target"
+    STOP_LOSS = "stop_loss"
+    FRIDAY_CLOSE = "friday_close"
+    EXPIRY = "expiry"
+    MANUAL = "manual"
+    WING_BREACH = "wing_breach"
+    GAP_OPEN = "gap_open"
+    CLAUDE_ADVISORY = "claude_advisory"
+    VIX_BREACH = "vix_breach"  # TDD Section 5.3: VIX > 20 is HARD exit trigger
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
+@dataclass
+class ExitCondition:
+    """
+    Exit condition check result.
+
+    Attributes:
+        should_exit: Whether position should be exited
+        reason: Exit reason
+        current_pnl: Current P&L
+        pnl_percentage: P&L as % of max profit
+        details: Additional details
+    """
+    should_exit: bool
+    reason: Optional[ExitReason] = None
+    current_pnl: float = 0.0
+    pnl_percentage: float = 0.0
+    details: str = ""
+
+
+@dataclass
+class ExitResult:
+    """
+    Exit execution result.
+
+    Attributes:
+        success: Whether exit was successful
+        reason: Exit reason
+        realized_pnl: Final realized P&L
+        charges: Transaction charges
+        orders: Executed orders
+        error: Error message if failed
+    """
+    success: bool
+    reason: Optional[ExitReason] = None
+    realized_pnl: float = 0.0
+    charges: float = 0.0
+    orders: Optional[IronFlyOrders] = None
+    error: str = ""
+
+
+# =============================================================================
+# EXIT MANAGER CLASS
+# =============================================================================
+
+class ExitManager:
+    """
+    Manages Iron Fly position exit.
+
+    Responsibilities:
+    - Monitor exit conditions (profit target, stop loss)
+    - Execute exit orders
+    - Record exit to database
+    - Set cooldown after exit
+    - Send alerts
+
+    Attributes:
+        kite: Kite client
+        telegram: Telegram client
+        claude: Claude client
+        config: Trading configuration
+    """
+
+    def __init__(
+        self,
+        kite: Optional[SNAILKiteClient] = None,
+        telegram: Optional[TelegramAlerts] = None,
+        claude: Optional[SNAILClaudeClient] = None,
+        config: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Initialize exit manager.
+
+        Args:
+            kite: Kite client
+            telegram: Telegram client
+            claude: Claude client
+            config: Configuration
+        """
+        self.config = config or load_config()
+        self.trading_config = get_trading_config()
+
+        self.kite = kite or get_kite_client(self.config)
+        self.telegram = telegram or get_telegram()
+        self.claude = claude or get_claude_client()
+
+        logger.info("Exit manager initialized")
+
+    # =========================================================================
+    # QUOTE FETCHING
+    # =========================================================================
+
+    def get_position_quotes(self, position: Position, legs: List[PositionLeg]) -> Dict[str, Quote]:
+        """
+        Fetch current quotes for position legs.
+
+        Args:
+            position: Active position
+            legs: Position legs
+
+        Returns:
+            Dict of quotes by leg type
+        """
+        instruments = []
+        leg_map = {}
+
+        for leg in legs:
+            inst = f"NFO:{leg.tradingsymbol}"
+            instruments.append(inst)
+            leg_map[inst] = leg.leg_type
+
+        raw_quotes = self.kite.quote(instruments)
+
+        quotes = {}
+        for inst, quote in raw_quotes.items():
+            leg_type = leg_map.get(inst)
+            if leg_type:
+                quotes[leg_type] = quote
+
+        return quotes
+
+    # =========================================================================
+    # CONDITION CHECKS
+    # =========================================================================
+
+    def check_exit_conditions(
+        self,
+        position: Optional[Position] = None,
+        legs: Optional[List[PositionLeg]] = None
+    ) -> ExitCondition:
+        """
+        Check if position should be exited.
+
+        Checks:
+        1. Profit target (50% of max profit)
+        2. Stop loss (50% of max loss - advisory)
+        3. Friday close (before expiry week)
+        4. Expiry day (auto-exit)
+
+        Args:
+            position: Position to check (fetched if None)
+            legs: Position legs (fetched if None)
+
+        Returns:
+            ExitCondition result
+        """
+        # Get position if not provided
+        if position is None:
+            position = get_active_position()
+            if position is None:
+                return ExitCondition(
+                    should_exit=False,
+                    details="No active position"
+                )
+
+        if legs is None:
+            legs = get_position_legs(position.id)
+
+        # Get current quotes
+        quotes = self.get_position_quotes(position, legs)
+
+        # Calculate current P&L
+        entry_straddle = 0.0
+        entry_wing = 0.0
+        current_straddle_ask = 0.0
+        current_wing_bid = 0.0
+
+        for leg in legs:
+            quote = quotes.get(leg.leg_type)
+            if not quote:
+                continue
+
+            if leg.side == 'SHORT':
+                entry_straddle += leg.entry_price
+                current_straddle_ask += quote.ask
+            else:
+                entry_wing += leg.entry_price
+                current_wing_bid += quote.bid
+
+        current_pnl, pnl_pct = calculate_position_pnl(
+            entry_straddle_credit=entry_straddle,
+            entry_wing_debit=entry_wing,
+            current_straddle_ask=current_straddle_ask,
+            current_wing_bid=current_wing_bid,
+            quantity=position.quantity
+        )
+
+        # Check profit target (50% of max profit)
+        profit_target_pct = self.trading_config.get('exit', {}).get('profit_target_pct', 50)
+        if pnl_pct >= profit_target_pct:
+            return ExitCondition(
+                should_exit=True,
+                reason=ExitReason.PROFIT_TARGET,
+                current_pnl=current_pnl,
+                pnl_percentage=pnl_pct,
+                details=f"Profit target reached ({pnl_pct:.1f}% >= {profit_target_pct}%)"
+            )
+
+        # Check VIX > 20 - HARD exit trigger (TDD Section 5.3)
+        india_vix = self.kite.get_india_vix()
+        vix_hard_exit_threshold = self.trading_config.get('exit', {}).get('vix_hard_exit', 20)
+
+        if india_vix > vix_hard_exit_threshold:
+            logger.warning(f"VIX breach detected! VIX={india_vix:.2f} > {vix_hard_exit_threshold}")
+            return ExitCondition(
+                should_exit=True,
+                reason=ExitReason.VIX_BREACH,
+                current_pnl=current_pnl,
+                pnl_percentage=pnl_pct,
+                details=f"VIX HARD EXIT: {india_vix:.2f} > {vix_hard_exit_threshold} threshold"
+            )
+
+        # Check stop loss (50% of max loss - advisory only)
+        stop_loss_pct = self.trading_config.get('exit', {}).get('stop_loss_pct', 50)
+        loss_pct = abs(pnl_pct) if pnl_pct < 0 else 0
+
+        if loss_pct >= stop_loss_pct:
+            # This is advisory - Claude decides
+            return ExitCondition(
+                should_exit=False,  # Don't auto-exit, need Claude decision
+                reason=ExitReason.STOP_LOSS,
+                current_pnl=current_pnl,
+                pnl_percentage=pnl_pct,
+                details=f"Stop loss level reached ({loss_pct:.1f}% loss) - Claude advisory needed"
+            )
+
+        # Check Friday close
+        today = date.today()
+        if today.weekday() == 4:  # Friday
+            # If position expiry is next week or later
+            if position.expiry and position.expiry > today + timedelta(days=2):
+                current_time = datetime.now().strftime("%H:%M")
+                friday_exit_time = self.trading_config.get('exit', {}).get('friday_exit_time', "15:15")
+
+                if current_time >= friday_exit_time:
+                    return ExitCondition(
+                        should_exit=True,
+                        reason=ExitReason.FRIDAY_CLOSE,
+                        current_pnl=current_pnl,
+                        pnl_percentage=pnl_pct,
+                        details="Friday close before weekend"
+                    )
+
+        # Check expiry day (NIFTY typically expires on Tuesday)
+        # TDD Section 6.1.3: Expiry day must exit by 3:20 PM
+        if position.expiry and position.expiry == today:
+            current_time = datetime.now().strftime("%H:%M")
+            expiry_exit_time = self.trading_config.get('exit', {}).get('expiry_exit_time', "15:20")
+
+            if current_time >= expiry_exit_time:
+                logger.warning(f"EXPIRY DAY EXIT: Today is expiry ({position.expiry}), time={current_time}")
+                return ExitCondition(
+                    should_exit=True,
+                    reason=ExitReason.EXPIRY,
+                    current_pnl=current_pnl,
+                    pnl_percentage=pnl_pct,
+                    details=f"Expiry day auto-exit (expiry={position.expiry}, time={current_time})"
+                )
+
+        # Check if expiry is tomorrow (DTE = 1) - alert but don't auto-exit
+        if position.expiry and (position.expiry - today).days == 1:
+            logger.info(f"Expiry tomorrow ({position.expiry}). DTE=1, monitoring closely.")
+
+        # No exit condition met
+        return ExitCondition(
+            should_exit=False,
+            current_pnl=current_pnl,
+            pnl_percentage=pnl_pct,
+            details="No exit conditions met"
+        )
+
+    # =========================================================================
+    # EXIT EXECUTION
+    # =========================================================================
+
+    def execute_exit(
+        self,
+        reason: ExitReason,
+        position: Optional[Position] = None,
+        require_confirmation: bool = False
+    ) -> ExitResult:
+        """
+        Execute position exit.
+
+        Args:
+            reason: Reason for exit
+            position: Position to exit (fetched if None)
+            require_confirmation: Whether to require Telegram confirmation
+
+        Returns:
+            ExitResult with execution details
+        """
+        # Get position
+        if position is None:
+            position = get_active_position()
+            if position is None:
+                return ExitResult(
+                    success=False,
+                    error="No active position to exit"
+                )
+
+        legs = get_position_legs(position.id)
+        if not legs:
+            return ExitResult(
+                success=False,
+                error="No legs found for position"
+            )
+
+        logger.info(f"Executing exit for position {position.id}, reason: {reason.value}")
+
+        try:
+            # Get current quotes
+            quotes = self.get_position_quotes(position, legs)
+
+            # Build symbols dict
+            symbols = {leg.leg_type: leg.tradingsymbol for leg in legs}
+
+            # Execute exit orders
+            slippage_ticks = self.trading_config.get('exit', {}).get('slippage_ticks', 2)
+
+            orders = execute_iron_fly_exit(
+                kite=self.kite,
+                symbols=symbols,
+                quotes=quotes,
+                quantity=position.quantity,
+                slippage_ticks=slippage_ticks
+            )
+
+            # Position Verification after Exit (TDD Section 6.2)
+            # Verify all positions are CLOSED (qty = 0)
+            logger.info("Verifying positions are closed after exit...")
+            exit_verified = True
+            verification_issues = []
+
+            for leg_type, symbol in symbols.items():
+                # After exit, we expect NO position (qty = 0)
+                # Check that position doesn't exist with original quantity
+                positions = self.kite.positions()
+                net_positions = positions.get('net', [])
+
+                for pos in net_positions:
+                    if pos.get('tradingsymbol') == symbol:
+                        qty = pos.get('quantity', 0)
+                        if qty != 0:
+                            exit_verified = False
+                            verification_issues.append(
+                                f"{leg_type}: Expected 0, found {qty}"
+                            )
+                        break
+
+            if not exit_verified:
+                issue_text = "; ".join(verification_issues)
+                logger.error(f"EXIT VERIFICATION FAILED: {issue_text}")
+
+                self.telegram.send(
+                    f"🚨 *CRITICAL: Exit Verification Failed!*\n\n"
+                    f"Exit orders executed but positions may remain:\n"
+                    f"{''.join(f'• {i}' + chr(10) for i in verification_issues)}\n"
+                    f"⚠️ *Manual intervention required!*\n\n"
+                    f"Check Kite positions immediately."
+                )
+
+            # Calculate realized P&L
+            entry_credit = position.entry_credit
+            exit_debit = (
+                (orders.straddle_ce.fill_price + orders.straddle_pe.fill_price) -
+                (orders.wing_ce.fill_price + orders.wing_pe.fill_price)
+            ) * position.quantity
+
+            realized_pnl = entry_credit - exit_debit
+
+            # Calculate charges
+            sell_value = (orders.wing_ce.fill_price + orders.wing_pe.fill_price) * position.quantity
+            buy_value = (orders.straddle_ce.fill_price + orders.straddle_pe.fill_price) * position.quantity
+            charges = calculate_transaction_charges(buy_value, sell_value)
+
+            # Update position in database
+            self._record_exit(
+                position=position,
+                legs=legs,
+                orders=orders,
+                reason=reason,
+                realized_pnl=realized_pnl
+            )
+
+            # Set cooldown (1 day after exit)
+            cooldown_hours = self.trading_config.get('exit', {}).get('cooldown_hours', 24)
+            set_cooldown('entry', cooldown_hours * 3600)
+
+            # Send exit alert
+            self._send_exit_alert(
+                position=position,
+                reason=reason,
+                realized_pnl=realized_pnl,
+                charges=charges.total
+            )
+
+            logger.info(f"Exit complete! Realized P&L: {realized_pnl:.2f}")
+
+            return ExitResult(
+                success=True,
+                reason=reason,
+                realized_pnl=realized_pnl,
+                charges=charges.total,
+                orders=orders
+            )
+
+        except OrderExecutionError as e:
+            logger.error(f"Exit order execution failed: {e}")
+            self.telegram.send_error_alert(
+                error=str(e),
+                module="exit_manager",
+                function="execute_exit"
+            )
+            return ExitResult(success=False, error=str(e))
+
+        except Exception as e:
+            logger.error(f"Exit failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return ExitResult(success=False, error=str(e))
+
+    def execute_manual_exit(self) -> ExitResult:
+        """Execute manual exit requested by user."""
+        return self.execute_exit(ExitReason.MANUAL)
+
+    def execute_stop_loss_exit(
+        self,
+        position: Position,
+        require_claude: bool = True
+    ) -> ExitResult:
+        """
+        Execute stop loss exit with optional Claude advisory.
+
+        Args:
+            position: Position to exit
+            require_claude: Whether to get Claude decision first
+
+        Returns:
+            ExitResult
+        """
+        if require_claude:
+            # Get Claude advisory
+            legs = get_position_legs(position.id)
+            quotes = self.get_position_quotes(position, legs)
+
+            # Calculate current P&L for context
+            entry_straddle = sum(l.entry_price for l in legs if l.side == 'SHORT')
+            entry_wing = sum(l.entry_price for l in legs if l.side == 'LONG')
+            current_straddle = sum(quotes[l.leg_type].ask for l in legs if l.side == 'SHORT')
+            current_wing = sum(quotes[l.leg_type].bid for l in legs if l.side == 'LONG')
+
+            current_pnl, pnl_pct = calculate_position_pnl(
+                entry_straddle, entry_wing, current_straddle, current_wing, position.quantity
+            )
+
+            # Get NIFTY and VIX
+            nifty_spot = self.kite.get_nifty_spot()
+            india_vix = self.kite.get_india_vix()
+
+            context = MarketContext(
+                nifty_spot=nifty_spot,
+                india_vix=india_vix,
+                atm_strike=position.atm_strike,
+                wing_distance=position.wing_distance,
+                position_pnl=current_pnl,
+                dte=(position.expiry - date.today()).days if position.expiry else 0
+            )
+
+            response = self.claude.get_stop_loss_advisory(context)
+
+            if response.decision == ClaudeDecision.HOLD:
+                logger.info("Claude advises HOLD at stop loss level")
+                self.telegram.send(
+                    f"⚠️ Stop loss level reached but Claude advises HOLD:\n{response.reasoning[:200]}..."
+                )
+                return ExitResult(
+                    success=False,
+                    reason=ExitReason.STOP_LOSS,
+                    error="Claude advises holding position"
+                )
+
+        return self.execute_exit(ExitReason.STOP_LOSS, position)
+
+    # =========================================================================
+    # DATABASE RECORDING
+    # =========================================================================
+
+    def _record_exit(
+        self,
+        position: Position,
+        legs: List[PositionLeg],
+        orders: IronFlyOrders,
+        reason: ExitReason,
+        realized_pnl: float
+    ) -> None:
+        """Record exit to database."""
+        # Update position status
+        update_position_status(
+            position_id=position.id,
+            status='CLOSED',
+            exit_time=datetime.now(),
+            exit_reason=reason.value,
+            realized_pnl=realized_pnl
+        )
+
+        # Record exit orders
+        exit_orders = [
+            ('straddle_ce', orders.straddle_ce),
+            ('straddle_pe', orders.straddle_pe),
+            ('wing_ce', orders.wing_ce),
+            ('wing_pe', orders.wing_pe),
+        ]
+
+        for leg_type, order in exit_orders:
+            # Find matching leg
+            leg = next((l for l in legs if l.leg_type == leg_type), None)
+            if leg:
+                order_record = Order(
+                    id=0,
+                    position_id=position.id,
+                    leg_id=leg.id,
+                    order_id=order.order_id,
+                    tradingsymbol=order.tradingsymbol,
+                    transaction_type=order.transaction_type,
+                    quantity=order.quantity,
+                    order_type='LIMIT',
+                    price=order.order_price,
+                    status=order.status,
+                    fill_price=order.fill_price,
+                    slippage=order.slippage,
+                    created_at=datetime.now()
+                )
+                save_order(order_record)
+
+    def _send_exit_alert(
+        self,
+        position: Position,
+        reason: ExitReason,
+        realized_pnl: float,
+        charges: float
+    ) -> None:
+        """Send exit alert via Telegram."""
+        net_pnl = realized_pnl - charges
+        exit_time = datetime.now()
+
+        # Calculate P&L percentage (of max profit if positive, max loss if negative)
+        if net_pnl >= 0 and position.max_profit and position.max_profit > 0:
+            pnl_percent = (net_pnl / position.max_profit) * 100
+        elif net_pnl < 0 and position.max_loss and position.max_loss > 0:
+            pnl_percent = (abs(net_pnl) / position.max_loss) * 100 * -1
+        else:
+            pnl_percent = 0
+
+        self.telegram.send_exit_alert(
+            exit_reason=reason.value,
+            net_pnl=net_pnl,
+            pnl_percent=pnl_percent,
+            entry_time=position.entry_time or exit_time,
+            exit_time=exit_time
+        )
+
+
+# =============================================================================
+# SINGLETON INSTANCE
+# =============================================================================
+
+_exit_manager: Optional[ExitManager] = None
+
+
+def get_exit_manager(config: Optional[Dict] = None) -> ExitManager:
+    """Get or create singleton exit manager."""
+    global _exit_manager
+
+    if _exit_manager is None:
+        _exit_manager = ExitManager(config=config)
+
+    return _exit_manager
+
+
+def reset_exit_manager() -> None:
+    """Reset singleton exit manager."""
+    global _exit_manager
+    _exit_manager = None
+
+
+# =============================================================================
+# CLI ENTRY POINT
+# =============================================================================
+
+if __name__ == '__main__':
+    import sys
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
+
+    print("\n" + "=" * 60)
+    print("SNAIL Exit Manager Test")
+    print("=" * 60)
+
+    try:
+        manager = ExitManager()
+
+        # Check for active position
+        print("\n[1] Checking for active position...")
+        position = get_active_position()
+
+        if position:
+            print(f"    Found position ID: {position.id}")
+            print(f"    Strategy: {position.strategy}")
+            print(f"    Entry credit: {position.entry_credit:.2f}")
+
+            # Check exit conditions
+            print("\n[2] Checking exit conditions...")
+            condition = manager.check_exit_conditions(position)
+            print(f"    Should exit: {condition.should_exit}")
+            print(f"    Reason: {condition.reason}")
+            print(f"    Current P&L: {condition.current_pnl:.2f}")
+            print(f"    P&L %: {condition.pnl_percentage:.1f}%")
+            print(f"    Details: {condition.details}")
+
+        else:
+            print("    No active position found")
+
+        print("\n" + "=" * 60)
+        print("Exit manager test complete!")
+        print("=" * 60 + "\n")
+
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

@@ -2,8 +2,8 @@
 .env
 .env.*
 *.env
-config/config.yaml
-**/config/config.yaml
+
+# CROCODILE config (has credentials)
 CROCODILE/config/config.yaml
 
 # Python
@@ -77,3 +77,22 @@ desktop.ini
 # Token files
 *token*.txt
 *enctoken*
+*access_token*.json
+
+# SNAIL specific excludes
+SNAIL/Archive/
+SNAIL/tests/
+SNAIL/docs/
+SNAIL/sample/
+SNAIL/kite_integration/
+SNAIL/data/*.json
+SNAIL/creds.env
+SNAIL/*.md
+!SNAIL/README.md
+
+# CROCODILE specific excludes
+CROCODILE/data/*.db
+CROCODILE/data/circuit_breaker_state.json
+
+# Misc
+nul

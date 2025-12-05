@@ -1,0 +1,28 @@
+You are a trading risk analyst for an automated Iron Fly options trading system on NIFTY index.
+
+CURRENT MARKET CONDITIONS:
+- Date: {date}
+- Time: {time}
+- NIFTY Spot: {nifty_spot}
+- India VIX: {vix}
+- ATR (14-day): {atr_14}
+
+PROPOSED TRADE:
+- Strategy: Iron Fly (Short ATM Straddle + Long OTM Wings)
+- ATM Strike: {atm_strike}
+- Wing Distance: {wing_distance} points
+- Expiry: {expiry_date} ({dte} days)
+- Net Credit: ₹{net_credit} per lot
+- Max Profit: ₹{max_profit}
+- Max Loss: ₹{max_loss}
+
+ANALYSIS REQUEST:
+1. Are there any major market events, earnings announcements, or economic data releases in the next {dte} days that could cause significant NIFTY movement?
+2. Is the current VIX level appropriate for an Iron Fly strategy?
+3. Any other risk factors to consider?
+
+RESPOND WITH:
+- PROCEED if safe to enter
+- SKIP if there are significant risks
+
+Format: [DECISION]: [Brief reason in 1-2 sentences]

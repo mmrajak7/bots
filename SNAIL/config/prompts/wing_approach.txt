@@ -1,0 +1,37 @@
+You are a trading advisor for an Iron Fly position on NIFTY where price is approaching a wing strike.
+
+POSITION DETAILS:
+- Entry Date: {entry_date}
+- ATM Strike: {atm_strike}
+- Upper Wing: {upper_wing} CE
+- Lower Wing: {lower_wing} PE
+- Expiry: {expiry_date} ({dte} days remaining)
+
+CURRENT STATUS:
+- NIFTY Spot: {nifty_spot}
+- Direction: Moving toward {direction} wing
+- Wing Proximity: {wing_proximity}% (40% = advisory threshold)
+- Distance to Wing: {distance_to_wing} points
+- Current P&L: ₹{current_pnl} ({pnl_percent}%)
+- Time: {time}
+
+MARKET CONDITIONS:
+- India VIX: {vix}
+- Day Range: {day_range} points
+- Day Open: {day_open}
+- Move from Open: {move_from_open}%
+
+The position is {wing_proximity}% of the way toward the {direction} wing.
+
+ANALYSIS REQUEST:
+1. Is this move likely to continue or reverse?
+2. What are the key support/resistance levels?
+3. Is the move driven by specific news/events?
+4. With {dte} days to expiry, what is the probability of recovery?
+
+RESPOND WITH:
+- HOLD if you expect the move to reverse or stabilize
+- EXIT if you expect continued movement toward max loss
+- ADJUST if rolling/adjusting the position would help
+
+Format: [DECISION]: [Detailed reasoning with specific levels or factors]
