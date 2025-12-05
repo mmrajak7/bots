@@ -239,7 +239,7 @@ CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON alert_queue(status);
 CREATE INDEX IF NOT EXISTS idx_alerts_created ON alert_queue(created_at);
 CREATE INDEX IF NOT EXISTS idx_cooldowns_end ON cooldowns(cooldown_end);
-CREATE INDEX IF NOT EXISTS idx_alert_cooldowns ON alert_cooldowns(position_id, trigger_type);
+CREATE INDEX IF NOT EXISTS idx_alert_cooldowns ON alert_cooldowns(position_id, alert_type);
 CREATE INDEX IF NOT EXISTS idx_market_data_date ON market_data(date);
 CREATE INDEX IF NOT EXISTS idx_entry_attempts_time ON entry_attempts(attempt_time);
 CREATE INDEX IF NOT EXISTS idx_claude_decisions_position ON claude_decisions(position_id);
