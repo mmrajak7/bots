@@ -172,6 +172,8 @@ class KiteAuthenticator:
         login_url = f"{self.KITE_BASE_URL}/connect/login?v=3&api_key={self.api_key}"
 
         logger.debug("[1/5] Getting login page...")
+        # Note: allow_redirects=True here is intentional - Kite may redirect
+        # during initial page load. The localhost callback issue occurs later.
         response = self.session.get(login_url, allow_redirects=True, timeout=30)
 
         if response.status_code != 200:
@@ -195,7 +197,7 @@ class KiteAuthenticator:
         }
 
         logger.debug("[2/5] Submitting credentials...")
-        response = self.session.post(login_endpoint, data=payload, timeout=30)
+        response = self.session.post(login_endpoint, data=payload, timeout=30, allow_redirects=False)
 
         if response.status_code != 200:
             raise KiteAuthenticationError(
@@ -232,7 +234,7 @@ class KiteAuthenticator:
         }
 
         logger.debug("[3/5] Submitting TOTP...")
-        response = self.session.post(totp_endpoint, data=payload, timeout=30)
+        response = self.session.post(totp_endpoint, data=payload, timeout=30, allow_redirects=False)
 
         if response.status_code != 200:
             raise KiteAuthenticationError(
