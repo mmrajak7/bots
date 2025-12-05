@@ -40,6 +40,9 @@ tzlocal==5.2
 urllib3>=1.26.0
 certifi>=2020.4.0
 
+# Web scraping (holiday calendar)
+beautifulsoup4>=4.9.0
+
 # Async support
 anyio>=3.0.0
 sniffio>=1.0.0
