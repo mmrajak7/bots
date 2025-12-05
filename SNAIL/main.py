@@ -398,8 +398,16 @@ def cmd_init(args):
 
 def main():
     """Main entry point."""
-    # Load environment
-    load_dotenv(PROJECT_ROOT / '.env')
+    # Load environment (check multiple locations)
+    env_paths = [
+        PROJECT_ROOT / 'config' / 'creds.env',
+        PROJECT_ROOT / '.env',
+        PROJECT_ROOT / 'creds.env',
+    ]
+    for env_path in env_paths:
+        if env_path.exists():
+            load_dotenv(env_path)
+            break
 
     # Parse arguments
     parser = argparse.ArgumentParser(
