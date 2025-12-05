@@ -237,7 +237,8 @@ def process_signals():
 
                 todays_orders = session.query(OpenOrder).filter(
                     OpenOrder.placed_at >= today_start,
-                    OpenOrder.placed_at <= today_end
+                    OpenOrder.placed_at <= today_end,
+                    OpenOrder.status != OrderStatus.CANCELLED
                 ).all()
 
                 if todays_orders:
