@@ -26,7 +26,7 @@ except ImportError:
     requests = None
     BeautifulSoup = None
 
-from src.utils.config import PROJECT_ROOT
+from src.utils.config import PROJECT_ROOT, get_paths_config
 
 
 # =============================================================================
@@ -34,8 +34,17 @@ from src.utils.config import PROJECT_ROOT
 # =============================================================================
 
 ZERODHA_HOLIDAY_URL = "https://zerodha.com/marketintel/holiday-calendar/"
-HOLIDAY_FILE_PATH = PROJECT_ROOT / "config" / "nse_holidays.json"
 REQUEST_TIMEOUT = 10
+MAX_CACHE_AGE_HOURS = 24  # Only re-scrape if older than this
+
+
+def get_holiday_file_path():
+    """Get holiday file path from config."""
+    paths = get_paths_config()
+    return PROJECT_ROOT / paths.get('holidays', '../data/holiday_calendar.json')
+
+
+HOLIDAY_FILE_PATH = get_holiday_file_path()
 
 # Date formats to try when parsing
 DATE_FORMATS = [
@@ -239,16 +248,43 @@ def deduplicate_holidays(holidays: List[Dict]) -> List[Dict]:
 # CALENDAR MANAGEMENT
 # =============================================================================
 
-def scrape_and_save_holidays() -> Tuple[bool, str]:
+def get_holiday_cache_age() -> Optional[float]:
+    """Get age of holiday cache in hours."""
+    try:
+        if not HOLIDAY_FILE_PATH.exists():
+            return None
+        import os
+        mtime = os.path.getmtime(HOLIDAY_FILE_PATH)
+        age_hours = (datetime.now().timestamp() - mtime) / 3600
+        return age_hours
+    except Exception:
+        return None
+
+
+def scrape_and_save_holidays(force: bool = False) -> Tuple[bool, str]:
     """
     Scrape holidays from Zerodha and save to JSON file.
+
+    Args:
+        force: If True, ignore cache and always scrape
 
     Returns:
         Tuple of (success, message)
     """
+    # Check cache age first
+    if not force:
+        cache_age = get_holiday_cache_age()
+        if cache_age is not None and cache_age < MAX_CACHE_AGE_HOURS:
+            logger.debug(f"Holiday cache is fresh ({cache_age:.1f}h old), skipping scrape")
+            return True, f"Using cached holidays ({cache_age:.1f}h old)"
+
     # Fetch page
     html_content = fetch_holiday_page()
     if not html_content:
+        # If fetch fails but we have a cache, use it
+        if HOLIDAY_FILE_PATH.exists():
+            cache_age = get_holiday_cache_age()
+            return True, f"Using cached holidays (fetch failed, cache {cache_age:.1f}h old)"
         return False, "Failed to fetch holiday page"
 
     # Parse holidays
