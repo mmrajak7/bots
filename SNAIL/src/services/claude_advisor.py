@@ -221,14 +221,20 @@ class ClaudeAdvisor:
     ) -> None:
         """Record Claude decision to database."""
         try:
+            # Log warning if truncation occurs
+            if len(prompt) > 2000:
+                logger.warning(f"Truncating prompt from {len(prompt)} to 2000 chars")
+            if len(response.reasoning) > 2000:
+                logger.warning(f"Truncating response from {len(response.reasoning)} to 2000 chars")
+
             save_claude_decision(
                 position_id=position_id,
                 trigger_type=trigger_type,
-                prompt=prompt[:2000],  # Truncate prompt if needed
-                response=response.reasoning[:2000],  # Store reasoning as response
+                prompt=prompt[:2000],
+                response=response.reasoning[:2000],
                 decision=response.decision.value if response.decision else None,
-                model_used='haiku',  # Default model
-                tokens_used=None  # Not tracked currently
+                model_used='haiku',
+                tokens_used=None
             )
         except Exception as e:
             logger.warning(f"Failed to record Claude decision: {e}")

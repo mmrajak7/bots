@@ -118,8 +118,9 @@ class TelegramAlerts:
         try:
             url = f"{self.TELEGRAM_API}{self.bot_token}/sendMessage"
 
-            # Truncate if too long
+            # Truncate if too long (log warning so we know important info may be lost)
             if len(message) > self.MAX_MESSAGE_LENGTH:
+                logger.warning(f"Telegram message truncated from {len(message)} to {self.MAX_MESSAGE_LENGTH} chars")
                 message = message[:self.MAX_MESSAGE_LENGTH - 20] + "\n...[truncated]"
 
             payload = {
@@ -478,7 +479,8 @@ Position: *{'Active' if has_position else 'None'}*"""
                 return data.get("result")
             return None
 
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to get bot info: {e}")
             return None
 
     def is_valid(self) -> bool:

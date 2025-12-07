@@ -405,8 +405,23 @@ class EntryManager:
 
             atm_quotes = self.kite.quote([atm_ce_inst, atm_pe_inst])
 
+            # Validate quotes exist before accessing
+            if atm_ce_inst not in atm_quotes or atm_pe_inst not in atm_quotes:
+                missing = [i for i in [atm_ce_inst, atm_pe_inst] if i not in atm_quotes]
+                return EntryResult(
+                    success=False,
+                    error=f"Failed to get quotes for ATM options: {missing}"
+                )
+
             ce_bid = atm_quotes[atm_ce_inst].bid
             pe_bid = atm_quotes[atm_pe_inst].bid
+
+            # Validate bid prices are valid
+            if ce_bid <= 0 or pe_bid <= 0:
+                return EntryResult(
+                    success=False,
+                    error=f"Invalid ATM bid prices: CE={ce_bid}, PE={pe_bid}"
+                )
 
             # Calculate dynamic wing distance
             wing_distance = calculate_wing_distance(ce_bid, pe_bid)
@@ -593,6 +608,16 @@ class EntryManager:
         capital_config = self.trading_config.get('capital', {})
         lots = capital_config.get('lots', 1)
         lot_size = get_lot_size_from_instruments(self.instruments_df, date.today())
+
+        # Validate lot_size to prevent division by zero or invalid quantities
+        if lot_size <= 0:
+            logger.error(f"Invalid lot_size: {lot_size}, using default 75")
+            lot_size = 75  # NIFTY default
+
+        if lots <= 0:
+            logger.error(f"Invalid lots config: {lots}, using default 1")
+            lots = 1
+
         return lots * lot_size
 
     def _get_claude_approval(

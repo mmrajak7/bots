@@ -289,8 +289,8 @@ def scrape_zerodha_pulse() -> List[NewsItem]:
                                     source=item.get('source', 'Pulse'),
                                     scraped_at=scraped_at
                                 ))
-                except:
-                    pass
+                except (json.JSONDecodeError, KeyError, TypeError) as e:
+                    logger.debug(f"Failed to parse script JSON: {e}")
 
         logger.info(f"Scraped {len(news_items)} news items from Zerodha Pulse")
 

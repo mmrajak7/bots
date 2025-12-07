@@ -412,14 +412,22 @@ class ExitManager:
                 logger.error(f"EXIT VERIFICATION FAILED: {issue_text}")
 
                 self.telegram.send(
-                    f"🚨 *CRITICAL: Exit Verification Failed!*\n\n"
+                    f"[CRITICAL] *Exit Verification Failed!*\n\n"
                     f"Exit orders executed but positions may remain:\n"
-                    f"{''.join(f'• {i}' + chr(10) for i in verification_issues)}\n"
-                    f"⚠️ *Manual intervention required!*\n\n"
-                    f"Check Kite positions immediately."
+                    f"{''.join(f'- {i}' + chr(10) for i in verification_issues)}\n"
+                    f"[!] *Manual intervention required!*\n\n"
+                    f"Check Kite positions immediately.\n"
+                    f"P&L NOT recorded due to verification failure."
                 )
 
-            # Calculate realized P&L
+                # Return partial success - orders placed but not verified
+                return ExitResult(
+                    success=False,
+                    error=f"Exit verification failed: {issue_text}. Manual check required.",
+                    orders=orders
+                )
+
+            # Calculate realized P&L (only if exit verified)
             entry_credit = position.entry_credit
             exit_debit = (
                 (orders.straddle_ce.fill_price + orders.straddle_pe.fill_price) -

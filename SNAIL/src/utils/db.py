@@ -901,7 +901,18 @@ def is_on_cooldown(cooldown_type: str) -> bool:
     Returns:
         True if cooldown active
     """
-    return check_cooldown_active()
+    today = date.today()
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            "SELECT * FROM cooldowns WHERE cooldown_type = ? AND cooldown_end > ? LIMIT 1",
+            (cooldown_type, today.isoformat())
+        )
+        row = cursor.fetchone()
+
+        if row:
+            logger.info(f"Cooldown '{cooldown_type}' active until {row['cooldown_end']}")
+            return True
+        return False
 
 
 def set_cooldown(cooldown_type: Union[str, int], duration_seconds: Union[int, date]) -> None:
