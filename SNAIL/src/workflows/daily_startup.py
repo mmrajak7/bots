@@ -37,6 +37,11 @@ from src.utils.holiday_scraper import (
     is_friday_before_holiday,
     is_long_weekend
 )
+from src.utils.market_events_scraper import (
+    scrape_and_save_all as scrape_market_events,
+    get_events_for_telegram,
+    get_news_for_telegram
+)
 from src.utils.db import (
     get_active_position,
     get_position_legs,
@@ -331,6 +336,39 @@ class DailyStartup:
                 message=f"Check error: {e}"
             )
 
+    def _scrape_market_events(self) -> StartupCheck:
+        """
+        Scrape market events and news from Zerodha.
+
+        Scrapes:
+        - Zerodha Calendar for upcoming market events
+        - Zerodha Pulse for latest news headlines
+
+        Saves to shared ../BOTS/data/ folder.
+        """
+        try:
+            events_count, news_count = scrape_market_events()
+
+            if events_count > 0 or news_count > 0:
+                return StartupCheck(
+                    name="Market Events",
+                    passed=True,
+                    message=f"Scraped {events_count} events, {news_count} news"
+                )
+            else:
+                return StartupCheck(
+                    name="Market Events",
+                    passed=True,  # Non-critical
+                    message="No events/news scraped (sources may be unavailable)"
+                )
+
+        except Exception as e:
+            return StartupCheck(
+                name="Market Events",
+                passed=True,  # Non-critical
+                message=f"Scrape error: {e}"
+            )
+
     def _refresh_instruments(self) -> StartupCheck:
         """
         Refresh instruments CSV from Kite API.
@@ -595,6 +633,12 @@ class DailyStartup:
         if not holiday_check.passed:
             warnings.append(f"Holidays: {holiday_check.message}")
 
+        # 4b. Market events scrape (calendar + news)
+        events_check = self._scrape_market_events()
+        checks.append(events_check)
+        if not events_check.passed:
+            warnings.append(f"Events: {events_check.message}")
+
         # 5. Instruments refresh (before instruments check)
         instruments_refresh_check = self._refresh_instruments()
         checks.append(instruments_refresh_check)
@@ -694,12 +738,18 @@ class DailyStartup:
         if startup_result.market_data:
             margin_available = startup_result.market_data.get('available_margin', 0)
 
+        # Get scraped events and news for Telegram
+        events_summary = get_events_for_telegram()
+        news_summary = get_news_for_telegram(limit=5)
+
         self.telegram.send_morning_summary(
             nifty_spot=nifty_spot,
             vix=vix,
             has_position=has_position,
             entry_conditions=entry_conditions,
-            margin_available=margin_available
+            margin_available=margin_available,
+            events_summary=events_summary,
+            news_summary=news_summary
         )
 
 
@@ -739,13 +789,13 @@ if __name__ == '__main__':
     try:
         result = run_daily_startup()
 
-        print("\n📋 Startup Checks:")
+        print("\n[STARTUP CHECKS]:")
         for check in result.checks:
-            status = "✅" if check.passed else ("❌" if check.critical else "⚠️")
+            status = "[OK]" if check.passed else ("[FAIL]" if check.critical else "[WARN]")
             print(f"   {status} {check.name}: {check.message}")
 
         if result.warnings:
-            print("\n⚠️ Warnings:")
+            print("\n[WARNINGS]:")
             for warning in result.warnings:
                 print(f"   - {warning}")
 

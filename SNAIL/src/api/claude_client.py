@@ -139,6 +139,11 @@ class MarketContext:
         position_pnl: Current position P&L (if any)
         dte: Days to expiry
         time_str: Current time string
+        atr_14: 14-day Average True Range
+        net_credit: Net credit received per lot
+        max_profit: Maximum profit per lot
+        max_loss: Maximum loss per lot
+        expiry_date: Expiry date string
     """
     nifty_spot: float
     india_vix: float
@@ -148,6 +153,11 @@ class MarketContext:
     position_pnl: float = 0.0
     dte: int = 0
     time_str: str = ""
+    atr_14: float = 0.0
+    net_credit: float = 0.0
+    max_profit: float = 0.0
+    max_loss: float = 0.0
+    expiry_date: str = ""
     additional_context: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -194,6 +204,7 @@ def format_prompt(template: str, context: MarketContext) -> str:
     # Build substitution dict
     subs = {
         'nifty_spot': f"{context.nifty_spot:,.2f}",
+        'vix': f"{context.india_vix:.2f}",
         'india_vix': f"{context.india_vix:.2f}",
         'atm_strike': str(context.atm_strike),
         'straddle_premium': f"{context.straddle_premium:.2f}",
@@ -202,6 +213,11 @@ def format_prompt(template: str, context: MarketContext) -> str:
         'dte': str(context.dte),
         'time': context.time_str,
         'date': datetime.now().strftime("%Y-%m-%d"),
+        'atr_14': f"{context.atr_14:.2f}",
+        'net_credit': f"{context.net_credit:,.2f}",
+        'max_profit': f"{context.max_profit:,.2f}",
+        'max_loss': f"{context.max_loss:,.2f}",
+        'expiry_date': context.expiry_date,
     }
 
     # Add additional context

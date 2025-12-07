@@ -12,17 +12,24 @@ PROPOSED TRADE:
 - ATM Strike: {atm_strike}
 - Wing Distance: {wing_distance} points
 - Expiry: {expiry_date} ({dte} days)
-- Net Credit: ₹{net_credit} per lot
-- Max Profit: ₹{max_profit}
-- Max Loss: ₹{max_loss}
+- Net Credit: Rs.{net_credit} per lot
+- Max Profit: Rs.{max_profit}
+- Max Loss: Rs.{max_loss}
+
+UPCOMING MARKET EVENTS (Next 10 days):
+{market_events}
+
+LATEST NEWS:
+{market_news}
 
 ANALYSIS REQUEST:
-1. Are there any major market events, earnings announcements, or economic data releases in the next {dte} days that could cause significant NIFTY movement?
-2. Is the current VIX level appropriate for an Iron Fly strategy?
-3. Any other risk factors to consider?
+1. Review the upcoming events - are there any HIGH IMPACT events (RBI, Fed, Budget, GDP, etc.) before expiry that could cause significant NIFTY movement?
+2. Check the news - any breaking developments that suggest market volatility?
+3. Is the current VIX level appropriate for an Iron Fly strategy (ideal: 12-18)?
+4. Any other risk factors to consider?
 
 RESPOND WITH:
-- PROCEED if safe to enter
-- SKIP if there are significant risks
+- PROCEED if safe to enter (no major events, VIX in range, no concerning news)
+- SKIP if there are significant risks (major event before expiry, VIX too high/low, concerning news)
 
 Format: [DECISION]: [Brief reason in 1-2 sentences]

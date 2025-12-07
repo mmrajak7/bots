@@ -432,21 +432,31 @@ _Reply: EXIT / HOLD_"""
         vix: float,
         has_position: bool,
         entry_conditions: Dict[str, bool],
-        margin_available: float
+        margin_available: float,
+        events_summary: str = "",
+        news_summary: str = ""
     ) -> bool:
-        """Send morning startup summary."""
-        vix_ok = "✅" if entry_conditions.get('vix_ok') else "❌"
-        dte_ok = "✅" if entry_conditions.get('dte_ok') else "❌"
-        cooldown_ok = "✅" if entry_conditions.get('cooldown_ok') else "❌"
-        margin_ok = "✅" if entry_conditions.get('margin_ok') else "❌"
+        """Send morning startup summary with events and news."""
+        vix_ok = "[OK]" if entry_conditions.get('vix_ok') else "[X]"
+        dte_ok = "[OK]" if entry_conditions.get('dte_ok') else "[X]"
+        cooldown_ok = "[OK]" if entry_conditions.get('cooldown_ok') else "[X]"
+        margin_ok = "[OK]" if entry_conditions.get('margin_ok') else "[X]"
 
-        message = f"""🌅 *SNAIL Morning*
+        message = f"""*SNAIL Morning*
 
-NIFTY {nifty_spot:,.0f} | VIX {vix:.1f} | Margin ₹{margin_available:,.0f}
+NIFTY {nifty_spot:,.0f} | VIX {vix:.1f} | Margin Rs.{margin_available:,.0f}
 
 Entry: VIX {vix_ok} DTE {dte_ok} Cooldown {cooldown_ok} Margin {margin_ok}
 
 Position: *{'Active' if has_position else 'None'}*"""
+
+        # Add events if available
+        if events_summary:
+            message += f"\n\n*Events (10d):*\n{events_summary}"
+
+        # Add news if available
+        if news_summary:
+            message += f"\n\n*News:*\n{news_summary}"
 
         return self.send(message)
 

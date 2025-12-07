@@ -35,6 +35,7 @@ from src.utils.db import (
 )
 from src.utils.calculations import calculate_position_pnl
 from src.utils.config import get_trading_config, load_config
+from src.utils.market_events_scraper import get_events_compact, get_news_compact
 
 
 # =============================================================================
@@ -165,7 +166,7 @@ class ClaudeAdvisor:
             context.atm_strike = position.atm_strike
             context.wing_distance = position.wing_distance
             context.position_pnl = current_pnl
-            context.dte = (position.expiry - date.today()).days if position.expiry else 0
+            context.dte = (position.expiry_date - date.today()).days if position.expiry_date else 0
 
             # Add straddle premium if available
             if position.entry_premium and position.lot_size and position.lot_size > 0:
@@ -243,7 +244,12 @@ class ClaudeAdvisor:
         atm_strike: int,
         straddle_premium: float,
         wing_distance: int,
-        dte: int
+        dte: int,
+        expiry_date: str = "",
+        net_credit: float = 0.0,
+        max_profit: float = 0.0,
+        max_loss: float = 0.0,
+        atr_14: float = 0.0
     ) -> AdvisoryResult:
         """
         Get pre-entry advisory from Claude.
@@ -257,18 +263,54 @@ class ClaudeAdvisor:
             straddle_premium: Expected straddle premium
             wing_distance: Calculated wing distance
             dte: Days to expiry
+            expiry_date: Expiry date string
+            net_credit: Net credit per lot
+            max_profit: Max profit per lot
+            max_loss: Max loss per lot
+            atr_14: 14-day ATR (fetched if 0)
 
         Returns:
             AdvisoryResult with decision
         """
         try:
+            # Fetch ATR if not provided
+            if atr_14 == 0.0:
+                from src.utils.db import get_today_market_data
+                market_data = get_today_market_data()
+                if market_data and market_data.atr_14:
+                    atr_14 = market_data.atr_14
+                else:
+                    atr_14 = 150.0  # Default fallback
+                    logger.warning("ATR not available, using default 150")
+
+            # Calculate metrics if not provided
+            if net_credit == 0.0:
+                net_credit = straddle_premium - (straddle_premium * 0.3)  # Rough estimate
+            if max_profit == 0.0:
+                max_profit = net_credit * 75  # 1 lot
+            if max_loss == 0.0:
+                max_loss = (wing_distance - net_credit) * 75
+
+            # Get scraped market events and news for Claude context
+            events_str = get_events_compact(days=10)
+            news_str = get_news_compact(limit=10)
+
             context = MarketContext(
                 nifty_spot=nifty_spot,
                 india_vix=india_vix,
                 atm_strike=atm_strike,
                 straddle_premium=straddle_premium,
                 wing_distance=wing_distance,
-                dte=dte
+                dte=dte,
+                atr_14=atr_14,
+                net_credit=net_credit,
+                max_profit=max_profit,
+                max_loss=max_loss,
+                expiry_date=expiry_date,
+                additional_context={
+                    'market_events': events_str,
+                    'market_news': news_str
+                }
             )
 
             response = self.claude.get_pre_entry_decision(context)
