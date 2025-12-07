@@ -12,7 +12,7 @@ from src.services.capital_manager import capital_manager
 from src.indicators.supertrend_calculator import SuperTrendCalculator
 from src.indicators.nifty_data_fetcher import NiftyDataFetcher
 from src.indicators.nifty_trend_filter import NiftyTrendFilter
-from src.api.kite_trade_client import KiteTradeClient
+from src.api.broker_factory import get_broker
 from src.utils.config_manager import config
 from src.utils.price_rounder import round_price, PriceRounder
 from src.reporting.telegram_client import telegram
@@ -45,7 +45,7 @@ class EntryManager:
 
     def __init__(self):
         """Initialize entry manager"""
-        self.kite_client = KiteTradeClient()
+        self.kite_client = get_broker()
         self.st_calculator = SuperTrendCalculator()
         self.nifty_fetcher = NiftyDataFetcher()
         self.nifty_filter = NiftyTrendFilter()

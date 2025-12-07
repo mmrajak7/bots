@@ -10,7 +10,7 @@ from typing import Dict, Optional
 import pandas as pd
 from loguru import logger
 
-from src.api.kite_trade_client import KiteTradeClient
+from src.api.broker_factory import get_broker
 from src.utils.timezone_helper import now_ist, today_ist
 
 
@@ -22,7 +22,7 @@ class NiftyDataFetcher:
 
     def __init__(self, config_path: str = "config/config.yaml"):
         """Initialize NIFTY data fetcher"""
-        self.kite_client = KiteTradeClient(config_path)
+        self.kite_client = get_broker(config_path)
         self._cache = {}  # In-memory cache for NIFTY data
 
         # Historical data requirements from architecture

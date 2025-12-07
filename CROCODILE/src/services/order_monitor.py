@@ -11,7 +11,7 @@ from src.models.database import (
 )
 from src.models.kite_constants import KiteOrderStatus
 from src.services.exit_manager import exit_manager
-from src.api.kite_trade_client import KiteTradeClient
+from src.api.broker_factory import get_broker
 from src.utils.config_manager import config
 from src.utils.timezone_helper import ist_now_naive
 from src.utils.cost_calculator import cost_calculator
@@ -31,7 +31,7 @@ class OrderMonitor:
 
     def __init__(self):
         """Initialize order monitor"""
-        self.kite_client = KiteTradeClient()
+        self.kite_client = get_broker()
         logger.info("Order Monitor initialized")
 
     def check_order_status(self, open_order: OpenOrder, session: Session) -> bool:

@@ -15,7 +15,7 @@ from src.utils.config_manager import config
 from src.services.entry_manager import entry_manager
 from src.reporting.telegram_client import telegram
 from src.models.database import get_session, OpenOrder, OrderStatus, ProcessedSignal
-from src.api.kite_trade_client import KiteTradeClient
+from src.api.broker_factory import get_broker
 from src.utils.timezone_helper import ist_now_naive
 
 # Market hours (IST)
@@ -75,7 +75,7 @@ def reconcile_processing_signals():
     logger.info("="*60)
 
     session = get_session()
-    kite_client = KiteTradeClient()
+    kite_client = get_broker()
 
     try:
         # Find all signals in PROCESSING status

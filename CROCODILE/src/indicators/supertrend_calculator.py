@@ -11,7 +11,7 @@ import pandas as pd
 import yaml
 from loguru import logger
 
-from src.api.kite_trade_client import KiteTradeClient
+from src.api.broker_factory import get_broker
 from src.utils.timezone_helper import now_ist
 
 
@@ -21,7 +21,7 @@ class SuperTrendCalculator:
     def __init__(self, config_path: str = "config/config.yaml"):
         """Initialize SuperTrend calculator"""
         self.config = self._load_config(config_path)
-        self.kite_client = KiteTradeClient(config_path)
+        self.kite_client = get_broker(config_path)
         self.period = self.config['supertrend']['period']
         self.multiplier = self.config['supertrend']['multiplier']
 

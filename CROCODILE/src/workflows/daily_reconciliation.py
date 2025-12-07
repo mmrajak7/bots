@@ -29,7 +29,7 @@ from src.models.database import (
     OpenPosition, ClosedPosition, CapitalLedger, TransactionHistory,
     PositionStatus, TransactionType, get_session
 )
-from src.api.kite_trade_client import KiteTradeClient
+from src.api.broker_factory import get_broker
 from src.reporting.telegram_client import telegram
 from src.reporting.report_formatter import fmt
 from src.utils.config_manager import config
@@ -49,7 +49,7 @@ class DailyReconciliation:
 
     def __init__(self):
         """Initialize reconciliation manager"""
-        self.kite_client = KiteTradeClient()
+        self.kite_client = get_broker()
         self.tolerance_pct = config.get('reconciliation.tolerance_percent', 0.5)  # 0.5% tolerance
         self.alert_on_mismatch = config.get('reconciliation.alert_on_mismatch', True)
         self.track_history_days = config.get('reconciliation.track_history_days', 30)

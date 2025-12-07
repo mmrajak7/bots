@@ -12,7 +12,7 @@ from src.models.database import (
 )
 from src.reporting.telegram_client import telegram
 from src.reporting.report_formatter import fmt
-from src.api.kite_trade_client import KiteTradeClient
+from src.api.broker_factory import get_broker
 
 
 class ReportGenerator:
@@ -20,7 +20,7 @@ class ReportGenerator:
 
     def __init__(self):
         """Initialize report generator"""
-        self.kite_client = KiteTradeClient()
+        self.kite_client = get_broker()
 
     def generate_daily_report(self, session: Optional[Session] = None) -> str:
         """

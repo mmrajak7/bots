@@ -11,7 +11,7 @@ from src.models.database import (
     OpenPosition, ClosedPosition, GTTUpdateLog, TransactionHistory, CapitalLedger,
     PositionStatus, TransactionType, get_session
 )
-from src.api.kite_trade_client import KiteTradeClient
+from src.api.broker_factory import get_broker
 from src.utils.config_manager import config
 from src.utils.price_rounder import round_price
 from src.utils.cost_calculator import cost_calculator
@@ -36,7 +36,7 @@ class ExitManager:
 
     def __init__(self):
         """Initialize exit manager"""
-        self.kite_client = KiteTradeClient()
+        self.kite_client = get_broker()
         self.dummy_sl_percent = config.get('trading.dummy_sl_percent', 15) / 100
         self.gtt_expiry_days = 365  # 1 year
 

@@ -15,7 +15,7 @@ from src.models.database import init_database, get_session, OpenPosition, Positi
 from src.services.capital_manager import capital_manager
 from src.services.exit_manager import exit_manager
 from src.reporting.telegram_client import telegram
-from src.api.kite_trade_client import KiteTradeClient
+from src.api.broker_factory import get_broker, validate_kite_api_token
 
 
 def check_missed_gtt_updates(session) -> Dict[str, List[str]]:
@@ -206,9 +206,20 @@ def morning_startup():
         logger.info("Initializing database...")
         init_database()
 
-        # Initialize Kite client (generates token if needed)
-        logger.info("Initializing Kite API client...")
-        kite_client = KiteTradeClient()
+        # Validate Kite API token if using kite_api method
+        logger.info("Validating broker configuration...")
+        token_valid, token_message = validate_kite_api_token()
+        if not token_valid:
+            error_msg = f"🔴 *Kite API Token Invalid*\n❌ {token_message}"
+            logger.error(error_msg)
+            telegram.send_alert(error_msg, critical=True)
+            return False
+        logger.info(f"Token validation: {token_message}")
+
+        # Initialize broker client (enctoken or kite_api based on config)
+        logger.info("Initializing broker client...")
+        kite_client = get_broker()
+        logger.info(f"Using trade method: {kite_client.trade_method}")
 
         # Validate connection
         if not kite_client.validate_connection():

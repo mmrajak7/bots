@@ -8,8 +8,28 @@
 # Kite API Configuration
 kite:
   # ===================================================================
+  # TRADE METHOD SELECTION
+  # ===================================================================
+  # Choose which authentication method to use for Zerodha API:
+  #
+  # "enctoken" (default) - Uses web scraping login to get encrypted token
+  #   - Requires: ZERODHA_USER_ID, ZERODHA_PASSWORD, ZERODHA_TOTP_KEY in .env
+  #   - Token stored in: token_file (../data/enctoken.txt)
+  #   - CROCODILE handles its own authentication
+  #
+  # "kite_api" - Uses official Kite Connect API with access token from SNAIL
+  #   - Requires: SNAIL bot to run morning startup at 8:45 AM
+  #   - Token read from: kite_api.token_file (../data/kite_access_token.json)
+  #   - No credentials needed in CROCODILE - SNAIL handles authentication
+  #   - Uses kiteconnect library for API calls (pip install kiteconnect)
+  #
+  # ===================================================================
+  trade_method: "enctoken"  # Options: "enctoken" | "kite_api"
+
+  # ===================================================================
   # SECURITY: Credentials are now loaded from .env file (RECOMMENDED)
   # ===================================================================
+  # (Only used when trade_method: "enctoken")
   #
   # DO NOT store credentials in this file!
   # Instead, create a .env file in the project root with:
@@ -29,8 +49,15 @@ kite:
   #   totp_key: "YOUR_TOTP_SECRET_KEY"
   # ===================================================================
 
-  token_file: "data/enctoken.txt"
-  rate_limit_delay: 0.5  # seconds between API calls
+  # Enctoken settings (used when trade_method: "enctoken")
+  token_file: "../data/enctoken.txt"
+
+  # Kite API settings (used when trade_method: "kite_api")
+  kite_api:
+    token_file: "../data/kite_access_token.json"  # Shared token from SNAIL
+    validate_token_date: true  # Check if token was generated today
+
+  rate_limit_delay: 1.0  # seconds between API calls
   order_tag: "croc"  # Tag to identify bot's orders (max 20 chars)
 
 # API Resilience & Retry Configuration

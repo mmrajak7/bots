@@ -33,7 +33,7 @@ from src.models.database import CapitalLedger, OpenPosition, OpenOrder, ClosedPo
 from src.utils.config_manager import config
 from src.utils.price_rounder import round_price
 from src.utils.timezone_helper import ist_now_naive
-from src.api.kite_trade_client import KiteTradeClient
+from src.api.broker_factory import get_broker
 
 
 class CapitalManager:
@@ -57,7 +57,7 @@ class CapitalManager:
 
     def __init__(self):
         """Initialize capital manager"""
-        self.kite_client = KiteTradeClient()
+        self.kite_client = get_broker()
         self.test_mode = config.is_test_mode()
         self.position_size_pct = config.get('trading.position_size_pct', 20) / 100  # Convert to decimal
         self.min_position_value = config.get('trading.min_position_value', 10000)

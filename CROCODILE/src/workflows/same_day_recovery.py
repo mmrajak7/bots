@@ -27,7 +27,7 @@ sys.path.insert(0, str(project_root))
 from src.models.database import (
     OpenPosition, OpenOrder, PositionStatus, OrderStatus, get_session
 )
-from src.api.kite_trade_client import KiteTradeClient
+from src.api.broker_factory import get_broker
 from src.services.exit_manager import exit_manager
 from src.services.entry_manager import entry_manager
 from src.reporting.telegram_client import telegram
@@ -49,7 +49,7 @@ class SameDayRecovery:
 
     def __init__(self):
         """Initialize recovery manager"""
-        self.kite_client = KiteTradeClient()
+        self.kite_client = get_broker()
         self.auto_fix_enabled = config.get('recovery.auto_fix_enabled', True)
         self.alert_threshold = config.get('recovery.alert_threshold', 'any')  # 'any' or 'critical_only'
 
