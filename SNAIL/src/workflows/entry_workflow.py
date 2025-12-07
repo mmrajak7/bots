@@ -13,7 +13,7 @@ Orchestrates the complete Iron Fly entry process.
 
 import sys
 from datetime import datetime, date, time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
 from loguru import logger
@@ -143,7 +143,7 @@ class EntryWorkflow:
     # PRE-CHECKS
     # =========================================================================
 
-    def _pre_checks(self) -> tuple[bool, str]:
+    def _pre_checks(self) -> Tuple[bool, str]:
         """
         Perform pre-entry checks.
 

@@ -16,7 +16,7 @@ import sys
 import json
 import hashlib
 from datetime import datetime, date, timedelta, time
-from typing import Optional, Any, Dict, List, Callable, TypeVar
+from typing import Optional, Any, Dict, List, Callable, TypeVar, Tuple
 from pathlib import Path
 from functools import wraps
 import threading
@@ -85,7 +85,7 @@ def load_nse_holidays() -> Dict[str, List[str]]:
 _nse_holidays_cache: Optional[Dict[str, List[str]]] = None
 
 
-def is_nse_holiday(check_date: Optional[date] = None) -> tuple[bool, str]:
+def is_nse_holiday(check_date: Optional[date] = None) -> Tuple[bool, str]:
     """
     Check if a date is an NSE holiday.
 
@@ -156,7 +156,7 @@ def is_trading_day(check_date: Optional[date] = None) -> bool:
     return True
 
 
-def is_friday_before_holiday(check_date: Optional[date] = None) -> tuple[bool, str]:
+def is_friday_before_holiday(check_date: Optional[date] = None) -> Tuple[bool, str]:
     """
     Check if the given date is a Friday before a Monday holiday.
 
@@ -182,7 +182,7 @@ def is_friday_before_holiday(check_date: Optional[date] = None) -> tuple[bool, s
     return is_holiday, holiday_name
 
 
-def is_long_weekend(check_date: Optional[date] = None) -> tuple[bool, int]:
+def is_long_weekend(check_date: Optional[date] = None) -> Tuple[bool, int]:
     """
     Check if the given Friday starts a long weekend (3+ consecutive off days).
 

@@ -37,19 +37,13 @@ from src.utils.db import init_database
 
 VERSION = "1.0.0"
 BANNER = """
-╔═══════════════════════════════════════════════════════════════╗
-║                                                               ║
-║   ███████╗███╗   ██╗ █████╗ ██╗██╗                           ║
-║   ██╔════╝████╗  ██║██╔══██╗██║██║                           ║
-║   ███████╗██╔██╗ ██║███████║██║██║                           ║
-║   ╚════██║██║╚██╗██║██╔══██║██║██║                           ║
-║   ███████║██║ ╚████║██║  ██║██║███████╗                      ║
-║   ╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝╚══════╝                      ║
-║                                                               ║
-║   Systematic NIFTY Automated Iron-fly Leverager              ║
-║   Version: {version:<52}║
-║                                                               ║
-╚═══════════════════════════════════════════════════════════════╝
++---------------------------------------------------------------+
+|                                                               |
+|   SNAIL - Systematic NIFTY Automated Iron-fly Leverager      |
+|                                                               |
+|   Version: {version:<52}|
+|                                                               |
++---------------------------------------------------------------+
 """.format(version=VERSION)
 
 
@@ -103,13 +97,13 @@ def cmd_startup(args):
 
     result = run_daily_startup()
 
-    print("\n📋 Startup Checks:")
+    print("\n[STARTUP CHECKS]:")
     for check in result.checks:
-        status = "✅" if check.passed else ("❌" if check.critical else "⚠️")
+        status = "[OK]" if check.passed else ("[FAIL]" if check.critical else "[WARN]")
         print(f"   {status} {check.name}: {check.message}")
 
     if result.warnings:
-        print("\n⚠️ Warnings:")
+        print("\n[WARNINGS]:")
         for warning in result.warnings:
             print(f"   - {warning}")
 
@@ -126,12 +120,12 @@ def cmd_entry(args):
     manager = get_entry_manager()
     conditions = manager.check_entry_conditions()
 
-    print("\n📊 Entry Conditions:")
+    print("\n[ENTRY CONDITIONS]:")
     print(f"   Can enter: {conditions.can_enter}")
     print(f"   Reason: {conditions.reason}")
 
     if conditions.can_enter:
-        print(f"\n   NIFTY: ₹{conditions.nifty_spot:,.2f}")
+        print(f"\n   NIFTY: Rs.{conditions.nifty_spot:,.2f}")
         print(f"   VIX: {conditions.india_vix:.2f}")
         print(f"   ATM Strike: {conditions.atm_strike}")
         print(f"   Expiry: {conditions.expiry} (DTE: {conditions.dte})")
@@ -144,9 +138,9 @@ def cmd_entry(args):
             )
 
             if result.success:
-                print(f"✅ Entry successful! Position ID: {result.position_id}")
+                print(f"[OK] Entry successful! Position ID: {result.position_id}")
             else:
-                print(f"❌ Entry failed: {result.error}")
+                print(f"[FAIL] Entry failed: {result.error}")
                 return 1
 
     return 0
@@ -163,18 +157,18 @@ def cmd_exit(args):
         print("No active position to exit.")
         return 0
 
-    print(f"\n📊 Active Position: #{position.id}")
+    print(f"\n[ACTIVE POSITION]: #{position.id}")
     print(f"   Strategy: {position.strategy}")
-    print(f"   Entry credit: ₹{position.entry_credit:,.2f}")
+    print(f"   Entry credit: Rs.{position.entry_credit:,.2f}")
 
     if args.force or input("\nConfirm exit? (y/N): ").lower() == 'y':
         manager = get_exit_manager()
         result = manager.execute_exit(reason=ExitReason.MANUAL, position=position)
 
         if result.success:
-            print(f"✅ Exit successful! Realized P&L: ₹{result.realized_pnl:,.2f}")
+            print(f"[OK] Exit successful! Realized P&L: Rs.{result.realized_pnl:,.2f}")
         else:
-            print(f"❌ Exit failed: {result.error}")
+            print(f"[FAIL] Exit failed: {result.error}")
             return 1
 
     return 0
@@ -191,7 +185,7 @@ def cmd_status(args):
     print("=" * 60)
 
     # Market status
-    print(f"\n📈 Market:")
+    print(f"\n[MARKET]:")
     print(f"   Trading day: {is_trading_day()}")
     print(f"   Market open: {is_market_open()}")
 
@@ -203,22 +197,22 @@ def cmd_status(args):
         vix = kite.get_india_vix()
         margin = kite.get_available_margin()
 
-        print(f"   NIFTY: ₹{nifty:,.2f}")
+        print(f"   NIFTY: Rs.{nifty:,.2f}")
         print(f"   VIX: {vix:.2f}")
-        print(f"   Margin: ₹{margin:,.2f}")
+        print(f"   Margin: Rs.{margin:,.2f}")
     except Exception as e:
         print(f"   (Market data unavailable: {e})")
 
     # Position status
     position = get_active_position()
 
-    print(f"\n📊 Position:")
+    print(f"\n[POSITION]:")
     if position:
         print(f"   ID: {position.id}")
         print(f"   Strategy: {position.strategy}")
         print(f"   ATM: {position.atm_strike}")
         print(f"   Wing distance: {position.wing_distance}")
-        print(f"   Entry credit: ₹{position.entry_credit:,.2f}")
+        print(f"   Entry credit: Rs.{position.entry_credit:,.2f}")
         print(f"   Expiry: {position.expiry}")
 
         # Calculate current P&L
@@ -243,26 +237,26 @@ def cmd_summary(args):
 
     if args.weekly:
         summary = summary_gen.generate_weekly_summary()
-        print(f"\n📊 Weekly Summary ({summary.week_start} to {summary.week_end})")
-        print(f"   Total P&L: ₹{summary.total_pnl:,.2f}")
+        print(f"\n[WEEKLY SUMMARY] ({summary.week_start} to {summary.week_end})")
+        print(f"   Total P&L: Rs.{summary.total_pnl:,.2f}")
         print(f"   Winning days: {summary.winning_days}")
         print(f"   Losing days: {summary.losing_days}")
         print(f"   Trades: {summary.trades_count}")
 
         if args.send:
             summary_gen.send_weekly_summary(summary)
-            print("\n✅ Weekly summary sent to Telegram")
+            print("\n[OK] Weekly summary sent to Telegram")
     else:
         summary = summary_gen.generate_daily_summary()
-        print(f"\n📊 Daily Summary ({summary.date})")
+        print(f"\n[DAILY SUMMARY] ({summary.date})")
         print(f"   Has position: {summary.has_position}")
-        print(f"   Day P&L change: ₹{summary.day_pnl_change:,.2f}")
+        print(f"   Day P&L change: Rs.{summary.day_pnl_change:,.2f}")
         print(f"   Orders: {summary.orders_executed}")
         print(f"   Trades: {len(summary.trades_today)}")
 
         if args.send:
             summary_gen.send_daily_summary(summary)
-            print("\n✅ Daily summary sent to Telegram")
+            print("\n[OK] Daily summary sent to Telegram")
 
     return 0
 
@@ -292,13 +286,13 @@ def cmd_test(args):
         config = load_config()
         result = validate_config(config)
         if result['errors']:
-            print(f"    ❌ Errors: {result['errors']}")
+            print(f"    [FAIL] Errors: {result['errors']}")
             tests_failed += 1
         else:
-            print("    ✅ Configuration valid")
+            print("    [OK] Configuration valid")
             tests_passed += 1
     except Exception as e:
-        print(f"    ❌ Failed: {e}")
+        print(f"    [FAIL] Failed: {e}")
         tests_failed += 1
 
     # Test 2: Database
@@ -308,10 +302,10 @@ def cmd_test(args):
         with get_db_session() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
-        print("    ✅ Database connected")
+        print("    [OK] Database connected")
         tests_passed += 1
     except Exception as e:
-        print(f"    ❌ Failed: {e}")
+        print(f"    [FAIL] Failed: {e}")
         tests_failed += 1
 
     # Test 3: Kite Auth
@@ -321,10 +315,10 @@ def cmd_test(args):
         kite = get_kite_client()
         kite.ensure_authenticated()
         profile = kite.profile()
-        print(f"    ✅ Authenticated as {profile.get('user_name', 'Unknown')}")
+        print(f"    [OK] Authenticated as {profile.get('user_name', 'Unknown')}")
         tests_passed += 1
     except Exception as e:
-        print(f"    ❌ Failed: {e}")
+        print(f"    [FAIL] Failed: {e}")
         tests_failed += 1
 
     # Test 4: Telegram
@@ -333,13 +327,13 @@ def cmd_test(args):
         from src.api.telegram_alerts import get_telegram
         telegram = get_telegram()
         if telegram.test_connection():
-            print("    ✅ Telegram connected")
+            print("    [OK] Telegram connected")
             tests_passed += 1
         else:
-            print("    ⚠️ Telegram test failed")
+            print("    [WARN] Telegram test failed")
             tests_failed += 1
     except Exception as e:
-        print(f"    ❌ Failed: {e}")
+        print(f"    [FAIL] Failed: {e}")
         tests_failed += 1
 
     # Test 5: Claude
@@ -348,13 +342,13 @@ def cmd_test(args):
         from src.api.claude_client import get_claude_client
         claude = get_claude_client()
         if claude.test_connection():
-            print("    ✅ Claude API connected")
+            print("    [OK] Claude API connected")
             tests_passed += 1
         else:
-            print("    ⚠️ Claude test failed")
+            print("    [WARN] Claude test failed")
             tests_failed += 1
     except Exception as e:
-        print(f"    ❌ Failed: {e}")
+        print(f"    [FAIL] Failed: {e}")
         tests_failed += 1
 
     print("\n" + "=" * 60)
@@ -376,24 +370,24 @@ def cmd_init(args):
     for d in dirs:
         path = PROJECT_ROOT / d
         path.mkdir(parents=True, exist_ok=True)
-        print(f"    ✅ {d}/")
+        print(f"    [OK] {d}/")
 
     # Initialize database
     print("\n[2] Initializing database...")
     try:
         init_database()
-        print("    ✅ Database initialized")
+        print("    [OK] Database initialized")
     except Exception as e:
-        print(f"    ❌ Failed: {e}")
+        print(f"    [FAIL] Failed: {e}")
         return 1
 
     # Check .env
     print("\n[3] Checking environment...")
     env_file = PROJECT_ROOT / '.env'
     if env_file.exists():
-        print("    ✅ .env file found")
+        print("    [OK] .env file found")
     else:
-        print("    ⚠️ .env file not found - create from .env.example")
+        print("    [WARN] .env file not found - create from .env.example")
 
     print("\n" + "=" * 60)
     print("Initialization complete!")
