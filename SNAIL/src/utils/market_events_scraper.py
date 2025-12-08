@@ -500,6 +500,8 @@ def get_events_for_telegram() -> str:
     Get compact events summary for Telegram notification.
     Only shows HIGH IMPACT events, grouped by country.
 
+    DANGER events (RBI, Budget, Election, etc.) are highlighted with ⚠️🔴
+
     Returns:
         Formatted string for Telegram
     """
@@ -514,6 +516,31 @@ def get_events_for_telegram() -> str:
     if not high:
         return ""
 
+    # Keywords that indicate HIGH DANGER for Iron Fly positions
+    # These events historically caused 500-2000pt moves
+    danger_keywords = [
+        'rbi', 'central bank', 'policy rate', 'repo rate', 'monetary policy',
+        'budget', 'union budget',
+        'election', 'vote', 'poll', 'result',
+        'gdp', 'real gdp',
+        'fed', 'fomc',
+        'tariff', 'trade war',
+        'inflation', 'cpi'
+    ]
+
+    def is_danger_event(event_name: str) -> bool:
+        """Check if event matches danger keywords."""
+        event_lower = event_name.lower()
+        return any(kw in event_lower for kw in danger_keywords)
+
+    def format_event(e) -> str:
+        """Format event with danger highlighting if needed."""
+        event_text = e.event[:45]
+        if is_danger_event(e.event):
+            return f"  ⚠️🔴 *{e.date}: {event_text}* ⚠️"
+        else:
+            return f"  📌 {e.date}: {event_text}"
+
     # Group by country
     india_events = [e for e in high if e.country == "India"]
     us_events = [e for e in high if e.country in ("United States", "US", "USA")]
@@ -523,14 +550,14 @@ def get_events_for_telegram() -> str:
     if india_events:
         lines.append("🇮🇳 *India:*")
         for e in india_events[:5]:
-            lines.append(f"  📌 {e.date}: {e.event[:45]}")
+            lines.append(format_event(e))
 
     if us_events:
         if lines:
             lines.append("")  # Blank line separator
         lines.append("🇺🇸 *US:*")
         for e in us_events[:5]:
-            lines.append(f"  📌 {e.date}: {e.event[:45]}")
+            lines.append(format_event(e))
 
     return '\n'.join(lines) if lines else ""
 
