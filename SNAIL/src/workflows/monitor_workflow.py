@@ -159,6 +159,7 @@ class MonitorWorkflow:
         self._pending_stop_loss_decision = False
         self._pending_friday_decision = False
         self._pending_vix_decision = False
+        self._pending_wing_approach_decision = False
 
         # Signal handling
         self._setup_signal_handlers()
@@ -430,6 +431,25 @@ class MonitorWorkflow:
                     self.telegram.send("*Position HELD* despite VIX warning. Monitoring closely.")
                     return False
 
+            elif alert_type == "wing_approach":
+                self._pending_wing_approach_decision = False
+                if action_str == "exit":
+                    position = get_active_position()
+                    if position:
+                        result = self.exit_manager.execute_exit(
+                            reason=ExitReason.WING_BREACH,
+                            position=position
+                        )
+                        return result.success
+                elif action_str == "hold":
+                    logger.info("User chose HOLD at wing approach (from callback)")
+                    self.telegram.send("*Position HELD* at wing approach. Monitoring closely.")
+                    return False
+                elif action_str == "adjust":
+                    logger.info("User requested adjustment at wing approach (from callback)")
+                    self.telegram.send("*ADJUSTMENT requested* at wing approach. Manual intervention required.")
+                    return False
+
             elif alert_type == "exit_confirm":
                 if action_str == "yes":
                     position = get_active_position()
@@ -511,6 +531,27 @@ class MonitorWorkflow:
                     self.telegram.send("*Position HELD* despite VIX warning. Monitoring closely.")
                     return False
 
+            # Handle wing approach decision
+            elif response.alert_type == "wing_approach":
+                self._pending_wing_approach_decision = False
+
+                if response.action == CallbackAction.EXIT:
+                    position = get_active_position()
+                    if position:
+                        result = self.exit_manager.execute_exit(
+                            reason=ExitReason.WING_BREACH,
+                            position=position
+                        )
+                        return result.success
+                elif response.action == CallbackAction.HOLD:
+                    logger.info("User chose HOLD at wing approach")
+                    self.telegram.send("*Position HELD* at wing approach. Monitoring closely.")
+                    return False
+                elif response.action == CallbackAction.ADJUST:
+                    logger.info("User requested adjustment at wing approach")
+                    self.telegram.send("*ADJUSTMENT requested* at wing approach. Manual intervention required.")
+                    return False
+
             # Handle exit confirmation
             elif response.alert_type == "exit_confirm":
                 if response.action == CallbackAction.CONFIRM_YES:
@@ -577,6 +618,95 @@ _Last updated: {datetime.now().strftime('%H:%M:%S')}_"""
 _Fetching P&L data..._"""
 
         self.telegram.send(msg)
+
+    # =========================================================================
+    # VIX WARNING HANDLING
+    # =========================================================================
+
+    def _handle_vix_warning(self, snapshot: MonitorSnapshot) -> bool:
+        """
+        Handle VIX warning (16-20) with decision buttons.
+
+        Args:
+            snapshot: Current position snapshot
+
+        Returns:
+            True if exit was triggered
+        """
+        position = get_active_position()
+        if not position:
+            return False
+
+        # Skip if already waiting for user decision
+        if self._pending_vix_decision:
+            logger.debug("Waiting for user VIX warning decision...")
+            return False
+
+        # Get Claude VIX advisory (use spike advisory with 0 previous to indicate warning)
+        advisory = self.claude_advisor.get_vix_spike_advisory(snapshot.india_vix, 0)
+
+        # Send decision buttons via Telegram bot
+        if self.telegram_bot:
+            self.telegram_bot.send_vix_warning_decision(
+                current_vix=snapshot.india_vix,
+                claude_advice=advisory.reasoning[:500] if advisory else "VIX elevated. Monitor closely.",
+                position_id=position.id
+            )
+            self._pending_vix_decision = True
+            logger.info(f"VIX warning decision sent to user (VIX={snapshot.india_vix:.2f})")
+            return False
+        else:
+            # Fallback: just log, don't auto-exit (VIX < 20 is warning only)
+            logger.warning(f"VIX warning at {snapshot.india_vix:.2f} (no Telegram bot for buttons)")
+            return False
+
+        return False
+
+    # =========================================================================
+    # WING APPROACH HANDLING
+    # =========================================================================
+
+    def _handle_wing_approach(self, snapshot: MonitorSnapshot, direction: str, proximity_pct: float) -> bool:
+        """
+        Handle wing approach with decision buttons.
+
+        Args:
+            snapshot: Current position snapshot
+            direction: Wing direction (CE/PE)
+            proximity_pct: How close to wing (0-100%)
+
+        Returns:
+            True if exit was triggered
+        """
+        position = get_active_position()
+        if not position:
+            return False
+
+        # Skip if already waiting for user decision
+        if self._pending_wing_approach_decision:
+            logger.debug("Waiting for user wing approach decision...")
+            return False
+
+        # Get Claude wing approach advisory
+        advisory = self.claude_advisor.get_wing_approach_advisory(direction)
+
+        # Send decision buttons via Telegram bot
+        if self.telegram_bot:
+            self.telegram_bot.send_wing_approach_decision(
+                direction=direction,
+                proximity_percent=proximity_pct,
+                claude_advice=advisory.reasoning[:500] if advisory else f"Price approaching {direction} wing.",
+                position_id=position.id
+            )
+            self._pending_wing_approach_decision = True
+            logger.info(f"Wing approach decision sent to user ({direction}, {proximity_pct:.0f}%)")
+            return False
+        else:
+            # Fallback: just log, don't auto-exit
+            logger.warning(f"Wing approach {direction} at {proximity_pct:.0f}% (no Telegram bot for buttons)")
+            return False
+
+        return False
 
     # =========================================================================
     # STOP LOSS HANDLING
@@ -768,6 +898,36 @@ _Fetching P&L data..._"""
 
                     if snapshot.pnl_percentage < 0 and abs(snapshot.pnl_percentage) >= stop_loss_pct:
                         if self._handle_stop_loss(snapshot):
+                            self._stats.exits_triggered += 1
+                            return
+
+                    # Check VIX warning (16-20) - send decision buttons
+                    vix_config = self.trading_config.get('entry', {}).get('vix_range', {})
+                    vix_max = vix_config.get('max', 16)
+                    vix_hard_exit = self.trading_config.get('exit', {}).get('vix_hard_exit', 20)
+
+                    if vix_max < snapshot.india_vix < vix_hard_exit:
+                        # VIX in warning zone (16-20), send decision buttons
+                        if self._handle_vix_warning(snapshot):
+                            self._stats.exits_triggered += 1
+                            return
+
+                    # Check wing approach - send decision buttons
+                    from src.utils.calculations import is_approaching_wing
+                    approaching, direction = is_approaching_wing(
+                        spot_price=snapshot.nifty_spot,
+                        atm_strike=position.atm_strike,
+                        wing_distance=position.wing_distance,
+                        threshold_pct=0.75  # Alert at 75% of wing distance
+                    )
+
+                    if approaching:
+                        # Calculate wing proximity percentage
+                        wing_strike = position.atm_strike + (position.wing_distance if direction == 'CE' else -position.wing_distance)
+                        distance_to_wing = abs(snapshot.nifty_spot - wing_strike)
+                        wing_proximity = ((position.wing_distance - distance_to_wing) / position.wing_distance) * 100 if position.wing_distance > 0 else 0
+
+                        if self._handle_wing_approach(snapshot, direction, wing_proximity):
                             self._stats.exits_triggered += 1
                             return
 
