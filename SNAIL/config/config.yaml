@@ -34,7 +34,7 @@ trading:
     min_dte: 6               # Minimum days to expiry
     window:
       start: "09:30"         # Entry window start
-      end: "14:30"           # Entry window end
+      end: "15:10"           # Entry window end (3:10 PM)
     cooldown_days: 1         # Days to wait after exit
     slippage_ticks: 2        # Fixed slippage ticks
     use_tiered_slippage: false # Use progressive tiered slippage (TDD Section 1.3)
