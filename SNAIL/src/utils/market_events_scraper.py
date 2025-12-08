@@ -498,6 +498,7 @@ def get_news_compact(limit: int = 10) -> str:
 def get_events_for_telegram() -> str:
     """
     Get compact events summary for Telegram notification.
+    Only shows HIGH IMPACT events.
 
     Returns:
         Formatted string for Telegram
@@ -505,30 +506,25 @@ def get_events_for_telegram() -> str:
     events = get_upcoming_events(10)
 
     if not events:
-        return "No upcoming market events"
+        return ""
 
-    # Group by importance
+    # Only HIGH IMPACT events
     high = [e for e in events if e.importance == "High"]
-    medium = [e for e in events if e.importance == "Medium"]
 
-    lines = []
+    if not high:
+        return ""
 
-    if high:
-        lines.append("HIGH IMPACT:")
-        for e in high[:5]:
-            lines.append(f"  {e.date}: {e.event[:50]}")
+    lines = ["🔴 *HIGH IMPACT:*"]
+    for e in high[:7]:  # Show up to 7 high impact events
+        lines.append(f"  📌 {e.date}: {e.event[:50]}")
 
-    if medium:
-        lines.append("MEDIUM:")
-        for e in medium[:3]:
-            lines.append(f"  {e.date}: {e.event[:50]}")
-
-    return '\n'.join(lines) if lines else "No significant events"
+    return '\n'.join(lines)
 
 
 def get_news_for_telegram(limit: int = 5) -> str:
     """
     Get compact news summary for Telegram notification.
+    Filters out IPO-related news.
 
     Returns:
         Formatted string for Telegram
@@ -536,12 +532,29 @@ def get_news_for_telegram(limit: int = 5) -> str:
     news, _ = load_news()
 
     if not news:
-        return "No recent news"
+        return ""
+
+    # IPO-related keywords to filter out
+    ipo_keywords = [
+        'ipo', 'listing', 'debut', 'gmp', 'grey market',
+        'shares to list', 'to list today', 'listing today',
+        'subscription', 'allotment', 'issue opens', 'issue closes'
+    ]
+
+    # Filter out IPO news
+    filtered_news = []
+    for item in news:
+        headline_lower = item.headline.lower()
+        if not any(kw in headline_lower for kw in ipo_keywords):
+            filtered_news.append(item)
+
+    if not filtered_news:
+        return ""
 
     lines = []
-    for item in news[:limit]:
+    for item in filtered_news[:limit]:
         headline = item.headline[:60] + "..." if len(item.headline) > 60 else item.headline
-        lines.append(f"- {headline}")
+        lines.append(f"• {headline}")
 
     return '\n'.join(lines)
 

@@ -460,7 +460,8 @@ class TelegramAlerts:
 
         message = f"""🐌 *SNAIL Morning* ☀️
 
-📊 NIFTY {nifty_spot:,.0f} | 🌡️ VIX {vix:.1f} | 💰 Margin ₹{margin_available:,.0f}
+📊 NIFTY {nifty_spot:,.0f} | 🌡️ VIX {vix:.1f}
+💰 Zerodha Balance: ₹{margin_available:,.0f}
 
 *Entry Checklist:*
 {vix_ok} VIX | {dte_ok} DTE | {cooldown_ok} Cooldown | {margin_ok} Margin
