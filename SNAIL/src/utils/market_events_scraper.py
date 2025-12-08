@@ -498,7 +498,7 @@ def get_news_compact(limit: int = 10) -> str:
 def get_events_for_telegram() -> str:
     """
     Get compact events summary for Telegram notification.
-    Only shows HIGH IMPACT events.
+    Only shows HIGH IMPACT events, grouped by country.
 
     Returns:
         Formatted string for Telegram
@@ -514,11 +514,25 @@ def get_events_for_telegram() -> str:
     if not high:
         return ""
 
-    lines = ["🔴 *HIGH IMPACT:*"]
-    for e in high[:7]:  # Show up to 7 high impact events
-        lines.append(f"  📌 {e.date}: {e.event[:50]}")
+    # Group by country
+    india_events = [e for e in high if e.country == "India"]
+    us_events = [e for e in high if e.country in ("United States", "US", "USA")]
 
-    return '\n'.join(lines)
+    lines = []
+
+    if india_events:
+        lines.append("🇮🇳 *India:*")
+        for e in india_events[:5]:
+            lines.append(f"  📌 {e.date}: {e.event[:45]}")
+
+    if us_events:
+        if lines:
+            lines.append("")  # Blank line separator
+        lines.append("🇺🇸 *US:*")
+        for e in us_events[:5]:
+            lines.append(f"  📌 {e.date}: {e.event[:45]}")
+
+    return '\n'.join(lines) if lines else ""
 
 
 def get_news_for_telegram(limit: int = 5) -> str:
