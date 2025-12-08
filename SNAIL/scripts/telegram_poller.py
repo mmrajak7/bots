@@ -75,7 +75,7 @@ def main():
     # Handle shutdown signals
     def signal_handler(signum, frame):
         logger.info(f"Received signal {signum}, shutting down...")
-        bot.stop()
+        bot.stop_polling()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, signal_handler)

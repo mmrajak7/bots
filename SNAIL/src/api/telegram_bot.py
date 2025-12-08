@@ -797,8 +797,7 @@ _VIX Range for entry: 10-16_""")
 
 {status_text}
 
-_To clear: /cooldown clear [type]_
-_Example: /cooldown clear user\\_skip_""")
+To clear: `/cooldown clear` or `/cooldown clear user_skip`""")
             else:
                 self._send_reply(f"""⏰ *Cooldown Status*
 
