@@ -63,9 +63,9 @@ from src.utils.config import (
 # CONSTANTS
 # =============================================================================
 
-# Entry time window
-ENTRY_START_TIME = "09:20"  # After market settles
-ENTRY_END_TIME = "14:30"    # Leave buffer before close
+# Entry time window defaults (overridden by config)
+ENTRY_START_TIME = "09:30"
+ENTRY_END_TIME = "15:10"
 
 # Slippage allowance
 DEFAULT_SLIPPAGE_TICKS = 2
@@ -219,20 +219,24 @@ class EntryManager:
                 reason="User skipped entry for today"
             )
 
-        # Check time
+        # Check time - use config values
         now = datetime.now()
         current_time = now.strftime("%H:%M")
 
-        if current_time < ENTRY_START_TIME:
+        entry_window = self.trading_config.get('entry', {}).get('window', {})
+        entry_start = entry_window.get('start', ENTRY_START_TIME)
+        entry_end = entry_window.get('end', ENTRY_END_TIME)
+
+        if current_time < entry_start:
             return EntryConditions(
                 can_enter=False,
-                reason=f"Before entry window ({ENTRY_START_TIME})"
+                reason=f"Before entry window ({entry_start})"
             )
 
-        if current_time > ENTRY_END_TIME:
+        if current_time > entry_end:
             return EntryConditions(
                 can_enter=False,
-                reason=f"After entry window ({ENTRY_END_TIME})"
+                reason=f"After entry window ({entry_end})"
             )
 
         # Check if trading day (basic weekday check)

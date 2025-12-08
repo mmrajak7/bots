@@ -116,6 +116,17 @@ def cmd_startup(args):
 def cmd_entry(args):
     """Check entry conditions or execute entry."""
     from src.services.entry_manager import get_entry_manager
+    from src.utils.config import get_trading_config
+
+    # Graceful exit if outside entry window (for cron)
+    config = get_trading_config()
+    entry_start = config.get('entry', {}).get('window', {}).get('start', '09:30')
+    entry_end = config.get('entry', {}).get('window', {}).get('end', '15:10')
+    current_time = datetime.now().strftime('%H:%M')
+
+    if current_time < entry_start or current_time > entry_end:
+        logger.debug(f"Outside entry window ({entry_start}-{entry_end}), skipping")
+        return 0
 
     manager = get_entry_manager()
     conditions = manager.check_entry_conditions()
@@ -264,6 +275,17 @@ def cmd_summary(args):
 def cmd_monitor(args):
     """Run a single monitoring iteration (for cron)."""
     from src.workflows.monitor_workflow import MonitorWorkflow
+    from src.utils.config import get_monitoring_config
+
+    # Graceful exit if outside monitor window (for cron)
+    config = get_monitoring_config()
+    monitor_start = config.get('start_time', '09:16')
+    monitor_end = config.get('end_time', '15:26')
+    current_time = datetime.now().strftime('%H:%M')
+
+    if current_time < monitor_start or current_time > monitor_end:
+        logger.debug(f"Outside monitor window ({monitor_start}-{monitor_end}), skipping")
+        return 0
 
     monitor = MonitorWorkflow()
     monitor.run_once()
