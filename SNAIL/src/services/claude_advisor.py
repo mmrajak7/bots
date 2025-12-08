@@ -245,51 +245,59 @@ class ClaudeAdvisor:
     # HELPER METHODS
     # =========================================================================
 
-    def _get_option_quotes_table(self, atm_strike: int, wing_distance: int, expiry_date: date) -> tuple:
+    def _get_option_quotes_and_structure(self, atm_strike: int, expiry_date: date) -> tuple:
         """
-        Fetch actual option quotes and format as visual Iron Fly structure.
+        Fetch actual option quotes, calculate wing distance from straddle premium,
+        and format as visual Iron Fly structure.
+
+        Wing distance = Straddle Premium (CE + PE) rounded to nearest 100.
 
         Args:
             atm_strike: ATM strike price
-            wing_distance: Wing distance from ATM
             expiry_date: Option expiry date
 
         Returns:
-            Tuple of (html_formatted_string, net_credit)
+            Tuple of (html_formatted_string, wing_distance, straddle_premium, net_credit)
         """
         try:
             # Use provided expiry
             expiry = expiry_date
             expiry_str = expiry.strftime('%d-%b')
 
+            # First, fetch ATM quotes to get straddle premium
+            short_ce_sym = generate_nifty_option_symbol(expiry, atm_strike, 'CE')
+            short_pe_sym = generate_nifty_option_symbol(expiry, atm_strike, 'PE')
+
+            atm_quotes = self.kite.quote([f"NFO:{short_ce_sym}", f"NFO:{short_pe_sym}"])
+
+            s_ce = atm_quotes.get(f"NFO:{short_ce_sym}")
+            s_pe = atm_quotes.get(f"NFO:{short_pe_sym}")
+
+            s_ce_ltp = s_ce.ltp if s_ce else 0
+            s_pe_ltp = s_pe.ltp if s_pe else 0
+
+            # Calculate straddle premium and wing distance
+            straddle_premium = s_ce_ltp + s_pe_ltp
+            wing_distance = round(straddle_premium / 100) * 100
+
+            # Ensure minimum wing distance of 200
+            wing_distance = max(wing_distance, 200)
+
+            logger.info(f"Wing distance calculated: {wing_distance} (CE={s_ce_ltp:.2f} + PE={s_pe_ltp:.2f} = {straddle_premium:.2f})")
+
             # Calculate wing strikes
             upper_wing = atm_strike + wing_distance
             lower_wing = atm_strike - wing_distance
 
-            # Build symbols
-            short_ce_sym = generate_nifty_option_symbol(expiry, atm_strike, 'CE')
-            short_pe_sym = generate_nifty_option_symbol(expiry, atm_strike, 'PE')
+            # Fetch wing quotes
             long_ce_sym = generate_nifty_option_symbol(expiry, upper_wing, 'CE')
             long_pe_sym = generate_nifty_option_symbol(expiry, lower_wing, 'PE')
 
-            # Fetch quotes
-            instruments = [
-                f"NFO:{short_ce_sym}",
-                f"NFO:{short_pe_sym}",
-                f"NFO:{long_ce_sym}",
-                f"NFO:{long_pe_sym}"
-            ]
+            wing_quotes = self.kite.quote([f"NFO:{long_ce_sym}", f"NFO:{long_pe_sym}"])
 
-            quotes = self.kite.quote(instruments)
+            l_ce = wing_quotes.get(f"NFO:{long_ce_sym}")
+            l_pe = wing_quotes.get(f"NFO:{long_pe_sym}")
 
-            # Extract prices
-            s_ce = quotes.get(f"NFO:{short_ce_sym}")
-            s_pe = quotes.get(f"NFO:{short_pe_sym}")
-            l_ce = quotes.get(f"NFO:{long_ce_sym}")
-            l_pe = quotes.get(f"NFO:{long_pe_sym}")
-
-            s_ce_ltp = s_ce.ltp if s_ce else 0
-            s_pe_ltp = s_pe.ltp if s_pe else 0
             l_ce_ltp = l_ce.ltp if l_ce else 0
             l_pe_ltp = l_pe.ltp if l_pe else 0
 
@@ -318,19 +326,19 @@ class ClaudeAdvisor:
 </code>
 <b>💰 Net Credit: ₹{net_credit:.1f}/lot</b>"""
 
-            return html, net_credit
+            return html, wing_distance, straddle_premium, net_credit
 
         except Exception as e:
             logger.warning(f"Could not fetch option quotes: {e}")
-            # Fallback to simple format
-            upper_wing = atm_strike + wing_distance
-            lower_wing = atm_strike - wing_distance
+            # Fallback - use VIX-based estimate
+            estimated_straddle = 300  # Default fallback
+            wing_distance = 300
             html = f"""<b>🦋 IRON FLY STRUCTURE</b>
 <code>
-   {lower_wing} PE ◄━━━━ {atm_strike} ━━━━► {upper_wing} CE
+   {atm_strike - wing_distance} PE ◄━━━━ {atm_strike} ━━━━► {atm_strike + wing_distance} CE
 </code>
 <i>(Live quotes unavailable)</i>"""
-            return html, 0
+            return html, wing_distance, estimated_straddle, 0
 
     # =========================================================================
     # ADVISORY METHODS
@@ -341,31 +349,22 @@ class ClaudeAdvisor:
         nifty_spot: float,
         india_vix: float,
         atm_strike: int,
-        straddle_premium: float,
-        wing_distance: int,
         dte: int,
         expiry_date: date = None,
-        net_credit: float = 0.0,
-        max_profit: float = 0.0,
-        max_loss: float = 0.0,
         atr_14: float = 0.0
     ) -> AdvisoryResult:
         """
         Get pre-entry advisory from Claude.
 
-        Called before entering a new position.
+        Called before entering a new position. Fetches real option quotes
+        to calculate straddle premium and wing distance.
 
         Args:
             nifty_spot: Current NIFTY spot
             india_vix: Current VIX
             atm_strike: Calculated ATM strike
-            straddle_premium: Expected straddle premium
-            wing_distance: Calculated wing distance
             dte: Days to expiry
             expiry_date: Expiry date object
-            net_credit: Net credit per lot
-            max_profit: Max profit per lot
-            max_loss: Max loss per lot
             atr_14: 14-day ATR (fetched if 0)
 
         Returns:
@@ -382,13 +381,19 @@ class ClaudeAdvisor:
                     atr_14 = 150.0  # Default fallback
                     logger.warning("ATR not available, using default 150")
 
-            # Calculate metrics if not provided
-            if net_credit == 0.0:
-                net_credit = straddle_premium - (straddle_premium * 0.3)  # Rough estimate
-            if max_profit == 0.0:
-                max_profit = net_credit * 75  # 1 lot
-            if max_loss == 0.0:
-                max_loss = (wing_distance - net_credit) * 75
+            # Use expiry_date if provided, otherwise estimate from dte
+            exp_date = expiry_date if expiry_date else (date.today() + timedelta(days=dte))
+
+            # Fetch REAL option quotes and calculate wing distance from straddle premium
+            option_html, wing_distance, straddle_premium, net_credit = self._get_option_quotes_and_structure(
+                atm_strike, exp_date
+            )
+
+            # Calculate metrics from real values
+            max_profit = net_credit * 75  # 1 lot
+            max_loss = (wing_distance - net_credit) * 75
+
+            logger.info(f"Pre-entry metrics: straddle={straddle_premium:.2f}, wing={wing_distance}, credit={net_credit:.2f}")
 
             # Get scraped market events and news for Claude context
             events_str = get_events_compact(days=10)
@@ -415,13 +420,8 @@ class ClaudeAdvisor:
             response = self.claude.get_pre_entry_decision(context)
 
             # Record decision
-            prompt = f"Pre-entry check: NIFTY={nifty_spot}, VIX={india_vix}, ATM={atm_strike}, DTE={dte}"
+            prompt = f"Pre-entry check: NIFTY={nifty_spot}, VIX={india_vix}, ATM={atm_strike}, Wing={wing_distance}, DTE={dte}"
             self._record_decision(response, 'pre_entry', prompt)
-
-            # Fetch actual option quotes for display
-            # Use expiry_date if provided, otherwise estimate from dte
-            exp_date = expiry_date if expiry_date else (date.today() + timedelta(days=dte))
-            option_html, _ = self._get_option_quotes_table(atm_strike, wing_distance, exp_date)
 
             # Determine emoji based on Claude's recommendation
             rec_emoji = "✅" if response.decision == ClaudeDecision.PROCEED else "⚠️"
@@ -947,9 +947,7 @@ if __name__ == '__main__':
         result = advisor.get_pre_entry_advisory(
             nifty_spot=24150.00,
             india_vix=12.5,
-            atm_strike=24150,
-            straddle_premium=320.0,
-            wing_distance=300,
+            atm_strike=24200,  # Rounded to 100
             dte=6
         )
         print(f"    Decision: {result.decision.value}")

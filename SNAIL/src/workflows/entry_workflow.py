@@ -232,17 +232,11 @@ class EntryWorkflow:
             if not skip_claude:
                 self._state = EntryWorkflowState.AWAITING_APPROVAL
 
-                # Calculate preliminary metrics for Claude
-                atm_ce_inst = f"NFO:NIFTY{conditions.expiry.strftime('%y%m%d') if conditions.expiry else ''}"
-                # Get preliminary straddle premium estimate
-                straddle_premium = conditions.india_vix * 20  # Rough estimate
-
+                # Get Claude advisory - it fetches real quotes internally
                 claude_decision = self.claude_advisor.get_pre_entry_advisory(
                     nifty_spot=conditions.nifty_spot,
                     india_vix=conditions.india_vix,
                     atm_strike=conditions.atm_strike,
-                    straddle_premium=straddle_premium,
-                    wing_distance=int(round(straddle_premium / 100) * 100),
                     dte=conditions.dte,
                     expiry_date=conditions.expiry
                 )
