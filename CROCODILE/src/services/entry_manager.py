@@ -741,6 +741,14 @@ class EntryManager:
             )
             return False, f"Duplicate: {dup_check['reason']}"
 
+        # ====== CHECK FOR EXISTING POSITION/ORDER (EARLY) ======
+        # Must check BEFORE position limit check to avoid infinite retry loops
+        # e.g., MAXHEALTH signal when we already have MAXHEALTH position
+        is_dup, dup_reason = self.is_duplicate_position_or_order(signal.script, signal.timeframe, session)
+        if is_dup:
+            logger.info(f"Duplicate position/order (early check): {dup_reason}")
+            return False, dup_reason
+
         # ====== EARLY POSITION LIMIT CHECK (OPTIMIZATION) ======
         # Check position limits BEFORE expensive validation work
         # If no slots available, gracefully skip and retry later
