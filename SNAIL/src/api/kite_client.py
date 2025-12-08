@@ -12,6 +12,7 @@ Unified wrapper for Kite Connect API with automatic authentication.
 """
 
 import os
+import threading
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, List, Any, Tuple
@@ -523,11 +524,12 @@ class SNAILKiteClient:
 # =============================================================================
 
 _kite_client: Optional[SNAILKiteClient] = None
+_kite_client_lock = threading.Lock()
 
 
 def get_kite_client(config: Optional[Dict] = None) -> SNAILKiteClient:
     """
-    Get or create singleton Kite client.
+    Get or create singleton Kite client (thread-safe).
 
     Args:
         config: Optional configuration dictionary
@@ -538,10 +540,13 @@ def get_kite_client(config: Optional[Dict] = None) -> SNAILKiteClient:
     global _kite_client
 
     if _kite_client is None:
-        if config is None:
-            from src.utils.config import load_config
-            config = load_config()
-        _kite_client = SNAILKiteClient(config)
+        with _kite_client_lock:
+            # Double-check after acquiring lock
+            if _kite_client is None:
+                if config is None:
+                    from src.utils.config import load_config
+                    config = load_config()
+                _kite_client = SNAILKiteClient(config)
 
     return _kite_client
 
@@ -549,7 +554,8 @@ def get_kite_client(config: Optional[Dict] = None) -> SNAILKiteClient:
 def reset_kite_client() -> None:
     """Reset the singleton client (for testing)."""
     global _kite_client
-    _kite_client = None
+    with _kite_client_lock:
+        _kite_client = None
 
 
 # =============================================================================

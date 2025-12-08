@@ -231,8 +231,8 @@ def cmd_status(args):
             legs = get_position_legs(position.id)
             # Would need to fetch quotes for actual P&L
             print(f"   Legs: {len(legs)}")
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Could not fetch position legs: {e}")
     else:
         print("   No active position")
 

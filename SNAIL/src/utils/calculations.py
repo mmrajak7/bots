@@ -111,23 +111,26 @@ def calculate_atm_strike(spot_price: float, interval: int = NIFTY_STRIKE_INTERVA
 def calculate_wing_distance(
     ce_premium: float,
     pe_premium: float,
-    round_to: int = 100
+    round_to: int = 100,
+    min_distance: int = 200
 ) -> int:
     """
     Calculate dynamic wing distance based on straddle premium.
 
-    Wing distance = Straddle premium rounded to nearest 100.
+    Wing distance = Straddle premium rounded to nearest 100, with minimum bound.
 
     Args:
         ce_premium: ATM CE premium
         pe_premium: ATM PE premium
         round_to: Rounding interval (default 100)
+        min_distance: Minimum wing distance to prevent division by zero (default 200)
 
     Returns:
-        Wing distance in points
+        Wing distance in points (at least min_distance)
     """
     straddle_premium = ce_premium + pe_premium
-    return round(straddle_premium / round_to) * round_to
+    calculated = round(straddle_premium / round_to) * round_to
+    return max(calculated, min_distance)
 
 
 def get_iron_fly_strikes(

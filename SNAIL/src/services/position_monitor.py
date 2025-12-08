@@ -289,7 +289,21 @@ class PositionMonitor:
             # Get quotes
             quotes = self.get_current_quotes()
             if not quotes:
+                logger.warning("Could not fetch quotes for P&L calculation")
                 return None
+
+            # Validate all legs have quotes with valid prices
+            for leg in self.state.legs:
+                if leg.leg_type not in quotes:
+                    logger.warning(f"Missing quote for leg: {leg.leg_type}")
+                    return None
+                quote = quotes[leg.leg_type]
+                if leg.side == 'SHORT' and (quote.ask is None or quote.ask <= 0):
+                    logger.warning(f"Invalid ask price for SHORT leg {leg.leg_type}: {quote.ask}")
+                    return None
+                if leg.side == 'LONG' and (quote.bid is None or quote.bid <= 0):
+                    logger.warning(f"Invalid bid price for LONG leg {leg.leg_type}: {quote.bid}")
+                    return None
 
             # Calculate P&L
             entry_straddle = sum(l.entry_price for l in self.state.legs if l.side == 'SHORT')

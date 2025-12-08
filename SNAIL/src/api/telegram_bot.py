@@ -16,6 +16,7 @@ import os
 import threading
 import time
 import json
+from collections import deque
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass
@@ -157,8 +158,8 @@ class TelegramBot:
         self._response_queue: List[UserResponse] = []
         self._queue_lock = threading.Lock()
 
-        # Callback deduplication - track processed callback query IDs
-        self._processed_callbacks: List[str] = []
+        # Callback deduplication - use deque with maxlen for thread-safe auto-trimming
+        self._processed_callbacks: deque = deque(maxlen=MAX_PROCESSED_CALLBACKS)
         self._callbacks_lock = threading.Lock()
 
         # Pending decisions awaiting user response (for timeout tracking)
@@ -439,13 +440,8 @@ class TelegramBot:
             if callback_query_id in self._processed_callbacks:
                 return True
 
-            # Add to processed list
+            # Add to processed deque (auto-trims via maxlen)
             self._processed_callbacks.append(callback_query_id)
-
-            # Trim list if too long (keep last N)
-            if len(self._processed_callbacks) > MAX_PROCESSED_CALLBACKS:
-                self._processed_callbacks = self._processed_callbacks[-MAX_PROCESSED_CALLBACKS:]
-
             return False
 
     def _handle_callback(self, update: TelegramUpdate):

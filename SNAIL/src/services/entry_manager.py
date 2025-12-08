@@ -496,6 +496,24 @@ class EntryManager:
                     error=f"Missing required quotes: {missing_keys}"
                 )
 
+            # Validate quote prices are valid (non-zero)
+            for key in required_quote_keys:
+                quote = quotes[key]
+                if key.startswith('straddle'):
+                    # SELL legs - need valid bid
+                    if quote.bid is None or quote.bid <= 0:
+                        return EntryResult(
+                            success=False,
+                            error=f"Invalid bid price for {key}: {quote.bid}"
+                        )
+                else:
+                    # BUY legs (wings) - need valid ask
+                    if quote.ask is None or quote.ask <= 0:
+                        return EntryResult(
+                            success=False,
+                            error=f"Invalid ask price for {key}: {quote.ask}"
+                        )
+
             metrics = calculate_iron_fly_metrics(
                 atm_strike=conditions.atm_strike,
                 wing_distance=wing_distance,
