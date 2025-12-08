@@ -275,6 +275,9 @@ class OrderMonitor:
                 telegram.send_alert(critical_msg, critical=True)
 
             else:
+                # Check if verification passed or failed (error will have message if verification failed)
+                verification_status = "GTT verified ✓" if error is None else "GTT verification pending ⚠️"
+
                 logger.info(
                     f"✅ Position created with protective GTT: {zerodha_symbol} - "
                     f"GTT ID: {gtt_id}, SL: Rs.{position.current_sl:.2f}"
@@ -288,7 +291,7 @@ class OrderMonitor:
                     f"• Position created @ Rs.{fill_price:.2f}\n"
                     f"• Qty: {filled_qty} shares\n"
                     f"• GTT placed: SL @ Rs.{position.current_sl:.2f}\n"
-                    f"• GTT verified on Zerodha ✓\n"
+                    f"• {verification_status}\n"
                     f"• Capital deployed: Rs.{fill_price * filled_qty:.2f}"
                 )
                 telegram.send_alert(success_msg, critical=False)

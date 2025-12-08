@@ -747,7 +747,8 @@ class EntryManager:
         is_dup, dup_reason = self.is_duplicate_position_or_order(signal.script, signal.timeframe, session)
         if is_dup:
             logger.info(f"Duplicate position/order (early check): {dup_reason}")
-            return False, dup_reason
+            # Return with "Duplicate:" prefix so CSV status detection marks it as 'D'
+            return False, f"Duplicate: {dup_reason}"
 
         # ====== EARLY POSITION LIMIT CHECK (OPTIMIZATION) ======
         # Check position limits BEFORE expensive validation work
