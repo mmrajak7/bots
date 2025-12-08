@@ -510,7 +510,7 @@ class KiteAPIAdapter(BrokerAdapter):
         gtt_type = payload['type']
         expires_at = payload['expires_at']
 
-        trigger_id = kite.place_gtt(
+        response = kite.place_gtt(
             trigger_type=gtt_type,
             tradingsymbol=condition['tradingsymbol'],
             exchange=condition['exchange'],
@@ -525,6 +525,12 @@ class KiteAPIAdapter(BrokerAdapter):
             }]
         )
 
+        # kite.place_gtt() returns {'trigger_id': <int>}, extract the actual ID
+        if isinstance(response, dict):
+            trigger_id = response.get('trigger_id', response)
+        else:
+            trigger_id = response
+
         logger.info(f"GTT placed: {trigger_id}")
         return {'trigger_id': trigger_id}
 
@@ -533,6 +539,10 @@ class KiteAPIAdapter(BrokerAdapter):
         """Cancel GTT order"""
         self._rate_limit()
         kite = self._get_kite()
+
+        # Handle case where gtt_id might be a dict {'trigger_id': <int>}
+        if isinstance(gtt_id, dict):
+            gtt_id = gtt_id.get('trigger_id', gtt_id)
 
         kite.delete_gtt(trigger_id=int(gtt_id))
         logger.info(f"GTT cancelled: {gtt_id}")

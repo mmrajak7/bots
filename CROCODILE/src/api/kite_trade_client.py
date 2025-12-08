@@ -960,6 +960,10 @@ class KiteTradeClient:
         Returns:
             Success status
         """
+        # Handle case where gtt_id might be a dict {'trigger_id': <int>}
+        if isinstance(gtt_id, dict):
+            gtt_id = gtt_id.get('trigger_id', gtt_id)
+
         url = f"{self.base_url}/oms/gtt/triggers/{gtt_id}"
         headers = self._get_headers()
 
