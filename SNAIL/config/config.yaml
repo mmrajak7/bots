@@ -43,7 +43,7 @@ trading:
     # Only send entry alert if R:R meets this threshold
     # R:R = Max Loss / Max Profit (e.g., 0.5 means risk 1 to make 2)
     min_rr_ratio: 0.5        # Only enter if R:R <= 0.5 (1:2 or better)
-    require_good_rr: true    # Enable R:R filter
+    require_good_rr: false   # Enable R:R filter (set true for production)
 
     # Claude pre-entry advisory
     use_claude_advisory: false # Disable Claude analysis for pre-entry (set true to enable)
