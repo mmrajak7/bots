@@ -962,11 +962,12 @@ def is_on_cooldown(cooldown_type: str) -> bool:
     Returns:
         True if cooldown active
     """
-    today = date.today()
+    # Use datetime for precise comparison (cooldown_end stores datetime)
+    now = datetime.now()
     with get_db_session() as conn:
         cursor = conn.execute(
             "SELECT * FROM cooldowns WHERE cooldown_type = ? AND cooldown_end > ? LIMIT 1",
-            (cooldown_type, today.isoformat())
+            (cooldown_type, now.isoformat())
         )
         row = cursor.fetchone()
 
@@ -974,6 +975,31 @@ def is_on_cooldown(cooldown_type: str) -> bool:
             logger.info(f"Cooldown '{cooldown_type}' active until {row['cooldown_end']}")
             return True
         return False
+
+
+def get_cooldown_remaining(cooldown_type: str) -> Optional[int]:
+    """
+    Get remaining cooldown time in seconds.
+
+    Args:
+        cooldown_type: Type of cooldown ('entry', 'user_skip', etc.)
+
+    Returns:
+        Remaining seconds, or None if no active cooldown
+    """
+    now = datetime.now()
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            "SELECT cooldown_end FROM cooldowns WHERE cooldown_type = ? AND cooldown_end > ? LIMIT 1",
+            (cooldown_type, now.isoformat())
+        )
+        row = cursor.fetchone()
+
+        if row:
+            cooldown_end = datetime.fromisoformat(row['cooldown_end'])
+            remaining = (cooldown_end - now).total_seconds()
+            return max(0, int(remaining))
+        return None
 
 
 def set_cooldown(cooldown_type: str, duration_seconds: int, position_id: Optional[int] = None) -> None:
@@ -986,14 +1012,15 @@ def set_cooldown(cooldown_type: str, duration_seconds: int, position_id: Optiona
         position_id: Optional position ID that triggered the cooldown
     """
     with get_db_session() as conn:
-        cooldown_end = date.today() + timedelta(seconds=duration_seconds)
+        # Use datetime for precise cooldown end time (not just date)
+        cooldown_end = datetime.now() + timedelta(seconds=duration_seconds)
 
         conn.execute(
             """INSERT INTO cooldowns (position_id, cooldown_type, exit_date, cooldown_end)
                VALUES (?, ?, ?, ?)""",
             (position_id, cooldown_type, date.today().isoformat(), cooldown_end.isoformat())
         )
-        logger.info(f"Cooldown '{cooldown_type}' set until {cooldown_end}")
+        logger.info(f"Cooldown '{cooldown_type}' set until {cooldown_end.strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 def clear_cooldown(cooldown_type: Optional[str] = None) -> int:
@@ -1007,16 +1034,17 @@ def clear_cooldown(cooldown_type: Optional[str] = None) -> int:
         Number of cooldowns cleared
     """
     with get_db_session() as conn:
-        today = date.today()
+        # Use datetime for precise comparison (cooldown_end stores datetime)
+        now = datetime.now()
         if cooldown_type:
             cursor = conn.execute(
                 "DELETE FROM cooldowns WHERE cooldown_type = ? AND cooldown_end > ?",
-                (cooldown_type, today.isoformat())
+                (cooldown_type, now.isoformat())
             )
         else:
             cursor = conn.execute(
                 "DELETE FROM cooldowns WHERE cooldown_end > ?",
-                (today.isoformat(),)
+                (now.isoformat(),)
             )
         count = cursor.rowcount
         logger.info(f"Cleared {count} cooldown(s)" + (f" of type '{cooldown_type}'" if cooldown_type else ""))

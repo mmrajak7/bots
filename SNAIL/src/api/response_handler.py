@@ -32,9 +32,11 @@ from src.utils.config import get_telegram_config
 DEFAULT_RESPONSE_TIMEOUT = 300  # 5 minutes
 POLL_INTERVAL = 2  # seconds
 
-# Message update tracking
-UPDATE_OFFSET_FILE = "data/telegram_update_offset.txt"
-RESPONSE_QUEUE_FILE = "data/telegram_responses.json"  # Shared response queue
+# Message update tracking - use absolute paths based on project root
+from pathlib import Path as _Path
+_PROJECT_ROOT = _Path(__file__).parent.parent.parent
+UPDATE_OFFSET_FILE = str(_PROJECT_ROOT / "data" / "telegram_update_offset.txt")
+RESPONSE_QUEUE_FILE = str(_PROJECT_ROOT / "data" / "telegram_responses.json")  # Shared response queue
 
 
 # =============================================================================
@@ -238,19 +240,28 @@ class TelegramResponseHandler:
             from pathlib import Path
 
             queue_file = Path(RESPONSE_QUEUE_FILE)
+            logger.debug(f"Checking shared queue file: {queue_file} (exists={queue_file.exists()})")
+
             if not queue_file.exists():
                 return []
 
             with open(queue_file, 'r') as f:
-                responses = json.load(f)
+                content = f.read().strip()
+                logger.debug(f"Shared queue content: '{content}'")
+                if not content or content == '[]':
+                    return []
+                responses = json.loads(content)
 
-            # Clear the file after reading
-            queue_file.write_text('[]')
+            if responses:
+                logger.info(f"Read {len(responses)} response(s) from shared queue: {responses}")
+                # Clear the file after reading
+                queue_file.write_text('[]')
+                logger.debug("Cleared shared queue file")
 
             return responses if isinstance(responses, list) else []
 
         except Exception as e:
-            logger.warning(f"Could not read shared responses: {e}")
+            logger.warning(f"Could not read shared responses from {RESPONSE_QUEUE_FILE}: {e}")
             return []
 
     @staticmethod
@@ -291,7 +302,7 @@ class TelegramResponseHandler:
             with open(queue_file, 'w') as f:
                 json.dump(responses, f)
 
-            logger.debug(f"Wrote response to shared queue: {text[:30]}...")
+            logger.info(f"Wrote response to shared queue {queue_file}: {text}")
 
         except Exception as e:
             logger.error(f"Could not write shared response: {e}")
@@ -440,10 +451,13 @@ class TelegramResponseHandler:
                     break
 
             elif pending.response_type == ResponseType.CHOICE:
-                if normalized in [c.lower() for c in pending.valid_choices]:
+                valid_lower = [c.lower() for c in pending.valid_choices]
+                logger.debug(f"Checking CHOICE: normalized='{normalized}' in valid={valid_lower}")
+                if normalized in valid_lower:
                     pending.response = normalized
                     pending.status = ResponseStatus.RECEIVED
                     matched_prompt = prompt_id
+                    logger.info(f"CHOICE matched! '{normalized}' for {prompt_id}")
                     break
 
             elif pending.response_type == ResponseType.NUMERIC:
@@ -621,6 +635,7 @@ class TelegramResponseHandler:
 
         deadline = datetime.now() + timedelta(seconds=timeout_seconds)
         poll_conflict_count = 0
+        logger.info(f"Waiting for response '{prompt_id}' with timeout {timeout_seconds}s, valid_choices={valid_choices}")
 
         while datetime.now() < deadline:
             # First check shared response queue (from telegram_poller daemon)
@@ -632,6 +647,7 @@ class TelegramResponseHandler:
                     'text': resp.get('text', ''),
                     'message_id': 0
                 }
+                logger.info(f"Processing shared response: text='{resp.get('text')}', chat_id={resp.get('chat_id')}")
                 self._process_message(fake_message)
 
             # Then try direct polling (with short timeout to not conflict)

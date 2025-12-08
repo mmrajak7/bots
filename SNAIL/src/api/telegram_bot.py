@@ -391,12 +391,14 @@ class TelegramBot:
         # Handle ENTER/SKIP responses for pre-entry (write to shared queue)
         elif text_upper in ["ENTER", "SKIP", "YES", "NO", "PROCEED"]:
             # Write to shared response queue for response_handler to pick up
-            from src.api.response_handler import TelegramResponseHandler
+            from src.api.response_handler import TelegramResponseHandler, RESPONSE_QUEUE_FILE
             TelegramResponseHandler.write_shared_response(
                 text=text_upper.lower(),
                 chat_id=str(update.chat_id)
             )
-            logger.info(f"Text response queued: {text_upper}")
+            logger.info(f"Text response queued to {RESPONSE_QUEUE_FILE}: {text_upper}")
+            # Send confirmation to user
+            self._send_reply(f"✅ Received: {text_upper}")
         # Otherwise ignore non-command messages
 
     def _is_callback_processed(self, callback_query_id: str) -> bool:

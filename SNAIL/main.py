@@ -360,7 +360,7 @@ def cmd_test(args):
 
 def cmd_cooldown(args):
     """Manage cooldowns."""
-    from src.utils.db import is_on_cooldown, clear_cooldown
+    from src.utils.db import is_on_cooldown, clear_cooldown, get_cooldown_remaining
 
     if args.clear:
         # Clear cooldown
@@ -376,8 +376,12 @@ def cmd_cooldown(args):
         cooldown_types = ['entry', 'user_skip']
         any_active = False
         for ct in cooldown_types:
-            if is_on_cooldown(ct):
-                print(f"   {ct}: ACTIVE")
+            remaining = get_cooldown_remaining(ct)
+            if remaining is not None:
+                hours = remaining // 3600
+                minutes = (remaining % 3600) // 60
+                time_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+                print(f"   {ct}: ACTIVE ({time_str} remaining)")
                 any_active = True
             else:
                 print(f"   {ct}: inactive")
