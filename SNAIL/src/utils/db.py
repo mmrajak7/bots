@@ -195,6 +195,36 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE cooldowns ADD COLUMN cooldown_type TEXT NOT NULL DEFAULT 'entry'")
         logger.info("Migration complete: cooldown_type column added")
 
+    # Migration 2: Fix cooldowns table to allow NULL position_id
+    # Check if position_id has NOT NULL constraint (by checking if we can insert NULL)
+    try:
+        # Check table schema for notnull flag on position_id
+        cursor = conn.execute("PRAGMA table_info(cooldowns)")
+        for row in cursor.fetchall():
+            col_name = row[1]
+            notnull = row[3]
+            if col_name == 'position_id' and notnull:
+                logger.info("Running migration: Fixing cooldowns table to allow NULL position_id")
+                # Recreate the table with correct schema
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS cooldowns_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        position_id INTEGER REFERENCES positions(id),
+                        cooldown_type TEXT NOT NULL DEFAULT 'entry',
+                        exit_date DATE NOT NULL,
+                        cooldown_end DATE NOT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.execute("INSERT INTO cooldowns_new SELECT * FROM cooldowns")
+                conn.execute("DROP TABLE cooldowns")
+                conn.execute("ALTER TABLE cooldowns_new RENAME TO cooldowns")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_cooldowns_end ON cooldowns(cooldown_end)")
+                logger.info("Migration complete: cooldowns table recreated with nullable position_id")
+                break
+    except Exception as e:
+        logger.warning(f"Migration 2 check failed: {e}")
+
 
 _migrations_run = False  # Track if migrations have been run this session
 

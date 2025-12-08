@@ -379,13 +379,24 @@ class TelegramBot:
             self._handle_text_response(update, text)
 
     def _handle_text_response(self, update: TelegramUpdate, text: str):
-        """Handle text responses like EXIT, HOLD, ADJUST."""
+        """Handle text responses like EXIT, HOLD, ADJUST, ENTER, SKIP."""
         text_upper = text.upper().strip()
 
+        # Handle standard callback actions
         if text_upper in ["EXIT", "HOLD", "ADJUST"]:
             action = CallbackAction[text_upper]
             self._queue_response(action, "text_command")
             self._send_reply(f"Received: {text_upper}\n\nProcessing your request...")
+
+        # Handle ENTER/SKIP responses for pre-entry (write to shared queue)
+        elif text_upper in ["ENTER", "SKIP", "YES", "NO", "PROCEED"]:
+            # Write to shared response queue for response_handler to pick up
+            from src.api.response_handler import TelegramResponseHandler
+            TelegramResponseHandler.write_shared_response(
+                text=text_upper.lower(),
+                chat_id=str(update.chat_id)
+            )
+            logger.info(f"Text response queued: {text_upper}")
         # Otherwise ignore non-command messages
 
     def _is_callback_processed(self, callback_query_id: str) -> bool:

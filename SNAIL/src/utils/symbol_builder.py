@@ -30,7 +30,7 @@ MONTH_CODES = {
 }
 
 # NIFTY strike interval
-NIFTY_STRIKE_INTERVAL = 50
+NIFTY_STRIKE_INTERVAL = 100  # ATM rounds to nearest 100
 
 # Default lot size (verify from instruments)
 DEFAULT_LOT_SIZE = 75

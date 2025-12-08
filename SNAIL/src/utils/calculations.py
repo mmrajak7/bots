@@ -28,7 +28,7 @@ from src.utils.config import get_charges_config, get_trading_config
 NIFTY_LOT_SIZE = 75
 
 # Strike interval
-NIFTY_STRIKE_INTERVAL = 50
+NIFTY_STRIKE_INTERVAL = 100  # ATM rounds to nearest 100
 
 # Default charges (overridden by config)
 DEFAULT_STT_RATE = 0.000625  # 0.0625% on sell side premium

@@ -34,6 +34,7 @@ POLL_INTERVAL = 2  # seconds
 
 # Message update tracking
 UPDATE_OFFSET_FILE = "data/telegram_update_offset.txt"
+RESPONSE_QUEUE_FILE = "data/telegram_responses.json"  # Shared response queue
 
 
 # =============================================================================
@@ -225,6 +226,76 @@ class TelegramResponseHandler:
         except Exception as e:
             logger.warning(f"Could not save update offset: {e}")
 
+    def _read_shared_responses(self) -> List[Dict[str, Any]]:
+        """
+        Read responses from shared queue file (written by telegram_poller daemon).
+
+        Returns:
+            List of response dicts
+        """
+        try:
+            import json
+            from pathlib import Path
+
+            queue_file = Path(RESPONSE_QUEUE_FILE)
+            if not queue_file.exists():
+                return []
+
+            with open(queue_file, 'r') as f:
+                responses = json.load(f)
+
+            # Clear the file after reading
+            queue_file.write_text('[]')
+
+            return responses if isinstance(responses, list) else []
+
+        except Exception as e:
+            logger.warning(f"Could not read shared responses: {e}")
+            return []
+
+    @staticmethod
+    def write_shared_response(text: str, chat_id: str, timestamp: str = None) -> None:
+        """
+        Write a response to the shared queue file (called by telegram_poller daemon).
+
+        Args:
+            text: Response text
+            chat_id: Chat ID the response came from
+            timestamp: ISO timestamp
+        """
+        try:
+            import json
+            from pathlib import Path
+            from datetime import datetime
+
+            queue_file = Path(RESPONSE_QUEUE_FILE)
+            queue_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Read existing
+            responses = []
+            if queue_file.exists():
+                try:
+                    with open(queue_file, 'r') as f:
+                        responses = json.load(f)
+                except:
+                    responses = []
+
+            # Add new response
+            responses.append({
+                'text': text,
+                'chat_id': chat_id,
+                'timestamp': timestamp or datetime.now().isoformat()
+            })
+
+            # Write back
+            with open(queue_file, 'w') as f:
+                json.dump(responses, f)
+
+            logger.debug(f"Wrote response to shared queue: {text[:30]}...")
+
+        except Exception as e:
+            logger.error(f"Could not write shared response: {e}")
+
     # =========================================================================
     # RESPONSE REGISTRATION
     # =========================================================================
@@ -410,9 +481,12 @@ class TelegramResponseHandler:
     # POLLING
     # =========================================================================
 
-    def poll_updates(self) -> List[Dict[str, Any]]:
+    def poll_updates(self, short_poll: bool = False) -> List[Dict[str, Any]]:
         """
         Poll for new Telegram updates.
+
+        Args:
+            short_poll: Use short polling (0 timeout) to avoid conflict with daemon
 
         Returns:
             List of new message updates
@@ -426,11 +500,17 @@ class TelegramResponseHandler:
             url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
             params = {
                 'offset': self.update_offset + 1,
-                'timeout': 30,  # Long polling
+                'timeout': 0 if short_poll else 30,  # Short or long polling
                 'allowed_updates': ['message']
             }
 
             response = requests.get(url, params=params, timeout=35)
+
+            # Handle 409 Conflict (another process is polling)
+            if response.status_code == 409:
+                logger.debug("Telegram polling conflict (409) - another poller is running")
+                return []
+
             response.raise_for_status()
 
             result = response.json()
@@ -450,7 +530,9 @@ class TelegramResponseHandler:
             return messages
 
         except Exception as e:
-            logger.error(f"Error polling updates: {e}")
+            # Don't spam logs with 409 errors
+            if '409' not in str(e):
+                logger.error(f"Error polling updates: {e}")
             return []
 
     def _poll_loop(self) -> None:
@@ -519,6 +601,7 @@ class TelegramResponseHandler:
         Wait synchronously for a user response.
 
         This blocks until response is received or timeout.
+        Checks both direct polling and shared queue (for daemon mode).
 
         Args:
             prompt_id: Unique prompt identifier
@@ -537,10 +620,26 @@ class TelegramResponseHandler:
         )
 
         deadline = datetime.now() + timedelta(seconds=timeout_seconds)
+        poll_conflict_count = 0
 
         while datetime.now() < deadline:
-            # Poll for updates
-            messages = self.poll_updates()
+            # First check shared response queue (from telegram_poller daemon)
+            shared_responses = self._read_shared_responses()
+            for resp in shared_responses:
+                # Create a fake message dict and process it
+                fake_message = {
+                    'chat': {'id': resp.get('chat_id', self.chat_id)},
+                    'text': resp.get('text', ''),
+                    'message_id': 0
+                }
+                self._process_message(fake_message)
+
+            # Then try direct polling (with short timeout to not conflict)
+            messages = self.poll_updates(short_poll=True)
+
+            # If we get 409 conflict, the daemon is running - rely on shared queue
+            if not messages and poll_conflict_count < 3:
+                poll_conflict_count += 1
 
             for message in messages:
                 self._process_message(message)

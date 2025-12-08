@@ -245,7 +245,7 @@ class ClaudeAdvisor:
     # HELPER METHODS
     # =========================================================================
 
-    def _get_option_quotes_table(self, atm_strike: int, wing_distance: int, expiry_date: date) -> str:
+    def _get_option_quotes_table(self, atm_strike: int, wing_distance: int, expiry_date: date) -> tuple:
         """
         Fetch actual option quotes and format as visual Iron Fly structure.
 
@@ -255,7 +255,7 @@ class ClaudeAdvisor:
             expiry_date: Option expiry date
 
         Returns:
-            Formatted visual structure string for Telegram
+            Tuple of (html_formatted_string, net_credit)
         """
         try:
             # Use provided expiry
@@ -298,35 +298,39 @@ class ClaudeAdvisor:
             buy_premium = l_ce_ltp + l_pe_ltp
             net_credit = sell_premium - buy_premium
 
-            # Build visual structure
-            lines = []
-            lines.append(f"═══════ 🦋 IRON FLY ═══════")
-            lines.append(f"        Exp: {expiry_str}")
-            lines.append("")
-            lines.append(f"  🛡️ ─────────── 💰 ─────────── 🛡️")
-            lines.append(f" L-PE          ATM          L-CE")
-            lines.append(f"{lower_wing}  ←───── {atm_strike} ─────→  {upper_wing}")
-            lines.append("")
-            lines.append(f"┌────────────────────────────────┐")
-            lines.append(f"│ SELL ATM │ CE ₹{s_ce_ltp:>5.0f}  PE ₹{s_pe_ltp:>5.0f} │")
-            lines.append(f"│ BUY WING │ CE ₹{l_ce_ltp:>5.0f}  PE ₹{l_pe_ltp:>5.0f} │")
-            lines.append(f"├────────────────────────────────┤")
-            lines.append(f"│ 💰 NET CREDIT: ₹{net_credit:>5.0f}/lot     │")
-            lines.append(f"└────────────────────────────────┘")
+            # Build HTML formatted structure for Telegram
+            html = f"""<b>🦋 IRON FLY STRUCTURE</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Expiry: {expiry_str}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-            return '\n'.join(lines)
+   🛡️ PUT      💰 ATM      🛡️ CALL
+   {lower_wing}      {atm_strike}       {upper_wing}
+   ◄━━━━━━━━━━┃━━━━━━━━━━►
+
+┌─────────────────────────────┐
+│  SELL {atm_strike}CE   ₹{s_ce_ltp:>6.1f}      │
+│  SELL {atm_strike}PE   ₹{s_pe_ltp:>6.1f}      │
+├─────────────────────────────┤
+│  BUY  {upper_wing}CE   ₹{l_ce_ltp:>6.1f}      │
+│  BUY  {lower_wing}PE   ₹{l_pe_ltp:>6.1f}      │
+└─────────────────────────────┘
+</code>
+<b>💰 Net Credit: ₹{net_credit:.1f}/lot</b>"""
+
+            return html, net_credit
 
         except Exception as e:
             logger.warning(f"Could not fetch option quotes: {e}")
             # Fallback to simple format
             upper_wing = atm_strike + wing_distance
             lower_wing = atm_strike - wing_distance
-            return (
-                f"═══════ 🦋 IRON FLY ═══════\n"
-                f"  🛡️ ─────────── 💰 ─────────── 🛡️\n"
-                f"{lower_wing}  ←───── {atm_strike} ─────→  {upper_wing}\n"
-                f"(Live quotes unavailable)"
-            )
+            html = f"""<b>🦋 IRON FLY STRUCTURE</b>
+<code>
+   {lower_wing} PE ◄━━━━ {atm_strike} ━━━━► {upper_wing} CE
+</code>
+<i>(Live quotes unavailable)</i>"""
+            return html, 0
 
     # =========================================================================
     # ADVISORY METHODS
@@ -417,22 +421,29 @@ class ClaudeAdvisor:
             # Fetch actual option quotes for display
             # Use expiry_date if provided, otherwise estimate from dte
             exp_date = expiry_date if expiry_date else (date.today() + timedelta(days=dte))
-            option_table = self._get_option_quotes_table(atm_strike, wing_distance, exp_date)
+            option_html, _ = self._get_option_quotes_table(atm_strike, wing_distance, exp_date)
 
             # Determine emoji based on Claude's recommendation
             rec_emoji = "✅" if response.decision == ClaudeDecision.PROCEED else "⚠️"
             rec_text = "ENTER" if response.decision == ClaudeDecision.PROCEED else "SKIP"
 
-            # Send analysis to user with decision options
-            decision_msg = (
-                f"🤖 *Pre-Entry Analysis*\n\n"
-                f"📊 NIFTY {nifty_spot:,.0f} | 🌡️ VIX {india_vix:.1f} | ⏳ DTE {dte}\n\n"
-                f"{option_table}\n\n"
-                f"*Claude's Analysis:*\n{escape_markdown(response.reasoning[:300])}\n\n"
-                f"{rec_emoji} *Recommendation: {rec_text}*  ({response.confidence:.0%})\n\n"
-                f"⌨️ _Reply: ENTER or SKIP_"
-            )
-            self.telegram.send(decision_msg)
+            # Escape HTML special chars in reasoning
+            reasoning_escaped = response.reasoning.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+            # Send analysis to user with decision options (using HTML)
+            decision_msg = f"""🤖 <b>Pre-Entry Analysis</b>
+
+📊 NIFTY <b>{nifty_spot:,.0f}</b> | 🌡️ VIX <b>{india_vix:.1f}</b> | ⏳ DTE <b>{dte}</b>
+
+{option_html}
+
+<b>📝 Claude's Analysis:</b>
+{reasoning_escaped}
+
+{rec_emoji} <b>Recommendation: {rec_text}</b> ({response.confidence:.0%})
+
+⌨️ <i>Reply: ENTER or SKIP</i>"""
+            self.telegram.send(decision_msg, parse_mode="HTML")
 
             # Wait for user response
             from src.api.response_handler import get_response_handler, ResponseType
