@@ -358,6 +358,36 @@ def cmd_test(args):
     return 0 if tests_failed == 0 else 1
 
 
+def cmd_cooldown(args):
+    """Manage cooldowns."""
+    from src.utils.db import is_on_cooldown, clear_cooldown
+
+    if args.clear:
+        # Clear cooldown
+        cooldown_type = args.clear if args.clear != 'all' else None
+        count = clear_cooldown(cooldown_type)
+        if count > 0:
+            print(f"[OK] Cleared {count} cooldown(s)")
+        else:
+            print("No active cooldowns to clear")
+    else:
+        # Show cooldown status
+        print("\n[COOLDOWN STATUS]:")
+        cooldown_types = ['entry', 'user_skip']
+        any_active = False
+        for ct in cooldown_types:
+            if is_on_cooldown(ct):
+                print(f"   {ct}: ACTIVE")
+                any_active = True
+            else:
+                print(f"   {ct}: inactive")
+
+        if not any_active:
+            print("\n   No active cooldowns")
+
+    return 0
+
+
 def cmd_init(args):
     """Initialize SNAIL system (database, directories)."""
     print("\n" + "=" * 60)
@@ -468,6 +498,11 @@ Commands:
     # Init command
     init_parser = subparsers.add_parser('init', help='Initialize system')
 
+    # Cooldown command
+    cooldown_parser = subparsers.add_parser('cooldown', help='Manage cooldowns')
+    cooldown_parser.add_argument('--clear', nargs='?', const='all', metavar='TYPE',
+                                  help='Clear cooldown (all, entry, user_skip)')
+
     args = parser.parse_args()
 
     # Show banner
@@ -490,6 +525,7 @@ Commands:
         'monitor': cmd_monitor,
         'test': cmd_test,
         'init': cmd_init,
+        'cooldown': cmd_cooldown,
     }
 
     if args.command is None:

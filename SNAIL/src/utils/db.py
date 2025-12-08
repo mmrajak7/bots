@@ -966,6 +966,33 @@ def set_cooldown(cooldown_type: str, duration_seconds: int, position_id: Optiona
         logger.info(f"Cooldown '{cooldown_type}' set until {cooldown_end}")
 
 
+def clear_cooldown(cooldown_type: Optional[str] = None) -> int:
+    """
+    Clear active cooldowns.
+
+    Args:
+        cooldown_type: Specific cooldown type to clear, or None for all
+
+    Returns:
+        Number of cooldowns cleared
+    """
+    with get_db_session() as conn:
+        today = date.today()
+        if cooldown_type:
+            cursor = conn.execute(
+                "DELETE FROM cooldowns WHERE cooldown_type = ? AND cooldown_end > ?",
+                (cooldown_type, today.isoformat())
+            )
+        else:
+            cursor = conn.execute(
+                "DELETE FROM cooldowns WHERE cooldown_end > ?",
+                (today.isoformat(),)
+            )
+        count = cursor.rowcount
+        logger.info(f"Cleared {count} cooldown(s)" + (f" of type '{cooldown_type}'" if cooldown_type else ""))
+        return count
+
+
 def get_next_trading_day(from_date: Optional[date] = None) -> date:
     """
     Get next trading day (skip weekends).
