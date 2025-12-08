@@ -282,19 +282,18 @@ class ClaudeAdvisor:
             s_ce = atm_quotes.get(f"NFO:{short_ce_sym}")
             s_pe = atm_quotes.get(f"NFO:{short_pe_sym}")
 
-            s_ce_ltp = s_ce.ltp if s_ce else 0
-            s_pe_ltp = s_pe.ltp if s_pe else 0
+            # Use BID for SELL orders (what we receive when selling)
             s_ce_bid = s_ce.bid if s_ce else 0
             s_pe_bid = s_pe.bid if s_pe else 0
 
-            # Calculate straddle premium and wing distance
-            straddle_premium = s_ce_ltp + s_pe_ltp
+            # Calculate straddle premium (using bid prices) and wing distance
+            straddle_premium = s_ce_bid + s_pe_bid
             wing_distance = round(straddle_premium / 100) * 100
 
             # Ensure minimum wing distance of 200
             wing_distance = max(wing_distance, 200)
 
-            logger.info(f"Wing distance calculated: {wing_distance} (CE={s_ce_ltp:.2f} + PE={s_pe_ltp:.2f} = {straddle_premium:.2f})")
+            logger.info(f"Wing distance calculated: {wing_distance} (CE Bid={s_ce_bid:.2f} + PE Bid={s_pe_bid:.2f} = {straddle_premium:.2f})")
 
             # Calculate wing strikes
             upper_wing = atm_strike + wing_distance
@@ -309,14 +308,14 @@ class ClaudeAdvisor:
             l_ce = wing_quotes.get(f"NFO:{long_ce_sym}")
             l_pe = wing_quotes.get(f"NFO:{long_pe_sym}")
 
-            l_ce_ltp = l_ce.ltp if l_ce else 0
-            l_pe_ltp = l_pe.ltp if l_pe else 0
+            # Use ASK for BUY orders (what we pay when buying)
             l_ce_ask = l_ce.ask if l_ce else 0
             l_pe_ask = l_pe.ask if l_pe else 0
 
-            # Calculate premiums and net credit
-            straddle_credit = s_ce_ltp + s_pe_ltp
-            wing_cost = l_ce_ltp + l_pe_ltp
+            # Calculate premiums and net credit using Bid/Ask
+            # SELL at Bid (receive), BUY at Ask (pay)
+            straddle_credit = s_ce_bid + s_pe_bid
+            wing_cost = l_ce_ask + l_pe_ask
             net_credit = straddle_credit - wing_cost
 
             # Calculate max profit and max loss for 1 lot
@@ -342,16 +341,17 @@ class ClaudeAdvisor:
                 rr_line = f"<b>⚖️ Risk:Reward:</b> {rr_display}"
 
             # Build HTML table format for Telegram
+            # Show Bid for SELL legs, Ask for BUY legs (actual execution prices)
             html = f"""<b>🦋 IRON FLY</b>
 
-<code>┌──────┬─────────┬────────┬────────┐
-│ Actn │ Strike  │   LTP  │Bid/Ask │
-├──────┼─────────┼────────┼────────┤
-│ SELL │ {atm_strike}CE │ {s_ce_ltp:>6.1f} │ {s_ce_bid:>6.1f} │
-│ SELL │ {atm_strike}PE │ {s_pe_ltp:>6.1f} │ {s_pe_bid:>6.1f} │
-│ BUY  │ {upper_wing}CE │ {l_ce_ltp:>6.1f} │ {l_ce_ask:>6.1f} │
-│ BUY  │ {lower_wing}PE │ {l_pe_ltp:>6.1f} │ {l_pe_ask:>6.1f} │
-└──────┴─────────┴────────┴────────┘</code>
+<code>┌──────┬─────────┬─────────┐
+│ Actn │ Strike  │ Bid/Ask │
+├──────┼─────────┼─────────┤
+│ SELL │ {atm_strike}CE │ {s_ce_bid:>7.1f} │
+│ SELL │ {atm_strike}PE │ {s_pe_bid:>7.1f} │
+│ BUY  │ {upper_wing}CE │ {l_ce_ask:>7.1f} │
+│ BUY  │ {lower_wing}PE │ {l_pe_ask:>7.1f} │
+└──────┴─────────┴─────────┘</code>
 
 <b>💰 Net Credit:</b> ₹{net_credit:.1f} <i>({straddle_credit:.1f} - {wing_cost:.1f})</i>
 <b>📈 Max Profit:</b> ₹{max_profit:,.0f} <i>({net_credit:.1f} × {lot_size})</i>
