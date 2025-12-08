@@ -955,6 +955,17 @@ class EntryManager:
             for signal in signals:
                 success, message = self.process_signal(signal, session)
 
+                # Check if this is a retryable condition - DON'T update CSV, leave blank for retry
+                is_retryable = ("position limit reached" in message.lower() or
+                               "pending order limit reached" in message.lower() or
+                               "insufficient margin" in message.lower())
+
+                if is_retryable:
+                    # Retryable condition - skip CSV update, leave signal blank for next cycle
+                    stats['skipped'] += 1
+                    logger.debug(f"Skipping CSV update for {signal.script} - retryable: {message}")
+                    continue  # Skip CSV update
+
                 # Determine status code for CSV update
                 if success:
                     csv_status = 'S'  # Success - order placed
@@ -978,7 +989,7 @@ class EntryManager:
                     csv_status = 'E'  # Error
                     stats['failed'] += 1
                     stats['processed'] += 1
-                
+
                 # Update CSV status (atomic update for each signal)
                 self.update_signal_status_in_csv(signal, csv_status)
 
