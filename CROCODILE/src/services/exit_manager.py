@@ -415,41 +415,39 @@ class ExitManager:
                         time.sleep(1)
                     continue
 
-                # GTT placed - Now verify it exists
+                # GTT placement succeeded - SAVE IT IMMEDIATELY before verification
+                # This prevents duplicate GTTs if verification fails but GTT actually exists
+                position.current_sl = dummy_sl_rounded
+                position.initial_sl = dummy_sl_rounded  # Will be updated at EOD
+                position.current_gtt_id = str(gtt_id)  # Ensure string format
+                position.gtt_placed_at = ist_now_naive()
+                session.commit()
+                logger.info(f"GTT ID {gtt_id} saved to DB for {trading_symbol}")
+
+                # Now verify it exists in Zerodha
                 verified, verify_error = self._verify_gtt_exists(
                     gtt_id=gtt_id,
                     script=trading_symbol
                 )
 
                 if verified:
-                    # SUCCESS! Update position with GTT details
-                    position.current_sl = dummy_sl_rounded
-                    position.initial_sl = dummy_sl_rounded  # Will be updated at EOD
-                    position.current_gtt_id = gtt_id
-                    position.gtt_placed_at = ist_now_naive()
-                    session.commit()
-
                     logger.info(
                         f"✅ Dummy GTT placed and verified: {gtt_id} for {trading_symbol}"
                     )
                     return True, gtt_id, None
 
                 else:
-                    # Verification failed - GTT might not exist despite success response
-                    last_error = verify_error
-                    logger.error(
-                        f"⚠️ GTT {gtt_id} verification failed (attempt {attempt}): {verify_error}"
+                    # Verification failed but GTT ID already saved to DB
+                    # DON'T cancel - GTT might exist but not propagated yet
+                    # DON'T retry - would create duplicate GTTs
+                    logger.warning(
+                        f"⚠️ GTT {gtt_id} verification failed but ID saved to DB: {verify_error}. "
+                        f"GTT may exist - will be verified by monitoring. NOT retrying to avoid duplicates."
                     )
 
-                    # Try to cancel the phantom GTT (might not exist, but try anyway)
-                    try:
-                        self.cancel_gtt_order(gtt_id)
-                    except Exception as cancel_err:
-                        logger.warning(f"Could not cancel phantom GTT {gtt_id}: {cancel_err}")
-
-                    # Wait before retry (except on last attempt)
-                    if attempt < self.gtt_max_placement_attempts:
-                        time.sleep(1)
+                    # Return success with warning - GTT is placed but unverified
+                    # The monitoring system will detect if it's actually missing
+                    return True, gtt_id, f"GTT placed but verification failed: {verify_error}"
 
             # All attempts failed
             critical_error = (
@@ -696,7 +694,14 @@ class ExitManager:
                         time.sleep(1)
                     continue
 
-                # GTT placed - Now verify it exists
+                # GTT placement succeeded - SAVE IT IMMEDIATELY before verification
+                # This prevents duplicate GTTs if verification fails but GTT actually exists
+                new_gtt_id = gtt_id
+                position.current_gtt_id = str(new_gtt_id)  # Ensure string format
+                session.commit()
+                logger.info(f"New GTT ID {new_gtt_id} saved to DB for {position.script}")
+
+                # Now verify it exists in Zerodha
                 verified, verify_error = self._verify_gtt_exists(
                     gtt_id=gtt_id,
                     script=position.script
@@ -704,26 +709,19 @@ class ExitManager:
 
                 if verified:
                     # SUCCESS!
-                    new_gtt_id = gtt_id
                     break
                 else:
-                    # Verification failed
-                    last_error = verify_error
-                    logger.error(
-                        f"⚠️ GTT {gtt_id} verification failed (attempt {attempt}): {verify_error}"
+                    # Verification failed but GTT ID already saved to DB
+                    # DON'T cancel - GTT might exist but not propagated yet
+                    # DON'T retry - would create duplicate GTTs
+                    logger.warning(
+                        f"⚠️ GTT {gtt_id} verification failed but ID saved to DB: {verify_error}. "
+                        f"GTT may exist - will be verified by monitoring. NOT retrying to avoid duplicates."
                     )
+                    # Break out of retry loop - GTT ID is saved, monitoring will verify
+                    break
 
-                    # Try to cancel the phantom GTT
-                    try:
-                        self.cancel_gtt_order(gtt_id)
-                    except Exception as cancel_err:
-                        logger.warning(f"Could not cancel phantom GTT {gtt_id}: {cancel_err}")
-
-                    # Wait before retry (except on last attempt)
-                    if attempt < self.gtt_max_placement_attempts:
-                        time.sleep(1)
-
-            # Check if we successfully placed and verified new GTT
+            # Check if we successfully placed new GTT (verified or unverified)
             if new_gtt_id is None:
                 # CRITICAL: Old GTT cancelled but new one failed verification!
                 critical_error = (
