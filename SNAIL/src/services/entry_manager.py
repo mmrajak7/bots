@@ -528,29 +528,37 @@ class EntryManager:
             )
 
             # Step 5b: Position Verification (TDD Section 6.2)
-            logger.info("Verifying positions after entry...")
-            verified, verification_issues = verify_iron_fly_positions(
-                kite=self.kite,
-                symbols=symbols,
-                quantity=quantity
-            )
+            # Skip verification in paper trading mode (no real positions to verify)
+            from src.utils.config import is_paper_trading
+            verified = True
+            verification_issues = []
 
-            if not verified:
-                # Position mismatch detected - CRITICAL alert
-                issue_text = "; ".join(verification_issues)
-                logger.error(f"POSITION VERIFICATION FAILED: {issue_text}")
-
-                self.telegram.send(
-                    f"🚨 *CRITICAL: Position Verification Failed!*\n\n"
-                    f"Orders executed but positions don't match expected:\n"
-                    f"{''.join(f'• {i}' + chr(10) for i in verification_issues)}\n"
-                    f"⚠️ *Manual intervention required!*\n\n"
-                    f"Check Kite positions immediately."
+            if is_paper_trading():
+                logger.info("Paper trading mode - skipping position verification")
+            else:
+                logger.info("Verifying positions after entry...")
+                verified, verification_issues = verify_iron_fly_positions(
+                    kite=self.kite,
+                    symbols=symbols,
+                    quantity=quantity
                 )
 
-                # Still record position but mark as unverified
-                # The database Position has a 'verified' field for this
-                logger.warning("Recording position as UNVERIFIED")
+                if not verified:
+                    # Position mismatch detected - CRITICAL alert
+                    issue_text = "; ".join(verification_issues)
+                    logger.error(f"POSITION VERIFICATION FAILED: {issue_text}")
+
+                    self.telegram.send(
+                        f"🚨 *CRITICAL: Position Verification Failed!*\n\n"
+                        f"Orders executed but positions don't match expected:\n"
+                        f"{''.join(f'• {i}' + chr(10) for i in verification_issues)}\n"
+                        f"⚠️ *Manual intervention required!*\n\n"
+                        f"Check Kite positions immediately."
+                    )
+
+                    # Still record position but mark as unverified
+                    # The database Position has a 'verified' field for this
+                    logger.warning("Recording position as UNVERIFIED")
 
             # Step 6: Calculate charges
             charges = calculate_iron_fly_charges(

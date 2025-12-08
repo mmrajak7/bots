@@ -258,11 +258,64 @@ class TelegramResponseHandler:
                 queue_file.write_text('[]')
                 logger.debug("Cleared shared queue file")
 
+                # Filter out stale responses (older than 60 seconds)
+                valid_responses = []
+                now = datetime.now()
+                for resp in responses:
+                    ts = resp.get('timestamp')
+                    if ts:
+                        try:
+                            resp_time = datetime.fromisoformat(ts)
+                            age_seconds = (now - resp_time).total_seconds()
+                            if age_seconds <= 60:
+                                valid_responses.append(resp)
+                            else:
+                                logger.warning(f"Rejecting stale response (age={age_seconds:.0f}s): {resp}")
+                        except:
+                            valid_responses.append(resp)  # Keep if timestamp parse fails
+                    else:
+                        valid_responses.append(resp)  # Keep if no timestamp
+
+                return valid_responses
+
             return responses if isinstance(responses, list) else []
 
         except Exception as e:
             logger.warning(f"Could not read shared responses from {RESPONSE_QUEUE_FILE}: {e}")
             return []
+
+    @staticmethod
+    def clear_shared_queue() -> int:
+        """
+        Clear all responses from the shared queue.
+        Call this BEFORE sending a new prompt to prevent stale responses.
+
+        Returns:
+            Number of responses cleared
+        """
+        try:
+            from pathlib import Path
+            import json
+
+            queue_file = Path(RESPONSE_QUEUE_FILE)
+            if not queue_file.exists():
+                return 0
+
+            with open(queue_file, 'r') as f:
+                content = f.read().strip()
+                if not content or content == '[]':
+                    return 0
+                responses = json.loads(content)
+
+            count = len(responses) if isinstance(responses, list) else 0
+            if count > 0:
+                queue_file.write_text('[]')
+                logger.warning(f"Cleared {count} stale response(s) from shared queue: {responses}")
+            return count
+
+        except Exception as e:
+            logger.warning(f"Could not clear shared queue: {e}")
+            return 0
 
     @staticmethod
     def write_shared_response(text: str, chat_id: str, timestamp: str = None) -> None:
@@ -272,7 +325,7 @@ class TelegramResponseHandler:
         Args:
             text: Response text
             chat_id: Chat ID the response came from
-            timestamp: ISO timestamp
+            timestamp: ISO timestamp (auto-generated if None)
         """
         try:
             import json

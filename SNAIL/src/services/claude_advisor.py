@@ -535,10 +535,15 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             msg_parts.append("⌨️ <i>Reply: ENTER or SKIP</i>")
 
             decision_msg = "\n".join(msg_parts)
+
+            # CRITICAL: Clear any stale responses from queue BEFORE sending prompt
+            # This prevents old "enter"/"skip" responses from auto-confirming new prompts
+            from src.api.response_handler import get_response_handler, ResponseType, TelegramResponseHandler
+            TelegramResponseHandler.clear_shared_queue()
+
             self.telegram.send(decision_msg, parse_mode="HTML")
 
             # Step 5: Wait for user response
-            from src.api.response_handler import get_response_handler, ResponseType
             handler = get_response_handler()
 
             user_response = handler.wait_for_response(
