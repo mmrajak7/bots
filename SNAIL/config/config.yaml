@@ -50,7 +50,7 @@ trading:
 
   # Exit conditions
   exit:
-    profit_target_pct: 25    # Exit at 25% of max profit
+    profit_target_pct: 30    # Exit at 30% of max profit
     stop_loss_pct: 50        # Alert at 50% of max loss
     vix_hard_exit: 20        # Hard exit if VIX > 20
     vix_warning_zone: 16.5   # Warning if VIX > 16.5

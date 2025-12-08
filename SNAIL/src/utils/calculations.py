@@ -112,7 +112,7 @@ def calculate_wing_distance(
     ce_premium: float,
     pe_premium: float,
     round_to: int = 100,
-    min_distance: int = 200
+    min_distance: int = 300
 ) -> int:
     """
     Calculate dynamic wing distance based on straddle premium.

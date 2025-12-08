@@ -108,6 +108,9 @@ sample/
 # Kite integration experiments
 kite_integration/
 
+# Backtest folder (local analysis only)
+backtest/
+
 # Review files
 *.txt
 !requirements*.txt
