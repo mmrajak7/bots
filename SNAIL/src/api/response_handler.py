@@ -36,7 +36,8 @@ POLL_INTERVAL = 2  # seconds
 from pathlib import Path as _Path
 _PROJECT_ROOT = _Path(__file__).parent.parent.parent
 UPDATE_OFFSET_FILE = str(_PROJECT_ROOT / "data" / "telegram_update_offset.txt")
-RESPONSE_QUEUE_FILE = str(_PROJECT_ROOT / "data" / "telegram_responses.json")  # Shared response queue
+RESPONSE_QUEUE_FILE = str(_PROJECT_ROOT / "data" / "telegram_responses.json")  # Shared response queue for ENTER/SKIP
+CALLBACK_QUEUE_FILE = str(_PROJECT_ROOT / "data" / "telegram_callbacks.json")  # Shared queue for button callbacks (HOLD/EXIT/ADJUST)
 
 
 # =============================================================================
@@ -359,6 +360,112 @@ class TelegramResponseHandler:
 
         except Exception as e:
             logger.error(f"Could not write shared response: {e}")
+
+    # =========================================================================
+    # CALLBACK QUEUE (for button responses: HOLD/EXIT/ADJUST)
+    # =========================================================================
+
+    @staticmethod
+    def write_callback(action: str, alert_type: str, position_id: int = None, chat_id: str = None) -> None:
+        """
+        Write a button callback to the shared callback queue.
+        Called by telegram_poller daemon when user clicks HOLD/EXIT/ADJUST buttons.
+
+        Args:
+            action: Action type (hold, exit, adjust, yes, no)
+            alert_type: Alert type (stop_loss, wing_approach, friday, vix_warning, exit_confirm)
+            position_id: Position ID if applicable
+            chat_id: Chat ID
+        """
+        try:
+            import json
+            from pathlib import Path
+            from datetime import datetime
+
+            queue_file = Path(CALLBACK_QUEUE_FILE)
+            queue_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Read existing
+            callbacks = []
+            if queue_file.exists():
+                try:
+                    with open(queue_file, 'r') as f:
+                        callbacks = json.load(f)
+                except:
+                    callbacks = []
+
+            # Add new callback
+            callbacks.append({
+                'action': action,
+                'alert_type': alert_type,
+                'position_id': position_id,
+                'chat_id': chat_id,
+                'timestamp': datetime.now().isoformat()
+            })
+
+            # Write back
+            with open(queue_file, 'w') as f:
+                json.dump(callbacks, f)
+
+            logger.info(f"Wrote callback to queue: {action}:{alert_type}:{position_id}")
+
+        except Exception as e:
+            logger.error(f"Could not write callback: {e}")
+
+    @staticmethod
+    def read_callbacks() -> list:
+        """
+        Read and clear callbacks from the shared callback queue.
+
+        Returns:
+            List of callback dicts
+        """
+        try:
+            import json
+            from pathlib import Path
+            from datetime import datetime
+
+            queue_file = Path(CALLBACK_QUEUE_FILE)
+            if not queue_file.exists():
+                return []
+
+            with open(queue_file, 'r') as f:
+                content = f.read().strip()
+                if not content or content == '[]':
+                    return []
+                callbacks = json.loads(content)
+
+            if callbacks:
+                # Clear the file after reading
+                queue_file.write_text('[]')
+
+                # Filter out stale callbacks (older than 5 minutes)
+                valid_callbacks = []
+                now = datetime.now()
+                for cb in callbacks:
+                    ts = cb.get('timestamp')
+                    if ts:
+                        try:
+                            cb_time = datetime.fromisoformat(ts)
+                            age_seconds = (now - cb_time).total_seconds()
+                            if age_seconds <= 300:  # 5 minutes
+                                valid_callbacks.append(cb)
+                            else:
+                                logger.warning(f"Rejecting stale callback (age={age_seconds:.0f}s): {cb}")
+                        except:
+                            valid_callbacks.append(cb)
+                    else:
+                        valid_callbacks.append(cb)
+
+                if valid_callbacks:
+                    logger.info(f"Read {len(valid_callbacks)} callback(s) from queue")
+                return valid_callbacks
+
+            return []
+
+        except Exception as e:
+            logger.warning(f"Could not read callbacks: {e}")
+            return []
 
     # =========================================================================
     # RESPONSE REGISTRATION

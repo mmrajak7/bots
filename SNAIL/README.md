@@ -57,6 +57,64 @@ Edit `.env` for credentials:
 
 Set `SNAIL_PAPER_TRADING=true` for paper trading mode.
 
+## Telegram Bot Setup
+
+### BotFather Commands
+
+Open Telegram, find @BotFather, and send these commands:
+
+1. **Create bot** (if new): `/newbot` → Follow prompts
+2. **Set commands**: `/setcommands` → Select your bot → Paste:
+
+```
+start - Show welcome and help
+help - Show available commands
+status - System and position status
+position - Detailed position info
+pnl - Current P&L summary
+market - NIFTY and VIX data
+cooldown - Show/clear entry cooldowns
+exit - Request position exit
+hold - Confirm hold position
+```
+
+3. **Set description**: `/setdescription` → Select bot → Paste:
+```
+SNAIL Trading Bot - Automated NIFTY Iron Fly system with real-time alerts and interactive controls.
+```
+
+### Telegram Commands
+
+| Command | Description |
+|---------|-------------|
+| `/status` | System status, position summary, P&L |
+| `/position` | Detailed position with all 4 legs |
+| `/pnl` | Current P&L with targets |
+| `/market` | Live NIFTY spot and VIX |
+| `/cooldown` | View active cooldowns |
+| `/cooldown clear` | Clear all cooldowns |
+| `/cooldown clear user_skip` | Clear specific cooldown |
+| `/exit` | Request position exit (with confirmation) |
+| `/hold` | Confirm hold decision |
+
+### Quick Actions (Text Responses)
+
+For entry prompts:
+- **ENTER** (or: yes, proceed, go, ok) → Proceed with trade
+- **SKIP** (or: no, cancel, wait, pass) → Skip entry
+
+For position alerts:
+- **HOLD** → Keep position
+- **EXIT** → Close position
+- **ADJUST** → Request manual adjustment
+
+### Interactive Buttons
+
+All alerts include inline buttons for quick response:
+- Stop loss alerts: HOLD / EXIT / ADJUST
+- Friday close: HOLD / EXIT
+- VIX warnings: HOLD / EXIT
+
 ## Cron Schedule (Raspberry Pi)
 
 ```cron

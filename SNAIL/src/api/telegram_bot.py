@@ -183,6 +183,8 @@ class TelegramBot:
         self.register_command("exit", self._cmd_exit)
         self.register_command("hold", self._cmd_hold)
         self.register_command("pnl", self._cmd_pnl)
+        self.register_command("market", self._cmd_market)
+        self.register_command("cooldown", self._cmd_cooldown)
 
     def register_command(self, command: str, handler: Callable):
         """
@@ -468,9 +470,9 @@ class TelegramBot:
                 return
             action_str = parts[0]
             alert_type = parts[1] if len(parts) > 1 else "unknown"
-            position_id = int(parts[2]) if len(parts) > 2 else None
+            position_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
 
-            # Map to CallbackAction
+            # Map to CallbackAction for in-memory queue (keep for backward compat)
             action_map = {
                 "hold": CallbackAction.HOLD,
                 "exit": CallbackAction.EXIT,
@@ -481,6 +483,17 @@ class TelegramBot:
 
             action = action_map.get(action_str.lower())
             if action:
+                # Write to SHARED file queue (for monitor_workflow to read)
+                from src.api.response_handler import TelegramResponseHandler
+                TelegramResponseHandler.write_callback(
+                    action=action_str.lower(),
+                    alert_type=alert_type,
+                    position_id=position_id,
+                    chat_id=str(update.chat_id)
+                )
+                logger.info(f"Callback written to shared queue: {action_str}:{alert_type}:{position_id}")
+
+                # Also queue in-memory for backward compatibility
                 self._queue_response(action, alert_type, position_id, update.from_user_id)
 
                 # Clear the pending decision for this alert type
@@ -490,7 +503,7 @@ class TelegramBot:
 
                 # Update message to show selection
                 self._edit_message_reply_markup(update.chat_id, update.message_id, None)
-                self._send_reply(f"Response received: *{action_str.upper()}*\n\nProcessing...")
+                self._send_reply(f"✅ *{action_str.upper()}* received\n\nProcessing...")
 
         except Exception as e:
             logger.error(f"Error handling callback: {e}")
@@ -545,59 +558,293 @@ class TelegramBot:
 
 Welcome! I'm the SNAIL Iron Fly trading system.
 
-*Available Commands:*
-/status - System status
-/position - Current position details
-/pnl - Current P&L
+*Commands:*
+/status - System & position status
+/position - Detailed position info
+/pnl - Current P&L summary
+/market - NIFTY & VIX data
+/cooldown - Show/clear cooldowns
 /exit - Request position exit
 /hold - Confirm hold position
 /help - Show this help
 
-_Use buttons or type commands directly._""")
+*Quick Actions:*
+Type ENTER/SKIP for entry prompts
+Type HOLD/EXIT for position alerts
+
+_Buttons work too!_""")
 
     def _cmd_help(self, update: TelegramUpdate, args: List[str]):
         """Handle /help command."""
         self._cmd_start(update, args)
 
     def _cmd_status(self, update: TelegramUpdate, args: List[str]):
-        """Handle /status command."""
-        # This will be overridden by the main system
-        self._send_reply("""📊 *System Status*
+        """Handle /status command - shows market + position status."""
+        try:
+            from src.utils.db import get_active_position, get_latest_pnl_snapshot
+            from src.utils.helpers import is_market_open
 
-Use this command during trading hours for live status.
+            position = get_active_position()
 
-_Status check initiated..._""")
+            if not position:
+                market_status = "Open" if is_market_open() else "Closed"
+                self._send_reply(f"""📊 *System Status*
 
-        # Queue a status request
-        self._queue_response(CallbackAction.HOLD, "status_request")
+• Position: None
+• State: {'Waiting for entry' if is_market_open() else 'Idle'}
+• Market: {market_status}
+
+_Use /market for NIFTY & VIX data_""")
+                return
+
+            # Get P&L snapshot
+            snapshot = get_latest_pnl_snapshot(position.id)
+
+            if snapshot:
+                pnl_emoji = "🟢" if snapshot.current_pnl >= 0 else "🔴"
+                pnl_sign = "+" if snapshot.current_pnl >= 0 else ""
+
+                self._send_reply(f"""📊 *System Status*
+
+• Position: Active Iron Fly
+• ATM Strike: {position.atm_strike}
+• Wings: ±{position.wing_distance}
+• Expiry: {position.expiry_date}
+
+{pnl_emoji} *P&L: {pnl_sign}₹{snapshot.current_pnl:,.0f}* ({snapshot.pnl_percent:+.1f}%)
+
+• NIFTY: ₹{snapshot.nifty_spot:,.0f}
+• VIX: {snapshot.vix:.2f}
+
+_Last updated: {snapshot.timestamp.strftime('%H:%M:%S') if snapshot.timestamp else 'N/A'}_""")
+            else:
+                self._send_reply(f"""📊 *System Status*
+
+• Position: Active Iron Fly
+• ATM Strike: {position.atm_strike}
+• Wings: ±{position.wing_distance}
+• Expiry: {position.expiry_date}
+
+_P&L data pending - monitor will update soon_""")
+
+        except Exception as e:
+            logger.error(f"Error in /status: {e}")
+            self._send_reply(f"❌ Error fetching status: {str(e)[:100]}")
 
     def _cmd_position(self, update: TelegramUpdate, args: List[str]):
-        """Handle /position command."""
-        self._send_reply("📍 Checking position...")
-        self._queue_response(CallbackAction.HOLD, "position_request")
+        """Handle /position command - shows detailed position info."""
+        try:
+            from src.utils.db import get_active_position, get_position_legs
+
+            position = get_active_position()
+
+            if not position:
+                self._send_reply("📍 *No Active Position*\n\n_Waiting for entry opportunity._")
+                return
+
+            legs = get_position_legs(position.id)
+
+            # Format legs
+            legs_text = ""
+            for leg in legs:
+                side = "S" if leg.side == "SHORT" else "B"
+                legs_text += f"• {side} {leg.tradingsymbol} @ ₹{leg.entry_price:.1f}\n"
+
+            self._send_reply(f"""📍 *Position Details*
+
+*Iron Fly on NIFTY*
+• ATM: {position.atm_strike}
+• Wings: ±{position.wing_distance}
+• Expiry: {position.expiry_date}
+• Qty: {position.quantity} ({position.lot_size} per lot)
+
+*Entry:*
+• Net Credit: ₹{position.entry_premium:.1f}
+• Max Profit: ₹{position.max_profit:,.0f}
+• Max Loss: ₹{position.max_loss:,.0f}
+
+*Legs:*
+{legs_text}
+_Entry: {position.entry_time.strftime('%Y-%m-%d %H:%M') if position.entry_time else 'N/A'}_""")
+
+        except Exception as e:
+            logger.error(f"Error in /position: {e}")
+            self._send_reply(f"❌ Error: {str(e)[:100]}")
 
     def _cmd_pnl(self, update: TelegramUpdate, args: List[str]):
-        """Handle /pnl command."""
-        self._send_reply("💰 Calculating P&L...")
-        self._queue_response(CallbackAction.HOLD, "pnl_request")
+        """Handle /pnl command - shows current P&L with real-time quote."""
+        try:
+            from src.utils.db import get_active_position, get_position_legs, get_latest_pnl_snapshot
+
+            position = get_active_position()
+
+            if not position:
+                self._send_reply("💰 *No Active Position*\n\n_No P&L to display._")
+                return
+
+            snapshot = get_latest_pnl_snapshot(position.id)
+
+            if snapshot:
+                pnl_emoji = "🟢" if snapshot.current_pnl >= 0 else "🔴"
+                pnl_sign = "+" if snapshot.current_pnl >= 0 else ""
+
+                # Calculate P&L percentage of max profit/loss
+                if snapshot.current_pnl >= 0:
+                    pct_of_target = (snapshot.current_pnl / position.max_profit * 100) if position.max_profit else 0
+                    target_text = f"{pct_of_target:.1f}% of max profit"
+                else:
+                    pct_of_max_loss = (abs(snapshot.current_pnl) / position.max_loss * 100) if position.max_loss else 0
+                    target_text = f"{pct_of_max_loss:.1f}% of max loss"
+
+                self._send_reply(f"""💰 *P&L Summary*
+
+{pnl_emoji} *Current: {pnl_sign}₹{snapshot.current_pnl:,.0f}*
+📊 {snapshot.pnl_percent:+.1f}% ({target_text})
+
+*Targets:*
+• Max Profit: ₹{position.max_profit:,.0f}
+• Max Loss: ₹{position.max_loss:,.0f}
+• Exit at: 50% profit (₹{position.max_profit * 0.5:,.0f})
+
+*Market:*
+• NIFTY: ₹{snapshot.nifty_spot:,.0f}
+• VIX: {snapshot.vix:.2f}
+
+_Updated: {snapshot.timestamp.strftime('%H:%M:%S') if snapshot.timestamp else 'N/A'}_""")
+            else:
+                self._send_reply(f"""💰 *P&L Summary*
+
+• Max Profit: ₹{position.max_profit:,.0f}
+• Max Loss: ₹{position.max_loss:,.0f}
+
+_Real-time P&L pending - monitor updating..._""")
+
+        except Exception as e:
+            logger.error(f"Error in /pnl: {e}")
+            self._send_reply(f"❌ Error: {str(e)[:100]}")
+
+    def _cmd_market(self, update: TelegramUpdate, args: List[str]):
+        """Handle /market command - shows current market data."""
+        try:
+            from src.api.kite_client import get_kite_client
+            from src.utils.config import load_config
+
+            kite = get_kite_client(load_config())
+            nifty = kite.get_nifty_spot()
+            vix = kite.get_india_vix()
+
+            if nifty and vix:
+                # Determine market sentiment
+                if vix < 12:
+                    sentiment = "🟢 Low volatility"
+                elif vix < 16:
+                    sentiment = "🟡 Normal volatility"
+                elif vix < 20:
+                    sentiment = "🟠 Elevated volatility"
+                else:
+                    sentiment = "🔴 High volatility"
+
+                self._send_reply(f"""📈 *Market Data*
+
+*NIFTY 50:* ₹{nifty:,.2f}
+*India VIX:* {vix:.2f}
+
+{sentiment}
+
+_VIX Range for entry: 10-16_""")
+            else:
+                self._send_reply("❌ Could not fetch market data. Market may be closed.")
+
+        except Exception as e:
+            logger.error(f"Error in /market: {e}")
+            self._send_reply(f"❌ Error: {str(e)[:100]}")
+
+    def _cmd_cooldown(self, update: TelegramUpdate, args: List[str]):
+        """Handle /cooldown command - shows/clears cooldowns."""
+        try:
+            from src.utils.db import is_on_cooldown, get_cooldown_remaining, clear_cooldown
+
+            # Check for clear argument
+            if args and args[0].lower() == 'clear':
+                cooldown_type = args[1] if len(args) > 1 else None
+                count = clear_cooldown(cooldown_type)
+                if count > 0:
+                    self._send_reply(f"✅ Cleared {count} cooldown(s)")
+                else:
+                    self._send_reply("ℹ️ No active cooldowns to clear")
+                return
+
+            # Show cooldown status
+            cooldown_types = ['entry', 'user_skip']
+            status_lines = []
+            any_active = False
+
+            for ct in cooldown_types:
+                remaining = get_cooldown_remaining(ct)
+                if remaining is not None:
+                    hours = remaining // 3600
+                    minutes = (remaining % 3600) // 60
+                    time_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+                    status_lines.append(f"• {ct}: 🔴 ACTIVE ({time_str} left)")
+                    any_active = True
+                else:
+                    status_lines.append(f"• {ct}: 🟢 inactive")
+
+            status_text = "\n".join(status_lines)
+
+            if any_active:
+                self._send_reply(f"""⏰ *Cooldown Status*
+
+{status_text}
+
+_To clear: /cooldown clear [type]_
+_Example: /cooldown clear user\\_skip_""")
+            else:
+                self._send_reply(f"""⏰ *Cooldown Status*
+
+{status_text}
+
+✅ No active cooldowns - entry allowed""")
+
+        except Exception as e:
+            logger.error(f"Error in /cooldown: {e}")
+            self._send_reply(f"❌ Error: {str(e)[:100]}")
 
     def _cmd_exit(self, update: TelegramUpdate, args: List[str]):
-        """Handle /exit command."""
-        # Send confirmation with inline keyboard
-        self.send_with_keyboard(
-            "⚠️ *Confirm Exit?*",
-            [
+        """Handle /exit command - confirm and queue exit request."""
+        try:
+            from src.utils.db import get_active_position
+
+            position = get_active_position()
+            if not position:
+                self._send_reply("❌ *No Active Position*\n\n_Nothing to exit._")
+                return
+
+            # Send confirmation with inline keyboard
+            self.send_with_keyboard(
+                f"""⚠️ *Confirm Exit?*
+
+Position: Iron Fly @ {position.atm_strike}
+Expiry: {position.expiry_date}
+
+This will close all 4 legs at market.""",
                 [
-                    {"text": "✅ Yes", "callback_data": "yes:exit_confirm"},
-                    {"text": "❌ No", "callback_data": "no:exit_confirm"}
+                    [
+                        {"text": "✅ Yes, Exit", "callback_data": f"yes:exit_confirm:{position.id}"},
+                        {"text": "❌ Cancel", "callback_data": "no:exit_confirm"}
+                    ]
                 ]
-            ]
-        )
+            )
+
+        except Exception as e:
+            logger.error(f"Error in /exit: {e}")
+            self._send_reply(f"❌ Error: {str(e)[:100]}")
 
     def _cmd_hold(self, update: TelegramUpdate, args: List[str]):
-        """Handle /hold command."""
+        """Handle /hold command - confirms hold decision."""
+        from src.api.response_handler import TelegramResponseHandler
+        TelegramResponseHandler.write_callback("hold", "manual_hold")
         self._send_reply("✋ *Hold confirmed* - monitoring continues")
-        self._queue_response(CallbackAction.HOLD, "manual_hold")
 
     # =========================================================================
     # INLINE KEYBOARD METHODS

@@ -362,9 +362,92 @@ class MonitorWorkflow:
         """
         Process pending user responses from Telegram.
 
+        Checks both:
+        1. In-memory queue (when telegram_bot runs in same process)
+        2. Shared file queue (when telegram_poller daemon is separate process)
+
         Returns:
             True if exit action taken, False if hold, None if no responses
         """
+        # First check shared file queue (from telegram_poller daemon)
+        from src.api.response_handler import TelegramResponseHandler
+        callbacks = TelegramResponseHandler.read_callbacks()
+
+        for cb in callbacks:
+            action_str = cb.get('action', '')
+            alert_type = cb.get('alert_type', 'unknown')
+            position_id = cb.get('position_id')
+
+            logger.info(f"Processing callback from shared queue: {action_str} for {alert_type}")
+
+            # Convert to UserResponse-like handling
+            if alert_type == "stop_loss":
+                self._pending_stop_loss_decision = False
+                if action_str == "exit":
+                    position = get_active_position()
+                    if position:
+                        result = self.exit_manager.execute_exit(
+                            reason=ExitReason.STOP_LOSS,
+                            position=position
+                        )
+                        return result.success
+                elif action_str == "hold":
+                    logger.info("User chose HOLD at stop loss (from callback)")
+                    self.telegram.send("*Position HELD* per your decision. Monitoring continues.")
+                    return False
+                elif action_str == "adjust":
+                    logger.info("User requested adjustment at stop loss (from callback)")
+                    self.telegram.send("*ADJUSTMENT requested*. Manual intervention required.")
+                    return False
+
+            elif alert_type == "friday":
+                self._pending_friday_decision = False
+                if action_str == "exit":
+                    position = get_active_position()
+                    if position:
+                        result = self.exit_manager.execute_exit(
+                            reason=ExitReason.FRIDAY_CLOSE,
+                            position=position
+                        )
+                        return result.success
+                elif action_str == "hold":
+                    logger.info("User chose HOLD over weekend (from callback)")
+                    self.telegram.send("*Position HELD* for weekend carry. Next check Monday.")
+                    return False
+
+            elif alert_type == "vix_warning":
+                self._pending_vix_decision = False
+                if action_str == "exit":
+                    position = get_active_position()
+                    if position:
+                        result = self.exit_manager.execute_exit(
+                            reason=ExitReason.VIX_BREACH,
+                            position=position
+                        )
+                        return result.success
+                elif action_str == "hold":
+                    logger.info("User chose HOLD despite VIX warning (from callback)")
+                    self.telegram.send("*Position HELD* despite VIX warning. Monitoring closely.")
+                    return False
+
+            elif alert_type == "exit_confirm":
+                if action_str == "yes":
+                    position = get_active_position()
+                    if position:
+                        result = self.exit_manager.execute_exit(
+                            reason=ExitReason.MANUAL,
+                            position=position
+                        )
+                        return result.success
+                elif action_str == "no":
+                    self.telegram.send("*Exit cancelled.* Position unchanged.")
+                    return False
+
+            elif alert_type == "manual_hold":
+                logger.info("User confirmed HOLD via /hold command")
+                return False
+
+        # Then check in-memory queue (for backward compat when bot runs in same process)
         if not self.telegram_bot:
             return None
 
