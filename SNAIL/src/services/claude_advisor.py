@@ -245,24 +245,32 @@ class ClaudeAdvisor:
     # HELPER METHODS
     # =========================================================================
 
-    def _get_option_quotes_and_structure(self, atm_strike: int, expiry_date: date) -> tuple:
+    def _get_option_quotes_and_structure(self, atm_strike: int, expiry_date: date, dte: int) -> tuple:
         """
         Fetch actual option quotes, calculate wing distance from straddle premium,
-        and format as visual Iron Fly structure.
+        and format as table for Telegram.
 
         Wing distance = Straddle Premium (CE + PE) rounded to nearest 100.
 
         Args:
             atm_strike: ATM strike price
             expiry_date: Option expiry date
+            dte: Days to expiry
 
         Returns:
-            Tuple of (html_formatted_string, wing_distance, straddle_premium, net_credit)
+            Tuple of (html_formatted_string, wing_distance, straddle_premium, net_credit, lot_size, max_profit, max_loss)
         """
         try:
+            from src.utils.symbol_builder import get_lot_size_from_instruments, load_instruments
+
             # Use provided expiry
             expiry = expiry_date
             expiry_str = expiry.strftime('%d-%b')
+
+            # Get lot size from instruments
+            instruments_df = load_instruments()
+            lot_size = get_lot_size_from_instruments(instruments_df, expiry)
+            logger.info(f"Lot size for expiry {expiry}: {lot_size}")
 
             # First, fetch ATM quotes to get straddle premium
             short_ce_sym = generate_nifty_option_symbol(expiry, atm_strike, 'CE')
@@ -275,6 +283,8 @@ class ClaudeAdvisor:
 
             s_ce_ltp = s_ce.ltp if s_ce else 0
             s_pe_ltp = s_pe.ltp if s_pe else 0
+            s_ce_bid = s_ce.bid if s_ce else 0
+            s_pe_bid = s_pe.bid if s_pe else 0
 
             # Calculate straddle premium and wing distance
             straddle_premium = s_ce_ltp + s_pe_ltp
@@ -300,45 +310,49 @@ class ClaudeAdvisor:
 
             l_ce_ltp = l_ce.ltp if l_ce else 0
             l_pe_ltp = l_pe.ltp if l_pe else 0
+            l_ce_ask = l_ce.ask if l_ce else 0
+            l_pe_ask = l_pe.ask if l_pe else 0
 
-            # Calculate net credit
-            sell_premium = s_ce_ltp + s_pe_ltp
-            buy_premium = l_ce_ltp + l_pe_ltp
-            net_credit = sell_premium - buy_premium
+            # Calculate premiums and net credit
+            straddle_credit = s_ce_ltp + s_pe_ltp
+            wing_cost = l_ce_ltp + l_pe_ltp
+            net_credit = straddle_credit - wing_cost
 
-            # Build HTML formatted structure for Telegram
-            html = f"""<b>🦋 IRON FLY STRUCTURE</b>
-<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   Expiry: {expiry_str}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # Calculate max profit and max loss for 1 lot
+            max_profit = net_credit * lot_size
+            max_loss = (wing_distance - net_credit) * lot_size
 
-   🛡️ PUT      💰 ATM      🛡️ CALL
-   {lower_wing}      {atm_strike}       {upper_wing}
-   ◄━━━━━━━━━━┃━━━━━━━━━━►
+            # Build HTML table format for Telegram
+            html = f"""<b>🦋 IRON FLY</b>
 
-┌─────────────────────────────┐
-│  SELL {atm_strike}CE   ₹{s_ce_ltp:>6.1f}      │
-│  SELL {atm_strike}PE   ₹{s_pe_ltp:>6.1f}      │
-├─────────────────────────────┤
-│  BUY  {upper_wing}CE   ₹{l_ce_ltp:>6.1f}      │
-│  BUY  {lower_wing}PE   ₹{l_pe_ltp:>6.1f}      │
-└─────────────────────────────┘
-</code>
-<b>💰 Net Credit: ₹{net_credit:.1f}/lot</b>"""
+<code>┌──────┬─────────┬────────┬────────┐
+│ Actn │ Strike  │   LTP  │Bid/Ask │
+├──────┼─────────┼────────┼────────┤
+│ SELL │ {atm_strike}CE │ {s_ce_ltp:>6.1f} │ {s_ce_bid:>6.1f} │
+│ SELL │ {atm_strike}PE │ {s_pe_ltp:>6.1f} │ {s_pe_bid:>6.1f} │
+│ BUY  │ {upper_wing}CE │ {l_ce_ltp:>6.1f} │ {l_ce_ask:>6.1f} │
+│ BUY  │ {lower_wing}PE │ {l_pe_ltp:>6.1f} │ {l_pe_ask:>6.1f} │
+└──────┴─────────┴────────┴────────┘</code>
 
-            return html, wing_distance, straddle_premium, net_credit
+<b>💰 Net Credit:</b> ₹{net_credit:.1f} <i>({straddle_credit:.1f} - {wing_cost:.1f})</i>
+<b>📈 Max Profit:</b> ₹{max_profit:,.0f} <i>({net_credit:.1f} × {lot_size})</i>
+<b>📉 Max Loss:</b> ₹{max_loss:,.0f} <i>({wing_distance} - {net_credit:.1f}) × {lot_size}</i>"""
+
+            return html, wing_distance, straddle_premium, net_credit, lot_size, max_profit, max_loss
 
         except Exception as e:
             logger.warning(f"Could not fetch option quotes: {e}")
-            # Fallback - use VIX-based estimate
-            estimated_straddle = 300  # Default fallback
+            import traceback
+            traceback.print_exc()
+            # Fallback - use defaults
+            lot_size = 75
             wing_distance = 300
-            html = f"""<b>🦋 IRON FLY STRUCTURE</b>
+            html = f"""<b>🦋 IRON FLY</b>
 <code>
-   {atm_strike - wing_distance} PE ◄━━━━ {atm_strike} ━━━━► {atm_strike + wing_distance} CE
+ATM: {atm_strike} | Wings: ±{wing_distance}
 </code>
-<i>(Live quotes unavailable)</i>"""
-            return html, wing_distance, estimated_straddle, 0
+<i>(Live quotes unavailable: {str(e)[:50]})</i>"""
+            return html, wing_distance, 300, 0, lot_size, 0, 0
 
     # =========================================================================
     # ADVISORY METHODS
@@ -383,17 +397,14 @@ class ClaudeAdvisor:
 
             # Use expiry_date if provided, otherwise estimate from dte
             exp_date = expiry_date if expiry_date else (date.today() + timedelta(days=dte))
+            expiry_str = exp_date.strftime('%d-%b')
 
             # Fetch REAL option quotes and calculate wing distance from straddle premium
-            option_html, wing_distance, straddle_premium, net_credit = self._get_option_quotes_and_structure(
-                atm_strike, exp_date
+            option_html, wing_distance, straddle_premium, net_credit, lot_size, max_profit, max_loss = self._get_option_quotes_and_structure(
+                atm_strike, exp_date, dte
             )
 
-            # Calculate metrics from real values
-            max_profit = net_credit * 75  # 1 lot
-            max_loss = (wing_distance - net_credit) * 75
-
-            logger.info(f"Pre-entry metrics: straddle={straddle_premium:.2f}, wing={wing_distance}, credit={net_credit:.2f}")
+            logger.info(f"Pre-entry metrics: straddle={straddle_premium:.2f}, wing={wing_distance}, credit={net_credit:.2f}, lot={lot_size}")
 
             # Get scraped market events and news for Claude context
             events_str = get_events_compact(days=10)
@@ -433,7 +444,7 @@ class ClaudeAdvisor:
             # Send analysis to user with decision options (using HTML)
             decision_msg = f"""🤖 <b>Pre-Entry Analysis</b>
 
-📊 NIFTY <b>{nifty_spot:,.0f}</b> | 🌡️ VIX <b>{india_vix:.1f}</b> | ⏳ DTE <b>{dte}</b>
+📊 NIFTY <b>{nifty_spot:,.0f}</b> | 🌡️ VIX <b>{india_vix:.1f}</b> | ⏳ DTE <b>{dte}</b> ({expiry_str})
 
 {option_html}
 
