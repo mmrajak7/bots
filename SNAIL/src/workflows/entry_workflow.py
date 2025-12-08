@@ -202,6 +202,14 @@ class EntryWorkflow:
         self._state = EntryWorkflowState.CHECKING_CONDITIONS
 
         try:
+            # Step 0: Scrape latest news and events (before any checks)
+            try:
+                from src.utils.market_events_scraper import scrape_and_save_all
+                events_count, news_count = scrape_and_save_all()
+                logger.info(f"Scraped {events_count} events, {news_count} news items")
+            except Exception as e:
+                logger.warning(f"News scraping failed (non-critical): {e}")
+
             # Step 1: Pre-checks
             passed, reason = self._pre_checks()
             if not passed:
@@ -242,14 +250,14 @@ class EntryWorkflow:
                 )
 
                 if claude_decision.action_required:
-                    # Claude advises against entry
-                    logger.info(f"Claude advises against entry: {claude_decision.suggested_action}")
+                    # Entry skipped (R:R filter, Claude, or user decision)
+                    logger.info(f"Entry skipped: {claude_decision.suggested_action}")
                     self._state = EntryWorkflowState.SKIPPED
                     return WorkflowResult(
                         state=self._state,
                         conditions=conditions,
                         claude_decision=claude_decision,
-                        skipped_reason=f"Claude: {claude_decision.suggested_action}"
+                        skipped_reason=claude_decision.suggested_action
                     )
 
             # Step 4: User confirmation (if required)

@@ -39,6 +39,15 @@ trading:
     slippage_ticks: 2        # Fixed slippage ticks
     use_tiered_slippage: false # Use progressive tiered slippage (TDD Section 1.3)
 
+    # Risk:Reward filter (highest priority entry filter)
+    # Only send entry alert if R:R meets this threshold
+    # R:R = Max Loss / Max Profit (e.g., 0.5 means risk 1 to make 2)
+    min_rr_ratio: 0.5        # Only enter if R:R <= 0.5 (1:2 or better)
+    require_good_rr: true    # Enable R:R filter
+
+    # Claude pre-entry advisory
+    use_claude_advisory: false # Disable Claude analysis for pre-entry (set true to enable)
+
   # Exit conditions
   exit:
     profit_target_pct: 50    # Exit at 50% of max profit

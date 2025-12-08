@@ -180,6 +180,11 @@ def get_trading_config() -> Dict[str, Any]:
     return load_config().get('trading', {})
 
 
+def get_entry_config() -> Dict[str, Any]:
+    """Get entry-specific configuration including R:R and Claude settings."""
+    return get_trading_config().get('entry', {})
+
+
 def get_api_config() -> Dict[str, Any]:
     """Get API configuration."""
     return load_config().get('api', {})

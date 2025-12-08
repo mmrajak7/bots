@@ -262,13 +262,14 @@ class ClaudeAdvisor:
         """
         try:
             from src.utils.symbol_builder import get_lot_size_from_instruments, load_instruments
+            from src.utils.config import get_instruments_path
 
             # Use provided expiry
             expiry = expiry_date
             expiry_str = expiry.strftime('%d-%b')
 
             # Get lot size from instruments
-            instruments_df = load_instruments()
+            instruments_df = load_instruments(get_instruments_path())
             lot_size = get_lot_size_from_instruments(instruments_df, expiry)
             logger.info(f"Lot size for expiry {expiry}: {lot_size}")
 
@@ -387,10 +388,14 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
         atr_14: float = 0.0
     ) -> AdvisoryResult:
         """
-        Get pre-entry advisory from Claude.
+        Get pre-entry advisory with R:R filter and optional Claude analysis.
 
-        Called before entering a new position. Fetches real option quotes
-        to calculate straddle premium and wing distance.
+        Flow:
+        1. Fetch real option quotes
+        2. Check R:R filter (highest priority - skip if not met)
+        3. Get Claude advisory (if enabled in config)
+        4. Send Telegram message with quotes, events, news
+        5. Wait for user response
 
         Args:
             nifty_spot: Current NIFTY spot
@@ -403,79 +408,136 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
         Returns:
             AdvisoryResult with decision
         """
-        try:
-            # Fetch ATR if not provided
-            if atr_14 == 0.0:
-                from src.utils.db import get_today_market_data
-                market_data = get_today_market_data()
-                if market_data and market_data.atr_14:
-                    atr_14 = market_data.atr_14
-                else:
-                    atr_14 = 150.0  # Default fallback
-                    logger.warning("ATR not available, using default 150")
+        from src.utils.config import get_entry_config
+        from src.utils.market_events_scraper import get_events_for_telegram, get_news_for_telegram
 
+        entry_config = get_entry_config()
+        min_rr_ratio = entry_config.get('min_rr_ratio', 0.5)
+        require_good_rr = entry_config.get('require_good_rr', True)
+        use_claude = entry_config.get('use_claude_advisory', False)
+
+        try:
             # Use expiry_date if provided, otherwise estimate from dte
             exp_date = expiry_date if expiry_date else (date.today() + timedelta(days=dte))
             expiry_str = exp_date.strftime('%d-%b')
 
-            # Fetch REAL option quotes and calculate wing distance from straddle premium
+            # Step 1: Fetch REAL option quotes and calculate wing distance from straddle premium
             option_html, wing_distance, straddle_premium, net_credit, lot_size, max_profit, max_loss = self._get_option_quotes_and_structure(
                 atm_strike, exp_date, dte
             )
 
-            logger.info(f"Pre-entry metrics: straddle={straddle_premium:.2f}, wing={wing_distance}, credit={net_credit:.2f}, lot={lot_size}")
+            # Calculate R:R ratio
+            if max_profit > 0:
+                rr_ratio = max_loss / max_profit
+                rr_display = f"1:{1/rr_ratio:.1f}" if rr_ratio > 0 else "N/A"
+            else:
+                rr_ratio = float('inf')
+                rr_display = "N/A"
 
-            # Get scraped market events and news for Claude context
-            events_str = get_events_compact(days=10)
-            news_str = get_news_compact(limit=10)
+            logger.info(f"Pre-entry metrics: straddle={straddle_premium:.2f}, wing={wing_distance}, credit={net_credit:.2f}, R:R={rr_display}")
 
-            context = MarketContext(
-                nifty_spot=nifty_spot,
-                india_vix=india_vix,
-                atm_strike=atm_strike,
-                straddle_premium=straddle_premium,
-                wing_distance=wing_distance,
-                dte=dte,
-                atr_14=atr_14,
-                net_credit=net_credit,
-                max_profit=max_profit,
-                max_loss=max_loss,
-                expiry_date=expiry_date,
-                additional_context={
-                    'market_events': events_str,
-                    'market_news': news_str
-                }
-            )
+            # Step 2: R:R Filter (HIGHEST PRIORITY)
+            if require_good_rr and rr_ratio > min_rr_ratio:
+                # R:R not met - log and skip silently (no Telegram message)
+                logger.info(f"R:R filter not met: {rr_display} > required 1:{1/min_rr_ratio:.0f} - skipping entry alert")
+                return AdvisoryResult(
+                    decision=ClaudeDecision.SKIP,
+                    reasoning=f"Risk:Reward ratio {rr_display} does not meet minimum 1:{1/min_rr_ratio:.0f} requirement",
+                    confidence=1.0,
+                    action_required=True,
+                    suggested_action="Skip - R:R filter not met"
+                )
 
-            response = self.claude.get_pre_entry_decision(context)
+            # Step 3: Get Claude advisory (if enabled)
+            claude_reasoning = ""
+            claude_decision = ClaudeDecision.PROCEED
+            claude_confidence = 0.0
 
-            # Record decision
-            prompt = f"Pre-entry check: NIFTY={nifty_spot}, VIX={india_vix}, ATM={atm_strike}, Wing={wing_distance}, DTE={dte}"
-            self._record_decision(response, 'pre_entry', prompt)
+            if use_claude:
+                # Fetch ATR for Claude context
+                if atr_14 == 0.0:
+                    from src.utils.db import get_today_market_data
+                    market_data = get_today_market_data()
+                    if market_data and market_data.atr_14:
+                        atr_14 = market_data.atr_14
+                    else:
+                        atr_14 = 150.0
 
-            # Determine emoji based on Claude's recommendation
-            rec_emoji = "✅" if response.decision == ClaudeDecision.PROCEED else "⚠️"
-            rec_text = "ENTER" if response.decision == ClaudeDecision.PROCEED else "SKIP"
+                events_str = get_events_compact(days=10)
+                news_str = get_news_compact(limit=10)
 
-            # Escape HTML special chars in reasoning
-            reasoning_escaped = response.reasoning.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                context = MarketContext(
+                    nifty_spot=nifty_spot,
+                    india_vix=india_vix,
+                    atm_strike=atm_strike,
+                    straddle_premium=straddle_premium,
+                    wing_distance=wing_distance,
+                    dte=dte,
+                    atr_14=atr_14,
+                    net_credit=net_credit,
+                    max_profit=max_profit,
+                    max_loss=max_loss,
+                    expiry_date=expiry_date,
+                    additional_context={
+                        'market_events': events_str,
+                        'market_news': news_str
+                    }
+                )
 
-            # Send analysis to user with decision options (using HTML)
-            decision_msg = f"""🤖 <b>Pre-Entry Analysis</b>
+                response = self.claude.get_pre_entry_decision(context)
+                claude_reasoning = response.reasoning
+                claude_decision = response.decision
+                claude_confidence = response.confidence
 
-📊 NIFTY <b>{nifty_spot:,.0f}</b> | 🌡️ VIX <b>{india_vix:.1f}</b> | ⏳ DTE <b>{dte}</b> ({expiry_str})
+                # Record decision
+                prompt = f"Pre-entry: NIFTY={nifty_spot}, VIX={india_vix}, ATM={atm_strike}, Wing={wing_distance}, DTE={dte}"
+                self._record_decision(response, 'pre_entry', prompt)
 
-{option_html}
+            # Step 4: Get Events and News for Telegram
+            events_telegram = get_events_for_telegram()
+            news_telegram = get_news_for_telegram(limit=5)
 
-<b>📝 Claude's Analysis:</b>
-{reasoning_escaped}
+            # Build Telegram message (HTML format)
+            # Header
+            msg_parts = [
+                f"🤖 <b>Pre-Entry Analysis</b>",
+                f"",
+                f"📊 NIFTY <b>{nifty_spot:,.0f}</b> | 🌡️ VIX <b>{india_vix:.1f}</b> | ⏳ DTE <b>{dte}</b> ({expiry_str})",
+                f"",
+                option_html
+            ]
 
-{rec_emoji} <b>Recommendation: {rec_text}</b> ({response.confidence:.0%})
+            # Add Events section (if any)
+            if events_telegram:
+                msg_parts.append("")
+                msg_parts.append(f"<b>📅 Upcoming Events:</b>")
+                msg_parts.append(events_telegram)
 
-⌨️ <i>Reply: ENTER or SKIP</i>"""
+            # Add News section (if any)
+            if news_telegram:
+                msg_parts.append("")
+                msg_parts.append(f"<b>📰 News:</b>")
+                msg_parts.append(news_telegram)
+
+            # Add Claude analysis (if enabled)
+            if use_claude and claude_reasoning:
+                reasoning_escaped = claude_reasoning.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                rec_emoji = "✅" if claude_decision == ClaudeDecision.PROCEED else "⚠️"
+                rec_text = "ENTER" if claude_decision == ClaudeDecision.PROCEED else "SKIP"
+                msg_parts.append("")
+                msg_parts.append(f"<b>📝 Claude's Analysis:</b>")
+                msg_parts.append(reasoning_escaped)
+                msg_parts.append(f"")
+                msg_parts.append(f"{rec_emoji} <b>Recommendation: {rec_text}</b> ({claude_confidence:.0%})")
+
+            # Add user prompt
+            msg_parts.append("")
+            msg_parts.append("⌨️ <i>Reply: ENTER or SKIP</i>")
+
+            decision_msg = "\n".join(msg_parts)
             self.telegram.send(decision_msg, parse_mode="HTML")
 
-            # Wait for user response
+            # Step 5: Wait for user response
             from src.api.response_handler import get_response_handler, ResponseType
             handler = get_response_handler()
 
@@ -490,52 +552,46 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             if user_response:
                 user_choice = user_response.normalized
                 if user_choice in ['enter', 'proceed', 'yes']:
-                    # User wants to enter (override if Claude said skip)
                     final_decision = ClaudeDecision.PROCEED
-                    if response.decision != ClaudeDecision.PROCEED:
-                        self.telegram.send("✅ *User override:* Proceeding with entry despite Claude's SKIP recommendation")
-                        logger.info("User overrode Claude SKIP recommendation - proceeding with entry")
-                    else:
-                        self.telegram.send("✅ *Confirmed:* Proceeding with entry")
+                    self.telegram.send("✅ *Confirmed:* Proceeding with entry")
+                    logger.info("User confirmed ENTER")
                 else:
-                    # User wants to skip - set cooldown for 10 hours (expires before next market open)
+                    # User wants to skip - set cooldown for 10 hours
                     final_decision = ClaudeDecision.SKIP
                     set_cooldown('user_skip', 36000)  # 10 hours
-                    if response.decision == ClaudeDecision.PROCEED:
-                        self.telegram.send("⏭️ *User override:* Skipping entry for today despite Claude's ENTER recommendation\n⏰ Cooldown: 10 hours")
-                        logger.info("User overrode Claude PROCEED recommendation - skipping entry, 10h cooldown set")
-                    else:
-                        self.telegram.send("⏭️ *Confirmed:* Skipping entry for today\n⏰ Cooldown: 10 hours")
-                        logger.info("User confirmed SKIP - 10h cooldown set")
+                    self.telegram.send("⏭️ *Confirmed:* Skipping entry for today\n⏰ Cooldown: 10 hours")
+                    logger.info("User confirmed SKIP - 10h cooldown set")
             else:
                 # Timeout - default to SKIP (conservative) and set cooldown
                 final_decision = ClaudeDecision.SKIP
                 set_cooldown('user_skip', 36000)  # 10 hours
-                self.telegram.send(f"⏰ *Timeout:* No response - skipping entry for today\n⏰ Cooldown: 10 hours")
-                logger.info(f"User response timeout - defaulting to SKIP with 10h cooldown")
+                self.telegram.send("⏰ *Timeout:* No response - skipping entry for today\n⏰ Cooldown: 10 hours")
+                logger.info("User response timeout - defaulting to SKIP with 10h cooldown")
 
             return AdvisoryResult(
                 decision=final_decision,
-                reasoning=response.reasoning,
-                confidence=response.confidence,
+                reasoning=claude_reasoning if use_claude else f"R:R {rr_display} meets filter. User decision: {final_decision.value}",
+                confidence=claude_confidence if use_claude else 1.0,
                 action_required=final_decision != ClaudeDecision.PROCEED,
                 suggested_action="Proceed with entry" if final_decision == ClaudeDecision.PROCEED else "Do not enter"
             )
 
         except Exception as e:
             logger.error(f"Error in pre-entry advisory: {e}")
+            import traceback
+            traceback.print_exc()
             self.telegram.send(
-                f"⚠️ *Claude Advisory Error*\n\n"
-                f"Failed to get pre-entry decision.\n"
+                f"⚠️ *Pre-Entry Error*\n\n"
+                f"Failed to get entry analysis.\n"
                 f"Error: {escape_markdown(str(e)[:100])}\n\n"
-                f"_Defaulting to SKIP entry._"
+                f"_Check logs for details._"
             )
             return AdvisoryResult(
                 decision=ClaudeDecision.SKIP,
-                reasoning=f"Error getting advisory: {str(e)}",
+                reasoning=f"Error: {str(e)}",
                 confidence=0.0,
                 action_required=True,
-                suggested_action="Skip entry due to advisory error"
+                suggested_action="Skip entry due to error"
             )
 
     def get_stop_loss_advisory(self) -> AdvisoryResult:
