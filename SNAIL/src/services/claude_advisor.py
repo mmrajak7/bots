@@ -325,21 +325,65 @@ class ClaudeAdvisor:
             prompt = f"Pre-entry check: NIFTY={nifty_spot}, VIX={india_vix}, ATM={atm_strike}, DTE={dte}"
             self._record_decision(response, 'pre_entry', prompt)
 
-            # Notify via Telegram
+            # Determine emoji based on Claude's recommendation
+            rec_emoji = "✅" if response.decision == ClaudeDecision.PROCEED else "⚠️"
+            rec_text = "ENTER" if response.decision == ClaudeDecision.PROCEED else "SKIP"
+
+            # Send analysis to user with decision options
             decision_msg = (
-                f"🤖 *Pre-Entry Advisory*\n\n"
-                f"Decision: *{response.decision.value}*\n"
-                f"Confidence: {response.confidence:.0%}\n\n"
-                f"Reasoning:\n{escape_markdown(response.reasoning[:300])}..."
+                f"🤖 *Pre-Entry Analysis*\n\n"
+                f"📊 NIFTY {nifty_spot:,.0f} | 🌡️ VIX {india_vix:.1f}\n"
+                f"🎯 ATM {atm_strike} | ⏳ DTE {dte}\n"
+                f"💰 Est. Credit ₹{net_credit:.0f}/lot\n\n"
+                f"*Claude's Analysis:*\n{escape_markdown(response.reasoning[:400])}\n\n"
+                f"{rec_emoji} *Recommendation: {rec_text}*\n"
+                f"🎯 Confidence: {response.confidence:.0%}\n\n"
+                f"⌨️ _Reply: ENTER or SKIP_"
             )
             self.telegram.send(decision_msg)
 
+            # Wait for user response
+            from src.api.response_handler import get_response_handler, ResponseType
+            handler = get_response_handler()
+
+            user_response = handler.wait_for_response(
+                prompt_id=f"pre_entry_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                response_type=ResponseType.CHOICE,
+                timeout_seconds=300,  # 5 minutes
+                valid_choices=['enter', 'skip', 'proceed', 'yes', 'no']
+            )
+
+            # Determine final decision based on user input
+            if user_response:
+                user_choice = user_response.normalized
+                if user_choice in ['enter', 'proceed', 'yes']:
+                    # User wants to enter (override if Claude said skip)
+                    final_decision = ClaudeDecision.PROCEED
+                    if response.decision != ClaudeDecision.PROCEED:
+                        self.telegram.send("✅ *User override:* Proceeding with entry despite Claude's SKIP recommendation")
+                        logger.info("User overrode Claude SKIP recommendation - proceeding with entry")
+                    else:
+                        self.telegram.send("✅ *Confirmed:* Proceeding with entry")
+                else:
+                    # User wants to skip
+                    final_decision = ClaudeDecision.SKIP
+                    if response.decision == ClaudeDecision.PROCEED:
+                        self.telegram.send("⏭️ *User override:* Skipping entry despite Claude's ENTER recommendation")
+                        logger.info("User overrode Claude PROCEED recommendation - skipping entry")
+                    else:
+                        self.telegram.send("⏭️ *Confirmed:* Skipping entry")
+            else:
+                # Timeout - default to Claude's recommendation
+                self.telegram.send(f"⏰ *Timeout:* No response received. Using Claude's recommendation: *{rec_text}*")
+                final_decision = response.decision
+                logger.info(f"User response timeout - defaulting to Claude's recommendation: {rec_text}")
+
             return AdvisoryResult(
-                decision=response.decision,
+                decision=final_decision,
                 reasoning=response.reasoning,
                 confidence=response.confidence,
-                action_required=response.decision != ClaudeDecision.PROCEED,
-                suggested_action="Proceed with entry" if response.decision == ClaudeDecision.PROCEED else "Do not enter"
+                action_required=final_decision != ClaudeDecision.PROCEED,
+                suggested_action="Proceed with entry" if final_decision == ClaudeDecision.PROCEED else "Do not enter"
             )
 
         except Exception as e:
