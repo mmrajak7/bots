@@ -322,6 +322,24 @@ class ClaudeAdvisor:
             max_profit = net_credit * lot_size
             max_loss = (wing_distance - net_credit) * lot_size
 
+            # Calculate Risk:Reward ratio (Risk = Max Loss, Reward = Max Profit)
+            # RR = Max Loss / Max Profit (e.g., 1:2 means risk 1 to make 2)
+            if max_profit > 0:
+                rr_ratio = max_loss / max_profit
+                rr_display = f"1:{1/rr_ratio:.1f}" if rr_ratio > 0 else "N/A"
+                # Good RR is when reward >= 2x risk (i.e., rr_ratio <= 0.5)
+                is_good_rr = rr_ratio <= 0.5
+            else:
+                rr_ratio = 0
+                rr_display = "N/A"
+                is_good_rr = False
+
+            # Format RR line with green highlight if good
+            if is_good_rr:
+                rr_line = f"<b>⚖️ Risk:Reward:</b> {rr_display} ✅ <i>Good entry!</i>"
+            else:
+                rr_line = f"<b>⚖️ Risk:Reward:</b> {rr_display}"
+
             # Build HTML table format for Telegram
             html = f"""<b>🦋 IRON FLY</b>
 
@@ -336,7 +354,8 @@ class ClaudeAdvisor:
 
 <b>💰 Net Credit:</b> ₹{net_credit:.1f} <i>({straddle_credit:.1f} - {wing_cost:.1f})</i>
 <b>📈 Max Profit:</b> ₹{max_profit:,.0f} <i>({net_credit:.1f} × {lot_size})</i>
-<b>📉 Max Loss:</b> ₹{max_loss:,.0f} <i>({wing_distance} - {net_credit:.1f}) × {lot_size}</i>"""
+<b>📉 Max Loss:</b> ₹{max_loss:,.0f} <i>({wing_distance} - {net_credit:.1f}) × {lot_size}</i>
+{rr_line}"""
 
             return html, wing_distance, straddle_premium, net_credit, lot_size, max_profit, max_loss
 
