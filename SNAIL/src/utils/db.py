@@ -172,8 +172,31 @@ def init_database(db_path: Optional[Path] = None) -> sqlite3.Connection:
     else:
         logger.warning(f"Schema file not found at {SCHEMA_PATH}")
 
+    # Run migrations for existing databases
+    _run_migrations(conn)
+
     conn.commit()
     return conn
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """
+    Run database migrations to update schema for existing databases.
+
+    Args:
+        conn: Database connection
+    """
+    # Migration 1: Add cooldown_type column to cooldowns table if not exists
+    cursor = conn.execute("PRAGMA table_info(cooldowns)")
+    columns = [row[1] for row in cursor.fetchall()]
+
+    if 'cooldown_type' not in columns:
+        logger.info("Running migration: Adding cooldown_type to cooldowns table")
+        conn.execute("ALTER TABLE cooldowns ADD COLUMN cooldown_type TEXT NOT NULL DEFAULT 'entry'")
+        logger.info("Migration complete: cooldown_type column added")
+
+
+_migrations_run = False  # Track if migrations have been run this session
 
 
 def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
@@ -186,12 +209,20 @@ def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
     Returns:
         Database connection with row factory set
     """
+    global _migrations_run
     db_path = db_path or DATABASE_PATH
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA synchronous=NORMAL")
+
+    # Run migrations once per session
+    if not _migrations_run:
+        _run_migrations(conn)
+        conn.commit()
+        _migrations_run = True
+
     return conn
 
 
@@ -915,28 +946,24 @@ def is_on_cooldown(cooldown_type: str) -> bool:
         return False
 
 
-def set_cooldown(cooldown_type: Union[str, int], duration_seconds: Union[int, date]) -> None:
+def set_cooldown(cooldown_type: str, duration_seconds: int, position_id: Optional[int] = None) -> None:
     """
     Set cooldown after position exit.
 
     Args:
-        cooldown_type: Type of cooldown or position_id
-        duration_seconds: Duration in seconds or cooldown_end date
+        cooldown_type: Type of cooldown ('entry', etc.)
+        duration_seconds: Duration in seconds
+        position_id: Optional position ID that triggered the cooldown
     """
     with get_db_session() as conn:
-        if isinstance(duration_seconds, date):
-            cooldown_end = duration_seconds
-        else:
-            cooldown_end = date.today() + timedelta(seconds=duration_seconds)
-
-        position_id = cooldown_type if isinstance(cooldown_type, int) else 0
+        cooldown_end = date.today() + timedelta(seconds=duration_seconds)
 
         conn.execute(
-            """INSERT INTO cooldowns (position_id, exit_date, cooldown_end)
-               VALUES (?, ?, ?)""",
-            (position_id, date.today().isoformat(), cooldown_end.isoformat())
+            """INSERT INTO cooldowns (position_id, cooldown_type, exit_date, cooldown_end)
+               VALUES (?, ?, ?, ?)""",
+            (position_id, cooldown_type, date.today().isoformat(), cooldown_end.isoformat())
         )
-        logger.info(f"Cooldown set until {cooldown_end}")
+        logger.info(f"Cooldown '{cooldown_type}' set until {cooldown_end}")
 
 
 def get_next_trading_day(from_date: Optional[date] = None) -> date:

@@ -197,7 +197,8 @@ CREATE TABLE IF NOT EXISTS alert_cooldowns (
 -- Cooldowns: Post-exit cooldown tracking
 CREATE TABLE IF NOT EXISTS cooldowns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    position_id INTEGER NOT NULL REFERENCES positions(id),
+    position_id INTEGER REFERENCES positions(id),
+    cooldown_type TEXT NOT NULL DEFAULT 'entry',
     exit_date DATE NOT NULL,
     cooldown_end DATE NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP

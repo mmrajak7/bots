@@ -51,14 +51,15 @@ def get_ist_now() -> datetime:
 
 def load_nse_holidays() -> Dict[str, List[str]]:
     """
-    Load NSE holiday calendar from config file.
+    Load NSE holiday calendar from shared data folder.
 
     TDD Section 5.2: NSE Holiday Calendar Integration
 
     Returns:
         Dict mapping year to list of holiday dates (YYYY-MM-DD format)
     """
-    holidays_path = PROJECT_ROOT / "config" / "nse_holidays.json"
+    # Use shared data folder: ../data/holiday_calendar.json (relative to SNAIL)
+    holidays_path = PROJECT_ROOT.parent / "data" / "holiday_calendar.json"
 
     try:
         if holidays_path.exists():
@@ -70,7 +71,11 @@ def load_nse_holidays() -> Dict[str, List[str]]:
             for year, holidays in data.items():
                 if year.startswith('_'):  # Skip metadata fields
                     continue
-                holidays_by_year[year] = [h['date'] for h in holidays]
+                # Handle both list of dicts and list of strings
+                if holidays and isinstance(holidays[0], dict):
+                    holidays_by_year[year] = [h['date'] for h in holidays]
+                else:
+                    holidays_by_year[year] = holidays
 
             return holidays_by_year
         else:
@@ -109,13 +114,13 @@ def is_nse_holiday(check_date: Optional[date] = None) -> Tuple[bool, str]:
 
     if year in _nse_holidays_cache:
         if date_str in _nse_holidays_cache[year]:
-            # Get holiday name
-            holidays_path = PROJECT_ROOT / "config" / "nse_holidays.json"
+            # Get holiday name from shared data folder
+            holidays_path = PROJECT_ROOT.parent / "data" / "holiday_calendar.json"
             try:
                 with open(holidays_path, 'r') as f:
                     data = json.load(f)
                 for holiday in data.get(year, []):
-                    if holiday.get('date') == date_str:
+                    if isinstance(holiday, dict) and holiday.get('date') == date_str:
                         return True, holiday.get('name', 'NSE Holiday')
             except (json.JSONDecodeError, IOError, KeyError) as e:
                 logger.debug(f"Could not get holiday name: {e}")
@@ -688,17 +693,17 @@ class SingletonMeta(type):
 def setup_logging(
     log_level: str = "INFO",
     log_file: Optional[Path] = None,
-    rotation: str = "10 MB",
-    retention: str = "7 days"
+    rotation: str = "00:00",
+    retention: str = "30 days"
 ) -> None:
     """
-    Setup logging configuration.
+    Setup logging configuration with daily log files.
 
     Args:
         log_level: Minimum log level
-        log_file: Path to log file (optional)
-        rotation: Log rotation setting
-        retention: Log retention period
+        log_file: Path to log file (optional). Date will be appended to filename.
+        rotation: Log rotation setting (default: "00:00" for daily rotation at midnight)
+        retention: Log retention period (default: "30 days")
     """
     # Remove default handler
     logger.remove()
@@ -711,11 +716,17 @@ def setup_logging(
         colorize=True
     )
 
-    # File handler
+    # File handler with daily rotation
     if log_file:
         ensure_directory(log_file.parent)
+        # Use date in filename: snail.log -> snail_2025-12-08.log
+        log_dir = log_file.parent
+        log_stem = log_file.stem  # e.g., "snail"
+        log_suffix = log_file.suffix  # e.g., ".log"
+        dated_log_file = log_dir / f"{log_stem}_{{time:YYYY-MM-DD}}{log_suffix}"
+
         logger.add(
-            log_file,
+            str(dated_log_file),
             level=log_level,
             format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
             rotation=rotation,
