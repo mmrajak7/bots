@@ -1119,6 +1119,30 @@ def get_today_market_data() -> Optional[MarketData]:
         return None
 
 
+def get_week_market_data() -> List[MarketData]:
+    """
+    Get this week's market data (Monday to today).
+
+    Returns:
+        List of MarketData objects for the week
+    """
+    from datetime import timedelta
+
+    today = date.today()
+    # Find Monday of this week
+    monday = today - timedelta(days=today.weekday())
+
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            """SELECT * FROM market_data
+               WHERE date >= ? AND date <= ?
+               ORDER BY date ASC""",
+            (monday.isoformat(), today.isoformat())
+        )
+        rows = cursor.fetchall()
+        return [_row_to_market_data(row) for row in rows]
+
+
 def capture_day_open(nifty_price: float) -> None:
     """
     Capture day open at first monitor run (9:16 AM).

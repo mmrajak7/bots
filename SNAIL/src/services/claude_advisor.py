@@ -145,34 +145,136 @@ class ClaudeAdvisor:
         current_pnl: float = 0.0
     ) -> MarketContext:
         """
-        Build market context for Claude prompts.
+        Build rich market context for Claude prompts.
+
+        Populates all fields needed by prompt templates including:
+        - Position details (entry_date, entry_premium, strikes, wings)
+        - Current status (pnl, pnl_percent, loss/profit percentages)
+        - Market data (nifty_spot, vix, day_range, day_open)
+        - Derived metrics (wing_proximity, distance_to_wing)
 
         Args:
             position: Current position (if any)
             current_pnl: Current position P&L
 
         Returns:
-            MarketContext for prompts
+            MarketContext with all template fields populated
         """
         # Get market data
         nifty_spot = self.kite.get_nifty_spot()
         india_vix = self.kite.get_india_vix()
 
-        # Build context
+        # Build base context
         context = MarketContext(
             nifty_spot=nifty_spot,
             india_vix=india_vix
         )
 
         if position:
+            # Basic position data
             context.atm_strike = position.atm_strike
             context.wing_distance = position.wing_distance
             context.position_pnl = current_pnl
             context.dte = (position.expiry_date - date.today()).days if position.expiry_date else 0
+            context.expiry_date = position.expiry_date
 
-            # Add straddle premium if available
-            if position.entry_premium and position.lot_size and position.lot_size > 0:
-                context.straddle_premium = position.entry_premium / position.lot_size
+            # Calculate max profit/loss
+            context.max_profit = position.max_profit if position.max_profit else 0
+            context.max_loss = position.max_loss if position.max_loss else 0
+
+            # Entry premium per unit
+            if position.entry_credit and position.quantity and position.quantity > 0:
+                context.straddle_premium = position.entry_credit / position.quantity
+                context.net_credit = position.entry_credit / position.quantity
+            else:
+                context.straddle_premium = 0
+                context.net_credit = 0
+
+            # Calculate wings
+            upper_wing = position.atm_strike + position.wing_distance
+            lower_wing = position.atm_strike - position.wing_distance
+
+            # P&L percentages
+            pnl_percent = 0.0
+            if context.max_profit > 0 and current_pnl >= 0:
+                pnl_percent = (current_pnl / context.max_profit) * 100
+            elif context.max_loss > 0 and current_pnl < 0:
+                pnl_percent = (current_pnl / context.max_loss) * 100
+
+            # Loss as % of max loss (for stop loss scenarios)
+            loss_pct_of_max = 0.0
+            if context.max_loss > 0 and current_pnl < 0:
+                loss_pct_of_max = (abs(current_pnl) / context.max_loss) * 100
+
+            # Profit as % of max profit (for Friday decisions)
+            profit_pct_of_max = 0.0
+            if context.max_profit > 0 and current_pnl > 0:
+                profit_pct_of_max = (current_pnl / context.max_profit) * 100
+
+            # Wing proximity calculations
+            distance_to_upper = upper_wing - nifty_spot
+            distance_to_lower = nifty_spot - lower_wing
+            distance_to_wing = min(abs(distance_to_upper), abs(distance_to_lower))
+
+            # Wing proximity as percentage (100% = at wing, 0% = at ATM)
+            wing_proximity = 0.0
+            if position.wing_distance > 0:
+                distance_from_atm = abs(nifty_spot - position.atm_strike)
+                wing_proximity = (distance_from_atm / position.wing_distance) * 100
+
+            # Determine direction (which wing is being approached)
+            direction = "CE" if nifty_spot > position.atm_strike else "PE"
+
+            # Get day's market data
+            try:
+                from src.utils.db import get_today_market_data
+                market_data = get_today_market_data()
+                day_open = market_data.day_open if market_data and market_data.day_open else nifty_spot
+                day_high = market_data.day_high if market_data and market_data.day_high else nifty_spot
+                day_low = market_data.day_low if market_data and market_data.day_low else nifty_spot
+                day_range = day_high - day_low
+                move_from_open = ((nifty_spot - day_open) / day_open * 100) if day_open > 0 else 0
+                previous_close = market_data.previous_close if market_data and market_data.previous_close else nifty_spot
+            except Exception:
+                day_open = nifty_spot
+                day_range = 0
+                move_from_open = 0
+                previous_close = nifty_spot
+
+            # Populate additional context for all prompt templates
+            context.additional_context = {
+                # Position details
+                'entry_date': position.entry_time.strftime('%Y-%m-%d') if position.entry_time else '',
+                'entry_premium': f"{position.entry_credit:,.2f}" if position.entry_credit else '0',
+                'entry_credit': f"{context.net_credit:.2f}",
+                'upper_wing': str(upper_wing),
+                'lower_wing': str(lower_wing),
+
+                # Current P&L status
+                'current_pnl': f"{current_pnl:,.2f}",
+                'pnl_percent': f"{pnl_percent:.1f}",
+                'loss_pct_of_max': f"{loss_pct_of_max:.1f}",
+                'profit_pct_of_max': f"{profit_pct_of_max:.1f}",
+
+                # Wing proximity
+                'distance_to_wing': f"{distance_to_wing:.0f}",
+                'wing_proximity': f"{wing_proximity:.1f}",
+                'direction': direction,
+
+                # Day's market data
+                'day_open': f"{day_open:,.2f}",
+                'day_range': f"{day_range:.0f}",
+                'move_from_open': f"{move_from_open:.2f}",
+                'previous_close': f"{previous_close:,.2f}",
+
+                # Entry VIX (if stored)
+                'entry_vix': f"{position.entry_vix:.2f}" if hasattr(position, 'entry_vix') and position.entry_vix else f"{india_vix:.2f}",
+
+                # VIX change (will be updated by specific methods)
+                'current_vix': f"{india_vix:.2f}",
+                'vix_change': '0',
+                'vix_change_pct': '0',
+            }
 
         return context
 
@@ -746,6 +848,39 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             current_pnl = self._get_position_pnl(position, legs)
 
             context = self._build_context(position, current_pnl)
+
+            # Get week's range data
+            try:
+                from src.utils.db import get_week_market_data
+                week_data = get_week_market_data()
+                if week_data:
+                    week_high = max(d.day_high for d in week_data if d.day_high)
+                    week_low = min(d.day_low for d in week_data if d.day_low)
+                    week_range = week_high - week_low
+                    week_open = week_data[0].day_open if week_data[0].day_open else context.nifty_spot
+                    week_change = ((context.nifty_spot - week_open) / week_open * 100) if week_open > 0 else 0
+                else:
+                    week_range = 0
+                    week_change = 0
+            except Exception:
+                week_range = 0
+                week_change = 0
+
+            # Get weekend events
+            try:
+                weekend_events = get_events_compact(days=3)  # Sat, Sun, Mon
+                if not weekend_events:
+                    weekend_events = "No major events scheduled"
+            except Exception:
+                weekend_events = "Unable to fetch events"
+
+            # Update Friday-specific context
+            context.additional_context.update({
+                'week_range': f"{week_range:.0f}",
+                'week_change': f"{week_change:+.2f}",
+                'weekend_events': weekend_events,
+            })
+
             response = self.claude.get_friday_decision(context)
 
             # Record decision
@@ -809,8 +944,16 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             current_pnl = self._get_position_pnl(position, legs)
 
             context = self._build_context(position, current_pnl)
-            context.additional_context['vix_change'] = current_vix - previous_vix
-            context.additional_context['previous_vix'] = previous_vix
+
+            # Calculate VIX change metrics
+            vix_change = current_vix - previous_vix
+            vix_change_pct = ((current_vix - previous_vix) / previous_vix * 100) if previous_vix > 0 else 0
+
+            # Update VIX-specific context
+            context.additional_context['current_vix'] = f"{current_vix:.2f}"
+            context.additional_context['entry_vix'] = f"{previous_vix:.2f}"
+            context.additional_context['vix_change'] = f"{vix_change:+.2f}"
+            context.additional_context['vix_change_pct'] = f"{vix_change_pct:+.1f}"
 
             response = self.claude.get_vix_spike_advisory(context)
 
@@ -883,10 +1026,31 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             current_pnl = self._get_position_pnl(position, legs)
 
             context = self._build_context(position, current_pnl)
+
+            # Calculate gap-specific fields
+            nifty_spot = context.nifty_spot
+            previous_close = float(context.additional_context.get('previous_close', '0').replace(',', ''))
+            gap_percent = (gap_size / previous_close * 100) if previous_close > 0 else 0
+
+            # Determine breached wing
+            upper_wing = position.atm_strike + position.wing_distance
+            lower_wing = position.atm_strike - position.wing_distance
+            breached_wing = f"{upper_wing} CE" if gap_direction == "UP" else f"{lower_wing} PE"
+            distance_beyond = abs(nifty_spot - upper_wing) if gap_direction == "UP" else abs(nifty_spot - lower_wing)
+
+            # Estimated current loss (at max loss if beyond wing)
+            current_loss = abs(current_pnl) if current_pnl < 0 else position.max_loss
+
+            # Update gap-specific context
             context.additional_context.update({
-                'gap_size': gap_size,
+                'gap_size': f"{gap_size:.0f}",
                 'gap_direction': gap_direction,
-                'beyond_wing': opened_beyond_wing
+                'gap_percent': f"{gap_percent:.2f}",
+                'beyond_wing': 'Yes' if opened_beyond_wing else 'No',
+                'breached_wing': breached_wing,
+                'distance_beyond': f"{distance_beyond:.0f}",
+                'current_loss': f"{current_loss:,.2f}",
+                'global_context': 'Check global markets for overnight moves',  # Placeholder
             })
 
             response = self.claude.get_gap_advisory(context)
