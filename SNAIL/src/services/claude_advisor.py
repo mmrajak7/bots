@@ -247,7 +247,7 @@ class ClaudeAdvisor:
 
     def _get_option_quotes_table(self, atm_strike: int, wing_distance: int, expiry_date: date) -> str:
         """
-        Fetch actual option quotes and format as table.
+        Fetch actual option quotes and format as visual Iron Fly structure.
 
         Args:
             atm_strike: ATM strike price
@@ -255,7 +255,7 @@ class ClaudeAdvisor:
             expiry_date: Option expiry date
 
         Returns:
-            Formatted table string for Telegram
+            Formatted visual structure string for Telegram
         """
         try:
             # Use provided expiry
@@ -282,31 +282,51 @@ class ClaudeAdvisor:
 
             quotes = self.kite.quote(instruments)
 
-            # Build table
-            rows = []
-            rows.append(f"{'Leg':<6} {'Strike':>6} {'LTP':>7} {'Bid':>7} {'Ask':>7}")
-            rows.append("-" * 40)
+            # Extract prices
+            s_ce = quotes.get(f"NFO:{short_ce_sym}")
+            s_pe = quotes.get(f"NFO:{short_pe_sym}")
+            l_ce = quotes.get(f"NFO:{long_ce_sym}")
+            l_pe = quotes.get(f"NFO:{long_pe_sym}")
 
-            for inst, label, strike in [
-                (f"NFO:{short_ce_sym}", "S-CE", atm_strike),
-                (f"NFO:{short_pe_sym}", "S-PE", atm_strike),
-                (f"NFO:{long_ce_sym}", "L-CE", upper_wing),
-                (f"NFO:{long_pe_sym}", "L-PE", lower_wing),
-            ]:
-                q = quotes.get(inst)
-                if q:
-                    rows.append(f"{label:<6} {strike:>6} {q.ltp:>7.1f} {q.bid:>7.1f} {q.ask:>7.1f}")
-                else:
-                    rows.append(f"{label:<6} {strike:>6} {'N/A':>7} {'N/A':>7} {'N/A':>7}")
+            s_ce_ltp = s_ce.ltp if s_ce else 0
+            s_pe_ltp = s_pe.ltp if s_pe else 0
+            l_ce_ltp = l_ce.ltp if l_ce else 0
+            l_pe_ltp = l_pe.ltp if l_pe else 0
 
-            rows.append("-" * 40)
-            rows.append(f"Expiry: {expiry_str} | Wings: ±{wing_distance}")
+            # Calculate net credit
+            sell_premium = s_ce_ltp + s_pe_ltp
+            buy_premium = l_ce_ltp + l_pe_ltp
+            net_credit = sell_premium - buy_premium
 
-            return '\n'.join(rows)
+            # Build visual structure
+            lines = []
+            lines.append(f"═══════ 🦋 IRON FLY ═══════")
+            lines.append(f"        Exp: {expiry_str}")
+            lines.append("")
+            lines.append(f"  🛡️ ─────────── 💰 ─────────── 🛡️")
+            lines.append(f" L-PE          ATM          L-CE")
+            lines.append(f"{lower_wing}  ←───── {atm_strike} ─────→  {upper_wing}")
+            lines.append("")
+            lines.append(f"┌────────────────────────────────┐")
+            lines.append(f"│ SELL ATM │ CE ₹{s_ce_ltp:>5.0f}  PE ₹{s_pe_ltp:>5.0f} │")
+            lines.append(f"│ BUY WING │ CE ₹{l_ce_ltp:>5.0f}  PE ₹{l_pe_ltp:>5.0f} │")
+            lines.append(f"├────────────────────────────────┤")
+            lines.append(f"│ 💰 NET CREDIT: ₹{net_credit:>5.0f}/lot     │")
+            lines.append(f"└────────────────────────────────┘")
+
+            return '\n'.join(lines)
 
         except Exception as e:
             logger.warning(f"Could not fetch option quotes: {e}")
-            return f"ATM: {atm_strike} | Wings: ±{wing_distance}\n(Live quotes unavailable)"
+            # Fallback to simple format
+            upper_wing = atm_strike + wing_distance
+            lower_wing = atm_strike - wing_distance
+            return (
+                f"═══════ 🦋 IRON FLY ═══════\n"
+                f"  🛡️ ─────────── 💰 ─────────── 🛡️\n"
+                f"{lower_wing}  ←───── {atm_strike} ─────→  {upper_wing}\n"
+                f"(Live quotes unavailable)"
+            )
 
     # =========================================================================
     # ADVISORY METHODS
@@ -407,13 +427,9 @@ class ClaudeAdvisor:
             decision_msg = (
                 f"🤖 *Pre-Entry Analysis*\n\n"
                 f"📊 NIFTY {nifty_spot:,.0f} | 🌡️ VIX {india_vix:.1f} | ⏳ DTE {dte}\n\n"
-                f"*🦋 Iron Fly Structure:*\n"
-                f"```\n{option_table}```\n\n"
-                f"💰 *Est. Net Credit:* ₹{net_credit:.0f}/lot\n"
-                f"✅ Max Profit: ₹{max_profit:,.0f} | ⛔ Max Loss: ₹{max_loss:,.0f}\n\n"
-                f"*Claude's Analysis:*\n{escape_markdown(response.reasoning[:350])}\n\n"
-                f"{rec_emoji} *Recommendation: {rec_text}*\n"
-                f"🎯 Confidence: {response.confidence:.0%}\n\n"
+                f"{option_table}\n\n"
+                f"*Claude's Analysis:*\n{escape_markdown(response.reasoning[:300])}\n\n"
+                f"{rec_emoji} *Recommendation: {rec_text}*  ({response.confidence:.0%})\n\n"
                 f"⌨️ _Reply: ENTER or SKIP_"
             )
             self.telegram.send(decision_msg)
@@ -441,21 +457,21 @@ class ClaudeAdvisor:
                     else:
                         self.telegram.send("✅ *Confirmed:* Proceeding with entry")
                 else:
-                    # User wants to skip - set cooldown for rest of day
+                    # User wants to skip - set cooldown for 10 hours (expires before next market open)
                     final_decision = ClaudeDecision.SKIP
-                    set_cooldown('user_skip', 86400)  # 24 hours (will expire next day)
+                    set_cooldown('user_skip', 36000)  # 10 hours
                     if response.decision == ClaudeDecision.PROCEED:
-                        self.telegram.send("⏭️ *User override:* Skipping entry for today despite Claude's ENTER recommendation")
-                        logger.info("User overrode Claude PROCEED recommendation - skipping entry, cooldown set")
+                        self.telegram.send("⏭️ *User override:* Skipping entry for today despite Claude's ENTER recommendation\n⏰ Cooldown: 10 hours")
+                        logger.info("User overrode Claude PROCEED recommendation - skipping entry, 10h cooldown set")
                     else:
-                        self.telegram.send("⏭️ *Confirmed:* Skipping entry for today")
-                        logger.info("User confirmed SKIP - cooldown set for rest of day")
+                        self.telegram.send("⏭️ *Confirmed:* Skipping entry for today\n⏰ Cooldown: 10 hours")
+                        logger.info("User confirmed SKIP - 10h cooldown set")
             else:
                 # Timeout - default to SKIP (conservative) and set cooldown
                 final_decision = ClaudeDecision.SKIP
-                set_cooldown('user_skip', 86400)  # Skip for rest of day on timeout
-                self.telegram.send(f"⏰ *Timeout:* No response - skipping entry for today (conservative default)")
-                logger.info(f"User response timeout - defaulting to SKIP with cooldown")
+                set_cooldown('user_skip', 36000)  # 10 hours
+                self.telegram.send(f"⏰ *Timeout:* No response - skipping entry for today\n⏰ Cooldown: 10 hours")
+                logger.info(f"User response timeout - defaulting to SKIP with 10h cooldown")
 
             return AdvisoryResult(
                 decision=final_decision,
