@@ -84,17 +84,22 @@ def main():
     try:
         logger.info("Starting polling loop...")
 
-        # Run polling (blocking call)
-        bot.run_polling()
+        # Start polling in background thread
+        bot.start_polling()
+
+        # Keep main thread alive
+        while True:
+            time.sleep(1)
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
-        bot.stop()
+        bot.stop_polling()
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         logger.exception("Traceback:")
         raise
     finally:
+        bot.stop_polling()
         logger.info("Telegram poller stopped")
 
 
