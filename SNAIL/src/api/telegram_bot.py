@@ -807,8 +807,10 @@ _Example: /cooldown clear user\\_skip_""")
 ✅ No active cooldowns - entry allowed""")
 
         except Exception as e:
+            import traceback
             logger.error(f"Error in /cooldown: {e}")
-            self._send_reply(f"❌ Error: {str(e)[:100]}")
+            logger.error(traceback.format_exc())
+            self._send_reply(f"❌ Error: {str(e)[:200]}")
 
     def _cmd_exit(self, update: TelegramUpdate, args: List[str]):
         """Handle /exit command - confirm and queue exit request."""
