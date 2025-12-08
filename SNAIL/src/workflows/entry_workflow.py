@@ -243,7 +243,8 @@ class EntryWorkflow:
                     atm_strike=conditions.atm_strike,
                     straddle_premium=straddle_premium,
                     wing_distance=int(round(straddle_premium / 100) * 100),
-                    dte=conditions.dte
+                    dte=conditions.dte,
+                    expiry_date=conditions.expiry
                 )
 
                 if claude_decision.action_required:

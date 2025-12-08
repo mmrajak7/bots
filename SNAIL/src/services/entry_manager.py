@@ -212,6 +212,13 @@ class EntryManager:
                 reason="Entry on cooldown (1-day after exit)"
             )
 
+        # Check user skip cooldown (user explicitly skipped today)
+        if is_on_cooldown('user_skip'):
+            return EntryConditions(
+                can_enter=False,
+                reason="User skipped entry for today"
+            )
+
         # Check time
         now = datetime.now()
         current_time = now.strftime("%H:%M")

@@ -11,7 +11,7 @@ AI-powered trading decision advisor using Claude for complex scenarios.
 @references  TECHNICAL_DESIGN_REFERENCE.md Section 5
 """
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 from loguru import logger
@@ -31,8 +31,10 @@ from src.utils.db import (
     PositionLeg,
     get_active_position,
     get_position_legs,
-    save_claude_decision
+    save_claude_decision,
+    set_cooldown
 )
+from src.utils.symbol_builder import generate_nifty_option_symbol
 from src.utils.calculations import calculate_position_pnl
 from src.utils.config import get_trading_config, load_config
 from src.utils.market_events_scraper import get_events_compact, get_news_compact
@@ -240,6 +242,73 @@ class ClaudeAdvisor:
             logger.warning(f"Failed to record Claude decision: {e}")
 
     # =========================================================================
+    # HELPER METHODS
+    # =========================================================================
+
+    def _get_option_quotes_table(self, atm_strike: int, wing_distance: int, expiry_date: date) -> str:
+        """
+        Fetch actual option quotes and format as table.
+
+        Args:
+            atm_strike: ATM strike price
+            wing_distance: Wing distance from ATM
+            expiry_date: Option expiry date
+
+        Returns:
+            Formatted table string for Telegram
+        """
+        try:
+            # Use provided expiry
+            expiry = expiry_date
+            expiry_str = expiry.strftime('%d-%b')
+
+            # Calculate wing strikes
+            upper_wing = atm_strike + wing_distance
+            lower_wing = atm_strike - wing_distance
+
+            # Build symbols
+            short_ce_sym = generate_nifty_option_symbol(expiry, atm_strike, 'CE')
+            short_pe_sym = generate_nifty_option_symbol(expiry, atm_strike, 'PE')
+            long_ce_sym = generate_nifty_option_symbol(expiry, upper_wing, 'CE')
+            long_pe_sym = generate_nifty_option_symbol(expiry, lower_wing, 'PE')
+
+            # Fetch quotes
+            instruments = [
+                f"NFO:{short_ce_sym}",
+                f"NFO:{short_pe_sym}",
+                f"NFO:{long_ce_sym}",
+                f"NFO:{long_pe_sym}"
+            ]
+
+            quotes = self.kite.quote(instruments)
+
+            # Build table
+            rows = []
+            rows.append(f"{'Leg':<6} {'Strike':>6} {'LTP':>7} {'Bid':>7} {'Ask':>7}")
+            rows.append("-" * 40)
+
+            for inst, label, strike in [
+                (f"NFO:{short_ce_sym}", "S-CE", atm_strike),
+                (f"NFO:{short_pe_sym}", "S-PE", atm_strike),
+                (f"NFO:{long_ce_sym}", "L-CE", upper_wing),
+                (f"NFO:{long_pe_sym}", "L-PE", lower_wing),
+            ]:
+                q = quotes.get(inst)
+                if q:
+                    rows.append(f"{label:<6} {strike:>6} {q.ltp:>7.1f} {q.bid:>7.1f} {q.ask:>7.1f}")
+                else:
+                    rows.append(f"{label:<6} {strike:>6} {'N/A':>7} {'N/A':>7} {'N/A':>7}")
+
+            rows.append("-" * 40)
+            rows.append(f"Expiry: {expiry_str} | Wings: ±{wing_distance}")
+
+            return '\n'.join(rows)
+
+        except Exception as e:
+            logger.warning(f"Could not fetch option quotes: {e}")
+            return f"ATM: {atm_strike} | Wings: ±{wing_distance}\n(Live quotes unavailable)"
+
+    # =========================================================================
     # ADVISORY METHODS
     # =========================================================================
 
@@ -251,7 +320,7 @@ class ClaudeAdvisor:
         straddle_premium: float,
         wing_distance: int,
         dte: int,
-        expiry_date: str = "",
+        expiry_date: date = None,
         net_credit: float = 0.0,
         max_profit: float = 0.0,
         max_loss: float = 0.0,
@@ -269,7 +338,7 @@ class ClaudeAdvisor:
             straddle_premium: Expected straddle premium
             wing_distance: Calculated wing distance
             dte: Days to expiry
-            expiry_date: Expiry date string
+            expiry_date: Expiry date object
             net_credit: Net credit per lot
             max_profit: Max profit per lot
             max_loss: Max loss per lot
@@ -325,6 +394,11 @@ class ClaudeAdvisor:
             prompt = f"Pre-entry check: NIFTY={nifty_spot}, VIX={india_vix}, ATM={atm_strike}, DTE={dte}"
             self._record_decision(response, 'pre_entry', prompt)
 
+            # Fetch actual option quotes for display
+            # Use expiry_date if provided, otherwise estimate from dte
+            exp_date = expiry_date if expiry_date else (date.today() + timedelta(days=dte))
+            option_table = self._get_option_quotes_table(atm_strike, wing_distance, exp_date)
+
             # Determine emoji based on Claude's recommendation
             rec_emoji = "✅" if response.decision == ClaudeDecision.PROCEED else "⚠️"
             rec_text = "ENTER" if response.decision == ClaudeDecision.PROCEED else "SKIP"
@@ -332,10 +406,12 @@ class ClaudeAdvisor:
             # Send analysis to user with decision options
             decision_msg = (
                 f"🤖 *Pre-Entry Analysis*\n\n"
-                f"📊 NIFTY {nifty_spot:,.0f} | 🌡️ VIX {india_vix:.1f}\n"
-                f"🎯 ATM {atm_strike} | ⏳ DTE {dte}\n"
-                f"💰 Est. Credit ₹{net_credit:.0f}/lot\n\n"
-                f"*Claude's Analysis:*\n{escape_markdown(response.reasoning[:400])}\n\n"
+                f"📊 NIFTY {nifty_spot:,.0f} | 🌡️ VIX {india_vix:.1f} | ⏳ DTE {dte}\n\n"
+                f"*🦋 Iron Fly Structure:*\n"
+                f"```\n{option_table}```\n\n"
+                f"💰 *Est. Net Credit:* ₹{net_credit:.0f}/lot\n"
+                f"✅ Max Profit: ₹{max_profit:,.0f} | ⛔ Max Loss: ₹{max_loss:,.0f}\n\n"
+                f"*Claude's Analysis:*\n{escape_markdown(response.reasoning[:350])}\n\n"
                 f"{rec_emoji} *Recommendation: {rec_text}*\n"
                 f"🎯 Confidence: {response.confidence:.0%}\n\n"
                 f"⌨️ _Reply: ENTER or SKIP_"
@@ -365,18 +441,21 @@ class ClaudeAdvisor:
                     else:
                         self.telegram.send("✅ *Confirmed:* Proceeding with entry")
                 else:
-                    # User wants to skip
+                    # User wants to skip - set cooldown for rest of day
                     final_decision = ClaudeDecision.SKIP
+                    set_cooldown('user_skip', 86400)  # 24 hours (will expire next day)
                     if response.decision == ClaudeDecision.PROCEED:
-                        self.telegram.send("⏭️ *User override:* Skipping entry despite Claude's ENTER recommendation")
-                        logger.info("User overrode Claude PROCEED recommendation - skipping entry")
+                        self.telegram.send("⏭️ *User override:* Skipping entry for today despite Claude's ENTER recommendation")
+                        logger.info("User overrode Claude PROCEED recommendation - skipping entry, cooldown set")
                     else:
-                        self.telegram.send("⏭️ *Confirmed:* Skipping entry")
+                        self.telegram.send("⏭️ *Confirmed:* Skipping entry for today")
+                        logger.info("User confirmed SKIP - cooldown set for rest of day")
             else:
-                # Timeout - default to Claude's recommendation
-                self.telegram.send(f"⏰ *Timeout:* No response received. Using Claude's recommendation: *{rec_text}*")
-                final_decision = response.decision
-                logger.info(f"User response timeout - defaulting to Claude's recommendation: {rec_text}")
+                # Timeout - default to SKIP (conservative) and set cooldown
+                final_decision = ClaudeDecision.SKIP
+                set_cooldown('user_skip', 86400)  # Skip for rest of day on timeout
+                self.telegram.send(f"⏰ *Timeout:* No response - skipping entry for today (conservative default)")
+                logger.info(f"User response timeout - defaulting to SKIP with cooldown")
 
             return AdvisoryResult(
                 decision=final_decision,
