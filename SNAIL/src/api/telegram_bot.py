@@ -781,14 +781,16 @@ _VIX Range for entry: 10-16_""")
 
             for ct in cooldown_types:
                 remaining = get_cooldown_remaining(ct)
+                # Escape underscores for Telegram Markdown
+                ct_display = ct.replace('_', '\\_')
                 if remaining is not None:
                     hours = remaining // 3600
                     minutes = (remaining % 3600) // 60
                     time_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
-                    status_lines.append(f"• {ct}: 🔴 ACTIVE ({time_str} left)")
+                    status_lines.append(f"• {ct_display}: 🔴 ACTIVE ({time_str} left)")
                     any_active = True
                 else:
-                    status_lines.append(f"• {ct}: 🟢 inactive")
+                    status_lines.append(f"• {ct_display}: 🟢 inactive")
 
             status_text = "\n".join(status_lines)
 
@@ -797,7 +799,7 @@ _VIX Range for entry: 10-16_""")
 
 {status_text}
 
-To clear: `/cooldown clear` or `/cooldown clear user_skip`""")
+To clear: /cooldown clear""")
             else:
                 self._send_reply(f"""⏰ *Cooldown Status*
 
