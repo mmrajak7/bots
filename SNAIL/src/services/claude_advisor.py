@@ -545,13 +545,14 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
                 prompt_id=f"pre_entry_{datetime.now().strftime('%Y%m%d%H%M%S')}",
                 response_type=ResponseType.CHOICE,
                 timeout_seconds=300,  # 5 minutes
-                valid_choices=['enter', 'skip', 'proceed', 'yes', 'no']
+                # telegram_bot normalizes all natural language to 'enter' or 'skip'
+                valid_choices=['enter', 'skip']
             )
 
             # Determine final decision based on user input
             if user_response:
                 user_choice = user_response.normalized
-                if user_choice in ['enter', 'proceed', 'yes']:
+                if user_choice == 'enter':
                     final_decision = ClaudeDecision.PROCEED
                     self.telegram.send("✅ *Confirmed:* Proceeding with entry")
                     logger.info("User confirmed ENTER")

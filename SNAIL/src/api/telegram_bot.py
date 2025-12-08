@@ -380,6 +380,7 @@ class TelegramBot:
 
     def _handle_text_response(self, update: TelegramUpdate, text: str):
         """Handle text responses like EXIT, HOLD, ADJUST, ENTER, SKIP."""
+        # Normalize to uppercase for case-insensitive matching
         text_upper = text.upper().strip()
 
         # Handle standard callback actions
@@ -389,17 +390,38 @@ class TelegramBot:
             self._send_reply(f"Received: {text_upper}\n\nProcessing your request...")
 
         # Handle ENTER/SKIP responses for pre-entry (write to shared queue)
-        elif text_upper in ["ENTER", "SKIP", "YES", "NO", "PROCEED"]:
-            # Write to shared response queue for response_handler to pick up
-            from src.api.response_handler import TelegramResponseHandler, RESPONSE_QUEUE_FILE
-            TelegramResponseHandler.write_shared_response(
-                text=text_upper.lower(),
-                chat_id=str(update.chat_id)
-            )
-            logger.info(f"Text response queued to {RESPONSE_QUEUE_FILE}: {text_upper}")
-            # Send confirmation to user
-            self._send_reply(f"✅ Received: {text_upper}")
-        # Otherwise ignore non-command messages
+        # Normalize various natural language inputs to standard responses
+        else:
+            # Aliases for ENTER (proceed with trade)
+            enter_aliases = [
+                "ENTER", "YES", "PROCEED", "Y", "OK", "OKAY", "GO", "SURE",
+                "DO IT", "DOIT", "TRADE", "EXECUTE", "CONFIRM", "APPROVED",
+                "GO AHEAD", "LET'S GO", "LETS GO", "YEP", "YA", "YEAH"
+            ]
+            # Aliases for SKIP (don't trade)
+            skip_aliases = [
+                "SKIP", "NO", "N", "NOPE", "CANCEL", "WAIT", "PASS",
+                "NO THANKS", "NOTHANKS", "DONT", "DON'T", "STOP", "ABORT",
+                "NOT NOW", "NOTNOW", "LATER", "NAH", "NA"
+            ]
+
+            normalized_response = None
+            if text_upper in enter_aliases:
+                normalized_response = "enter"
+            elif text_upper in skip_aliases:
+                normalized_response = "skip"
+
+            if normalized_response:
+                from src.api.response_handler import TelegramResponseHandler, RESPONSE_QUEUE_FILE
+                TelegramResponseHandler.write_shared_response(
+                    text=normalized_response,
+                    chat_id=str(update.chat_id)
+                )
+                logger.info(f"Text response '{text_upper}' normalized to '{normalized_response}' and queued")
+                # Send confirmation to user
+                action_text = "ENTER ✅" if normalized_response == "enter" else "SKIP ⏭️"
+                self._send_reply(f"✅ Received: {text_upper} → {action_text}")
+            # Otherwise ignore non-command messages
 
     def _is_callback_processed(self, callback_query_id: str) -> bool:
         """
