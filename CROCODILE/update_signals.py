@@ -175,24 +175,38 @@ def fetch_from_chartink(payload):
 
 
 def initialize_signals_file():
-    """Create signals_crocodile.csv if it doesn't exist, or migrate if Status column missing"""
+    """Create signals_crocodile.csv if it doesn't exist, or migrate if columns missing"""
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
         logger.info(f"Created data directory: {DATA_DIR}")
 
     if not os.path.exists(SIGNALS_FILE):
-        # Create new file with Status column
-        df = pd.DataFrame(columns=['Date', 'Script', 'TF', 'Status'])
+        # Create new file with all columns including Time
+        df = pd.DataFrame(columns=['Date', 'Time', 'Script', 'TF', 'Status'])
         df.to_csv(SIGNALS_FILE, index=False)
         logger.info(f"Created signals file: signals_crocodile.csv")
     else:
-        # Migrate existing file if Status column missing
+        # Migrate existing file if columns missing
         try:
             df = pd.read_csv(SIGNALS_FILE)
+            migrated = False
+
             if 'Status' not in df.columns:
                 df['Status'] = ''  # Add empty Status for existing rows
-                df.to_csv(SIGNALS_FILE, index=False)
+                migrated = True
                 logger.info(f"Migrated signals file: added Status column")
+
+            if 'Time' not in df.columns:
+                df['Time'] = '00:00:00'  # Add default time for existing rows
+                migrated = True
+                logger.info(f"Migrated signals file: added Time column (default 00:00:00)")
+
+            if migrated:
+                # Reorder columns to: Date, Time, Script, TF, Status
+                cols = ['Date', 'Time', 'Script', 'TF', 'Status']
+                df = df[cols]
+                df.to_csv(SIGNALS_FILE, index=False)
+
         except Exception as e:
             logger.warning(f"Could not check/migrate signals file: {e}")
 
@@ -202,7 +216,7 @@ def update_signals_file(new_signals):
     Append new signals to signals_crocodile.csv with empty Status
 
     Args:
-        new_signals: List of [date, script, timeframe] lists
+        new_signals: List of [date, time, script, timeframe] lists
     """
     if not new_signals:
         logger.info("No new signals to add")
@@ -212,18 +226,23 @@ def update_signals_file(new_signals):
         # Read existing signals
         if os.path.exists(SIGNALS_FILE):
             df_existing = pd.read_csv(SIGNALS_FILE)
-            # Ensure Status column exists
+            # Ensure required columns exist
             if 'Status' not in df_existing.columns:
                 df_existing['Status'] = ''
+            if 'Time' not in df_existing.columns:
+                df_existing['Time'] = '00:00:00'
         else:
-            df_existing = pd.DataFrame(columns=['Date', 'Script', 'TF', 'Status'])
+            df_existing = pd.DataFrame(columns=['Date', 'Time', 'Script', 'TF', 'Status'])
 
         # Create dataframe from new signals with empty Status
-        df_new = pd.DataFrame(new_signals, columns=['Date', 'Script', 'TF'])
+        df_new = pd.DataFrame(new_signals, columns=['Date', 'Time', 'Script', 'TF'])
         df_new['Status'] = ''  # New signals have empty status (pending processing)
 
         # Concatenate
         df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+
+        # Ensure column order is consistent
+        df_combined = df_combined[['Date', 'Time', 'Script', 'TF', 'Status']]
 
         # Save
         df_combined.to_csv(SIGNALS_FILE, index=False)
@@ -232,7 +251,7 @@ def update_signals_file(new_signals):
 
         # Display new signals
         for signal in new_signals:
-            logger.info(f"   [{signal[2]}] {signal[1]} - {signal[0]}")
+            logger.info(f"   [{signal[3]}] {signal[2]} - {signal[0]} {signal[1]}")
 
     except Exception as e:
         logger.error(f"Error updating signals file: {e}")
@@ -308,8 +327,8 @@ def main():
                     logger.debug(f"   Skipped {stock} (duplicate)")
                     continue
 
-                # Add to new signals
-                new_signals.append([str(curr_date), stock, timeframe])
+                # Add to new signals (with current time)
+                new_signals.append([str(curr_date), curr_time.strftime('%H:%M:%S'), stock, timeframe])
                 added += 1
 
             logger.info(f"   Added {added} new signals for {timeframe}")
