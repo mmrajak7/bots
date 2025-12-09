@@ -670,11 +670,11 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
                     self.telegram.send("⏭️ *Confirmed:* Skipping entry for today\n⏰ Cooldown: 10 hours")
                     logger.info("User confirmed SKIP - 10h cooldown set")
             else:
-                # Timeout - default to SKIP (conservative) and set cooldown
+                # Timeout - skip this alert but NO cooldown (will continue sending alerts)
                 final_decision = ClaudeDecision.SKIP
-                set_cooldown('user_skip', 36000)  # 10 hours
-                self.telegram.send("⏰ *Timeout:* No response - skipping entry for today\n⏰ Cooldown: 10 hours")
-                logger.info("User response timeout - defaulting to SKIP with 10h cooldown")
+                # No cooldown set - only explicit SKIP sets cooldown
+                self.telegram.send("⏰ *Timeout:* No response - skipping this alert\n📢 Will continue sending alerts until explicit SKIP")
+                logger.info("User response timeout - skipping alert, no cooldown (will re-alert)")
 
             return AdvisoryResult(
                 decision=final_decision,
