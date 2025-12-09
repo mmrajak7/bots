@@ -1,5 +1,6 @@
 """EOD GTT Update Workflow - 3:50 PM Daily"""
 
+import os
 import sys
 from pathlib import Path
 
@@ -11,7 +12,6 @@ from loguru import logger
 from src.utils.config_manager import config
 from src.services.exit_manager import exit_manager
 from src.reporting.telegram_client import telegram
-from src.models.database import ProcessedSignal, get_session
 from src.utils.timezone_helper import ist_now_naive
 from datetime import date
 
@@ -148,56 +148,88 @@ def update_gtt_eod():
 
 def cleanup_stale_signals():
     """
-    Mark today's unprocessed blank signals as 'T' (Timeout/Stale)
+    Mark unprocessed blank signals as 'T' (Timeout/Stale) in the CSV file.
 
     Run at EOD (3:50 PM) to clean up signals that were waiting for position slots
     but never got executed during the day.
 
     Blank signals are those that:
-    - Were validated successfully
-    - Hit position/pending order limit
-    - Were left blank for retry
-    - Never executed by EOD
+    - Were added to CSV but never processed
+    - Hit position/pending order limit all day
+    - Were left blank for retry but never executed by EOD
+
+    NOTE: We clean up the CSV file directly (not database) because signals that
+    hit position limits early never get a database record created - they're simply
+    skipped and retried. The CSV is the source of truth for these unprocessed signals.
+
+    Also handles missed cleanup from previous days (e.g., if EOD job didn't run).
     """
-    logger.info("=== Starting stale signal cleanup ===")
+    import pandas as pd
+    import shutil
 
-    session = get_session()
+    logger.info("=== Starting stale signal cleanup (CSV-based) ===")
+
+    signals_file = config.get('signals.csv_file', 'data/signals.csv')
+    today = date.today()
+
     try:
-        today = date.today()
+        # Read current CSV
+        if not os.path.exists(signals_file):
+            logger.warning(f"Signals file not found: {signals_file}")
+            return {'cleaned': 0, 'signals': []}
 
-        # Find all signals from today with blank status (NULL processing_status)
-        # These are signals that were left blank for retry but never executed
-        stale_signals = session.query(ProcessedSignal).filter(
-            ProcessedSignal.date == today,
-            ProcessedSignal.processing_status.is_(None)  # Blank status
-        ).all()
+        df = pd.read_csv(signals_file)
 
-        if not stale_signals:
-            logger.info("No stale signals found for cleanup")
+        # Ensure Status column exists
+        if 'Status' not in df.columns:
+            df['Status'] = ''
+
+        # Convert Date column to date objects for comparison
+        df['_parsed_date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+
+        # Find rows with blank/empty status from today or earlier
+        # (catches both today's stale signals AND any missed from previous days)
+        blank_mask = (
+            (df['Status'].isna() | (df['Status'] == '')) &
+            (df['_parsed_date'] <= today)
+        )
+
+        stale_rows = df[blank_mask]
+
+        if len(stale_rows) == 0:
+            logger.info("No stale signals found in CSV for cleanup")
             return {'cleaned': 0, 'signals': []}
 
         # Mark them as 'T' (Timeout/Stale)
         cleaned_count = 0
         cleaned_list = []
 
-        for signal in stale_signals:
-            signal.processing_status = 'TIMEOUT'  # Mark as timeout/stale
-            signal.rejection_reason = "EOD: Signal timed out (no position slots available all day)"
-            signal.completed_at = ist_now_naive()
+        for idx in stale_rows.index:
+            script = df.loc[idx, 'Script']
+            timeframe = df.loc[idx, 'TF']
+            signal_date = df.loc[idx, 'Date']
+
+            df.loc[idx, 'Status'] = 'T'
             cleaned_count += 1
-            cleaned_list.append(f"{signal.script}({signal.timeframe})")
+            cleaned_list.append(f"{script}({timeframe}) [{signal_date}]")
 
-        session.commit()
+        # Remove temporary column
+        df = df.drop(columns=['_parsed_date'])
 
-        logger.info(f"✅ Cleaned up {cleaned_count} stale signals: {', '.join(cleaned_list)}")
+        # Write atomically using temp file
+        temp_file = signals_file + '.tmp'
+        df.to_csv(temp_file, index=False)
+        shutil.move(temp_file, signals_file)
+
+        logger.info(f"✅ Cleaned up {cleaned_count} stale signals in CSV: {', '.join(cleaned_list)}")
 
         # Send Telegram alert if signals were cleaned up
         if cleaned_count > 0:
             alert_msg = (
                 f"🧹 **EOD Stale Signal Cleanup**\n\n"
-                f"**Marked {cleaned_count} signal(s) as TIMEOUT:**\n"
+                f"**Marked {cleaned_count} signal(s) as TIMEOUT (T):**\n"
                 f"{chr(10).join('• ' + s for s in cleaned_list)}\n\n"
-                f"*Reason: No position slots available all day*"
+                f"*Reason: No position slots available / not processed by EOD*"
             )
             telegram.send_alert(alert_msg, critical=False)
 
@@ -205,10 +237,7 @@ def cleanup_stale_signals():
 
     except Exception as e:
         logger.error(f"Failed to cleanup stale signals: {e}", exc_info=True)
-        session.rollback()
         return {'cleaned': 0, 'signals': [], 'error': str(e)}
-    finally:
-        session.close()
 
 
 if __name__ == "__main__":
