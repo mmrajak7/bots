@@ -138,7 +138,7 @@ def monitor_orders():
         )
 
         # Part 2: Check GTT status for SL hits (real-time position closure)
-        logger.info("[STEP 2/4] Checking GTT status for SL hits...")
+        logger.info("[STEP 2/5] Checking GTT status for SL hits...")
         gtt_stats = order_monitor.check_gtt_triggered_positions()
 
         logger.info(
@@ -147,11 +147,26 @@ def monitor_orders():
             f"Positions closed={gtt_stats['positions_closed']}"
         )
 
-        # Part 3: Manage stale pending orders (cancel orders unlikely to fill)
+        # Part 3: Check for stuck SL orders (GTT triggered but LIMIT order not filled)
+        # If price drifted >0.5% below order price, convert to MARKET
+        logger.info("[STEP 3/5] Checking for stuck SL LIMIT orders...")
+        sl_order_stats = order_monitor.check_pending_sl_orders()
+
+        if sl_order_stats['orders_checked'] > 0:
+            logger.info(
+                f"Pending SL check: Checked={sl_order_stats['orders_checked']}, "
+                f"Converted to MARKET={sl_order_stats['orders_converted']}"
+            )
+            if sl_order_stats['errors']:
+                logger.warning(f"SL order errors: {sl_order_stats['errors']}")
+        else:
+            logger.debug("No pending SL orders to check")
+
+        # Part 4: Manage stale pending orders (cancel orders unlikely to fill)
         # Only run during market hours (not after close - EOD cleanup handles that)
         stale_stats = None
         if not after_market_close:
-            logger.info("[STEP 3/4] Checking for stale pending orders...")
+            logger.info("[STEP 4/5] Checking for stale pending orders...")
             stale_stats = order_monitor.manage_stale_pending_orders()
 
             stale_cancelled = stale_stats['stale_by_time'] + stale_stats['stale_by_price']
@@ -164,14 +179,14 @@ def monitor_orders():
             else:
                 logger.info(f"Stale order check: {stale_stats['pending_checked']} orders checked, none stale")
         else:
-            logger.info("[STEP 3/4] Skipped stale order check (after market close)")
+            logger.info("[STEP 4/5] Skipped stale order check (after market close)")
 
-        # Part 4: EOD Order Cleanup (only after 3:40 PM when exchange allows cancellations)
+        # Part 5: EOD Order Cleanup (only after 3:40 PM when exchange allows cancellations)
         # Exchange doesn't allow cancellations during 15:30-15:40 post-market window
         eod_stats = None
         eod_cleanup_ready = is_eod_cleanup_time()
         if eod_cleanup_ready:
-            logger.info("[STEP 4/4] EOD Order Cleanup - Cancelling unfulfilled orders...")
+            logger.info("[STEP 5/5] EOD Order Cleanup - Cancelling unfulfilled orders...")
             eod_stats = order_monitor.cancel_unfulfilled_orders()
 
             if eod_stats['pending_found'] > 0:
@@ -184,9 +199,9 @@ def monitor_orders():
             else:
                 logger.info("EOD Cleanup: No pending orders to cancel")
         elif after_market_close:
-            logger.info("[STEP 4/4] Skipped EOD cleanup (waiting until 15:40 for exchange to allow cancellations)")
+            logger.info("[STEP 5/5] Skipped EOD cleanup (waiting until 15:40 for exchange to allow cancellations)")
         else:
-            logger.info("[STEP 4/4] Skipped EOD cleanup (market still open)")
+            logger.info("[STEP 5/5] Skipped EOD cleanup (market still open)")
 
         # Log combined summary
         summary = (

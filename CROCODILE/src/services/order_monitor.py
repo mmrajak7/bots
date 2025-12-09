@@ -533,6 +533,154 @@ class OrderMonitor:
             if close_session:
                 session.close()
 
+    def check_pending_sl_orders(self, session: Optional[Session] = None) -> Dict[str, any]:
+        """
+        Check for pending SELL orders from GTT triggers that haven't filled.
+
+        When a GTT triggers, it places a LIMIT sell order. If the price drops
+        quickly, this LIMIT order may not fill. This function:
+        1. Finds pending SELL LIMIT orders
+        2. Checks if LTP has moved > 0.5% below the order price
+        3. If so, converts the LIMIT order to MARKET for immediate execution
+
+        Returns:
+            Stats dict with orders_checked, orders_converted, errors
+        """
+        close_session = False
+        if session is None:
+            session = get_session()
+            close_session = True
+
+        stats = {
+            'orders_checked': 0,
+            'orders_converted': 0,
+            'orders_filled': 0,
+            'errors': []
+        }
+
+        # Threshold for converting LIMIT to MARKET (0.5% below trigger price)
+        PRICE_DRIFT_THRESHOLD = 0.005  # 0.5%
+
+        try:
+            # Get all orders from Zerodha
+            all_orders = self.kite_client.get_all_orders()
+
+            # Filter for pending SELL LIMIT orders (likely from GTT triggers)
+            pending_sells = [
+                o for o in all_orders
+                if o.get('transaction_type') == 'SELL'
+                and o.get('status') in ['OPEN', 'PENDING', 'TRIGGER PENDING']
+                and o.get('order_type') == 'LIMIT'
+                and o.get('product') == 'CNC'
+            ]
+
+            if not pending_sells:
+                logger.debug("No pending SELL LIMIT orders found")
+                return stats
+
+            logger.info(f"Checking {len(pending_sells)} pending SELL LIMIT orders...")
+            stats['orders_checked'] = len(pending_sells)
+
+            for order in pending_sells:
+                symbol = order.get('tradingsymbol', '')
+                order_id = order.get('order_id')
+                order_price = order.get('price', 0)
+                quantity = order.get('quantity', 0)
+
+                # Get current LTP
+                try:
+                    ltp = self._get_ltp(symbol)
+                    if ltp is None:
+                        logger.warning(f"Could not get LTP for {symbol}")
+                        continue
+                except Exception as e:
+                    logger.error(f"Error getting LTP for {symbol}: {e}")
+                    continue
+
+                # Calculate price drift
+                price_drift = (order_price - ltp) / order_price if order_price > 0 else 0
+
+                logger.info(
+                    f"Pending SELL: {symbol} - Order Price: {order_price:.2f}, "
+                    f"LTP: {ltp:.2f}, Drift: {price_drift*100:.2f}%"
+                )
+
+                # If LTP has drifted more than threshold below order price, convert to MARKET
+                if price_drift > PRICE_DRIFT_THRESHOLD:
+                    logger.warning(
+                        f"🔴 Price drifted {price_drift*100:.2f}% below LIMIT price for {symbol}! "
+                        f"Converting to MARKET order..."
+                    )
+
+                    try:
+                        # Modify order to MARKET type
+                        kite = self.kite_client._get_kite()
+                        kite.modify_order(
+                            variety='regular',
+                            order_id=order_id,
+                            order_type='MARKET'
+                        )
+
+                        stats['orders_converted'] += 1
+                        logger.info(f"✅ Converted {symbol} SELL order {order_id} to MARKET")
+
+                        # Send Telegram alert
+                        telegram.send_alert(
+                            f"⚠️ **SL Order Converted to MARKET**\n\n"
+                            f"Stock: {symbol}\n"
+                            f"Original LIMIT: ₹{order_price:.2f}\n"
+                            f"Current LTP: ₹{ltp:.2f}\n"
+                            f"Price drift: {price_drift*100:.2f}%\n\n"
+                            f"*Converted to MARKET for immediate exit*",
+                            critical=True
+                        )
+
+                    except Exception as e:
+                        error_msg = f"Failed to convert {symbol} order to MARKET: {e}"
+                        logger.error(error_msg)
+                        stats['errors'].append(error_msg)
+
+                        # Alert about failed conversion
+                        telegram.send_alert(
+                            f"🚨 **CRITICAL: SL Order Stuck**\n\n"
+                            f"Stock: {symbol}\n"
+                            f"LIMIT Price: ₹{order_price:.2f}\n"
+                            f"Current LTP: ₹{ltp:.2f}\n"
+                            f"Drift: {price_drift*100:.2f}%\n\n"
+                            f"*Failed to convert to MARKET: {e}*\n"
+                            f"**MANUAL INTERVENTION REQUIRED**",
+                            critical=True
+                        )
+
+            return stats
+
+        except Exception as e:
+            logger.error(f"Error checking pending SL orders: {e}", exc_info=True)
+            stats['errors'].append(str(e))
+            return stats
+        finally:
+            if close_session:
+                session.close()
+
+    def _get_ltp(self, symbol: str) -> Optional[float]:
+        """Get Last Traded Price for a symbol"""
+        try:
+            kite = self.kite_client._get_kite()
+            # Try NSE first, then BSE
+            for exchange in ['NSE', 'BSE']:
+                try:
+                    quote = kite.ltp(f"{exchange}:{symbol}")
+                    if quote:
+                        key = f"{exchange}:{symbol}"
+                        if key in quote:
+                            return quote[key].get('last_price')
+                except:
+                    continue
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching LTP for {symbol}: {e}")
+            return None
+
     def _check_for_sell_order(self, position: OpenPosition) -> bool:
         """
         Check if there's a completed SELL order for a position (indicates SL hit)
