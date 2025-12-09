@@ -189,7 +189,8 @@ class SuperTrendCalculator:
         script: str,
         timeframe: str,
         signal_date: str,
-        use_completed_candle_only: bool = False
+        use_completed_candle_only: bool = False,
+        check_fresh_touch: bool = True
     ) -> Tuple[bool, Optional[float], Dict[str, Any]]:
         """
         Verify if signal is valid based on SuperTrend calculation
@@ -202,6 +203,8 @@ class SuperTrendCalculator:
                                        (ignores current incomplete candle during market hours).
                                        Use for signal processing and order monitoring.
                                        Default False for after-hours operations (GTT, SL, recovery).
+            check_fresh_touch: If True, validate that this is a "fresh touch"
+                              (no touches in previous N candles). Default True.
 
         Returns:
             Tuple of (is_valid, buy_level, metadata)
@@ -248,20 +251,127 @@ class SuperTrendCalculator:
                 "candle_reference": candle_type,
                 "candle_index": st_index,
                 "use_completed_candle_only": use_completed_candle_only,
-                "calculation_time": now_ist().isoformat()
+                "calculation_time": now_ist().isoformat(),
+                "fresh_touch_checked": False,
+                "fresh_touch_result": None,
+                "fresh_touch_reason": None
             }
 
-            if is_valid:
-                price_position = "above" if latest_close > reference_supertrend else "below"
-                logger.info(f"✅ Signal VERIFIED for {script} ({timeframe}): Trend={metadata['trend']}, Close={latest_close:.2f} ({price_position} ST={reference_supertrend:.2f}) [{candle_type} candle]")
-                return True, reference_supertrend, metadata
-            else:
+            # Early exit if trend direction check failed
+            if not is_valid:
                 logger.info(f"❌ Signal REJECTED for {script} ({timeframe}): Trend={metadata['trend']} (need UP), Close={latest_close:.2f}, ST={reference_supertrend:.2f} [{candle_type} candle]")
                 return False, None, metadata
+
+            # Fresh Touch Filter (if enabled)
+            if check_fresh_touch:
+                fresh_touch_enabled = self.config.get('supertrend', {}).get('fresh_touch', {}).get('enabled', True)
+                lookback = self.config.get('supertrend', {}).get('fresh_touch', {}).get('lookback_candles', 10)
+
+                if fresh_touch_enabled:
+                    is_fresh, fresh_reason = self.is_fresh_touch(df_with_st, lookback)
+                    metadata["fresh_touch_checked"] = True
+                    metadata["fresh_touch_result"] = is_fresh
+                    metadata["fresh_touch_reason"] = fresh_reason
+                    metadata["fresh_touch_lookback"] = lookback
+
+                    if not is_fresh:
+                        logger.info(
+                            f"❌ Signal REJECTED for {script} ({timeframe}): "
+                            f"Not a fresh touch - {fresh_reason}"
+                        )
+                        return False, None, metadata
+                    else:
+                        logger.debug(f"Fresh touch PASSED for {script}: {fresh_reason}")
+
+            # All checks passed
+            price_position = "above" if latest_close > reference_supertrend else "below"
+            fresh_info = ""
+            if metadata.get("fresh_touch_checked"):
+                fresh_info = f", Fresh={metadata['fresh_touch_result']}"
+            logger.info(f"✅ Signal VERIFIED for {script} ({timeframe}): Trend={metadata['trend']}, Close={latest_close:.2f} ({price_position} ST={reference_supertrend:.2f}) [{candle_type} candle]{fresh_info}")
+            return True, reference_supertrend, metadata
 
         except Exception as e:
             logger.error(f"Signal verification failed for {script}: {e}")
             return False, None, {"error": str(e)}
+
+    def is_fresh_touch(
+        self,
+        df_with_st: pd.DataFrame,
+        lookback: int = 10
+    ) -> Tuple[bool, str]:
+        """
+        Check if current touch is "fresh" (first time price touches ST in last N candles)
+
+        A fresh touch means price APPROACHED SuperTrend from above, indicating a
+        true pullback-to-support scenario rather than price grinding along ST line.
+
+        Args:
+            df_with_st: DataFrame with OHLCV + SuperTrend columns (from calculate_supertrend)
+            lookback: Number of previous candles to check (default: 10)
+
+        Returns:
+            Tuple of (is_fresh, reason_string)
+
+        Logic:
+        - Previous N candles must have LOW > SuperTrend (strict, no tolerance)
+        - Current candle touch detection uses existing Chartink tolerance (handled elsewhere)
+
+        Edge Cases:
+        - Insufficient history (<N candles): Returns True (allow entry, can't verify)
+        - First touch after ST direction flip: Returns True (direction just changed = fresh)
+        """
+        if len(df_with_st) < 2:
+            return True, "Insufficient data for fresh touch check"
+
+        # Use completed candle for reference (index -2), current candle is -1
+        # This matches the use_completed_candle_only=True logic in verify_signal
+        current_idx = len(df_with_st) - 1
+
+        # Edge case: Insufficient history for full lookback
+        available_candles = current_idx  # How many candles before current
+        if available_candles < lookback:
+            logger.debug(
+                f"Fresh touch: Only {available_candles} candles available "
+                f"(need {lookback}), allowing entry"
+            )
+            return True, f"Insufficient history ({available_candles} < {lookback} candles)"
+
+        # Edge case: Check for ST direction flip in lookback period
+        # If trend changed from DOWN to UP within lookback, consider fresh
+        current_trend = df_with_st['trend'].iloc[-1]
+        for i in range(1, min(lookback + 1, available_candles + 1)):
+            prev_trend = df_with_st['trend'].iloc[current_idx - i]
+            if prev_trend != current_trend:
+                # Trend flipped within lookback period - this is a fresh touch
+                candles_since_flip = i
+                logger.debug(
+                    f"Fresh touch: ST direction flipped {candles_since_flip} candles ago, "
+                    f"considering as fresh entry"
+                )
+                return True, f"ST direction flipped {candles_since_flip} candles ago"
+
+        # Check previous N candles for any touch (strict: LOW <= ST)
+        for i in range(1, lookback + 1):
+            check_idx = current_idx - i
+            if check_idx < 0:
+                break
+
+            candle_low = df_with_st['Low'].iloc[check_idx]
+            candle_st = df_with_st['supertrend'].iloc[check_idx]
+
+            # Strict check: LOW must be strictly above ST (no tolerance)
+            if candle_low <= candle_st:
+                # Found a previous touch - NOT a fresh touch
+                candle_date = df_with_st.index[check_idx] if isinstance(df_with_st.index, pd.DatetimeIndex) else f"candle-{i}"
+                logger.debug(
+                    f"Fresh touch FAILED: Candle {i} back ({candle_date}) had "
+                    f"LOW={candle_low:.2f} <= ST={candle_st:.2f}"
+                )
+                return False, f"Previous touch found {i} candles ago (LOW={candle_low:.2f} <= ST={candle_st:.2f})"
+
+        # All previous N candles had gap (LOW > ST) - this is a fresh touch!
+        return True, f"No touches in previous {lookback} candles"
 
     def validate_connection(self) -> bool:
         """Validate API connection"""

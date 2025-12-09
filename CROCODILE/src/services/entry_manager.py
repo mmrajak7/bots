@@ -418,13 +418,22 @@ class EntryManager:
             )
 
             if not is_valid:
-                reason = f"SuperTrend validation failed: {metadata.get('trend', 'N/A')}"
+                # Check if it was a fresh touch rejection
+                if metadata.get('fresh_touch_checked') and metadata.get('fresh_touch_result') is False:
+                    reason = f"Fresh touch validation failed: {metadata.get('fresh_touch_reason', 'N/A')}"
+                else:
+                    reason = f"SuperTrend validation failed: {metadata.get('trend', 'N/A')}"
                 logger.info(f"Signal rejected: {reason}")
                 return False, reason, None
 
+            # Build detailed validation log message
+            fresh_touch_info = ""
+            if metadata.get('fresh_touch_checked'):
+                fresh_touch_info = f", FreshTouch={metadata.get('fresh_touch_result')}"
+
             logger.info(
                 f"Signal VALID: {signal.script} ({signal.timeframe}) - ST={st_price:.2f}, "
-                f"Close={metadata.get('latest_close', 0):.2f}"
+                f"Close={metadata.get('close_price', 0):.2f}{fresh_touch_info}"
             )
 
             return True, "Valid signal", st_price
