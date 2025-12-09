@@ -173,12 +173,28 @@ class EntryManager:
                     logger.warning(f"Invalid signal at row {row_num}: {row} - {e}")
                     continue
 
+            # Sort signals by timeframe priority: W (Weekly) > M (Monthly) > D (Daily)
+            # Weekly signals are rarer and typically have better risk/reward
+            # Within same timeframe, maintain original CSV order (stable sort)
+            timeframe_priority = {'W': 0, 'M': 1, 'D': 2}
+            signals.sort(key=lambda s: timeframe_priority.get(s.timeframe.upper(), 99))
+
             # Report results
             new_signals = len(signals)
+
+            # Log timeframe breakdown
+            tf_counts = {}
+            for s in signals:
+                tf = s.timeframe.upper()
+                tf_counts[tf] = tf_counts.get(tf, 0) + 1
+            tf_summary = ", ".join(f"{tf}={cnt}" for tf, cnt in sorted(tf_counts.items(), key=lambda x: timeframe_priority.get(x[0], 99)))
+
             logger.info(
                 f"CSV read complete: {new_signals} new signals to process "
                 f"(skipped {already_processed} already processed, {invalid_rows} invalid out of {total_rows} total)"
             )
+            if tf_summary:
+                logger.info(f"Signal priority order: {tf_summary} (W > M > D)")
 
             # Alert only if there are many invalid rows (>20% of total)
             # Note: new_signals=0 is normal when all signals already processed
