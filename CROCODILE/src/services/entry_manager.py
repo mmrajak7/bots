@@ -360,7 +360,11 @@ class EntryManager:
         ).first()
 
         if recent_exit:
-            days_since_exit = (date.today() - recent_exit.exit_date.date()).days
+            # exit_date is already a date object (Date column), no need for .date()
+            exit_date = recent_exit.exit_date
+            if hasattr(exit_date, 'date'):
+                exit_date = exit_date.date()
+            days_since_exit = (date.today() - exit_date).days
             return True, (
                 f"Recently exited {script} {timeframe} ({days_since_exit} days ago, "
                 f"cooldown: {cooldown_days} days / 7 candles)"
