@@ -14,9 +14,10 @@ from loguru import logger
 from src.utils.config_manager import config
 from src.services.entry_manager import entry_manager
 from src.reporting.telegram_client import telegram
-from src.models.database import get_session, OpenOrder, OrderStatus, ProcessedSignal
+from src.models.database import get_session, OpenOrder, OpenPosition, ClosedPosition, OrderStatus, PositionStatus, ProcessedSignal
 from src.api.broker_factory import get_broker
 from src.utils.timezone_helper import ist_now_naive
+from src.utils.cost_calculator import cost_calculator
 
 # Market hours (IST)
 MARKET_START_HOUR = 9
@@ -60,6 +61,154 @@ def check_market_hours(now):
         logger.info(f"Outside market hours ({curr_time.strftime('%H:%M')}) - Exiting")
         return False
     return True
+
+
+def reconcile_positions_with_zerodha():
+    """
+    Reconcile DB open positions with actual Zerodha holdings.
+
+    Called at script startup to detect and close any positions that were
+    stopped out (GTT triggered) when the bot was not running.
+
+    Checks:
+    1. Holdings API (quantity + t1_quantity for pending settlement)
+    2. Day positions (bought today, not yet in holdings)
+    3. Today's sell orders (for exit price of stopped out positions)
+    """
+    logger.info("=" * 60)
+    logger.info("STARTUP RECONCILIATION: Syncing positions with Zerodha...")
+    logger.info("=" * 60)
+
+    session = get_session()
+    broker = get_broker()
+
+    try:
+        # Get underlying kite client for holdings
+        kite = broker._get_kite()
+
+        # 1. Get holdings (including T1 pending settlement)
+        holdings = kite.holdings()
+        holdings_map = {}
+        for h in holdings:
+            symbol = h.get('tradingsymbol', '')
+            qty = h.get('quantity', 0)
+            t1_qty = h.get('t1_quantity', 0)
+            total_qty = qty + t1_qty
+            if total_qty > 0:
+                holdings_map[symbol] = total_qty
+
+        # 2. Get day positions (bought today, pending settlement tomorrow)
+        positions = kite.positions()
+        day_pos_map = {}
+        for p in positions.get('net', []):
+            symbol = p.get('tradingsymbol', '')
+            qty = p.get('quantity', 0)
+            if qty > 0:  # Only buys (positive qty)
+                day_pos_map[symbol] = qty
+
+        # 3. Get today's sell orders (for exit prices)
+        orders = kite.orders()
+        today_sells = {}
+        for o in orders:
+            if o.get('transaction_type') == 'SELL' and o.get('status') == 'COMPLETE':
+                symbol = o.get('tradingsymbol', '')
+                today_sells[symbol] = o.get('average_price', 0)
+
+        # 4. Get DB open positions for this bot
+        bot_id = config.get_bot_instance_id()
+        db_positions = session.query(OpenPosition).filter_by(
+            bot_instance_id=bot_id,
+            status=PositionStatus.OPEN
+        ).all()
+
+        if not db_positions:
+            logger.info("No open positions in DB to reconcile")
+            return
+
+        logger.info(f"Checking {len(db_positions)} DB positions against Zerodha...")
+
+        closed_count = 0
+        kept_count = 0
+
+        for p in db_positions:
+            total_hld = holdings_map.get(p.script, 0)
+            day_qty = day_pos_map.get(p.script, 0)
+
+            # Position is active if in holdings OR bought today
+            if total_hld > 0 or day_qty > 0:
+                kept_count += 1
+                continue
+
+            # Position NOT in Zerodha - needs to be closed
+            sold_today = p.script in today_sells
+
+            if sold_today:
+                exit_price = today_sells[p.script]
+                exit_reason = 'GTT_SL_TRIGGERED'
+            else:
+                # Sold on prior day - use entry as fallback
+                exit_price = p.entry_price
+                exit_reason = 'STALE_POSITION_SYNC'
+
+            # Calculate P&L
+            pnl_details = cost_calculator.calculate_pnl(
+                entry_price=p.entry_price,
+                exit_price=exit_price,
+                quantity=p.quantity,
+                entry_date=p.entry_date,
+                exit_date=date.today()
+            )
+
+            # Create closed position record
+            closed = ClosedPosition(
+                bot_instance_id=p.bot_instance_id,
+                script=p.script,
+                timeframe=p.timeframe,
+                entry_date=p.entry_date,
+                entry_price=p.entry_price,
+                quantity=p.quantity,
+                capital_deployed=p.capital_deployed,
+                exit_date=date.today(),
+                exit_price=exit_price,
+                exit_reason=exit_reason,
+                gross_pnl=pnl_details['gross_pnl'],
+                transaction_costs=pnl_details['total_costs'],
+                cost_breakdown=pnl_details.get('cost_breakdown'),
+                net_pnl=pnl_details['net_pnl'],
+                pnl_percent=pnl_details['pnl_percent'],
+                days_held=pnl_details['days_held'],
+                sl_movements=p.sl_movements if hasattr(p, 'sl_movements') else 0,
+                highest_sl_achieved=p.highest_sl if hasattr(p, 'highest_sl') else None,
+                closed_at=ist_now_naive()
+            )
+
+            session.add(closed)
+            session.delete(p)
+
+            logger.warning(
+                f"RECONCILED: {p.script}({p.timeframe}) - "
+                f"Exit={exit_price:.2f}, Net P&L={pnl_details['net_pnl']:.2f}, Reason={exit_reason}"
+            )
+            closed_count += 1
+
+        session.commit()
+
+        if closed_count > 0:
+            logger.warning(f"Reconciliation complete: Closed {closed_count} stale positions, {kept_count} active")
+            telegram.send_alert(
+                f"🔄 **Startup Position Reconciliation**\n\n"
+                f"Closed {closed_count} stale position(s) not found in Zerodha.\n"
+                f"Active positions: {kept_count}",
+                critical=False
+            )
+        else:
+            logger.info(f"Reconciliation complete: All {kept_count} positions verified active")
+
+    except Exception as e:
+        logger.error(f"Error reconciling positions: {e}", exc_info=True)
+        session.rollback()
+    finally:
+        session.close()
 
 
 def reconcile_processing_signals():
@@ -214,10 +363,14 @@ def process_signals():
         sys.exit(0)
 
     try:
-        # ====== STEP 1: RECONCILIATION (IDEMPOTENCY LAYER) ======
+        # ====== STEP 1: POSITION RECONCILIATION (SYNC WITH ZERODHA) ======
+        # Detect and close positions that were stopped out while bot was down
+        reconcile_positions_with_zerodha()
+
+        # ====== STEP 2: SIGNAL RECONCILIATION (IDEMPOTENCY LAYER) ======
         reconcile_processing_signals()
 
-        # ====== STEP 2: PROCESS NEW SIGNALS ======
+        # ====== STEP 3: PROCESS NEW SIGNALS ======
         stats = entry_manager.process_all_signals()
 
         logger.info(
