@@ -21,7 +21,18 @@ from src.api.kite_client import SNAILKiteClient, Quote, get_kite_client
 from src.api.telegram_alerts import TelegramAlerts, get_telegram
 from src.api.claude_client import SNAILClaudeClient, MarketContext, ClaudeDecision, get_claude_client
 from src.utils.symbol_builder import build_iron_fly_instruments
-from src.utils.order_helpers import execute_iron_fly_exit, IronFlyOrders, OrderExecutionError, verify_position
+from src.utils.order_helpers import (
+    execute_iron_fly_exit,
+    IronFlyOrders,
+    ExecutedOrder,
+    OrderExecutionError,
+    verify_position
+)
+from src.utils.scaled_execution import (
+    ScaledOrderExecutor,
+    ExecutionResult as ScaledExecutionResult,
+    should_use_scaled_execution
+)
 from src.utils.calculations import calculate_position_pnl, calculate_transaction_charges
 from src.utils.db import (
     get_db_session,
@@ -378,16 +389,73 @@ class ExitManager:
             # Build symbols dict
             symbols = {leg.leg_type: leg.tradingsymbol for leg in legs}
 
-            # Execute exit orders
-            slippage_ticks = self.trading_config.get('exit', {}).get('slippage_ticks', 2)
+            # Determine if urgent exit (VIX breach, expiry, etc.)
+            urgent_reasons = [ExitReason.VIX_BREACH, ExitReason.EXPIRY, ExitReason.WING_BREACH]
+            is_urgent = reason in urgent_reasons
 
-            orders = execute_iron_fly_exit(
-                kite=self.kite,
-                symbols=symbols,
-                quotes=quotes,
-                quantity=position.lot_size,
-                slippage_ticks=slippage_ticks
-            )
+            # Check if we need scaled execution (quantity > freeze limit)
+            from src.utils.config import is_paper_trading
+
+            if should_use_scaled_execution(position.lot_size, self.config):
+                # Use scaled execution for large orders
+                logger.info(f"Using scaled exit for {position.lot_size} contracts")
+
+                scaled_executor = ScaledOrderExecutor(
+                    kite=self.kite,
+                    config=self.config,
+                    paper_trading=is_paper_trading()
+                )
+
+                scaled_result = scaled_executor.execute_exit(
+                    symbols=symbols,
+                    total_quantity=position.lot_size,
+                    quotes=quotes,
+                    instrument="NIFTY",
+                    urgent=is_urgent
+                )
+
+                if not scaled_result.success:
+                    error_msg = "; ".join(scaled_result.errors) if scaled_result.errors else "Scaled exit failed"
+                    # For exit, even partial failure is critical
+                    logger.critical(f"Scaled exit failed: {error_msg}")
+                    return ExitResult(success=False, error=error_msg)
+
+                # Check if full exit achieved
+                if scaled_result.total_filled_qty != position.lot_size:
+                    remaining = position.lot_size - scaled_result.total_filled_qty
+                    logger.critical(
+                        f"INCOMPLETE EXIT: {remaining} contracts still open! "
+                        f"Manual intervention required!"
+                    )
+                    self.telegram.send(
+                        f"🚨 *CRITICAL: Incomplete Exit!*\n\n"
+                        f"Only {scaled_result.total_filled_qty}/{position.lot_size} closed.\n"
+                        f"*{remaining} contracts still open!*\n\n"
+                        f"⚠️ Manual exit required immediately!"
+                    )
+
+                # Convert scaled result to IronFlyOrders for compatibility
+                orders = self._convert_scaled_exit_result_to_orders(
+                    scaled_result=scaled_result,
+                    symbols=symbols,
+                    quantity=scaled_result.total_filled_qty
+                )
+
+                # Log warnings from scaled execution
+                for warning in scaled_result.warnings:
+                    logger.warning(f"Scaled exit warning: {warning}")
+
+            else:
+                # Use standard single-batch execution
+                slippage_ticks = self.trading_config.get('exit', {}).get('slippage_ticks', 2)
+
+                orders = execute_iron_fly_exit(
+                    kite=self.kite,
+                    symbols=symbols,
+                    quotes=quotes,
+                    quantity=position.lot_size,
+                    slippage_ticks=slippage_ticks
+                )
 
             # Position Verification after Exit (TDD Section 6.2)
             # Verify all 4 legs are CLOSED (qty = 0)
@@ -564,6 +632,51 @@ class ExitManager:
                 )
 
         return self.execute_exit(ExitReason.STOP_LOSS, position)
+
+    def _convert_scaled_exit_result_to_orders(
+        self,
+        scaled_result: ScaledExecutionResult,
+        symbols: Dict[str, str],
+        quantity: int
+    ) -> IronFlyOrders:
+        """
+        Convert ScaledExecutionResult to IronFlyOrders for compatibility.
+
+        EXIT transaction types are REVERSED from entry:
+        - Straddle: BUY (closing short)
+        - Wings: SELL (closing long)
+
+        Args:
+            scaled_result: Result from ScaledOrderExecutor.execute_exit()
+            symbols: Mapping of leg_type to tradingsymbol
+            quantity: Actual closed quantity per leg
+
+        Returns:
+            IronFlyOrders compatible with existing recording flow
+        """
+        leg_fills = scaled_result.leg_fills
+
+        def create_executed_order(leg_type: str, transaction_type: str) -> ExecutedOrder:
+            """Create ExecutedOrder from scaled result data."""
+            fill_price = leg_fills.get(leg_type, 0.0)
+            return ExecutedOrder(
+                order_id=f"SCALED_EXIT_{leg_type}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                tradingsymbol=symbols[leg_type],
+                transaction_type=transaction_type,
+                quantity=quantity,
+                order_price=fill_price,
+                fill_price=fill_price,
+                slippage=0.0,
+                status='COMPLETE'
+            )
+
+        # EXIT: Transaction types are REVERSED from entry
+        return IronFlyOrders(
+            straddle_ce=create_executed_order('straddle_ce', 'BUY'),   # Close short
+            straddle_pe=create_executed_order('straddle_pe', 'BUY'),   # Close short
+            wing_ce=create_executed_order('wing_ce', 'SELL'),          # Close long
+            wing_pe=create_executed_order('wing_pe', 'SELL')           # Close long
+        )
 
     # =========================================================================
     # DATABASE RECORDING

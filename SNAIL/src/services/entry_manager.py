@@ -12,7 +12,7 @@ Manages Iron Fly position entry including validation, execution, and recording.
 """
 
 from datetime import datetime, date, timedelta
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from dataclasses import dataclass
 from loguru import logger
 
@@ -31,11 +31,17 @@ from src.utils.symbol_builder import (
 from src.utils.order_helpers import (
     execute_iron_fly_entry,
     IronFlyOrders,
+    ExecutedOrder,
     OrderExecutionError,
     validate_iron_fly_quotes,
     validate_bid_ask_spreads,
     SpreadValidationResult,
     verify_iron_fly_positions
+)
+from src.utils.scaled_execution import (
+    ScaledOrderExecutor,
+    ExecutionResult as ScaledExecutionResult,
+    should_use_scaled_execution
 )
 from src.utils.calculations import (
     calculate_iron_fly_metrics,
@@ -550,23 +556,68 @@ class EntryManager:
                     )
 
             # Step 5: Execute orders (quantity already calculated in Step 2b)
-            slippage_ticks = self.trading_config.get('entry', {}).get('slippage_ticks', DEFAULT_SLIPPAGE_TICKS)
-            use_tiered_slippage = self.trading_config.get('entry', {}).get('use_tiered_slippage', False)
+            # Check if we need scaled execution (quantity > freeze limit)
+            from src.utils.config import is_paper_trading
 
-            orders = execute_iron_fly_entry(
-                kite=self.kite,
-                symbols=symbols,
-                quotes=quotes,
-                quantity=quantity,
-                slippage_ticks=slippage_ticks,
-                use_tiered_slippage=use_tiered_slippage
-            )
+            if should_use_scaled_execution(quantity, self.config):
+                # Use scaled execution for large orders
+                logger.info(f"Using scaled execution for {quantity} contracts")
+
+                scaled_executor = ScaledOrderExecutor(
+                    kite=self.kite,
+                    config=self.config,
+                    paper_trading=is_paper_trading()
+                )
+
+                scaled_result = scaled_executor.execute_entry(
+                    symbols=symbols,
+                    total_quantity=quantity,
+                    quotes=quotes,
+                    instrument="NIFTY"
+                )
+
+                if not scaled_result.success:
+                    error_msg = "; ".join(scaled_result.errors) if scaled_result.errors else "Scaled execution failed"
+                    return EntryResult(success=False, error=error_msg)
+
+                # Update quantity to actual filled amount (may be partial)
+                actual_quantity = scaled_result.total_filled_qty
+                if actual_quantity != quantity:
+                    logger.warning(
+                        f"Partial fill: {actual_quantity}/{quantity} contracts "
+                        f"({scaled_result.batches_completed}/{scaled_result.batches_total} batches)"
+                    )
+                    quantity = actual_quantity
+
+                # Convert scaled result to IronFlyOrders for compatibility
+                orders = self._convert_scaled_result_to_orders(
+                    scaled_result=scaled_result,
+                    symbols=symbols,
+                    quantity=quantity
+                )
+
+                # Log warnings from scaled execution
+                for warning in scaled_result.warnings:
+                    logger.warning(f"Scaled execution warning: {warning}")
+
+            else:
+                # Use standard single-batch execution
+                slippage_ticks = self.trading_config.get('entry', {}).get('slippage_ticks', DEFAULT_SLIPPAGE_TICKS)
+                use_tiered_slippage = self.trading_config.get('entry', {}).get('use_tiered_slippage', False)
+
+                orders = execute_iron_fly_entry(
+                    kite=self.kite,
+                    symbols=symbols,
+                    quotes=quotes,
+                    quantity=quantity,
+                    slippage_ticks=slippage_ticks,
+                    use_tiered_slippage=use_tiered_slippage
+                )
 
             # Step 5b: Position Verification (TDD Section 6.2)
             # Skip verification in paper trading mode (no real positions to verify)
-            from src.utils.config import is_paper_trading
             verified = True
-            verification_issues = []
+            verification_issues: List[str] = []  # ISSUE-016 FIX: Use List[str] for Python 3.8
 
             if is_paper_trading():
                 logger.info("Paper trading mode - skipping position verification")
@@ -685,6 +736,51 @@ class EntryManager:
             lots = 1
 
         return lots * lot_size
+
+    def _convert_scaled_result_to_orders(
+        self,
+        scaled_result: ScaledExecutionResult,
+        symbols: Dict[str, str],
+        quantity: int
+    ) -> IronFlyOrders:
+        """
+        Convert ScaledExecutionResult to IronFlyOrders for compatibility.
+
+        The existing database recording and alert functions expect IronFlyOrders,
+        so we create synthetic ExecutedOrder objects from the scaled execution result.
+
+        Args:
+            scaled_result: Result from ScaledOrderExecutor
+            symbols: Mapping of leg_type to tradingsymbol
+            quantity: Actual filled quantity per leg
+
+        Returns:
+            IronFlyOrders compatible with existing flow
+        """
+        from datetime import datetime
+
+        leg_fills = scaled_result.leg_fills
+
+        def create_executed_order(leg_type: str, transaction_type: str) -> ExecutedOrder:
+            """Create ExecutedOrder from scaled result data."""
+            fill_price = leg_fills.get(leg_type, 0.0)
+            return ExecutedOrder(
+                order_id=f"SCALED_{leg_type}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                tradingsymbol=symbols[leg_type],
+                transaction_type=transaction_type,
+                quantity=quantity,
+                order_price=fill_price,  # Use fill price as order price
+                fill_price=fill_price,
+                slippage=0.0,  # Slippage already aggregated in scaled_result
+                status='COMPLETE'
+            )
+
+        return IronFlyOrders(
+            straddle_ce=create_executed_order('straddle_ce', 'SELL'),
+            straddle_pe=create_executed_order('straddle_pe', 'SELL'),
+            wing_ce=create_executed_order('wing_ce', 'BUY'),
+            wing_pe=create_executed_order('wing_pe', 'BUY')
+        )
 
     def _get_claude_approval(
         self,

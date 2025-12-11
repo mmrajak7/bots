@@ -188,6 +188,48 @@ charges:
   sebi_per_crore: 10         # ₹10 per crore
 
 # -----------------------------------------------------------------------------
+# Scaled Order Execution
+# -----------------------------------------------------------------------------
+# For large orders (>1 lot), system splits into batches respecting freeze limits
+# Reference: docs/SCALED_ORDER_EXECUTION_DESIGN.md
+scaling:
+  # NSE Freeze Limits - UPDATE WHEN NSE ANNOUNCES CHANGES
+  # Last updated: 2025-12-11
+  # Orders exceeding these limits are rejected by exchange
+  freeze_limits:
+    NIFTY: 1800              # 24 lots max per order (lot_size=75)
+    BANKNIFTY: 600           # 40 lots max per order (lot_size=15)
+    FINNIFTY: 1200           # 48 lots max per order (lot_size=25)
+    MIDCPNIFTY: 2800         # 56 lots max per order (lot_size=50)
+    NIFTYNXT50: 600          # 10 lots max per order (lot_size=60)
+
+  # Execution parameters
+  execution:
+    inter_batch_delay_ms: 3000    # 3 seconds between batches
+    order_timeout_seconds: 30     # Max wait per order fill
+    cancel_wait_seconds: 1        # Wait after cancel before new order
+    max_retries_per_order: 2      # Retry failed orders
+
+  # Order types by leg type
+  # ATM legs use MARKET for guaranteed fills
+  # Wing legs use LIMIT with slippage for price control
+  order_types:
+    atm_straddle: "MARKET"        # Guaranteed fill for short straddle
+    otm_wings: "LIMIT"            # Price control for long wings
+
+  # Slippage configuration for LIMIT orders
+  slippage:
+    base_ticks: 3                 # Starting slippage (0.15 pts)
+    depth_buffer_ticks: 2         # Extra when visible depth < 50%
+    max_ticks: 15                 # Cap slippage (0.75 pts)
+    wing_retry_increment: 2       # Add per retry attempt
+
+  # Rebalancing - restore position balance if fills are unequal
+  rebalance:
+    max_attempts: 2               # Max rebalance tries per batch
+    strategy: "trim_to_balance"   # Trim excess to match minimum
+
+# -----------------------------------------------------------------------------
 # Paper Trading Mode
 # -----------------------------------------------------------------------------
 paper_trading:
