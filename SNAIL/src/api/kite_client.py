@@ -117,6 +117,7 @@ class SNAILKiteClient:
         self._kite: Optional[KiteConnect] = None
         self._authenticator = KiteAuthenticator(kite_config)
         self._paper_trading = config.get('paper_trading', {}).get('enabled', False)
+        self._paper_orders: Dict[str, Dict[str, Any]] = {}  # Track paper trading orders
 
         if self._paper_trading:
             logger.info("Paper trading mode enabled")
@@ -251,6 +252,18 @@ class SNAILKiteClient:
         """
         if self._paper_trading:
             order_id = f"PAPER_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+            # Store order details for later retrieval
+            self._paper_orders[order_id] = {
+                'order_id': order_id,
+                'tradingsymbol': tradingsymbol,
+                'transaction_type': transaction_type,
+                'quantity': quantity,
+                'price': price,
+                'order_type': order_type,
+                'status': 'COMPLETE',
+                'filled_quantity': quantity,
+                'average_price': price if price else 100.0  # Use order price as fill
+            }
             logger.info(f"[PAPER] Order placed: {order_id} - {transaction_type} "
                        f"{quantity} {tradingsymbol} @ {price or 'MARKET'}")
             return order_id
@@ -335,6 +348,10 @@ class SNAILKiteClient:
             Order details dictionary
         """
         if self._paper_trading:
+            # Return stored order details if available
+            if order_id in self._paper_orders:
+                return self._paper_orders[order_id]
+            # Fallback for unknown orders
             return {
                 'order_id': order_id,
                 'status': 'COMPLETE',
@@ -352,7 +369,7 @@ class SNAILKiteClient:
     def orders(self) -> List[Dict]:
         """Get all orders for the day."""
         if self._paper_trading:
-            return []
+            return list(self._paper_orders.values())
         return self.kite.orders()
 
     # =========================================================================

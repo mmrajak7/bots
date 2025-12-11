@@ -217,13 +217,28 @@ class TelegramAlerts:
         """Send trade entry alert."""
         net_credit = premium.get('net', 0)
 
+        # Calculate values
+        short_ce = premium.get('short_ce', 0)
+        short_pe = premium.get('short_pe', 0)
+        long_ce = premium.get('long_ce', 0)
+        long_pe = premium.get('long_pe', 0)
+        straddle_total = short_ce + short_pe
+        wings_total = long_ce + long_pe
+
+        # Calculate lots (NIFTY lot size is 75)
+        nifty_lot_size = 75
+        num_lots = lot_size // nifty_lot_size if lot_size >= nifty_lot_size else 1
+
         message = f"""🦋 *ENTRY: Iron Fly*
 
-🎯 ATM {atm_strike} | 🪽 Wings ±{wing_distance} | 📅 {expiry} | 📦 {lot_size}L
+🎯 ATM {atm_strike} | 🪽 Wings ±{wing_distance} | 📅 {expiry} | 📦 {num_lots} lot ({lot_size} qty)
 
-💰 *Premium:* CE ₹{premium.get('short_ce', 0):.1f} + PE ₹{premium.get('short_pe', 0):.1f} - Wings ₹{premium.get('long_ce', 0) + premium.get('long_pe', 0):.1f} = *₹{net_credit:.1f}*
+💰 *Premium (per share):*
+• SELL Straddle: ₹{short_ce:.2f} + ₹{short_pe:.2f} = ₹{straddle_total:.2f}
+• BUY Wings: ₹{long_ce:.2f} + ₹{long_pe:.2f} = ₹{wings_total:.2f}
+• *Net Credit: ₹{net_credit:.2f}*
 
-✅ Max Profit ₹{max_profit:,.0f} | ⛔ Max Loss ₹{max_loss:,.0f}"""
+✅ Max Profit: ₹{max_profit:,.0f} | ⛔ Max Loss: ₹{max_loss:,.0f}"""
 
         return self.send(message)
 
