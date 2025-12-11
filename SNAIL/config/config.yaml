@@ -52,8 +52,8 @@ trading:
   # All percentages are calculated on margin_deployed, not max_profit
   # This gives realistic P&L percentages based on capital at risk
   exit:
-    profit_target_pct: 5     # Exit at 5% ROM (e.g., ₹5,000 on ₹1L margin)
-    stop_loss_pct: 10        # Alert at 10% loss on margin (e.g., -₹10,000 on ₹1L margin)
+    profit_target_pct: 2.6   # Exit at 2.6% ROM (e.g., ₹2,600 on ₹1L margin)
+    stop_loss_pct: 5         # Alert at 5% loss on margin (e.g., -₹5,000 on ₹1L margin)
     vix_hard_exit: 20        # Hard exit if VIX > 20
     vix_warning_zone: 16.5   # Warning if VIX > 16.5
     friday_check_time: "15:00"  # Friday exit decision time
