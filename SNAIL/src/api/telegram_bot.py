@@ -647,11 +647,13 @@ _P&L data pending - monitor will update soon_""")
                 side = "S" if leg.leg_type.startswith('straddle') else "B"
                 legs_text += f"• {side} {leg.tradingsymbol} @ ₹{leg.entry_price:.1f}\n"
 
-            # Current P&L section
+            # Current P&L section with ROM (Return on Margin)
             if snapshot:
                 pnl_emoji = "🟢" if snapshot.current_pnl >= 0 else "🔴"
                 pnl_sign = "+" if snapshot.current_pnl >= 0 else ""
-                pnl_text = f"""{pnl_emoji} *Current P&L: {pnl_sign}₹{snapshot.current_pnl:,.0f}* ({snapshot.pnl_percent:+.1f}%)
+                # Calculate ROM % if margin available
+                rom_text = f" | ROM: {snapshot.pnl_percent:+.2f}%" if position.margin_deployed > 0 else ""
+                pnl_text = f"""{pnl_emoji} *P&L: {pnl_sign}₹{snapshot.current_pnl:,.0f}*{rom_text}
 • NIFTY: {snapshot.nifty_spot:,.0f} | VIX: {snapshot.vix:.1f}"""
             else:
                 pnl_text = "_P&L pending - monitor updating..._"
@@ -668,6 +670,9 @@ _P&L data pending - monitor will update soon_""")
             # Format expiry for display
             expiry_str = position.expiry_date.strftime('%d-%b') if position.expiry_date else 'N/A'
 
+            # Format margin
+            margin_text = f"₹{position.margin_deployed:,.0f}" if position.margin_deployed > 0 else "N/A"
+
             # ASCII Payoff diagram with all info
             payoff = f"""```
   ₹{position.max_profit:,.0f} (Max Profit)
@@ -682,6 +687,7 @@ _P&L data pending - monitor will update soon_""")
  BE: {be_lower:.0f} ←──→ {be_upper:.0f}
  Max Loss: ₹{position.max_loss:,.0f}
  Exp: {expiry_str} | {position.lot_size // 75} lot ({position.lot_size} qty)
+ Margin: {margin_text}
 ```"""
 
             self._send_reply(f"""📍 *Iron Fly Position*
