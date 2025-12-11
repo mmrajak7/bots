@@ -256,10 +256,17 @@ class PositionMonitor:
         """
         Take a monitoring snapshot of current position state.
 
+        Auto-loads position if state is empty (supports cron-based execution).
+
         Returns:
             MonitorSnapshot or None if no position
         """
+        # Auto-load position if state is empty (cron creates fresh instances)
         if not self.state.position:
+            self.load_position()
+
+        if not self.state.position:
+            logger.info("SKIP snapshot: No active position found")
             return None
 
         # Validate position lot_size
@@ -269,12 +276,12 @@ class PositionMonitor:
 
         # Validate legs exist and have entry prices
         if not self.state.legs:
-            logger.warning("No legs found for position")
+            logger.info("SKIP snapshot: No legs found for position")
             return None
 
         for leg in self.state.legs:
             if leg.entry_price is None:
-                logger.error(f"Leg {leg.leg_type} has no entry_price")
+                logger.info(f"SKIP snapshot: Leg {leg.leg_type} has no entry_price")
                 return None
 
         try:
@@ -283,28 +290,28 @@ class PositionMonitor:
             india_vix = self.kite.get_india_vix()
 
             if nifty_spot is None or india_vix is None:
-                logger.warning("Could not fetch market data (nifty_spot or india_vix is None)")
+                logger.info(f"SKIP snapshot: Market data unavailable (NIFTY={nifty_spot}, VIX={india_vix})")
                 return None
 
             # Get quotes
             quotes = self.get_current_quotes()
             if not quotes:
-                logger.warning("Could not fetch quotes for P&L calculation")
+                logger.info("SKIP snapshot: Could not fetch quotes for P&L calculation")
                 return None
 
             # Validate all legs have quotes with valid prices
             # Side is determined by leg_type: straddle_* = SHORT (sell), wing_* = LONG (buy)
             for leg in self.state.legs:
                 if leg.leg_type not in quotes:
-                    logger.warning(f"Missing quote for leg: {leg.leg_type}")
+                    logger.info(f"SKIP snapshot: Missing quote for leg {leg.leg_type}")
                     return None
                 quote = quotes[leg.leg_type]
                 is_short = leg.leg_type.startswith('straddle')
                 if is_short and (quote.ask is None or quote.ask <= 0):
-                    logger.warning(f"Invalid ask price for SHORT leg {leg.leg_type}: {quote.ask}")
+                    logger.info(f"SKIP snapshot: Invalid ask price for SHORT leg {leg.leg_type}: {quote.ask}")
                     return None
                 if not is_short and (quote.bid is None or quote.bid <= 0):
-                    logger.warning(f"Invalid bid price for LONG leg {leg.leg_type}: {quote.bid}")
+                    logger.info(f"SKIP snapshot: Invalid bid price for LONG leg {leg.leg_type}: {quote.bid}")
                     return None
 
             # Calculate P&L
