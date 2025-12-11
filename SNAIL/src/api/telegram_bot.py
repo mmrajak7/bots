@@ -628,9 +628,9 @@ _P&L data pending - monitor will update soon_""")
             self._send_reply(f"❌ Error fetching status: {str(e)[:100]}")
 
     def _cmd_position(self, update: TelegramUpdate, args: List[str]):
-        """Handle /position command - shows detailed position info."""
+        """Handle /position command - shows detailed position info with payoff diagram."""
         try:
-            from src.utils.db import get_active_position, get_position_legs
+            from src.utils.db import get_active_position, get_position_legs, get_latest_pnl_snapshot
 
             position = get_active_position()
 
@@ -639,6 +639,7 @@ _P&L data pending - monitor will update soon_""")
                 return
 
             legs = get_position_legs(position.id)
+            snapshot = get_latest_pnl_snapshot(position.id)
 
             # Format legs (side inferred from leg_type: straddle_* = SHORT, wing_* = LONG)
             legs_text = ""
@@ -646,19 +647,54 @@ _P&L data pending - monitor will update soon_""")
                 side = "S" if leg.leg_type.startswith('straddle') else "B"
                 legs_text += f"• {side} {leg.tradingsymbol} @ ₹{leg.entry_price:.1f}\n"
 
+            # Current P&L section
+            if snapshot:
+                pnl_emoji = "🟢" if snapshot.current_pnl >= 0 else "🔴"
+                pnl_sign = "+" if snapshot.current_pnl >= 0 else ""
+                pnl_text = f"""{pnl_emoji} *Current P&L: {pnl_sign}₹{snapshot.current_pnl:,.0f}* ({snapshot.pnl_percent:+.1f}%)
+• NIFTY: {snapshot.nifty_spot:,.0f} | VIX: {snapshot.vix:.1f}"""
+            else:
+                pnl_text = "_P&L pending - monitor updating..._"
+
+            # Calculate breakevens
+            net_credit_per_share = position.entry_premium / position.lot_size if position.lot_size else 0
+            be_lower = position.atm_strike - net_credit_per_share
+            be_upper = position.atm_strike + net_credit_per_share
+
+            # Wing strikes
+            wing_ce = position.atm_strike + position.wing_distance
+            wing_pe = position.atm_strike - position.wing_distance
+
+            # ASCII Payoff diagram
+            payoff = f"""```
+     ₹{position.max_profit:,.0f} (Max Profit)
+            /\\
+           /  \\
+    ──────/    \\──────
+         /      \\
+    ════/        \\════
+   {wing_pe}    {position.atm_strike}    {wing_ce}
+  (PE Wing) (ATM) (CE Wing)
+
+  BE: {be_lower:.0f} ←──→ {be_upper:.0f}
+  Max Loss: ₹{position.max_loss:,.0f}
+```"""
+
             self._send_reply(f"""📍 *Position Details*
 
 *Iron Fly on NIFTY*
-• ATM: {position.atm_strike}
-• Wings: ±{position.wing_distance}
-• Expiry: {position.expiry_date}
-• Qty: {position.lot_size}
+• ATM: {position.atm_strike} | Wings: ±{position.wing_distance}
+• Expiry: {position.expiry_date} | Qty: {position.lot_size}
+
+{pnl_text}
 
 *Entry:*
-• Net Credit: ₹{position.entry_premium:.1f}
+• Net Credit: ₹{position.entry_premium:,.1f}
 • Max Profit: ₹{position.max_profit:,.0f}
 • Max Loss: ₹{position.max_loss:,.0f}
 
+*Payoff:*
+{payoff}
 *Legs:*
 {legs_text}
 _Entry: {position.entry_time.strftime('%Y-%m-%d %H:%M') if position.entry_time else 'N/A'}_""")
