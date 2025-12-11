@@ -665,39 +665,34 @@ _P&L data pending - monitor will update soon_""")
             wing_ce = position.atm_strike + position.wing_distance
             wing_pe = position.atm_strike - position.wing_distance
 
-            # ASCII Payoff diagram
-            payoff = f"""```
-     ₹{position.max_profit:,.0f} (Max Profit)
-            /\\
-           /  \\
-    ──────/    \\──────
-         /      \\
-    ════/        \\════
-   {wing_pe}    {position.atm_strike}    {wing_ce}
-  (PE Wing) (ATM) (CE Wing)
+            # Format expiry for display
+            expiry_str = position.expiry_date.strftime('%d-%b') if position.expiry_date else 'N/A'
 
-  BE: {be_lower:.0f} ←──→ {be_upper:.0f}
-  Max Loss: ₹{position.max_loss:,.0f}
+            # ASCII Payoff diagram with all info
+            payoff = f"""```
+  ₹{position.max_profit:,.0f} (Max Profit)
+           /\\
+          /  \\
+   ──────/    \\──────
+        /      \\
+   ════/        \\════
+  {wing_pe}   {position.atm_strike}   {wing_ce}
+ (Wing)  (ATM)  (Wing)
+
+ BE: {be_lower:.0f} ←──→ {be_upper:.0f}
+ Max Loss: ₹{position.max_loss:,.0f}
+ Exp: {expiry_str} | Qty: {position.lot_size}
 ```"""
 
-            self._send_reply(f"""📍 *Position Details*
-
-*Iron Fly on NIFTY*
-• ATM: {position.atm_strike} | Wings: ±{position.wing_distance}
-• Expiry: {position.expiry_date} | Qty: {position.lot_size}
+            self._send_reply(f"""📍 *Iron Fly Position*
 
 {pnl_text}
-
-*Entry:*
-• Net Credit: ₹{position.entry_premium:,.1f}
-• Max Profit: ₹{position.max_profit:,.0f}
-• Max Loss: ₹{position.max_loss:,.0f}
 
 *Payoff:*
 {payoff}
 *Legs:*
 {legs_text}
-_Entry: {position.entry_time.strftime('%Y-%m-%d %H:%M') if position.entry_time else 'N/A'}_""")
+_Entry: {position.entry_time.strftime('%d-%b %H:%M') if position.entry_time else 'N/A'}_""")
 
         except Exception as e:
             logger.error(f"Error in /position: {e}")
