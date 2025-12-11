@@ -740,9 +740,7 @@ _Entry: {position.entry_time.strftime('%d-%b %H:%M') if position.entry_time else
 • Exit Target: {profit_target_pct}% ROM (₹{target_profit:,.0f})
 
 *Market:*
-• NIFTY: {snapshot.nifty_spot:,.0f} | VIX: {snapshot.vix:.1f}
-
-_Updated: {snapshot.timestamp.strftime('%H:%M:%S') if snapshot.timestamp else 'N/A'}_""")
+• NIFTY: {snapshot.nifty_spot:,.0f} | VIX: {snapshot.vix:.1f}""")
             else:
                 self._send_reply(f"""💰 *P&L Summary*
 
