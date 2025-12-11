@@ -256,30 +256,34 @@ class PositionMonitor:
         """
         Take a monitoring snapshot of current position state.
 
-        Auto-loads position if state is empty (supports cron-based execution).
+        Always queries fresh from DB - no cached state dependency.
+        Simpler and more reliable for cron-based execution.
 
         Returns:
             MonitorSnapshot or None if no position
         """
-        # Auto-load position if state is empty (cron creates fresh instances)
-        if not self.state.position:
-            self.load_position()
-
-        if not self.state.position:
+        # Always query fresh from DB (cron creates fresh instances each run)
+        position = get_active_position()
+        if not position:
             logger.info("SKIP snapshot: No active position found")
             return None
 
-        # Validate position lot_size
-        if not self.state.position.lot_size or self.state.position.lot_size <= 0:
-            logger.error("Position has invalid lot_size")
-            return None
-
-        # Validate legs exist and have entry prices
-        if not self.state.legs:
+        legs = get_position_legs(position.id)
+        if not legs:
             logger.info("SKIP snapshot: No legs found for position")
             return None
 
-        for leg in self.state.legs:
+        # Update cached state for other methods that might need it
+        self.state.position = position
+        self.state.legs = legs
+
+        # Validate position lot_size
+        if not position.lot_size or position.lot_size <= 0:
+            logger.error("Position has invalid lot_size")
+            return None
+
+        # Validate legs have entry prices
+        for leg in legs:
             if leg.entry_price is None:
                 logger.info(f"SKIP snapshot: Leg {leg.leg_type} has no entry_price")
                 return None
@@ -301,7 +305,7 @@ class PositionMonitor:
 
             # Validate all legs have quotes with valid prices
             # Side is determined by leg_type: straddle_* = SHORT (sell), wing_* = LONG (buy)
-            for leg in self.state.legs:
+            for leg in legs:
                 if leg.leg_type not in quotes:
                     logger.info(f"SKIP snapshot: Missing quote for leg {leg.leg_type}")
                     return None
@@ -317,22 +321,22 @@ class PositionMonitor:
             # Calculate P&L
             # straddle legs (straddle_ce, straddle_pe) are SHORT - we sold them
             # wing legs (wing_ce, wing_pe) are LONG - we bought them
-            entry_straddle = sum(l.entry_price for l in self.state.legs if l.leg_type.startswith('straddle'))
-            entry_wing = sum(l.entry_price for l in self.state.legs if l.leg_type.startswith('wing'))
+            entry_straddle = sum(l.entry_price for l in legs if l.leg_type.startswith('straddle'))
+            entry_wing = sum(l.entry_price for l in legs if l.leg_type.startswith('wing'))
 
             current_straddle = sum(
-                quotes[l.leg_type].ask for l in self.state.legs
+                quotes[l.leg_type].ask for l in legs
                 if l.leg_type.startswith('straddle') and l.leg_type in quotes
             )
             current_wing = sum(
-                quotes[l.leg_type].bid for l in self.state.legs
+                quotes[l.leg_type].bid for l in legs
                 if l.leg_type.startswith('wing') and l.leg_type in quotes
             )
 
             current_pnl, pnl_pct = calculate_position_pnl(
                 entry_straddle, entry_wing, current_straddle, current_wing,
-                self.state.position.lot_size,
-                self.state.position.margin_deployed
+                position.lot_size,
+                position.margin_deployed
             )
 
             # Update state
