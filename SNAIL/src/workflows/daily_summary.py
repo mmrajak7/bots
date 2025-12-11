@@ -385,18 +385,21 @@ class DailySummary:
         if summary is None:
             summary = self.generate_daily_summary()
 
-        # Build position status string
-        position_status = None
-        if summary.has_position:
-            position_status = f"P&L: {summary.ending_pnl:+,.2f} (Day: {summary.day_pnl_change:+,.2f})"
+        # Extract entry/exit dates from trades
+        entry_date = None
+        exit_date = None
+        for trade in summary.trades_today:
+            if trade.get('type') == 'entry':
+                entry_date = summary.date.strftime('%Y-%m-%d')
+            elif trade.get('type') == 'exit':
+                exit_date = summary.date.strftime('%Y-%m-%d')
 
-        # Send using correct signature
         self.telegram.send_daily_summary(
             date_str=summary.date.strftime('%Y-%m-%d'),
             total_pnl=summary.ending_pnl,
-            trades=len(summary.trades_today),
             has_position=summary.has_position,
-            position_status=position_status
+            entry_date=entry_date,
+            exit_date=exit_date
         )
 
     def send_weekly_summary(self, summary: Optional[WeeklySummaryData] = None) -> None:

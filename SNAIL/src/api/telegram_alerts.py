@@ -437,22 +437,26 @@ class TelegramAlerts:
         self,
         date_str: str,
         total_pnl: float,
-        trades: int,
         has_position: bool,
-        position_status: Optional[str] = None
+        entry_date: Optional[str] = None,
+        exit_date: Optional[str] = None
     ) -> bool:
         """Send daily summary alert."""
         emoji = "💚" if total_pnl >= 0 else "❌"
         result_emoji = "🎉" if total_pnl > 0 else ("😐" if total_pnl == 0 else "😔")
         pnl_sign = "+" if total_pnl >= 0 else ""
-        pos_text = position_status if position_status else ('🟢 Active' if has_position else '⚪ None')
+        pos_text = '🟢 Active' if has_position else '⚪ None'
 
         message = f"""🐌 *SNAIL Daily Summary* 📊
 
 📅 {date_str}
 {emoji} P&L: *{pnl_sign}₹{total_pnl:,.0f}* {result_emoji}
-📈 Trades: {trades}
 🦋 Position: {pos_text}"""
+
+        if entry_date:
+            message += f"\n📥 Entry: {entry_date}"
+        if exit_date:
+            message += f"\n📤 Exit: {exit_date}"
 
         return self.send(message)
 
