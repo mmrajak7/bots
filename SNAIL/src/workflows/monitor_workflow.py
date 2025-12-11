@@ -893,6 +893,10 @@ _Fetching P&L data..._"""
                 snapshot = self.position_monitor.take_snapshot()
 
                 if snapshot:
+                    # Save snapshot to database for status/pnl commands
+                    self.position_monitor.save_snapshot_to_db(snapshot)
+                    logger.debug(f"P&L snapshot saved: {snapshot.current_pnl:.2f} ({snapshot.pnl_percentage:.1f}%)")
+
                     # Check stop loss (50% max loss)
                     stop_loss_pct = self.trading_config.get('exit', {}).get('stop_loss_pct', 50)
 
