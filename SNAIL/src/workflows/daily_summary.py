@@ -153,25 +153,22 @@ class DailySummary:
             with get_db_session() as conn:
                 cursor = conn.cursor()
 
-                start = datetime.combine(target_date, datetime.min.time())
-                end = datetime.combine(target_date, datetime.max.time())
+                start_str = f"{target_date} 00:00:00"
+                end_str = f"{target_date} 23:59:59"
 
                 cursor.execute('''
-                    SELECT timestamp, nifty_spot, india_vix, unrealized_pnl,
-                           straddle_value, wing_value
+                    SELECT created_at, nifty_spot, vix, current_pnl
                     FROM pnl_snapshots
-                    WHERE timestamp BETWEEN ? AND ?
-                    ORDER BY timestamp
-                ''', (start.isoformat(), end.isoformat()))
+                    WHERE created_at BETWEEN ? AND ?
+                    ORDER BY created_at
+                ''', (start_str, end_str))
 
                 return [
                     {
                         'timestamp': row[0],
                         'nifty_spot': row[1],
                         'india_vix': row[2],
-                        'unrealized_pnl': row[3],
-                        'straddle_value': row[4],
-                        'wing_value': row[5]
+                        'unrealized_pnl': row[3]
                     }
                     for row in cursor.fetchall()
                 ]
@@ -190,7 +187,7 @@ class DailySummary:
                 end = datetime.combine(target_date, datetime.max.time())
 
                 cursor.execute('''
-                    SELECT order_id, tradingsymbol, transaction_type, quantity,
+                    SELECT kite_order_id, tradingsymbol, transaction_type, quantity,
                            price, fill_price, status, created_at
                     FROM orders
                     WHERE created_at BETWEEN ? AND ?
@@ -222,8 +219,8 @@ class DailySummary:
                 cursor = conn.cursor()
 
                 cursor.execute('''
-                    SELECT id, strategy, status, entry_time, exit_time,
-                           entry_credit, realized_pnl, exit_reason
+                    SELECT id, status, entry_time, exit_time,
+                           entry_premium, net_pnl, exit_reason
                     FROM positions
                     WHERE DATE(entry_time) <= ? AND
                           (exit_time IS NULL OR DATE(exit_time) >= ?)
@@ -233,13 +230,12 @@ class DailySummary:
                 return [
                     {
                         'id': row[0],
-                        'strategy': row[1],
-                        'status': row[2],
-                        'entry_time': row[3],
-                        'exit_time': row[4],
-                        'entry_credit': row[5],
-                        'realized_pnl': row[6],
-                        'exit_reason': row[7]
+                        'status': row[1],
+                        'entry_time': row[2],
+                        'exit_time': row[3],
+                        'entry_credit': row[4],
+                        'realized_pnl': row[5],
+                        'exit_reason': row[6]
                     }
                     for row in cursor.fetchall()
                 ]
