@@ -109,6 +109,7 @@ class PnLSnapshot:
     wing_ce_ask: Optional[float] = None
     wing_pe_bid: Optional[float] = None
     wing_pe_ask: Optional[float] = None
+    timestamp: Optional[datetime] = None  # Maps to created_at in DB
 
 
 @dataclass
@@ -607,7 +608,7 @@ def save_pnl_snapshot(snapshot: Any) -> int:
     Save a P&L snapshot to database.
 
     Args:
-        snapshot: PnL snapshot object
+        snapshot: PnL snapshot object (PnLSnapshot dataclass)
 
     Returns:
         Snapshot ID
@@ -621,18 +622,23 @@ def save_pnl_snapshot(snapshot: Any) -> int:
         cursor = conn.execute(
             """INSERT INTO pnl_snapshots (
                 position_id, current_pnl, pnl_percent, nifty_spot, vix,
-                ce_bid, ce_ask, pe_bid, pe_ask
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ce_bid, ce_ask, pe_bid, pe_ask,
+                wing_ce_bid, wing_ce_ask, wing_pe_bid, wing_pe_ask
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 data.get('position_id'),
-                data.get('unrealized_pnl', data.get('current_pnl', 0)),
+                data.get('current_pnl', 0),
                 data.get('pnl_percent', 0),
                 data.get('nifty_spot', 0),
-                data.get('india_vix', data.get('vix', 0)),
-                data.get('straddle_value', data.get('ce_bid', 0)),
+                data.get('vix', 0),
+                data.get('ce_bid', 0),
                 data.get('ce_ask', 0),
-                data.get('wing_value', data.get('pe_bid', 0)),
-                data.get('pe_ask', 0)
+                data.get('pe_bid', 0),
+                data.get('pe_ask', 0),
+                data.get('wing_ce_bid'),
+                data.get('wing_ce_ask'),
+                data.get('wing_pe_bid'),
+                data.get('wing_pe_ask')
             )
         )
         return cursor.lastrowid
@@ -1551,7 +1557,8 @@ def _row_to_pnl_snapshot(row: sqlite3.Row) -> PnLSnapshot:
         wing_ce_bid=row['wing_ce_bid'],
         wing_ce_ask=row['wing_ce_ask'],
         wing_pe_bid=row['wing_pe_bid'],
-        wing_pe_ask=row['wing_pe_ask']
+        wing_pe_ask=row['wing_pe_ask'],
+        timestamp=datetime.fromisoformat(row['created_at']) if row['created_at'] else None
     )
 
 

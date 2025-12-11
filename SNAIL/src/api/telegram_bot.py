@@ -640,10 +640,10 @@ _P&L data pending - monitor will update soon_""")
 
             legs = get_position_legs(position.id)
 
-            # Format legs
+            # Format legs (side inferred from leg_type: straddle_* = SHORT, wing_* = LONG)
             legs_text = ""
             for leg in legs:
-                side = "S" if leg.side == "SHORT" else "B"
+                side = "S" if leg.leg_type.startswith('straddle') else "B"
                 legs_text += f"• {side} {leg.tradingsymbol} @ ₹{leg.entry_price:.1f}\n"
 
             self._send_reply(f"""📍 *Position Details*
@@ -652,7 +652,7 @@ _P&L data pending - monitor will update soon_""")
 • ATM: {position.atm_strike}
 • Wings: ±{position.wing_distance}
 • Expiry: {position.expiry_date}
-• Qty: {position.quantity} ({position.lot_size} per lot)
+• Qty: {position.lot_size}
 
 *Entry:*
 • Net Credit: ₹{position.entry_premium:.1f}

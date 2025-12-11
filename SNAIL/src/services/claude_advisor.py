@@ -183,9 +183,9 @@ class ClaudeAdvisor:
             context.max_loss = position.max_loss if position.max_loss else 0
 
             # Entry premium per unit
-            if position.entry_credit and position.quantity and position.quantity > 0:
-                context.straddle_premium = position.entry_credit / position.quantity
-                context.net_credit = position.entry_credit / position.quantity
+            if position.entry_premium and position.lot_size and position.lot_size > 0:
+                context.straddle_premium = position.entry_premium / position.lot_size
+                context.net_credit = position.entry_premium / position.lot_size
             else:
                 context.straddle_premium = 0
                 context.net_credit = 0
@@ -245,7 +245,7 @@ class ClaudeAdvisor:
             context.additional_context = {
                 # Position details
                 'entry_date': position.entry_time.strftime('%Y-%m-%d') if position.entry_time else '',
-                'entry_premium': f"{position.entry_credit:,.2f}" if position.entry_credit else '0',
+                'entry_premium': f"{position.entry_premium:,.2f}" if position.entry_premium else '0',
                 'entry_credit': f"{context.net_credit:.2f}",
                 'upper_wing': str(upper_wing),
                 'lower_wing': str(lower_wing),
@@ -295,8 +295,9 @@ class ClaudeAdvisor:
         quotes = self.kite.quote(instruments)
 
         # Calculate P&L
-        entry_straddle = sum(l.entry_price for l in legs if l.side == 'SHORT')
-        entry_wing = sum(l.entry_price for l in legs if l.side == 'LONG')
+        # Side is determined by leg_type: straddle_* = SHORT, wing_* = LONG
+        entry_straddle = sum(l.entry_price for l in legs if l.leg_type.startswith('straddle'))
+        entry_wing = sum(l.entry_price for l in legs if l.leg_type.startswith('wing'))
 
         current_straddle = 0.0
         current_wing = 0.0
@@ -304,14 +305,14 @@ class ClaudeAdvisor:
         for inst, quote in quotes.items():
             leg = leg_map.get(inst)
             if leg:
-                if leg.side == 'SHORT':
+                if leg.leg_type.startswith('straddle'):
                     current_straddle += quote.ask
                 else:
                     current_wing += quote.bid
 
         pnl, _ = calculate_position_pnl(
             entry_straddle, entry_wing, current_straddle, current_wing,
-            position.quantity
+            position.lot_size
         )
 
         return pnl
@@ -579,7 +580,7 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
                     net_credit=net_credit,
                     max_profit=max_profit,
                     max_loss=max_loss,
-                    expiry_date=expiry_date,
+                    expiry_date=exp_date.strftime('%Y-%m-%d') if exp_date else '',
                     additional_context={
                         'market_events': events_str,
                         'market_news': news_str

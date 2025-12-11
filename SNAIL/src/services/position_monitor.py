@@ -262,9 +262,9 @@ class PositionMonitor:
         if not self.state.position:
             return None
 
-        # Validate position quantity
-        if not self.state.position.quantity or self.state.position.quantity <= 0:
-            logger.error("Position has invalid quantity")
+        # Validate position lot_size
+        if not self.state.position.lot_size or self.state.position.lot_size <= 0:
+            logger.error("Position has invalid lot_size")
             return None
 
         # Validate legs exist and have entry prices
@@ -293,34 +293,38 @@ class PositionMonitor:
                 return None
 
             # Validate all legs have quotes with valid prices
+            # Side is determined by leg_type: straddle_* = SHORT (sell), wing_* = LONG (buy)
             for leg in self.state.legs:
                 if leg.leg_type not in quotes:
                     logger.warning(f"Missing quote for leg: {leg.leg_type}")
                     return None
                 quote = quotes[leg.leg_type]
-                if leg.side == 'SHORT' and (quote.ask is None or quote.ask <= 0):
+                is_short = leg.leg_type.startswith('straddle')
+                if is_short and (quote.ask is None or quote.ask <= 0):
                     logger.warning(f"Invalid ask price for SHORT leg {leg.leg_type}: {quote.ask}")
                     return None
-                if leg.side == 'LONG' and (quote.bid is None or quote.bid <= 0):
+                if not is_short and (quote.bid is None or quote.bid <= 0):
                     logger.warning(f"Invalid bid price for LONG leg {leg.leg_type}: {quote.bid}")
                     return None
 
             # Calculate P&L
-            entry_straddle = sum(l.entry_price for l in self.state.legs if l.side == 'SHORT')
-            entry_wing = sum(l.entry_price for l in self.state.legs if l.side == 'LONG')
+            # straddle legs (straddle_ce, straddle_pe) are SHORT - we sold them
+            # wing legs (wing_ce, wing_pe) are LONG - we bought them
+            entry_straddle = sum(l.entry_price for l in self.state.legs if l.leg_type.startswith('straddle'))
+            entry_wing = sum(l.entry_price for l in self.state.legs if l.leg_type.startswith('wing'))
 
             current_straddle = sum(
                 quotes[l.leg_type].ask for l in self.state.legs
-                if l.side == 'SHORT' and l.leg_type in quotes
+                if l.leg_type.startswith('straddle') and l.leg_type in quotes
             )
             current_wing = sum(
                 quotes[l.leg_type].bid for l in self.state.legs
-                if l.side == 'LONG' and l.leg_type in quotes
+                if l.leg_type.startswith('wing') and l.leg_type in quotes
             )
 
             current_pnl, pnl_pct = calculate_position_pnl(
                 entry_straddle, entry_wing, current_straddle, current_wing,
-                self.state.position.quantity
+                self.state.position.lot_size
             )
 
             # Update state
@@ -345,15 +349,28 @@ class PositionMonitor:
 
     def save_snapshot_to_db(self, snapshot: MonitorSnapshot) -> None:
         """Save P&L snapshot to database."""
+        # Extract bid/ask from quotes
+        quotes = snapshot.quotes
+        ce_quote = quotes.get('straddle_ce')
+        pe_quote = quotes.get('straddle_pe')
+        wing_ce_quote = quotes.get('wing_ce')
+        wing_pe_quote = quotes.get('wing_pe')
+
         pnl_snapshot = PnLSnapshot(
             id=0,
             position_id=self.state.position.id,
-            timestamp=snapshot.timestamp,
+            current_pnl=snapshot.current_pnl,
+            pnl_percent=snapshot.pnl_percentage,
             nifty_spot=snapshot.nifty_spot,
-            india_vix=snapshot.india_vix,
-            unrealized_pnl=snapshot.current_pnl,
-            straddle_value=snapshot.straddle_value,
-            wing_value=snapshot.wing_value
+            vix=snapshot.india_vix,
+            ce_bid=ce_quote.bid if ce_quote else 0.0,
+            ce_ask=ce_quote.ask if ce_quote else 0.0,
+            pe_bid=pe_quote.bid if pe_quote else 0.0,
+            pe_ask=pe_quote.ask if pe_quote else 0.0,
+            wing_ce_bid=wing_ce_quote.bid if wing_ce_quote else None,
+            wing_ce_ask=wing_ce_quote.ask if wing_ce_quote else None,
+            wing_pe_bid=wing_pe_quote.bid if wing_pe_quote else None,
+            wing_pe_ask=wing_pe_quote.ask if wing_pe_quote else None
         )
         save_pnl_snapshot(pnl_snapshot)
 

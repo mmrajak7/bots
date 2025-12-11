@@ -229,7 +229,8 @@ class ExitManager:
             if not quote:
                 continue
 
-            if leg.side == 'SHORT':
+            # Side is determined by leg_type: straddle_* = SHORT, wing_* = LONG
+            if leg.leg_type.startswith('straddle'):
                 entry_straddle += leg.entry_price
                 current_straddle_ask += quote.ask
             else:
@@ -241,7 +242,7 @@ class ExitManager:
             entry_wing_debit=entry_wing,
             current_straddle_ask=current_straddle_ask,
             current_wing_bid=current_wing_bid,
-            quantity=position.quantity
+            quantity=position.lot_size
         )
 
         # Check profit target (50% of max profit)
@@ -287,7 +288,7 @@ class ExitManager:
         today = date.today()
         if today.weekday() == 4:  # Friday
             # If position expiry is next week or later
-            if position.expiry and position.expiry > today + timedelta(days=2):
+            if position.expiry_date and position.expiry_date > today + timedelta(days=2):
                 current_time = datetime.now().strftime("%H:%M")
                 friday_exit_time = self.trading_config.get('exit', {}).get('friday_exit_time', "15:15")
 
@@ -302,23 +303,23 @@ class ExitManager:
 
         # Check expiry day (NIFTY typically expires on Tuesday)
         # TDD Section 6.1.3: Expiry day must exit by 3:20 PM
-        if position.expiry and position.expiry == today:
+        if position.expiry_date and position.expiry_date == today:
             current_time = datetime.now().strftime("%H:%M")
             expiry_exit_time = self.trading_config.get('exit', {}).get('expiry_exit_time', "15:20")
 
             if current_time >= expiry_exit_time:
-                logger.warning(f"EXPIRY DAY EXIT: Today is expiry ({position.expiry}), time={current_time}")
+                logger.warning(f"EXPIRY DAY EXIT: Today is expiry ({position.expiry_date}), time={current_time}")
                 return ExitCondition(
                     should_exit=True,
                     reason=ExitReason.EXPIRY,
                     current_pnl=current_pnl,
                     pnl_percentage=pnl_pct,
-                    details=f"Expiry day auto-exit (expiry={position.expiry}, time={current_time})"
+                    details=f"Expiry day auto-exit (expiry={position.expiry_date}, time={current_time})"
                 )
 
         # Check if expiry is tomorrow (DTE = 1) - alert but don't auto-exit
-        if position.expiry and (position.expiry - today).days == 1:
-            logger.info(f"Expiry tomorrow ({position.expiry}). DTE=1, monitoring closely.")
+        if position.expiry_date and (position.expiry_date - today).days == 1:
+            logger.info(f"Expiry tomorrow ({position.expiry_date}). DTE=1, monitoring closely.")
 
         # No exit condition met
         return ExitCondition(
@@ -381,22 +382,27 @@ class ExitManager:
                 kite=self.kite,
                 symbols=symbols,
                 quotes=quotes,
-                quantity=position.quantity,
+                quantity=position.lot_size,
                 slippage_ticks=slippage_ticks
             )
 
             # Position Verification after Exit (TDD Section 6.2)
-            # Verify all positions are CLOSED (qty = 0)
-            logger.info("Verifying positions are closed after exit...")
+            # Verify all 4 legs are CLOSED (qty = 0)
+            logger.info("Verifying all 4 legs are closed after exit...")
             exit_verified = True
             verification_issues = []
 
-            for leg_type, symbol in symbols.items():
-                # After exit, we expect NO position (qty = 0)
-                # Check that position doesn't exist with original quantity
+            # Get positions once (not in loop)
+            try:
                 positions = self.kite.positions()
                 net_positions = positions.get('net', [])
+            except Exception as e:
+                logger.error(f"Failed to fetch positions for verification: {e}")
+                net_positions = []
 
+            # Check each of the 4 legs
+            for leg_type, symbol in symbols.items():
+                # After exit, we expect NO position (qty = 0)
                 for pos in net_positions:
                     if pos.get('tradingsymbol') == symbol:
                         qty = pos.get('quantity', 0)
@@ -406,6 +412,11 @@ class ExitManager:
                                 f"{leg_type}: Expected 0, found {qty}"
                             )
                         break
+
+            # Verify we checked all 4 legs
+            if len(symbols) != 4:
+                exit_verified = False
+                verification_issues.append(f"Expected 4 legs, found {len(symbols)}")
 
             if not exit_verified:
                 issue_text = "; ".join(verification_issues)
@@ -428,17 +439,17 @@ class ExitManager:
                 )
 
             # Calculate realized P&L (only if exit verified)
-            entry_credit = position.entry_credit
+            entry_credit = position.entry_premium
             exit_debit = (
                 (orders.straddle_ce.fill_price + orders.straddle_pe.fill_price) -
                 (orders.wing_ce.fill_price + orders.wing_pe.fill_price)
-            ) * position.quantity
+            ) * position.lot_size
 
             realized_pnl = entry_credit - exit_debit
 
             # Calculate charges
-            sell_value = (orders.wing_ce.fill_price + orders.wing_pe.fill_price) * position.quantity
-            buy_value = (orders.straddle_ce.fill_price + orders.straddle_pe.fill_price) * position.quantity
+            sell_value = (orders.wing_ce.fill_price + orders.wing_pe.fill_price) * position.lot_size
+            buy_value = (orders.straddle_ce.fill_price + orders.straddle_pe.fill_price) * position.lot_size
             charges = calculate_transaction_charges(buy_value, sell_value)
 
             # Update position in database
@@ -512,13 +523,14 @@ class ExitManager:
             quotes = self.get_position_quotes(position, legs)
 
             # Calculate current P&L for context
-            entry_straddle = sum(l.entry_price for l in legs if l.side == 'SHORT')
-            entry_wing = sum(l.entry_price for l in legs if l.side == 'LONG')
-            current_straddle = sum(quotes[l.leg_type].ask for l in legs if l.side == 'SHORT')
-            current_wing = sum(quotes[l.leg_type].bid for l in legs if l.side == 'LONG')
+            # Side is determined by leg_type: straddle_* = SHORT, wing_* = LONG
+            entry_straddle = sum(l.entry_price for l in legs if l.leg_type.startswith('straddle'))
+            entry_wing = sum(l.entry_price for l in legs if l.leg_type.startswith('wing'))
+            current_straddle = sum(quotes[l.leg_type].ask for l in legs if l.leg_type.startswith('straddle'))
+            current_wing = sum(quotes[l.leg_type].bid for l in legs if l.leg_type.startswith('wing'))
 
             current_pnl, pnl_pct = calculate_position_pnl(
-                entry_straddle, entry_wing, current_straddle, current_wing, position.quantity
+                entry_straddle, entry_wing, current_straddle, current_wing, position.lot_size
             )
 
             # Get NIFTY and VIX
@@ -531,7 +543,7 @@ class ExitManager:
                 atm_strike=position.atm_strike,
                 wing_distance=position.wing_distance,
                 position_pnl=current_pnl,
-                dte=(position.expiry - date.today()).days if position.expiry else 0
+                dte=(position.expiry_date - date.today()).days if position.expiry_date else 0
             )
 
             response = self.claude.get_stop_loss_advisory(context)
@@ -562,10 +574,10 @@ class ExitManager:
         realized_pnl: float
     ) -> None:
         """Record exit to database."""
-        # Update position status
+        # Update position status (schema expects lowercase: 'closed')
         update_position_status(
             position_id=position.id,
-            status='CLOSED',
+            status='closed',
             exit_time=datetime.now(),
             exit_reason=reason.value,
             realized_pnl=realized_pnl
@@ -586,17 +598,17 @@ class ExitManager:
                 order_record = Order(
                     id=0,
                     position_id=position.id,
-                    leg_id=leg.id,
-                    order_id=order.order_id,
-                    tradingsymbol=order.tradingsymbol,
-                    transaction_type=order.transaction_type,
-                    quantity=order.quantity,
+                    kite_order_id=order.order_id,
                     order_type='LIMIT',
+                    transaction_type=order.transaction_type,
+                    tradingsymbol=order.tradingsymbol,
+                    strike=leg.strike,
+                    option_type=leg.option_type,
                     price=order.order_price,
+                    quantity=order.quantity,
                     status=order.status,
                     fill_price=order.fill_price,
-                    slippage=order.slippage,
-                    created_at=datetime.now()
+                    slippage=order.slippage
                 )
                 save_order(order_record)
 
@@ -677,8 +689,8 @@ if __name__ == '__main__':
 
         if position:
             print(f"    Found position ID: {position.id}")
-            print(f"    Strategy: {position.strategy}")
-            print(f"    Entry credit: {position.entry_credit:.2f}")
+            print(f"    Status: {position.status}")
+            print(f"    Entry premium: {position.entry_premium:.2f}")
 
             # Check exit conditions
             print("\n[2] Checking exit conditions...")

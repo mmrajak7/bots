@@ -402,6 +402,19 @@ class EntryManager:
                 error=f"Entry conditions not met: {conditions.reason}"
             )
 
+        # Validate required fields
+        if not conditions.expiry:
+            return EntryResult(
+                success=False,
+                error="Entry conditions missing expiry date"
+            )
+
+        if not conditions.atm_strike:
+            return EntryResult(
+                success=False,
+                error="Entry conditions missing ATM strike"
+            )
+
         logger.info("Starting Iron Fly entry execution...")
 
         try:
@@ -598,7 +611,8 @@ class EntryManager:
                 orders=orders,
                 metrics=metrics,
                 wing_distance=wing_distance,
-                quantity=quantity
+                quantity=quantity,
+                charges=charges
             )
 
             # Step 8: Send alerts
@@ -684,47 +698,69 @@ class EntryManager:
         orders: IronFlyOrders,
         metrics: IronFlyMetrics,
         wing_distance: int,
-        quantity: int
+        quantity: int,
+        charges: Any
     ) -> int:
         """Record position and legs to database."""
+        # Calculate premiums
+        straddle_credit = (orders.straddle_ce.fill_price + orders.straddle_pe.fill_price) * quantity
+        wing_debit = (orders.wing_ce.fill_price + orders.wing_pe.fill_price) * quantity
+        entry_premium = straddle_credit - wing_debit
+
+        # Note: conditions.expiry and atm_strike validated at function start
+        assert conditions.expiry is not None  # For mypy - validated above
+        assert conditions.atm_strike is not None  # For mypy - validated above
+
         position = Position(
             id=0,  # Auto-assigned
-            strategy='iron_fly',
-            status='ACTIVE',
+            status='active',
             entry_time=datetime.now(),
-            expiry=conditions.expiry,
+            exit_time=None,
+            expiry_date=conditions.expiry,
             atm_strike=conditions.atm_strike,
             wing_distance=wing_distance,
-            quantity=quantity,
-            entry_credit=orders.net_credit * quantity,
+            lot_size=quantity,
+            entry_premium=entry_premium,
+            straddle_credit=straddle_credit,
+            wing_debit=wing_debit,
             max_profit=metrics.max_profit,
             max_loss=metrics.max_loss,
-            created_at=datetime.now()
+            margin_deployed=0.0,  # Can be updated later if margin info available
+            entry_charges=charges.total if charges else 0.0
         )
 
         position_id = save_position(position)
 
         # Save legs
         legs = [
-            ('straddle_ce', orders.straddle_ce, 'SHORT', conditions.atm_strike),
-            ('straddle_pe', orders.straddle_pe, 'SHORT', conditions.atm_strike),
-            ('wing_ce', orders.wing_ce, 'LONG', conditions.atm_strike + wing_distance),
-            ('wing_pe', orders.wing_pe, 'LONG', conditions.atm_strike - wing_distance),
+            ('straddle_ce', orders.straddle_ce, conditions.atm_strike),
+            ('straddle_pe', orders.straddle_pe, conditions.atm_strike),
+            ('wing_ce', orders.wing_ce, conditions.atm_strike + wing_distance),
+            ('wing_pe', orders.wing_pe, conditions.atm_strike - wing_distance),
         ]
 
-        for leg_type, order, side, strike in legs:
+        for leg_type, order, strike in legs:
+            # Look up actual instrument_token from instruments DataFrame
+            instrument_token = ''
+            try:
+                match = self.instruments_df[self.instruments_df['tradingsymbol'] == order.tradingsymbol]
+                if not match.empty:
+                    instrument_token = str(match['instrument_token'].iloc[0])
+            except Exception as e:
+                logger.warning(f"Could not find instrument_token for {order.tradingsymbol}: {e}")
+                instrument_token = order.order_id  # Fallback to order_id
+
             leg = PositionLeg(
                 id=0,
                 position_id=position_id,
                 leg_type=leg_type,
-                tradingsymbol=order.tradingsymbol,
-                strike=strike,
                 option_type='CE' if 'ce' in leg_type else 'PE',
-                side=side,
-                quantity=order.quantity,
+                strike=strike,
+                tradingsymbol=order.tradingsymbol,
                 entry_price=order.fill_price,
-                entry_order_id=order.order_id,
-                created_at=datetime.now()
+                exit_price=None,
+                quantity=order.quantity,
+                instrument_token=instrument_token
             )
             save_position_leg(leg)
 

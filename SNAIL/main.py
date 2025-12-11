@@ -169,8 +169,8 @@ def cmd_exit(args):
         return 0
 
     print(f"\n[ACTIVE POSITION]: #{position.id}")
-    print(f"   Strategy: {position.strategy}")
-    print(f"   Entry credit: Rs.{position.entry_credit:,.2f}")
+    print(f"   Status: {position.status}")
+    print(f"   Entry premium: Rs.{position.entry_premium:,.2f}")
 
     if args.force or input("\nConfirm exit? (y/N): ").lower() == 'y':
         manager = get_exit_manager()
@@ -220,11 +220,11 @@ def cmd_status(args):
     print(f"\n[POSITION]:")
     if position:
         print(f"   ID: {position.id}")
-        print(f"   Strategy: {position.strategy}")
+        print(f"   Status: {position.status}")
         print(f"   ATM: {position.atm_strike}")
         print(f"   Wing distance: {position.wing_distance}")
-        print(f"   Entry credit: Rs.{position.entry_credit:,.2f}")
-        print(f"   Expiry: {position.expiry}")
+        print(f"   Entry premium: Rs.{position.entry_premium:,.2f}")
+        print(f"   Expiry: {position.expiry_date}")
 
         # Calculate current P&L
         try:

@@ -430,6 +430,14 @@ class DailyStartup:
             # Load and validate
             self._instruments_df = load_instruments(instruments_path)
 
+            if self._instruments_df is None or self._instruments_df.empty:
+                return StartupCheck(
+                    name="Instruments",
+                    passed=False,
+                    message="Failed to load instruments file or file is empty",
+                    critical=True
+                )
+
             # Check for NIFTY options
             nifty_options = self._instruments_df[
                 (self._instruments_df['name'] == 'NIFTY') &

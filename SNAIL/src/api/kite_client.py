@@ -299,7 +299,7 @@ class SNAILKiteClient:
             logger.info(f"[PAPER] Order modified: {order_id} -> price={price}, type={order_type}")
             return order_id
 
-        params = {'variety': self.VARIETY_REGULAR, 'order_id': order_id}
+        params: Dict[str, Any] = {'variety': self.VARIETY_REGULAR, 'order_id': order_id}
 
         if price is not None:
             params['price'] = price
