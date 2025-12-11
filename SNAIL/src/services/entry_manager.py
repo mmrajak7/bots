@@ -467,7 +467,7 @@ class EntryManager:
                 )
 
             # Step 2b: Validate bid-ask spreads (TDD Section 5.2)
-            quantity = self._get_quantity()
+            quantity = self._get_quantity(conditions.expiry)
             spread_result = validate_bid_ask_spreads(quotes, quantity)
 
             if not spread_result.valid:
@@ -534,7 +534,7 @@ class EntryManager:
                 pe_sell_price=quotes['straddle_pe'].bid,
                 wing_ce_buy_price=quotes['wing_ce'].ask,
                 wing_pe_buy_price=quotes['wing_pe'].ask,
-                quantity=self._get_quantity()
+                quantity=self._get_quantity(conditions.expiry)
             )
 
             logger.info(f"Position metrics: Max profit={metrics.max_profit:.2f}, "
@@ -654,11 +654,26 @@ class EntryManager:
             traceback.print_exc()
             return EntryResult(success=False, error=str(e))
 
-    def _get_quantity(self) -> int:
-        """Get position quantity based on config."""
+    def _get_quantity(self, expiry: Optional[date] = None) -> int:
+        """
+        Get position quantity based on config.
+
+        Args:
+            expiry: Target expiry date for lot size lookup. If None, uses any NIFTY instrument.
+        """
         capital_config = self.trading_config.get('capital', {})
-        lots = capital_config.get('lots', 1)
-        lot_size = get_lot_size_from_instruments(self.instruments_df, date.today())
+        lots = capital_config.get('num_lots', capital_config.get('lots', 1))
+
+        # Get lot size from instruments - use expiry if provided, else get from any NIFTY option
+        if expiry:
+            lot_size = get_lot_size_from_instruments(self.instruments_df, expiry)
+        else:
+            # Fallback: get lot size from any NIFTY instrument
+            nifty_df = self.instruments_df[self.instruments_df['name'] == 'NIFTY']
+            if not nifty_df.empty:
+                lot_size = int(nifty_df['lot_size'].iloc[0])
+            else:
+                lot_size = 75  # Default NIFTY lot size
 
         # Validate lot_size to prevent division by zero or invalid quantities
         if lot_size <= 0:

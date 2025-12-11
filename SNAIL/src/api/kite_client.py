@@ -116,11 +116,18 @@ class SNAILKiteClient:
         self.api_key = kite_config.get('api_key') or os.getenv('ZERODHA_API_KEY')
         self._kite: Optional[KiteConnect] = None
         self._authenticator = KiteAuthenticator(kite_config)
-        self._paper_trading = config.get('paper_trading', {}).get('enabled', False)
+        paper_config = config.get('paper_trading', {}).get('enabled', False)
+        # Handle both bool and string values
+        if isinstance(paper_config, str):
+            self._paper_trading = paper_config.lower() in ('true', 'yes', '1', 'on')
+        else:
+            self._paper_trading = bool(paper_config)
+
         self._paper_orders: Dict[str, Dict[str, Any]] = {}  # Track paper trading orders
 
-        if self._paper_trading:
-            logger.info("Paper trading mode enabled")
+        # Log the paper trading status with source info for debugging
+        env_value = os.getenv('SNAIL_PAPER_TRADING', 'not set')
+        logger.info(f"Paper trading: enabled={self._paper_trading} (env={env_value}, config={paper_config})")
 
     def ensure_authenticated(self) -> 'SNAILKiteClient':
         """
