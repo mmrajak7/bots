@@ -681,7 +681,7 @@ _P&L data pending - monitor will update soon_""")
 
  BE: {be_lower:.0f} ←──→ {be_upper:.0f}
  Max Loss: ₹{position.max_loss:,.0f}
- Exp: {expiry_str} | Qty: {position.lot_size}
+ Exp: {expiry_str} | {position.lot_size // 75} lot ({position.lot_size} qty)
 ```"""
 
             self._send_reply(f"""📍 *Iron Fly Position*
