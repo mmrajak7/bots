@@ -354,6 +354,9 @@ class PositionMonitor:
             logger.warning("Cannot save snapshot: no active position")
             return
 
+        # Update margin from Zerodha (changes daily based on SPAN)
+        self._update_margin()
+
         # Extract bid/ask from quotes
         quotes = snapshot.quotes
         ce_quote = quotes.get('straddle_ce')
@@ -378,6 +381,28 @@ class PositionMonitor:
             wing_pe_ask=wing_pe_quote.ask if wing_pe_quote else None
         )
         save_pnl_snapshot(pnl_snapshot)
+
+    def _update_margin(self) -> None:
+        """Update margin_deployed from Zerodha (SPAN margin changes daily)."""
+        if not self.state.position:
+            return
+
+        try:
+            current_margin = self.kite.get_margin_utilised()
+            if current_margin > 0 and current_margin != self.state.position.margin_deployed:
+                # Update in database
+                from src.utils.db import get_connection
+                conn = get_connection()
+                conn.execute(
+                    "UPDATE positions SET margin_deployed = ? WHERE id = ?",
+                    (current_margin, self.state.position.id)
+                )
+                conn.commit()
+                logger.debug(f"Margin updated: ₹{current_margin:,.0f}")
+                # Update local state
+                self.state.position.margin_deployed = current_margin
+        except Exception as e:
+            logger.debug(f"Could not update margin: {e}")
 
     # =========================================================================
     # ALERT CHECKS
