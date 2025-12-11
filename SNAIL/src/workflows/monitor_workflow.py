@@ -862,104 +862,89 @@ _Fetching P&L data..._"""
 
             # Check if market is open
             if not is_market_open():
+                logger.info("Monitor: Market closed, skipping")
                 self._state = MonitorWorkflowState.IDLE
                 return
 
             # Check for active position
             position = get_active_position()
 
-            if position:
-                self._state = MonitorWorkflowState.MONITORING
-                self._stats.position_checks += 1
+            if not position:
+                logger.info("Monitor: No active position found")
+                return
 
-                # Gap check at market open (9:16)
-                if current_time.time() >= GAP_CHECK_TIME and current_time.time() < dt_time(9, 20):
-                    if not hasattr(self, '_gap_checked_today') or self._gap_checked_today != date.today():
-                        self._state = MonitorWorkflowState.GAP_CHECK
-                        gap_info = self._check_gap_open()
-                        self._gap_checked_today = date.today()
+            # Active position found
+            logger.info(f"Monitor: Position {position.id} found, taking snapshot...")
+            self._state = MonitorWorkflowState.MONITORING
+            self._stats.position_checks += 1
 
-                        if gap_info and gap_info.get('beyond_wing'):
-                            # Handle based on Claude decision
-                            from src.api.claude_client import ClaudeDecision
-                            if gap_info.get('claude_decision') == ClaudeDecision.EXIT.value:
-                                self.exit_manager.execute_exit(
-                                    reason=ExitReason.GAP_OPEN,
-                                    position=position
-                                )
-                                return
+            # Gap check at market open (9:16)
+            if current_time.time() >= GAP_CHECK_TIME and current_time.time() < dt_time(9, 20):
+                if not hasattr(self, '_gap_checked_today') or self._gap_checked_today != date.today():
+                    self._state = MonitorWorkflowState.GAP_CHECK
+                    gap_info = self._check_gap_open()
+                    self._gap_checked_today = date.today()
 
-                # Take position snapshot
-                snapshot = self.position_monitor.take_snapshot()
-
-                if snapshot:
-                    # Save snapshot to database for status/pnl commands
-                    self.position_monitor.save_snapshot_to_db(snapshot)
-                    logger.debug(f"P&L snapshot saved: {snapshot.current_pnl:.2f} ({snapshot.pnl_percentage:.1f}%)")
-
-                    # Check stop loss (50% max loss)
-                    stop_loss_pct = self.trading_config.get('exit', {}).get('stop_loss_pct', 50)
-
-                    if snapshot.pnl_percentage < 0 and abs(snapshot.pnl_percentage) >= stop_loss_pct:
-                        if self._handle_stop_loss(snapshot):
-                            self._stats.exits_triggered += 1
+                    if gap_info and gap_info.get('beyond_wing'):
+                        # Handle based on Claude decision
+                        from src.api.claude_client import ClaudeDecision
+                        if gap_info.get('claude_decision') == ClaudeDecision.EXIT.value:
+                            self.exit_manager.execute_exit(
+                                reason=ExitReason.GAP_OPEN,
+                                position=position
+                            )
                             return
 
-                    # Check VIX warning (16-20) - send decision buttons
-                    vix_config = self.trading_config.get('entry', {}).get('vix_range', {})
-                    vix_max = vix_config.get('max', 16)
-                    vix_hard_exit = self.trading_config.get('exit', {}).get('vix_hard_exit', 20)
+            # Take position snapshot
+            snapshot = self.position_monitor.take_snapshot()
 
-                    if vix_max < snapshot.india_vix < vix_hard_exit:
-                        # VIX in warning zone (16-20), send decision buttons
-                        if self._handle_vix_warning(snapshot):
-                            self._stats.exits_triggered += 1
-                            return
+            if snapshot:
+                # Save snapshot to database for status/pnl commands
+                self.position_monitor.save_snapshot_to_db(snapshot)
+                logger.info(f"Monitor: P&L snapshot saved: ₹{snapshot.current_pnl:,.0f} ({snapshot.pnl_percentage:+.1f}%)")
 
-                    # Check wing approach - send decision buttons
-                    from src.utils.calculations import is_approaching_wing
-                    approaching, direction = is_approaching_wing(
-                        spot_price=snapshot.nifty_spot,
-                        atm_strike=position.atm_strike,
-                        wing_distance=position.wing_distance,
-                        threshold_pct=0.75  # Alert at 75% of wing distance
-                    )
+                # Check stop loss (50% max loss)
+                stop_loss_pct = self.trading_config.get('exit', {}).get('stop_loss_pct', 50)
 
-                    if approaching:
-                        # Calculate wing proximity percentage
-                        wing_strike = position.atm_strike + (position.wing_distance if direction == 'CE' else -position.wing_distance)
-                        distance_to_wing = abs(snapshot.nifty_spot - wing_strike)
-                        wing_proximity = ((position.wing_distance - distance_to_wing) / position.wing_distance) * 100 if position.wing_distance > 0 else 0
+                if snapshot.pnl_percentage < 0 and abs(snapshot.pnl_percentage) >= stop_loss_pct:
+                    if self._handle_stop_loss(snapshot):
+                        self._stats.exits_triggered += 1
+                        return
 
-                        if self._handle_wing_approach(snapshot, direction, wing_proximity):
-                            self._stats.exits_triggered += 1
-                            return
+                # Check VIX warning (16-20) - send decision buttons
+                vix_config = self.trading_config.get('entry', {}).get('vix_range', {})
+                vix_max = vix_config.get('max', 16)
+                vix_hard_exit = self.trading_config.get('exit', {}).get('vix_hard_exit', 20)
+
+                if vix_max < snapshot.india_vix < vix_hard_exit:
+                    # VIX in warning zone (16-20), send decision buttons
+                    if self._handle_vix_warning(snapshot):
+                        self._stats.exits_triggered += 1
+                        return
+
+                # Check wing approach - send decision buttons
+                from src.utils.calculations import is_approaching_wing
+                approaching, direction = is_approaching_wing(
+                    spot_price=snapshot.nifty_spot,
+                    atm_strike=position.atm_strike,
+                    wing_distance=position.wing_distance,
+                    threshold_pct=0.75  # Alert at 75% of wing distance
+                )
+
+                if approaching:
+                    # Calculate wing proximity percentage
+                    wing_strike = position.atm_strike + (position.wing_distance if direction == 'CE' else -position.wing_distance)
+                    distance_to_wing = abs(snapshot.nifty_spot - wing_strike)
+                    wing_proximity = ((position.wing_distance - distance_to_wing) / position.wing_distance) * 100 if position.wing_distance > 0 else 0
+
+                    if self._handle_wing_approach(snapshot, direction, wing_proximity):
+                        self._stats.exits_triggered += 1
+                        return
 
                 # Friday close check
                 if self._check_friday_close():
                     self._stats.exits_triggered += 1
                     return
-
-            else:
-                # No active position - check for entry opportunity
-                self._state = MonitorWorkflowState.ENTRY_CHECK
-
-                # Only check for entry during entry window
-                entry_start = self.trading_config.get('entry', {}).get('start_time', '09:20')
-                entry_end = self.trading_config.get('entry', {}).get('end_time', '14:30')
-
-                current_time_str = current_time.strftime('%H:%M')
-
-                if entry_start <= current_time_str <= entry_end:
-                    # Check entry conditions
-                    conditions = self.entry_manager.check_entry_conditions()
-
-                    if conditions.can_enter:
-                        logger.info("Entry conditions met, initiating entry workflow")
-                        from src.workflows.entry_workflow import EntryWorkflow
-
-                        entry_workflow = EntryWorkflow()
-                        entry_workflow.run()
 
         except Exception as e:
             logger.error(f"Monitor iteration error: {e}")
