@@ -878,9 +878,6 @@ _Fetching P&L data..._"""
             self._state = MonitorWorkflowState.MONITORING
             self._stats.position_checks += 1
 
-            # Load position into monitor state
-            self.position_monitor.load_position()
-
             # Gap check at market open (9:16)
             if current_time.time() >= GAP_CHECK_TIME and current_time.time() < dt_time(9, 20):
                 if not hasattr(self, '_gap_checked_today') or self._gap_checked_today != date.today():
