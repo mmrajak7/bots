@@ -721,27 +721,26 @@ _Entry: {position.entry_time.strftime('%d-%b %H:%M') if position.entry_time else
                 pnl_emoji = "🟢" if snapshot.current_pnl >= 0 else "🔴"
                 pnl_sign = "+" if snapshot.current_pnl >= 0 else ""
 
-                # Calculate P&L percentage of max profit/loss
-                if snapshot.current_pnl >= 0:
-                    pct_of_target = (snapshot.current_pnl / position.max_profit * 100) if position.max_profit else 0
-                    target_text = f"{pct_of_target:.1f}% of max profit"
-                else:
-                    pct_of_max_loss = (abs(snapshot.current_pnl) / position.max_loss * 100) if position.max_loss else 0
-                    target_text = f"{pct_of_max_loss:.1f}% of max loss"
+                # ROM % (Return on Margin)
+                rom_text = f" | ROM: {snapshot.pnl_percent:+.2f}%" if position.margin_deployed > 0 else ""
+                margin_text = f"₹{position.margin_deployed:,.0f}" if position.margin_deployed > 0 else "N/A"
+
+                # Exit target based on config (default 2.6% ROM)
+                from src.utils.config import get_trading_config
+                profit_target_pct = get_trading_config().get('exit', {}).get('profit_target_pct', 2.6)
+                target_profit = (position.margin_deployed * profit_target_pct / 100) if position.margin_deployed > 0 else position.max_profit * 0.5
 
                 self._send_reply(f"""💰 *P&L Summary*
 
-{pnl_emoji} *Current: {pnl_sign}₹{snapshot.current_pnl:,.0f}*
-📊 {snapshot.pnl_percent:+.1f}% ({target_text})
+{pnl_emoji} *P&L: {pnl_sign}₹{snapshot.current_pnl:,.0f}*{rom_text}
 
-*Targets:*
 • Max Profit: ₹{position.max_profit:,.0f}
 • Max Loss: ₹{position.max_loss:,.0f}
-• Exit at: 50% profit (₹{position.max_profit * 0.5:,.0f})
+• Margin: {margin_text}
+• Exit Target: {profit_target_pct}% ROM (₹{target_profit:,.0f})
 
 *Market:*
-• NIFTY: ₹{snapshot.nifty_spot:,.0f}
-• VIX: {snapshot.vix:.2f}
+• NIFTY: {snapshot.nifty_spot:,.0f} | VIX: {snapshot.vix:.1f}
 
 _Updated: {snapshot.timestamp.strftime('%H:%M:%S') if snapshot.timestamp else 'N/A'}_""")
             else:
