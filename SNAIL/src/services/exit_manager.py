@@ -242,18 +242,20 @@ class ExitManager:
             entry_wing_debit=entry_wing,
             current_straddle_ask=current_straddle_ask,
             current_wing_bid=current_wing_bid,
-            quantity=position.lot_size
+            quantity=position.lot_size,
+            margin_deployed=position.margin_deployed
         )
 
-        # Check profit target (50% of max profit)
-        profit_target_pct = self.trading_config.get('exit', {}).get('profit_target_pct', 50)
+        # Check profit target (% of margin deployed - Return on Margin)
+        # e.g., profit_target_pct=5 means exit when profit is 5% of margin deployed
+        profit_target_pct = self.trading_config.get('exit', {}).get('profit_target_pct', 5)
         if pnl_pct >= profit_target_pct:
             return ExitCondition(
                 should_exit=True,
                 reason=ExitReason.PROFIT_TARGET,
                 current_pnl=current_pnl,
                 pnl_percentage=pnl_pct,
-                details=f"Profit target reached ({pnl_pct:.1f}% >= {profit_target_pct}%)"
+                details=f"Profit target reached ({pnl_pct:.1f}% ROM >= {profit_target_pct}% target)"
             )
 
         # Check VIX > 20 - HARD exit trigger (TDD Section 5.3)
@@ -270,8 +272,9 @@ class ExitManager:
                 details=f"VIX HARD EXIT: {india_vix:.2f} > {vix_hard_exit_threshold} threshold"
             )
 
-        # Check stop loss (50% of max loss - advisory only)
-        stop_loss_pct = self.trading_config.get('exit', {}).get('stop_loss_pct', 50)
+        # Check stop loss (% of margin deployed - advisory only)
+        # e.g., stop_loss_pct=10 means alert when loss is 10% of margin deployed
+        stop_loss_pct = self.trading_config.get('exit', {}).get('stop_loss_pct', 10)
         loss_pct = abs(pnl_pct) if pnl_pct < 0 else 0
 
         if loss_pct >= stop_loss_pct:
@@ -281,7 +284,7 @@ class ExitManager:
                 reason=ExitReason.STOP_LOSS,
                 current_pnl=current_pnl,
                 pnl_percentage=pnl_pct,
-                details=f"Stop loss level reached ({loss_pct:.1f}% loss) - Claude advisory needed"
+                details=f"Stop loss level reached ({loss_pct:.1f}% of margin) - Claude advisory needed"
             )
 
         # Check Friday close
@@ -530,7 +533,8 @@ class ExitManager:
             current_wing = sum(quotes[l.leg_type].bid for l in legs if l.leg_type.startswith('wing'))
 
             current_pnl, pnl_pct = calculate_position_pnl(
-                entry_straddle, entry_wing, current_straddle, current_wing, position.lot_size
+                entry_straddle, entry_wing, current_straddle, current_wing,
+                position.lot_size, position.margin_deployed
             )
 
             # Get NIFTY and VIX

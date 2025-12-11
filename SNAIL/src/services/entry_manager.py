@@ -707,6 +707,16 @@ class EntryManager:
         wing_debit = (orders.wing_ce.fill_price + orders.wing_pe.fill_price) * quantity
         entry_premium = straddle_credit - wing_debit
 
+        # Get margin deployed after entry orders
+        # This captures the actual span + exposure margin blocked for the position
+        try:
+            margin_deployed = self.kite.get_margin_utilised()
+            logger.info(f"Margin deployed after entry: ₹{margin_deployed:,.2f}")
+        except Exception as e:
+            logger.warning(f"Could not fetch margin utilised: {e}")
+            # Fallback: estimate from max_loss (typical margin requirement for Iron Fly)
+            margin_deployed = metrics.max_loss * 0.8  # Conservative estimate
+
         # Note: conditions.expiry and atm_strike validated at function start
         assert conditions.expiry is not None  # For mypy - validated above
         assert conditions.atm_strike is not None  # For mypy - validated above
@@ -725,7 +735,7 @@ class EntryManager:
             wing_debit=wing_debit,
             max_profit=metrics.max_profit,
             max_loss=metrics.max_loss,
-            margin_deployed=0.0,  # Can be updated later if margin info available
+            margin_deployed=margin_deployed,
             entry_charges=charges.total if charges else 0.0
         )
 

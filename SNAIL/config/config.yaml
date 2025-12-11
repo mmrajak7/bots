@@ -48,10 +48,12 @@ trading:
     # Claude pre-entry advisory
     use_claude_advisory: false # Disable Claude analysis for pre-entry (set true to enable)
 
-  # Exit conditions
+  # Exit conditions (based on Return on Margin - ROM)
+  # All percentages are calculated on margin_deployed, not max_profit
+  # This gives realistic P&L percentages based on capital at risk
   exit:
-    profit_target_pct: 30    # Exit at 30% of max profit
-    stop_loss_pct: 50        # Alert at 50% of max loss
+    profit_target_pct: 5     # Exit at 5% ROM (e.g., ₹5,000 on ₹1L margin)
+    stop_loss_pct: 10        # Alert at 10% loss on margin (e.g., -₹10,000 on ₹1L margin)
     vix_hard_exit: 20        # Hard exit if VIX > 20
     vix_warning_zone: 16.5   # Warning if VIX > 16.5
     friday_check_time: "15:00"  # Friday exit decision time

@@ -324,7 +324,8 @@ class PositionMonitor:
 
             current_pnl, pnl_pct = calculate_position_pnl(
                 entry_straddle, entry_wing, current_straddle, current_wing,
-                self.state.position.lot_size
+                self.state.position.lot_size,
+                self.state.position.margin_deployed
             )
 
             # Update state
@@ -349,6 +350,10 @@ class PositionMonitor:
 
     def save_snapshot_to_db(self, snapshot: MonitorSnapshot) -> None:
         """Save P&L snapshot to database."""
+        if not self.state.position:
+            logger.warning("Cannot save snapshot: no active position")
+            return
+
         # Extract bid/ask from quotes
         quotes = snapshot.quotes
         ce_quote = quotes.get('straddle_ce')

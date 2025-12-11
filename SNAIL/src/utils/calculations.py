@@ -245,10 +245,15 @@ def calculate_position_pnl(
     entry_wing_debit: float,
     current_straddle_ask: float,
     current_wing_bid: float,
-    quantity: int
+    quantity: int,
+    margin_deployed: float = 0.0
 ) -> Tuple[float, float]:
     """
-    Calculate position P&L and percentage.
+    Calculate position P&L and percentage based on margin deployed.
+
+    The P&L percentage is calculated as Return on Margin (ROM):
+    - This gives a meaningful percentage that represents actual return on capital at risk
+    - Example: If margin is ₹1,00,000 and profit is ₹5,000, ROM = 5%
 
     Args:
         entry_straddle_credit: Credit received from selling straddle
@@ -256,17 +261,24 @@ def calculate_position_pnl(
         current_straddle_ask: Current ask to buy back straddle
         current_wing_bid: Current bid to sell wings
         quantity: Position quantity
+        margin_deployed: Margin blocked for position (if 0, falls back to max_profit based)
 
     Returns:
-        (P&L in INR, P&L percentage of max profit)
+        (P&L in INR, P&L percentage based on margin deployed)
     """
     entry_credit = entry_straddle_credit - entry_wing_debit
     exit_debit = current_straddle_ask - current_wing_bid
 
     pnl = (entry_credit - exit_debit) * quantity
-    max_profit = entry_credit * quantity
 
-    pnl_pct = (pnl / max_profit * 100) if max_profit > 0 else 0
+    # Calculate P&L percentage based on margin deployed (Return on Margin)
+    # This is more meaningful than % of max_profit since max_profit is rarely achieved
+    if margin_deployed > 0:
+        pnl_pct = (pnl / margin_deployed * 100)
+    else:
+        # Fallback: use max_profit if margin not available (legacy behavior)
+        max_profit = entry_credit * quantity
+        pnl_pct = (pnl / max_profit * 100) if max_profit > 0 else 0
 
     return pnl, pnl_pct
 
