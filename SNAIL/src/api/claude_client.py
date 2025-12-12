@@ -217,7 +217,7 @@ def format_prompt(template: str, context: MarketContext) -> str:
         'net_credit': f"{context.net_credit:,.2f}",
         'max_profit': f"{context.max_profit:,.2f}",
         'max_loss': f"{context.max_loss:,.2f}",
-        'expiry_date': context.expiry_date if context.expiry_date else "",
+        'expiry_date': str(context.expiry_date) if context.expiry_date else "",
     }
 
     # Add additional context
