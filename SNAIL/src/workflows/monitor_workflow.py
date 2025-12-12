@@ -786,6 +786,12 @@ _Fetching P&L data..._"""
             logger.debug("Waiting for user Friday decision...")
             return False
 
+        # Skip if Friday decision already sent today (persisted check)
+        from src.utils.db import was_friday_decision_sent_today
+        if was_friday_decision_sent_today(position.id):
+            logger.debug("Friday decision already sent today, skipping...")
+            return False
+
         # Check if expiry is next week or later
         from datetime import timedelta
         if position.expiry_date and position.expiry_date <= today + timedelta(days=2):

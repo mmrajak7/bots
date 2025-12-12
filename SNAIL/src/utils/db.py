@@ -1431,6 +1431,29 @@ def queue_response(alert_id: int, user_response: str) -> int:
         return cursor.lastrowid
 
 
+def was_friday_decision_sent_today(position_id: int) -> bool:
+    """
+    Check if a Friday decision was already recorded today for this position.
+
+    Args:
+        position_id: Position ID to check
+
+    Returns:
+        True if friday_decision already exists for today
+    """
+    today = date.today().isoformat()
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            """SELECT COUNT(*) FROM claude_decisions
+               WHERE position_id = ?
+               AND trigger_type = 'friday_decision'
+               AND date(created_at) = ?""",
+            (position_id, today)
+        )
+        count = cursor.fetchone()[0]
+        return count > 0
+
+
 # =============================================================================
 # DATA CLEANUP OPERATIONS
 # =============================================================================
