@@ -730,13 +730,7 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             prompt = f"Stop loss advisory: P&L={current_pnl}, Position={position.id}"
             self._record_decision(response, 'stop_loss_advisory', prompt, position.id)
 
-            # Notify via Telegram
-            self.telegram.send(
-                f"🤖 *Stop Loss Advisory*\n\n"
-                f"Decision: *{response.decision.value}*\n"
-                f"Current P&L: ₹{current_pnl:,.2f}\n\n"
-                f"Reasoning:\n{escape_markdown(response.reasoning[:300])}..."
-            )
+            # Note: Telegram message with buttons sent by caller (monitor_workflow)
 
             return AdvisoryResult(
                 decision=response.decision,
@@ -748,15 +742,9 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
 
         except Exception as e:
             logger.error(f"Error in stop loss advisory: {e}")
-            self.telegram.send(
-                f"⚠️ *Claude Advisory Error*\n\n"
-                f"Failed to get stop loss decision.\n"
-                f"Error: {escape_markdown(str(e)[:100])}\n\n"
-                f"_Defaulting to HOLD. Please check position manually._"
-            )
             return AdvisoryResult(
                 decision=ClaudeDecision.HOLD,
-                reasoning=f"Error getting advisory: {str(e)}",
+                reasoning=f"⚠️ Error getting advisory: {str(e)}. Defaulting to HOLD.",
                 confidence=0.0,
                 action_required=False,
                 suggested_action="Hold due to advisory error - check manually"
@@ -794,13 +782,7 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             prompt = f"Wing approach ({direction}): P&L={current_pnl}, Position={position.id}"
             self._record_decision(response, 'wing_approach', prompt, position.id)
 
-            # Send Telegram alert
-            self.telegram.send(
-                f"🤖 *Wing Approach Advisory* ({direction})\n\n"
-                f"Decision: *{response.decision.value}*\n"
-                f"Current P&L: ₹{current_pnl:,.2f}\n\n"
-                f"Reasoning:\n{escape_markdown(response.reasoning[:300])}..."
-            )
+            # Note: Telegram message with buttons sent by caller (monitor_workflow)
 
             return AdvisoryResult(
                 decision=response.decision,
@@ -812,15 +794,9 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
 
         except Exception as e:
             logger.error(f"Error in wing approach advisory: {e}")
-            self.telegram.send(
-                f"⚠️ *Claude Advisory Error*\n\n"
-                f"Failed to get wing approach decision.\n"
-                f"Error: {escape_markdown(str(e)[:100])}\n\n"
-                f"_Defaulting to HOLD. Please check position manually._"
-            )
             return AdvisoryResult(
                 decision=ClaudeDecision.HOLD,
-                reasoning=f"Error getting advisory: {str(e)}",
+                reasoning=f"⚠️ Error getting advisory: {str(e)}. Defaulting to HOLD.",
                 confidence=0.0,
                 action_required=False,
                 suggested_action="Hold due to advisory error - check manually"
@@ -888,13 +864,8 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             prompt = f"Friday decision: P&L={current_pnl}, Position={position.id}"
             self._record_decision(response, 'friday_decision', prompt, position.id)
 
-            # Send decision to user
-            self.telegram.send(
-                f"🤖 *Friday Decision Advisory*\n\n"
-                f"Decision: *{response.decision.value}*\n"
-                f"Current P&L: ₹{current_pnl:,.2f}\n\n"
-                f"Reasoning:\n{escape_markdown(response.reasoning[:300])}..."
-            )
+            # Note: Telegram message with buttons sent by caller (monitor_workflow)
+            # to allow user interaction (HOLD/EXIT buttons)
 
             return AdvisoryResult(
                 decision=response.decision,
@@ -906,15 +877,10 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
 
         except Exception as e:
             logger.error(f"Error in Friday decision advisory: {e}")
-            self.telegram.send(
-                f"⚠️ *Claude Advisory Error*\n\n"
-                f"Failed to get Friday decision.\n"
-                f"Error: {escape_markdown(str(e)[:100])}\n\n"
-                f"_Defaulting to HOLD. Please check position manually._"
-            )
+            # Error will be shown in button message via advisory.reasoning
             return AdvisoryResult(
                 decision=ClaudeDecision.HOLD,
-                reasoning=f"Error getting advisory: {str(e)}",
+                reasoning=f"⚠️ Error getting advisory: {str(e)}. Defaulting to HOLD.",
                 confidence=0.0,
                 action_required=False,
                 suggested_action="Hold due to advisory error - check manually"
@@ -962,13 +928,7 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             prompt = f"VIX spike: VIX={previous_vix:.2f}→{current_vix:.2f}, P&L={current_pnl}, Position={position.id}"
             self._record_decision(response, 'vix_spike', prompt, position.id)
 
-            # Notify via Telegram
-            self.telegram.send(
-                f"🤖 *VIX Spike Advisory*\n\n"
-                f"VIX Change: {previous_vix:.2f} → {current_vix:.2f}\n"
-                f"Decision: *{response.decision.value}*\n\n"
-                f"Reasoning:\n{escape_markdown(response.reasoning[:300])}..."
-            )
+            # Note: Telegram message with buttons sent by caller (monitor_workflow)
 
             return AdvisoryResult(
                 decision=response.decision,
@@ -980,15 +940,9 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
 
         except Exception as e:
             logger.error(f"Error in VIX spike advisory: {e}")
-            self.telegram.send(
-                f"⚠️ *Claude Advisory Error*\n\n"
-                f"Failed to get VIX spike decision.\n"
-                f"Error: {escape_markdown(str(e)[:100])}\n\n"
-                f"_Defaulting to HOLD. Please check position manually._"
-            )
             return AdvisoryResult(
                 decision=ClaudeDecision.HOLD,
-                reasoning=f"Error getting advisory: {str(e)}",
+                reasoning=f"⚠️ Error getting advisory: {str(e)}. Defaulting to HOLD.",
                 confidence=0.0,
                 action_required=False,
                 suggested_action="Hold due to advisory error - check manually"
@@ -1060,14 +1014,7 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             prompt = f"Gap open: gap={gap_size:.0f} pts {gap_direction}, beyond_wing={opened_beyond_wing}, Position={position.id}"
             self._record_decision(response, 'gap_beyond_wing', prompt, position.id)
 
-            # Send alert via Telegram
-            self.telegram.send(
-                f"🤖 *Gap Open Advisory*\n\n"
-                f"Gap: {gap_size:.0f} pts {gap_direction}\n"
-                f"Beyond Wing: {'Yes' if opened_beyond_wing else 'No'}\n"
-                f"Decision: *{response.decision.value}*\n\n"
-                f"Reasoning:\n{escape_markdown(response.reasoning[:300])}..."
-            )
+            # Note: Telegram message sent by caller (monitor_workflow)
 
             return AdvisoryResult(
                 decision=response.decision,
@@ -1079,15 +1026,9 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
 
         except Exception as e:
             logger.error(f"Error in gap open advisory: {e}")
-            self.telegram.send(
-                f"⚠️ *Claude Advisory Error*\n\n"
-                f"Failed to get gap open decision.\n"
-                f"Error: {escape_markdown(str(e)[:100])}\n\n"
-                f"_Defaulting to HOLD. Please check position manually._"
-            )
             return AdvisoryResult(
                 decision=ClaudeDecision.HOLD,
-                reasoning=f"Error getting advisory: {str(e)}",
+                reasoning=f"⚠️ Error getting advisory: {str(e)}. Defaulting to HOLD.",
                 confidence=0.0,
                 action_required=True,  # Gap scenarios always need attention
                 suggested_action="Hold due to advisory error - check manually"
@@ -1123,13 +1064,7 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             prompt = f"Market event: {event_description[:100]}, P&L={current_pnl}, Position={position.id}"
             self._record_decision(response, 'market_event', prompt, position.id)
 
-            # Notify via Telegram
-            self.telegram.send(
-                f"🤖 *Market Event Advisory*\n\n"
-                f"Event: {escape_markdown(event_description[:100])}\n"
-                f"Decision: *{response.decision.value}*\n\n"
-                f"Reasoning:\n{escape_markdown(response.reasoning[:300])}..."
-            )
+            # Note: Telegram message should be sent by caller if needed
 
             return AdvisoryResult(
                 decision=response.decision,
@@ -1141,15 +1076,9 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
 
         except Exception as e:
             logger.error(f"Error in market event advisory: {e}")
-            self.telegram.send(
-                f"⚠️ *Claude Advisory Error*\n\n"
-                f"Failed to get market event decision.\n"
-                f"Error: {escape_markdown(str(e)[:100])}\n\n"
-                f"_Defaulting to HOLD. Please check position manually._"
-            )
             return AdvisoryResult(
                 decision=ClaudeDecision.HOLD,
-                reasoning=f"Error getting advisory: {str(e)}",
+                reasoning=f"⚠️ Error getting advisory: {str(e)}. Defaulting to HOLD.",
                 confidence=0.0,
                 action_required=False,
                 suggested_action="Hold due to advisory error - check manually"
