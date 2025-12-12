@@ -290,7 +290,7 @@ class MonitorWorkflow:
                 # Send Claude's analysis
                 self.telegram.send(
                     f"🤖 *Claude Analysis:*\n\n"
-                    f"{advisory.reasoning[:500] if advisory else 'Analysis unavailable'}\n\n"
+                    f"{advisory.reasoning[:1000] if advisory else 'Analysis unavailable'}\n\n"
                     f"Recommendation: *{gap_info['claude_decision']}*\n\n"
                     f"_User decision required - use /exit or /hold_"
                 )
@@ -322,7 +322,7 @@ class MonitorWorkflow:
                 gap_info['severity'] = 'HIGH'
 
                 self.telegram.send(
-                    f"🤖 *Claude's Take:*\n{advisory.reasoning[:400] if advisory else 'Analysis unavailable'}"
+                    f"🤖 *Claude's Take:*\n{advisory.reasoning[:1000] if advisory else 'Analysis unavailable'}"
                 )
 
                 self._stats.alerts_sent += 1
@@ -649,7 +649,7 @@ _Fetching P&L data..._"""
         if self.telegram_bot:
             self.telegram_bot.send_vix_warning_decision(
                 current_vix=snapshot.india_vix,
-                claude_advice=advisory.reasoning[:500] if advisory else "VIX elevated. Monitor closely.",
+                claude_advice=advisory.reasoning[:1000] if advisory else "VIX elevated. Monitor closely.",
                 position_id=position.id
             )
             self._pending_vix_decision = True
@@ -693,7 +693,7 @@ _Fetching P&L data..._"""
             self.telegram_bot.send_wing_approach_decision(
                 direction=direction,
                 proximity_percent=proximity_pct,
-                claude_advice=advisory.reasoning[:500] if advisory else f"Price approaching {direction} wing.",
+                claude_advice=advisory.reasoning[:1000] if advisory else f"Price approaching {direction} wing.",
                 position_id=position.id
             )
             self._pending_wing_approach_decision = True
@@ -740,7 +740,7 @@ _Fetching P&L data..._"""
             self.telegram_bot.send_stop_loss_decision(
                 current_pnl=snapshot.current_pnl,
                 loss_percent=loss_percent,
-                claude_advice=advisory.reasoning[:500] if advisory else "Analysis unavailable",
+                claude_advice=advisory.reasoning[:1000] if advisory else "Analysis unavailable",
                 position_id=position.id
             )
             self._pending_stop_loss_decision = True
@@ -817,7 +817,7 @@ _Fetching P&L data..._"""
                 self.telegram_bot.send_friday_decision(
                     current_pnl=current_pnl,
                     dte=dte,
-                    claude_advice=advisory.reasoning[:500] if advisory else "Analysis unavailable",
+                    claude_advice=advisory.reasoning[:1000] if advisory else "Analysis unavailable",
                     position_id=position.id
                 )
                 self._pending_friday_decision = True
