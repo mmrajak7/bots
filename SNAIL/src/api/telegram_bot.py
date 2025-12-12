@@ -356,6 +356,9 @@ class TelegramBot:
 
     def _handle_message(self, update: TelegramUpdate):
         """Handle text message."""
+        if update.text is None:
+            logger.warning("Received update with None text in _handle_message")
+            return
         text = update.text.strip()
 
         # Check for command
@@ -447,6 +450,11 @@ class TelegramBot:
     def _handle_callback(self, update: TelegramUpdate):
         """Handle callback query from inline button."""
         try:
+            # Validate required fields before processing
+            if update.callback_query_id is None:
+                logger.warning("Callback update missing callback_query_id")
+                return
+
             # Answer callback to stop loading animation
             self._answer_callback(update.callback_query_id)
 
@@ -497,8 +505,9 @@ class TelegramBot:
                     del self._pending_decisions[alert_type]
                     logger.debug(f"Cleared pending decision for {alert_type}")
 
-                # Update message to show selection
-                self._edit_message_reply_markup(update.chat_id, update.message_id, None)
+                # Update message to show selection (only if we have valid IDs)
+                if update.chat_id is not None and update.message_id is not None:
+                    self._edit_message_reply_markup(update.chat_id, update.message_id, None)
                 self._send_reply(f"✅ *{action_str.upper()}* received\n\nProcessing...")
 
         except Exception as e:

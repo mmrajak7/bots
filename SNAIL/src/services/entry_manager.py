@@ -12,7 +12,7 @@ Manages Iron Fly position entry including validation, execution, and recording.
 """
 
 from datetime import datetime, date, timedelta
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, TYPE_CHECKING
 from dataclasses import dataclass
 from loguru import logger
 
@@ -42,6 +42,14 @@ from src.utils.scaled_execution import (
     ScaledOrderExecutor,
     ExecutionResult as ScaledExecutionResult,
     should_use_scaled_execution
+)
+from src.utils.atomic_execution import (
+    AtomicIronFlyExecutor,
+    AtomicExecutionResult,
+    PositionState,
+    LegStatus,
+    execute_atomic_iron_fly_entry,
+    get_position_risk_description
 )
 from src.utils.calculations import (
     calculate_iron_fly_metrics,
@@ -116,6 +124,7 @@ class EntryResult:
         orders: Executed orders
         charges: Transaction charges
         error: Error message if failed
+        partial_position_state: If partial execution, the resulting position state
     """
     success: bool
     position_id: Optional[int] = None
@@ -123,6 +132,7 @@ class EntryResult:
     orders: Optional[IronFlyOrders] = None
     charges: Optional[Dict[str, float]] = None
     error: str = ""
+    partial_position_state: Optional[str] = None  # For atomic execution partial fills
 
 
 # =============================================================================
@@ -559,6 +569,10 @@ class EntryManager:
             # Check if we need scaled execution (quantity > freeze limit)
             from src.utils.config import is_paper_trading
 
+            # Determine execution mode
+            # Priority: scaled (for large orders) > atomic (default safe mode) > legacy
+            use_atomic = self.trading_config.get('entry', {}).get('use_atomic_execution', True)
+
             if should_use_scaled_execution(quantity, self.config):
                 # Use scaled execution for large orders
                 logger.info(f"Using scaled execution for {quantity} contracts")
@@ -600,8 +614,58 @@ class EntryManager:
                 for warning in scaled_result.warnings:
                     logger.warning(f"Scaled execution warning: {warning}")
 
+            elif use_atomic:
+                # Use atomic execution (safe mode) - DEFAULT
+                # This guarantees we never have unlimited risk at any failure point
+                logger.info(f"Using ATOMIC execution for {quantity} contracts (safety mode)")
+
+                atomic_result = execute_atomic_iron_fly_entry(
+                    kite=self.kite,
+                    symbols=symbols,
+                    quotes=quotes,
+                    quantity=quantity,
+                    config=self.config,
+                    telegram_alerts=self.telegram
+                )
+
+                if not atomic_result.success:
+                    # Handle partial execution
+                    if atomic_result.position_state != PositionState.NO_POSITION:
+                        # We have a partial position - it has DEFINED risk
+                        risk_desc = get_position_risk_description(atomic_result.position_state)
+                        logger.warning(f"Partial position created: {atomic_result.position_state.name}")
+                        logger.warning(f"Risk profile: {risk_desc}")
+
+                        # Send alert about partial position
+                        self.telegram.send(
+                            f"⚠️ *Partial Iron Fly Entry*\n\n"
+                            f"Entry incomplete at: {atomic_result.failed_leg}\n"
+                            f"Position state: {atomic_result.position_state.name}\n\n"
+                            f"*Risk:* {risk_desc}\n\n"
+                            f"Error: {atomic_result.error}\n\n"
+                            f"{'🔄 Rollback performed' if atomic_result.rollback_performed else 'No rollback needed (defined risk)'}"
+                        )
+
+                        # Record partial position for tracking
+                        # Note: Need to handle this specially in database
+                        return EntryResult(
+                            success=False,
+                            error=f"Partial execution: {atomic_result.position_state.name} - {atomic_result.error}",
+                            partial_position_state=atomic_result.position_state.name
+                        )
+                    else:
+                        return EntryResult(success=False, error=atomic_result.error or "Unknown atomic execution error")
+
+                # Convert atomic result to IronFlyOrders for compatibility
+                orders = self._convert_atomic_result_to_orders(
+                    atomic_result=atomic_result,
+                    symbols=symbols,
+                    quantity=quantity
+                )
+
             else:
-                # Use standard single-batch execution
+                # Legacy execution mode (not recommended - no atomicity guarantee)
+                logger.warning("Using LEGACY execution (atomic mode disabled)")
                 slippage_ticks = self.trading_config.get('entry', {}).get('slippage_ticks', DEFAULT_SLIPPAGE_TICKS)
                 use_tiered_slippage = self.trading_config.get('entry', {}).get('use_tiered_slippage', False)
 
@@ -772,6 +836,58 @@ class EntryManager:
                 order_price=fill_price,  # Use fill price as order price
                 fill_price=fill_price,
                 slippage=0.0,  # Slippage already aggregated in scaled_result
+                status='COMPLETE'
+            )
+
+        return IronFlyOrders(
+            straddle_ce=create_executed_order('straddle_ce', 'SELL'),
+            straddle_pe=create_executed_order('straddle_pe', 'SELL'),
+            wing_ce=create_executed_order('wing_ce', 'BUY'),
+            wing_pe=create_executed_order('wing_pe', 'BUY')
+        )
+
+    def _convert_atomic_result_to_orders(
+        self,
+        atomic_result: AtomicExecutionResult,
+        symbols: Dict[str, str],
+        quantity: int
+    ) -> IronFlyOrders:
+        """
+        Convert AtomicExecutionResult to IronFlyOrders for compatibility.
+
+        The existing database recording and alert functions expect IronFlyOrders,
+        so we create synthetic ExecutedOrder objects from the atomic execution result.
+
+        Args:
+            atomic_result: Result from AtomicIronFlyExecutor
+            symbols: Mapping of leg_type to tradingsymbol
+            quantity: Actual filled quantity per leg
+
+        Returns:
+            IronFlyOrders compatible with existing flow
+        """
+        from datetime import datetime
+
+        # Build a mapping from leg_type to fill info
+        leg_fills: Dict[str, Tuple[float, str]] = {}
+        for leg in atomic_result.legs:
+            if leg.status == LegStatus.FILLED and leg.fill_price:
+                leg_fills[leg.leg_type] = (leg.fill_price, leg.order_id or '')
+
+        def create_executed_order(leg_type: str, transaction_type: str) -> ExecutedOrder:
+            """Create ExecutedOrder from atomic result data."""
+            fill_price, order_id = leg_fills.get(leg_type, (0.0, ''))
+            if not order_id:
+                order_id = f"ATOMIC_{leg_type}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+            return ExecutedOrder(
+                order_id=order_id,
+                tradingsymbol=symbols[leg_type],
+                transaction_type=transaction_type,
+                quantity=quantity,
+                order_price=fill_price,  # Use fill price as order price
+                fill_price=fill_price,
+                slippage=0.0,  # Slippage tracked separately
                 status='COMPLETE'
             )
 

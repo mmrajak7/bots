@@ -14,6 +14,8 @@ Handles incoming Telegram messages and user responses to trading prompts.
 import re
 import time
 import threading
+import fcntl
+import os
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Callable, List
 from dataclasses import dataclass, field
@@ -38,6 +40,52 @@ _PROJECT_ROOT = _Path(__file__).parent.parent.parent
 UPDATE_OFFSET_FILE = str(_PROJECT_ROOT / "data" / "telegram_update_offset.txt")
 RESPONSE_QUEUE_FILE = str(_PROJECT_ROOT / "data" / "telegram_responses.json")  # Shared response queue for ENTER/SKIP
 CALLBACK_QUEUE_FILE = str(_PROJECT_ROOT / "data" / "telegram_callbacks.json")  # Shared queue for button callbacks (HOLD/EXIT/ADJUST)
+
+# Lock files for inter-process synchronization
+RESPONSE_LOCK_FILE = str(_PROJECT_ROOT / "data" / ".telegram_responses.lock")
+CALLBACK_LOCK_FILE = str(_PROJECT_ROOT / "data" / ".telegram_callbacks.lock")
+
+
+# =============================================================================
+# FILE LOCKING UTILITIES
+# =============================================================================
+
+class FileLock:
+    """
+    Cross-platform file lock for inter-process synchronization.
+
+    Uses fcntl on Unix/Linux and msvcrt on Windows.
+    """
+
+    def __init__(self, lock_file: str):
+        self.lock_file = lock_file
+        self._fd: Optional[int] = None
+
+    def __enter__(self) -> 'FileLock':
+        # Ensure parent directory exists
+        os.makedirs(os.path.dirname(self.lock_file), exist_ok=True)
+
+        # Open/create lock file
+        self._fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR)
+
+        # Platform-specific locking
+        if os.name == 'nt':  # Windows
+            import msvcrt
+            msvcrt.locking(self._fd, msvcrt.LK_LOCK, 1)
+        else:  # Unix/Linux
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._fd is not None:
+            if os.name == 'nt':  # Windows
+                import msvcrt
+                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+            else:  # Unix/Linux
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
 
 
 # =============================================================================
@@ -233,6 +281,8 @@ class TelegramResponseHandler:
         """
         Read responses from shared queue file (written by telegram_poller daemon).
 
+        Uses file locking to prevent race conditions with concurrent processes.
+
         Returns:
             List of response dicts
         """
@@ -246,40 +296,42 @@ class TelegramResponseHandler:
             if not queue_file.exists():
                 return []
 
-            with open(queue_file, 'r') as f:
-                content = f.read().strip()
-                logger.debug(f"Shared queue content: '{content}'")
-                if not content or content == '[]':
-                    return []
-                responses = json.loads(content)
+            # Use file lock for atomic read-clear operation
+            with FileLock(RESPONSE_LOCK_FILE):
+                with open(queue_file, 'r') as f:
+                    content = f.read().strip()
+                    logger.debug(f"Shared queue content: '{content}'")
+                    if not content or content == '[]':
+                        return []
+                    responses = json.loads(content)
 
-            if responses:
-                logger.info(f"Read {len(responses)} response(s) from shared queue: {responses}")
-                # Clear the file after reading
-                queue_file.write_text('[]')
-                logger.debug("Cleared shared queue file")
+                if responses:
+                    logger.info(f"Read {len(responses)} response(s) from shared queue: {responses}")
+                    # Clear the file after reading (atomic with read due to lock)
+                    queue_file.write_text('[]')
+                    logger.debug("Cleared shared queue file")
 
-                # Filter out stale responses (older than 60 seconds)
-                valid_responses = []
-                now = datetime.now()
-                for resp in responses:
-                    ts = resp.get('timestamp')
-                    if ts:
-                        try:
-                            resp_time = datetime.fromisoformat(ts)
-                            age_seconds = (now - resp_time).total_seconds()
-                            if age_seconds <= 60:
-                                valid_responses.append(resp)
-                            else:
-                                logger.warning(f"Rejecting stale response (age={age_seconds:.0f}s): {resp}")
-                        except:
-                            valid_responses.append(resp)  # Keep if timestamp parse fails
-                    else:
-                        valid_responses.append(resp)  # Keep if no timestamp
+                    # Filter out stale responses (older than 60 seconds)
+                    valid_responses = []
+                    now = datetime.now()
+                    for resp in responses:
+                        ts = resp.get('timestamp')
+                        if ts:
+                            try:
+                                resp_time = datetime.fromisoformat(ts)
+                                age_seconds = (now - resp_time).total_seconds()
+                                if age_seconds <= 60:
+                                    valid_responses.append(resp)
+                                else:
+                                    logger.warning(f"Rejecting stale response (age={age_seconds:.0f}s): {resp}")
+                            except:
+                                valid_responses.append(resp)  # Keep if timestamp parse fails
+                        else:
+                            valid_responses.append(resp)  # Keep if no timestamp
 
-                return valid_responses
+                    return valid_responses
 
-            return responses if isinstance(responses, list) else []
+                return responses if isinstance(responses, list) else []
 
         except Exception as e:
             logger.warning(f"Could not read shared responses from {RESPONSE_QUEUE_FILE}: {e}")
@@ -319,9 +371,11 @@ class TelegramResponseHandler:
             return 0
 
     @staticmethod
-    def write_shared_response(text: str, chat_id: str, timestamp: str = None) -> None:
+    def write_shared_response(text: str, chat_id: str, timestamp: Optional[str] = None) -> None:
         """
         Write a response to the shared queue file (called by telegram_poller daemon).
+
+        Uses file locking to prevent race conditions with concurrent processes.
 
         Args:
             text: Response text
@@ -336,25 +390,27 @@ class TelegramResponseHandler:
             queue_file = Path(RESPONSE_QUEUE_FILE)
             queue_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # Read existing
-            responses = []
-            if queue_file.exists():
-                try:
-                    with open(queue_file, 'r') as f:
-                        responses = json.load(f)
-                except:
-                    responses = []
+            # Use file lock for atomic read-modify-write
+            with FileLock(RESPONSE_LOCK_FILE):
+                # Read existing
+                responses: List[Dict[str, Any]] = []
+                if queue_file.exists():
+                    try:
+                        with open(queue_file, 'r') as f:
+                            responses = json.load(f)
+                    except:
+                        responses = []
 
-            # Add new response
-            responses.append({
-                'text': text,
-                'chat_id': chat_id,
-                'timestamp': timestamp or datetime.now().isoformat()
-            })
+                # Add new response
+                responses.append({
+                    'text': text,
+                    'chat_id': chat_id,
+                    'timestamp': timestamp or datetime.now().isoformat()
+                })
 
-            # Write back
-            with open(queue_file, 'w') as f:
-                json.dump(responses, f)
+                # Write back
+                with open(queue_file, 'w') as f:
+                    json.dump(responses, f)
 
             logger.info(f"Wrote response to shared queue {queue_file}: {text}")
 
@@ -366,10 +422,12 @@ class TelegramResponseHandler:
     # =========================================================================
 
     @staticmethod
-    def write_callback(action: str, alert_type: str, position_id: int = None, chat_id: str = None) -> None:
+    def write_callback(action: str, alert_type: str, position_id: Optional[int] = None, chat_id: Optional[str] = None) -> None:
         """
         Write a button callback to the shared callback queue.
         Called by telegram_poller daemon when user clicks HOLD/EXIT/ADJUST buttons.
+
+        Uses file locking to prevent race conditions with concurrent processes.
 
         Args:
             action: Action type (hold, exit, adjust, yes, no)
@@ -385,27 +443,29 @@ class TelegramResponseHandler:
             queue_file = Path(CALLBACK_QUEUE_FILE)
             queue_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # Read existing
-            callbacks = []
-            if queue_file.exists():
-                try:
-                    with open(queue_file, 'r') as f:
-                        callbacks = json.load(f)
-                except:
-                    callbacks = []
+            # Use file lock for atomic read-modify-write
+            with FileLock(CALLBACK_LOCK_FILE):
+                # Read existing
+                callbacks: List[Dict[str, Any]] = []
+                if queue_file.exists():
+                    try:
+                        with open(queue_file, 'r') as f:
+                            callbacks = json.load(f)
+                    except:
+                        callbacks = []
 
-            # Add new callback
-            callbacks.append({
-                'action': action,
-                'alert_type': alert_type,
-                'position_id': position_id,
-                'chat_id': chat_id,
-                'timestamp': datetime.now().isoformat()
-            })
+                # Add new callback
+                callbacks.append({
+                    'action': action,
+                    'alert_type': alert_type,
+                    'position_id': position_id,
+                    'chat_id': chat_id,
+                    'timestamp': datetime.now().isoformat()
+                })
 
-            # Write back
-            with open(queue_file, 'w') as f:
-                json.dump(callbacks, f)
+                # Write back
+                with open(queue_file, 'w') as f:
+                    json.dump(callbacks, f)
 
             logger.info(f"Wrote callback to queue: {action}:{alert_type}:{position_id}")
 
@@ -413,9 +473,11 @@ class TelegramResponseHandler:
             logger.error(f"Could not write callback: {e}")
 
     @staticmethod
-    def read_callbacks() -> list:
+    def read_callbacks() -> List[Dict[str, Any]]:
         """
         Read and clear callbacks from the shared callback queue.
+
+        Uses file locking to prevent race conditions with concurrent processes.
 
         Returns:
             List of callback dicts
@@ -429,37 +491,39 @@ class TelegramResponseHandler:
             if not queue_file.exists():
                 return []
 
-            with open(queue_file, 'r') as f:
-                content = f.read().strip()
-                if not content or content == '[]':
-                    return []
-                callbacks = json.loads(content)
+            # Use file lock for atomic read-clear operation
+            with FileLock(CALLBACK_LOCK_FILE):
+                with open(queue_file, 'r') as f:
+                    content = f.read().strip()
+                    if not content or content == '[]':
+                        return []
+                    callbacks = json.loads(content)
 
-            if callbacks:
-                # Clear the file after reading
-                queue_file.write_text('[]')
+                if callbacks:
+                    # Clear the file after reading (atomic with read due to lock)
+                    queue_file.write_text('[]')
 
-                # Filter out stale callbacks (older than 5 minutes)
-                valid_callbacks = []
-                now = datetime.now()
-                for cb in callbacks:
-                    ts = cb.get('timestamp')
-                    if ts:
-                        try:
-                            cb_time = datetime.fromisoformat(ts)
-                            age_seconds = (now - cb_time).total_seconds()
-                            if age_seconds <= 300:  # 5 minutes
+                    # Filter out stale callbacks (older than 5 minutes)
+                    valid_callbacks: List[Dict[str, Any]] = []
+                    now = datetime.now()
+                    for cb in callbacks:
+                        ts = cb.get('timestamp')
+                        if ts:
+                            try:
+                                cb_time = datetime.fromisoformat(ts)
+                                age_seconds = (now - cb_time).total_seconds()
+                                if age_seconds <= 300:  # 5 minutes
+                                    valid_callbacks.append(cb)
+                                else:
+                                    logger.warning(f"Rejecting stale callback (age={age_seconds:.0f}s): {cb}")
+                            except:
                                 valid_callbacks.append(cb)
-                            else:
-                                logger.warning(f"Rejecting stale callback (age={age_seconds:.0f}s): {cb}")
-                        except:
+                        else:
                             valid_callbacks.append(cb)
-                    else:
-                        valid_callbacks.append(cb)
 
-                if valid_callbacks:
-                    logger.info(f"Read {len(valid_callbacks)} callback(s) from queue")
-                return valid_callbacks
+                    if valid_callbacks:
+                        logger.info(f"Read {len(valid_callbacks)} callback(s) from queue")
+                    return valid_callbacks
 
             return []
 

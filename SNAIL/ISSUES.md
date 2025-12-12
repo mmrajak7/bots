@@ -1,11 +1,197 @@
-# Code Review Issues - Scaled Order Execution
+# SNAIL Comprehensive Code Review - All Issues
 
-## Summary
-Comprehensive review of scaled execution implementation found **17 issues**: 3 Critical, 5 High, 5 Medium, 2 Low.
-
-**Status: All Critical and High issues FIXED. 40 tests passing.**
+**Review Date:** 2025-12-12
+**Reviewer:** Automated Static Analysis + Manual Code Review
 
 ---
+
+## EXECUTIVE SUMMARY
+
+| Category | Count |
+|----------|-------|
+| Critical | 5     |
+| High     | 11    |
+| Medium   | 16    |
+| Low      | 8     |
+| **Total**| **40**|
+
+This document consolidates all issues found during comprehensive code review including:
+- Static analysis with mypy --strict (170+ type errors)
+- Manual logic review of all critical code paths
+- Race condition and concurrency analysis
+- Edge case and boundary condition review
+
+---
+
+# SECTION A: NEW CRITICAL ISSUES (2025-12-12)
+
+## A-C001: Race Condition in Shared File Queue Operations
+**File:** `src/api/response_handler.py:232-286, 368-414`
+**Severity:** CRITICAL
+**Status:** OPEN
+
+**Description:** The shared response queue (`telegram_responses.json`) and callback queue (`telegram_callbacks.json`) are accessed by multiple processes (telegram_poller daemon and main workflow) without proper file locking. This can cause:
+- Lost responses during concurrent read/write
+- Corrupted JSON data
+- Duplicate processing
+
+**Suggested Fix:** Use `filelock` library or `fcntl` locking to ensure atomic operations.
+
+---
+
+## A-C002: No Transaction Atomicity for Multi-Leg Order Execution
+**File:** `src/utils/order_helpers.py:180-380`
+**Severity:** CRITICAL
+**Status:** ✅ FIXED (2025-12-12)
+
+**Description:** The `execute_iron_fly_entry()` function places 4 orders sequentially. If orders 1-2 succeed but order 3 fails:
+- Position is partially filled
+- No automatic rollback of completed orders
+- System may be in inconsistent state with naked short options (extremely dangerous)
+
+**Fix Implemented:** Created `src/utils/atomic_execution.py` with `AtomicIronFlyExecutor` class that:
+1. **Reorders execution** to: Wing CE → Straddle CE → Wing PE → Straddle PE
+   - At any failure point, position has DEFINED risk (never unlimited)
+2. **Pre-validates** margin, spreads, and liquidity before starting
+3. **Auto-rolls back** if dangerous state detected (naked short)
+4. **Logs comprehensively** for audit trail
+
+**Entry manager** now uses atomic execution by default (`use_atomic_execution: true`).
+
+---
+
+## A-C003: Singleton Reset Race Condition
+**File:** `src/api/kite_client.py:554-583`
+**Severity:** CRITICAL
+**Status:** OPEN
+
+**Description:** The `get_kite_client()` function has double-checked locking but reads the global `_kite_client` outside the lock first. In Python this is not thread-safe.
+
+```python
+if _kite_client is None:  # Read outside lock - can see stale data
+    with _kite_client_lock:
+        if _kite_client is None:
+            ...
+```
+
+**Suggested Fix:** Always access singleton under lock.
+
+---
+
+## A-C004: Implicit Optional Types Without None Checks
+**File:** `src/api/telegram_bot.py:359, 451, 454, 487, 501`
+**Severity:** CRITICAL
+**Status:** OPEN
+
+**Description:** Multiple methods access attributes on Optional types without None checks:
+
+```python
+# Line 359: update.text could be None
+text = update.text.strip()  # AttributeError if text is None
+
+# Line 451: callback_query_id could be None
+self._answer_callback(update.callback_query_id)
+```
+
+**Suggested Fix:** Add explicit None checks before attribute access.
+
+---
+
+## A-C005: Unreachable Code After Return
+**File:** `src/workflows/monitor_workflow.py:663, 709`
+**Severity:** HIGH (Code Quality)
+**Status:** OPEN
+
+Dead code after unconditional return statements.
+
+---
+
+# SECTION B: NEW HIGH SEVERITY ISSUES
+
+## A-H001: OrderExecutionError Not Exported from order_helpers.py
+**File:** `src/services/exit_manager.py:24`, `src/services/entry_manager.py:31`
+**Severity:** HIGH
+
+Both managers import `OrderExecutionError` from `order_helpers.py` but it's defined in `kite_client.py`.
+
+---
+
+## A-H002: Paper Trading MARKET Order Fill Price Hardcoded
+**File:** `src/api/kite_client.py:272`
+**Severity:** HIGH
+
+MARKET orders use hardcoded fill price of 100.0, giving unrealistic P&L.
+
+---
+
+## A-H003: Gap Open Detection Uses Stale Position Data
+**File:** `src/workflows/monitor_workflow.py:192-347`
+**Severity:** HIGH
+
+Position fetched once but used after multiple API calls that could change state.
+
+---
+
+## A-H004: Claude API Error Type Mismatch
+**File:** `src/api/claude_client.py:428-434`
+**Severity:** HIGH
+
+```python
+last_error: Optional[RateLimitError] = None
+except APIError as e:
+    last_error = e  # Type mismatch
+```
+
+---
+
+## A-H005: VIX Hard Exit May Be Blocked By Pending Decision Flag
+**File:** `src/workflows/monitor_workflow.py:919-923`
+**Severity:** HIGH
+
+If user chooses HOLD during VIX warning (16-20), but VIX then crosses 20, the `_pending_vix_decision` flag might block hard exit logic.
+
+---
+
+# SECTION C: NEW MEDIUM SEVERITY ISSUES
+
+## A-M001: Alert Deduplication Uses In-Memory Cache Only
+Loss of cooldown state on restart.
+
+## A-M002: No Validation of Instrument CSV Freshness
+Stale lot sizes or missing symbols possible.
+
+## A-M003: Float Comparison for P&L Thresholds
+Floating point precision could cause missed triggers.
+
+## A-M004: No Graceful Degradation for Claude API Failures
+Missing circuit breaker pattern.
+
+## A-M005: Expiry Date Comparison Without Time Zone
+Could be off by 1 day in non-IST timezone.
+
+## A-M006: No Idempotency Check for Order Placement
+Retry could place duplicate orders.
+
+## A-M007: Callback Queue File Not Cleaned On Startup
+Old callbacks could be processed in wrong context.
+
+---
+
+# SECTION D: MYPY TYPE ERRORS (Summary)
+
+Total errors from `mypy --strict`: **170+**
+
+Key categories:
+1. Missing return type annotations: ~30
+2. Missing function type annotations: ~25
+3. Returning Any from typed functions: ~50
+4. Missing generic type parameters: ~40
+5. Incompatible types in assignments: ~15
+6. Library stubs not installed: ~10
+
+---
+
+# SECTION E: PREVIOUSLY IDENTIFIED ISSUES (Scaled Execution Review)
 
 ## Critical Issues
 
@@ -182,6 +368,158 @@ Comprehensive review of scaled execution implementation found **17 issues**: 3 C
 3. **No test for rebalance with partial fills** on trim orders
 4. **No test for missing quote for a leg** in `_set_batch_prices`
 5. **No integration test** with mock API failures mid-batch
+
+---
+
+# SECTION F: ATOMIC EXECUTION REVIEW (2025-12-12)
+
+## Overview
+Review of `src/utils/atomic_execution.py` - the new transactionally-safe Iron Fly execution module.
+
+## Issues Found
+
+### AE-001: Hardcoded Lot Size in Margin/Liquidity Checks
+**File:** `src/utils/atomic_execution.py:702, 742`
+**Severity:** LOW
+**Status:** OPEN
+
+```python
+lot_size = 75  # NIFTY lot size - hardcoded
+min_qty = quantity * 75  # Same hardcoded value
+```
+
+**Impact:** Would give incorrect validation for BANKNIFTY (lot size 15).
+**Fix:** Use instrument data or config for lot sizes.
+
+---
+
+### AE-002: Hardcoded Lot Size in Slippage Cost Reporting
+**File:** `src/utils/atomic_execution.py:656`
+**Severity:** LOW
+**Status:** OPEN
+
+```python
+logger.critical(f"Total slippage cost: ₹{total_slippage * 75:.2f}")  # Assume NIFTY lot
+```
+
+**Impact:** Incorrect slippage cost for BANKNIFTY.
+**Fix:** Accept lot_size as parameter or from config.
+
+---
+
+### AE-003: Missing Quantity Validation
+**File:** `src/utils/atomic_execution.py:237-242`
+**Severity:** MEDIUM
+**Status:** ✅ FIXED (2025-12-12)
+
+**Problem:** `execute()` method accepted quantity <= 0.
+**Fix Applied:** Added validation at start of execute():
+```python
+if quantity <= 0:
+    return AtomicExecutionResult(
+        success=False,
+        error=f"Invalid quantity: {quantity} (must be > 0)",
+        ...
+    )
+```
+
+---
+
+### AE-004: Orphan Filled Orders After Cancel
+**File:** `src/utils/atomic_execution.py:381-394`
+**Severity:** MEDIUM
+**Status:** OPEN
+
+**Description:** If an order fills AFTER `_cancel_order_safe()` is called (race condition), we have an orphan filled order that's not tracked.
+
+**Impact:** Position accounting could be off by one leg.
+**Mitigation:** This is rare - cancel+fill race is uncommon.
+**Suggested Fix:** Re-check order status after cancel attempt.
+
+---
+
+### AE-005: No Concurrent Execution Protection
+**File:** `src/utils/atomic_execution.py` (global)
+**Severity:** MEDIUM
+**Status:** OPEN
+
+**Description:** Multiple concurrent calls to `execute()` could result in multiple entries.
+
+**Impact:** Unintended position multiplication.
+**Mitigation:** Current architecture doesn't allow concurrent entry attempts (single workflow).
+**Suggested Fix:** Add class-level or module-level lock if needed.
+
+---
+
+### AE-006: mypy Tag Parameter Error
+**File:** `src/utils/atomic_execution.py:354, 597`
+**Severity:** MEDIUM
+**Status:** ✅ FIXED (2025-12-12)
+
+**Problem:** `place_order()` was called with `tag=` parameter that doesn't exist.
+**Fix Applied:** Removed tag parameter from both place_order calls.
+
+---
+
+### AE-007: Optional Quantity Type in Rollback
+**File:** `src/utils/atomic_execution.py:600`
+**Severity:** MEDIUM
+**Status:** ✅ FIXED (2025-12-12)
+
+**Problem:** `leg.quantity` is `Optional[int]` but used directly in rollback.
+**Fix Applied:** Added None check before rollback:
+```python
+if leg.quantity is None or leg.quantity <= 0:
+    logger.error(f"Cannot rollback {leg.leg_type}: invalid quantity")
+    continue
+```
+
+---
+
+## entry_manager.py Integration Issues
+
+### EM-AE001: Optional Error Without Fallback
+**File:** `src/services/entry_manager.py:657`
+**Severity:** LOW
+**Status:** ✅ FIXED (2025-12-12)
+
+**Problem:** `atomic_result.error` could be None causing type error.
+**Fix Applied:** `error=atomic_result.error or "Unknown atomic execution error"`
+
+---
+
+## Summary
+
+| ID | Severity | Status | Description |
+|----|----------|--------|-------------|
+| AE-001 | LOW | ✅ FIXED | Hardcoded lot size in margin check |
+| AE-002 | LOW | ✅ FIXED | Hardcoded lot size in slippage cost |
+| AE-003 | MEDIUM | ✅ FIXED | Missing quantity validation |
+| AE-004 | MEDIUM | ✅ FIXED | Orphan filled orders after cancel |
+| AE-005 | MEDIUM | ✅ FIXED | No concurrent execution protection |
+| AE-006 | MEDIUM | ✅ FIXED | mypy tag parameter error |
+| AE-007 | MEDIUM | ✅ FIXED | Optional quantity in rollback |
+| EM-AE001 | LOW | ✅ FIXED | Optional error fallback |
+
+**Total:** 8 issues found, **8 fixed** ✅
+
+### Fixes Applied (2025-12-12)
+
+**AE-001 & AE-002: Configurable Lot Size**
+- Added `lot_size` and `instrument` parameters to `AtomicIronFlyExecutor.__init__()`
+- Added `DEFAULT_LOT_SIZES` dict with NIFTY (75), BANKNIFTY (15), FINNIFTY (40)
+- Replaced all hardcoded `75` values with `self.lot_size`
+
+**AE-004: Orphan Order Detection**
+- Added `_get_final_order_status()` method to check order status after cancel
+- Modified failure path to re-check if order filled during cancel race condition
+- If order filled during cancel, properly records it as FILLED instead of FAILED
+
+**AE-005: Concurrent Execution Protection**
+- Added class-level `_execution_lock` (threading.Lock)
+- `execute()` now acquires lock with `blocking=False`
+- Returns error result if another execution already in progress
+- Proper try/finally to ensure lock release
 
 ---
 

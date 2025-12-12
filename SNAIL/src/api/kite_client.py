@@ -563,16 +563,15 @@ def get_kite_client(config: Optional[Dict] = None) -> SNAILKiteClient:
     """
     global _kite_client
 
-    if _kite_client is None:
-        with _kite_client_lock:
-            # Double-check after acquiring lock
-            if _kite_client is None:
-                if config is None:
-                    from src.utils.config import load_config
-                    config = load_config()
-                _kite_client = SNAILKiteClient(config)
-
-    return _kite_client
+    # Always acquire lock first to ensure thread safety
+    # Reading outside lock can see stale data due to instruction reordering
+    with _kite_client_lock:
+        if _kite_client is None:
+            if config is None:
+                from src.utils.config import load_config
+                config = load_config()
+            _kite_client = SNAILKiteClient(config)
+        return _kite_client
 
 
 def reset_kite_client() -> None:

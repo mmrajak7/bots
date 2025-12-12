@@ -660,8 +660,6 @@ _Fetching P&L data..._"""
             logger.warning(f"VIX warning at {snapshot.india_vix:.2f} (no Telegram bot for buttons)")
             return False
 
-        return False
-
     # =========================================================================
     # WING APPROACH HANDLING
     # =========================================================================
@@ -705,8 +703,6 @@ _Fetching P&L data..._"""
             # Fallback: just log, don't auto-exit
             logger.warning(f"Wing approach {direction} at {proximity_pct:.0f}% (no Telegram bot for buttons)")
             return False
-
-        return False
 
     # =========================================================================
     # STOP LOSS HANDLING
