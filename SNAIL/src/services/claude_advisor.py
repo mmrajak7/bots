@@ -176,7 +176,7 @@ class ClaudeAdvisor:
             context.wing_distance = position.wing_distance
             context.position_pnl = current_pnl
             context.dte = (position.expiry_date - date.today()).days if position.expiry_date else 0
-            context.expiry_date = position.expiry_date
+            context.expiry_date = str(position.expiry_date) if position.expiry_date else ""
 
             # Calculate max profit/loss
             context.max_profit = position.max_profit if position.max_profit else 0
