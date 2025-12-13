@@ -15,7 +15,7 @@ import json
 import re
 from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Tuple
 from dataclasses import dataclass, asdict
 from loguru import logger
 
@@ -55,38 +55,39 @@ INCLUDE_COUNTRIES = {"India", "United States", "US", "USA"}
 # CRITICAL: Events that historically cause 200-500+ pt Nifty moves, VIX spikes
 CRITICAL_KEYWORDS = [
     # Central Banks
-    'fed', 'fomc', 'rbi', 'rate cut', 'rate hike', 'monetary policy', 'repo rate',
-    'powell', 'das', 'interest rate',
+    'fed ', 'fomc', 'rbi ', 'rate cut', 'rate hike', 'monetary policy', 'repo rate',
+    'powell', 'das ', 'interest rate',
     # Market Crashes/Rallies
     'crash', 'plunge', 'tank', 'surge', 'soar', 'circuit', 'halt',
     'bloodbath', 'meltdown', 'selloff', 'sell-off', 'rout',
-    # Geopolitical
-    'war', 'attack', 'strike', 'missile', 'conflict', 'sanction', 'tariff',
+    # Geopolitical - use specific terms to avoid false positives
+    'war ', 'attack', 'airstrike', 'missile', 'conflict', 'sanction', 'tariff',
     # Major Economic
     'recession', 'crisis', 'default', 'downgrade', 'inflation data', 'cpi',
     'gdp', 'jobs report', 'nonfarm', 'unemployment',
-    # India Specific
-    'budget', 'election result', 'exit poll', 'fii outflow', 'dii',
-    # Global Markets
-    'dow', 'nasdaq', 'global market', 's&p', 'asian market', 'europe',
+    # India Specific - fii/dii outflow is critical, routine flows are WATCH
+    'budget', 'election result', 'exit poll', 'fii sell', 'dii sell',
+    'massive outflow', 'heavy selling',
+    # Global Markets - use specific terms to avoid 'dow' matching 'gap down'
+    'dow jones', 'djia', 'nasdaq', 'global market', 's&p 500', 'asian market', 'europe market',
 ]
 
 # WATCH: Events that may cause 50-200 pt moves, worth monitoring
 WATCH_KEYWORDS = [
-    # Flows
-    'fii', 'dii', 'foreign', 'institutional', 'outflow', 'inflow',
-    # Market Moves
-    'gap up', 'gap down', 'opening', 'flat', 'weak', 'strong',
-    'volatile', 'volatility', 'vix',
+    # Flows - routine FII/DII activity
+    'fii', 'dii', 'foreign investor', 'institutional', 'outflow', 'inflow',
+    # Market Moves - specific terms only
+    'gap up', 'gap down', 'volatile', 'volatility', 'vix',
+    'nifty open', 'sensex open', 'market open',
     # Earnings/Results
     'results', 'earnings', 'profit', 'revenue', 'quarterly',
     'tcs', 'reliance', 'hdfc', 'infosys', 'icici', 'sbi', 'bharti',
     # Sectors
-    'banking', 'it sector', 'auto', 'pharma', 'metal', 'oil',
+    'banking sector', 'it sector', 'auto sector', 'pharma', 'metal', 'oil price',
     # Currency
-    'rupee', 'dollar', 'inr', 'usd', 'crude', 'gold',
+    'rupee', 'dollar', 'inr', 'usd', 'crude', 'gold price',
     # Policy
-    'sebi', 'government', 'ministry', 'policy',
+    'sebi', 'government', 'ministry', 'gst',
 ]
 
 # IPO and other irrelevant news to filter out
@@ -172,7 +173,7 @@ def scrape_zerodha_calendar() -> List[MarketEvent]:
     """
     logger.info(f"Scraping Zerodha Calendar: {ZERODHA_CALENDAR_URL}")
 
-    events = []
+    events: List[MarketEvent] = []
 
     try:
         response = requests.get(ZERODHA_CALENDAR_URL, headers=HEADERS, timeout=30)
@@ -755,22 +756,22 @@ if __name__ == '__main__':
     # Run scraping
     events_count, news_count = scrape_and_save_all()
 
-    print(f"\n[RESULTS]")
+    print("\n[RESULTS]")
     print(f"  Events scraped: {events_count}")
     print(f"  News scraped: {news_count}")
     print(f"  Events file: {EVENTS_FILE}")
     print(f"  News file: {NEWS_FILE}")
 
     # Show upcoming events
-    print(f"\n[UPCOMING EVENTS (10 days)]:")
+    print("\n[UPCOMING EVENTS (10 days)]:")
     print(get_events_compact(10))
 
     # Show news
-    print(f"\n[LATEST NEWS]:")
+    print("\n[LATEST NEWS]:")
     print(get_news_compact(5))
 
     # Show Telegram format
-    print(f"\n[TELEGRAM FORMAT]:")
+    print("\n[TELEGRAM FORMAT]:")
     print("Events:", get_events_for_telegram())
     print("\nNews:", get_news_for_telegram())
 
