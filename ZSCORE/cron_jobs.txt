@@ -1,0 +1,19 @@
+# ============================================================================
+# ZSCORE BOT - CRON JOBS
+# ============================================================================
+# To install: crontab -e -> paste contents -> save
+# To verify:  crontab -l
+# ============================================================================
+
+# 1. Start Bot - 12:00 PM (Mon-Fri)
+# Starts early to be ready by 1 PM trading window
+0 12 * * 1-5 cd /home/trustit/Desktop/BOTS/ZSCORE && ./start_bot.sh >> logs/cron_$(date +\%Y-\%m-\%d).log 2>&1
+
+# 2. Stop Bot - 3:30 PM (Mon-Fri)
+# Stops after trading window ends
+30 15 * * 1-5 cd /home/trustit/Desktop/BOTS/ZSCORE && ./stop_bot.sh >> logs/cron_$(date +\%Y-\%m-\%d).log 2>&1
+
+# ============================================================================
+# LOG CLEANUP - Delete logs older than 45 days (runs at midnight)
+# ============================================================================
+0 0 * * * find /home/trustit/Desktop/BOTS/ZSCORE/logs -name "*.log" -mtime +45 -delete

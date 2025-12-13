@@ -94,5 +94,10 @@ SNAIL/*.md
 CROCODILE/data/*.db
 CROCODILE/data/circuit_breaker_state.json
 
+# ZSCORE specific excludes
+ZSCORE/config.json
+ZSCORE/logs/
+ZSCORE/*.pid
+
 # Misc
 nul
