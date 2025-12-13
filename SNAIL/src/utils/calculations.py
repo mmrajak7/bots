@@ -12,12 +12,17 @@ and transaction charges.
 @references  TECHNICAL_DESIGN_REFERENCE.md Section 8
 """
 
-from datetime import date, datetime, timedelta
-from typing import Dict, Any, Optional, Tuple
+from datetime import date, datetime
+from typing import Dict, Any, Optional, Tuple, List, TYPE_CHECKING
 from dataclasses import dataclass
 from loguru import logger
 
-from src.utils.config import get_charges_config, get_trading_config
+from src.utils.config import get_charges_config
+
+# Type checking imports to avoid circular imports
+if TYPE_CHECKING:
+    import pandas as pd
+    from src.api.kite_client import SNAILKiteClient
 
 
 # =============================================================================
@@ -96,16 +101,270 @@ class TransactionCharges:
 
 def calculate_atm_strike(spot_price: float, interval: int = NIFTY_STRIKE_INTERVAL) -> int:
     """
-    Calculate ATM strike price.
+    Calculate ATM strike price (simple spot-based rounding).
 
     Args:
         spot_price: Current spot price
-        interval: Strike interval (default 50)
+        interval: Strike interval (default 100)
 
     Returns:
         ATM strike price
     """
     return round(spot_price / interval) * interval
+
+
+# =============================================================================
+# FUTURES-BASED ATM STRIKE SELECTION
+# =============================================================================
+
+@dataclass
+class StrikeSelectionResult:
+    """
+    Result of futures-based ATM strike selection.
+
+    Attributes:
+        strike: Final validated ATM strike
+        method: Selection method ("futures" or "spot_fallback")
+        spot_price: NIFTY spot price
+        futures_price: NIFTY futures price (0 if spot fallback)
+        futures_premium: Futures - Spot premium
+        pro_rated_premium: Pro-rated premium for options expiry
+        estimated_forward: Spot + pro-rated premium
+        initial_strike: Strike before CE-PE validation
+        iterations_used: Number of CE-PE validation iterations
+        ce_pe_history: List of (strike, ce_price, pe_price, diff) per iteration
+        validated: Whether strike passed CE-PE validation
+        oscillation_detected: Whether CE-PE adjustment oscillated between strikes
+        warning: Warning message if any
+    """
+    strike: int
+    method: str
+    spot_price: float
+    futures_price: float
+    futures_premium: float
+    pro_rated_premium: float
+    estimated_forward: float
+    initial_strike: int
+    iterations_used: int
+    ce_pe_history: List[Tuple[int, float, float, float]]  # (strike, ce, pe, diff)
+    validated: bool
+    oscillation_detected: bool = False
+    warning: str = ""
+
+
+def get_atm_strike_futures_based(
+    kite: 'SNAILKiteClient',
+    instruments_df: 'pd.DataFrame',
+    options_expiry: date,
+    config: Optional[Dict[str, Any]] = None
+) -> StrikeSelectionResult:
+    """
+    Get ATM strike using futures-based pro-rated premium + CE-PE validation.
+
+    Algorithm:
+    1. Get NIFTY spot and nearest futures LTP
+    2. Calculate pro-rated futures premium for options expiry
+    3. Round (spot + pro_rated_premium) to nearest 100
+    4. Validate with CE-PE check (|CE-PE| <= tolerance)
+    5. Adjust strike by 100 if validation fails (max iterations)
+
+    Fallback: If futures unavailable, uses spot + CE-PE validation.
+
+    Args:
+        kite: Kite client for fetching prices
+        instruments_df: Instruments DataFrame (with futures contracts)
+        options_expiry: Target options expiry date
+        config: Optional config with strike_selection settings
+
+    Returns:
+        StrikeSelectionResult with validated strike and metadata
+    """
+    from src.utils.symbol_builder import (
+        get_nearest_futures_contract,
+        generate_nifty_option_symbol
+    )
+
+    # Get config settings
+    strike_config = {}
+    if config:
+        strike_config = config.get('trading', {}).get('strike_selection', {})
+
+    ce_pe_tolerance = strike_config.get('ce_pe_tolerance', 35)
+    max_iterations = strike_config.get('max_iterations', 3)
+    strike_interval = strike_config.get('strike_interval', 100)
+    use_futures = strike_config.get('use_futures', True)
+    fallback_to_spot = strike_config.get('fallback_to_spot', True)
+
+    # Initialize result tracking
+    ce_pe_history = []
+    warning = ""
+
+    # Step 1: Get spot price
+    spot_price = kite.get_nifty_spot()
+    if spot_price <= 0:
+        raise ValueError("Failed to fetch NIFTY spot price")
+
+    logger.info(f"[STRIKE SELECTION] Spot: {spot_price:.2f}")
+
+    # Step 2: Get futures data
+    futures_price = 0.0
+    futures_premium = 0.0
+    pro_rated_premium = 0.0
+    estimated_forward = spot_price
+    method = "futures"
+
+    futures_contract = None
+    if use_futures:
+        futures_contract = get_nearest_futures_contract(instruments_df)
+
+    if futures_contract and use_futures:
+        # Get futures LTP
+        futures_price = kite.get_nifty_futures_ltp(futures_contract.tradingsymbol)
+
+        if futures_price > 0:
+            # Calculate pro-rated premium
+            futures_premium = futures_price - spot_price
+            futures_dte = max(futures_contract.dte, 1)  # Prevent division by zero
+            options_dte = max((options_expiry - date.today()).days, 1)
+
+            # Pro-rate the premium: premium * (options_dte / futures_dte)
+            pro_rated_premium = futures_premium * (options_dte / futures_dte)
+            estimated_forward = spot_price + pro_rated_premium
+
+            logger.info(f"[STRIKE SELECTION] Futures: {futures_price:.2f} ({futures_contract.tradingsymbol})")
+            logger.info(f"[STRIKE SELECTION] Futures Premium: {futures_premium:.2f}")
+            logger.info(f"[STRIKE SELECTION] Options DTE: {options_dte}, Futures DTE: {futures_dte}")
+            logger.info(f"[STRIKE SELECTION] Pro-rated Premium: {pro_rated_premium:.2f}")
+            logger.info(f"[STRIKE SELECTION] Estimated Forward: {estimated_forward:.2f}")
+        else:
+            # Futures LTP unavailable
+            warning = "Futures LTP unavailable, using spot + CE-PE fallback"
+            logger.warning(f"[STRIKE SELECTION] {warning}")
+            method = "spot_fallback"
+            estimated_forward = spot_price
+    else:
+        # No futures contract or use_futures=False
+        if not fallback_to_spot:
+            raise ValueError("Futures unavailable and fallback disabled")
+        method = "spot_fallback"
+        warning = "Futures contract not found, using spot + CE-PE fallback"
+        logger.warning(f"[STRIKE SELECTION] {warning}")
+        estimated_forward = spot_price
+
+    # Step 3: Round to nearest 100 (explicitly cast to int)
+    initial_strike = int(round(estimated_forward / strike_interval) * strike_interval)
+    logger.info(f"[STRIKE SELECTION] Initial Strike: {initial_strike}")
+
+    # Define bounds for strike adjustment (within 10% of spot)
+    max_strike_deviation = int(spot_price * 0.10)
+    min_valid_strike = initial_strike - max_strike_deviation
+    max_valid_strike = initial_strike + max_strike_deviation
+
+    # Step 4: CE-PE Validation
+    current_strike = initial_strike
+    validated = False
+    oscillation_detected = False
+    visited_strikes: List[int] = []  # Track visited strikes for oscillation detection
+
+    for iteration in range(max_iterations):
+        # Check for oscillation (visiting same strike twice)
+        if current_strike in visited_strikes:
+            oscillation_detected = True
+            # Pick the middle strike between oscillating values
+            if len(visited_strikes) >= 2:
+                current_strike = (visited_strikes[-1] + current_strike) // 2
+                # Round to nearest strike interval
+                current_strike = int(round(current_strike / strike_interval) * strike_interval)
+            warning = f"Oscillation detected, using middle strike {current_strike}"
+            logger.warning(f"[STRIKE SELECTION] {warning}")
+            break
+
+        visited_strikes.append(current_strike)
+
+        # Build option symbols for current strike
+        ce_symbol = f"NFO:{generate_nifty_option_symbol(options_expiry, current_strike, 'CE')}"
+        pe_symbol = f"NFO:{generate_nifty_option_symbol(options_expiry, current_strike, 'PE')}"
+
+        # Fetch LTPs with error handling
+        try:
+            option_ltps = kite.ltp([ce_symbol, pe_symbol])
+            ce_price = option_ltps.get(ce_symbol, 0)
+            pe_price = option_ltps.get(pe_symbol, 0)
+        except Exception as e:
+            # Network error during CE-PE validation
+            warning = f"API error fetching option prices: {e}"
+            logger.warning(f"[STRIKE SELECTION] {warning}")
+            ce_pe_history.append((current_strike, 0.0, 0.0, 0.0))
+            break
+
+        if ce_price <= 0 or pe_price <= 0:
+            # Can't validate without prices - use current strike with warning
+            warning = f"Option prices unavailable for strike {current_strike}"
+            logger.warning(f"[STRIKE SELECTION] {warning}")
+            ce_pe_history.append((current_strike, ce_price, pe_price, 0.0))
+            break
+
+        diff = ce_price - pe_price
+        ce_pe_history.append((current_strike, ce_price, pe_price, diff))
+
+        logger.info(f"[STRIKE SELECTION] Iteration {iteration + 1}: Strike {current_strike}")
+        logger.info(f"[STRIKE SELECTION]   CE: {ce_price:.2f}, PE: {pe_price:.2f}, Diff: {diff:.2f}")
+
+        # Check if within tolerance
+        if abs(diff) <= ce_pe_tolerance:
+            validated = True
+            logger.info(f"[STRIKE SELECTION] ✓ Strike {current_strike} VALIDATED (CE-PE diff: {diff:.2f})")
+            break
+
+        # Adjust strike with bounds checking
+        if diff > ce_pe_tolerance:
+            # CE >> PE: Strike is too LOW, move UP
+            old_strike = current_strike
+            new_strike = current_strike + strike_interval
+
+            # Bounds check
+            if new_strike > max_valid_strike:
+                warning = f"Strike adjustment would exceed bounds ({new_strike} > {max_valid_strike})"
+                logger.warning(f"[STRIKE SELECTION] {warning}")
+                break
+
+            current_strike = new_strike
+            logger.info(f"[STRIKE SELECTION]   CE >> PE by {diff:.2f}, moving UP: {old_strike} -> {current_strike}")
+        else:
+            # PE >> CE: Strike is too HIGH, move DOWN
+            old_strike = current_strike
+            new_strike = current_strike - strike_interval
+
+            # Bounds check
+            if new_strike < min_valid_strike:
+                warning = f"Strike adjustment would exceed bounds ({new_strike} < {min_valid_strike})"
+                logger.warning(f"[STRIKE SELECTION] {warning}")
+                break
+
+            current_strike = new_strike
+            logger.info(f"[STRIKE SELECTION]   PE >> CE by {abs(diff):.2f}, moving DOWN: {old_strike} -> {current_strike}")
+
+    if not validated and not warning:
+        warning = f"Max iterations ({max_iterations}) reached, using strike {current_strike}"
+        logger.warning(f"[STRIKE SELECTION] {warning}")
+
+    logger.info(f"[STRIKE SELECTION] Final ATM Strike: {current_strike}")
+
+    return StrikeSelectionResult(
+        strike=current_strike,
+        method=method,
+        spot_price=spot_price,
+        futures_price=futures_price,
+        futures_premium=futures_premium,
+        pro_rated_premium=pro_rated_premium,
+        estimated_forward=estimated_forward,
+        initial_strike=initial_strike,
+        iterations_used=len(ce_pe_history),
+        ce_pe_history=ce_pe_history,
+        validated=validated,
+        oscillation_detected=oscillation_detected,
+        warning=warning
+    )
 
 
 def calculate_wing_distance(

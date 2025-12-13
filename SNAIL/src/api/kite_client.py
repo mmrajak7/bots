@@ -13,15 +13,14 @@ Unified wrapper for Kite Connect API with automatic authentication.
 
 import os
 import threading
-from pathlib import Path
 from datetime import datetime, date, timedelta
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
 
 from kiteconnect import KiteConnect
 from loguru import logger
 
-from src.api.kite_auth import KiteAuthenticator, KiteAuthenticationError
+from src.api.kite_auth import KiteAuthenticator
 
 
 # =============================================================================
@@ -228,6 +227,20 @@ class SNAILKiteClient:
         """
         result = self.ltp(["NSE:INDIA VIX"])
         return result.get("NSE:INDIA VIX", 0)
+
+    def get_nifty_futures_ltp(self, futures_symbol: str) -> float:
+        """
+        Get current NIFTY Futures LTP.
+
+        Args:
+            futures_symbol: Futures trading symbol (e.g., "NIFTY25DECFUT")
+
+        Returns:
+            NIFTY Futures last traded price, or 0 if unavailable
+        """
+        instrument = f"NFO:{futures_symbol}"
+        result = self.ltp([instrument])
+        return result.get(instrument, 0)
 
     # =========================================================================
     # ORDER OPERATIONS

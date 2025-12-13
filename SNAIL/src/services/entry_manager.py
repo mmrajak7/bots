@@ -11,8 +11,9 @@ Manages Iron Fly position entry including validation, execution, and recording.
 @references  TECHNICAL_DESIGN_REFERENCE.md Section 4.1
 """
 
-from datetime import datetime, date, timedelta
-from typing import Optional, Dict, Any, Tuple, List, TYPE_CHECKING
+import traceback
+from datetime import datetime, date
+from typing import Optional, Dict, Any, Tuple, List
 from dataclasses import dataclass
 from loguru import logger
 
@@ -35,7 +36,6 @@ from src.utils.order_helpers import (
     OrderExecutionError,
     validate_iron_fly_quotes,
     validate_bid_ask_spreads,
-    SpreadValidationResult,
     verify_iron_fly_positions
 )
 from src.utils.scaled_execution import (
@@ -44,7 +44,6 @@ from src.utils.scaled_execution import (
     should_use_scaled_execution
 )
 from src.utils.atomic_execution import (
-    AtomicIronFlyExecutor,
     AtomicExecutionResult,
     PositionState,
     LegStatus,
@@ -54,17 +53,16 @@ from src.utils.atomic_execution import (
 from src.utils.calculations import (
     calculate_iron_fly_metrics,
     calculate_iron_fly_charges,
-    IronFlyMetrics
+    IronFlyMetrics,
+    get_atm_strike_futures_based
 )
 from src.utils.db import (
-    get_db_session,
     Position,
     PositionLeg,
     save_position,
     save_position_leg,
     get_active_position,
-    is_on_cooldown,
-    set_cooldown
+    is_on_cooldown
 )
 from src.utils.config import (
     get_trading_config,
@@ -325,8 +323,34 @@ class EntryManager:
                 india_vix=india_vix
             )
 
-        # Calculate ATM strike
-        atm_strike = calculate_atm_strike(nifty_spot)
+        # Calculate ATM strike using futures-based pro-rated premium + CE-PE validation
+        try:
+            strike_result = get_atm_strike_futures_based(
+                kite=self.kite,
+                instruments_df=self.instruments_df,
+                options_expiry=expiry,
+                config=self.config
+            )
+            atm_strike = strike_result.strike
+
+            # Use spot from strike calculation for consistency
+            nifty_spot = strike_result.spot_price
+
+            # Log strike selection details
+            if strike_result.method == "futures":
+                logger.info(f"Strike selection: Futures-based (Forward: {strike_result.estimated_forward:.2f})")
+            else:
+                logger.info(f"Strike selection: Spot fallback ({strike_result.warning})")
+
+            if not strike_result.validated:
+                logger.warning(f"Strike not fully validated: {strike_result.warning}")
+
+        except Exception as e:
+            # Fallback to simple spot-based calculation
+            # Log full traceback for debugging, but don't block entry
+            logger.warning(f"Futures-based strike selection failed: {e}, using spot fallback")
+            logger.debug(f"Strike selection exception traceback:\n{traceback.format_exc()}")
+            atm_strike = calculate_atm_strike(nifty_spot)
 
         logger.info(f"Entry conditions met: NIFTY={nifty_spot:.2f}, VIX={india_vix:.2f}, "
                    f"ATM={atm_strike}, Expiry={expiry} (DTE={dte})")
@@ -435,10 +459,6 @@ class EntryManager:
 
         try:
             # Step 1: Get preliminary ATM quotes for wing distance calculation
-            preliminary_instruments = build_iron_fly_instruments(
-                conditions.expiry, conditions.atm_strike, 300  # Initial guess
-            )
-
             # Get ATM CE and PE quotes
             atm_ce_inst = f"NFO:{generate_nifty_option_symbol(conditions.expiry, conditions.atm_strike, 'CE')}"
             atm_pe_inst = f"NFO:{generate_nifty_option_symbol(conditions.expiry, conditions.atm_strike, 'PE')}"

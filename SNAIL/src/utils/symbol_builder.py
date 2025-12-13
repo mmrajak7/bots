@@ -12,6 +12,7 @@ Trading symbol generation for NIFTY options.
 """
 
 import time
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Optional, Tuple, List, Dict
 from pathlib import Path
@@ -473,6 +474,114 @@ def get_all_expiries(instruments_df: pd.DataFrame) -> List[date]:
 
 
 # =============================================================================
+# FUTURES INSTRUMENTS
+# =============================================================================
+
+@dataclass
+class FuturesContract:
+    """
+    NIFTY Futures contract details.
+
+    Attributes:
+        tradingsymbol: Trading symbol (e.g., NIFTY25DECFUT)
+        instrument_token: Kite instrument token
+        expiry_date: Contract expiry date
+        lot_size: Contract lot size
+        dte: Days to expiry
+    """
+    tradingsymbol: str
+    instrument_token: int
+    expiry_date: date
+    lot_size: int
+    dte: int
+
+
+def get_nearest_futures_contract(instruments_df: pd.DataFrame) -> Optional[FuturesContract]:
+    """
+    Get the nearest (current month) NIFTY futures contract.
+
+    Uses the futures contract with earliest expiry that is still valid (expiry >= today).
+    This is typically the "current month" contract used for hedging/pricing.
+
+    Args:
+        instruments_df: Instruments DataFrame from Kite
+
+    Returns:
+        FuturesContract with details, or None if not found
+
+    Example:
+        >>> contract = get_nearest_futures_contract(instruments_df)
+        >>> if contract:
+        ...     print(f"Using {contract.tradingsymbol} (DTE: {contract.dte})")
+    """
+    today = date.today()
+
+    # Validate required columns exist
+    required_columns = ['name', 'instrument_type', 'expiry', 'tradingsymbol', 'instrument_token', 'lot_size']
+    missing_columns = [col for col in required_columns if col not in instruments_df.columns]
+    if missing_columns:
+        logger.error(f"Instruments DataFrame missing required columns: {missing_columns}")
+        return None
+
+    # Filter to NIFTY futures only
+    futures_mask = (
+        (instruments_df['name'] == 'NIFTY') &
+        (instruments_df['instrument_type'] == 'FUT')
+    )
+    futures_df = instruments_df[futures_mask].copy()
+
+    if futures_df.empty:
+        logger.warning("No NIFTY futures found in instruments")
+        return None
+
+    # Parse expiry dates with error handling
+    try:
+        futures_df['expiry_date'] = pd.to_datetime(futures_df['expiry']).dt.date
+    except Exception as e:
+        logger.error(f"Failed to parse futures expiry dates: {e}")
+        return None
+
+    # Filter to valid (not expired) contracts
+    valid_futures = futures_df[futures_df['expiry_date'] >= today]
+
+    if valid_futures.empty:
+        logger.warning("No valid NIFTY futures (all expired)")
+        return None
+
+    # Sort by expiry and get nearest
+    valid_futures = valid_futures.sort_values('expiry_date')
+    nearest = valid_futures.iloc[0]
+
+    expiry_date = nearest['expiry_date']
+    # Use max(dte, 1) to avoid 0 DTE on expiry day
+    dte = max((expiry_date - today).days, 1)
+
+    contract = FuturesContract(
+        tradingsymbol=str(nearest['tradingsymbol']),
+        instrument_token=int(nearest['instrument_token']),
+        expiry_date=expiry_date,
+        lot_size=int(nearest['lot_size']),
+        dte=dte
+    )
+
+    logger.debug(f"Nearest futures: {contract.tradingsymbol} (DTE: {contract.dte})")
+    return contract
+
+
+def get_futures_instrument_string(futures_contract: FuturesContract) -> str:
+    """
+    Build full instrument string for Kite quote API.
+
+    Args:
+        futures_contract: FuturesContract object
+
+    Returns:
+        Full instrument string (e.g., "NFO:NIFTY25DECFUT")
+    """
+    return f"NFO:{futures_contract.tradingsymbol}"
+
+
+# =============================================================================
 # SYMBOL BUILDING UTILITIES
 # =============================================================================
 
@@ -541,7 +650,6 @@ def build_iron_fly_instruments(
 # =============================================================================
 
 if __name__ == '__main__':
-    import sys
 
     print("\n" + "=" * 60)
     print("SNAIL Symbol Builder Test")
@@ -574,7 +682,7 @@ if __name__ == '__main__':
         print(f"    {leg}: {sym}")
 
     # Test all month codes
-    print(f"\n[6] Month code test:")
+    print("\n[6] Month code test:")
     for month in range(1, 13):
         first_day = date(2025, month, 1)
         days_to_tuesday = (1 - first_day.weekday()) % 7

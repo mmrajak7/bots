@@ -82,6 +82,15 @@ trading:
     wing_warn: 5             # Wing warning threshold
     wing_block: 10           # Wing block threshold
 
+  # Strike Selection (Futures-based ATM calculation)
+  # Uses pro-rated futures premium + CE-PE validation
+  strike_selection:
+    strike_interval: 100       # NIFTY strikes are multiples of 100
+    ce_pe_tolerance: 35        # |CE-PE| must be <= this for strike to be validated
+    max_iterations: 3          # Max CE-PE validation adjustments before accepting
+    use_futures: true          # Use futures-based calculation (false = spot only)
+    fallback_to_spot: true     # If futures unavailable, fallback to spot + CE-PE
+
 # -----------------------------------------------------------------------------
 # API Configuration
 # -----------------------------------------------------------------------------
