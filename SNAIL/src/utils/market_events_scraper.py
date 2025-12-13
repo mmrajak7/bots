@@ -48,6 +48,82 @@ HEADERS = {
 # Countries to include - only India and US have real impact on NIFTY
 INCLUDE_COUNTRIES = {"India", "United States", "US", "USA"}
 
+# =============================================================================
+# NEWS IMPORTANCE CLASSIFICATION
+# =============================================================================
+
+# CRITICAL: Events that historically cause 200-500+ pt Nifty moves, VIX spikes
+CRITICAL_KEYWORDS = [
+    # Central Banks
+    'fed', 'fomc', 'rbi', 'rate cut', 'rate hike', 'monetary policy', 'repo rate',
+    'powell', 'das', 'interest rate',
+    # Market Crashes/Rallies
+    'crash', 'plunge', 'tank', 'surge', 'soar', 'circuit', 'halt',
+    'bloodbath', 'meltdown', 'selloff', 'sell-off', 'rout',
+    # Geopolitical
+    'war', 'attack', 'strike', 'missile', 'conflict', 'sanction', 'tariff',
+    # Major Economic
+    'recession', 'crisis', 'default', 'downgrade', 'inflation data', 'cpi',
+    'gdp', 'jobs report', 'nonfarm', 'unemployment',
+    # India Specific
+    'budget', 'election result', 'exit poll', 'fii outflow', 'dii',
+    # Global Markets
+    'dow', 'nasdaq', 'global market', 's&p', 'asian market', 'europe',
+]
+
+# WATCH: Events that may cause 50-200 pt moves, worth monitoring
+WATCH_KEYWORDS = [
+    # Flows
+    'fii', 'dii', 'foreign', 'institutional', 'outflow', 'inflow',
+    # Market Moves
+    'gap up', 'gap down', 'opening', 'flat', 'weak', 'strong',
+    'volatile', 'volatility', 'vix',
+    # Earnings/Results
+    'results', 'earnings', 'profit', 'revenue', 'quarterly',
+    'tcs', 'reliance', 'hdfc', 'infosys', 'icici', 'sbi', 'bharti',
+    # Sectors
+    'banking', 'it sector', 'auto', 'pharma', 'metal', 'oil',
+    # Currency
+    'rupee', 'dollar', 'inr', 'usd', 'crude', 'gold',
+    # Policy
+    'sebi', 'government', 'ministry', 'policy',
+]
+
+# IPO and other irrelevant news to filter out
+IGNORE_KEYWORDS = [
+    'ipo', 'listing', 'debut', 'gmp', 'grey market',
+    'shares to list', 'to list today', 'listing today',
+    'subscription', 'allotment', 'issue opens', 'issue closes',
+    'buyback', 'bonus', 'dividend', 'split', 'rights issue',
+]
+
+
+def classify_news_importance(headline: str) -> str:
+    """
+    Classify news headline importance for Iron Fly trading.
+
+    Args:
+        headline: News headline text
+
+    Returns:
+        'CRITICAL', 'WATCH', or 'OTHER'
+    """
+    headline_lower = headline.lower()
+
+    # Check for ignore keywords first
+    if any(kw in headline_lower for kw in IGNORE_KEYWORDS):
+        return 'OTHER'
+
+    # Check for critical keywords
+    if any(kw in headline_lower for kw in CRITICAL_KEYWORDS):
+        return 'CRITICAL'
+
+    # Check for watch keywords
+    if any(kw in headline_lower for kw in WATCH_KEYWORDS):
+        return 'WATCH'
+
+    return 'OTHER'
+
 
 # =============================================================================
 # DATA CLASSES
@@ -562,40 +638,72 @@ def get_events_for_telegram() -> str:
     return '\n'.join(lines) if lines else ""
 
 
-def get_news_for_telegram(limit: int = 5) -> str:
+def get_news_for_telegram(limit: int = 8) -> str:
     """
-    Get compact news summary for Telegram notification.
-    Filters out IPO-related news.
+    Get categorized news summary for Telegram notification.
+
+    Shows only CRITICAL and WATCH news (ignores OTHER/irrelevant).
+    Headlines are 120 chars max for better context.
+
+    Format:
+        🔴 CRITICAL:
+        • Fed cuts rates by 25bps, signals cautious approach for 2025 (Reuters)
+
+        🟡 WATCH:
+        • FII outflow continues for 5th session, sold Rs 2,100 cr (ET)
+
+    Args:
+        limit: Max news items per category (default 8 total)
 
     Returns:
-        Formatted string for Telegram
+        Formatted string for Telegram with priority markers
     """
     news, _ = load_news()
 
     if not news:
         return ""
 
-    # IPO-related keywords to filter out
-    ipo_keywords = [
-        'ipo', 'listing', 'debut', 'gmp', 'grey market',
-        'shares to list', 'to list today', 'listing today',
-        'subscription', 'allotment', 'issue opens', 'issue closes'
-    ]
+    # Classify all news items
+    critical_news = []
+    watch_news = []
 
-    # Filter out IPO news
-    filtered_news = []
     for item in news:
-        headline_lower = item.headline.lower()
-        if not any(kw in headline_lower for kw in ipo_keywords):
-            filtered_news.append(item)
+        importance = classify_news_importance(item.headline)
+        if importance == 'CRITICAL':
+            critical_news.append(item)
+        elif importance == 'WATCH':
+            watch_news.append(item)
+        # OTHER is ignored
 
-    if not filtered_news:
+    # If no important news, return empty
+    if not critical_news and not watch_news:
         return ""
 
     lines = []
-    for item in filtered_news[:limit]:
-        headline = item.headline[:60] + "..." if len(item.headline) > 60 else item.headline
-        lines.append(f"• {headline}")
+
+    # Format headline with 120 char limit
+    def format_headline(item: NewsItem) -> str:
+        headline = item.headline
+        if len(headline) > 120:
+            headline = headline[:117] + "..."
+        source = f" ({item.source})" if item.source and item.source != "Pulse" else ""
+        return f"• {headline}{source}"
+
+    # Critical news first (limit to half)
+    critical_limit = min(len(critical_news), limit // 2 + 1)
+    if critical_news:
+        lines.append("🔴 *CRITICAL:*")
+        for item in critical_news[:critical_limit]:
+            lines.append(format_headline(item))
+
+    # Watch news (remaining slots)
+    watch_limit = limit - critical_limit if critical_news else limit
+    if watch_news:
+        if lines:
+            lines.append("")  # Blank line separator
+        lines.append("🟡 *WATCH:*")
+        for item in watch_news[:watch_limit]:
+            lines.append(format_headline(item))
 
     return '\n'.join(lines)
 
