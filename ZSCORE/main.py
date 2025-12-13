@@ -30,7 +30,7 @@ import statistics
 from datetime import datetime, timedelta, date
 from collections import deque
 from typing import Dict, Optional, Tuple, List
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 # Kite Connect
 from kiteconnect import KiteConnect, KiteTicker
@@ -60,9 +60,12 @@ def load_holidays(config: dict) -> set:
     """Load holidays from JSON file"""
     holidays = set()
 
-    # Try to load from config data_dir
-    data_dir = resolve_path(config.get('data_dir', 'data'))
-    holiday_file = os.path.join(data_dir, 'holiday_calendar.json')
+    # Try to load from config market.holidays_path or fallback to data_dir
+    if config.get('market', {}).get('holidays_path'):
+        holiday_file = resolve_path(config['market']['holidays_path'])
+    else:
+        data_dir = resolve_path(config.get('data_dir', 'data'))
+        holiday_file = os.path.join(data_dir, 'holiday_calendar.json')
 
     if os.path.exists(holiday_file):
         try:
@@ -142,15 +145,25 @@ class Position:
 class InstrumentManager:
     """Manage instrument lookups from cached CSV"""
 
-    def __init__(self, kite: KiteConnect, data_dir: str):
+    def __init__(self, kite: KiteConnect, data_dir: str, instruments_path: str = None):
         self.kite = kite
         self.data_dir = data_dir
-        self.instruments_file = os.path.join(data_dir, "nfo_instruments.csv")
+        self.external_instruments = instruments_path is not None
+        self.instruments_file = instruments_path if instruments_path else os.path.join(data_dir, "nfo_instruments.csv")
         self.instruments = {}  # symbol -> {token, expiry, strike, etc.}
         self._load_or_refresh()
 
     def _load_or_refresh(self):
         """Load instruments from cache or refresh from API"""
+        # If using external instruments file (e.g., from SNAIL), just load it
+        if self.external_instruments:
+            if os.path.exists(self.instruments_file):
+                logging.info(f"Loading instruments from external file: {self.instruments_file}")
+                self._load_from_csv()
+            else:
+                raise FileNotFoundError(f"External instruments file not found: {self.instruments_file}")
+            return
+
         today = datetime.now().strftime("%Y-%m-%d")
 
         # Check if we have today's instruments
@@ -230,18 +243,29 @@ class InstrumentManager:
     def _load_from_csv(self):
         """Load instruments from CSV into memory"""
         self.instruments = {}
+        skipped = 0
         with open(self.instruments_file, 'r') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                symbol = row['tradingsymbol']
-                self.instruments[symbol] = {
-                    'token': int(row['instrument_token']),
-                    'exchange': row['exchange'],
-                    'type': row['instrument_type'],
-                    'expiry': row['expiry'],
-                    'strike': row['strike'],
-                    'lot_size': row['lot_size']
-                }
+                try:
+                    symbol = row['tradingsymbol']
+                    token_str = row.get('instrument_token', '')
+                    if not token_str:
+                        skipped += 1
+                        continue
+                    self.instruments[symbol] = {
+                        'token': int(token_str),
+                        'exchange': row.get('exchange', 'NFO'),
+                        'type': row.get('instrument_type', ''),
+                        'expiry': row.get('expiry', ''),
+                        'strike': row.get('strike', ''),
+                        'lot_size': row.get('lot_size', '')
+                    }
+                except (ValueError, KeyError) as e:
+                    skipped += 1
+                    continue
+        if skipped > 0:
+            logging.warning(f"Skipped {skipped} invalid instrument rows")
         logging.info(f"Loaded {len(self.instruments)} instruments into memory")
 
     def get_token(self, symbol: str) -> Optional[int]:
@@ -827,7 +851,10 @@ class ZScoreBot:
         self.db = TradingDB(db_path)
 
         # Initialize instrument manager (fetches/caches instruments)
-        self.inst_mgr = InstrumentManager(self.kite, self.data_dir)
+        instruments_path = self.config.get('market', {}).get('instruments_path')
+        if instruments_path:
+            instruments_path = resolve_path(instruments_path)
+        self.inst_mgr = InstrumentManager(self.kite, self.data_dir, instruments_path)
 
         # Resolve instrument tokens from config symbols
         self._resolve_tokens()
@@ -1077,11 +1104,25 @@ class ZScoreBot:
             self.ticker.subscribe([token])
             self.ticker.set_mode(self.ticker.MODE_LTP, [token])
 
-        time.sleep(1)  # Wait for price
-        premium = self.order_mgr.get_option_ltp(symbol)
+        # Wait for option price with retry
+        premium = None
+        for attempt in range(5):
+            time.sleep(1)
+            premium = self.order_mgr.get_option_ltp(symbol)
+            if premium and premium > 0:
+                break
+            logging.debug(f"Waiting for option price, attempt {attempt + 1}/5")
 
-        if not premium:
-            logging.error("Could not get option price")
+        if not premium or premium <= 0:
+            logging.error("Could not get option price after 5 attempts")
+            # Cleanup on failure
+            if self.ws_connected and self.ticker and self.option_token:
+                try:
+                    self.ticker.unsubscribe([self.option_token])
+                except Exception:
+                    pass
+            self.option_token = None
+            self.option_symbol = None
             return
 
         # Calculate stop/target - qty from lot_size * max_lots
@@ -1201,22 +1242,6 @@ class ZScoreBot:
         self.option_symbol = None
 
         logging.info(f"Position closed: {db_pos.symbol}, P&L: ₹{pnl:+.2f} ({pnl_pct:+.1f}%), Reason: {reason}")
-
-    def _log_trade_csv(self, trade: Trade):
-        """Log trade to CSV file"""
-        trades_file = os.path.join(self.data_dir, "logs", "zscore", "trades.csv")
-        os.makedirs(os.path.dirname(trades_file), exist_ok=True)
-
-        file_exists = os.path.exists(trades_file)
-
-        with open(trades_file, 'a') as f:
-            if not file_exists:
-                f.write("entry_time,exit_time,symbol,qty,entry_price,exit_price,entry_spot,exit_spot,entry_z_score,fut_used,pnl,pnl_pct,exit_reason,result\n")
-
-            f.write(f"{trade.entry_time},{trade.exit_time},{trade.symbol},{trade.qty},"
-                    f"{trade.entry_price},{trade.exit_price},{trade.entry_spot},{trade.exit_spot},"
-                    f"{trade.entry_z_score},{trade.fut_used},{trade.pnl},{trade.pnl_pct},"
-                    f"{trade.exit_reason},{trade.result}\n")
 
     def is_trading_time(self) -> bool:
         """Check if current time is within trading hours"""
@@ -1440,6 +1465,14 @@ Charges: <code>₹{charges:,.2f}</code>
             logging.info("Shutting down...")
         finally:
             self.running = False
+
+            # Close WebSocket connection
+            if self.ticker:
+                try:
+                    self.ticker.close()
+                    logging.info("WebSocket closed")
+                except Exception as e:
+                    logging.warning(f"Error closing WebSocket: {e}")
 
             # Send daily summary from DB
             if not self.daily_summary_sent:

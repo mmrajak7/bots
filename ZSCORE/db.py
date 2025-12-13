@@ -240,7 +240,9 @@ class TradingDB:
         conn.close()
 
         if row:
-            return Order(**dict(row))
+            data = dict(row)
+            data['paper_trade'] = bool(data.get('paper_trade', 0))
+            return Order(**data)
         return None
 
     # ==================== POSITION METHODS ====================
@@ -284,7 +286,9 @@ class TradingDB:
         conn.close()
 
         if row:
-            return Position(**dict(row))
+            data = dict(row)
+            data['paper_trade'] = bool(data.get('paper_trade', 0))
+            return Position(**data)
         return None
 
     def close_position(self, position_id: int, exit_price: float, exit_spot: float,
@@ -350,7 +354,12 @@ class TradingDB:
         rows = cursor.fetchall()
         conn.close()
 
-        return [Position(**dict(row)) for row in rows]
+        positions = []
+        for row in rows:
+            data = dict(row)
+            data['paper_trade'] = bool(data.get('paper_trade', 0))
+            positions.append(Position(**data))
+        return positions
 
     def get_today_stats(self) -> Dict:
         """Get today's trading statistics"""
@@ -420,4 +429,9 @@ class TradingDB:
         rows = cursor.fetchall()
         conn.close()
 
-        return [DailySummary(**dict(row)) for row in rows]
+        summaries = []
+        for row in rows:
+            data = dict(row)
+            data['paper_trade'] = bool(data.get('paper_trade', 0))
+            summaries.append(DailySummary(**data))
+        return summaries

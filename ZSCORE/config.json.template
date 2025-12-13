@@ -3,6 +3,11 @@
     "path": "data/kite_access_token.json"
   },
 
+  "market": {
+    "holidays_path": "data/holiday_calendar.json",
+    "instruments_path": "SNAIL/data/instruments.csv"
+  },
+
   "data_dir": "data",
 
   "instruments": {
