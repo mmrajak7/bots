@@ -98,6 +98,7 @@ CROCODILE/data/circuit_breaker_state.json
 ZSCORE/config.json
 ZSCORE/logs/
 ZSCORE/*.pid
+ZSCORE/*.md
 
 # Misc
 nul
