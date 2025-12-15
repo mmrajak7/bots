@@ -20,6 +20,7 @@ Execution Sequence (Interleaved for Safety):
 @references  ISSUES.md A-C002
 """
 
+import threading
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
@@ -27,11 +28,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from loguru import logger
 
-from src.api.kite_client import SNAILKiteClient, Quote, OrderExecutionError
-from src.utils.order_helpers import (
-    round_to_tick, apply_slippage, TICK_SIZE,
-    ORDER_POLL_INTERVAL, ORDER_TIMEOUT_SECONDS
-)
+from src.api.kite_client import SNAILKiteClient, Quote
+from src.utils.order_helpers import round_to_tick, TICK_SIZE, ORDER_POLL_INTERVAL
 
 
 # =============================================================================
@@ -57,6 +55,9 @@ DEFAULT_LOT_SIZES = {
     'FINNIFTY': 40,
 }
 DEFAULT_LOT_SIZE = 75  # Fallback if instrument not found
+
+# Module-level lock for concurrent execution protection (thread-safe initialization)
+_EXECUTION_LOCK = threading.Lock()
 
 
 # =============================================================================
@@ -218,9 +219,6 @@ class AtomicIronFlyExecutor:
         ('straddle_pe', 'SELL'),  # Step 4: Now protected on PE side
     ]
 
-    # Class-level lock for concurrent execution protection (AE-005 fix)
-    _execution_lock: Optional[Any] = None
-
     def __init__(
         self,
         kite: SNAILKiteClient,
@@ -260,11 +258,6 @@ class AtomicIronFlyExecutor:
             'entry', {}
         ).get('slippage_ticks', ATOMIC_SLIPPAGE_TICKS)
 
-        # Initialize class-level lock if not already done
-        if AtomicIronFlyExecutor._execution_lock is None:
-            import threading
-            AtomicIronFlyExecutor._execution_lock = threading.Lock()
-
     def execute(
         self,
         symbols: Dict[str, str],
@@ -276,30 +269,27 @@ class AtomicIronFlyExecutor:
 
         Args:
             symbols: Dict mapping leg_type to trading symbol
-            quantity: Order quantity (lot size)
+            quantity: Order quantity (total contracts, e.g., 75 for 1 NIFTY lot)
             quotes: Dict mapping leg_type to Quote
 
         Returns:
             AtomicExecutionResult with execution details
         """
-        # AE-005 Fix: Acquire lock to prevent concurrent executions
-        lock = AtomicIronFlyExecutor._execution_lock
-        if lock is not None:
-            acquired = lock.acquire(blocking=False)
-            if not acquired:
-                logger.error("Another atomic execution is already in progress")
-                return AtomicExecutionResult(
-                    success=False,
-                    error="Concurrent execution blocked - another atomic execution in progress",
-                    legs=[],
-                    position_state=PositionState.NO_POSITION
-                )
+        # Use module-level lock to prevent concurrent executions (AE-010 fix)
+        acquired = _EXECUTION_LOCK.acquire(blocking=False)
+        if not acquired:
+            logger.error("Another atomic execution is already in progress")
+            return AtomicExecutionResult(
+                success=False,
+                error="Concurrent execution blocked - another atomic execution in progress",
+                legs=[],
+                position_state=PositionState.NO_POSITION
+            )
 
         try:
             return self._execute_internal(symbols, quantity, quotes)
         finally:
-            if lock is not None:
-                lock.release()
+            _EXECUTION_LOCK.release()
 
     def _execute_internal(
         self,
@@ -593,7 +583,7 @@ class AtomicIronFlyExecutor:
         position_state = self._determine_position_state()
 
         logger.warning("=" * 60)
-        logger.warning(f"ATOMIC EXECUTION INCOMPLETE")
+        logger.warning("ATOMIC EXECUTION INCOMPLETE")
         logger.warning(f"Failed at: {failed_leg}")
         logger.warning(f"Position state: {position_state.name}")
         logger.warning(f"Error: {result.error}")
@@ -699,8 +689,8 @@ class AtomicIronFlyExecutor:
             # Check if this SELL has corresponding protective wing
             wing_type = 'wing_ce' if leg.leg_type == 'straddle_ce' else 'wing_pe'
             wing_filled = any(
-                l.leg_type == wing_type and l.status == LegStatus.FILLED
-                for l in self.executed_legs
+                exec_leg.leg_type == wing_type and exec_leg.status == LegStatus.FILLED
+                for exec_leg in self.executed_legs
             )
 
             if wing_filled:
@@ -727,10 +717,11 @@ class AtomicIronFlyExecutor:
                 fill = self._wait_for_fill(order_id, ROLLBACK_TIMEOUT_SECONDS)
 
                 if fill['filled']:
-                    slippage = abs(fill['avg_price'] - leg.fill_price) if leg.fill_price else 0
-                    total_slippage += slippage
+                    slippage_pts = abs(fill['avg_price'] - leg.fill_price) if leg.fill_price else 0
+                    slippage_cost = slippage_pts * (leg.quantity or 0)  # Convert to ₹
+                    total_slippage += slippage_cost
 
-                    logger.info(f"  ✓ Rollback filled @ {fill['avg_price']:.2f} (slippage: {slippage:.2f})")
+                    logger.info(f"  ✓ Rollback filled @ {fill['avg_price']:.2f} (slippage: {slippage_pts:.2f} pts = ₹{slippage_cost:.2f})")
 
                     rollback_results.append(RollbackLegResult(
                         leg_type=leg.leg_type,
@@ -761,8 +752,8 @@ class AtomicIronFlyExecutor:
 
         logger.critical("=" * 60)
         logger.critical(f"ROLLBACK {'SUCCESSFUL' if all_success else 'FAILED'}")
-        # AE-002 Fix: Use instance lot_size instead of hardcoded value
-        logger.critical(f"Total slippage cost: ₹{total_slippage * self.lot_size:.2f}")
+        # AE-011 Fix: total_slippage is now already in ₹ (calculated per leg × quantity)
+        logger.critical(f"Total slippage cost: ₹{total_slippage:.2f}")
         logger.critical("=" * 60)
 
         return RollbackResult(
