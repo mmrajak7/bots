@@ -116,9 +116,9 @@ def cmd_startup(args):
 def cmd_entry(args):
     """Check entry conditions or execute entry."""
     from src.services.entry_manager import get_entry_manager
+    from src.services.claude_advisor import get_claude_advisor
     from src.utils.config import get_trading_config
-    from src.api.telegram_alerts import get_telegram
-    from src.api.response_handler import get_response_handler
+    from src.utils.market_events_scraper import scrape_and_save_all
 
     # Graceful exit if outside entry window (for cron)
     config = get_trading_config()
@@ -129,6 +129,13 @@ def cmd_entry(args):
     if current_time < entry_start or current_time > entry_end:
         logger.debug(f"Outside entry window ({entry_start}-{entry_end}), skipping")
         return 0
+
+    # Scrape latest news and events first
+    try:
+        events_count, news_count = scrape_and_save_all()
+        logger.info(f"Scraped {events_count} events, {news_count} news items")
+    except Exception as e:
+        logger.warning(f"News scraping failed (non-critical): {e}")
 
     manager = get_entry_manager()
     conditions = manager.check_entry_conditions()
@@ -147,49 +154,38 @@ def cmd_entry(args):
         print(f"   Expiry: {conditions.expiry} (DTE: {conditions.dte})")
 
         if args.execute:
-            # Send Telegram alert and wait for user confirmation
-            telegram = get_telegram()
-            response_handler = get_response_handler()
-
-            entry_msg = (
-                f"📊 *Entry Signal Detected*\n\n"
-                f"*Market Data:*\n"
-                f"• NIFTY Forward: ₹{conditions.nifty_forward:,.0f}\n"
-                f"• NIFTY Spot: ₹{conditions.nifty_spot:,.0f}\n"
-                f"• VIX: {conditions.india_vix:.2f}\n\n"
-                f"*Trade Setup:*\n"
-                f"• ATM Strike: {conditions.atm_strike}\n"
-                f"• Expiry: {conditions.expiry} (DTE: {conditions.dte})\n\n"
-                f"Reply *ENTER* to execute or *SKIP* to pass"
+            # Use existing pre-entry advisory which:
+            # 1. Fetches real option quotes
+            # 2. Checks R:R filter
+            # 3. Sends Telegram with quotes + events + news
+            # 4. Waits for user response (ENTER/SKIP)
+            advisor = get_claude_advisor()
+            advisory_result = advisor.get_pre_entry_advisory(
+                nifty_spot=conditions.nifty_spot,
+                india_vix=conditions.india_vix,
+                atm_strike=conditions.atm_strike,
+                dte=conditions.dte,
+                expiry_date=conditions.expiry,
+                nifty_forward=conditions.nifty_forward
             )
 
-            telegram.send(entry_msg)
-            print("\n📱 Entry alert sent to Telegram. Waiting for confirmation...")
+            if advisory_result.action_required:
+                # User said SKIP, timeout, or R:R filter not met
+                print(f"\n⏭️ Entry skipped: {advisory_result.suggested_action}")
+                return 0
 
-            # Wait for user response (2 minute timeout)
-            response = response_handler.wait_for_response(
-                valid_responses=['ENTER', 'SKIP'],
-                timeout_seconds=120
+            # User said ENTER - execute
+            print("\n🚀 User confirmed - Executing entry...")
+            result = manager.execute_entry(
+                conditions=conditions,
+                require_claude_approval=False
             )
 
-            if response and response.response.upper() == 'ENTER':
-                print("\n🚀 User confirmed - Executing entry...")
-                result = manager.execute_entry(
-                    conditions=conditions,
-                    require_claude_approval=False
-                )
-
-                if result.success:
-                    print(f"[OK] Entry successful! Position ID: {result.position_id}")
-                    telegram.send(f"✅ *Entry Executed*\n\nPosition ID: {result.position_id}")
-                else:
-                    print(f"[FAIL] Entry failed: {result.error}")
-                    telegram.send(f"❌ *Entry Failed*\n\n{result.error}")
-                    return 1
+            if result.success:
+                print(f"[OK] Entry successful! Position ID: {result.position_id}")
             else:
-                skip_reason = "timeout" if not response else "user chose SKIP"
-                print(f"\n⏭️ Entry skipped ({skip_reason})")
-                telegram.send(f"⏭️ Entry skipped ({skip_reason})")
+                print(f"[FAIL] Entry failed: {result.error}")
+                return 1
 
     return 0
 
