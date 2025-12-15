@@ -933,6 +933,41 @@ def get_latest_pnl_snapshot(position_id: int) -> Optional[PnLSnapshot]:
         return None
 
 
+def get_pnl_snapshots_for_position(
+    position_id: int,
+    target_date: Optional[date] = None
+) -> List[PnLSnapshot]:
+    """
+    Get all P&L snapshots for a position, optionally filtered by date.
+
+    Args:
+        position_id: Position ID
+        target_date: Optional date to filter (defaults to all)
+
+    Returns:
+        List of PnLSnapshot objects ordered by timestamp
+    """
+    with get_db_session() as conn:
+        if target_date:
+            start_str = f"{target_date} 00:00:00"
+            end_str = f"{target_date} 23:59:59"
+            cursor = conn.execute(
+                """SELECT * FROM pnl_snapshots
+                   WHERE position_id = ?
+                   AND created_at BETWEEN ? AND ?
+                   ORDER BY created_at ASC""",
+                (position_id, start_str, end_str)
+            )
+        else:
+            cursor = conn.execute(
+                """SELECT * FROM pnl_snapshots
+                   WHERE position_id = ?
+                   ORDER BY created_at ASC""",
+                (position_id,)
+            )
+        return [_row_to_pnl_snapshot(row) for row in cursor.fetchall()]
+
+
 # =============================================================================
 # COOLDOWN OPERATIONS
 # =============================================================================

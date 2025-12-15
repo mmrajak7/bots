@@ -714,9 +714,10 @@ _Entry: {position.entry_time.strftime('%d-%b %H:%M') if position.entry_time else
             self._send_reply(f"❌ Error: {str(e)[:100]}")
 
     def _cmd_pnl(self, update: TelegramUpdate, args: List[str]):
-        """Handle /pnl command - shows current P&L with real-time quote."""
+        """Handle /pnl command - shows current P&L with chart."""
         try:
-            from src.utils.db import get_active_position, get_position_legs, get_latest_pnl_snapshot
+            from src.utils.db import get_active_position, get_latest_pnl_snapshot
+            from src.utils.charts import generate_daily_pnl_chart, is_chart_available
 
             position = get_active_position()
 
@@ -739,7 +740,8 @@ _Entry: {position.entry_time.strftime('%d-%b %H:%M') if position.entry_time else
                 profit_target_pct = get_trading_config().get('exit', {}).get('profit_target_pct', 2.6)
                 target_profit = (position.margin_deployed * profit_target_pct / 100) if position.margin_deployed > 0 else position.max_profit * 0.5
 
-                self._send_reply(f"""💰 *P&L Summary*
+                # Build caption for chart
+                caption = f"""💰 *P&L Summary*
 
 {pnl_emoji} *P&L: {pnl_sign}₹{snapshot.current_pnl:,.0f}*{rom_text}
 
@@ -748,8 +750,19 @@ _Entry: {position.entry_time.strftime('%d-%b %H:%M') if position.entry_time else
 • Margin: {margin_text}
 • Exit Target: {profit_target_pct}% ROM (₹{target_profit:,.0f})
 
-*Market:*
-• NIFTY: {snapshot.nifty_spot:,.0f} | VIX: {snapshot.vix:.1f}""")
+• NIFTY: {snapshot.nifty_spot:,.0f} | VIX: {snapshot.vix:.1f}"""
+
+                # Try to generate and send chart
+                if is_chart_available():
+                    chart_bytes, status = generate_daily_pnl_chart(position.id)
+                    if chart_bytes:
+                        if self.send_photo(chart_bytes, caption):
+                            return  # Chart sent successfully with caption
+                        else:
+                            logger.warning("Failed to send chart, falling back to text")
+
+                # Fallback: send text only
+                self._send_reply(caption)
             else:
                 self._send_reply(f"""💰 *P&L Summary*
 
@@ -760,6 +773,8 @@ _Real-time P&L pending - monitor updating..._""")
 
         except Exception as e:
             logger.error(f"Error in /pnl: {e}")
+            import traceback
+            traceback.print_exc()
             self._send_reply(f"❌ Error: {str(e)[:100]}")
 
     def _cmd_market(self, update: TelegramUpdate, args: List[str]):
@@ -1193,6 +1208,53 @@ P&L: *-₹{abs(current_pnl):,.0f}*
     def _send_reply(self, message: str, parse_mode: str = "Markdown") -> bool:
         """Send a simple reply message."""
         return self._alerts.send(message, parse_mode)
+
+    def send_photo(
+        self,
+        photo_bytes: bytes,
+        caption: Optional[str] = None,
+        parse_mode: str = "Markdown"
+    ) -> bool:
+        """
+        Send a photo to the chat.
+
+        Args:
+            photo_bytes: PNG/JPEG image bytes
+            caption: Optional caption text
+            parse_mode: Caption format (Markdown/HTML)
+
+        Returns:
+            True if sent successfully
+        """
+        try:
+            url = f"{self.base_url}/sendPhoto"
+
+            files = {
+                'photo': ('chart.png', photo_bytes, 'image/png')
+            }
+            data = {
+                'chat_id': self.chat_id
+            }
+            if caption:
+                data['caption'] = caption
+                data['parse_mode'] = parse_mode
+
+            response = requests.post(url, files=files, data=data, timeout=30)
+
+            if response.status_code != 200:
+                logger.error(f"sendPhoto failed: HTTP {response.status_code}")
+                return False
+
+            result = response.json()
+            if not result.get('ok'):
+                logger.error(f"sendPhoto error: {result.get('description')}")
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error sending photo: {e}")
+            return False
 
     def _answer_callback(self, callback_query_id: str, text: str = None):
         """Answer a callback query to stop loading animation."""
