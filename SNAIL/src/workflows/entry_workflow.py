@@ -232,7 +232,7 @@ class EntryWorkflow:
                     skipped_reason=conditions.reason
                 )
 
-            logger.info(f"Entry conditions met: NIFTY={conditions.nifty_spot:.2f}, VIX={conditions.india_vix:.2f}")
+            logger.info(f"Entry conditions met: Forward={conditions.nifty_forward:.2f}, Spot={conditions.nifty_spot:.2f}, VIX={conditions.india_vix:.2f}")
 
             # Step 3: Claude pre-entry advisory
             claude_decision = None
@@ -246,7 +246,8 @@ class EntryWorkflow:
                     india_vix=conditions.india_vix,
                     atm_strike=conditions.atm_strike,
                     dte=conditions.dte,
-                    expiry_date=conditions.expiry
+                    expiry_date=conditions.expiry,
+                    nifty_forward=conditions.nifty_forward
                 )
 
                 if claude_decision.action_required:
@@ -267,7 +268,8 @@ class EntryWorkflow:
 
                 confirmation_msg = (
                     f"📊 *Entry Confirmation Required*\n\n"
-                    f"NIFTY: ₹{conditions.nifty_spot:,.2f}\n"
+                    f"NIFTY Forward: ₹{conditions.nifty_forward:,.2f}\n"
+                    f"NIFTY Spot: ₹{conditions.nifty_spot:,.2f}\n"
                     f"VIX: {conditions.india_vix:.2f}\n"
                     f"ATM Strike: {conditions.atm_strike}\n"
                     f"Expiry: {conditions.expiry} (DTE: {conditions.dte})\n\n"

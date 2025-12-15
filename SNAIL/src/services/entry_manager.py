@@ -96,6 +96,8 @@ class EntryConditions:
         can_enter: Whether entry is allowed
         reason: Reason if entry blocked
         nifty_spot: Current NIFTY spot
+        nifty_forward: Estimated forward price (spot + pro-rated futures premium)
+        nifty_futures: NIFTY futures price
         india_vix: Current VIX
         atm_strike: Calculated ATM strike
         expiry: Target expiry date
@@ -104,6 +106,8 @@ class EntryConditions:
     can_enter: bool
     reason: str
     nifty_spot: float = 0.0
+    nifty_forward: float = 0.0  # Forward price used for ATM selection
+    nifty_futures: float = 0.0  # Raw futures price
     india_vix: float = 0.0
     atm_strike: int = 0
     expiry: Optional[date] = None
@@ -324,6 +328,9 @@ class EntryManager:
             )
 
         # Calculate ATM strike using futures-based pro-rated premium + CE-PE validation
+        nifty_forward = nifty_spot  # Default to spot
+        nifty_futures = 0.0
+
         try:
             strike_result = get_atm_strike_futures_based(
                 kite=self.kite,
@@ -333,8 +340,10 @@ class EntryManager:
             )
             atm_strike = strike_result.strike
 
-            # Use spot from strike calculation for consistency
+            # Use values from strike calculation
             nifty_spot = strike_result.spot_price
+            nifty_forward = strike_result.estimated_forward
+            nifty_futures = strike_result.futures_price
 
             # Log strike selection details
             if strike_result.method == "futures":
@@ -351,14 +360,17 @@ class EntryManager:
             logger.warning(f"Futures-based strike selection failed: {e}, using spot fallback")
             logger.debug(f"Strike selection exception traceback:\n{traceback.format_exc()}")
             atm_strike = calculate_atm_strike(nifty_spot)
+            nifty_forward = nifty_spot  # No forward available
 
-        logger.info(f"Entry conditions met: NIFTY={nifty_spot:.2f}, VIX={india_vix:.2f}, "
-                   f"ATM={atm_strike}, Expiry={expiry} (DTE={dte})")
+        logger.info(f"Entry conditions met: Forward={nifty_forward:.2f}, Spot={nifty_spot:.2f}, "
+                   f"VIX={india_vix:.2f}, ATM={atm_strike}, Expiry={expiry} (DTE={dte})")
 
         return EntryConditions(
             can_enter=True,
             reason="All conditions met",
             nifty_spot=nifty_spot,
+            nifty_forward=nifty_forward,
+            nifty_futures=nifty_futures,
             india_vix=india_vix,
             atm_strike=atm_strike,
             expiry=expiry,

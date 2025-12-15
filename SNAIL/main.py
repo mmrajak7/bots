@@ -136,7 +136,10 @@ def cmd_entry(args):
     print(f"   Reason: {conditions.reason}")
 
     if conditions.can_enter:
-        print(f"\n   NIFTY: Rs.{conditions.nifty_spot:,.2f}")
+        print(f"\n   NIFTY Forward: Rs.{conditions.nifty_forward:,.2f}")
+        print(f"   NIFTY Spot: Rs.{conditions.nifty_spot:,.2f}")
+        if conditions.nifty_futures > 0:
+            print(f"   NIFTY Futures: Rs.{conditions.nifty_futures:,.2f}")
         print(f"   VIX: {conditions.india_vix:.2f}")
         print(f"   ATM Strike: {conditions.atm_strike}")
         print(f"   Expiry: {conditions.expiry} (DTE: {conditions.dte})")

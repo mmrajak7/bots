@@ -488,7 +488,8 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
         atm_strike: int,
         dte: int,
         expiry_date: date = None,
-        atr_14: float = 0.0
+        atr_14: float = 0.0,
+        nifty_forward: float = 0.0
     ) -> AdvisoryResult:
         """
         Get pre-entry advisory with R:R filter and optional Claude analysis.
@@ -507,10 +508,13 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             dte: Days to expiry
             expiry_date: Expiry date object
             atr_14: 14-day ATR (fetched if 0)
+            nifty_forward: Forward price used for ATM selection (spot if not available)
 
         Returns:
             AdvisoryResult with decision
         """
+        # Use forward price for display (fall back to spot if not provided)
+        display_price = nifty_forward if nifty_forward > 0 else nifty_spot
         from src.utils.config import get_entry_config
         from src.utils.market_events_scraper import get_events_for_telegram, get_news_for_telegram
 
@@ -601,11 +605,11 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             news_telegram = get_news_for_telegram(limit=5)
 
             # Build Telegram message (HTML format)
-            # Header
+            # Header - show forward price (used for ATM selection)
             msg_parts = [
                 f"🤖 <b>Pre-Entry Analysis</b>",
                 f"",
-                f"📊 NIFTY <b>{nifty_spot:,.0f}</b> | 🌡️ VIX <b>{india_vix:.1f}</b> | ⏳ DTE <b>{dte}</b> ({expiry_str})",
+                f"📊 NIFTY Forward <b>{display_price:,.0f}</b> | 🌡️ VIX <b>{india_vix:.1f}</b> | ⏳ DTE <b>{dte}</b> ({expiry_str})",
                 f"",
                 option_html
             ]
