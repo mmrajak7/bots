@@ -148,7 +148,7 @@ def cmd_entry(args):
             print("\n🚀 Executing entry...")
             result = manager.execute_entry(
                 conditions=conditions,
-                require_claude_approval=not args.skip_claude
+                require_claude_approval=False  # Claude advisory disabled for entry
             )
 
             if result.success:
