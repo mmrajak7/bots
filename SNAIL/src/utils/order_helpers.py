@@ -206,6 +206,50 @@ class SpreadValidationResult:
     spreads: Dict[str, float] = field(default_factory=dict)
 
 
+@dataclass
+class ExitExecutionResult:
+    """
+    Result of Iron Fly exit execution with detailed leg status.
+
+    Tracks which legs succeeded and which failed for proper
+    error handling and partial exit recovery.
+
+    Attributes:
+        success: True if ALL legs closed successfully
+        partial: True if SOME legs closed (requires manual intervention)
+        orders: IronFlyOrders if complete, None if partial/failed
+        legs_closed: List of leg names that were closed successfully
+        legs_failed: Dict of leg names to error messages
+        total_debit: Total debit paid to close (if any legs closed)
+        total_credit: Total credit received from wings (if any)
+        error: Overall error message if failed
+    """
+    success: bool
+    partial: bool = False
+    orders: Optional['IronFlyOrders'] = None
+    legs_closed: List[str] = field(default_factory=list)
+    legs_failed: Dict[str, str] = field(default_factory=dict)
+    total_debit: float = 0.0
+    total_credit: float = 0.0
+    error: str = ""
+
+    @property
+    def net_exit_cost(self) -> float:
+        """Net cost of exit (debit - credit from wings)."""
+        return self.total_debit - self.total_credit
+
+    def get_status_summary(self) -> str:
+        """Get human-readable status summary."""
+        if self.success:
+            return f"EXIT COMPLETE: Net cost ₹{self.net_exit_cost:.2f}"
+        elif self.partial:
+            closed = ", ".join(self.legs_closed) or "None"
+            failed = ", ".join(self.legs_failed.keys()) or "None"
+            return f"PARTIAL EXIT: Closed [{closed}], Failed [{failed}]"
+        else:
+            return f"EXIT FAILED: {self.error}"
+
+
 # =============================================================================
 # PRICE UTILITIES
 # =============================================================================
@@ -960,7 +1004,7 @@ def execute_iron_fly_exit(
     slippage_ticks: int = DEFAULT_SLIPPAGE_TICKS
 ) -> IronFlyOrders:
     """
-    Execute Iron Fly exit orders.
+    Execute Iron Fly exit orders (legacy interface - wraps safe version).
 
     CRITICAL: Exit sequence must close SHORT positions (straddle) FIRST
     to release margin before closing long wings. Closing wings first would
@@ -981,79 +1025,144 @@ def execute_iron_fly_exit(
 
     Returns:
         IronFlyOrders with exit details
+
+    Raises:
+        OrderExecutionError: If exit fails (includes partial exit info)
     """
-    logger.info(f"Executing Iron Fly exit: {quantity} qty")
+    result = execute_iron_fly_exit_safe(kite, symbols, quotes, quantity, slippage_ticks)
+
+    if result.success:
+        return result.orders
+
+    # Partial or full failure
+    error_msg = result.get_status_summary()
+    if result.legs_failed:
+        error_msg += f" Errors: {result.legs_failed}"
+    raise OrderExecutionError(error_msg)
+
+
+def execute_iron_fly_exit_safe(
+    kite: SNAILKiteClient,
+    symbols: Dict[str, str],
+    quotes: Dict[str, Quote],
+    quantity: int,
+    slippage_ticks: int = DEFAULT_SLIPPAGE_TICKS
+) -> ExitExecutionResult:
+    """
+    Execute Iron Fly exit orders with robust partial failure handling.
+
+    Unlike execute_iron_fly_exit, this function:
+    - Attempts ALL legs even if some fail
+    - Returns detailed status of each leg
+    - Never raises exceptions for order failures
+    - Enables proper recovery from partial exits
+
+    CRITICAL: Exit sequence must close SHORT positions (straddle) FIRST.
+
+    Args:
+        kite: Kite client instance
+        symbols: Dict of symbols by leg name
+        quotes: Dict of quotes by leg name
+        quantity: Order quantity
+        slippage_ticks: Slippage buffer
+
+    Returns:
+        ExitExecutionResult with detailed leg status
+    """
+    logger.info(f"Executing Iron Fly exit (safe mode): {quantity} qty")
 
     executed = {}
+    legs_closed = []
+    legs_failed = {}
+    total_debit = 0.0
+    total_credit = 0.0
 
-    try:
-        # Order 1: BUY Straddle CE (close short) - RELEASE MARGIN FIRST
-        logger.info("Closing straddle CE position (releasing margin)...")
-        ce_price = apply_slippage(quotes['straddle_ce'].ask, "BUY", slippage_ticks)
-        executed['straddle_ce'] = execute_order(
-            kite,
-            OrderParams(
-                tradingsymbol=symbols['straddle_ce'],
-                transaction_type="BUY",
-                quantity=quantity,
-                price=ce_price,
-                tag="SNAIL_EXIT_STRADDLE_CE"
+    # Define exit order - STRADDLE FIRST (release margin), THEN WINGS
+    exit_sequence = [
+        ('straddle_ce', 'BUY', 'ask', 'SNAIL_EXIT_STRADDLE_CE', 'debit'),
+        ('straddle_pe', 'BUY', 'ask', 'SNAIL_EXIT_STRADDLE_PE', 'debit'),
+        ('wing_ce', 'SELL', 'bid', 'SNAIL_EXIT_WING_CE', 'credit'),
+        ('wing_pe', 'SELL', 'bid', 'SNAIL_EXIT_WING_PE', 'credit'),
+    ]
+
+    for leg_name, txn_type, price_field, tag, cost_type in exit_sequence:
+        try:
+            logger.info(f"Closing {leg_name} position ({txn_type})...")
+
+            # Get price based on transaction type
+            if price_field == 'ask':
+                base_price = quotes[leg_name].ask
+            else:
+                base_price = quotes[leg_name].bid
+
+            price = apply_slippage(base_price, txn_type, slippage_ticks)
+
+            order = execute_order(
+                kite,
+                OrderParams(
+                    tradingsymbol=symbols[leg_name],
+                    transaction_type=txn_type,
+                    quantity=quantity,
+                    price=price,
+                    tag=tag
+                )
             )
+
+            executed[leg_name] = order
+            legs_closed.append(leg_name)
+
+            # Track costs
+            if cost_type == 'debit':
+                total_debit += order.fill_price
+            else:
+                total_credit += order.fill_price
+
+            logger.info(f"  {leg_name}: Closed @ {order.fill_price:.2f}")
+
+        except Exception as e:
+            error_msg = str(e)
+            legs_failed[leg_name] = error_msg
+            logger.error(f"  {leg_name}: FAILED - {error_msg}")
+            # Continue attempting other legs
+
+    # Determine overall status
+    all_closed = len(legs_closed) == 4
+    some_closed = len(legs_closed) > 0
+
+    if all_closed:
+        # Complete success
+        orders = IronFlyOrders(**executed)
+        logger.info(f"Iron Fly exit complete. Debit: {total_debit:.2f}, Credit: {total_credit:.2f}")
+        return ExitExecutionResult(
+            success=True,
+            partial=False,
+            orders=orders,
+            legs_closed=legs_closed,
+            total_debit=total_debit,
+            total_credit=total_credit
         )
-
-        # Order 2: BUY Straddle PE (close short) - RELEASE MARGIN
-        logger.info("Closing straddle PE position (releasing margin)...")
-        pe_price = apply_slippage(quotes['straddle_pe'].ask, "BUY", slippage_ticks)
-        executed['straddle_pe'] = execute_order(
-            kite,
-            OrderParams(
-                tradingsymbol=symbols['straddle_pe'],
-                transaction_type="BUY",
-                quantity=quantity,
-                price=pe_price,
-                tag="SNAIL_EXIT_STRADDLE_PE"
-            )
+    elif some_closed:
+        # Partial exit - CRITICAL situation requiring manual intervention
+        logger.critical(f"PARTIAL EXIT! Closed: {legs_closed}, Failed: {list(legs_failed.keys())}")
+        return ExitExecutionResult(
+            success=False,
+            partial=True,
+            orders=None,
+            legs_closed=legs_closed,
+            legs_failed=legs_failed,
+            total_debit=total_debit,
+            total_credit=total_credit,
+            error="Partial exit - manual intervention required"
         )
-
-        # Order 3: SELL Wing CE (close long) - Close protection
-        logger.info("Closing wing CE position...")
-        wing_ce_price = apply_slippage(quotes['wing_ce'].bid, "SELL", slippage_ticks)
-        executed['wing_ce'] = execute_order(
-            kite,
-            OrderParams(
-                tradingsymbol=symbols['wing_ce'],
-                transaction_type="SELL",
-                quantity=quantity,
-                price=wing_ce_price,
-                tag="SNAIL_EXIT_WING_CE"
-            )
+    else:
+        # Complete failure
+        logger.error(f"Exit FAILED - no legs closed. Errors: {legs_failed}")
+        return ExitExecutionResult(
+            success=False,
+            partial=False,
+            legs_failed=legs_failed,
+            error="Exit failed - all legs failed"
         )
-
-        # Order 4: SELL Wing PE (close long) - Close protection
-        logger.info("Closing wing PE position...")
-        wing_pe_price = apply_slippage(quotes['wing_pe'].bid, "SELL", slippage_ticks)
-        executed['wing_pe'] = execute_order(
-            kite,
-            OrderParams(
-                tradingsymbol=symbols['wing_pe'],
-                transaction_type="SELL",
-                quantity=quantity,
-                price=wing_pe_price,
-                tag="SNAIL_EXIT_WING_PE"
-            )
-        )
-
-        result = IronFlyOrders(**executed)
-
-        logger.info(f"Iron Fly exit complete. Debit: {result.total_premium_collected:.2f}, "
-                   f"Credit from wings: {result.total_premium_paid:.2f}")
-
-        return result
-
-    except Exception as e:
-        if executed:
-            logger.error(f"Partial exit - completed legs: {list(executed.keys())}")
-        raise OrderExecutionError(f"Iron Fly exit failed: {e}")
 
 
 # =============================================================================

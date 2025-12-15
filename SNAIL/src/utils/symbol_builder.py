@@ -31,7 +31,7 @@ MONTH_CODES = {
 }
 
 # NIFTY strike interval
-NIFTY_STRIKE_INTERVAL = 100  # ATM rounds to nearest 100
+NIFTY_STRIKE_INTERVAL = 50  # ATM rounds to nearest 50 (changed from 100)
 
 # Default lot size (verify from instruments)
 DEFAULT_LOT_SIZE = 75
@@ -173,27 +173,37 @@ def calculate_atm_strike(nifty_spot: float, interval: int = NIFTY_STRIKE_INTERVA
     return round(nifty_spot / interval) * interval
 
 
-def calculate_wing_distance(ce_premium: float, pe_premium: float) -> int:
+def calculate_wing_distance(
+    ce_premium: float,
+    pe_premium: float,
+    round_to: int = 50,
+    min_distance: int = 200
+) -> int:
     """
     Calculate dynamic wing distance based on straddle premium.
 
-    Wing distance = Straddle Premium rounded to nearest 100.
+    Wing distance = Straddle Premium rounded to nearest interval (50 by default).
 
     Args:
         ce_premium: ATM CE premium (bid price)
         pe_premium: ATM PE premium (bid price)
+        round_to: Round to nearest this value (default 50)
+        min_distance: Minimum wing distance (default 200)
 
     Returns:
         Wing distance in points
 
     Example:
-        >>> calculate_wing_distance(170, 130)
+        >>> calculate_wing_distance(170, 130)  # straddle=300
         300
-        >>> calculate_wing_distance(210, 190)
-        400
+        >>> calculate_wing_distance(160, 115)  # straddle=275
+        300  # rounds to nearest 50
+        >>> calculate_wing_distance(145, 105)  # straddle=250
+        250
     """
     straddle_premium = ce_premium + pe_premium
-    return round(straddle_premium / 100) * 100
+    calculated = round(straddle_premium / round_to) * round_to
+    return max(calculated, min_distance)
 
 
 def get_iron_fly_strikes(

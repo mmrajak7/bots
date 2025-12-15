@@ -85,7 +85,8 @@ trading:
   # Strike Selection (Futures-based ATM calculation)
   # Uses pro-rated futures premium + CE-PE validation
   strike_selection:
-    strike_interval: 100       # NIFTY strikes are multiples of 100
+    strike_interval: 50        # NIFTY strikes are multiples of 50 (changed from 100)
+    wing_interval: 50          # Wing distance rounded to nearest 50 (changed from 100)
     ce_pe_tolerance: 35        # |CE-PE| must be <= this for strike to be validated
     max_iterations: 3          # Max CE-PE validation adjustments before accepting
     use_futures: true          # Use futures-based calculation (false = spot only)

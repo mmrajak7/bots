@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 NIFTY_LOT_SIZE = 75
 
 # Strike interval
-NIFTY_STRIKE_INTERVAL = 100  # ATM rounds to nearest 100
+NIFTY_STRIKE_INTERVAL = 50  # ATM rounds to nearest 50 (changed from 100)
 
 # Default charges (overridden by config)
 DEFAULT_STT_RATE = 0.000625  # 0.0625% on sell side premium
@@ -370,19 +370,19 @@ def get_atm_strike_futures_based(
 def calculate_wing_distance(
     ce_premium: float,
     pe_premium: float,
-    round_to: int = 100,
-    min_distance: int = 300
+    round_to: int = 50,
+    min_distance: int = 200
 ) -> int:
     """
     Calculate dynamic wing distance based on straddle premium.
 
-    Wing distance = Straddle premium rounded to nearest 100, with minimum bound.
+    Wing distance = Straddle premium rounded to nearest 50 (changed from 100).
 
     Args:
         ce_premium: ATM CE premium
         pe_premium: ATM PE premium
-        round_to: Rounding interval (default 100)
-        min_distance: Minimum wing distance to prevent division by zero (default 200)
+        round_to: Rounding interval (default 50)
+        min_distance: Minimum wing distance (default 200)
 
     Returns:
         Wing distance in points (at least min_distance)

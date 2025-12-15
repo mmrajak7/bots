@@ -563,6 +563,83 @@ def save_position_leg(leg: Any) -> int:
         return cursor.lastrowid
 
 
+def save_position_with_legs(position: Any, legs: List[Any]) -> int:
+    """
+    Save position and all legs in a single atomic transaction.
+
+    This ensures database consistency - either all data is saved or none.
+    Prevents orphaned position records if leg insertion fails.
+
+    Args:
+        position: Position object or dataclass
+        legs: List of position leg objects
+
+    Returns:
+        Position ID
+
+    Raises:
+        Exception: If any part of the save fails (entire transaction rolled back)
+    """
+    # Handle both dataclass and dict-like objects for position
+    if hasattr(position, '__dict__'):
+        pos_data = position.__dict__ if not hasattr(position, 'asdict') else position.asdict()
+    else:
+        pos_data = dict(position)
+
+    with get_db_session() as conn:
+        # Insert position
+        cursor = conn.execute(
+            """INSERT INTO positions (
+                status, entry_time, expiry_date, atm_strike, wing_distance,
+                lot_size, entry_premium, straddle_credit, wing_debit,
+                max_profit, max_loss, margin_deployed, entry_charges
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                pos_data.get('status', 'active'),
+                pos_data.get('entry_time', datetime.now()).isoformat() if isinstance(pos_data.get('entry_time'), datetime) else pos_data.get('entry_time'),
+                pos_data.get('expiry', pos_data.get('expiry_date', date.today())).isoformat() if isinstance(pos_data.get('expiry', pos_data.get('expiry_date')), date) else pos_data.get('expiry', pos_data.get('expiry_date')),
+                pos_data.get('atm_strike', 0),
+                pos_data.get('wing_distance', 0),
+                pos_data.get('quantity', pos_data.get('lot_size', 75)),
+                pos_data.get('entry_credit', pos_data.get('entry_premium', 0)),
+                pos_data.get('entry_credit', pos_data.get('straddle_credit', 0)),
+                pos_data.get('wing_debit', 0),
+                pos_data.get('max_profit', 0),
+                pos_data.get('max_loss', 0),
+                pos_data.get('margin_deployed', 0),
+                pos_data.get('entry_charges', 0)
+            )
+        )
+        position_id = cursor.lastrowid
+
+        # Insert all legs with the new position_id
+        for leg in legs:
+            if hasattr(leg, '__dict__'):
+                leg_data = leg.__dict__
+            else:
+                leg_data = dict(leg)
+
+            conn.execute(
+                """INSERT INTO position_legs (
+                    position_id, leg_type, option_type, strike,
+                    tradingsymbol, entry_price, quantity, instrument_token
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    position_id,  # Use the newly created position_id
+                    leg_data.get('leg_type'),
+                    leg_data.get('option_type'),
+                    leg_data.get('strike'),
+                    leg_data.get('tradingsymbol'),
+                    leg_data.get('entry_price'),
+                    leg_data.get('quantity'),
+                    leg_data.get('instrument_token', leg_data.get('entry_order_id', ''))
+                )
+            )
+
+        logger.info(f"Saved position {position_id} with {len(legs)} legs (atomic)")
+        return position_id
+
+
 def save_order(order: Any) -> int:
     """
     Save an order to database.

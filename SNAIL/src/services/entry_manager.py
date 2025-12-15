@@ -61,6 +61,7 @@ from src.utils.db import (
     PositionLeg,
     save_position,
     save_position_leg,
+    save_position_with_legs,
     get_active_position,
     is_on_cooldown
 )
@@ -102,6 +103,9 @@ class EntryConditions:
         atm_strike: Calculated ATM strike
         expiry: Target expiry date
         dte: Days to expiry
+        wing_distance: Calculated wing distance (to ensure consistency between advisory and entry)
+        atm_ce_bid: ATM CE bid price at condition check time
+        atm_pe_bid: ATM PE bid price at condition check time
     """
     can_enter: bool
     reason: str
@@ -112,6 +116,9 @@ class EntryConditions:
     atm_strike: int = 0
     expiry: Optional[date] = None
     dte: int = 0
+    wing_distance: int = 0  # Calculated once, used by both advisory and entry
+    atm_ce_bid: float = 0.0  # ATM CE bid at condition check
+    atm_pe_bid: float = 0.0  # ATM PE bid at condition check
 
 
 @dataclass
@@ -362,8 +369,30 @@ class EntryManager:
             atm_strike = calculate_atm_strike(nifty_spot)
             nifty_forward = nifty_spot  # No forward available
 
+        # Fetch ATM quotes and calculate wing distance NOW (used by both advisory and entry)
+        # This ensures consistency - user approves the same wing distance that will be executed
+        atm_ce_bid = 0.0
+        atm_pe_bid = 0.0
+        wing_distance = 300  # Default fallback
+
+        try:
+            atm_ce_inst = f"NFO:{generate_nifty_option_symbol(expiry, atm_strike, 'CE')}"
+            atm_pe_inst = f"NFO:{generate_nifty_option_symbol(expiry, atm_strike, 'PE')}"
+            atm_quotes = self.kite.quote([atm_ce_inst, atm_pe_inst])
+
+            if atm_ce_inst in atm_quotes and atm_pe_inst in atm_quotes:
+                atm_ce_bid = atm_quotes[atm_ce_inst].bid
+                atm_pe_bid = atm_quotes[atm_pe_inst].bid
+
+                if atm_ce_bid > 0 and atm_pe_bid > 0:
+                    wing_distance = calculate_wing_distance(atm_ce_bid, atm_pe_bid)
+                    logger.info(f"Wing distance calculated at conditions check: {wing_distance} "
+                               f"(CE={atm_ce_bid:.2f}, PE={atm_pe_bid:.2f})")
+        except Exception as e:
+            logger.warning(f"Could not fetch ATM quotes for wing calculation: {e}, using default {wing_distance}")
+
         logger.info(f"Entry conditions met: Forward={nifty_forward:.2f}, Spot={nifty_spot:.2f}, "
-                   f"VIX={india_vix:.2f}, ATM={atm_strike}, Expiry={expiry} (DTE={dte})")
+                   f"VIX={india_vix:.2f}, ATM={atm_strike}, Wing={wing_distance}, Expiry={expiry} (DTE={dte})")
 
         return EntryConditions(
             can_enter=True,
@@ -374,7 +403,10 @@ class EntryManager:
             india_vix=india_vix,
             atm_strike=atm_strike,
             expiry=expiry,
-            dte=dte
+            dte=dte,
+            wing_distance=wing_distance,
+            atm_ce_bid=atm_ce_bid,
+            atm_pe_bid=atm_pe_bid
         )
 
     # =========================================================================
@@ -495,9 +527,16 @@ class EntryManager:
                     error=f"Invalid ATM bid prices: CE={ce_bid}, PE={pe_bid}"
                 )
 
-            # Calculate dynamic wing distance
-            wing_distance = calculate_wing_distance(ce_bid, pe_bid)
-            logger.info(f"Wing distance calculated: {wing_distance} (CE={ce_bid:.2f}, PE={pe_bid:.2f})")
+            # Use wing_distance from conditions if set (ensures consistency with advisory)
+            # Only recalculate if conditions.wing_distance is 0 (not set)
+            if conditions.wing_distance > 0:
+                wing_distance = conditions.wing_distance
+                logger.info(f"Using wing distance from conditions: {wing_distance} "
+                           f"(current quotes: CE={ce_bid:.2f}, PE={pe_bid:.2f})")
+            else:
+                # Fallback: Calculate wing distance (legacy path or missing conditions)
+                wing_distance = calculate_wing_distance(ce_bid, pe_bid)
+                logger.info(f"Wing distance calculated: {wing_distance} (CE={ce_bid:.2f}, PE={pe_bid:.2f})")
 
             # Step 2: Get full quotes for all legs
             symbols, quotes = self.get_iron_fly_quotes(
@@ -998,17 +1037,16 @@ class EntryManager:
             entry_charges=charges.total if charges else 0.0
         )
 
-        position_id = save_position(position)
-
-        # Save legs
-        legs = [
+        # Build leg objects
+        leg_data = [
             ('straddle_ce', orders.straddle_ce, conditions.atm_strike),
             ('straddle_pe', orders.straddle_pe, conditions.atm_strike),
             ('wing_ce', orders.wing_ce, conditions.atm_strike + wing_distance),
             ('wing_pe', orders.wing_pe, conditions.atm_strike - wing_distance),
         ]
 
-        for leg_type, order, strike in legs:
+        legs = []
+        for leg_type, order, strike in leg_data:
             # Look up actual instrument_token from instruments DataFrame
             instrument_token = ''
             try:
@@ -1021,7 +1059,7 @@ class EntryManager:
 
             leg = PositionLeg(
                 id=0,
-                position_id=position_id,
+                position_id=0,  # Will be set by save_position_with_legs
                 leg_type=leg_type,
                 option_type='CE' if 'ce' in leg_type else 'PE',
                 strike=strike,
@@ -1031,7 +1069,10 @@ class EntryManager:
                 quantity=order.quantity,
                 instrument_token=instrument_token
             )
-            save_position_leg(leg)
+            legs.append(leg)
+
+        # Save position and legs atomically (single transaction)
+        position_id = save_position_with_legs(position, legs)
 
         return position_id
 
