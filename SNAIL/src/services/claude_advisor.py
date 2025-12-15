@@ -609,7 +609,7 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             msg_parts = [
                 f"🤖 <b>Pre-Entry Analysis</b>",
                 f"",
-                f"📊 NIFTY Forward <b>{display_price:,.0f}</b> | 🌡️ VIX <b>{india_vix:.1f}</b> | ⏳ DTE <b>{dte}</b> ({expiry_str})",
+                f"📊 NIFTY Forward <b>₹{display_price:,.0f}</b> | 🌡️ VIX <b>{india_vix:.1f}</b> | ⏳ DTE <b>{dte}</b> ({expiry_str})",
                 f"",
                 option_html
             ]

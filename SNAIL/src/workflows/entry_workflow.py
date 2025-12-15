@@ -268,9 +268,9 @@ class EntryWorkflow:
 
                 confirmation_msg = (
                     f"📊 *Entry Confirmation Required*\n\n"
-                    f"NIFTY Forward: ₹{conditions.nifty_forward:,.2f}\n"
-                    f"NIFTY Spot: ₹{conditions.nifty_spot:,.2f}\n"
-                    f"VIX: {conditions.india_vix:.2f}\n"
+                    f"NIFTY Forward: ₹{conditions.nifty_forward:,.0f}\n"
+                    f"NIFTY Spot: ₹{conditions.nifty_spot:,.0f}\n"
+                    f"VIX: {conditions.india_vix:.1f}\n"
                     f"ATM Strike: {conditions.atm_strike}\n"
                     f"Expiry: {conditions.expiry} (DTE: {conditions.dte})\n\n"
                     f"Proceed with Iron Fly entry?"
