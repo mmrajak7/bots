@@ -215,6 +215,8 @@ class TelegramAlerts:
         max_loss: float
     ) -> bool:
         """Send trade entry alert."""
+        logger.info(f"Sending entry alert: ATM={atm_strike}, Wings={wing_distance}, "
+                   f"Expiry={expiry}, MaxProfit={max_profit:.0f}, MaxLoss={max_loss:.0f}")
         net_credit = premium.get('net', 0)
 
         # Calculate values
