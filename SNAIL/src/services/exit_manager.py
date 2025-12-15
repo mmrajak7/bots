@@ -382,6 +382,26 @@ class ExitManager:
 
         logger.info(f"Executing exit for position {position.id}, reason: {reason.value}")
 
+        # Notify user that exit is starting
+        reason_emoji = {
+            ExitReason.PROFIT_TARGET: "🎯",
+            ExitReason.STOP_LOSS: "🛑",
+            ExitReason.MANUAL: "👤",
+            ExitReason.FRIDAY_CLOSE: "📅",
+            ExitReason.VIX_BREACH: "⚡",
+            ExitReason.WING_BREACH: "🚨",
+            ExitReason.EXPIRY: "⏰",
+            ExitReason.GAP_OPEN: "📉",
+            ExitReason.CLAUDE_ADVISORY: "🤖"
+        }
+        emoji = reason_emoji.get(reason, "🔄")
+        self.telegram.send(
+            f"{emoji} *Exit Started*\n\n"
+            f"Reason: {reason.value.replace('_', ' ').title()}\n"
+            f"Placing LIMIT orders for all 4 legs...\n\n"
+            f"_Will notify on completion or if action needed._"
+        )
+
         try:
             # Get current quotes
             quotes = self.get_position_quotes(position, legs)
