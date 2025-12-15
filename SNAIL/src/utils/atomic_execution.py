@@ -801,27 +801,30 @@ class AtomicIronFlyExecutor:
         if errors:
             return PreValidationResult(valid=False, errors=errors)
 
-        # 2. Check margin (estimate for worst case - naked straddle)
+        # 2. Check margin for Iron Fly (defined risk position)
+        # Iron Fly margin is much lower than naked straddle since risk is capped
+        # Typical broker margin for 1 lot NIFTY Iron Fly: ~₹80,000-₹1,00,000
         try:
             margins = self.kite.get_available_margin()
             available = margins if isinstance(margins, (int, float)) else 0
 
-            # Estimate naked straddle margin (conservative: ~15% of notional)
-            # Note: quantity is already total contracts (num_lots * lot_size), not lots
-            spot = self.kite.get_nifty_spot()
-            naked_margin = spot * quantity * 0.15
+            # Use config's min_available as the expected margin per lot
+            # quantity is total contracts, so num_lots = quantity / lot_size
+            num_lots = quantity // self.lot_size if self.lot_size > 0 else 1
+            min_available = self.config.get('trading', {}).get('capital', {}).get('min_available', 100000)
 
-            required_with_buffer = naked_margin * 1.5  # 50% buffer
+            # Required margin = min_available per lot × number of lots × 1.2 buffer
+            required_margin = min_available * num_lots * 1.2
 
-            if available < required_with_buffer:
+            if available < required_margin:
                 errors.append(
-                    f"Insufficient margin: ₹{available:,.0f} < ₹{required_with_buffer:,.0f} "
-                    f"(150% of estimated naked margin)"
+                    f"Insufficient margin: ₹{available:,.0f} < ₹{required_margin:,.0f} "
+                    f"(estimated Iron Fly margin for {num_lots} lot(s) with 20% buffer)"
                 )
-            elif available < naked_margin * 2:
+            elif available < min_available * num_lots * 1.5:
                 warnings.append(
                     f"Margin buffer low: ₹{available:,.0f} "
-                    f"(recommend 200% of naked margin: ₹{naked_margin * 2:,.0f})"
+                    f"(recommend ₹{min_available * num_lots * 1.5:,.0f} for comfortable buffer)"
                 )
         except Exception as e:
             warnings.append(f"Could not verify margin: {e}")
@@ -848,14 +851,13 @@ class AtomicIronFlyExecutor:
                     warnings.append(f"{leg_type}: Elevated spread ({spread_pct:.2f}%)")
 
         # 4. Check liquidity
-        # AE-001 Fix: Use instance lot_size instead of hardcoded value
-        min_qty = quantity * self.lot_size  # quantity in lots * lot size
+        # quantity is already total contracts (e.g., 75 for 1 lot NIFTY)
         for leg_type, quote in quotes.items():
             if hasattr(quote, 'bid_qty') and hasattr(quote, 'ask_qty'):
-                if quote.bid_qty < min_qty or quote.ask_qty < min_qty:
+                if quote.bid_qty < quantity or quote.ask_qty < quantity:
                     warnings.append(
                         f"{leg_type}: Low liquidity "
-                        f"(need {min_qty}, have bid={quote.bid_qty}, ask={quote.ask_qty})"
+                        f"(need {quantity}, have bid={quote.bid_qty}, ask={quote.ask_qty})"
                     )
 
         return PreValidationResult(
