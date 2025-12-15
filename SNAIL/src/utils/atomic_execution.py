@@ -807,9 +807,9 @@ class AtomicIronFlyExecutor:
             available = margins if isinstance(margins, (int, float)) else 0
 
             # Estimate naked straddle margin (conservative: ~15% of notional)
+            # Note: quantity is already total contracts (num_lots * lot_size), not lots
             spot = self.kite.get_nifty_spot()
-            # AE-001 Fix: Use instance lot_size instead of hardcoded value
-            naked_margin = spot * self.lot_size * quantity * 0.15
+            naked_margin = spot * quantity * 0.15
 
             required_with_buffer = naked_margin * 1.5  # 50% buffer
 
