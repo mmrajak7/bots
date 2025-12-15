@@ -97,12 +97,17 @@ def generate_pnl_chart(
             current_pos += 1
             prev_day = day
 
-        # Plot main P&L line with gradient effect
+        # Plot main P&L line
         ax.plot(x_positions, pnl_values, color=line_color, linewidth=2.5,
                 label=f'P&L', zorder=5)
 
-        # Fill area under curve with gradient
-        ax.fill_between(x_positions, pnl_values, 0, alpha=0.25, color=fill_color, zorder=2)
+        # Fill area under curve - green for positive, red for negative
+        pnl_array = np.array(pnl_values)
+        x_array = np.array(x_positions)
+        ax.fill_between(x_array, pnl_array, 0, where=(pnl_array >= 0),
+                       alpha=0.3, color='#00ff88', zorder=2)
+        ax.fill_between(x_array, pnl_array, 0, where=(pnl_array < 0),
+                       alpha=0.3, color='#ff5555', zorder=2)
 
         # Add zero line
         ax.axhline(y=0, color='#555555', linestyle='-', linewidth=1, zorder=3)
