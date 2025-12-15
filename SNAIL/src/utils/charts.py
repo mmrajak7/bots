@@ -7,11 +7,11 @@ Generates P&L charts for Telegram display.
 @description P&L chart generation using matplotlib
 @author      SNAIL Development Team
 @created     2025-12-15
-@version     1.0.0
+@version     1.1.0
 """
 
 import io
-from datetime import datetime, date
+from datetime import datetime, date, time as dt_time, timedelta
 from typing import List, Optional, Tuple
 from loguru import logger
 
@@ -20,10 +20,16 @@ try:
     matplotlib.use('Agg')  # Non-interactive backend for headless servers
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
+    from matplotlib.patches import Rectangle
+    import numpy as np
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
     logger.warning("matplotlib not available - charts will be disabled")
+
+# Market hours (IST)
+MARKET_OPEN = dt_time(9, 15)
+MARKET_CLOSE = dt_time(15, 30)
 
 
 def generate_pnl_chart(
@@ -31,9 +37,7 @@ def generate_pnl_chart(
     pnl_values: List[float],
     title: str = "P&L Progress",
     profit_target: Optional[float] = None,
-    stop_loss: Optional[float] = None,
-    max_profit: Optional[float] = None,
-    max_loss: Optional[float] = None
+    stop_loss: Optional[float] = None
 ) -> Optional[bytes]:
     """
     Generate a P&L chart as PNG bytes.
@@ -44,8 +48,6 @@ def generate_pnl_chart(
         title: Chart title
         profit_target: Optional profit target line
         stop_loss: Optional stop loss line
-        max_profit: Optional max profit line
-        max_loss: Optional max loss line
 
     Returns:
         PNG image bytes or None if chart cannot be generated
@@ -59,85 +61,153 @@ def generate_pnl_chart(
         return None
 
     try:
-        # Create figure with dark theme for better Telegram visibility
+        # Create figure with dark theme
         plt.style.use('dark_background')
-        fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
+        fig, ax = plt.subplots(figsize=(12, 6), dpi=100)
+
+        # Set background color
+        fig.patch.set_facecolor('#0d1117')
+        ax.set_facecolor('#0d1117')
 
         # Determine color based on final P&L
         final_pnl = pnl_values[-1]
-        line_color = '#00ff88' if final_pnl >= 0 else '#ff4444'
-        fill_color = '#00ff8833' if final_pnl >= 0 else '#ff444433'
+        line_color = '#00ff88' if final_pnl >= 0 else '#ff5555'
+        fill_color = line_color
 
-        # Plot main P&L line
-        ax.plot(timestamps, pnl_values, color=line_color, linewidth=2, label='P&L')
+        # Find unique trading days
+        trading_days = sorted(set(ts.date() for ts in timestamps))
 
-        # Fill area under curve
-        ax.fill_between(timestamps, pnl_values, 0, alpha=0.3, color=line_color)
+        # Create sequential x-axis (market hours only)
+        # Map each timestamp to a sequential position
+        x_positions = []
+        x_labels = []
+        day_boundaries = []
+
+        current_pos = 0
+        prev_day = None
+
+        for i, ts in enumerate(timestamps):
+            day = ts.date()
+
+            # Add day boundary marker
+            if prev_day is not None and day != prev_day:
+                day_boundaries.append(current_pos - 0.5)
+
+            x_positions.append(current_pos)
+            current_pos += 1
+            prev_day = day
+
+        # Plot main P&L line with gradient effect
+        ax.plot(x_positions, pnl_values, color=line_color, linewidth=2.5,
+                label=f'P&L', zorder=5)
+
+        # Fill area under curve with gradient
+        ax.fill_between(x_positions, pnl_values, 0, alpha=0.25, color=fill_color, zorder=2)
 
         # Add zero line
-        ax.axhline(y=0, color='white', linestyle='-', linewidth=0.5, alpha=0.5)
+        ax.axhline(y=0, color='#555555', linestyle='-', linewidth=1, zorder=3)
 
-        # Add target/stop lines if provided
+        # Add target line if provided
         if profit_target is not None:
             ax.axhline(y=profit_target, color='#00ff88', linestyle='--',
-                      linewidth=1.5, alpha=0.7, label=f'Target: +₹{profit_target:,.0f}')
+                      linewidth=2, alpha=0.8, label=f'Target: +₹{profit_target:,.0f}', zorder=4)
 
+        # Add stop loss line if provided
         if stop_loss is not None:
-            ax.axhline(y=stop_loss, color='#ff4444', linestyle='--',
-                      linewidth=1.5, alpha=0.7, label=f'Stop: -₹{abs(stop_loss):,.0f}')
+            ax.axhline(y=stop_loss, color='#ff5555', linestyle='--',
+                      linewidth=2, alpha=0.8, label=f'Stop: ₹{stop_loss:,.0f}', zorder=4)
 
-        if max_profit is not None:
-            ax.axhline(y=max_profit, color='#4488ff', linestyle=':',
-                      linewidth=1, alpha=0.5, label=f'Max: +₹{max_profit:,.0f}')
+        # Add day boundary vertical lines
+        for boundary in day_boundaries:
+            ax.axvline(x=boundary, color='#333333', linestyle='-', linewidth=2, zorder=1)
 
-        if max_loss is not None:
-            ax.axhline(y=max_loss, color='#ff8844', linestyle=':',
-                      linewidth=1, alpha=0.5, label=f'Max Loss: -₹{abs(max_loss):,.0f}')
+        # Calculate Y-axis limits based on actual data (not max profit/loss)
+        pnl_min = min(pnl_values)
+        pnl_max = max(pnl_values)
 
-        # Format x-axis based on date range
-        if timestamps:
-            date_range = (timestamps[-1] - timestamps[0]).days
-            if date_range == 0:
-                # Single day - show time only
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-                ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-            elif date_range <= 5:
-                # Few days - show day and time
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b\n%H:%M'))
-                ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
-            else:
-                # Many days - show date only
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
-                ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-        plt.xticks(rotation=45)
+        # Include target and stop in range if they're close to data
+        y_values_for_range = list(pnl_values)
+        if profit_target is not None and profit_target < pnl_max * 3:
+            y_values_for_range.append(profit_target)
+        if stop_loss is not None and stop_loss > pnl_min * 3:
+            y_values_for_range.append(stop_loss)
+
+        y_min = min(y_values_for_range)
+        y_max = max(y_values_for_range)
+        y_padding = (y_max - y_min) * 0.15 if y_max != y_min else abs(y_max) * 0.3 or 1000
+
+        ax.set_ylim(y_min - y_padding, y_max + y_padding)
+
+        # X-axis: Show day labels at day boundaries
+        if len(trading_days) == 1:
+            # Single day - show time labels
+            n_labels = min(8, len(timestamps))
+            label_indices = [int(i * (len(timestamps) - 1) / (n_labels - 1)) for i in range(n_labels)]
+            ax.set_xticks([x_positions[i] for i in label_indices])
+            ax.set_xticklabels([timestamps[i].strftime('%H:%M') for i in label_indices],
+                             fontsize=10, color='#aaaaaa')
+            ax.set_xlabel('Time', fontsize=11, color='#aaaaaa')
+        else:
+            # Multi-day - show day labels
+            day_centers = []
+            day_labels = []
+
+            start_idx = 0
+            for i, day in enumerate(trading_days):
+                day_timestamps = [j for j, ts in enumerate(timestamps) if ts.date() == day]
+                if day_timestamps:
+                    center = (x_positions[day_timestamps[0]] + x_positions[day_timestamps[-1]]) / 2
+                    day_centers.append(center)
+                    day_labels.append(day.strftime('%d %b'))
+
+            ax.set_xticks(day_centers)
+            ax.set_xticklabels(day_labels, fontsize=11, color='#aaaaaa')
+            ax.set_xlabel('Trading Days', fontsize=11, color='#aaaaaa')
 
         # Format y-axis for currency
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'₹{x:,.0f}'))
+        ax.tick_params(axis='y', colors='#aaaaaa', labelsize=10)
 
-        # Labels and title
-        ax.set_xlabel('Time', fontsize=10, color='white')
-        ax.set_ylabel('P&L (₹)', fontsize=10, color='white')
-        ax.set_title(title, fontsize=12, fontweight='bold', color='white')
+        # Title
+        ax.set_title(title, fontsize=14, fontweight='bold', color='white', pad=15)
+        ax.set_ylabel('P&L (₹)', fontsize=11, color='#aaaaaa')
 
-        # Grid
-        ax.grid(True, alpha=0.2, linestyle='--')
+        # Grid - horizontal only for cleaner look
+        ax.grid(True, axis='y', alpha=0.15, linestyle='-', color='#555555')
+        ax.grid(False, axis='x')
 
-        # Legend
-        ax.legend(loc='upper left', fontsize=8, framealpha=0.7)
+        # Legend - positioned better
+        legend = ax.legend(loc='upper left', fontsize=10, framealpha=0.9,
+                          facecolor='#1a1a2e', edgecolor='#333333')
+        for text in legend.get_texts():
+            text.set_color('white')
 
-        # Add current P&L annotation
-        final_time = timestamps[-1]
+        # Add current P&L annotation with better styling
+        final_x = x_positions[-1]
         pnl_sign = '+' if final_pnl >= 0 else ''
+
+        # Annotation box
+        bbox_color = '#00aa55' if final_pnl >= 0 else '#cc3333'
         ax.annotate(
             f'{pnl_sign}₹{final_pnl:,.0f}',
-            xy=(final_time, final_pnl),
-            xytext=(10, 10),
+            xy=(final_x, final_pnl),
+            xytext=(15, 0),
             textcoords='offset points',
-            fontsize=11,
+            fontsize=13,
             fontweight='bold',
-            color=line_color,
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7)
+            color='white',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor=bbox_color, edgecolor='none', alpha=0.9),
+            zorder=10
         )
+
+        # Add a dot at the final point
+        ax.scatter([final_x], [final_pnl], color=line_color, s=80, zorder=6, edgecolors='white', linewidths=2)
+
+        # Remove spines for cleaner look
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color('#333333')
+        ax.spines['bottom'].set_color('#333333')
 
         # Tight layout
         plt.tight_layout()
@@ -145,7 +215,7 @@ def generate_pnl_chart(
         # Save to BytesIO
         buf = io.BytesIO()
         fig.savefig(buf, format='png', bbox_inches='tight',
-                   facecolor='#1a1a2e', edgecolor='none')
+                   facecolor='#0d1117', edgecolor='none', dpi=120)
         buf.seek(0)
         plt.close(fig)
 
@@ -202,13 +272,8 @@ def generate_daily_pnl_chart(
     position = get_position_by_id(position_id)
     profit_target = None
     stop_loss = None
-    max_profit = None
-    max_loss = None
 
     if position:
-        max_profit = position.max_profit
-        max_loss = -position.max_loss if position.max_loss else None
-
         # Calculate targets from config
         config = get_trading_config()
         profit_target_pct = config.get('exit', {}).get('profit_target_pct', 2.6)
@@ -239,9 +304,7 @@ def generate_daily_pnl_chart(
         pnl_values=pnl_values,
         title=title,
         profit_target=profit_target,
-        stop_loss=stop_loss,
-        max_profit=max_profit,
-        max_loss=max_loss
+        stop_loss=stop_loss
     )
 
     if chart_bytes:
