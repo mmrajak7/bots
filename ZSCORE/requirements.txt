@@ -1,0 +1,11 @@
+# ZSCORE Bot Dependencies
+# Minimal requirements - uses shared venv with CROCODILE
+
+# API & Network
+requests>=2.31.0
+
+# Kite Connect
+kiteconnect>=5.0.0
+
+# Database (for shared db.py)
+sqlalchemy>=2.0.0

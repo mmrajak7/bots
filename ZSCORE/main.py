@@ -73,12 +73,22 @@ def load_holidays(config: dict) -> set:
                 data = json.load(f)
                 # Support both list format and dict format
                 if isinstance(data, list):
-                    holidays = set(data)
+                    for item in data:
+                        if isinstance(item, dict) and 'date' in item:
+                            holidays.add(item['date'])
+                        elif isinstance(item, str):
+                            holidays.add(item)
                 elif isinstance(data, dict):
-                    # Assume format like {"2025": ["2025-01-26", ...]}
-                    for year_holidays in data.values():
+                    # Format: {"2025": ["2025-01-26", ...]} or {"2025": [{"date": "...", "name": "..."}]}
+                    for key, year_holidays in data.items():
+                        if key.startswith('_'):  # Skip metadata keys like _comment
+                            continue
                         if isinstance(year_holidays, list):
-                            holidays.update(year_holidays)
+                            for item in year_holidays:
+                                if isinstance(item, dict) and 'date' in item:
+                                    holidays.add(item['date'])
+                                elif isinstance(item, str):
+                                    holidays.add(item)
             logging.info(f"Loaded {len(holidays)} holidays from {holiday_file}")
         except Exception as e:
             logging.warning(f"Could not load holidays: {e}")
@@ -902,10 +912,24 @@ class ZScoreBot:
         """Resolve instrument tokens - auto-detect futures from instruments"""
         inst = self.config['instruments']
 
-        # Get spot token
-        self.spot_token = self.inst_mgr.get_token(inst['spot_symbol'])
-        if not self.spot_token:
-            raise ValueError(f"Could not find spot token for {inst['spot_symbol']}")
+        # Get spot token - direct config takes priority, then lookup, then well-known defaults
+        if inst.get('spot_token'):
+            self.spot_token = inst['spot_token']
+            logging.info(f"Using configured spot_token: {self.spot_token}")
+        else:
+            self.spot_token = self.inst_mgr.get_token(inst['spot_symbol'])
+            if not self.spot_token:
+                # Well-known defaults for common indices
+                well_known = {
+                    'NIFTY 50': 256265,
+                    'NIFTY BANK': 260105,
+                    'NIFTY': 256265,
+                }
+                self.spot_token = well_known.get(inst['spot_symbol'])
+                if self.spot_token:
+                    logging.info(f"Using well-known token for {inst['spot_symbol']}: {self.spot_token}")
+                else:
+                    raise ValueError(f"Could not find spot token for {inst['spot_symbol']}")
 
         # Auto-detect current and next month futures
         underlying = inst.get('underlying', 'NIFTY')
