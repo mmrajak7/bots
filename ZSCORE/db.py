@@ -421,16 +421,24 @@ class TradingDB:
         return positions
 
     def get_today_stats(self) -> Dict:
-        """Get today's trading statistics"""
+        """Get today's trading statistics.
+
+        Counts straddles (linked by trade_group_id) as 1 trade, not 2.
+        """
         conn = self._get_conn()
         cursor = conn.cursor()
 
         today = date.today().isoformat()
+
+        # Count unique trade groups (straddle = 1 trade, not 2)
+        # Empty trade_group_id counts as individual trades
         cursor.execute("""
             SELECT
-                COUNT(*) as total_trades,
-                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN pnl <= 0 AND status = 'CLOSED' THEN 1 ELSE 0 END) as losses,
+                COUNT(DISTINCT CASE
+                    WHEN trade_group_id IS NOT NULL AND trade_group_id != ''
+                    THEN trade_group_id
+                    ELSE id  -- Each position without group is a separate trade
+                END) as total_trades,
                 COALESCE(SUM(pnl), 0) as gross_pnl,
                 COUNT(CASE WHEN status = 'OPEN' THEN 1 END) as open_positions
             FROM positions
@@ -438,11 +446,38 @@ class TradingDB:
         """, (BOT_ID, today))
 
         row = cursor.fetchone()
+
+        # Calculate wins/losses by trade group
+        cursor.execute("""
+            SELECT
+                SUM(CASE WHEN group_pnl > 0 THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN group_pnl <= 0 AND has_closed > 0 THEN 1 ELSE 0 END) as losses
+            FROM (
+                SELECT
+                    CASE
+                        WHEN trade_group_id IS NOT NULL AND trade_group_id != ''
+                        THEN trade_group_id
+                        ELSE CAST(id AS TEXT)
+                    END as trade_group,
+                    SUM(pnl) as group_pnl,
+                    SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END) as has_closed
+                FROM positions
+                WHERE bot_id = ? AND trade_date = ?
+                GROUP BY trade_group
+            )
+        """, (BOT_ID, today))
+
+        wl_row = cursor.fetchone()
         conn.close()
 
+        result = {'total_trades': 0, 'wins': 0, 'losses': 0, 'gross_pnl': 0, 'open_positions': 0}
         if row:
-            return dict(row)
-        return {'total_trades': 0, 'wins': 0, 'losses': 0, 'gross_pnl': 0, 'open_positions': 0}
+            result.update(dict(row))
+        if wl_row:
+            result['wins'] = wl_row['wins'] or 0
+            result['losses'] = wl_row['losses'] or 0
+
+        return result
 
     # ==================== DAILY SUMMARY ====================
 

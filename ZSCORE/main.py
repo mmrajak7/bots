@@ -857,22 +857,38 @@ class OrderManager:
             (ce_success, pe_success, ce_fill, pe_fill, ce_order_id, pe_order_id)
         """
         def place_ce():
-            return self.place_entry_order(ce_symbol, ce_token, qty, ce_price)
+            try:
+                return self.place_entry_order(ce_symbol, ce_token, qty, ce_price)
+            except Exception as e:
+                logging.error(f"CE order exception: {e}")
+                return False, 0.0, ""
 
         def place_pe():
-            return self.place_entry_order(pe_symbol, pe_token, qty, pe_price)
+            try:
+                return self.place_entry_order(pe_symbol, pe_token, qty, pe_price)
+            except Exception as e:
+                logging.error(f"PE order exception: {e}")
+                return False, 0.0, ""
 
         # Execute both orders in parallel using ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            ce_future = executor.submit(place_ce)
-            pe_future = executor.submit(place_pe)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                ce_future = executor.submit(place_ce)
+                pe_future = executor.submit(place_pe)
 
-            # Wait for both to complete
-            ce_result = ce_future.result()
-            pe_result = pe_future.result()
+                # Wait for both to complete with timeout
+                ce_result = ce_future.result(timeout=30)
+                pe_result = pe_future.result(timeout=30)
 
-        ce_success, ce_fill, ce_order_id = ce_result
-        pe_success, pe_fill, pe_order_id = pe_result
+            ce_success, ce_fill, ce_order_id = ce_result
+            pe_success, pe_fill, pe_order_id = pe_result
+
+        except concurrent.futures.TimeoutError:
+            logging.error("Parallel order placement timed out")
+            return False, False, 0.0, 0.0, "", ""
+        except Exception as e:
+            logging.error(f"Parallel order placement failed: {e}")
+            return False, False, 0.0, 0.0, "", ""
 
         logging.info(f"Parallel straddle entry: CE={ce_success}@{ce_fill}, PE={pe_success}@{pe_fill}")
 
@@ -1673,11 +1689,25 @@ class ZScoreBot:
             self.telegram.alert_error(f"PE exit failed for {pe_pos.symbol} after {max_retries} attempts")
             self.db.mark_position_error(pe_pos.id, f"EXIT_FAILED_{reason}")
 
-        if not ce_success or not pe_success:
-            logging.critical("Straddle exit partially failed - MANUAL INTERVENTION REQUIRED")
+        # Handle partial success - close successful leg in DB even if other failed
+        if ce_success and not pe_success:
+            self.db.close_position(ce_pos.id, ce_fill, self.prices['spot'], reason, ce_order_id)
+            logging.critical("CE exit succeeded but PE failed - CE closed, PE needs manual intervention")
+            self._cleanup_straddle()
             return
 
-        # Close positions in DB
+        if pe_success and not ce_success:
+            self.db.close_position(pe_pos.id, pe_fill, self.prices['spot'], reason, pe_order_id)
+            logging.critical("PE exit succeeded but CE failed - PE closed, CE needs manual intervention")
+            self._cleanup_straddle()
+            return
+
+        if not ce_success and not pe_success:
+            logging.critical("Both exits failed - MANUAL INTERVENTION REQUIRED")
+            self._cleanup_straddle()
+            return
+
+        # Both succeeded - close positions in DB
         self.db.close_position(ce_pos.id, ce_fill, self.prices['spot'], reason, ce_order_id)
         self.db.close_position(pe_pos.id, pe_fill, self.prices['spot'], reason, pe_order_id)
 
@@ -1911,16 +1941,23 @@ Charges: <code>₹{charges:,.2f}</code>
                         else:
                             logging.warning(f"Straddle prices stale: CE={ce_price}, PE={pe_price}")
 
-                    # Single position (legacy or partial)
+                    # Single position (legacy or orphan from partial straddle failure)
                     elif len(open_positions) == 1:
                         open_position = open_positions[0]
-                        current_premium = self.prices['option']
 
-                        if current_premium <= 0 and self.option_symbol:
-                            rest_price = self.order_mgr.get_option_ltp(self.option_symbol)
+                        # Get price - check if it's an orphan CE/PE or legacy single option
+                        if 'CE' in open_position.symbol:
+                            current_premium = self.prices.get('ce', 0)
+                        elif 'PE' in open_position.symbol:
+                            current_premium = self.prices.get('pe', 0)
+                        else:
+                            current_premium = self.prices.get('option', 0)
+
+                        # REST API fallback using the position's actual symbol
+                        if current_premium <= 0:
+                            rest_price = self.order_mgr.get_option_ltp(open_position.symbol)
                             if rest_price:
                                 current_premium = rest_price
-                                self.prices['option'] = rest_price
 
                         if current_premium > 0:
                             pos = Position(
