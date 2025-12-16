@@ -536,14 +536,11 @@ class TelegramAlerter:
             logging.error(f"Telegram send failed: {e}")
             return False
 
-    def alert_startup(self, paper_mode: bool):
+    def alert_startup(self, paper_mode: bool, capital: float):
         mode = "PAPER" if paper_mode else "LIVE"
         msg = f"""
 🚀 <b>Z-Score Bot Started</b>
-━━━━━━━━━━━━━━━━━━━
-Mode: <code>{mode}</code>
-Version: <code>{VERSION}</code>
-Time: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+Mode: <code>{mode}</code> | Capital: <code>{capital:,.0f}</code>
 """
         self.send(msg)
 
@@ -2434,8 +2431,19 @@ Charges: <code>₹{charges:,.2f}</code>
         logging.info(f"Data Dir: {self.data_dir}")
         logging.info("=" * 60)
 
+        # Get available capital for startup alert
+        capital = 0.0
+        if self.config['paper_trade']:
+            capital = 100000.0  # Simulated capital for paper mode
+        else:
+            try:
+                margins = self.kite.margins()
+                capital = margins.get('equity', {}).get('available', {}).get('live_balance', 0)
+            except Exception as e:
+                logging.warning(f"Could not fetch margins: {e}")
+
         # Startup alert
-        self.telegram.alert_startup(self.config['paper_trade'])
+        self.telegram.alert_startup(self.config['paper_trade'], capital)
 
         # Start WebSocket
         self.start_websocket()
