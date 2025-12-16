@@ -291,6 +291,27 @@ class TradingDB:
             return Position(**data)
         return None
 
+    def get_all_open_positions(self) -> List[Position]:
+        """Get all open positions for this bot (for straddle: CE and PE)"""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM positions
+            WHERE bot_id = ? AND status = 'OPEN'
+            ORDER BY id ASC
+        """, (BOT_ID,))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        positions = []
+        for row in rows:
+            data = dict(row)
+            data['paper_trade'] = bool(data.get('paper_trade', 0))
+            positions.append(Position(**data))
+        return positions
+
     def close_position(self, position_id: int, exit_price: float, exit_spot: float,
                        exit_reason: str, exit_order_id: str):
         """Close a position with exit details"""

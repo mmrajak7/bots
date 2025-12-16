@@ -462,6 +462,31 @@ class InstrumentManager:
         logging.warning(f"Available expiries: {sorted_expiries}")
         return None
 
+    def find_atm_straddle(self, spot_price: float, min_dte: int = 3) -> Optional[Dict]:
+        """Find ATM straddle (both CE and PE) for weekly expiry with minimum DTE.
+
+        Returns dict with 'ce' and 'pe' option details, or None if not found.
+        """
+        ce = self.find_atm_option(spot_price, "CE", min_dte)
+        pe = self.find_atm_option(spot_price, "PE", min_dte)
+
+        if ce and pe:
+            logging.info(f"Found ATM straddle: CE={ce['symbol']}, PE={pe['symbol']}, "
+                        f"strike={ce['strike']}, expiry={ce['expiry']}")
+            return {
+                'ce': ce,
+                'pe': pe,
+                'strike': ce['strike'],
+                'expiry': ce['expiry'],
+                'lot_size': ce['lot_size']
+            }
+
+        if not ce:
+            logging.error("Could not find ATM CE for straddle")
+        if not pe:
+            logging.error("Could not find ATM PE for straddle")
+        return None
+
     def get_ltp(self, symbol: str) -> Optional[float]:
         """Get LTP for a symbol"""
         token = self.get_token(symbol)
@@ -542,6 +567,42 @@ Qty: <code>{qty}</code>
 Price: <code>₹{price:.2f}</code>
 Stop: <code>₹{stop:.2f}</code>
 Target: <code>₹{target:.2f}</code>
+"""
+        self.send(msg)
+
+    def alert_straddle_entry(self, ce_symbol: str, pe_symbol: str, qty: int,
+                             ce_price: float, pe_price: float, stop: float, target: float, paper: bool):
+        mode = "📝 PAPER" if paper else "💰 LIVE"
+        total = ce_price + pe_price
+        msg = f"""
+{mode} <b>STRADDLE ENTRY</b>
+━━━━━━━━━━━━━━━━━━━
+CE: <code>{ce_symbol}</code> @ <code>₹{ce_price:.2f}</code>
+PE: <code>{pe_symbol}</code> @ <code>₹{pe_price:.2f}</code>
+Qty: <code>{qty}</code> each
+━━━━━━━━━━━━━━━━━━━
+Total: <code>₹{total:.2f}</code>
+Stop: <code>₹{stop:.2f}</code>
+Target: <code>₹{target:.2f}</code>
+"""
+        self.send(msg)
+
+    def alert_straddle_exit(self, ce_symbol: str, pe_symbol: str,
+                            ce_entry: float, ce_exit: float,
+                            pe_entry: float, pe_exit: float,
+                            total_pnl: float, reason: str, paper: bool):
+        mode = "📝 PAPER" if paper else "💰 LIVE"
+        emoji = "✅" if total_pnl > 0 else "❌"
+        ce_pnl = ce_exit - ce_entry
+        pe_pnl = pe_exit - pe_entry
+        msg = f"""
+{emoji} {mode} <b>STRADDLE EXIT</b>
+━━━━━━━━━━━━━━━━━━━
+CE: <code>₹{ce_entry:.2f}</code> → <code>₹{ce_exit:.2f}</code> ({ce_pnl:+.2f})
+PE: <code>₹{pe_entry:.2f}</code> → <code>₹{pe_exit:.2f}</code> ({pe_pnl:+.2f})
+━━━━━━━━━━━━━━━━━━━
+Total P&L: <code>₹{total_pnl:+.2f}</code>
+Reason: <code>{reason}</code>
 """
         self.send(msg)
 
@@ -766,6 +827,15 @@ class OrderManager:
         min_dte = self.config.get('instruments', {}).get('min_dte', 3)
         option_type = "CE" if direction == "BULLISH" else "PE"
         return self.inst_mgr.find_atm_option(spot, option_type, min_dte)
+
+    def get_atm_straddle(self, spot: float) -> Optional[Dict]:
+        """Get ATM straddle (CE + PE) details with DTE filter.
+
+        Returns:
+            Dict with 'ce' and 'pe' option details, or None if not found
+        """
+        min_dte = self.config.get('instruments', {}).get('min_dte', 3)
+        return self.inst_mgr.find_atm_straddle(spot, min_dte)
 
     def get_option_ltp(self, symbol: str) -> Optional[float]:
         """Get LTP for option"""
@@ -1005,11 +1075,21 @@ class ZScoreBot:
             'spot': 0.0,
             'current_fut': 0.0,
             'next_fut': 0.0,
-            'option': 0.0
+            'option': 0.0,
+            'ce': 0.0,  # For straddle
+            'pe': 0.0   # For straddle
         }
         self.option_symbol = None
         self.option_token = None
         self.lot_size = 75  # Will be updated from instruments
+
+        # Straddle tracking
+        self.straddle_mode = True  # Always use straddle
+        self.ce_symbol = None
+        self.ce_token = None
+        self.pe_symbol = None
+        self.pe_token = None
+        self.straddle_entry_value = 0.0  # Combined CE + PE entry price
 
         # WebSocket
         self.ticker = None
@@ -1122,6 +1202,10 @@ class ZScoreBot:
                 self.prices['next_fut'] = ltp
             elif token == self.option_token:
                 self.prices['option'] = ltp
+            elif token == self.ce_token:
+                self.prices['ce'] = ltp
+            elif token == self.pe_token:
+                self.prices['pe'] = ltp
 
     def _on_connect(self, ws, response):
         """WebSocket connect callback"""
@@ -1227,112 +1311,227 @@ class ZScoreBot:
         return False
 
     def process_entry(self, z_score: float, basis: float, fut_used: str, spot: float):
-        """Process entry signal using database"""
+        """Process entry signal - buy straddle (both CE and PE)"""
 
-        # Determine market direction for CE/PE selection
-        direction = self.signal_engine.get_direction(lookback_minutes=5)
-        if direction == "NEUTRAL":
-            logging.info(f"Skipping entry - market direction is NEUTRAL (no clear trend)")
+        # Get ATM straddle (both CE and PE)
+        straddle = self.order_mgr.get_atm_straddle(spot)
+        if not straddle:
+            logging.error("Could not find ATM straddle")
+            self.telegram.alert_error("ATM straddle not found")
             return
 
-        option_type = "CE" if direction == "BULLISH" else "PE"
-        logging.info(f"Market direction: {direction} -> Selecting {option_type}")
+        ce = straddle['ce']
+        pe = straddle['pe']
+        lot_size = straddle['lot_size']
 
-        # Get ATM option based on direction (includes lot_size from instruments)
-        option = self.order_mgr.get_atm_option(spot, direction)
-        if not option:
-            logging.error(f"Could not find ATM {option_type} option")
-            self.telegram.alert_error(f"ATM {option_type} option not found")
-            return
-
-        symbol = option['symbol']
-        token = option['token']
-        lot_size = option.get('lot_size', 75)  # Get from instruments file
-
-        # Subscribe to option
-        self.option_token = token
-        self.option_symbol = symbol
+        # Store straddle details
+        self.ce_symbol = ce['symbol']
+        self.ce_token = ce['token']
+        self.pe_symbol = pe['symbol']
+        self.pe_token = pe['token']
         self.lot_size = lot_size
-        if self.ws_connected and self.ticker:
-            self.ticker.subscribe([token])
-            self.ticker.set_mode(self.ticker.MODE_LTP, [token])
 
-        # Wait for option price with retry
-        premium = None
+        logging.info(f"Straddle: CE={self.ce_symbol}, PE={self.pe_symbol}, Strike={straddle['strike']}")
+
+        # Subscribe to both options
+        if self.ws_connected and self.ticker:
+            self.ticker.subscribe([self.ce_token, self.pe_token])
+            self.ticker.set_mode(self.ticker.MODE_LTP, [self.ce_token, self.pe_token])
+
+        # Wait for option prices with retry
+        ce_premium = None
+        pe_premium = None
         for attempt in range(5):
             time.sleep(1)
-            premium = self.order_mgr.get_option_ltp(symbol)
-            if premium and premium > 0:
+            ce_premium = self.order_mgr.get_option_ltp(self.ce_symbol)
+            pe_premium = self.order_mgr.get_option_ltp(self.pe_symbol)
+            if ce_premium and ce_premium > 0 and pe_premium and pe_premium > 0:
                 break
-            logging.debug(f"Waiting for option price, attempt {attempt + 1}/5")
+            logging.debug(f"Waiting for straddle prices, attempt {attempt + 1}/5 (CE={ce_premium}, PE={pe_premium})")
 
-        if not premium or premium <= 0:
-            logging.error("Could not get option price after 5 attempts")
-            # Cleanup on failure
-            if self.ws_connected and self.ticker and self.option_token:
-                try:
-                    self.ticker.unsubscribe([self.option_token])
-                except Exception:
-                    pass
-            self.option_token = None
-            self.option_symbol = None
+        if not ce_premium or ce_premium <= 0 or not pe_premium or pe_premium <= 0:
+            logging.error(f"Could not get straddle prices after 5 attempts (CE={ce_premium}, PE={pe_premium})")
+            self._cleanup_straddle()
             return
 
-        # Calculate stop/target - qty from lot_size * max_lots
+        # Calculate combined straddle value and stop/target
+        straddle_value = ce_premium + pe_premium
+        self.straddle_entry_value = straddle_value
         qty = lot_size * self.config['risk']['max_lots']
-        stop_loss = premium * (1 - self.config['risk']['stop_loss_pct'])
-        target = premium * (1 + self.config['risk']['target_pct'])
+
+        # Stop/target based on combined straddle value
+        stop_loss = straddle_value * (1 - self.config['risk']['stop_loss_pct'])
+        target = straddle_value * (1 + self.config['risk']['target_pct'])
 
         holding_mins = self.config['strategy']['holding_minutes']
         exit_deadline = (datetime.now() + timedelta(minutes=holding_mins)).isoformat()
+        entry_time = datetime.now().isoformat()
 
         # Alert signal
         self.telegram.alert_signal(z_score, basis, fut_used, spot)
 
-        # Place order
-        success, fill_price, order_id = self.order_mgr.place_entry_order(
-            symbol, token, qty, premium
+        # Place CE order
+        ce_success, ce_fill, ce_order_id = self.order_mgr.place_entry_order(
+            self.ce_symbol, self.ce_token, qty, ce_premium
         )
-
-        if not success:
-            self.telegram.alert_error(f"Entry order failed for {symbol}")
-            # Cleanup - unsubscribe and clear option tracking
-            if self.ws_connected and self.ticker and self.option_token:
-                try:
-                    self.ticker.unsubscribe([self.option_token])
-                except Exception:
-                    pass
-            self.option_token = None
-            self.option_symbol = None
+        if not ce_success:
+            self.telegram.alert_error(f"CE entry order failed for {self.ce_symbol}")
+            self._cleanup_straddle()
             return
 
-        # Create position in DB
-        db_position = DBPosition(
+        # Place PE order
+        pe_success, pe_fill, pe_order_id = self.order_mgr.place_entry_order(
+            self.pe_symbol, self.pe_token, qty, pe_premium
+        )
+        if not pe_success:
+            self.telegram.alert_error(f"PE entry order failed for {self.pe_symbol}")
+            # Need to exit the CE leg we just bought
+            self.order_mgr.place_exit_order(self.ce_symbol, qty, ce_fill)
+            self._cleanup_straddle()
+            return
+
+        # Create CE position in DB
+        ce_position = DBPosition(
             trade_date=date.today().isoformat(),
-            symbol=symbol,
-            instrument_token=token,
+            symbol=self.ce_symbol,
+            instrument_token=self.ce_token,
             qty=qty,
             lot_size=lot_size,
-            entry_order_id=order_id,
-            entry_price=fill_price,
-            entry_time=datetime.now().isoformat(),
+            entry_order_id=ce_order_id,
+            entry_price=ce_fill,
+            entry_time=entry_time,
             entry_spot=spot,
             entry_z_score=z_score,
             entry_basis=basis,
             fut_used=fut_used,
-            stop_loss=stop_loss,
-            target=target,
+            stop_loss=stop_loss,  # Combined straddle stop
+            target=target,  # Combined straddle target
             exit_deadline=exit_deadline,
             status="OPEN",
             paper_trade=self.config['paper_trade']
         )
-        self.db.create_position(db_position)
+        self.db.create_position(ce_position)
+
+        # Create PE position in DB
+        pe_position = DBPosition(
+            trade_date=date.today().isoformat(),
+            symbol=self.pe_symbol,
+            instrument_token=self.pe_token,
+            qty=qty,
+            lot_size=lot_size,
+            entry_order_id=pe_order_id,
+            entry_price=pe_fill,
+            entry_time=entry_time,
+            entry_spot=spot,
+            entry_z_score=z_score,
+            entry_basis=basis,
+            fut_used=fut_used,
+            stop_loss=stop_loss,  # Combined straddle stop
+            target=target,  # Combined straddle target
+            exit_deadline=exit_deadline,
+            status="OPEN",
+            paper_trade=self.config['paper_trade']
+        )
+        self.db.create_position(pe_position)
+
+        # Update combined entry value
+        self.straddle_entry_value = ce_fill + pe_fill
 
         # Alert
-        self.telegram.alert_entry(
-            symbol, qty, fill_price, stop_loss, target,
-            self.config['paper_trade']
+        self.telegram.alert_straddle_entry(
+            self.ce_symbol, self.pe_symbol, qty, ce_fill, pe_fill,
+            stop_loss, target, self.config['paper_trade']
         )
+
+        logging.info(f"Straddle entry: CE@{ce_fill:.2f} + PE@{pe_fill:.2f} = {self.straddle_entry_value:.2f}")
+
+    def _cleanup_straddle(self):
+        """Cleanup straddle tracking on failure"""
+        if self.ws_connected and self.ticker:
+            tokens = []
+            if self.ce_token:
+                tokens.append(self.ce_token)
+            if self.pe_token:
+                tokens.append(self.pe_token)
+            if tokens:
+                try:
+                    self.ticker.unsubscribe(tokens)
+                except Exception:
+                    pass
+        self.ce_token = None
+        self.ce_symbol = None
+        self.pe_token = None
+        self.pe_symbol = None
+        self.straddle_entry_value = 0.0
+        self.prices['ce'] = 0.0
+        self.prices['pe'] = 0.0
+
+    def process_straddle_exit(self, positions: list, reason: str, ce_price: float, pe_price: float):
+        """Process straddle exit - close both CE and PE legs"""
+
+        if len(positions) != 2:
+            logging.error(f"Expected 2 positions for straddle exit, got {len(positions)}")
+            return
+
+        # Identify CE and PE positions
+        ce_pos = None
+        pe_pos = None
+        for pos in positions:
+            if 'CE' in pos.symbol:
+                ce_pos = pos
+            elif 'PE' in pos.symbol:
+                pe_pos = pos
+
+        if not ce_pos or not pe_pos:
+            logging.error("Could not identify CE and PE positions")
+            return
+
+        # Exit CE leg
+        ce_success, ce_fill, ce_order_id = self.order_mgr.place_exit_order(
+            ce_pos.symbol, ce_pos.qty, ce_price
+        )
+        if not ce_success:
+            self.telegram.alert_error(f"CE exit failed for {ce_pos.symbol}")
+            self.db.mark_position_error(ce_pos.id, f"EXIT_FAILED_{reason}")
+
+        # Exit PE leg
+        pe_success, pe_fill, pe_order_id = self.order_mgr.place_exit_order(
+            pe_pos.symbol, pe_pos.qty, pe_price
+        )
+        if not pe_success:
+            self.telegram.alert_error(f"PE exit failed for {pe_pos.symbol}")
+            self.db.mark_position_error(pe_pos.id, f"EXIT_FAILED_{reason}")
+
+        if not ce_success or not pe_success:
+            logging.critical("Straddle exit partially failed - MANUAL INTERVENTION REQUIRED")
+            return
+
+        # Close positions in DB
+        self.db.close_position(ce_pos.id, ce_fill, self.prices['spot'], reason, ce_order_id)
+        self.db.close_position(pe_pos.id, pe_fill, self.prices['spot'], reason, pe_order_id)
+
+        # Calculate combined P&L
+        ce_pnl = (ce_fill - ce_pos.entry_price) * ce_pos.qty
+        pe_pnl = (pe_fill - pe_pos.entry_price) * pe_pos.qty
+        total_pnl = ce_pnl + pe_pnl
+
+        # Check daily loss
+        stats = self.db.get_today_stats()
+        if stats.get('gross_pnl', 0) <= -self.config['risk']['max_daily_loss']:
+            self.telegram.alert_error("Daily loss limit hit! Trading stopped.")
+
+        # Alert
+        self.telegram.alert_straddle_exit(
+            ce_pos.symbol, pe_pos.symbol,
+            ce_pos.entry_price, ce_fill,
+            pe_pos.entry_price, pe_fill,
+            total_pnl, reason, self.config['paper_trade']
+        )
+
+        # Cleanup
+        self._cleanup_straddle()
+
+        logging.info(f"Straddle exit: CE P&L=₹{ce_pnl:+.2f}, PE P&L=₹{pe_pnl:+.2f}, Total=₹{total_pnl:+.2f}, Reason={reason}")
 
     def process_exit(self, db_pos: DBPosition, reason: str, current_premium: float):
         """Process exit using database with retry logic"""
@@ -1500,39 +1699,74 @@ Charges: <code>₹{charges:,.2f}</code>
                     last_log = time.time()
                     self.consecutive_errors = 0  # Reset error count on successful tick
 
-                # Get current position from DB
-                open_position = self.db.get_open_position()
+                # Get all open positions from DB (straddle = 2 positions)
+                open_positions = self.db.get_all_open_positions()
 
                 # Check for exit first (if in position)
-                if open_position:
-                    current_premium = self.prices['option']
+                if open_positions:
+                    # Straddle mode - check combined value
+                    if len(open_positions) == 2:
+                        ce_price = self.prices['ce']
+                        pe_price = self.prices['pe']
 
-                    # If option price is stale (0), try REST API fallback
-                    if current_premium <= 0 and self.option_symbol:
-                        logging.debug("Option price stale, trying REST API")
-                        rest_price = self.order_mgr.get_option_ltp(self.option_symbol)
-                        if rest_price:
-                            current_premium = rest_price
-                            self.prices['option'] = rest_price  # Update cache
+                        # Try REST API fallback if prices are stale
+                        if ce_price <= 0 and self.ce_symbol:
+                            ce_price = self.order_mgr.get_option_ltp(self.ce_symbol) or 0
+                            self.prices['ce'] = ce_price
+                        if pe_price <= 0 and self.pe_symbol:
+                            pe_price = self.order_mgr.get_option_ltp(self.pe_symbol) or 0
+                            self.prices['pe'] = pe_price
 
-                    if current_premium > 0:
-                        # Convert DB position to Position dataclass for signal engine
-                        pos = Position(
-                            active=True,
-                            symbol=open_position.symbol,
-                            entry_price=open_position.entry_price,
-                            stop_loss=open_position.stop_loss,
-                            target=open_position.target,
-                            exit_deadline=open_position.exit_deadline
-                        )
-                        should_exit, reason = self.signal_engine.should_exit(
-                            pos, current_premium, z_score
-                        )
-                        if should_exit:
-                            self.process_exit(open_position, reason, current_premium)
-                    else:
-                        # Still no price - log warning
-                        logging.warning(f"No option price available for {open_position.symbol}")
+                        if ce_price > 0 and pe_price > 0:
+                            current_straddle_value = ce_price + pe_price
+
+                            # Use first position's stop/target (same for both in straddle)
+                            first_pos = open_positions[0]
+
+                            # Check exit conditions based on combined straddle value
+                            pos = Position(
+                                active=True,
+                                symbol="STRADDLE",
+                                entry_price=self.straddle_entry_value,
+                                stop_loss=first_pos.stop_loss,
+                                target=first_pos.target,
+                                exit_deadline=first_pos.exit_deadline
+                            )
+                            should_exit, reason = self.signal_engine.should_exit(
+                                pos, current_straddle_value, z_score
+                            )
+                            if should_exit:
+                                self.process_straddle_exit(open_positions, reason, ce_price, pe_price)
+                        else:
+                            logging.warning(f"Straddle prices stale: CE={ce_price}, PE={pe_price}")
+
+                    # Single position (legacy or partial)
+                    elif len(open_positions) == 1:
+                        open_position = open_positions[0]
+                        current_premium = self.prices['option']
+
+                        if current_premium <= 0 and self.option_symbol:
+                            rest_price = self.order_mgr.get_option_ltp(self.option_symbol)
+                            if rest_price:
+                                current_premium = rest_price
+                                self.prices['option'] = rest_price
+
+                        if current_premium > 0:
+                            pos = Position(
+                                active=True,
+                                symbol=open_position.symbol,
+                                entry_price=open_position.entry_price,
+                                stop_loss=open_position.stop_loss,
+                                target=open_position.target,
+                                exit_deadline=open_position.exit_deadline
+                            )
+                            should_exit, reason = self.signal_engine.should_exit(
+                                pos, current_premium, z_score
+                            )
+                            if should_exit:
+                                self.process_exit(open_position, reason, current_premium)
+                        else:
+                            logging.warning(f"No option price available for {open_position.symbol}")
 
                 # Check for entry (if no position)
                 else:
