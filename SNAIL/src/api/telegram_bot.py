@@ -15,7 +15,6 @@ Implements hybrid architecture: alerts via HTTP, commands via polling.
 import os
 import threading
 import time
-import json
 from collections import deque
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
@@ -24,7 +23,7 @@ from enum import Enum
 import requests
 from loguru import logger
 
-from src.api.telegram_alerts import TelegramAlerts, get_telegram
+from src.api.telegram_alerts import get_telegram
 
 
 # =============================================================================
@@ -141,7 +140,7 @@ class TelegramBot:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID required")
 
         self.base_url = f"{TELEGRAM_API}{self.bot_token}"
-        self._last_update_id = 0
+        self._last_update_id = self._load_update_offset()  # Load persisted offset
         self._running = False
         self._poll_thread: Optional[threading.Thread] = None
 
@@ -170,6 +169,38 @@ class TelegramBot:
 
         # Register default commands
         self._register_default_commands()
+
+    # =========================================================================
+    # UPDATE OFFSET PERSISTENCE
+    # =========================================================================
+
+    def _load_update_offset(self) -> int:
+        """Load last update offset from file (shared with TelegramResponseHandler)."""
+        try:
+            from pathlib import Path
+            # Use the same offset file as TelegramResponseHandler
+            project_root = Path(__file__).parent.parent.parent
+            offset_file = project_root / "data" / "telegram_update_offset.txt"
+
+            if offset_file.exists():
+                return int(offset_file.read_text().strip())
+            return 0
+
+        except Exception as e:
+            logger.warning(f"Could not load update offset: {e}")
+            return 0
+
+    def _save_update_offset(self, offset: int) -> None:
+        """Save update offset to file (shared with TelegramResponseHandler)."""
+        try:
+            from pathlib import Path
+            project_root = Path(__file__).parent.parent.parent
+            offset_file = project_root / "data" / "telegram_update_offset.txt"
+            offset_file.parent.mkdir(parents=True, exist_ok=True)
+            offset_file.write_text(str(offset))
+
+        except Exception as e:
+            logger.warning(f"Could not save update offset: {e}")
 
     # =========================================================================
     # COMMAND REGISTRATION
@@ -292,6 +323,10 @@ class TelegramBot:
                 if update:
                     updates.append(update)
                     self._last_update_id = max(self._last_update_id, update.update_id)
+
+            # Persist offset to file so restarts don't re-process old messages
+            if updates:
+                self._save_update_offset(self._last_update_id)
 
             return updates
 
@@ -418,7 +453,7 @@ class TelegramBot:
                 normalized_response = "skip"
 
             if normalized_response:
-                from src.api.response_handler import TelegramResponseHandler, RESPONSE_QUEUE_FILE
+                from src.api.response_handler import TelegramResponseHandler
                 TelegramResponseHandler.write_shared_response(
                     text=normalized_response,
                     chat_id=str(update.chat_id)
@@ -816,7 +851,7 @@ _VIX Range for entry: 10-16_""")
     def _cmd_cooldown(self, update: TelegramUpdate, args: List[str]):
         """Handle /cooldown command - shows/clears cooldowns."""
         try:
-            from src.utils.db import is_on_cooldown, get_cooldown_remaining, clear_cooldown
+            from src.utils.db import get_cooldown_remaining, clear_cooldown
 
             # Check for clear argument
             if args and args[0].lower() == 'clear':
@@ -1256,7 +1291,7 @@ P&L: *-₹{abs(current_pnl):,.0f}*
             logger.error(f"Error sending photo: {e}")
             return False
 
-    def _answer_callback(self, callback_query_id: str, text: str = None):
+    def _answer_callback(self, callback_query_id: str, text: Optional[str] = None):
         """Answer a callback query to stop loading animation."""
         try:
             url = f"{self.base_url}/answerCallbackQuery"

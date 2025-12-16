@@ -324,7 +324,7 @@ class TelegramResponseHandler:
                                     valid_responses.append(resp)
                                 else:
                                     logger.warning(f"Rejecting stale response (age={age_seconds:.0f}s): {resp}")
-                            except:
+                            except (ValueError, TypeError):
                                 valid_responses.append(resp)  # Keep if timestamp parse fails
                         else:
                             valid_responses.append(resp)  # Keep if no timestamp
@@ -343,6 +343,8 @@ class TelegramResponseHandler:
         Clear all responses from the shared queue.
         Call this BEFORE sending a new prompt to prevent stale responses.
 
+        Uses file locking to prevent race conditions with concurrent processes.
+
         Returns:
             Number of responses cleared
         """
@@ -354,17 +356,19 @@ class TelegramResponseHandler:
             if not queue_file.exists():
                 return 0
 
-            with open(queue_file, 'r') as f:
-                content = f.read().strip()
-                if not content or content == '[]':
-                    return 0
-                responses = json.loads(content)
+            # Use file lock for atomic read-clear operation
+            with FileLock(RESPONSE_LOCK_FILE):
+                with open(queue_file, 'r') as f:
+                    content = f.read().strip()
+                    if not content or content == '[]':
+                        return 0
+                    responses = json.loads(content)
 
-            count = len(responses) if isinstance(responses, list) else 0
-            if count > 0:
-                queue_file.write_text('[]')
-                logger.warning(f"Cleared {count} stale response(s) from shared queue: {responses}")
-            return count
+                count = len(responses) if isinstance(responses, list) else 0
+                if count > 0:
+                    queue_file.write_text('[]')
+                    logger.warning(f"Cleared {count} stale response(s) from shared queue: {responses}")
+                return count
 
         except Exception as e:
             logger.warning(f"Could not clear shared queue: {e}")
@@ -398,7 +402,7 @@ class TelegramResponseHandler:
                     try:
                         with open(queue_file, 'r') as f:
                             responses = json.load(f)
-                    except:
+                    except (json.JSONDecodeError, IOError):
                         responses = []
 
                 # Add new response
@@ -451,7 +455,7 @@ class TelegramResponseHandler:
                     try:
                         with open(queue_file, 'r') as f:
                             callbacks = json.load(f)
-                    except:
+                    except (json.JSONDecodeError, IOError):
                         callbacks = []
 
                 # Add new callback
@@ -516,7 +520,7 @@ class TelegramResponseHandler:
                                     valid_callbacks.append(cb)
                                 else:
                                     logger.warning(f"Rejecting stale callback (age={age_seconds:.0f}s): {cb}")
-                            except:
+                            except (ValueError, TypeError):
                                 valid_callbacks.append(cb)
                         else:
                             valid_callbacks.append(cb)
@@ -627,7 +631,6 @@ class TelegramResponseHandler:
         # Extract message details
         chat_id = str(message.get('chat', {}).get('id', ''))
         text = message.get('text', '').strip()
-        message_id = message.get('message_id')
         from_user = message.get('from', {}).get('username', 'unknown')
 
         # Verify chat ID
