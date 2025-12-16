@@ -1,0 +1,22 @@
+# Backtest data and results
+backtest/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.env
+
+# Data files with sensitive info
+data/kite_access_token.json
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/

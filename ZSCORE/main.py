@@ -1082,6 +1082,404 @@ class OrderManager:
                 self.db.create_order(order)
             return False, 0.0, order.order_id if order_created else ""
 
+    # =========================================================================
+    # SMART EXIT METHODS (Bid/Ask Optimization)
+    # =========================================================================
+
+    def get_market_depth(self, symbol: str) -> Optional[Dict]:
+        """
+        Fetch bid/ask depth for a symbol.
+
+        Returns:
+            {
+                'best_bid': float,
+                'best_ask': float,
+                'spread': float,
+                'mid_price': float,
+                'bid_qty': int,
+                'ask_qty': int,
+            }
+            or None if fetch fails
+        """
+        try:
+            quote = self.kite.quote([f"NFO:{symbol}"])
+            data = quote.get(f"NFO:{symbol}", {})
+            depth = data.get('depth', {})
+
+            buy_depth = depth.get('buy', [])
+            sell_depth = depth.get('sell', [])
+
+            if not buy_depth or not sell_depth:
+                logging.warning(f"Empty depth for {symbol}")
+                return None
+
+            best_bid = buy_depth[0]['price'] if buy_depth[0]['price'] > 0 else 0
+            best_ask = sell_depth[0]['price'] if sell_depth[0]['price'] > 0 else 0
+
+            if best_bid <= 0 or best_ask <= 0:
+                logging.warning(f"Invalid bid/ask for {symbol}: bid={best_bid}, ask={best_ask}")
+                return None
+
+            spread = best_ask - best_bid
+            mid_price = (best_bid + best_ask) / 2
+
+            return {
+                'best_bid': best_bid,
+                'best_ask': best_ask,
+                'spread': spread,
+                'mid_price': mid_price,
+                'bid_qty': buy_depth[0].get('quantity', 0),
+                'ask_qty': sell_depth[0].get('quantity', 0),
+                'last_price': data.get('last_price', mid_price),
+            }
+        except Exception as e:
+            logging.error(f"Failed to get depth for {symbol}: {e}")
+            return None
+
+    def place_limit_exit(self, symbol: str, qty: int, price: float) -> Optional[str]:
+        """
+        Place a LIMIT sell order. Returns order_id or None if failed.
+        Does not wait for fill - caller must monitor.
+        """
+        try:
+            order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=self.kite.EXCHANGE_NFO,
+                tradingsymbol=symbol,
+                transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                quantity=qty,
+                product=self.kite.PRODUCT_MIS,
+                order_type=self.kite.ORDER_TYPE_LIMIT,
+                price=price
+            )
+            logging.info(f"Placed LIMIT sell {qty} {symbol} @ {price}, order_id={order_id}")
+            return str(order_id)
+        except Exception as e:
+            logging.error(f"Failed to place limit exit for {symbol}: {e}")
+            return None
+
+    def place_market_exit(self, symbol: str, qty: int) -> Optional[str]:
+        """
+        Place a MARKET sell order. Returns order_id or None if failed.
+        """
+        try:
+            order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=self.kite.EXCHANGE_NFO,
+                tradingsymbol=symbol,
+                transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                quantity=qty,
+                product=self.kite.PRODUCT_MIS,
+                order_type=self.kite.ORDER_TYPE_MARKET
+            )
+            logging.info(f"Placed MARKET sell {qty} {symbol}, order_id={order_id}")
+            return str(order_id)
+        except Exception as e:
+            logging.error(f"Failed to place market exit for {symbol}: {e}")
+            return None
+
+    def modify_order_to_market(self, order_id: str) -> bool:
+        """Convert a limit order to market order."""
+        try:
+            self.kite.modify_order(
+                variety=self.kite.VARIETY_REGULAR,
+                order_id=order_id,
+                order_type=self.kite.ORDER_TYPE_MARKET
+            )
+            logging.info(f"Modified order {order_id} to MARKET")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to modify order {order_id} to market: {e}")
+            return False
+
+    def get_order_status_quick(self, order_id: str) -> Dict:
+        """
+        Quick order status check (single call, no retry).
+        Returns {'status': str, 'filled_qty': int, 'price': float}
+        """
+        try:
+            orders = self.kite.order_history(order_id)
+            if orders:
+                latest = orders[-1]
+                return {
+                    'status': latest.get('status', 'UNKNOWN'),
+                    'filled_qty': latest.get('filled_quantity', 0),
+                    'price': latest.get('average_price', 0.0),
+                }
+        except Exception as e:
+            logging.error(f"Order status check failed for {order_id}: {e}")
+        return {'status': 'UNKNOWN', 'filled_qty': 0, 'price': 0.0}
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order."""
+        try:
+            self.kite.cancel_order(
+                variety=self.kite.VARIETY_REGULAR,
+                order_id=order_id
+            )
+            logging.info(f"Cancelled order {order_id}")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to cancel order {order_id}: {e}")
+            return False
+
+    def exit_straddle_smart(
+        self,
+        ce_symbol: str,
+        pe_symbol: str,
+        qty: int,
+        ce_expected_price: float,
+        pe_expected_price: float
+    ) -> Tuple[bool, bool, float, float, str, str]:
+        """
+        Smart straddle exit with parallel limit orders and cross-leg acceleration.
+
+        Algorithm:
+        1. Fetch market depth for both legs
+        2. If spread > 1pt, use LIMIT at mid-price; else use MARKET
+        3. Monitor both orders in parallel (3s timeout)
+        4. If one leg fills, immediately convert other to market (cross-leg acceleration)
+        5. At timeout, convert any unfilled to market
+
+        Args:
+            ce_symbol: CE option symbol
+            pe_symbol: PE option symbol
+            qty: Quantity per leg
+            ce_expected_price: Expected CE price (for paper mode / fallback)
+            pe_expected_price: Expected PE price (for paper mode / fallback)
+
+        Returns:
+            (ce_success, pe_success, ce_fill_price, pe_fill_price, ce_order_id, pe_order_id)
+        """
+        TIMEOUT = 3.0
+        POLL_INTERVAL = 0.3
+        SPREAD_THRESHOLD = 1.0
+
+        # Paper trading mode - use mid-price simulation
+        if self.paper_mode:
+            ce_depth = self.get_market_depth(ce_symbol)
+            pe_depth = self.get_market_depth(pe_symbol)
+
+            # Use mid-price if available, else expected price
+            ce_fill = ce_depth['mid_price'] if ce_depth else ce_expected_price
+            pe_fill = pe_depth['mid_price'] if pe_depth else pe_expected_price
+
+            ce_order_id = f"PAPER_EXIT_{int(time.time())}_CE"
+            pe_order_id = f"PAPER_EXIT_{int(time.time())}_PE"
+
+            # Calculate savings for logging
+            if ce_depth and ce_depth['spread'] > SPREAD_THRESHOLD:
+                ce_saved = ce_fill - ce_depth['best_bid']
+                logging.info(f"[PAPER] CE smart exit: mid={ce_fill:.2f}, bid={ce_depth['best_bid']:.2f}, saved={ce_saved:+.2f}")
+            if pe_depth and pe_depth['spread'] > SPREAD_THRESHOLD:
+                pe_saved = pe_fill - pe_depth['best_bid']
+                logging.info(f"[PAPER] PE smart exit: mid={pe_fill:.2f}, bid={pe_depth['best_bid']:.2f}, saved={pe_saved:+.2f}")
+
+            logging.info(f"[PAPER] Smart straddle exit: CE={ce_fill:.2f}, PE={pe_fill:.2f}")
+
+            # Create order records
+            for symbol, fill, order_id in [(ce_symbol, ce_fill, ce_order_id), (pe_symbol, pe_fill, pe_order_id)]:
+                order = Order(
+                    order_type="EXIT",
+                    symbol=symbol,
+                    qty=qty,
+                    side="SELL",
+                    order_status="COMPLETE",
+                    expected_price=fill,
+                    fill_price=fill,
+                    order_id=order_id,
+                    paper_trade=True
+                )
+                self.db.create_order(order)
+
+            return True, True, ce_fill, pe_fill, ce_order_id, pe_order_id
+
+        # Live trading mode
+        # 1. Fetch depth for both legs
+        ce_depth = self.get_market_depth(ce_symbol)
+        pe_depth = self.get_market_depth(pe_symbol)
+
+        ce_use_limit = ce_depth and ce_depth['spread'] > SPREAD_THRESHOLD
+        pe_use_limit = pe_depth and pe_depth['spread'] > SPREAD_THRESHOLD
+
+        # Log spread info
+        if ce_depth:
+            logging.info(f"CE depth: bid={ce_depth['best_bid']:.2f}, ask={ce_depth['best_ask']:.2f}, "
+                        f"spread={ce_depth['spread']:.2f}, use_limit={ce_use_limit}")
+        if pe_depth:
+            logging.info(f"PE depth: bid={pe_depth['best_bid']:.2f}, ask={pe_depth['best_ask']:.2f}, "
+                        f"spread={pe_depth['spread']:.2f}, use_limit={pe_use_limit}")
+
+        # 2. Place both orders simultaneously
+        ce_order_id: Optional[str] = None
+        pe_order_id: Optional[str] = None
+        ce_filled = False
+        pe_filled = False
+        ce_fill_price = 0.0
+        pe_fill_price = 0.0
+        ce_is_limit = False  # Track if order is currently a limit order
+        pe_is_limit = False
+
+        # Place CE order
+        if ce_use_limit and ce_depth:
+            ce_mid = ce_depth['mid_price']
+            ce_order_id = self.place_limit_exit(ce_symbol, qty, ce_mid)
+            if ce_order_id:
+                ce_is_limit = True
+            else:
+                # Fallback to market
+                ce_order_id = self.place_market_exit(ce_symbol, qty)
+        else:
+            ce_order_id = self.place_market_exit(ce_symbol, qty)
+
+        # Place PE order
+        if pe_use_limit and pe_depth:
+            pe_mid = pe_depth['mid_price']
+            pe_order_id = self.place_limit_exit(pe_symbol, qty, pe_mid)
+            if pe_order_id:
+                pe_is_limit = True
+            else:
+                pe_order_id = self.place_market_exit(pe_symbol, qty)
+        else:
+            pe_order_id = self.place_market_exit(pe_symbol, qty)
+
+        # Handle order placement failures
+        # FIX #14: If one leg fails to place, cancel the other to avoid orphan
+        if not ce_order_id and not pe_order_id:
+            logging.error("Both exit orders failed to place")
+            return False, False, 0.0, 0.0, "", ""
+
+        if not ce_order_id and pe_order_id:
+            logging.error("CE order failed, canceling PE to avoid orphan")
+            self.cancel_order(pe_order_id)
+            return False, False, 0.0, 0.0, "", ""
+
+        if ce_order_id and not pe_order_id:
+            logging.error("PE order failed, canceling CE to avoid orphan")
+            self.cancel_order(ce_order_id)
+            return False, False, 0.0, 0.0, "", ""
+
+        # 3. Monitor with cross-leg acceleration
+        start = time.time()
+
+        while time.time() - start < TIMEOUT:
+            # Check CE status
+            if ce_order_id and not ce_filled:
+                ce_status = self.get_order_status_quick(ce_order_id)
+                if ce_status['status'] == 'COMPLETE':
+                    ce_filled = True
+                    ce_fill_price = ce_status['price']
+                    ce_is_limit = False  # Order complete, no longer modifiable
+                    logging.info(f"CE filled at {ce_fill_price:.2f}")
+
+                    # CROSS-LEG ACCELERATION: Convert PE to market immediately
+                    # FIX #11 & #12: Re-check PE status before modifying to prevent double execution
+                    if pe_order_id and not pe_filled and pe_is_limit:
+                        # Re-check PE status first to avoid race condition
+                        pe_recheck = self.get_order_status_quick(pe_order_id)
+                        if pe_recheck['status'] == 'COMPLETE':
+                            # PE already filled, don't modify
+                            pe_filled = True
+                            pe_fill_price = pe_recheck['price']
+                            pe_is_limit = False
+                            logging.info(f"PE already filled at {pe_fill_price:.2f}")
+                        else:
+                            logging.info("CE filled - converting PE to market (cross-leg)")
+                            if self.modify_order_to_market(pe_order_id):
+                                pe_is_limit = False
+                            # If modify fails, order might be filled or rejected
+                            # Don't place new order - will check status next iteration
+
+            # Check PE status
+            if pe_order_id and not pe_filled:
+                pe_status = self.get_order_status_quick(pe_order_id)
+                if pe_status['status'] == 'COMPLETE':
+                    pe_filled = True
+                    pe_fill_price = pe_status['price']
+                    pe_is_limit = False
+                    logging.info(f"PE filled at {pe_fill_price:.2f}")
+
+                    # CROSS-LEG ACCELERATION: Convert CE to market immediately
+                    if ce_order_id and not ce_filled and ce_is_limit:
+                        # Re-check CE status first
+                        ce_recheck = self.get_order_status_quick(ce_order_id)
+                        if ce_recheck['status'] == 'COMPLETE':
+                            ce_filled = True
+                            ce_fill_price = ce_recheck['price']
+                            ce_is_limit = False
+                            logging.info(f"CE already filled at {ce_fill_price:.2f}")
+                        else:
+                            logging.info("PE filled - converting CE to market (cross-leg)")
+                            if self.modify_order_to_market(ce_order_id):
+                                ce_is_limit = False
+
+            if ce_filled and pe_filled:
+                break
+
+            time.sleep(POLL_INTERVAL)
+
+        # 4. Timeout - force market any remaining
+        elapsed = time.time() - start
+
+        # FIX #11: Check status BEFORE modifying to prevent double execution
+        if ce_order_id and not ce_filled:
+            ce_status = self.get_order_status_quick(ce_order_id)
+            if ce_status['status'] == 'COMPLETE':
+                ce_filled = True
+                ce_fill_price = ce_status['price']
+                logging.info(f"CE filled during timeout check at {ce_fill_price:.2f}")
+            elif ce_is_limit:
+                logging.warning(f"CE timeout after {elapsed:.1f}s - converting to market")
+                self.modify_order_to_market(ce_order_id)
+                ce_is_limit = False
+
+        if pe_order_id and not pe_filled:
+            pe_status = self.get_order_status_quick(pe_order_id)
+            if pe_status['status'] == 'COMPLETE':
+                pe_filled = True
+                pe_fill_price = pe_status['price']
+                logging.info(f"PE filled during timeout check at {pe_fill_price:.2f}")
+            elif pe_is_limit:
+                logging.warning(f"PE timeout after {elapsed:.1f}s - converting to market")
+                self.modify_order_to_market(pe_order_id)
+                pe_is_limit = False
+
+        # 5. Wait for final fills (with shorter verify timeout)
+        # FIX #16: Reduced verify timeout from 5s to 2s to limit total time
+        if ce_order_id and not ce_filled:
+            status, price = self.verify_order(ce_order_id, max_wait=2)
+            ce_filled = status == 'COMPLETE'
+            ce_fill_price = price if ce_filled else 0.0
+
+        if pe_order_id and not pe_filled:
+            status, price = self.verify_order(pe_order_id, max_wait=2)
+            pe_filled = status == 'COMPLETE'
+            pe_fill_price = price if pe_filled else 0.0
+
+        # Log results
+        total_time = time.time() - start
+        logging.info(f"Smart exit complete in {total_time:.1f}s: "
+                    f"CE={ce_filled}@{ce_fill_price:.2f}, PE={pe_filled}@{pe_fill_price:.2f}")
+
+        # Calculate and log savings
+        if ce_depth and ce_filled and ce_fill_price > 0:
+            ce_saved = ce_fill_price - ce_depth['best_bid']
+            if ce_saved > 0.1:
+                logging.info(f"CE saved {ce_saved:.2f} pts vs market bid")
+        if pe_depth and pe_filled and pe_fill_price > 0:
+            pe_saved = pe_fill_price - pe_depth['best_bid']
+            if pe_saved > 0.1:
+                logging.info(f"PE saved {pe_saved:.2f} pts vs market bid")
+
+        return (
+            ce_filled,
+            pe_filled,
+            ce_fill_price,
+            pe_fill_price,
+            ce_order_id or "",
+            pe_order_id or ""
+        )
+
 # =============================================================================
 # MAIN TRADING BOT
 # =============================================================================
@@ -1632,7 +2030,7 @@ class ZScoreBot:
         self.prices['pe'] = 0.0
 
     def process_straddle_exit(self, positions: list, reason: str, ce_price: float, pe_price: float):
-        """Process straddle exit - close both CE and PE legs with retry logic"""
+        """Process straddle exit using smart bid/ask optimization with cross-leg acceleration"""
 
         if len(positions) != 2:
             logging.error(f"Expected 2 positions for straddle exit, got {len(positions)}")
@@ -1651,42 +2049,36 @@ class ZScoreBot:
             logging.error("Could not identify CE and PE positions")
             return
 
-        max_retries = 2
+        # Use smart exit with bid/ask optimization and cross-leg acceleration
+        # This handles parallel execution, limit orders at mid-price, and market fallback
+        logging.info(f"Starting smart straddle exit: CE={ce_pos.symbol}, PE={pe_pos.symbol}")
 
-        # Exit CE leg with retry
-        ce_success = False
-        ce_fill = 0.0
-        ce_order_id = ""
-        for attempt in range(max_retries):
+        ce_success, pe_success, ce_fill, pe_fill, ce_order_id, pe_order_id = \
+            self.order_mgr.exit_straddle_smart(
+                ce_symbol=ce_pos.symbol,
+                pe_symbol=pe_pos.symbol,
+                qty=ce_pos.qty,
+                ce_expected_price=ce_price,
+                pe_expected_price=pe_price
+            )
+
+        # If smart exit failed completely, try fallback with simple market orders
+        if not ce_success and not pe_success:
+            logging.warning("Smart exit failed for both legs, attempting market fallback")
             ce_success, ce_fill, ce_order_id = self.order_mgr.place_exit_order(
                 ce_pos.symbol, ce_pos.qty, ce_price
             )
-            if ce_success:
-                break
-            logging.warning(f"CE exit attempt {attempt + 1} failed, {'retrying...' if attempt < max_retries - 1 else 'giving up'}")
-            if attempt < max_retries - 1:
-                time.sleep(2)
-
-        if not ce_success:
-            self.telegram.alert_error(f"CE exit failed for {ce_pos.symbol} after {max_retries} attempts")
-            self.db.mark_position_error(ce_pos.id, f"EXIT_FAILED_{reason}")
-
-        # Exit PE leg with retry
-        pe_success = False
-        pe_fill = 0.0
-        pe_order_id = ""
-        for attempt in range(max_retries):
             pe_success, pe_fill, pe_order_id = self.order_mgr.place_exit_order(
                 pe_pos.symbol, pe_pos.qty, pe_price
             )
-            if pe_success:
-                break
-            logging.warning(f"PE exit attempt {attempt + 1} failed, {'retrying...' if attempt < max_retries - 1 else 'giving up'}")
-            if attempt < max_retries - 1:
-                time.sleep(2)
+
+        # Handle failures
+        if not ce_success:
+            self.telegram.alert_error(f"CE exit failed for {ce_pos.symbol}")
+            self.db.mark_position_error(ce_pos.id, f"EXIT_FAILED_{reason}")
 
         if not pe_success:
-            self.telegram.alert_error(f"PE exit failed for {pe_pos.symbol} after {max_retries} attempts")
+            self.telegram.alert_error(f"PE exit failed for {pe_pos.symbol}")
             self.db.mark_position_error(pe_pos.id, f"EXIT_FAILED_{reason}")
 
         # Handle partial success - close successful leg in DB even if other failed
