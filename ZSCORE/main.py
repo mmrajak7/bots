@@ -29,14 +29,14 @@ import csv
 import statistics
 from datetime import datetime, timedelta, date
 from collections import deque
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 
 # Kite Connect
 from kiteconnect import KiteConnect, KiteTicker
 
 # Local imports
-from db import TradingDB, Order, Position as DBPosition, DailySummary, BOT_ID
+from db import TradingDB, Order, Position as DBPosition, DailySummary
 
 # Estimated charges per lot (Rs) - brokerage + STT + GST + exchange
 CHARGES_PER_LOT = 62
@@ -271,7 +271,7 @@ class InstrumentManager:
                         'strike': row.get('strike', ''),
                         'lot_size': row.get('lot_size', '')
                     }
-                except (ValueError, KeyError) as e:
+                except (ValueError, KeyError):
                     skipped += 1
                     continue
         if skipped > 0:
@@ -1277,23 +1277,66 @@ class ZScoreBot:
             self.start_websocket()
 
     def check_and_recover_position(self):
-        """Check for existing position on startup from DB"""
-        db_pos = self.db.get_open_position()
-        if db_pos:
+        """Check for existing positions on startup from DB (handles straddle)"""
+        positions = self.db.get_all_open_positions()
+
+        if not positions:
+            return False
+
+        # Straddle recovery (2 positions)
+        if len(positions) == 2:
+            ce_pos = None
+            pe_pos = None
+            for pos in positions:
+                if 'CE' in pos.symbol:
+                    ce_pos = pos
+                elif 'PE' in pos.symbol:
+                    pe_pos = pos
+
+            if ce_pos and pe_pos:
+                logging.info(f"Recovering straddle: CE={ce_pos.symbol}, PE={pe_pos.symbol}")
+
+                # Restore straddle tracking
+                ce_token = self.inst_mgr.get_token(ce_pos.symbol)
+                pe_token = self.inst_mgr.get_token(pe_pos.symbol)
+
+                if ce_token and pe_token:
+                    self.ce_symbol = ce_pos.symbol
+                    self.ce_token = ce_token
+                    self.pe_symbol = pe_pos.symbol
+                    self.pe_token = pe_token
+                    self.lot_size = ce_pos.lot_size
+
+                    # Restore straddle entry value from DB
+                    self.straddle_entry_value = ce_pos.entry_price + pe_pos.entry_price
+
+                    # Subscribe to both options
+                    if self.ws_connected and self.ticker:
+                        self.ticker.subscribe([ce_token, pe_token])
+                        self.ticker.set_mode(self.ticker.MODE_LTP, [ce_token, pe_token])
+
+                    self.telegram.send(f"🔄 <b>Straddle Recovered</b>\nCE: {ce_pos.symbol}\nPE: {pe_pos.symbol}\nEntry: ₹{self.straddle_entry_value:.2f}")
+                    return True
+                else:
+                    logging.error(f"Could not find tokens for straddle recovery")
+            else:
+                logging.warning("Found 2 positions but couldn't identify CE/PE pair")
+
+        # Single position recovery (legacy)
+        elif len(positions) == 1:
+            db_pos = positions[0]
             logging.info(f"Found existing position in DB: {db_pos.symbol}")
 
-            # Get current option token
             token = self.inst_mgr.get_token(db_pos.symbol)
             if token:
                 self.option_token = token
                 self.option_symbol = db_pos.symbol
                 self.lot_size = db_pos.lot_size
-                # Re-subscribe if WS is connected
+
                 if self.ws_connected and self.ticker:
                     self.ticker.subscribe([token])
                     self.ticker.set_mode(self.ticker.MODE_LTP, [token])
 
-                # Create Position dataclass for alert
                 pos = Position(
                     active=True,
                     symbol=db_pos.symbol,
@@ -1306,7 +1349,6 @@ class ZScoreBot:
                 return True
             else:
                 logging.error(f"Could not find token for {db_pos.symbol}")
-                # Don't auto-close - this needs manual intervention
 
         return False
 
@@ -1385,8 +1427,34 @@ class ZScoreBot:
         )
         if not pe_success:
             self.telegram.alert_error(f"PE entry order failed for {self.pe_symbol}")
-            # Need to exit the CE leg we just bought
-            self.order_mgr.place_exit_order(self.ce_symbol, qty, ce_fill)
+            # Try to exit the CE leg we just bought
+            exit_success, exit_price, exit_order_id = self.order_mgr.place_exit_order(
+                self.ce_symbol, qty, ce_fill
+            )
+            if not exit_success:
+                # CRITICAL: CE position is live but PE failed - create DB record for manual handling
+                logging.critical(f"ORPHANED POSITION: CE {self.ce_symbol} is live, PE failed, CE exit also failed!")
+                ce_position = DBPosition(
+                    trade_date=date.today().isoformat(),
+                    symbol=self.ce_symbol,
+                    instrument_token=self.ce_token,
+                    qty=qty,
+                    lot_size=lot_size,
+                    entry_order_id=ce_order_id,
+                    entry_price=ce_fill,
+                    entry_time=entry_time,
+                    entry_spot=spot,
+                    entry_z_score=z_score,
+                    entry_basis=basis,
+                    fut_used=fut_used,
+                    stop_loss=ce_fill * 0.8,  # Emergency stop
+                    target=ce_fill * 1.2,
+                    exit_deadline=(datetime.now() + timedelta(minutes=30)).isoformat(),
+                    status="OPEN",
+                    paper_trade=self.config['paper_trade']
+                )
+                self.db.create_position(ce_position)
+                self.telegram.alert_error("CRITICAL: Orphaned CE position created - MANUAL INTERVENTION REQUIRED")
             self._cleanup_straddle()
             return
 
@@ -1467,7 +1535,7 @@ class ZScoreBot:
         self.prices['pe'] = 0.0
 
     def process_straddle_exit(self, positions: list, reason: str, ce_price: float, pe_price: float):
-        """Process straddle exit - close both CE and PE legs"""
+        """Process straddle exit - close both CE and PE legs with retry logic"""
 
         if len(positions) != 2:
             logging.error(f"Expected 2 positions for straddle exit, got {len(positions)}")
@@ -1486,20 +1554,42 @@ class ZScoreBot:
             logging.error("Could not identify CE and PE positions")
             return
 
-        # Exit CE leg
-        ce_success, ce_fill, ce_order_id = self.order_mgr.place_exit_order(
-            ce_pos.symbol, ce_pos.qty, ce_price
-        )
+        max_retries = 2
+
+        # Exit CE leg with retry
+        ce_success = False
+        ce_fill = 0.0
+        ce_order_id = ""
+        for attempt in range(max_retries):
+            ce_success, ce_fill, ce_order_id = self.order_mgr.place_exit_order(
+                ce_pos.symbol, ce_pos.qty, ce_price
+            )
+            if ce_success:
+                break
+            logging.warning(f"CE exit attempt {attempt + 1} failed, {'retrying...' if attempt < max_retries - 1 else 'giving up'}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+
         if not ce_success:
-            self.telegram.alert_error(f"CE exit failed for {ce_pos.symbol}")
+            self.telegram.alert_error(f"CE exit failed for {ce_pos.symbol} after {max_retries} attempts")
             self.db.mark_position_error(ce_pos.id, f"EXIT_FAILED_{reason}")
 
-        # Exit PE leg
-        pe_success, pe_fill, pe_order_id = self.order_mgr.place_exit_order(
-            pe_pos.symbol, pe_pos.qty, pe_price
-        )
+        # Exit PE leg with retry
+        pe_success = False
+        pe_fill = 0.0
+        pe_order_id = ""
+        for attempt in range(max_retries):
+            pe_success, pe_fill, pe_order_id = self.order_mgr.place_exit_order(
+                pe_pos.symbol, pe_pos.qty, pe_price
+            )
+            if pe_success:
+                break
+            logging.warning(f"PE exit attempt {attempt + 1} failed, {'retrying...' if attempt < max_retries - 1 else 'giving up'}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+
         if not pe_success:
-            self.telegram.alert_error(f"PE exit failed for {pe_pos.symbol}")
+            self.telegram.alert_error(f"PE exit failed for {pe_pos.symbol} after {max_retries} attempts")
             self.db.mark_position_error(pe_pos.id, f"EXIT_FAILED_{reason}")
 
         if not ce_success or not pe_success:
