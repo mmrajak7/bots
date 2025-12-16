@@ -601,6 +601,7 @@ class SignalEngine:
     def __init__(self, lookback: int = 20):
         self.lookback = lookback
         self.basis_buffer = deque(maxlen=lookback)
+        self.spot_buffer = deque(maxlen=lookback)  # Track spot for direction
         self.last_minute = None
 
     def update(self, spot: float, current_fut: float, next_fut: float,
@@ -630,6 +631,7 @@ class SignalEngine:
         current_minute = datetime.now().strftime("%H:%M")
         if current_minute != self.last_minute:
             self.basis_buffer.append(basis_pct)
+            self.spot_buffer.append(spot)  # Track spot for direction
             self.last_minute = current_minute
 
         # Calculate z-score
@@ -645,6 +647,64 @@ class SignalEngine:
         z_score = (basis_pct - mean) / std
 
         return z_score, active_basis, fut_used, basis_pct
+
+    def get_direction(self, lookback_minutes: int = 5) -> str:
+        """
+        Determine market direction based on momentum (rate of change).
+
+        Uses average per-minute momentum over the lookback period to smooth out noise.
+        Also checks consistency - how many candles moved in the same direction.
+
+        Args:
+            lookback_minutes: How many minutes to analyze (default 5)
+
+        Returns:
+            "BULLISH" if strong upward momentum
+            "BEARISH" if strong downward momentum
+            "NEUTRAL" if weak/mixed momentum
+        """
+        if len(self.spot_buffer) < lookback_minutes + 1:
+            return "NEUTRAL"
+
+        # Get recent prices
+        recent_prices = list(self.spot_buffer)[-lookback_minutes - 1:]
+
+        # Calculate per-minute changes
+        changes = []
+        for i in range(1, len(recent_prices)):
+            change = recent_prices[i] - recent_prices[i - 1]
+            changes.append(change)
+
+        if not changes:
+            return "NEUTRAL"
+
+        # Calculate momentum metrics
+        total_change = sum(changes)
+        avg_change = total_change / len(changes)
+
+        # Count direction consistency
+        up_candles = sum(1 for c in changes if c > 0)
+        down_candles = sum(1 for c in changes if c < 0)
+
+        # Calculate momentum as points per minute
+        momentum = avg_change
+
+        # Log for debugging
+        import logging
+        logging.debug(f"Momentum: {momentum:.2f} pts/min, Up: {up_candles}, Down: {down_candles}")
+
+        # Thresholds:
+        # - Need at least 1 pt/min average momentum
+        # - Need majority of candles in same direction (>60%)
+        min_momentum = 1.0  # points per minute
+        consistency_threshold = 0.6  # 60% of candles in same direction
+
+        if momentum > min_momentum and (up_candles / len(changes)) >= consistency_threshold:
+            return "BULLISH"
+        elif momentum < -min_momentum and (down_candles / len(changes)) >= consistency_threshold:
+            return "BEARISH"
+        else:
+            return "NEUTRAL"
 
     def should_exit(self, position: Position, current_premium: float,
                     z_score: float) -> Tuple[bool, str]:
@@ -693,10 +753,19 @@ class OrderManager:
         self.paper_mode = paper_mode
         self.config = config
 
-    def get_atm_option(self, spot: float) -> Optional[Dict]:
-        """Get ATM CE option details with DTE filter"""
+    def get_atm_option(self, spot: float, direction: str = "BULLISH") -> Optional[Dict]:
+        """Get ATM option details with DTE filter.
+
+        Args:
+            spot: Current spot price for ATM strike calculation
+            direction: Market direction - "BULLISH" for CE, "BEARISH" for PE
+
+        Returns:
+            Option dict with symbol, token, strike, expiry, dte, lot_size
+        """
         min_dte = self.config.get('instruments', {}).get('min_dte', 3)
-        return self.inst_mgr.find_atm_option(spot, "CE", min_dte)
+        option_type = "CE" if direction == "BULLISH" else "PE"
+        return self.inst_mgr.find_atm_option(spot, option_type, min_dte)
 
     def get_option_ltp(self, symbol: str) -> Optional[float]:
         """Get LTP for option"""
@@ -1160,11 +1229,20 @@ class ZScoreBot:
     def process_entry(self, z_score: float, basis: float, fut_used: str, spot: float):
         """Process entry signal using database"""
 
-        # Get ATM option (includes lot_size from instruments)
-        option = self.order_mgr.get_atm_option(spot)
+        # Determine market direction for CE/PE selection
+        direction = self.signal_engine.get_direction(lookback_minutes=5)
+        if direction == "NEUTRAL":
+            logging.info(f"Skipping entry - market direction is NEUTRAL (no clear trend)")
+            return
+
+        option_type = "CE" if direction == "BULLISH" else "PE"
+        logging.info(f"Market direction: {direction} -> Selecting {option_type}")
+
+        # Get ATM option based on direction (includes lot_size from instruments)
+        option = self.order_mgr.get_atm_option(spot, direction)
         if not option:
-            logging.error("Could not find ATM option")
-            self.telegram.alert_error("ATM option not found")
+            logging.error(f"Could not find ATM {option_type} option")
+            self.telegram.alert_error(f"ATM {option_type} option not found")
             return
 
         symbol = option['symbol']
