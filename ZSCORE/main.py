@@ -28,6 +28,7 @@ import requests
 import csv
 import statistics
 import uuid
+import concurrent.futures
 from datetime import datetime, timedelta, date
 from collections import deque
 from typing import Dict, Optional, Tuple
@@ -770,14 +771,20 @@ class SignalEngine:
 
     def should_exit(self, position: Position, current_premium: float,
                     z_score: float) -> Tuple[bool, str]:
-        """Check if exit conditions are met"""
+        """Check if exit conditions are met.
+
+        For straddle (symbol="STRADDLE"):
+        - Only TIME and TARGET exits (no stop loss, no z-revert)
+        - Rationale: One leg saves in volatility, theta decay minimal with DTE>3
+        """
 
         if not position.active:
             return False, ""
 
         now = datetime.now()
+        is_straddle = position.symbol == "STRADDLE"
 
-        # Time-based exit (with validation)
+        # Time-based exit (with validation) - applies to all
         if position.exit_deadline:
             try:
                 deadline = datetime.fromisoformat(position.exit_deadline)
@@ -786,17 +793,19 @@ class SignalEngine:
             except ValueError:
                 logging.warning(f"Invalid exit_deadline format: {position.exit_deadline}")
 
-        # Target hit
+        # Target hit - applies to all
         if current_premium >= position.target:
             return True, "TARGET"
 
-        # Stop loss hit
-        if current_premium <= position.stop_loss:
-            return True, "STOP_LOSS"
+        # Stop loss - DISABLED for straddle (time exit handles risk)
+        if not is_straddle and position.stop_loss > 0:
+            if current_premium <= position.stop_loss:
+                return True, "STOP_LOSS"
 
-        # Z-score reversion (optional)
-        if z_score < 0:
-            return True, "Z_REVERT"
+        # Z-score reversion - DISABLED for straddle (basis revert != volatility end)
+        if not is_straddle:
+            if z_score < 0:
+                return True, "Z_REVERT"
 
         return False, ""
 
@@ -837,6 +846,37 @@ class OrderManager:
         """
         min_dte = self.config.get('instruments', {}).get('min_dte', 3)
         return self.inst_mgr.find_atm_straddle(spot, min_dte)
+
+    def place_straddle_entry_parallel(self, ce_symbol: str, ce_token: int,
+                                       pe_symbol: str, pe_token: int,
+                                       qty: int, ce_price: float, pe_price: float
+                                       ) -> Tuple[bool, bool, float, float, str, str]:
+        """Place CE and PE entry orders in parallel for minimal leg risk.
+
+        Returns:
+            (ce_success, pe_success, ce_fill, pe_fill, ce_order_id, pe_order_id)
+        """
+        def place_ce():
+            return self.place_entry_order(ce_symbol, ce_token, qty, ce_price)
+
+        def place_pe():
+            return self.place_entry_order(pe_symbol, pe_token, qty, pe_price)
+
+        # Execute both orders in parallel using ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            ce_future = executor.submit(place_ce)
+            pe_future = executor.submit(place_pe)
+
+            # Wait for both to complete
+            ce_result = ce_future.result()
+            pe_result = pe_future.result()
+
+        ce_success, ce_fill, ce_order_id = ce_result
+        pe_success, pe_fill, pe_order_id = pe_result
+
+        logging.info(f"Parallel straddle entry: CE={ce_success}@{ce_fill}, PE={pe_success}@{pe_fill}")
+
+        return ce_success, pe_success, ce_fill, pe_fill, ce_order_id, pe_order_id
 
     def get_option_ltp(self, symbol: str) -> Optional[float]:
         """Get LTP for option"""
@@ -1418,27 +1458,58 @@ class ZScoreBot:
         # Alert signal
         self.telegram.alert_signal(z_score, basis, fut_used, spot)
 
-        # Place CE order
-        ce_success, ce_fill, ce_order_id = self.order_mgr.place_entry_order(
-            self.ce_symbol, self.ce_token, qty, ce_premium
-        )
-        if not ce_success:
-            self.telegram.alert_error(f"CE entry order failed for {self.ce_symbol}")
+        # Place both orders in PARALLEL for minimal leg risk
+        ce_success, pe_success, ce_fill, pe_fill, ce_order_id, pe_order_id = \
+            self.order_mgr.place_straddle_entry_parallel(
+                self.ce_symbol, self.ce_token,
+                self.pe_symbol, self.pe_token,
+                qty, ce_premium, pe_premium
+            )
+
+        # Handle failures
+        if not ce_success and not pe_success:
+            self.telegram.alert_error(f"Both legs failed: CE={self.ce_symbol}, PE={self.pe_symbol}")
             self._cleanup_straddle()
             return
 
-        # Place PE order
-        pe_success, pe_fill, pe_order_id = self.order_mgr.place_entry_order(
-            self.pe_symbol, self.pe_token, qty, pe_premium
-        )
-        if not pe_success:
-            self.telegram.alert_error(f"PE entry order failed for {self.pe_symbol}")
-            # Try to exit the CE leg we just bought
-            exit_success, exit_price, exit_order_id = self.order_mgr.place_exit_order(
-                self.ce_symbol, qty, ce_fill
-            )
+        if not ce_success:
+            # PE succeeded but CE failed - exit PE
+            self.telegram.alert_error("CE entry failed, exiting PE leg")
+            exit_success, _, _ = self.order_mgr.place_exit_order(self.pe_symbol, qty, pe_fill)
             if not exit_success:
-                # CRITICAL: CE position is live but PE failed - create DB record for manual handling
+                # Create orphan PE position
+                logging.critical(f"ORPHANED POSITION: PE {self.pe_symbol} is live, CE failed, PE exit also failed!")
+                pe_position = DBPosition(
+                    trade_date=date.today().isoformat(),
+                    trade_group_id=self.trade_group_id,
+                    symbol=self.pe_symbol,
+                    instrument_token=self.pe_token,
+                    qty=qty,
+                    lot_size=lot_size,
+                    entry_order_id=pe_order_id,
+                    entry_price=pe_fill,
+                    entry_time=entry_time,
+                    entry_spot=spot,
+                    entry_z_score=z_score,
+                    entry_basis=basis,
+                    fut_used=fut_used,
+                    stop_loss=pe_fill * 0.8,
+                    target=pe_fill * 1.2,
+                    exit_deadline=(datetime.now() + timedelta(minutes=30)).isoformat(),
+                    status="OPEN",
+                    paper_trade=self.config['paper_trade']
+                )
+                self.db.create_position(pe_position)
+                self.telegram.alert_error("CRITICAL: Orphaned PE position created - MANUAL INTERVENTION REQUIRED")
+            self._cleanup_straddle()
+            return
+
+        if not pe_success:
+            # CE succeeded but PE failed - exit CE
+            self.telegram.alert_error("PE entry failed, exiting CE leg")
+            exit_success, _, _ = self.order_mgr.place_exit_order(self.ce_symbol, qty, ce_fill)
+            if not exit_success:
+                # Create orphan CE position
                 logging.critical(f"ORPHANED POSITION: CE {self.ce_symbol} is live, PE failed, CE exit also failed!")
                 ce_position = DBPosition(
                     trade_date=date.today().isoformat(),
@@ -1454,7 +1525,7 @@ class ZScoreBot:
                     entry_z_score=z_score,
                     entry_basis=basis,
                     fut_used=fut_used,
-                    stop_loss=ce_fill * 0.8,  # Emergency stop
+                    stop_loss=ce_fill * 0.8,
                     target=ce_fill * 1.2,
                     exit_deadline=(datetime.now() + timedelta(minutes=30)).isoformat(),
                     status="OPEN",
@@ -1465,7 +1536,7 @@ class ZScoreBot:
             self._cleanup_straddle()
             return
 
-        # Create CE position in DB
+        # Both legs succeeded - create positions in DB
         ce_position = DBPosition(
             trade_date=date.today().isoformat(),
             trade_group_id=self.trade_group_id,
