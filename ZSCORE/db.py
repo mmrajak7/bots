@@ -38,6 +38,7 @@ class Position:
     id: int = 0
     bot_id: str = BOT_ID
     trade_date: str = ""
+    trade_group_id: str = ""  # Links CE+PE legs of a straddle
     symbol: str = ""
     instrument_token: int = 0
     qty: int = 0
@@ -127,6 +128,7 @@ class TradingDB:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 bot_id TEXT NOT NULL,
                 trade_date TEXT,
+                trade_group_id TEXT,
                 symbol TEXT,
                 instrument_token INTEGER,
                 qty INTEGER,
@@ -153,6 +155,12 @@ class TradingDB:
             )
         """)
 
+        # Migration: Add trade_group_id column if not exists (for existing DBs)
+        try:
+            cursor.execute("ALTER TABLE positions ADD COLUMN trade_group_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # Daily summary table - UNIQUE on (bot_id, trade_date) for multi-bot support
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS daily_summary (
@@ -177,6 +185,7 @@ class TradingDB:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_bot_id ON positions(bot_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_date ON positions(trade_date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_group ON positions(trade_group_id)")
 
         conn.commit()
         conn.close()
@@ -253,13 +262,13 @@ class TradingDB:
         cursor = conn.cursor()
 
         cursor.execute("""
-            INSERT INTO positions (bot_id, trade_date, symbol, instrument_token, qty, lot_size,
+            INSERT INTO positions (bot_id, trade_date, trade_group_id, symbol, instrument_token, qty, lot_size,
                                   entry_order_id, exit_order_id, entry_price, exit_price,
                                   entry_time, exit_time, entry_spot, exit_spot,
                                   entry_z_score, entry_basis, fut_used, stop_loss, target,
                                   exit_deadline, exit_reason, pnl, pnl_pct, status, paper_trade)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (pos.bot_id, pos.trade_date, pos.symbol, pos.instrument_token, pos.qty, pos.lot_size,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (pos.bot_id, pos.trade_date, pos.trade_group_id, pos.symbol, pos.instrument_token, pos.qty, pos.lot_size,
               pos.entry_order_id, pos.exit_order_id, pos.entry_price, pos.exit_price,
               pos.entry_time, pos.exit_time, pos.entry_spot, pos.exit_spot,
               pos.entry_z_score, pos.entry_basis, pos.fut_used, pos.stop_loss, pos.target,
@@ -288,6 +297,9 @@ class TradingDB:
         if row:
             data = dict(row)
             data['paper_trade'] = bool(data.get('paper_trade', 0))
+            # Handle missing trade_group_id for legacy records
+            if 'trade_group_id' not in data:
+                data['trade_group_id'] = ''
             return Position(**data)
         return None
 
@@ -309,6 +321,32 @@ class TradingDB:
         for row in rows:
             data = dict(row)
             data['paper_trade'] = bool(data.get('paper_trade', 0))
+            # Handle missing trade_group_id for legacy records
+            if 'trade_group_id' not in data:
+                data['trade_group_id'] = ''
+            positions.append(Position(**data))
+        return positions
+
+    def get_positions_by_group(self, trade_group_id: str) -> List[Position]:
+        """Get all positions with the same trade_group_id (both legs of straddle)"""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM positions
+            WHERE bot_id = ? AND trade_group_id = ?
+            ORDER BY id ASC
+        """, (BOT_ID, trade_group_id))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        positions = []
+        for row in rows:
+            data = dict(row)
+            data['paper_trade'] = bool(data.get('paper_trade', 0))
+            if 'trade_group_id' not in data:
+                data['trade_group_id'] = ''
             positions.append(Position(**data))
         return positions
 

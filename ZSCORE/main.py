@@ -27,6 +27,7 @@ import logging
 import requests
 import csv
 import statistics
+import uuid
 from datetime import datetime, timedelta, date
 from collections import deque
 from typing import Dict, Optional, Tuple
@@ -1090,6 +1091,7 @@ class ZScoreBot:
         self.pe_symbol = None
         self.pe_token = None
         self.straddle_entry_value = 0.0  # Combined CE + PE entry price
+        self.trade_group_id = ""  # Links CE+PE as one straddle trade
 
         # WebSocket
         self.ticker = None
@@ -1307,8 +1309,9 @@ class ZScoreBot:
                     self.pe_token = pe_token
                     self.lot_size = ce_pos.lot_size
 
-                    # Restore straddle entry value from DB
+                    # Restore straddle entry value and group ID from DB
                     self.straddle_entry_value = ce_pos.entry_price + pe_pos.entry_price
+                    self.trade_group_id = ce_pos.trade_group_id
 
                     # Subscribe to both options
                     if self.ws_connected and self.ticker:
@@ -1318,7 +1321,7 @@ class ZScoreBot:
                     self.telegram.send(f"🔄 <b>Straddle Recovered</b>\nCE: {ce_pos.symbol}\nPE: {pe_pos.symbol}\nEntry: ₹{self.straddle_entry_value:.2f}")
                     return True
                 else:
-                    logging.error(f"Could not find tokens for straddle recovery")
+                    logging.error("Could not find tokens for straddle recovery")
             else:
                 logging.warning("Found 2 positions but couldn't identify CE/PE pair")
 
@@ -1409,6 +1412,9 @@ class ZScoreBot:
         exit_deadline = (datetime.now() + timedelta(minutes=holding_mins)).isoformat()
         entry_time = datetime.now().isoformat()
 
+        # Generate trade_group_id to link CE and PE legs
+        self.trade_group_id = str(uuid.uuid4())[:8]  # Short UUID for readability
+
         # Alert signal
         self.telegram.alert_signal(z_score, basis, fut_used, spot)
 
@@ -1436,6 +1442,7 @@ class ZScoreBot:
                 logging.critical(f"ORPHANED POSITION: CE {self.ce_symbol} is live, PE failed, CE exit also failed!")
                 ce_position = DBPosition(
                     trade_date=date.today().isoformat(),
+                    trade_group_id=self.trade_group_id,
                     symbol=self.ce_symbol,
                     instrument_token=self.ce_token,
                     qty=qty,
@@ -1461,6 +1468,7 @@ class ZScoreBot:
         # Create CE position in DB
         ce_position = DBPosition(
             trade_date=date.today().isoformat(),
+            trade_group_id=self.trade_group_id,
             symbol=self.ce_symbol,
             instrument_token=self.ce_token,
             qty=qty,
@@ -1483,6 +1491,7 @@ class ZScoreBot:
         # Create PE position in DB
         pe_position = DBPosition(
             trade_date=date.today().isoformat(),
+            trade_group_id=self.trade_group_id,
             symbol=self.pe_symbol,
             instrument_token=self.pe_token,
             qty=qty,
@@ -1531,6 +1540,7 @@ class ZScoreBot:
         self.pe_token = None
         self.pe_symbol = None
         self.straddle_entry_value = 0.0
+        self.trade_group_id = ""
         self.prices['ce'] = 0.0
         self.prices['pe'] = 0.0
 
