@@ -351,7 +351,11 @@ class InstrumentManager:
 
     def find_atm_option(self, spot_price: float, option_type: str = "CE",
                         min_dte: int = 3) -> Optional[Dict]:
-        """Find ATM option for weekly expiry with minimum DTE"""
+        """Find ATM option for weekly expiry with minimum DTE.
+
+        If the ideal expiry (next Thursday with min_dte) isn't available in instruments,
+        falls back to the nearest available expiry from the instruments file.
+        """
         atm_strike = round(spot_price / 50) * 50
         now = datetime.now()
         today = now.date()
@@ -360,15 +364,62 @@ class InstrumentManager:
         days_until_thursday = (3 - now.weekday()) % 7
         if days_until_thursday == 0 and now.hour >= 15:
             days_until_thursday = 7
-        expiry_date = (now + timedelta(days=days_until_thursday)).date()
+        ideal_expiry = (now + timedelta(days=days_until_thursday)).date()
 
         # Check DTE - if too close to expiry, use next week
-        dte = (expiry_date - today).days
+        dte = (ideal_expiry - today).days
         if dte < min_dte:
-            expiry_date = expiry_date + timedelta(days=7)
-            logging.info(f"Current expiry DTE={dte} < {min_dte}, using next week: {expiry_date}")
+            ideal_expiry = ideal_expiry + timedelta(days=7)
+            logging.info(f"Current expiry DTE={dte} < {min_dte}, ideal next week: {ideal_expiry}")
 
-        # Search for matching option
+        # First, collect all available expiries from instruments
+        available_expiries = set()
+        for symbol, data in self.instruments.items():
+            if not symbol.startswith('NIFTY'):
+                continue
+            if data['type'] not in ['CE', 'PE']:
+                continue
+            exp_str = data.get('expiry', '')
+            if exp_str:
+                try:
+                    exp_date = datetime.strptime(exp_str[:10], '%Y-%m-%d').date()
+                    if exp_date >= today:
+                        available_expiries.add(exp_date)
+                except Exception:
+                    continue
+
+        if not available_expiries:
+            logging.error("No valid expiries found in instruments file!")
+            return None
+
+        # Sort available expiries
+        sorted_expiries = sorted(available_expiries)
+        logging.debug(f"Available expiries in instruments: {sorted_expiries}")
+
+        # Find the best expiry to use
+        expiry_date = None
+        if ideal_expiry in available_expiries:
+            expiry_date = ideal_expiry
+        else:
+            # Ideal expiry not available - find the nearest one >= today
+            # Prefer expiries that meet min_dte requirement
+            for exp in sorted_expiries:
+                exp_dte = (exp - today).days
+                if exp_dte >= min_dte:
+                    expiry_date = exp
+                    logging.info(f"Ideal expiry {ideal_expiry} not in instruments, using available: {expiry_date}")
+                    break
+
+            # If no expiry meets min_dte, use the nearest available
+            if not expiry_date and sorted_expiries:
+                expiry_date = sorted_expiries[0]
+                logging.warning(f"No expiry meets min_dte={min_dte}, using nearest: {expiry_date}")
+
+        if not expiry_date:
+            logging.error("Could not determine expiry date")
+            return None
+
+        # Search for matching ATM option
         candidates = []
         for symbol, data in self.instruments.items():
             if not symbol.startswith('NIFTY'):
@@ -379,7 +430,6 @@ class InstrumentManager:
                 continue
 
             try:
-                # Parse expiry
                 exp_str = data['expiry']
                 if exp_str:
                     exp_date = datetime.strptime(exp_str[:10], '%Y-%m-%d').date()
@@ -407,8 +457,9 @@ class InstrumentManager:
 
         # Log available options for debugging
         logging.warning(f"No ATM option found for strike={atm_strike}, expiry={expiry_date}")
-        sample = [s for s in self.instruments.keys() if s.startswith('NIFTY') and 'CE' in s][:5]
-        logging.warning(f"Sample NIFTY options: {sample}")
+        sample = [s for s in self.instruments.keys() if s.startswith('NIFTY') and option_type in s][:5]
+        logging.warning(f"Sample NIFTY {option_type} options: {sample}")
+        logging.warning(f"Available expiries: {sorted_expiries}")
         return None
 
     def get_ltp(self, symbol: str) -> Optional[float]:
