@@ -669,16 +669,10 @@ class SignalEngine:
         if spot <= 0:
             return 0.0, 0.0, "CURRENT", 0.0
 
-        # Determine which futures to use
-        current_basis = current_fut - spot
-        next_basis = next_fut - spot
-
-        if current_basis >= min_basis_current:
-            active_basis = current_basis
-            fut_used = "CURRENT"
-        else:
-            active_basis = next_basis
-            fut_used = "NEXT"
+        # Always use CURRENT month futures (trade what you analyze)
+        # Note: min_basis_current kept in signature for backward compatibility
+        active_basis = current_fut - spot
+        fut_used = "CURRENT"
 
         # Calculate basis percentage
         basis_pct = (active_basis / spot) * 100
