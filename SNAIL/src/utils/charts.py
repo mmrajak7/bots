@@ -15,12 +15,13 @@ from datetime import datetime, date, time as dt_time, timedelta
 from typing import List, Optional, Tuple
 from loguru import logger
 
+# IST offset from UTC (5 hours 30 minutes)
+IST_OFFSET = timedelta(hours=5, minutes=30)
+
 try:
     import matplotlib
     matplotlib.use('Agg')  # Non-interactive backend for headless servers
     import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    from matplotlib.patches import Rectangle
     import numpy as np
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
@@ -72,7 +73,6 @@ def generate_pnl_chart(
         # Determine color based on final P&L
         final_pnl = pnl_values[-1]
         line_color = '#00ff88' if final_pnl >= 0 else '#ff5555'
-        fill_color = line_color
 
         # Find unique trading days
         trading_days = sorted(set(ts.date() for ts in timestamps))
@@ -80,7 +80,6 @@ def generate_pnl_chart(
         # Create sequential x-axis (market hours only)
         # Map each timestamp to a sequential position
         x_positions = []
-        x_labels = []
         day_boundaries = []
 
         current_pos = 0
@@ -99,7 +98,7 @@ def generate_pnl_chart(
 
         # Plot main P&L line
         ax.plot(x_positions, pnl_values, color=line_color, linewidth=2.5,
-                label=f'P&L', zorder=5)
+                label='P&L', zorder=5)
 
         # Fill area under curve - green for positive, red for negative
         pnl_array = np.array(pnl_values)
@@ -157,7 +156,6 @@ def generate_pnl_chart(
             day_centers = []
             day_labels = []
 
-            start_idx = 0
             for i, day in enumerate(trading_days):
                 day_timestamps = [j for j, ts in enumerate(timestamps) if ts.date() == day]
                 if day_timestamps:
@@ -266,8 +264,9 @@ def generate_daily_pnl_chart(
     if len(snapshots) < 2:
         return None, "Not enough data points (need at least 2)"
 
-    # Extract data
-    timestamps = [s.timestamp for s in snapshots if s.timestamp]
+    # Extract data and convert UTC timestamps to IST for display
+    timestamps_utc = [s.timestamp for s in snapshots if s.timestamp]
+    timestamps = [ts + IST_OFFSET for ts in timestamps_utc]  # Convert UTC -> IST
     pnl_values = [s.current_pnl for s in snapshots]
 
     if len(timestamps) != len(pnl_values):
@@ -284,13 +283,16 @@ def generate_daily_pnl_chart(
         profit_target_pct = config.get('exit', {}).get('profit_target_pct', 2.6)
         stop_loss_pct = config.get('exit', {}).get('stop_loss_pct', 50)
 
+        # Profit target: X% of margin deployed (ROM - Return on Margin)
         if position.margin_deployed > 0:
             profit_target = position.margin_deployed * profit_target_pct / 100
         elif position.max_profit > 0:
             profit_target = position.max_profit * 0.5
 
-        if position.max_loss > 0:
-            stop_loss = -(position.max_loss * stop_loss_pct / 100)
+        # Stop loss: X% loss on margin deployed (NOT max_loss)
+        # Config says: "Alert at 5% loss on margin (e.g., -₹5,000 on ₹1L margin)"
+        if position.margin_deployed > 0:
+            stop_loss = -(position.margin_deployed * stop_loss_pct / 100)
 
     # Generate title based on date range
     if timestamps:
