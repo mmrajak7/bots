@@ -570,19 +570,15 @@ Target: <code>₹{target:.2f}</code>
         self.send(msg)
 
     def alert_straddle_entry(self, ce_symbol: str, pe_symbol: str, qty: int,
-                             ce_price: float, pe_price: float, stop: float, target: float, paper: bool):
+                             ce_price: float, pe_price: float, target: float, paper: bool):
         mode = "📝 PAPER" if paper else "💰 LIVE"
         total = ce_price + pe_price
         msg = f"""
 {mode} <b>STRADDLE ENTRY</b>
-━━━━━━━━━━━━━━━━━━━
 CE: <code>{ce_symbol}</code> @ <code>₹{ce_price:.2f}</code>
 PE: <code>{pe_symbol}</code> @ <code>₹{pe_price:.2f}</code>
-Qty: <code>{qty}</code> each
-━━━━━━━━━━━━━━━━━━━
-Total: <code>₹{total:.2f}</code>
-Stop: <code>₹{stop:.2f}</code>
-Target: <code>₹{target:.2f}</code>
+Qty: <code>{qty}</code> | Total: <code>₹{total:.2f}</code>
+Target: <code>₹{target:.2f}</code> (+15%)
 """
         self.send(msg)
 
@@ -1996,10 +1992,10 @@ class ZScoreBot:
         # Update combined entry value
         self.straddle_entry_value = ce_fill + pe_fill
 
-        # Alert
+        # Alert (stop_loss not shown - disabled for straddles)
         self.telegram.alert_straddle_entry(
             self.ce_symbol, self.pe_symbol, qty, ce_fill, pe_fill,
-            stop_loss, target, self.config['paper_trade']
+            target, self.config['paper_trade']
         )
 
         logging.info(f"Straddle entry: CE@{ce_fill:.2f} + PE@{pe_fill:.2f} = {self.straddle_entry_value:.2f}")
