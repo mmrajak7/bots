@@ -23,7 +23,6 @@ from src.api.claude_client import (
     MarketContext,
     ClaudeDecision,
     ClaudeResponse,
-    DecisionType,
     get_claude_client
 )
 from src.utils.db import (
@@ -296,8 +295,8 @@ class ClaudeAdvisor:
 
         # Calculate P&L
         # Side is determined by leg_type: straddle_* = SHORT, wing_* = LONG
-        entry_straddle = sum(l.entry_price for l in legs if l.leg_type.startswith('straddle'))
-        entry_wing = sum(l.entry_price for l in legs if l.leg_type.startswith('wing'))
+        entry_straddle = sum(leg.entry_price for leg in legs if leg.leg_type.startswith('straddle'))
+        entry_wing = sum(leg.entry_price for leg in legs if leg.leg_type.startswith('wing'))
 
         current_straddle = 0.0
         current_wing = 0.0
@@ -353,7 +352,7 @@ class ClaudeAdvisor:
         Fetch actual option quotes, calculate wing distance from straddle premium,
         and format as table for Telegram.
 
-        Wing distance = Straddle Premium (CE + PE) rounded to nearest 100.
+        Wing distance = Straddle Premium (CE + PE) rounded to nearest 50.
 
         Args:
             atm_strike: ATM strike price
@@ -369,7 +368,6 @@ class ClaudeAdvisor:
 
             # Use provided expiry
             expiry = expiry_date
-            expiry_str = expiry.strftime('%d-%b')
 
             # Get lot size from instruments
             instruments_df = load_instruments(get_instruments_path())
@@ -391,7 +389,7 @@ class ClaudeAdvisor:
 
             # Calculate straddle premium (using bid prices) and wing distance
             straddle_premium = s_ce_bid + s_pe_bid
-            wing_distance = round(straddle_premium / 100) * 100
+            wing_distance = round(straddle_premium / 50) * 50  # Round to nearest 50
 
             # Ensure minimum wing distance of 200
             wing_distance = max(wing_distance, 200)
@@ -487,7 +485,7 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
         india_vix: float,
         atm_strike: int,
         dte: int,
-        expiry_date: date = None,
+        expiry_date: Optional[date] = None,
         atr_14: float = 0.0,
         nifty_forward: float = 0.0
     ) -> AdvisoryResult:
@@ -607,23 +605,23 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             # Build Telegram message (HTML format)
             # Header - show forward price (used for ATM selection)
             msg_parts = [
-                f"🤖 <b>Pre-Entry Analysis</b>",
-                f"",
+                "🤖 <b>Pre-Entry Analysis</b>",
+                "",
                 f"📊 NIFTY Forward <b>₹{display_price:,.0f}</b> | 🌡️ VIX <b>{india_vix:.1f}</b> | ⏳ DTE <b>{dte}</b> ({expiry_str})",
-                f"",
+                "",
                 option_html
             ]
 
             # Add Events section (if any)
             if events_telegram:
                 msg_parts.append("")
-                msg_parts.append(f"<b>📅 Upcoming Events:</b>")
+                msg_parts.append("<b>📅 Upcoming Events:</b>")
                 msg_parts.append(events_telegram)
 
             # Add News section (if any)
             if news_telegram:
                 msg_parts.append("")
-                msg_parts.append(f"<b>📰 News:</b>")
+                msg_parts.append("<b>📰 News:</b>")
                 msg_parts.append(news_telegram)
 
             # Add Claude analysis (if enabled)
@@ -632,9 +630,9 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
                 rec_emoji = "✅" if claude_decision == ClaudeDecision.PROCEED else "⚠️"
                 rec_text = "ENTER" if claude_decision == ClaudeDecision.PROCEED else "SKIP"
                 msg_parts.append("")
-                msg_parts.append(f"<b>📝 Claude's Analysis:</b>")
+                msg_parts.append("<b>📝 Claude's Analysis:</b>")
                 msg_parts.append(reasoning_escaped)
-                msg_parts.append(f"")
+                msg_parts.append("")
                 msg_parts.append(f"{rec_emoji} <b>Recommendation: {rec_text}</b> ({claude_confidence:.0%})")
 
             # Add user prompt

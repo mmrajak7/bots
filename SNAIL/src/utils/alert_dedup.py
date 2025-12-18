@@ -12,9 +12,8 @@ Prevents duplicate alerts from flooding Telegram within cooldown periods.
 """
 
 import hashlib
-import json
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
 from pathlib import Path
 import threading
@@ -471,7 +470,6 @@ def reset_alert_cooldown(alert_type: str) -> None:
 
 if __name__ == '__main__':
     import sys
-    import time
 
     logger.remove()
     logger.add(sys.stderr, level="DEBUG")

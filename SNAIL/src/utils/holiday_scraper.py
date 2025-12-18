@@ -12,10 +12,8 @@ Automated scraping of NSE trading holidays from Zerodha marketintel.
 """
 
 import json
-import sys
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple
-from pathlib import Path
 from loguru import logger
 
 try:

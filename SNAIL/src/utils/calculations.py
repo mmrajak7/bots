@@ -105,7 +105,7 @@ def calculate_atm_strike(spot_price: float, interval: int = NIFTY_STRIKE_INTERVA
 
     Args:
         spot_price: Current spot price
-        interval: Strike interval (default 100)
+        interval: Strike interval (default 50)
 
     Returns:
         ATM strike price
@@ -164,9 +164,9 @@ def get_atm_strike_futures_based(
     Algorithm:
     1. Get NIFTY spot and nearest futures LTP
     2. Calculate pro-rated futures premium for options expiry
-    3. Round (spot + pro_rated_premium) to nearest 100
+    3. Round (spot + pro_rated_premium) to nearest strike_interval (50)
     4. Validate with CE-PE check (|CE-PE| <= tolerance)
-    5. Adjust strike by 100 if validation fails (max iterations)
+    5. Adjust strike by strike_interval if validation fails (max iterations)
 
     Fallback: If futures unavailable, uses spot + CE-PE validation.
 
@@ -191,7 +191,7 @@ def get_atm_strike_futures_based(
 
     ce_pe_tolerance = strike_config.get('ce_pe_tolerance', 35)
     max_iterations = strike_config.get('max_iterations', 3)
-    strike_interval = strike_config.get('strike_interval', 100)
+    strike_interval = strike_config.get('strike_interval', 50)  # Default 50 for NIFTY
     use_futures = strike_config.get('use_futures', True)
     fallback_to_spot = strike_config.get('fallback_to_spot', True)
 
@@ -251,7 +251,7 @@ def get_atm_strike_futures_based(
         logger.warning(f"[STRIKE SELECTION] {warning}")
         estimated_forward = spot_price
 
-    # Step 3: Round to nearest 100 (explicitly cast to int)
+    # Step 3: Round to nearest strike_interval (explicitly cast to int)
     initial_strike = int(round(estimated_forward / strike_interval) * strike_interval)
     logger.info(f"[STRIKE SELECTION] Initial Strike: {initial_strike}")
 

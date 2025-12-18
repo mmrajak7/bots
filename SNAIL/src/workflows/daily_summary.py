@@ -20,13 +20,8 @@ from loguru import logger
 from src.api.kite_client import SNAILKiteClient, get_kite_client
 from src.api.telegram_alerts import TelegramAlerts, get_telegram
 from src.utils.db import (
-    get_db_session,
-    get_active_position,
-    get_position_legs,
-    Position,
-    PnLSnapshot
+    get_db_session
 )
-from src.utils.calculations import calculate_position_pnl
 from src.utils.config import get_trading_config, load_config
 
 

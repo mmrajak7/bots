@@ -1760,7 +1760,6 @@ def get_scaling_config(config: Dict[str, Any]) -> Dict[str, Any]:
 # =============================================================================
 
 if __name__ == '__main__':
-    import sys
 
     print("\n" + "=" * 60)
     print("SNAIL Scaled Execution Module Test")

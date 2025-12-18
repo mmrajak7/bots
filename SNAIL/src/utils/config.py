@@ -14,7 +14,7 @@ Configuration loading, validation, and environment variable substitution.
 import os
 import re
 from pathlib import Path
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional
 import yaml
 from loguru import logger
 
@@ -357,10 +357,10 @@ if __name__ == '__main__':
     try:
         config = load_config()
 
-        print(f"\n[1] Configuration loaded successfully")
+        print("\n[1] Configuration loaded successfully")
         print(f"    Root: {config['_paths']['root']}")
 
-        print(f"\n[2] Trading configuration:")
+        print("\n[2] Trading configuration:")
         trading = get_trading_config()
         print(f"    Instrument: {trading.get('instrument')}")
         print(f"    Strategy: {trading.get('strategy')}")
@@ -368,7 +368,7 @@ if __name__ == '__main__':
 
         print(f"\n[3] Paper trading: {is_paper_trading()}")
 
-        print(f"\n[4] Validating configuration...")
+        print("\n[4] Validating configuration...")
         result = validate_config()
         if result['errors']:
             print("    Errors:")

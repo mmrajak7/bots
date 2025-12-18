@@ -1247,7 +1247,6 @@ def verify_iron_fly_positions(
 # =============================================================================
 
 if __name__ == '__main__':
-    import sys
 
     print("\n" + "=" * 60)
     print("SNAIL Order Helpers Test")

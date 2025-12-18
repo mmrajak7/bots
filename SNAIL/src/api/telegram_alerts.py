@@ -13,7 +13,7 @@ Telegram messaging for trading alerts and notifications.
 
 import os
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict
 import requests
 from loguru import logger
 

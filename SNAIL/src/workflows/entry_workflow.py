@@ -12,7 +12,7 @@ Orchestrates the complete Iron Fly entry process.
 """
 
 import sys
-from datetime import datetime, date, time
+from datetime import datetime, time
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -21,9 +21,9 @@ from loguru import logger
 from src.services.entry_manager import EntryManager, EntryConditions, EntryResult, get_entry_manager
 from src.services.claude_advisor import ClaudeAdvisor, AdvisoryResult, get_claude_advisor
 from src.api.telegram_alerts import TelegramAlerts, get_telegram
-from src.api.response_handler import TelegramResponseHandler, ResponseType, get_response_handler
+from src.api.response_handler import TelegramResponseHandler, get_response_handler
 from src.utils.db import get_active_position, is_on_cooldown, check_system_ready
-from src.utils.helpers import is_trading_day, is_market_open
+from src.utils.helpers import is_trading_day
 from src.utils.config import get_trading_config, load_config
 
 
@@ -402,7 +402,7 @@ if __name__ == '__main__':
             print("\n    Skipping workflow execution")
 
         print(f"\n{'='*60}")
-        print(f"Entry workflow check complete")
+        print("Entry workflow check complete")
         print(f"{'='*60}\n")
 
     except Exception as e:

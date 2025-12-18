@@ -11,7 +11,6 @@ General utility functions for the SNAIL trading system.
 @references  TECHNICAL_DESIGN_REFERENCE.md Section 10
 """
 
-import os
 import sys
 import json
 import hashlib
@@ -881,7 +880,7 @@ if __name__ == '__main__':
     print("\n[4] Cooldown Manager:")
     cm = get_cooldown_manager()
     cm.set_cooldown("test", 5)
-    print(f"    Set cooldown for 5s")
+    print("    Set cooldown for 5s")
     print(f"    Is on cooldown: {cm.is_on_cooldown('test')}")
     print(f"    Remaining: {cm.get_remaining('test')}s")
 

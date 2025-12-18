@@ -11,14 +11,19 @@ Main entry point for the SNAIL trading system.
 @version     1.0.0
 """
 
-import os
 import sys
+import os
 import argparse
-import time
-import signal
-from datetime import datetime, time as dt_time
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from contextlib import contextmanager
+from functools import wraps
+
+# Platform-specific file locking
+if os.name == 'nt':  # Windows
+    import msvcrt
+else:  # Unix/Linux/Mac
+    import fcntl
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -29,6 +34,70 @@ from loguru import logger
 from src.utils.config import load_config, validate_config, PROJECT_ROOT
 from src.utils.helpers import setup_logging, is_trading_day, is_market_open
 from src.utils.db import init_database
+
+
+# =============================================================================
+# FILE LOCKING (ISSUE-013: Prevent concurrent cron job execution)
+# =============================================================================
+
+LOCK_FILE = PROJECT_ROOT / "data" / ".snail.lock"
+
+
+@contextmanager
+def file_lock(lock_path: Path = LOCK_FILE, timeout: float = 0):
+    """
+    Context manager for file-based locking to prevent concurrent execution.
+
+    Cross-platform: Uses fcntl on Unix/Linux, msvcrt on Windows.
+
+    Args:
+        lock_path: Path to lock file
+        timeout: Timeout in seconds (0 = non-blocking, fail immediately)
+
+    Yields:
+        Lock file handle
+
+    Raises:
+        BlockingIOError: If lock cannot be acquired (another process has it)
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, 'w')
+    try:
+        if os.name == 'nt':  # Windows
+            # Windows file locking using msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:  # Unix/Linux/Mac
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        lock_file.write(f"PID: {os.getpid()}\nTime: {datetime.now().isoformat()}\n")
+        lock_file.flush()
+        yield lock_file
+    finally:
+        if os.name == 'nt':  # Windows
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass  # Already unlocked or file issue
+        else:  # Unix/Linux/Mac
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def with_file_lock(func):
+    """
+    Decorator to ensure function runs with exclusive file lock.
+    Prevents concurrent execution of entry/exit/monitor commands.
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            with file_lock():
+                return func(*args, **kwargs)
+        except BlockingIOError:
+            logger.warning(f"Could not acquire lock - another SNAIL process is running")
+            print("⚠️ Another SNAIL process is running. Skipping to prevent conflicts.")
+            return 0
+    return wrapper
 
 
 # =============================================================================
@@ -113,6 +182,7 @@ def cmd_startup(args):
     return 0 if result.success else 1
 
 
+@with_file_lock
 def cmd_entry(args):
     """Check entry conditions or execute entry."""
     from src.services.entry_manager import get_entry_manager
@@ -151,6 +221,7 @@ def cmd_entry(args):
             print(f"   NIFTY Futures: ₹{conditions.nifty_futures:,.0f}")
         print(f"   VIX: {conditions.india_vix:.2f}")
         print(f"   ATM Strike: {conditions.atm_strike}")
+        print(f"   Wing Distance: {conditions.wing_distance}")
         print(f"   Expiry: {conditions.expiry} (DTE: {conditions.dte})")
 
         if args.execute:
@@ -174,10 +245,27 @@ def cmd_entry(args):
                 print(f"\n⏭️ Entry skipped: {advisory_result.suggested_action}")
                 return 0
 
-            # User said ENTER - execute
-            print("\n🚀 User confirmed - Executing entry...")
+            # User said ENTER - refresh conditions before executing (ISSUE-002)
+            # User may have taken 1-5 minutes to respond, market may have moved
+            print("\n🔄 Refreshing conditions before entry...")
+            fresh_conditions = manager.check_entry_conditions()
+
+            if not fresh_conditions.can_enter:
+                print(f"⚠️ Conditions changed during wait: {fresh_conditions.reason}")
+                logger.warning(f"Entry aborted - conditions changed: {fresh_conditions.reason}")
+                return 0
+
+            # Check if ATM strike changed significantly
+            if fresh_conditions.atm_strike != conditions.atm_strike:
+                print(f"⚠️ ATM strike changed: {conditions.atm_strike} → {fresh_conditions.atm_strike}")
+                logger.warning(f"ATM strike changed during wait, proceeding with new strike")
+
+            # Use fresh conditions for entry
+            print(f"\n🚀 Executing entry with fresh conditions...")
+            print(f"   ATM: {fresh_conditions.atm_strike}, Wing: {fresh_conditions.wing_distance}")
+
             result = manager.execute_entry(
-                conditions=conditions,
+                conditions=fresh_conditions,
                 require_claude_approval=False
             )
 
@@ -190,6 +278,7 @@ def cmd_entry(args):
     return 0
 
 
+@with_file_lock
 def cmd_exit(args):
     """Execute position exit."""
     from src.services.exit_manager import get_exit_manager, ExitReason
@@ -305,6 +394,7 @@ def cmd_summary(args):
     return 0
 
 
+@with_file_lock
 def cmd_monitor(args):
     """Run a single monitoring iteration (for cron)."""
     from src.workflows.monitor_workflow import MonitorWorkflow

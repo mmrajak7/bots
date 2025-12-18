@@ -15,8 +15,8 @@ import sqlite3
 import json
 from pathlib import Path
 from datetime import datetime, date, timedelta
-from typing import Optional, Dict, List, Any, Union, Tuple
-from dataclasses import dataclass, asdict
+from typing import Optional, Dict, List, Any, Tuple
+from dataclasses import dataclass
 from contextlib import contextmanager
 from loguru import logger
 
@@ -420,6 +420,58 @@ def update_position_status(
                 (status, datetime.now().isoformat(), position_id)
             )
         logger.info(f"Updated position {position_id} status to {status}")
+
+
+def record_failed_exit(
+    position_id: int,
+    legs_closed: List[str],
+    legs_failed: Dict[str, str],
+    error: str,
+    partial: bool = False
+) -> None:
+    """
+    Record a failed or partial exit attempt for audit trail.
+
+    ISSUE-008: When exit verification fails or partial exit occurs,
+    we must record what happened so:
+    1. Position shows correct status (not 'active')
+    2. User/admin knows which legs were closed
+    3. Manual intervention can be informed by the data
+
+    Args:
+        position_id: Position ID
+        legs_closed: List of leg types successfully closed
+        legs_failed: Dict of leg type -> error message for failures
+        error: Overall error message
+        partial: True if some legs closed (partial exit)
+    """
+    status = 'partial_exit' if partial else 'exit_failed'
+
+    # Build notes for audit trail
+    notes_parts = []
+    if legs_closed:
+        notes_parts.append(f"Closed: {', '.join(legs_closed)}")
+    if legs_failed:
+        failed_details = "; ".join(f"{k}: {v}" for k, v in legs_failed.items())
+        notes_parts.append(f"Failed: {failed_details}")
+    notes_parts.append(f"Error: {error}")
+    notes = " | ".join(notes_parts)
+
+    with get_db_session() as conn:
+        conn.execute(
+            """UPDATE positions SET
+                status = ?,
+                exit_reason = 'exit_failed',
+                notes = ?,
+                updated_at = ?
+            WHERE id = ?""",
+            (status, notes, datetime.now().isoformat(), position_id)
+        )
+
+    logger.critical(
+        f"RECORDED FAILED EXIT: position={position_id}, status={status}, "
+        f"closed={legs_closed}, failed={list(legs_failed.keys())}"
+    )
 
 
 def close_position(

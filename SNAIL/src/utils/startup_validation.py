@@ -13,7 +13,7 @@ all dependencies are properly configured before trading begins.
 
 import os
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
 from loguru import logger
@@ -155,7 +155,7 @@ class StartupValidator:
         from src.utils.config import load_config, get_trading_config
 
         try:
-            config = load_config()
+            load_config()  # Validates config loads successfully
             self.result.add(
                 name='CONFIG_LOAD',
                 passed=True,

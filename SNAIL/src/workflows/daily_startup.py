@@ -11,21 +11,18 @@ Morning initialization and validation procedures.
 @references  TECHNICAL_DESIGN_REFERENCE.md Section 9.1
 """
 
-import os
 import sys
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, time
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
-from pathlib import Path
 from loguru import logger
 
 from src.api.kite_client import SNAILKiteClient, get_kite_client
 from src.api.telegram_alerts import TelegramAlerts, get_telegram
-from src.api.claude_client import SNAILClaudeClient, get_claude_client
+from src.api.claude_client import get_claude_client
 from src.services.claude_advisor import ClaudeAdvisor, get_claude_advisor
 from src.utils.symbol_builder import (
     load_instruments,
-    get_target_expiry,
     get_all_expiries,
     refresh_instruments_csv,
     get_instruments_age,
@@ -52,10 +49,9 @@ from src.utils.config import (
     load_config,
     get_trading_config,
     get_instruments_path,
-    validate_config,
-    PROJECT_ROOT
+    validate_config
 )
-from src.utils.helpers import is_trading_day, is_market_open
+from src.utils.helpers import is_trading_day
 
 
 # =============================================================================
