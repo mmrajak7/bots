@@ -59,11 +59,10 @@ from src.utils.calculations import (
 from src.utils.db import (
     Position,
     PositionLeg,
-    save_position,
-    save_position_leg,
     save_position_with_legs,
     get_active_position,
-    is_on_cooldown
+    is_on_cooldown,
+    clear_cooldown
 )
 from src.utils.config import (
     get_trading_config,
@@ -811,6 +810,11 @@ class EntryManager:
             )
 
             logger.info(f"Entry complete! Position ID: {position_id}")
+
+            # Clear any stale hold cooldowns from previous positions
+            for cooldown_type in ['wing_hold', 'stop_loss_hold', 'vix_hold']:
+                clear_cooldown(cooldown_type)
+            logger.debug("Cleared stale hold cooldowns for new position")
 
             return EntryResult(
                 success=True,

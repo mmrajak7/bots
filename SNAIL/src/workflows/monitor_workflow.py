@@ -15,7 +15,7 @@ import sys
 import time
 import signal
 from datetime import datetime, date, time as dt_time
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 from loguru import logger
@@ -25,15 +25,17 @@ from src.services.exit_manager import ExitManager, ExitReason, get_exit_manager
 from src.services.entry_manager import EntryManager, get_entry_manager
 from src.services.claude_advisor import ClaudeAdvisor, get_claude_advisor
 from src.api.telegram_alerts import TelegramAlerts, get_telegram
-from src.api.telegram_bot import TelegramBot, get_telegram_bot, CallbackAction, UserResponse
+from src.api.telegram_bot import TelegramBot, get_telegram_bot, CallbackAction
 from src.utils.db import (
     get_active_position,
-    get_position_legs,
     get_latest_pnl_snapshot,
     get_today_market_data,
     capture_day_open,
     update_day_high_low,
-    check_system_ready
+    check_system_ready,
+    is_on_cooldown,
+    set_cooldown,
+    get_cooldown_remaining
 )
 from src.utils.helpers import is_trading_day, is_market_open
 from src.utils.config import get_trading_config, get_monitoring_config, load_config
@@ -377,7 +379,6 @@ class MonitorWorkflow:
         for cb in callbacks:
             action_str = cb.get('action', '')
             alert_type = cb.get('alert_type', 'unknown')
-            position_id = cb.get('position_id')
 
             logger.info(f"Processing callback from shared queue: {action_str} for {alert_type}")
 
@@ -393,8 +394,10 @@ class MonitorWorkflow:
                         )
                         return result.success
                 elif action_str == "hold":
-                    logger.info("User chose HOLD at stop loss (from callback)")
-                    self.telegram.send("*Position HELD* per your decision. Monitoring continues.")
+                    # Set 8-hour cooldown to suppress alerts and Claude API calls
+                    set_cooldown('stop_loss_hold', 8 * 3600)
+                    logger.info("User chose HOLD at stop loss - 8hr cooldown set (from callback)")
+                    self.telegram.send("*Position HELD* per your decision.\n⏰ Alerts suppressed for 8 hours.")
                     return False
                 elif action_str == "adjust":
                     logger.info("User requested adjustment at stop loss (from callback)")
@@ -427,8 +430,10 @@ class MonitorWorkflow:
                         )
                         return result.success
                 elif action_str == "hold":
-                    logger.info("User chose HOLD despite VIX warning (from callback)")
-                    self.telegram.send("*Position HELD* despite VIX warning. Monitoring closely.")
+                    # Set 8-hour cooldown to suppress alerts and Claude API calls
+                    set_cooldown('vix_hold', 8 * 3600)
+                    logger.info("User chose HOLD despite VIX warning - 8hr cooldown set (from callback)")
+                    self.telegram.send("*Position HELD* despite VIX warning.\n⏰ Alerts suppressed for 8 hours.")
                     return False
 
             elif alert_type == "wing_approach":
@@ -442,8 +447,10 @@ class MonitorWorkflow:
                         )
                         return result.success
                 elif action_str == "hold":
-                    logger.info("User chose HOLD at wing approach (from callback)")
-                    self.telegram.send("*Position HELD* at wing approach. Monitoring closely.")
+                    # Set 8-hour cooldown to suppress alerts and Claude API calls
+                    set_cooldown('wing_hold', 8 * 3600)
+                    logger.info("User chose HOLD at wing approach - 8hr cooldown set (from callback)")
+                    self.telegram.send("*Position HELD* at wing approach.\n⏰ Alerts suppressed for 8 hours.")
                     return False
                 elif action_str == "adjust":
                     logger.info("User requested adjustment at wing approach (from callback)")
@@ -489,8 +496,10 @@ class MonitorWorkflow:
                         )
                         return result.success
                 elif response.action == CallbackAction.HOLD:
-                    logger.info("User chose HOLD at stop loss")
-                    self.telegram.send("*Position HELD* per your decision. Monitoring continues.")
+                    # Set 8-hour cooldown to suppress alerts and Claude API calls
+                    set_cooldown('stop_loss_hold', 8 * 3600)
+                    logger.info("User chose HOLD at stop loss - 8hr cooldown set")
+                    self.telegram.send("*Position HELD* per your decision.\n⏰ Alerts suppressed for 8 hours.")
                     return False
                 elif response.action == CallbackAction.ADJUST:
                     logger.info("User requested adjustment at stop loss")
@@ -527,8 +536,10 @@ class MonitorWorkflow:
                         )
                         return result.success
                 elif response.action == CallbackAction.HOLD:
-                    logger.info("User chose HOLD despite VIX warning")
-                    self.telegram.send("*Position HELD* despite VIX warning. Monitoring closely.")
+                    # Set 8-hour cooldown to suppress alerts and Claude API calls
+                    set_cooldown('vix_hold', 8 * 3600)
+                    logger.info("User chose HOLD despite VIX warning - 8hr cooldown set")
+                    self.telegram.send("*Position HELD* despite VIX warning.\n⏰ Alerts suppressed for 8 hours.")
                     return False
 
             # Handle wing approach decision
@@ -544,8 +555,10 @@ class MonitorWorkflow:
                         )
                         return result.success
                 elif response.action == CallbackAction.HOLD:
-                    logger.info("User chose HOLD at wing approach")
-                    self.telegram.send("*Position HELD* at wing approach. Monitoring closely.")
+                    # Set 8-hour cooldown to suppress alerts and Claude API calls
+                    set_cooldown('wing_hold', 8 * 3600)
+                    logger.info("User chose HOLD at wing approach - 8hr cooldown set")
+                    self.telegram.send("*Position HELD* at wing approach.\n⏰ Alerts suppressed for 8 hours.")
                     return False
                 elif response.action == CallbackAction.ADJUST:
                     logger.info("User requested adjustment at wing approach")
@@ -637,6 +650,15 @@ _Fetching P&L data..._"""
         if not position:
             return False
 
+        # Skip if user previously chose HOLD (8-hour cooldown active)
+        if is_on_cooldown('vix_hold'):
+            remaining = get_cooldown_remaining('vix_hold')
+            if remaining:
+                hrs = remaining // 3600
+                mins = (remaining % 3600) // 60
+                logger.debug(f"VIX warning alert suppressed - HOLD cooldown active ({hrs}h {mins}m remaining)")
+            return False
+
         # Skip if already waiting for user decision
         if self._pending_vix_decision:
             logger.debug("Waiting for user VIX warning decision...")
@@ -678,6 +700,15 @@ _Fetching P&L data..._"""
         """
         position = get_active_position()
         if not position:
+            return False
+
+        # Skip if user previously chose HOLD (8-hour cooldown active)
+        if is_on_cooldown('wing_hold'):
+            remaining = get_cooldown_remaining('wing_hold')
+            if remaining:
+                hrs = remaining // 3600
+                mins = (remaining % 3600) // 60
+                logger.debug(f"Wing approach alert suppressed - HOLD cooldown active ({hrs}h {mins}m remaining)")
             return False
 
         # Skip if already waiting for user decision
@@ -722,6 +753,15 @@ _Fetching P&L data..._"""
         """
         position = get_active_position()
         if not position:
+            return False
+
+        # Skip if user previously chose HOLD (8-hour cooldown active)
+        if is_on_cooldown('stop_loss_hold'):
+            remaining = get_cooldown_remaining('stop_loss_hold')
+            if remaining:
+                hrs = remaining // 3600
+                mins = (remaining % 3600) // 60
+                logger.debug(f"Stop loss alert suppressed - HOLD cooldown active ({hrs}h {mins}m remaining)")
             return False
 
         # Skip if already waiting for user decision
@@ -1052,7 +1092,6 @@ def run_monitor_workflow() -> None:
 
 if __name__ == '__main__':
     from dotenv import load_dotenv
-    from datetime import timedelta
 
     load_dotenv()
 

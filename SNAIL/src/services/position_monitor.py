@@ -13,7 +13,7 @@ Continuous monitoring of active Iron Fly positions with alert generation.
 
 import time
 import threading
-from datetime import datetime, date, timedelta
+from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -21,15 +21,13 @@ from loguru import logger
 
 from src.api.kite_client import SNAILKiteClient, Quote, get_kite_client
 from src.api.telegram_alerts import TelegramAlerts, get_telegram
-from src.api.claude_client import SNAILClaudeClient, MarketContext, ClaudeDecision, get_claude_client
+from src.api.claude_client import SNAILClaudeClient, get_claude_client
 from src.services.exit_manager import ExitManager, ExitReason, get_exit_manager
 from src.utils.calculations import (
     calculate_position_pnl,
     is_approaching_wing,
     is_within_trading_hours,
-    detect_big_move,
-    calculate_atr,
-    BigMoveDetection
+    detect_big_move
 )
 from src.utils.db import (
     Position,
@@ -38,7 +36,8 @@ from src.utils.db import (
     get_active_position,
     get_position_legs,
     save_pnl_snapshot,
-    get_today_market_data
+    get_today_market_data,
+    is_on_cooldown
 )
 from src.utils.alert_dedup import should_send_alert
 from src.utils.config import get_trading_config, get_monitoring_config, load_config
@@ -321,16 +320,16 @@ class PositionMonitor:
             # Calculate P&L
             # straddle legs (straddle_ce, straddle_pe) are SHORT - we sold them
             # wing legs (wing_ce, wing_pe) are LONG - we bought them
-            entry_straddle = sum(l.entry_price for l in legs if l.leg_type.startswith('straddle'))
-            entry_wing = sum(l.entry_price for l in legs if l.leg_type.startswith('wing'))
+            entry_straddle = sum(leg.entry_price for leg in legs if leg.leg_type.startswith('straddle'))
+            entry_wing = sum(leg.entry_price for leg in legs if leg.leg_type.startswith('wing'))
 
             current_straddle = sum(
-                quotes[l.leg_type].ask for l in legs
-                if l.leg_type.startswith('straddle') and l.leg_type in quotes
+                quotes[leg.leg_type].ask for leg in legs
+                if leg.leg_type.startswith('straddle') and leg.leg_type in quotes
             )
             current_wing = sum(
-                quotes[l.leg_type].bid for l in legs
-                if l.leg_type.startswith('wing') and l.leg_type in quotes
+                quotes[leg.leg_type].bid for leg in legs
+                if leg.leg_type.startswith('wing') and leg.leg_type in quotes
             )
 
             current_pnl, pnl_pct = calculate_position_pnl(
@@ -470,7 +469,8 @@ class PositionMonitor:
 
         if loss_pct >= stop_loss_pct:
             # At stop loss level - need Claude advisory
-            if should_send_alert('stop_loss_warning', f"sl_{loss_pct:.0f}"):
+            # Skip if user previously chose HOLD (8-hour cooldown active)
+            if not is_on_cooldown('stop_loss_hold') and should_send_alert('stop_loss_warning', f"sl_{loss_pct:.0f}"):
                 # Calculate distance to nearest wing
                 ce_wing = position.atm_strike + position.wing_distance
                 pe_wing = position.atm_strike - position.wing_distance
@@ -498,7 +498,8 @@ class PositionMonitor:
         )
 
         if approaching:
-            if should_send_alert('wing_approach', f"wing_{direction}"):
+            # Skip if user previously chose HOLD (8-hour cooldown active)
+            if not is_on_cooldown('wing_hold') and should_send_alert('wing_approach', f"wing_{direction}"):
                 # Calculate wing proximity percentage and distance
                 wing_strike = position.atm_strike + (position.wing_distance if direction == 'CE' else -position.wing_distance)
                 distance_to_wing = abs(snapshot.nifty_spot - wing_strike)
@@ -517,7 +518,8 @@ class PositionMonitor:
         vix_max = vix_config.get('max', 16)
 
         if snapshot.india_vix > vix_max:
-            if should_send_alert('vix_spike', f"vix_{snapshot.india_vix:.0f}"):
+            # Skip if user previously chose HOLD (8-hour cooldown active)
+            if not is_on_cooldown('vix_hold') and should_send_alert('vix_spike', f"vix_{snapshot.india_vix:.0f}"):
                 # Calculate VIX change from entry
                 vix_change = snapshot.india_vix - self.state.entry_vix if self.state.entry_vix > 0 else 0
 
@@ -569,7 +571,7 @@ class PositionMonitor:
                         logger.warning(f"CRITICAL big move detected: {big_move_result.conditions_met}")
 
         # Periodic P&L update (every 30 minutes during market hours)
-        if should_send_alert('pnl_update', f"pnl_periodic"):
+        if should_send_alert('pnl_update', "pnl_periodic"):
             self.telegram.send_pnl_update(
                 current_pnl=snapshot.current_pnl,
                 pnl_percent=snapshot.pnl_percentage,

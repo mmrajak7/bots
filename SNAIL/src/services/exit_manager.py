@@ -20,13 +20,11 @@ from loguru import logger
 from src.api.kite_client import SNAILKiteClient, Quote, get_kite_client
 from src.api.telegram_alerts import TelegramAlerts, get_telegram
 from src.api.claude_client import SNAILClaudeClient, MarketContext, ClaudeDecision, get_claude_client
-from src.utils.symbol_builder import build_iron_fly_instruments
 from src.utils.order_helpers import (
     execute_iron_fly_exit,
     IronFlyOrders,
     ExecutedOrder,
-    OrderExecutionError,
-    verify_position
+    OrderExecutionError
 )
 from src.utils.scaled_execution import (
     ScaledOrderExecutor,
@@ -35,15 +33,16 @@ from src.utils.scaled_execution import (
 )
 from src.utils.calculations import calculate_position_pnl, calculate_transaction_charges
 from src.utils.db import (
-    get_db_session,
     Position,
     PositionLeg,
     get_active_position,
     get_position_legs,
     update_position_status,
+    record_failed_exit,
     save_order,
     Order,
-    set_cooldown
+    set_cooldown,
+    clear_cooldown
 )
 from src.utils.config import get_trading_config, load_config
 
@@ -513,13 +512,32 @@ class ExitManager:
                 issue_text = "; ".join(verification_issues)
                 logger.error(f"EXIT VERIFICATION FAILED: {issue_text}")
 
+                # ISSUE-008: Record failed exit to database
+                # Determine which legs closed vs failed based on verification
+                legs_closed = []
+                legs_failed = {}
+                for leg_type in symbols.keys():
+                    is_failed = any(leg_type in issue for issue in verification_issues)
+                    if is_failed:
+                        legs_failed[leg_type] = "Position still open after exit order"
+                    else:
+                        legs_closed.append(leg_type)
+
+                record_failed_exit(
+                    position_id=position.id,
+                    legs_closed=legs_closed,
+                    legs_failed=legs_failed,
+                    error=issue_text,
+                    partial=len(legs_closed) > 0
+                )
+
                 self.telegram.send(
                     f"[CRITICAL] *Exit Verification Failed!*\n\n"
                     f"Exit orders executed but positions may remain:\n"
                     f"{''.join(f'- {i}' + chr(10) for i in verification_issues)}\n"
                     f"[!] *Manual intervention required!*\n\n"
                     f"Check Kite positions immediately.\n"
-                    f"P&L NOT recorded due to verification failure."
+                    f"Position marked as '{('partial_exit' if legs_closed else 'exit_failed')}' in DB."
                 )
 
                 # Return partial success - orders placed but not verified
@@ -555,6 +573,11 @@ class ExitManager:
             # Set cooldown (1 day after exit)
             cooldown_hours = self.trading_config.get('exit', {}).get('cooldown_hours', 24)
             set_cooldown('entry', cooldown_hours * 3600)
+
+            # Clear hold cooldowns (no longer relevant after position exit)
+            for cooldown_type in ['wing_hold', 'stop_loss_hold', 'vix_hold']:
+                clear_cooldown(cooldown_type)
+            logger.info("Cleared hold cooldowns after position exit")
 
             # Send exit alert
             self._send_exit_alert(
@@ -615,10 +638,10 @@ class ExitManager:
 
             # Calculate current P&L for context
             # Side is determined by leg_type: straddle_* = SHORT, wing_* = LONG
-            entry_straddle = sum(l.entry_price for l in legs if l.leg_type.startswith('straddle'))
-            entry_wing = sum(l.entry_price for l in legs if l.leg_type.startswith('wing'))
-            current_straddle = sum(quotes[l.leg_type].ask for l in legs if l.leg_type.startswith('straddle'))
-            current_wing = sum(quotes[l.leg_type].bid for l in legs if l.leg_type.startswith('wing'))
+            entry_straddle = sum(leg.entry_price for leg in legs if leg.leg_type.startswith('straddle'))
+            entry_wing = sum(leg.entry_price for leg in legs if leg.leg_type.startswith('wing'))
+            current_straddle = sum(quotes[leg.leg_type].ask for leg in legs if leg.leg_type.startswith('straddle'))
+            current_wing = sum(quotes[leg.leg_type].bid for leg in legs if leg.leg_type.startswith('wing'))
 
             current_pnl, pnl_pct = calculate_position_pnl(
                 entry_straddle, entry_wing, current_straddle, current_wing,
@@ -730,8 +753,8 @@ class ExitManager:
 
         for leg_type, order in exit_orders:
             # Find matching leg
-            leg = next((l for l in legs if l.leg_type == leg_type), None)
-            if leg:
+            matching_leg = next((pos_leg for pos_leg in legs if pos_leg.leg_type == leg_type), None)
+            if matching_leg:
                 order_record = Order(
                     id=0,
                     position_id=position.id,
@@ -739,8 +762,8 @@ class ExitManager:
                     order_type='LIMIT',
                     transaction_type=order.transaction_type,
                     tradingsymbol=order.tradingsymbol,
-                    strike=leg.strike,
-                    option_type=leg.option_type,
+                    strike=matching_leg.strike,
+                    option_type=matching_leg.option_type,
                     price=order.order_price,
                     quantity=order.quantity,
                     status=order.status,
