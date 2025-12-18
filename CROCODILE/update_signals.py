@@ -294,7 +294,7 @@ def main():
 
     # Define screeners to run
     screeners = [
-        ['D', DAILY_PAYLOAD, 'Daily SuperTrend Touch'],
+        # ['D', DAILY_PAYLOAD, 'Daily SuperTrend Touch'],  # TEMPORARILY DISABLED - pushing daily signals manually
         ['W', WEEKLY_PAYLOAD, 'Weekly SuperTrend Touch']
     ]
 
