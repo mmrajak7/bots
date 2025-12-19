@@ -1221,6 +1221,118 @@ def clear_cooldown(cooldown_type: Optional[str] = None) -> int:
         return count
 
 
+# =============================================================================
+# PENDING DECISION TRACKING
+# =============================================================================
+
+def set_pending_decision(decision_type: str, position_id: int) -> None:
+    """
+    Mark that a decision alert was sent and awaiting user response.
+
+    Uses cooldowns table with 'pending_' prefix and 7-day expiry.
+    Alert will not be resent until user responds or position closes.
+
+    Args:
+        decision_type: Type of decision ('stop_loss', 'wing_approach', 'vix_warning', 'friday')
+        position_id: Position ID this decision is for
+    """
+    cooldown_type = f"pending_{decision_type}"
+    # Set 7-day expiry (effectively "until user responds")
+    duration = 7 * 24 * 3600  # 7 days in seconds
+
+    with get_db_session() as conn:
+        cooldown_end = datetime.now() + timedelta(seconds=duration)
+
+        # Use REPLACE to update if exists
+        conn.execute(
+            """INSERT OR REPLACE INTO cooldowns (position_id, cooldown_type, exit_date, cooldown_end)
+               VALUES (?, ?, ?, ?)""",
+            (position_id, cooldown_type, date.today().isoformat(), cooldown_end.isoformat())
+        )
+        logger.info(f"Pending decision '{decision_type}' set for position {position_id}")
+
+
+def has_pending_decision(decision_type: str, position_id: int) -> bool:
+    """
+    Check if a decision alert is pending user response.
+
+    Args:
+        decision_type: Type of decision ('stop_loss', 'wing_approach', 'vix_warning', 'friday')
+        position_id: Position ID to check
+
+    Returns:
+        True if alert was sent and awaiting response
+    """
+    cooldown_type = f"pending_{decision_type}"
+    now = datetime.now()
+
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            """SELECT * FROM cooldowns
+               WHERE cooldown_type = ? AND position_id = ? AND cooldown_end > ?
+               LIMIT 1""",
+            (cooldown_type, position_id, now.isoformat())
+        )
+        row = cursor.fetchone()
+
+        if row:
+            logger.debug(f"Pending decision '{decision_type}' exists for position {position_id}")
+            return True
+        return False
+
+
+def clear_pending_decision(decision_type: str, position_id: Optional[int] = None) -> int:
+    """
+    Clear pending decision when user responds.
+
+    Args:
+        decision_type: Type of decision ('stop_loss', 'wing_approach', 'vix_warning', 'friday')
+        position_id: Optional position ID (clears all if None)
+
+    Returns:
+        Number of records cleared
+    """
+    cooldown_type = f"pending_{decision_type}"
+
+    with get_db_session() as conn:
+        if position_id is not None:
+            cursor = conn.execute(
+                "DELETE FROM cooldowns WHERE cooldown_type = ? AND position_id = ?",
+                (cooldown_type, position_id)
+            )
+        else:
+            cursor = conn.execute(
+                "DELETE FROM cooldowns WHERE cooldown_type = ?",
+                (cooldown_type,)
+            )
+        count = cursor.rowcount
+        if count > 0:
+            logger.info(f"Cleared pending decision '{decision_type}'" +
+                       (f" for position {position_id}" if position_id else ""))
+        return count
+
+
+def clear_all_pending_decisions(position_id: int) -> int:
+    """
+    Clear all pending decisions for a position (e.g., when position closes).
+
+    Args:
+        position_id: Position ID
+
+    Returns:
+        Number of records cleared
+    """
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            "DELETE FROM cooldowns WHERE cooldown_type LIKE 'pending_%' AND position_id = ?",
+            (position_id,)
+        )
+        count = cursor.rowcount
+        if count > 0:
+            logger.info(f"Cleared {count} pending decision(s) for position {position_id}")
+        return count
+
+
 def get_next_trading_day(from_date: Optional[date] = None) -> date:
     """
     Get next trading day (skip weekends).

@@ -35,7 +35,11 @@ from src.utils.db import (
     check_system_ready,
     is_on_cooldown,
     set_cooldown,
-    get_cooldown_remaining
+    get_cooldown_remaining,
+    has_pending_decision,
+    set_pending_decision,
+    clear_pending_decision,
+    clear_all_pending_decisions
 )
 from src.utils.helpers import is_trading_day, is_market_open
 from src.utils.config import get_trading_config, get_monitoring_config, load_config
@@ -157,11 +161,8 @@ class MonitorWorkflow:
         self._stats = MonitorLoopStats(start_time=datetime.now())
         self._previous_close = None
 
-        # Pending user decisions (waiting for button press)
-        self._pending_stop_loss_decision = False
-        self._pending_friday_decision = False
-        self._pending_vix_decision = False
-        self._pending_wing_approach_decision = False
+        # NOTE: Pending user decisions are now tracked in DB via has_pending_decision()
+        # This survives process restarts (cron-based execution)
 
         # Signal handling
         self._setup_signal_handlers()
@@ -383,10 +384,12 @@ class MonitorWorkflow:
             logger.info(f"Processing callback from shared queue: {action_str} for {alert_type}")
 
             # Convert to UserResponse-like handling
+            position = get_active_position()
+
             if alert_type == "stop_loss":
-                self._pending_stop_loss_decision = False
+                if position:
+                    clear_pending_decision('stop_loss', position.id)
                 if action_str == "exit":
-                    position = get_active_position()
                     if position:
                         result = self.exit_manager.execute_exit(
                             reason=ExitReason.STOP_LOSS,
@@ -405,9 +408,9 @@ class MonitorWorkflow:
                     return False
 
             elif alert_type == "friday":
-                self._pending_friday_decision = False
+                if position:
+                    clear_pending_decision('friday', position.id)
                 if action_str == "exit":
-                    position = get_active_position()
                     if position:
                         result = self.exit_manager.execute_exit(
                             reason=ExitReason.FRIDAY_CLOSE,
@@ -420,9 +423,9 @@ class MonitorWorkflow:
                     return False
 
             elif alert_type == "vix_warning":
-                self._pending_vix_decision = False
+                if position:
+                    clear_pending_decision('vix_warning', position.id)
                 if action_str == "exit":
-                    position = get_active_position()
                     if position:
                         result = self.exit_manager.execute_exit(
                             reason=ExitReason.VIX_BREACH,
@@ -437,9 +440,9 @@ class MonitorWorkflow:
                     return False
 
             elif alert_type == "wing_approach":
-                self._pending_wing_approach_decision = False
+                if position:
+                    clear_pending_decision('wing_approach', position.id)
                 if action_str == "exit":
-                    position = get_active_position()
                     if position:
                         result = self.exit_manager.execute_exit(
                             reason=ExitReason.WING_BREACH,
@@ -479,16 +482,17 @@ class MonitorWorkflow:
             return None
 
         responses = self.telegram_bot.get_pending_responses()
+        position = get_active_position()
 
         for response in responses:
             logger.info(f"Processing user response: {response.action.value} for {response.alert_type}")
 
             # Handle stop loss decision
             if response.alert_type == "stop_loss":
-                self._pending_stop_loss_decision = False
+                if position:
+                    clear_pending_decision('stop_loss', position.id)
 
                 if response.action == CallbackAction.EXIT:
-                    position = get_active_position()
                     if position:
                         result = self.exit_manager.execute_exit(
                             reason=ExitReason.STOP_LOSS,
@@ -508,10 +512,10 @@ class MonitorWorkflow:
 
             # Handle Friday decision
             elif response.alert_type == "friday":
-                self._pending_friday_decision = False
+                if position:
+                    clear_pending_decision('friday', position.id)
 
                 if response.action == CallbackAction.EXIT:
-                    position = get_active_position()
                     if position:
                         result = self.exit_manager.execute_exit(
                             reason=ExitReason.FRIDAY_CLOSE,
@@ -525,10 +529,10 @@ class MonitorWorkflow:
 
             # Handle VIX warning decision
             elif response.alert_type == "vix_warning":
-                self._pending_vix_decision = False
+                if position:
+                    clear_pending_decision('vix_warning', position.id)
 
                 if response.action == CallbackAction.EXIT:
-                    position = get_active_position()
                     if position:
                         result = self.exit_manager.execute_exit(
                             reason=ExitReason.VIX_BREACH,
@@ -544,10 +548,10 @@ class MonitorWorkflow:
 
             # Handle wing approach decision
             elif response.alert_type == "wing_approach":
-                self._pending_wing_approach_decision = False
+                if position:
+                    clear_pending_decision('wing_approach', position.id)
 
                 if response.action == CallbackAction.EXIT:
-                    position = get_active_position()
                     if position:
                         result = self.exit_manager.execute_exit(
                             reason=ExitReason.WING_BREACH,
@@ -659,8 +663,8 @@ _Fetching P&L data..._"""
                 logger.debug(f"VIX warning alert suppressed - HOLD cooldown active ({hrs}h {mins}m remaining)")
             return False
 
-        # Skip if already waiting for user decision
-        if self._pending_vix_decision:
+        # Skip if already waiting for user decision (persisted in DB)
+        if has_pending_decision('vix_warning', position.id):
             logger.debug("Waiting for user VIX warning decision...")
             return False
 
@@ -674,7 +678,7 @@ _Fetching P&L data..._"""
                 claude_advice=advisory.reasoning[:1000] if advisory else "VIX elevated. Monitor closely.",
                 position_id=position.id
             )
-            self._pending_vix_decision = True
+            set_pending_decision('vix_warning', position.id)
             logger.info(f"VIX warning decision sent to user (VIX={snapshot.india_vix:.2f})")
             return False
         else:
@@ -711,8 +715,8 @@ _Fetching P&L data..._"""
                 logger.debug(f"Wing approach alert suppressed - HOLD cooldown active ({hrs}h {mins}m remaining)")
             return False
 
-        # Skip if already waiting for user decision
-        if self._pending_wing_approach_decision:
+        # Skip if already waiting for user decision (persisted in DB)
+        if has_pending_decision('wing_approach', position.id):
             logger.debug("Waiting for user wing approach decision...")
             return False
 
@@ -727,7 +731,7 @@ _Fetching P&L data..._"""
                 claude_advice=advisory.reasoning[:1000] if advisory else f"Price approaching {direction} wing.",
                 position_id=position.id
             )
-            self._pending_wing_approach_decision = True
+            set_pending_decision('wing_approach', position.id)
             logger.info(f"Wing approach decision sent to user ({direction}, {proximity_pct:.0f}%)")
             return False
         else:
@@ -764,8 +768,8 @@ _Fetching P&L data..._"""
                 logger.debug(f"Stop loss alert suppressed - HOLD cooldown active ({hrs}h {mins}m remaining)")
             return False
 
-        # Skip if already waiting for user decision
-        if self._pending_stop_loss_decision:
+        # Skip if already waiting for user decision (persisted in DB)
+        if has_pending_decision('stop_loss', position.id):
             logger.debug("Waiting for user stop loss decision...")
             return False
 
@@ -783,7 +787,7 @@ _Fetching P&L data..._"""
                 claude_advice=advisory.reasoning[:1000] if advisory else "Analysis unavailable",
                 position_id=position.id
             )
-            self._pending_stop_loss_decision = True
+            set_pending_decision('stop_loss', position.id)
             logger.info("Stop loss decision sent to user via Telegram")
             return False
         else:
@@ -821,15 +825,9 @@ _Fetching P&L data..._"""
         if not position:
             return False
 
-        # Skip if already waiting for decision
-        if self._pending_friday_decision:
+        # Skip if already waiting for decision (persisted in DB)
+        if has_pending_decision('friday', position.id):
             logger.debug("Waiting for user Friday decision...")
-            return False
-
-        # Skip if Friday decision already sent today (persisted check)
-        from src.utils.db import was_friday_decision_sent_today
-        if was_friday_decision_sent_today(position.id):
-            logger.debug("Friday decision already sent today, skipping...")
             return False
 
         # Check if expiry is next week or later
@@ -860,7 +858,7 @@ _Fetching P&L data..._"""
                     claude_advice=advisory.reasoning[:1000] if advisory else "Analysis unavailable",
                     position_id=position.id
                 )
-                self._pending_friday_decision = True
+                set_pending_decision('friday', position.id)
                 logger.info("Friday decision sent to user via Telegram")
                 return False
             else:
