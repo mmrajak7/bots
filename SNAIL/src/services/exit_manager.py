@@ -478,33 +478,33 @@ class ExitManager:
                 )
 
             # Position Verification after Exit (TDD Section 6.2)
-            # Verify all 4 legs are CLOSED (qty = 0)
-            logger.info("Verifying all 4 legs are closed after exit...")
+            # Verify exit by checking ORDER completion status, not net positions
+            # (Net positions may include other manual trades in same symbols)
+            logger.info("Verifying all 4 exit orders completed...")
             exit_verified = True
             verification_issues = []
 
-            # Get positions once (not in loop)
-            try:
-                positions = self.kite.positions()
-                net_positions = positions.get('net', [])
-            except Exception as e:
-                logger.error(f"Failed to fetch positions for verification: {e}")
-                net_positions = []
+            # Verify each order completed successfully
+            exit_order_list = [
+                ('straddle_ce', orders.straddle_ce),
+                ('straddle_pe', orders.straddle_pe),
+                ('wing_ce', orders.wing_ce),
+                ('wing_pe', orders.wing_pe),
+            ]
 
-            # Check each of the 4 legs
-            for leg_type, symbol in symbols.items():
-                # After exit, we expect NO position (qty = 0)
-                for pos in net_positions:
-                    if pos.get('tradingsymbol') == symbol:
-                        qty = pos.get('quantity', 0)
-                        if qty != 0:
-                            exit_verified = False
-                            verification_issues.append(
-                                f"{leg_type}: Expected 0, found {qty}"
-                            )
-                        break
+            for leg_type, order in exit_order_list:
+                if order.status != 'COMPLETE':
+                    exit_verified = False
+                    verification_issues.append(
+                        f"{leg_type}: Order {order.order_id} status={order.status}"
+                    )
+                elif order.quantity != position.lot_size:
+                    exit_verified = False
+                    verification_issues.append(
+                        f"{leg_type}: Partial fill {order.quantity}/{position.lot_size}"
+                    )
 
-            # Verify we checked all 4 legs
+            # Verify we have all 4 legs
             if len(symbols) != 4:
                 exit_verified = False
                 verification_issues.append(f"Expected 4 legs, found {len(symbols)}")

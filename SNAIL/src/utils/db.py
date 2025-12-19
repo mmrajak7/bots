@@ -445,9 +445,11 @@ def record_failed_exit(
         error: Overall error message
         partial: True if some legs closed (partial exit)
     """
-    status = 'partial_exit' if partial else 'exit_failed'
+    # Use 'exiting' status (valid in schema) to indicate incomplete exit
+    # Position requires manual intervention
+    status = 'exiting'
 
-    # Build notes for audit trail
+    # Build detailed error info for logging (schema doesn't have notes column)
     notes_parts = []
     if legs_closed:
         notes_parts.append(f"Closed: {', '.join(legs_closed)}")
@@ -455,22 +457,24 @@ def record_failed_exit(
         failed_details = "; ".join(f"{k}: {v}" for k, v in legs_failed.items())
         notes_parts.append(f"Failed: {failed_details}")
     notes_parts.append(f"Error: {error}")
-    notes = " | ".join(notes_parts)
+    notes_text = " | ".join(notes_parts)
 
     with get_db_session() as conn:
+        # Update position to 'exiting' status - requires manual intervention
+        # Cannot use 'exit_failed' as exit_reason (not in schema CHECK constraint)
         conn.execute(
             """UPDATE positions SET
                 status = ?,
-                exit_reason = 'exit_failed',
-                notes = ?,
                 updated_at = ?
             WHERE id = ?""",
-            (status, notes, datetime.now().isoformat(), position_id)
+            (status, datetime.now().isoformat(), position_id)
         )
 
+    # Log full details for audit trail since we can't store in DB
     logger.critical(
         f"RECORDED FAILED EXIT: position={position_id}, status={status}, "
-        f"closed={legs_closed}, failed={list(legs_failed.keys())}"
+        f"closed={legs_closed}, failed={list(legs_failed.keys())}, "
+        f"details={notes_text}"
     )
 
 
