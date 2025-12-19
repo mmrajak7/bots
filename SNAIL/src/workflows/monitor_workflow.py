@@ -38,8 +38,7 @@ from src.utils.db import (
     get_cooldown_remaining,
     has_pending_decision,
     set_pending_decision,
-    clear_pending_decision,
-    clear_all_pending_decisions
+    clear_pending_decision
 )
 from src.utils.helpers import is_trading_day, is_market_open
 from src.utils.config import get_trading_config, get_monitoring_config, load_config
@@ -389,13 +388,16 @@ class MonitorWorkflow:
             if alert_type == "stop_loss":
                 if position:
                     clear_pending_decision('stop_loss', position.id)
+                else:
+                    logger.warning("Stop loss callback received but no active position")
+                    self.telegram.send("⚠️ No active position found. Alert may be stale.")
+                    return False
                 if action_str == "exit":
-                    if position:
-                        result = self.exit_manager.execute_exit(
-                            reason=ExitReason.STOP_LOSS,
-                            position=position
-                        )
-                        return result.success
+                    result = self.exit_manager.execute_exit(
+                        reason=ExitReason.STOP_LOSS,
+                        position=position
+                    )
+                    return result.success
                 elif action_str == "hold":
                     # Set 8-hour cooldown to suppress alerts and Claude API calls
                     set_cooldown('stop_loss_hold', 8 * 3600)
@@ -410,13 +412,16 @@ class MonitorWorkflow:
             elif alert_type == "friday":
                 if position:
                     clear_pending_decision('friday', position.id)
+                else:
+                    logger.warning("Friday callback received but no active position")
+                    self.telegram.send("⚠️ No active position found. Alert may be stale.")
+                    return False
                 if action_str == "exit":
-                    if position:
-                        result = self.exit_manager.execute_exit(
-                            reason=ExitReason.FRIDAY_CLOSE,
-                            position=position
-                        )
-                        return result.success
+                    result = self.exit_manager.execute_exit(
+                        reason=ExitReason.FRIDAY_CLOSE,
+                        position=position
+                    )
+                    return result.success
                 elif action_str == "hold":
                     logger.info("User chose HOLD over weekend (from callback)")
                     self.telegram.send("*Position HELD* for weekend carry. Next check Monday.")
@@ -425,13 +430,16 @@ class MonitorWorkflow:
             elif alert_type == "vix_warning":
                 if position:
                     clear_pending_decision('vix_warning', position.id)
+                else:
+                    logger.warning("VIX warning callback received but no active position")
+                    self.telegram.send("⚠️ No active position found. Alert may be stale.")
+                    return False
                 if action_str == "exit":
-                    if position:
-                        result = self.exit_manager.execute_exit(
-                            reason=ExitReason.VIX_BREACH,
-                            position=position
-                        )
-                        return result.success
+                    result = self.exit_manager.execute_exit(
+                        reason=ExitReason.VIX_BREACH,
+                        position=position
+                    )
+                    return result.success
                 elif action_str == "hold":
                     # Set 8-hour cooldown to suppress alerts and Claude API calls
                     set_cooldown('vix_hold', 8 * 3600)
@@ -442,13 +450,16 @@ class MonitorWorkflow:
             elif alert_type == "wing_approach":
                 if position:
                     clear_pending_decision('wing_approach', position.id)
+                else:
+                    logger.warning("Wing approach callback received but no active position")
+                    self.telegram.send("⚠️ No active position found. Alert may be stale.")
+                    return False
                 if action_str == "exit":
-                    if position:
-                        result = self.exit_manager.execute_exit(
-                            reason=ExitReason.WING_BREACH,
-                            position=position
-                        )
-                        return result.success
+                    result = self.exit_manager.execute_exit(
+                        reason=ExitReason.WING_BREACH,
+                        position=position
+                    )
+                    return result.success
                 elif action_str == "hold":
                     # Set 8-hour cooldown to suppress alerts and Claude API calls
                     set_cooldown('wing_hold', 8 * 3600)
@@ -491,14 +502,17 @@ class MonitorWorkflow:
             if response.alert_type == "stop_loss":
                 if position:
                     clear_pending_decision('stop_loss', position.id)
+                else:
+                    logger.warning("Stop loss callback received but no active position")
+                    self.telegram.send("⚠️ No active position found. Alert may be stale.")
+                    continue
 
                 if response.action == CallbackAction.EXIT:
-                    if position:
-                        result = self.exit_manager.execute_exit(
-                            reason=ExitReason.STOP_LOSS,
-                            position=position
-                        )
-                        return result.success
+                    result = self.exit_manager.execute_exit(
+                        reason=ExitReason.STOP_LOSS,
+                        position=position
+                    )
+                    return result.success
                 elif response.action == CallbackAction.HOLD:
                     # Set 8-hour cooldown to suppress alerts and Claude API calls
                     set_cooldown('stop_loss_hold', 8 * 3600)
@@ -514,14 +528,17 @@ class MonitorWorkflow:
             elif response.alert_type == "friday":
                 if position:
                     clear_pending_decision('friday', position.id)
+                else:
+                    logger.warning("Friday callback received but no active position")
+                    self.telegram.send("⚠️ No active position found. Alert may be stale.")
+                    continue
 
                 if response.action == CallbackAction.EXIT:
-                    if position:
-                        result = self.exit_manager.execute_exit(
-                            reason=ExitReason.FRIDAY_CLOSE,
-                            position=position
-                        )
-                        return result.success
+                    result = self.exit_manager.execute_exit(
+                        reason=ExitReason.FRIDAY_CLOSE,
+                        position=position
+                    )
+                    return result.success
                 elif response.action == CallbackAction.HOLD:
                     logger.info("User chose HOLD over weekend")
                     self.telegram.send("*Position HELD* for weekend carry. Next check Monday.")
@@ -531,14 +548,17 @@ class MonitorWorkflow:
             elif response.alert_type == "vix_warning":
                 if position:
                     clear_pending_decision('vix_warning', position.id)
+                else:
+                    logger.warning("VIX warning callback received but no active position")
+                    self.telegram.send("⚠️ No active position found. Alert may be stale.")
+                    continue
 
                 if response.action == CallbackAction.EXIT:
-                    if position:
-                        result = self.exit_manager.execute_exit(
-                            reason=ExitReason.VIX_BREACH,
-                            position=position
-                        )
-                        return result.success
+                    result = self.exit_manager.execute_exit(
+                        reason=ExitReason.VIX_BREACH,
+                        position=position
+                    )
+                    return result.success
                 elif response.action == CallbackAction.HOLD:
                     # Set 8-hour cooldown to suppress alerts and Claude API calls
                     set_cooldown('vix_hold', 8 * 3600)
@@ -550,14 +570,17 @@ class MonitorWorkflow:
             elif response.alert_type == "wing_approach":
                 if position:
                     clear_pending_decision('wing_approach', position.id)
+                else:
+                    logger.warning("Wing approach callback received but no active position")
+                    self.telegram.send("⚠️ No active position found. Alert may be stale.")
+                    continue
 
                 if response.action == CallbackAction.EXIT:
-                    if position:
-                        result = self.exit_manager.execute_exit(
-                            reason=ExitReason.WING_BREACH,
-                            position=position
-                        )
-                        return result.success
+                    result = self.exit_manager.execute_exit(
+                        reason=ExitReason.WING_BREACH,
+                        position=position
+                    )
+                    return result.success
                 elif response.action == CallbackAction.HOLD:
                     # Set 8-hour cooldown to suppress alerts and Claude API calls
                     set_cooldown('wing_hold', 8 * 3600)

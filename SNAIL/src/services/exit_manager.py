@@ -42,7 +42,8 @@ from src.utils.db import (
     save_order,
     Order,
     set_cooldown,
-    clear_cooldown
+    clear_cooldown,
+    clear_all_pending_decisions
 )
 from src.utils.config import get_trading_config, load_config
 
@@ -578,6 +579,10 @@ class ExitManager:
             for cooldown_type in ['wing_hold', 'stop_loss_hold', 'vix_hold']:
                 clear_cooldown(cooldown_type)
             logger.info("Cleared hold cooldowns after position exit")
+
+            # Clear pending decisions (user can't respond to alerts for closed position)
+            clear_all_pending_decisions(position.id)
+            logger.info("Cleared pending decisions after position exit")
 
             # Send exit alert
             self._send_exit_alert(
