@@ -1243,9 +1243,14 @@ def set_pending_decision(decision_type: str, position_id: int) -> None:
     with get_db_session() as conn:
         cooldown_end = datetime.now() + timedelta(seconds=duration)
 
-        # Use REPLACE to update if exists
+        # Delete existing pending decision for this type/position first
         conn.execute(
-            """INSERT OR REPLACE INTO cooldowns (position_id, cooldown_type, exit_date, cooldown_end)
+            "DELETE FROM cooldowns WHERE cooldown_type = ? AND position_id = ?",
+            (cooldown_type, position_id)
+        )
+        # Insert new pending decision
+        conn.execute(
+            """INSERT INTO cooldowns (position_id, cooldown_type, exit_date, cooldown_end)
                VALUES (?, ?, ?, ?)""",
             (position_id, cooldown_type, date.today().isoformat(), cooldown_end.isoformat())
         )
