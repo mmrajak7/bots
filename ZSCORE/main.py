@@ -122,6 +122,137 @@ def get_next_trading_day(holidays: set = None) -> date:
             return check_date
         check_date += timedelta(days=1)
 
+
+# =============================================================================
+# BSE INSTRUMENTS DOWNLOAD
+# =============================================================================
+
+# Retry configuration for instruments download
+INSTRUMENTS_MAX_RETRIES = 3
+INSTRUMENTS_RETRY_BACKOFF = [2, 5, 10]  # Exponential backoff in seconds
+INSTRUMENTS_MAX_AGE_HOURS = 24
+
+
+def get_instruments_age(instruments_path: str) -> Optional[float]:
+    """Get age of instruments file in hours."""
+    if not os.path.exists(instruments_path):
+        return None
+    mtime = os.path.getmtime(instruments_path)
+    age_seconds = time.time() - mtime
+    return age_seconds / 3600
+
+
+def refresh_bse_instruments(
+    kite: KiteConnect,
+    instruments_path: str,
+    max_retries: int = INSTRUMENTS_MAX_RETRIES
+) -> Tuple[bool, str]:
+    """
+    Download and cache BSE (BFO) instruments filtered to SENSEX only.
+
+    Implements:
+    - 3 retries with exponential backoff (2s, 5s, 10s)
+    - Falls back to cache if less than 24 hours old
+    - Similar logic to SNAIL's refresh_instruments_csv
+
+    Args:
+        kite: KiteConnect instance
+        instruments_path: Path to save instruments CSV
+        max_retries: Maximum retry attempts
+
+    Returns:
+        Tuple of (success, message)
+    """
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            logging.info(f"Downloading BSE instruments (attempt {attempt + 1}/{max_retries})...")
+
+            # Fetch BFO (BSE F&O) instruments
+            bfo_instruments = kite.instruments("BFO")
+
+            if not bfo_instruments:
+                raise ValueError("Empty BFO instruments response from Kite")
+
+            # Also fetch BSE for spot index token
+            bse_instruments = kite.instruments("BSE")
+
+            # Filter to SENSEX futures and options
+            sensex_count = 0
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(instruments_path) if os.path.dirname(instruments_path) else '.', exist_ok=True)
+
+            with open(instruments_path, 'w', newline='') as f:
+                fieldnames = ['fetch_date', 'instrument_token', 'tradingsymbol', 'name',
+                              'exchange', 'instrument_type', 'expiry', 'strike', 'lot_size']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+
+                # Write SENSEX futures and options from BFO
+                for inst in bfo_instruments:
+                    if inst.get('name') == 'SENSEX':
+                        writer.writerow({
+                            'fetch_date': today,
+                            'instrument_token': inst['instrument_token'],
+                            'tradingsymbol': inst['tradingsymbol'],
+                            'name': inst.get('name', ''),
+                            'exchange': 'BFO',
+                            'instrument_type': inst.get('instrument_type', ''),
+                            'expiry': inst.get('expiry', ''),
+                            'strike': inst.get('strike', ''),
+                            'lot_size': inst.get('lot_size', '')
+                        })
+                        sensex_count += 1
+
+                # Write SENSEX spot index from BSE (for spot price)
+                for inst in bse_instruments:
+                    if inst['tradingsymbol'] == 'SENSEX':
+                        writer.writerow({
+                            'fetch_date': today,
+                            'instrument_token': inst['instrument_token'],
+                            'tradingsymbol': inst['tradingsymbol'],
+                            'name': inst.get('name', ''),
+                            'exchange': 'BSE',
+                            'instrument_type': 'INDEX',
+                            'expiry': '',
+                            'strike': '',
+                            'lot_size': ''
+                        })
+                        sensex_count += 1
+
+            if sensex_count == 0:
+                raise ValueError("No SENSEX instruments found in BFO response")
+
+            logging.info(f"BSE instruments saved: {sensex_count} SENSEX instruments to {instruments_path}")
+            return True, f"BSE instruments refreshed: {sensex_count} records"
+
+        except Exception as e:
+            last_error = str(e)
+            logging.warning(f"BSE instruments refresh attempt {attempt + 1} failed: {e}")
+
+            if attempt < max_retries - 1:
+                backoff = INSTRUMENTS_RETRY_BACKOFF[min(attempt, len(INSTRUMENTS_RETRY_BACKOFF) - 1)]
+                logging.info(f"Retrying in {backoff}s...")
+                time.sleep(backoff)
+
+    # All retries failed - check cache
+    logging.error(f"All {max_retries} BSE instrument refresh attempts failed")
+
+    cache_age = get_instruments_age(instruments_path)
+    if cache_age is not None and cache_age < INSTRUMENTS_MAX_AGE_HOURS:
+        logging.warning(f"Using cached BSE instruments ({cache_age:.1f} hours old)")
+        return True, f"Using cached BSE instruments ({cache_age:.1f}h old). Refresh failed: {last_error}"
+
+    # No valid cache
+    if cache_age is not None:
+        return False, f"BSE instruments cache too old ({cache_age:.1f}h). Refresh failed: {last_error}"
+    else:
+        return False, f"No BSE instruments cache available. Refresh failed: {last_error}"
+
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -155,108 +286,52 @@ class Position:
 # =============================================================================
 
 class InstrumentManager:
-    """Manage instrument lookups from cached CSV"""
+    """Manage instrument lookups from multiple cached CSV files (NSE + BSE)"""
 
-    def __init__(self, kite: KiteConnect, data_dir: str, instruments_path: str = None):
+    def __init__(self, kite: KiteConnect, data_dir: str,
+                 nse_instruments_path: str = None,
+                 bse_instruments_path: str = None):
+        """
+        Initialize InstrumentManager with support for both NSE and BSE instruments.
+
+        Args:
+            kite: KiteConnect instance
+            data_dir: Directory for caching instruments
+            nse_instruments_path: Path to NSE/NFO instruments CSV (NIFTY)
+            bse_instruments_path: Path to BSE/BFO instruments CSV (SENSEX)
+        """
         self.kite = kite
         self.data_dir = data_dir
-        self.external_instruments = instruments_path is not None
-        self.instruments_file = instruments_path if instruments_path else os.path.join(data_dir, "nfo_instruments.csv")
-        self.instruments = {}  # symbol -> {token, expiry, strike, etc.}
-        self._load_or_refresh()
+        self.nse_instruments_path = nse_instruments_path
+        self.bse_instruments_path = bse_instruments_path
+        self.instruments = {}  # symbol -> {token, exchange, expiry, strike, etc.}
+        self._load_instruments()
 
-    def _load_or_refresh(self):
-        """Load instruments from cache or refresh from API"""
-        # If using external instruments file (e.g., from SNAIL), just load it
-        if self.external_instruments:
-            if os.path.exists(self.instruments_file):
-                logging.info(f"Loading instruments from external file: {self.instruments_file}")
-                self._load_from_csv()
-            else:
-                raise FileNotFoundError(f"External instruments file not found: {self.instruments_file}")
-            return
-
-        today = datetime.now().strftime("%Y-%m-%d")
-
-        # Check if we have today's instruments
-        if os.path.exists(self.instruments_file):
-            try:
-                with open(self.instruments_file, 'r') as f:
-                    reader = csv.DictReader(f)
-                    first_row = next(reader, None)
-                    # Check file has data and is from today
-                    if first_row is not None and first_row.get('fetch_date') == today:
-                        logging.info(f"Loading cached instruments from {self.instruments_file}")
-                        self._load_from_csv()
-                        return
-                    elif first_row is None:
-                        logging.warning("Instruments file is empty, refreshing from API")
-            except Exception as e:
-                logging.warning(f"Error reading instruments cache: {e}")
-
-        # Fetch fresh from API
-        self._refresh_from_api()
-
-    def _refresh_from_api(self):
-        """Fetch instruments from Kite API and cache"""
-        logging.info("Fetching NFO instruments from Kite API...")
-        try:
-            nfo = self.kite.instruments("NFO")
-            nse = self.kite.instruments("NSE")
-
-            today = datetime.now().strftime("%Y-%m-%d")
-            os.makedirs(self.data_dir, exist_ok=True)
-
-            # Save to CSV
-            with open(self.instruments_file, 'w', newline='') as f:
-                fieldnames = ['fetch_date', 'instrument_token', 'tradingsymbol', 'name',
-                              'exchange', 'instrument_type', 'expiry', 'strike', 'lot_size']
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-
-                # Write NFO instruments
-                for inst in nfo:
-                    writer.writerow({
-                        'fetch_date': today,
-                        'instrument_token': inst['instrument_token'],
-                        'tradingsymbol': inst['tradingsymbol'],
-                        'name': inst.get('name', ''),
-                        'exchange': 'NFO',
-                        'instrument_type': inst.get('instrument_type', ''),
-                        'expiry': inst.get('expiry', ''),
-                        'strike': inst.get('strike', ''),
-                        'lot_size': inst.get('lot_size', '')
-                    })
-
-                # Write NSE spot indices (NIFTY 50, NIFTY BANK, etc.)
-                for inst in nse:
-                    symbol = inst['tradingsymbol']
-                    # Include NIFTY 50, NIFTY BANK and similar indices
-                    if 'NIFTY' in symbol:
-                        writer.writerow({
-                            'fetch_date': today,
-                            'instrument_token': inst['instrument_token'],
-                            'tradingsymbol': symbol,
-                            'name': inst.get('name', ''),
-                            'exchange': 'NSE',
-                            'instrument_type': inst.get('instrument_type', ''),
-                            'expiry': '',
-                            'strike': '',
-                            'lot_size': ''
-                        })
-
-            logging.info(f"Saved {len(nfo) + len(nse)} instruments to {self.instruments_file}")
-            self._load_from_csv()
-
-        except Exception as e:
-            logging.error(f"Failed to fetch instruments: {e}")
-            raise
-
-    def _load_from_csv(self):
-        """Load instruments from CSV into memory"""
+    def _load_instruments(self):
+        """Load instruments from both NSE and BSE CSV files"""
         self.instruments = {}
+
+        # Load NSE instruments (NIFTY)
+        if self.nse_instruments_path and os.path.exists(self.nse_instruments_path):
+            logging.info(f"Loading NSE instruments from: {self.nse_instruments_path}")
+            self._load_from_csv(self.nse_instruments_path)
+        else:
+            logging.warning(f"NSE instruments file not found: {self.nse_instruments_path}")
+
+        # Load BSE instruments (SENSEX)
+        if self.bse_instruments_path and os.path.exists(self.bse_instruments_path):
+            logging.info(f"Loading BSE instruments from: {self.bse_instruments_path}")
+            self._load_from_csv(self.bse_instruments_path)
+        else:
+            logging.warning(f"BSE instruments file not found: {self.bse_instruments_path}")
+
+        logging.info(f"Total instruments loaded: {len(self.instruments)}")
+
+    def _load_from_csv(self, csv_path: str):
+        """Load instruments from a CSV file into memory (appends to existing)"""
         skipped = 0
-        with open(self.instruments_file, 'r') as f:
+        loaded = 0
+        with open(csv_path, 'r') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
@@ -271,14 +346,16 @@ class InstrumentManager:
                         'type': row.get('instrument_type', ''),
                         'expiry': row.get('expiry', ''),
                         'strike': row.get('strike', ''),
-                        'lot_size': row.get('lot_size', '')
+                        'lot_size': row.get('lot_size', ''),
+                        'name': row.get('name', '')
                     }
+                    loaded += 1
                 except (ValueError, KeyError):
                     skipped += 1
                     continue
         if skipped > 0:
-            logging.warning(f"Skipped {skipped} invalid instrument rows")
-        logging.info(f"Loaded {len(self.instruments)} instruments into memory")
+            logging.warning(f"Skipped {skipped} invalid rows from {csv_path}")
+        logging.info(f"Loaded {loaded} instruments from {csv_path}")
 
     def get_token(self, symbol: str) -> Optional[int]:
         """Get instrument token by symbol"""
@@ -294,6 +371,10 @@ class InstrumentManager:
         logging.warning(f"Symbol not found: {symbol}")
         return None
 
+    def get_instrument(self, symbol: str) -> Optional[Dict]:
+        """Get full instrument data by symbol"""
+        return self.instruments.get(symbol)
+
     def get_spot_token(self, symbol: str) -> Optional[int]:
         """Get spot/index token"""
         return self.get_token(symbol)
@@ -302,16 +383,22 @@ class InstrumentManager:
         """Get futures token"""
         return self.get_token(symbol)
 
-    def find_nifty_futures(self, underlying: str = "NIFTY") -> Tuple[Optional[Dict], Optional[Dict]]:
+    def find_futures(self, underlying: str, default_lot_size: int = 75) -> Tuple[Optional[Dict], Optional[Dict]]:
         """
-        Auto-detect current and next month futures from instruments.
-        Returns (current_month_fut, next_month_fut) dicts with symbol, token, expiry, lot_size.
+        Auto-detect current and next month futures for any underlying.
+
+        Args:
+            underlying: Underlying symbol (e.g., "NIFTY", "SENSEX")
+            default_lot_size: Default lot size if not found in instruments
+
+        Returns:
+            (current_month_fut, next_month_fut) dicts with symbol, token, expiry, lot_size, exchange.
         """
         today = datetime.now().date()
         futures = []
 
         for symbol, data in self.instruments.items():
-            # Match NIFTY futures (e.g., NIFTY25DECFUT, NIFTY25JANFUT)
+            # Match futures for the underlying (e.g., NIFTY25DECFUT, SENSEX25DECFUT)
             if not symbol.startswith(underlying):
                 continue
             if not symbol.endswith('FUT'):
@@ -323,14 +410,15 @@ class InstrumentManager:
                 exp_str = data['expiry']
                 if exp_str:
                     exp_date = datetime.strptime(exp_str[:10], '%Y-%m-%d').date()
-                    lot_size = int(data['lot_size']) if data['lot_size'] else 75
+                    lot_size = int(data['lot_size']) if data['lot_size'] else default_lot_size
                     # Only consider futures that haven't expired
                     if exp_date >= today:
                         futures.append({
                             'symbol': symbol,
                             'token': data['token'],
                             'expiry': exp_date,
-                            'lot_size': lot_size
+                            'lot_size': lot_size,
+                            'exchange': data['exchange']
                         })
             except Exception:
                 continue
@@ -341,32 +429,54 @@ class InstrumentManager:
         if len(futures) >= 2:
             current = futures[0]
             next_month = futures[1]
-            logging.info(f"Auto-detected futures - Current: {current['symbol']} (exp: {current['expiry']}, lot: {current['lot_size']}), "
+            logging.info(f"Auto-detected {underlying} futures - Current: {current['symbol']} "
+                        f"(exp: {current['expiry']}, lot: {current['lot_size']}, exchange: {current['exchange']}), "
                         f"Next: {next_month['symbol']} (exp: {next_month['expiry']})")
             return current, next_month
         elif len(futures) == 1:
-            logging.warning(f"Only one future found: {futures[0]['symbol']}")
+            logging.warning(f"Only one {underlying} future found: {futures[0]['symbol']}")
             return futures[0], None
         else:
             logging.error(f"No {underlying} futures found in instruments!")
             return None, None
 
-    def find_atm_option(self, spot_price: float, option_type: str = "CE",
-                        min_dte: int = 3) -> Optional[Dict]:
-        """Find ATM option for weekly expiry with minimum DTE.
+    # Backward compatibility alias
+    def find_nifty_futures(self, underlying: str = "NIFTY") -> Tuple[Optional[Dict], Optional[Dict]]:
+        """Backward compatible method - calls find_futures"""
+        return self.find_futures(underlying)
 
-        If the ideal expiry (next Thursday with min_dte) isn't available in instruments,
-        falls back to the nearest available expiry from the instruments file.
+    def find_atm_option(self, spot_price: float, option_type: str = "CE",
+                        min_dte: int = 3, underlying: str = "NIFTY",
+                        strike_interval: int = 50,
+                        default_lot_size: int = 75) -> Optional[Dict]:
         """
-        atm_strike = round(spot_price / 50) * 50
+        Find ATM option for weekly expiry with minimum DTE.
+
+        Args:
+            spot_price: Current spot price
+            option_type: "CE" or "PE"
+            min_dte: Minimum days to expiry
+            underlying: Underlying symbol (e.g., "NIFTY", "SENSEX")
+            strike_interval: Strike price interval (50 for NIFTY, 100 for SENSEX)
+            default_lot_size: Default lot size if not found
+
+        Returns:
+            Dict with symbol, token, strike, expiry, dte, lot_size, exchange
+        """
+        atm_strike = round(spot_price / strike_interval) * strike_interval
         now = datetime.now()
         today = now.date()
 
-        # Find next Thursday (weekly expiry)
-        days_until_thursday = (3 - now.weekday()) % 7
-        if days_until_thursday == 0 and now.hour >= 15:
-            days_until_thursday = 7
-        ideal_expiry = (now + timedelta(days=days_until_thursday)).date()
+        # Determine expiry day based on underlying
+        # NIFTY: Thursday (3), SENSEX: Friday (4) typically
+        # But always use instruments file as source of truth
+        expiry_day = 3 if underlying == "NIFTY" else 4  # Thursday for NIFTY, Friday for SENSEX
+
+        # Find next expiry day
+        days_until_expiry = (expiry_day - now.weekday()) % 7
+        if days_until_expiry == 0 and now.hour >= 15:
+            days_until_expiry = 7
+        ideal_expiry = (now + timedelta(days=days_until_expiry)).date()
 
         # Check DTE - if too close to expiry, use next week
         dte = (ideal_expiry - today).days
@@ -374,10 +484,10 @@ class InstrumentManager:
             ideal_expiry = ideal_expiry + timedelta(days=7)
             logging.info(f"Current expiry DTE={dte} < {min_dte}, ideal next week: {ideal_expiry}")
 
-        # First, collect all available expiries from instruments
+        # First, collect all available expiries from instruments for this underlying
         available_expiries = set()
         for symbol, data in self.instruments.items():
-            if not symbol.startswith('NIFTY'):
+            if not symbol.startswith(underlying):
                 continue
             if data['type'] not in ['CE', 'PE']:
                 continue
@@ -391,12 +501,12 @@ class InstrumentManager:
                     continue
 
         if not available_expiries:
-            logging.error("No valid expiries found in instruments file!")
+            logging.error(f"No valid expiries found for {underlying} in instruments file!")
             return None
 
         # Sort available expiries
         sorted_expiries = sorted(available_expiries)
-        logging.debug(f"Available expiries in instruments: {sorted_expiries}")
+        logging.debug(f"Available {underlying} expiries: {sorted_expiries}")
 
         # Find the best expiry to use
         expiry_date = None
@@ -409,22 +519,22 @@ class InstrumentManager:
                 exp_dte = (exp - today).days
                 if exp_dte >= min_dte:
                     expiry_date = exp
-                    logging.info(f"Ideal expiry {ideal_expiry} not in instruments, using available: {expiry_date}")
+                    logging.info(f"Ideal expiry {ideal_expiry} not in {underlying} instruments, using available: {expiry_date}")
                     break
 
             # If no expiry meets min_dte, use the nearest available
             if not expiry_date and sorted_expiries:
                 expiry_date = sorted_expiries[0]
-                logging.warning(f"No expiry meets min_dte={min_dte}, using nearest: {expiry_date}")
+                logging.warning(f"No {underlying} expiry meets min_dte={min_dte}, using nearest: {expiry_date}")
 
         if not expiry_date:
-            logging.error("Could not determine expiry date")
+            logging.error(f"Could not determine expiry date for {underlying}")
             return None
 
         # Search for matching ATM option
         candidates = []
         for symbol, data in self.instruments.items():
-            if not symbol.startswith('NIFTY'):
+            if not symbol.startswith(underlying):
                 continue
             if not symbol.endswith(option_type):
                 continue
@@ -439,54 +549,68 @@ class InstrumentManager:
 
                     if exp_date == expiry_date and strike == atm_strike:
                         option_dte = (exp_date - today).days
-                        lot_size = int(data['lot_size']) if data['lot_size'] else 75
+                        lot_size = int(data['lot_size']) if data['lot_size'] else default_lot_size
                         candidates.append({
                             'symbol': symbol,
                             'token': data['token'],
                             'strike': strike,
                             'expiry': exp_date,
                             'dte': option_dte,
-                            'lot_size': lot_size
+                            'lot_size': lot_size,
+                            'exchange': data['exchange']
                         })
             except Exception:
                 continue
 
         if candidates:
             result = candidates[0]
-            logging.info(f"Found ATM option: {result['symbol']} (strike={result['strike']}, "
-                        f"expiry={result['expiry']}, DTE={result['dte']})")
+            logging.info(f"Found {underlying} ATM {option_type}: {result['symbol']} "
+                        f"(strike={result['strike']}, expiry={result['expiry']}, DTE={result['dte']})")
             return result
 
         # Log available options for debugging
-        logging.warning(f"No ATM option found for strike={atm_strike}, expiry={expiry_date}")
-        sample = [s for s in self.instruments.keys() if s.startswith('NIFTY') and option_type in s][:5]
-        logging.warning(f"Sample NIFTY {option_type} options: {sample}")
+        logging.warning(f"No {underlying} ATM option found for strike={atm_strike}, expiry={expiry_date}")
+        sample = [s for s in self.instruments.keys() if s.startswith(underlying) and option_type in s][:5]
+        logging.warning(f"Sample {underlying} {option_type} options: {sample}")
         logging.warning(f"Available expiries: {sorted_expiries}")
         return None
 
-    def find_atm_straddle(self, spot_price: float, min_dte: int = 3) -> Optional[Dict]:
-        """Find ATM straddle (both CE and PE) for weekly expiry with minimum DTE.
-
-        Returns dict with 'ce' and 'pe' option details, or None if not found.
+    def find_atm_straddle(self, spot_price: float, min_dte: int = 3,
+                          underlying: str = "NIFTY", strike_interval: int = 50,
+                          default_lot_size: int = 75) -> Optional[Dict]:
         """
-        ce = self.find_atm_option(spot_price, "CE", min_dte)
-        pe = self.find_atm_option(spot_price, "PE", min_dte)
+        Find ATM straddle (both CE and PE) for weekly expiry with minimum DTE.
+
+        Args:
+            spot_price: Current spot price
+            min_dte: Minimum days to expiry
+            underlying: Underlying symbol (e.g., "NIFTY", "SENSEX")
+            strike_interval: Strike price interval
+            default_lot_size: Default lot size if not found
+
+        Returns:
+            Dict with 'ce' and 'pe' option details, or None if not found.
+        """
+        ce = self.find_atm_option(spot_price, "CE", min_dte, underlying, strike_interval, default_lot_size)
+        pe = self.find_atm_option(spot_price, "PE", min_dte, underlying, strike_interval, default_lot_size)
 
         if ce and pe:
-            logging.info(f"Found ATM straddle: CE={ce['symbol']}, PE={pe['symbol']}, "
+            logging.info(f"Found {underlying} ATM straddle: CE={ce['symbol']}, PE={pe['symbol']}, "
                         f"strike={ce['strike']}, expiry={ce['expiry']}")
             return {
                 'ce': ce,
                 'pe': pe,
                 'strike': ce['strike'],
                 'expiry': ce['expiry'],
-                'lot_size': ce['lot_size']
+                'lot_size': ce['lot_size'],
+                'exchange': ce['exchange'],
+                'underlying': underlying
             }
 
         if not ce:
-            logging.error("Could not find ATM CE for straddle")
+            logging.error(f"Could not find {underlying} ATM CE for straddle")
         if not pe:
-            logging.error("Could not find ATM PE for straddle")
+            logging.error(f"Could not find {underlying} ATM PE for straddle")
         return None
 
     def get_ltp(self, symbol: str) -> Optional[float]:
@@ -836,23 +960,34 @@ class OrderManager:
 
     def place_straddle_entry_parallel(self, ce_symbol: str, ce_token: int,
                                        pe_symbol: str, pe_token: int,
-                                       qty: int, ce_price: float, pe_price: float
+                                       qty: int, ce_price: float, pe_price: float,
+                                       exchange: str = "NFO"
                                        ) -> Tuple[bool, bool, float, float, str, str]:
         """Place CE and PE entry orders in parallel for minimal leg risk.
+
+        Args:
+            ce_symbol: CE option symbol
+            ce_token: CE instrument token
+            pe_symbol: PE option symbol
+            pe_token: PE instrument token
+            qty: Quantity per leg
+            ce_price: Expected CE price
+            pe_price: Expected PE price
+            exchange: Exchange (NFO for NIFTY, BFO for SENSEX)
 
         Returns:
             (ce_success, pe_success, ce_fill, pe_fill, ce_order_id, pe_order_id)
         """
         def place_ce():
             try:
-                return self.place_entry_order(ce_symbol, ce_token, qty, ce_price)
+                return self.place_entry_order(ce_symbol, ce_token, qty, ce_price, exchange)
             except Exception as e:
                 logging.error(f"CE order exception: {e}")
                 return False, 0.0, ""
 
         def place_pe():
             try:
-                return self.place_entry_order(pe_symbol, pe_token, qty, pe_price)
+                return self.place_entry_order(pe_symbol, pe_token, qty, pe_price, exchange)
             except Exception as e:
                 logging.error(f"PE order exception: {e}")
                 return False, 0.0, ""
@@ -935,13 +1070,22 @@ class OrderManager:
         return "PENDING", 0.0
 
     def place_entry_order(self, symbol: str, token: int, qty: int,
-                          current_price: float) -> Tuple[bool, float, str]:
-        """Place entry order with DB tracking. Returns (success, fill_price, order_id)"""
+                          current_price: float, exchange: str = "NFO") -> Tuple[bool, float, str]:
+        """Place entry order with DB tracking. Returns (success, fill_price, order_id)
+
+        Args:
+            symbol: Trading symbol
+            token: Instrument token
+            qty: Quantity
+            current_price: Expected price
+            exchange: Exchange (NFO for NIFTY, BFO for SENSEX)
+        """
 
         # Create order record in DB first
         order = Order(
             order_type="ENTRY",
             symbol=symbol,
+            exchange=exchange,
             qty=qty,
             side="BUY",
             order_status="PENDING",
@@ -950,7 +1094,7 @@ class OrderManager:
         )
 
         if self.paper_mode:
-            order_id = f"PAPER_{int(time.time())}"
+            order_id = f"PAPER_{int(time.time() * 1000)}_{symbol[-6:]}"  # Milliseconds + symbol suffix for uniqueness
             order.order_id = order_id
             order.fill_price = current_price
             order.order_status = "COMPLETE"
@@ -968,9 +1112,12 @@ class OrderManager:
                 self.db.create_order(order)
                 return False, 0.0, ""
 
+            # Map exchange string to Kite constant
+            kite_exchange = self.kite.EXCHANGE_BFO if exchange == "BFO" else self.kite.EXCHANGE_NFO
+
             order_id = self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR,
-                exchange=self.kite.EXCHANGE_NFO,
+                exchange=kite_exchange,
                 tradingsymbol=symbol,
                 transaction_type=self.kite.TRANSACTION_TYPE_BUY,
                 quantity=qty,
@@ -1008,12 +1155,20 @@ class OrderManager:
             return False, 0.0, order.order_id if order_created else ""
 
     def place_exit_order(self, symbol: str, qty: int,
-                         current_price: float) -> Tuple[bool, float, str]:
-        """Place exit order with DB tracking. Returns (success, fill_price, order_id)"""
+                         current_price: float, exchange: str = "NFO") -> Tuple[bool, float, str]:
+        """Place exit order with DB tracking. Returns (success, fill_price, order_id)
+
+        Args:
+            symbol: Trading symbol
+            qty: Quantity
+            current_price: Expected price
+            exchange: Exchange (NFO for NIFTY, BFO for SENSEX)
+        """
 
         order = Order(
             order_type="EXIT",
             symbol=symbol,
+            exchange=exchange,
             qty=qty,
             side="SELL",
             order_status="PENDING",
@@ -1022,7 +1177,7 @@ class OrderManager:
         )
 
         if self.paper_mode:
-            order_id = f"PAPER_EXIT_{int(time.time())}"
+            order_id = f"PAPER_EXIT_{int(time.time() * 1000)}_{symbol[-6:]}"
             order.order_id = order_id
             order.fill_price = current_price
             order.order_status = "COMPLETE"
@@ -1032,9 +1187,12 @@ class OrderManager:
 
         order_created = False
         try:
+            # Map exchange string to Kite constant
+            kite_exchange = self.kite.EXCHANGE_BFO if exchange == "BFO" else self.kite.EXCHANGE_NFO
+
             order_id = self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR,
-                exchange=self.kite.EXCHANGE_NFO,
+                exchange=kite_exchange,
                 tradingsymbol=symbol,
                 transaction_type=self.kite.TRANSACTION_TYPE_SELL,
                 quantity=qty,
@@ -1073,9 +1231,13 @@ class OrderManager:
     # SMART EXIT METHODS (Bid/Ask Optimization)
     # =========================================================================
 
-    def get_market_depth(self, symbol: str) -> Optional[Dict]:
+    def get_market_depth(self, symbol: str, exchange: str = "NFO") -> Optional[Dict]:
         """
         Fetch bid/ask depth for a symbol.
+
+        Args:
+            symbol: Trading symbol
+            exchange: Exchange (NFO for NIFTY, BFO for SENSEX)
 
         Returns:
             {
@@ -1089,8 +1251,9 @@ class OrderManager:
             or None if fetch fails
         """
         try:
-            quote = self.kite.quote([f"NFO:{symbol}"])
-            data = quote.get(f"NFO:{symbol}", {})
+            quote_key = f"{exchange}:{symbol}"
+            quote = self.kite.quote([quote_key])
+            data = quote.get(quote_key, {})
             depth = data.get('depth', {})
 
             buy_depth = depth.get('buy', [])
@@ -1123,15 +1286,23 @@ class OrderManager:
             logging.error(f"Failed to get depth for {symbol}: {e}")
             return None
 
-    def place_limit_exit(self, symbol: str, qty: int, price: float) -> Optional[str]:
+    def place_limit_exit(self, symbol: str, qty: int, price: float, exchange: str = "NFO") -> Optional[str]:
         """
         Place a LIMIT sell order. Returns order_id or None if failed.
         Does not wait for fill - caller must monitor.
+
+        Args:
+            symbol: Trading symbol
+            qty: Quantity
+            price: Limit price
+            exchange: Exchange (NFO for NIFTY, BFO for SENSEX)
         """
         try:
+            kite_exchange = self.kite.EXCHANGE_BFO if exchange == "BFO" else self.kite.EXCHANGE_NFO
+
             order_id = self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR,
-                exchange=self.kite.EXCHANGE_NFO,
+                exchange=kite_exchange,
                 tradingsymbol=symbol,
                 transaction_type=self.kite.TRANSACTION_TYPE_SELL,
                 quantity=qty,
@@ -1145,14 +1316,21 @@ class OrderManager:
             logging.error(f"Failed to place limit exit for {symbol}: {e}")
             return None
 
-    def place_market_exit(self, symbol: str, qty: int) -> Optional[str]:
+    def place_market_exit(self, symbol: str, qty: int, exchange: str = "NFO") -> Optional[str]:
         """
         Place a MARKET sell order. Returns order_id or None if failed.
+
+        Args:
+            symbol: Trading symbol
+            qty: Quantity
+            exchange: Exchange (NFO for NIFTY, BFO for SENSEX)
         """
         try:
+            kite_exchange = self.kite.EXCHANGE_BFO if exchange == "BFO" else self.kite.EXCHANGE_NFO
+
             order_id = self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR,
-                exchange=self.kite.EXCHANGE_NFO,
+                exchange=kite_exchange,
                 tradingsymbol=symbol,
                 transaction_type=self.kite.TRANSACTION_TYPE_SELL,
                 quantity=qty,
@@ -1216,7 +1394,8 @@ class OrderManager:
         pe_symbol: str,
         qty: int,
         ce_expected_price: float,
-        pe_expected_price: float
+        pe_expected_price: float,
+        exchange: str = "NFO"
     ) -> Tuple[bool, bool, float, float, str, str]:
         """
         Smart straddle exit with parallel limit orders and cross-leg acceleration.
@@ -1234,6 +1413,7 @@ class OrderManager:
             qty: Quantity per leg
             ce_expected_price: Expected CE price (for paper mode / fallback)
             pe_expected_price: Expected PE price (for paper mode / fallback)
+            exchange: Exchange (NFO for NIFTY, BFO for SENSEX)
 
         Returns:
             (ce_success, pe_success, ce_fill_price, pe_fill_price, ce_order_id, pe_order_id)
@@ -1244,15 +1424,17 @@ class OrderManager:
 
         # Paper trading mode - use mid-price simulation
         if self.paper_mode:
-            ce_depth = self.get_market_depth(ce_symbol)
-            pe_depth = self.get_market_depth(pe_symbol)
+            ce_depth = self.get_market_depth(ce_symbol, exchange)
+            pe_depth = self.get_market_depth(pe_symbol, exchange)
 
             # Use mid-price if available, else expected price
             ce_fill = ce_depth['mid_price'] if ce_depth else ce_expected_price
             pe_fill = pe_depth['mid_price'] if pe_depth else pe_expected_price
 
-            ce_order_id = f"PAPER_EXIT_{int(time.time())}_CE"
-            pe_order_id = f"PAPER_EXIT_{int(time.time())}_PE"
+            # Use milliseconds for unique order IDs
+            ts = int(time.time() * 1000)
+            paper_ce_order_id = f"PAPER_EXIT_{ts}_CE"
+            paper_pe_order_id = f"PAPER_EXIT_{ts + 1}_PE"
 
             # Calculate savings for logging
             if ce_depth and ce_depth['spread'] > SPREAD_THRESHOLD:
@@ -1265,26 +1447,27 @@ class OrderManager:
             logging.info(f"[PAPER] Smart straddle exit: CE={ce_fill:.2f}, PE={pe_fill:.2f}")
 
             # Create order records
-            for symbol, fill, order_id in [(ce_symbol, ce_fill, ce_order_id), (pe_symbol, pe_fill, pe_order_id)]:
+            for symbol, fill, oid in [(ce_symbol, ce_fill, paper_ce_order_id), (pe_symbol, pe_fill, paper_pe_order_id)]:
                 order = Order(
                     order_type="EXIT",
                     symbol=symbol,
+                    exchange=exchange,
                     qty=qty,
                     side="SELL",
                     order_status="COMPLETE",
                     expected_price=fill,
                     fill_price=fill,
-                    order_id=order_id,
+                    order_id=oid,
                     paper_trade=True
                 )
                 self.db.create_order(order)
 
-            return True, True, ce_fill, pe_fill, ce_order_id, pe_order_id
+            return True, True, ce_fill, pe_fill, paper_ce_order_id, paper_pe_order_id
 
         # Live trading mode
         # 1. Fetch depth for both legs
-        ce_depth = self.get_market_depth(ce_symbol)
-        pe_depth = self.get_market_depth(pe_symbol)
+        ce_depth = self.get_market_depth(ce_symbol, exchange)
+        pe_depth = self.get_market_depth(pe_symbol, exchange)
 
         ce_use_limit = ce_depth and ce_depth['spread'] > SPREAD_THRESHOLD
         pe_use_limit = pe_depth and pe_depth['spread'] > SPREAD_THRESHOLD
@@ -1310,25 +1493,25 @@ class OrderManager:
         # Place CE order
         if ce_use_limit and ce_depth:
             ce_mid = ce_depth['mid_price']
-            ce_order_id = self.place_limit_exit(ce_symbol, qty, ce_mid)
+            ce_order_id = self.place_limit_exit(ce_symbol, qty, ce_mid, exchange)
             if ce_order_id:
                 ce_is_limit = True
             else:
                 # Fallback to market
-                ce_order_id = self.place_market_exit(ce_symbol, qty)
+                ce_order_id = self.place_market_exit(ce_symbol, qty, exchange)
         else:
-            ce_order_id = self.place_market_exit(ce_symbol, qty)
+            ce_order_id = self.place_market_exit(ce_symbol, qty, exchange)
 
         # Place PE order
         if pe_use_limit and pe_depth:
             pe_mid = pe_depth['mid_price']
-            pe_order_id = self.place_limit_exit(pe_symbol, qty, pe_mid)
+            pe_order_id = self.place_limit_exit(pe_symbol, qty, pe_mid, exchange)
             if pe_order_id:
                 pe_is_limit = True
             else:
-                pe_order_id = self.place_market_exit(pe_symbol, qty)
+                pe_order_id = self.place_market_exit(pe_symbol, qty, exchange)
         else:
-            pe_order_id = self.place_market_exit(pe_symbol, qty)
+            pe_order_id = self.place_market_exit(pe_symbol, qty, exchange)
 
         # Handle order placement failures
         # FIX #14: If one leg fails to place, cancel the other to avoid orphan
@@ -1472,7 +1655,7 @@ class OrderManager:
 # =============================================================================
 
 class ZScoreBot:
-    """Main trading bot"""
+    """Main trading bot with multi-instrument support (NIFTY + SENSEX)"""
 
     def __init__(self, config_file: str = CONFIG_FILE):
         self.config = self._load_config(config_file)
@@ -1488,17 +1671,33 @@ class ZScoreBot:
         # Initialize Kite first
         self.kite = self._init_kite()
 
+        # Download BSE instruments (SENSEX) - ZSCORE's responsibility
+        self._download_bse_instruments()
+
         # Initialize database
         db_path = os.path.join(self.data_dir, "zscore_trades.db")
         self.db = TradingDB(db_path)
 
-        # Initialize instrument manager (fetches/caches instruments)
-        instruments_path = self.config.get('market', {}).get('instruments_path')
-        if instruments_path:
-            instruments_path = resolve_path(instruments_path)
-        self.inst_mgr = InstrumentManager(self.kite, self.data_dir, instruments_path)
+        # Initialize instrument manager with both NSE and BSE paths
+        nse_path = self.config.get('market', {}).get('instruments_nse_path')
+        bse_path = self.config.get('market', {}).get('instruments_bse_path')
 
-        # Resolve instrument tokens from config symbols
+        # Backward compatibility: check old 'instruments_path' config
+        if not nse_path:
+            nse_path = self.config.get('market', {}).get('instruments_path')
+
+        if nse_path:
+            nse_path = resolve_path(nse_path)
+        if bse_path:
+            bse_path = resolve_path(bse_path)
+
+        self.inst_mgr = InstrumentManager(self.kite, self.data_dir, nse_path, bse_path)
+
+        # Identify enabled instruments from config
+        self.enabled_instruments = self._get_enabled_instruments()
+        logging.info(f"Enabled instruments: {list(self.enabled_instruments.keys())}")
+
+        # Resolve instrument tokens for all enabled instruments
         self._resolve_tokens()
 
         # Initialize other components
@@ -1508,31 +1707,43 @@ class ZScoreBot:
             self.config['telegram']['enabled']
         )
 
-        self.signal_engine = SignalEngine(self.config['strategy']['lookback_minutes'])
+        # Create separate SignalEngine per instrument (independent z-scores)
+        self.signal_engines = {}
+        for inst_key in self.enabled_instruments:
+            self.signal_engines[inst_key] = SignalEngine(self.config['strategy']['lookback_minutes'])
+        logging.info(f"Created {len(self.signal_engines)} SignalEngine instances")
+
         self.order_mgr = OrderManager(self.kite, self.inst_mgr, self.db,
                                        self.config['paper_trade'], self.config)
 
-        # Price storage
-        self.prices = {
-            'spot': 0.0,
-            'current_fut': 0.0,
-            'next_fut': 0.0,
-            'option': 0.0,
-            'ce': 0.0,  # For straddle
-            'pe': 0.0   # For straddle
-        }
-        self.option_symbol = None
-        self.option_token = None
-        self.lot_size = 75  # Will be updated from instruments
+        # Price storage per instrument
+        # Structure: self.prices[inst_key] = {'spot': 0.0, 'current_fut': 0.0, ...}
+        self.prices = {}
+        for inst_key in self.enabled_instruments:
+            self.prices[inst_key] = {
+                'spot': 0.0,
+                'current_fut': 0.0,
+                'next_fut': 0.0,
+                'ce': 0.0,
+                'pe': 0.0
+            }
 
-        # Straddle tracking
-        self.straddle_mode = True  # Always use straddle
-        self.ce_symbol = None
-        self.ce_token = None
-        self.pe_symbol = None
-        self.pe_token = None
-        self.straddle_entry_value = 0.0  # Combined CE + PE entry price
-        self.trade_group_id = ""  # Links CE+PE as one straddle trade
+        # Straddle tracking per instrument
+        # Structure: self.straddle_state[inst_key] = {ce_symbol, ce_token, pe_symbol, ...}
+        self.straddle_state = {}
+        for inst_key in self.enabled_instruments:
+            self.straddle_state[inst_key] = {
+                'ce_symbol': None,
+                'ce_token': None,
+                'pe_symbol': None,
+                'pe_token': None,
+                'entry_value': 0.0,
+                'trade_group_id': '',
+                'lot_size': self.enabled_instruments[inst_key].get('default_lot_size', 75)
+            }
+
+        # Token to instrument mapping for WebSocket callbacks
+        self.token_to_instrument = {}  # token -> (inst_key, price_type)
 
         # WebSocket
         self.ticker = None
@@ -1546,59 +1757,138 @@ class ZScoreBot:
         self.consecutive_errors = 0
         self.max_consecutive_errors = 10
 
+    def _download_bse_instruments(self):
+        """Download BSE instruments (SENSEX) on startup"""
+        bse_path = self.config.get('market', {}).get('instruments_bse_path')
+        if not bse_path:
+            logging.info("BSE instruments path not configured, skipping download")
+            return
+
+        bse_path = resolve_path(bse_path)
+
+        # Check if SENSEX is enabled
+        sensex_config = self.config.get('instruments', {}).get('sensex', {})
+        if not sensex_config.get('enabled', False):
+            logging.info("SENSEX is disabled in config, skipping BSE instruments download")
+            return
+
+        # Check if we need to refresh (once per day)
+        cache_age = get_instruments_age(bse_path)
+        if cache_age is not None and cache_age < 8:  # Less than 8 hours old
+            logging.info(f"BSE instruments file is recent ({cache_age:.1f}h old), skipping download")
+            return
+
+        # Download BSE instruments
+        success, message = refresh_bse_instruments(self.kite, bse_path)
+        if success:
+            logging.info(f"BSE instruments: {message}")
+        else:
+            logging.error(f"BSE instruments download failed: {message}")
+            self.telegram.alert_error(f"BSE instruments download failed: {message}")
+
+    def _get_enabled_instruments(self) -> Dict[str, Dict]:
+        """Get dictionary of enabled instruments from config"""
+        instruments_config = self.config.get('instruments', {})
+        enabled = {}
+
+        # Check for new multi-instrument config format
+        for inst_key, inst_config in instruments_config.items():
+            if isinstance(inst_config, dict) and inst_config.get('enabled', False):
+                enabled[inst_key] = {
+                    'spot_symbol': inst_config.get('spot_symbol'),
+                    'underlying': inst_config.get('underlying'),
+                    'exchange': inst_config.get('exchange', 'NFO'),
+                    'spot_exchange': inst_config.get('spot_exchange', 'NSE'),
+                    'strike_interval': inst_config.get('strike_interval', 50),
+                    'min_dte': inst_config.get('min_dte', 3),
+                    'default_lot_size': 75 if inst_key == 'nifty' else 10  # SENSEX lot is typically 10
+                }
+
+        # Backward compatibility: if no instruments enabled, check for old format
+        if not enabled:
+            old_config = instruments_config
+            if old_config.get('spot_symbol') and old_config.get('underlying'):
+                enabled['nifty'] = {
+                    'spot_symbol': old_config.get('spot_symbol', 'NIFTY 50'),
+                    'underlying': old_config.get('underlying', 'NIFTY'),
+                    'exchange': 'NFO',
+                    'spot_exchange': 'NSE',
+                    'strike_interval': 50,
+                    'min_dte': old_config.get('min_dte', 3),
+                    'default_lot_size': 75
+                }
+                logging.info("Using backward-compatible single instrument config")
+
+        return enabled
+
     def _load_config(self, config_file: str) -> dict:
         """Load configuration from JSON file"""
         with open(config_file, 'r') as f:
             return json.load(f)
 
     def _resolve_tokens(self):
-        """Resolve instrument tokens - auto-detect futures from instruments"""
-        inst = self.config['instruments']
+        """Resolve instrument tokens for all enabled instruments"""
+        # Well-known tokens for common indices
+        well_known = {
+            'NIFTY 50': 256265,
+            'NIFTY BANK': 260105,
+            'NIFTY': 256265,
+            'SENSEX': 265  # BSE SENSEX token
+        }
 
-        # Get spot token - direct config takes priority, then lookup, then well-known defaults
-        if inst.get('spot_token'):
-            self.spot_token = inst['spot_token']
-            logging.info(f"Using configured spot_token: {self.spot_token}")
-        else:
-            self.spot_token = self.inst_mgr.get_token(inst['spot_symbol'])
-            if not self.spot_token:
-                # Well-known defaults for common indices
-                well_known = {
-                    'NIFTY 50': 256265,
-                    'NIFTY BANK': 260105,
-                    'NIFTY': 256265,
-                }
-                self.spot_token = well_known.get(inst['spot_symbol'])
-                if self.spot_token:
-                    logging.info(f"Using well-known token for {inst['spot_symbol']}: {self.spot_token}")
+        # Store resolved data per instrument
+        self.instrument_data = {}
+
+        for inst_key, inst_config in self.enabled_instruments.items():
+            spot_symbol = inst_config['spot_symbol']
+            underlying = inst_config['underlying']
+
+            logging.info(f"Resolving tokens for {inst_key.upper()} ({underlying})...")
+
+            # Get spot token
+            spot_token = self.inst_mgr.get_token(spot_symbol)
+            if not spot_token:
+                spot_token = well_known.get(spot_symbol)
+                if spot_token:
+                    logging.info(f"Using well-known token for {spot_symbol}: {spot_token}")
                 else:
-                    raise ValueError(f"Could not find spot token for {inst['spot_symbol']}")
+                    logging.error(f"Could not find spot token for {spot_symbol}")
+                    continue
 
-        # Auto-detect current and next month futures
-        underlying = inst.get('underlying', 'NIFTY')
-        current_fut, next_fut = self.inst_mgr.find_nifty_futures(underlying)
+            # Auto-detect current and next month futures
+            default_lot_size = inst_config.get('default_lot_size', 75)
+            current_fut, next_fut = self.inst_mgr.find_futures(underlying, default_lot_size)
 
-        if not current_fut:
-            raise ValueError(f"Could not find current month {underlying} futures")
+            if not current_fut:
+                logging.error(f"Could not find current month {underlying} futures")
+                continue
 
-        self.current_fut_token = current_fut['token']
-        self.current_fut_symbol = current_fut['symbol']
-        self.current_fut_expiry = current_fut['expiry']
+            # Store resolved data
+            self.instrument_data[inst_key] = {
+                'spot_token': spot_token,
+                'spot_symbol': spot_symbol,
+                'underlying': underlying,
+                'exchange': inst_config['exchange'],
+                'spot_exchange': inst_config['spot_exchange'],
+                'strike_interval': inst_config['strike_interval'],
+                'min_dte': inst_config['min_dte'],
+                'current_fut': current_fut,
+                'next_fut': next_fut if next_fut else current_fut
+            }
 
-        if next_fut:
-            self.next_fut_token = next_fut['token']
-            self.next_fut_symbol = next_fut['symbol']
-            self.next_fut_expiry = next_fut['expiry']
-        else:
-            # Fallback to current if only one future available
-            self.next_fut_token = self.current_fut_token
-            self.next_fut_symbol = self.current_fut_symbol
-            self.next_fut_expiry = self.current_fut_expiry
-            logging.warning("Only one futures contract available, using same for next month")
+            # Build token to instrument mapping
+            self.token_to_instrument[spot_token] = (inst_key, 'spot')
+            self.token_to_instrument[current_fut['token']] = (inst_key, 'current_fut')
+            if next_fut:
+                self.token_to_instrument[next_fut['token']] = (inst_key, 'next_fut')
 
-        logging.info(f"Resolved tokens - Spot: {self.spot_token}, "
-                    f"Current Fut: {self.current_fut_symbol} ({self.current_fut_token}), "
-                    f"Next Fut: {self.next_fut_symbol} ({self.next_fut_token})")
+            logging.info(f"Resolved {inst_key.upper()}: spot={spot_token}, "
+                        f"current_fut={current_fut['symbol']}, "
+                        f"next_fut={next_fut['symbol'] if next_fut else 'N/A'}")
+
+        # Verify at least one instrument was resolved
+        if not self.instrument_data:
+            raise ValueError("No instruments could be resolved - check config and instruments files")
 
     def setup_logging(self):
         """Setup logging"""
@@ -1632,37 +1922,49 @@ class ZScoreBot:
         return kite
 
     def _on_ticks(self, ws, ticks):
-        """WebSocket tick callback"""
+        """WebSocket tick callback - handles multiple instruments"""
         for tick in ticks:
             token = tick['instrument_token']
             ltp = tick['last_price']
 
-            if token == self.spot_token:
-                self.prices['spot'] = ltp
-            elif token == self.current_fut_token:
-                self.prices['current_fut'] = ltp
-            elif token == self.next_fut_token:
-                self.prices['next_fut'] = ltp
-            elif token == self.option_token:
-                self.prices['option'] = ltp
-            elif token == self.ce_token:
-                self.prices['ce'] = ltp
-            elif token == self.pe_token:
-                self.prices['pe'] = ltp
+            # Check if this token is mapped to an instrument
+            if token in self.token_to_instrument:
+                inst_key, price_type = self.token_to_instrument[token]
+                if inst_key in self.prices:
+                    self.prices[inst_key][price_type] = ltp
+
+            # Also check straddle tokens (CE/PE) for each instrument
+            for inst_key, state in self.straddle_state.items():
+                if token == state.get('ce_token'):
+                    self.prices[inst_key]['ce'] = ltp
+                elif token == state.get('pe_token'):
+                    self.prices[inst_key]['pe'] = ltp
 
     def _on_connect(self, ws, response):
-        """WebSocket connect callback"""
+        """WebSocket connect callback - subscribes to all enabled instruments"""
         logging.info("WebSocket connected")
         self.ws_connected = True
 
-        # Subscribe to instruments
-        tokens = [self.spot_token, self.current_fut_token, self.next_fut_token]
-        if self.option_token:
-            tokens.append(self.option_token)
+        # Build list of all tokens to subscribe to
+        tokens = []
+        for inst_key, inst_data in self.instrument_data.items():
+            tokens.append(inst_data['spot_token'])
+            tokens.append(inst_data['current_fut']['token'])
+            if inst_data['next_fut']:
+                tokens.append(inst_data['next_fut']['token'])
 
+            # Also subscribe to any active straddle tokens
+            state = self.straddle_state.get(inst_key, {})
+            if state.get('ce_token'):
+                tokens.append(state['ce_token'])
+            if state.get('pe_token'):
+                tokens.append(state['pe_token'])
+
+        # Remove duplicates and subscribe
+        tokens = list(set(tokens))
         ws.subscribe(tokens)
         ws.set_mode(ws.MODE_LTP, tokens)
-        logging.info(f"Subscribed to {len(tokens)} instruments")
+        logging.info(f"Subscribed to {len(tokens)} instruments across {len(self.instrument_data)} underlyings")
 
     def _on_close(self, ws, code, reason):
         """WebSocket close callback"""
@@ -1709,7 +2011,7 @@ class ZScoreBot:
             self.telegram.alert_error(error_msg)
 
     def reconnect_websocket(self):
-        """Attempt to reconnect WebSocket"""
+        """Attempt to reconnect WebSocket and resubscribe to active tokens"""
         if self.ticker:
             logging.info("Attempting WebSocket reconnection...")
             try:
@@ -1719,130 +2021,195 @@ class ZScoreBot:
             time.sleep(2)
             self.start_websocket()
 
+            # Resubscribe to any active straddle tokens after reconnection
+            if self.ws_connected:
+                straddle_tokens = []
+                for inst_key, state in self.straddle_state.items():
+                    if state.get('ce_token'):
+                        straddle_tokens.append(state['ce_token'])
+                    if state.get('pe_token'):
+                        straddle_tokens.append(state['pe_token'])
+
+                if straddle_tokens and self.ticker:
+                    logging.info(f"Resubscribing to {len(straddle_tokens)} straddle tokens after reconnect")
+                    self.ticker.subscribe(straddle_tokens)
+                    self.ticker.set_mode(self.ticker.MODE_LTP, straddle_tokens)
+
     def check_and_recover_position(self):
-        """Check for existing positions on startup from DB (handles straddle)"""
+        """Check for existing positions on startup from DB (handles straddle per instrument)"""
         positions = self.db.get_all_open_positions()
 
         if not positions:
             return False
 
-        # Straddle recovery (2 positions)
-        if len(positions) == 2:
-            ce_pos = None
-            pe_pos = None
-            for pos in positions:
-                if 'CE' in pos.symbol:
-                    ce_pos = pos
-                elif 'PE' in pos.symbol:
-                    pe_pos = pos
+        recovered = False
 
-            if ce_pos and pe_pos:
-                logging.info(f"Recovering straddle: CE={ce_pos.symbol}, PE={pe_pos.symbol}")
+        # Group positions by instrument (NIFTY vs SENSEX)
+        positions_by_instrument = {}
+        for pos in positions:
+            # Determine instrument based on symbol prefix
+            inst_key = None
+            for key, data in self.instrument_data.items():
+                if pos.symbol.startswith(data['underlying']):
+                    inst_key = key
+                    break
 
-                # Restore straddle tracking
-                ce_token = self.inst_mgr.get_token(ce_pos.symbol)
-                pe_token = self.inst_mgr.get_token(pe_pos.symbol)
+            if inst_key:
+                if inst_key not in positions_by_instrument:
+                    positions_by_instrument[inst_key] = []
+                positions_by_instrument[inst_key].append(pos)
+            else:
+                logging.warning(f"Could not identify instrument for position: {pos.symbol}")
 
-                if ce_token and pe_token:
-                    self.ce_symbol = ce_pos.symbol
-                    self.ce_token = ce_token
-                    self.pe_symbol = pe_pos.symbol
-                    self.pe_token = pe_token
-                    self.lot_size = ce_pos.lot_size
+        # Recover each instrument's positions
+        for inst_key, inst_positions in positions_by_instrument.items():
+            # Straddle recovery (2 positions for this instrument)
+            if len(inst_positions) == 2:
+                ce_pos = None
+                pe_pos = None
+                for pos in inst_positions:
+                    if 'CE' in pos.symbol:
+                        ce_pos = pos
+                    elif 'PE' in pos.symbol:
+                        pe_pos = pos
 
-                    # Restore straddle entry value and group ID from DB
-                    self.straddle_entry_value = ce_pos.entry_price + pe_pos.entry_price
-                    self.trade_group_id = ce_pos.trade_group_id
+                if ce_pos and pe_pos:
+                    logging.info(f"[{inst_key.upper()}] Recovering straddle: CE={ce_pos.symbol}, PE={pe_pos.symbol}")
 
-                    # Subscribe to both options
-                    if self.ws_connected and self.ticker:
-                        self.ticker.subscribe([ce_token, pe_token])
-                        self.ticker.set_mode(self.ticker.MODE_LTP, [ce_token, pe_token])
+                    # Restore straddle tracking
+                    ce_token = self.inst_mgr.get_token(ce_pos.symbol)
+                    pe_token = self.inst_mgr.get_token(pe_pos.symbol)
 
-                    self.telegram.send(f"🔄 <b>Straddle Recovered</b>\nCE: {ce_pos.symbol}\nPE: {pe_pos.symbol}\nEntry: ₹{self.straddle_entry_value:.2f}")
-                    return True
+                    if ce_token and pe_token:
+                        state = self.straddle_state[inst_key]
+                        state['ce_symbol'] = ce_pos.symbol
+                        state['ce_token'] = ce_token
+                        state['pe_symbol'] = pe_pos.symbol
+                        state['pe_token'] = pe_token
+                        state['lot_size'] = ce_pos.lot_size
+                        state['entry_value'] = ce_pos.entry_price + pe_pos.entry_price
+                        state['trade_group_id'] = ce_pos.trade_group_id
+
+                        # Add to token mapping for WebSocket
+                        self.token_to_instrument[ce_token] = (inst_key, 'ce')
+                        self.token_to_instrument[pe_token] = (inst_key, 'pe')
+
+                        # Subscribe to both options
+                        if self.ws_connected and self.ticker:
+                            self.ticker.subscribe([ce_token, pe_token])
+                            self.ticker.set_mode(self.ticker.MODE_LTP, [ce_token, pe_token])
+
+                        self.telegram.send(f"🔄 <b>[{inst_key.upper()}] Straddle Recovered</b>\nCE: {ce_pos.symbol}\nPE: {pe_pos.symbol}\nEntry: ₹{state['entry_value']:.2f}")
+                        recovered = True
+                    else:
+                        logging.error(f"[{inst_key.upper()}] Could not find tokens for straddle recovery")
                 else:
-                    logging.error("Could not find tokens for straddle recovery")
-            else:
-                logging.warning("Found 2 positions but couldn't identify CE/PE pair")
+                    logging.warning(f"[{inst_key.upper()}] Found 2 positions but couldn't identify CE/PE pair")
 
-        # Single position recovery (legacy)
-        elif len(positions) == 1:
-            db_pos = positions[0]
-            logging.info(f"Found existing position in DB: {db_pos.symbol}")
+            # Single position recovery (orphan from partial straddle failure)
+            elif len(inst_positions) == 1:
+                db_pos = inst_positions[0]
+                logging.info(f"[{inst_key.upper()}] Found existing single position: {db_pos.symbol}")
 
-            token = self.inst_mgr.get_token(db_pos.symbol)
-            if token:
-                self.option_token = token
-                self.option_symbol = db_pos.symbol
-                self.lot_size = db_pos.lot_size
+                token = self.inst_mgr.get_token(db_pos.symbol)
+                if token:
+                    # Store in straddle state (as orphan)
+                    state = self.straddle_state[inst_key]
+                    if 'CE' in db_pos.symbol:
+                        state['ce_symbol'] = db_pos.symbol
+                        state['ce_token'] = token
+                        self.token_to_instrument[token] = (inst_key, 'ce')
+                    elif 'PE' in db_pos.symbol:
+                        state['pe_symbol'] = db_pos.symbol
+                        state['pe_token'] = token
+                        self.token_to_instrument[token] = (inst_key, 'pe')
 
-                if self.ws_connected and self.ticker:
-                    self.ticker.subscribe([token])
-                    self.ticker.set_mode(self.ticker.MODE_LTP, [token])
+                    state['lot_size'] = db_pos.lot_size
 
-                pos = Position(
-                    active=True,
-                    symbol=db_pos.symbol,
-                    entry_price=db_pos.entry_price,
-                    stop_loss=db_pos.stop_loss,
-                    target=db_pos.target,
-                    exit_deadline=db_pos.exit_deadline
-                )
-                self.telegram.alert_recovery(pos)
-                return True
-            else:
-                logging.error(f"Could not find token for {db_pos.symbol}")
+                    if self.ws_connected and self.ticker:
+                        self.ticker.subscribe([token])
+                        self.ticker.set_mode(self.ticker.MODE_LTP, [token])
 
-        return False
+                    pos = Position(
+                        active=True,
+                        symbol=db_pos.symbol,
+                        entry_price=db_pos.entry_price,
+                        stop_loss=db_pos.stop_loss,
+                        target=db_pos.target,
+                        exit_deadline=db_pos.exit_deadline
+                    )
+                    self.telegram.alert_recovery(pos)
+                    recovered = True
+                else:
+                    logging.error(f"[{inst_key.upper()}] Could not find token for {db_pos.symbol}")
 
-    def process_entry(self, z_score: float, basis: float, fut_used: str, spot: float):
-        """Process entry signal - buy straddle (both CE and PE)"""
+        return recovered
 
-        # Get ATM straddle (both CE and PE)
-        straddle = self.order_mgr.get_atm_straddle(spot)
+    def process_entry(self, z_score: float, basis: float, fut_used: str, spot: float, inst_key: str = 'nifty'):
+        """Process entry signal - buy straddle (both CE and PE) for specific instrument"""
+
+        # Get instrument config
+        inst_data = self.instrument_data.get(inst_key)
+        if not inst_data:
+            logging.error(f"No instrument data found for {inst_key}")
+            return
+
+        underlying = inst_data['underlying']
+        strike_interval = inst_data['strike_interval']
+        min_dte = inst_data['min_dte']
+        default_lot_size = self.straddle_state[inst_key]['lot_size']
+
+        # Get ATM straddle (both CE and PE) for this instrument
+        straddle = self.inst_mgr.find_atm_straddle(
+            spot, min_dte, underlying, strike_interval, default_lot_size
+        )
         if not straddle:
-            logging.error("Could not find ATM straddle")
-            self.telegram.alert_error("ATM straddle not found")
+            logging.error(f"[{inst_key.upper()}] Could not find ATM straddle")
+            self.telegram.alert_error(f"[{inst_key.upper()}] ATM straddle not found")
             return
 
         ce = straddle['ce']
         pe = straddle['pe']
         lot_size = straddle['lot_size']
 
-        # Store straddle details
-        self.ce_symbol = ce['symbol']
-        self.ce_token = ce['token']
-        self.pe_symbol = pe['symbol']
-        self.pe_token = pe['token']
-        self.lot_size = lot_size
+        # Store straddle details for this instrument
+        state = self.straddle_state[inst_key]
+        state['ce_symbol'] = ce['symbol']
+        state['ce_token'] = ce['token']
+        state['pe_symbol'] = pe['symbol']
+        state['pe_token'] = pe['token']
+        state['lot_size'] = lot_size
 
-        logging.info(f"Straddle: CE={self.ce_symbol}, PE={self.pe_symbol}, Strike={straddle['strike']}")
+        # Also add tokens to the mapping for WebSocket callbacks
+        self.token_to_instrument[ce['token']] = (inst_key, 'ce')
+        self.token_to_instrument[pe['token']] = (inst_key, 'pe')
+
+        logging.info(f"[{inst_key.upper()}] Straddle: CE={ce['symbol']}, PE={pe['symbol']}, Strike={straddle['strike']}")
 
         # Subscribe to both options
         if self.ws_connected and self.ticker:
-            self.ticker.subscribe([self.ce_token, self.pe_token])
-            self.ticker.set_mode(self.ticker.MODE_LTP, [self.ce_token, self.pe_token])
+            self.ticker.subscribe([ce['token'], pe['token']])
+            self.ticker.set_mode(self.ticker.MODE_LTP, [ce['token'], pe['token']])
 
         # Wait for option prices with retry
         ce_premium = None
         pe_premium = None
         for attempt in range(5):
             time.sleep(1)
-            ce_premium = self.order_mgr.get_option_ltp(self.ce_symbol)
-            pe_premium = self.order_mgr.get_option_ltp(self.pe_symbol)
+            ce_premium = self.order_mgr.get_option_ltp(ce['symbol'])
+            pe_premium = self.order_mgr.get_option_ltp(pe['symbol'])
             if ce_premium and ce_premium > 0 and pe_premium and pe_premium > 0:
                 break
-            logging.debug(f"Waiting for straddle prices, attempt {attempt + 1}/5 (CE={ce_premium}, PE={pe_premium})")
+            logging.debug(f"[{inst_key.upper()}] Waiting for straddle prices, attempt {attempt + 1}/5 (CE={ce_premium}, PE={pe_premium})")
 
         if not ce_premium or ce_premium <= 0 or not pe_premium or pe_premium <= 0:
-            logging.error(f"Could not get straddle prices after 5 attempts (CE={ce_premium}, PE={pe_premium})")
-            self._cleanup_straddle()
+            logging.error(f"[{inst_key.upper()}] Could not get straddle prices after 5 attempts (CE={ce_premium}, PE={pe_premium})")
+            self._cleanup_straddle(inst_key)
             return
 
         # Calculate combined straddle value and stop/target
         straddle_value = ce_premium + pe_premium
-        self.straddle_entry_value = straddle_value
+        state['entry_value'] = straddle_value
         qty = lot_size * self.config['risk']['max_lots']
 
         # Stop/target based on combined straddle value
@@ -1854,37 +2221,41 @@ class ZScoreBot:
         entry_time = datetime.now().isoformat()
 
         # Generate trade_group_id to link CE and PE legs
-        self.trade_group_id = str(uuid.uuid4())[:8]  # Short UUID for readability
+        trade_group_id = f"{inst_key}_{str(uuid.uuid4())[:8]}"  # Include inst_key for clarity
+        state['trade_group_id'] = trade_group_id
 
         # Alert signal
         self.telegram.alert_signal(z_score, basis, fut_used, spot)
 
         # Place both orders in PARALLEL for minimal leg risk
+        # Use exchange from straddle (NFO for NIFTY, BFO for SENSEX)
+        exchange = straddle.get('exchange', 'NFO')
         ce_success, pe_success, ce_fill, pe_fill, ce_order_id, pe_order_id = \
             self.order_mgr.place_straddle_entry_parallel(
-                self.ce_symbol, self.ce_token,
-                self.pe_symbol, self.pe_token,
-                qty, ce_premium, pe_premium
+                ce['symbol'], ce['token'],
+                pe['symbol'], pe['token'],
+                qty, ce_premium, pe_premium,
+                exchange
             )
 
         # Handle failures
         if not ce_success and not pe_success:
-            self.telegram.alert_error(f"Both legs failed: CE={self.ce_symbol}, PE={self.pe_symbol}")
-            self._cleanup_straddle()
+            self.telegram.alert_error(f"[{inst_key.upper()}] Both legs failed: CE={ce['symbol']}, PE={pe['symbol']}")
+            self._cleanup_straddle(inst_key)
             return
 
         if not ce_success:
             # PE succeeded but CE failed - exit PE
-            self.telegram.alert_error("CE entry failed, exiting PE leg")
-            exit_success, _, _ = self.order_mgr.place_exit_order(self.pe_symbol, qty, pe_fill)
+            self.telegram.alert_error(f"[{inst_key.upper()}] CE entry failed, exiting PE leg")
+            exit_success, _, _ = self.order_mgr.place_exit_order(pe['symbol'], qty, pe_fill, exchange)
             if not exit_success:
                 # Create orphan PE position
-                logging.critical(f"ORPHANED POSITION: PE {self.pe_symbol} is live, CE failed, PE exit also failed!")
+                logging.critical(f"[{inst_key.upper()}] ORPHANED POSITION: PE {pe['symbol']} is live, CE failed, PE exit also failed!")
                 pe_position = DBPosition(
                     trade_date=date.today().isoformat(),
-                    trade_group_id=self.trade_group_id,
-                    symbol=self.pe_symbol,
-                    instrument_token=self.pe_token,
+                    trade_group_id=trade_group_id,
+                    symbol=pe['symbol'],
+                    instrument_token=pe['token'],
                     qty=qty,
                     lot_size=lot_size,
                     entry_order_id=pe_order_id,
@@ -1902,21 +2273,21 @@ class ZScoreBot:
                 )
                 self.db.create_position(pe_position)
                 self.telegram.alert_error("CRITICAL: Orphaned PE position created - MANUAL INTERVENTION REQUIRED")
-            self._cleanup_straddle()
+            self._cleanup_straddle(inst_key)
             return
 
         if not pe_success:
             # CE succeeded but PE failed - exit CE
-            self.telegram.alert_error("PE entry failed, exiting CE leg")
-            exit_success, _, _ = self.order_mgr.place_exit_order(self.ce_symbol, qty, ce_fill)
+            self.telegram.alert_error(f"[{inst_key.upper()}] PE entry failed, exiting CE leg")
+            exit_success, _, _ = self.order_mgr.place_exit_order(ce['symbol'], qty, ce_fill, exchange)
             if not exit_success:
                 # Create orphan CE position
-                logging.critical(f"ORPHANED POSITION: CE {self.ce_symbol} is live, PE failed, CE exit also failed!")
+                logging.critical(f"[{inst_key.upper()}] ORPHANED POSITION: CE {ce['symbol']} is live, PE failed, CE exit also failed!")
                 ce_position = DBPosition(
                     trade_date=date.today().isoformat(),
-                    trade_group_id=self.trade_group_id,
-                    symbol=self.ce_symbol,
-                    instrument_token=self.ce_token,
+                    trade_group_id=trade_group_id,
+                    symbol=ce['symbol'],
+                    instrument_token=ce['token'],
                     qty=qty,
                     lot_size=lot_size,
                     entry_order_id=ce_order_id,
@@ -1934,15 +2305,15 @@ class ZScoreBot:
                 )
                 self.db.create_position(ce_position)
                 self.telegram.alert_error("CRITICAL: Orphaned CE position created - MANUAL INTERVENTION REQUIRED")
-            self._cleanup_straddle()
+            self._cleanup_straddle(inst_key)
             return
 
         # Both legs succeeded - create positions in DB
         ce_position = DBPosition(
             trade_date=date.today().isoformat(),
-            trade_group_id=self.trade_group_id,
-            symbol=self.ce_symbol,
-            instrument_token=self.ce_token,
+            trade_group_id=trade_group_id,
+            symbol=ce['symbol'],
+            instrument_token=ce['token'],
             qty=qty,
             lot_size=lot_size,
             entry_order_id=ce_order_id,
@@ -1963,9 +2334,9 @@ class ZScoreBot:
         # Create PE position in DB
         pe_position = DBPosition(
             trade_date=date.today().isoformat(),
-            trade_group_id=self.trade_group_id,
-            symbol=self.pe_symbol,
-            instrument_token=self.pe_token,
+            trade_group_id=trade_group_id,
+            symbol=pe['symbol'],
+            instrument_token=pe['token'],
             qty=qty,
             lot_size=lot_size,
             entry_order_id=pe_order_id,
@@ -1984,43 +2355,51 @@ class ZScoreBot:
         self.db.create_position(pe_position)
 
         # Update combined entry value
-        self.straddle_entry_value = ce_fill + pe_fill
+        state['entry_value'] = ce_fill + pe_fill
 
         # Alert (stop_loss not shown - disabled for straddles)
         self.telegram.alert_straddle_entry(
-            self.ce_symbol, self.pe_symbol, qty, ce_fill, pe_fill,
+            ce['symbol'], pe['symbol'], qty, ce_fill, pe_fill,
             target, self.config['paper_trade']
         )
 
-        logging.info(f"Straddle entry: CE@{ce_fill:.2f} + PE@{pe_fill:.2f} = {self.straddle_entry_value:.2f}")
+        logging.info(f"[{inst_key.upper()}] Straddle entry: CE@{ce_fill:.2f} + PE@{pe_fill:.2f} = {state['entry_value']:.2f}")
 
-    def _cleanup_straddle(self):
-        """Cleanup straddle tracking on failure"""
+    def _cleanup_straddle(self, inst_key: str = 'nifty'):
+        """Cleanup straddle tracking on failure for specific instrument"""
+        state = self.straddle_state.get(inst_key, {})
+
         if self.ws_connected and self.ticker:
             tokens = []
-            if self.ce_token:
-                tokens.append(self.ce_token)
-            if self.pe_token:
-                tokens.append(self.pe_token)
+            if state.get('ce_token'):
+                tokens.append(state['ce_token'])
+            if state.get('pe_token'):
+                tokens.append(state['pe_token'])
             if tokens:
                 try:
                     self.ticker.unsubscribe(tokens)
                 except Exception:
                     pass
-        self.ce_token = None
-        self.ce_symbol = None
-        self.pe_token = None
-        self.pe_symbol = None
-        self.straddle_entry_value = 0.0
-        self.trade_group_id = ""
-        self.prices['ce'] = 0.0
-        self.prices['pe'] = 0.0
 
-    def process_straddle_exit(self, positions: list, reason: str, ce_price: float, pe_price: float):
+        # Clear state for this instrument
+        if inst_key in self.straddle_state:
+            self.straddle_state[inst_key]['ce_token'] = None
+            self.straddle_state[inst_key]['ce_symbol'] = None
+            self.straddle_state[inst_key]['pe_token'] = None
+            self.straddle_state[inst_key]['pe_symbol'] = None
+            self.straddle_state[inst_key]['entry_value'] = 0.0
+            self.straddle_state[inst_key]['trade_group_id'] = ''
+
+        # Clear prices for this instrument
+        if inst_key in self.prices:
+            self.prices[inst_key]['ce'] = 0.0
+            self.prices[inst_key]['pe'] = 0.0
+
+    def process_straddle_exit(self, positions: list, reason: str, ce_price: float, pe_price: float, inst_key: str = 'nifty'):
         """Process straddle exit using smart bid/ask optimization with cross-leg acceleration"""
 
         if len(positions) != 2:
-            logging.error(f"Expected 2 positions for straddle exit, got {len(positions)}")
+            logging.error(f"[{inst_key.upper()}] Expected 2 positions for straddle exit, got {len(positions)}")
             return
 
         # Identify CE and PE positions
@@ -2033,12 +2412,15 @@ class ZScoreBot:
                 pe_pos = pos
 
         if not ce_pos or not pe_pos:
-            logging.error("Could not identify CE and PE positions")
+            logging.error(f"[{inst_key.upper()}] Could not identify CE and PE positions")
             return
+
+        # Determine exchange from instrument data (NFO for NIFTY, BFO for SENSEX)
+        exchange = self.instrument_data.get(inst_key, {}).get('exchange', 'NFO')
 
         # Use smart exit with bid/ask optimization and cross-leg acceleration
         # This handles parallel execution, limit orders at mid-price, and market fallback
-        logging.info(f"Starting smart straddle exit: CE={ce_pos.symbol}, PE={pe_pos.symbol}")
+        logging.info(f"[{inst_key.upper()}] Starting smart straddle exit: CE={ce_pos.symbol}, PE={pe_pos.symbol}")
 
         ce_success, pe_success, ce_fill, pe_fill, ce_order_id, pe_order_id = \
             self.order_mgr.exit_straddle_smart(
@@ -2046,59 +2428,64 @@ class ZScoreBot:
                 pe_symbol=pe_pos.symbol,
                 qty=ce_pos.qty,
                 ce_expected_price=ce_price,
-                pe_expected_price=pe_price
+                pe_expected_price=pe_price,
+                exchange=exchange
             )
 
         # If smart exit failed completely, try fallback with simple market orders
         if not ce_success and not pe_success:
-            logging.warning("Smart exit failed for both legs, attempting market fallback")
+            logging.warning(f"[{inst_key.upper()}] Smart exit failed for both legs, attempting market fallback")
             ce_success, ce_fill, ce_order_id = self.order_mgr.place_exit_order(
-                ce_pos.symbol, ce_pos.qty, ce_price
+                ce_pos.symbol, ce_pos.qty, ce_price, exchange
             )
             pe_success, pe_fill, pe_order_id = self.order_mgr.place_exit_order(
-                pe_pos.symbol, pe_pos.qty, pe_price
+                pe_pos.symbol, pe_pos.qty, pe_price, exchange
             )
+
+        # Get spot price for this instrument
+        spot_price = self.prices.get(inst_key, {}).get('spot', 0)
 
         # Handle failures
         if not ce_success:
-            self.telegram.alert_error(f"CE exit failed for {ce_pos.symbol}")
+            self.telegram.alert_error(f"[{inst_key.upper()}] CE exit failed for {ce_pos.symbol}")
             self.db.mark_position_error(ce_pos.id, f"EXIT_FAILED_{reason}")
 
         if not pe_success:
-            self.telegram.alert_error(f"PE exit failed for {pe_pos.symbol}")
+            self.telegram.alert_error(f"[{inst_key.upper()}] PE exit failed for {pe_pos.symbol}")
             self.db.mark_position_error(pe_pos.id, f"EXIT_FAILED_{reason}")
 
         # Handle partial success - close successful leg in DB even if other failed
         if ce_success and not pe_success:
-            self.db.close_position(ce_pos.id, ce_fill, self.prices['spot'], reason, ce_order_id)
-            logging.critical("CE exit succeeded but PE failed - CE closed, PE needs manual intervention")
-            self._cleanup_straddle()
+            self.db.close_position(ce_pos.id, ce_fill, spot_price, reason, ce_order_id)
+            logging.critical(f"[{inst_key.upper()}] CE exit succeeded but PE failed - CE closed, PE needs manual intervention")
+            self._cleanup_straddle(inst_key)
             return
 
         if pe_success and not ce_success:
-            self.db.close_position(pe_pos.id, pe_fill, self.prices['spot'], reason, pe_order_id)
-            logging.critical("PE exit succeeded but CE failed - PE closed, CE needs manual intervention")
-            self._cleanup_straddle()
+            self.db.close_position(pe_pos.id, pe_fill, spot_price, reason, pe_order_id)
+            logging.critical(f"[{inst_key.upper()}] PE exit succeeded but CE failed - PE closed, CE needs manual intervention")
+            self._cleanup_straddle(inst_key)
             return
 
         if not ce_success and not pe_success:
-            logging.critical("Both exits failed - MANUAL INTERVENTION REQUIRED")
-            self._cleanup_straddle()
+            logging.critical(f"[{inst_key.upper()}] Both exits failed - MANUAL INTERVENTION REQUIRED")
+            self._cleanup_straddle(inst_key)
             return
 
         # Both succeeded - close positions in DB
-        self.db.close_position(ce_pos.id, ce_fill, self.prices['spot'], reason, ce_order_id)
-        self.db.close_position(pe_pos.id, pe_fill, self.prices['spot'], reason, pe_order_id)
+        self.db.close_position(ce_pos.id, ce_fill, spot_price, reason, ce_order_id)
+        self.db.close_position(pe_pos.id, pe_fill, spot_price, reason, pe_order_id)
 
         # Calculate combined P&L
         ce_pnl = (ce_fill - ce_pos.entry_price) * ce_pos.qty
         pe_pnl = (pe_fill - pe_pos.entry_price) * pe_pos.qty
         total_pnl = ce_pnl + pe_pnl
 
-        # Check daily loss
-        stats = self.db.get_today_stats()
+        # Check daily loss for this instrument
+        underlying = self.instrument_data.get(inst_key, {}).get('underlying', '')
+        stats = self._get_instrument_stats(underlying)
         if stats.get('gross_pnl', 0) <= -self.config['risk']['max_daily_loss']:
-            self.telegram.alert_error("Daily loss limit hit! Trading stopped.")
+            self.telegram.alert_error(f"[{inst_key.upper()}] Daily loss limit hit! Trading stopped.")
 
         # Alert
         self.telegram.alert_straddle_exit(
@@ -2109,12 +2496,21 @@ class ZScoreBot:
         )
 
         # Cleanup
-        self._cleanup_straddle()
+        self._cleanup_straddle(inst_key)
 
-        logging.info(f"Straddle exit: CE P&L=₹{ce_pnl:+.2f}, PE P&L=₹{pe_pnl:+.2f}, Total=₹{total_pnl:+.2f}, Reason={reason}")
+        logging.info(f"[{inst_key.upper()}] Straddle exit: CE P&L=₹{ce_pnl:+.2f}, PE P&L=₹{pe_pnl:+.2f}, Total=₹{total_pnl:+.2f}, Reason={reason}")
 
     def process_exit(self, db_pos: DBPosition, reason: str, current_premium: float):
-        """Process exit using database with retry logic"""
+        """Process exit for single/orphan position using database with retry logic"""
+
+        # Determine instrument key and exchange from symbol
+        inst_key = None
+        exchange = "NFO"  # Default to NFO
+        for key, data in self.instrument_data.items():
+            if db_pos.symbol.startswith(data['underlying']):
+                inst_key = key
+                exchange = data.get('exchange', 'NFO')
+                break
 
         # Place exit order with retry
         max_retries = 2
@@ -2124,7 +2520,7 @@ class ZScoreBot:
 
         for attempt in range(max_retries):
             success, fill_price, order_id = self.order_mgr.place_exit_order(
-                db_pos.symbol, db_pos.qty, current_premium
+                db_pos.symbol, db_pos.qty, current_premium, exchange
             )
             if success:
                 break
@@ -2140,11 +2536,14 @@ class ZScoreBot:
             self.db.mark_position_error(db_pos.id, f"EXIT_FAILED_{reason}")
             return
 
+        # Get spot price for this instrument
+        spot_price = self.prices.get(inst_key, {}).get('spot', 0) if inst_key else 0
+
         # Close position in DB (calculates P&L internally)
         self.db.close_position(
             position_id=db_pos.id,
             exit_price=fill_price,
-            exit_spot=self.prices['spot'],
+            exit_spot=spot_price,
             exit_reason=reason,
             exit_order_id=order_id
         )
@@ -2164,14 +2563,25 @@ class ZScoreBot:
             self.config['paper_trade']
         )
 
-        # Unsubscribe from option
-        if self.ws_connected and self.ticker and self.option_token:
-            try:
-                self.ticker.unsubscribe([self.option_token])
-            except Exception:
-                pass  # Ignore unsubscribe errors
-        self.option_token = None
-        self.option_symbol = None
+        # Cleanup straddle state for this instrument
+        if inst_key:
+            state = self.straddle_state.get(inst_key, {})
+            token_to_unsubscribe = None
+
+            if 'CE' in db_pos.symbol and state.get('ce_token'):
+                token_to_unsubscribe = state['ce_token']
+                state['ce_token'] = None
+                state['ce_symbol'] = None
+            elif 'PE' in db_pos.symbol and state.get('pe_token'):
+                token_to_unsubscribe = state['pe_token']
+                state['pe_token'] = None
+                state['pe_symbol'] = None
+
+            if token_to_unsubscribe and self.ws_connected and self.ticker:
+                try:
+                    self.ticker.unsubscribe([token_to_unsubscribe])
+                except Exception:
+                    pass  # Ignore unsubscribe errors
 
         logging.info(f"Position closed: {db_pos.symbol}, P&L: ₹{pnl:+.2f} ({pnl_pct:+.1f}%), Reason: {reason}")
 
@@ -2232,11 +2642,15 @@ Charges: <code>₹{charges:,.2f}</code>
         logging.info(f"Daily summary sent: {trades} trades, Net P&L: ₹{net_pnl:+,.2f}")
 
     def main_loop(self):
-        """Main trading loop"""
+        """Main trading loop - processes all enabled instruments"""
         logging.info("Starting main loop...")
-        last_log = 0
+        last_log = {}  # Per-instrument last log time
         last_ws_check = time.time()
         ws_reconnect_attempts = 0
+
+        # Initialize last_log for each instrument
+        for inst_key in self.instrument_data:
+            last_log[inst_key] = 0
 
         while self.running:
             try:
@@ -2259,112 +2673,9 @@ Charges: <code>₹{charges:,.2f}</code>
                     else:
                         ws_reconnect_attempts = 0  # Reset on successful connection
 
-                # Check if we have prices
-                if self.prices['spot'] == 0 or self.prices['current_fut'] == 0:
-                    time.sleep(1)
-                    continue
-
-                # Calculate z-score
-                z_score, basis, fut_used, basis_pct = self.signal_engine.update(
-                    self.prices['spot'],
-                    self.prices['current_fut'],
-                    self.prices['next_fut'],
-                    self.config['strategy']['min_basis_current']
-                )
-
-                # Log periodically
-                if time.time() - last_log > 60:
-                    logging.info(f"Spot: {self.prices['spot']:.2f}, Basis: {basis:.1f}, "
-                                f"Z: {z_score:.2f}, Fut: {fut_used}")
-                    last_log = time.time()
-                    self.consecutive_errors = 0  # Reset error count on successful tick
-
-                # Get all open positions from DB (straddle = 2 positions)
-                open_positions = self.db.get_all_open_positions()
-
-                # Check for exit first (if in position)
-                if open_positions:
-                    # Straddle mode - check combined value
-                    if len(open_positions) == 2:
-                        ce_price = self.prices['ce']
-                        pe_price = self.prices['pe']
-
-                        # Try REST API fallback if prices are stale
-                        if ce_price <= 0 and self.ce_symbol:
-                            ce_price = self.order_mgr.get_option_ltp(self.ce_symbol) or 0
-                            self.prices['ce'] = ce_price
-                        if pe_price <= 0 and self.pe_symbol:
-                            pe_price = self.order_mgr.get_option_ltp(self.pe_symbol) or 0
-                            self.prices['pe'] = pe_price
-
-                        if ce_price > 0 and pe_price > 0:
-                            current_straddle_value = ce_price + pe_price
-
-                            # Use first position's stop/target (same for both in straddle)
-                            first_pos = open_positions[0]
-
-                            # Check exit conditions based on combined straddle value
-                            pos = Position(
-                                active=True,
-                                symbol="STRADDLE",
-                                entry_price=self.straddle_entry_value,
-                                stop_loss=first_pos.stop_loss,
-                                target=first_pos.target,
-                                exit_deadline=first_pos.exit_deadline
-                            )
-                            should_exit, reason = self.signal_engine.should_exit(
-                                pos, current_straddle_value, z_score
-                            )
-                            if should_exit:
-                                self.process_straddle_exit(open_positions, reason, ce_price, pe_price)
-                        else:
-                            logging.warning(f"Straddle prices stale: CE={ce_price}, PE={pe_price}")
-
-                    # Single position (legacy or orphan from partial straddle failure)
-                    elif len(open_positions) == 1:
-                        open_position = open_positions[0]
-
-                        # Get price - check if it's an orphan CE/PE or legacy single option
-                        if 'CE' in open_position.symbol:
-                            current_premium = self.prices.get('ce', 0)
-                        elif 'PE' in open_position.symbol:
-                            current_premium = self.prices.get('pe', 0)
-                        else:
-                            current_premium = self.prices.get('option', 0)
-
-                        # REST API fallback using the position's actual symbol
-                        if current_premium <= 0:
-                            rest_price = self.order_mgr.get_option_ltp(open_position.symbol)
-                            if rest_price:
-                                current_premium = rest_price
-
-                        if current_premium > 0:
-                            pos = Position(
-                                active=True,
-                                symbol=open_position.symbol,
-                                entry_price=open_position.entry_price,
-                                stop_loss=open_position.stop_loss,
-                                target=open_position.target,
-                                exit_deadline=open_position.exit_deadline
-                            )
-                            should_exit, reason = self.signal_engine.should_exit(
-                                pos, current_premium, z_score
-                            )
-                            if should_exit:
-                                self.process_exit(open_position, reason, current_premium)
-                        else:
-                            logging.warning(f"No option price available for {open_position.symbol}")
-
-                # Check for entry (if no position)
-                else:
-                    # Get today's stats for limit checks
-                    stats = self.db.get_today_stats()
-                    should_enter, msg = self._check_entry_conditions(
-                        z_score, basis, fut_used, stats
-                    )
-                    if should_enter:
-                        logging.info(f"Entry signal! Z={z_score:.2f}, Basis={basis:.1f}")
-                        self.process_entry(z_score, basis, fut_used, self.prices['spot'])
+                # Process each enabled instrument
+                for inst_key, inst_data in self.instrument_data.items():
+                    self._process_instrument(inst_key, inst_data, last_log)
 
                 # Small sleep
                 time.sleep(0.5)
@@ -2381,17 +2692,166 @@ Charges: <code>₹{charges:,.2f}</code>
                 self.telegram.alert_error(str(e))
                 time.sleep(5)
 
+    def _process_instrument(self, inst_key: str, inst_data: Dict, last_log: Dict):
+        """Process a single instrument - z-score update, entry/exit checks"""
+        underlying = inst_data['underlying']
+        prices = self.prices.get(inst_key, {})
+
+        # Check if we have prices for this instrument
+        spot_price = prices.get('spot', 0)
+        current_fut_price = prices.get('current_fut', 0)
+
+        if spot_price == 0 or current_fut_price == 0:
+            return  # Skip this instrument until we have prices
+
+        next_fut_price = prices.get('next_fut', 0) or current_fut_price
+
+        # Calculate z-score using instrument-specific SignalEngine
+        signal_engine = self.signal_engines.get(inst_key)
+        if not signal_engine:
+            return
+
+        z_score, basis, fut_used, basis_pct = signal_engine.update(
+            spot_price,
+            current_fut_price,
+            next_fut_price,
+            self.config['strategy']['min_basis_current']
+        )
+
+        # Log periodically (per instrument)
+        if time.time() - last_log.get(inst_key, 0) > 60:
+            logging.info(f"[{inst_key.upper()}] Spot: {spot_price:.2f}, Basis: {basis:.1f}, "
+                        f"Z: {z_score:.2f}, Fut: {fut_used}")
+            last_log[inst_key] = time.time()
+            self.consecutive_errors = 0  # Reset error count on successful tick
+
+        # Get open positions for this specific instrument
+        open_positions = self._get_positions_for_instrument(inst_key, underlying)
+
+        # Check for exit first (if in position)
+        if open_positions:
+            self._check_exit_conditions(inst_key, open_positions, z_score, prices)
+        else:
+            # Check for entry
+            self._check_entry_for_instrument(inst_key, inst_data, z_score, basis, fut_used, spot_price)
+
+    def _get_positions_for_instrument(self, inst_key: str, underlying: str) -> list:
+        """Get open positions for a specific instrument"""
+        all_positions = self.db.get_all_open_positions()
+        # Filter positions by symbol prefix (NIFTY vs SENSEX)
+        return [p for p in all_positions if p.symbol.startswith(underlying)]
+
+    def _check_exit_conditions(self, inst_key: str, open_positions: list, z_score: float, prices: Dict):
+        """Check exit conditions for an instrument's positions"""
+        state = self.straddle_state.get(inst_key, {})
+        signal_engine = self.signal_engines.get(inst_key)
+
+        # Straddle mode - check combined value
+        if len(open_positions) == 2:
+            ce_price = prices.get('ce', 0)
+            pe_price = prices.get('pe', 0)
+
+            # Try REST API fallback if prices are stale
+            if ce_price <= 0 and state.get('ce_symbol'):
+                ce_price = self.order_mgr.get_option_ltp(state['ce_symbol']) or 0
+                prices['ce'] = ce_price
+            if pe_price <= 0 and state.get('pe_symbol'):
+                pe_price = self.order_mgr.get_option_ltp(state['pe_symbol']) or 0
+                prices['pe'] = pe_price
+
+            if ce_price > 0 and pe_price > 0:
+                current_straddle_value = ce_price + pe_price
+                first_pos = open_positions[0]
+
+                pos = Position(
+                    active=True,
+                    symbol="STRADDLE",
+                    entry_price=state.get('entry_value', 0),
+                    stop_loss=first_pos.stop_loss,
+                    target=first_pos.target,
+                    exit_deadline=first_pos.exit_deadline
+                )
+                should_exit, reason = signal_engine.should_exit(
+                    pos, current_straddle_value, z_score
+                )
+                if should_exit:
+                    self.process_straddle_exit(open_positions, reason, ce_price, pe_price, inst_key)
+            else:
+                logging.warning(f"[{inst_key.upper()}] Straddle prices stale: CE={ce_price}, PE={pe_price}")
+
+        # Single position (orphan from partial straddle failure)
+        elif len(open_positions) == 1:
+            open_position = open_positions[0]
+            if 'CE' in open_position.symbol:
+                current_premium = prices.get('ce', 0)
+            elif 'PE' in open_position.symbol:
+                current_premium = prices.get('pe', 0)
+            else:
+                current_premium = 0
+
+            if current_premium <= 0:
+                rest_price = self.order_mgr.get_option_ltp(open_position.symbol)
+                if rest_price:
+                    current_premium = rest_price
+
+            if current_premium > 0:
+                pos = Position(
+                    active=True,
+                    symbol=open_position.symbol,
+                    entry_price=open_position.entry_price,
+                    stop_loss=open_position.stop_loss,
+                    target=open_position.target,
+                    exit_deadline=open_position.exit_deadline
+                )
+                should_exit, reason = signal_engine.should_exit(
+                    pos, current_premium, z_score
+                )
+                if should_exit:
+                    self.process_exit(open_position, reason, current_premium)
+            else:
+                logging.warning(f"[{inst_key.upper()}] No option price for {open_position.symbol}")
+
+    def _check_entry_for_instrument(self, inst_key: str, inst_data: Dict,
+                                     z_score: float, basis: float, fut_used: str, spot_price: float):
+        """Check entry conditions for a specific instrument"""
+        underlying = inst_data['underlying']
+
+        # Get today's stats for this instrument
+        stats = self._get_instrument_stats(underlying)
+
+        should_enter, msg = self._check_entry_conditions(
+            z_score, basis, fut_used, stats, inst_key
+        )
+        if should_enter:
+            logging.info(f"[{inst_key.upper()}] Entry signal! Z={z_score:.2f}, Basis={basis:.1f}")
+            self.process_entry(z_score, basis, fut_used, spot_price, inst_key)
+
+    def _get_instrument_stats(self, underlying: str) -> Dict:
+        """Get today's trading stats filtered by instrument underlying"""
+        # Get positions for this specific instrument
+        # Note: For production, consider adding instrument column to DB for efficient filtering
+        all_positions = self.db.get_today_positions()
+        inst_positions = [p for p in all_positions if p.symbol.startswith(underlying)]
+
+        return {
+            'total_trades': len([p for p in inst_positions if p.status == 'CLOSED']) // 2,  # Straddle = 2 positions
+            'gross_pnl': sum(p.pnl or 0 for p in inst_positions if p.status == 'CLOSED'),
+        }
+
     def _check_entry_conditions(self, z_score: float, basis: float,
-                                 fut_used: str, stats: Dict) -> Tuple[bool, str]:
-        """Check if entry conditions are met using DB stats"""
+                                 fut_used: str, stats: Dict,
+                                 inst_key: str = None) -> Tuple[bool, str]:
+        """Check if entry conditions are met using DB stats (per instrument)"""
         config = self.config
+        max_trades = config['risk']['max_trades_per_day']
+        max_loss = config['risk']['max_daily_loss']
 
-        # Daily limits from DB
-        if stats.get('total_trades', 0) >= config['risk']['max_trades_per_day']:
-            return False, "Max trades reached"
+        # Per-instrument trade limits
+        if stats.get('total_trades', 0) >= max_trades:
+            return False, f"Max trades reached for {inst_key or 'instrument'}"
 
-        if stats.get('gross_pnl', 0) <= -config['risk']['max_daily_loss']:
-            return False, "Daily loss limit hit"
+        if stats.get('gross_pnl', 0) <= -max_loss:
+            return False, f"Daily loss limit hit for {inst_key or 'instrument'}"
 
         # Time check
         now = datetime.now()
@@ -2419,6 +2879,11 @@ Charges: <code>₹{charges:,.2f}</code>
         logging.info("Z-SCORE TRADING BOT STARTING")
         logging.info(f"Paper Mode: {self.config['paper_trade']}")
         logging.info(f"Data Dir: {self.data_dir}")
+        logging.info(f"Enabled Instruments: {list(self.instrument_data.keys())}")
+        for inst_key, inst_data in self.instrument_data.items():
+            logging.info(f"  {inst_key.upper()}: {inst_data['underlying']} "
+                        f"(spot={inst_data['spot_symbol']}, "
+                        f"fut={inst_data['current_fut']['symbol']})")
         logging.info("=" * 60)
 
         # Get available capital for startup alert

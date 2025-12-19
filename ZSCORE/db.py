@@ -193,8 +193,8 @@ class TradingDB:
 
     # ==================== ORDER METHODS ====================
 
-    def create_order(self, order: Order) -> int:
-        """Create a new order record, return ID"""
+    def create_order(self, order: Order) -> Optional[int]:
+        """Create a new order record, return ID or None if failed"""
         conn = self._get_conn()
         cursor = conn.cursor()
 
@@ -256,8 +256,8 @@ class TradingDB:
 
     # ==================== POSITION METHODS ====================
 
-    def create_position(self, pos: Position) -> int:
-        """Create a new position record"""
+    def create_position(self, pos: Position) -> Optional[int]:
+        """Create a new position record, return ID or None if failed"""
         conn = self._get_conn()
         cursor = conn.cursor()
 
