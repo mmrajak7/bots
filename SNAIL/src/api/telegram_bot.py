@@ -17,7 +17,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Callable
+from typing import Optional, Dict, Any, List, Callable, Union
 from dataclasses import dataclass
 from enum import Enum
 import requests
@@ -118,6 +118,10 @@ class TelegramBot:
         poll_interval: Polling interval in seconds
     """
 
+    # Class-level type annotations (set in __init__ after validation)
+    bot_token: str
+    chat_id: str
+
     def __init__(
         self,
         bot_token: Optional[str] = None,
@@ -132,12 +136,15 @@ class TelegramBot:
             chat_id: Authorized chat ID (defaults to env var)
             poll_interval: Seconds between polls
         """
-        self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
-        self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+        _bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
+        _chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
         self.poll_interval = poll_interval
 
-        if not self.bot_token or not self.chat_id:
+        if not _bot_token or not _chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID required")
+
+        self.bot_token = _bot_token
+        self.chat_id = _chat_id
 
         self.base_url = f"{TELEGRAM_API}{self.bot_token}"
         self._last_update_id = self._load_update_offset()  # Load persisted offset
@@ -1305,14 +1312,14 @@ P&L: *-₹{abs(current_pnl):,.0f}*
 
     def _edit_message_reply_markup(
         self,
-        chat_id: int,
+        chat_id: Union[int, str],
         message_id: int,
         keyboard: Optional[List[List[Dict]]]
     ):
         """Edit message to update/remove inline keyboard."""
         try:
             url = f"{self.base_url}/editMessageReplyMarkup"
-            payload = {
+            payload: Dict[str, Any] = {
                 "chat_id": chat_id,
                 "message_id": message_id
             }

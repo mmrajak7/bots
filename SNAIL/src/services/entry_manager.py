@@ -1098,10 +1098,11 @@ class EntryManager:
             'net': orders.net_credit
         }
 
+        expiry_str = conditions.expiry.strftime('%Y-%m-%d') if conditions.expiry else "N/A"
         self.telegram.send_entry_alert(
             atm_strike=conditions.atm_strike,
             wing_distance=wing_distance,
-            expiry=conditions.expiry.strftime('%Y-%m-%d'),
+            expiry=expiry_str,
             lot_size=orders.straddle_ce.quantity,
             premium=premium,
             max_profit=metrics.max_profit,

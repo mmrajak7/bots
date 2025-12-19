@@ -13,12 +13,19 @@ Order execution utilities including validation, slippage handling, and batch ope
 
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, TypedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from loguru import logger
 
 from src.api.kite_client import SNAILKiteClient, Quote, OrderExecutionError
+
+
+class SlippageTierConfig(TypedDict):
+    """Type definition for slippage tier configuration."""
+    ticks: List[int]
+    interval_seconds: int
+    final_market: bool
 
 
 # =============================================================================
@@ -39,7 +46,7 @@ DEFAULT_SLIPPAGE_TICKS = 2  # 0.10 for options
 
 # Tiered Slippage Configuration (TDD Section 1.3)
 # Progressive slippage: Exact → +2pts → +3pts → MARKET (10s intervals)
-SLIPPAGE_TIERS = {
+SLIPPAGE_TIERS: Dict[str, SlippageTierConfig] = {
     "entry": {
         "ticks": [0, 2],           # Exact, then +2 ticks
         "interval_seconds": 10,

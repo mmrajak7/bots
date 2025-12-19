@@ -14,13 +14,19 @@ Handles incoming Telegram messages and user responses to trading prompts.
 import re
 import time
 import threading
-import fcntl
 import os
 from datetime import datetime, timedelta
+from pathlib import Path as _Path
 from typing import Optional, Dict, Any, Callable, List
 from dataclasses import dataclass, field
 from enum import Enum
 from loguru import logger
+
+# Platform-specific imports for file locking
+if os.name != 'nt':  # Unix/Linux
+    import fcntl
+else:
+    fcntl = None  # type: ignore[assignment]
 
 from src.api.telegram_alerts import TelegramAlerts, get_telegram
 from src.utils.config import get_telegram_config
@@ -35,7 +41,6 @@ DEFAULT_RESPONSE_TIMEOUT = 300  # 5 minutes
 POLL_INTERVAL = 2  # seconds
 
 # Message update tracking - use absolute paths based on project root
-from pathlib import Path as _Path
 _PROJECT_ROOT = _Path(__file__).parent.parent.parent
 UPDATE_OFFSET_FILE = str(_PROJECT_ROOT / "data" / "telegram_update_offset.txt")
 RESPONSE_QUEUE_FILE = str(_PROJECT_ROOT / "data" / "telegram_responses.json")  # Shared response queue for ENTER/SKIP
@@ -712,7 +717,7 @@ class TelegramResponseHandler:
             pending = self.pending_responses[matched_prompt]
             logger.info(f"Response received for {matched_prompt}: {pending.response}")
 
-            if pending.callback:
+            if pending.callback and pending.response is not None:
                 try:
                     pending.callback(pending.response)
                 except Exception as e:
@@ -889,7 +894,7 @@ class TelegramResponseHandler:
 
             # Check if our response was received
             pending = self.pending_responses.get(prompt_id)
-            if pending and pending.status == ResponseStatus.RECEIVED:
+            if pending and pending.status == ResponseStatus.RECEIVED and pending.response is not None:
                 return UserResponse(
                     prompt_id=prompt_id,
                     response=pending.response,

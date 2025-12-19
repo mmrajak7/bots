@@ -562,6 +562,14 @@ class DailyStartup:
 
     def _get_market_data(self) -> Tuple[StartupCheck, Optional[Dict]]:
         """Get current market data."""
+        if self.kite is None:
+            return StartupCheck(
+                name="Market Data",
+                passed=False,
+                message="Kite client not initialized",
+                critical=True
+            ), None
+
         try:
             nifty_spot = self.kite.get_nifty_spot()
             india_vix = self.kite.get_india_vix()

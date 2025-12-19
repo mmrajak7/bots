@@ -772,7 +772,7 @@ if __name__ == '__main__':
         print("\n[1] Checking for active position...")
         has_position = monitor.refresh_position()
 
-        if has_position:
+        if has_position and monitor.state.position is not None:
             print(f"    Position ID: {monitor.state.position.id}")
             print(f"    Legs: {len(monitor.state.legs)}")
 
