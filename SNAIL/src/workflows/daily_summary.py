@@ -13,7 +13,7 @@ End-of-day summary generation and reporting.
 
 import sys
 from datetime import datetime, date, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 from loguru import logger
 
@@ -23,6 +23,7 @@ from src.utils.db import (
     get_db_session
 )
 from src.utils.config import get_trading_config, load_config
+from src.utils.trading_charts import TradingCharts
 
 
 # =============================================================================
@@ -421,17 +422,122 @@ class DailySummary:
 
         self.telegram.send(message)
 
+    def send_friday_charts(self, starting_capital: float = 100000) -> int:
+        """
+        Generate and send Friday performance charts via Telegram.
+
+        This method:
+        1. Generates all trading charts from database
+        2. Calculates summary metrics
+        3. Sends charts to Telegram
+
+        Args:
+            starting_capital: Starting capital for growth calculation
+
+        Returns:
+            Number of charts sent successfully
+        """
+        logger.info("Generating Friday charts...")
+
+        try:
+            # Generate charts
+            charts = TradingCharts()
+            chart_paths = charts.generate_all_charts(starting_capital)
+
+            # Check if any charts were generated
+            if not any([chart_paths.cumulative_pnl, chart_paths.drawdown,
+                       chart_paths.capital_growth, chart_paths.monthly_metrics,
+                       chart_paths.yearly_metrics]):
+                logger.warning("No charts generated - no closed trades in database")
+                self.telegram.send("📊 *Friday Report*\n\n_No trades yet - charts will appear after first closed position._")
+                return 0
+
+            # Get summary metrics from database
+            total_pnl, total_trades, win_rate = self._get_trading_metrics()
+
+            # Build chart paths dictionary
+            paths_dict = {
+                'cumulative_pnl': chart_paths.cumulative_pnl,
+                'drawdown': chart_paths.drawdown,
+                'capital_growth': chart_paths.capital_growth,
+                'monthly_metrics': chart_paths.monthly_metrics,
+                'yearly_metrics': chart_paths.yearly_metrics
+            }
+
+            # Remove None entries
+            paths_dict = {k: v for k, v in paths_dict.items() if v is not None}
+
+            # Send charts via Telegram
+            sent_count = self.telegram.send_friday_charts(
+                chart_paths=paths_dict,
+                total_pnl=total_pnl,
+                total_trades=total_trades,
+                win_rate=win_rate
+            )
+
+            logger.info(f"Friday charts sent: {sent_count}")
+            return sent_count
+
+        except Exception as e:
+            logger.error(f"Failed to send Friday charts: {e}")
+            self.telegram.send(f"📊 *Friday Report Error*\n\n_Failed to generate charts: {str(e)[:100]}_")
+            return 0
+
+    def _get_trading_metrics(self) -> Tuple[float, int, float]:
+        """
+        Get summary trading metrics from database.
+
+        Returns:
+            Tuple of (total_pnl, total_trades, win_rate)
+        """
+        try:
+            with get_db_session() as conn:
+                cursor = conn.cursor()
+
+                # Get closed trades summary
+                cursor.execute('''
+                    SELECT
+                        COALESCE(SUM(net_pnl), 0) as total_pnl,
+                        COUNT(*) as total_trades,
+                        SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END) as wins
+                    FROM positions
+                    WHERE status = 'closed' AND net_pnl IS NOT NULL
+                ''')
+
+                row = cursor.fetchone()
+                if row:
+                    total_pnl = float(row[0] or 0)
+                    total_trades = int(row[1] or 0)
+                    wins = int(row[2] or 0)
+                    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
+                    return total_pnl, total_trades, win_rate
+
+                return 0.0, 0, 0.0
+
+        except Exception as e:
+            logger.error(f"Error getting trading metrics: {e}")
+            return 0.0, 0, 0.0
+
+    def is_friday(self, target_date: Optional[date] = None) -> bool:
+        """Check if the given date is Friday."""
+        if target_date is None:
+            target_date = date.today()
+        return target_date.weekday() == 4  # Friday = 4
+
 
 # =============================================================================
 # STANDALONE EXECUTION
 # =============================================================================
 
-def run_daily_summary(send_telegram: bool = True) -> DailySummaryData:
+def run_daily_summary(send_telegram: bool = True, force_friday_charts: bool = False) -> DailySummaryData:
     """
     Run daily summary as standalone function.
 
+    On Fridays, also sends performance charts via Telegram.
+
     Args:
         send_telegram: Whether to send Telegram notification
+        force_friday_charts: Force Friday charts even if not Friday (for testing)
 
     Returns:
         DailySummaryData
@@ -441,6 +547,11 @@ def run_daily_summary(send_telegram: bool = True) -> DailySummaryData:
 
     if send_telegram:
         summary_gen.send_daily_summary(summary)
+
+        # Send Friday charts if it's Friday or forced
+        if force_friday_charts or summary_gen.is_friday():
+            logger.info("Friday detected - sending performance charts")
+            summary_gen.send_friday_charts()
 
     return summary
 
@@ -469,12 +580,20 @@ def run_weekly_summary(send_telegram: bool = True) -> WeeklySummaryData:
 # =============================================================================
 
 if __name__ == '__main__':
+    import argparse
     from dotenv import load_dotenv
 
     load_dotenv()
 
     logger.remove()
     logger.add(sys.stderr, level="INFO")
+
+    parser = argparse.ArgumentParser(description="SNAIL Daily Summary")
+    parser.add_argument('--friday-charts', action='store_true',
+                       help='Generate and send Friday charts (even if not Friday)')
+    parser.add_argument('--send-telegram', action='store_true',
+                       help='Send summary to Telegram')
+    args = parser.parse_args()
 
     print("\n" + "=" * 60)
     print("SNAIL Daily Summary")
@@ -509,6 +628,33 @@ if __name__ == '__main__':
         print(f"    Winning days: {weekly.winning_days}")
         print(f"    Losing days: {weekly.losing_days}")
         print(f"    Trades: {weekly.trades_count}")
+
+        # Friday charts
+        if args.friday_charts or summary_gen.is_friday():
+            print("\n[3] Generating Friday charts...")
+            charts = TradingCharts()
+            chart_paths = charts.generate_all_charts()
+
+            if chart_paths.cumulative_pnl:
+                print(f"    Cumulative P&L: {chart_paths.cumulative_pnl}")
+            if chart_paths.drawdown:
+                print(f"    Drawdown: {chart_paths.drawdown}")
+            if chart_paths.capital_growth:
+                print(f"    Capital Growth: {chart_paths.capital_growth}")
+            if chart_paths.monthly_metrics:
+                print(f"    Monthly Metrics: {chart_paths.monthly_metrics}")
+            if chart_paths.yearly_metrics:
+                print(f"    Yearly Metrics: {chart_paths.yearly_metrics}")
+
+            if args.send_telegram:
+                print("\n[4] Sending to Telegram...")
+                sent = summary_gen.send_friday_charts()
+                print(f"    Charts sent: {sent}")
+
+        elif args.send_telegram:
+            print("\n[3] Sending daily summary to Telegram...")
+            summary_gen.send_daily_summary(daily)
+            print("    Done!")
 
         print(f"\n{'='*60}")
         print("Daily summary complete!")

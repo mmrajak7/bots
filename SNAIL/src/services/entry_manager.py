@@ -66,6 +66,7 @@ from src.utils.db import (
 )
 from src.utils.config import (
     get_trading_config,
+    get_entry_config,
     get_instruments_path,
     load_config
 )
@@ -384,9 +385,12 @@ class EntryManager:
                 atm_pe_bid = atm_quotes[atm_pe_inst].bid
 
                 if atm_ce_bid > 0 and atm_pe_bid > 0:
-                    wing_distance = calculate_wing_distance(atm_ce_bid, atm_pe_bid)
+                    # Get wing multiplier from config (default 1.0 for backward compatibility)
+                    entry_config = get_entry_config()
+                    wing_multiplier = entry_config.get('wing_multiplier', 1.0)
+                    wing_distance = calculate_wing_distance(atm_ce_bid, atm_pe_bid, multiplier=wing_multiplier)
                     logger.info(f"Wing distance calculated at conditions check: {wing_distance} "
-                               f"(CE={atm_ce_bid:.2f}, PE={atm_pe_bid:.2f})")
+                               f"(CE={atm_ce_bid:.2f}, PE={atm_pe_bid:.2f}, multiplier={wing_multiplier})")
         except Exception as e:
             logger.warning(f"Could not fetch ATM quotes for wing calculation: {e}, using default {wing_distance}")
 
@@ -534,8 +538,10 @@ class EntryManager:
                            f"(current quotes: CE={ce_bid:.2f}, PE={pe_bid:.2f})")
             else:
                 # Fallback: Calculate wing distance (legacy path or missing conditions)
-                wing_distance = calculate_wing_distance(ce_bid, pe_bid)
-                logger.info(f"Wing distance calculated: {wing_distance} (CE={ce_bid:.2f}, PE={pe_bid:.2f})")
+                entry_config = get_entry_config()
+                wing_multiplier = entry_config.get('wing_multiplier', 1.0)
+                wing_distance = calculate_wing_distance(ce_bid, pe_bid, multiplier=wing_multiplier)
+                logger.info(f"Wing distance calculated: {wing_distance} (CE={ce_bid:.2f}, PE={pe_bid:.2f}, multiplier={wing_multiplier})")
 
             # Step 2: Get full quotes for all legs
             symbols, quotes = self.get_iron_fly_quotes(

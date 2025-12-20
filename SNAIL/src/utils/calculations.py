@@ -370,17 +370,23 @@ def get_atm_strike_futures_based(
 def calculate_wing_distance(
     ce_premium: float,
     pe_premium: float,
+    multiplier: float = 1.0,
     round_to: int = 50,
     min_distance: int = 200
 ) -> int:
     """
-    Calculate dynamic wing distance based on straddle premium.
+    Calculate dynamic wing distance based on straddle premium with multiplier.
 
-    Wing distance = Straddle premium rounded to nearest 50 (changed from 100).
+    Wing distance = (CE + PE) * multiplier, rounded to nearest interval.
+
+    Based on backtest analysis (2021-2025):
+    - 1.0x multiplier: 32.8% breach rate, lower profit
+    - 1.2x multiplier: 10.7% breach rate, higher profit (recommended)
 
     Args:
         ce_premium: ATM CE premium
         pe_premium: ATM PE premium
+        multiplier: Wing distance multiplier (default 1.0, recommended 1.2)
         round_to: Rounding interval (default 50)
         min_distance: Minimum wing distance (default 200)
 
@@ -388,7 +394,8 @@ def calculate_wing_distance(
         Wing distance in points (at least min_distance)
     """
     straddle_premium = ce_premium + pe_premium
-    calculated = round(straddle_premium / round_to) * round_to
+    adjusted_premium = straddle_premium * multiplier
+    calculated = round(adjusted_premium / round_to) * round_to
     return max(calculated, min_distance)
 
 

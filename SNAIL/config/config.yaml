@@ -32,6 +32,11 @@ trading:
       soft_min: 9.5          # Soft buffer lower
       soft_max: 16.5         # Soft buffer upper
     min_dte: 6               # Minimum days to expiry
+
+    # Wing distance multiplier (based on backtest analysis)
+    # Wing = (CE_premium + PE_premium) * multiplier, rounded to 50
+    # 1.0 = original (straddle premium), 1.2 = 20% wider wings (recommended)
+    wing_multiplier: 1.2
     window:
       start: "09:30"         # Entry window start
       end: "15:10"           # Entry window end (3:10 PM)

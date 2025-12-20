@@ -13,7 +13,8 @@ Telegram messaging for trading alerts and notifications.
 
 import os
 from datetime import datetime
-from typing import Optional, Dict
+from pathlib import Path
+from typing import Optional, Dict, List, Union
 import requests
 from loguru import logger
 
@@ -177,6 +178,94 @@ class TelegramAlerts:
 
         logger.error(f"Failed to send message after {max_retries} attempts")
         return False
+
+    def send_photo(
+        self,
+        photo_path: Union[str, Path],
+        caption: Optional[str] = None,
+        parse_mode: Optional[str] = "Markdown"
+    ) -> bool:
+        """
+        Send a photo via Telegram.
+
+        Args:
+            photo_path: Path to the image file
+            caption: Optional caption for the photo
+            parse_mode: "Markdown" or "HTML" (optional)
+
+        Returns:
+            True if sent successfully
+        """
+        try:
+            photo_path = Path(photo_path)
+            if not photo_path.exists():
+                logger.error(f"Photo file not found: {photo_path}")
+                return False
+
+            if not photo_path.is_file():
+                logger.error(f"Photo path is not a file: {photo_path}")
+                return False
+
+            url = f"{self.TELEGRAM_API}{self.bot_token}/sendPhoto"
+
+            data = {"chat_id": self.chat_id}
+            if caption:
+                data["caption"] = caption
+            if parse_mode:
+                data["parse_mode"] = parse_mode
+
+            with open(photo_path, 'rb') as photo_file:
+                files = {"photo": photo_file}
+                response = requests.post(
+                    url,
+                    data=data,
+                    files=files,
+                    timeout=30  # Longer timeout for file upload
+                )
+
+            if response.status_code != 200:
+                logger.error(f"Telegram photo error: HTTP {response.status_code}")
+                return False
+
+            result = response.json()
+            if not result.get("ok"):
+                logger.error(f"Telegram API error: {result.get('description')}")
+                return False
+
+            logger.debug(f"Photo sent: {photo_path.name}")
+            return True
+
+        except requests.exceptions.Timeout:
+            logger.error("Telegram photo upload timed out")
+            return False
+        except Exception as e:
+            logger.error(f"Telegram photo error: {e}")
+            return False
+
+    def send_photos(
+        self,
+        photo_paths: List[Union[str, Path]],
+        captions: Optional[List[Optional[str]]] = None
+    ) -> int:
+        """
+        Send multiple photos via Telegram.
+
+        Args:
+            photo_paths: List of paths to image files
+            captions: Optional list of captions (one per photo)
+
+        Returns:
+            Number of photos successfully sent
+        """
+        sent_count = 0
+        final_captions: List[Optional[str]] = captions if captions else [None] * len(photo_paths)
+
+        for photo_path, caption in zip(photo_paths, final_captions):
+            if self.send_photo(photo_path, caption):
+                sent_count += 1
+
+        logger.info(f"Sent {sent_count}/{len(photo_paths)} photos to Telegram")
+        return sent_count
 
     def test_connection(self) -> bool:
         """
@@ -461,6 +550,57 @@ class TelegramAlerts:
             message += f"\n📤 Exit: {exit_date}"
 
         return self.send(message)
+
+    def send_friday_charts(
+        self,
+        chart_paths: Dict[str, Path],
+        total_pnl: float,
+        total_trades: int,
+        win_rate: float
+    ) -> int:
+        """
+        Send Friday weekly performance charts.
+
+        Args:
+            chart_paths: Dictionary with chart type to file path mapping
+            total_pnl: Total P&L amount
+            total_trades: Total number of trades
+            win_rate: Win rate percentage
+
+        Returns:
+            Number of charts successfully sent
+        """
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        emoji = "🎉" if total_pnl > 0 else ("😐" if total_pnl == 0 else "😔")
+
+        # Send header message first
+        header = f"""📊 *SNAIL Friday Report* {emoji}
+
+💰 Total P&L: *{pnl_sign}₹{total_pnl:,.0f}*
+📈 Trades: {total_trades} | Win Rate: {win_rate:.1f}%
+
+_Charts below:_"""
+
+        self.send(header)
+
+        # Chart captions
+        captions = {
+            'cumulative_pnl': '📈 *Cumulative P&L*',
+            'drawdown': '📉 *Drawdown*',
+            'capital_growth': '💹 *Capital Growth*',
+            'monthly_metrics': '📅 *Monthly Metrics*',
+            'yearly_metrics': '📊 *Yearly Metrics*'
+        }
+
+        sent_count = 0
+        for chart_type, path in chart_paths.items():
+            if path and path.exists():
+                caption = captions.get(chart_type, chart_type.replace('_', ' ').title())
+                if self.send_photo(path, caption):
+                    sent_count += 1
+
+        logger.info(f"Friday charts sent: {sent_count}/{len(chart_paths)}")
+        return sent_count
 
     def send_morning_summary(
         self,

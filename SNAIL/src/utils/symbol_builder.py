@@ -176,17 +176,23 @@ def calculate_atm_strike(nifty_spot: float, interval: int = NIFTY_STRIKE_INTERVA
 def calculate_wing_distance(
     ce_premium: float,
     pe_premium: float,
+    multiplier: float = 1.0,
     round_to: int = 50,
     min_distance: int = 200
 ) -> int:
     """
-    Calculate dynamic wing distance based on straddle premium.
+    Calculate dynamic wing distance based on straddle premium with multiplier.
 
-    Wing distance = Straddle Premium rounded to nearest interval (50 by default).
+    Wing distance = (CE + PE) * multiplier, rounded to nearest interval.
+
+    Based on backtest analysis (2021-2025):
+    - 1.0x multiplier: 32.8% breach rate, lower profit
+    - 1.2x multiplier: 10.7% breach rate, higher profit (recommended)
 
     Args:
         ce_premium: ATM CE premium (bid price)
         pe_premium: ATM PE premium (bid price)
+        multiplier: Wing distance multiplier (default 1.0, recommended 1.2)
         round_to: Round to nearest this value (default 50)
         min_distance: Minimum wing distance (default 200)
 
@@ -194,15 +200,16 @@ def calculate_wing_distance(
         Wing distance in points
 
     Example:
-        >>> calculate_wing_distance(170, 130)  # straddle=300
+        >>> calculate_wing_distance(170, 130, multiplier=1.0)  # straddle=300
         300
-        >>> calculate_wing_distance(160, 115)  # straddle=275
-        300  # rounds to nearest 50
-        >>> calculate_wing_distance(145, 105)  # straddle=250
-        250
+        >>> calculate_wing_distance(170, 130, multiplier=1.2)  # straddle=300*1.2=360
+        350  # rounds to nearest 50
+        >>> calculate_wing_distance(160, 115, multiplier=1.2)  # straddle=275*1.2=330
+        350  # rounds to nearest 50
     """
     straddle_premium = ce_premium + pe_premium
-    calculated = round(straddle_premium / round_to) * round_to
+    adjusted_premium = straddle_premium * multiplier
+    calculated = round(adjusted_premium / round_to) * round_to
     return max(calculated, min_distance)
 
 
