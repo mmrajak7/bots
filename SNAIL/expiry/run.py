@@ -15,17 +15,25 @@ Cron example (every minute from 9:25 to 15:20):
 @description Main entry point for expiry day trading system
 """
 
-import os
 import sys
 import json
 from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Dict, Any, Optional
+from dataclasses import dataclass
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from loguru import logger
+
+
+@dataclass
+class QuoteWrapper:
+    """Wrapper for quote data with bid/ask/ltp."""
+    bid: float
+    ask: float
+    ltp: float
 
 # Configure logging
 LOG_DIR = Path(__file__).parent / "logs"
@@ -127,7 +135,6 @@ class ExpiryTradingSystem:
         from src.state_manager import StateManager, TradingStatus, Position, LegPosition
         from src.state_manager import save_trade_record
         from src.strategy import ExpiryChecker, StrategyCalculator, calculate_premium_from_quotes
-        from src.order_executor import OrderExecutor
         from src.position_manager import PositionManager, ExitReason
         from src.telegram_alerts import TelegramAlerts
         from src.chart_generator import ChartGenerator, ChartData
@@ -143,8 +150,8 @@ class ExpiryTradingSystem:
         self.chart_generator = ChartGenerator(Path(config['paths']['state']).parent / "charts")
 
         # Kite client (created on demand)
-        self._kite = None
-        self._order_executor = None
+        self._kite: Any = None
+        self._order_executor: Any = None
 
         # Chart data for P&L tracking
         self._chart_data: Optional[ChartData] = None
@@ -159,14 +166,14 @@ class ExpiryTradingSystem:
         self._calculate_premium_from_quotes = calculate_premium_from_quotes
 
     @property
-    def kite(self):
+    def kite(self) -> Any:
         """Get Kite client (lazy initialization)."""
         if self._kite is None:
             self._kite = create_kite_client(self.config)
         return self._kite
 
     @property
-    def order_executor(self):
+    def order_executor(self) -> Any:
         """Get order executor (lazy initialization)."""
         if self._order_executor is None:
             from src.order_executor import OrderExecutor
@@ -258,11 +265,18 @@ class ExpiryTradingSystem:
         now = datetime.now()
         strategy_config = self.config.get('strategy', {})
 
-        entry_start = dt_time(9, 27)
-        entry_end = dt_time(9, 30)
+        # Parse entry times from config
+        entry_start_str = strategy_config.get('entry_start_time', '09:27')
+        entry_end_str = strategy_config.get('entry_end_time', '09:30')
+
+        entry_start_parts = entry_start_str.split(':')
+        entry_end_parts = entry_end_str.split(':')
+
+        entry_start = dt_time(int(entry_start_parts[0]), int(entry_start_parts[1]))
+        entry_end = dt_time(int(entry_end_parts[0]), int(entry_end_parts[1]))
 
         if now.time() < entry_start:
-            logger.info(f"Waiting for entry window (9:27 AM)")
+            logger.info(f"Waiting for entry window ({entry_start_str})")
             return
 
         if now.time() > entry_end:
@@ -309,19 +323,11 @@ class ExpiryTradingSystem:
             f"NFO:{setup.long_ce.symbol}",
             f"NFO:{setup.long_pe.symbol}"
         ]
-        quotes = self.kite.quote(symbols)
+        raw_quotes = self.kite.quote(symbols)
 
-        # Convert quotes to our format
-        from dataclasses import dataclass
-
-        @dataclass
-        class QuoteWrapper:
-            bid: float
-            ask: float
-            ltp: float
-
-        formatted_quotes = {}
-        for key, data in quotes.items():
+        # Convert quotes to our format (option quotes have depth)
+        formatted_quotes: Dict[str, QuoteWrapper] = {}
+        for key, data in raw_quotes.items():
             depth = data.get('depth', {})
             buy = depth.get('buy', [{}])
             sell = depth.get('sell', [{}])
@@ -365,7 +371,7 @@ class ExpiryTradingSystem:
         # Save position
         self.state_manager.set_position(position)
 
-        # Initialize chart data
+        # Initialize chart data and persist for future invocations
         self._chart_data = self._ChartData(
             entry_time=datetime.now(),
             spot_at_entry=spot,
@@ -374,6 +380,8 @@ class ExpiryTradingSystem:
             stop_loss_pnl=stop_loss_pnl,
             total_credit=setup.total_credit
         )
+        # Save initial chart data to file
+        self.chart_generator.save_pnl_history(self._chart_data)
 
         # Send telegram alert
         self.telegram.send_entry_alert(position, {
@@ -404,25 +412,28 @@ class ExpiryTradingSystem:
             logger.error(f"Quote fetch failed: {e}")
             return
 
-        # Format quotes
-        from dataclasses import dataclass
-
-        @dataclass
-        class QuoteWrapper:
-            bid: float
-            ask: float
-            ltp: float
-
-        quotes = {}
+        # Format quotes - handle both option quotes (with depth) and index quotes
+        quotes: Dict[str, QuoteWrapper] = {}
         for key, data in raw_quotes.items():
-            depth = data.get('depth', {})
-            buy = depth.get('buy', [{}])
-            sell = depth.get('sell', [{}])
-            quotes[key] = QuoteWrapper(
-                bid=buy[0].get('price', 0) if buy else 0,
-                ask=sell[0].get('price', 0) if sell else 0,
-                ltp=data.get('last_price', 0)
-            )
+            ltp = data.get('last_price', 0)
+
+            if 'depth' in data and data['depth']:
+                # Option quotes have depth with bid/ask
+                depth = data.get('depth', {})
+                buy = depth.get('buy', [{}])
+                sell = depth.get('sell', [{}])
+                quotes[key] = QuoteWrapper(
+                    bid=buy[0].get('price', 0) if buy else 0,
+                    ask=sell[0].get('price', 0) if sell else 0,
+                    ltp=ltp
+                )
+            else:
+                # Index quotes (NIFTY, VIX) don't have depth - use LTP for all
+                quotes[key] = QuoteWrapper(
+                    bid=ltp,
+                    ask=ltp,
+                    ltp=ltp
+                )
 
         # Calculate MTM P&L
         mtm_pnl, snapshot = self.position_manager.calculate_mtm_pnl(position, quotes)
@@ -432,21 +443,30 @@ class ExpiryTradingSystem:
         # Update state
         self.state_manager.update_pnl(mtm_pnl, snapshot.vix)
 
-        # Update chart data
+        # Update chart data - try to load existing history first
         if self._chart_data is None:
-            self._chart_data = self._ChartData(
-                entry_time=datetime.strptime(position.entry_time, "%H:%M:%S").replace(
-                    year=datetime.now().year,
-                    month=datetime.now().month,
-                    day=datetime.now().day
-                ),
-                spot_at_entry=position.spot_at_entry,
-                wing_distance=position.wing_distance,
-                target_pnl=position.target_pnl,
-                stop_loss_pnl=position.stop_loss_pnl,
-                total_credit=position.total_credit
-            )
+            # Try to load persisted P&L history from previous invocations
+            self._chart_data = self.chart_generator.load_pnl_history()
 
+            if self._chart_data is None:
+                # No history found, create fresh chart data
+                self._chart_data = self._ChartData(
+                    entry_time=datetime.strptime(position.entry_time, "%H:%M:%S").replace(
+                        year=datetime.now().year,
+                        month=datetime.now().month,
+                        day=datetime.now().day
+                    ),
+                    spot_at_entry=position.spot_at_entry,
+                    wing_distance=position.wing_distance,
+                    target_pnl=position.target_pnl,
+                    stop_loss_pnl=position.stop_loss_pnl,
+                    total_credit=position.total_credit
+                )
+                logger.info("Created new P&L chart data")
+            else:
+                logger.info(f"Loaded P&L history with {len(self._chart_data.pnl_history)} points")
+
+        # Add current P&L point and auto-save to file
         self.chart_generator.add_pnl_point(
             self._chart_data, mtm_pnl, snapshot.spot
         )
@@ -563,16 +583,8 @@ class ExpiryTradingSystem:
             symbols = [f"NFO:{leg.symbol}" for leg in position.legs]
             raw_quotes = self.kite.quote(symbols)
 
-            # Format quotes
-            from dataclasses import dataclass
-
-            @dataclass
-            class QuoteWrapper:
-                bid: float
-                ask: float
-                ltp: float
-
-            quotes = {}
+            # Format quotes (option quotes have depth)
+            quotes: Dict[str, QuoteWrapper] = {}
             for key, data in raw_quotes.items():
                 depth = data.get('depth', {})
                 buy = depth.get('buy', [{}])
@@ -590,7 +602,7 @@ class ExpiryTradingSystem:
             self.state_manager.set_error(f"Force exit failed: {e}")
 
 
-def main():
+def main() -> None:
     """Main entry point."""
     try:
         config = load_config()

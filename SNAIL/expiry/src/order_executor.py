@@ -9,12 +9,12 @@ Handles batch order execution respecting exchange freeze limits.
 
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Any, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 from loguru import logger
 
-from src.strategy import IronCondorSetup, Strike
+from src.strategy import IronCondorSetup
 from src.state_manager import LegPosition
 
 
@@ -191,11 +191,14 @@ class OrderExecutor:
 
             # Live trading
             order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=self.EXCHANGE,
                 tradingsymbol=request.symbol,
                 transaction_type=request.transaction_type.value,
                 quantity=request.quantity,
                 price=request.price,
-                order_type=request.order_type
+                order_type=request.order_type,
+                product=self.PRODUCT
             )
 
             logger.info(
@@ -242,13 +245,30 @@ class OrderExecutor:
 
         while time.time() - start_time < self.order_timeout:
             try:
-                status = self.kite.get_order_status(order_id)
-                if status.get('status') == 'COMPLETE':
+                # Use order_history to get order status (Kite Connect API)
+                history = self.kite.order_history(order_id)
+                if not history:
+                    logger.warning(f"No order history for {order_id}")
+                    time.sleep(1)
+                    continue
+
+                # Latest status is the last item in history
+                status = history[-1]
+                order_status = status.get('status', '')
+
+                if order_status == 'COMPLETE':
                     return float(status.get('average_price', 0))
-                elif status.get('status') in ['REJECTED', 'CANCELLED']:
-                    raise Exception(f"Order {status.get('status')}: {status.get('status_message')}")
+                elif order_status in ['REJECTED', 'CANCELLED']:
+                    raise Exception(
+                        f"Order {order_status}: {status.get('status_message', 'Unknown error')}"
+                    )
+                # OPEN, PENDING, TRIGGER_PENDING - keep waiting
             except Exception as e:
-                logger.warning(f"Error checking order status: {e}")
+                if 'Order not found' in str(e):
+                    # Order may not be in system yet, retry
+                    logger.debug(f"Order {order_id} not found yet, retrying...")
+                else:
+                    logger.warning(f"Error checking order status: {e}")
 
             time.sleep(1)
 
@@ -327,6 +347,9 @@ class OrderExecutor:
             setup.long_pe.symbol: []
         }
 
+        # Track filled orders for potential rollback
+        filled_orders: List[OrderResult] = []
+
         # Execute batches
         for batch_idx, batch_qty in enumerate(batches):
             logger.info(f"Executing batch {batch_idx + 1}/{len(batches)}: {batch_qty} qty")
@@ -337,9 +360,22 @@ class OrderExecutor:
                 result = self.place_single_order(order)
                 all_results[order.symbol].append(result)
 
-                if result.status != OrderStatus.COMPLETE:
+                if result.status == OrderStatus.COMPLETE:
+                    filled_orders.append(result)
+                else:
                     logger.error(f"Order failed: {result.message}")
-                    # TODO: Handle partial fills / rollback
+
+                    # CRITICAL: On failure, attempt to unwind filled orders
+                    if filled_orders and self.mode != 'paper':
+                        logger.error(
+                            f"PARTIAL FILL DETECTED: {len(filled_orders)} legs filled, "
+                            f"attempting rollback"
+                        )
+                        self._rollback_partial_fill(filled_orders)
+
+                    # Return immediately with failure
+                    legs = self._build_leg_positions(setup, all_results, total_qty)
+                    return False, legs
 
             # Delay between batches
             if batch_idx < len(batches) - 1:
@@ -439,6 +475,65 @@ class OrderExecutor:
             return 0.0
 
         return total_value / total_qty
+
+    def _rollback_partial_fill(self, filled_orders: List[OrderResult]) -> None:
+        """
+        Attempt to unwind partially filled orders.
+
+        When some legs of an iron condor fill but others fail,
+        we must close the filled positions to avoid naked exposure.
+
+        Args:
+            filled_orders: List of successfully filled order results
+        """
+        logger.error("=" * 60)
+        logger.error("EMERGENCY ROLLBACK: Unwinding partial fill")
+        logger.error("=" * 60)
+
+        for order in filled_orders:
+            try:
+                # Reverse the transaction type
+                if order.transaction_type == 'SELL':
+                    reverse_side = 'BUY'
+                    # For closing a short, pay more to ensure fill
+                    exit_price = order.fill_price * 1.02  # 2% above fill
+                else:
+                    reverse_side = 'SELL'
+                    # For closing a long, accept less
+                    exit_price = order.fill_price * 0.98  # 2% below fill
+
+                logger.error(
+                    f"Rollback: {reverse_side} {order.quantity} {order.symbol} "
+                    f"@ {exit_price:.2f} (original: {order.fill_price:.2f})"
+                )
+
+                rollback_order_id = self.kite.place_order(
+                    variety=self.kite.VARIETY_REGULAR,
+                    exchange=self.EXCHANGE,
+                    tradingsymbol=order.symbol,
+                    transaction_type=reverse_side,
+                    quantity=order.quantity,
+                    price=round(exit_price, 2),
+                    order_type="LIMIT",
+                    product=self.PRODUCT
+                )
+
+                logger.error(f"Rollback order placed: {rollback_order_id}")
+
+                # Wait briefly for fill
+                try:
+                    self._wait_for_fill(rollback_order_id)
+                    logger.error(f"Rollback order {rollback_order_id} filled")
+                except Exception as fill_error:
+                    logger.error(f"Rollback order may not have filled: {fill_error}")
+
+            except Exception as e:
+                logger.error(f"CRITICAL: Rollback failed for {order.symbol}: {e}")
+                logger.error("MANUAL INTERVENTION REQUIRED!")
+
+        logger.error("=" * 60)
+        logger.error("ROLLBACK COMPLETE - Check positions manually")
+        logger.error("=" * 60)
 
     def execute_exit(
         self,

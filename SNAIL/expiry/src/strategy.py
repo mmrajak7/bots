@@ -8,9 +8,9 @@ VIX-based wing calculation and strike selection.
 """
 
 import pandas as pd
-from datetime import datetime, date
+from datetime import date
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any
 from dataclasses import dataclass
 from loguru import logger
 
@@ -159,7 +159,7 @@ class ExpiryChecker:
             options = options[options['expiry'] == expiry_date]
 
         if options.empty:
-            logger.warning(f"No options found, using default lot size 75")
+            logger.warning("No options found, using default lot size 75")
             return 75
 
         # Get lot size from first matching option

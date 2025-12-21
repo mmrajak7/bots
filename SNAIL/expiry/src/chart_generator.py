@@ -7,9 +7,10 @@ Generates P&L charts for Telegram updates.
 @description Dark theme P&L chart generation
 """
 
-from datetime import datetime
+import json
+from datetime import datetime, date
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 from dataclasses import dataclass, field
 from loguru import logger
 
@@ -18,7 +19,6 @@ try:
     matplotlib.use('Agg')  # Non-interactive backend
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
-    from matplotlib.patches import Rectangle
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
@@ -81,23 +81,130 @@ class ChartGenerator:
         }
 
         if MATPLOTLIB_AVAILABLE:
-            plt.style.use('seaborn-v0_8-darkgrid')
+            # Try different style names for compatibility across matplotlib versions
+            for style in ['seaborn-v0_8-darkgrid', 'seaborn-darkgrid', 'dark_background']:
+                try:
+                    plt.style.use(style)
+                    break
+                except OSError:
+                    continue
+
+    def _get_history_file_path(self, for_date: Optional[date] = None) -> Path:
+        """Get path to P&L history file for a specific date."""
+        if for_date is None:
+            for_date = date.today()
+        return self.output_dir / f"pnl_history_{for_date.isoformat()}.json"
+
+    def save_pnl_history(self, chart_data: ChartData) -> bool:
+        """
+        Save P&L history to file for persistence across script invocations.
+
+        Args:
+            chart_data: Chart data with P&L history
+
+        Returns:
+            True if saved successfully
+        """
+        try:
+            history_path = self._get_history_file_path()
+
+            # Convert to serializable format
+            history_data = {
+                "date": date.today().isoformat(),
+                "entry_time": chart_data.entry_time.isoformat(),
+                "spot_at_entry": chart_data.spot_at_entry,
+                "wing_distance": chart_data.wing_distance,
+                "target_pnl": chart_data.target_pnl,
+                "stop_loss_pnl": chart_data.stop_loss_pnl,
+                "total_credit": chart_data.total_credit,
+                "pnl_history": [
+                    {
+                        "timestamp": p.timestamp.isoformat(),
+                        "pnl": p.pnl,
+                        "spot": p.spot
+                    }
+                    for p in chart_data.pnl_history
+                ]
+            }
+
+            with open(history_path, 'w') as f:
+                json.dump(history_data, f, indent=2)
+
+            logger.debug(f"P&L history saved: {len(chart_data.pnl_history)} points")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to save P&L history: {e}")
+            return False
+
+    def load_pnl_history(self, for_date: Optional[date] = None) -> Optional[ChartData]:
+        """
+        Load P&L history from file.
+
+        Args:
+            for_date: Date to load history for (defaults to today)
+
+        Returns:
+            ChartData with loaded history, or None if not found
+        """
+        try:
+            history_path = self._get_history_file_path(for_date)
+
+            if not history_path.exists():
+                logger.debug(f"No P&L history file found: {history_path}")
+                return None
+
+            with open(history_path, 'r') as f:
+                data = json.load(f)
+
+            # Verify it's for today
+            if data.get("date") != date.today().isoformat():
+                logger.debug("P&L history is from a different day, ignoring")
+                return None
+
+            # Reconstruct ChartData
+            chart_data = ChartData(
+                entry_time=datetime.fromisoformat(data["entry_time"]),
+                spot_at_entry=data["spot_at_entry"],
+                wing_distance=data["wing_distance"],
+                target_pnl=data["target_pnl"],
+                stop_loss_pnl=data["stop_loss_pnl"],
+                total_credit=data["total_credit"],
+                pnl_history=[]
+            )
+
+            # Reconstruct P&L points
+            for point in data.get("pnl_history", []):
+                chart_data.pnl_history.append(PnLPoint(
+                    timestamp=datetime.fromisoformat(point["timestamp"]),
+                    pnl=point["pnl"],
+                    spot=point["spot"]
+                ))
+
+            logger.info(f"Loaded P&L history: {len(chart_data.pnl_history)} points")
+            return chart_data
+
+        except Exception as e:
+            logger.error(f"Failed to load P&L history: {e}")
+            return None
 
     def add_pnl_point(
         self,
         chart_data: ChartData,
         pnl: float,
         spot: float,
-        timestamp: Optional[datetime] = None
+        timestamp: Optional[datetime] = None,
+        auto_save: bool = True
     ) -> ChartData:
         """
-        Add P&L data point.
+        Add P&L data point and optionally persist to file.
 
         Args:
             chart_data: Existing chart data
             pnl: Current P&L
             spot: Current spot price
             timestamp: Timestamp (defaults to now)
+            auto_save: Whether to save history after adding point
 
         Returns:
             Updated chart data
@@ -110,6 +217,10 @@ class ChartGenerator:
             pnl=pnl,
             spot=spot
         ))
+
+        # Persist to file for next invocation
+        if auto_save:
+            self.save_pnl_history(chart_data)
 
         return chart_data
 
@@ -361,7 +472,7 @@ class ChartGenerator:
 
     def cleanup_old_charts(self, keep_days: int = 7) -> int:
         """
-        Remove old chart files.
+        Remove old chart and history files.
 
         Args:
             keep_days: Days to keep charts
@@ -374,12 +485,19 @@ class ChartGenerator:
         removed = 0
         cutoff = time.time() - (keep_days * 24 * 60 * 60)
 
+        # Clean up chart images
         for chart_file in self.output_dir.glob("*.png"):
             if chart_file.stat().st_mtime < cutoff:
                 chart_file.unlink()
                 removed += 1
 
+        # Clean up P&L history files
+        for history_file in self.output_dir.glob("pnl_history_*.json"):
+            if history_file.stat().st_mtime < cutoff:
+                history_file.unlink()
+                removed += 1
+
         if removed > 0:
-            logger.info(f"Cleaned up {removed} old chart files")
+            logger.info(f"Cleaned up {removed} old chart/history files")
 
         return removed

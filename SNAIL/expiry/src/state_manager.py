@@ -8,6 +8,8 @@ Handles persistent state across script invocations.
 """
 
 import json
+import os
+import tempfile
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional, Dict, List, Any
@@ -196,14 +198,39 @@ class StateManager:
         return self._state
 
     def save(self) -> None:
-        """Save current state to file."""
+        """
+        Save current state to file atomically.
+
+        Uses write-to-temp-then-rename pattern to prevent corruption
+        if process is killed mid-write.
+        """
         if self._state is None:
             return
 
         try:
-            with open(self.state_path, 'w') as f:
-                json.dump(self._state.to_dict(), f, indent=2)
-            logger.debug(f"State saved: {self._state.status.value}")
+            # Write to temporary file in same directory
+            temp_fd, temp_path = tempfile.mkstemp(
+                dir=self.state_path.parent,
+                prefix='.state_',
+                suffix='.tmp'
+            )
+            try:
+                with os.fdopen(temp_fd, 'w') as f:
+                    json.dump(self._state.to_dict(), f, indent=2)
+
+                # Atomic rename (on POSIX) or replace (on Windows)
+                if os.name == 'nt':
+                    # Windows: need to remove target first
+                    if self.state_path.exists():
+                        os.remove(self.state_path)
+                os.rename(temp_path, self.state_path)
+
+                logger.debug(f"State saved: {self._state.status.value}")
+            except Exception:
+                # Clean up temp file on error
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                raise
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
 

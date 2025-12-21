@@ -8,12 +8,12 @@ Handles P&L calculation and exit condition checking.
 """
 
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, Optional, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
 from loguru import logger
 
-from src.state_manager import Position, LegPosition
+from src.state_manager import Position
 
 
 class ExitReason(str, Enum):
@@ -144,8 +144,12 @@ class PositionManager:
         mtm_pnl = pnl_per_share * total_qty
 
         # Calculate distances to wings
-        spot = quotes.get('NSE:NIFTY 50', {})
-        spot_price = spot.ltp if hasattr(spot, 'ltp') else position.spot_at_entry
+        spot_quote = quotes.get('NSE:NIFTY 50')
+        if spot_quote and hasattr(spot_quote, 'ltp') and spot_quote.ltp > 0:
+            spot_price = spot_quote.ltp
+        else:
+            spot_price = position.spot_at_entry
+            logger.warning(f"Using stale spot price: {spot_price}")
 
         atm_strike = position.legs[0].strike  # Short CE strike = ATM
         ce_wing_strike = atm_strike + position.wing_distance
@@ -155,8 +159,12 @@ class PositionManager:
         distance_to_pe = spot_price - pe_wing_strike
 
         # Get VIX
-        vix_quote = quotes.get('NSE:INDIA VIX', {})
-        current_vix = vix_quote.ltp if hasattr(vix_quote, 'ltp') else position.vix_at_entry
+        vix_quote = quotes.get('NSE:INDIA VIX')
+        if vix_quote and hasattr(vix_quote, 'ltp') and vix_quote.ltp > 0:
+            current_vix = vix_quote.ltp
+        else:
+            current_vix = position.vix_at_entry
+            logger.warning(f"Using stale VIX: {current_vix}")
 
         # P&L as percentage of target
         pnl_pct = (mtm_pnl / position.target_pnl) * 100 if position.target_pnl > 0 else 0
