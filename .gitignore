@@ -102,3 +102,10 @@ ZSCORE/*.md
 
 # Misc
 nul
+
+# Runtime data files (updated frequently by programs)
+data/signals_crocodile.csv
+data/holiday_calendar.json
+data/market_events.json
+data/market_news.json
+SNAIL/data/instruments.csv
