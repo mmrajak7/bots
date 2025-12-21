@@ -103,6 +103,13 @@ class OrderExecutor:
         strategy_config = config.get('strategy', {})
         self.slippage_pct = strategy_config.get('slippage_buffer_pct', 0.5)
 
+        # Store rollback message for caller to retrieve
+        self._last_rollback_message: str = ""
+
+    def get_last_rollback_message(self) -> str:
+        """Get the last rollback message (for sending alerts)."""
+        return self._last_rollback_message
+
     def get_freeze_limit(self, instrument: str) -> int:
         """Get freeze limit for instrument."""
         return self.freeze_limits.get(instrument, 1800)
@@ -366,15 +373,18 @@ class OrderExecutor:
                     logger.error(f"Order failed: {result.message}")
 
                     # CRITICAL: On failure, attempt to unwind filled orders
+                    rollback_message = ""
                     if filled_orders and self.mode != 'paper':
                         logger.error(
                             f"PARTIAL FILL DETECTED: {len(filled_orders)} legs filled, "
                             f"attempting rollback"
                         )
-                        self._rollback_partial_fill(filled_orders)
+                        rollback_message = self._rollback_partial_fill(filled_orders)
 
                     # Return immediately with failure
                     legs = self._build_leg_positions(setup, all_results, total_qty)
+                    # Store rollback message for caller to send alert
+                    self._last_rollback_message = rollback_message
                     return False, legs
 
             # Delay between batches
@@ -476,7 +486,7 @@ class OrderExecutor:
 
         return total_value / total_qty
 
-    def _rollback_partial_fill(self, filled_orders: List[OrderResult]) -> None:
+    def _rollback_partial_fill(self, filled_orders: List[OrderResult]) -> str:
         """
         Attempt to unwind partially filled orders.
 
@@ -485,10 +495,17 @@ class OrderExecutor:
 
         Args:
             filled_orders: List of successfully filled order results
+
+        Returns:
+            Rollback summary message for alerting
         """
         logger.error("=" * 60)
         logger.error("EMERGENCY ROLLBACK: Unwinding partial fill")
         logger.error("=" * 60)
+
+        rollback_summary = []
+        rollback_summary.append("EMERGENCY ROLLBACK INITIATED")
+        rollback_summary.append(f"Filled orders to unwind: {len(filled_orders)}")
 
         for order in filled_orders:
             try:
@@ -496,11 +513,18 @@ class OrderExecutor:
                 if order.transaction_type == 'SELL':
                     reverse_side = 'BUY'
                     # For closing a short, pay more to ensure fill
-                    exit_price = order.fill_price * 1.02  # 2% above fill
+                    # Handle zero fill_price - use order price as fallback
+                    base_price = order.fill_price if order.fill_price > 0 else order.price
+                    if base_price <= 0:
+                        base_price = 1.0  # Minimum price fallback
+                    exit_price = base_price * 1.05  # 5% above to ensure fill
                 else:
                     reverse_side = 'SELL'
                     # For closing a long, accept less
-                    exit_price = order.fill_price * 0.98  # 2% below fill
+                    base_price = order.fill_price if order.fill_price > 0 else order.price
+                    if base_price <= 0:
+                        base_price = 1.0
+                    exit_price = max(base_price * 0.95, 0.05)  # 5% below, min 0.05
 
                 logger.error(
                     f"Rollback: {reverse_side} {order.quantity} {order.symbol} "
@@ -519,21 +543,31 @@ class OrderExecutor:
                 )
 
                 logger.error(f"Rollback order placed: {rollback_order_id}")
+                rollback_summary.append(f"{reverse_side} {order.symbol}: Order {rollback_order_id}")
 
                 # Wait briefly for fill
                 try:
                     self._wait_for_fill(rollback_order_id)
                     logger.error(f"Rollback order {rollback_order_id} filled")
+                    rollback_summary.append("  -> FILLED")
                 except Exception as fill_error:
                     logger.error(f"Rollback order may not have filled: {fill_error}")
+                    rollback_summary.append(f"  -> PENDING: {fill_error}")
 
             except Exception as e:
                 logger.error(f"CRITICAL: Rollback failed for {order.symbol}: {e}")
                 logger.error("MANUAL INTERVENTION REQUIRED!")
+                rollback_summary.append(f"FAILED {order.symbol}: {e}")
+                rollback_summary.append("MANUAL INTERVENTION REQUIRED!")
 
         logger.error("=" * 60)
         logger.error("ROLLBACK COMPLETE - Check positions manually")
         logger.error("=" * 60)
+
+        rollback_summary.append("")
+        rollback_summary.append("CHECK POSITIONS MANUALLY!")
+
+        return "\n".join(rollback_summary)
 
     def execute_exit(
         self,
@@ -579,6 +613,11 @@ class OrderExecutor:
             freeze_limit = self.get_freeze_limit(self.config.get('instrument', 'NIFTY'))
             batches = self.calculate_batches(leg.quantity, freeze_limit)
 
+            # Track weighted average for multi-batch exits
+            leg_total_value = 0.0
+            leg_total_qty = 0
+            order_ids = []
+
             for batch_idx, batch_qty in enumerate(batches):
                 request = OrderRequest(
                     symbol=leg.symbol,
@@ -594,14 +633,20 @@ class OrderExecutor:
 
                 if result.status == OrderStatus.COMPLETE:
                     fill_price = result.fill_price if result.fill_price > 0 else exit_price
-                    leg.exit_price = fill_price
-                    leg.exit_order_id = result.order_id
+                    leg_total_value += fill_price * batch_qty
+                    leg_total_qty += batch_qty
                     total_exit_value += fill_price * batch_qty
+                    order_ids.append(result.order_id)
                 else:
                     logger.error(f"Exit failed for {leg.symbol}: {result.message}")
                     all_success = False
 
                 if batch_idx < len(batches) - 1:
                     time.sleep(self.inter_batch_delay)
+
+            # Set weighted average exit price for the leg
+            if leg_total_qty > 0:
+                leg.exit_price = leg_total_value / leg_total_qty
+                leg.exit_order_id = ','.join(order_ids)
 
         return all_success, total_exit_value

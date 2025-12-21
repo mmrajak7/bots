@@ -151,7 +151,14 @@ class PositionManager:
             spot_price = position.spot_at_entry
             logger.warning(f"Using stale spot price: {spot_price}")
 
-        atm_strike = position.legs[0].strike  # Short CE strike = ATM
+        # Validate legs exist before accessing
+        if not position.legs or len(position.legs) < 4:
+            logger.error(f"Invalid position: expected 4 legs, got {len(position.legs) if position.legs else 0}")
+            # Use spot as fallback for ATM strike
+            atm_strike = round(spot_price / 50) * 50
+        else:
+            atm_strike = position.legs[0].strike  # Short CE strike = ATM
+
         ce_wing_strike = atm_strike + position.wing_distance
         pe_wing_strike = atm_strike - position.wing_distance
 

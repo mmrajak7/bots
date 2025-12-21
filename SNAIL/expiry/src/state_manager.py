@@ -326,7 +326,9 @@ def save_trade_record(
     charges: float
 ) -> Path:
     """
-    Save completed trade to trades directory.
+    Save completed trade to trades directory atomically.
+
+    Uses write-to-temp-then-rename pattern to prevent corruption.
 
     Args:
         trades_dir: Directory for trade records
@@ -363,8 +365,24 @@ def save_trade_record(
     filename = f"trade_{state.date}.json"
     filepath = trades_dir / filename
 
-    with open(filepath, 'w') as f:
-        json.dump(trade_record, f, indent=2)
+    # Atomic write: temp file then rename
+    temp_fd, temp_path = tempfile.mkstemp(
+        dir=trades_dir,
+        prefix='.trade_',
+        suffix='.tmp'
+    )
+    try:
+        with os.fdopen(temp_fd, 'w') as f:
+            json.dump(trade_record, f, indent=2)
 
-    logger.info(f"Trade record saved: {filepath}")
-    return filepath
+        # Atomic rename (Windows needs target removed first)
+        if os.name == 'nt' and filepath.exists():
+            os.remove(filepath)
+        os.rename(temp_path, filepath)
+
+        logger.info(f"Trade record saved: {filepath}")
+        return filepath
+    except Exception:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise

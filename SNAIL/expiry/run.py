@@ -296,9 +296,16 @@ class ExpiryTradingSystem:
 
     def _execute_entry(self) -> None:
         """Execute iron condor entry."""
-        # Get market data
-        spot = self.kite.ltp(["NSE:NIFTY 50"])["NSE:NIFTY 50"]["last_price"]
-        vix = self.kite.ltp(["NSE:INDIA VIX"])["NSE:INDIA VIX"]["last_price"]
+        # Get market data with error handling
+        try:
+            ltp_data = self.kite.ltp(["NSE:NIFTY 50", "NSE:INDIA VIX"])
+            spot = ltp_data.get("NSE:NIFTY 50", {}).get("last_price")
+            vix = ltp_data.get("NSE:INDIA VIX", {}).get("last_price")
+
+            if not spot or not vix:
+                raise ValueError(f"Invalid LTP data: spot={spot}, vix={vix}")
+        except Exception as e:
+            raise ValueError(f"Failed to fetch market data: {e}")
 
         logger.info(f"Market: NIFTY={spot}, VIX={vix}")
 
@@ -347,6 +354,14 @@ class ExpiryTradingSystem:
         success, legs = self.order_executor.execute_iron_condor_entry(setup, num_lots)
 
         if not success:
+            # Check if there was a rollback (partial fill scenario)
+            rollback_msg = self.order_executor.get_last_rollback_message()
+            if rollback_msg:
+                # Send critical alert for rollback
+                self.telegram.send_error_alert(
+                    f"PARTIAL FILL ROLLBACK\n\n{rollback_msg}",
+                    "Entry - CRITICAL"
+                )
             raise ValueError("Order execution failed")
 
         # Calculate targets

@@ -8,6 +8,8 @@ Generates P&L charts for Telegram updates.
 """
 
 import json
+import os
+import tempfile
 from datetime import datetime, date
 from pathlib import Path
 from typing import List, Optional
@@ -97,7 +99,9 @@ class ChartGenerator:
 
     def save_pnl_history(self, chart_data: ChartData) -> bool:
         """
-        Save P&L history to file for persistence across script invocations.
+        Save P&L history to file atomically for persistence across script invocations.
+
+        Uses write-to-temp-then-rename pattern to prevent corruption.
 
         Args:
             chart_data: Chart data with P&L history
@@ -127,11 +131,27 @@ class ChartGenerator:
                 ]
             }
 
-            with open(history_path, 'w') as f:
-                json.dump(history_data, f, indent=2)
+            # Atomic write: temp file then rename
+            temp_fd, temp_path = tempfile.mkstemp(
+                dir=self.output_dir,
+                prefix='.pnl_history_',
+                suffix='.tmp'
+            )
+            try:
+                with os.fdopen(temp_fd, 'w') as f:
+                    json.dump(history_data, f, indent=2)
 
-            logger.debug(f"P&L history saved: {len(chart_data.pnl_history)} points")
-            return True
+                # Atomic rename (Windows needs target removed first)
+                if os.name == 'nt' and history_path.exists():
+                    os.remove(history_path)
+                os.rename(temp_path, history_path)
+
+                logger.debug(f"P&L history saved: {len(chart_data.pnl_history)} points")
+                return True
+            except Exception:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                raise
 
         except Exception as e:
             logger.error(f"Failed to save P&L history: {e}")
@@ -199,6 +219,9 @@ class ChartGenerator:
         """
         Add P&L data point and optionally persist to file.
 
+        Prevents duplicate points for the same minute (handles multiple
+        script invocations in same minute).
+
         Args:
             chart_data: Existing chart data
             pnl: Current P&L
@@ -212,6 +235,20 @@ class ChartGenerator:
         if timestamp is None:
             timestamp = datetime.now()
 
+        # Check for duplicate - same minute already exists
+        current_minute = timestamp.strftime("%H:%M")
+        for existing in chart_data.pnl_history:
+            if existing.timestamp.strftime("%H:%M") == current_minute:
+                # Update existing point instead of adding duplicate
+                existing.pnl = pnl
+                existing.spot = spot
+                existing.timestamp = timestamp
+                logger.debug(f"Updated existing P&L point for {current_minute}")
+                if auto_save:
+                    self.save_pnl_history(chart_data)
+                return chart_data
+
+        # No duplicate, add new point
         chart_data.pnl_history.append(PnLPoint(
             timestamp=timestamp,
             pnl=pnl,
