@@ -12,6 +12,7 @@ venv/
 
 # Data files with sensitive info
 data/kite_access_token.json
+config.json
 
 # Logs
 *.log
