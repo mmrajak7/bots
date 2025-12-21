@@ -111,6 +111,9 @@ kite_integration/
 # Backtest folder (local analysis only)
 backtest/
 
+# Analysis folder (Iron Fly breach probability study)
+analysis/
+
 # Review files
 *.txt
 !requirements*.txt

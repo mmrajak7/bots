@@ -1,0 +1,1446 @@
+{
+  "scraped_at": "2025-12-19T15:00:11.652176",
+  "source": "zerodha_calendar",
+  "events": [
+    {
+      "date": "2025-12-18",
+      "event": "Inflation",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-19",
+      "event": "Rural Wage Growth",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-19",
+      "event": "Rural Wage Growth",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-19",
+      "event": "Rural Wage Growth",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-19",
+      "event": "Corporate Bond Issuance",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-19",
+      "event": "Non-Cash Payments",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-19",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-19",
+      "event": "MPC Minutes",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-19",
+      "event": "Rural Wage Growth",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-19",
+      "event": "FDI Net Inflows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-22",
+      "event": "Core Sector",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-23",
+      "event": "Real GDP (Advance Estimate)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-23",
+      "event": "Industrial Production",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-23",
+      "event": "Industrial Production",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-24",
+      "event": "Durable Goods",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-25",
+      "event": "Bank Credit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-25",
+      "event": "Domestic Airline Passenger Load Factor",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-25",
+      "event": "Domestic Airline Passengers Carried",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-25",
+      "event": "Domestic Airline Cargo Carried",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-25",
+      "event": "Bank Deposit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-25",
+      "event": "Wireless Subscribers Addition",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-26",
+      "event": "Fixedline Subscribers Addition",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-26",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-28",
+      "event": "Industrial Production",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-30",
+      "event": "House Price Index",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-30",
+      "event": "External Debt",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Goods Trade Balance",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Goods Exports",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Goods Imports",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Goods Trade Balance",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Durable Goods",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Goods Imports",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Goods Exports",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Total Retail Sales and Food Services",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "External Debt",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Non-Food Credit",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Central Government Expenditure",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Central Government Gross Tax Revenue",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Personal Consumption Expenditure (PCE)",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Personal Consumption Expenditure (PCE)",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2025-12-31",
+      "event": "Total Retail Sales and Food Services",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-01",
+      "event": "Services Imports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-01",
+      "event": "GST Collections",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-01",
+      "event": "Services Exports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-02",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "Portfolio Net Debt Flows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "Coal Production",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "Power Generation",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "Naukri JobSpeak Index",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "State Government Receipts",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "Tractor Sales",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "NREGA Demand",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "2W Sales",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "Portfolio Net Equity Flows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "Domestic Coal Dispatch",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "Passenger Vehicle Sales",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-05",
+      "event": "State Government Expenditure",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-08",
+      "event": "Merchandise Imports",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-08",
+      "event": "Merchandise Trade Balance",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-08",
+      "event": "Merchandise Exports",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-08",
+      "event": "Bank Credit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-08",
+      "event": "Bank Deposit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-09",
+      "event": "Cargo Traffic at Major Ports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-09",
+      "event": "Life Insurance Premium",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-09",
+      "event": "Monthly Non Farm",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-09",
+      "event": "General Insurance Premium",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-09",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-09",
+      "event": "E-Way Bills",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-09",
+      "event": "Rural Wage Growth",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-09",
+      "event": "Unemployment",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-10",
+      "event": "Mutual Fund Equity Inflows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-10",
+      "event": "Corporate Bond Issuance",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-10",
+      "event": "Railway Freight",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-12",
+      "event": "CPI Inflation",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-13",
+      "event": "Inflation",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-14",
+      "event": "Producer Price Index (PPI)",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-14",
+      "event": "Current Account Balance",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-14",
+      "event": "WPI Inflation",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-15",
+      "event": "Goods Exports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-15",
+      "event": "Goods Imports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-15",
+      "event": "Goods Trade Balance",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-16",
+      "event": "Industrial Production",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-16",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-20",
+      "event": "Core Sector",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-20",
+      "event": "Non-Cash Payments",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-20",
+      "event": "FDI Net Inflows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-22",
+      "event": "Bank Deposit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-22",
+      "event": "Bank Credit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-23",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-25",
+      "event": "Domestic Airline Passengers Carried",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-25",
+      "event": "Domestic Airline Cargo Carried",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-25",
+      "event": "Domestic Airline Passenger Load Factor",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-27",
+      "event": "House Price Index",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-28",
+      "event": "Durable Goods",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-28",
+      "event": "Central Bank Policy Rate (Lower Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-28",
+      "event": "Central Bank Policy Rate (Upper Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-29",
+      "event": "Personal Consumption Expenditure (PCE)",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-29",
+      "event": "Real GDP (Advance Estimate)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-30",
+      "event": "Producer Price Index (PPI)",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-01-30",
+      "event": "Services Exports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-30",
+      "event": "GST Collections",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-30",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-30",
+      "event": "Services Imports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-31",
+      "event": "Central Government Expenditure",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-31",
+      "event": "Non-Food Credit",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2026-01-31",
+      "event": "Central Government Gross Tax Revenue",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-01",
+      "event": "Union Budget",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-03",
+      "event": "Portfolio Net Equity Flows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-03",
+      "event": "State Government Expenditure",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-03",
+      "event": "NREGA Demand",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-03",
+      "event": "Tractor Sales",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-03",
+      "event": "Power Generation",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-03",
+      "event": "Naukri JobSpeak Index",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-03",
+      "event": "State Government Receipts",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-03",
+      "event": "Passenger Vehicle Sales",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-03",
+      "event": "2W Sales",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-03",
+      "event": "Portfolio Net Debt Flows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-05",
+      "event": "Merchandise Exports",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-02-05",
+      "event": "Merchandise Imports",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-02-05",
+      "event": "Bank Credit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-05",
+      "event": "Domestic Coal Dispatch",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-05",
+      "event": "Bank Deposit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-05",
+      "event": "Merchandise Trade Balance",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-02-05",
+      "event": "Coal Production",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-06",
+      "event": "Unemployment",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-02-06",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-06",
+      "event": "Cash Reserve Ratio",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-06",
+      "event": "Monthly Non Farm",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-02-10",
+      "event": "Railway Freight",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-10",
+      "event": "General Insurance Premium",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-10",
+      "event": "Corporate Bond Issuance",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-10",
+      "event": "E-Way Bills",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-10",
+      "event": "Rural Wage Growth",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-10",
+      "event": "Cargo Traffic at Major Ports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-10",
+      "event": "Life Insurance Premium",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-10",
+      "event": "Mutual Fund Equity Inflows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-11",
+      "event": "House Price Index",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-11",
+      "event": "Inflation",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-02-12",
+      "event": "CPI Inflation",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-12",
+      "event": "Producer Price Index (PPI)",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-02-13",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-16",
+      "event": "Goods Trade Balance",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-16",
+      "event": "WPI Inflation",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-16",
+      "event": "Goods Exports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-16",
+      "event": "Goods Imports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-18",
+      "event": "Industrial Production",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-02-19",
+      "event": "Bank Credit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-19",
+      "event": "Bank Deposit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-20",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-20",
+      "event": "Non-Cash Payments",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-20",
+      "event": "FDI Net Inflows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-20",
+      "event": "Core Sector",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-20",
+      "event": "MPC Minutes",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-24",
+      "event": "House Price Index",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-02-25",
+      "event": "Domestic Airline Passengers Carried",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-25",
+      "event": "Wireless Subscribers Addition",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-25",
+      "event": "Fixedline Subscribers Addition",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-25",
+      "event": "Domestic Airline Passenger Load Factor",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-25",
+      "event": "Domestic Airline Cargo Carried",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-26",
+      "event": "Personal Consumption Expenditure (PCE)",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-02-26",
+      "event": "Durable Goods",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-02-27",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-27",
+      "event": "GST Collections",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-27",
+      "event": "Services Exports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-27",
+      "event": "Real GDP",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-27",
+      "event": "Services Imports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-28",
+      "event": "Central Government Gross Tax Revenue",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-28",
+      "event": "Non-Food Credit",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2026-02-28",
+      "event": "Central Government Expenditure",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-03",
+      "event": "2W Sales",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-03",
+      "event": "Portfolio Net Equity Flows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-03",
+      "event": "Portfolio Net Debt Flows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-03",
+      "event": "Tractor Sales",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-03",
+      "event": "State Government Receipts",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-03",
+      "event": "State Government Expenditure",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-03",
+      "event": "Naukri JobSpeak Index",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-03",
+      "event": "Power Generation",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-03",
+      "event": "NREGA Demand",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-03",
+      "event": "Passenger Vehicle Sales",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-05",
+      "event": "Domestic Coal Dispatch",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-05",
+      "event": "Coal Production",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-05",
+      "event": "Merchandise Trade Balance",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-05",
+      "event": "Merchandise Exports",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-05",
+      "event": "Bank Credit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-05",
+      "event": "Bank Deposit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-05",
+      "event": "Merchandise Imports",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-06",
+      "event": "Unemployment",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-06",
+      "event": "Monthly Non Farm",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-06",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-10",
+      "event": "E-Way Bills",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-10",
+      "event": "Corporate Bond Issuance",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-10",
+      "event": "Mutual Fund Equity Inflows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-10",
+      "event": "Life Insurance Premium",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-10",
+      "event": "General Insurance Premium",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-10",
+      "event": "Rural Wage Growth",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-10",
+      "event": "Cargo Traffic at Major Ports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-11",
+      "event": "Inflation",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-12",
+      "event": "CPI Inflation",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-12",
+      "event": "Producer Price Index (PPI)",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-13",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-16",
+      "event": "Goods Trade Balance",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-16",
+      "event": "Goods Imports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-16",
+      "event": "Industrial Production",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-16",
+      "event": "Goods Exports",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-16",
+      "event": "WPI Inflation",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-18",
+      "event": "Central Bank Policy Rate (Lower Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-18",
+      "event": "Central Bank Policy Rate (Upper Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-19",
+      "event": "Bank Deposit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-19",
+      "event": "Bank Credit",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-20",
+      "event": "FDI Net Inflows",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-20",
+      "event": "Non-Cash Payments",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-20",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-20",
+      "event": "Core Sector",
+      "importance": "High",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-25",
+      "event": "External Debt",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-25",
+      "event": "Durable Goods",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-25",
+      "event": "Current Account Balance",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-25",
+      "event": "Fixedline Subscribers Addition",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-25",
+      "event": "Wireless Subscribers Addition",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-25",
+      "event": "Domestic Airline Passengers Carried",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-25",
+      "event": "Domestic Airline Cargo Carried",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-25",
+      "event": "Domestic Airline Passenger Load Factor",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-27",
+      "event": "Personal Consumption Expenditure (PCE)",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-03-27",
+      "event": "FX Reserves",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-31",
+      "event": "Central Government Gross Tax Revenue",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-31",
+      "event": "Non-Food Credit",
+      "importance": "Low",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-31",
+      "event": "External Debt",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-31",
+      "event": "Central Government Expenditure",
+      "importance": "Medium",
+      "country": "India"
+    },
+    {
+      "date": "2026-03-31",
+      "event": "House Price Index",
+      "importance": "Medium",
+      "country": "United States"
+    },
+    {
+      "date": "2026-04-29",
+      "event": "Central Bank Policy Rate (Lower Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-04-29",
+      "event": "Central Bank Policy Rate (Upper Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-06-17",
+      "event": "Central Bank Policy Rate (Lower Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-06-17",
+      "event": "Central Bank Policy Rate (Upper Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-07-29",
+      "event": "Central Bank Policy Rate (Upper Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-07-29",
+      "event": "Central Bank Policy Rate (Lower Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-09-16",
+      "event": "Central Bank Policy Rate (Lower Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-09-16",
+      "event": "Central Bank Policy Rate (Upper Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-10-28",
+      "event": "Central Bank Policy Rate (Upper Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-10-28",
+      "event": "Central Bank Policy Rate (Lower Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-12-09",
+      "event": "Central Bank Policy Rate (Lower Range)",
+      "importance": "High",
+      "country": "United States"
+    },
+    {
+      "date": "2026-12-09",
+      "event": "Central Bank Policy Rate (Upper Range)",
+      "importance": "High",
+      "country": "United States"
+    }
+  ]
+}
