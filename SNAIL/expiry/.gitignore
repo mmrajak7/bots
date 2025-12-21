@@ -1,0 +1,19 @@
+# Configuration (contains sensitive paths/tokens)
+config.json
+
+# Review documents
+*.md
+
+# Runtime data
+data/state.json
+data/trades/
+data/charts/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/

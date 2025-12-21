@@ -1,0 +1,60 @@
+{
+  "mode": "paper",
+  "instrument": "NIFTY",
+  "num_lots": 1,
+
+  "paths": {
+    "kite_token": "../../data/kite_access_token.json",
+    "instruments": "../data/instruments.csv",
+    "state": "data/state.json",
+    "trades": "data/trades",
+    "logs": "logs/expiry.log"
+  },
+
+  "strategy": {
+    "entry_start_time": "09:27",
+    "entry_end_time": "09:30",
+    "hard_exit_time": "15:15",
+    "target_decay_pct": 50,
+    "stop_loss_multiplier": 2.0,
+    "slippage_buffer_pct": 0.5,
+    "min_wing_distance": 100,
+    "wing_rounding": 50
+  },
+
+  "vix_multipliers": {
+    "below_11": 0.90,
+    "11_to_13": 1.00,
+    "13_to_15": 1.10,
+    "15_to_18": 1.25,
+    "18_to_22": 1.40,
+    "above_22": 1.60
+  },
+
+  "telegram": {
+    "bot_token": "${TELEGRAM_BOT_TOKEN}",
+    "chat_id": "${TELEGRAM_CHAT_ID}",
+    "pnl_chart_interval_mins": 15,
+    "wing_approach_pct": 70,
+    "vix_spike_threshold": 1.0
+  },
+
+  "freeze_limits": {
+    "NIFTY": 1800,
+    "SENSEX": 500
+  },
+
+  "order_execution": {
+    "inter_batch_delay_secs": 3,
+    "order_timeout_secs": 30,
+    "max_retries": 2
+  },
+
+  "charges": {
+    "brokerage_per_order": 20,
+    "stt_sell_rate": 0.000625,
+    "exchange_txn_rate": 0.0005,
+    "gst_rate": 0.18,
+    "stamp_duty_rate": 0.00003
+  }
+}
