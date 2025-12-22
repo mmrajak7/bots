@@ -28,6 +28,7 @@ import requests
 import csv
 import statistics
 import uuid
+import signal
 import concurrent.futures
 from datetime import datetime, timedelta, date
 from collections import deque
@@ -114,13 +115,17 @@ def is_trading_day(holidays: set = None) -> bool:
 
 
 def get_next_trading_day(holidays: set = None) -> date:
-    """Get next trading day"""
+    """Get next trading day with iteration limit to prevent infinite loop"""
     check_date = date.today() + timedelta(days=1)
     holidays = holidays or set()
-    while True:
+    max_iterations = 365  # Safety limit - shouldn't need more than a year
+    for _ in range(max_iterations):
         if check_date.weekday() < 5 and check_date.isoformat() not in holidays:
             return check_date
         check_date += timedelta(days=1)
+    # Fallback: return next weekday if loop exhausted (should never happen)
+    logging.warning("get_next_trading_day exceeded max iterations, returning next weekday")
+    return check_date
 
 
 # =============================================================================
@@ -143,20 +148,18 @@ def get_instruments_age(instruments_path: str) -> Optional[float]:
 
 
 def refresh_bse_instruments(
-    kite: KiteConnect,
     instruments_path: str,
     max_retries: int = INSTRUMENTS_MAX_RETRIES
 ) -> Tuple[bool, str]:
     """
     Download and cache BSE (BFO) instruments filtered to SENSEX only.
+    Uses Zerodha's public API - no authentication required.
 
     Implements:
     - 3 retries with exponential backoff (2s, 5s, 10s)
     - Falls back to cache if less than 24 hours old
-    - Similar logic to SNAIL's refresh_instruments_csv
 
     Args:
-        kite: KiteConnect instance
         instruments_path: Path to save instruments CSV
         max_retries: Maximum retry attempts
 
@@ -164,19 +167,31 @@ def refresh_bse_instruments(
         Tuple of (success, message)
     """
     last_error = None
+    BFO_URL = "https://api.kite.trade/instruments/BFO"
+    BSE_URL = "https://api.kite.trade/instruments/BSE"
 
     for attempt in range(max_retries):
         try:
             logging.info(f"Downloading BSE instruments (attempt {attempt + 1}/{max_retries})...")
 
-            # Fetch BFO (BSE F&O) instruments
-            bfo_instruments = kite.instruments("BFO")
+            # Fetch BFO (BSE F&O) instruments - public API, no auth needed
+            bfo_response = requests.get(BFO_URL, timeout=30)
+            bfo_response.raise_for_status()
+
+            # Parse CSV response using csv module for proper handling of quoted fields
+            import io
+            bfo_reader = csv.DictReader(io.StringIO(bfo_response.text))
+            bfo_instruments = list(bfo_reader)
 
             if not bfo_instruments:
-                raise ValueError("Empty BFO instruments response from Kite")
+                raise ValueError("Empty BFO instruments response")
 
             # Also fetch BSE for spot index token
-            bse_instruments = kite.instruments("BSE")
+            bse_response = requests.get(BSE_URL, timeout=30)
+            bse_response.raise_for_status()
+
+            bse_reader = csv.DictReader(io.StringIO(bse_response.text))
+            bse_instruments = list(bse_reader)
 
             # Filter to SENSEX futures and options
             sensex_count = 0
@@ -196,8 +211,8 @@ def refresh_bse_instruments(
                     if inst.get('name') == 'SENSEX':
                         writer.writerow({
                             'fetch_date': today,
-                            'instrument_token': inst['instrument_token'],
-                            'tradingsymbol': inst['tradingsymbol'],
+                            'instrument_token': inst.get('instrument_token', ''),
+                            'tradingsymbol': inst.get('tradingsymbol', ''),
                             'name': inst.get('name', ''),
                             'exchange': 'BFO',
                             'instrument_type': inst.get('instrument_type', ''),
@@ -209,11 +224,11 @@ def refresh_bse_instruments(
 
                 # Write SENSEX spot index from BSE (for spot price)
                 for inst in bse_instruments:
-                    if inst['tradingsymbol'] == 'SENSEX':
+                    if inst.get('tradingsymbol') == 'SENSEX':
                         writer.writerow({
                             'fetch_date': today,
-                            'instrument_token': inst['instrument_token'],
-                            'tradingsymbol': inst['tradingsymbol'],
+                            'instrument_token': inst.get('instrument_token', ''),
+                            'tradingsymbol': inst.get('tradingsymbol', ''),
                             'name': inst.get('name', ''),
                             'exchange': 'BSE',
                             'instrument_type': 'INDEX',
@@ -864,7 +879,6 @@ class SignalEngine:
         momentum = avg_change
 
         # Log for debugging
-        import logging
         logging.debug(f"Momentum: {momentum:.2f} pts/min, Up: {up_candles}, Down: {down_candles}")
 
         # Thresholds:
@@ -1778,13 +1792,13 @@ class ZScoreBot:
             logging.info(f"BSE instruments file is recent ({cache_age:.1f}h old), skipping download")
             return
 
-        # Download BSE instruments
-        success, message = refresh_bse_instruments(self.kite, bse_path)
+        # Download BSE instruments (uses public API, no auth needed)
+        success, message = refresh_bse_instruments(bse_path)
         if success:
             logging.info(f"BSE instruments: {message}")
         else:
+            # Note: Can't use self.telegram here - not initialized yet
             logging.error(f"BSE instruments download failed: {message}")
-            self.telegram.alert_error(f"BSE instruments download failed: {message}")
 
     def _get_enabled_instruments(self) -> Dict[str, Dict]:
         """Get dictionary of enabled instruments from config"""
@@ -2763,10 +2777,22 @@ Charges: <code>₹{charges:,.2f}</code>
                 current_straddle_value = ce_price + pe_price
                 first_pos = open_positions[0]
 
+                # Validate entry_value - if 0 or missing, reconstruct from DB positions
+                entry_value = state.get('entry_value', 0)
+                if entry_value <= 0:
+                    # Reconstruct entry_value from DB positions
+                    entry_value = sum(p.entry_price for p in open_positions)
+                    if entry_value > 0:
+                        state['entry_value'] = entry_value
+                        logging.info(f"[{inst_key.upper()}] Reconstructed entry_value from DB: {entry_value:.2f}")
+                    else:
+                        logging.error(f"[{inst_key.upper()}] Cannot determine straddle entry value")
+                        return
+
                 pos = Position(
                     active=True,
                     symbol="STRADDLE",
-                    entry_price=state.get('entry_value', 0),
+                    entry_price=entry_value,
                     stop_loss=first_pos.stop_loss,
                     target=first_pos.target,
                     exit_deadline=first_pos.exit_deadline
@@ -2906,13 +2932,22 @@ Charges: <code>₹{charges:,.2f}</code>
         # Check for existing position
         self.check_and_recover_position()
 
+        # Setup signal handlers for graceful shutdown
+        def handle_shutdown(signum, frame):
+            sig_name = signal.Signals(signum).name
+            logging.info(f"Received {sig_name}, initiating graceful shutdown...")
+            self.running = False
+
+        signal.signal(signal.SIGTERM, handle_shutdown)
+        signal.signal(signal.SIGINT, handle_shutdown)
+
         # Start main loop
         self.running = True
 
         try:
             self.main_loop()
         except KeyboardInterrupt:
-            logging.info("Shutting down...")
+            logging.info("Shutting down (KeyboardInterrupt)...")
         finally:
             self.running = False
 
