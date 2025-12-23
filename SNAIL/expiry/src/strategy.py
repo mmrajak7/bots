@@ -234,16 +234,19 @@ class StrategyCalculator:
         """
         Calculate expected daily move from VIX.
 
-        Formula: Expected Move = Spot × (VIX / 15.87)
+        Formula: Expected Move = Spot × (VIX% / 100) / sqrt(252)
+
+        VIX is annualized volatility in percentage terms.
+        Divide by sqrt(252) to get daily volatility.
 
         Args:
             spot: Current spot price
-            vix: Current VIX value
+            vix: Current VIX value (percentage, e.g., 9.59 for 9.59%)
 
         Returns:
             Expected move in points
         """
-        return spot * (vix / self.VIX_DAILY_FACTOR)
+        return spot * (vix / 100) / self.VIX_DAILY_FACTOR
 
     def calculate_wing_distance(self, spot: float, vix: float) -> int:
         """
