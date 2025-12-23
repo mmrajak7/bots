@@ -178,6 +178,9 @@ class TelegramAlerts:
             action = "SELL" if leg.transaction_type == 'SELL' else "BUY"
             legs_text += f"  {action} {leg.symbol} @ {leg.entry_price:.2f}\n"
 
+        # Calculate ATM strike from spot (not from legs - legs[0] is Short CE at ATM + wing)
+        atm_strike = round(position.spot_at_entry / 50) * 50
+
         message = f"""🎯 *EXPIRY IC ENTRY* {mode_tag}
 
 📅 *{self.instrument}* | {datetime.now().strftime('%d %b %Y')}
@@ -187,7 +190,7 @@ class TelegramAlerts:
   VIX: {position.vix_at_entry:.1f}
 
 🦋 *Iron Condor Setup:*
-  ATM Strike: {position.legs[0].strike:,.0f}
+  ATM Strike: {atm_strike:,.0f}
   Wing Distance: {position.wing_distance} pts
   Lots: {position.num_lots} ({position.num_lots * position.lot_size} qty)
 
@@ -258,13 +261,24 @@ class TelegramAlerts:
         max_profit = position.total_credit * total_qty
         max_loss = (spread_width - position.total_credit) * total_qty
 
-        # Risk:Reward ratio
-        rr_ratio = abs(max_loss / max_profit) if max_profit > 0 else 0
+        # Margin deployed ≈ max loss (this is approximate, actual margin is complex)
+        margin_deployed = max_loss
+
+        # Expected ROI based on target vs margin
+        expected_roi = (position.target_pnl / margin_deployed * 100) if margin_deployed > 0 else 0
+
+        # Practical R:R ratio based on actual SL:Target (not theoretical max_loss:max_profit)
+        sl_amount = abs(position.stop_loss_pnl)
+        target_amount = position.target_pnl
+        practical_rr = sl_amount / target_amount if target_amount > 0 else 0
 
         # Simple single-line condor representation
         condor_line = f"`|{long_pe}|──{short_pe}════{short_ce}──|{long_ce}|`"
 
         caption = f"""{pnl_emoji} *IRON CONDOR*
+
+📦 {position.num_lots} lot × {position.lot_size} = {total_qty} qty
+💰 Margin: ~Rs.{margin_deployed:,.0f}
 
 *P&L: {pnl_sign}Rs.{snapshot.mtm_pnl:,.0f}* [{bar}] {snapshot.pnl_pct:.0f}%
 📊 NIFTY: {snapshot.spot:,.0f} | VIX: {snapshot.vix:.1f}
@@ -272,9 +286,8 @@ class TelegramAlerts:
 {condor_line}
 ↔ CE: {snapshot.distance_to_ce_wing:.0f}pts{ce_warning} | PE: {snapshot.distance_to_pe_wing:.0f}pts{pe_warning}
 
-🎯 Target: Rs.{position.target_pnl:,.0f} (Max: Rs.{max_profit:,.0f})
-⛔ SL: Rs.{position.stop_loss_pnl:,.0f} (Max Loss: Rs.{max_loss:,.0f})
-📐 R:R = 1:{rr_ratio:.1f}"""
+🎯 Target: Rs.{target_amount:,.0f} | ⛔ SL: Rs.{sl_amount:,.0f}
+📐 R:R = {practical_rr:.1f}:1 | ROI: {expected_roi:.1f}%"""
 
         if chart_path and chart_path.exists():
             return self.send_photo(chart_path, caption)
@@ -359,20 +372,7 @@ _Increased volatility detected. Wing breaches more likely._"""
         Returns:
             True if sent
         """
-        # Result emoji
-        if final_pnl > 0:
-            result_emoji = "🎉"
-            pnl_emoji = "💚"
-        elif final_pnl == 0:
-            result_emoji = "😐"
-            pnl_emoji = "⚪"
-        else:
-            result_emoji = "😔"
-            pnl_emoji = "❌"
-
-        pnl_sign = "+" if final_pnl >= 0 else ""
-
-        # Duration
+        # Duration calculation
         try:
             entry_time = datetime.strptime(position.entry_time, "%H:%M:%S")
             exit_time = datetime.now()
@@ -380,41 +380,57 @@ _Increased volatility detected. Wing breaches more likely._"""
                 year=exit_time.year, month=exit_time.month, day=exit_time.day
             )
             duration = exit_time - entry_time
-            hours = int(duration.total_seconds() // 3600)
-            mins = int((duration.total_seconds() % 3600) // 60)
-            duration_str = f"{hours}h {mins}m"
+            total_mins = int(duration.total_seconds() // 60)
+            duration_str = f"{total_mins}min"
         except ValueError:
             duration_str = "N/A"
 
-        # Reason text
-        reason_text = {
-            ExitReason.TARGET_HIT: "🎯 Target Hit",
-            ExitReason.STOP_LOSS: "⛔ Stop Loss",
-            ExitReason.TIME_EXIT: "⏰ Time Exit (3:15 PM)",
-            ExitReason.MANUAL: "👤 Manual Exit",
-            ExitReason.ERROR: "❌ Error Exit"
+        # Result based on ACTUAL P&L (not reason - reason can be wrong)
+        if final_pnl > 0:
+            result = "WIN"
+            result_emoji = "🎉"
+        elif final_pnl == 0:
+            result = "BREAKEVEN"
+            result_emoji = "😐"
+        else:
+            result = "LOSS"
+            result_emoji = "😔"
+
+        pnl_sign = "+" if final_pnl >= 0 else ""
+
+        # Calculate % of target achieved (can be negative or >100%)
+        target_pct = (final_pnl / position.target_pnl * 100) if position.target_pnl > 0 else 0
+
+        # Reason emoji only (compact)
+        reason_emoji = {
+            ExitReason.TARGET_HIT: "🎯",
+            ExitReason.STOP_LOSS: "⛔",
+            ExitReason.TIME_EXIT: "⏰",
+            ExitReason.MANUAL: "👤",
+            ExitReason.ERROR: "❌"
+        }.get(reason, "📋")
+
+        reason_short = {
+            ExitReason.TARGET_HIT: "Target",
+            ExitReason.STOP_LOSS: "SL Hit",
+            ExitReason.TIME_EXIT: "3:15PM",
+            ExitReason.MANUAL: "Manual",
+            ExitReason.ERROR: "Error"
         }.get(reason, reason.value)
 
-        mode_tag = "[PAPER]" if self.mode == 'paper' else "[LIVE]"
+        mode_tag = "PAPER" if self.mode == 'paper' else "LIVE"
+        total_qty = position.num_lots * position.lot_size
 
-        message = f"""🚪 *EXPIRY IC EXIT* {result_emoji} {mode_tag}
+        # Compact, informative format
+        message = f"""🏁 *IC EXIT* [{mode_tag}]
 
-📋 *Reason:* {reason_text}
+{result_emoji} *{result}: {pnl_sign}Rs.{final_pnl:,.0f}* ({target_pct:+.0f}% of target)
 
-{pnl_emoji} *Net P&L: {pnl_sign}Rs.{final_pnl:,.0f}*
-  Gross: {pnl_sign}Rs.{gross_pnl:,.0f}
-  Charges: Rs.{charges:,.0f}
+{reason_emoji} {reason_short} | ⏱ {duration_str}
+📦 {position.num_lots}L × {position.lot_size} = {total_qty}qty
+💵 Credit: {position.total_credit:.2f}pts | Charges: Rs.{charges:,.0f}
 
-📊 *Trade Summary:*
-  Entry: {position.entry_time}
-  Exit: {datetime.now().strftime('%H:%M:%S')}
-  Duration: {duration_str}
-  Lots: {position.num_lots}
-  Credit: {position.total_credit:.2f} pts
-
-📈 *Market:*
-  Entry Spot: {position.spot_at_entry:,.0f}
-  Entry VIX: {position.vix_at_entry:.1f}"""
+_{position.entry_time} → {datetime.now().strftime('%H:%M:%S')}_"""
 
         return self._send(message)
 

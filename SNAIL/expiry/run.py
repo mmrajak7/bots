@@ -494,9 +494,9 @@ class ExpiryTradingSystem:
             self._execute_exit(exit_signal.reason, quotes)
             return
 
-        # Check wing approach
+        # Check wing approach (with 15-minute cooldown to avoid alert flood)
         wing_approach = self.position_manager.check_wing_approach(position, snapshot)
-        if wing_approach:
+        if wing_approach and self.state_manager.should_send_wing_alert(cooldown_mins=15):
             direction, proximity = wing_approach
             logger.warning(f"Wing approach: {direction} at {proximity:.0f}%")
             self.telegram.send_wing_approach_alert(
@@ -504,12 +504,14 @@ class ExpiryTradingSystem:
                 snapshot.distance_to_ce_wing if direction == 'CE' else snapshot.distance_to_pe_wing,
                 snapshot.spot
             )
+            self.state_manager.mark_wing_alert_sent()
 
-        # Check VIX spike
+        # Check VIX spike (with 15-minute cooldown to avoid alert flood)
         vix_spike = self.position_manager.check_vix_spike(snapshot.vix, position.vix_at_entry)
-        if vix_spike:
+        if vix_spike and self.state_manager.should_send_vix_alert(cooldown_mins=15):
             logger.warning(f"VIX spike: +{vix_spike:.1f}")
             self.telegram.send_vix_spike_alert(snapshot.vix, position.vix_at_entry, vix_spike)
+            self.state_manager.mark_vix_alert_sent()
 
         # Send P&L chart if interval reached
         telegram_config = self.config.get('telegram', {})
@@ -535,7 +537,7 @@ class ExpiryTradingSystem:
             return
 
         # Execute exit orders
-        success, exit_value = self.order_executor.execute_exit(position.legs, quotes)
+        success, net_exit_debit = self.order_executor.execute_exit(position.legs, quotes)
 
         if not success:
             logger.error("Exit execution had issues")
@@ -544,22 +546,27 @@ class ExpiryTradingSystem:
         entry_credit = position.total_credit
         total_qty = position.num_lots * position.lot_size
 
-        # Entry value
+        # Entry value (net credit received)
         entry_value = entry_credit * total_qty
 
-        # Exit debit (what we paid to close)
-        exit_debit = exit_value
+        # Gross P&L = Entry Credit - Exit Net Debit
+        # If we received 200 on entry and paid 150 net on exit, gross = 200 - 150 = 50 profit
+        # If we received 200 on entry and paid 250 net on exit, gross = 200 - 250 = -50 loss
+        gross_pnl = entry_value - net_exit_debit
 
-        # Gross P&L
-        gross_pnl = entry_value - exit_debit
+        # For charges, calculate total exit turnover from leg exit prices
+        exit_turnover = sum(leg.exit_price * total_qty for leg in position.legs if leg.exit_price > 0)
 
-        # Charges
-        charges = self.position_manager.calculate_charges(position, exit_value)
+        # Charges (based on total turnover, not net)
+        charges = self.position_manager.calculate_charges(position, exit_turnover)
 
         # Net P&L
         net_pnl = gross_pnl - charges
 
-        logger.info(f"Exit complete: Gross={gross_pnl:.0f}, Charges={charges:.0f}, Net={net_pnl:.0f}")
+        logger.info(
+            f"P&L Calc: Entry={entry_value:.0f}, NetExitDebit={net_exit_debit:.0f}, "
+            f"Gross={gross_pnl:.0f}, Charges={charges:.0f}, Net={net_pnl:.0f}"
+        )
 
         # Save trade record
         self._save_trade_record(

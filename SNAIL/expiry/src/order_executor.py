@@ -577,17 +577,19 @@ class OrderExecutor:
         """
         Execute exit for all legs.
 
-        For SELL positions: BUY back at ask
-        For BUY positions: SELL at bid
+        For SELL positions: BUY back at ask (we pay - debit)
+        For BUY positions: SELL at bid (we receive - credit)
 
         Args:
             legs: List of leg positions to exit
             quotes: Current quotes for pricing
 
         Returns:
-            Tuple of (success, total_exit_value)
+            Tuple of (success, net_exit_debit)
+            net_exit_debit = cost_to_close_shorts - proceeds_from_closing_longs
         """
-        total_exit_value = 0.0
+        exit_debit = 0.0   # Cost to close short positions (we pay)
+        exit_credit = 0.0  # Proceeds from closing long positions (we receive)
         all_success = True
 
         for leg in legs:
@@ -601,13 +603,15 @@ class OrderExecutor:
 
             # Determine exit price and side
             if leg.transaction_type == 'SELL':
-                # Close short by buying back at ask
+                # Close short by buying back at ask (we PAY)
                 exit_side = OrderSide.BUY
                 exit_price = self.apply_slippage(quote.ask, OrderSide.BUY)
+                is_debit = True
             else:
-                # Close long by selling at bid
+                # Close long by selling at bid (we RECEIVE)
                 exit_side = OrderSide.SELL
                 exit_price = self.apply_slippage(quote.bid, OrderSide.SELL)
+                is_debit = False
 
             # Execute in batches if needed
             freeze_limit = self.get_freeze_limit(self.config.get('instrument', 'NIFTY'))
@@ -633,9 +637,16 @@ class OrderExecutor:
 
                 if result.status == OrderStatus.COMPLETE:
                     fill_price = result.fill_price if result.fill_price > 0 else exit_price
-                    leg_total_value += fill_price * batch_qty
+                    fill_value = fill_price * batch_qty
+                    leg_total_value += fill_value
                     leg_total_qty += batch_qty
-                    total_exit_value += fill_price * batch_qty
+
+                    # Track debit vs credit separately
+                    if is_debit:
+                        exit_debit += fill_value
+                    else:
+                        exit_credit += fill_value
+
                     order_ids.append(result.order_id)
                 else:
                     logger.error(f"Exit failed for {leg.symbol}: {result.message}")
@@ -649,4 +660,12 @@ class OrderExecutor:
                 leg.exit_price = leg_total_value / leg_total_qty
                 leg.exit_order_id = ','.join(order_ids)
 
-        return all_success, total_exit_value
+        # Net exit debit = what we paid - what we received
+        net_exit_debit = exit_debit - exit_credit
+
+        logger.info(
+            f"Exit values: Debit={exit_debit:.0f} (close shorts), "
+            f"Credit={exit_credit:.0f} (close longs), Net={net_exit_debit:.0f}"
+        )
+
+        return all_success, net_exit_debit

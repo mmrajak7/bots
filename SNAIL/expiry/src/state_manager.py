@@ -106,6 +106,9 @@ class TradingState:
     current_pnl: float = 0.0
     exit_reason: str = ""
     error_message: str = ""
+    # Alert cooldown tracking
+    last_wing_alert: str = ""
+    last_vix_alert: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -119,7 +122,9 @@ class TradingState:
             "last_vix": self.last_vix,
             "current_pnl": self.current_pnl,
             "exit_reason": self.exit_reason,
-            "error_message": self.error_message
+            "error_message": self.error_message,
+            "last_wing_alert": self.last_wing_alert,
+            "last_vix_alert": self.last_vix_alert
         }
 
     @classmethod
@@ -145,7 +150,9 @@ class TradingState:
             last_vix=data.get("last_vix", 0.0),
             current_pnl=data.get("current_pnl", 0.0),
             exit_reason=data.get("exit_reason", ""),
-            error_message=data.get("error_message", "")
+            error_message=data.get("error_message", ""),
+            last_wing_alert=data.get("last_wing_alert", ""),
+            last_vix_alert=data.get("last_vix_alert", "")
         )
 
 
@@ -202,7 +209,8 @@ class StateManager:
         Save current state to file atomically.
 
         Uses write-to-temp-then-rename pattern to prevent corruption
-        if process is killed mid-write.
+        if process is killed mid-write. On Windows, uses backup-then-rename
+        for crash safety.
         """
         if self._state is None:
             return
@@ -218,12 +226,24 @@ class StateManager:
                 with os.fdopen(temp_fd, 'w') as f:
                     json.dump(self._state.to_dict(), f, indent=2)
 
-                # Atomic rename (on POSIX) or replace (on Windows)
+                # Atomic rename (on POSIX) or backup-then-rename (on Windows)
                 if os.name == 'nt':
-                    # Windows: need to remove target first
+                    # Windows: backup first to avoid data loss on crash
+                    backup_path = self.state_path.with_suffix('.bak')
                     if self.state_path.exists():
-                        os.remove(self.state_path)
-                os.rename(temp_path, self.state_path)
+                        # Remove old backup if exists
+                        if backup_path.exists():
+                            os.remove(backup_path)
+                        # Rename current to backup (if crash here, backup has data)
+                        os.rename(self.state_path, backup_path)
+                    # Now rename temp to target (if crash here, backup still has data)
+                    os.rename(temp_path, self.state_path)
+                    # Clean up backup after successful write
+                    if backup_path.exists():
+                        os.remove(backup_path)
+                else:
+                    # POSIX: atomic rename
+                    os.rename(temp_path, self.state_path)
 
                 logger.debug(f"State saved: {self._state.status.value}")
             except Exception:
@@ -316,6 +336,48 @@ class StateManager:
             self.state.position is not None and
             self.state.status == TradingStatus.POSITION_OPEN
         )
+
+    def should_send_wing_alert(self, cooldown_mins: int = 15) -> bool:
+        """Check if wing approach alert should be sent (with cooldown)."""
+        if not self.state.last_wing_alert:
+            return True
+
+        try:
+            last_sent = datetime.strptime(self.state.last_wing_alert, "%H:%M:%S")
+            now = datetime.now()
+            last_sent = last_sent.replace(
+                year=now.year, month=now.month, day=now.day
+            )
+            diff_mins = (now - last_sent).total_seconds() / 60
+            return diff_mins >= cooldown_mins
+        except ValueError:
+            return True
+
+    def mark_wing_alert_sent(self) -> None:
+        """Mark that wing approach alert was sent."""
+        self.state.last_wing_alert = datetime.now().strftime("%H:%M:%S")
+        self.save()
+
+    def should_send_vix_alert(self, cooldown_mins: int = 15) -> bool:
+        """Check if VIX spike alert should be sent (with cooldown)."""
+        if not self.state.last_vix_alert:
+            return True
+
+        try:
+            last_sent = datetime.strptime(self.state.last_vix_alert, "%H:%M:%S")
+            now = datetime.now()
+            last_sent = last_sent.replace(
+                year=now.year, month=now.month, day=now.day
+            )
+            diff_mins = (now - last_sent).total_seconds() / 60
+            return diff_mins >= cooldown_mins
+        except ValueError:
+            return True
+
+    def mark_vix_alert_sent(self) -> None:
+        """Mark that VIX spike alert was sent."""
+        self.state.last_vix_alert = datetime.now().strftime("%H:%M:%S")
+        self.save()
 
 
 def save_trade_record(

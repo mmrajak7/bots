@@ -35,6 +35,7 @@ class IronCondorSetup:
     atm_strike: float
     expiry: date
     lot_size: int
+    spread_width: int  # Distance between short and long strikes
 
     # Strikes
     short_ce: Strike
@@ -63,8 +64,8 @@ class IronCondorSetup:
 
     @property
     def max_loss(self) -> float:
-        """Max loss = wing distance - credit."""
-        return self.wing_distance - self.total_credit
+        """Max loss per share = spread width - credit received."""
+        return self.spread_width - self.total_credit
 
 
 class ExpiryChecker:
@@ -374,6 +375,7 @@ class StrategyCalculator:
             atm_strike=atm_strike,
             expiry=expiry_date,
             lot_size=lot_size,
+            spread_width=self.spread_width,
             short_ce=short_ce,
             short_pe=short_pe,
             long_ce=long_ce,

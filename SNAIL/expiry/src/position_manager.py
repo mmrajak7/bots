@@ -165,18 +165,14 @@ class PositionManager:
             # Find long strikes (the wings/protection)
             long_ce_strike = None
             long_pe_strike = None
-            short_ce_strike = None
-            short_pe_strike = None
 
             for leg in position.legs:
                 if leg.transaction_type == 'BUY' and leg.option_type == 'CE':
                     long_ce_strike = leg.strike
                 elif leg.transaction_type == 'BUY' and leg.option_type == 'PE':
                     long_pe_strike = leg.strike
-                elif leg.transaction_type == 'SELL' and leg.option_type == 'CE':
-                    short_ce_strike = leg.strike
-                elif leg.transaction_type == 'SELL' and leg.option_type == 'PE':
-                    short_pe_strike = leg.strike
+                # Note: short strikes not needed for wing distance calculation
+                # Wing boundaries are defined by long strikes (protection level)
 
             # Use actual long strikes as wing boundaries
             if long_ce_strike and long_pe_strike:
