@@ -387,12 +387,12 @@ class ChartGenerator:
             # P&L value - right aligned, big and prominent
             pnl_sign = "+" if current_pnl >= 0 else ""
             pnl_color = self.colors['profit'] if current_pnl >= 0 else self.colors['loss']
-            ax_header.text(0.98, 0.55, f'{pnl_sign}₹{current_pnl:,.0f}',
-                         fontsize=28, fontweight='bold', color=pnl_color,
+            ax_header.text(0.98, 0.55, f'{pnl_sign}Rs.{current_pnl:,.0f}',
+                         fontsize=26, fontweight='bold', color=pnl_color,
                          ha='right', va='center')
 
             # SL | Target info - center, smaller
-            ax_header.text(0.50, 0.55, f'SL: ₹{chart_data.stop_loss_pnl:,.0f}  |  Target: ₹{chart_data.target_pnl:,.0f}',
+            ax_header.text(0.50, 0.55, f'SL: Rs.{chart_data.stop_loss_pnl:,.0f}  |  Target: Rs.{chart_data.target_pnl:,.0f}',
                          fontsize=11, color=self.colors['text'], alpha=0.8,
                          ha='center', va='center')
 
