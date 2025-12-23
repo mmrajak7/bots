@@ -317,14 +317,14 @@ class PositionManager:
     def calculate_charges(
         self,
         position: Position,
-        exit_value: float
+        exit_turnover: float
     ) -> float:
         """
         Calculate transaction charges.
 
         Args:
             position: Position details
-            exit_value: Total exit value
+            exit_turnover: Total exit turnover (sum of all leg exit values)
 
         Returns:
             Total charges in rupees
@@ -333,15 +333,9 @@ class PositionManager:
 
         total_qty = position.num_lots * position.lot_size
 
-        # Entry value
-        entry_credit = sum(
-            leg.entry_price for leg in position.legs
-            if leg.transaction_type == 'SELL'
-        ) - sum(
-            leg.entry_price for leg in position.legs
-            if leg.transaction_type == 'BUY'
-        )
-        entry_value = entry_credit * total_qty
+        # Entry turnover = sum of ALL leg entry values (not net credit)
+        # This is the actual turnover for exchange charges calculation
+        entry_turnover = sum(leg.entry_price * total_qty for leg in position.legs)
 
         # Brokerage: Rs.20 per order × 8 orders (4 entry + 4 exit)
         brokerage = charges_config.get('brokerage_per_order', 20) * 8
@@ -349,34 +343,42 @@ class PositionManager:
         # STT: 0.0625% on sell side (entry short + exit long)
         stt_rate = charges_config.get('stt_sell_rate', 0.000625)
         # Entry: short CE + short PE (sell)
-        # Exit: short CE + short PE (buy back - no STT) + long CE + long PE (sell - STT)
+        # Exit: long CE + long PE (sell) - buying back shorts has no STT
         sell_value: float = 0.0
         for leg in position.legs:
             if leg.transaction_type == 'SELL':
+                # Entry sell (short positions)
                 sell_value += leg.entry_price * total_qty
             else:
+                # Exit sell (closing long positions)
                 sell_value += leg.exit_price * total_qty if leg.exit_price > 0 else 0.0
         stt = sell_value * stt_rate
 
-        # Exchange charges: 0.0495%
+        # Exchange charges: 0.0495% on total turnover (both entry and exit)
         exchange_rate = charges_config.get('exchange_txn_rate', 0.0005)
-        exchange_charges = (entry_value + exit_value) * exchange_rate
+        exchange_charges = (entry_turnover + exit_turnover) * exchange_rate
 
-        # GST: 18% on brokerage + exchange
+        # GST: 18% on brokerage + exchange charges
         gst_rate = charges_config.get('gst_rate', 0.18)
         gst = (brokerage + exchange_charges) * gst_rate
 
-        # Stamp duty: 0.003% on buy side
+        # Stamp duty: 0.003% on buy side (entry longs + exit closing shorts)
         stamp_rate = charges_config.get('stamp_duty_rate', 0.00003)
-        buy_value = sum(
+        # Entry buy (long positions)
+        entry_buy_value = sum(
             leg.entry_price * total_qty for leg in position.legs
             if leg.transaction_type == 'BUY'
         )
-        stamp_duty = buy_value * stamp_rate
+        # Exit buy (closing short positions)
+        exit_buy_value = sum(
+            leg.exit_price * total_qty for leg in position.legs
+            if leg.transaction_type == 'SELL' and leg.exit_price > 0
+        )
+        stamp_duty = (entry_buy_value + exit_buy_value) * stamp_rate
 
         total_charges = brokerage + stt + exchange_charges + gst + stamp_duty
 
-        logger.debug(
+        logger.info(
             f"Charges: Brokerage={brokerage:.0f}, STT={stt:.0f}, "
             f"Exchange={exchange_charges:.0f}, GST={gst:.0f}, "
             f"Stamp={stamp_duty:.0f}, Total={total_charges:.0f}"
