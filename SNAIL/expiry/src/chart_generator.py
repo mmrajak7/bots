@@ -372,24 +372,24 @@ class ChartGenerator:
             ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
             ax1.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
 
-            # ========== P&L Gauge with Title (TOP) - Simplified horizontal bar ==========
+            # ========== P&L Gauge with Title (TOP) - Clean horizontal bar ==========
             ax_gauge.set_xlim(0, 1)
             ax_gauge.set_ylim(0, 1)
             ax_gauge.axis('off')
 
             from matplotlib.patches import Rectangle, FancyBboxPatch
 
-            # Title at top
-            ax_gauge.text(0.5, 0.92, f"Iron Condor - {chart_data.entry_time.strftime('%d %b %Y')}",
-                         fontsize=18, fontweight='bold', color=self.colors['text'],
+            # Title at top center
+            ax_gauge.text(0.5, 0.95, f"Iron Condor - {chart_data.entry_time.strftime('%d %b %Y')}",
+                         fontsize=16, fontweight='bold', color=self.colors['text'],
                          ha='center', va='top')
 
-            # Simple horizontal gauge bar
-            bar_left = 0.08
-            bar_right = 0.92
+            # Gauge bar with more margins for labels
+            bar_left = 0.15
+            bar_right = 0.85
             bar_width = bar_right - bar_left
-            bar_y = 0.35
-            bar_h = 0.25
+            bar_y = 0.40
+            bar_h = 0.20
 
             # Calculate marker position based on P&L
             if current_pnl >= 0:
@@ -418,23 +418,23 @@ class ChartGenerator:
             marker_color = self.colors['profit'] if current_pnl >= 0 else self.colors['loss']
             ax_gauge.plot([marker_x, marker_x], [bar_y, bar_y + bar_h],
                          color='white', linewidth=3, alpha=0.95)
-            ax_gauge.plot([marker_x], [bar_y + bar_h + 0.03], marker='v', markersize=12,
+            ax_gauge.plot([marker_x], [bar_y + bar_h + 0.02], marker='v', markersize=10,
                          color=marker_color, markeredgecolor='white', markeredgewidth=1.5)
 
-            # Current P&L value above marker
+            # Current P&L value above gauge (centered)
             pnl_sign = "+" if current_pnl >= 0 else ""
             pct_of_target = (current_pnl / chart_data.target_pnl * 100) if chart_data.target_pnl > 0 else 0
-            ax_gauge.text(marker_x, bar_y + bar_h + 0.18,
+            ax_gauge.text(0.5, bar_y + bar_h + 0.18,
                          f'{pnl_sign}Rs.{current_pnl:,.0f} ({pct_of_target:.0f}%)',
                          fontsize=14, color=marker_color, ha='center', fontweight='bold',
                          bbox=dict(boxstyle='round,pad=0.3', facecolor=self.colors['background'],
                                   edgecolor=marker_color, linewidth=2, alpha=0.95))
 
-            # Labels below gauge - cleaner placement
-            ax_gauge.text(bar_left, bar_y - 0.08, f'SL: Rs.{chart_data.stop_loss_pnl:,.0f}',
-                         fontsize=12, color=self.colors['loss'], ha='left', fontweight='bold')
-            ax_gauge.text(bar_right, bar_y - 0.08, f'Target: Rs.{chart_data.target_pnl:,.0f}',
-                         fontsize=12, color=self.colors['profit'], ha='right', fontweight='bold')
+            # SL and Target labels - positioned at ends with padding
+            ax_gauge.text(bar_left - 0.02, bar_y + bar_h/2, f'SL\n₹{chart_data.stop_loss_pnl:,.0f}',
+                         fontsize=10, color=self.colors['loss'], ha='right', va='center', fontweight='bold')
+            ax_gauge.text(bar_right + 0.02, bar_y + bar_h/2, f'Target\n₹{chart_data.target_pnl:,.0f}',
+                         fontsize=10, color=self.colors['profit'], ha='left', va='center', fontweight='bold')
 
             # ========== Spot Chart with Iron Condor Visualization (bottom) ==========
 
