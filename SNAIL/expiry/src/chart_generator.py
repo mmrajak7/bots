@@ -292,12 +292,14 @@ class ChartGenerator:
             return None
 
         try:
-            # Create figure with 3 sections: P&L chart, gauge, spot chart
-            fig = plt.figure(figsize=(10, 9))
-            gs = fig.add_gridspec(3, 1, height_ratios=[3, 0.4, 1.2], hspace=0.3)
-            ax1 = fig.add_subplot(gs[0])  # P&L chart
-            ax_gauge = fig.add_subplot(gs[1])  # Progress gauge
-            ax2 = fig.add_subplot(gs[2])  # Spot chart
+            # Create figure with new layout:
+            # Top: Gauge with P&L (compact)
+            # Bottom: NIFTY spot chart with IC zones (larger)
+            fig = plt.figure(figsize=(10, 8))
+            gs = fig.add_gridspec(3, 1, height_ratios=[0.5, 2, 3], hspace=0.25)
+            ax_gauge = fig.add_subplot(gs[0])  # P&L gauge (top)
+            ax1 = fig.add_subplot(gs[1])  # P&L chart (middle)
+            ax2 = fig.add_subplot(gs[2])  # Spot chart with IC (bottom - larger)
 
             # Apply dark theme
             fig.patch.set_facecolor(self.colors['background'])
@@ -314,11 +316,8 @@ class ChartGenerator:
             pnls = [p.pnl for p in chart_data.pnl_history]
             spots = [p.spot for p in chart_data.pnl_history]
 
-            # ========== P&L Chart (top) ==========
-            ax1.set_title(
-                f"Expiry Iron Condor - {chart_data.entry_time.strftime('%d %b %Y')}",
-                fontsize=14, fontweight='bold', color=self.colors['text']
-            )
+            # ========== P&L Chart (middle) ==========
+            # Title is now in the gauge section above
 
             # P&L line with color based on value
             for i in range(1, len(times)):
@@ -373,71 +372,76 @@ class ChartGenerator:
             ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
             ax1.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
 
-            # ========== Progress Gauge (middle) ==========
+            # ========== P&L Gauge with Title (TOP) ==========
             ax_gauge.set_xlim(0, 1)
             ax_gauge.set_ylim(0, 1)
             ax_gauge.axis('off')
 
-            from matplotlib.patches import Rectangle, FancyBboxPatch, Polygon
+            from matplotlib.patches import Rectangle, FancyBboxPatch
+
+            # Title at top of gauge
+            ax_gauge.text(0.5, 0.95, f"Iron Condor - {chart_data.entry_time.strftime('%d %b %Y')}",
+                         fontsize=14, fontweight='bold', color=self.colors['text'],
+                         ha='center', va='top')
 
             # Gauge layout: [SL -------- 0 -------- Target]
-            # Position 0.05 = SL, 0.5 = zero, 0.95 = Target
-            sl_x = 0.05
+            sl_x = 0.08
             zero_x = 0.5
-            target_x = 0.95
-            gauge_width = 0.9
+            target_x = 0.92
+            gauge_width = target_x - sl_x
+            gauge_y = 0.25
+            gauge_h = 0.35
 
             # Calculate marker position based on P&L
             if current_pnl >= 0:
-                # Positive P&L: map 0→Target to 0.5→0.95
                 pct = current_pnl / chart_data.target_pnl if chart_data.target_pnl > 0 else 0
-                pct = min(pct, 1.0)  # Cap at 100%
+                pct = min(pct, 1.0)
                 marker_x = zero_x + pct * (target_x - zero_x)
             else:
-                # Negative P&L: map SL→0 to 0.05→0.5
                 pct = current_pnl / chart_data.stop_loss_pnl if chart_data.stop_loss_pnl < 0 else 0
-                pct = min(pct, 1.0)  # Cap at 100% of SL
+                pct = min(pct, 1.0)
                 marker_x = zero_x - pct * (zero_x - sl_x)
 
-            # Loss zone (red gradient) - left half
-            ax_gauge.add_patch(Rectangle((sl_x, 0.3), zero_x - sl_x, 0.4,
-                                         facecolor=self.colors['loss'], alpha=0.25,
-                                         edgecolor='none'))
-            # Profit zone (green gradient) - right half
-            ax_gauge.add_patch(Rectangle((zero_x, 0.3), target_x - zero_x, 0.4,
-                                         facecolor=self.colors['profit'], alpha=0.25,
-                                         edgecolor='none'))
+            # Loss zone (red) - left half
+            ax_gauge.add_patch(Rectangle((sl_x, gauge_y), zero_x - sl_x, gauge_h,
+                                         facecolor=self.colors['loss'], alpha=0.25))
+            # Profit zone (green) - right half
+            ax_gauge.add_patch(Rectangle((zero_x, gauge_y), target_x - zero_x, gauge_h,
+                                         facecolor=self.colors['profit'], alpha=0.25))
 
             # Gauge outline
-            ax_gauge.add_patch(FancyBboxPatch((sl_x, 0.3), gauge_width, 0.4,
+            ax_gauge.add_patch(FancyBboxPatch((sl_x, gauge_y), gauge_width, gauge_h,
                                               boxstyle="round,pad=0.02",
                                               facecolor='none',
                                               edgecolor=self.colors['grid'], linewidth=2))
 
             # Zero line marker
-            ax_gauge.plot([zero_x, zero_x], [0.28, 0.72], color=self.colors['text'],
-                         linewidth=2, alpha=0.5)
+            ax_gauge.plot([zero_x, zero_x], [gauge_y - 0.02, gauge_y + gauge_h + 0.02],
+                         color=self.colors['text'], linewidth=2, alpha=0.5)
 
             # Current position marker (triangle pointing down)
             marker_color = self.colors['profit'] if current_pnl >= 0 else self.colors['loss']
-            ax_gauge.plot([marker_x], [0.5], marker='v', markersize=15,
+            ax_gauge.plot([marker_x], [gauge_y + gauge_h/2], marker='v', markersize=12,
                          color=marker_color, markeredgecolor='white', markeredgewidth=2)
-            ax_gauge.plot([marker_x, marker_x], [0.3, 0.7], color=marker_color,
-                         linewidth=3, alpha=0.8)
+            ax_gauge.plot([marker_x, marker_x], [gauge_y, gauge_y + gauge_h],
+                         color=marker_color, linewidth=3, alpha=0.8)
 
-            # Labels
-            ax_gauge.text(sl_x, 0.15, f'SL\n{chart_data.stop_loss_pnl:,.0f}',
+            # Labels below gauge
+            ax_gauge.text(sl_x, gauge_y - 0.08, f'SL: Rs.{chart_data.stop_loss_pnl:,.0f}',
                          fontsize=8, color=self.colors['loss'], ha='left', fontweight='bold')
-            ax_gauge.text(zero_x, 0.15, '0', fontsize=9, color=self.colors['text'],
+            ax_gauge.text(zero_x, gauge_y - 0.08, '0', fontsize=8, color=self.colors['text'],
                          ha='center', alpha=0.7)
-            ax_gauge.text(target_x, 0.15, f'Target\n{chart_data.target_pnl:,.0f}',
+            ax_gauge.text(target_x, gauge_y - 0.08, f'Target: Rs.{chart_data.target_pnl:,.0f}',
                          fontsize=8, color=self.colors['profit'], ha='right', fontweight='bold')
 
-            # Current P&L value above marker
+            # Current P&L value - prominent display above gauge
             pnl_sign = "+" if current_pnl >= 0 else ""
             pct_of_target = (current_pnl / chart_data.target_pnl * 100) if chart_data.target_pnl > 0 else 0
-            ax_gauge.text(marker_x, 0.85, f'{pnl_sign}Rs.{current_pnl:,.0f} ({pct_of_target:.0f}%)',
-                         fontsize=10, color=marker_color, ha='center', fontweight='bold')
+            ax_gauge.text(marker_x, gauge_y + gauge_h + 0.12,
+                         f'{pnl_sign}Rs.{current_pnl:,.0f} ({pct_of_target:.0f}%)',
+                         fontsize=11, color=marker_color, ha='center', fontweight='bold',
+                         bbox=dict(boxstyle='round,pad=0.3', facecolor=self.colors['background'],
+                                  edgecolor=marker_color, alpha=0.9))
 
             # ========== Spot Chart with Iron Condor Visualization (bottom) ==========
 
@@ -482,16 +486,29 @@ class ChartGenerator:
             # ATM reference
             ax2.axhline(y=atm, color=self.colors['text'], linestyle=':', linewidth=1, alpha=0.3)
 
-            # Strike labels on right side (compact)
+            # Strike labels on right side - offset vertically to avoid overlap
             label_x = times[-1]
-            ax2.text(label_x, long_ce, f' {long_ce:.0f} (Long CE)', color=self.colors['loss'],
-                    fontsize=8, va='center', alpha=0.8)
-            ax2.text(label_x, short_ce, f' {short_ce:.0f} (Short CE)', color=self.colors['warning'],
-                    fontsize=8, va='center', fontweight='bold')
-            ax2.text(label_x, short_pe, f' {short_pe:.0f} (Short PE)', color=self.colors['warning'],
-                    fontsize=8, va='center', fontweight='bold')
-            ax2.text(label_x, long_pe, f' {long_pe:.0f} (Long PE)', color=self.colors['loss'],
-                    fontsize=8, va='center', alpha=0.8)
+            # Use annotations with offset to prevent overlap
+            ax2.annotate(f'{long_ce:.0f} Long CE', xy=(label_x, long_ce),
+                        xytext=(5, 8), textcoords='offset points',
+                        fontsize=9, color=self.colors['loss'], fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor=self.colors['background'],
+                                 edgecolor=self.colors['loss'], alpha=0.9))
+            ax2.annotate(f'{short_ce:.0f} Short CE', xy=(label_x, short_ce),
+                        xytext=(5, -12), textcoords='offset points',
+                        fontsize=9, color=self.colors['warning'], fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor=self.colors['background'],
+                                 edgecolor=self.colors['warning'], alpha=0.9))
+            ax2.annotate(f'{short_pe:.0f} Short PE', xy=(label_x, short_pe),
+                        xytext=(5, 8), textcoords='offset points',
+                        fontsize=9, color=self.colors['warning'], fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor=self.colors['background'],
+                                 edgecolor=self.colors['warning'], alpha=0.9))
+            ax2.annotate(f'{long_pe:.0f} Long PE', xy=(label_x, long_pe),
+                        xytext=(5, -12), textcoords='offset points',
+                        fontsize=9, color=self.colors['loss'], fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor=self.colors['background'],
+                                 edgecolor=self.colors['loss'], alpha=0.9))
 
             # Current spot marker with label
             ax2.scatter([times[-1]], [spots[-1]], color=self.colors['neutral'],

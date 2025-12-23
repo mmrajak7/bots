@@ -250,25 +250,34 @@ class TelegramAlerts:
             elif leg.transaction_type == 'BUY' and leg.option_type == 'PE':
                 long_pe = int(leg.strike)
 
-        # Max profit = total credit, Max loss = wing spread - credit
-        max_profit = position.total_credit * position.num_lots * position.lot_size
-        max_loss = (position.wing_distance - position.total_credit) * position.num_lots * position.lot_size
+        # Calculate spread width (distance between short and long strikes)
+        spread_width = long_ce - short_ce if long_ce and short_ce else 50
 
-        caption = f"""{pnl_emoji} *IRON CONDOR UPDATE*
+        # Max profit = total credit, Max loss = spread width - credit (per spread)
+        total_qty = position.num_lots * position.lot_size
+        max_profit = position.total_credit * total_qty
+        max_loss = (spread_width - position.total_credit) * total_qty
+
+        # Risk:Reward ratio
+        rr_ratio = abs(max_loss / max_profit) if max_profit > 0 else 0
+
+        # ASCII Iron Condor payoff diagram
+        condor_art = f"""```
+    ╱╲{'─' * 8}╱╲
+   ╱  ╲{'─' * 6}╱  ╲
+──╱────╲────────╱────╲──
+ {long_pe}  {short_pe}    {short_ce}  {long_ce}```"""
+
+        caption = f"""{pnl_emoji} *IRON CONDOR*
 
 *P&L: {pnl_sign}Rs.{snapshot.mtm_pnl:,.0f}* [{bar}] {snapshot.pnl_pct:.0f}%
+📊 NIFTY: {snapshot.spot:,.0f} | VIX: {snapshot.vix:.1f} | {snapshot.timestamp}
+{condor_art}
+CE: {snapshot.distance_to_ce_wing:.0f}pts{ce_warning} | PE: {snapshot.distance_to_pe_wing:.0f}pts{pe_warning}
 
-📊 NIFTY: {snapshot.spot:,.0f} | VIX: {snapshot.vix:.1f}
-🕐 {snapshot.timestamp} | {position.num_lots}L × {position.lot_size}
-
-*Structure:*
-`{long_pe}━━{short_pe}━━━━{short_ce}━━{long_ce}`
-     PE Wing ━━ ATM ━━ CE Wing
-
-*Distances:* CE {snapshot.distance_to_ce_wing:.0f}pts{ce_warning} | PE {snapshot.distance_to_pe_wing:.0f}pts{pe_warning}
-
-🎯 Target: Rs.{position.target_pnl:,.0f} (Max: Rs.{max_profit:,.0f})
-⛔ SL: Rs.{position.stop_loss_pnl:,.0f} (Max Loss: Rs.{max_loss:,.0f})"""
+🎯 Target: Rs.{position.target_pnl:,.0f} | Max: Rs.{max_profit:,.0f}
+⛔ SL: Rs.{position.stop_loss_pnl:,.0f} | Max Loss: Rs.{max_loss:,.0f}
+📐 R:R = 1:{rr_ratio:.1f}"""
 
         if chart_path and chart_path.exists():
             return self.send_photo(chart_path, caption)
