@@ -223,29 +223,52 @@ class TelegramAlerts:
         pnl_emoji = "📈" if snapshot.mtm_pnl >= 0 else "📉"
         pnl_sign = "+" if snapshot.mtm_pnl >= 0 else ""
 
-        # Progress bar
-        progress = min(max(snapshot.pnl_pct, 0), 100)
-        filled = int(progress / 10)
-        bar = "█" * filled + "░" * (10 - filled)
+        # Progress bar (handle negative P&L)
+        if snapshot.pnl_pct >= 0:
+            progress = min(snapshot.pnl_pct, 100)
+            filled = int(progress / 10)
+            bar = "▓" * filled + "░" * (10 - filled)
+        else:
+            # Show negative as red blocks from left
+            loss_pct = min(abs(snapshot.pnl_pct), 100)
+            filled = int(loss_pct / 10)
+            bar = "▒" * filled + "░" * (10 - filled)
 
         # Wing distances
         ce_warning = "⚠️" if snapshot.distance_to_ce_wing < position.wing_distance * 0.3 else ""
         pe_warning = "⚠️" if snapshot.distance_to_pe_wing < position.wing_distance * 0.3 else ""
 
-        caption = f"""{pnl_emoji} *EXPIRY IC P&L UPDATE*
+        # Find strikes from position legs
+        short_ce = short_pe = long_ce = long_pe = 0
+        for leg in position.legs:
+            if leg.transaction_type == 'SELL' and leg.option_type == 'CE':
+                short_ce = int(leg.strike)
+            elif leg.transaction_type == 'SELL' and leg.option_type == 'PE':
+                short_pe = int(leg.strike)
+            elif leg.transaction_type == 'BUY' and leg.option_type == 'CE':
+                long_ce = int(leg.strike)
+            elif leg.transaction_type == 'BUY' and leg.option_type == 'PE':
+                long_pe = int(leg.strike)
 
-💰 *P&L: {pnl_sign}Rs.{snapshot.mtm_pnl:,.0f}*
-[{bar}] {snapshot.pnl_pct:.0f}% of target
+        # Max profit = total credit, Max loss = wing spread - credit
+        max_profit = position.total_credit * position.num_lots * position.lot_size
+        max_loss = (position.wing_distance - position.total_credit) * position.num_lots * position.lot_size
+
+        caption = f"""{pnl_emoji} *IRON CONDOR UPDATE*
+
+*P&L: {pnl_sign}Rs.{snapshot.mtm_pnl:,.0f}* [{bar}] {snapshot.pnl_pct:.0f}%
 
 📊 NIFTY: {snapshot.spot:,.0f} | VIX: {snapshot.vix:.1f}
-⏰ Time: {snapshot.timestamp}
+🕐 {snapshot.timestamp} | {position.num_lots}L × {position.lot_size}
 
-🪽 *Wing Status:*
-  CE Wing: {snapshot.distance_to_ce_wing:.0f} pts away {ce_warning}
-  PE Wing: {snapshot.distance_to_pe_wing:.0f} pts away {pe_warning}
+*Structure:*
+`{long_pe}━━{short_pe}━━━━{short_ce}━━{long_ce}`
+     PE Wing ━━ ATM ━━ CE Wing
 
-🎯 Target: Rs.{position.target_pnl:,.0f}
-⛔ SL: Rs.{position.stop_loss_pnl:,.0f}"""
+*Distances:* CE {snapshot.distance_to_ce_wing:.0f}pts{ce_warning} | PE {snapshot.distance_to_pe_wing:.0f}pts{pe_warning}
+
+🎯 Target: Rs.{position.target_pnl:,.0f} (Max: Rs.{max_profit:,.0f})
+⛔ SL: Rs.{position.stop_loss_pnl:,.0f} (Max Loss: Rs.{max_loss:,.0f})"""
 
         if chart_path and chart_path.exists():
             return self.send_photo(chart_path, caption)

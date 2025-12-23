@@ -378,39 +378,47 @@ class ChartGenerator:
             ax_gauge.set_ylim(0, 1)
             ax_gauge.axis('off')
 
-            # Calculate position on gauge (SL = 0, Entry = 0.5, Target = 1)
-            total_range = chart_data.target_pnl - chart_data.stop_loss_pnl
-            if total_range > 0:
-                # Position: 0 = SL, 0.5 = breakeven, 1 = target
-                normalized_pos = (current_pnl - chart_data.stop_loss_pnl) / total_range
-                normalized_pos = max(0, min(1, normalized_pos))  # Clamp to [0, 1]
+            from matplotlib.patches import Rectangle, FancyBboxPatch, Polygon
+
+            # Gauge layout: [SL -------- 0 -------- Target]
+            # Position 0.05 = SL, 0.5 = zero, 0.95 = Target
+            sl_x = 0.05
+            zero_x = 0.5
+            target_x = 0.95
+            gauge_width = 0.9
+
+            # Calculate marker position based on P&L
+            if current_pnl >= 0:
+                # Positive P&L: map 0→Target to 0.5→0.95
+                pct = current_pnl / chart_data.target_pnl if chart_data.target_pnl > 0 else 0
+                pct = min(pct, 1.0)  # Cap at 100%
+                marker_x = zero_x + pct * (target_x - zero_x)
             else:
-                normalized_pos = 0.5
+                # Negative P&L: map SL→0 to 0.05→0.5
+                pct = current_pnl / chart_data.stop_loss_pnl if chart_data.stop_loss_pnl < 0 else 0
+                pct = min(pct, 1.0)  # Cap at 100% of SL
+                marker_x = zero_x - pct * (zero_x - sl_x)
 
-            # Draw gauge background (gradient from red to green)
-            from matplotlib.patches import Rectangle, FancyBboxPatch
-
-            # SL zone (red)
-            ax_gauge.add_patch(Rectangle((0.05, 0.3), 0.4, 0.4,
-                                         facecolor=self.colors['loss'], alpha=0.3,
+            # Loss zone (red gradient) - left half
+            ax_gauge.add_patch(Rectangle((sl_x, 0.3), zero_x - sl_x, 0.4,
+                                         facecolor=self.colors['loss'], alpha=0.25,
                                          edgecolor='none'))
-            # Profit zone (green)
-            ax_gauge.add_patch(Rectangle((0.55, 0.3), 0.4, 0.4,
-                                         facecolor=self.colors['profit'], alpha=0.3,
-                                         edgecolor='none'))
-            # Neutral zone around zero
-            ax_gauge.add_patch(Rectangle((0.4, 0.3), 0.2, 0.4,
-                                         facecolor=self.colors['text'], alpha=0.1,
+            # Profit zone (green gradient) - right half
+            ax_gauge.add_patch(Rectangle((zero_x, 0.3), target_x - zero_x, 0.4,
+                                         facecolor=self.colors['profit'], alpha=0.25,
                                          edgecolor='none'))
 
             # Gauge outline
-            ax_gauge.add_patch(FancyBboxPatch((0.05, 0.3), 0.9, 0.4,
+            ax_gauge.add_patch(FancyBboxPatch((sl_x, 0.3), gauge_width, 0.4,
                                               boxstyle="round,pad=0.02",
                                               facecolor='none',
                                               edgecolor=self.colors['grid'], linewidth=2))
 
-            # Current position marker (triangle)
-            marker_x = 0.05 + normalized_pos * 0.9
+            # Zero line marker
+            ax_gauge.plot([zero_x, zero_x], [0.28, 0.72], color=self.colors['text'],
+                         linewidth=2, alpha=0.5)
+
+            # Current position marker (triangle pointing down)
             marker_color = self.colors['profit'] if current_pnl >= 0 else self.colors['loss']
             ax_gauge.plot([marker_x], [0.5], marker='v', markersize=15,
                          color=marker_color, markeredgecolor='white', markeredgewidth=2)
@@ -418,53 +426,85 @@ class ChartGenerator:
                          linewidth=3, alpha=0.8)
 
             # Labels
-            ax_gauge.text(0.05, 0.15, f'SL: Rs.{chart_data.stop_loss_pnl:,.0f}',
-                         fontsize=9, color=self.colors['loss'], ha='left', fontweight='bold')
-            ax_gauge.text(0.5, 0.15, '0', fontsize=9, color=self.colors['text'],
+            ax_gauge.text(sl_x, 0.15, f'SL\n{chart_data.stop_loss_pnl:,.0f}',
+                         fontsize=8, color=self.colors['loss'], ha='left', fontweight='bold')
+            ax_gauge.text(zero_x, 0.15, '0', fontsize=9, color=self.colors['text'],
                          ha='center', alpha=0.7)
-            ax_gauge.text(0.95, 0.15, f'Target: Rs.{chart_data.target_pnl:,.0f}',
-                         fontsize=9, color=self.colors['profit'], ha='right', fontweight='bold')
+            ax_gauge.text(target_x, 0.15, f'Target\n{chart_data.target_pnl:,.0f}',
+                         fontsize=8, color=self.colors['profit'], ha='right', fontweight='bold')
 
-            # Percentage of target
+            # Current P&L value above marker
+            pnl_sign = "+" if current_pnl >= 0 else ""
             pct_of_target = (current_pnl / chart_data.target_pnl * 100) if chart_data.target_pnl > 0 else 0
-            ax_gauge.text(0.5, 0.85, f'{pct_of_target:.1f}% of Target',
-                         fontsize=10, color=self.colors['text'], ha='center', fontweight='bold')
+            ax_gauge.text(marker_x, 0.85, f'{pnl_sign}Rs.{current_pnl:,.0f} ({pct_of_target:.0f}%)',
+                         fontsize=10, color=marker_color, ha='center', fontweight='bold')
 
-            # ========== Spot Chart (bottom) ==========
-            ax2.plot(times, spots, color=self.colors['neutral'], linewidth=2)
+            # ========== Spot Chart with Iron Condor Visualization (bottom) ==========
 
-            # Wing lines - now using actual short strikes
+            # Calculate all 4 strikes
             atm = round(chart_data.spot_at_entry / 50) * 50
-            short_ce = atm + chart_data.wing_distance  # Short CE strike
-            short_pe = atm - chart_data.wing_distance  # Short PE strike
+            spread_width = 50  # Default spread width
+            short_ce = atm + chart_data.wing_distance
+            short_pe = atm - chart_data.wing_distance
+            long_ce = short_ce + spread_width
+            long_pe = short_pe - spread_width
 
-            ax2.axhline(y=short_ce, color=self.colors['warning'], linestyle='--',
-                       linewidth=1.5, alpha=0.8)
-            ax2.axhline(y=short_pe, color=self.colors['warning'], linestyle='--',
-                       linewidth=1.5, alpha=0.8)
-            ax2.axhline(y=atm, color=self.colors['text'], linestyle=':',
-                       linewidth=1, alpha=0.4)
+            # Auto-scale to show all strikes
+            spot_min = min(min(spots), long_pe) - 30
+            spot_max = max(max(spots), long_ce) + 30
+            ax2.set_ylim(spot_min, spot_max)
 
-            # Wing labels on right side
-            ax2.text(times[-1], short_ce, f'  {short_ce:.0f}',
-                    color=self.colors['warning'], fontsize=9, va='center', fontweight='bold')
-            ax2.text(times[-1], short_pe, f'  {short_pe:.0f}',
-                    color=self.colors['warning'], fontsize=9, va='center', fontweight='bold')
+            # Draw Iron Condor profit/loss zones as background
+            # Profit zone (between short strikes) - green
+            ax2.axhspan(short_pe, short_ce, alpha=0.15, color=self.colors['profit'],
+                       label='Profit Zone')
 
-            # Current spot marker
+            # Partial loss zone (between short and long strikes) - yellow/orange
+            ax2.axhspan(long_pe, short_pe, alpha=0.1, color=self.colors['warning'])
+            ax2.axhspan(short_ce, long_ce, alpha=0.1, color=self.colors['warning'])
+
+            # Max loss zone (beyond long strikes) - red
+            ax2.axhspan(spot_min, long_pe, alpha=0.08, color=self.colors['loss'])
+            ax2.axhspan(long_ce, spot_max, alpha=0.08, color=self.colors['loss'])
+
+            # Plot price line
+            ax2.plot(times, spots, color=self.colors['neutral'], linewidth=2.5, zorder=3)
+
+            # Strike lines with different styles
+            # Long strikes (protection/wings) - dashed
+            ax2.axhline(y=long_ce, color=self.colors['loss'], linestyle=':', linewidth=1.5, alpha=0.7)
+            ax2.axhline(y=long_pe, color=self.colors['loss'], linestyle=':', linewidth=1.5, alpha=0.7)
+
+            # Short strikes (sold options) - solid
+            ax2.axhline(y=short_ce, color=self.colors['warning'], linestyle='-', linewidth=2, alpha=0.9)
+            ax2.axhline(y=short_pe, color=self.colors['warning'], linestyle='-', linewidth=2, alpha=0.9)
+
+            # ATM reference
+            ax2.axhline(y=atm, color=self.colors['text'], linestyle=':', linewidth=1, alpha=0.3)
+
+            # Strike labels on right side (compact)
+            label_x = times[-1]
+            ax2.text(label_x, long_ce, f' {long_ce:.0f} (Long CE)', color=self.colors['loss'],
+                    fontsize=8, va='center', alpha=0.8)
+            ax2.text(label_x, short_ce, f' {short_ce:.0f} (Short CE)', color=self.colors['warning'],
+                    fontsize=8, va='center', fontweight='bold')
+            ax2.text(label_x, short_pe, f' {short_pe:.0f} (Short PE)', color=self.colors['warning'],
+                    fontsize=8, va='center', fontweight='bold')
+            ax2.text(label_x, long_pe, f' {long_pe:.0f} (Long PE)', color=self.colors['loss'],
+                    fontsize=8, va='center', alpha=0.8)
+
+            # Current spot marker with label
             ax2.scatter([times[-1]], [spots[-1]], color=self.colors['neutral'],
-                       s=80, zorder=5, edgecolors='white', linewidth=2)
+                       s=100, zorder=5, edgecolors='white', linewidth=2)
+            ax2.annotate(f'{spots[-1]:,.0f}', xy=(times[-1], spots[-1]),
+                        xytext=(-40, 10), textcoords='offset points',
+                        fontsize=9, color=self.colors['neutral'], fontweight='bold')
 
             ax2.set_ylabel('NIFTY', fontsize=10, color=self.colors['text'])
             ax2.set_xlabel('Time', fontsize=10, color=self.colors['text'])
-            ax2.grid(True, color=self.colors['grid'], alpha=0.3)
+            ax2.grid(True, color=self.colors['grid'], alpha=0.2, zorder=1)
             ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
             ax2.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
-
-            # Auto-scale spot chart to show wings properly
-            spot_min = min(min(spots), short_pe) - 50
-            spot_max = max(max(spots), short_ce) + 50
-            ax2.set_ylim(spot_min, spot_max)
 
             plt.tight_layout()
 
