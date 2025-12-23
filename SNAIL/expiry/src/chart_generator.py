@@ -268,7 +268,12 @@ class ChartGenerator:
         current_spot: float
     ) -> Optional[Path]:
         """
-        Generate P&L chart.
+        Generate P&L chart with smart Y-axis scaling.
+
+        Design:
+        - Top: P&L chart with auto-scaled Y-axis (not forced by target/SL)
+        - Middle: Progress gauge showing position relative to SL/Target
+        - Bottom: NIFTY spot with wing boundaries
 
         Args:
             chart_data: Chart data with history
@@ -287,14 +292,16 @@ class ChartGenerator:
             return None
 
         try:
-            fig, (ax1, ax2) = plt.subplots(
-                2, 1, figsize=(10, 8),
-                gridspec_kw={'height_ratios': [3, 1]}
-            )
+            # Create figure with 3 sections: P&L chart, gauge, spot chart
+            fig = plt.figure(figsize=(10, 9))
+            gs = fig.add_gridspec(3, 1, height_ratios=[3, 0.4, 1.2], hspace=0.3)
+            ax1 = fig.add_subplot(gs[0])  # P&L chart
+            ax_gauge = fig.add_subplot(gs[1])  # Progress gauge
+            ax2 = fig.add_subplot(gs[2])  # Spot chart
 
             # Apply dark theme
             fig.patch.set_facecolor(self.colors['background'])
-            for ax in [ax1, ax2]:
+            for ax in [ax1, ax_gauge, ax2]:
                 ax.set_facecolor(self.colors['background'])
                 ax.tick_params(colors=self.colors['text'])
                 ax.xaxis.label.set_color(self.colors['text'])
@@ -307,7 +314,7 @@ class ChartGenerator:
             pnls = [p.pnl for p in chart_data.pnl_history]
             spots = [p.spot for p in chart_data.pnl_history]
 
-            # P&L Chart (top)
+            # ========== P&L Chart (top) ==========
             ax1.set_title(
                 f"Expiry Iron Condor - {chart_data.entry_time.strftime('%d %b %Y')}",
                 fontsize=14, fontweight='bold', color=self.colors['text']
@@ -325,85 +332,139 @@ class ChartGenerator:
             ax1.fill_between(
                 times, 0, pnls,
                 where=[p >= 0 for p in pnls],
-                color=self.colors['profit'], alpha=0.2
+                color=self.colors['profit'], alpha=0.3
             )
             ax1.fill_between(
                 times, 0, pnls,
                 where=[p < 0 for p in pnls],
-                color=self.colors['loss'], alpha=0.2
+                color=self.colors['loss'], alpha=0.3
             )
 
-            # Target line
-            ax1.axhline(
-                y=chart_data.target_pnl, color=self.colors['target'],
-                linestyle='--', linewidth=1.5, alpha=0.8,
-                label=f'Target: Rs.{chart_data.target_pnl:,.0f}'
-            )
-
-            # Stop loss line
-            ax1.axhline(
-                y=chart_data.stop_loss_pnl, color=self.colors['stoploss'],
-                linestyle='--', linewidth=1.5, alpha=0.8,
-                label=f'SL: Rs.{chart_data.stop_loss_pnl:,.0f}'
-            )
+            # Auto-scale Y-axis based on ACTUAL P&L data, not target/SL
+            pnl_min, pnl_max = min(pnls), max(pnls)
+            pnl_range = max(abs(pnl_max), abs(pnl_min), 100)  # Minimum range of 100
+            y_padding = pnl_range * 0.3  # 30% padding
+            ax1.set_ylim(-pnl_range - y_padding, pnl_range + y_padding)
 
             # Zero line
-            ax1.axhline(y=0, color=self.colors['text'], linestyle='-', linewidth=0.5, alpha=0.5)
+            ax1.axhline(y=0, color=self.colors['text'], linestyle='-', linewidth=1, alpha=0.5)
 
             # Current P&L marker
+            marker_color = self.colors['profit'] if pnls[-1] >= 0 else self.colors['loss']
             ax1.scatter(
                 [times[-1]], [pnls[-1]],
-                color=self.colors['profit'] if pnls[-1] >= 0 else self.colors['loss'],
-                s=100, zorder=5, edgecolors='white', linewidth=2
+                color=marker_color, s=120, zorder=5, edgecolors='white', linewidth=2
             )
 
-            # Current P&L annotation
+            # Current P&L annotation (prominent)
             pnl_sign = "+" if current_pnl >= 0 else ""
             ax1.annotate(
-                f'{pnl_sign}Rs.{current_pnl:,.0f}',
+                f'Rs.{current_pnl:,.0f}',
                 xy=(times[-1], pnls[-1]),
-                xytext=(10, 10), textcoords='offset points',
-                fontsize=12, fontweight='bold',
-                color=self.colors['profit'] if current_pnl >= 0 else self.colors['loss'],
-                bbox=dict(boxstyle='round', facecolor=self.colors['background'], alpha=0.8)
+                xytext=(15, 0), textcoords='offset points',
+                fontsize=14, fontweight='bold',
+                color=marker_color,
+                bbox=dict(boxstyle='round,pad=0.3', facecolor=self.colors['background'],
+                         edgecolor=marker_color, alpha=0.9)
             )
 
             ax1.set_ylabel('P&L (Rs.)', fontsize=10, color=self.colors['text'])
-            ax1.legend(loc='upper left', facecolor=self.colors['background'], labelcolor=self.colors['text'])
             ax1.grid(True, color=self.colors['grid'], alpha=0.3)
-
-            # Format x-axis
             ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
             ax1.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
 
-            # Spot Chart (bottom)
-            ax2.plot(times, spots, color=self.colors['neutral'], linewidth=1.5)
+            # ========== Progress Gauge (middle) ==========
+            ax_gauge.set_xlim(0, 1)
+            ax_gauge.set_ylim(0, 1)
+            ax_gauge.axis('off')
 
-            # Wing lines
-            atm = chart_data.spot_at_entry
-            ce_wing = atm + chart_data.wing_distance
-            pe_wing = atm - chart_data.wing_distance
+            # Calculate position on gauge (SL = 0, Entry = 0.5, Target = 1)
+            total_range = chart_data.target_pnl - chart_data.stop_loss_pnl
+            if total_range > 0:
+                # Position: 0 = SL, 0.5 = breakeven, 1 = target
+                normalized_pos = (current_pnl - chart_data.stop_loss_pnl) / total_range
+                normalized_pos = max(0, min(1, normalized_pos))  # Clamp to [0, 1]
+            else:
+                normalized_pos = 0.5
 
-            ax2.axhline(y=ce_wing, color=self.colors['warning'], linestyle='--', linewidth=1, alpha=0.7)
-            ax2.axhline(y=pe_wing, color=self.colors['warning'], linestyle='--', linewidth=1, alpha=0.7)
-            ax2.axhline(y=atm, color=self.colors['text'], linestyle=':', linewidth=1, alpha=0.5)
+            # Draw gauge background (gradient from red to green)
+            from matplotlib.patches import Rectangle, FancyBboxPatch
 
-            # Add wing labels
-            ax2.text(
-                times[0], ce_wing, f' CE Wing {ce_wing:.0f}',
-                color=self.colors['warning'], fontsize=8, va='bottom'
-            )
-            ax2.text(
-                times[0], pe_wing, f' PE Wing {pe_wing:.0f}',
-                color=self.colors['warning'], fontsize=8, va='top'
-            )
+            # SL zone (red)
+            ax_gauge.add_patch(Rectangle((0.05, 0.3), 0.4, 0.4,
+                                         facecolor=self.colors['loss'], alpha=0.3,
+                                         edgecolor='none'))
+            # Profit zone (green)
+            ax_gauge.add_patch(Rectangle((0.55, 0.3), 0.4, 0.4,
+                                         facecolor=self.colors['profit'], alpha=0.3,
+                                         edgecolor='none'))
+            # Neutral zone around zero
+            ax_gauge.add_patch(Rectangle((0.4, 0.3), 0.2, 0.4,
+                                         facecolor=self.colors['text'], alpha=0.1,
+                                         edgecolor='none'))
+
+            # Gauge outline
+            ax_gauge.add_patch(FancyBboxPatch((0.05, 0.3), 0.9, 0.4,
+                                              boxstyle="round,pad=0.02",
+                                              facecolor='none',
+                                              edgecolor=self.colors['grid'], linewidth=2))
+
+            # Current position marker (triangle)
+            marker_x = 0.05 + normalized_pos * 0.9
+            marker_color = self.colors['profit'] if current_pnl >= 0 else self.colors['loss']
+            ax_gauge.plot([marker_x], [0.5], marker='v', markersize=15,
+                         color=marker_color, markeredgecolor='white', markeredgewidth=2)
+            ax_gauge.plot([marker_x, marker_x], [0.3, 0.7], color=marker_color,
+                         linewidth=3, alpha=0.8)
+
+            # Labels
+            ax_gauge.text(0.05, 0.15, f'SL: Rs.{chart_data.stop_loss_pnl:,.0f}',
+                         fontsize=9, color=self.colors['loss'], ha='left', fontweight='bold')
+            ax_gauge.text(0.5, 0.15, '0', fontsize=9, color=self.colors['text'],
+                         ha='center', alpha=0.7)
+            ax_gauge.text(0.95, 0.15, f'Target: Rs.{chart_data.target_pnl:,.0f}',
+                         fontsize=9, color=self.colors['profit'], ha='right', fontweight='bold')
+
+            # Percentage of target
+            pct_of_target = (current_pnl / chart_data.target_pnl * 100) if chart_data.target_pnl > 0 else 0
+            ax_gauge.text(0.5, 0.85, f'{pct_of_target:.1f}% of Target',
+                         fontsize=10, color=self.colors['text'], ha='center', fontweight='bold')
+
+            # ========== Spot Chart (bottom) ==========
+            ax2.plot(times, spots, color=self.colors['neutral'], linewidth=2)
+
+            # Wing lines - now using actual short strikes
+            atm = round(chart_data.spot_at_entry / 50) * 50
+            short_ce = atm + chart_data.wing_distance  # Short CE strike
+            short_pe = atm - chart_data.wing_distance  # Short PE strike
+
+            ax2.axhline(y=short_ce, color=self.colors['warning'], linestyle='--',
+                       linewidth=1.5, alpha=0.8)
+            ax2.axhline(y=short_pe, color=self.colors['warning'], linestyle='--',
+                       linewidth=1.5, alpha=0.8)
+            ax2.axhline(y=atm, color=self.colors['text'], linestyle=':',
+                       linewidth=1, alpha=0.4)
+
+            # Wing labels on right side
+            ax2.text(times[-1], short_ce, f'  {short_ce:.0f}',
+                    color=self.colors['warning'], fontsize=9, va='center', fontweight='bold')
+            ax2.text(times[-1], short_pe, f'  {short_pe:.0f}',
+                    color=self.colors['warning'], fontsize=9, va='center', fontweight='bold')
+
+            # Current spot marker
+            ax2.scatter([times[-1]], [spots[-1]], color=self.colors['neutral'],
+                       s=80, zorder=5, edgecolors='white', linewidth=2)
 
             ax2.set_ylabel('NIFTY', fontsize=10, color=self.colors['text'])
             ax2.set_xlabel('Time', fontsize=10, color=self.colors['text'])
             ax2.grid(True, color=self.colors['grid'], alpha=0.3)
-
             ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
             ax2.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
+
+            # Auto-scale spot chart to show wings properly
+            spot_min = min(min(spots), short_pe) - 50
+            spot_max = max(max(spots), short_ce) + 50
+            ax2.set_ylim(spot_min, spot_max)
 
             plt.tight_layout()
 
@@ -417,7 +478,7 @@ class ChartGenerator:
             return output_path
 
         except Exception as e:
-            logger.error(f"Chart generation failed: {e}")
+            logger.exception(f"Chart generation failed: {e}")
             return None
 
     def generate_summary_chart(
