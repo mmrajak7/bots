@@ -182,7 +182,6 @@ def cmd_startup(args):
     return 0 if result.success else 1
 
 
-@with_file_lock
 def cmd_entry(args):
     """Check entry conditions or execute entry."""
     from src.services.entry_manager import get_entry_manager
@@ -190,7 +189,8 @@ def cmd_entry(args):
     from src.utils.config import get_trading_config
     from src.utils.market_events_scraper import scrape_and_save_all
 
-    # Graceful exit if outside entry window (for cron)
+    # IMPORTANT: Check time window BEFORE acquiring lock (ISSUE-FIX: lock contention)
+    # This prevents entry from blocking on lock when outside entry window
     config = get_trading_config()
     entry_start = config.get('entry', {}).get('window', {}).get('start', '09:30')
     entry_end = config.get('entry', {}).get('window', {}).get('end', '15:10')
@@ -199,6 +199,18 @@ def cmd_entry(args):
     if current_time < entry_start or current_time > entry_end:
         logger.debug(f"Outside entry window ({entry_start}-{entry_end}), skipping")
         return 0
+
+    # Now acquire lock for actual entry operations
+    logger.info(f"Entry attempt at {current_time} - acquiring lock...")
+    return _cmd_entry_with_lock(args, config)
+
+
+@with_file_lock
+def _cmd_entry_with_lock(args, config):
+    """Entry logic that requires exclusive lock."""
+    from src.services.entry_manager import get_entry_manager
+    from src.services.claude_advisor import get_claude_advisor
+    from src.utils.market_events_scraper import scrape_and_save_all
 
     # Scrape latest news and events first
     try:
