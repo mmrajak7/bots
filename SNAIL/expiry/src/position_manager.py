@@ -143,7 +143,7 @@ class PositionManager:
         total_qty = position.num_lots * position.lot_size
         mtm_pnl = pnl_per_share * total_qty
 
-        # Calculate distances to wings
+        # Calculate distances to wings (protection strikes)
         spot_quote = quotes.get('NSE:NIFTY 50')
         if spot_quote and hasattr(spot_quote, 'ltp') and spot_quote.ltp > 0:
             spot_price = spot_quote.ltp
@@ -151,16 +151,43 @@ class PositionManager:
             spot_price = position.spot_at_entry
             logger.warning(f"Using stale spot price: {spot_price}")
 
-        # Validate legs exist before accessing
+        # Find wing strikes from position legs
+        # Iron Condor structure:
+        #   legs[0] = Short CE (SELL), legs[1] = Short PE (SELL)
+        #   legs[2] = Long CE (BUY),   legs[3] = Long PE (BUY)
+        # Wings are the LONG strikes (protection level)
         if not position.legs or len(position.legs) < 4:
             logger.error(f"Invalid position: expected 4 legs, got {len(position.legs) if position.legs else 0}")
-            # Use spot as fallback for ATM strike
             atm_strike = round(spot_price / 50) * 50
+            ce_wing_strike = atm_strike + position.wing_distance
+            pe_wing_strike = atm_strike - position.wing_distance
         else:
-            atm_strike = position.legs[0].strike  # Short CE strike = ATM
+            # Find long strikes (the wings/protection)
+            long_ce_strike = None
+            long_pe_strike = None
+            short_ce_strike = None
+            short_pe_strike = None
 
-        ce_wing_strike = atm_strike + position.wing_distance
-        pe_wing_strike = atm_strike - position.wing_distance
+            for leg in position.legs:
+                if leg.transaction_type == 'BUY' and leg.option_type == 'CE':
+                    long_ce_strike = leg.strike
+                elif leg.transaction_type == 'BUY' and leg.option_type == 'PE':
+                    long_pe_strike = leg.strike
+                elif leg.transaction_type == 'SELL' and leg.option_type == 'CE':
+                    short_ce_strike = leg.strike
+                elif leg.transaction_type == 'SELL' and leg.option_type == 'PE':
+                    short_pe_strike = leg.strike
+
+            # Use actual long strikes as wing boundaries
+            if long_ce_strike and long_pe_strike:
+                ce_wing_strike = long_ce_strike
+                pe_wing_strike = long_pe_strike
+            else:
+                # Fallback: calculate from short strikes
+                logger.warning("Could not find long strikes, using calculation")
+                atm_strike = round(spot_price / 50) * 50
+                ce_wing_strike = atm_strike + position.wing_distance
+                pe_wing_strike = atm_strike - position.wing_distance
 
         distance_to_ce = ce_wing_strike - spot_price
         distance_to_pe = spot_price - pe_wing_strike
@@ -376,6 +403,19 @@ class PositionManager:
         Returns:
             Summary dictionary
         """
+        # Calculate ATM from spot at entry
+        atm_strike = round(position.spot_at_entry / 50) * 50
+
+        # Find short strikes for summary
+        short_ce_strike = None
+        short_pe_strike = None
+        if position.legs:
+            for leg in position.legs:
+                if leg.transaction_type == 'SELL' and leg.option_type == 'CE':
+                    short_ce_strike = leg.strike
+                elif leg.transaction_type == 'SELL' and leg.option_type == 'PE':
+                    short_pe_strike = leg.strike
+
         return {
             'entry_time': position.entry_time,
             'spot_at_entry': position.spot_at_entry,
@@ -383,7 +423,9 @@ class PositionManager:
             'vix_at_entry': position.vix_at_entry,
             'current_vix': snapshot.vix,
             'wing_distance': position.wing_distance,
-            'atm_strike': position.legs[0].strike if position.legs else 0,
+            'atm_strike': atm_strike,
+            'short_ce_strike': short_ce_strike,
+            'short_pe_strike': short_pe_strike,
             'total_credit': position.total_credit,
             'target_pnl': position.target_pnl,
             'stop_loss_pnl': position.stop_loss_pnl,
