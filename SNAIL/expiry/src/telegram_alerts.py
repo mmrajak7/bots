@@ -261,22 +261,19 @@ class TelegramAlerts:
         # Risk:Reward ratio
         rr_ratio = abs(max_loss / max_profit) if max_profit > 0 else 0
 
-        # ASCII Iron Condor payoff diagram
-        condor_art = f"""```
-    ╱╲{'─' * 8}╱╲
-   ╱  ╲{'─' * 6}╱  ╲
-──╱────╲────────╱────╲──
- {long_pe}  {short_pe}    {short_ce}  {long_ce}```"""
+        # Simple single-line condor representation
+        condor_line = f"`|{long_pe}|──{short_pe}════{short_ce}──|{long_ce}|`"
 
         caption = f"""{pnl_emoji} *IRON CONDOR*
 
 *P&L: {pnl_sign}Rs.{snapshot.mtm_pnl:,.0f}* [{bar}] {snapshot.pnl_pct:.0f}%
-📊 NIFTY: {snapshot.spot:,.0f} | VIX: {snapshot.vix:.1f} | {snapshot.timestamp}
-{condor_art}
-CE: {snapshot.distance_to_ce_wing:.0f}pts{ce_warning} | PE: {snapshot.distance_to_pe_wing:.0f}pts{pe_warning}
+📊 NIFTY: {snapshot.spot:,.0f} | VIX: {snapshot.vix:.1f}
 
-🎯 Target: Rs.{position.target_pnl:,.0f} | Max: Rs.{max_profit:,.0f}
-⛔ SL: Rs.{position.stop_loss_pnl:,.0f} | Max Loss: Rs.{max_loss:,.0f}
+{condor_line}
+↔ CE: {snapshot.distance_to_ce_wing:.0f}pts{ce_warning} | PE: {snapshot.distance_to_pe_wing:.0f}pts{pe_warning}
+
+🎯 Target: Rs.{position.target_pnl:,.0f} (Max: Rs.{max_profit:,.0f})
+⛔ SL: Rs.{position.stop_loss_pnl:,.0f} (Max Loss: Rs.{max_loss:,.0f})
 📐 R:R = 1:{rr_ratio:.1f}"""
 
         if chart_path and chart_path.exists():
