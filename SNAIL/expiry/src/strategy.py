@@ -206,6 +206,7 @@ class StrategyCalculator:
         self.strategy_config = config.get('strategy', {})
         self.min_wing = self.strategy_config.get('min_wing_distance', 100)
         self.wing_rounding = self.strategy_config.get('wing_rounding', 50)
+        self.spread_width = self.strategy_config.get('spread_width', 50)
 
     def get_vix_multiplier(self, vix: float) -> float:
         """
@@ -298,6 +299,12 @@ class StrategyCalculator:
         """
         Build iron condor setup from market data.
 
+        Iron Condor Structure:
+        - Short CE: ATM + wing_distance (OTM call sold)
+        - Short PE: ATM - wing_distance (OTM put sold)
+        - Long CE: Short CE + spread_width (further OTM call bought)
+        - Long PE: Short PE - spread_width (further OTM put bought)
+
         Args:
             spot: Current spot price
             vix: Current VIX
@@ -310,13 +317,20 @@ class StrategyCalculator:
         wing_distance = self.calculate_wing_distance(spot, vix)
         atm_strike = self.find_atm_strike(spot)
 
-        # Calculate wing strikes
-        ce_wing_strike = atm_strike + wing_distance
-        pe_wing_strike = atm_strike - wing_distance
+        # Calculate short strikes (OTM strangle)
+        short_ce_strike = atm_strike + wing_distance
+        short_pe_strike = atm_strike - wing_distance
+
+        # Calculate long strikes (further OTM for protection)
+        long_ce_strike = short_ce_strike + self.spread_width
+        long_pe_strike = short_pe_strike - self.spread_width
 
         logger.info(
-            f"Building IC: ATM={atm_strike}, Wings={wing_distance}, "
-            f"CE Wing={ce_wing_strike}, PE Wing={pe_wing_strike}"
+            f"Building IC: ATM={atm_strike}, Wing={wing_distance}, Spread={self.spread_width}"
+        )
+        logger.info(
+            f"Strikes: Short CE={short_ce_strike}, Short PE={short_pe_strike}, "
+            f"Long CE={long_ce_strike}, Long PE={long_pe_strike}"
         )
 
         # Find strikes in option chain
@@ -338,13 +352,13 @@ class StrategyCalculator:
                 expiry=expiry_date
             )
 
-        # Short straddle at ATM
-        short_ce = find_strike(atm_strike, 'CE')
-        short_pe = find_strike(atm_strike, 'PE')
+        # Short strangle (OTM options)
+        short_ce = find_strike(short_ce_strike, 'CE')
+        short_pe = find_strike(short_pe_strike, 'PE')
 
-        # Long wings
-        long_ce = find_strike(ce_wing_strike, 'CE')
-        long_pe = find_strike(pe_wing_strike, 'PE')
+        # Long wings (further OTM for protection)
+        long_ce = find_strike(long_ce_strike, 'CE')
+        long_pe = find_strike(long_pe_strike, 'PE')
 
         # Validate all strikes found
         if short_ce is None or short_pe is None or long_ce is None or long_pe is None:
