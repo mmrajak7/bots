@@ -1711,6 +1711,9 @@ class ZScoreBot:
         self.enabled_instruments = self._get_enabled_instruments()
         logging.info(f"Enabled instruments: {list(self.enabled_instruments.keys())}")
 
+        # Token to instrument mapping for WebSocket callbacks (must be initialized before _resolve_tokens)
+        self.token_to_instrument = {}  # token -> (inst_key, price_type)
+
         # Resolve instrument tokens for all enabled instruments
         self._resolve_tokens()
 
@@ -1755,9 +1758,6 @@ class ZScoreBot:
                 'trade_group_id': '',
                 'lot_size': self.enabled_instruments[inst_key].get('default_lot_size', 75)
             }
-
-        # Token to instrument mapping for WebSocket callbacks
-        self.token_to_instrument = {}  # token -> (inst_key, price_type)
 
         # WebSocket
         self.ticker = None
