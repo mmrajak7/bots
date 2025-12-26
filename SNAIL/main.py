@@ -411,16 +411,30 @@ def cmd_monitor(args):
     """Run a single monitoring iteration (for cron)."""
     from src.workflows.monitor_workflow import MonitorWorkflow
     from src.utils.config import get_monitoring_config
+    from src.api.response_handler import CALLBACK_QUEUE_FILE
+    from pathlib import Path
+
+    # Check if there are pending user callbacks
+    queue_file = Path(CALLBACK_QUEUE_FILE)
+    has_pending_callbacks = queue_file.exists() and queue_file.stat().st_size > 10
 
     # Graceful exit if outside monitor window (for cron)
+    # BUT always run if there are pending user callbacks to process
     config = get_monitoring_config()
     monitor_start = config.get('start_time', '09:16')
     monitor_end = config.get('end_time', '15:26')
     current_time = datetime.now().strftime('%H:%M')
 
     if current_time < monitor_start or current_time > monitor_end:
-        logger.debug(f"Outside monitor window ({monitor_start}-{monitor_end}), skipping")
-        return 0
+        if has_pending_callbacks:
+            # Process pending callbacks even outside monitor window
+            logger.info("Processing pending user callbacks outside monitor window")
+            monitor = MonitorWorkflow()
+            monitor._process_user_responses()
+            return 0
+        else:
+            logger.debug(f"Outside monitor window ({monitor_start}-{monitor_end}), skipping")
+            return 0
 
     monitor = MonitorWorkflow()
     monitor.run_once()
