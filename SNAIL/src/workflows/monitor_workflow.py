@@ -984,8 +984,10 @@ _Fetching P&L data..._"""
                 # =============================================================
                 trailing_config = self.trading_config.get('exit', {}).get('trailing', {})
                 trailing_enabled = trailing_config.get('enabled', False)
+                trailing_state_cached = None  # Cache for reuse below
 
-                if trailing_enabled and current_pnl_pct > 0:
+                # IMPORTANT: Check trailing even if P&L is negative (floor could be > 0 with breakeven locked)
+                if trailing_enabled:
                     # Get trailing configuration
                     activation_pct = trailing_config.get('activation_pct', 2.0)
                     lock_breakeven_at = trailing_config.get('lock_breakeven_at', 2.5)
@@ -1001,16 +1003,16 @@ _Fetching P&L data..._"""
                     position_age_minutes = (datetime.now() - position.entry_time).total_seconds() / 60
 
                     if position_age_minutes >= min_holding_minutes:
-                        # Get current trailing state
-                        trailing_state = get_trailing_state(position.id)
-                        trailing_active = trailing_state.get('trailing_active', False)
-                        current_peak_pct = trailing_state.get('peak_pnl_pct')
-                        current_floor_pct = trailing_state.get('trailing_floor_pct')
-                        breakeven_locked = trailing_state.get('breakeven_locked', False)
+                        # Get current trailing state (cache for reuse in fixed TP check)
+                        trailing_state_cached = get_trailing_state(position.id)
+                        trailing_active = trailing_state_cached.get('trailing_active', False)
+                        current_peak_pct = trailing_state_cached.get('peak_pnl_pct')
+                        current_floor_pct = trailing_state_cached.get('trailing_floor_pct')
+                        breakeven_locked = trailing_state_cached.get('breakeven_locked', False)
 
                         if not trailing_active:
-                            # Check if we should activate trailing
-                            if current_pnl_pct >= activation_pct:
+                            # Check if we should activate trailing (only when P&L is positive)
+                            if current_pnl_pct > 0 and current_pnl_pct >= activation_pct:
                                 # ACTIVATE TRAILING
                                 floor_pct = activate_trailing(
                                     position_id=position.id,
@@ -1032,9 +1034,12 @@ _Fetching P&L data..._"""
                         else:
                             # Trailing is active - check for new peak or exit
                             if current_peak_pct is None:
+                                # Edge case: trailing active but no peak recorded - use current
+                                logger.warning(f"Trailing active but peak is None - initializing to {current_pnl_pct:.2f}%")
                                 current_peak_pct = current_pnl_pct
 
-                            if current_pnl_pct > current_peak_pct:
+                            # Only update peak if P&L is positive and higher than current peak
+                            if current_pnl_pct > 0 and current_pnl_pct > current_peak_pct:
                                 # NEW PEAK - update trailing state
                                 new_floor_pct, new_breakeven_locked = update_trailing_peak(
                                     position_id=position.id,
@@ -1058,7 +1063,10 @@ _Fetching P&L data..._"""
                                 breakeven_locked = new_breakeven_locked
 
                             # Check if P&L dropped below floor - TRAILING STOP
-                            if current_floor_pct is not None and current_pnl_pct <= current_floor_pct:
+                            # Use round() to avoid floating point precision issues (e.g., 2.6499 vs 2.65)
+                            if current_floor_pct is None:
+                                logger.warning("Trailing active but floor is None - skipping exit check")
+                            elif round(current_pnl_pct, 2) <= round(current_floor_pct, 2):
                                 logger.warning(
                                     f"TRAILING STOP HIT! P&L: {current_pnl_pct:.2f}% <= floor {current_floor_pct:.2f}% "
                                     f"(peak was {current_peak_pct:.2f}%)"
@@ -1095,8 +1103,8 @@ _Fetching P&L data..._"""
                 auto_exit_on_tp = self.trading_config.get('exit', {}).get('auto_exit_on_tp', True)
 
                 # Only use fixed TP if trailing is disabled or not yet active
-                trailing_state = get_trailing_state(position.id) if trailing_enabled else {}
-                use_fixed_tp = not trailing_enabled or not trailing_state.get('trailing_active', False)
+                # Reuse cached trailing_state from above to avoid duplicate DB query
+                use_fixed_tp = not trailing_enabled or not (trailing_state_cached or {}).get('trailing_active', False)
 
                 if use_fixed_tp and current_pnl_pct >= profit_target_pct:
                     logger.info(f"PROFIT TARGET HIT! P&L: {current_pnl_pct:.2f}% >= {profit_target_pct}% target")

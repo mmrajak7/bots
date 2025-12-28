@@ -475,8 +475,8 @@ def update_trailing_state(
         trailing_floor_pct: Current trailing floor
         breakeven_locked: Whether breakeven is locked
     """
-    updates = []
-    params = []
+    updates: List[str] = []
+    params: List[Any] = []
 
     if peak_pnl_pct is not None:
         updates.append("peak_pnl_pct = ?")
