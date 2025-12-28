@@ -57,6 +57,13 @@ class Position:
     pnl_percent: Optional[float] = None
     exit_reason: Optional[str] = None
     verified: bool = True
+    # Trailing profit fields
+    peak_pnl_pct: Optional[float] = None          # Highest P&L % recorded
+    peak_pnl_amount: Optional[float] = None       # Highest P&L amount recorded
+    peak_pnl_time: Optional[datetime] = None      # When peak was hit
+    trailing_active: bool = False                  # Whether trailing is active
+    trailing_floor_pct: Optional[float] = None    # Current exit threshold %
+    breakeven_locked: bool = False                 # Whether breakeven is locked
 
 
 @dataclass
@@ -195,6 +202,25 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         logger.info("Running migration: Adding cooldown_type to cooldowns table")
         conn.execute("ALTER TABLE cooldowns ADD COLUMN cooldown_type TEXT NOT NULL DEFAULT 'entry'")
         logger.info("Migration complete: cooldown_type column added")
+
+    # Migration 3: Add trailing profit columns to positions table
+    cursor = conn.execute("PRAGMA table_info(positions)")
+    position_columns = [row[1] for row in cursor.fetchall()]
+
+    trailing_columns = [
+        ('peak_pnl_pct', 'REAL'),
+        ('peak_pnl_amount', 'REAL'),
+        ('peak_pnl_time', 'DATETIME'),
+        ('trailing_active', 'INTEGER DEFAULT 0'),
+        ('trailing_floor_pct', 'REAL'),
+        ('breakeven_locked', 'INTEGER DEFAULT 0'),
+    ]
+
+    for col_name, col_type in trailing_columns:
+        if col_name not in position_columns:
+            logger.info(f"Running migration: Adding {col_name} to positions table")
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {col_name} {col_type}")
+            logger.info(f"Migration complete: {col_name} column added")
 
     # Migration 2: Fix cooldowns table to allow NULL position_id
     # Check if position_id has NOT NULL constraint (by checking if we can insert NULL)
@@ -420,6 +446,229 @@ def update_position_status(
                 (status, datetime.now().isoformat(), position_id)
             )
         logger.info(f"Updated position {position_id} status to {status}")
+
+
+# =============================================================================
+# TRAILING PROFIT FUNCTIONS
+# =============================================================================
+
+def update_trailing_state(
+    position_id: int,
+    peak_pnl_pct: Optional[float] = None,
+    peak_pnl_amount: Optional[float] = None,
+    peak_pnl_time: Optional[datetime] = None,
+    trailing_active: Optional[bool] = None,
+    trailing_floor_pct: Optional[float] = None,
+    breakeven_locked: Optional[bool] = None
+) -> None:
+    """
+    Update trailing profit state for a position.
+
+    Only updates fields that are provided (not None).
+
+    Args:
+        position_id: Position ID
+        peak_pnl_pct: New peak P&L percentage
+        peak_pnl_amount: New peak P&L amount
+        peak_pnl_time: When peak was hit
+        trailing_active: Whether trailing is now active
+        trailing_floor_pct: Current trailing floor
+        breakeven_locked: Whether breakeven is locked
+    """
+    updates = []
+    params = []
+
+    if peak_pnl_pct is not None:
+        updates.append("peak_pnl_pct = ?")
+        params.append(peak_pnl_pct)
+
+    if peak_pnl_amount is not None:
+        updates.append("peak_pnl_amount = ?")
+        params.append(peak_pnl_amount)
+
+    if peak_pnl_time is not None:
+        updates.append("peak_pnl_time = ?")
+        params.append(peak_pnl_time.isoformat())
+
+    if trailing_active is not None:
+        updates.append("trailing_active = ?")
+        params.append(1 if trailing_active else 0)
+
+    if trailing_floor_pct is not None:
+        updates.append("trailing_floor_pct = ?")
+        params.append(trailing_floor_pct)
+
+    if breakeven_locked is not None:
+        updates.append("breakeven_locked = ?")
+        params.append(1 if breakeven_locked else 0)
+
+    if not updates:
+        return  # Nothing to update
+
+    updates.append("updated_at = ?")
+    params.append(datetime.now().isoformat())
+    params.append(position_id)
+
+    sql = f"UPDATE positions SET {', '.join(updates)} WHERE id = ?"
+
+    with get_db_session() as conn:
+        conn.execute(sql, params)
+        logger.debug(f"Updated trailing state for position {position_id}")
+
+
+def activate_trailing(
+    position_id: int,
+    current_pnl_pct: float,
+    current_pnl_amount: float,
+    trail_pct: float
+) -> float:
+    """
+    Activate trailing profit for a position.
+
+    Called when P&L first hits the activation threshold.
+
+    Args:
+        position_id: Position ID
+        current_pnl_pct: Current P&L percentage (becomes initial peak)
+        current_pnl_amount: Current P&L amount
+        trail_pct: Trailing percentage from config
+
+    Returns:
+        Initial trailing floor percentage
+    """
+    floor_pct = round(current_pnl_pct - trail_pct, 4)
+
+    update_trailing_state(
+        position_id=position_id,
+        peak_pnl_pct=current_pnl_pct,
+        peak_pnl_amount=current_pnl_amount,
+        peak_pnl_time=datetime.now(),
+        trailing_active=True,
+        trailing_floor_pct=floor_pct,
+        breakeven_locked=False
+    )
+
+    logger.info(
+        f"Trailing ACTIVATED for position {position_id}: "
+        f"peak={current_pnl_pct:.2f}%, floor={floor_pct:.2f}%"
+    )
+
+    return floor_pct
+
+
+def update_trailing_peak(
+    position_id: int,
+    new_peak_pct: float,
+    new_peak_amount: float,
+    trail_pct: float,
+    lock_breakeven_at: float,
+    current_breakeven_locked: bool
+) -> Tuple[float, bool]:
+    """
+    Update trailing peak when a new high is reached.
+
+    Args:
+        position_id: Position ID
+        new_peak_pct: New peak P&L percentage
+        new_peak_amount: New peak P&L amount
+        trail_pct: Trailing percentage from config
+        lock_breakeven_at: Threshold to lock breakeven
+        current_breakeven_locked: Whether breakeven is already locked
+
+    Returns:
+        Tuple of (new_floor_pct, breakeven_locked)
+    """
+    # Calculate new floor
+    new_floor = round(new_peak_pct - trail_pct, 4)
+
+    # Check if breakeven should be locked
+    should_lock_breakeven = new_peak_pct >= lock_breakeven_at
+
+    # If breakeven is locked, floor can never go below 0
+    if should_lock_breakeven or current_breakeven_locked:
+        new_floor = max(0.0, new_floor)
+
+    update_trailing_state(
+        position_id=position_id,
+        peak_pnl_pct=new_peak_pct,
+        peak_pnl_amount=new_peak_amount,
+        peak_pnl_time=datetime.now(),
+        trailing_floor_pct=new_floor,
+        breakeven_locked=should_lock_breakeven or current_breakeven_locked
+    )
+
+    if should_lock_breakeven and not current_breakeven_locked:
+        logger.info(
+            f"BREAKEVEN LOCKED for position {position_id}: "
+            f"peak={new_peak_pct:.2f}%, floor={new_floor:.2f}%"
+        )
+    else:
+        logger.debug(
+            f"Trailing peak updated for position {position_id}: "
+            f"peak={new_peak_pct:.2f}%, floor={new_floor:.2f}%"
+        )
+
+    return new_floor, should_lock_breakeven or current_breakeven_locked
+
+
+def get_trailing_state(position_id: int) -> Dict[str, Any]:
+    """
+    Get current trailing profit state for a position.
+
+    Args:
+        position_id: Position ID
+
+    Returns:
+        Dict with trailing state fields, or empty dict if not found
+    """
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            """SELECT peak_pnl_pct, peak_pnl_amount, peak_pnl_time,
+                      trailing_active, trailing_floor_pct, breakeven_locked
+               FROM positions WHERE id = ?""",
+            (position_id,)
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            return {}
+
+        # Parse peak_pnl_time if present
+        peak_time = None
+        if row['peak_pnl_time']:
+            try:
+                peak_time = datetime.fromisoformat(row['peak_pnl_time'])
+            except (ValueError, TypeError):
+                pass
+
+        return {
+            'peak_pnl_pct': row['peak_pnl_pct'],
+            'peak_pnl_amount': row['peak_pnl_amount'],
+            'peak_pnl_time': peak_time,
+            'trailing_active': bool(row['trailing_active']) if row['trailing_active'] is not None else False,
+            'trailing_floor_pct': row['trailing_floor_pct'],
+            'breakeven_locked': bool(row['breakeven_locked']) if row['breakeven_locked'] is not None else False,
+        }
+
+
+def reset_trailing_state(position_id: int) -> None:
+    """
+    Reset trailing profit state for a position.
+
+    Called when position is closed or needs to start fresh.
+
+    Args:
+        position_id: Position ID
+    """
+    update_trailing_state(
+        position_id=position_id,
+        peak_pnl_pct=None,
+        peak_pnl_amount=None,
+        trailing_active=False,
+        trailing_floor_pct=None,
+        breakeven_locked=False
+    )
+    logger.info(f"Trailing state reset for position {position_id}")
 
 
 def record_failed_exit(
@@ -1808,6 +2057,17 @@ def cleanup_old_data(
 
 def _row_to_position(row: sqlite3.Row) -> Position:
     """Convert database row to Position object."""
+    # Handle trailing fields that may not exist in older databases
+    row_keys = row.keys()
+
+    # Parse peak_pnl_time if it exists and has value
+    peak_pnl_time = None
+    if 'peak_pnl_time' in row_keys and row['peak_pnl_time']:
+        try:
+            peak_pnl_time = datetime.fromisoformat(row['peak_pnl_time'])
+        except (ValueError, TypeError):
+            peak_pnl_time = None
+
     return Position(
         id=row['id'],
         status=row['status'],
@@ -1829,7 +2089,14 @@ def _row_to_position(row: sqlite3.Row) -> Position:
         net_pnl=row['net_pnl'],
         pnl_percent=row['pnl_percent'],
         exit_reason=row['exit_reason'],
-        verified=bool(row['verified'])
+        verified=bool(row['verified']),
+        # Trailing profit fields (with safe defaults for older DBs)
+        peak_pnl_pct=row['peak_pnl_pct'] if 'peak_pnl_pct' in row_keys else None,
+        peak_pnl_amount=row['peak_pnl_amount'] if 'peak_pnl_amount' in row_keys else None,
+        peak_pnl_time=peak_pnl_time,
+        trailing_active=bool(row['trailing_active']) if 'trailing_active' in row_keys and row['trailing_active'] else False,
+        trailing_floor_pct=row['trailing_floor_pct'] if 'trailing_floor_pct' in row_keys else None,
+        breakeven_locked=bool(row['breakeven_locked']) if 'breakeven_locked' in row_keys and row['breakeven_locked'] else False,
     )
 
 

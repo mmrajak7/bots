@@ -56,6 +56,7 @@ class ExitReason(Enum):
     """Reasons for position exit."""
     PROFIT_TARGET = "profit_target"
     STOP_LOSS = "stop_loss"
+    TRAILING_STOP = "trailing_stop"  # Trailing profit triggered exit
     FRIDAY_CLOSE = "friday_close"
     EXPIRY = "expiry"
     MANUAL = "manual"
@@ -572,8 +573,14 @@ class ExitManager:
             )
 
             # Set cooldown (1 day after exit)
-            cooldown_hours = self.trading_config.get('exit', {}).get('cooldown_hours', 24)
-            set_cooldown('entry', cooldown_hours * 3600)
+            # ISSUE-FIX: Skip cooldown on Friday - weekend is enough buffer
+            # and we don't want Friday exit to block Monday entry
+            today = datetime.now()
+            if today.weekday() == 4:  # Friday
+                logger.info("Friday exit - skipping cooldown (weekend provides buffer)")
+            else:
+                cooldown_hours = self.trading_config.get('exit', {}).get('cooldown_hours', 24)
+                set_cooldown('entry', cooldown_hours * 3600)
 
             # Clear hold cooldowns (no longer relevant after position exit)
             for cooldown_type in ['wing_hold', 'stop_loss_hold', 'vix_hold']:

@@ -646,7 +646,16 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
             from src.api.response_handler import get_response_handler, ResponseType, TelegramResponseHandler
             TelegramResponseHandler.clear_shared_queue()
 
-            self.telegram.send(decision_msg, parse_mode="HTML")
+            send_result = self.telegram.send(decision_msg, parse_mode="HTML")
+            if not send_result:
+                logger.error("CRITICAL: Failed to send pre-entry alert to Telegram!")
+                # Try sending as plain text as fallback
+                plain_msg = decision_msg.replace('<b>', '').replace('</b>', '').replace('<i>', '').replace('</i>', '').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+                fallback_result = self.telegram.send(f"⚠️ HTML FAILED - Plain text:\n\n{plain_msg[:3000]}")
+                if not fallback_result:
+                    logger.error("CRITICAL: Even plain text fallback failed!")
+            else:
+                logger.info("Pre-entry alert sent to Telegram successfully")
 
             # Step 5: Wait for user response
             handler = get_response_handler()

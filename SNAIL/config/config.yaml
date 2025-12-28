@@ -57,14 +57,42 @@ trading:
   # All percentages are calculated on margin_deployed, not max_profit
   # This gives realistic P&L percentages based on capital at risk
   exit:
-    profit_target_pct: 2.6   # Exit at 2.6% ROM (e.g., ₹2,600 on ₹1L margin)
-    stop_loss_pct: 5         # Alert at 5% loss on margin (e.g., -₹5,000 on ₹1L margin)
+    profit_target_pct: 3     # Exit at 3% ROM (e.g., ₹3,000 on ₹1L margin)
+    stop_loss_pct: 3         # Exit at 3% loss on margin (e.g., -₹3,000 on ₹1L margin)
+    auto_exit_on_tp: true    # Auto-exit when profit target hit (true=exit, false=advisory)
+    auto_exit_on_sl: true    # Auto-exit when stop loss hit (true=exit, false=advisory)
     vix_hard_exit: 20        # Hard exit if VIX > 20
     vix_warning_zone: 16.5   # Warning if VIX > 16.5
     friday_check_time: "15:00"  # Friday exit decision time
     friday_exit_time: "15:15"   # Default Friday exit (if not held)
     expiry_exit_time: "15:20"   # Expiry day forced exit time
     cooldown_hours: 24          # Cooldown after exit
+
+    # =========================================================================
+    # TRAILING PROFIT CONFIGURATION
+    # =========================================================================
+    # Trailing profit lets winners run while protecting gains.
+    # Once P&L hits activation level, we track peak and exit if it drops.
+    #
+    # How it works:
+    #   1. P&L < activation_pct: Normal mode (fixed TP/SL apply)
+    #   2. P&L >= activation_pct: Trailing ACTIVATED, track peak
+    #   3. P&L >= lock_breakeven_at: Breakeven LOCKED (floor never below 0%)
+    #   4. Exit when P&L drops below: max(floor, peak - trail_pct)
+    #
+    # Example with activation=2%, lock=2.5%, trail=0.8%:
+    #   - P&L hits 2.0% -> Trailing active, floor = 1.2%
+    #   - P&L hits 2.5% -> Breakeven locked, floor never < 0%
+    #   - P&L hits 3.5% -> Floor = 2.7% (3.5 - 0.8)
+    #   - P&L drops to 2.7% -> EXIT (trailing stop triggered)
+    # =========================================================================
+    trailing:
+      enabled: true               # Enable/disable trailing profit
+      activation_pct: 2.0         # Start trailing after 2% ROM profit
+      lock_breakeven_at: 2.5      # Lock breakeven (0% floor) after 2.5% ROM
+      trail_pct: 0.8              # Trail 0.8% below peak
+      min_holding_minutes: 30     # Don't activate trailing in first 30 min
+      expiry_day_trail_pct: 0.5   # Tighter trail on expiry day (0.5%)
 
   # Wing approach thresholds
   wing_approach:

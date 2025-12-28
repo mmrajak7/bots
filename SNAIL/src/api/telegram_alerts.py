@@ -144,7 +144,7 @@ class TelegramAlerts:
                 logger.error(f"Telegram API error: {data.get('description')}")
                 return False
 
-            logger.debug(f"Message sent: {message[:50]}...")
+            logger.info(f"Telegram message sent successfully ({len(message)} chars)")
             return True
 
         except requests.exceptions.Timeout:

@@ -231,6 +231,15 @@ class EntryManager:
             )
 
         # Check cooldown
+        # ISSUE-FIX: On Monday, auto-clear any stale Friday cooldowns
+        # Weekend provides enough buffer, no need to block Monday entry
+        now = datetime.now()
+        if now.weekday() == 0:  # Monday
+            from src.utils.db import clear_cooldown
+            cleared = clear_cooldown('entry')
+            if cleared > 0:
+                logger.info(f"Monday: Auto-cleared {cleared} stale entry cooldown(s) from weekend")
+
         if is_on_cooldown('entry'):
             return EntryConditions(
                 can_enter=False,

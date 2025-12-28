@@ -38,7 +38,12 @@ from src.utils.db import (
     get_cooldown_remaining,
     has_pending_decision,
     set_pending_decision,
-    clear_pending_decision
+    clear_pending_decision,
+    # Trailing profit functions
+    get_trailing_state,
+    activate_trailing,
+    update_trailing_peak,
+    reset_trailing_state
 )
 from src.utils.helpers import is_trading_day, is_market_open
 from src.utils.config import get_trading_config, get_monitoring_config, load_config
@@ -964,20 +969,204 @@ _Fetching P&L data..._"""
             if snapshot:
                 # Save snapshot to database for status/pnl commands
                 self.position_monitor.save_snapshot_to_db(snapshot)
-                logger.info(f"Monitor: P&L snapshot saved: ₹{snapshot.current_pnl:,.0f} ({snapshot.pnl_percentage:+.1f}%)")
 
-                # Check stop loss (50% max loss)
-                stop_loss_pct = self.trading_config.get('exit', {}).get('stop_loss_pct', 50)
+                # Calculate correct P&L percentage using margin deployed
+                # (snapshot.pnl_percentage may have rounding issues)
+                if position.margin_deployed and position.margin_deployed > 0:
+                    current_pnl_pct = round((snapshot.current_pnl / position.margin_deployed) * 100, 4)
+                else:
+                    current_pnl_pct = snapshot.pnl_percentage
 
-                if snapshot.pnl_percentage < 0 and abs(snapshot.pnl_percentage) >= stop_loss_pct:
-                    if self._handle_stop_loss(snapshot):
+                logger.info(f"Monitor: P&L snapshot saved: ₹{snapshot.current_pnl:,.0f} ({current_pnl_pct:+.2f}% ROM)")
+
+                # =============================================================
+                # TRAILING PROFIT CHECK (runs before fixed TP/SL)
+                # =============================================================
+                trailing_config = self.trading_config.get('exit', {}).get('trailing', {})
+                trailing_enabled = trailing_config.get('enabled', False)
+
+                if trailing_enabled and current_pnl_pct > 0:
+                    # Get trailing configuration
+                    activation_pct = trailing_config.get('activation_pct', 2.0)
+                    lock_breakeven_at = trailing_config.get('lock_breakeven_at', 2.5)
+                    trail_pct = trailing_config.get('trail_pct', 0.8)
+                    min_holding_minutes = trailing_config.get('min_holding_minutes', 30)
+                    expiry_day_trail_pct = trailing_config.get('expiry_day_trail_pct', 0.5)
+
+                    # Check if today is expiry day - use tighter trail
+                    is_expiry_day = position.expiry_date and position.expiry_date == date.today()
+                    effective_trail_pct = expiry_day_trail_pct if is_expiry_day else trail_pct
+
+                    # Check if position is old enough for trailing
+                    position_age_minutes = (datetime.now() - position.entry_time).total_seconds() / 60
+
+                    if position_age_minutes >= min_holding_minutes:
+                        # Get current trailing state
+                        trailing_state = get_trailing_state(position.id)
+                        trailing_active = trailing_state.get('trailing_active', False)
+                        current_peak_pct = trailing_state.get('peak_pnl_pct')
+                        current_floor_pct = trailing_state.get('trailing_floor_pct')
+                        breakeven_locked = trailing_state.get('breakeven_locked', False)
+
+                        if not trailing_active:
+                            # Check if we should activate trailing
+                            if current_pnl_pct >= activation_pct:
+                                # ACTIVATE TRAILING
+                                floor_pct = activate_trailing(
+                                    position_id=position.id,
+                                    current_pnl_pct=current_pnl_pct,
+                                    current_pnl_amount=snapshot.current_pnl,
+                                    trail_pct=effective_trail_pct
+                                )
+                                self.telegram.send(
+                                    f"📈 *Trailing Profit ACTIVATED*\n\n"
+                                    f"P&L hit {current_pnl_pct:.2f}% (activation: {activation_pct}%)\n"
+                                    f"Peak: {current_pnl_pct:.2f}%\n"
+                                    f"Floor: {floor_pct:.2f}%\n"
+                                    f"{'🔒 Expiry day - tighter trail' if is_expiry_day else ''}\n\n"
+                                    f"_Will exit if P&L drops below floor_"
+                                )
+                                trailing_active = True
+                                current_peak_pct = current_pnl_pct
+                                current_floor_pct = floor_pct
+                        else:
+                            # Trailing is active - check for new peak or exit
+                            if current_peak_pct is None:
+                                current_peak_pct = current_pnl_pct
+
+                            if current_pnl_pct > current_peak_pct:
+                                # NEW PEAK - update trailing state
+                                new_floor_pct, new_breakeven_locked = update_trailing_peak(
+                                    position_id=position.id,
+                                    new_peak_pct=current_pnl_pct,
+                                    new_peak_amount=snapshot.current_pnl,
+                                    trail_pct=effective_trail_pct,
+                                    lock_breakeven_at=lock_breakeven_at,
+                                    current_breakeven_locked=breakeven_locked
+                                )
+
+                                # Notify if breakeven was just locked
+                                if new_breakeven_locked and not breakeven_locked:
+                                    self.telegram.send(
+                                        f"🔒 *Breakeven LOCKED*\n\n"
+                                        f"P&L hit {current_pnl_pct:.2f}% (lock at: {lock_breakeven_at}%)\n"
+                                        f"Floor: {new_floor_pct:.2f}% (can never go below 0%)\n\n"
+                                        f"_Profit protected - no loss possible_"
+                                    )
+
+                                current_floor_pct = new_floor_pct
+                                breakeven_locked = new_breakeven_locked
+
+                            # Check if P&L dropped below floor - TRAILING STOP
+                            if current_floor_pct is not None and current_pnl_pct <= current_floor_pct:
+                                logger.warning(
+                                    f"TRAILING STOP HIT! P&L: {current_pnl_pct:.2f}% <= floor {current_floor_pct:.2f}% "
+                                    f"(peak was {current_peak_pct:.2f}%)"
+                                )
+                                self.telegram.send(
+                                    f"📉 *Trailing Stop TRIGGERED*\n\n"
+                                    f"P&L dropped to {current_pnl_pct:.2f}%\n"
+                                    f"Floor was: {current_floor_pct:.2f}%\n"
+                                    f"Peak was: {current_peak_pct:.2f}%\n\n"
+                                    f"_Executing exit..._"
+                                )
+                                result = self.exit_manager.execute_exit(
+                                    reason=ExitReason.TRAILING_STOP,
+                                    position=position
+                                )
+                                if result.success:
+                                    reset_trailing_state(position.id)
+                                    self._stats.exits_triggered += 1
+                                    return
+                                else:
+                                    logger.error(f"Trailing stop exit failed: {result.error}")
+                    else:
+                        # Position too young for trailing, but still track peak for later
+                        if current_pnl_pct >= activation_pct:
+                            logger.debug(
+                                f"Trailing would activate but position too young "
+                                f"({position_age_minutes:.0f}/{min_holding_minutes} min)"
+                            )
+
+                # =============================================================
+                # FIXED PROFIT TARGET CHECK (fallback when trailing disabled)
+                # =============================================================
+                profit_target_pct = self.trading_config.get('exit', {}).get('profit_target_pct', 2.6)
+                auto_exit_on_tp = self.trading_config.get('exit', {}).get('auto_exit_on_tp', True)
+
+                # Only use fixed TP if trailing is disabled or not yet active
+                trailing_state = get_trailing_state(position.id) if trailing_enabled else {}
+                use_fixed_tp = not trailing_enabled or not trailing_state.get('trailing_active', False)
+
+                if use_fixed_tp and current_pnl_pct >= profit_target_pct:
+                    logger.info(f"PROFIT TARGET HIT! P&L: {current_pnl_pct:.2f}% >= {profit_target_pct}% target")
+                    if auto_exit_on_tp:
+                        logger.info("Auto-exit on TP enabled - executing exit...")
+                        result = self.exit_manager.execute_exit(
+                            reason=ExitReason.PROFIT_TARGET,
+                            position=position
+                        )
+                        if result.success:
+                            self._stats.exits_triggered += 1
+                            return
+                        else:
+                            logger.error(f"Profit target exit failed: {result.error}")
+                    else:
+                        # Advisory mode - just alert, don't auto-exit
+                        logger.info("Auto-exit on TP disabled - sending advisory alert")
+                        self.telegram.send(
+                            f"🎯 *Profit Target Reached!*\n\n"
+                            f"P&L: ₹{snapshot.current_pnl:,.0f} ({current_pnl_pct:+.1f}%)\n"
+                            f"Target: {profit_target_pct}%\n\n"
+                            f"_Use /exit to close position_"
+                        )
+
+                # =============================================================
+                # STOP LOSS CHECK (fixed - now auto-exits instead of advisory)
+                # =============================================================
+                stop_loss_pct = self.trading_config.get('exit', {}).get('stop_loss_pct', 5)
+                auto_exit_on_sl = self.trading_config.get('exit', {}).get('auto_exit_on_sl', True)
+
+                if current_pnl_pct < 0 and abs(current_pnl_pct) >= stop_loss_pct:
+                    loss_pct = abs(current_pnl_pct)
+                    logger.warning(f"STOP LOSS HIT! Loss: {loss_pct:.2f}% >= {stop_loss_pct}% threshold")
+                    if auto_exit_on_sl:
+                        logger.info("Auto-exit on SL enabled - executing exit...")
+                        result = self.exit_manager.execute_exit(
+                            reason=ExitReason.STOP_LOSS,
+                            position=position
+                        )
+                        if result.success:
+                            self._stats.exits_triggered += 1
+                            return
+                        else:
+                            logger.error(f"Stop loss exit failed: {result.error}")
+                    else:
+                        # Advisory mode - use Claude (legacy behavior)
+                        if self._handle_stop_loss(snapshot):
+                            self._stats.exits_triggered += 1
+                            return
+
+                # =============================================================
+                # VIX HARD EXIT CHECK (VIX > 20 = immediate exit)
+                # =============================================================
+                vix_hard_exit = self.trading_config.get('exit', {}).get('vix_hard_exit', 20)
+
+                if snapshot.india_vix > vix_hard_exit:
+                    logger.warning(f"VIX BREACH! VIX={snapshot.india_vix:.2f} > {vix_hard_exit} threshold - HARD EXIT")
+                    result = self.exit_manager.execute_exit(
+                        reason=ExitReason.VIX_BREACH,
+                        position=position
+                    )
+                    if result.success:
                         self._stats.exits_triggered += 1
                         return
+                    else:
+                        logger.error(f"VIX breach exit failed: {result.error}")
 
                 # Check VIX warning (16-20) - send decision buttons
                 vix_config = self.trading_config.get('entry', {}).get('vix_range', {})
                 vix_max = vix_config.get('max', 16)
-                vix_hard_exit = self.trading_config.get('exit', {}).get('vix_hard_exit', 20)
 
                 if vix_max < snapshot.india_vix < vix_hard_exit:
                     # VIX in warning zone (16-20), send decision buttons
@@ -1008,6 +1197,26 @@ _Fetching P&L data..._"""
                 if self._check_friday_close():
                     self._stats.exits_triggered += 1
                     return
+
+                # =============================================================
+                # EXPIRY DAY CHECK (auto-exit at 3:20 PM on expiry day)
+                # =============================================================
+                today = date.today()
+                if position.expiry_date and position.expiry_date == today:
+                    current_time_str = datetime.now().strftime('%H:%M')
+                    expiry_exit_time = self.trading_config.get('exit', {}).get('expiry_exit_time', '15:20')
+
+                    if current_time_str >= expiry_exit_time:
+                        logger.warning(f"EXPIRY DAY EXIT: Today is expiry ({position.expiry_date}), time={current_time_str}")
+                        result = self.exit_manager.execute_exit(
+                            reason=ExitReason.EXPIRY,
+                            position=position
+                        )
+                        if result.success:
+                            self._stats.exits_triggered += 1
+                            return
+                        else:
+                            logger.error(f"Expiry day exit failed: {result.error}")
 
         except Exception as e:
             logger.error(f"Monitor iteration error: {e}")
