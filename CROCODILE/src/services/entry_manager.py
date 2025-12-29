@@ -418,8 +418,14 @@ class EntryManager:
             )
 
             if not is_valid:
-                # Check if it was a fresh touch rejection
-                if metadata.get('fresh_touch_checked') and metadata.get('fresh_touch_result') is False:
+                # Check specific rejection reason
+                rejection_reason = metadata.get('rejection_reason', '')
+                if rejection_reason == 'price_proximity':
+                    reason = (
+                        f"Price proximity failed: LTP {metadata.get('price_distance_pct', 0):.1f}% above ST "
+                        f"(max allowed: {metadata.get('max_distance_pct', 5)}%)"
+                    )
+                elif metadata.get('fresh_touch_checked') and metadata.get('fresh_touch_result') is False:
                     reason = f"Fresh touch validation failed: {metadata.get('fresh_touch_reason', 'N/A')}"
                 else:
                     reason = f"SuperTrend validation failed: {metadata.get('trend', 'N/A')}"

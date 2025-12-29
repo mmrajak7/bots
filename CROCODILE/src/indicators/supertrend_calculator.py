@@ -283,6 +283,33 @@ class SuperTrendCalculator:
                     else:
                         logger.debug(f"Fresh touch PASSED for {script}: {fresh_reason}")
 
+            # Price Proximity Filter (prevents chasing breakouts)
+            # Reject if LTP is too far above SuperTrend - signal has "run away"
+            proximity_config = self.config.get('supertrend', {}).get('price_proximity', {})
+            proximity_enabled = proximity_config.get('enabled', True)
+            max_distance_pct = proximity_config.get('max_distance_pct', 5.0)
+
+            if proximity_enabled and reference_supertrend > 0:
+                price_distance_pct = ((latest_close - reference_supertrend) / reference_supertrend) * 100
+
+                metadata["price_proximity_checked"] = True
+                metadata["price_distance_pct"] = price_distance_pct
+                metadata["max_distance_pct"] = max_distance_pct
+
+                if price_distance_pct > max_distance_pct:
+                    logger.info(
+                        f"❌ Signal REJECTED for {script} ({timeframe}): "
+                        f"Price too far from ST - LTP={latest_close:.2f} is {price_distance_pct:.1f}% above ST={reference_supertrend:.2f} "
+                        f"(max allowed: {max_distance_pct}%)"
+                    )
+                    metadata["rejection_reason"] = "price_proximity"
+                    return False, None, metadata
+                else:
+                    logger.debug(
+                        f"Price proximity PASSED for {script}: "
+                        f"LTP={latest_close:.2f} is {price_distance_pct:.1f}% above ST (max: {max_distance_pct}%)"
+                    )
+
             # All checks passed
             price_position = "above" if latest_close > reference_supertrend else "below"
             fresh_info = ""
