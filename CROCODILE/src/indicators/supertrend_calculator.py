@@ -305,9 +305,10 @@ class SuperTrendCalculator:
                     metadata["rejection_reason"] = "price_proximity"
                     return False, None, metadata
                 else:
+                    position_desc = f"{price_distance_pct:.1f}% above" if price_distance_pct > 0 else f"{abs(price_distance_pct):.1f}% below"
                     logger.debug(
                         f"Price proximity PASSED for {script}: "
-                        f"LTP={latest_close:.2f} is {price_distance_pct:.1f}% above ST (max: {max_distance_pct}%)"
+                        f"LTP={latest_close:.2f} is {position_desc} ST (max above: {max_distance_pct}%)"
                     )
 
             # All checks passed
