@@ -43,7 +43,10 @@ from src.utils.db import (
     Order,
     set_cooldown,
     clear_cooldown,
-    clear_all_pending_decisions
+    clear_all_pending_decisions,
+    # Exit in progress guard (prevents duplicate exits)
+    set_exit_in_progress,
+    clear_exit_in_progress
 )
 from src.utils.config import get_trading_config, load_config
 
@@ -381,12 +384,29 @@ class ExitManager:
                 error="No legs found for position"
             )
 
+        # =====================================================================
+        # EXIT IN PROGRESS GUARD (CRITICAL BUG FIX)
+        # =====================================================================
+        # This guard prevents the catastrophic bug where trailing stop or other
+        # exit triggers keep firing repeatedly while an exit is in progress.
+        # The atomic set_exit_in_progress() returns False if already in progress.
+        if not set_exit_in_progress(position.id):
+            logger.warning(
+                f"EXIT BLOCKED: Exit already in progress for position {position.id}. "
+                f"Ignoring duplicate {reason.value} trigger."
+            )
+            return ExitResult(
+                success=False,
+                error="Exit already in progress - duplicate trigger blocked"
+            )
+
         logger.info(f"Executing exit for position {position.id}, reason: {reason.value}")
 
         # Notify user that exit is starting
         reason_emoji = {
             ExitReason.PROFIT_TARGET: "🎯",
             ExitReason.STOP_LOSS: "🛑",
+            ExitReason.TRAILING_STOP: "📉",
             ExitReason.MANUAL: "👤",
             ExitReason.FRIDAY_CLOSE: "📅",
             ExitReason.VIX_BREACH: "⚡",
@@ -623,6 +643,12 @@ class ExitManager:
             import traceback
             traceback.print_exc()
             return ExitResult(success=False, error=str(e))
+
+        finally:
+            # CRITICAL: Always clear exit_in_progress flag, regardless of success/failure
+            # This ensures the position isn't permanently locked if exit fails
+            clear_exit_in_progress(position.id)
+            logger.debug(f"Exit in progress flag cleared for position {position.id}")
 
     def execute_manual_exit(self) -> ExitResult:
         """Execute manual exit requested by user."""

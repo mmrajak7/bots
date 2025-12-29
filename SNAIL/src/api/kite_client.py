@@ -327,19 +327,26 @@ class SNAILKiteClient:
 
         Returns:
             Modified order ID
+
+        Raises:
+            OrderExecutionError: If modification fails
         """
         if self._paper_trading:
             logger.info(f"[PAPER] Order modified: {order_id} -> price={price}, type={order_type}")
             return order_id
 
-        params: Dict[str, Any] = {'variety': self.VARIETY_REGULAR, 'order_id': order_id}
+        try:
+            params: Dict[str, Any] = {'variety': self.VARIETY_REGULAR, 'order_id': order_id}
 
-        if price is not None:
-            params['price'] = price
-        if order_type is not None:
-            params['order_type'] = order_type
+            if price is not None:
+                params['price'] = price
+            if order_type is not None:
+                params['order_type'] = order_type
 
-        return self.kite.modify_order(**params)
+            return self.kite.modify_order(**params)
+        except Exception as e:
+            logger.error(f"Order modification failed for {order_id}: {e}")
+            raise OrderExecutionError(f"Failed to modify order {order_id}: {e}")
 
     def cancel_order(self, order_id: str) -> str:
         """
@@ -350,12 +357,19 @@ class SNAILKiteClient:
 
         Returns:
             Cancelled order ID
+
+        Raises:
+            OrderExecutionError: If cancellation fails
         """
         if self._paper_trading:
             logger.info(f"[PAPER] Order cancelled: {order_id}")
             return order_id
 
-        return self.kite.cancel_order(variety=self.VARIETY_REGULAR, order_id=order_id)
+        try:
+            return self.kite.cancel_order(variety=self.VARIETY_REGULAR, order_id=order_id)
+        except Exception as e:
+            logger.error(f"Order cancellation failed for {order_id}: {e}")
+            raise OrderExecutionError(f"Failed to cancel order {order_id}: {e}")
 
     def get_order_status(self, order_id: str) -> Dict[str, Any]:
         """

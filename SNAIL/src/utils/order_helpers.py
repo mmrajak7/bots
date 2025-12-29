@@ -609,7 +609,17 @@ def wait_for_order_completion(
             logger.warning(f"Error checking order status: {e}")
             time.sleep(ORDER_POLL_INTERVAL)
 
-    raise OrderExecutionError(f"Order {order_id} timeout after {timeout}s")
+    # CRITICAL FIX: Cancel orphan order on timeout to prevent unexpected fills
+    # Without this, timed-out orders can fill later causing position mismatches
+    logger.warning(f"Order {order_id} timeout after {timeout}s - attempting to cancel")
+    try:
+        kite.cancel_order(order_id)
+        logger.info(f"Order {order_id} cancelled after timeout")
+    except Exception as cancel_err:
+        logger.error(f"Failed to cancel timed-out order {order_id}: {cancel_err}")
+        # Continue to raise timeout error - order may still be open!
+
+    raise OrderExecutionError(f"Order {order_id} timeout after {timeout}s (cancel attempted)")
 
 
 def execute_order(

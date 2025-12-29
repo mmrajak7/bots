@@ -13,6 +13,7 @@ Configuration loading, validation, and environment variable substitution.
 
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
 import yaml
@@ -284,6 +285,56 @@ def is_paper_trading() -> bool:
     """Check if paper trading mode is enabled."""
     config = load_config()
     return config.get('paper_trading', {}).get('enabled', False)
+
+
+def is_bot_enabled() -> bool:
+    """
+    Check if bot is enabled (master kill switch).
+
+    Returns False if:
+    1. Config bot.enabled is false
+    2. Runtime override file exists (data/bot_disabled.flag)
+
+    The runtime override allows /stop command to disable bot
+    without editing config file.
+    """
+    # Check config file
+    config = load_config()
+    config_enabled = config.get('bot', {}).get('enabled', True)
+
+    if not config_enabled:
+        return False
+
+    # Check runtime override (from /stop command)
+    flag_file = PROJECT_ROOT / 'data' / 'bot_disabled.flag'
+    if flag_file.exists():
+        return False
+
+    return True
+
+
+def set_bot_enabled(enabled: bool) -> None:
+    """
+    Set bot enabled/disabled state via runtime flag.
+
+    This doesn't modify config.yaml - it creates/removes a flag file
+    that is checked by is_bot_enabled().
+
+    Args:
+        enabled: True to enable, False to disable
+    """
+    flag_file = PROJECT_ROOT / 'data' / 'bot_disabled.flag'
+    flag_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if enabled:
+        # Enable bot - remove flag file if exists
+        if flag_file.exists():
+            flag_file.unlink()
+            logger.info("Bot ENABLED - removed disabled flag")
+    else:
+        # Disable bot - create flag file
+        flag_file.write_text(f"Disabled at {datetime.now().isoformat()}")
+        logger.warning("Bot DISABLED - created disabled flag")
 
 
 def get_prompt_path(prompt_name: str) -> Path:

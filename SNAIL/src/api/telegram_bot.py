@@ -224,6 +224,9 @@ class TelegramBot:
         self.register_command("pnl", self._cmd_pnl)
         self.register_command("market", self._cmd_market)
         self.register_command("cooldown", self._cmd_cooldown)
+        # Kill switch commands
+        self.register_command("stop", self._cmd_stop_bot)
+        self.register_command("resume", self._cmd_resume_bot)
 
     def register_command(self, command: str, handler: Callable):
         """
@@ -613,6 +616,8 @@ Welcome! I'm the SNAIL Iron Fly trading system.
 /cooldown - Show/clear cooldowns
 /exit - Request position exit
 /hold - Confirm hold position
+/stop - *KILL SWITCH* - Stop all trading
+/resume - Resume trading after /stop
 /help - Show this help
 
 *Quick Actions:*
@@ -944,6 +949,62 @@ This will close all 4 legs at market.""",
         from src.api.response_handler import TelegramResponseHandler
         TelegramResponseHandler.write_callback("hold", "manual_hold")
         self._send_reply("✋ *Hold confirmed* - monitoring continues")
+
+    def _cmd_stop_bot(self, update: TelegramUpdate, args: List[str]):
+        """
+        Handle /stop command - KILL SWITCH.
+
+        Immediately disables all trading activity.
+        - No new entries will be taken
+        - No auto-exits will trigger
+        - Monitor continues running but takes no action
+
+        Use /resume to re-enable.
+        """
+        from src.utils.config import set_bot_enabled, is_bot_enabled
+
+        if not is_bot_enabled():
+            self._send_reply("⚠️ Bot is already *STOPPED*.\n\nUse /resume to re-enable trading.")
+            return
+
+        set_bot_enabled(False)
+        self._send_reply("""🛑 *BOT STOPPED*
+
+Trading is now *DISABLED*.
+
+• No new entries will be taken
+• No auto-exits will trigger
+• Existing positions remain open
+• Manual /exit still works
+
+⚠️ *Any open positions need manual management!*
+
+Use /resume to re-enable trading.""")
+        logger.warning("BOT STOPPED via Telegram /stop command")
+
+    def _cmd_resume_bot(self, update: TelegramUpdate, args: List[str]):
+        """
+        Handle /resume command - Re-enable trading.
+
+        Removes the kill switch and allows normal trading.
+        """
+        from src.utils.config import set_bot_enabled, is_bot_enabled
+
+        if is_bot_enabled():
+            self._send_reply("✅ Bot is already *RUNNING*.\n\nNo action needed.")
+            return
+
+        set_bot_enabled(True)
+        self._send_reply("""✅ *BOT RESUMED*
+
+Trading is now *ENABLED*.
+
+• Entry signals will be processed
+• Auto-exits are active
+• Monitoring normal
+
+_Bot is fully operational._""")
+        logger.info("BOT RESUMED via Telegram /resume command")
 
     # =========================================================================
     # INLINE KEYBOARD METHODS

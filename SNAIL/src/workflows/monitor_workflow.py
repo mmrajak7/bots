@@ -43,10 +43,12 @@ from src.utils.db import (
     get_trailing_state,
     activate_trailing,
     update_trailing_peak,
-    reset_trailing_state
+    reset_trailing_state,
+    # Exit in progress guard
+    is_exit_in_progress
 )
 from src.utils.helpers import is_trading_day, is_market_open
-from src.utils.config import get_trading_config, get_monitoring_config, load_config
+from src.utils.config import get_trading_config, get_monitoring_config, load_config, is_bot_enabled
 
 
 # =============================================================================
@@ -911,6 +913,20 @@ _Fetching P&L data..._"""
         current_time = datetime.now()
 
         try:
+            # =================================================================
+            # BOT ENABLED CHECK (KILL SWITCH)
+            # =================================================================
+            # Check if bot is disabled via config or /stop command
+            # This is the master kill switch to immediately stop all trading
+            if not is_bot_enabled():
+                # Log once per minute (every ~2 iterations at 30s interval)
+                if self._stats.iterations % 2 == 1:
+                    logger.warning("Monitor: Bot is DISABLED (kill switch active). Skipping all actions.")
+                self._state = MonitorWorkflowState.STOPPED
+                # Still process user commands (so /resume works)
+                self._process_user_responses()
+                return
+
             # Check system status (TDD Section 4.3)
             # Monitor can run in 'normal' or 'monitoring_paused' states
             is_ready, status_msg = check_system_ready(['normal', 'monitoring_paused'])
@@ -1067,27 +1083,34 @@ _Fetching P&L data..._"""
                             if current_floor_pct is None:
                                 logger.warning("Trailing active but floor is None - skipping exit check")
                             elif round(current_pnl_pct, 2) <= round(current_floor_pct, 2):
-                                logger.warning(
-                                    f"TRAILING STOP HIT! P&L: {current_pnl_pct:.2f}% <= floor {current_floor_pct:.2f}% "
-                                    f"(peak was {current_peak_pct:.2f}%)"
-                                )
-                                self.telegram.send(
-                                    f"📉 *Trailing Stop TRIGGERED*\n\n"
-                                    f"P&L dropped to {current_pnl_pct:.2f}%\n"
-                                    f"Floor was: {current_floor_pct:.2f}%\n"
-                                    f"Peak was: {current_peak_pct:.2f}%\n\n"
-                                    f"_Executing exit..._"
-                                )
-                                result = self.exit_manager.execute_exit(
-                                    reason=ExitReason.TRAILING_STOP,
-                                    position=position
-                                )
-                                if result.success:
-                                    reset_trailing_state(position.id)
-                                    self._stats.exits_triggered += 1
-                                    return
+                                # CRITICAL: Check if exit is already in progress (defense-in-depth)
+                                # This prevents repeated telegram notifications while exit is executing
+                                if is_exit_in_progress(position.id):
+                                    logger.debug(
+                                        "Trailing stop condition met but exit already in progress - skipping"
+                                    )
                                 else:
-                                    logger.error(f"Trailing stop exit failed: {result.error}")
+                                    logger.warning(
+                                        f"TRAILING STOP HIT! P&L: {current_pnl_pct:.2f}% <= floor {current_floor_pct:.2f}% "
+                                        f"(peak was {current_peak_pct:.2f}%)"
+                                    )
+                                    self.telegram.send(
+                                        f"📉 *Trailing Stop TRIGGERED*\n\n"
+                                        f"P&L dropped to {current_pnl_pct:.2f}%\n"
+                                        f"Floor was: {current_floor_pct:.2f}%\n"
+                                        f"Peak was: {current_peak_pct:.2f}%\n\n"
+                                        f"_Executing exit..._"
+                                    )
+                                    result = self.exit_manager.execute_exit(
+                                        reason=ExitReason.TRAILING_STOP,
+                                        position=position
+                                    )
+                                    if result.success:
+                                        reset_trailing_state(position.id)
+                                        self._stats.exits_triggered += 1
+                                        return
+                                    else:
+                                        logger.error(f"Trailing stop exit failed: {result.error}")
                     else:
                         # Position too young for trailing, but still track peak for later
                         if current_pnl_pct >= activation_pct:

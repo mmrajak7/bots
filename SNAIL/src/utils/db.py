@@ -64,6 +64,8 @@ class Position:
     trailing_active: bool = False                  # Whether trailing is active
     trailing_floor_pct: Optional[float] = None    # Current exit threshold %
     breakeven_locked: bool = False                 # Whether breakeven is locked
+    # Exit in progress guard (prevents duplicate exit triggers)
+    exit_in_progress: bool = False                 # True when exit is being executed
 
 
 @dataclass
@@ -214,6 +216,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ('trailing_active', 'INTEGER DEFAULT 0'),
         ('trailing_floor_pct', 'REAL'),
         ('breakeven_locked', 'INTEGER DEFAULT 0'),
+        ('exit_in_progress', 'INTEGER DEFAULT 0'),  # Guard against duplicate exits
     ]
 
     for col_name, col_type in trailing_columns:
@@ -669,6 +672,83 @@ def reset_trailing_state(position_id: int) -> None:
         breakeven_locked=False
     )
     logger.info(f"Trailing state reset for position {position_id}")
+
+
+# =============================================================================
+# EXIT IN PROGRESS GUARD
+# =============================================================================
+# These functions prevent duplicate exit triggers (CRITICAL BUG FIX)
+# When exit is triggered, we set exit_in_progress=True IMMEDIATELY
+# This prevents the monitor from triggering another exit before the first completes
+
+def set_exit_in_progress(position_id: int) -> bool:
+    """
+    Set exit_in_progress flag to prevent duplicate exit triggers.
+
+    Uses atomic update with WHERE clause to prevent race conditions.
+    Only sets the flag if it's not already set.
+
+    Args:
+        position_id: Position ID
+
+    Returns:
+        True if flag was set successfully, False if already in progress
+    """
+    with get_db_session() as conn:
+        # Atomic check-and-set using WHERE clause
+        cursor = conn.execute(
+            """UPDATE positions
+               SET exit_in_progress = 1, updated_at = ?
+               WHERE id = ? AND (exit_in_progress = 0 OR exit_in_progress IS NULL)""",
+            (datetime.now().isoformat(), position_id)
+        )
+
+        if cursor.rowcount > 0:
+            logger.info(f"Exit in progress SET for position {position_id}")
+            return True
+        else:
+            logger.warning(f"Exit already in progress for position {position_id} - blocking duplicate")
+            return False
+
+
+def is_exit_in_progress(position_id: int) -> bool:
+    """
+    Check if an exit is already in progress for a position.
+
+    Args:
+        position_id: Position ID
+
+    Returns:
+        True if exit is in progress, False otherwise
+    """
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            "SELECT exit_in_progress FROM positions WHERE id = ?",
+            (position_id,)
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            return False
+
+        return bool(row['exit_in_progress']) if row['exit_in_progress'] is not None else False
+
+
+def clear_exit_in_progress(position_id: int) -> None:
+    """
+    Clear exit_in_progress flag after exit completes or fails.
+
+    Called after exit manager finishes (success or failure).
+
+    Args:
+        position_id: Position ID
+    """
+    with get_db_session() as conn:
+        conn.execute(
+            "UPDATE positions SET exit_in_progress = 0, updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), position_id)
+        )
+        logger.info(f"Exit in progress CLEARED for position {position_id}")
 
 
 def record_failed_exit(
@@ -2097,6 +2177,7 @@ def _row_to_position(row: sqlite3.Row) -> Position:
         trailing_active=bool(row['trailing_active']) if 'trailing_active' in row_keys and row['trailing_active'] else False,
         trailing_floor_pct=row['trailing_floor_pct'] if 'trailing_floor_pct' in row_keys else None,
         breakeven_locked=bool(row['breakeven_locked']) if 'breakeven_locked' in row_keys and row['breakeven_locked'] else False,
+        exit_in_progress=bool(row['exit_in_progress']) if 'exit_in_progress' in row_keys and row['exit_in_progress'] else False,
     )
 
 

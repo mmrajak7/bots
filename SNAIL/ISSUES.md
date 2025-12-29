@@ -1,8 +1,8 @@
 # SNAIL Code Review - Issues Found
 
-**Review Date:** 2025-12-19 (Updated)
+**Review Date:** 2025-12-29 (Updated)
 **Reviewer:** Claude Code Review
-**Scope:** Full codebase review including static analysis, logic review, and edge case analysis
+**Scope:** Post-trailing-stop-chaos incident + full codebase review
 
 ---
 
@@ -10,13 +10,80 @@
 
 | Severity | Count | Fixed |
 |----------|-------|-------|
-| CRITICAL | 3 | 3 |
-| HIGH | 10 | 10 |
-| MEDIUM | 13 | 13 |
+| CRITICAL | 6 | 6 |
+| HIGH | 11 | 11 |
+| MEDIUM | 14 | 13 |
 | LOW | 6 | 6 |
-| **Total** | **32** | **32** |
+| **Total** | **37** | **36** |
 
-**ALL ISSUES FIXED!**
+**ALL CRITICAL ISSUES FIXED!** (1 deferred: mypy stubs installation)
+
+---
+
+## CRITICAL Issues (2025-12-29 Trailing Stop Chaos Fix)
+
+### ISSUE-CR04: Trailing Stop Infinite Loop (THE CHAOS BUG) [FIXED]
+**File:** `src/workflows/monitor_workflow.py:1081-1113`, `src/services/exit_manager.py:387-401`
+**Severity:** CRITICAL
+**Status:** FIXED
+
+**Description:**
+Trailing stop triggered repeatedly in a loop because:
+1. Exit manager places LIMIT orders (non-blocking)
+2. Position remains "active" while orders pending
+3. Next monitor iteration (30s later) checks trailing stop again
+4. Condition still met → triggers ANOTHER exit
+5. This loops indefinitely, flooding orders
+
+**Impact:** Multiple exit orders placed, chaos in the morning, server had to be shut off.
+
+**Fix Applied:**
+1. Added `exit_in_progress` column to positions table
+2. Added atomic `set_exit_in_progress()` guard in exit_manager
+3. Added `is_exit_in_progress()` check in monitor_workflow before triggering
+4. Added `finally` block to always clear flag after exit completes
+
+---
+
+### ISSUE-CR05: No Kill Switch to Stop Bot [FIXED]
+**File:** `config/config.yaml`, `src/utils/config.py`, `src/api/telegram_bot.py`
+**Severity:** CRITICAL
+**Status:** FIXED
+
+**Description:**
+No way to immediately stop the bot without shutting down server. When things go wrong, user has no emergency brake.
+
+**Fix Applied:**
+1. Added `bot.enabled` config parameter
+2. Added `is_bot_enabled()` / `set_bot_enabled()` functions
+3. Added `/stop` and `/resume` Telegram commands
+4. Monitor checks `is_bot_enabled()` at start of each iteration
+
+---
+
+### ISSUE-CR06: Order Timeout Leaves Orphan Orders [FIXED]
+**File:** `src/utils/order_helpers.py:612-622`
+**Severity:** CRITICAL
+**Status:** FIXED
+
+**Description:**
+When `wait_for_order_completion()` times out, it raised error but order may still be OPEN on exchange. This leaves orphan orders that can fill later unexpectedly.
+
+**Impact:** Unexpected position changes, margin issues.
+
+**Fix Applied:** Added cancel attempt before raising timeout error.
+
+---
+
+### ISSUE-H11: modify_order/cancel_order Missing Exception Handling [FIXED]
+**File:** `src/api/kite_client.py:314-372`
+**Severity:** HIGH
+**Status:** FIXED
+
+**Description:**
+`modify_order()` and `cancel_order()` methods called Kite API without try-except, meaning network errors or API errors would crash the caller.
+
+**Fix Applied:** Added try-except blocks that catch exceptions and raise OrderExecutionError.
 
 ---
 
@@ -418,6 +485,31 @@ Some loop variables shadow outer scope variables.
 | `src/services/position_monitor.py` | 775 | None check for position |
 | `src/services/entry_manager.py` | 1101 | Optional date handling |
 | `src/utils/order_helpers.py` | 22-26, 49 | TypedDict for SLIPPAGE_TIERS |
+
+---
+
+## Additional Fixes (2025-12-29 Session - Trailing Stop Chaos)
+
+| File | Line(s) | Fix Applied |
+|------|---------|-------------|
+| `config/config.yaml` | 1-5 | Added `bot.enabled` kill switch config |
+| `src/utils/config.py` | 16, 289-336 | Added `is_bot_enabled()`, `set_bot_enabled()` |
+| `src/utils/db.py` | Position dataclass, migrations, 674-730 | Added `exit_in_progress` column + helper functions |
+| `src/services/exit_manager.py` | 46-49, 387-401, 647-651 | Import guards, set/clear exit_in_progress |
+| `src/workflows/monitor_workflow.py` | 48, 51, 916-928, 1086-1091 | Import guards, bot enabled check, exit_in_progress check |
+| `src/api/telegram_bot.py` | 227-229, 619-620, 953-1007 | Added `/stop` and `/resume` commands |
+| `src/utils/order_helpers.py` | 612-622 | Added cancel attempt on timeout |
+| `src/api/kite_client.py` | 314-372 | Added exception handling to modify_order/cancel_order |
+
+---
+
+## Remaining Actions
+
+### MUST FIX (Before Production)
+All critical issues fixed!
+
+### DEFERRED (Optional)
+1. Install mypy stubs for requests/yaml (`pip install types-requests types-PyYAML`)
 
 ---
 

@@ -12,6 +12,14 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
+# Bot Control
+# -----------------------------------------------------------------------------
+# Master kill switch - set to false to immediately stop all trading activity
+# Can also be controlled via /stop and /start Telegram commands
+bot:
+  enabled: true                # Master enable/disable switch
+
+# -----------------------------------------------------------------------------
 # Trading Parameters
 # -----------------------------------------------------------------------------
 trading:
