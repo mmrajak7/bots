@@ -68,6 +68,29 @@ class ExitReason(Enum):
     CLAUDE_ADVISORY = "claude_advisory"
     VIX_BREACH = "vix_breach"  # TDD Section 5.3: VIX > 20 is HARD exit trigger
 
+    def to_db_value(self) -> str:
+        """
+        Map ExitReason to valid database exit_reason value.
+
+        The database has a CHECK constraint that only allows specific values.
+        This maps newer exit reasons to compatible DB values.
+        """
+        # DB CHECK constraint allows: profit_target, stop_loss, friday_exit,
+        # vix_spike, manual, timeout, adjustment, expiry_day
+        mapping = {
+            ExitReason.PROFIT_TARGET: "profit_target",
+            ExitReason.STOP_LOSS: "stop_loss",
+            ExitReason.TRAILING_STOP: "profit_target",  # Trailing is a type of profit exit
+            ExitReason.FRIDAY_CLOSE: "friday_exit",     # DB uses friday_exit
+            ExitReason.EXPIRY: "expiry_day",            # DB uses expiry_day
+            ExitReason.MANUAL: "manual",
+            ExitReason.WING_BREACH: "stop_loss",        # Protective exit
+            ExitReason.GAP_OPEN: "stop_loss",           # Protective exit
+            ExitReason.CLAUDE_ADVISORY: "manual",       # AI-assisted = manual decision
+            ExitReason.VIX_BREACH: "vix_spike",         # DB uses vix_spike
+        }
+        return mapping.get(self, "manual")
+
 
 # =============================================================================
 # DATA CLASSES
@@ -773,11 +796,12 @@ class ExitManager:
     ) -> None:
         """Record exit to database."""
         # Update position status (schema expects lowercase: 'closed')
+        # Use to_db_value() to map enum to valid DB CHECK constraint value
         update_position_status(
             position_id=position.id,
             status='closed',
             exit_time=datetime.now(),
-            exit_reason=reason.value,
+            exit_reason=reason.to_db_value(),
             realized_pnl=realized_pnl
         )
 
@@ -830,7 +854,7 @@ class ExitManager:
             pnl_percent = 0
 
         self.telegram.send_exit_alert(
-            exit_reason=reason.value,
+            exit_reason=reason.to_db_value(),
             net_pnl=net_pnl,
             pnl_percent=pnl_percent,
             entry_time=position.entry_time or exit_time,
