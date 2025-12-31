@@ -1,0 +1,15 @@
+# Bouncer - Required packages
+
+# Core
+kiteconnect>=4.0.0
+pandas>=1.3.0
+numpy>=1.20.0
+requests>=2.25.0
+pytz>=2021.1
+
+# Google Sheets integration (optional)
+gspread>=5.0.0
+oauth2client>=4.1.3
+
+# Logging
+# (uses stdlib logging)

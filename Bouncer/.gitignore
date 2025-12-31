@@ -1,0 +1,19 @@
+# Config with secrets
+config/config.json
+
+# Logs
+logs/
+
+# Data files (generated)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
