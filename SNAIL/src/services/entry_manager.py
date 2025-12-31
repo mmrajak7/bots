@@ -400,6 +400,18 @@ class EntryManager:
                     wing_distance = calculate_wing_distance(atm_ce_bid, atm_pe_bid, multiplier=wing_multiplier)
                     logger.info(f"Wing distance calculated at conditions check: {wing_distance} "
                                f"(CE={atm_ce_bid:.2f}, PE={atm_pe_bid:.2f}, multiplier={wing_multiplier})")
+
+                    # Premium Quality Filter: Check straddle premium minimum
+                    straddle_premium = atm_ce_bid + atm_pe_bid
+                    min_straddle = entry_config.get('min_straddle_premium', 0)
+                    if min_straddle > 0 and straddle_premium < min_straddle:
+                        logger.warning(f"Straddle premium too low: {straddle_premium:.2f} < {min_straddle} minimum")
+                        return EntryConditions(
+                            can_enter=False,
+                            reason=f"Straddle premium too low ({straddle_premium:.1f} < {min_straddle} min). Low premium = risky entry.",
+                            nifty_spot=nifty_spot,
+                            india_vix=india_vix
+                        )
         except Exception as e:
             logger.warning(f"Could not fetch ATM quotes for wing calculation: {e}, using default {wing_distance}")
 
@@ -509,6 +521,14 @@ class EntryManager:
             return EntryResult(
                 success=False,
                 error="Entry conditions missing ATM strike"
+            )
+
+        # Acquire entry lock to prevent any exit triggers during entry
+        from src.utils.config import set_entry_in_progress
+        if not set_entry_in_progress(True):
+            return EntryResult(
+                success=False,
+                error="Entry already in progress - blocking duplicate"
             )
 
         logger.info("Starting Iron Fly entry execution...")
@@ -627,6 +647,25 @@ class EntryManager:
                             success=False,
                             error=f"Invalid ask price for {key}: {quote.ask}"
                         )
+
+            # Premium Quality Filter: Check net credit minimum
+            straddle_credit_per_share = quotes['straddle_ce'].bid + quotes['straddle_pe'].bid
+            wing_debit_per_share = quotes['wing_ce'].ask + quotes['wing_pe'].ask
+            net_credit_per_share = straddle_credit_per_share - wing_debit_per_share
+
+            entry_config = get_entry_config()
+            min_net_credit = entry_config.get('min_net_credit', 0)
+            if min_net_credit > 0 and net_credit_per_share < min_net_credit:
+                logger.warning(f"Net credit too low: {net_credit_per_share:.2f} < {min_net_credit} minimum "
+                              f"(straddle={straddle_credit_per_share:.2f}, wings={wing_debit_per_share:.2f})")
+                # No Telegram alert - just log and block silently
+                return EntryResult(
+                    success=False,
+                    error=f"Net credit too low ({net_credit_per_share:.1f} < {min_net_credit} min)"
+                )
+
+            logger.info(f"Premium quality check passed: straddle={straddle_credit_per_share:.2f}, "
+                       f"wings={wing_debit_per_share:.2f}, net={net_credit_per_share:.2f} (min={min_net_credit})")
 
             metrics = calculate_iron_fly_metrics(
                 atm_strike=conditions.atm_strike,
@@ -763,6 +802,29 @@ class EntryManager:
                     use_tiered_slippage=use_tiered_slippage
                 )
 
+            # Step 5a: Check total slippage against threshold
+            # If slippage exceeds threshold, warn but continue (unwinding would cause more slippage)
+            max_slippage_pct = self.trading_config.get('entry', {}).get('max_total_slippage_pct', 10.0)
+            total_slippage = orders.total_slippage
+            net_credit = orders.net_credit
+            if net_credit > 0:
+                slippage_pct = (total_slippage / net_credit) * 100
+                if slippage_pct > max_slippage_pct:
+                    logger.warning(
+                        f"HIGH SLIPPAGE: {slippage_pct:.1f}% of net credit "
+                        f"(threshold: {max_slippage_pct}%)"
+                    )
+                    self.telegram.send(
+                        f"⚠️ *High Entry Slippage*\n\n"
+                        f"Total slippage: Rs.{total_slippage:.2f}\n"
+                        f"Net credit: Rs.{net_credit:.2f}\n"
+                        f"Slippage %: {slippage_pct:.1f}%\n"
+                        f"Threshold: {max_slippage_pct}%\n\n"
+                        f"_Position opened but slippage was high._"
+                    )
+                else:
+                    logger.info(f"Entry slippage: {slippage_pct:.1f}% of net credit (OK)")
+
             # Step 5b: Position Verification (TDD Section 6.2)
             # Skip verification in paper trading mode (no real positions to verify)
             verified = True
@@ -858,6 +920,10 @@ class EntryManager:
             import traceback
             traceback.print_exc()
             return EntryResult(success=False, error=str(e))
+
+        finally:
+            # ALWAYS release entry lock, even on error
+            set_entry_in_progress(False)
 
     def _get_quantity(self, expiry: Optional[date] = None) -> int:
         """

@@ -227,6 +227,8 @@ class TelegramBot:
         # Kill switch commands
         self.register_command("stop", self._cmd_stop_bot)
         self.register_command("resume", self._cmd_resume_bot)
+        # Emergency exit (nuclear option)
+        self.register_command("emergency_exit", self._cmd_emergency_exit)
 
     def register_command(self, command: str, handler: Callable):
         """
@@ -1005,6 +1007,127 @@ Trading is now *ENABLED*.
 
 _Bot is fully operational._""")
         logger.info("BOT RESUMED via Telegram /resume command")
+
+    def _cmd_emergency_exit(self, update: TelegramUpdate, args: List[str]):
+        """
+        Handle /emergency_exit command - NUCLEAR OPTION.
+
+        Immediately:
+        1. Stops the bot (kill switch)
+        2. Closes ALL positions with MARKET orders
+        3. Confirms closure
+
+        This is for CHAOS scenarios where you need instant exit.
+        """
+        from src.utils.config import set_bot_enabled
+        from src.utils.db import get_active_position, get_position_legs
+
+        self._send_reply("""🚨 *EMERGENCY EXIT INITIATED*
+
+Stopping bot and closing all positions...
+
+_This may take a moment._""")
+
+        # Step 1: Stop the bot immediately
+        set_bot_enabled(False)
+        logger.critical("EMERGENCY EXIT: Bot stopped")
+
+        # Step 2: Check for active position
+        position = get_active_position()
+        if not position:
+            self._send_reply("""🛑 *Bot Stopped - No Position*
+
+Kill switch activated.
+No active position to close.
+
+Use /resume to re-enable trading.""")
+            return
+
+        # Step 3: Execute emergency exit with MARKET orders
+        try:
+            from src.api.kite_client import get_kite_client
+            from src.utils.config import load_config
+
+            config = load_config()
+            kite = get_kite_client(config)
+            kite.ensure_authenticated()
+
+            legs = get_position_legs(position.id)
+            if not legs:
+                self._send_reply("""🛑 *Bot Stopped - No Legs Found*
+
+Position exists but no leg data found.
+Manual intervention required!
+
+Check Kite positions immediately.""")
+                return
+
+            # Place MARKET orders for all legs
+            exit_results = []
+            for leg in legs:
+                try:
+                    # Determine transaction type (reverse of position)
+                    if leg.leg_type.startswith('straddle'):
+                        # Short leg - need to BUY to close
+                        txn_type = "BUY"
+                    else:
+                        # Long leg (wing) - need to SELL to close
+                        txn_type = "SELL"
+
+                    order_id = kite.place_order(
+                        tradingsymbol=leg.tradingsymbol,
+                        transaction_type=txn_type,
+                        quantity=leg.quantity,
+                        price=None,  # MARKET order
+                        order_type="MARKET"
+                    )
+                    exit_results.append(f"✅ {leg.leg_type}: {txn_type} MARKET order {order_id}")
+                    logger.critical(f"EMERGENCY: {leg.leg_type} {txn_type} MARKET order placed: {order_id}")
+
+                except Exception as e:
+                    exit_results.append(f"❌ {leg.leg_type}: FAILED - {str(e)[:50]}")
+                    logger.error(f"EMERGENCY EXIT failed for {leg.leg_type}: {e}")
+
+            # Step 4: Update position status
+            from src.utils.db import update_position_status
+            try:
+                update_position_status(
+                    position_id=position.id,
+                    status='closed',
+                    exit_reason='manual',
+                    exit_time=datetime.now()
+                )
+            except Exception as e:
+                logger.error(f"Failed to update position status: {e}")
+
+            # Send result
+            results_text = "\n".join(exit_results)
+            self._send_reply(f"""🚨 *EMERGENCY EXIT COMPLETE*
+
+*Bot Status:* STOPPED
+*Position:* ID {position.id}
+
+*Exit Orders:*
+{results_text}
+
+⚠️ *Verify in Kite that all positions are closed!*
+
+Use /resume to re-enable trading.""")
+
+            logger.critical(f"EMERGENCY EXIT complete for position {position.id}")
+
+        except Exception as e:
+            logger.error(f"EMERGENCY EXIT error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self._send_reply(f"""❌ *EMERGENCY EXIT ERROR*
+
+Bot is STOPPED but exit failed!
+
+Error: {str(e)[:200]}
+
+⚠️ *MANUAL INTERVENTION REQUIRED*
+Check Kite positions immediately!""")
 
     # =========================================================================
     # INLINE KEYBOARD METHODS

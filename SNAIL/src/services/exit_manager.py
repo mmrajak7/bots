@@ -400,6 +400,20 @@ class ExitManager:
                     error="No active position to exit"
                 )
 
+        # =====================================================================
+        # ENTRY IN PROGRESS GUARD
+        # =====================================================================
+        # Block exits while entry is executing to prevent race conditions
+        from src.utils.config import is_entry_in_progress
+        if is_entry_in_progress():
+            logger.warning(
+                f"EXIT BLOCKED: Entry in progress. Ignoring {reason.value} trigger."
+            )
+            return ExitResult(
+                success=False,
+                error="Entry in progress - exit blocked"
+            )
+
         legs = get_position_legs(position.id)
         if not legs:
             return ExitResult(

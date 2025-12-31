@@ -51,6 +51,7 @@ trading:
     cooldown_days: 1         # Days to wait after exit
     slippage_ticks: 2        # Fixed slippage ticks
     use_tiered_slippage: false # Use progressive tiered slippage (TDD Section 1.3)
+    max_total_slippage_pct: 10.0  # Abort entry if total slippage > 10% of net credit
 
     # Risk:Reward filter (highest priority entry filter)
     # Only send entry alert if R:R meets this threshold
@@ -60,6 +61,11 @@ trading:
 
     # Claude pre-entry advisory
     use_claude_advisory: false # Disable Claude analysis for pre-entry (set true to enable)
+
+    # Premium Quality Filter (reject low-premium entries)
+    # Low premium = low VIX = dangerous for iron fly (market can move suddenly)
+    min_straddle_premium: 250  # Reject if ATM straddle < 250 pts (CE+PE combined)
+    min_net_credit: 180        # Reject if net credit < 180 pts per share
 
   # Exit conditions (based on Return on Margin - ROM)
   # All percentages are calculated on margin_deployed, not max_profit

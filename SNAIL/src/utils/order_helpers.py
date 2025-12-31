@@ -1063,13 +1063,17 @@ def execute_iron_fly_exit_safe(
     symbols: Dict[str, str],
     quotes: Dict[str, Quote],
     quantity: int,
-    slippage_ticks: int = DEFAULT_SLIPPAGE_TICKS
+    slippage_ticks: int = DEFAULT_SLIPPAGE_TICKS,
+    max_retries: int = 3,
+    use_market_fallback: bool = True
 ) -> ExitExecutionResult:
     """
-    Execute Iron Fly exit orders with robust partial failure handling.
+    Execute Iron Fly exit orders with robust partial failure handling and retry logic.
 
     Unlike execute_iron_fly_exit, this function:
     - Attempts ALL legs even if some fail
+    - RETRIES failed legs with increasing slippage
+    - Uses MARKET orders as final fallback (configurable)
     - Returns detailed status of each leg
     - Never raises exceptions for order failures
     - Enables proper recovery from partial exits
@@ -1081,16 +1085,18 @@ def execute_iron_fly_exit_safe(
         symbols: Dict of symbols by leg name
         quotes: Dict of quotes by leg name
         quantity: Order quantity
-        slippage_ticks: Slippage buffer
+        slippage_ticks: Initial slippage buffer
+        max_retries: Maximum retry attempts per leg (default 3)
+        use_market_fallback: Use MARKET orders if all retries fail (default True)
 
     Returns:
         ExitExecutionResult with detailed leg status
     """
-    logger.info(f"Executing Iron Fly exit (safe mode): {quantity} qty")
+    logger.info(f"Executing Iron Fly exit (safe mode with retry): {quantity} qty")
 
-    executed = {}
-    legs_closed = []
-    legs_failed = {}
+    executed: Dict[str, ExecutedOrder] = {}
+    legs_closed: List[str] = []
+    legs_failed: Dict[str, str] = {}
     total_debit = 0.0
     total_credit = 0.0
 
@@ -1102,45 +1108,102 @@ def execute_iron_fly_exit_safe(
         ('wing_pe', 'SELL', 'bid', 'SNAIL_EXIT_WING_PE', 'credit'),
     ]
 
+    # Slippage progression: initial, +3, +5, then MARKET
+    slippage_progression = [slippage_ticks, slippage_ticks + 3, slippage_ticks + 5]
+
     for leg_name, txn_type, price_field, tag, cost_type in exit_sequence:
-        try:
-            logger.info(f"Closing {leg_name} position ({txn_type})...")
+        leg_success = False
+        last_error = ""
 
-            # Get price based on transaction type
-            if price_field == 'ask':
-                base_price = quotes[leg_name].ask
-            else:
-                base_price = quotes[leg_name].bid
+        # Get base price
+        if price_field == 'ask':
+            base_price = quotes[leg_name].ask
+        else:
+            base_price = quotes[leg_name].bid
 
-            price = apply_slippage(base_price, txn_type, slippage_ticks)
+        # Try with increasing slippage
+        for retry_idx, current_slippage in enumerate(slippage_progression[:max_retries]):
+            try:
+                logger.info(f"Closing {leg_name} ({txn_type}), attempt {retry_idx + 1}, slippage={current_slippage}...")
 
-            order = execute_order(
-                kite,
-                OrderParams(
+                price = apply_slippage(base_price, txn_type, current_slippage)
+
+                order = execute_order(
+                    kite,
+                    OrderParams(
+                        tradingsymbol=symbols[leg_name],
+                        transaction_type=txn_type,
+                        quantity=quantity,
+                        price=price,
+                        tag=tag
+                    )
+                )
+
+                executed[leg_name] = order
+                legs_closed.append(leg_name)
+                leg_success = True
+
+                # Track costs
+                if cost_type == 'debit':
+                    total_debit += order.fill_price
+                else:
+                    total_credit += order.fill_price
+
+                logger.info(f"  {leg_name}: Closed @ {order.fill_price:.2f} (attempt {retry_idx + 1})")
+                break  # Success, move to next leg
+
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"  {leg_name}: Attempt {retry_idx + 1} failed - {last_error}")
+                time.sleep(1)  # Brief pause before retry
+
+        # If all LIMIT attempts failed, try MARKET order as fallback
+        if not leg_success and use_market_fallback:
+            try:
+                logger.warning(f"  {leg_name}: All LIMIT attempts failed, trying MARKET order...")
+
+                order_id = kite.place_order(
                     tradingsymbol=symbols[leg_name],
                     transaction_type=txn_type,
                     quantity=quantity,
-                    price=price,
-                    tag=tag
+                    price=None,
+                    order_type="MARKET"
                 )
-            )
 
-            executed[leg_name] = order
-            legs_closed.append(leg_name)
+                # Wait for MARKET order completion
+                order_details = wait_for_order_completion(kite, order_id, timeout=15)
+                fill_price = order_details.get('average_price', base_price)
 
-            # Track costs
-            if cost_type == 'debit':
-                total_debit += order.fill_price
-            else:
-                total_credit += order.fill_price
+                market_order = ExecutedOrder(
+                    order_id=order_id,
+                    tradingsymbol=symbols[leg_name],
+                    transaction_type=txn_type,
+                    quantity=quantity,
+                    order_price=0,  # MARKET
+                    fill_price=fill_price,
+                    slippage=calculate_slippage(base_price, fill_price, txn_type),
+                    status='COMPLETE'
+                )
 
-            logger.info(f"  {leg_name}: Closed @ {order.fill_price:.2f}")
+                executed[leg_name] = market_order
+                legs_closed.append(leg_name)
+                leg_success = True
 
-        except Exception as e:
-            error_msg = str(e)
-            legs_failed[leg_name] = error_msg
-            logger.error(f"  {leg_name}: FAILED - {error_msg}")
-            # Continue attempting other legs
+                if cost_type == 'debit':
+                    total_debit += fill_price
+                else:
+                    total_credit += fill_price
+
+                logger.info(f"  {leg_name}: MARKET order filled @ {fill_price:.2f}")
+
+            except Exception as e:
+                last_error = f"MARKET fallback failed: {str(e)}"
+                logger.error(f"  {leg_name}: {last_error}")
+
+        # Record failure if all attempts failed
+        if not leg_success:
+            legs_failed[leg_name] = last_error
+            logger.error(f"  {leg_name}: ALL ATTEMPTS FAILED - {last_error}")
 
     # Determine overall status
     all_closed = len(legs_closed) == 4

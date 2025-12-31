@@ -337,6 +337,58 @@ def set_bot_enabled(enabled: bool) -> None:
         logger.warning("Bot DISABLED - created disabled flag")
 
 
+def is_entry_in_progress() -> bool:
+    """
+    Check if an entry is currently in progress.
+
+    This prevents any exit triggers from firing while entry is executing.
+    Uses file-based lock since entry creates a new position (no ID yet).
+
+    Returns:
+        True if entry is in progress, False otherwise
+    """
+    lock_file = PROJECT_ROOT / 'data' / 'entry_in_progress.lock'
+    if lock_file.exists():
+        # Check if lock is stale (older than 5 minutes)
+        import time
+        lock_age = time.time() - lock_file.stat().st_mtime
+        if lock_age > 300:  # 5 minutes
+            logger.warning(f"Entry lock is stale ({lock_age:.0f}s old), clearing")
+            lock_file.unlink()
+            return False
+        return True
+    return False
+
+
+def set_entry_in_progress(in_progress: bool) -> bool:
+    """
+    Set or clear the entry-in-progress lock.
+
+    Args:
+        in_progress: True to set lock, False to clear
+
+    Returns:
+        True if operation succeeded, False if lock already held (when setting)
+    """
+    lock_file = PROJECT_ROOT / 'data' / 'entry_in_progress.lock'
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if in_progress:
+        # Check if already locked (prevent double entry)
+        if lock_file.exists():
+            logger.warning("Entry already in progress - blocking duplicate")
+            return False
+        lock_file.write_text(f"Entry started at {datetime.now().isoformat()}")
+        logger.info("Entry lock ACQUIRED")
+        return True
+    else:
+        # Clear lock
+        if lock_file.exists():
+            lock_file.unlink()
+            logger.info("Entry lock RELEASED")
+        return True
+
+
 def get_prompt_path(prompt_name: str) -> Path:
     """
     Get path to a prompt template file.
