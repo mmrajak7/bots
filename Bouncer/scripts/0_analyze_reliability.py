@@ -360,9 +360,18 @@ def calculate_reliability_score(
     neutrals: int
 ) -> Tuple[float, int, int]:
     """
-    Calculate reliability score (0-100) with bonus for high performers.
+    Calculate reliability score (0-100) with bonus/penalty based on performance.
 
     Returns: (success_rate, reliability_score, bonus_points)
+
+    Bonus/Penalty system:
+    - 75%+ success: +20 bonus (excellent S/R respect)
+    - 60-74%: +15 bonus
+    - 50-59%: +10 bonus
+    - 40-49%: +5 bonus
+    - 30-39%: +0 (neutral)
+    - 20-29%: -5 penalty (poor S/R respect)
+    - <20%: -10 penalty (avoid these stocks!)
     """
     total = successes + failures
     if total < 5:  # Not enough data
@@ -385,17 +394,22 @@ def calculate_reliability_score(
 
     reliability_score = min(100, int(base_score + bonus_score))
 
-    # Calculate bonus points for level scoring
-    if reliability_score >= 80:
-        bonus_points = 20
-    elif reliability_score >= 70:
-        bonus_points = 15
-    elif reliability_score >= 60:
-        bonus_points = 10
-    elif reliability_score >= 50:
-        bonus_points = 5
+    # Calculate bonus/penalty points for level scoring
+    # Good performers get bonus, poor performers get PENALTY
+    if success_rate >= 0.75:
+        bonus_points = 20   # Excellent - easy to alert
+    elif success_rate >= 0.60:
+        bonus_points = 15   # Strong
+    elif success_rate >= 0.50:
+        bonus_points = 10   # Moderate
+    elif success_rate >= 0.40:
+        bonus_points = 5    # Weak
+    elif success_rate >= 0.30:
+        bonus_points = 0    # Poor - neutral
+    elif success_rate >= 0.20:
+        bonus_points = -5   # Very poor - penalty
     else:
-        bonus_points = 0
+        bonus_points = -10  # Terrible - strong penalty (Adani-type stocks)
 
     return round(success_rate, 3), reliability_score, bonus_points
 
