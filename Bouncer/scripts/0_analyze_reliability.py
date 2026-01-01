@@ -376,9 +376,6 @@ def calculate_reliability_score(
     if total < 10:  # Raised from 5 to 10 for statistical significance
         return 0.5, 50, 5  # Neutral - not enough data
 
-    if total == 0:  # Safety check
-        return 0.5, 50, 5
-
     success_rate = successes / total
 
     # Base score: success_rate × 80 (max 80 points)
