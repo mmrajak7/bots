@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Bouncer - Support/Resistance Bounce Strategy Scanner
+Bouncer - Support Bounce Strategy Scanner (BULLISH ONLY)
 
-Identifies high-probability trading setups at key technical levels.
-Uses 4% target approach for optimal strike selection.
+Identifies high-probability BULLISH trading setups at SUPPORT levels.
+Uses ATR-based targeting for optimal strike selection.
 Integrates with Google Sheets and Telegram for alerts.
 """
 
@@ -137,17 +137,16 @@ def send_telegram(message: str) -> bool:
         return False
 
 def format_alert(setup: Setup) -> str:
-    """Format setup as Telegram alert."""
-    emoji = "🟢" if setup.direction == "BULLISH" else "🔴"
+    """Format BULLISH setup as Telegram alert."""
     flip = "✨ POLARITY FLIP" if setup.is_polarity_flip else ""
 
     return f"""
-{emoji} <b>BOUNCER ALERT</b> {emoji}
+🟢 <b>BOUNCER ALERT</b> 🟢
 
-<b>{setup.symbol}</b> - {setup.direction}
+<b>{setup.symbol}</b> - BULLISH
 Score: <b>{setup.level_score}</b> ({setup.touches} touches) {flip}
 
-Level: ₹{setup.level_price:.2f} ({setup.level_type})
+Level: ₹{setup.level_price:.2f} (SUPPORT)
 LTP: ₹{setup.ltp:.2f} ({setup.distance_pct:.1f}% away)
 
 <b>Strategy:</b> {setup.strategy}
@@ -529,13 +528,13 @@ def round_to_strike(price: float, interval: int, direction: str = 'nearest') -> 
 def identify_setups(kite: KiteConnect, symbol: str, df: pd.DataFrame,
                     levels: List[Level], ltp: float) -> List[Setup]:
     """
-    Identify trade setups using 4% target approach.
-    Long strike at level, short strike at target.
+    Identify BULLISH trade setups at SUPPORT levels.
+    Long strike at support, short strike at target.
     """
     setups = []
     max_distance = CONFIG['entry_rules']['max_distance_from_level_pct']
     min_score = CONFIG['scoring']['min_score_to_trade']
-    target_pct = CONFIG['spread_config']['target_pct']
+    target_pct = CONFIG['spread_config'].get('target_pct', 4.0)
 
     expiry, dte = get_valid_expiry(kite, symbol)
     if not expiry or not dte:
@@ -553,24 +552,14 @@ def identify_setups(kite: KiteConnect, symbol: str, df: pd.DataFrame,
         if distance_pct > max_distance:
             continue
 
-        # 4% TARGET APPROACH
+        # BULLISH ONLY: Only process support levels
         if level.level_type == 'support' and ltp >= level.price:
             direction = 'BULLISH'
-            # Long strike at support, short at 4% target
+            # Bull Call Spread: Long at support, short at target
             long_strike = round_to_strike(level.price, interval, 'down')
             target_price = ltp * (1 + target_pct / 100)
             short_strike = round_to_strike(target_price, interval, 'down')
-            opt_type = 'CE'
             strategy = f"Bull Call Spread {long_strike}/{short_strike}"
-
-        elif level.level_type == 'resistance' and ltp <= level.price:
-            direction = 'BEARISH'
-            # Long strike at resistance, short at 4% below
-            long_strike = round_to_strike(level.price, interval, 'up')
-            target_price = ltp * (1 - target_pct / 100)
-            short_strike = round_to_strike(target_price, interval, 'up')
-            opt_type = 'PE'
-            strategy = f"Bear Put Spread {long_strike}/{short_strike}"
         else:
             continue
 

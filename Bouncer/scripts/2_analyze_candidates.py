@@ -2,11 +2,13 @@
 """
 Step 2: Analyze Candidates (8:50 AM)
 ====================================
+BULLISH ONLY - Support bounce strategy
+
 - Filters stocks by OI for liquidity
 - Checks F&O ban list (best effort)
-- Computes S/R levels using 180-day data
+- Computes SUPPORT levels using 180-day data (resistance for polarity flip detection only)
 - Scores each level (with S/R reliability bonus!)
-- Saves top candidates to levels.json
+- Saves top SUPPORT candidates to levels.json
 
 Requires: Kite token (available after 8:45 AM via SNAIL)
 
@@ -403,7 +405,10 @@ def score_level(touches: int, is_flip: bool, is_round: bool, is_recent: bool, hi
 
 
 def compute_levels(df: pd.DataFrame, ltp: float, symbol: str = '') -> List[Dict]:
-    """Compute all S/R levels for a stock with reliability bonus."""
+    """
+    Compute SUPPORT levels for a stock with reliability bonus.
+    BULLISH ONLY - Resistance is detected for polarity flip but not output.
+    """
     min_touches = CONFIG.get('support_resistance', {}).get('min_touches', 2)
     recency_days = CONFIG.get('support_resistance', {}).get('recency_bonus_days', 30)
     # Only track levels within this % of current price (ignore ancient levels)
@@ -411,12 +416,13 @@ def compute_levels(df: pd.DataFrame, ltp: float, symbol: str = '') -> List[Dict]
 
     swing_lows, swing_highs = find_swing_points(df)
     support_clusters = cluster_levels(swing_lows)
+    # Resistance clusters needed for polarity flip detection only (not output)
     resistance_clusters = cluster_levels(swing_highs)
 
     avg_vol = df['volume'].mean()
     levels = []
 
-    # Process supports
+    # BULLISH ONLY: Process support levels only
     for cluster in support_clusters:
         if cluster['touches'] < min_touches:
             continue
@@ -431,6 +437,7 @@ def compute_levels(df: pd.DataFrame, ltp: float, symbol: str = '') -> List[Dict]
         if was_level_broken(df, cluster['price'], 'support', last_touch):
             continue
 
+        # Polarity flip = Resistance turned support (strong bullish signal)
         is_flip = detect_polarity_flip(df, cluster['price'], 'support')
         is_round = is_round_number(cluster['price'])
         last_touch = max(cluster['dates'])
@@ -455,48 +462,11 @@ def compute_levels(df: pd.DataFrame, ltp: float, symbol: str = '') -> List[Dict]
             'reliability_bonus': reliability_bonus
         })
 
-    # Process resistances
-    for cluster in resistance_clusters:
-        if cluster['touches'] < min_touches:
-            continue
-
-        # Skip levels too far from current price (irrelevant ancient levels)
-        distance_pct = abs(cluster['price'] - ltp) / ltp * 100
-        if distance_pct > max_distance_pct:
-            continue
-
-        # Skip levels that were historically broken after formation
-        last_touch = max(cluster['dates'])
-        if was_level_broken(df, cluster['price'], 'resistance', last_touch):
-            continue
-
-        is_flip = detect_polarity_flip(df, cluster['price'], 'resistance')
-        is_round = is_round_number(cluster['price'])
-        last_touch = max(cluster['dates'])
-        is_recent = (datetime.now().date() - datetime.strptime(last_touch, '%Y-%m-%d').date()).days <= recency_days
-        high_vol = cluster['volume'] > avg_vol * 1.5
-
-        score = score_level(cluster['touches'], is_flip, is_round, is_recent, high_vol)
-
-        # Add S/R reliability bonus (from weekly analysis)
-        reliability_bonus = get_reliability_bonus(symbol) if symbol else 0
-        score += reliability_bonus
-
-        levels.append({
-            'price': cluster['price'],
-            'type': 'resistance',
-            'touches': cluster['touches'],
-            'score': score,
-            'is_polarity_flip': is_flip,
-            'last_touch': last_touch,
-            'status': 'active',
-            'alerted': False,
-            'reliability_bonus': reliability_bonus
-        })
+    # NOTE: Resistance levels NOT output - BULLISH ONLY strategy
 
     # Sort by score, keep top levels
     levels.sort(key=lambda x: x['score'], reverse=True)
-    return levels[:10]  # Keep top 10 levels per stock
+    return levels[:10]  # Keep top 10 support levels per stock
 
 # ============================================================================
 # ATR CALCULATION
@@ -651,14 +621,14 @@ def main():
 
     print()
     print("=" * 60)
-    print("SUMMARY")
+    print("SUMMARY (BULLISH ONLY)")
     print("=" * 60)
     print(f"Stocks analyzed: {len(results['stocks'])}")
-    print(f"Total levels: {total_levels}")
+    print(f"Total SUPPORT levels: {total_levels}")
     print(f"High-score levels (60+): {high_score}")
     print(f"Output: {LEVELS_FILE}")
     print()
-    print("DONE - Ready for market scanner")
+    print("DONE - Ready for market scanner (BULLISH setups only)")
 
 
 if __name__ == "__main__":

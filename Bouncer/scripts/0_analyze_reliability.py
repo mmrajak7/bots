@@ -2,15 +2,17 @@
 """
 Step 0b: Analyze S/R Reliability (Weekly - Sunday 8:30 PM)
 ==========================================================
-- Backtests S/R levels on historical data for each stock
+BULLISH ONLY - Support bounce testing
+
+- Backtests SUPPORT levels on historical data for each stock
 - Calculates reliability scores with recency weighting
 - Stores results in SQLite + exports JSON for scanner
 
 Simulation Logic:
-- Walk through history, identify S/R levels at each point
-- When price approaches level, simulate trade:
+- Walk through history, identify SUPPORT levels at each point
+- When price approaches support, simulate LONG trade:
   - Target = ATR × 1.5 (same as live)
-  - Stop = Level break by 1.5%
+  - Stop = Support break by 1.5%
   - Track: Success (target hit) vs Failure (stop hit)
 - Calculate weighted success rate (recent tests weight more)
 
@@ -192,11 +194,10 @@ def simulate_trade(
     entry_price: float,
     target_price: float,
     stop_price: float,
-    direction: str,
     max_days: int = 10
 ) -> Tuple[str, int, float, float]:
     """
-    Simulate a trade forward from entry point.
+    Simulate a LONG trade forward from entry point (support bounce).
 
     Returns: (outcome, days_held, exit_price, pnl_pct)
     - outcome: 'success', 'failure', or 'neutral'
@@ -205,27 +206,15 @@ def simulate_trade(
         idx = entry_idx + i
         candle = df.iloc[idx]
 
-        if direction == 'LONG':
-            # Check target hit (high reaches target)
-            if candle['high'] >= target_price:
-                pnl = (target_price - entry_price) / entry_price * 100
-                return 'success', i, target_price, pnl
+        # LONG only: Check target hit (high reaches target)
+        if candle['high'] >= target_price:
+            pnl = (target_price - entry_price) / entry_price * 100
+            return 'success', i, target_price, pnl
 
-            # Check stop hit (close below stop)
-            if candle['close'] < stop_price:
-                pnl = (candle['close'] - entry_price) / entry_price * 100
-                return 'failure', i, candle['close'], pnl
-
-        else:  # SHORT
-            # Check target hit (low reaches target)
-            if candle['low'] <= target_price:
-                pnl = (entry_price - target_price) / entry_price * 100
-                return 'success', i, target_price, pnl
-
-            # Check stop hit (close above stop)
-            if candle['close'] > stop_price:
-                pnl = (entry_price - candle['close']) / entry_price * 100
-                return 'failure', i, candle['close'], pnl
+        # LONG only: Check stop hit (close below stop - support broken)
+        if candle['close'] < stop_price:
+            pnl = (candle['close'] - entry_price) / entry_price * 100
+            return 'failure', i, candle['close'], pnl
 
     # Timeout - neither target nor stop hit
     return 'neutral', max_days, df.iloc[entry_idx + min(max_days, len(df) - entry_idx - 1)]['close'], 0.0
@@ -233,8 +222,8 @@ def simulate_trade(
 
 def backtest_stock(symbol: str, df: pd.DataFrame) -> List[LevelTest]:
     """
-    Backtest S/R reliability for a single stock.
-    Walk through history, simulate trades at each level approach.
+    Backtest SUPPORT reliability for a single stock (BULLISH only).
+    Walk through history, simulate LONG trades at support level approaches.
     """
     tests = []
     lookback_days = 180
@@ -270,8 +259,12 @@ def backtest_stock(symbol: str, df: pd.DataFrame) -> List[LevelTest]:
             level_price = level['price']
             level_type = level['type']
 
+            # BULLISH ONLY: Only test support levels
+            if level_type != 'support':
+                continue
+
             # Check if we've tested this level recently (within 10 days)
-            level_key = f"{level_type}_{int(level_price)}"
+            level_key = f"support_{int(level_price)}"
             if level_key in tested_levels:
                 days_since = (current_date - tested_levels[level_key]).days
                 if days_since < 10:
@@ -282,23 +275,17 @@ def backtest_stock(symbol: str, df: pd.DataFrame) -> List[LevelTest]:
             if distance_pct > approach_pct:
                 continue
 
-            # Valid setup - determine direction and simulate
-            if level_type == 'support' and current_price >= level_price:
-                direction = 'LONG'
+            # LONG only: Price at/above support
+            if current_price >= level_price:
                 entry = current_price
                 target = entry + (atr * atr_multiplier)
                 stop = level_price * (1 - break_pct / 100)
-            elif level_type == 'resistance' and current_price <= level_price:
-                direction = 'SHORT'
-                entry = current_price
-                target = entry - (atr * atr_multiplier)
-                stop = level_price * (1 + break_pct / 100)
             else:
                 continue
 
-            # Simulate trade
+            # Simulate LONG trade
             outcome, days_held, exit_price, pnl_pct = simulate_trade(
-                df, i, entry, target, stop, direction, max_days=10
+                df, i, entry, target, stop, max_days=10
             )
 
             # Record test
@@ -308,7 +295,7 @@ def backtest_stock(symbol: str, df: pd.DataFrame) -> List[LevelTest]:
                 symbol=symbol,
                 test_date=current_date.strftime('%Y-%m-%d'),
                 level_price=level_price,
-                level_type=level_type,
+                level_type='support',
                 entry_price=entry,
                 atr=atr,
                 target_price=target,
@@ -653,7 +640,7 @@ def main():
 
     conn.close()
 
-    print("\nDONE - Reliability scores ready for scanner")
+    print("\nDONE - SUPPORT reliability scores ready for scanner (BULLISH only)")
     return 0
 
 

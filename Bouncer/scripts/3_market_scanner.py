@@ -2,14 +2,16 @@
 """
 Step 3: Market Scanner (9:15 AM - 3:30 PM, every 5 mins)
 ========================================================
-- Loads pre-computed levels from levels.json
+BULLISH ONLY - Support bounce strategy
+
+- Loads pre-computed SUPPORT levels from levels.json
 - Fetches LTP for all stocks (single batch call)
-- Checks if price is near any level
+- Checks if price is near support level
 - Invalidates broken levels
-- When at level: builds full trade analysis and sends Telegram alert
-- NEW: For 90+ score setups with illiquid options -> FUTURES alert
-- NEW: Position tracking in open_positions.json
-- NEW: Exit signal checking (TP intraday, SL at 9 AM morning)
+- When at support: builds Bull Call Spread and sends Telegram alert
+- For 90+ score setups with illiquid options -> FUTURES LONG alert
+- Position tracking in open_positions.json
+- Exit signal checking (TP intraday, SL at 9 AM morning)
 
 Run: python scripts/3_market_scanner.py
      python scripts/3_market_scanner.py --test       (no alerts)
@@ -397,8 +399,7 @@ def send_telegram(message: str) -> bool:
 
 
 def format_alert(setup: TradeSetup) -> str:
-    """Format trade setup as detailed Telegram alert."""
-    emoji = "🟢" if setup.direction == "BULLISH" else "🔴"
+    """Format BULLISH trade setup as detailed Telegram alert."""
     flip_tag = " ✨FLIP" if setup.is_flip else ""
 
     warnings_text = ""
@@ -406,17 +407,17 @@ def format_alert(setup: TradeSetup) -> str:
         warnings_text = "\n⚠️ " + " | ".join(setup.warnings)
 
     return f"""
-{emoji} <b>BOUNCER ALERT</b> {emoji}
+🟢 <b>BOUNCER ALERT</b> 🟢
 
-<b>{setup.symbol}</b> - {setup.direction}{flip_tag}
+<b>{setup.symbol}</b> - BULLISH{flip_tag}
 Score: <b>{setup.level_score}</b> ({setup.touches} touches)
 
 ━━━ LEVEL ━━━
-Type: {setup.level_type.upper()} @ ₹{setup.level_price:.2f}
+Type: SUPPORT @ ₹{setup.level_price:.2f}
 LTP: ₹{setup.ltp:.2f} ({setup.distance_pct:.2f}% away)
 
 ━━━ TRADE ━━━
-<b>{setup.direction.replace('ISH', '')} {'CALL' if setup.direction == 'BULLISH' else 'PUT'} SPREAD</b>
+<b>BULL CALL SPREAD</b>
 BUY  {setup.long_symbol}
      Ask: ₹{setup.long_ask:.2f} | Bid: ₹{setup.long_bid:.2f}
 SELL {setup.short_symbol}
@@ -438,22 +439,21 @@ Slippage: ₹{setup.total_slippage:,.0f}
 
 
 def format_futures_alert(setup: FuturesSetup) -> str:
-    """Format futures setup as Telegram alert."""
-    emoji = "🔵" if setup.direction == "LONG" else "🟠"
+    """Format LONG futures setup as Telegram alert."""
     flip_tag = " ✨FLIP" if setup.is_flip else ""
 
     return f"""
-{emoji} <b>BOUNCER FUTURES ALERT</b> {emoji}
+🔵 <b>BOUNCER FUTURES ALERT</b> 🔵
 
-<b>{setup.symbol}</b> - {setup.direction}{flip_tag}
+<b>{setup.symbol}</b> - LONG{flip_tag}
 Score: <b>{setup.level_score}</b> (EXCEPTIONAL - {setup.touches} touches)
 
 ━━━ LEVEL ━━━
-Type: {setup.level_type.upper()} @ ₹{setup.level_price:.2f}
+Type: SUPPORT @ ₹{setup.level_price:.2f}
 LTP: ₹{setup.ltp:.2f} ({setup.distance_pct:.2f}% away)
 
 ━━━ FUTURES TRADE ━━━
-<b>{'BUY' if setup.direction == 'LONG' else 'SELL'} {setup.futures_symbol}</b>
+<b>BUY {setup.futures_symbol}</b>
 
 Entry: ₹{setup.entry_price:.2f}
 Stop Loss: ₹{setup.stop_price:.2f} (level break)
@@ -475,8 +475,8 @@ R:R: 1:{setup.risk_reward:.1f}
 
 
 def format_sl_alert(position: Position, prev_close: float) -> str:
-    """Format stop loss exit alert."""
-    pnl = (prev_close - position.entry_price) if position.direction == 'LONG' else (position.entry_price - prev_close)
+    """Format stop loss exit alert for LONG positions."""
+    pnl = prev_close - position.entry_price  # LONG only
     pnl_total = pnl * position.lot_size
     pnl_pct = (pnl / position.entry_price) * 100
 
@@ -484,9 +484,9 @@ def format_sl_alert(position: Position, prev_close: float) -> str:
 🔴 <b>BOUNCER EXIT ALERT - STOP LOSS</b> 🔴
 
 <b>{position.symbol}</b> - {position.instrument_type}
-Direction: {position.direction}
+Direction: LONG
 
-━━━ LEVEL BROKEN ━━━
+━━━ SUPPORT BROKEN ━━━
 Level: ₹{position.level_price:.2f}
 Prev Close: ₹{prev_close:.2f}
 Stop was: ₹{position.stop_price:.2f}
@@ -505,8 +505,8 @@ Total: ₹{pnl_total:,.0f}
 
 
 def format_tp_alert(position: Position, exit_price: float) -> str:
-    """Format take profit exit alert."""
-    pnl = (exit_price - position.entry_price) if position.direction == 'LONG' else (position.entry_price - exit_price)
+    """Format take profit exit alert for LONG positions."""
+    pnl = exit_price - position.entry_price  # LONG only
     pnl_total = pnl * position.lot_size
     pnl_pct = (pnl / position.entry_price) * 100
 
@@ -514,7 +514,7 @@ def format_tp_alert(position: Position, exit_price: float) -> str:
 🟢 <b>BOUNCER EXIT ALERT - TARGET HIT</b> 🎯
 
 <b>{position.symbol}</b> - {position.instrument_type}
-Direction: {position.direction}
+Direction: LONG
 
 ━━━ TARGET REACHED ━━━
 Target: ₹{position.target_price:.2f}
@@ -595,9 +595,14 @@ def build_futures_setup(
     atr: float,
     reason: str
 ) -> Optional[FuturesSetup]:
-    """Build a futures trade setup."""
+    """Build a LONG futures trade setup (support bounce only)."""
     level_price = level['price']
     level_type = level['type']
+
+    # BULLISH ONLY: Only process support levels
+    if level_type != 'support':
+        log.debug(f"{symbol}: SKIP FUTURES - Not a support level (type={level_type})")
+        return None
 
     # Get futures symbol
     futures_symbol, fut_lot_size, expiry_str, dte = get_futures_symbol(symbol)
@@ -609,17 +614,13 @@ def build_futures_setup(
     atr_multiplier = CONFIG.get('spread_config', {}).get('atr_multiplier', 1.5)
     break_pct = 1.5  # Level break percentage
 
-    if level_type == 'support' and ltp >= level_price:
-        direction = 'LONG'
+    # LONG only: Support bounce
+    if ltp >= level_price:
         entry = ltp
         target = entry + (atr * atr_multiplier)
         stop = level_price * (1 - break_pct / 100)
-    elif level_type == 'resistance' and ltp <= level_price:
-        direction = 'SHORT'
-        entry = ltp
-        target = entry - (atr * atr_multiplier)
-        stop = level_price * (1 + break_pct / 100)
     else:
+        log.debug(f"{symbol}: SKIP FUTURES - Price below support level")
         return None
 
     # Calculate risk/reward with zero checks
@@ -636,11 +637,11 @@ def build_futures_setup(
 
     distance_pct = abs(ltp - level_price) / level_price * 100
 
-    log.info(f"{symbol}: FUTURES setup - {direction} | Entry: {entry:.2f} | SL: {stop:.2f} | Target: {target:.2f}")
+    log.info(f"{symbol}: FUTURES setup - LONG | Entry: {entry:.2f} | SL: {stop:.2f} | Target: {target:.2f}")
 
     return FuturesSetup(
         symbol=symbol,
-        direction=direction,
+        direction='LONG',
         ltp=ltp,
         level_price=level_price,
         level_type=level_type,
@@ -708,7 +709,7 @@ def get_previous_close(kite: KiteConnect, symbol: str) -> Optional[float]:
 
 def check_sl_signals(kite: KiteConnect, send_alerts: bool = True) -> List[Position]:
     """
-    Check stop loss signals for open positions.
+    Check stop loss signals for LONG positions.
     Called at 9 AM to check previous day's close.
     Returns list of positions that hit SL.
     """
@@ -729,16 +730,8 @@ def check_sl_signals(kite: KiteConnect, send_alerts: bool = True) -> List[Positi
             log.warning(f"{pos.symbol}: Could not fetch previous close, skipping SL check")
             continue
 
-        # Check SL based on daily close (not intraday)
-        sl_triggered = False
-        if pos.direction == 'LONG':
-            if prev_close < pos.stop_price:
-                sl_triggered = True
-        else:  # SHORT
-            if prev_close > pos.stop_price:
-                sl_triggered = True
-
-        if sl_triggered:
+        # LONG only: SL triggers when price closes below stop (support broken)
+        if prev_close < pos.stop_price:
             log.warning(f"{pos.symbol}: SL TRIGGERED - Prev close {prev_close:.2f} vs Stop {pos.stop_price:.2f}")
 
             if send_alerts:
@@ -755,7 +748,7 @@ def check_sl_signals(kite: KiteConnect, send_alerts: bool = True) -> List[Positi
 
 def check_tp_signals(kite: KiteConnect, send_alerts: bool = True) -> List[Position]:
     """
-    Check take profit signals for open positions.
+    Check take profit signals for LONG positions.
     Called during market hours - TP can trigger intraday.
     Returns list of positions that hit TP.
     """
@@ -782,16 +775,8 @@ def check_tp_signals(kite: KiteConnect, send_alerts: bool = True) -> List[Positi
 
         ltp = ltps[nse_sym]['last_price']
 
-        # Check TP (can trigger intraday)
-        tp_triggered = False
-        if pos.direction == 'LONG':
-            if ltp >= pos.target_price:
-                tp_triggered = True
-        else:  # SHORT
-            if ltp <= pos.target_price:
-                tp_triggered = True
-
-        if tp_triggered:
+        # LONG only: TP triggers when price reaches target (above)
+        if ltp >= pos.target_price:
             log.info(f"{pos.symbol}: TARGET HIT! LTP {ltp:.2f} vs Target {pos.target_price:.2f}")
 
             if send_alerts:
@@ -933,15 +918,20 @@ MIN_RR = spread_cfg.get('min_risk_reward', 0.8)
 def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
                       level: Dict, lot_size: int, atr: float, atr_pct: float) -> Optional[TradeSetup]:
     """
-    Build complete trade setup with option analysis.
-    Uses ATR-based targeting with guardrails.
+    Build BULLISH trade setup with option analysis (Bull Call Spread).
+    SUPPORT LEVELS ONLY - Uses ATR-based targeting with guardrails.
     All decisions are logged for analysis.
     Option symbols are read from CSV - NEVER constructed manually!
     """
     level_price = level['price']
     level_type = level['type']
 
-    log.debug(f"{symbol}: Analyzing {level_type} @ {level_price} | LTP: {ltp} | ATR: {atr:.1f} ({atr_pct:.1f}%)")
+    # BULLISH ONLY: Only process support levels
+    if level_type != 'support':
+        log.debug(f"{symbol}: SKIP - Not a support level (type={level_type})")
+        return None
+
+    log.debug(f"{symbol}: Analyzing SUPPORT @ {level_price} | LTP: {ltp} | ATR: {atr:.1f} ({atr_pct:.1f}%)")
 
     # Get expiry from CSV cache
     expiry_str, dte = get_expiry_for_stock(symbol)
@@ -952,7 +942,7 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
         log.debug(f"{symbol}: SKIP - DTE {dte} < minimum {MIN_DTE}")
         return None
 
-    # Determine direction and calculate ATR-based target
+    # Calculate ATR-based target
     interval = get_strike_interval(symbol)
 
     # ATR-based target: use ATR × multiplier, fallback to fixed %
@@ -969,34 +959,17 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
     # This matches the scanner's ALERT_DISTANCE_PCT logic
     tolerance_pct = ALERT_DISTANCE_PCT / 100  # 0.5% = 0.005
 
-    if level_type == 'support':
-        # For support: price should be at or above support (or slightly below within tolerance)
-        min_price = level_price * (1 - tolerance_pct)
-        if ltp >= min_price:
-            direction = 'BULLISH'
-            opt_type = 'CE'
-            # Long at/below support, Short at ATR-based target
-            long_strike = round_strike(level_price, interval, 'down')
-            target = ltp + target_distance
-            short_strike = round_strike(target, interval, 'down')
-        else:
-            log.debug(f"{symbol}: SKIP - Price too far below support (LTP {ltp} < {min_price:.2f})")
-            return None
-    elif level_type == 'resistance':
-        # For resistance: price should be at or below resistance (or slightly above within tolerance)
-        max_price = level_price * (1 + tolerance_pct)
-        if ltp <= max_price:
-            direction = 'BEARISH'
-            opt_type = 'PE'
-            # Long at/above resistance, Short at ATR-based target below
-            long_strike = round_strike(level_price, interval, 'up')
-            target = ltp - target_distance
-            short_strike = round_strike(target, interval, 'up')
-        else:
-            log.debug(f"{symbol}: SKIP - Price too far above resistance (LTP {ltp} > {max_price:.2f})")
-            return None
+    # For support: price should be at or above support (or slightly below within tolerance)
+    min_price = level_price * (1 - tolerance_pct)
+    if ltp >= min_price:
+        direction = 'BULLISH'
+        opt_type = 'CE'
+        # Bull Call Spread: Long at/below support, Short at ATR-based target
+        long_strike = round_strike(level_price, interval, 'down')
+        target = ltp + target_distance
+        short_strike = round_strike(target, interval, 'down')
     else:
-        log.debug(f"{symbol}: SKIP - Unknown level type: {level_type}")
+        log.debug(f"{symbol}: SKIP - Price too far below support (LTP {ltp} < {min_price:.2f})")
         return None
 
     # Calculate spread width and check limits
@@ -1078,10 +1051,8 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
 
     log.debug(f"{symbol}: Metrics - Debit: {net_debit:.2f} ({debit_pct:.0f}%) | R:R: {risk_reward:.2f} | Max Profit: {max_profit:.2f}")
 
-    if direction == 'BULLISH':
-        breakeven = long_strike + net_debit
-    else:
-        breakeven = long_strike - net_debit
+    # Bull Call Spread breakeven
+    breakeven = long_strike + net_debit
 
     # Distance from level
     distance_pct = abs(ltp - level_price) / level_price * 100
@@ -1241,16 +1212,15 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
             # Calculate distance
             distance_pct = abs(ltp - level_price) / level_price * 100
 
+            # BULLISH ONLY: Only process support levels
+            if level_type != 'support':
+                continue
+
             # Check if level is invalidated (broken through)
-            if level_type == 'support' and ltp < level_price * (1 - INVALIDATE_PCT / 100):
+            if ltp < level_price * (1 - INVALIDATE_PCT / 100):
                 level['status'] = 'invalidated'
                 levels_invalidated += 1
                 log.warning(f"{symbol}: INVALIDATED support {level_price} - LTP {ltp} broke through by {distance_pct:.1f}%")
-                continue
-            if level_type == 'resistance' and ltp > level_price * (1 + INVALIDATE_PCT / 100):
-                level['status'] = 'invalidated'
-                levels_invalidated += 1
-                log.warning(f"{symbol}: INVALIDATED resistance {level_price} - LTP {ltp} broke through by {distance_pct:.1f}%")
                 continue
 
             # Check if at level (within alert distance)
@@ -1277,17 +1247,17 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
                             log.info(f"{symbol}: ALERT SENT - {setup.direction} {setup.long_strike}/{setup.short_strike}")
                             level['alerted'] = True
 
-                            # Track position
+                            # Track LONG position (BULLISH only)
                             pos = Position(
                                 id=f"{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                                 symbol=symbol,
                                 instrument_type='OPTIONS',
-                                direction='LONG' if setup.direction == 'BULLISH' else 'SHORT',
+                                direction='LONG',
                                 entry_price=setup.net_debit,
                                 entry_date=datetime.now().strftime('%Y-%m-%d'),
                                 level_price=level_price,
-                                stop_price=level_price * (0.985 if level_type == 'support' else 1.015),
-                                target_price=setup.breakeven + setup.max_profit if setup.direction == 'BULLISH' else setup.breakeven - setup.max_profit,
+                                stop_price=level_price * 0.985,  # Support break
+                                target_price=setup.breakeven + setup.max_profit,
                                 lot_size=lot_size,
                                 expiry=setup.expiry,
                                 score=level['score'],
