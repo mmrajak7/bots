@@ -902,7 +902,9 @@ def get_option_quotes(kite: KiteConnect, symbol: str, expiry: str,
 spread_cfg = CONFIG.get('spread_config', {})
 ATR_MULTIPLIER = spread_cfg.get('atr_multiplier', 1.5)
 FALLBACK_PCT = spread_cfg.get('fallback_pct', 4.0)
-MIN_WIDTH_PCT = spread_cfg.get('min_spread_width_pct', 2.0)
+# Dynamic spread width: min_width = ATR × multiplier, with absolute floor
+MIN_WIDTH_ATR_MULT = spread_cfg.get('min_width_atr_multiplier', 1.25)  # Dynamic: ATR × 1.25
+MIN_WIDTH_FLOOR_PCT = spread_cfg.get('min_width_floor_pct', 1.0)      # Absolute floor: 1.0%
 MAX_WIDTH_PCT = spread_cfg.get('max_spread_width_pct', 6.0)
 MAX_DEBIT_PCT = spread_cfg.get('max_debit_pct_of_width', 50)
 MIN_RR = spread_cfg.get('min_risk_reward', 0.8)
@@ -943,22 +945,38 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
         target_distance = ltp * target_pct / 100
         log.debug(f"{symbol}: Using fallback target: {target_pct}%")
 
-    if level_type == 'support' and ltp >= level_price:
-        direction = 'BULLISH'
-        opt_type = 'CE'
-        # Long at/below support, Short at ATR-based target
-        long_strike = round_strike(level_price, interval, 'down')
-        target = ltp + target_distance
-        short_strike = round_strike(target, interval, 'down')
-    elif level_type == 'resistance' and ltp <= level_price:
-        direction = 'BEARISH'
-        opt_type = 'PE'
-        # Long at/above resistance, Short at ATR-based target below
-        long_strike = round_strike(level_price, interval, 'up')
-        target = ltp - target_distance
-        short_strike = round_strike(target, interval, 'up')
+    # Allow tolerance for "at level" scenarios - price can be slightly through the level
+    # This matches the scanner's ALERT_DISTANCE_PCT logic
+    tolerance_pct = ALERT_DISTANCE_PCT / 100  # 0.5% = 0.005
+
+    if level_type == 'support':
+        # For support: price should be at or above support (or slightly below within tolerance)
+        min_price = level_price * (1 - tolerance_pct)
+        if ltp >= min_price:
+            direction = 'BULLISH'
+            opt_type = 'CE'
+            # Long at/below support, Short at ATR-based target
+            long_strike = round_strike(level_price, interval, 'down')
+            target = ltp + target_distance
+            short_strike = round_strike(target, interval, 'down')
+        else:
+            log.debug(f"{symbol}: SKIP - Price too far below support (LTP {ltp} < {min_price:.2f})")
+            return None
+    elif level_type == 'resistance':
+        # For resistance: price should be at or below resistance (or slightly above within tolerance)
+        max_price = level_price * (1 + tolerance_pct)
+        if ltp <= max_price:
+            direction = 'BEARISH'
+            opt_type = 'PE'
+            # Long at/above resistance, Short at ATR-based target below
+            long_strike = round_strike(level_price, interval, 'up')
+            target = ltp - target_distance
+            short_strike = round_strike(target, interval, 'up')
+        else:
+            log.debug(f"{symbol}: SKIP - Price too far above resistance (LTP {ltp} > {max_price:.2f})")
+            return None
     else:
-        log.debug(f"{symbol}: SKIP - Price/level mismatch (LTP {ltp} vs {level_type} {level_price})")
+        log.debug(f"{symbol}: SKIP - Unknown level type: {level_type}")
         return None
 
     # Calculate spread width and check limits
@@ -971,11 +989,15 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
 
     spread_width_pct = (spread_width / ltp) * 100
 
-    log.debug(f"{symbol}: Spread {long_strike}/{short_strike} = {spread_width} pts ({spread_width_pct:.1f}%)")
+    # GUARDRAIL 1: Dynamic spread width limits based on ATR
+    # min_width = max(ATR × multiplier, absolute_floor)
+    # This ensures low-ATR stocks get proportionally lower thresholds
+    dynamic_min_width_pct = max(atr_pct * MIN_WIDTH_ATR_MULT, MIN_WIDTH_FLOOR_PCT)
 
-    # GUARDRAIL 1: Spread width limits
-    if spread_width_pct < MIN_WIDTH_PCT:
-        log.info(f"{symbol}: SKIP - Spread too narrow: {spread_width_pct:.1f}% < {MIN_WIDTH_PCT}%")
+    log.debug(f"{symbol}: Spread {long_strike}/{short_strike} = {spread_width} pts ({spread_width_pct:.1f}%) | Min: {dynamic_min_width_pct:.1f}% (ATR {atr_pct:.1f}% × {MIN_WIDTH_ATR_MULT})")
+
+    if spread_width_pct < dynamic_min_width_pct:
+        log.info(f"{symbol}: SKIP - Spread too narrow: {spread_width_pct:.1f}% < {dynamic_min_width_pct:.1f}% (dynamic min for ATR {atr_pct:.1f}%)")
         return None
     if spread_width_pct > MAX_WIDTH_PCT:
         log.info(f"{symbol}: SKIP - Spread too wide: {spread_width_pct:.1f}% > {MAX_WIDTH_PCT}%")
