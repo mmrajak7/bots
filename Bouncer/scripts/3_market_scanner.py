@@ -50,6 +50,7 @@ DATA_DIR = BOUNCER_DIR.parent / 'data'
 CONFIG_FILE = BOUNCER_DIR / 'config' / 'config.json'
 LEVELS_FILE = BOUNCER_DIR / 'data' / 'levels.json'
 POSITIONS_FILE = BOUNCER_DIR / 'data' / 'open_positions.json'
+RELIABILITY_FILE = BOUNCER_DIR / 'data' / 'sr_reliability.json'
 LOGS_DIR = BOUNCER_DIR / 'logs'
 STOCK_INSTRUMENTS_FILE = DATA_DIR / 'stock_instruments.csv'
 LOGS_DIR.mkdir(exist_ok=True)
@@ -67,6 +68,25 @@ except json.JSONDecodeError as e:
 # Futures alert thresholds
 FUTURES_SCORE_THRESHOLD = 90  # Minimum score for futures consideration
 FUTURES_ENABLED = CONFIG.get('futures', {}).get('enabled', True)
+
+# Reliability filter - skip stocks that historically don't respect S/R levels
+MIN_RELIABILITY_RATE = CONFIG.get('reliability', {}).get('min_success_rate', 0.30)
+RELIABILITY_DATA: Dict = {}  # Loaded at scan time
+
+def load_reliability_data():
+    """Load S/R reliability scores for filtering poor performers."""
+    global RELIABILITY_DATA
+    RELIABILITY_DATA = {}
+
+    if not RELIABILITY_FILE.exists():
+        return
+
+    try:
+        with open(RELIABILITY_FILE) as f:
+            data = json.load(f)
+            RELIABILITY_DATA = data.get('stocks', {})
+    except Exception as e:
+        log.warning(f"Failed to load reliability data: {e}")
 
 # ============================================================================
 # INSTRUMENTS CACHE (loaded once from CSV - no manual symbol construction!)
@@ -1138,6 +1158,11 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
     if tp_positions:
         log.info(f"TP triggered for {len(tp_positions)} positions")
 
+    # Load reliability data for filtering poor performers
+    load_reliability_data()
+    if RELIABILITY_DATA:
+        log.debug(f"Loaded reliability data for {len(RELIABILITY_DATA)} stocks")
+
     # Load levels
     if not LEVELS_FILE.exists():
         log.error(f"Levels file not found: {LEVELS_FILE}")
@@ -1180,12 +1205,22 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
     levels_checked = 0
     levels_at_price = 0
     levels_invalidated = 0
+    stocks_skipped_reliability = 0
 
     for symbol, stock_data in data['stocks'].items():
         nse_sym = f"NSE:{symbol}"
         if nse_sym not in ltps:
             log.debug(f"{symbol}: No LTP data")
             continue
+
+        # Check reliability - skip stocks that historically don't respect S/R levels
+        if symbol in RELIABILITY_DATA:
+            reliability = RELIABILITY_DATA[symbol]
+            success_rate = reliability.get('success_rate', 0.5)
+            if success_rate < MIN_RELIABILITY_RATE:
+                log.debug(f"{symbol}: SKIP - Poor S/R reliability ({success_rate*100:.1f}% < {MIN_RELIABILITY_RATE*100:.0f}%)")
+                stocks_skipped_reliability += 1
+                continue
 
         ltp = ltps[nse_sym]['last_price']
         lot_size = stock_data.get('lot_size', 1)
@@ -1311,6 +1346,8 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
 
     # Summary
     log.info("-" * 50)
+    if stocks_skipped_reliability > 0:
+        log.info(f"Skipped {stocks_skipped_reliability} stocks due to poor S/R reliability (<{MIN_RELIABILITY_RATE*100:.0f}%)")
     log.info(f"SCAN COMPLETE | Checked: {levels_checked} | At level: {levels_at_price} | Invalidated: {levels_invalidated} | Setups: {len(setups_found)}")
 
     return setups_found
