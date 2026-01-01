@@ -67,8 +67,8 @@ LOOKBACK_DAYS = 365  # Test only past 1 year
 # Trade Parameters
 ATR_TARGET_MULTIPLIER = 1.5
 MAX_HOLD_DAYS = 20  # Timeout after 20 days
-TOUCH_THRESHOLD_PCT = 0.5  # % proximity to ST for touch detection
-FRESH_TOUCH_LOOKBACK = 10  # Candles gap for "fresh" touch
+TOUCH_THRESHOLD_PCT = 1.5  # % proximity to ST for touch detection (was 0.5 - too strict)
+ATR_PERIOD = 10  # TradingView default (was 14)
 
 
 def load_historical_data(symbol: str) -> Optional[pd.DataFrame]:
@@ -176,7 +176,7 @@ def simulate_trade(
     )
 
 
-def backtest_stock(symbol: str, use_fresh_only: bool = True) -> Optional[StockReliability]:
+def backtest_stock(symbol: str, use_fresh_only: bool = False) -> Optional[StockReliability]:
     """
     Run backtest for a single stock.
 
@@ -184,27 +184,35 @@ def backtest_stock(symbol: str, use_fresh_only: bool = True) -> Optional[StockRe
         symbol: Stock symbol
         use_fresh_only: If True, only test "fresh" touches (10-candle gap)
     """
-    # Load data
+    # Load data - need extra warmup data for proper ST calculation
     df = load_historical_data(symbol)
-    if df is None or len(df) < 50:
+    if df is None or len(df) < 100:
         return None
 
-    # Filter to lookback period
-    df = filter_to_lookback(df, LOOKBACK_DAYS)
+    # Keep warmup period for proper ST calculation (50 extra candles)
+    warmup_cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS + 50)
+    df = df[df['date'] >= warmup_cutoff].reset_index(drop=True)
+
+    if len(df) < 50:
+        return None
+
+    # Calculate SuperTrend with correct ATR period
+    df = calculate_supertrend(df, period=10, multiplier=3.0, atr_period=ATR_PERIOD)
+
+    # Filter to actual test period AFTER calculating ST
+    test_cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+    df = df[df['date'] >= test_cutoff].reset_index(drop=True)
+
     if len(df) < 30:
         return None
-
-    # Calculate SuperTrend
-    df = calculate_supertrend(df, period=10, multiplier=3.0, atr_period=14)
 
     # Find touches
     df = find_supertrend_touches(
         df,
-        touch_threshold_pct=TOUCH_THRESHOLD_PCT,
-        fresh_touch_lookback=FRESH_TOUCH_LOOKBACK
+        touch_threshold_pct=TOUCH_THRESHOLD_PCT
     )
 
-    # Get touch indices
+    # Get touch indices - use ALL touches by default
     if use_fresh_only:
         touch_mask = df['is_fresh_touch']
     else:
@@ -280,7 +288,7 @@ def get_available_stocks() -> List[str]:
     return sorted(stocks)
 
 
-def run_full_backtest(use_fresh_only: bool = True) -> Dict:
+def run_full_backtest(use_fresh_only: bool = False) -> Dict:
     """
     Run backtest on all available stocks.
 
@@ -317,6 +325,8 @@ def run_full_backtest(use_fresh_only: bool = True) -> Dict:
         "metadata": {
             "generated_at": datetime.now().isoformat(),
             "lookback_days": LOOKBACK_DAYS,
+            "atr_period": ATR_PERIOD,
+            "touch_threshold_pct": TOUCH_THRESHOLD_PCT,
             "atr_target_multiplier": ATR_TARGET_MULTIPLIER,
             "max_hold_days": MAX_HOLD_DAYS,
             "touch_type": "fresh_only" if use_fresh_only else "all",

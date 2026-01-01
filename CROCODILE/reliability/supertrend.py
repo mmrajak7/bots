@@ -48,7 +48,7 @@ def calculate_supertrend(
     df: pd.DataFrame,
     period: int = 10,
     multiplier: float = 3.0,
-    atr_period: int = 14
+    atr_period: int = 10  # TradingView default (was 14)
 ) -> pd.DataFrame:
     """
     Calculate SuperTrend indicator.
@@ -126,7 +126,7 @@ def calculate_supertrend(
 
 def find_supertrend_touches(
     df: pd.DataFrame,
-    touch_threshold_pct: float = 0.5,
+    touch_threshold_pct: float = 1.5,
     fresh_touch_lookback: int = 10
 ) -> pd.DataFrame:
     """
@@ -139,7 +139,7 @@ def find_supertrend_touches(
 
     Args:
         df: DataFrame with SuperTrend calculated
-        touch_threshold_pct: % threshold for touch detection (default 0.5%)
+        touch_threshold_pct: % threshold for touch detection (default 1.5%)
         fresh_touch_lookback: Candles to check for fresh touch (default 10)
 
     Returns:
