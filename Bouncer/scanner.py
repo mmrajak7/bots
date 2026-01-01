@@ -385,7 +385,7 @@ def score_level(touches: int, is_flip: bool, is_round: bool,
         score += scoring['touches_2']
 
     if is_flip:
-        score += scoring['resistance_turned_support']
+        score += scoring.get('polarity_flip', 25)
     if is_round:
         score += scoring['round_number_confluence']
     if is_recent:
@@ -429,25 +429,8 @@ def find_levels(df: pd.DataFrame) -> List[Level]:
             )
             levels.append(level)
 
-    for cluster in resistance_clusters:
-        if cluster['touches'] >= min_touches:
-            is_flip = detect_polarity_flip(df, cluster['price'], 'resistance', tolerance)
-            is_round = is_near_round_number(cluster['price'])
-            last_touch = max(cluster['dates'])
-            is_recent = (datetime.now() - last_touch.to_pydatetime().replace(tzinfo=None)).days <= recency_days
-            high_vol = np.mean(cluster['volumes']) > avg_volume * 1.5
-
-            level = Level(
-                price=round(cluster['price'], 2),
-                level_type='resistance',
-                touches=cluster['touches'],
-                first_touch=str(min(cluster['dates']).date()),
-                last_touch=str(last_touch.date()),
-                is_polarity_flip=is_flip,
-                volume_at_touches=np.mean(cluster['volumes']),
-                score=score_level(cluster['touches'], is_flip, is_round, is_recent, high_vol)
-            )
-            levels.append(level)
+    # NOTE: Resistance levels NOT processed - BULLISH ONLY strategy
+    # Resistance clusters are still detected above for polarity flip detection only
 
     levels.sort(key=lambda x: x.score, reverse=True)
     return levels
@@ -509,7 +492,7 @@ def get_strike_interval(kite: KiteConnect, symbol: str) -> int:
 
         intervals = [strikes[i+1] - strikes[i] for i in range(len(strikes)-1)]
         return int(min(set(intervals), key=intervals.count))
-    except:
+    except Exception:
         return 10
 
 def round_to_strike(price: float, interval: int, direction: str = 'nearest') -> int:
@@ -600,7 +583,7 @@ def scan_stock(kite: KiteConnect, symbol: str) -> List[Setup]:
     try:
         ltp_data = kite.ltp([f'NSE:{symbol}'])
         ltp = ltp_data[f'NSE:{symbol}']['last_price']
-    except:
+    except Exception:
         return []
 
     levels = find_levels(df)

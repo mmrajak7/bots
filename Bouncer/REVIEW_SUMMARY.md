@@ -1,7 +1,7 @@
 # Bouncer v2.1 - Code Review Summary
 
-**Review Date:** 2026-01-01 (Updated)
-**Previous Review:** 2025-12-31
+**Review Date:** 2026-01-01 (Session 2)
+**Previous Review:** 2026-01-01 (Session 1)
 **Reviewer:** Claude Opus 4.5
 **Status:** FIXED - Ready for Production
 
@@ -9,23 +9,37 @@
 
 ## Executive Summary
 
-Follow-up code review performed on Bouncer v2.1 codebase. Static analysis (mypy, ruff) identified **6 new issues** (mostly type safety). All **CRITICAL** issues have been resolved. Key improvements include retry logic for API calls and dynamic spread width calculation.
+Session 2 review focused on BULLISH ONLY compliance and config alignment. Found **7 issues** including critical config key mismatches that would cause KeyErrors at runtime. All issues fixed. Codebase now fully compliant with BULLISH ONLY strategy.
 
 ---
 
-## Review Statistics
+## Session 2 Fixes (2026-01-01 Evening)
 
-| Severity | Previous | Found | Fixed | Remaining |
-|----------|----------|-------|-------|-----------|
-| CRITICAL | 5 | 4 | 4 | 0 |
-| HIGH | 7 | 5 | 2 | 3 |
-| MEDIUM | 6 | 8 | 3 | 5 |
-| LOW | 4 | 6 | 0 | 6 |
-| **TOTAL** | **22** | **23** | **9** | **14** |
+| # | Issue | File | Severity |
+|---|-------|------|----------|
+| 1 | Config key `polarity_flip` vs `resistance_turned_support` | `2_analyze_candidates.py:396` | Critical |
+| 2 | Config key `polarity_flip` vs `resistance_turned_support` | `scanner.py:387-389` | Critical |
+| 3 | Resistance level processing in BULLISH ONLY mode | `scanner.py:432-451` | Critical |
+| 4 | Undefined variable `INSTRUMENTS_FILE` | `fetch_instruments.py:143` | Critical |
+| 5 | Bare `except:` clauses | `scanner.py:512,603` | Medium |
+| 6 | Bare `except:` clauses | `fetch_instruments.py:126,167` | Medium |
+| 7 | Reliability thresholds not from config | `0_analyze_reliability.py:371-401` | Medium |
 
 ---
 
-## Session Fixes (2026-01-01)
+## Review Statistics (Cumulative)
+
+| Severity | Previous | Session 2 | Fixed | Remaining |
+|----------|----------|-----------|-------|-----------|
+| CRITICAL | 0 | 4 | 4 | 0 |
+| HIGH | 3 | 0 | 0 | 3 |
+| MEDIUM | 5 | 3 | 3 | 5 |
+| LOW | 6 | 0 | 0 | 6 |
+| **TOTAL** | **14** | **7** | **7** | **14** |
+
+---
+
+## Session 1 Fixes (2026-01-01 Morning)
 
 ### Fix 1: Price/Level Mismatch Logic (Bug Fix)
 **Issue:** NTPC, ICICIBANK etc. being skipped at valid S/R levels

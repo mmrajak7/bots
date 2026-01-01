@@ -1,9 +1,23 @@
 # Bouncer v2.1 - Code Review Issues
 
-**Review Date:** 2026-01-01 (Updated)
+**Review Date:** 2026-01-01 (Updated - Session 2)
 **Previous Review:** 2025-12-31
 **Reviewer:** Claude Opus 4.5
-**Scope:** All scripts in `scripts/` directory
+**Scope:** All scripts in `scripts/` directory + root level files
+
+---
+
+## Session 2 Fixes (2026-01-01 Evening)
+
+| Issue | File | Description | Status |
+|-------|------|-------------|--------|
+| Config Key Mismatch | `2_analyze_candidates.py:396` | Used `resistance_turned_support` instead of `polarity_flip` | ✅ FIXED |
+| Config Key Mismatch | `scanner.py:387-389` | Used `resistance_turned_support` (would cause KeyError) | ✅ FIXED |
+| BULLISH ONLY Violation | `scanner.py:432-451` | Still processed resistance levels | ✅ FIXED |
+| Undefined Variable | `fetch_instruments.py:143` | Used `INSTRUMENTS_FILE` instead of `STOCK_INSTRUMENTS_FILE` | ✅ FIXED |
+| Bare except | `scanner.py:512,603` | Bare `except:` clauses | ✅ FIXED |
+| Bare except | `fetch_instruments.py:126,167` | Bare `except:` clauses | ✅ FIXED |
+| Config Alignment | `0_analyze_reliability.py:371-401` | Bonus thresholds not reading from config | ✅ FIXED |
 
 ---
 

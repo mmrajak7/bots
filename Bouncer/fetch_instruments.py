@@ -123,7 +123,7 @@ def write_instruments_csv(nse_stocks, stock_options):
                     try:
                         expiry_date = datetime.strptime(opt['expiry'], '%Y-%m-%d').date()
                         dte = (expiry_date - today).days
-                    except:
+                    except (ValueError, TypeError):
                         dte = 0
 
                     writer.writerow({
@@ -140,7 +140,7 @@ def write_instruments_csv(nse_stocks, stock_options):
                         'dte': dte
                     })
 
-    print(f"  Written {INSTRUMENTS_FILE.name}")
+    print(f"  Written {STOCK_INSTRUMENTS_FILE.name}")
 
 
 def write_index_options_csv(index_options):
@@ -164,7 +164,7 @@ def write_index_options_csv(index_options):
                 try:
                     expiry_date = datetime.strptime(opt['expiry'], '%Y-%m-%d').date()
                     dte = (expiry_date - today).days
-                except:
+                except (ValueError, TypeError):
                     dte = 0
 
                 writer.writerow({

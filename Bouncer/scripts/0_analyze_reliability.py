@@ -365,37 +365,40 @@ def calculate_reliability_score(
 
     success_rate = successes / total
 
+    # Load thresholds from config (or use defaults)
+    bonus_cfg = CONFIG.get('reliability', {}).get('bonus_thresholds', {})
+
     # Base score: success_rate × 80 (max 80 points)
     base_score = success_rate * 80
 
-    # Bonus for high performers
+    # Bonus for high performers (aligned with config)
     if success_rate >= 0.75:
         bonus_score = 20
-    elif success_rate >= 0.65:
+    elif success_rate >= 0.60:
         bonus_score = 15
-    elif success_rate >= 0.55:
+    elif success_rate >= 0.50:
         bonus_score = 10
     else:
         bonus_score = 0
 
     reliability_score = min(100, int(base_score + bonus_score))
 
-    # Calculate bonus/penalty points for level scoring
-    # Good performers get bonus, poor performers get PENALTY
-    if success_rate >= 0.75:
-        bonus_points = 20   # Excellent - strong S/R respect
-    elif success_rate >= 0.60:
-        bonus_points = 15   # Strong
-    elif success_rate >= 0.50:
-        bonus_points = 10   # Moderate
-    elif success_rate >= 0.40:
-        bonus_points = 5    # Weak but acceptable
-    elif success_rate >= 0.30:
-        bonus_points = -5   # Poor - penalize (ICICIBANK 37.8% type)
-    elif success_rate >= 0.20:
-        bonus_points = -10  # Very poor - strong penalty
+    # Calculate bonus/penalty points for level scoring (aligned with config bonus_thresholds)
+    # Thresholds: exceptional(75+), strong(60+), moderate(50+), weak(40+), poor(30+), very_poor(20+), terrible(<20)
+    if success_rate >= bonus_cfg.get('exceptional', {}).get('min_rate', 0.75):
+        bonus_points = bonus_cfg.get('exceptional', {}).get('points', 20)
+    elif success_rate >= bonus_cfg.get('strong', {}).get('min_rate', 0.60):
+        bonus_points = bonus_cfg.get('strong', {}).get('points', 15)
+    elif success_rate >= bonus_cfg.get('moderate', {}).get('min_rate', 0.50):
+        bonus_points = bonus_cfg.get('moderate', {}).get('points', 10)
+    elif success_rate >= bonus_cfg.get('weak', {}).get('min_rate', 0.40):
+        bonus_points = bonus_cfg.get('weak', {}).get('points', 5)
+    elif success_rate >= bonus_cfg.get('poor', {}).get('min_rate', 0.30):
+        bonus_points = bonus_cfg.get('poor', {}).get('points', -5)
+    elif success_rate >= bonus_cfg.get('very_poor', {}).get('min_rate', 0.20):
+        bonus_points = bonus_cfg.get('very_poor', {}).get('points', -10)
     else:
-        bonus_points = -15  # Terrible - avoid these stocks completely!
+        bonus_points = bonus_cfg.get('terrible', {}).get('points', -15)
 
     return round(success_rate, 3), reliability_score, bonus_points
 

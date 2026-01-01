@@ -393,7 +393,7 @@ def score_level(touches: int, is_flip: bool, is_round: bool, is_recent: bool, hi
         score += scoring.get('touches_2', 10)
 
     if is_flip:
-        score += scoring.get('resistance_turned_support', 25)
+        score += scoring.get('polarity_flip', 25)
     if is_round:
         score += scoring.get('round_number_confluence', 10)
     if is_recent:
