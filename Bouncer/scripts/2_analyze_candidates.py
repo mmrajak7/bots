@@ -22,7 +22,6 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
-from collections import defaultdict
 from kiteconnect import KiteConnect
 
 # ============================================================================
@@ -647,7 +646,7 @@ def main():
     total_levels = sum(len(s['levels']) for s in results['stocks'].values())
     high_score = sum(
         1 for s in results['stocks'].values()
-        for l in s['levels'] if l['score'] >= 60
+        for level in s['levels'] if level['score'] >= 60
     )
 
     print()

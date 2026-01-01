@@ -29,7 +29,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict, field
 from kiteconnect import KiteConnect
 import pytz
@@ -581,8 +581,8 @@ def build_futures_setup(
 
     # Get futures symbol
     futures_symbol, fut_lot_size, expiry_str, dte = get_futures_symbol(symbol)
-    if not futures_symbol:
-        log.debug(f"{symbol}: Could not find futures symbol")
+    if not futures_symbol or not expiry_str or dte is None:
+        log.debug(f"{symbol}: Could not find futures symbol or expiry")
         return None
 
     # Calculate ATR-based target and stop
@@ -925,7 +925,7 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
 
     # Get expiry from CSV cache
     expiry_str, dte = get_expiry_for_stock(symbol)
-    if not expiry_str:
+    if not expiry_str or dte is None:
         log.debug(f"{symbol}: SKIP - No valid expiry found in CSV")
         return None
     if dte < MIN_DTE:
@@ -1154,13 +1154,25 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
     level_count = sum(len(s['levels']) for s in data['stocks'].values())
     log.info(f"Loaded {stock_count} stocks with {level_count} levels")
 
-    # Fetch LTP for all stocks (single batch call)
+    # Fetch LTP for all stocks (single batch call) with retry
     symbols = [f"NSE:{s}" for s in data['stocks'].keys()]
-    try:
-        ltps = kite.ltp(symbols)
-        log.debug(f"Fetched LTP for {len(ltps)} symbols")
-    except Exception as e:
-        log.error(f"Failed to fetch LTPs: {e}")
+    ltps: Dict = {}
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            ltps = kite.ltp(symbols)
+            log.debug(f"Fetched LTP for {len(ltps)} symbols")
+            break
+        except Exception as e:
+            log.warning(f"LTP fetch attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+            else:
+                log.error(f"Failed to fetch LTPs after {max_retries} attempts")
+                return []
+
+    if not ltps:
+        log.error("No LTP data retrieved")
         return []
 
     setups_found = []

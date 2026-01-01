@@ -21,7 +21,7 @@ import requests
 from io import StringIO
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Set, Optional
+from typing import List, Dict, Optional
 from kiteconnect import KiteConnect
 
 # =============================================================================

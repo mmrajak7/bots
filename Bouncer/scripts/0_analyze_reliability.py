@@ -18,13 +18,12 @@ Run: python scripts/0_analyze_reliability.py
 Cron: 30 20 * * 0 (Sunday 8:30 PM, after historical data fetch)
 """
 
-import csv
 import json
 import sqlite3
 import sys
 from pathlib import Path
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from datetime import datetime
+from typing import List, Dict, Tuple
 from dataclasses import dataclass
 import pandas as pd
 import numpy as np
@@ -566,7 +565,7 @@ def main():
     csv_files = sorted(HISTORICAL_DIR.glob("*_daily.csv"))
     if not csv_files:
         print("ERROR: No historical CSV files found!")
-        print(f"Run 0_build_historical.py first")
+        print("Run 0_build_historical.py first")
         return 1
 
     print(f"Found {len(csv_files)} historical data files")
