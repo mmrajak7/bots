@@ -77,6 +77,8 @@ def calculate_supertrend(df, period=10, multiplier=3.0, atr_period=10):
 def find_touches(df, threshold_pct=1.5):
     """Find touch events: low within threshold of ST in uptrend, close above ST"""
     touches = []
+    min_distance = -0.5  # Max allowed undershoot (if lower, it's a breakdown not touch)
+
     for i in range(1, len(df)):
         if df['direction'].iloc[i] != 1:  # Must be uptrend
             continue
@@ -87,8 +89,9 @@ def find_touches(df, threshold_pct=1.5):
 
         dist_pct = (low - st) / st * 100
 
-        # Touch: low within threshold of ST (or below), close above ST
-        if dist_pct <= threshold_pct and close > st:
+        # Touch: low within -0.5% to +1.5% of ST, close above ST
+        # If low goes more than 0.5% below ST, it's a breakdown not a touch
+        if dist_pct >= min_distance and dist_pct <= threshold_pct and close > st:
             touches.append(i)
 
     return touches

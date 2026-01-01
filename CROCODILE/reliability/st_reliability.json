@@ -1,34 +1,44 @@
 {
   "metadata": {
-    "generated_at": "2026-01-01T19:02:17.287609",
+    "generated_at": "2026-01-01T19:20:29.570004",
     "lookback_days": 365,
     "atr_period": 10,
     "touch_threshold_pct": 1.5,
     "atr_target_multiplier": 1.5,
     "max_hold_days": 20,
     "touch_type": "fresh_only",
-    "total_stocks": 207
+    "total_stocks": 205
   },
   "summary": {
-    "total_stocks_tested": 207,
-    "total_trades": 802,
-    "total_wins": 292,
-    "overall_win_rate": 0.3641,
-    "avg_stock_win_rate": 0.3296,
+    "total_stocks_tested": 205,
+    "total_trades": 700,
+    "total_wins": 247,
+    "overall_win_rate": 0.3529,
+    "avg_stock_win_rate": 0.3159,
     "median_stock_win_rate": 0.3333,
     "best_stock": "BPCL",
     "worst_stock": "ADANIGREEN"
   },
   "stocks": {
     "BPCL": {
-      "total_touches": 6,
-      "wins": 6,
+      "total_touches": 5,
+      "wins": 5,
       "losses": 0,
       "timeouts": 0,
       "win_rate": 1.0,
-      "avg_win_pct": 3.82,
+      "avg_win_pct": 3.65,
       "avg_loss_pct": 0.0,
-      "avg_days_held": 5.5
+      "avg_days_held": 4.4
+    },
+    "BSE": {
+      "total_touches": 1,
+      "wins": 1,
+      "losses": 0,
+      "timeouts": 0,
+      "win_rate": 1.0,
+      "avg_win_pct": 3.87,
+      "avg_loss_pct": 0.0,
+      "avg_days_held": 5.0
     },
     "ETERNAL": {
       "total_touches": 1,
@@ -40,15 +50,35 @@
       "avg_loss_pct": 0.0,
       "avg_days_held": 3.0
     },
-    "MCX": {
+    "INDHOTEL": {
+      "total_touches": 2,
+      "wins": 2,
+      "losses": 0,
+      "timeouts": 0,
+      "win_rate": 1.0,
+      "avg_win_pct": 3.09,
+      "avg_loss_pct": 0.0,
+      "avg_days_held": 7.5
+    },
+    "KEI": {
       "total_touches": 4,
       "wins": 4,
       "losses": 0,
       "timeouts": 0,
       "win_rate": 1.0,
-      "avg_win_pct": 6.07,
+      "avg_win_pct": 3.86,
       "avg_loss_pct": 0.0,
-      "avg_days_held": 8.0
+      "avg_days_held": 7.2
+    },
+    "MCX": {
+      "total_touches": 2,
+      "wins": 2,
+      "losses": 0,
+      "timeouts": 0,
+      "win_rate": 1.0,
+      "avg_win_pct": 5.03,
+      "avg_loss_pct": 0.0,
+      "avg_days_held": 12.5
     },
     "WAAREEENER": {
       "total_touches": 3,
@@ -60,15 +90,15 @@
       "avg_loss_pct": 0.0,
       "avg_days_held": 4.3
     },
-    "ABCAPITAL": {
+    "BEL": {
       "total_touches": 5,
       "wins": 4,
       "losses": 1,
       "timeouts": 0,
       "win_rate": 0.8,
-      "avg_win_pct": 4.96,
-      "avg_loss_pct": -2.54,
-      "avg_days_held": 6.8
+      "avg_win_pct": 3.02,
+      "avg_loss_pct": -2.34,
+      "avg_days_held": 3.0
     },
     "HDFCBANK": {
       "total_touches": 10,
@@ -90,15 +120,15 @@
       "avg_loss_pct": -2.38,
       "avg_days_held": 8.4
     },
-    "KEI": {
-      "total_touches": 5,
-      "wins": 4,
+    "ABCAPITAL": {
+      "total_touches": 4,
+      "wins": 3,
       "losses": 1,
       "timeouts": 0,
-      "win_rate": 0.8,
-      "avg_win_pct": 3.86,
-      "avg_loss_pct": -1.81,
-      "avg_days_held": 6.0
+      "win_rate": 0.75,
+      "avg_win_pct": 4.55,
+      "avg_loss_pct": -2.54,
+      "avg_days_held": 6.5
     },
     "BHARTIARTL": {
       "total_touches": 4,
@@ -120,15 +150,15 @@
       "avg_loss_pct": -1.65,
       "avg_days_held": 8.8
     },
-    "FORTIS": {
+    "NUVAMA": {
       "total_touches": 4,
       "wins": 3,
       "losses": 1,
       "timeouts": 0,
       "win_rate": 0.75,
-      "avg_win_pct": 5.03,
-      "avg_loss_pct": -2.52,
-      "avg_days_held": 5.8
+      "avg_win_pct": 4.62,
+      "avg_loss_pct": -2.89,
+      "avg_days_held": 8.2
     },
     "SHRIRAMFIN": {
       "total_touches": 4,
@@ -150,25 +180,15 @@
       "avg_loss_pct": -1.81,
       "avg_days_held": 6.8
     },
-    "AMBUJACEM": {
+    "ADANIENSOL": {
       "total_touches": 3,
       "wins": 2,
       "losses": 1,
       "timeouts": 0,
       "win_rate": 0.6667,
-      "avg_win_pct": 4.52,
-      "avg_loss_pct": -2.02,
-      "avg_days_held": 2.0
-    },
-    "BEL": {
-      "total_touches": 6,
-      "wins": 4,
-      "losses": 2,
-      "timeouts": 0,
-      "win_rate": 0.6667,
-      "avg_win_pct": 3.02,
-      "avg_loss_pct": -1.6,
-      "avg_days_held": 2.8
+      "avg_win_pct": 5.58,
+      "avg_loss_pct": -3.74,
+      "avg_days_held": 3.7
     },
     "BOSCHLTD": {
       "total_touches": 3,
@@ -180,6 +200,26 @@
       "avg_loss_pct": -1.74,
       "avg_days_held": 14.3
     },
+    "FORTIS": {
+      "total_touches": 3,
+      "wins": 2,
+      "losses": 1,
+      "timeouts": 0,
+      "win_rate": 0.6667,
+      "avg_win_pct": 3.48,
+      "avg_loss_pct": -2.52,
+      "avg_days_held": 5.0
+    },
+    "IDFCFIRSTB": {
+      "total_touches": 3,
+      "wins": 2,
+      "losses": 1,
+      "timeouts": 0,
+      "win_rate": 0.6667,
+      "avg_win_pct": 3.12,
+      "avg_loss_pct": -2.07,
+      "avg_days_held": 3.3
+    },
     "IIFL": {
       "total_touches": 3,
       "wins": 2,
@@ -189,16 +229,6 @@
       "avg_win_pct": 6.3,
       "avg_loss_pct": -3.99,
       "avg_days_held": 10.3
-    },
-    "INDHOTEL": {
-      "total_touches": 3,
-      "wins": 2,
-      "losses": 1,
-      "timeouts": 0,
-      "win_rate": 0.6667,
-      "avg_win_pct": 3.09,
-      "avg_loss_pct": -0.8,
-      "avg_days_held": 5.3
     },
     "LICHSGFIN": {
       "total_touches": 3,
@@ -210,16 +240,6 @@
       "avg_loss_pct": -3.04,
       "avg_days_held": 3.7
     },
-    "SBILIFE": {
-      "total_touches": 9,
-      "wins": 6,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.6667,
-      "avg_win_pct": 2.89,
-      "avg_loss_pct": -2.66,
-      "avg_days_held": 7.4
-    },
     "TCS": {
       "total_touches": 6,
       "wins": 4,
@@ -229,6 +249,16 @@
       "avg_win_pct": 2.37,
       "avg_loss_pct": -1.34,
       "avg_days_held": 4.8
+    },
+    "SBILIFE": {
+      "total_touches": 8,
+      "wins": 5,
+      "losses": 3,
+      "timeouts": 0,
+      "win_rate": 0.625,
+      "avg_win_pct": 3.02,
+      "avg_loss_pct": -2.66,
+      "avg_days_held": 7.5
     },
     "ASHOKLEY": {
       "total_touches": 5,
@@ -330,35 +360,15 @@
       "avg_loss_pct": -2.18,
       "avg_days_held": 5.0
     },
-    "ADANIENSOL": {
-      "total_touches": 4,
-      "wins": 2,
-      "losses": 2,
-      "timeouts": 0,
-      "win_rate": 0.5,
-      "avg_win_pct": 5.58,
-      "avg_loss_pct": -2.41,
-      "avg_days_held": 3.5
-    },
-    "ADANIPORTS": {
-      "total_touches": 6,
-      "wins": 3,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.5,
-      "avg_win_pct": 3.93,
-      "avg_loss_pct": -1.2,
-      "avg_days_held": 3.8
-    },
-    "ANGELONE": {
+    "AMBUJACEM": {
       "total_touches": 2,
       "wins": 1,
       "losses": 1,
       "timeouts": 0,
       "win_rate": 0.5,
-      "avg_win_pct": 8.0,
-      "avg_loss_pct": -3.75,
-      "avg_days_held": 3.5
+      "avg_win_pct": 3.49,
+      "avg_loss_pct": -2.02,
+      "avg_days_held": 1.0
     },
     "AUROPHARMA": {
       "total_touches": 4,
@@ -370,26 +380,6 @@
       "avg_loss_pct": -3.54,
       "avg_days_held": 6.8
     },
-    "AXISBANK": {
-      "total_touches": 2,
-      "wins": 1,
-      "losses": 1,
-      "timeouts": 0,
-      "win_rate": 0.5,
-      "avg_win_pct": 4.02,
-      "avg_loss_pct": -1.22,
-      "avg_days_held": 5.0
-    },
-    "BHEL": {
-      "total_touches": 6,
-      "wins": 3,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.5,
-      "avg_win_pct": 5.67,
-      "avg_loss_pct": -1.22,
-      "avg_days_held": 5.5
-    },
     "BRITANNIA": {
       "total_touches": 4,
       "wins": 2,
@@ -400,25 +390,15 @@
       "avg_loss_pct": -1.62,
       "avg_days_held": 12.2
     },
-    "BSE": {
+    "CAMS": {
       "total_touches": 2,
       "wins": 1,
       "losses": 1,
       "timeouts": 0,
       "win_rate": 0.5,
-      "avg_win_pct": 3.87,
-      "avg_loss_pct": -0.51,
-      "avg_days_held": 4.0
-    },
-    "CAMS": {
-      "total_touches": 4,
-      "wins": 2,
-      "losses": 2,
-      "timeouts": 0,
-      "win_rate": 0.5,
-      "avg_win_pct": 4.89,
-      "avg_loss_pct": -1.72,
-      "avg_days_held": 4.5
+      "avg_win_pct": 3.34,
+      "avg_loss_pct": -3.43,
+      "avg_days_held": 3.5
     },
     "CIPLA": {
       "total_touches": 4,
@@ -440,6 +420,16 @@
       "avg_loss_pct": -2.18,
       "avg_days_held": 4.0
     },
+    "CROMPTON": {
+      "total_touches": 4,
+      "wins": 2,
+      "losses": 2,
+      "timeouts": 0,
+      "win_rate": 0.5,
+      "avg_win_pct": 4.03,
+      "avg_loss_pct": -1.98,
+      "avg_days_held": 5.0
+    },
     "CUMMINSIND": {
       "total_touches": 2,
       "wins": 1,
@@ -459,16 +449,6 @@
       "avg_win_pct": 5.57,
       "avg_loss_pct": -1.0,
       "avg_days_held": 2.0
-    },
-    "DMART": {
-      "total_touches": 4,
-      "wins": 2,
-      "losses": 2,
-      "timeouts": 0,
-      "win_rate": 0.5,
-      "avg_win_pct": 4.83,
-      "avg_loss_pct": -3.18,
-      "avg_days_held": 5.0
     },
     "EICHERMOT": {
       "total_touches": 6,
@@ -510,15 +490,25 @@
       "avg_loss_pct": -1.78,
       "avg_days_held": 7.8
     },
-    "HINDUNILVR": {
+    "HDFCAMC": {
+      "total_touches": 2,
+      "wins": 1,
+      "losses": 1,
+      "timeouts": 0,
+      "win_rate": 0.5,
+      "avg_win_pct": 3.2,
+      "avg_loss_pct": -2.13,
+      "avg_days_held": 4.0
+    },
+    "ICICIBANK": {
       "total_touches": 6,
       "wins": 3,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.5,
-      "avg_win_pct": 3.17,
-      "avg_loss_pct": -1.86,
-      "avg_days_held": 4.5
+      "avg_win_pct": 2.45,
+      "avg_loss_pct": -1.21,
+      "avg_days_held": 8.5
     },
     "ICICIPRULI": {
       "total_touches": 2,
@@ -530,25 +520,15 @@
       "avg_loss_pct": -1.78,
       "avg_days_held": 10.5
     },
-    "IDFCFIRSTB": {
-      "total_touches": 4,
-      "wins": 2,
-      "losses": 2,
-      "timeouts": 0,
-      "win_rate": 0.5,
-      "avg_win_pct": 3.12,
-      "avg_loss_pct": -1.94,
-      "avg_days_held": 2.8
-    },
     "IEX": {
-      "total_touches": 4,
-      "wins": 2,
-      "losses": 2,
+      "total_touches": 2,
+      "wins": 1,
+      "losses": 1,
       "timeouts": 0,
       "win_rate": 0.5,
-      "avg_win_pct": 6.15,
-      "avg_loss_pct": -2.47,
-      "avg_days_held": 6.8
+      "avg_win_pct": 6.35,
+      "avg_loss_pct": -3.15,
+      "avg_days_held": 9.0
     },
     "INDIANB": {
       "total_touches": 4,
@@ -559,16 +539,6 @@
       "avg_win_pct": 2.68,
       "avg_loss_pct": -2.78,
       "avg_days_held": 7.0
-    },
-    "INDIGO": {
-      "total_touches": 4,
-      "wins": 2,
-      "losses": 2,
-      "timeouts": 0,
-      "win_rate": 0.5,
-      "avg_win_pct": 3.76,
-      "avg_loss_pct": -2.69,
-      "avg_days_held": 1.5
     },
     "INFY": {
       "total_touches": 4,
@@ -600,25 +570,35 @@
       "avg_loss_pct": -0.39,
       "avg_days_held": 5.0
     },
-    "KAYNES": {
-      "total_touches": 4,
-      "wins": 2,
-      "losses": 2,
+    "JSWSTEEL": {
+      "total_touches": 2,
+      "wins": 1,
+      "losses": 1,
       "timeouts": 0,
       "win_rate": 0.5,
-      "avg_win_pct": 7.63,
-      "avg_loss_pct": -1.86,
-      "avg_days_held": 3.5
+      "avg_win_pct": 2.88,
+      "avg_loss_pct": -3.01,
+      "avg_days_held": 4.0
+    },
+    "KAYNES": {
+      "total_touches": 2,
+      "wins": 1,
+      "losses": 1,
+      "timeouts": 0,
+      "win_rate": 0.5,
+      "avg_win_pct": 5.16,
+      "avg_loss_pct": -1.51,
+      "avg_days_held": 4.0
     },
     "LTF": {
-      "total_touches": 4,
-      "wins": 2,
-      "losses": 1,
+      "total_touches": 2,
+      "wins": 1,
+      "losses": 0,
       "timeouts": 1,
       "win_rate": 0.5,
-      "avg_win_pct": 4.95,
-      "avg_loss_pct": 0.36,
-      "avg_days_held": 9.8
+      "avg_win_pct": 4.05,
+      "avg_loss_pct": 2.8,
+      "avg_days_held": 16.5
     },
     "MARUTI": {
       "total_touches": 6,
@@ -650,26 +630,6 @@
       "avg_loss_pct": -3.91,
       "avg_days_held": 3.5
     },
-    "NMDC": {
-      "total_touches": 6,
-      "wins": 3,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.5,
-      "avg_win_pct": 4.67,
-      "avg_loss_pct": -3.05,
-      "avg_days_held": 4.7
-    },
-    "NUVAMA": {
-      "total_touches": 4,
-      "wins": 2,
-      "losses": 1,
-      "timeouts": 1,
-      "win_rate": 0.5,
-      "avg_win_pct": 5.23,
-      "avg_loss_pct": -1.26,
-      "avg_days_held": 15.2
-    },
     "ONGC": {
       "total_touches": 6,
       "wins": 3,
@@ -689,6 +649,36 @@
       "avg_win_pct": 3.22,
       "avg_loss_pct": -1.69,
       "avg_days_held": 7.0
+    },
+    "PAYTM": {
+      "total_touches": 2,
+      "wins": 1,
+      "losses": 1,
+      "timeouts": 0,
+      "win_rate": 0.5,
+      "avg_win_pct": 6.28,
+      "avg_loss_pct": -1.93,
+      "avg_days_held": 2.5
+    },
+    "PETRONET": {
+      "total_touches": 2,
+      "wins": 1,
+      "losses": 1,
+      "timeouts": 0,
+      "win_rate": 0.5,
+      "avg_win_pct": 2.9,
+      "avg_loss_pct": -2.06,
+      "avg_days_held": 7.0
+    },
+    "PIDILITIND": {
+      "total_touches": 6,
+      "wins": 3,
+      "losses": 3,
+      "timeouts": 0,
+      "win_rate": 0.5,
+      "avg_win_pct": 2.93,
+      "avg_loss_pct": -1.95,
+      "avg_days_held": 4.2
     },
     "POWERGRID": {
       "total_touches": 2,
@@ -760,16 +750,6 @@
       "avg_loss_pct": -1.42,
       "avg_days_held": 5.5
     },
-    "TATAPOWER": {
-      "total_touches": 6,
-      "wins": 3,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.5,
-      "avg_win_pct": 3.55,
-      "avg_loss_pct": -1.73,
-      "avg_days_held": 4.2
-    },
     "TATASTEEL": {
       "total_touches": 4,
       "wins": 2,
@@ -791,14 +771,14 @@
       "avg_days_held": 5.0
     },
     "TORNTPOWER": {
-      "total_touches": 4,
-      "wins": 2,
-      "losses": 2,
+      "total_touches": 2,
+      "wins": 1,
+      "losses": 1,
       "timeouts": 0,
       "win_rate": 0.5,
-      "avg_win_pct": 4.89,
-      "avg_loss_pct": -0.48,
-      "avg_days_held": 4.2
+      "avg_win_pct": 4.05,
+      "avg_loss_pct": -0.84,
+      "avg_days_held": 4.0
     },
     "TRENT": {
       "total_touches": 2,
@@ -810,15 +790,25 @@
       "avg_loss_pct": -0.49,
       "avg_days_held": 4.0
     },
-    "UNITDSPR": {
+    "UPL": {
       "total_touches": 2,
       "wins": 1,
       "losses": 1,
       "timeouts": 0,
       "win_rate": 0.5,
-      "avg_win_pct": 3.14,
-      "avg_loss_pct": -1.24,
-      "avg_days_held": 3.0
+      "avg_win_pct": 4.72,
+      "avg_loss_pct": -6.82,
+      "avg_days_held": 8.5
+    },
+    "VEDL": {
+      "total_touches": 6,
+      "wins": 3,
+      "losses": 3,
+      "timeouts": 0,
+      "win_rate": 0.5,
+      "avg_win_pct": 3.79,
+      "avg_loss_pct": -3.74,
+      "avg_days_held": 3.3
     },
     "ZYDUSLIFE": {
       "total_touches": 2,
@@ -830,26 +820,6 @@
       "avg_loss_pct": -2.69,
       "avg_days_held": 10.0
     },
-    "ALKEM": {
-      "total_touches": 7,
-      "wins": 3,
-      "losses": 4,
-      "timeouts": 0,
-      "win_rate": 0.4286,
-      "avg_win_pct": 3.33,
-      "avg_loss_pct": -1.47,
-      "avg_days_held": 7.1
-    },
-    "ICICIBANK": {
-      "total_touches": 7,
-      "wins": 3,
-      "losses": 4,
-      "timeouts": 0,
-      "win_rate": 0.4286,
-      "avg_win_pct": 2.45,
-      "avg_loss_pct": -0.94,
-      "avg_days_held": 7.6
-    },
     "MARICO": {
       "total_touches": 7,
       "wins": 3,
@@ -859,36 +829,6 @@
       "avg_win_pct": 2.41,
       "avg_loss_pct": -1.78,
       "avg_days_held": 4.7
-    },
-    "PIDILITIND": {
-      "total_touches": 7,
-      "wins": 3,
-      "losses": 4,
-      "timeouts": 0,
-      "win_rate": 0.4286,
-      "avg_win_pct": 2.93,
-      "avg_loss_pct": -2.08,
-      "avg_days_held": 5.0
-    },
-    "UNIONBANK": {
-      "total_touches": 7,
-      "wins": 3,
-      "losses": 4,
-      "timeouts": 0,
-      "win_rate": 0.4286,
-      "avg_win_pct": 5.58,
-      "avg_loss_pct": -2.81,
-      "avg_days_held": 3.7
-    },
-    "VEDL": {
-      "total_touches": 7,
-      "wins": 3,
-      "losses": 4,
-      "timeouts": 0,
-      "win_rate": 0.4286,
-      "avg_win_pct": 3.79,
-      "avg_loss_pct": -3.18,
-      "avg_days_held": 3.0
     },
     "360ONE": {
       "total_touches": 5,
@@ -900,15 +840,15 @@
       "avg_loss_pct": -4.27,
       "avg_days_held": 4.2
     },
-    "ASIANPAINT": {
+    "ADANIPORTS": {
       "total_touches": 5,
       "wins": 2,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.4,
-      "avg_win_pct": 3.11,
-      "avg_loss_pct": -1.54,
-      "avg_days_held": 5.2
+      "avg_win_pct": 3.06,
+      "avg_loss_pct": -1.2,
+      "avg_days_held": 3.0
     },
     "BAJAJ-AUTO": {
       "total_touches": 5,
@@ -930,65 +870,65 @@
       "avg_loss_pct": -2.05,
       "avg_days_held": 10.0
     },
-    "CROMPTON": {
+    "BHEL": {
       "total_touches": 5,
       "wins": 2,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.4,
-      "avg_win_pct": 4.03,
-      "avg_loss_pct": -1.52,
+      "avg_win_pct": 5.17,
+      "avg_loss_pct": -1.22,
+      "avg_days_held": 5.0
+    },
+    "HINDUNILVR": {
+      "total_touches": 5,
+      "wins": 2,
+      "losses": 3,
+      "timeouts": 0,
+      "win_rate": 0.4,
+      "avg_win_pct": 3.08,
+      "avg_loss_pct": -1.86,
       "avg_days_held": 4.6
     },
-    "LT": {
+    "ICICIGI": {
       "total_touches": 5,
       "wins": 2,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.4,
-      "avg_win_pct": 2.54,
-      "avg_loss_pct": -1.7,
-      "avg_days_held": 8.2
+      "avg_win_pct": 4.35,
+      "avg_loss_pct": -1.34,
+      "avg_days_held": 4.2
     },
-    "POLYCAB": {
+    "NMDC": {
       "total_touches": 5,
       "wins": 2,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.4,
-      "avg_win_pct": 3.78,
-      "avg_loss_pct": -2.11,
-      "avg_days_held": 7.0
+      "avg_win_pct": 5.22,
+      "avg_loss_pct": -3.05,
+      "avg_days_held": 4.4
     },
-    "SBIN": {
+    "TATAPOWER": {
       "total_touches": 5,
       "wins": 2,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.4,
-      "avg_win_pct": 4.0,
-      "avg_loss_pct": -1.64,
-      "avg_days_held": 5.4
+      "avg_win_pct": 2.45,
+      "avg_loss_pct": -1.73,
+      "avg_days_held": 3.4
     },
-    "VBL": {
-      "total_touches": 5,
-      "wins": 2,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.4,
-      "avg_win_pct": 4.96,
-      "avg_loss_pct": -3.56,
-      "avg_days_held": 13.4
-    },
-    "ADANIENT": {
+    "ALKEM": {
       "total_touches": 6,
       "wins": 2,
       "losses": 4,
       "timeouts": 0,
       "win_rate": 0.3333,
-      "avg_win_pct": 4.02,
-      "avg_loss_pct": -2.07,
-      "avg_days_held": 3.0
+      "avg_win_pct": 2.66,
+      "avg_loss_pct": -1.47,
+      "avg_days_held": 7.0
     },
     "AMBER": {
       "total_touches": 3,
@@ -1000,15 +940,35 @@
       "avg_loss_pct": -2.43,
       "avg_days_held": 12.3
     },
-    "BAJAJFINSV": {
-      "total_touches": 9,
-      "wins": 3,
-      "losses": 6,
+    "APLAPOLLO": {
+      "total_touches": 3,
+      "wins": 1,
+      "losses": 2,
       "timeouts": 0,
       "win_rate": 0.3333,
-      "avg_win_pct": 4.33,
-      "avg_loss_pct": -0.91,
-      "avg_days_held": 3.9
+      "avg_win_pct": 2.7,
+      "avg_loss_pct": -1.78,
+      "avg_days_held": 6.0
+    },
+    "BLUESTARCO": {
+      "total_touches": 3,
+      "wins": 1,
+      "losses": 2,
+      "timeouts": 0,
+      "win_rate": 0.3333,
+      "avg_win_pct": 3.67,
+      "avg_loss_pct": -0.89,
+      "avg_days_held": 2.0
+    },
+    "CGPOWER": {
+      "total_touches": 3,
+      "wins": 1,
+      "losses": 1,
+      "timeouts": 1,
+      "win_rate": 0.3333,
+      "avg_win_pct": 2.78,
+      "avg_loss_pct": -2.62,
+      "avg_days_held": 11.3
     },
     "COFORGE": {
       "total_touches": 3,
@@ -1030,6 +990,26 @@
       "avg_loss_pct": -1.99,
       "avg_days_held": 4.3
     },
+    "DIVISLAB": {
+      "total_touches": 3,
+      "wins": 1,
+      "losses": 2,
+      "timeouts": 0,
+      "win_rate": 0.3333,
+      "avg_win_pct": 4.09,
+      "avg_loss_pct": -1.38,
+      "avg_days_held": 4.3
+    },
+    "DMART": {
+      "total_touches": 3,
+      "wins": 1,
+      "losses": 2,
+      "timeouts": 0,
+      "win_rate": 0.3333,
+      "avg_win_pct": 4.02,
+      "avg_loss_pct": -3.18,
+      "avg_days_held": 3.7
+    },
     "HCLTECH": {
       "total_touches": 3,
       "wins": 1,
@@ -1039,16 +1019,6 @@
       "avg_win_pct": 2.44,
       "avg_loss_pct": -1.19,
       "avg_days_held": 2.3
-    },
-    "HDFCAMC": {
-      "total_touches": 3,
-      "wins": 1,
-      "losses": 1,
-      "timeouts": 1,
-      "win_rate": 0.3333,
-      "avg_win_pct": 3.2,
-      "avg_loss_pct": 0.16,
-      "avg_days_held": 12.0
     },
     "HDFCLIFE": {
       "total_touches": 6,
@@ -1060,25 +1030,25 @@
       "avg_loss_pct": -1.73,
       "avg_days_held": 8.5
     },
-    "ICICIGI": {
-      "total_touches": 6,
-      "wins": 2,
-      "losses": 4,
-      "timeouts": 0,
-      "win_rate": 0.3333,
-      "avg_win_pct": 4.35,
-      "avg_loss_pct": -1.1,
-      "avg_days_held": 3.7
-    },
-    "JSWSTEEL": {
+    "INDIGO": {
       "total_touches": 3,
       "wins": 1,
       "losses": 2,
       "timeouts": 0,
       "win_rate": 0.3333,
-      "avg_win_pct": 2.88,
-      "avg_loss_pct": -5.26,
-      "avg_days_held": 3.7
+      "avg_win_pct": 2.87,
+      "avg_loss_pct": -2.69,
+      "avg_days_held": 1.3
+    },
+    "INOXWIND": {
+      "total_touches": 3,
+      "wins": 1,
+      "losses": 2,
+      "timeouts": 0,
+      "win_rate": 0.3333,
+      "avg_win_pct": 8.38,
+      "avg_loss_pct": -2.42,
+      "avg_days_held": 2.3
     },
     "JUBLFOOD": {
       "total_touches": 3,
@@ -1120,16 +1090,6 @@
       "avg_loss_pct": -2.02,
       "avg_days_held": 4.3
     },
-    "NHPC": {
-      "total_touches": 3,
-      "wins": 1,
-      "losses": 2,
-      "timeouts": 0,
-      "win_rate": 0.3333,
-      "avg_win_pct": 6.11,
-      "avg_loss_pct": -1.14,
-      "avg_days_held": 6.0
-    },
     "OBEROIRLTY": {
       "total_touches": 3,
       "wins": 1,
@@ -1139,26 +1099,6 @@
       "avg_win_pct": 6.08,
       "avg_loss_pct": -1.54,
       "avg_days_held": 3.0
-    },
-    "PETRONET": {
-      "total_touches": 3,
-      "wins": 1,
-      "losses": 2,
-      "timeouts": 0,
-      "win_rate": 0.3333,
-      "avg_win_pct": 2.9,
-      "avg_loss_pct": -1.68,
-      "avg_days_held": 5.7
-    },
-    "PIIND": {
-      "total_touches": 3,
-      "wins": 1,
-      "losses": 2,
-      "timeouts": 0,
-      "win_rate": 0.3333,
-      "avg_win_pct": 5.41,
-      "avg_loss_pct": -3.76,
-      "avg_days_held": 5.7
     },
     "PNBHOUSING": {
       "total_touches": 3,
@@ -1170,6 +1110,16 @@
       "avg_loss_pct": -0.88,
       "avg_days_held": 4.3
     },
+    "POLYCAB": {
+      "total_touches": 3,
+      "wins": 1,
+      "losses": 2,
+      "timeouts": 0,
+      "win_rate": 0.3333,
+      "avg_win_pct": 3.97,
+      "avg_loss_pct": -1.42,
+      "avg_days_held": 6.0
+    },
     "SAIL": {
       "total_touches": 6,
       "wins": 2,
@@ -1179,16 +1129,6 @@
       "avg_win_pct": 4.65,
       "avg_loss_pct": -2.69,
       "avg_days_held": 4.3
-    },
-    "SOLARINDS": {
-      "total_touches": 3,
-      "wins": 1,
-      "losses": 2,
-      "timeouts": 0,
-      "win_rate": 0.3333,
-      "avg_win_pct": 5.33,
-      "avg_loss_pct": -2.2,
-      "avg_days_held": 2.3
     },
     "TITAN": {
       "total_touches": 3,
@@ -1210,45 +1150,25 @@
       "avg_loss_pct": -0.96,
       "avg_days_held": 5.2
     },
-    "UPL": {
-      "total_touches": 3,
-      "wins": 1,
-      "losses": 2,
+    "UNIONBANK": {
+      "total_touches": 6,
+      "wins": 2,
+      "losses": 4,
       "timeouts": 0,
       "win_rate": 0.3333,
-      "avg_win_pct": 4.72,
-      "avg_loss_pct": -3.68,
-      "avg_days_held": 6.0
+      "avg_win_pct": 4.34,
+      "avg_loss_pct": -2.81,
+      "avg_days_held": 2.8
     },
-    "CDSL": {
-      "total_touches": 7,
-      "wins": 2,
-      "losses": 5,
-      "timeouts": 0,
-      "win_rate": 0.2857,
-      "avg_win_pct": 6.86,
-      "avg_loss_pct": -2.51,
-      "avg_days_held": 5.4
-    },
-    "JIOFIN": {
-      "total_touches": 7,
-      "wins": 2,
-      "losses": 5,
-      "timeouts": 0,
-      "win_rate": 0.2857,
-      "avg_win_pct": 5.3,
-      "avg_loss_pct": -2.09,
-      "avg_days_held": 3.7
-    },
-    "APLAPOLLO": {
+    "ASIANPAINT": {
       "total_touches": 4,
       "wins": 1,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.25,
-      "avg_win_pct": 2.7,
-      "avg_loss_pct": -1.32,
-      "avg_days_held": 4.8
+      "avg_win_pct": 2.46,
+      "avg_loss_pct": -1.54,
+      "avg_days_held": 6.0
     },
     "BANKINDIA": {
       "total_touches": 4,
@@ -1260,45 +1180,15 @@
       "avg_loss_pct": -2.23,
       "avg_days_held": 3.0
     },
-    "BLUESTARCO": {
+    "HAVELLS": {
       "total_touches": 4,
       "wins": 1,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.25,
-      "avg_win_pct": 3.67,
-      "avg_loss_pct": -1.24,
-      "avg_days_held": 2.0
-    },
-    "CGPOWER": {
-      "total_touches": 4,
-      "wins": 1,
-      "losses": 2,
-      "timeouts": 1,
-      "win_rate": 0.25,
-      "avg_win_pct": 2.78,
-      "avg_loss_pct": -2.31,
-      "avg_days_held": 8.8
-    },
-    "GAIL": {
-      "total_touches": 4,
-      "wins": 1,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.25,
-      "avg_win_pct": 7.17,
-      "avg_loss_pct": -1.57,
-      "avg_days_held": 4.5
-    },
-    "GMRAIRPORT": {
-      "total_touches": 4,
-      "wins": 1,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.25,
-      "avg_win_pct": 5.74,
-      "avg_loss_pct": -3.16,
-      "avg_days_held": 6.0
+      "avg_win_pct": 3.26,
+      "avg_loss_pct": -2.11,
+      "avg_days_held": 7.8
     },
     "HUDCO": {
       "total_touches": 4,
@@ -1310,26 +1200,6 @@
       "avg_loss_pct": -2.09,
       "avg_days_held": 1.5
     },
-    "IDEA": {
-      "total_touches": 4,
-      "wins": 1,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.25,
-      "avg_win_pct": 9.33,
-      "avg_loss_pct": -4.99,
-      "avg_days_held": 5.0
-    },
-    "INOXWIND": {
-      "total_touches": 4,
-      "wins": 1,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.25,
-      "avg_win_pct": 8.38,
-      "avg_loss_pct": -3.0,
-      "avg_days_held": 2.5
-    },
     "IOC": {
       "total_touches": 4,
       "wins": 1,
@@ -1340,35 +1210,15 @@
       "avg_loss_pct": -1.49,
       "avg_days_held": 7.0
     },
-    "IRFC": {
+    "LT": {
       "total_touches": 4,
       "wins": 1,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.25,
-      "avg_win_pct": 6.72,
-      "avg_loss_pct": -2.16,
-      "avg_days_held": 4.8
-    },
-    "LICI": {
-      "total_touches": 4,
-      "wins": 1,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.25,
-      "avg_win_pct": 4.6,
-      "avg_loss_pct": -2.07,
-      "avg_days_held": 5.2
-    },
-    "PAYTM": {
-      "total_touches": 4,
-      "wins": 1,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.25,
-      "avg_win_pct": 6.28,
-      "avg_loss_pct": -1.2,
-      "avg_days_held": 2.2
+      "avg_win_pct": 2.23,
+      "avg_loss_pct": -1.7,
+      "avg_days_held": 6.8
     },
     "PNB": {
       "total_touches": 4,
@@ -1380,16 +1230,6 @@
       "avg_loss_pct": -2.14,
       "avg_days_held": 4.2
     },
-    "POLICYBZR": {
-      "total_touches": 4,
-      "wins": 1,
-      "losses": 3,
-      "timeouts": 0,
-      "win_rate": 0.25,
-      "avg_win_pct": 8.39,
-      "avg_loss_pct": -2.93,
-      "avg_days_held": 7.2
-    },
     "PRESTIGE": {
       "total_touches": 4,
       "wins": 1,
@@ -1399,6 +1239,16 @@
       "avg_win_pct": 4.8,
       "avg_loss_pct": -3.42,
       "avg_days_held": 4.8
+    },
+    "SBIN": {
+      "total_touches": 4,
+      "wins": 1,
+      "losses": 3,
+      "timeouts": 0,
+      "win_rate": 0.25,
+      "avg_win_pct": 4.18,
+      "avg_loss_pct": -1.64,
+      "avg_days_held": 4.2
     },
     "SHREECEM": {
       "total_touches": 4,
@@ -1420,25 +1270,35 @@
       "avg_loss_pct": -9.64,
       "avg_days_held": 2.2
     },
-    "BDL": {
-      "total_touches": 5,
+    "VBL": {
+      "total_touches": 4,
       "wins": 1,
-      "losses": 4,
+      "losses": 3,
       "timeouts": 0,
-      "win_rate": 0.2,
-      "avg_win_pct": 10.71,
-      "avg_loss_pct": -2.49,
-      "avg_days_held": 4.6
+      "win_rate": 0.25,
+      "avg_win_pct": 3.88,
+      "avg_loss_pct": -3.56,
+      "avg_days_held": 14.8
     },
-    "HAVELLS": {
+    "ADANIENT": {
       "total_touches": 5,
       "wins": 1,
       "losses": 4,
       "timeouts": 0,
       "win_rate": 0.2,
-      "avg_win_pct": 3.26,
-      "avg_loss_pct": -1.59,
-      "avg_days_held": 6.8
+      "avg_win_pct": 2.4,
+      "avg_loss_pct": -2.07,
+      "avg_days_held": 2.8
+    },
+    "BAJAJFINSV": {
+      "total_touches": 5,
+      "wins": 1,
+      "losses": 4,
+      "timeouts": 0,
+      "win_rate": 0.2,
+      "avg_win_pct": 3.27,
+      "avg_loss_pct": -0.74,
+      "avg_days_held": 2.6
     },
     "JINDALSTEL": {
       "total_touches": 5,
@@ -1490,25 +1350,15 @@
       "avg_loss_pct": -1.73,
       "avg_days_held": 4.8
     },
-    "DIVISLAB": {
+    "JIOFIN": {
       "total_touches": 6,
       "wins": 1,
       "losses": 5,
       "timeouts": 0,
       "win_rate": 0.1667,
-      "avg_win_pct": 4.09,
-      "avg_loss_pct": -2.0,
-      "avg_days_held": 4.5
-    },
-    "MPHASIS": {
-      "total_touches": 6,
-      "wins": 1,
-      "losses": 5,
-      "timeouts": 0,
-      "win_rate": 0.1667,
-      "avg_win_pct": 3.74,
-      "avg_loss_pct": -2.44,
-      "avg_days_held": 3.0
+      "avg_win_pct": 5.05,
+      "avg_loss_pct": -2.09,
+      "avg_days_held": 4.2
     },
     "NESTLEIND": {
       "total_touches": 6,
@@ -1521,14 +1371,24 @@
       "avg_days_held": 7.7
     },
     "ADANIGREEN": {
-      "total_touches": 5,
+      "total_touches": 4,
       "wins": 0,
-      "losses": 5,
+      "losses": 4,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -1.63,
-      "avg_days_held": 2.8
+      "avg_loss_pct": -1.51,
+      "avg_days_held": 3.0
+    },
+    "ANGELONE": {
+      "total_touches": 1,
+      "wins": 0,
+      "losses": 1,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -3.75,
+      "avg_days_held": 3.0
     },
     "APOLLOHOSP": {
       "total_touches": 5,
@@ -1560,6 +1420,16 @@
       "avg_loss_pct": -5.53,
       "avg_days_held": 4.0
     },
+    "AXISBANK": {
+      "total_touches": 1,
+      "wins": 0,
+      "losses": 1,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -1.22,
+      "avg_days_held": 2.0
+    },
     "BANDHANBNK": {
       "total_touches": 2,
       "wins": 0,
@@ -1569,6 +1439,16 @@
       "avg_win_pct": 0.0,
       "avg_loss_pct": -3.34,
       "avg_days_held": 3.0
+    },
+    "BDL": {
+      "total_touches": 4,
+      "wins": 0,
+      "losses": 4,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -2.49,
+      "avg_days_held": 3.8
     },
     "BHARATFORG": {
       "total_touches": 3,
@@ -1581,14 +1461,14 @@
       "avg_days_held": 1.0
     },
     "BIOCON": {
-      "total_touches": 4,
+      "total_touches": 2,
       "wins": 0,
-      "losses": 4,
+      "losses": 2,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -2.93,
-      "avg_days_held": 2.2
+      "avg_loss_pct": -1.92,
+      "avg_days_held": 2.5
     },
     "CANBK": {
       "total_touches": 3,
@@ -1600,15 +1480,25 @@
       "avg_loss_pct": -1.56,
       "avg_days_held": 1.0
     },
-    "CHOLAFIN": {
+    "CDSL": {
       "total_touches": 5,
       "wins": 0,
-      "losses": 4,
+      "losses": 5,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -2.51,
+      "avg_days_held": 3.6
+    },
+    "CHOLAFIN": {
+      "total_touches": 3,
+      "wins": 0,
+      "losses": 2,
       "timeouts": 1,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -2.34,
-      "avg_days_held": 8.2
+      "avg_loss_pct": -1.19,
+      "avg_days_held": 12.0
     },
     "COALINDIA": {
       "total_touches": 3,
@@ -1650,15 +1540,35 @@
       "avg_loss_pct": -1.47,
       "avg_days_held": 1.7
     },
+    "GAIL": {
+      "total_touches": 1,
+      "wins": 0,
+      "losses": 1,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -1.38,
+      "avg_days_held": 1.0
+    },
     "GLENMARK": {
+      "total_touches": 2,
+      "wins": 0,
+      "losses": 2,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -2.06,
+      "avg_days_held": 2.5
+    },
+    "GMRAIRPORT": {
       "total_touches": 3,
       "wins": 0,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -2.9,
-      "avg_days_held": 2.3
+      "avg_loss_pct": -3.16,
+      "avg_days_held": 7.0
     },
     "GODREJPROP": {
       "total_touches": 2,
@@ -1700,14 +1610,24 @@
       "avg_loss_pct": -4.16,
       "avg_days_held": 5.5
     },
-    "INDUSINDBK": {
+    "IDEA": {
       "total_touches": 3,
       "wins": 0,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -2.78,
+      "avg_loss_pct": -4.99,
+      "avg_days_held": 5.3
+    },
+    "INDUSINDBK": {
+      "total_touches": 2,
+      "wins": 0,
+      "losses": 2,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -3.68,
       "avg_days_held": 3.0
     },
     "IREDA": {
@@ -1720,15 +1640,25 @@
       "avg_loss_pct": -4.62,
       "avg_days_held": 2.0
     },
-    "ITC": {
-      "total_touches": 4,
+    "IRFC": {
+      "total_touches": 3,
       "wins": 0,
-      "losses": 4,
+      "losses": 3,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -1.24,
-      "avg_days_held": 3.5
+      "avg_loss_pct": -2.16,
+      "avg_days_held": 3.0
+    },
+    "ITC": {
+      "total_touches": 3,
+      "wins": 0,
+      "losses": 3,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -1.28,
+      "avg_days_held": 3.0
     },
     "KALYANKJIL": {
       "total_touches": 4,
@@ -1751,14 +1681,24 @@
       "avg_days_held": 1.0
     },
     "LAURUSLABS": {
+      "total_touches": 2,
+      "wins": 0,
+      "losses": 2,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -1.82,
+      "avg_days_held": 1.5
+    },
+    "LICI": {
       "total_touches": 3,
       "wins": 0,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -1.98,
-      "avg_days_held": 2.0
+      "avg_loss_pct": -2.07,
+      "avg_days_held": 3.7
     },
     "LODHA": {
       "total_touches": 2,
@@ -1820,15 +1760,25 @@
       "avg_loss_pct": -3.94,
       "avg_days_held": 9.0
     },
-    "MUTHOOTFIN": {
-      "total_touches": 3,
+    "MPHASIS": {
+      "total_touches": 5,
       "wins": 0,
-      "losses": 3,
+      "losses": 5,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -3.95,
-      "avg_days_held": 5.0
+      "avg_loss_pct": -2.44,
+      "avg_days_held": 2.2
+    },
+    "MUTHOOTFIN": {
+      "total_touches": 1,
+      "wins": 0,
+      "losses": 1,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -4.97,
+      "avg_days_held": 8.0
     },
     "NTPC": {
       "total_touches": 5,
@@ -1861,14 +1811,14 @@
       "avg_days_held": 2.5
     },
     "PATANJALI": {
-      "total_touches": 2,
+      "total_touches": 1,
       "wins": 0,
-      "losses": 2,
+      "losses": 1,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -1.89,
-      "avg_days_held": 1.5
+      "avg_loss_pct": -1.93,
+      "avg_days_held": 2.0
     },
     "PERSISTENT": {
       "total_touches": 2,
@@ -1910,25 +1860,45 @@
       "avg_loss_pct": -1.43,
       "avg_days_held": 1.0
     },
-    "POWERINDIA": {
+    "PIIND": {
       "total_touches": 2,
       "wins": 0,
       "losses": 2,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -1.76,
-      "avg_days_held": 1.0
+      "avg_loss_pct": -3.76,
+      "avg_days_held": 6.5
     },
-    "PPLPHARMA": {
+    "POLICYBZR": {
       "total_touches": 3,
       "wins": 0,
       "losses": 3,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -4.65,
-      "avg_days_held": 11.3
+      "avg_loss_pct": -2.93,
+      "avg_days_held": 7.0
+    },
+    "POWERINDIA": {
+      "total_touches": 1,
+      "wins": 0,
+      "losses": 1,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -2.85,
+      "avg_days_held": 1.0
+    },
+    "PPLPHARMA": {
+      "total_touches": 2,
+      "wins": 0,
+      "losses": 2,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -2.56,
+      "avg_days_held": 1.5
     },
     "RECLTD": {
       "total_touches": 3,
@@ -1941,14 +1911,14 @@
       "avg_days_held": 1.3
     },
     "RVNL": {
-      "total_touches": 4,
+      "total_touches": 3,
       "wins": 0,
-      "losses": 4,
+      "losses": 3,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -2.08,
-      "avg_days_held": 2.2
+      "avg_loss_pct": -2.62,
+      "avg_days_held": 2.7
     },
     "SBICARD": {
       "total_touches": 2,
@@ -1959,6 +1929,16 @@
       "avg_win_pct": 0.0,
       "avg_loss_pct": -6.24,
       "avg_days_held": 8.0
+    },
+    "SOLARINDS": {
+      "total_touches": 2,
+      "wins": 0,
+      "losses": 2,
+      "timeouts": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": -2.2,
+      "avg_days_held": 1.5
     },
     "SONACOMS": {
       "total_touches": 3,
@@ -1991,13 +1971,13 @@
       "avg_days_held": 8.0
     },
     "SUZLON": {
-      "total_touches": 3,
+      "total_touches": 2,
       "wins": 0,
-      "losses": 3,
+      "losses": 2,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -1.83,
+      "avg_loss_pct": -1.86,
       "avg_days_held": 2.0
     },
     "SWIGGY": {
@@ -2011,14 +1991,14 @@
       "avg_days_held": 7.0
     },
     "SYNGENE": {
-      "total_touches": 2,
+      "total_touches": 1,
       "wins": 0,
-      "losses": 2,
+      "losses": 1,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -2.13,
-      "avg_days_held": 1.5
+      "avg_loss_pct": -2.67,
+      "avg_days_held": 1.0
     },
     "TATAELXSI": {
       "total_touches": 3,
@@ -2041,14 +2021,14 @@
       "avg_days_held": 1.7
     },
     "TIINDIA": {
-      "total_touches": 3,
+      "total_touches": 2,
       "wins": 0,
-      "losses": 3,
+      "losses": 2,
       "timeouts": 0,
       "win_rate": 0.0,
       "avg_win_pct": 0.0,
-      "avg_loss_pct": -2.04,
-      "avg_days_held": 3.0
+      "avg_loss_pct": -2.52,
+      "avg_days_held": 2.5
     },
     "TMPV": {
       "total_touches": 3,

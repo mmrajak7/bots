@@ -166,8 +166,11 @@ def find_supertrend_touches(
             distance_pct = (low - st) / st * 100
             df.loc[df.index[i], 'touch_distance_pct'] = distance_pct
 
-            # Touch: low within threshold of ST or below, but close above ST
-            if distance_pct <= touch_threshold_pct and close > st:
+            # Touch: low within threshold of ST, but NOT too far below
+            # -0.5% to +1.5% is valid touch range
+            # If low goes more than 0.5% BELOW ST, it's a breakdown, not touch
+            min_distance = -0.5  # Max allowed undershoot
+            if distance_pct >= min_distance and distance_pct <= touch_threshold_pct and close > st:
                 df.loc[df.index[i], 'is_touch'] = True
 
                 # Fresh touch: previous N candles had low > ST (gap existed)
