@@ -68,7 +68,8 @@ except json.JSONDecodeError as e:
     sys.exit(1)
 
 # Futures alert thresholds
-FUTURES_SCORE_THRESHOLD = 90  # Minimum score for futures consideration
+FUTURES_SCORE_THRESHOLD = 90  # Minimum score for futures consideration (slippage issues)
+FUTURES_EXPENSIVE_OPTIONS_THRESHOLD = 50  # Lower threshold when options are too expensive (debit > 50%)
 FUTURES_ENABLED = CONFIG.get('futures', {}).get('enabled', True)
 
 # Reliability filter - skip stocks that historically don't respect S/R levels
@@ -852,12 +853,17 @@ MIN_RR = spread_cfg.get('min_risk_reward', 0.8)
 
 
 def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
-                      level: Dict, lot_size: int, atr: float, atr_pct: float) -> Optional[TradeSetup]:
+                      level: Dict, lot_size: int, atr: float, atr_pct: float) -> Tuple[Optional[TradeSetup], Optional[str]]:
     """
     Build BULLISH trade setup with option analysis (Bull Call Spread).
     SUPPORT LEVELS ONLY - Uses ATR-based targeting with guardrails.
     All decisions are logged for analysis.
     Option symbols are read from CSV - NEVER constructed manually!
+
+    Returns: (setup, failure_reason)
+    - setup: TradeSetup if successful, None otherwise
+    - failure_reason: None if successful, or one of:
+      'expensive_debit', 'slippage', 'no_options', 'invalid', etc.
     """
     level_price = level['price']
     level_type = level['type']
@@ -865,7 +871,7 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
     # BULLISH ONLY: Only process support levels
     if level_type != 'support':
         log.debug(f"{symbol}: SKIP - Not a support level (type={level_type})")
-        return None
+        return None, 'invalid'
 
     log.debug(f"{symbol}: Analyzing SUPPORT @ {level_price} | LTP: {ltp} | ATR: {atr:.1f} ({atr_pct:.1f}%)")
 
@@ -873,10 +879,10 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
     expiry_str, dte = get_expiry_for_stock(symbol)
     if not expiry_str or dte is None:
         log.debug(f"{symbol}: SKIP - No valid expiry found in CSV")
-        return None
+        return None, 'no_options'
     if dte < MIN_DTE:
         log.debug(f"{symbol}: SKIP - DTE {dte} < minimum {MIN_DTE}")
-        return None
+        return None, 'invalid'
 
     # Calculate ATR-based target
     interval = get_strike_interval(symbol)
@@ -906,7 +912,7 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
         short_strike = round_strike(target, interval, 'down')
     else:
         log.debug(f"{symbol}: SKIP - Price too far below support (LTP {ltp} < {min_price:.2f})")
-        return None
+        return None, 'invalid'
 
     # Calculate spread width and check limits
     spread_width = abs(long_strike - short_strike)
@@ -914,7 +920,7 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
     # Zero width check (can happen if strikes are same)
     if spread_width == 0:
         log.info(f"{symbol}: SKIP - Zero spread width (long={long_strike}, short={short_strike})")
-        return None
+        return None, 'invalid'
 
     spread_width_pct = (spread_width / ltp) * 100
 
@@ -927,19 +933,19 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
 
     if spread_width_pct < dynamic_min_width_pct:
         log.info(f"{symbol}: SKIP - Spread too narrow: {spread_width_pct:.1f}% < {dynamic_min_width_pct:.1f}% (dynamic min for ATR {atr_pct:.1f}%)")
-        return None
+        return None, 'invalid'
     if spread_width_pct > MAX_WIDTH_PCT:
         log.info(f"{symbol}: SKIP - Spread too wide: {spread_width_pct:.1f}% > {MAX_WIDTH_PCT}%")
-        return None
+        return None, 'invalid'
 
     # Get option quotes (symbols from CSV, not constructed!)
     quotes = get_option_quotes(kite, symbol, expiry_str, long_strike, short_strike, opt_type)
     if not quotes:
         log.debug(f"{symbol}: SKIP - Failed to fetch option quotes")
-        return None
+        return None, 'no_options'
     if quotes['long_ask'] == 0 or quotes['short_bid'] == 0:
         log.info(f"{symbol}: SKIP - No valid quotes (long_ask={quotes['long_ask']}, short_bid={quotes['short_bid']})")
-        return None
+        return None, 'no_options'
 
     log.debug(f"{symbol}: Quotes - Long: {quotes['long_bid']}/{quotes['long_ask']} | Short: {quotes['short_bid']}/{quotes['short_ask']}")
 
@@ -957,7 +963,7 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
 
     if total_slippage > SKIP_ALERT_SLIPPAGE:
         log.info(f"{symbol}: SKIP - Slippage Rs {total_slippage:.0f} > max Rs {SKIP_ALERT_SLIPPAGE}")
-        return None
+        return None, 'slippage'
 
     if total_slippage > MAX_ENTRY_SLIPPAGE:
         warnings.append(f"High slippage: Rs {total_slippage:,.0f}")
@@ -971,19 +977,19 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
     # Zero/negative debit check
     if max_loss <= 0:
         log.info(f"{symbol}: SKIP - Invalid debit: {net_debit:.2f} (long_ask={quotes['long_ask']}, short_bid={quotes['short_bid']})")
-        return None
+        return None, 'invalid'
 
     # GUARDRAIL 2: Max debit as % of spread width (spread_width already validated > 0)
     debit_pct = (net_debit / spread_width) * 100
     if debit_pct > MAX_DEBIT_PCT:
         log.info(f"{symbol}: SKIP - Debit {debit_pct:.0f}% > max {MAX_DEBIT_PCT}% of width (paying Rs {net_debit:.2f} for {spread_width} spread)")
-        return None
+        return None, 'expensive_debit'
 
     # GUARDRAIL 3: Minimum risk:reward (max_loss already validated > 0)
     risk_reward = max_profit / max_loss
     if risk_reward < MIN_RR:
         log.info(f"{symbol}: SKIP - R:R {risk_reward:.2f} < min {MIN_RR} (profit {max_profit:.2f} vs loss {max_loss:.2f})")
-        return None
+        return None, 'invalid'
 
     log.debug(f"{symbol}: Metrics - Debit: {net_debit:.2f} ({debit_pct:.0f}%) | R:R: {risk_reward:.2f} | Max Profit: {max_profit:.2f}")
 
@@ -1029,7 +1035,7 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
         dte=dte,
         lot_size=lot_size,
         warnings=warnings
-    )
+    ), None
 
 # ============================================================================
 # MARKET HOURS CHECK
@@ -1178,7 +1184,7 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
                 log.info(f"{symbol}: AT LEVEL {level_type} @ {level_price} | LTP: {ltp} | Score: {level['score']} | ATR: {atr_pct:.1f}%")
 
                 # Build full trade setup with ATR-based targeting
-                setup = build_trade_setup(kite, symbol, ltp, level, lot_size, atr, atr_pct)
+                setup, failure_reason = build_trade_setup(kite, symbol, ltp, level, lot_size, atr, atr_pct)
 
                 if setup:
                     setups_found.append(setup)
@@ -1214,44 +1220,54 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
                     else:
                         log.info(f"{symbol}: Alert suppressed (test mode)")
 
-                # FUTURES FALLBACK: If options setup failed (likely due to slippage) and score >= 90
-                elif level['score'] >= FUTURES_SCORE_THRESHOLD and FUTURES_ENABLED:
-                    log.info(f"{symbol}: Score {level['score']} >= {FUTURES_SCORE_THRESHOLD}, trying FUTURES fallback")
+                # FUTURES FALLBACK: If options setup failed due to slippage/expensive debit
+                # Use lower threshold (50) for expensive_debit, higher (90) for slippage
+                elif FUTURES_ENABLED and failure_reason in ('expensive_debit', 'slippage'):
+                    # Lower threshold when options are too expensive (debit > 50%)
+                    if failure_reason == 'expensive_debit':
+                        futures_threshold = FUTURES_EXPENSIVE_OPTIONS_THRESHOLD  # 50
+                        reason = "Options too expensive (debit > 50% of spread)"
+                    else:  # slippage
+                        futures_threshold = FUTURES_SCORE_THRESHOLD  # 90
+                        reason = "Options illiquid (high slippage)"
 
-                    futures_setup = build_futures_setup(
-                        kite, symbol, ltp, level, lot_size, atr,
-                        reason="Options illiquid (high slippage) - exceptional setup warrants futures"
-                    )
+                    if level['score'] >= futures_threshold:
+                        log.info(f"{symbol}: Score {level['score']} >= {futures_threshold}, trying FUTURES fallback ({failure_reason})")
 
-                    if futures_setup:
-                        if send_alerts:
-                            msg = format_futures_alert(futures_setup)
-                            if send_telegram(msg):
-                                log.info(f"{symbol}: FUTURES ALERT SENT - {futures_setup.direction} {futures_setup.futures_symbol}")
-                                level['alerted'] = True
+                        futures_setup = build_futures_setup(
+                            kite, symbol, ltp, level, lot_size, atr,
+                            reason=reason
+                        )
 
-                                # Track futures position
-                                pos = Position(
-                                    id=f"{symbol}_FUT_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                                    symbol=symbol,
-                                    instrument_type='FUTURES',
-                                    direction=futures_setup.direction,
-                                    entry_price=futures_setup.entry_price,
-                                    entry_date=datetime.now().strftime('%Y-%m-%d'),
-                                    level_price=level_price,
-                                    stop_price=futures_setup.stop_price,
-                                    target_price=futures_setup.target_price,
-                                    lot_size=futures_setup.lot_size,
-                                    expiry=futures_setup.expiry,
-                                    score=level['score'],
-                                    status='open',
-                                    futures_symbol=futures_setup.futures_symbol
-                                )
-                                add_position(pos)
+                        if futures_setup:
+                            if send_alerts:
+                                msg = format_futures_alert(futures_setup)
+                                if send_telegram(msg):
+                                    log.info(f"{symbol}: FUTURES ALERT SENT - {futures_setup.direction} {futures_setup.futures_symbol}")
+                                    level['alerted'] = True
+
+                                    # Track futures position
+                                    pos = Position(
+                                        id=f"{symbol}_FUT_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                                        symbol=symbol,
+                                        instrument_type='FUTURES',
+                                        direction=futures_setup.direction,
+                                        entry_price=futures_setup.entry_price,
+                                        entry_date=datetime.now().strftime('%Y-%m-%d'),
+                                        level_price=level_price,
+                                        stop_price=futures_setup.stop_price,
+                                        target_price=futures_setup.target_price,
+                                        lot_size=futures_setup.lot_size,
+                                        expiry=futures_setup.expiry,
+                                        score=level['score'],
+                                        status='open',
+                                        futures_symbol=futures_setup.futures_symbol
+                                    )
+                                    add_position(pos)
+                                else:
+                                    log.error(f"{symbol}: Futures alert failed to send")
                             else:
-                                log.error(f"{symbol}: Futures alert failed to send")
-                        else:
-                            log.info(f"{symbol}: Futures alert suppressed (test mode)")
+                                log.info(f"{symbol}: Futures alert suppressed (test mode)")
 
     # Save updated levels
     with open(LEVELS_FILE, 'w') as f:
