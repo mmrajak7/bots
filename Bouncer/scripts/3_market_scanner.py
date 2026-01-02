@@ -399,138 +399,73 @@ def send_telegram(message: str) -> bool:
 
 
 def format_alert(setup: TradeSetup) -> str:
-    """Format BULLISH trade setup as detailed Telegram alert."""
+    """Format BULLISH trade setup as compact Telegram alert."""
     flip_tag = " ✨FLIP" if setup.is_flip else ""
 
     warnings_text = ""
     if setup.warnings:
         warnings_text = "\n⚠️ " + " | ".join(setup.warnings)
 
-    return f"""
-🟢 <b>BOUNCER ALERT</b> 🟢
+    return f"""🟢 <b>BOUNCER</b> | <b>{setup.symbol}</b>{flip_tag}
+Score: {setup.level_score} ({setup.touches}T) | {setup.dte} DTE
 
-<b>{setup.symbol}</b> - BULLISH{flip_tag}
-Score: <b>{setup.level_score}</b> ({setup.touches} touches)
+Support: ₹{setup.level_price:.0f} | LTP: ₹{setup.ltp:.0f}
 
-━━━ LEVEL ━━━
-Type: SUPPORT @ ₹{setup.level_price:.2f}
-LTP: ₹{setup.ltp:.2f} ({setup.distance_pct:.2f}% away)
+<b>BUY</b> {setup.long_symbol} @ ₹{setup.long_ask:.1f}
+<b>SELL</b> {setup.short_symbol} @ ₹{setup.short_bid:.1f}
 
-━━━ TRADE ━━━
-<b>BULL CALL SPREAD</b>
-BUY  {setup.long_symbol}
-     Ask: ₹{setup.long_ask:.2f} | Bid: ₹{setup.long_bid:.2f}
-SELL {setup.short_symbol}
-     Ask: ₹{setup.short_ask:.2f} | Bid: ₹{setup.short_bid:.2f}
-
-━━━ METRICS ━━━
-Net Debit: <b>₹{setup.net_debit:.2f}</b> × {setup.lot_size} = ₹{setup.net_debit * setup.lot_size:,.0f}
-Max Profit: ₹{setup.max_profit * setup.lot_size:,.0f}
-Max Loss: ₹{setup.max_loss * setup.lot_size:,.0f}
-Breakeven: ₹{setup.breakeven:.2f}
-R:R: 1:{setup.risk_reward:.1f}
-Slippage: ₹{setup.total_slippage:,.0f}
-
-━━━ EXPIRY ━━━
-{setup.expiry} ({setup.dte} DTE)
-{warnings_text}
-⏰ {datetime.now().strftime('%H:%M:%S')}
-"""
+Debit: ₹{setup.net_debit * setup.lot_size:,.0f} | R:R 1:{setup.risk_reward:.1f}{warnings_text}"""
 
 
 def format_futures_alert(setup: FuturesSetup) -> str:
-    """Format LONG futures setup as Telegram alert."""
+    """Format LONG futures setup as compact Telegram alert."""
     flip_tag = " ✨FLIP" if setup.is_flip else ""
 
-    return f"""
-🔵 <b>BOUNCER FUTURES ALERT</b> 🔵
+    return f"""🔵 <b>BOUNCER FUT</b> | <b>{setup.symbol}</b>{flip_tag}
+Score: {setup.level_score} ({setup.touches}T) | {setup.dte} DTE
 
-<b>{setup.symbol}</b> - LONG{flip_tag}
-Score: <b>{setup.level_score}</b> (EXCEPTIONAL - {setup.touches} touches)
-
-━━━ LEVEL ━━━
-Type: SUPPORT @ ₹{setup.level_price:.2f}
-LTP: ₹{setup.ltp:.2f} ({setup.distance_pct:.2f}% away)
-
-━━━ FUTURES TRADE ━━━
 <b>BUY {setup.futures_symbol}</b>
+Entry: ₹{setup.entry_price:.0f} | SL: ₹{setup.stop_price:.0f} | Target: ₹{setup.target_price:.0f}
 
-Entry: ₹{setup.entry_price:.2f}
-Stop Loss: ₹{setup.stop_price:.2f} (level break)
-Target: ₹{setup.target_price:.2f} (ATR × 1.5)
-
-━━━ RISK METRICS ━━━
-Lot Size: {setup.lot_size}
-Risk/Lot: ₹{setup.risk_per_lot:,.0f}
-Reward/Lot: ₹{setup.reward_per_lot:,.0f}
-R:R: 1:{setup.risk_reward:.1f}
-
-━━━ EXPIRY ━━━
-{setup.expiry} ({setup.dte} DTE)
-
-⚠️ {setup.reason}
-📊 Position tracked for exit signals
-⏰ {datetime.now().strftime('%H:%M:%S')}
-"""
+Risk: ₹{setup.risk_per_lot:,.0f} | R:R 1:{setup.risk_reward:.1f}"""
 
 
 def format_sl_alert(position: Position, prev_close: float) -> str:
     """Format stop loss exit alert for LONG positions."""
-    pnl = prev_close - position.entry_price  # LONG only
-    pnl_total = pnl * position.lot_size
-    pnl_pct = (pnl / position.entry_price) * 100
+    if position.instrument_type == 'FUTURES':
+        # Futures: P&L based on price difference
+        pnl = prev_close - position.entry_price
+        pnl_total = pnl * position.lot_size
+        pnl_line = f"\nLoss: ~₹{abs(pnl_total):,.0f}"
+    else:
+        # Options: Can't calculate P&L without fetching spread quotes
+        pnl_line = ""
 
-    return f"""
-🔴 <b>BOUNCER EXIT ALERT - STOP LOSS</b> 🔴
+    return f"""🔴 <b>SL HIT</b> | <b>{position.symbol}</b>
+Support ₹{position.level_price:.0f} BROKEN
 
-<b>{position.symbol}</b> - {position.instrument_type}
-Direction: LONG
+Prev Close: ₹{prev_close:.0f} (below SL ₹{position.stop_price:.0f}){pnl_line}
 
-━━━ SUPPORT BROKEN ━━━
-Level: ₹{position.level_price:.2f}
-Prev Close: ₹{prev_close:.2f}
-Stop was: ₹{position.stop_price:.2f}
-
-━━━ TRADE DETAILS ━━━
-Entry: ₹{position.entry_price:.2f}
-Exit Signal: ₹{prev_close:.2f}
-
-━━━ P&L ━━━
-Per Unit: ₹{pnl:.2f} ({pnl_pct:.1f}%)
-Total: ₹{pnl_total:,.0f}
-
-<b>ACTION: Place GTT to EXIT</b>
-⏰ {datetime.now().strftime('%H:%M:%S')}
-"""
+<b>ACTION: EXIT {position.instrument_type}</b>"""
 
 
 def format_tp_alert(position: Position, exit_price: float) -> str:
     """Format take profit exit alert for LONG positions."""
-    pnl = exit_price - position.entry_price  # LONG only
-    pnl_total = pnl * position.lot_size
-    pnl_pct = (pnl / position.entry_price) * 100
+    if position.instrument_type == 'FUTURES':
+        # Futures: P&L based on price difference
+        pnl = exit_price - position.entry_price
+        pnl_total = pnl * position.lot_size
+        pnl_line = f"\nProfit: ~₹{pnl_total:,.0f}"
+    else:
+        # Options: Can't calculate P&L without fetching spread quotes
+        pnl_line = ""
 
-    return f"""
-🟢 <b>BOUNCER EXIT ALERT - TARGET HIT</b> 🎯
+    return f"""🎯 <b>TARGET HIT</b> | <b>{position.symbol}</b>
+Target ₹{position.target_price:.0f} REACHED ✓
 
-<b>{position.symbol}</b> - {position.instrument_type}
-Direction: LONG
+LTP: ₹{exit_price:.0f}{pnl_line}
 
-━━━ TARGET REACHED ━━━
-Target: ₹{position.target_price:.2f}
-Current: ₹{exit_price:.2f} ✓
-
-━━━ TRADE DETAILS ━━━
-Entry: ₹{position.entry_price:.2f}
-Exit Signal: ₹{exit_price:.2f}
-
-━━━ P&L ━━━
-Per Unit: ₹{pnl:.2f} ({pnl_pct:.1f}%)
-Total: ₹{pnl_total:,.0f}
-
-<b>ACTION: Book Profit / Place GTT to EXIT</b>
-⏰ {datetime.now().strftime('%H:%M:%S')}
-"""
+<b>ACTION: BOOK PROFIT on {position.instrument_type}</b>"""
 
 
 # ============================================================================

@@ -137,23 +137,15 @@ def send_telegram(message: str) -> bool:
         return False
 
 def format_alert(setup: Setup) -> str:
-    """Format BULLISH setup as Telegram alert."""
-    flip = "✨ POLARITY FLIP" if setup.is_polarity_flip else ""
+    """Format BULLISH setup as compact Telegram alert."""
+    flip_tag = " ✨FLIP" if setup.is_polarity_flip else ""
 
-    return f"""
-🟢 <b>BOUNCER ALERT</b> 🟢
+    return f"""🟢 <b>BOUNCER</b> | <b>{setup.symbol}</b>{flip_tag}
+Score: {setup.level_score} ({setup.touches}T) | {setup.dte} DTE
 
-<b>{setup.symbol}</b> - BULLISH
-Score: <b>{setup.level_score}</b> ({setup.touches} touches) {flip}
+Support: ₹{setup.level_price:.0f} | LTP: ₹{setup.ltp:.0f}
 
-Level: ₹{setup.level_price:.2f} (SUPPORT)
-LTP: ₹{setup.ltp:.2f} ({setup.distance_pct:.1f}% away)
-
-<b>Strategy:</b> {setup.strategy}
-Expiry: {setup.expiry} ({setup.dte} DTE)
-
-⏰ {setup.timestamp}
-"""
+{setup.strategy}"""
 
 # ============================================================================
 # GOOGLE SHEETS
