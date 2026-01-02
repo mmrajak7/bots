@@ -346,22 +346,22 @@ def calculate_reliability_score(
     neutrals: int
 ) -> Tuple[float, int, int]:
     """
-    Calculate reliability score (0-100) with bonus/penalty based on performance.
+    Calculate reliability score (0-100) with bonus based on performance.
 
     Returns: (success_rate, reliability_score, bonus_points)
 
-    Bonus/Penalty system (updated 2026-01-01):
-    - 75%+ success: +20 bonus (excellent S/R respect)
-    - 60-74%: +15 bonus
-    - 50-59%: +10 bonus
-    - 40-49%: +5 bonus
-    - 30-39%: -5 penalty (poor - ICICIBANK type, breaks levels often)
-    - 20-29%: -10 penalty (very poor - avoid)
-    - <20%: -15 penalty (terrible - CGPOWER type, never trade S/R!)
+    Bonus system (updated 2026-01-02 - aggressive weighting):
+    - 70%+ success: +25 bonus (exceptional - DLF type)
+    - 60-69%: +20 bonus (strong)
+    - 55-59%: +15 bonus (good)
+    - 50-54%: +10 bonus (moderate)
+    - 45-49%: +5 bonus (weak)
+    - 40-44%: 0 bonus (marginal - at threshold)
+    - <40%: skipped by scanner (min_success_rate filter)
     """
     total = successes + failures
-    if total < 10:  # Raised from 5 to 10 for statistical significance
-        return 0.5, 50, 5  # Neutral - not enough data
+    if total < 10:  # Need sufficient data for statistical significance
+        return 0.5, 50, 0  # Neutral - not enough data
 
     success_rate = successes / total
 
@@ -371,8 +371,8 @@ def calculate_reliability_score(
     # Base score: success_rate × 80 (max 80 points)
     base_score = success_rate * 80
 
-    # Bonus for high performers (aligned with config)
-    if success_rate >= 0.75:
+    # Bonus for high performers
+    if success_rate >= 0.70:
         bonus_score = 20
     elif success_rate >= 0.60:
         bonus_score = 15
@@ -383,22 +383,19 @@ def calculate_reliability_score(
 
     reliability_score = min(100, int(base_score + bonus_score))
 
-    # Calculate bonus/penalty points for level scoring (aligned with config bonus_thresholds)
-    # Thresholds: exceptional(75+), strong(60+), moderate(50+), weak(40+), poor(30+), very_poor(20+), terrible(<20)
-    if success_rate >= bonus_cfg.get('exceptional', {}).get('min_rate', 0.75):
-        bonus_points = bonus_cfg.get('exceptional', {}).get('points', 20)
+    # Calculate bonus points for level scoring (from config)
+    if success_rate >= bonus_cfg.get('exceptional', {}).get('min_rate', 0.70):
+        bonus_points = bonus_cfg.get('exceptional', {}).get('points', 25)
     elif success_rate >= bonus_cfg.get('strong', {}).get('min_rate', 0.60):
-        bonus_points = bonus_cfg.get('strong', {}).get('points', 15)
+        bonus_points = bonus_cfg.get('strong', {}).get('points', 20)
+    elif success_rate >= bonus_cfg.get('good', {}).get('min_rate', 0.55):
+        bonus_points = bonus_cfg.get('good', {}).get('points', 15)
     elif success_rate >= bonus_cfg.get('moderate', {}).get('min_rate', 0.50):
         bonus_points = bonus_cfg.get('moderate', {}).get('points', 10)
-    elif success_rate >= bonus_cfg.get('weak', {}).get('min_rate', 0.40):
+    elif success_rate >= bonus_cfg.get('weak', {}).get('min_rate', 0.45):
         bonus_points = bonus_cfg.get('weak', {}).get('points', 5)
-    elif success_rate >= bonus_cfg.get('poor', {}).get('min_rate', 0.30):
-        bonus_points = bonus_cfg.get('poor', {}).get('points', -5)
-    elif success_rate >= bonus_cfg.get('very_poor', {}).get('min_rate', 0.20):
-        bonus_points = bonus_cfg.get('very_poor', {}).get('points', -10)
     else:
-        bonus_points = bonus_cfg.get('terrible', {}).get('points', -15)
+        bonus_points = bonus_cfg.get('marginal', {}).get('points', 0)
 
     return round(success_rate, 3), reliability_score, bonus_points
 

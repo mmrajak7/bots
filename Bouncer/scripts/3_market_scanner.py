@@ -72,7 +72,8 @@ FUTURES_SCORE_THRESHOLD = 90  # Minimum score for futures consideration
 FUTURES_ENABLED = CONFIG.get('futures', {}).get('enabled', True)
 
 # Reliability filter - skip stocks that historically don't respect S/R levels
-MIN_RELIABILITY_RATE = CONFIG.get('reliability', {}).get('min_success_rate', 0.30)
+MIN_RELIABILITY_RATE = CONFIG.get('reliability', {}).get('min_success_rate', 0.40)
+MIN_RELIABILITY_TESTS = CONFIG.get('reliability', {}).get('min_tests', 10)
 RELIABILITY_DATA: Dict = {}  # Loaded at scan time
 
 def load_reliability_data():
@@ -1122,7 +1123,14 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
         # Check reliability - skip stocks that historically don't respect S/R levels
         if symbol in RELIABILITY_DATA:
             reliability = RELIABILITY_DATA[symbol]
+            total_tests = reliability.get('total_tests', 0)
             success_rate = reliability.get('success_rate', 0.5)
+            # Skip if insufficient test data
+            if total_tests < MIN_RELIABILITY_TESTS:
+                log.debug(f"{symbol}: SKIP - Insufficient tests ({total_tests} < {MIN_RELIABILITY_TESTS})")
+                stocks_skipped_reliability += 1
+                continue
+            # Skip if poor success rate
             if success_rate < MIN_RELIABILITY_RATE:
                 log.debug(f"{symbol}: SKIP - Poor S/R reliability ({success_rate*100:.1f}% < {MIN_RELIABILITY_RATE*100:.0f}%)")
                 stocks_skipped_reliability += 1
