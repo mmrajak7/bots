@@ -9,7 +9,7 @@ BULLISH ONLY - Support bounce strategy
 - Checks if price is near support level
 - Invalidates broken levels
 - When at support: builds Bull Call Spread and sends Telegram alert
-- For 90+ score setups with illiquid options -> FUTURES LONG alert
+- If spread too expensive/illiquid -> OTM Call Buy fallback (capped risk)
 - Position tracking in open_positions.json
 - Exit signal checking (TP intraday, SL at 9 AM morning)
 
@@ -67,10 +67,10 @@ except json.JSONDecodeError as e:
     print(f"ERROR: Config file is malformed: {e}")
     sys.exit(1)
 
-# Futures alert thresholds
-FUTURES_SCORE_THRESHOLD = 90  # Minimum score for futures consideration (slippage issues)
-FUTURES_EXPENSIVE_OPTIONS_THRESHOLD = 50  # Lower threshold when options are too expensive (debit > 50%)
-FUTURES_ENABLED = CONFIG.get('futures', {}).get('enabled', True)
+# OTM Call Buy fallback (when spreads fail due to expensive debit or slippage)
+OTM_BUY_ENABLED = CONFIG.get('otm_buy', {}).get('enabled', True)
+OTM_BUY_MIN_SCORE = CONFIG.get('otm_buy', {}).get('min_score', 50)
+OTM_BUY_MAX_PREMIUM_PCT = CONFIG.get('otm_buy', {}).get('max_premium_pct', 3.0)  # Max premium as % of LTP
 
 # Reliability filter - skip stocks that historically don't respect S/R levels
 MIN_RELIABILITY_RATE = CONFIG.get('reliability', {}).get('min_success_rate', 0.40)
@@ -218,33 +218,32 @@ class TradeSetup:
 
 
 @dataclass
-class FuturesSetup:
-    """Represents a futures trade setup (for 90+ score with illiquid options)."""
+class OTMBuySetup:
+    """Represents an OTM call buy setup (fallback when spreads are too expensive)."""
     symbol: str
-    direction: str
+    direction: str  # Always 'BULLISH'
     ltp: float
     level_price: float
-    level_type: str
+    level_type: str  # Always 'support'
     level_score: int
     touches: int
     is_flip: bool
     distance_pct: float
-    # Futures details
-    futures_symbol: str
-    entry_price: float
-    stop_price: float
-    target_price: float
+    # Option details
+    option_symbol: str
+    strike: float
+    option_type: str  # 'CE'
+    premium: float  # Per unit
     # Trade metrics
-    atr: float
     lot_size: int
-    risk_per_lot: float
-    reward_per_lot: float
-    risk_reward: float
+    total_premium: float  # premium × lot_size (max loss)
+    target_price: float  # Stock price target
+    breakeven: float  # strike + premium
     # Expiry
     expiry: str
     dte: int
     # Reason
-    reason: str  # Why futures instead of options
+    reason: str  # Why OTM buy instead of spread
 
 
 @dataclass
@@ -252,9 +251,9 @@ class Position:
     """Represents an open position being tracked."""
     id: str
     symbol: str
-    instrument_type: str  # 'OPTIONS' or 'FUTURES'
-    direction: str  # 'LONG' or 'SHORT'
-    entry_price: float
+    instrument_type: str  # 'OPTIONS' (spread) or 'OTM_CALL' (naked call)
+    direction: str  # Always 'LONG' for BULLISH only
+    entry_price: float  # For spread: net debit, for OTM: premium
     entry_date: str
     level_price: float
     stop_price: float
@@ -263,10 +262,11 @@ class Position:
     expiry: str
     score: int
     status: str  # 'open', 'closed'
-    # Optional fields for options
+    # Optional fields for spread
     long_symbol: Optional[str] = None
     short_symbol: Optional[str] = None
-    futures_symbol: Optional[str] = None
+    # Optional field for OTM call
+    option_symbol: Optional[str] = None
     # Exit info (filled when closed)
     exit_price: Optional[float] = None
     exit_date: Optional[str] = None
@@ -419,166 +419,158 @@ Support: ₹{setup.level_price:.0f} | LTP: ₹{setup.ltp:.0f}
 Debit: ₹{setup.net_debit * setup.lot_size:,.0f} | R:R 1:{setup.risk_reward:.1f}{warnings_text}"""
 
 
-def format_futures_alert(setup: FuturesSetup) -> str:
-    """Format LONG futures setup as compact Telegram alert."""
+def format_otm_buy_alert(setup: OTMBuySetup) -> str:
+    """Format OTM call buy setup as compact Telegram alert."""
     flip_tag = " ✨FLIP" if setup.is_flip else ""
 
-    return f"""🔵 <b>BOUNCER FUT</b> | <b>{setup.symbol}</b>{flip_tag}
+    return f"""🟡 <b>BOUNCER OTM</b> | <b>{setup.symbol}</b>{flip_tag}
 Score: {setup.level_score} ({setup.touches}T) | {setup.dte} DTE
 
-<b>BUY {setup.futures_symbol}</b>
-Entry: ₹{setup.entry_price:.0f} | SL: ₹{setup.stop_price:.0f} | Target: ₹{setup.target_price:.0f}
+Support: ₹{setup.level_price:.0f} | LTP: ₹{setup.ltp:.0f}
 
-Risk: ₹{setup.risk_per_lot:,.0f} | R:R 1:{setup.risk_reward:.1f}"""
+<b>BUY {setup.option_symbol}</b> @ ₹{setup.premium:.1f}
+Max Loss: ₹{setup.total_premium:,.0f} | Target: ₹{setup.target_price:.0f}
+
+⚠️ {setup.reason}"""
 
 
 def format_sl_alert(position: Position, prev_close: float) -> str:
     """Format stop loss exit alert for LONG positions."""
-    if position.instrument_type == 'FUTURES':
-        # Futures: P&L based on price difference
-        pnl = prev_close - position.entry_price
-        pnl_total = pnl * position.lot_size
-        pnl_line = f"\nLoss: ~₹{abs(pnl_total):,.0f}"
-    else:
-        # Options: Can't calculate P&L without fetching spread quotes
-        pnl_line = ""
+    # For all position types, can't calculate exact P&L without fetching current quotes
+    # Just show exit signal
 
     return f"""🔴 <b>SL HIT</b> | <b>{position.symbol}</b>
 Support ₹{position.level_price:.0f} BROKEN
 
-Prev Close: ₹{prev_close:.0f} (below SL ₹{position.stop_price:.0f}){pnl_line}
+Prev Close: ₹{prev_close:.0f} (below SL ₹{position.stop_price:.0f})
 
 <b>ACTION: EXIT {position.instrument_type}</b>"""
 
 
 def format_tp_alert(position: Position, exit_price: float) -> str:
     """Format take profit exit alert for LONG positions."""
-    if position.instrument_type == 'FUTURES':
-        # Futures: P&L based on price difference
-        pnl = exit_price - position.entry_price
-        pnl_total = pnl * position.lot_size
-        pnl_line = f"\nProfit: ~₹{pnl_total:,.0f}"
-    else:
-        # Options: Can't calculate P&L without fetching spread quotes
-        pnl_line = ""
+    # For all position types, can't calculate exact P&L without fetching current quotes
+    # Just show exit signal
 
     return f"""🎯 <b>TARGET HIT</b> | <b>{position.symbol}</b>
 Target ₹{position.target_price:.0f} REACHED ✓
 
-LTP: ₹{exit_price:.0f}{pnl_line}
+LTP: ₹{exit_price:.0f}
 
 <b>ACTION: BOOK PROFIT on {position.instrument_type}</b>"""
 
 
 # ============================================================================
-# FUTURES HELPERS
+# OTM CALL BUY HELPERS (Fallback when spreads fail)
 # ============================================================================
 
-def get_futures_symbol(symbol: str) -> Tuple[Optional[str], Optional[int], Optional[str], Optional[int]]:
+def get_single_option_quote(kite: KiteConnect, symbol: str, strike: float,
+                             expiry: str, opt_type: str) -> Optional[Dict]:
     """
-    Get current month futures symbol for a stock.
-    Returns: (futures_symbol, lot_size, expiry_str, dte)
+    Fetch quote for a single option (for OTM buy fallback).
+    Returns: {symbol, bid, ask} or None
     """
-    if symbol not in INSTRUMENTS_CACHE:
-        return None, None, None, None
+    option_sym_base = find_option_symbol(symbol, strike, expiry, opt_type)
+    if not option_sym_base:
+        log.debug(f"{symbol}: Option symbol not found in CSV for strike {strike}")
+        return None
 
-    # Look for FUT entries in the data - we need to check instruments CSV for futures
-    # For now, use the nearest expiry and construct based on pattern
-    # Get unique expiries from options
-    expiries = set()
-    lot_size = None
-    for opt in INSTRUMENTS_CACHE[symbol]:
-        expiries.add(opt['expiry'])
-        if lot_size is None:
-            lot_size = opt['lot_size']
+    nfo_sym = f"NFO:{option_sym_base}"
 
-    if not expiries:
-        return None, None, None, None
+    try:
+        quotes = kite.quote([nfo_sym])
 
-    # Get nearest expiry with DTE >= 10
-    today = date.today()
-    valid_expiries = []
-    for exp in expiries:
-        try:
-            exp_date = datetime.strptime(exp, '%Y-%m-%d').date()
-            dte = (exp_date - today).days
-            if dte >= 10:
-                valid_expiries.append((exp, dte))
-        except (ValueError, TypeError):
-            continue
+        if nfo_sym in quotes:
+            q = quotes[nfo_sym]
+            bid = q['depth']['buy'][0]['price'] if q['depth']['buy'] else 0
+            ask = q['depth']['sell'][0]['price'] if q['depth']['sell'] else 0
 
-    if not valid_expiries:
-        return None, None, None, None
+            return {
+                'symbol': option_sym_base,
+                'bid': bid,
+                'ask': ask
+            }
+        return None
 
-    # Sort by DTE and get nearest
-    valid_expiries.sort(key=lambda x: x[1])
-    expiry_str, dte = valid_expiries[0]
-
-    # Construct futures symbol (e.g., RELIANCE25JANFUT)
-    exp_date = datetime.strptime(expiry_str, '%Y-%m-%d')
-    month_abbr = exp_date.strftime('%b').upper()
-    year_suffix = exp_date.strftime('%y')
-    futures_symbol = f"{symbol}{year_suffix}{month_abbr}FUT"
-
-    return futures_symbol, lot_size, expiry_str, dte
+    except Exception as e:
+        log.error(f"Error fetching option quote for {symbol} {strike}: {e}")
+        return None
 
 
-def build_futures_setup(
+def build_otm_buy_setup(
     kite: KiteConnect,
     symbol: str,
     ltp: float,
     level: Dict,
     lot_size: int,
     atr: float,
+    target_strike: float,
     reason: str
-) -> Optional[FuturesSetup]:
-    """Build a LONG futures trade setup (support bounce only)."""
+) -> Optional[OTMBuySetup]:
+    """
+    Build an OTM call buy setup (fallback when spreads are too expensive).
+
+    This is used when:
+    - Spread debit > 50% of width (too expensive)
+    - Options have high slippage
+
+    We buy the target strike (short leg of failed spread) as a naked call.
+    Max loss = premium paid (capped, unlike futures).
+    """
     level_price = level['price']
     level_type = level['type']
 
     # BULLISH ONLY: Only process support levels
     if level_type != 'support':
-        log.debug(f"{symbol}: SKIP FUTURES - Not a support level (type={level_type})")
+        log.debug(f"{symbol}: SKIP OTM BUY - Not a support level")
         return None
 
-    # Get futures symbol
-    futures_symbol, fut_lot_size, expiry_str, dte = get_futures_symbol(symbol)
-    if not futures_symbol or not expiry_str or dte is None:
-        log.debug(f"{symbol}: Could not find futures symbol or expiry")
+    # Get expiry from cache
+    expiry_str, dte = get_expiry_for_stock(symbol)
+    if not expiry_str or dte is None:
+        log.debug(f"{symbol}: SKIP OTM BUY - No valid expiry")
         return None
 
-    # Calculate ATR-based target and stop
-    atr_multiplier = CONFIG.get('spread_config', {}).get('atr_multiplier', 1.5)
-    break_pct = 1.5  # Level break percentage
-
-    # LONG only: Support bounce
-    if ltp >= level_price:
-        entry = ltp
-        target = entry + (atr * atr_multiplier)
-        stop = level_price * (1 - break_pct / 100)
-    else:
-        log.debug(f"{symbol}: SKIP FUTURES - Price below support level")
+    # Get quote for the target strike (OTM call)
+    quote = get_single_option_quote(kite, symbol, target_strike, expiry_str, 'CE')
+    if not quote:
+        log.debug(f"{symbol}: SKIP OTM BUY - No quote for {target_strike} CE")
         return None
 
-    # Calculate risk/reward with zero checks
-    risk_per_unit = abs(entry - stop)
-    reward_per_unit = abs(target - entry)
-
-    if risk_per_unit == 0:
-        log.warning(f"{symbol}: SKIP FUTURES - Zero risk (entry == stop)")
+    # Use ask price (we're buying)
+    premium = quote['ask']
+    if premium <= 0:
+        log.debug(f"{symbol}: SKIP OTM BUY - Invalid premium (ask={premium})")
         return None
 
-    risk_per_lot = risk_per_unit * (fut_lot_size or lot_size)
-    reward_per_lot = reward_per_unit * (fut_lot_size or lot_size)
-    risk_reward = reward_per_unit / risk_per_unit
+    # Check premium is reasonable (not too expensive relative to stock price)
+    premium_pct = (premium / ltp) * 100
+    if premium_pct > OTM_BUY_MAX_PREMIUM_PCT:
+        log.info(f"{symbol}: SKIP OTM BUY - Premium {premium_pct:.1f}% > max {OTM_BUY_MAX_PREMIUM_PCT}%")
+        return None
+
+    # Check bid-ask spread isn't too wide (liquidity check)
+    if quote['bid'] > 0:
+        bid_ask_spread_pct = ((quote['ask'] - quote['bid']) / quote['ask']) * 100
+        if bid_ask_spread_pct > 15:  # More than 15% spread = illiquid
+            log.info(f"{symbol}: SKIP OTM BUY - Wide bid-ask: {bid_ask_spread_pct:.1f}%")
+            return None
+
+    # Calculate metrics
+    total_premium = premium * lot_size
+    breakeven = target_strike + premium
+
+    # Target price: ATR-based (same as spread)
+    atr_multiplier = CONFIG.get('spread_config', {}).get('atr_multiplier', 1.2)
+    target_price = ltp + (atr * atr_multiplier)
 
     distance_pct = abs(ltp - level_price) / level_price * 100
 
-    log.info(f"{symbol}: FUTURES setup - LONG | Entry: {entry:.2f} | SL: {stop:.2f} | Target: {target:.2f}")
+    log.info(f"{symbol}: OTM BUY setup - {target_strike} CE @ ₹{premium:.2f} | Max Loss: ₹{total_premium:,.0f} | Target: {target_price:.0f}")
 
-    return FuturesSetup(
+    return OTMBuySetup(
         symbol=symbol,
-        direction='LONG',
+        direction='BULLISH',
         ltp=ltp,
         level_price=level_price,
         level_type=level_type,
@@ -586,15 +578,14 @@ def build_futures_setup(
         touches=level['touches'],
         is_flip=level.get('is_polarity_flip', False),
         distance_pct=round(distance_pct, 2),
-        futures_symbol=futures_symbol,
-        entry_price=round(entry, 2),
-        stop_price=round(stop, 2),
-        target_price=round(target, 2),
-        atr=atr,
-        lot_size=fut_lot_size or lot_size,
-        risk_per_lot=round(risk_per_lot, 0),
-        reward_per_lot=round(reward_per_lot, 0),
-        risk_reward=round(risk_reward, 2),
+        option_symbol=quote['symbol'],
+        strike=target_strike,
+        option_type='CE',
+        premium=round(premium, 2),
+        lot_size=lot_size,
+        total_premium=round(total_premium, 0),
+        target_price=round(target_price, 2),
+        breakeven=round(breakeven, 2),
         expiry=expiry_str,
         dte=dte,
         reason=reason
@@ -1220,54 +1211,57 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
                     else:
                         log.info(f"{symbol}: Alert suppressed (test mode)")
 
-                # FUTURES FALLBACK: If options setup failed due to slippage/expensive debit
-                # Use lower threshold (50) for expensive_debit, higher (90) for slippage
-                elif FUTURES_ENABLED and failure_reason in ('expensive_debit', 'slippage'):
-                    # Lower threshold when options are too expensive (debit > 50%)
+                # OTM CALL BUY FALLBACK: If spread setup failed due to expensive debit or slippage
+                # Buy the target strike as a naked call (capped risk, unlike futures)
+                elif OTM_BUY_ENABLED and failure_reason in ('expensive_debit', 'slippage'):
                     if failure_reason == 'expensive_debit':
-                        futures_threshold = FUTURES_EXPENSIVE_OPTIONS_THRESHOLD  # 50
-                        reason = "Options too expensive (debit > 50% of spread)"
-                    else:  # slippage
-                        futures_threshold = FUTURES_SCORE_THRESHOLD  # 90
+                        reason = "Spread too expensive (debit > 50%)"
+                    else:
                         reason = "Options illiquid (high slippage)"
 
-                    if level['score'] >= futures_threshold:
-                        log.info(f"{symbol}: Score {level['score']} >= {futures_threshold}, trying FUTURES fallback ({failure_reason})")
+                    if level['score'] >= OTM_BUY_MIN_SCORE:
+                        log.info(f"{symbol}: Score {level['score']} >= {OTM_BUY_MIN_SCORE}, trying OTM BUY fallback ({failure_reason})")
 
-                        futures_setup = build_futures_setup(
-                            kite, symbol, ltp, level, lot_size, atr,
+                        # Calculate target strike (same as spread's short leg)
+                        interval = get_strike_interval(symbol)
+                        target_distance = atr * ATR_MULTIPLIER
+                        target = ltp + target_distance
+                        target_strike = round_strike(target, interval, 'down')
+
+                        otm_setup = build_otm_buy_setup(
+                            kite, symbol, ltp, level, lot_size, atr, target_strike,
                             reason=reason
                         )
 
-                        if futures_setup:
+                        if otm_setup:
                             if send_alerts:
-                                msg = format_futures_alert(futures_setup)
+                                msg = format_otm_buy_alert(otm_setup)
                                 if send_telegram(msg):
-                                    log.info(f"{symbol}: FUTURES ALERT SENT - {futures_setup.direction} {futures_setup.futures_symbol}")
+                                    log.info(f"{symbol}: OTM BUY ALERT SENT - {otm_setup.option_symbol} @ ₹{otm_setup.premium}")
                                     level['alerted'] = True
 
-                                    # Track futures position
+                                    # Track OTM call position
                                     pos = Position(
-                                        id=f"{symbol}_FUT_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                                        id=f"{symbol}_OTM_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                                         symbol=symbol,
-                                        instrument_type='FUTURES',
-                                        direction=futures_setup.direction,
-                                        entry_price=futures_setup.entry_price,
+                                        instrument_type='OTM_CALL',
+                                        direction='LONG',
+                                        entry_price=otm_setup.premium,
                                         entry_date=datetime.now().strftime('%Y-%m-%d'),
                                         level_price=level_price,
-                                        stop_price=futures_setup.stop_price,
-                                        target_price=futures_setup.target_price,
-                                        lot_size=futures_setup.lot_size,
-                                        expiry=futures_setup.expiry,
+                                        stop_price=level_price * 0.985,  # Support break
+                                        target_price=otm_setup.target_price,
+                                        lot_size=otm_setup.lot_size,
+                                        expiry=otm_setup.expiry,
                                         score=level['score'],
                                         status='open',
-                                        futures_symbol=futures_setup.futures_symbol
+                                        option_symbol=otm_setup.option_symbol
                                     )
                                     add_position(pos)
                                 else:
-                                    log.error(f"{symbol}: Futures alert failed to send")
+                                    log.error(f"{symbol}: OTM buy alert failed to send")
                             else:
-                                log.info(f"{symbol}: Futures alert suppressed (test mode)")
+                                log.info(f"{symbol}: OTM buy alert suppressed (test mode)")
 
     # Save updated levels
     with open(LEVELS_FILE, 'w') as f:

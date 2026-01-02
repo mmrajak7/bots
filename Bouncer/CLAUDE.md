@@ -38,7 +38,7 @@ Bull call spreads at support levels using ATR-based targeting.
 ```
 Direction: BULLISH only (no shorts)
 Levels:    SUPPORT only (no resistance)
-Trade:     Bull Call Spreads + LONG Futures fallback
+Trade:     Bull Call Spreads + OTM Call Buy fallback
 ```
 
 ### 2. ATR-Based Targeting
@@ -50,16 +50,15 @@ Floor     = 1.0%             # Absolute minimum
 
 ### 3. Reliability Filter
 ```
-Skip stocks below 30% S/R success rate
-Penalize 30-40% success rate: -5 points
-Reward 60%+ success rate: +10 to +20 points
+Skip stocks below 40% S/R success rate
+Reward 50%+ success rate: +5 to +25 points
 ```
 
 ### 4. Score Thresholds
 ```
 Min Trade Score:  40  # Skip below this
 Alert Score:      50  # Send Telegram alert
-Futures Score:    90  # LONG futures fallback
+OTM Buy Score:    50  # OTM call fallback (when spread fails)
 ```
 
 ---
@@ -150,45 +149,52 @@ kite.set_access_token(token_data['access_token'])
 
 ---
 
-## Futures Fallback (Score >= 90)
+## OTM Call Buy Fallback (Score >= 50)
 
-When options have high slippage (> Rs 1000) on exceptional setups:
+When Bull Call Spread fails due to:
+- Expensive debit (> 50% of spread width)
+- High slippage (> Rs 1000)
 
 ```
-Trade:     LONG Futures (1 lot)
-Entry:     Market price
-Stop Loss: Support break (1.5%)
+Trade:     BUY OTM Call (target strike)
+Premium:   Max 3% of stock price
+Max Loss:  Premium × lot size (CAPPED!)
 Target:    ATR × 1.2 above entry
+
+Why OTM instead of Futures:
+- Capped risk (no margin calls, no gap risk)
+- Capital efficient (₹15k vs ₹3-5 lakhs)
+- Same directional exposure
 ```
 
 ---
 
 ## Alert Formats
 
-### Bull Call Spread
+### Bull Call Spread (Primary)
 ```
-🟢 BOUNCER ALERT 🟢
-ICICIBANK - BULLISH
-Score: 75 (4 touches)
+🟢 BOUNCER | ICICIBANK
+Score: 75 (4T) | 26 DTE
 
-LEVEL: SUPPORT @ 1340.00
-LTP: 1346.00 (0.45% away)
+Support: ₹1340 | LTP: ₹1346
 
-TRADE: BULL CALL SPREAD
-BUY  ICICIBANK25JAN1340CE
-SELL ICICIBANK25JAN1400CE
-Net Debit: Rs 15,225
-R:R: 1:2.3
+BUY ICICIBANK26JAN1340CE @ ₹28.1
+SELL ICICIBANK26JAN1360CE @ ₹17.9
+
+Debit: ₹12,285 | R:R 1:1.2
 ```
 
-### Futures LONG
+### OTM Call Buy (Fallback)
 ```
-🔵 BOUNCER FUTURES ALERT 🔵
-RELIANCE - LONG
-Score: 92 (EXCEPTIONAL)
+🟡 BOUNCER OTM | ICICIBANK
+Score: 55 (3T) | 26 DTE
 
-Entry: 2815.00 | SL: 2758.00 | Target: 2890.00
-R:R: 1:1.3
+Support: ₹1340 | LTP: ₹1346
+
+BUY ICICIBANK26JAN1360CE @ ₹17.5
+Max Loss: ₹12,250 | Target: ₹1375
+
+⚠️ Spread too expensive (debit > 50%)
 ```
 
 ---
@@ -200,7 +206,7 @@ R:R: 1:1.3
 | Token not found | Check `../data/kite_access_token.json`, run SNAIL auth |
 | No setups found | Normal - no stocks at levels currently |
 | Reliability not applied | Run `0_build_historical.py` then `0_analyze_reliability.py` |
-| Futures alerts missing | Verify `futures.enabled: true` and score >= 90 |
+| OTM alerts missing | Verify `otm_buy.enabled: true` and score >= 50 |
 | Position tracking issues | Check `data/open_positions.json` exists and is valid JSON |
 
 ---
@@ -212,10 +218,10 @@ R:R: 1:1.3
 | ATR Multiplier | 1.2 | `spread_config.atr_multiplier` |
 | Min Score | 40 | `scoring.min_score_to_trade` |
 | Alert Score | 50 | `scoring.alert_score` |
-| Futures Score | 90 | `futures.min_score` |
+| OTM Buy Score | 50 | `otm_buy.min_score` |
 | Max Positions | 5 | `position_sizing.max_positions` |
 | Scan Interval | 5 min | `scanner.interval_mins` |
-| Min S/R Success | 30% | `reliability.min_success_rate` |
+| Min S/R Success | 40% | `reliability.min_success_rate` |
 
 ---
 
@@ -242,15 +248,20 @@ R:R: 1:1.3
 
 ## Changelog
 
+### v2.2.0 (2026-01-02)
+- OTM Call Buy fallback: Replaces futures (capped risk, capital efficient)
+- Reliability thresholds tightened: 40% min (was 30%)
+- Aggressive reliability bonuses: +25 for 70%+ (was +20)
+- Stock universe strict: Only config stocks analyzed
+- Compact alert formats
+
 ### v2.1.0 (2026-01-01)
 - BULLISH ONLY: Removed all BEARISH/SHORT logic
 - SUPPORT levels only: No resistance processed
 - Bull Call Spreads only: No Bear Put Spreads
-- LONG futures only: Buy futures fallback
 
 ### v2.0.0 (2025-12-31)
 - Reliability scoring with recency weighting
-- Futures fallback for 90+ score setups
 - Position tracking with automated exits
 - ATR-based targeting
 
