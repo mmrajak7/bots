@@ -113,7 +113,7 @@ def cluster_levels(points: List, tolerance_pct: float = 1.0) -> List[Dict]:
 
     for point in sorted_points[1:]:
         avg = np.mean([p[1] for p in current])
-        if abs(point[1] - avg) / avg * 100 <= tolerance_pct:
+        if avg > 0 and abs(point[1] - avg) / avg * 100 <= tolerance_pct:
             current.append(point)
         else:
             if len(current) >= 2:  # At least 2 touches
@@ -164,6 +164,8 @@ def detect_levels_at_point(df_lookback: pd.DataFrame, current_price: float) -> L
     levels = []
 
     for cluster in support_clusters:
+        if current_price <= 0:
+            continue
         distance_pct = abs(cluster['price'] - current_price) / current_price * 100
         if distance_pct <= 10:  # Within 10% of current price
             levels.append({
@@ -173,6 +175,8 @@ def detect_levels_at_point(df_lookback: pd.DataFrame, current_price: float) -> L
             })
 
     for cluster in resistance_clusters:
+        if current_price <= 0:
+            continue
         distance_pct = abs(cluster['price'] - current_price) / current_price * 100
         if distance_pct <= 10:
             levels.append({
@@ -208,12 +212,12 @@ def simulate_trade(
 
         # LONG only: Check target hit (high reaches target)
         if candle['high'] >= target_price:
-            pnl = (target_price - entry_price) / entry_price * 100
+            pnl = (target_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
             return 'success', i, target_price, pnl
 
         # LONG only: Check stop hit (close below stop - support broken)
         if candle['close'] < stop_price:
-            pnl = (candle['close'] - entry_price) / entry_price * 100
+            pnl = (candle['close'] - entry_price) / entry_price * 100 if entry_price > 0 else 0
             return 'failure', i, candle['close'], pnl
 
     # Timeout - neither target nor stop hit
@@ -271,6 +275,8 @@ def backtest_stock(symbol: str, df: pd.DataFrame) -> List[LevelTest]:
                     continue
 
             # Check if price is near level (within approach_pct)
+            if level_price <= 0:
+                continue
             distance_pct = abs(current_price - level_price) / level_price * 100
             if distance_pct > approach_pct:
                 continue

@@ -30,9 +30,9 @@ import requests
 import tempfile
 import shutil
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from kiteconnect import KiteConnect
 import pytz
 
@@ -544,13 +544,16 @@ def build_otm_buy_setup(
         return None
 
     # Check premium is reasonable (not too expensive relative to stock price)
+    if ltp <= 0:
+        log.debug(f"{symbol}: SKIP OTM BUY - Invalid LTP ({ltp})")
+        return None
     premium_pct = (premium / ltp) * 100
     if premium_pct > OTM_BUY_MAX_PREMIUM_PCT:
         log.info(f"{symbol}: SKIP OTM BUY - Premium {premium_pct:.1f}% > max {OTM_BUY_MAX_PREMIUM_PCT}%")
         return None
 
     # Check bid-ask spread isn't too wide (liquidity check)
-    if quote['bid'] > 0:
+    if quote['bid'] > 0 and quote['ask'] > 0:
         bid_ask_spread_pct = ((quote['ask'] - quote['bid']) / quote['ask']) * 100
         if bid_ask_spread_pct > 15:  # More than 15% spread = illiquid
             log.info(f"{symbol}: SKIP OTM BUY - Wide bid-ask: {bid_ask_spread_pct:.1f}%")
@@ -564,6 +567,9 @@ def build_otm_buy_setup(
     atr_multiplier = CONFIG.get('spread_config', {}).get('atr_multiplier', 1.2)
     target_price = ltp + (atr * atr_multiplier)
 
+    if level_price <= 0:
+        log.debug(f"{symbol}: SKIP OTM BUY - Invalid level price ({level_price})")
+        return None
     distance_pct = abs(ltp - level_price) / level_price * 100
 
     log.info(f"{symbol}: OTM BUY setup - {target_strike} CE @ ₹{premium:.2f} | Max Loss: ₹{total_premium:,.0f} | Target: {target_price:.0f}")
@@ -879,7 +885,7 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
     interval = get_strike_interval(symbol)
 
     # ATR-based target: use ATR × multiplier, fallback to fixed %
-    if atr > 0:
+    if atr > 0 and ltp > 0:
         target_distance = atr * ATR_MULTIPLIER
         target_pct = (target_distance / ltp) * 100
         log.debug(f"{symbol}: Using ATR target: {atr:.1f} x {ATR_MULTIPLIER} = {target_distance:.1f} ({target_pct:.1f}%)")
@@ -913,6 +919,9 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
         log.info(f"{symbol}: SKIP - Zero spread width (long={long_strike}, short={short_strike})")
         return None, 'invalid'
 
+    if ltp <= 0:
+        log.debug(f"{symbol}: SKIP - Invalid LTP ({ltp})")
+        return None, 'invalid'
     spread_width_pct = (spread_width / ltp) * 100
 
     # GUARDRAIL 1: Dynamic spread width limits based on ATR
@@ -987,8 +996,8 @@ def build_trade_setup(kite: KiteConnect, symbol: str, ltp: float,
     # Bull Call Spread breakeven
     breakeven = long_strike + net_debit
 
-    # Distance from level
-    distance_pct = abs(ltp - level_price) / level_price * 100
+    # Distance from level (level_price already validated > 0 at function entry)
+    distance_pct = abs(ltp - level_price) / level_price * 100 if level_price > 0 else 0
 
     # Add info warnings
     if debit_pct > 40:
@@ -1149,7 +1158,9 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
             level_price = level['price']
             level_type = level['type']
 
-            # Calculate distance
+            # Calculate distance (guard against zero level_price)
+            if level_price <= 0:
+                continue
             distance_pct = abs(ltp - level_price) / level_price * 100
 
             # BULLISH ONLY: Only process support levels

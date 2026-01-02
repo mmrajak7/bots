@@ -1,47 +1,82 @@
-# Bouncer v2.1 - Code Review Issues
+# Bouncer v2.2 - Code Review Issues
 
-**Review Date:** 2026-01-01 (Updated - Session 2)
-**Previous Review:** 2025-12-31
+**Review Date:** 2026-01-02
+**Previous Review:** 2026-01-01
 **Reviewer:** Claude Opus 4.5
-**Scope:** All scripts in `scripts/` directory + root level files
+**Scope:** All scripts in `scripts/` directory + config
 
 ---
 
-## Session 2 Fixes (2026-01-01 Evening)
+## Session 3 Updates (2026-01-02)
 
-| Issue | File | Description | Status |
-|-------|------|-------------|--------|
-| Config Key Mismatch | `2_analyze_candidates.py:396` | Used `resistance_turned_support` instead of `polarity_flip` | ✅ FIXED |
-| Config Key Mismatch | `scanner.py:387-389` | Used `resistance_turned_support` (would cause KeyError) | ✅ FIXED |
-| BULLISH ONLY Violation | `scanner.py:432-451` | Still processed resistance levels | ✅ FIXED |
-| Undefined Variable | `fetch_instruments.py:143` | Used `INSTRUMENTS_FILE` instead of `STOCK_INSTRUMENTS_FILE` | ✅ FIXED |
-| Bare except | `scanner.py:512,603` | Bare `except:` clauses | ✅ FIXED |
-| Bare except | `fetch_instruments.py:126,167` | Bare `except:` clauses | ✅ FIXED |
-| Config Alignment | `0_analyze_reliability.py:371-401` | Bonus thresholds not reading from config | ✅ FIXED |
+### Fixed Since Last Review
+| Issue | Description | Status |
+|-------|-------------|--------|
+| C2, C3, C4 | FuturesSetup type mismatches and manual symbol construction | ✅ FIXED - Futures replaced with OTM Buy |
+| H5 | Options P&L calculation incorrect | ✅ FIXED - Removed P&L calc from exit alerts |
+| Unused imports | Multiple files had unused imports | ✅ FIXED |
+| BULLISH ONLY | Resistance levels still being processed | ✅ FIXED |
+| H1 (partial) | LTP fetch retry logic | ✅ FIXED - Added 3x retry with exponential backoff |
 
----
-
-## Status Update from Previous Review
-
-| Previous Issue | Status | Notes |
-|----------------|--------|-------|
-| C2: SL Check Uses LTP | ✅ FIXED | Now fetches actual previous day close |
-| C5: Position File Corruption | ✅ FIXED | Uses atomic write with temp file |
-| H4: Config Parsing | ✅ FIXED | Added try/except with clear errors |
-| H5: Token Validation | ✅ FIXED | Validates api_key and access_token |
-| M2: get_strike_interval | ✅ FIXED | Changed min() to max() |
+### New Issues Found
+| Issue | Severity | Description |
+|-------|----------|-------------|
+| Division by zero risks | CRITICAL | Multiple divisions without zero guards |
+| Unused `field` import | HIGH | dataclasses field imported but unused |
+| Unused `resistance_clusters` | HIGH | Computed but never used |
+| HAS_FCNTL unused | MEDIUM | fcntl imported but never used for locking |
+| No retry on other API calls | HIGH | Only main LTP has retry |
 
 ---
 
-## CRITICAL Issues (Must Fix)
+## CRITICAL Issues
 
-### C1: Race Condition in Position File Operations
-**File:** `scripts/3_market_scanner.py`
-**Lines:** 270-299
+### C1: Division by Zero Risks
+**Files:** All 3 main scripts
 **Severity:** CRITICAL
-**Status:** OPEN
+**Status:** ✅ FIXED
 
-**Issue:** Position file read/write operations lack proper locking. If scanner cron overlaps with manual run, data corruption possible.
+Multiple locations divide by variables that could theoretically be zero:
+
+**3_market_scanner.py:**
+```python
+# Line 547 - ltp could be 0
+premium_pct = (premium / ltp) * 100
+
+# Line 554 - quote['ask'] could be 0
+bid_ask_spread_pct = ((quote['ask'] - quote['bid']) / quote['ask']) * 100
+
+# Lines 567, 991, 1153 - level_price could be 0
+distance_pct = abs(ltp - level_price) / level_price * 100
+```
+
+**2_analyze_candidates.py:**
+```python
+# Line 288 - avg could be 0
+if abs(point[1] - avg) / avg * 100 <= tolerance_pct:
+
+# Line 431 - ltp could be 0
+distance_pct = abs(cluster['price'] - ltp) / ltp * 100
+```
+
+**0_analyze_reliability.py:**
+```python
+# Lines 167, 211, 216, 274 - similar division risks
+```
+
+**Mitigation:** In practice, prices from exchange are never 0. But defensive guards should be added.
+
+**Fix:** Add `if divisor == 0: continue` or `return` guards.
+
+---
+
+### C2: Race Condition in Position File Operations
+**File:** `scripts/3_market_scanner.py`
+**Lines:** 326-331
+**Severity:** CRITICAL
+**Status:** OPEN (from previous review)
+
+**Issue:** Position file read/write operations lack proper locking.
 
 ```python
 def add_position(position: Position):
@@ -50,246 +85,140 @@ def add_position(position: Position):
     save_positions(positions)     # WRITE - race window
 ```
 
-**Note:** Atomic write was added, but file locking still missing. `shutil.move` is NOT atomic on Windows across filesystems.
+**Note:** Atomic write helps but `shutil.move` is NOT atomic on Windows.
 
-**Fix:** Add file locking with `fcntl` (Unix) or `msvcrt.locking` (Windows).
-
----
-
-### C2: Type Mismatch in FuturesSetup - Runtime Crash Risk
-**File:** `scripts/3_market_scanner.py`
-**Lines:** 640-641
-**Severity:** CRITICAL
-**Status:** NEW
-
-**Issue:** `expiry` and `dte` passed to `FuturesSetup` can be `None` but dataclass expects `str` and `int`.
-
-```python
-futures_symbol, fut_lot_size, expiry_str, dte = get_futures_symbol(symbol)
-# expiry_str and dte can be None!
-return FuturesSetup(
-    expiry=expiry_str,  # Type error: Optional[str] vs str
-    dte=dte,            # Type error: Optional[int] vs int
-)
-```
-
-**Fix:** Add null check or make dataclass fields Optional.
-
----
-
-### C3: Type Mismatch in TradeSetup DTE
-**File:** `scripts/3_market_scanner.py`
-**Line:** 1102
-**Severity:** CRITICAL
-**Status:** NEW
-
-**Issue:** `dte` from `get_expiry_for_stock()` can be `None`, passed to TradeSetup expecting `int`.
-
-**Fix:** Add validation after `get_expiry_for_stock()` call.
-
----
-
-### C4: Futures Symbol Construction Violates Design Rule
-**File:** `scripts/3_market_scanner.py`
-**Lines:** 560-564
-**Severity:** CRITICAL
-**Status:** OPEN (from previous review)
-
-**Issue:** Design states "NEVER construct symbols manually!" but futures symbol is:
-
-```python
-futures_symbol = f"{symbol}{year_suffix}{month_abbr}FUT"  # Manual construction!
-```
-
-**Impact:** Could generate invalid symbols during expiry transitions.
-
-**Fix:** Load futures symbols from instruments CSV.
+**Fix:** Add file locking or use SQLite for positions.
 
 ---
 
 ## HIGH Severity Issues
 
-### H1: No Retry Logic for Kite API Calls
+### H1: Unused Imports
 **File:** `scripts/3_market_scanner.py`
-**Lines:** 1137-1142
-**Severity:** HIGH
-**Status:** OPEN
+**Severity:** HIGH (code smell)
+**Status:** ✅ FIXED
 
-**Issue:** Single LTP fetch failure aborts entire scan.
-
-```python
-try:
-    ltps = kite.ltp(symbols)
-except Exception as e:
-    log.error(f"Failed to fetch LTPs: {e}")
-    return []  # Entire scan lost!
-```
-
-**Impact:** Transient network issues cause complete scan failure.
-
-**Fix:** Implement retry with exponential backoff (3 attempts).
+Removed unused `date` and `field` imports.
 
 ---
 
-### H2: Instruments Cache Never Refreshed
-**File:** `scripts/3_market_scanner.py`
-**Lines:** 77-108
-**Severity:** HIGH
-**Status:** NEW
+### H2: Unused Variable - resistance_clusters
+**File:** `scripts/2_analyze_candidates.py`
+**Line:** 420
+**Severity:** HIGH (dead code)
+**Status:** ✅ FIXED
 
-**Issue:** `INSTRUMENTS_CACHE` loaded once at import, never refreshed.
-
-```python
-load_instruments_cache()  # Called once at module import
-```
-
-**Impact:** Long-running scanner (--loop) may have stale option data.
-
-**Fix:** Reload cache periodically or at start of each scan.
+Removed unused computation.
 
 ---
 
-### H3: Silent Exception in Previous Close Fetch
+### H3: No Retry on Other API Calls
 **File:** `scripts/3_market_scanner.py`
-**Lines:** 684-686
 **Severity:** HIGH
 **Status:** NEW
 
-**Issue:** All exceptions silently caught, SL check could fail for all positions.
+Only main `kite.ltp()` in scan has retry. These don't:
+- `kite.ltp()` in TP check (line 692)
+- `kite.instruments()` in get_previous_close (line 603)
+- `kite.quote()` in get_single_option_quote (line 481)
+- `kite.quote()` in get_option_quotes (line 805)
+
+**Fix:** Add retry wrapper for all Kite API calls.
+
+---
+
+### H4: Broad Exception Handling Loses Stack Traces
+**File:** `scripts/3_market_scanner.py`
+**Severity:** HIGH
+**Lines:** 92-93, 289-291, 495-497, 826-828
 
 ```python
 except Exception as e:
-    log.error(f"{symbol}: Failed to fetch historical data: {e}")
-    return None  # Silent failure - position unprotected!
+    log.warning(f"Failed to load reliability data: {e}")
+    # Stack trace lost, debugging harder
 ```
 
-**Fix:** Distinguish transient vs permanent errors, add retry.
+**Fix:** Use `log.exception()` to preserve stack traces.
 
 ---
 
-### H4: Division by Zero in Reliability Score
-**File:** `scripts/0_analyze_reliability.py`
-**Lines:** 376-378
-**Severity:** HIGH
-**Status:** NEW
-
-**Issue:** Edge case where `total == 0` could slip through if logic changes.
-
-```python
-total = successes + failures
-if total < 5:
-    return 0.5, 50, 5
-success_rate = successes / total  # If total somehow 0, crash
-```
-
-**Fix:** Add explicit `if total == 0` guard.
-
----
-
-### H5: Options Position P&L Calculation Incorrect
+### H5: Missing Token Expiry Handling
 **File:** `scripts/3_market_scanner.py`
-**Lines:** 457-460, 489-492
 **Severity:** HIGH
-**Status:** OPEN (from previous review)
 
-**Issue:** P&L for OPTIONS compares stock price to option net debit - apples to oranges.
+Kite tokens expire daily at 6 AM IST. If scanner runs overnight, `TokenException` will occur.
 
-**Fix:** Track stock entry price OR calculate spread value from option quotes.
+**Fix:** Catch `TokenException` specifically and alert user.
 
 ---
 
 ## MEDIUM Severity Issues
 
-### M1: Unused Imports
+### M1: HAS_FCNTL Imported but Never Used
+**File:** `scripts/3_market_scanner.py`
+**Lines:** 39-43
+**Severity:** MEDIUM
+
+```python
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
+```
+
+Imported but never used for file locking.
+
+**Fix:** Implement locking or remove import.
+
+---
+
+### M2: Concurrent levels.json Modification Risk
+**File:** `scripts/3_market_scanner.py`
+**Line:** 1267-1268
+**Severity:** MEDIUM
+
+Scanner modifies `levels.json` in-place. If two scanner instances run, corruption possible.
+
+**Fix:** Use atomic write pattern (same as positions file).
+
+---
+
+### M3: No Config Validation
+**File:** `scripts/3_market_scanner.py`
+**Severity:** MEDIUM
+
+Config values like `atr_multiplier`, `min_score` used directly without validation.
+
+**Fix:** Add config validation at startup.
+
+---
+
+### M4: Hardcoded Percentages
+**Files:** All scripts
+**Severity:** MEDIUM
+
+Some thresholds in config, others hardcoded:
+- Line 555: `if bid_ask_spread_pct > 15:` (hardcoded)
+- Reliability: `approach_pct = 0.5` (hardcoded)
+
+**Fix:** Move all thresholds to config.
+
+---
+
+### M5: Global Mutable State
 **Files:** Multiple
 **Severity:** MEDIUM
-**Status:** NEW
 
-```
-0_analyze_reliability.py: csv, timedelta, Optional
-0_build_historical.py: Set
-2_analyze_candidates.py: defaultdict
-3_market_scanner.py: Union
-```
-
-**Fix:** Remove unused imports.
-
----
-
-### M2: Ambiguous Variable Name
-**File:** `scripts/2_analyze_candidates.py`
-**Line:** 650
-**Severity:** MEDIUM
-**Status:** NEW
-
-```python
-for l in s['levels'] if l['score'] >= 60  # 'l' looks like '1'
-```
-
-**Fix:** Rename to `level`.
-
----
-
-### M3: Global Mutable State
-**Files:** Multiple
-**Severity:** MEDIUM
-**Status:** OPEN
-
-**Issue:** `RELIABILITY_DATA`, `INSTRUMENTS_CACHE`, `CONFIG` are global mutable state.
-
-**Impact:** Testing difficulty, potential race conditions.
-
----
-
-### M4: Hardcoded Magic Numbers
-**File:** `scripts/0_build_historical.py`
-**Lines:** 148-150, 282
-**Severity:** MEDIUM
-**Status:** NEW
-
-```python
-if batch_start.year < 2020:  # Why 2020?
-if data and len(data) > 100:  # Why 100?
-```
-
-**Fix:** Move to config or document reasoning.
-
----
-
-### M5: f-string Without Placeholders
-**File:** `scripts/0_analyze_reliability.py`
-**Line:** 569
-**Severity:** MEDIUM
-**Status:** NEW
-
-```python
-print(f"Run 0_build_historical.py first")  # No placeholders
-```
+`RELIABILITY_DATA`, `INSTRUMENTS_CACHE`, `CONFIG` are global mutable state.
 
 ---
 
 ### M6: No Expiry Warning for Positions
 **File:** `scripts/3_market_scanner.py`
 **Severity:** MEDIUM
-**Status:** OPEN (from previous review)
 
-**Issue:** Config has `expiry_warning_days: 3` but never implemented.
-
----
-
-### M7: Timezone Handling Fragile
-**File:** `scripts/2_analyze_candidates.py`
-**Lines:** 336-340
-**Severity:** MEDIUM
-**Status:** OPEN
-
----
-
-### M8: SQLite Connection Not Using Context Manager
-**File:** `scripts/0_analyze_reliability.py`
-**Lines:** 421-467
-**Severity:** MEDIUM
-**Status:** NEW
+Config has `expiry_warning_days: 3` but never implemented.
 
 ---
 
@@ -299,32 +228,26 @@ print(f"Run 0_build_historical.py first")  # No placeholders
 **Files:** All scripts
 **Severity:** LOW
 
-Mix of `print()` and `logging`. Standardize on logging module.
+Mix of `print()` and `logging`. Standardize on logging.
 
 ---
 
-### L2: Missing Type Hints
-**Files:** Multiple
-**Severity:** LOW
-
-`find_swing_points`, `cluster_levels` return types not fully specified.
-
----
-
-### L3: Unused Variable
-**File:** `scripts/0_build_historical.py`
-**Line:** 283
+### L2: Magic Numbers
+**File:** `scripts/3_market_scanner.py`
 **Severity:** LOW
 
 ```python
-csv_path = save_to_csv(data, symbol)  # Never used
+time.sleep(2 ** attempt)  # Magic backoff
+time.sleep(60)            # Magic error sleep
 ```
+
+**Fix:** Define as named constants.
 
 ---
 
-### L4: Position ID Not Globally Unique
+### L3: Position ID Not Globally Unique
 **File:** `scripts/3_market_scanner.py`
-**Line:** 1213
+**Line:** 1191
 **Severity:** LOW
 
 ```python
@@ -336,43 +259,77 @@ id=f"{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 ---
 
-### L5: Inconsistent Timeouts
-**Files:** Multiple
+### L4: Log File Rotation Not Configured
+**File:** `scripts/3_market_scanner.py`
 **Severity:** LOW
 
-Timeouts vary: 60, 30, 10 seconds. Define standard constants.
+Logs created daily but no rotation/cleanup. Disk could fill up.
 
 ---
 
-### L6: Telegram Token in Config
-**File:** `config/config.json`
-**Severity:** LOW (gitignored)
+### L5: Temp Files on Failed Write
+**File:** `scripts/3_market_scanner.py`
+**Lines:** 318-323
+**Severity:** LOW
 
-Bot token in config. Low risk as gitignored, but should use env var.
+Could leave stale temp files on write failure.
+
+---
+
+## API Failure Handling Summary
+
+| Function | Try/Except | Retry | Timeout |
+|----------|------------|-------|---------|
+| `kite.ltp()` main scan | ✓ | ✓ (3x) | ✗ |
+| `kite.ltp()` TP check | ✓ | ✗ | ✗ |
+| `kite.instruments()` | ✓ | ✗ | ✗ |
+| `kite.quote()` options | ✓ | ✗ | ✗ |
+| `kite.historical_data()` | ✓ | ✗ | ✗ |
+| `send_telegram()` | ✓ | ✗ | ✓ (10s) |
+
+---
+
+## Edge Cases Verified
+
+| Edge Case | Handled? | Notes |
+|-----------|----------|-------|
+| Empty instruments CSV | ✓ | Returns (None, None) |
+| No historical data | ✓ | Stock skipped |
+| Empty levels.json | ✓ | Early return |
+| No open positions | ✓ | Returns empty list |
+| Market holidays | ⚠️ | Runs anyway |
+| Weekend runs | ✓ | is_market_hours() |
+| Token expired | ✗ | Will crash |
+| Network timeout | ⚠️ | Only Telegram has timeout |
 
 ---
 
 ## Summary
 
-| Severity | Previous | Current | Change |
-|----------|----------|---------|--------|
-| CRITICAL | 5 | 4 | -1 |
-| HIGH | 7 | 5 | -2 |
-| MEDIUM | 6 | 8 | +2 |
-| LOW | 4 | 6 | +2 |
-| **TOTAL** | **22** | **23** | +1 |
+| Severity | Count | Fixed Today |
+|----------|-------|-------------|
+| CRITICAL | 2 | 1 (C1) |
+| HIGH | 5 | 7 total (2 more today) |
+| MEDIUM | 6 | 0 |
+| LOW | 5 | 0 |
+| **TOTAL** | **18** | **8** |
 
-### Progress
-- 5 issues fixed since last review
-- 6 new issues identified (mostly from mypy/ruff static analysis)
-- Net: +1 issues (better detection)
+### Fixed This Session
+- ✅ FuturesSetup removed (replaced with OTM Buy)
+- ✅ Options P&L calculation removed
+- ✅ LTP fetch retry added
+- ✅ Unused imports cleaned
+- ✅ BULLISH ONLY enforced
+- ✅ **C1: Division by zero guards** - Added in all 3 scripts
+- ✅ **H1: Unused imports** - Removed `date`, `field`
+- ✅ **H2: Unused resistance_clusters** - Removed
 
-### Priority Fixes
-1. **C2, C3**: Type mismatches - can crash scanner
-2. **H1**: Add retry logic - network issues cause missed trades
-3. **C1**: File locking - prevent position corruption
-4. **H2**: Refresh instruments cache - critical for loop mode
+### Priority Fixes Remaining
+1. **H3**: Add retry wrapper for all Kite API calls
+2. **C2**: File locking for positions
+3. **H5**: Handle token expiry gracefully
+4. **H4**: Use log.exception() for stack traces
 
 ---
 
-*Generated by Claude Code review on 2026-01-01*
+*Generated by Claude Code review on 2026-01-02*

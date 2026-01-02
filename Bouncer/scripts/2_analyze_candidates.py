@@ -285,7 +285,7 @@ def cluster_levels(points: List, tolerance_pct: float = 1.5) -> List[Dict]:
 
     for point in sorted_points[1:]:
         avg = np.mean([p[1] for p in current])
-        if abs(point[1] - avg) / avg * 100 <= tolerance_pct:
+        if avg > 0 and abs(point[1] - avg) / avg * 100 <= tolerance_pct:
             current.append(point)
         else:
             clusters.append({
@@ -377,7 +377,7 @@ def is_round_number(price: float) -> bool:
     else:
         levels = rn.get('above_5000', [5000, 6000, 7000, 8000, 9000, 10000])
 
-    return any(abs(price - lvl) / lvl * 100 <= 1.0 for lvl in levels)
+    return any(lvl > 0 and abs(price - lvl) / lvl * 100 <= 1.0 for lvl in levels)
 
 
 def score_level(touches: int, is_flip: bool, is_round: bool, is_recent: bool, high_vol: bool) -> int:
@@ -416,8 +416,7 @@ def compute_levels(df: pd.DataFrame, ltp: float, symbol: str = '') -> List[Dict]
 
     swing_lows, swing_highs = find_swing_points(df)
     support_clusters = cluster_levels(swing_lows)
-    # Resistance clusters needed for polarity flip detection only (not output)
-    resistance_clusters = cluster_levels(swing_highs)
+    # Note: resistance_clusters not needed - polarity flip detection reads from df directly
 
     avg_vol = df['volume'].mean()
     levels = []
@@ -428,6 +427,8 @@ def compute_levels(df: pd.DataFrame, ltp: float, symbol: str = '') -> List[Dict]
             continue
 
         # Skip levels too far from current price (irrelevant ancient levels)
+        if ltp <= 0:
+            continue
         distance_pct = abs(cluster['price'] - ltp) / ltp * 100
         if distance_pct > max_distance_pct:
             continue
@@ -504,6 +505,8 @@ def compute_atr_pct(df: pd.DataFrame, period: int = 14) -> float:
         return 0.0
 
     current_price = df['close'].iloc[-1]
+    if current_price <= 0:
+        return 0.0
     return round((atr / current_price) * 100, 2)
 
 
