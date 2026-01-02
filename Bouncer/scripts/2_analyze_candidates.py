@@ -544,20 +544,11 @@ def main():
         stocks = [s for s in stocks if s['symbol'] not in banned_stocks]
         print(f"After removing banned: {len(stocks)}")
 
-    # Use configured universe as priority filter
+    # Use ONLY configured universe (no expansion to other stocks)
     universe = CONFIG.get('stock_universe', {}).get('active_stocks', [])
     if universe:
-        # Prioritize configured stocks
-        priority_stocks = [s for s in stocks if s['symbol'] in universe]
-        other_stocks = [s for s in stocks if s['symbol'] not in universe]
-
-        # Take all priority + fill remaining to reach 30
-        max_stocks = 30
-        if len(priority_stocks) < max_stocks:
-            remaining = max_stocks - len(priority_stocks)
-            stocks = priority_stocks + other_stocks[:remaining]
-        else:
-            stocks = priority_stocks[:max_stocks]
+        stocks = [s for s in stocks if s['symbol'] in universe]
+        print(f"Filtered to config universe: {len(stocks)} stocks")
 
     print(f"Final candidate count: {len(stocks)}")
     print()
