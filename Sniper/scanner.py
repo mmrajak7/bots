@@ -13,7 +13,8 @@ QUICK CHECK (every minute):
   - 1-hour cooldown per symbol/zone
 
 Cron Setup:
-    * * * * * cd /path/to/Helper/helper && python3 scanner.py  # Every minute
+    * 9-14 * * 1-5 cd /path/to/Sniper && python3 scanner.py >> logs/cron.log 2>&1
+    0-30 15 * * 1-5 cd /path/to/Sniper && python3 scanner.py >> logs/cron.log 2>&1
 """
 
 import json
@@ -60,8 +61,10 @@ def setup_logging():
         if old_log.stem != f'scanner_{today}':
             try:
                 old_log.unlink()
-            except:
-                pass
+            except (OSError, PermissionError) as e:
+                # Can't use logger yet (not set up), print to stderr
+                import sys
+                print(f"Warning: Could not delete old log {old_log}: {e}", file=sys.stderr)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -79,11 +82,25 @@ logger = setup_logging()
 # CONFIG
 # =============================================================================
 
-with open(BOUNCER_CONFIG) as f:
-    BOUNCER_CFG = json.load(f)
+try:
+    with open(BOUNCER_CONFIG) as f:
+        BOUNCER_CFG = json.load(f)
 
-TELEGRAM_BOT_TOKEN = BOUNCER_CFG['telegram']['bot_token']
-TELEGRAM_CHAT_ID = BOUNCER_CFG['telegram']['chat_id']
+    TELEGRAM_BOT_TOKEN = BOUNCER_CFG['telegram']['bot_token']
+    TELEGRAM_CHAT_ID = BOUNCER_CFG['telegram']['chat_id']
+
+    # Validate config
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise ValueError("Telegram bot_token or chat_id is empty")
+
+except FileNotFoundError:
+    print(f"ERROR: Config file not found: {BOUNCER_CONFIG}", file=__import__('sys').stderr)
+    print("Ensure BOTS/Bouncer/config/config.json exists", file=__import__('sys').stderr)
+    __import__('sys').exit(1)
+except (json.JSONDecodeError, KeyError, ValueError) as e:
+    print(f"ERROR: Invalid config file: {e}", file=__import__('sys').stderr)
+    print(f"Check structure of {BOUNCER_CONFIG}", file=__import__('sys').stderr)
+    __import__('sys').exit(1)
 
 INDICES = {
     'BANKNIFTY': {'spot': 'NSE:NIFTY BANK', 'round_to': 1000},
@@ -124,11 +141,28 @@ def is_full_scan_time() -> bool:
 # =============================================================================
 
 def get_kite() -> KiteConnect:
-    with open(TOKEN_FILE) as f:
-        token_data = json.load(f)
-    kite = KiteConnect(api_key=token_data['api_key'])
-    kite.set_access_token(token_data['access_token'])
-    return kite
+    try:
+        with open(TOKEN_FILE) as f:
+            token_data = json.load(f)
+
+        # Validate token structure
+        required_keys = ['api_key', 'access_token']
+        for key in required_keys:
+            if key not in token_data or not token_data[key]:
+                raise ValueError(f"Missing or empty '{key}' in token file")
+
+        kite = KiteConnect(api_key=token_data['api_key'])
+        kite.set_access_token(token_data['access_token'])
+        return kite
+
+    except FileNotFoundError:
+        logger.error(f"Token file not found: {TOKEN_FILE}")
+        logger.error("Ensure BOTS/data/kite_access_token.json exists")
+        raise
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.error(f"Invalid token file: {e}")
+        logger.error(f"Check structure of {TOKEN_FILE}")
+        raise
 
 # =============================================================================
 # INSTRUMENTS CACHE
@@ -182,11 +216,18 @@ def load_zones_db() -> Dict:
     if not ZONES_DB.exists():
         return {}
 
-    with open(ZONES_DB, 'rb') as f:
-        db = pickle.load(f)
+    try:
+        with open(ZONES_DB, 'rb') as f:
+            db = pickle.load(f)
+    except (pickle.UnpicklingError, EOFError) as e:
+        logger.warning(f"Corrupted zones DB, resetting: {e}")
+        return {}
 
-    # Reset if new day
-    if db.get('date') != datetime.now().date():
+    # Reset if new day or no date key
+    db_date = db.get('date')
+    if db_date is None or db_date != datetime.now().date():
+        if db_date is not None:
+            logger.info(f"Zones DB is from {db_date}, resetting for today")
         return {}
 
     return db
@@ -211,7 +252,7 @@ def load_alerts_tracker() -> Dict:
 
     # Clean old entries (> 2 hours old)
     now = datetime.now()
-    cleaned = {k: v for k, v in tracker.items() if (now - v).seconds < 7200}
+    cleaned = {k: v for k, v in tracker.items() if (now - v).total_seconds() < 7200}
 
     return cleaned
 
@@ -226,7 +267,7 @@ def can_alert(symbol: str, zone_price: int, tracker: Dict) -> bool:
         return True
 
     last_alert = tracker[key]
-    hours_since = (datetime.now() - last_alert).seconds / 3600
+    hours_since = (datetime.now() - last_alert).total_seconds() / 3600
 
     return hours_since >= ALERT_COOLDOWN_HOURS
 
@@ -278,7 +319,17 @@ def get_historical_data(kite: KiteConnect, token: int) -> List[Dict]:
 def find_reversal_zones(data: List[Dict], ltp: float) -> List[Dict]:
     bounces = []
     for candle in data:
+        # Validate candle has all required keys
+        required_keys = ['open', 'high', 'low', 'close', 'date']
+        if not all(k in candle for k in required_keys):
+            continue
+
         o, h, l, c = candle['open'], candle['high'], candle['low'], candle['close']
+
+        # Validate OHLC values
+        if any(v is None or v < 0 for v in [o, h, l, c]):
+            continue
+
         candle_range = h - l
         if candle_range <= 0:
             continue
@@ -337,6 +388,10 @@ def find_reversal_zones(data: List[Dict], ltp: float) -> List[Dict]:
     return zones
 
 def score_zone(zone: Dict, ltp: float) -> float:
+    # Guard against invalid LTP
+    if ltp <= 0:
+        return 0.0
+
     bounce_score = min(50, (zone['bounces'] / 50) * 50)
     strength_score = zone['strength'] * 20
     distance_pct = abs(zone['price'] - ltp) / ltp * 100
@@ -386,7 +441,7 @@ def format_proximity_alert(symbol: str, opt_type: str, zone: Dict, ltp: float, s
     entry = int(zone['low'] - buffer)
     stop = int(entry - buffer)
 
-    emoji = "🎯" if opt_type == "CE" else "🎯"
+    emoji = "🟢" if opt_type == "CE" else "🔴"
     msg = f"{emoji} <b>{symbol} {opt_type}</b> [Score: {score:.0f}]\n"
     msg += f"Zone: {int(zone['low'])}-{int(zone['high'])} ({zone['bounces']} bounces, {int(zone['strength']*100)}% strength)\n"
     msg += f"Entry: {entry} | Stop: {stop} | LTP: {ltp:.0f}\n\n"
@@ -412,8 +467,23 @@ def full_scan(kite: KiteConnect, instruments: Dict):
     for index, config in INDICES.items():
         try:
             quote = kite.quote(config['spot'])
-            index_ltps[index] = quote[config['spot']]['last_price']
-            logger.info(f"{index}: {index_ltps[index]:.2f}")
+            spot_symbol = config['spot']
+
+            # Validate quote structure
+            if spot_symbol not in quote or 'last_price' not in quote[spot_symbol]:
+                logger.error(f"{index}: Invalid quote structure")
+                continue
+
+            ltp = quote[spot_symbol]['last_price']
+
+            # Validate LTP value
+            if ltp is None or ltp <= 0:
+                logger.error(f"{index}: Invalid LTP: {ltp}")
+                continue
+
+            index_ltps[index] = ltp
+            logger.info(f"{index}: {ltp:.2f}")
+
         except Exception as e:
             logger.error(f"{index} failed: {e}")
 
@@ -438,8 +508,21 @@ def full_scan(kite: KiteConnect, instruments: Dict):
             symbol = inst['symbol']
 
             try:
-                quote = kite.quote(f"{inst['exchange']}:{symbol}")
-                opt_ltp = quote[f"{inst['exchange']}:{symbol}"]['last_price']
+                # Get option quote
+                quote_key = f"{inst['exchange']}:{symbol}"
+                quote = kite.quote(quote_key)
+
+                # Validate quote structure
+                if quote_key not in quote or 'last_price' not in quote[quote_key]:
+                    logger.warning(f"{symbol}: Invalid quote structure")
+                    continue
+
+                opt_ltp = quote[quote_key]['last_price']
+
+                # Validate LTP
+                if opt_ltp is None or opt_ltp <= 0:
+                    logger.warning(f"{symbol}: Invalid LTP: {opt_ltp}")
+                    continue
 
                 data = get_historical_data(kite, inst['token'])
                 zones = find_reversal_zones(data, opt_ltp)
@@ -502,15 +585,40 @@ def quick_check(kite: KiteConnect):
     alerts_sent = 0
 
     for symbol, data in zones_db.items():
+        # Validate zones_db entry structure
+        if 'exchange' not in data or 'zones' not in data or 'type' not in data:
+            logger.warning(f"{symbol}: Invalid zones_db entry structure")
+            continue
+
         try:
             # Get current LTP
-            quote = kite.quote(f"{data['exchange']}:{symbol}")
-            ltp = quote[f"{data['exchange']}:{symbol}"]['last_price']
+            quote_key = f"{data['exchange']}:{symbol}"
+            quote = kite.quote(quote_key)
+
+            # Validate quote structure
+            if quote_key not in quote or 'last_price' not in quote[quote_key]:
+                logger.warning(f"{symbol}: Invalid quote structure")
+                continue
+
+            ltp = quote[quote_key]['last_price']
+
+            # Validate LTP
+            if ltp is None or ltp <= 0:
+                continue
 
             # Check each zone
             for zone in data['zones']:
+                # Validate zone structure
+                if 'price' not in zone or 'low' not in zone or 'score' not in zone:
+                    continue
+
                 # Check if price is within PROXIMITY_PCT of zone
                 zone_center = zone['price']
+
+                # Guard against invalid values
+                if zone_center <= 0 or ltp <= 0:
+                    continue
+
                 distance_pct = abs(ltp - zone_center) / zone_center * 100
 
                 if distance_pct <= PROXIMITY_PCT:
