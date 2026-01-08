@@ -109,3 +109,4 @@ data/holiday_calendar.json
 data/market_events.json
 data/market_news.json
 SNAIL/data/instruments.csv
+*.pkl
