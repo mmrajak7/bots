@@ -24,7 +24,7 @@ import requests
 from pathlib import Path
 from datetime import datetime, timedelta, date, time
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from kiteconnect import KiteConnect
 
 # =============================================================================
@@ -345,23 +345,23 @@ def find_reversal_zones(data: List[Dict], ltp: float) -> List[Dict]:
         if not all(k in candle for k in required_keys):
             continue
 
-        o, h, l, c = candle['open'], candle['high'], candle['low'], candle['close']
+        open_price, high, low, close = candle['open'], candle['high'], candle['low'], candle['close']
 
         # Validate OHLC values
-        if any(v is None or v < 0 for v in [o, h, l, c]):
+        if any(v is None or v < 0 for v in [open_price, high, low, close]):
             continue
 
-        candle_range = h - l
+        candle_range = high - low
         if candle_range <= 0:
             continue
 
-        close_position = (c - l) / candle_range
-        lower_wick = min(o, c) - l
+        close_position = (close - low) / candle_range
+        lower_wick = min(open_price, close) - low
         wick_pct = lower_wick / candle_range
 
         if close_position >= 0.4 or wick_pct >= 0.3:
             bounces.append({
-                'low': l,
+                'low': low,
                 'date': candle['date'],
                 'strength': close_position
             })
@@ -388,8 +388,8 @@ def find_reversal_zones(data: List[Dict], ltp: float) -> List[Dict]:
             used.add(level + 10)
 
         all_bounces = []
-        for l in merged:
-            all_bounces.extend(zone_data[l])
+        for price_level in merged:
+            all_bounces.extend(zone_data[price_level])
 
         if len(all_bounces) >= MIN_BOUNCES:
             lows = [b['low'] for b in all_bounces]
@@ -466,7 +466,7 @@ def format_proximity_alert(symbol: str, opt_type: str, zone: Dict, ltp: float, s
     msg = f"{emoji} <b>{symbol} {opt_type}</b> [Score: {score:.0f}]\n"
     msg += f"Zone: {int(zone['low'])}-{int(zone['high'])} ({zone['bounces']} bounces, {int(zone['strength']*100)}% strength)\n"
     msg += f"Entry: {entry} | Stop: {stop} | LTP: {ltp:.0f}\n\n"
-    msg += f"⚡ <b>PRICE NEAR ZONE</b> - Ready to enter"
+    msg += "⚡ <b>PRICE NEAR ZONE</b> - Ready to enter"
 
     return msg
 
