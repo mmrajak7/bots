@@ -245,36 +245,57 @@ def save_zones_db(db: Dict):
 def load_alerts_tracker() -> Dict:
     """Load alerts tracker (cooldown management)."""
     if not ALERTS_TRACKER.exists():
+        logger.info("Alerts tracker file not found, creating new tracker")
         return {}
 
-    with open(ALERTS_TRACKER, 'rb') as f:
-        tracker = pickle.load(f)
+    try:
+        with open(ALERTS_TRACKER, 'rb') as f:
+            tracker = pickle.load(f)
+    except (pickle.UnpicklingError, EOFError, Exception) as e:
+        logger.warning(f"Corrupted alerts tracker, resetting: {e}")
+        return {}
 
     # Clean old entries (> 2 hours old)
     now = datetime.now()
     cleaned = {k: v for k, v in tracker.items() if (now - v).total_seconds() < 7200}
 
+    if len(cleaned) < len(tracker):
+        logger.info(f"Cleaned {len(tracker) - len(cleaned)} old alert entries")
+
     return cleaned
 
 def save_alerts_tracker(tracker: Dict):
-    with open(ALERTS_TRACKER, 'wb') as f:
-        pickle.dump(tracker, f)
+    """Save alerts tracker to disk."""
+    try:
+        with open(ALERTS_TRACKER, 'wb') as f:
+            pickle.dump(tracker, f)
+        logger.debug(f"Saved alerts tracker ({len(tracker)} entries)")
+    except Exception as e:
+        logger.error(f"Failed to save alerts tracker: {e}")
 
 def can_alert(symbol: str, zone_price: int, tracker: Dict) -> bool:
     """Check if we can alert for this symbol/zone (1 hour cooldown)."""
     key = f"{symbol}_{zone_price}"
     if key not in tracker:
+        logger.debug(f"Can alert {key}: not in tracker")
         return True
 
     last_alert = tracker[key]
     hours_since = (datetime.now() - last_alert).total_seconds() / 3600
 
-    return hours_since >= ALERT_COOLDOWN_HOURS
+    can_send = hours_since >= ALERT_COOLDOWN_HOURS
+    if can_send:
+        logger.debug(f"Can alert {key}: {hours_since:.1f}h since last alert")
+    else:
+        logger.debug(f"Cooldown active {key}: {hours_since:.1f}h / {ALERT_COOLDOWN_HOURS}h")
+
+    return can_send
 
 def mark_alerted(symbol: str, zone_price: int, tracker: Dict):
     """Mark this symbol/zone as alerted."""
     key = f"{symbol}_{zone_price}"
     tracker[key] = datetime.now()
+    logger.debug(f"Marked alerted: {key} at {tracker[key].strftime('%H:%M:%S')}")
 
 # =============================================================================
 # STRIKE CALCULATION
@@ -584,60 +605,62 @@ def quick_check(kite: KiteConnect):
 
     alerts_sent = 0
 
-    for symbol, data in zones_db.items():
-        # Validate zones_db entry structure
-        if 'exchange' not in data or 'zones' not in data or 'type' not in data:
-            logger.warning(f"{symbol}: Invalid zones_db entry structure")
-            continue
-
-        try:
-            # Get current LTP
-            quote_key = f"{data['exchange']}:{symbol}"
-            quote = kite.quote(quote_key)
-
-            # Validate quote structure
-            if quote_key not in quote or 'last_price' not in quote[quote_key]:
-                logger.warning(f"{symbol}: Invalid quote structure")
+    try:
+        for symbol, data in zones_db.items():
+            # Validate zones_db entry structure
+            if 'exchange' not in data or 'zones' not in data or 'type' not in data:
+                logger.warning(f"{symbol}: Invalid zones_db entry structure")
                 continue
 
-            ltp = quote[quote_key]['last_price']
+            try:
+                # Get current LTP
+                quote_key = f"{data['exchange']}:{symbol}"
+                quote = kite.quote(quote_key)
 
-            # Validate LTP
-            if ltp is None or ltp <= 0:
-                continue
-
-            # Check each zone
-            for zone in data['zones']:
-                # Validate zone structure
-                if 'price' not in zone or 'low' not in zone or 'score' not in zone:
+                # Validate quote structure
+                if quote_key not in quote or 'last_price' not in quote[quote_key]:
+                    logger.warning(f"{symbol}: Invalid quote structure")
                     continue
 
-                # Check if price is within PROXIMITY_PCT of zone
-                zone_center = zone['price']
+                ltp = quote[quote_key]['last_price']
 
-                # Guard against invalid values
-                if zone_center <= 0 or ltp <= 0:
+                # Validate LTP
+                if ltp is None or ltp <= 0:
                     continue
 
-                distance_pct = abs(ltp - zone_center) / zone_center * 100
+                # Check each zone
+                for zone in data['zones']:
+                    # Validate zone structure
+                    if 'price' not in zone or 'low' not in zone or 'score' not in zone:
+                        continue
 
-                if distance_pct <= PROXIMITY_PCT:
-                    # Price is near zone!
-                    if can_alert(symbol, zone['price'], alerts_tracker):
-                        # Send alert
-                        msg = format_proximity_alert(symbol, data['type'], zone, ltp, zone['score'])
-                        send_telegram(msg)
+                    # Check if price is within PROXIMITY_PCT of zone
+                    zone_center = zone['price']
 
-                        mark_alerted(symbol, zone['price'], alerts_tracker)
-                        alerts_sent += 1
+                    # Guard against invalid values
+                    if zone_center <= 0 or ltp <= 0:
+                        continue
 
-                        logger.info(f"ALERT: {symbol} @ {ltp:.0f} near zone {zone['price']} (Score: {zone['score']:.0f})")
+                    distance_pct = abs(ltp - zone_center) / zone_center * 100
 
-        except Exception as e:
-            logger.error(f"{symbol} quick check failed: {str(e)[:50]}")
+                    if distance_pct <= PROXIMITY_PCT:
+                        # Price is near zone!
+                        if can_alert(symbol, zone['price'], alerts_tracker):
+                            # Send alert
+                            msg = format_proximity_alert(symbol, data['type'], zone, ltp, zone['score'])
+                            send_telegram(msg)
 
-    # Save alerts tracker
-    save_alerts_tracker(alerts_tracker)
+                            mark_alerted(symbol, zone['price'], alerts_tracker)
+                            alerts_sent += 1
+
+                            logger.info(f"ALERT: {symbol} @ {ltp:.0f} near zone {zone['price']} (Score: {zone['score']:.0f})")
+
+            except Exception as e:
+                logger.error(f"{symbol} quick check failed: {str(e)[:50]}")
+
+    finally:
+        # ALWAYS save alerts tracker, even if there's an exception
+        save_alerts_tracker(alerts_tracker)
 
     if alerts_sent > 0:
         logger.info(f"Quick check: {alerts_sent} alerts sent")
