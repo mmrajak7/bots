@@ -115,6 +115,7 @@ INDICES = {
 MIN_BOUNCES = 5
 MIN_SCORE = 50
 BUFFER_PCT = 2.0
+MAX_ZONE_WIDTH = 10  # Maximum zone width in points (prevents over-merging)
 
 # Proximity alert params
 PROXIMITY_PCT = 2.0  # Alert when within 2% of zone
@@ -123,16 +124,18 @@ PROXIMITY_PCT = 2.0  # Alert when within 2% of zone
 TIMEFRAMES = {
     '15m': {
         'interval': '15minute',
-        'lookback_days': 30,
+        'lookback_days': 30,        # How far back to fetch data
+        'max_bounce_age': 12,        # Only use bounces from last 12 days
         'scan_minutes': [16, 31, 46],  # Every 15 mins
         'cooldown_hours': 1,
         'enabled': True
     },
     '1h': {
         'interval': '60minute',
-        'lookback_days': 90,  # Need more history for hourly
-        'scan_minutes': [17, 47],  # Offset from 15m scans
-        'cooldown_hours': 2,  # Longer cooldown for higher TF
+        'lookback_days': 90,         # Need more history for hourly
+        'max_bounce_age': 20,        # Only use bounces from last 20 days
+        'scan_minutes': [17, 47],    # Offset from 15m scans
+        'cooldown_hours': 2,         # Longer cooldown for higher TF
         'enabled': True
     }
 }
@@ -385,12 +388,27 @@ def get_historical_data(kite: KiteConnect, token: int, timeframe: str = '15m') -
         interval=tf_config['interval']
     )
 
-def find_reversal_zones(data: List[Dict], ltp: float) -> List[Dict]:
+def find_reversal_zones(data: List[Dict], ltp: float, max_bounce_age_days: int = 30) -> List[Dict]:
+    """
+    Find reversal zones from historical data.
+
+    Args:
+        data: Historical OHLC data
+        ltp: Last traded price
+        max_bounce_age_days: Only use bounces within this many days (default: 30)
+    """
     bounces = []
+    cutoff_date = datetime.now() - timedelta(days=max_bounce_age_days)
+
     for candle in data:
         # Validate candle has all required keys
         required_keys = ['open', 'high', 'low', 'close', 'date']
         if not all(k in candle for k in required_keys):
+            continue
+
+        # Filter by age - remove timezone info for comparison
+        candle_date = candle['date'].replace(tzinfo=None) if candle['date'].tzinfo else candle['date']
+        if candle_date < cutoff_date:
             continue
 
         open_price, high, low, close = candle['open'], candle['high'], candle['low'], candle['close']
@@ -431,9 +449,18 @@ def find_reversal_zones(data: List[Dict], ltp: float) -> List[Dict]:
             continue
 
         merged = [level]
+
+        # Try to merge with level+10, but check zone width
         if level + 10 in zone_data:
-            merged.append(level + 10)
-            used.add(level + 10)
+            # Get all bounces from both levels to check width
+            test_bounces = zone_data[level] + zone_data[level + 10]
+            test_lows = [b['low'] for b in test_bounces]
+            zone_width = max(test_lows) - min(test_lows)
+
+            # Only merge if combined width is acceptable
+            if zone_width <= MAX_ZONE_WIDTH:
+                merged.append(level + 10)
+                used.add(level + 10)
 
         all_bounces = []
         for price_level in merged:
@@ -442,6 +469,7 @@ def find_reversal_zones(data: List[Dict], ltp: float) -> List[Dict]:
         if len(all_bounces) >= MIN_BOUNCES:
             lows = [b['low'] for b in all_bounces]
             zone_center = sum(merged) / len(merged)
+            zone_width = max(lows) - min(lows)
 
             zones.append({
                 'price': int(zone_center),
@@ -449,7 +477,8 @@ def find_reversal_zones(data: List[Dict], ltp: float) -> List[Dict]:
                 'high': max(lows),
                 'bounces': len(all_bounces),
                 'strength': sum(b['strength'] for b in all_bounces) / len(all_bounces),
-                'last_bounce': max(b['date'] for b in all_bounces)
+                'last_bounce': max(b['date'] for b in all_bounces),
+                'width': zone_width  # Track zone width for debugging
             })
 
         used.add(level)
@@ -609,7 +638,10 @@ def full_scan(kite: KiteConnect, instruments: Dict):
 
                     # Fetch historical data for this timeframe
                     data = get_historical_data(kite, inst['token'], timeframe)
-                    zones = find_reversal_zones(data, opt_ltp)
+
+                    # Get max bounce age for this timeframe
+                    max_bounce_age = tf_config.get('max_bounce_age', 30)
+                    zones = find_reversal_zones(data, opt_ltp, max_bounce_age)
 
                     if not zones:
                         continue
