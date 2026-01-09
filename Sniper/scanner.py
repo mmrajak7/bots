@@ -654,6 +654,10 @@ def quick_check(kite: KiteConnect):
 
     try:
         for symbol, tf_data in zones_db.items():
+            # Skip metadata entries (like 'date')
+            if symbol == 'date' or not isinstance(tf_data, dict):
+                continue
+
             try:
                 # Get current LTP once per symbol
                 quote_key = None
