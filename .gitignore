@@ -78,6 +78,7 @@ desktop.ini
 *token*.txt
 *enctoken*
 *access_token*.json
+data/secret.json
 
 # SNAIL specific excludes
 SNAIL/Archive/
@@ -110,3 +111,6 @@ data/market_events.json
 data/market_news.json
 SNAIL/data/instruments.csv
 *.pkl
+
+# Bouncer config (has Telegram token)
+Bouncer/config/config.json
