@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Options Scanner - Two-Tier Strategy
+Options Scanner - Multi-Timeframe Reversal Zone Strategy
 
-FULL SCAN (every 15 mins at :16, :31, :46):
+FULL SCAN (multiple timeframes):
+  - 15m timeframe: Every 15 mins at :16, :31, :46 (30-day lookback)
+  - 1h timeframe: At :17, :47 (90-day lookback)
   - Analyze reversal zones
   - Calculate scores
   - Mark broken zones
 
 QUICK CHECK (every minute):
   - Check if LTP near zones (within 2%)
-  - Send real-time entry alerts
-  - 1-hour cooldown per symbol/zone
+  - Send real-time entry alerts with timeframe badge
+  - Timeframe-specific cooldowns (15m: 1h, 1h: 2h)
+  - Each symbol/zone/timeframe tracked independently
 
 Cron Setup:
     * 9-14 * * 1-5 cd /path/to/Sniper && python3 scanner.py >> logs/cron.log 2>&1
@@ -109,17 +112,30 @@ INDICES = {
 }
 
 # Scanning params
-LOOKBACK_DAYS = 30
 MIN_BOUNCES = 5
 MIN_SCORE = 50
 BUFFER_PCT = 2.0
 
 # Proximity alert params
 PROXIMITY_PCT = 2.0  # Alert when within 2% of zone
-ALERT_COOLDOWN_HOURS = 1  # Don't re-alert same zone for 1 hour
 
-# Full scan minutes (16, 31, 46)
-FULL_SCAN_MINUTES = [16, 31, 46]
+# Multi-Timeframe Configuration
+TIMEFRAMES = {
+    '15m': {
+        'interval': '15minute',
+        'lookback_days': 30,
+        'scan_minutes': [16, 31, 46],  # Every 15 mins
+        'cooldown_hours': 1,
+        'enabled': True
+    },
+    '1h': {
+        'interval': '60minute',
+        'lookback_days': 90,  # Need more history for hourly
+        'scan_minutes': [17, 47],  # Offset from 15m scans
+        'cooldown_hours': 2,  # Longer cooldown for higher TF
+        'enabled': True
+    }
+}
 
 # =============================================================================
 # MARKET HOURS
@@ -133,8 +149,14 @@ def is_market_open() -> bool:
     return time(9, 15) <= current_time <= time(15, 30)
 
 def is_full_scan_time() -> bool:
-    """Check if current minute is a full scan minute."""
-    return datetime.now().minute in FULL_SCAN_MINUTES
+    """Check if current minute is a full scan minute for any enabled timeframe."""
+    current_minute = datetime.now().minute
+
+    for timeframe, config in TIMEFRAMES.items():
+        if config['enabled'] and current_minute in config['scan_minutes']:
+            return True
+
+    return False
 
 # =============================================================================
 # KITE
@@ -273,9 +295,9 @@ def save_alerts_tracker(tracker: Dict):
     except Exception as e:
         logger.error(f"Failed to save alerts tracker: {e}")
 
-def can_alert(symbol: str, zone_price: int, tracker: Dict) -> bool:
-    """Check if we can alert for this symbol/zone (1 hour cooldown)."""
-    key = f"{symbol}_{zone_price}"
+def can_alert(symbol: str, zone_price: int, tracker: Dict, timeframe: str = '15m', cooldown_hours: float = 1.0) -> bool:
+    """Check if we can alert for this symbol/zone/timeframe."""
+    key = f"{symbol}_{zone_price}_{timeframe}"
     if key not in tracker:
         logger.debug(f"Can alert {key}: not in tracker")
         return True
@@ -283,17 +305,17 @@ def can_alert(symbol: str, zone_price: int, tracker: Dict) -> bool:
     last_alert = tracker[key]
     hours_since = (datetime.now() - last_alert).total_seconds() / 3600
 
-    can_send = hours_since >= ALERT_COOLDOWN_HOURS
+    can_send = hours_since >= cooldown_hours
     if can_send:
         logger.debug(f"Can alert {key}: {hours_since:.1f}h since last alert")
     else:
-        logger.debug(f"Cooldown active {key}: {hours_since:.1f}h / {ALERT_COOLDOWN_HOURS}h")
+        logger.debug(f"Cooldown active {key}: {hours_since:.1f}h / {cooldown_hours}h")
 
     return can_send
 
-def mark_alerted(symbol: str, zone_price: int, tracker: Dict):
-    """Mark this symbol/zone as alerted."""
-    key = f"{symbol}_{zone_price}"
+def mark_alerted(symbol: str, zone_price: int, tracker: Dict, timeframe: str = '15m'):
+    """Mark this symbol/zone/timeframe as alerted."""
+    key = f"{symbol}_{zone_price}_{timeframe}"
     tracker[key] = datetime.now()
     logger.debug(f"Marked alerted: {key} at {tracker[key].strftime('%H:%M:%S')}")
 
@@ -329,12 +351,15 @@ def calculate_atm(ltp: float, index: str) -> int:
 # REVERSAL ZONE DETECTION (FULL SCAN ONLY)
 # =============================================================================
 
-def get_historical_data(kite: KiteConnect, token: int) -> List[Dict]:
+def get_historical_data(kite: KiteConnect, token: int, timeframe: str = '15m') -> List[Dict]:
+    """Fetch historical data for specified timeframe."""
+    tf_config = TIMEFRAMES.get(timeframe, TIMEFRAMES['15m'])
+
     return kite.historical_data(
         instrument_token=token,
-        from_date=datetime.now() - timedelta(days=LOOKBACK_DAYS),
+        from_date=datetime.now() - timedelta(days=tf_config['lookback_days']),
         to_date=datetime.now(),
-        interval='15minute'
+        interval=tf_config['interval']
     )
 
 def find_reversal_zones(data: List[Dict], ltp: float) -> List[Dict]:
@@ -447,12 +472,12 @@ def send_telegram(message: str):
         logger.error(f"Telegram failed: {e}")
         return False
 
-def format_proximity_alert(symbol: str, opt_type: str, zone: Dict, ltp: float, score: float) -> str:
+def format_proximity_alert(symbol: str, opt_type: str, zone: Dict, ltp: float, score: float, timeframe: str = '15m') -> str:
     """
-    Compact proximity alert with full info.
+    Compact proximity alert with timeframe badge.
 
     Format:
-        🎯 NIFTY 25900 PE [Score: 62]
+        🎯 NIFTY 25900 PE [1H] [Score: 72]
         Zone: 155-174 (24 bounces, 68% strength)
         Entry: 151 | Stop: 148 | LTP: 158
 
@@ -463,7 +488,9 @@ def format_proximity_alert(symbol: str, opt_type: str, zone: Dict, ltp: float, s
     stop = int(entry - buffer)
 
     emoji = "🟢" if opt_type == "CE" else "🔴"
-    msg = f"{emoji} <b>{symbol} {opt_type}</b> [Score: {score:.0f}]\n"
+    tf_badge = f"[{timeframe.upper()}]"
+
+    msg = f"{emoji} <b>{symbol} {opt_type}</b> {tf_badge} [Score: {score:.0f}]\n"
     msg += f"Zone: {int(zone['low'])}-{int(zone['high'])} ({zone['bounces']} bounces, {int(zone['strength']*100)}% strength)\n"
     msg += f"Entry: {entry} | Stop: {stop} | LTP: {ltp:.0f}\n\n"
     msg += "⚡ <b>PRICE NEAR ZONE</b> - Ready to enter"
@@ -476,14 +503,14 @@ def format_proximity_alert(symbol: str, opt_type: str, zone: Dict, ltp: float, s
 
 def full_scan(kite: KiteConnect, instruments: Dict):
     """
-    Full reversal zone analysis.
+    Full reversal zone analysis for all enabled timeframes.
     Updates zones database, NO alerts sent here.
     """
     logger.info("="*60)
     logger.info(f"FULL SCAN: {datetime.now().strftime('%H:%M:%S')}")
     logger.info("="*60)
 
-    # Get index LTPs
+    # Get index LTPs (shared across all timeframes)
     index_ltps = {}
     for index, config in INDICES.items():
         try:
@@ -508,79 +535,99 @@ def full_scan(kite: KiteConnect, instruments: Dict):
         except Exception as e:
             logger.error(f"{index} failed: {e}")
 
-    # Scan zones
+    # Scan zones for all enabled timeframes
     zones_db = {}
+    current_minute = datetime.now().minute
 
-    for index, ltp in index_ltps.items():
-        atm = calculate_atm(ltp, index)
-        expiry = get_monthly_expiry(index, instruments)
-
-        if not expiry:
+    for timeframe, tf_config in TIMEFRAMES.items():
+        if not tf_config['enabled']:
             continue
 
-        logger.info(f"{index}: ATM {atm}, Expiry {expiry.strftime('%d-%b')}")
+        # Check if this is a scan minute for this timeframe
+        if current_minute not in tf_config['scan_minutes']:
+            logger.info(f"Skipping {timeframe} scan (not a scan minute)")
+            continue
 
-        for opt_type in ['CE', 'PE']:
-            key = (index, atm, opt_type, expiry)
-            if key not in instruments:
+        logger.info(f"\n--- Scanning {timeframe.upper()} timeframe ---")
+
+        for index, ltp in index_ltps.items():
+            atm = calculate_atm(ltp, index)
+            expiry = get_monthly_expiry(index, instruments)
+
+            if not expiry:
                 continue
 
-            inst = instruments[key]
-            symbol = inst['symbol']
+            logger.info(f"{index} ({timeframe}): ATM {atm}, Expiry {expiry.strftime('%d-%b')}")
 
-            try:
-                # Get option quote
-                quote_key = f"{inst['exchange']}:{symbol}"
-                quote = kite.quote(quote_key)
-
-                # Validate quote structure
-                if quote_key not in quote or 'last_price' not in quote[quote_key]:
-                    logger.warning(f"{symbol}: Invalid quote structure")
+            for opt_type in ['CE', 'PE']:
+                key = (index, atm, opt_type, expiry)
+                if key not in instruments:
                     continue
 
-                opt_ltp = quote[quote_key]['last_price']
+                inst = instruments[key]
+                symbol = inst['symbol']
 
-                # Validate LTP
-                if opt_ltp is None or opt_ltp <= 0:
-                    logger.warning(f"{symbol}: Invalid LTP: {opt_ltp}")
-                    continue
+                try:
+                    # Get option quote
+                    quote_key = f"{inst['exchange']}:{symbol}"
+                    quote = kite.quote(quote_key)
 
-                data = get_historical_data(kite, inst['token'])
-                zones = find_reversal_zones(data, opt_ltp)
+                    # Validate quote structure
+                    if quote_key not in quote or 'last_price' not in quote[quote_key]:
+                        logger.warning(f"{symbol}: Invalid quote structure")
+                        continue
 
-                if not zones:
-                    continue
+                    opt_ltp = quote[quote_key]['last_price']
 
-                # Score zones
-                for z in zones:
-                    z['score'] = score_zone(z, opt_ltp)
+                    # Validate LTP
+                    if opt_ltp is None or opt_ltp <= 0:
+                        logger.warning(f"{symbol}: Invalid LTP: {opt_ltp}")
+                        continue
 
-                # Remove broken zones
-                zones = [z for z in zones if not is_zone_broken(z, opt_ltp)]
+                    # Fetch historical data for this timeframe
+                    data = get_historical_data(kite, inst['token'], timeframe)
+                    zones = find_reversal_zones(data, opt_ltp)
 
-                # Keep only strong zones (score > MIN_SCORE)
-                zones = [z for z in zones if z['score'] >= MIN_SCORE]
+                    if not zones:
+                        continue
 
-                # Sort by score
-                zones.sort(key=lambda x: x['score'], reverse=True)
+                    # Score zones
+                    for z in zones:
+                        z['score'] = score_zone(z, opt_ltp)
 
-                if zones:
-                    zones_db[symbol] = {
-                        'ltp': opt_ltp,
-                        'token': inst['token'],
-                        'exchange': inst['exchange'],
-                        'type': opt_type,
-                        'zones': zones
-                    }
+                    # Remove broken zones
+                    zones = [z for z in zones if not is_zone_broken(z, opt_ltp)]
 
-                    logger.info(f"{symbol}: {len(zones)} zones tracked")
+                    # Keep only strong zones (score > MIN_SCORE)
+                    zones = [z for z in zones if z['score'] >= MIN_SCORE]
 
-            except Exception as e:
-                logger.error(f"{symbol} failed: {str(e)[:50]}")
+                    # Sort by score
+                    zones.sort(key=lambda x: x['score'], reverse=True)
+
+                    if zones:
+                        # Initialize symbol dict if doesn't exist
+                        if symbol not in zones_db:
+                            zones_db[symbol] = {}
+
+                        # Store zones for this timeframe
+                        zones_db[symbol][timeframe] = {
+                            'ltp': opt_ltp,
+                            'token': inst['token'],
+                            'exchange': inst['exchange'],
+                            'type': opt_type,
+                            'zones': zones,
+                            'last_updated': datetime.now()
+                        }
+
+                        logger.info(f"{symbol} ({timeframe}): {len(zones)} zones tracked")
+
+                except Exception as e:
+                    logger.error(f"{symbol} ({timeframe}) failed: {str(e)[:50]}", exc_info=True)
 
     # Save zones DB
     save_zones_db(zones_db)
-    logger.info(f"Zones DB updated: {len(zones_db)} symbols")
+    total_tf_entries = sum(len(v) for v in zones_db.values())
+    logger.info(f"Zones DB updated: {total_tf_entries} timeframe entries across {len(zones_db)} symbols")
     logger.info("="*60)
 
 # =============================================================================
@@ -589,7 +636,7 @@ def full_scan(kite: KiteConnect, instruments: Dict):
 
 def quick_check(kite: KiteConnect):
     """
-    Quick proximity check.
+    Quick proximity check across all timeframes.
     Fetches LTP, checks if near zones, sends alerts.
     """
     logger.info(f"Quick check: {datetime.now().strftime('%H:%M:%S')}")
@@ -606,15 +653,21 @@ def quick_check(kite: KiteConnect):
     alerts_sent = 0
 
     try:
-        for symbol, data in zones_db.items():
-            # Validate zones_db entry structure
-            if 'exchange' not in data or 'zones' not in data or 'type' not in data:
-                logger.warning(f"{symbol}: Invalid zones_db entry structure")
-                continue
-
+        for symbol, tf_data in zones_db.items():
             try:
-                # Get current LTP
-                quote_key = f"{data['exchange']}:{symbol}"
+                # Get current LTP once per symbol
+                quote_key = None
+                ltp = None
+
+                # Find exchange from any timeframe
+                for tf_info in tf_data.values():
+                    if isinstance(tf_info, dict) and 'exchange' in tf_info:
+                        quote_key = f"{tf_info['exchange']}:{symbol}"
+                        break
+
+                if not quote_key:
+                    continue
+
                 quote = kite.quote(quote_key)
 
                 # Validate quote structure
@@ -628,35 +681,44 @@ def quick_check(kite: KiteConnect):
                 if ltp is None or ltp <= 0:
                     continue
 
-                # Check each zone
-                for zone in data['zones']:
-                    # Validate zone structure
-                    if 'price' not in zone or 'low' not in zone or 'score' not in zone:
+                # Check zones in each timeframe
+                for timeframe, data in tf_data.items():
+                    # Validate timeframe data structure
+                    if not isinstance(data, dict) or 'zones' not in data or 'type' not in data:
                         continue
 
-                    # Check if price is within PROXIMITY_PCT of zone
-                    zone_center = zone['price']
+                    # Get cooldown for this timeframe
+                    cooldown_hours = TIMEFRAMES.get(timeframe, {}).get('cooldown_hours', 1.0)
 
-                    # Guard against invalid values
-                    if zone_center <= 0 or ltp <= 0:
-                        continue
+                    # Check each zone
+                    for zone in data['zones']:
+                        # Validate zone structure
+                        if 'price' not in zone or 'low' not in zone or 'score' not in zone:
+                            continue
 
-                    distance_pct = abs(ltp - zone_center) / zone_center * 100
+                        # Check if price is within PROXIMITY_PCT of zone
+                        zone_center = zone['price']
 
-                    if distance_pct <= PROXIMITY_PCT:
-                        # Price is near zone!
-                        if can_alert(symbol, zone['price'], alerts_tracker):
-                            # Send alert
-                            msg = format_proximity_alert(symbol, data['type'], zone, ltp, zone['score'])
-                            send_telegram(msg)
+                        # Guard against invalid values
+                        if zone_center <= 0 or ltp <= 0:
+                            continue
 
-                            mark_alerted(symbol, zone['price'], alerts_tracker)
-                            alerts_sent += 1
+                        distance_pct = abs(ltp - zone_center) / zone_center * 100
 
-                            logger.info(f"ALERT: {symbol} @ {ltp:.0f} near zone {zone['price']} (Score: {zone['score']:.0f})")
+                        if distance_pct <= PROXIMITY_PCT:
+                            # Price is near zone!
+                            if can_alert(symbol, zone['price'], alerts_tracker, timeframe, cooldown_hours):
+                                # Send alert with timeframe info
+                                msg = format_proximity_alert(symbol, data['type'], zone, ltp, zone['score'], timeframe)
+                                send_telegram(msg)
+
+                                mark_alerted(symbol, zone['price'], alerts_tracker, timeframe)
+                                alerts_sent += 1
+
+                                logger.info(f"ALERT ({timeframe}): {symbol} @ {ltp:.0f} near zone {zone['price']} (Score: {zone['score']:.0f})")
 
             except Exception as e:
-                logger.error(f"{symbol} quick check failed: {str(e)[:50]}")
+                logger.error(f"{symbol} quick check failed: {str(e)[:50]}", exc_info=True)
 
     finally:
         # ALWAYS save alerts tracker, even if there's an exception
