@@ -193,15 +193,24 @@ def get_kite() -> KiteConnect:
 def load_instruments() -> Optional[Dict]:
     if not INSTRUMENTS_CACHE.exists():
         return None
-    cache_time = datetime.fromtimestamp(INSTRUMENTS_CACHE.stat().st_mtime)
-    if cache_time.date() < datetime.now().date():
+
+    try:
+        cache_time = datetime.fromtimestamp(INSTRUMENTS_CACHE.stat().st_mtime)
+        if cache_time.date() < datetime.now().date():
+            return None
+
+        with open(INSTRUMENTS_CACHE, 'rb') as f:
+            return pickle.load(f)
+    except (pickle.UnpicklingError, EOFError, OSError, Exception) as e:
+        logger.warning(f"Corrupted instruments cache, will re-download: {e}")
         return None
-    with open(INSTRUMENTS_CACHE, 'rb') as f:
-        return pickle.load(f)
 
 def save_instruments(instruments: Dict):
-    with open(INSTRUMENTS_CACHE, 'wb') as f:
-        pickle.dump(instruments, f)
+    try:
+        with open(INSTRUMENTS_CACHE, 'wb') as f:
+            pickle.dump(instruments, f)
+    except Exception as e:
+        logger.error(f"Failed to save instruments cache: {e}")
 
 def fetch_instruments(kite: KiteConnect) -> Dict:
     cached = load_instruments()
@@ -279,10 +288,24 @@ def load_alerts_tracker() -> Dict:
 
     # Clean old entries (> 2 hours old)
     now = datetime.now()
-    cleaned = {k: v for k, v in tracker.items() if (now - v).total_seconds() < 7200}
+    cleaned = {}
+
+    for k, v in tracker.items():
+        # Validate timestamp is datetime
+        if not isinstance(v, datetime):
+            logger.warning(f"Invalid tracker entry {k}: not a datetime, skipping")
+            continue
+
+        try:
+            hours_old = (now - v).total_seconds() / 3600
+            if hours_old < 2:  # Keep entries < 2 hours old
+                cleaned[k] = v
+        except Exception as e:
+            logger.warning(f"Error processing tracker entry {k}: {e}")
+            continue
 
     if len(cleaned) < len(tracker):
-        logger.info(f"Cleaned {len(tracker) - len(cleaned)} old alert entries")
+        logger.info(f"Cleaned {len(tracker) - len(cleaned)} old/invalid alert entries")
 
     return cleaned
 
@@ -626,8 +649,12 @@ def full_scan(kite: KiteConnect, instruments: Dict):
 
     # Save zones DB
     save_zones_db(zones_db)
-    total_tf_entries = sum(len(v) for v in zones_db.values())
-    logger.info(f"Zones DB updated: {total_tf_entries} timeframe entries across {len(zones_db)} symbols")
+
+    # Count timeframe entries (skip 'date' metadata)
+    total_tf_entries = sum(len(v) for k, v in zones_db.items() if k != 'date' and isinstance(v, dict))
+    symbol_count = len([k for k in zones_db.keys() if k != 'date'])
+
+    logger.info(f"Zones DB updated: {total_tf_entries} timeframe entries across {symbol_count} symbols")
     logger.info("="*60)
 
 # =============================================================================
