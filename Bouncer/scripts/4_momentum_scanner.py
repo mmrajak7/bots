@@ -59,6 +59,7 @@ CONFIG_FILE = PROJECT_DIR / 'config' / 'config.json'
 
 TOKEN_FILE = BOTS_DIR / 'data' / 'kite_access_token.json'
 POSITIONS_FILE = DATA_DIR / 'momentum_positions.json'
+ALERT_HISTORY_FILE = DATA_DIR / 'momentum_alert_history.json'
 
 # Ensure directories exist
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -106,6 +107,9 @@ TARGET_RR_RATIO = 1.5  # 1.5:1 risk-reward ratio
 MAX_POSITIONS = 3  # Max open positions at any time
 MAX_CLOSED_POSITIONS_TO_KEEP = 50  # Cleanup old closed positions
 MIN_TRAIL_AMOUNT = 2.0  # Minimum Rs to trail SL (avoid spam alerts)
+
+# Alert freeze (avoid repeat alerts on continuing pattern)
+ALERT_FREEZE_MINUTES = 60  # 1 hour freeze after alert
 
 
 # =============================================================================
@@ -224,9 +228,9 @@ def load_index_options() -> Dict[str, List[dict]]:
 
         options = fetch_index_options(
             indices=['NIFTY', 'BANKNIFTY', 'SENSEX'],
-            monthly_only=False,  # Include weekly expiries
+            monthly_only=True,   # Monthly expiry only
             min_dte=5,           # At least 5 DTE
-            max_dte=30           # Max 30 DTE
+            max_dte=45           # Max 45 DTE (for monthly)
         )
 
         log.info(f"Loaded options - NIFTY: {len(options.get('NIFTY', []))}, "
@@ -558,6 +562,62 @@ def is_position_expired(position: MomentumPosition) -> bool:
 
 
 # =============================================================================
+# ALERT FREEZE (avoid repeat alerts on continuing pattern)
+# =============================================================================
+def load_alert_history() -> Dict[str, str]:
+    """Load alert history (symbol -> last_alert_time)."""
+    if not ALERT_HISTORY_FILE.exists():
+        return {}
+    try:
+        with open(ALERT_HISTORY_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def save_alert_history(history: Dict[str, str]) -> None:
+    """Save alert history."""
+    try:
+        with open(ALERT_HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
+    except IOError as e:
+        log.error(f"Failed to save alert history: {e}")
+
+
+def is_alert_frozen(symbol: str, history: Dict[str, str]) -> bool:
+    """Check if symbol is in alert freeze period."""
+    if symbol not in history:
+        return False
+
+    try:
+        last_alert = datetime.fromisoformat(history[symbol])
+        elapsed = (datetime.now() - last_alert).total_seconds() / 60
+        return elapsed < ALERT_FREEZE_MINUTES
+    except (ValueError, TypeError):
+        return False
+
+
+def record_alert(symbol: str, history: Dict[str, str]) -> None:
+    """Record alert time for symbol."""
+    history[symbol] = datetime.now().isoformat()
+
+
+def cleanup_old_alerts(history: Dict[str, str]) -> Dict[str, str]:
+    """Remove alerts older than freeze period."""
+    now = datetime.now()
+    cleaned = {}
+    for symbol, time_str in history.items():
+        try:
+            alert_time = datetime.fromisoformat(time_str)
+            elapsed = (now - alert_time).total_seconds() / 60
+            if elapsed < ALERT_FREEZE_MINUTES * 2:  # Keep 2x freeze period
+                cleaned[symbol] = time_str
+        except (ValueError, TypeError):
+            pass
+    return cleaned
+
+
+# =============================================================================
 # ALERT FORMATTING
 # =============================================================================
 def format_entry_alert(signal: PatternSignal) -> str:
@@ -565,25 +625,18 @@ def format_entry_alert(signal: PatternSignal) -> str:
     # Map OTM position to label
     otm_label = 'ATM' if signal.otm_position == 0 else f'{signal.otm_position}OTM'
 
-    # Calculate R:R
-    risk = signal.entry_price - signal.sl_price
-    reward = signal.target_price - signal.entry_price
-    rr_ratio = reward / risk if risk > 0 else 0
+    # Calculate percentages
+    sl_pct = ((signal.entry_price - signal.sl_price) / signal.entry_price) * 100
+    target_pct = ((signal.target_price - signal.entry_price) / signal.entry_price) * 100
 
-    return f"""<b>MOMENTUM ENTRY</b> | {signal.index}
-
-{signal.option_type} Signal ({otm_label})
+    return f"""<b>MOMENTUM</b> | {signal.index} {signal.option_type} ({otm_label})
 
 <b>BUY {signal.option_symbol}</b>
-Strike: {signal.strike:.0f} | Expiry: {signal.expiry}
+Expiry: {signal.expiry}
 
 Entry: ₹{signal.entry_price:.2f}
-SL: ₹{signal.sl_price:.2f} | Target: ₹{signal.target_price:.2f}
-R:R = 1:{rr_ratio:.1f}
-
-Pattern: 3 HH-HL candles (trend aligned)
-Highs: {signal.candle_1_high:.2f} → {signal.candle_2_high:.2f} → {signal.candle_3_high:.2f}
-Lows: {signal.candle_1_low:.2f} → {signal.candle_2_low:.2f} → {signal.candle_3_low:.2f}"""
+SL: ₹{signal.sl_price:.2f} (-{sl_pct:.1f}%)
+Target: ₹{signal.target_price:.2f} (+{target_pct:.1f}%)"""
 
 
 def format_sl_update_alert(
@@ -939,10 +992,19 @@ def check_and_update_positions(
 def process_signals(
     signals: List[PatternSignal],
     positions: List[MomentumPosition],
+    alert_history: Dict[str, str],
     test_mode: bool = False
 ) -> List[MomentumPosition]:
     """Process new signals, create positions, send alerts."""
     for signal in signals:
+        # Check alert freeze
+        if is_alert_frozen(signal.option_symbol, alert_history):
+            log.info(
+                f"{signal.option_symbol}: Alert frozen "
+                f"(within {ALERT_FREEZE_MINUTES} min), skipping"
+            )
+            continue
+
         position = MomentumPosition(
             id=generate_position_id(signal.index, signal.option_symbol),
             index=signal.index,
@@ -969,6 +1031,9 @@ def process_signals(
             f"@ {signal.entry_price:.2f}, SL={signal.sl_price:.2f}, "
             f"Target={signal.target_price:.2f}"
         )
+
+        # Record alert time
+        record_alert(signal.option_symbol, alert_history)
         send_telegram(alert, test_mode)
 
     return positions
@@ -1072,6 +1137,10 @@ def main() -> None:
         open_count = len([p for p in positions if p.status == 'open'])
         log.info(f"Loaded {len(positions)} positions ({open_count} open)")
 
+        # Load alert history (for freeze mechanism)
+        alert_history = load_alert_history()
+        alert_history = cleanup_old_alerts(alert_history)
+
         # 1. Check and update existing positions (trail SL or exit)
         positions, sl_alerts = check_and_update_positions(
             kite, positions, args.test
@@ -1083,12 +1152,15 @@ def main() -> None:
         )
         log.info(f"Found {len(signals)} new signals")
 
-        # 3. Process new signals
+        # 3. Process new signals (with alert freeze check)
         if signals:
-            positions = process_signals(signals, positions, args.test)
+            positions = process_signals(
+                signals, positions, alert_history, args.test
+            )
 
-        # 4. Save positions
+        # 4. Save positions and alert history
         save_positions(positions)
+        save_alert_history(alert_history)
 
         # Summary
         open_positions = [p for p in positions if p.status == 'open']

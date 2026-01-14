@@ -67,12 +67,20 @@ def fetch_all_instruments(use_cache: bool = True) -> List[dict]:
     return instruments
 
 
-def is_last_thursday_of_month(date_obj: datetime) -> bool:
-    """Check if date is the last Thursday of its month."""
-    if date_obj.weekday() != 3:  # Not Thursday
+def is_last_expiry_of_month(date_obj: datetime, all_expiries: set) -> bool:
+    """
+    Check if date is the last expiry of its month.
+    Works with any expiry day (Thu/Wed/Tue).
+    """
+    # Find all expiries in the same month
+    month_expiries = [
+        e for e in all_expiries
+        if e.month == date_obj.month and e.year == date_obj.year
+    ]
+    if not month_expiries:
         return False
-    next_thursday = date_obj + timedelta(days=7)
-    return next_thursday.month != date_obj.month
+    # Return True if this is the last one
+    return date_obj.date() == max(e.date() for e in month_expiries)
 
 
 def fetch_index_options(
@@ -98,7 +106,9 @@ def fetch_index_options(
     instruments = fetch_all_instruments()
     today = datetime.now().date()
 
+    # First pass: collect all options per index
     index_options: Dict[str, List[dict]] = {}
+    index_expiries: Dict[str, set] = {}  # Track all expiries per index
 
     for inst in instruments:
         segment = inst.get('segment', '')
@@ -129,11 +139,11 @@ def fetch_index_options(
         if dte > max_dte:
             continue
 
-        # Filter for monthly expiry
-        if monthly_only:
-            expiry_dt = datetime.combine(expiry_date, datetime.min.time())
-            if not is_last_thursday_of_month(expiry_dt):
-                continue
+        # Track expiry for this index
+        if name not in index_expiries:
+            index_expiries[name] = set()
+        expiry_dt = datetime.combine(expiry_date, datetime.min.time())
+        index_expiries[name].add(expiry_dt)
 
         # Add to results
         if name not in index_options:
@@ -149,6 +159,18 @@ def fetch_index_options(
             'exchange': inst.get('exchange', 'NFO'),
             'dte': dte,
         })
+
+    # Second pass: filter for monthly expiry if needed
+    if monthly_only:
+        for idx in list(index_options.keys()):
+            expiries = index_expiries.get(idx, set())
+            index_options[idx] = [
+                opt for opt in index_options[idx]
+                if is_last_expiry_of_month(
+                    datetime.strptime(opt['expiry'], '%Y-%m-%d'),
+                    expiries
+                )
+            ]
 
     # Sort by expiry, then strike
     for idx in index_options:
