@@ -172,6 +172,11 @@ APPROACH_DISTANCE_PCT = 1.5   # Consider "approaching" within 1.5%
 INVALIDATE_PCT = 1.5          # Invalidate if breaks by 1.5%
 MIN_DTE = CONFIG.get('entry_rules', {}).get('preferred_dte_min', 15)
 
+# Sustained break detection (price spent significant time below support)
+SUSTAINED_BREAK_CANDLES = 3       # Min candles closing below to trigger
+SUSTAINED_BREAK_PENALTY = 30      # Score penalty for reclaimed broken levels
+INTRADAY_LOOKBACK_HOURS = 4       # How far back to check for breaks
+
 # Slippage thresholds from config (spread × lot_size for BOTH legs combined)
 slippage_cfg = CONFIG.get('entry_rules', {}).get('slippage', {})
 MAX_ENTRY_SLIPPAGE = slippage_cfg.get('max_entry_rs', 750)    # Warn if above
@@ -639,6 +644,99 @@ def get_previous_close(kite: KiteConnect, symbol: str) -> Optional[float]:
     except Exception as e:
         log.error(f"{symbol}: Failed to fetch historical data: {e}")
         return None
+
+
+def get_intraday_candles(
+    kite: KiteConnect,
+    symbol: str,
+    lookback_hours: int = INTRADAY_LOOKBACK_HOURS
+) -> Optional[List[Dict]]:
+    """
+    Fetch recent 15M candles for sustained break analysis.
+
+    Args:
+        kite: KiteConnect instance
+        symbol: Stock symbol (e.g., 'ICICIBANK')
+        lookback_hours: How many hours of data to fetch
+
+    Returns:
+        List of candle dicts with OHLCV data, or None on error
+    """
+    try:
+        # Get instrument token
+        instruments = kite.instruments('NSE')
+        token = None
+        for inst in instruments:
+            if inst['tradingsymbol'] == symbol:
+                token = inst['instrument_token']
+                break
+
+        if not token:
+            log.debug(f"{symbol}: Instrument token not found for intraday candles")
+            return None
+
+        # Fetch last N hours of 15M data
+        to_date = datetime.now()
+        from_date = to_date - timedelta(hours=lookback_hours)
+
+        data = kite.historical_data(
+            instrument_token=token,
+            from_date=from_date,
+            to_date=to_date,
+            interval='15minute'
+        )
+
+        if data:
+            log.debug(f"{symbol}: Fetched {len(data)} intraday candles")
+            return data
+
+        return None
+
+    except Exception as e:
+        log.error(f"{symbol}: Failed to fetch intraday candles: {e}")
+        return None
+
+
+def check_sustained_break(
+    candles: List[Dict],
+    support_price: float,
+    threshold_candles: int = SUSTAINED_BREAK_CANDLES
+) -> Tuple[bool, int, float]:
+    """
+    Check if support was broken for a sustained period.
+
+    A sustained break means multiple candles CLOSED below the support level.
+    This indicates the level is compromised even if price later reclaimed it.
+
+    Args:
+        candles: List of candle dicts with 'close', 'low' keys
+        support_price: The support level price to check against
+        threshold_candles: Minimum candles closing below to trigger
+
+    Returns:
+        Tuple of (is_broken, candles_below_count, lowest_price)
+    """
+    if not candles:
+        return False, 0, 0.0
+
+    candles_below = 0
+    lowest_price = float('inf')
+
+    for candle in candles:
+        close = candle.get('close', 0)
+        low = candle.get('low', 0)
+
+        # Count candles that CLOSED below support
+        if close < support_price:
+            candles_below += 1
+
+        # Track lowest price during the lookback period
+        if low < lowest_price:
+            lowest_price = low
+
+    is_broken = candles_below >= threshold_candles
+
+    return is_broken, candles_below, lowest_price if lowest_price != float('inf') else 0.0
 
 
 def check_sl_signals(kite: KiteConnect, send_alerts: bool = True) -> List[Position]:
@@ -1118,7 +1216,11 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
     levels_checked = 0
     levels_at_price = 0
     levels_invalidated = 0
+    levels_sustained_break = 0
     stocks_skipped_reliability = 0
+
+    # Cache for intraday candles (fetch once per stock per scan)
+    intraday_cache: Dict[str, Optional[List[Dict]]] = {}
 
     for symbol, stock_data in data['stocks'].items():
         nse_sym = f"NSE:{symbol}"
@@ -1147,6 +1249,10 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
         atr = stock_data.get('atr', 0)
         atr_pct = stock_data.get('atr_pct', 0)
 
+        # Fetch intraday candles once per stock (for sustained break detection)
+        if symbol not in intraday_cache:
+            intraday_cache[symbol] = get_intraday_candles(kite, symbol)
+
         for level in stock_data['levels']:
             # Skip inactive or already alerted
             if level.get('status') != 'active':
@@ -1167,12 +1273,26 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
             if level_type != 'support':
                 continue
 
-            # Check if level is invalidated (broken through)
+            # Check if level is invalidated (broken through currently)
             if ltp < level_price * (1 - INVALIDATE_PCT / 100):
                 level['status'] = 'invalidated'
                 levels_invalidated += 1
                 log.warning(f"{symbol}: INVALIDATED support {level_price} - LTP {ltp} broke through by {distance_pct:.1f}%")
                 continue
+
+            # Check for sustained break (multiple candles closed below support)
+            # Even if price reclaimed, the level is compromised
+            candles = intraday_cache.get(symbol)
+            if candles:
+                is_broken, candles_below, lowest = check_sustained_break(candles, level_price)
+                if is_broken:
+                    level['status'] = 'sustained_break'
+                    levels_sustained_break += 1
+                    log.warning(
+                        f"{symbol}: SUSTAINED BREAK at {level_price:.2f} - "
+                        f"{candles_below} candles closed below (lowest: {lowest:.2f}), LTP now {ltp:.2f}"
+                    )
+                    continue
 
             # Check if at level (within alert distance)
             if distance_pct <= ALERT_DISTANCE_PCT:
@@ -1282,7 +1402,7 @@ def run_scan(send_alerts: bool = True) -> List[TradeSetup]:
     log.info("-" * 50)
     if stocks_skipped_reliability > 0:
         log.info(f"Skipped {stocks_skipped_reliability} stocks due to poor S/R reliability (<{MIN_RELIABILITY_RATE*100:.0f}%)")
-    log.info(f"SCAN COMPLETE | Checked: {levels_checked} | At level: {levels_at_price} | Invalidated: {levels_invalidated} | Setups: {len(setups_found)}")
+    log.info(f"SCAN COMPLETE | Checked: {levels_checked} | At level: {levels_at_price} | Invalidated: {levels_invalidated} | Sustained breaks: {levels_sustained_break} | Setups: {len(setups_found)}")
 
     return setups_found
 
