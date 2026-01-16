@@ -3,14 +3,15 @@
 Momentum Scanner - HH-HL Pattern Detection on Index Options (OPTIMIZED)
 
 Detects 3 consecutive candles forming Higher Highs and Higher Lows
-on ATM strikes for NIFTY, BANKNIFTY, SENSEX.
+on ATM ± 1 strikes for NIFTY, BANKNIFTY, SENSEX.
 
 OPTIMIZATIONS (based on forward test - 58% win rate, +1047 P&L):
 1. Time Filter: Only trade 10:00-14:30 (skip volatile open/close)
 2. Trend Filter: CE only above 20 EMA, PE only below 20 EMA
-3. Strike Selection: ATM only (best delta for momentum)
+3. Strike Selection: ATM ± 1 (catches patterns near strike boundaries)
 4. Tighter SL: Candle 2 low (not candle 1)
 5. Profit Target: 1.5:1 risk-reward
+6. Index-level freeze: 1 hour freeze after any alert in an index
 
 Pattern: 3 green candles where each makes HH and HL vs previous
 Signal: BUY CE when pattern on CE (above EMA), BUY PE when pattern on PE (below EMA)
@@ -69,24 +70,22 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# Note: lot_size comes from Kite API at runtime, not from this config
 INDEX_CONFIG: Dict[str, Dict[str, Any]] = {
     'NIFTY': {
         'strike_gap': 50,
         'index_token': 256265,  # NSE:NIFTY 50
         'exchange': 'NFO',
-        'lot_size': 75,
     },
     'BANKNIFTY': {
         'strike_gap': 100,
         'index_token': 260105,  # NSE:NIFTY BANK
         'exchange': 'NFO',
-        'lot_size': 30,
     },
     'SENSEX': {
         'strike_gap': 100,
         'index_token': 265,  # BSE:SENSEX
         'exchange': 'BFO',
-        'lot_size': 20,
     }
 }
 
@@ -571,7 +570,7 @@ def is_position_expired(position: MomentumPosition) -> bool:
 # ALERT FREEZE (avoid repeat alerts on continuing pattern)
 # =============================================================================
 def load_alert_history() -> Dict[str, str]:
-    """Load alert history (symbol -> last_alert_time)."""
+    """Load alert history (index -> last_alert_time)."""
     if not ALERT_HISTORY_FILE.exists():
         return {}
     try:
@@ -612,12 +611,12 @@ def cleanup_old_alerts(history: Dict[str, str]) -> Dict[str, str]:
     """Remove alerts older than freeze period."""
     now = datetime.now()
     cleaned = {}
-    for symbol, time_str in history.items():
+    for key, time_str in history.items():
         try:
             alert_time = datetime.fromisoformat(time_str)
             elapsed = (now - alert_time).total_seconds() / 60
             if elapsed < ALERT_FREEZE_MINUTES * 2:  # Keep 2x freeze period
-                cleaned[symbol] = time_str
+                cleaned[key] = time_str
         except (ValueError, TypeError):
             pass
     return cleaned
@@ -628,14 +627,19 @@ def cleanup_old_alerts(history: Dict[str, str]) -> Dict[str, str]:
 # =============================================================================
 def format_entry_alert(signal: PatternSignal) -> str:
     """Format entry alert message."""
-    # Map OTM position to label
-    otm_label = 'ATM' if signal.otm_position == 0 else f'{signal.otm_position}OTM'
+    # Map position to label: 0=ATM, positive=OTM, negative=ITM
+    if signal.otm_position == 0:
+        strike_label = 'ATM'
+    elif signal.otm_position > 0:
+        strike_label = f'{signal.otm_position}OTM'
+    else:
+        strike_label = f'{abs(signal.otm_position)}ITM'
 
     # Calculate percentages
     sl_pct = ((signal.entry_price - signal.sl_price) / signal.entry_price) * 100
     target_pct = ((signal.target_price - signal.entry_price) / signal.entry_price) * 100
 
-    return f"""<b>MOMENTUM</b> | {signal.index} {signal.option_type} ({otm_label})
+    return f"""<b>MOMENTUM</b> | {signal.index} {signal.option_type} ({strike_label})
 
 <b>BUY {signal.option_symbol}</b>
 Expiry: {signal.expiry}
@@ -718,7 +722,8 @@ def scan_for_signals(
     kite: KiteConnect,
     index_options: Dict[str, List[dict]],
     spot_prices: Dict[str, float],
-    existing_positions: List[MomentumPosition]
+    existing_positions: List[MomentumPosition],
+    alert_history: Dict[str, str]
 ) -> List[PatternSignal]:
     """Scan all target options for HH-HL pattern."""
     signals: List[PatternSignal] = []
@@ -735,6 +740,11 @@ def scan_for_signals(
     }
 
     for index, options in index_options.items():
+        # Check INDEX freeze EARLY - before fetching any candles (saves API calls)
+        if is_index_frozen(index, alert_history):
+            log.info(f"{index}: Frozen (alert within {ALERT_FREEZE_MINUTES} min), skipping scan")
+            continue
+
         if index not in spot_prices:
             log.warning(f"{index}: No spot price, skipping")
             continue
@@ -1156,9 +1166,9 @@ def main() -> None:
             kite, positions, args.test
         )
 
-        # 2. Scan for new signals
+        # 2. Scan for new signals (freeze check happens inside, saves API calls)
         signals = scan_for_signals(
-            kite, index_options, spot_prices, positions
+            kite, index_options, spot_prices, positions, alert_history
         )
         log.info(f"Found {len(signals)} new signals")
 
