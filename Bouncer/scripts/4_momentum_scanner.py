@@ -90,8 +90,10 @@ INDEX_CONFIG: Dict[str, Dict[str, Any]] = {
     }
 }
 
-# Strike position to track (ATM only - best delta for momentum)
-OTM_POSITIONS = [0]
+# Strike positions to track relative to ATM
+# 0 = ATM, -1 = 1 strike below, 1 = 1 strike above
+# We check ATM ± 1 to catch patterns when spot is near strike boundary
+STRIKE_OFFSETS = [-1, 0, 1]
 
 # Pattern settings
 PATTERN_CANDLES = 3  # Need 3 candles for HH-HL pattern
@@ -108,8 +110,11 @@ MAX_POSITIONS = 3  # Max open positions at any time
 MAX_CLOSED_POSITIONS_TO_KEEP = 50  # Cleanup old closed positions
 MIN_TRAIL_AMOUNT = 2.0  # Minimum Rs to trail SL (avoid spam alerts)
 
-# Alert freeze (avoid repeat alerts on continuing pattern)
-ALERT_FREEZE_MINUTES = 60  # 1 hour freeze after alert
+# Alert freeze - INDEX LEVEL (not symbol level)
+# When any option in an index triggers, freeze ALL options in that index
+# Rationale: Can't actively trade 2 symbols in same index, and patterns
+# on adjacent strikes are just continuation of the same move
+ALERT_FREEZE_MINUTES = 60  # 1 hour freeze after any alert in index
 
 
 # =============================================================================
@@ -274,21 +279,22 @@ def get_atm_strike(spot: float, strike_gap: int) -> int:
     return int(round(spot / strike_gap) * strike_gap)
 
 
-def get_otm_strikes(spot: float, index: str) -> Dict[str, List[int]]:
+def get_strikes_to_scan(spot: float, index: str) -> List[int]:
     """
-    Get ATM strikes for CE and PE.
+    Get strikes to scan around ATM.
+
+    Checks ATM ± 1 strike to catch patterns when spot is near strike boundary.
+    For example, if spot=59932 (ATM=59900), we check [59800, 59900, 60000]
+    to avoid missing patterns on 60000 when spot is about to cross.
 
     Returns:
-        {'CE': [ATM], 'PE': [ATM]}
+        List of strikes to scan [ATM-gap, ATM, ATM+gap]
     """
     config = INDEX_CONFIG[index]
     strike_gap = int(config['strike_gap'])
     atm = get_atm_strike(spot, strike_gap)
 
-    return {
-        'CE': [atm + (i * strike_gap) for i in OTM_POSITIONS],
-        'PE': [atm - (i * strike_gap) for i in OTM_POSITIONS]
-    }
+    return [atm + (offset * strike_gap) for offset in STRIKE_OFFSETS]
 
 
 # =============================================================================
@@ -584,22 +590,22 @@ def save_alert_history(history: Dict[str, str]) -> None:
         log.error(f"Failed to save alert history: {e}")
 
 
-def is_alert_frozen(symbol: str, history: Dict[str, str]) -> bool:
-    """Check if symbol is in alert freeze period."""
-    if symbol not in history:
+def is_index_frozen(index: str, history: Dict[str, str]) -> bool:
+    """Check if index is in alert freeze period (index-level freeze)."""
+    if index not in history:
         return False
 
     try:
-        last_alert = datetime.fromisoformat(history[symbol])
+        last_alert = datetime.fromisoformat(history[index])
         elapsed = (datetime.now() - last_alert).total_seconds() / 60
         return elapsed < ALERT_FREEZE_MINUTES
     except (ValueError, TypeError):
         return False
 
 
-def record_alert(symbol: str, history: Dict[str, str]) -> None:
-    """Record alert time for symbol."""
-    history[symbol] = datetime.now().isoformat()
+def record_index_alert(index: str, history: Dict[str, str]) -> None:
+    """Record alert time for index (freezes all options in that index)."""
+    history[index] = datetime.now().isoformat()
 
 
 def cleanup_old_alerts(history: Dict[str, str]) -> Dict[str, str]:
@@ -734,7 +740,7 @@ def scan_for_signals(
             continue
 
         spot = spot_prices[index]
-        otm_strikes = get_otm_strikes(spot, index)
+        strikes_to_scan = get_strikes_to_scan(spot, index)
         monthly_expiry = get_nearest_expiry(options)
 
         if not monthly_expiry:
@@ -742,16 +748,19 @@ def scan_for_signals(
             continue
 
         strike_gap = int(INDEX_CONFIG[index]['strike_gap'])
+        atm = get_atm_strike(spot, strike_gap)
         log.info(
             f"{index}: Spot={spot:.0f}, "
-            f"ATM={get_atm_strike(spot, strike_gap)}, "
+            f"ATM={atm}, "
+            f"Scanning strikes={strikes_to_scan}, "
             f"Expiry={monthly_expiry}"
         )
 
-        # Check CE and PE sides
+        # Check CE and PE for each strike around ATM
         for opt_type in ['CE', 'PE']:
-            for idx, strike in enumerate(otm_strikes[opt_type]):
-                otm_pos = OTM_POSITIONS[idx]  # 0 = ATM
+            for strike in strikes_to_scan:
+                # Calculate OTM position: 0=ATM, positive=OTM, negative=ITM
+                otm_pos = int((strike - atm) / strike_gap) if opt_type == 'CE' else int((atm - strike) / strike_gap)
 
                 opt_data = find_option_by_strike(
                     options, strike, opt_type, monthly_expiry
@@ -997,11 +1006,12 @@ def process_signals(
 ) -> List[MomentumPosition]:
     """Process new signals, create positions, send alerts."""
     for signal in signals:
-        # Check alert freeze
-        if is_alert_frozen(signal.option_symbol, alert_history):
+        # Check INDEX-level freeze (not symbol-level)
+        # If any option in this index triggered recently, skip all options in that index
+        if is_index_frozen(signal.index, alert_history):
             log.info(
-                f"{signal.option_symbol}: Alert frozen "
-                f"(within {ALERT_FREEZE_MINUTES} min), skipping"
+                f"{signal.option_symbol}: {signal.index} frozen "
+                f"(alert within {ALERT_FREEZE_MINUTES} min), skipping"
             )
             continue
 
@@ -1032,8 +1042,8 @@ def process_signals(
             f"Target={signal.target_price:.2f}"
         )
 
-        # Record alert time
-        record_alert(signal.option_symbol, alert_history)
+        # Record alert at INDEX level (freezes all options in this index)
+        record_index_alert(signal.index, alert_history)
         send_telegram(alert, test_mode)
 
     return positions
