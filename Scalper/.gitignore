@@ -1,0 +1,38 @@
+# Credentials - NEVER commit
+config/creds.env
+config/credentials.yaml
+
+# Session data
+data/session.json
+data/scrip_master/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+*.egg-info/
+dist/
+build/
+*.exe

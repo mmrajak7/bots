@@ -1,0 +1,90 @@
+# Kayal - Application Configuration
+# ==============================================
+# This file contains app settings (safe to commit)
+#
+# CREDENTIALS: Create a separate file config/credentials.yaml with:
+#   neo_credentials:
+#     consumer_key: "YOUR_KEY"
+#     mobile_number: "+91XXXXXXXXXX"
+#     ucc: "YOUR_UCC"
+#     mpin: "XXXXXX"
+#     totp_secret: "YOUR_TOTP_SECRET"
+#   kite_credentials:
+#     api_key: "YOUR_KITE_API_KEY"
+#   telegram:
+#     enabled: true
+#     bot_token: "YOUR_BOT_TOKEN"
+#     chat_id: "YOUR_CHAT_ID"
+# ==============================================
+
+trading_defaults:
+  product: "MIS"           # MIS for intraday, NRML for positional
+  order_type: "L"          # L=Limit, MKT=Market
+  validity: "DAY"
+  default_lots: 1
+
+trailing_sl:
+  min_sl_distance: 5       # Minimum SL distance from LTP (points)
+  trail_buttons: [10, 25, 50]  # Quick trail button increments
+  ltp_buffer: 20           # LTP minus buffer for quick trail
+
+risk_management:
+  max_loss_per_day: 10000          # Daily loss circuit breaker
+  max_open_positions: 5            # Maximum concurrent positions
+  duplicate_order_window_sec: 5    # Duplicate order prevention window
+
+market_hours:
+  open: "09:15"                    # Market opens
+  close: "15:30"                   # Market closes
+  mis_warning: "15:15"             # Warn about MIS squareoff
+  mis_cutoff: "15:20"              # Block new MIS orders after this
+
+ui_preferences:
+  theme: "dark"
+  confirm_before_order: false      # Speed mode - no confirmation dialogs
+  confirm_before_exit: false
+  sound_on_fill: true
+  keyboard_shortcuts_enabled: true
+
+indices:
+  NIFTY:
+    strike_gap: 50
+    token: 256265
+    exchange: "NFO"
+  BANKNIFTY:
+    strike_gap: 100
+    token: 260105
+    exchange: "NFO"
+  SENSEX:
+    strike_gap: 100
+    token: 265
+    exchange: "BFO"
+  FINNIFTY:
+    strike_gap: 50
+    token: 257801
+    exchange: "NFO"
+
+lot_sizes:  # Fallback if scrip master lookup fails (Updated Jan 2026)
+  NIFTY: 65
+  BANKNIFTY: 30
+  FINNIFTY: 60
+  SENSEX: 10
+  BANKEX: 15
+  MIDCPNIFTY: 120
+
+paths:
+  # Kite session file - shared across all BOTS projects
+  # This is auto-updated by the Kite login script
+  kite_token: "../data/kite_access_token.json"
+  # Also try absolute path if relative fails
+  kite_token_backup: "C:/Users/mail2/Documents/Projects/BOTS/data/kite_access_token.json"
+  scrip_master: "data/scrip_master"
+  trade_log: "logs"
+
+websocket:
+  reconnect_attempts: 3
+  reconnect_delay_sec: 5
+  heartbeat_interval_sec: 30
+
+position_refresh:
+  interval_sec: 2
