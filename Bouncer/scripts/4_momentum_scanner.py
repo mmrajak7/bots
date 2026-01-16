@@ -17,7 +17,7 @@ Pattern: 3 green candles where each makes HH and HL vs previous
 Signal: BUY CE when pattern on CE (above EMA), BUY PE when pattern on PE (below EMA)
 SL: Low of second candle in pattern
 Target: Entry + 1.5x risk
-Trailing SL: Update to previous candle's low after target 1 hit
+Trailing SL: Update to previous candle's low (immediate, not waiting for target)
 
 Usage:
     python scripts/4_momentum_scanner.py           # Single scan (respects time filters)
@@ -635,9 +635,13 @@ def format_entry_alert(signal: PatternSignal) -> str:
     else:
         strike_label = f'{abs(signal.otm_position)}ITM'
 
-    # Calculate percentages
-    sl_pct = ((signal.entry_price - signal.sl_price) / signal.entry_price) * 100
-    target_pct = ((signal.target_price - signal.entry_price) / signal.entry_price) * 100
+    # Calculate percentages (guard against division by zero)
+    if signal.entry_price > 0:
+        sl_pct = ((signal.entry_price - signal.sl_price) / signal.entry_price) * 100
+        target_pct = ((signal.target_price - signal.entry_price) / signal.entry_price) * 100
+    else:
+        sl_pct = 0.0
+        target_pct = 0.0
 
     return f"""<b>MOMENTUM</b> | {signal.index} {signal.option_type} ({strike_label})
 
@@ -878,8 +882,9 @@ def check_and_update_positions(
     """
     Check open positions:
     1. Auto-close expired positions
-    2. If candle low < SL: Exit and close
-    3. If price moved up: Trail SL to previous candle low
+    2. Check TARGET HIT (LTP >= target)
+    3. Check SL HIT (LTP < current_sl)
+    4. Trail SL to previous candle's low (if above current SL and below LTP)
 
     Returns:
         (updated_positions, alert_messages)
@@ -897,11 +902,18 @@ def check_and_update_positions(
         if is_position_expired(pos):
             log.warning(f"{pos.option_symbol}: EXPIRED - closing position")
             pos.status = 'closed'
-            pos.exit_price = 0.0
             pos.exit_time = datetime.now().isoformat()
             pos.exit_reason = 'EXPIRED'
 
-            alert = format_exit_alert(pos, 0.0, 'Option Expired')
+            # Try to get last traded price for accurate P&L
+            try:
+                quote_sym = f"{pos.exchange}:{pos.option_symbol}"
+                quote = kite.quote([quote_sym])
+                pos.exit_price = float(quote.get(quote_sym, {}).get('last_price', 0))
+            except Exception:
+                pos.exit_price = 0.0  # Fallback if quote fails
+
+            alert = format_exit_alert(pos, pos.exit_price, 'Option Expired')
             alerts.append(alert)
             send_telegram(alert, test_mode)
             continue
@@ -964,7 +976,10 @@ def check_and_update_positions(
                 # Use COMPLETED candle's low for trailing
                 # (SL hit already checked using LTP above)
                 completed_candle = candles[-2]
-                candle_low = float(completed_candle.get('low', ltp))
+                if 'low' not in completed_candle:
+                    log.warning(f"{pos.option_symbol}: Candle missing 'low' field, skipping trail")
+                    continue
+                candle_low = float(completed_candle['low'])
 
                 # Trailing SL: Only trail UP if candle_low > current_sl
                 # AND candle_low is below LTP (valid trail)
@@ -995,17 +1010,12 @@ def process_signals(
     alert_history: Dict[str, str],
     test_mode: bool = False
 ) -> List[MomentumPosition]:
-    """Process new signals, create positions, send alerts."""
-    for signal in signals:
-        # Check INDEX-level freeze (not symbol-level)
-        # If any option in this index triggered recently, skip all options in that index
-        if is_index_frozen(signal.index, alert_history):
-            log.info(
-                f"{signal.option_symbol}: {signal.index} frozen "
-                f"(alert within {ALERT_FREEZE_MINUTES} min), skipping"
-            )
-            continue
+    """Process new signals, create positions, send alerts.
 
+    Note: Index freeze is already checked in scan_for_signals() before signals
+    are generated. We still record the alert to freeze future scans.
+    """
+    for signal in signals:
         position = MomentumPosition(
             id=generate_position_id(signal.index, signal.option_symbol),
             index=signal.index,

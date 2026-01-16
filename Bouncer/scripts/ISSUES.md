@@ -103,12 +103,48 @@
 
 ---
 
-## Summary (2026-01-16 Review)
+## Summary (2026-01-16 Review - Part 1)
 
 | Severity | Found | Fixed |
 |----------|-------|-------|
 | MEDIUM | 2 | 2 |
 | LOW | 4 | 4 |
 | **TOTAL** | **6** | **6** |
+
+---
+
+# Review 2026-01-16 Part 2: Comprehensive Bug Hunt
+
+**Trigger:** User reported SL trail message when LTP was already below SL.
+
+## Critical Bug Fixed
+
+| ID | Line | Issue | Severity | Status |
+|----|------|-------|----------|--------|
+| C2 | 943-958 | **SL checked using candle_low, not LTP**: Position stayed open when LTP < SL because completed candle had high low | CRITICAL | FIXED |
+
+**Root cause:** Code only checked `candle_low < SL` for exit, but current candle's LTP could be below SL.
+
+**Fix:** Added `LTP < SL` check before candle-based checks. Also added `candle_low < LTP` constraint on trailing.
+
+## Additional Bugs Found & Fixed
+
+| ID | Line | Issue | Severity | Status |
+|----|------|-------|----------|--------|
+| C3 | 639-640 | **Division by zero**: If entry_price=0, sl_pct calculation crashes | CRITICAL | FIXED |
+| H4 | 878-882 | **Docstring outdated**: Still said "candle low < SL" | HIGH | FIXED |
+| H5 | 20 | **Docstring misleading**: Said "trail after target hit" but code trails immediately | HIGH | FIXED |
+| H6 | 900 | **Expired position exit_price=0**: Should try to get actual last price | HIGH | FIXED |
+| M13 | 1000-1007 | **Duplicate freeze check**: Already done in scan_for_signals | MEDIUM | FIXED (removed) |
+| M14 | 967 | **Silent fallback**: candle_low defaulted to ltp without warning | MEDIUM | FIXED (added warning) |
+
+## Summary (2026-01-16 Review - Part 2)
+
+| Severity | Found | Fixed |
+|----------|-------|-------|
+| CRITICAL | 2 | 2 |
+| HIGH | 3 | 3 |
+| MEDIUM | 2 | 2 |
+| **TOTAL** | **7** | **7** |
 
 **All issues fixed.**
