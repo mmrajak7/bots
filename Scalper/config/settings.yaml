@@ -59,6 +59,10 @@ indices:
     strike_gap: 100
     token: 265
     exchange: "BFO"
+  BANKEX:
+    strike_gap: 100
+    token: 274
+    exchange: "BFO"
   FINNIFTY:
     strike_gap: 50
     token: 257801

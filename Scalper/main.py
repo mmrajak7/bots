@@ -174,9 +174,9 @@ def main():
         logger.info("Initializing order manager...")
         order_mgr = OrderManager(session.get_client(), config, mapper)
 
-        # Initialize Kite Spot Fetcher
+        # Initialize Kite Spot Fetcher (pass mapper for expiry date lookups)
         logger.info("Initializing Kite spot fetcher...")
-        kite_spot = KiteSpotFetcher(config)
+        kite_spot = KiteSpotFetcher(config, symbol_mapper=mapper)
         success, msg = kite_spot.connect()
         logger.info(msg)
         if not success:

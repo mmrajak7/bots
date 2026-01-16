@@ -18,10 +18,11 @@ logger = logging.getLogger(__name__)
 class KiteSpotFetcher:
     """Fetches spot prices from Kite for ATM strike calculation."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], symbol_mapper=None):
         self.config = config
         self.kite: Optional[KiteConnect] = None
         self._connected = False
+        self.symbol_mapper = symbol_mapper  # For getting actual expiry dates from scrip master
 
         # Index tokens (NSE)
         self.spot_tokens = {
@@ -114,6 +115,10 @@ class KiteSpotFetcher:
     def is_connected(self) -> bool:
         """Check if Kite is connected."""
         return self._connected and self.kite is not None
+
+    def set_symbol_mapper(self, symbol_mapper):
+        """Set symbol mapper for expiry date lookups."""
+        self.symbol_mapper = symbol_mapper
 
     def get_spot_price(self, underlying: str) -> float:
         """
@@ -229,15 +234,29 @@ class KiteSpotFetcher:
         if underlying in monthly_only_indices:
             use_monthly = True
 
-        # Get expiry date
+        # Get expiry date - prefer actual dates from scrip master
         if expiry_date is None:
-            if use_monthly:
-                expiry_date = self.get_monthly_expiry(0)
-                # If monthly expiry already passed this month, get next month
-                if expiry_date.date() < datetime.now().date():
-                    expiry_date = self.get_monthly_expiry(1)
-            else:
-                expiry_date = self._get_weekly_expiry(underlying)
+            # Try to get actual expiry from scrip master (primary source)
+            actual_expiry = None
+            if self.symbol_mapper:
+                try:
+                    actual_expiry = self.symbol_mapper.get_nearest_expiry(underlying, use_monthly)
+                    if actual_expiry:
+                        expiry_date = datetime.combine(actual_expiry, datetime.min.time())
+                        logger.debug(f"Got expiry from scrip master: {actual_expiry} for {underlying}")
+                except Exception as e:
+                    logger.warning(f"Failed to get expiry from scrip master: {e}")
+
+            # Fallback to calculated expiry if scrip master failed
+            if expiry_date is None:
+                logger.debug(f"Using calculated expiry for {underlying} (scrip master unavailable)")
+                if use_monthly:
+                    expiry_date = self.get_monthly_expiry(0, underlying)
+                    # If monthly expiry already passed this month, get next month
+                    if expiry_date.date() < datetime.now().date():
+                        expiry_date = self.get_monthly_expiry(1, underlying)
+                else:
+                    expiry_date = self._get_weekly_expiry(underlying)
 
         # Format expiry based on type
         if use_monthly:
@@ -260,7 +279,8 @@ class KiteSpotFetcher:
     def _get_weekly_expiry(self, underlying: str) -> datetime:
         """
         Get current weekly expiry date.
-        NSE indices expire on Thursday (or previous trading day if holiday).
+        NSE indices (NIFTY) expire on Thursday.
+        BSE indices (SENSEX) expire on Friday.
 
         Args:
             underlying: Index name
@@ -270,22 +290,31 @@ class KiteSpotFetcher:
         """
         today = datetime.now()
 
-        # Find next Thursday
-        days_until_thursday = (3 - today.weekday()) % 7
+        # SENSEX expires on Friday (weekday=4), NIFTY on Thursday (weekday=3)
+        if underlying.upper() in ['SENSEX', 'BANKEX']:
+            expiry_weekday = 4  # Friday
+        else:
+            expiry_weekday = 3  # Thursday
 
-        # If it's Thursday after market hours, get next week
-        if days_until_thursday == 0 and today.hour >= 15:
-            days_until_thursday = 7
+        # Find next expiry day
+        days_until_expiry = (expiry_weekday - today.weekday()) % 7
 
-        expiry = today + timedelta(days=days_until_thursday)
+        # If it's expiry day after market hours, get next week
+        if days_until_expiry == 0 and today.hour >= 15:
+            days_until_expiry = 7
+
+        expiry = today + timedelta(days=days_until_expiry)
         return expiry
 
-    def get_monthly_expiry(self, month_offset: int = 0) -> datetime:
+    def get_monthly_expiry(self, month_offset: int = 0, underlying: str = None) -> datetime:
         """
-        Get monthly expiry date (last Thursday of month).
+        Get monthly expiry date.
+        NSE indices: Last Thursday of month
+        BSE indices (SENSEX/BANKEX): Last Friday of month
 
         Args:
             month_offset: 0 for current month, 1 for next month, etc.
+            underlying: Index name (to determine NSE vs BSE expiry day)
 
         Returns:
             Expiry datetime
@@ -300,7 +329,13 @@ class KiteSpotFetcher:
             month -= 12
             year += 1
 
-        # Find last Thursday of target month
+        # BSE indices expire on Friday (weekday=4), NSE on Thursday (weekday=3)
+        if underlying and underlying.upper() in ['SENSEX', 'BANKEX']:
+            expiry_weekday = 4  # Friday
+        else:
+            expiry_weekday = 3  # Thursday
+
+        # Find last expiry day of target month
         # Start from end of month and go backwards
         if month == 12:
             next_month = datetime(year + 1, 1, 1)
@@ -309,11 +344,11 @@ class KiteSpotFetcher:
 
         last_day = next_month - timedelta(days=1)
 
-        # Find last Thursday
-        days_since_thursday = (last_day.weekday() - 3) % 7
-        last_thursday = last_day - timedelta(days=days_since_thursday)
+        # Find last occurrence of expiry_weekday
+        days_since_expiry_day = (last_day.weekday() - expiry_weekday) % 7
+        last_expiry = last_day - timedelta(days=days_since_expiry_day)
 
-        return last_thursday
+        return last_expiry
 
     def get_option_chain_strikes(self, underlying: str,
                                   range_count: int = 5) -> Dict[str, Any]:

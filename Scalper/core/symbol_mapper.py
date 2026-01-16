@@ -8,7 +8,7 @@ Downloads both Kite and NEO instruments at login, builds mapping cache.
 import pandas as pd
 import os
 import json
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import re
 import logging
 from typing import Dict, List, Optional, Any, Tuple
@@ -796,3 +796,188 @@ class SymbolMapper:
             # Fallback to defaults
             parsed = self.parse_kite_symbol(kite_symbol)
             return self.lot_sizes.get(parsed['underlying'], 1)
+
+    def get_available_expiries(self, underlying: str, use_monthly: bool = True) -> List[date]:
+        """
+        Get available expiry dates from scrip master for an underlying.
+        Uses NEO scrip master as primary source, Kite instruments as fallback.
+
+        Args:
+            underlying: Index name (NIFTY, SENSEX, BANKNIFTY, etc.)
+            use_monthly: True for monthly expiries, False for weekly
+
+        Returns:
+            List of expiry dates sorted ascending (nearest first)
+        """
+        underlying = underlying.upper()
+        expiries = set()
+        today = date.today()
+
+        # Try NEO scrip master first (primary source)
+        neo_expiries = self._get_expiries_from_neo(underlying, today)
+        expiries.update(neo_expiries)
+
+        # Fallback to Kite instruments if no expiries found
+        if not expiries and self.kite_instruments is not None:
+            kite_expiries = self._get_expiries_from_kite(underlying, today)
+            expiries.update(kite_expiries)
+
+        if not expiries:
+            logger.warning(f"No expiries found for {underlying} in any data source")
+            return []
+
+        # Sort ascending (nearest first)
+        sorted_expiries = sorted(expiries)
+
+        # Filter for monthly vs weekly
+        if use_monthly:
+            # Monthly expiries are in the last week of month
+            # Check if expiry is within last 7 days of its month
+            monthly = []
+            for exp in sorted_expiries:
+                # Get last day of the month
+                if exp.month == 12:
+                    next_month_first = date(exp.year + 1, 1, 1)
+                else:
+                    next_month_first = date(exp.year, exp.month + 1, 1)
+                last_day_of_month = (next_month_first - timedelta(days=1)).day
+
+                # Monthly expiry is in last 7 days of month (inclusive)
+                if exp.day >= last_day_of_month - 6:
+                    monthly.append(exp)
+            return monthly if monthly else sorted_expiries[:1]
+        else:
+            # Weekly: return all expiries, nearest first
+            return sorted_expiries
+
+    def _get_expiries_from_neo(self, underlying: str, today: date) -> set:
+        """Extract expiry dates from NEO scrip master."""
+        expiries = set()
+
+        # Determine which dataframe to use
+        if underlying in ['SENSEX', 'BANKEX']:
+            df = self.bse_fo_df
+        else:
+            df = self.nse_fo_df
+
+        if df is None or df.empty:
+            return expiries
+
+        try:
+            # Find the expiry date column
+            expiry_col = None
+            for col in ['pExpiryDate', 'expiryDate', 'ExpiryDate', 'expiry']:
+                if col in df.columns:
+                    expiry_col = col
+                    break
+
+            if not expiry_col:
+                return expiries
+
+            # Find trading symbol column
+            symbol_col = None
+            for col in ['pTrdSymbol', 'tradingSymbol', 'TradingSymbol']:
+                if col in df.columns:
+                    symbol_col = col
+                    break
+
+            if not symbol_col:
+                return expiries
+
+            # Filter for underlying options (CE/PE)
+            mask = df[symbol_col].str.upper().str.startswith(underlying)
+            mask &= df[symbol_col].str.upper().str.contains('CE|PE')
+            filtered = df[mask]
+
+            if filtered.empty:
+                return expiries
+
+            # Parse expiry dates
+            for expiry_str in filtered[expiry_col].unique():
+                exp_date = self._parse_expiry_date(expiry_str)
+                if exp_date and exp_date >= today:
+                    expiries.add(exp_date)
+
+        except Exception as e:
+            logger.debug(f"Error getting NEO expiries for {underlying}: {e}")
+
+        return expiries
+
+    def _get_expiries_from_kite(self, underlying: str, today: date) -> set:
+        """Extract expiry dates from Kite instruments (fallback)."""
+        expiries = set()
+
+        if self.kite_instruments is None or self.kite_instruments.empty:
+            return expiries
+
+        try:
+            df = self.kite_instruments
+
+            # Find expiry column
+            expiry_col = None
+            for col in ['expiry', 'expiry_date', 'ExpiryDate']:
+                if col in df.columns:
+                    expiry_col = col
+                    break
+
+            if not expiry_col:
+                return expiries
+
+            # Find symbol/name column
+            symbol_col = None
+            for col in ['name', 'tradingsymbol', 'trading_symbol', 'option_symbol']:
+                if col in df.columns:
+                    symbol_col = col
+                    break
+
+            if not symbol_col:
+                return expiries
+
+            # Filter for underlying
+            mask = df[symbol_col].str.upper().str.startswith(underlying)
+            filtered = df[mask]
+
+            if filtered.empty:
+                return expiries
+
+            # Parse expiry dates
+            for expiry_str in filtered[expiry_col].unique():
+                exp_date = self._parse_expiry_date(expiry_str)
+                if exp_date and exp_date >= today:
+                    expiries.add(exp_date)
+
+        except Exception as e:
+            logger.debug(f"Error getting Kite expiries for {underlying}: {e}")
+
+        return expiries
+
+    def _parse_expiry_date(self, expiry_str) -> Optional[date]:
+        """Parse expiry date string to date object."""
+        if pd.isna(expiry_str):
+            return None
+
+        expiry_str = str(expiry_str).strip()
+
+        # Try multiple date formats
+        for fmt in ['%d-%b-%Y', '%d-%m-%Y', '%Y-%m-%d', '%d %b %Y', '%d/%m/%Y',
+                    '%Y-%m-%dT%H:%M:%S', '%d-%b-%y', '%d %b, %Y']:
+            try:
+                return datetime.strptime(expiry_str, fmt).date()
+            except ValueError:
+                continue
+
+        return None
+
+    def get_nearest_expiry(self, underlying: str, use_monthly: bool = True) -> Optional[date]:
+        """
+        Get the nearest available expiry date for an underlying.
+
+        Args:
+            underlying: Index name
+            use_monthly: True for monthly, False for weekly (nearest)
+
+        Returns:
+            Nearest expiry date or None
+        """
+        expiries = self.get_available_expiries(underlying, use_monthly)
+        return expiries[0] if expiries else None

@@ -83,10 +83,13 @@ class WebSocketHandler:
             return False
 
         # Index tokens mapping
+        # NSE indices use nse_cm, BSE indices use bse_cm
         index_tokens = {
             'NIFTY': {'instrument_token': '26000', 'exchange_segment': 'nse_cm'},
             'BANKNIFTY': {'instrument_token': '26009', 'exchange_segment': 'nse_cm'},
             'FINNIFTY': {'instrument_token': '26037', 'exchange_segment': 'nse_cm'},
+            'SENSEX': {'instrument_token': '1', 'exchange_segment': 'bse_cm'},
+            'BANKEX': {'instrument_token': '12', 'exchange_segment': 'bse_cm'},
         }
 
         tokens = []

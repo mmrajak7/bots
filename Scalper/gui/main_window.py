@@ -566,6 +566,33 @@ class MainWindow(QMainWindow):
         self.f4_btn.clicked.connect(lambda: self._load_preset('BANKNIFTY', 'PE', 0))
         row2.addWidget(self.f4_btn)
 
+        # SENSEX preset buttons (BSE)
+        self.f7_btn = QPushButton("F7:SC")
+        self.f7_btn.setFixedSize(45, 22)
+        self.f7_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #996633; color: white;
+                font-weight: bold; font-size: 9px; border-radius: 3px;
+            }
+            QPushButton:hover { background-color: #aa7744; }
+        """)
+        self.f7_btn.setToolTip("F7: SENSEX CE ATM (BSE)")
+        self.f7_btn.clicked.connect(lambda: self._load_preset('SENSEX', 'CE', 0))
+        row2.addWidget(self.f7_btn)
+
+        self.f8_btn = QPushButton("F8:SP")
+        self.f8_btn.setFixedSize(45, 22)
+        self.f8_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #996633; color: white;
+                font-weight: bold; font-size: 9px; border-radius: 3px;
+            }
+            QPushButton:hover { background-color: #aa7744; }
+        """)
+        self.f8_btn.setToolTip("F8: SENSEX PE ATM (BSE)")
+        self.f8_btn.clicked.connect(lambda: self._load_preset('SENSEX', 'PE', 0))
+        row2.addWidget(self.f8_btn)
+
         row2.addStretch()
 
         # Breakeven points label (charges / qty)
@@ -826,6 +853,8 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("F4"), self, lambda: self._load_preset('BANKNIFTY', 'PE', 0))
         QShortcut(QKeySequence("F5"), self, lambda: self._adjust_lots(1))
         QShortcut(QKeySequence("F6"), self, lambda: self._adjust_lots(-1))
+        QShortcut(QKeySequence("F7"), self, lambda: self._load_preset('SENSEX', 'CE', 0))
+        QShortcut(QKeySequence("F8"), self, lambda: self._load_preset('SENSEX', 'PE', 0))
         QShortcut(QKeySequence("F9"), self, self._exit_all_positions)
         QShortcut(QKeySequence("F10"), self, self._cancel_all_orders)
 
