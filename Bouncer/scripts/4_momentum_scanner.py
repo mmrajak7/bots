@@ -162,6 +162,9 @@ def load_config() -> dict:
     except json.JSONDecodeError as e:
         log.error(f"Config JSON parse error: {e}")
         return {}
+    except IOError as e:
+        log.error(f"Config read error: {e}")
+        return {}
 
 
 CONFIG = load_config()
@@ -195,14 +198,22 @@ def send_telegram(message: str, test_mode: bool = False) -> bool:
         log.info(f"[TEST] Would send: {message[:100]}...")
         return True
 
-    if not CONFIG.get('telegram', {}).get('enabled', False):
+    telegram_config = CONFIG.get('telegram', {})
+    if not telegram_config.get('enabled', False):
         log.debug("Telegram disabled")
         return False
 
+    # Validate required keys exist
+    bot_token = telegram_config.get('bot_token')
+    chat_id = telegram_config.get('chat_id')
+    if not bot_token or not chat_id:
+        log.error("Telegram config missing bot_token or chat_id")
+        return False
+
     try:
-        url = f"https://api.telegram.org/bot{CONFIG['telegram']['bot_token']}/sendMessage"
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         response = requests.post(url, json={
-            'chat_id': CONFIG['telegram']['chat_id'],
+            'chat_id': chat_id,
             'text': message,
             'parse_mode': 'HTML'
         }, timeout=10)
@@ -705,8 +716,10 @@ def find_option_by_strike(
     expiry: str
 ) -> Optional[dict]:
     """Find option matching strike, type, and expiry."""
+    # Use int comparison to avoid float precision issues
+    strike_int = int(strike)
     for opt in options:
-        if (opt['strike'] == strike and
+        if (int(opt['strike']) == strike_int and
                 opt['option_type'] == option_type and
                 opt['expiry'] == expiry):
             return opt
@@ -733,17 +746,24 @@ def scan_for_signals(
     signals: List[PatternSignal] = []
 
     # Check max positions limit
-    open_count = len([p for p in existing_positions if p.status == 'open'])
+    open_positions = [p for p in existing_positions if p.status == 'open']
+    open_count = len(open_positions)
     if open_count >= MAX_POSITIONS:
         log.info(f"Max positions ({MAX_POSITIONS}) reached, skipping signal scan")
         return []
 
     # Get set of existing option symbols to avoid duplicates
-    existing_symbols = {
-        p.option_symbol for p in existing_positions if p.status == 'open'
-    }
+    existing_symbols = {p.option_symbol for p in open_positions}
+
+    # Get set of indices with open positions (one position per index rule)
+    existing_indices = {p.index for p in open_positions}
 
     for index, options in index_options.items():
+        # Skip if already have open position in this index
+        if index in existing_indices:
+            log.debug(f"{index}: Already have open position, skipping scan")
+            continue
+
         # Check INDEX freeze EARLY - before fetching any candles (saves API calls)
         if is_index_frozen(index, alert_history):
             log.info(f"{index}: Frozen (alert within {ALERT_FREEZE_MINUTES} min), skipping scan")
@@ -1004,6 +1024,84 @@ def check_and_update_positions(
     return positions, alerts
 
 
+def _get_strike_priority(sig: PatternSignal) -> int:
+    """Get strike priority: ATM (0) > OTM (1) > ITM (-1)."""
+    if sig.otm_position == 0:
+        return 0  # ATM - highest priority
+    elif sig.otm_position > 0:
+        return 1  # OTM - second priority
+    else:
+        return 2  # ITM - lowest priority
+
+
+def _get_strike_label(otm_position: int) -> str:
+    """Get human-readable strike label."""
+    if otm_position == 0:
+        return 'ATM'
+    elif otm_position > 0:
+        return f'{otm_position}OTM'
+    else:
+        return f'{abs(otm_position)}ITM'
+
+
+def select_best_signals(
+    signals: List[PatternSignal],
+    max_signals: int = MAX_POSITIONS
+) -> List[PatternSignal]:
+    """
+    Select best signal per INDEX (not per index+option_type).
+
+    Logic:
+    1. Group all signals by INDEX
+    2. Within each index, pick ONE best signal (ATM preferred, then OTM)
+    3. If both CE and PE have patterns in same index, pick the one with
+       better strike position (ATM over OTM over ITM)
+    4. Limit total signals to max_signals (for position limit enforcement)
+
+    Returns:
+        List with at most one signal per index, limited to max_signals
+    """
+    if not signals:
+        return []
+
+    # Group by INDEX only (not by option_type)
+    # This prevents both CE and PE from alerting in same scan
+    groups: Dict[str, List[PatternSignal]] = {}
+    for sig in signals:
+        if sig.index not in groups:
+            groups[sig.index] = []
+        groups[sig.index].append(sig)
+
+    best_signals: List[PatternSignal] = []
+
+    for index, group in groups.items():
+        # Sort by: strike priority (ATM > OTM > ITM)
+        # If tie, CE comes before PE (arbitrary but consistent)
+        group.sort(key=lambda s: (_get_strike_priority(s), s.option_type))
+        best = group[0]
+
+        # Log what was found and selected
+        if len(group) > 1:
+            found_list = [f"{s.option_type} {_get_strike_label(s.otm_position)}" for s in group]
+            selected = f"{best.option_type} {_get_strike_label(best.otm_position)}"
+            log.info(
+                f"{index}: Multiple patterns found {found_list}, "
+                f"selected {selected} (one per index, prefer ATM)"
+            )
+
+        best_signals.append(best)
+
+    # Limit to max_signals to enforce position limits
+    if len(best_signals) > max_signals:
+        log.info(
+            f"Limiting signals from {len(best_signals)} to {max_signals} "
+            f"(position limit)"
+        )
+        best_signals = best_signals[:max_signals]
+
+    return best_signals
+
+
 def process_signals(
     signals: List[PatternSignal],
     positions: List[MomentumPosition],
@@ -1015,6 +1113,17 @@ def process_signals(
     Note: Index freeze is already checked in scan_for_signals() before signals
     are generated. We still record the alert to freeze future scans.
     """
+    # Calculate available position slots
+    open_count = len([p for p in positions if p.status == 'open'])
+    available_slots = max(0, MAX_POSITIONS - open_count)
+
+    if available_slots == 0:
+        log.info("No position slots available, skipping signal processing")
+        return positions
+
+    # Select best signal per INDEX (ATM preferred, limited to available slots)
+    signals = select_best_signals(signals, max_signals=available_slots)
+
     for signal in signals:
         position = MomentumPosition(
             id=generate_position_id(signal.index, signal.option_symbol),
