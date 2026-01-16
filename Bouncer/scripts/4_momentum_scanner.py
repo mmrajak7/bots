@@ -940,65 +940,46 @@ def check_and_update_positions(
                 send_telegram(alert, test_mode)
                 continue
 
-            # Get latest candles to check if LOW breached SL
+            # Check SL hit using LTP (catches intraday breaches in current candle)
+            if ltp < pos.current_sl:
+                log.warning(
+                    f"{pos.option_symbol}: SL HIT! "
+                    f"LTP={ltp:.2f} < SL={pos.current_sl:.2f}"
+                )
+
+                pos.status = 'closed'
+                pos.exit_price = ltp
+                pos.exit_time = datetime.now().isoformat()
+                pos.exit_reason = 'SL_HIT'
+
+                alert = format_exit_alert(pos, ltp, 'SL Hit')
+                alerts.append(alert)
+                send_telegram(alert, test_mode)
+                continue
+
+            # Get latest candles for trailing SL
             candles = get_option_candles(kite, pos.option_token, lookback_hours=1)
 
             if candles and len(candles) >= 2:
-                # Use COMPLETED candle (second-to-last) for SL check
-                # candles[-1] may be incomplete/in-progress
+                # Use COMPLETED candle's low for trailing
+                # (SL hit already checked using LTP above)
                 completed_candle = candles[-2]
                 candle_low = float(completed_candle.get('low', ltp))
 
-                # SL hit if completed candle's low breached SL
-                if candle_low < pos.current_sl:
-                    log.warning(
-                        f"{pos.option_symbol}: SL HIT! "
-                        f"Candle low={candle_low:.2f} < SL={pos.current_sl:.2f}"
-                    )
-
-                    pos.status = 'closed'
-                    # Use min of LTP and SL for conservative exit price
-                    pos.exit_price = min(ltp, pos.current_sl)
-                    pos.exit_time = datetime.now().isoformat()
-                    pos.exit_reason = 'SL_HIT'
-
-                    alert = format_exit_alert(pos, pos.exit_price, 'SL Hit')
-                    alerts.append(alert)
-                    send_telegram(alert, test_mode)
-                    continue
-
-                # Trailing SL: Use completed candle's low
-                prev_low = candle_low
-
-                # Only trail UP with minimum threshold (avoid spam alerts)
-                if (prev_low > pos.current_sl + MIN_TRAIL_AMOUNT and
-                        prev_low > 0):
+                # Trailing SL: Only trail UP if candle_low > current_sl
+                # AND candle_low is below LTP (valid trail)
+                if (candle_low > pos.current_sl + MIN_TRAIL_AMOUNT and
+                        candle_low < ltp):  # New SL must be below current price
                     old_sl = pos.current_sl
-                    pos.current_sl = prev_low
-                    pos.last_candle_low = prev_low
+                    pos.current_sl = candle_low
+                    pos.last_candle_low = candle_low
 
                     log.info(
                         f"{pos.option_symbol}: "
-                        f"Trailing SL {old_sl:.2f} → {prev_low:.2f}"
+                        f"Trailing SL {old_sl:.2f} → {candle_low:.2f}"
                     )
 
-                    alert = format_sl_update_alert(pos, old_sl, prev_low, ltp)
-                    alerts.append(alert)
-                    send_telegram(alert, test_mode)
-            elif candles and len(candles) == 1:
-                # Only one candle (likely current) - use LTP check as fallback
-                if ltp < pos.current_sl:
-                    log.warning(
-                        f"{pos.option_symbol}: SL HIT (LTP fallback)! "
-                        f"LTP={ltp:.2f} < SL={pos.current_sl:.2f}"
-                    )
-
-                    pos.status = 'closed'
-                    pos.exit_price = min(ltp, pos.current_sl)
-                    pos.exit_time = datetime.now().isoformat()
-                    pos.exit_reason = 'SL_HIT'
-
-                    alert = format_exit_alert(pos, pos.exit_price, 'SL Hit')
+                    alert = format_sl_update_alert(pos, old_sl, candle_low, ltp)
                     alerts.append(alert)
                     send_telegram(alert, test_mode)
 
