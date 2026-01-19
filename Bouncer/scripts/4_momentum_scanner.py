@@ -656,7 +656,7 @@ def format_entry_alert(signal: PatternSignal) -> str:
 
     return f"""<b>MOMENTUM</b> | {signal.index} {signal.option_type} ({strike_label})
 
-<b>BUY {signal.option_symbol}</b>
+<b>BUY</b> <code>{signal.option_symbol}</code>
 Expiry: {signal.expiry}
 
 Entry: ₹{signal.entry_price:.2f}
@@ -697,7 +697,7 @@ def format_exit_alert(
 
     return f"""<b>MOMENTUM EXIT</b> | {position.index}
 
-{position.option_symbol}
+<code>{position.option_symbol}</code>
 Reason: {reason}
 
 Entry: ₹{position.entry_price:.2f}
@@ -1013,10 +1013,7 @@ def check_and_update_positions(
                         f"{pos.option_symbol}: "
                         f"Trailing SL {old_sl:.2f} → {candle_low:.2f}"
                     )
-
-                    alert = format_sl_update_alert(pos, old_sl, candle_low, ltp)
-                    alerts.append(alert)
-                    send_telegram(alert, test_mode)
+                    # Note: SL updates are logged only, no Telegram alert
 
         except Exception as e:
             log.error(f"{pos.option_symbol}: Error checking position: {e}")
