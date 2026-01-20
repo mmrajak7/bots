@@ -114,3 +114,4 @@ SNAIL/data/instruments.csv
 
 # Bouncer config (has Telegram token)
 Bouncer/config/config.json
+data/telegram_config.json
