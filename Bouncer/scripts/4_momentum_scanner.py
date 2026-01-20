@@ -935,7 +935,8 @@ def check_and_update_positions(
 
             alert = format_exit_alert(pos, pos.exit_price, 'Option Expired')
             alerts.append(alert)
-            send_telegram(alert, test_mode)
+            # Exit alerts tracked locally only (no Telegram)
+            log.info(f"Expired exit tracked locally: {pos.option_symbol}")
             continue
 
         try:
@@ -969,7 +970,8 @@ def check_and_update_positions(
 
                 alert = format_exit_alert(pos, ltp, 'Target Hit')
                 alerts.append(alert)
-                send_telegram(alert, test_mode)
+                # Exit alerts tracked locally only (no Telegram)
+                log.info(f"Target exit tracked locally: {pos.option_symbol}")
                 continue
 
             # Check SL hit using LTP (catches intraday breaches in current candle)
