@@ -9,10 +9,13 @@ PyQt6-based trading interface with:
 - Keyboard shortcuts for fast execution
 """
 
+import logging
 import re
 import sys
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+
+logger = logging.getLogger(__name__)
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -45,6 +48,154 @@ class SortableTableWidgetItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+def _get_position_qty(pos: Dict[str, Any]) -> int:
+    """Extract NET position quantity from NEO API response.
+
+    NEO API returns flBuyQty and flSellQty separately.
+    Net position = flBuyQty - flSellQty (positive = long, negative = short, 0 = closed)
+    """
+    # Calculate from buy/sell quantities (NEO API primary method)
+    buy_qty = pos.get('flBuyQty', pos.get('buyQty', 0))
+    sell_qty = pos.get('flSellQty', pos.get('sellQty', 0))
+    try:
+        net = int(buy_qty or 0) - int(sell_qty or 0)
+        if net != 0:
+            return net
+    except (ValueError, TypeError):
+        pass
+
+    # Fallback: Try direct qty field
+    qty = pos.get('qty')
+    if qty is not None and str(qty).strip():
+        try:
+            return int(qty)
+        except (ValueError, TypeError):
+            pass
+
+    # Fallback: Try netQty
+    net_qty = pos.get('netQty')
+    if net_qty is not None and str(net_qty).strip():
+        try:
+            return int(net_qty)
+        except (ValueError, TypeError):
+            pass
+
+    return 0
+
+
+def _get_position_symbol(pos: Dict[str, Any]) -> str:
+    """Extract trading symbol from NEO API position response."""
+    # NEO API uses 'trdSym' as primary field
+    for field in ['trdSym', 'tradingSymbol', 'symbol', 'tsym', 'scrip', 'scripName']:
+        val = pos.get(field)
+        if val and str(val).strip():
+            return str(val).strip()
+    return ''
+
+
+def _get_position_avg_price(pos: Dict[str, Any]) -> float:
+    """Extract/calculate average price from NEO API position response.
+
+    NEO API doesn't provide avgPrice directly - calculate from buyAmt/flBuyQty.
+    """
+    # Try direct fields first
+    for field in ['averagePrice', 'avgPrc', 'avgPrice', 'buyAvgPrc', 'netAvgPrc']:
+        val = pos.get(field)
+        if val is not None:
+            try:
+                price = float(val)
+                if price > 0:
+                    return price
+            except (ValueError, TypeError):
+                pass
+
+    # NEO API: Calculate from buyAmt / flBuyQty
+    try:
+        buy_amt = float(pos.get('buyAmt', 0) or 0)
+        buy_qty = int(pos.get('flBuyQty', 0) or 0)
+        if buy_qty > 0 and buy_amt > 0:
+            return round(buy_amt / buy_qty, 2)
+    except (ValueError, TypeError):
+        pass
+
+    return 0.0
+
+
+def _get_position_ltp(pos: Dict[str, Any]) -> float:
+    """Extract LTP from NEO API position response.
+
+    Note: NEO positions API doesn't return LTP - it comes from websocket/quotes.
+    """
+    for field in ['ltp', 'lastPrice', 'lp', 'lastTradedPrice', 'ltP']:
+        val = pos.get(field)
+        if val is not None:
+            try:
+                price = float(val)
+                if price > 0:
+                    return price
+            except (ValueError, TypeError):
+                pass
+    return 0.0
+
+
+def _get_position_pnl(pos: Dict[str, Any]) -> float:
+    """Extract/calculate P&L from NEO API position response.
+
+    NEO API: For closed positions, P&L = sellAmt - buyAmt
+    For open positions, need LTP to calculate MTM.
+    """
+    # Try direct P&L fields first
+    for field in ['pnl', 'dayPnl', 'mtm', 'realizedPnl', 'urmtom', 'unrealizedPnl', 'netPnl']:
+        val = pos.get(field)
+        if val is not None:
+            try:
+                pnl = float(val)
+                if pnl != 0:
+                    return pnl
+            except (ValueError, TypeError):
+                pass
+
+    # NEO API: Calculate realized P&L from sellAmt - buyAmt
+    try:
+        buy_amt = float(pos.get('buyAmt', 0) or 0)
+        sell_amt = float(pos.get('sellAmt', 0) or 0)
+        if sell_amt > 0:  # Has some sells
+            return round(sell_amt - buy_amt, 2)
+    except (ValueError, TypeError):
+        pass
+
+    return 0.0
+
+
+def _get_position_product(pos: Dict[str, Any]) -> str:
+    """Extract product type from NEO API position response."""
+    # NEO API uses 'prod'
+    for field in ['prod', 'product', 'prd', 'productType']:
+        val = pos.get(field)
+        if val and str(val).strip():
+            return str(val).strip().upper()
+    return 'MIS'
+
+
+def _get_position_exchange(pos: Dict[str, Any]) -> str:
+    """Extract exchange segment from NEO API position response."""
+    # NEO API uses 'exSeg'
+    for field in ['exSeg', 'exchange_segment', 'exchangeSegment', 'exchange', 'exch']:
+        val = pos.get(field)
+        if val and str(val).strip():
+            return str(val).strip()
+    return 'nse_fo'
+
+
+def _get_position_token(pos: Dict[str, Any]) -> str:
+    """Extract instrument token from NEO API position response."""
+    for field in ['tok', 'token', 'instrument_token', 'instrumentToken']:
+        val = pos.get(field)
+        if val and str(val).strip():
+            return str(val).strip()
+    return ''
+
+
 class MainWindow(QMainWindow):
     """Main trading terminal window."""
 
@@ -60,7 +211,8 @@ class MainWindow(QMainWindow):
                  kite_spot, config: Dict[str, Any],
                  sound_mgr=None, telegram_mgr=None, trade_logger=None,
                  trail_mgr: TrailingSLManager = None, oco_monitor=None,
-                 ws_handler=None):
+                 ws_handler=None, partial_fill_monitor=None, pnl_tracker=None,
+                 cancel_mgr=None, rejection_learner=None):
         super().__init__()
 
         # Core components
@@ -75,6 +227,10 @@ class MainWindow(QMainWindow):
         self.trail_mgr = trail_mgr
         self.oco_monitor = oco_monitor
         self.ws_handler = ws_handler
+        self.partial_fill_monitor = partial_fill_monitor
+        self.pnl_tracker = pnl_tracker
+        self.cancel_mgr = cancel_mgr
+        self.rejection_learner = rejection_learner
 
         # State
         self.basket_legs: List[Dict[str, Any]] = []
@@ -83,11 +239,15 @@ class MainWindow(QMainWindow):
         self._positions_cache: List[Dict[str, Any]] = []
         self._filtered_positions_cache: List[Dict[str, Any]] = []
 
-        # Position tracker for SL/Target order management
+        # Position tracker for SL/Target order management (with cancel manager)
         self.pos_tracker = PositionTracker(
             session_mgr.get_client() if session_mgr else None,
-            order_mgr
+            order_mgr,
+            cancel_mgr
         )
+        # Wire up OCO monitor reference for automatic cleanup on position removal
+        if oco_monitor:
+            self.pos_tracker.oco_monitor = oco_monitor
 
         # Setup UI
         self.init_ui()
@@ -120,28 +280,34 @@ class MainWindow(QMainWindow):
         # Quick entry panel (3 rows with F1-F4)
         layout.addWidget(self._create_quick_entry_panel())
 
-        # Main content: 3 columns - Positions | Basket+OrderBook | Logs
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # LAYOUT: Horizontal split - Left (Positions + Basket/Orders) | Right (Logs full height)
+        main_hsplit = QSplitter(Qt.Orientation.Horizontal)
 
-        # Column 1: Positions
-        main_splitter.addWidget(self._create_positions_panel())
+        # LEFT SIDE: Positions on top, Basket/Orders below
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
 
-        # Column 2: Basket + Order Book (stacked vertically)
-        middle_widget = QWidget()
-        middle_layout = QVBoxLayout(middle_widget)
-        middle_layout.setSpacing(4)
-        middle_layout.setContentsMargins(0, 0, 0, 0)
-        middle_layout.addWidget(self._create_basket_panel())
-        middle_layout.addWidget(self._create_order_book_panel(), 1)
-        main_splitter.addWidget(middle_widget)
+        # Positions panel (top)
+        left_layout.addWidget(self._create_positions_panel())
 
-        # Column 3: Logs
-        main_splitter.addWidget(self._create_log_panel())
+        # Basket | Orders (bottom, horizontal split)
+        bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
+        bottom_splitter.addWidget(self._create_basket_panel())
+        bottom_splitter.addWidget(self._create_order_book_panel())
+        bottom_splitter.setSizes([380, 550])  # Basket | Orders
+        left_layout.addWidget(bottom_splitter, 1)
 
-        # Set column sizes: Positions 45% | Basket+Orders 35% | Logs 20%
-        main_splitter.setSizes([650, 500, 300])
+        main_hsplit.addWidget(left_widget)
 
-        layout.addWidget(main_splitter, 1)
+        # RIGHT SIDE: Logs (full height, compact width)
+        main_hsplit.addWidget(self._create_log_panel())
+
+        # Set widths: Left 78% | Logs 22%
+        main_hsplit.setSizes([1050, 300])
+
+        layout.addWidget(main_hsplit, 1)
 
     def _create_status_bar(self) -> QFrame:
         """Create top status bar with margin, P&L, BUY/SELL buttons, and actions."""
@@ -469,6 +635,7 @@ class MainWindow(QMainWindow):
         self.price_input.setPlaceholderText("0.00")
         self.price_input.setFixedWidth(65)
         self.price_input.textChanged.connect(self._update_sl_target_pct)
+        self.price_input.returnPressed.connect(self._recalculate_sl_target_from_price)
         row2.addWidget(self.price_input)
 
         # SL with percentage
@@ -652,33 +819,33 @@ class MainWindow(QMainWindow):
         header_row.addStretch()
         layout.addLayout(header_row)
 
-        # Positions table
+        # Positions table - Symbol STRETCHES, others fixed
         self.positions_table = QTableWidget()
         self.positions_table.setColumnCount(9)
         self.positions_table.setHorizontalHeaderLabels([
             "Symbol", "Qty", "Avg", "LTP", "P&L", "%", "SL", "Trail", "Exit"
         ])
-        # Set optimal fixed column widths
         header = self.positions_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)  # Symbol stretches
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)  # Qty
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # Avg
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # LTP
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  # P&L
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)  # %
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)  # SL
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)  # Trail
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)  # Exit
+        header.setStretchLastSection(False)
+        # Symbol STRETCHES to absorb extra space - solves the empty space problem
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # All other columns: FIXED with proper widths
+        for i in range(1, 9):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.Fixed)
         self.positions_table.setColumnWidth(1, 45)   # Qty
-        self.positions_table.setColumnWidth(2, 55)   # Avg
-        self.positions_table.setColumnWidth(3, 55)   # LTP
-        self.positions_table.setColumnWidth(4, 65)   # P&L
-        self.positions_table.setColumnWidth(5, 40)   # %
-        self.positions_table.setColumnWidth(6, 55)   # SL
-        self.positions_table.setColumnWidth(7, 45)   # Trail
-        self.positions_table.setColumnWidth(8, 40)   # Exit
+        self.positions_table.setColumnWidth(2, 65)   # Avg
+        self.positions_table.setColumnWidth(3, 65)   # LTP
+        self.positions_table.setColumnWidth(4, 75)   # P&L
+        self.positions_table.setColumnWidth(5, 65)   # % (wider for +10.5%)
+        self.positions_table.setColumnWidth(6, 65)   # SL input
+        self.positions_table.setColumnWidth(7, 155)  # Trail: BE + +10 + +25 (bigger buttons)
+        self.positions_table.setColumnWidth(8, 115)  # Exit: 50% + EXIT (bigger buttons)
         self.positions_table.setAlternatingRowColors(True)
         self.positions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        # Set row height for button widgets (28px buttons + padding)
+        self.positions_table.verticalHeader().setDefaultSectionSize(34)
+        # Connect cell click for Symbol copy-to-clipboard
+        self.positions_table.cellClicked.connect(self._on_position_cell_clicked)
         layout.addWidget(self.positions_table)
 
         # Bottom row - P&L based on filter
@@ -756,31 +923,31 @@ class MainWindow(QMainWindow):
         return group
 
     def _create_order_book_panel(self) -> QGroupBox:
-        """Create order book display with proper columns."""
+        """Create order book display with cancel button and editable price."""
         group = QGroupBox("ORDER BOOK")
         layout = QVBoxLayout(group)
         layout.setSpacing(2)
         layout.setContentsMargins(5, 5, 5, 5)
 
         self.orders_table = QTableWidget()
-        self.orders_table.setColumnCount(7)
-        self.orders_table.setHorizontalHeaderLabels(["ID", "Symbol", "B/S", "Qty", "Price", "Status", "Time"])
+        self.orders_table.setColumnCount(8)
+        self.orders_table.setHorizontalHeaderLabels(["Symbol", "B/S", "Qty", "LTP", "Price", "Status", "Time", "X"])
         self.orders_table.verticalHeader().setVisible(False)  # Hide row numbers
-        # Optimize column widths for proper display
+        # Optimized columns: Symbol stretches, others fixed
         oheader = self.orders_table.horizontalHeader()
-        oheader.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)  # ID
-        oheader.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # Symbol - stretch to fill
-        oheader.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # B/S
-        oheader.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # Qty
-        oheader.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  # Price
-        oheader.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)  # Status
-        oheader.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)  # Time
-        self.orders_table.setColumnWidth(0, 65)   # ID
-        self.orders_table.setColumnWidth(2, 35)   # B/S
-        self.orders_table.setColumnWidth(3, 45)   # Qty
-        self.orders_table.setColumnWidth(4, 55)   # Price
-        self.orders_table.setColumnWidth(5, 65)   # Status
-        self.orders_table.setColumnWidth(6, 50)   # Time
+        oheader.setStretchLastSection(False)
+        # Symbol STRETCHES to absorb extra space
+        oheader.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # All other columns: FIXED with proper widths
+        for i in range(1, 8):
+            oheader.setSectionResizeMode(i, QHeaderView.ResizeMode.Fixed)
+        self.orders_table.setColumnWidth(1, 35)   # B/S
+        self.orders_table.setColumnWidth(2, 45)   # Qty
+        self.orders_table.setColumnWidth(3, 60)   # LTP
+        self.orders_table.setColumnWidth(4, 65)   # Price (editable)
+        self.orders_table.setColumnWidth(5, 75)   # Status
+        self.orders_table.setColumnWidth(6, 60)   # Time (HH:MM)
+        self.orders_table.setColumnWidth(7, 30)   # X button
         self.orders_table.setAlternatingRowColors(True)
 
         # Enable sorting - users can click headers to sort
@@ -793,6 +960,14 @@ class MainWindow(QMainWindow):
         # Connect header click to track user's sort preference
         oheader.sectionClicked.connect(self._on_orders_header_clicked)
 
+        # Connect cell changed for price editing
+        self.orders_table.cellChanged.connect(self._on_order_price_edited)
+        # Track editing state to avoid refresh during edit
+        self._editing_order_price = False
+
+        # Connect cell click for Symbol copy-to-clipboard
+        self.orders_table.cellClicked.connect(self._on_order_cell_clicked)
+
         layout.addWidget(self.orders_table, 1)
 
         return group
@@ -801,6 +976,135 @@ class MainWindow(QMainWindow):
         """Track user's sort preference when they click a header."""
         self._orders_sort_column = logical_index
         self._orders_sort_order = self.orders_table.horizontalHeader().sortIndicatorOrder()
+
+    def _on_order_cell_clicked(self, row: int, column: int):
+        """Handle cell click - copy Symbol to clipboard when Symbol column clicked."""
+        if column != 0:  # Only Symbol column
+            return
+
+        symbol_item = self.orders_table.item(row, 0)
+        if not symbol_item:
+            return
+
+        symbol_text = symbol_item.text()
+        if symbol_text:
+            QApplication.clipboard().setText(symbol_text)
+            self.log_message.emit(f"[INFO] Copied: {symbol_text}")
+
+    def _on_order_price_edited(self, row: int, column: int):
+        """Handle price cell editing - modify order when Enter pressed."""
+        # Only process price column (column 4)
+        if column != 4:
+            return
+
+        try:
+            # Get order data from Symbol column (stored in UserRole)
+            symbol_item = self.orders_table.item(row, 0)
+            price_item = self.orders_table.item(row, 4)
+            if not symbol_item or not price_item:
+                return
+
+            order_data = symbol_item.data(Qt.ItemDataRole.UserRole)
+            if not order_data or not isinstance(order_data, dict):
+                return
+
+            new_price_str = price_item.text().strip()
+            if not new_price_str or new_price_str == "--":
+                return
+
+            try:
+                new_price = float(new_price_str)
+            except ValueError:
+                self.log_message.emit(f"[ERROR] Invalid price: {new_price_str}")
+                return
+
+            if new_price <= 0:
+                self.log_message.emit(f"[ERROR] Price must be > 0")
+                return
+
+            order_id = order_data.get('order_id', '')
+            order_type = str(order_data.get('order_type', '')).upper()
+            trigger_price = order_data.get('trigger_price', '')
+            old_price = order_data.get('price', '')
+
+            # Determine if this is an SL order (uses trigger price)
+            is_sl_order = 'SL' in order_type or (trigger_price and float(trigger_price) > 0)
+
+            # Get old price for comparison
+            old_price_val = float(trigger_price) if is_sl_order and trigger_price else float(old_price or 0)
+
+            # Skip if price unchanged
+            if abs(new_price - old_price_val) < 0.01:
+                return
+
+            # Modify order
+            if is_sl_order:
+                result = self.orders.modify_order(order_id, new_trigger=new_price)
+                price_label = "trigger"
+            else:
+                result = self.orders.modify_order(order_id, new_price=new_price)
+                price_label = "price"
+
+            if result.success:
+                self.log_message.emit(f"[MODIFY] Order {order_id[-6:]}: {price_label} {old_price_val:.2f} -> {new_price:.2f}")
+                if self.sound:
+                    self.sound.play('order_placed')
+
+                # Update tracker if this is a tracked SL order
+                for symbol, pos in self.pos_tracker.positions.items():
+                    if pos.sl_order_id == order_id:
+                        pos.sl_price = new_price
+                        if self.trail_mgr and symbol in self.trail_mgr.positions:
+                            self.trail_mgr.positions[symbol].current_sl = new_price
+
+                self._force_next_orders_refresh()
+                QTimer.singleShot(500, self._refresh_orders)
+            else:
+                self.log_message.emit(f"[ERROR] Modify failed: {result.message}")
+                if self.sound:
+                    self.sound.play('error')
+                # Revert display to old price
+                self.orders_table.blockSignals(True)
+                price_item.setText(str(old_price_val))
+                self.orders_table.blockSignals(False)
+
+        except Exception as e:
+            self.log_message.emit(f"[ERROR] Modify order failed: {e}")
+
+    def _cancel_single_order(self, order_id: str, source: str = "button"):
+        """Cancel a single order by ID."""
+        import traceback
+        logger.info(f"Cancel triggered for {order_id}, source={source}, stack:\n{''.join(traceback.format_stack()[-5:])}")
+        try:
+            self.log_message.emit(f"[CANCEL] Cancelling {order_id[-6:]} (source: {source})")
+            result = self.orders.cancel_order(order_id)
+            if result.success:
+                self.log_message.emit(f"[CANCEL] Order {order_id[-6:]} cancelled OK")
+                if self.sound:
+                    self.sound.play('order_placed')
+
+                # Clear tracker references if this was SL/Target order
+                for symbol, pos in list(self.pos_tracker.positions.items()):
+                    if pos.sl_order_id == order_id:
+                        pos.sl_order_id = None
+                        pos.sl_price = None
+                    if pos.target_order_id == order_id:
+                        pos.target_order_id = None
+                        pos.target_price = None
+
+                # Remove from OCO monitor if present
+                if self.oco_monitor:
+                    self.oco_monitor.remove_order(order_id)
+
+                self._force_next_orders_refresh()
+                QTimer.singleShot(500, self._refresh_orders)
+            else:
+                self.log_message.emit(f"[ERROR] Cancel failed: {result.message}")
+                if self.sound:
+                    self.sound.play('error')
+
+        except Exception as e:
+            self.log_message.emit(f"[ERROR] Cancel order failed: {e}")
 
     def _create_log_panel(self) -> QGroupBox:
         """Create log panel for 3-column layout - fills vertical space."""
@@ -924,37 +1228,147 @@ class MainWindow(QMainWindow):
 
             # Log the update
             status_display = status.upper()
-            if status in ['complete', 'traded', 'filled']:
+            if status in ['complete', 'completed', 'traded', 'filled', 'executed']:
                 self.log_message.emit(f"[WS] ✓ Order {order_id[-6:]} FILLED: {symbol}")
                 if self.sound:
                     self.sound.play('order_filled')
+
+                # Check if this is an SL order - show popup alert
+                is_sl_or_target = False
+                for pos_symbol, pos in self.pos_tracker.positions.items():
+                    if pos.sl_order_id == order_id:
+                        # SL HIT! Show popup alert
+                        self._show_sl_breach_alert(pos_symbol, pos.sl_price)
+                        is_sl_or_target = True
+                        break
+                    if pos.target_order_id == order_id:
+                        # Target hit - just log
+                        self.log_message.emit(f"[ALERT] TARGET HIT: {pos_symbol}")
+                        is_sl_or_target = True
+                        break
+
+                # If this is an ENTRY order (not SL/Target), check for protection after delay
+                if not is_sl_or_target and symbol:
+                    # Wait 8 seconds for SL/Target placement to complete, then check
+                    QTimer.singleShot(8000, lambda s=symbol: self._check_position_protection(s))
+
                 # Immediately refresh positions and orders
+                self._force_next_orders_refresh()
                 QTimer.singleShot(100, self._refresh_positions)
                 QTimer.singleShot(200, self._refresh_orders)
 
             elif status in ['rejected']:
-                reason = data.get('rejRsn', data.get('rejectionReason', 'Unknown'))
-                self.log_message.emit(f"[WS] ✗ Order {order_id[-6:]} REJECTED: {reason}")
+                reason = data.get('rejRsn') or data.get('rejectionReason') or \
+                         data.get('errMsg') or data.get('text') or 'Unknown reason'
+                self.log_message.emit(f"[WS] ✗ REJECTED {symbol}: {reason}")
                 if self.sound:
                     self.sound.play('order_rejected')
+                # Send Telegram alert for rejected orders
+                if self.telegram:
+                    self.telegram.send(f"❌ ORDER REJECTED: {symbol}\n{reason}")
+                self._force_next_orders_refresh()
                 QTimer.singleShot(200, self._refresh_orders)
 
             elif status in ['cancelled']:
                 self.log_message.emit(f"[WS] Order {order_id[-6:]} CANCELLED: {symbol}")
+                self._force_next_orders_refresh()
                 QTimer.singleShot(200, self._refresh_orders)
 
             elif status in ['open', 'pending', 'trigger pending']:
                 self.log_message.emit(f"[WS] Order {order_id[-6:]} PENDING: {symbol}")
                 # Also refresh orders table for pending status changes
+                self._force_next_orders_refresh()
                 QTimer.singleShot(200, self._refresh_orders)
 
             else:
                 # Any other status change - refresh to keep table current
                 self.log_message.emit(f"[WS] Order {order_id[-6:]} {status_display}: {symbol}")
+                self._force_next_orders_refresh()
                 QTimer.singleShot(200, self._refresh_orders)
 
         except Exception as e:
             self.log_message.emit(f"[WS] Error processing update: {e}")
+
+    def _show_sl_breach_alert(self, symbol: str, sl_price: float):
+        """Show popup alert when SL is hit."""
+        self.log_message.emit(f"[ALERT] SL HIT: {symbol} @ {sl_price:.2f}")
+
+        # Play alert sound
+        if self.sound:
+            self.sound.play('sl_hit')  # Will fall back to error sound if not defined
+
+        # Send Telegram alert
+        if self.telegram:
+            self.telegram.send(f"🛑 SL TRIGGERED: {symbol} @ {sl_price:.2f}")
+
+        # Show popup message box
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("SL TRIGGERED")
+        msg.setText(f"STOP LOSS HIT!\n\n{symbol}\n@ {sl_price:.2f}")
+        msg.setStyleSheet("""
+            QMessageBox {
+                background-color: #2a0000;
+            }
+            QMessageBox QLabel {
+                color: #ff4444;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton {
+                background-color: #aa0000;
+                color: white;
+                font-weight: bold;
+                padding: 8px 20px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #cc0000;
+            }
+        """)
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+
+        # Auto-close after 5 seconds
+        QTimer.singleShot(5000, msg.close)
+        msg.show()  # Non-blocking show
+
+    def _check_position_protection(self, symbol: str):
+        """Check if position has SL/Target protection. Alert via Telegram if not."""
+        try:
+            # First check if position still exists and is open
+            pos_exists = False
+            for pos in self._positions_cache:
+                if _get_position_symbol(pos) == symbol:
+                    qty = _get_position_qty(pos)
+                    if qty != 0:  # Position is open
+                        pos_exists = True
+                    break
+
+            if not pos_exists:
+                # Position was closed or doesn't exist - no alert needed
+                return
+
+            # Check position tracker for SL/Target
+            tracked = self.pos_tracker.get_position(symbol)
+
+            has_sl = tracked and tracked.sl_order_id
+            has_target = tracked and tracked.target_order_id
+
+            if not has_sl and not has_target:
+                # NO PROTECTION! Send alert
+                alert_msg = f"⚠️ UNPROTECTED POSITION: {symbol}\nNo SL or Target order in place!"
+                self.log_message.emit(f"[ALERT] {alert_msg}")
+
+                # Send Telegram alert
+                if self.telegram:
+                    self.telegram.send(alert_msg)
+
+                # Play warning sound
+                if self.sound:
+                    self.sound.play('error')
+
+        except Exception as e:
+            self.log_message.emit(f"[ALERT] Error checking protection for {symbol}: {e}")
 
     # ==================== Event Handlers ====================
 
@@ -1075,6 +1489,21 @@ class MainWindow(QMainWindow):
 
             ltp_str = f", LTP: ₹{ltp:.2f}" if ltp else ""
             self.log_message.emit(f"[MAP] {symbol} -> Lot: {lot_size}{ltp_str}")
+
+            # Apply learned rules from rejection learner
+            if self.rejection_learner:
+                current_product = self.product_combo.currentText()
+                recommendation = self.rejection_learner.get_recommended_product(symbol, current_product)
+                if recommendation:
+                    new_product = recommendation['product']
+                    reason = recommendation['reason']
+                    # Auto-switch product
+                    idx = self.product_combo.findText(new_product)
+                    if idx >= 0:
+                        self.product_combo.setCurrentIndex(idx)
+                        self.log_message.emit(f"[LEARNER] Auto-switched to {new_product}: {reason}")
+                        if self.sound:
+                            self.sound.play('order_placed')  # Gentle notification
 
         except Exception as e:
             self.current_mapping = None
@@ -1289,6 +1718,32 @@ class MainWindow(QMainWindow):
             self.tgt_pct_label.setText("")
             self.be_label.setText("--")
 
+    def _recalculate_sl_target_from_price(self):
+        """Recalculate SL and Target when user changes price and presses Enter."""
+        try:
+            price_text = self.price_input.text().strip()
+            if not price_text:
+                return
+
+            price = float(price_text)
+            if price <= 0:
+                return
+
+            # Recalculate SL (10% below) and Target (25% above)
+            sl_default = round(price * 0.90, 2)
+            tgt_default = round(price * 1.25, 2)
+
+            self.entry_sl_input.setText(f"{sl_default:.2f}")
+            self.target_input.setText(f"{tgt_default:.2f}")
+
+            # Update percentage display
+            self._update_sl_target_pct()
+
+            self.log_message.emit(f"[PRICE] Recalculated SL: {sl_default:.2f}, Target: {tgt_default:.2f}")
+
+        except ValueError:
+            pass
+
     def _place_quick_order(self, action: str):
         """Place order from quick entry panel."""
         if not self.current_mapping:
@@ -1310,6 +1765,37 @@ class MainWindow(QMainWindow):
                 self.price_input.setStyleSheet("")  # Reset style
 
             price = float(price_text) if price_text else 0
+
+            # Validate price against LTP for LIMIT orders (trader sanity check)
+            if order_type == "LIMIT" and price > 0:
+                ltp_text = self.ltp_label.text().replace('₹', '').strip()
+                if ltp_text and ltp_text != '--':
+                    try:
+                        ltp = float(ltp_text)
+                        if ltp > 0:
+                            # Check if price is within 50% of LTP (reasonable for options)
+                            deviation = abs(price - ltp) / ltp * 100
+                            if deviation > 50:
+                                self.price_input.setStyleSheet("background-color: #663300; border: 2px solid orange;")
+                                self.log_message.emit(
+                                    f"[WARN] Price {price:.2f} is {deviation:.0f}% away from LTP {ltp:.2f}. "
+                                    f"Press again to confirm or adjust price."
+                                )
+                                if self.sound:
+                                    self.sound.play('error')
+                                # Use flag to allow second press to proceed
+                                if not hasattr(self, '_price_warning_acknowledged'):
+                                    self._price_warning_acknowledged = False
+                                if not self._price_warning_acknowledged:
+                                    self._price_warning_acknowledged = True
+                                    return
+                                self._price_warning_acknowledged = False
+                            else:
+                                self.price_input.setStyleSheet("")
+                                if hasattr(self, '_price_warning_acknowledged'):
+                                    self._price_warning_acknowledged = False
+                    except ValueError:
+                        pass
 
             # Map order type to NEO format
             type_map = {'LIMIT': 'L', 'MARKET': 'MKT', 'SL': 'SL', 'SL-M': 'SL-M'}
@@ -1347,36 +1833,45 @@ class MainWindow(QMainWindow):
                         order_id=result.order_id or ''
                     )
 
-                # Check if SL/Target provided - schedule placement after fill
+                # Get SL/Target prices before clearing
                 sl_text = self.entry_sl_input.text().strip()
                 target_text = self.target_input.text().strip()
+                sl_price_pending = float(sl_text) if sl_text else None
+                target_price_pending = float(target_text) if target_text else None
 
                 # Clear SL/Target fields after order placed
                 self.entry_sl_input.clear()
                 self.target_input.clear()
                 self.sl_pct_label.clear()
                 self.tgt_pct_label.clear()
-                if sl_text or target_text:
-                    self.log_message.emit("[INFO] Scheduling SL/Target after entry fill...")
-                    # Schedule a check for order fill and SL/Target placement
-                    QTimer.singleShot(1500, lambda: self._place_sl_target_after_fill(
-                        result.order_id,
-                        params.symbol,
-                        params.exchange_segment,
-                        params.quantity,
-                        action,
-                        sl_text,
-                        target_text,
-                        params.product,
-                        params.instrument_token
-                    ))
+
+                # Register entry order with PartialFillMonitor
+                # Monitor will place SL/Target automatically when entry fills (no timeout!)
+                if self.partial_fill_monitor and result.order_id:
+                    side = 'LONG' if action == 'B' else 'SHORT'
+                    self.partial_fill_monitor.register_entry(
+                        symbol=params.symbol,
+                        entry_order_id=result.order_id,
+                        expected_qty=params.quantity,
+                        side=side,
+                        exchange_segment=params.exchange_segment,
+                        product=params.product,
+                        sl_price_pending=sl_price_pending,
+                        target_price_pending=target_price_pending,
+                        instrument_token=params.instrument_token or ""
+                    )
+                    if sl_price_pending or target_price_pending:
+                        self.log_message.emit(f"[INFO] Entry registered - SL/Target will be placed on fill")
 
             else:
                 self.log_message.emit(f"[ERROR] {result.message}")
                 if self.sound:
                     self.sound.play('order_rejected')
 
+            # Force refresh after any order action
+            self._force_next_orders_refresh()
             QTimer.singleShot(500, self._refresh_positions)
+            QTimer.singleShot(600, self._refresh_orders)
 
         except Exception as e:
             self.log_message.emit(f"[ERROR] Order failed: {str(e)}")
@@ -1393,7 +1888,7 @@ class MainWindow(QMainWindow):
         Place SL/Target orders after entry order is filled.
         Called via QTimer after entry order placement.
         """
-        max_retries = 5  # Check up to 5 times (7.5 seconds total)
+        max_retries = 8  # Check up to 8 times (12 seconds total)
 
         try:
             # Check if order is filled
@@ -1415,7 +1910,7 @@ class MainWindow(QMainWindow):
             total_qty = int(entry_order.get('qty', quantity) or quantity)
             is_partial = status in ['partial', 'partially filled'] or (filled_qty > 0 and filled_qty < total_qty)
 
-            if status in ['complete', 'traded', 'filled'] or (is_partial and filled_qty > 0):
+            if status in ['complete', 'completed', 'traded', 'filled', 'executed'] or (is_partial and filled_qty > 0):
                 # Order filled (fully or partially) - place SL/Target for FILLED quantity only
                 if is_partial:
                     self.log_message.emit(f"[SL/TGT] Partial fill detected: {filled_qty}/{total_qty} filled")
@@ -1431,6 +1926,16 @@ class MainWindow(QMainWindow):
                 sl_order_id = None
                 target_order_id = None
                 entry_price = float(entry_order.get('avgPrc', 0) or 0)
+
+                # Record entry with P&L tracker for accurate realized P&L calculation
+                if self.pnl_tracker and entry_price > 0:
+                    self.pnl_tracker.record_entry(
+                        symbol=symbol,
+                        side='LONG' if is_long else 'SHORT',
+                        price=entry_price,
+                        qty=filled_qty,
+                        order_id=entry_order_id
+                    )
 
                 # Place SL order with retry logic
                 if sl_text:
@@ -1449,6 +1954,16 @@ class MainWindow(QMainWindow):
                         sl_order_id = sl_result.get('order_id')
                         if sl_order_id:
                             self.log_message.emit(f"[SL/TGT] SL placed @ {sl_price} -> {sl_order_id}")
+
+                            # Update partial fill monitor with SL order details
+                            if self.partial_fill_monitor:
+                                self.partial_fill_monitor.update_sl_order(
+                                    entry_order_id=entry_order_id,
+                                    sl_order_id=sl_order_id,
+                                    sl_price=sl_price,
+                                    sl_qty=quantity
+                                )
+
                         elif sl_result.get('critical'):
                             # CRITICAL: SL placement failed after all retries
                             self.log_message.emit(f"[SL/TGT] CRITICAL: SL FAILED - {sl_result.get('error')}")
@@ -1538,12 +2053,14 @@ class MainWindow(QMainWindow):
             else:
                 # Order still pending - retry
                 if retry_count < max_retries:
+                    if retry_count == 0:
+                        self.log_message.emit(f"[SL/TGT] Waiting for fill... (status: {status})")
                     QTimer.singleShot(1500, lambda: self._place_sl_target_after_fill(
                         entry_order_id, symbol, exchange_segment, quantity,
                         entry_action, sl_text, target_text, product, instrument_token, retry_count + 1
                     ))
                 else:
-                    self.log_message.emit(f"[SL/TGT] Entry order still pending after {max_retries} checks - set SL manually")
+                    self.log_message.emit(f"[SL/TGT] Entry order status='{status}' after {max_retries} checks - set SL manually")
 
         except Exception as e:
             self.log_message.emit(f"[SL/TGT] Error: {e}")
@@ -1720,6 +2237,9 @@ class MainWindow(QMainWindow):
         """Refresh positions from broker and sync with tracker."""
         try:
             positions = self.orders.get_positions()
+
+            # Debug logging removed - was for initial field discovery only
+
             self._positions_cache = positions
             self.position_updated.emit(positions)
 
@@ -1727,8 +2247,8 @@ class MainWindow(QMainWindow):
             # Find symbols that are no longer in broker positions
             broker_symbols = set()
             for pos in positions:
-                symbol = pos.get('tradingSymbol', pos.get('symbol', ''))
-                qty = int(pos.get('qty', 0))
+                symbol = _get_position_symbol(pos)
+                qty = _get_position_qty(pos)
                 if qty != 0:  # Only active positions
                     broker_symbols.add(symbol)
 
@@ -1762,13 +2282,27 @@ class MainWindow(QMainWindow):
             # Calculate total P&L
             total_pnl = 0
             for pos in positions:
-                pnl = float(pos.get('pnl', 0) or pos.get('dayPnl', 0) or 0)
+                pnl = _get_position_pnl(pos)
                 total_pnl += pnl
 
             self.pnl_updated.emit(total_pnl)
 
         except Exception as e:
             self.log_message.emit(f"[ERROR] Position refresh failed: {str(e)}")
+
+    def _on_position_cell_clicked(self, row: int, column: int):
+        """Handle cell click in positions table - copy Symbol to clipboard."""
+        if column != 0:  # Only Symbol column
+            return
+
+        symbol_item = self.positions_table.item(row, 0)
+        if not symbol_item:
+            return
+
+        symbol_text = symbol_item.text()
+        if symbol_text:
+            QApplication.clipboard().setText(symbol_text)
+            self.log_message.emit(f"[INFO] Copied: {symbol_text}")
 
     def _on_pos_filter_changed(self, filter_text: str):
         """Handle position filter dropdown change."""
@@ -1791,9 +2325,9 @@ class MainWindow(QMainWindow):
 
         # Filter positions based on selection
         if filter_type == "Open":
-            filtered_positions = [p for p in positions if int(p.get('qty', 0)) != 0]
+            filtered_positions = [p for p in positions if _get_position_qty(p) != 0]
         elif filter_type == "Closed":
-            filtered_positions = [p for p in positions if int(p.get('qty', 0)) == 0]
+            filtered_positions = [p for p in positions if _get_position_qty(p) == 0]
         else:  # All
             filtered_positions = positions
 
@@ -1802,35 +2336,60 @@ class MainWindow(QMainWindow):
         total_pnl = 0
 
         for row, pos in enumerate(filtered_positions):
-            symbol = pos.get('tradingSymbol', pos.get('symbol', ''))
-            qty = int(pos.get('qty', 0))
-            avg = float(pos.get('averagePrice', pos.get('avgPrc', 0)) or 0)
-            ltp = float(pos.get('ltp', pos.get('lastPrice', 0)) or 0)
-            pnl = float(pos.get('pnl', pos.get('dayPnl', 0)) or 0)
-            pnl_pct = ((ltp - avg) / avg * 100) if avg > 0 else 0
+            symbol = _get_position_symbol(pos)
+            qty = _get_position_qty(pos)
+            avg = _get_position_avg_price(pos)
+            ltp = _get_position_ltp(pos)
+            pnl = _get_position_pnl(pos)
 
-            # Symbol
-            self.positions_table.setItem(row, 0, QTableWidgetItem(symbol))
+            # P&L % calculation - handle closed positions correctly
+            # For open positions with LTP: unrealized % = (LTP - avg) / avg * 100
+            # For closed positions (qty=0 or LTP=0): realized % = P&L / cost * 100
+            if qty != 0 and ltp > 0 and avg > 0:
+                # Open position with live LTP - use unrealized calculation
+                pnl_pct = ((ltp - avg) / avg * 100)
+            elif avg > 0 and pnl != 0:
+                # Closed position or no LTP - use realized P&L percentage
+                # Cost basis = avg * total_buy_qty (but we use buyAmt directly)
+                buy_amt = float(pos.get('buyAmt', 0) or 0)
+                if buy_amt > 0:
+                    pnl_pct = (pnl / buy_amt * 100)
+                else:
+                    pnl_pct = 0
+            else:
+                pnl_pct = 0
 
-            # Qty (color coded)
+            # Symbol (non-editable)
+            symbol_item = QTableWidgetItem(symbol)
+            symbol_item.setFlags(symbol_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.positions_table.setItem(row, 0, symbol_item)
+
+            # Qty (color coded, non-editable)
             qty_item = QTableWidgetItem(str(qty))
             qty_item.setForeground(QBrush(QColor("#00ff88" if qty > 0 else "#ff4444")))
+            qty_item.setFlags(qty_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.positions_table.setItem(row, 1, qty_item)
 
-            # Avg
-            self.positions_table.setItem(row, 2, QTableWidgetItem(f"{avg:.2f}"))
+            # Avg (non-editable)
+            avg_item = QTableWidgetItem(f"{avg:.2f}")
+            avg_item.setFlags(avg_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.positions_table.setItem(row, 2, avg_item)
 
-            # LTP
-            self.positions_table.setItem(row, 3, QTableWidgetItem(f"{ltp:.2f}"))
+            # LTP (non-editable)
+            ltp_item = QTableWidgetItem(f"{ltp:.2f}")
+            ltp_item.setFlags(ltp_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.positions_table.setItem(row, 3, ltp_item)
 
-            # P&L (color coded)
+            # P&L (color coded, non-editable)
             pnl_item = QTableWidgetItem(f"₹{pnl:,.0f}")
             pnl_item.setForeground(QBrush(QColor("#00ff88" if pnl >= 0 else "#ff4444")))
+            pnl_item.setFlags(pnl_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.positions_table.setItem(row, 4, pnl_item)
 
-            # P&L %
+            # P&L % (non-editable)
             pct_item = QTableWidgetItem(f"{pnl_pct:+.1f}%")
             pct_item.setForeground(QBrush(QColor("#00ff88" if pnl_pct >= 0 else "#ff4444")))
+            pct_item.setFlags(pct_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.positions_table.setItem(row, 5, pct_item)
 
             # SL Input
@@ -1852,28 +2411,17 @@ class MainWindow(QMainWindow):
         self.total_pnl.setStyleSheet(f"color: {'#00ff88' if total_pnl >= 0 else '#ff4444'};")
 
     def _create_sl_widget(self, symbol: str, pos: Dict[str, Any]) -> QWidget:
-        """Create SL input widget for position row with +5/-5 adjustment buttons."""
+        """Create compact SL input widget - just input field, Enter to set."""
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(2)
-
-        # -5 button (decrease SL)
-        minus_btn = QPushButton("-5")
-        minus_btn.setFixedWidth(24)
-        minus_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #553333; color: #ff8888;
-                font-weight: bold; font-size: 9px; border-radius: 2px;
-            }
-            QPushButton:hover { background-color: #664444; }
-        """)
-        minus_btn.setToolTip("Decrease SL by 5 points")
-        layout.addWidget(minus_btn)
+        layout.setContentsMargins(1, 1, 1, 1)
+        layout.setSpacing(0)
+        layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         sl_input = QLineEdit()
         sl_input.setPlaceholderText("SL")
-        sl_input.setFixedWidth(55)
+        sl_input.setFixedWidth(60)
+        sl_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         # Check if we have a tracked SL for this position
         tracked = self.pos_tracker.get_position(symbol)
@@ -1881,21 +2429,33 @@ class MainWindow(QMainWindow):
             sl_input.setText(f"{tracked.sl_price:.2f}")
             sl_input.setStyleSheet("""
                 QLineEdit {
-                    background-color: #1a3a2e;
-                    border: 1px solid #00aa66;
-                    border-radius: 3px;
-                    color: #00ff88;
+                    background-color: #0d3320;
+                    border: 2px solid #00cc55;
+                    border-radius: 4px;
+                    color: #00ff66;
                     font-weight: bold;
+                    font-size: 11px;
+                    padding: 3px;
+                }
+                QLineEdit:focus {
+                    border: 2px solid #00ff88;
+                    background-color: #0a4428;
                 }
             """)
         else:
             sl_input.setStyleSheet("""
                 QLineEdit {
-                    background-color: #1a1a2e;
-                    border: 1px solid #444466;
-                    border-radius: 3px;
-                    color: #ffaa00;
-                    font-weight: bold;
+                    background-color: #2a2a35;
+                    border: 2px solid #555566;
+                    border-radius: 4px;
+                    color: #aaaaaa;
+                    font-size: 11px;
+                    padding: 3px;
+                }
+                QLineEdit:focus {
+                    border: 2px solid #ffaa00;
+                    color: #ffcc00;
+                    background-color: #332a1a;
                 }
             """)
 
@@ -1903,36 +2463,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(sl_input)
 
         self.sl_inputs[symbol] = sl_input
-
-        # +5 button (increase SL)
-        plus_btn = QPushButton("+5")
-        plus_btn.setFixedWidth(24)
-        plus_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #335533; color: #88ff88;
-                font-weight: bold; font-size: 9px; border-radius: 2px;
-            }
-            QPushButton:hover { background-color: #446644; }
-        """)
-        plus_btn.setToolTip("Increase SL by 5 points")
-        layout.addWidget(plus_btn)
-
-        # Connect +/- buttons to adjust SL value
-        minus_btn.clicked.connect(lambda _, inp=sl_input: self._adjust_sl_value(inp, -5))
-        plus_btn.clicked.connect(lambda _, inp=sl_input: self._adjust_sl_value(inp, 5))
-
-        set_btn = QPushButton("SET")
-        set_btn.setFixedWidth(32)
-        set_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #663300; color: white;
-                font-weight: bold; font-size: 9px; border-radius: 2px;
-            }
-            QPushButton:hover { background-color: #884400; }
-        """)
-        set_btn.clicked.connect(lambda _, s=symbol, inp=sl_input: self._update_sl_from_input(s, inp.text()))
-        layout.addWidget(set_btn)
-
         return widget
 
     def _adjust_sl_value(self, sl_input: QLineEdit, delta: float):
@@ -1950,48 +2480,150 @@ class MainWindow(QMainWindow):
             pass  # Invalid input, ignore
 
     def _create_trail_widget(self, symbol: str) -> QWidget:
-        """Create trail buttons widget."""
+        """Create trail buttons widget - bigger buttons with clear text."""
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(2)
+        layout.setSpacing(4)
+        layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
+        # Breakeven button - cyan/teal
         be_btn = QPushButton("BE")
-        be_btn.setToolTip("Trail to Breakeven")
-        be_btn.setMaximumWidth(30)
-        be_btn.setStyleSheet("background-color: #004466;")
+        be_btn.setToolTip("Trail to TRUE Breakeven (Entry + Charges)")
+        be_btn.setFixedSize(44, 28)
+        be_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #006688;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                border: 1px solid #0088aa;
+                border-radius: 3px;
+                margin: 0px;
+                padding-top: 0px;
+                padding-bottom: 4px;
+            }
+            QPushButton:hover {
+                background-color: #0099bb;
+            }
+            QPushButton:pressed {
+                background-color: #004466;
+            }
+        """)
         be_btn.clicked.connect(lambda _, s=symbol: self._trail_to_cost(s))
         layout.addWidget(be_btn)
 
+        # +10 button - green
         t10_btn = QPushButton("+10")
-        t10_btn.setMaximumWidth(30)
-        t10_btn.setStyleSheet("background-color: #005544;")
+        t10_btn.setToolTip("Trail SL +10 points")
+        t10_btn.setFixedSize(46, 28)
+        t10_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #227744;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                border: 1px solid #33aa55;
+                border-radius: 3px;
+                margin: 0px;
+                padding-top: 0px;
+                padding-bottom: 4px;
+            }
+            QPushButton:hover {
+                background-color: #33bb66;
+            }
+            QPushButton:pressed {
+                background-color: #115533;
+            }
+        """)
         t10_btn.clicked.connect(lambda _, s=symbol: self._trail_by_points(s, 10))
         layout.addWidget(t10_btn)
 
+        # +25 button - bright green
         t25_btn = QPushButton("+25")
-        t25_btn.setMaximumWidth(30)
-        t25_btn.setStyleSheet("background-color: #006633;")
+        t25_btn.setToolTip("Trail SL +25 points")
+        t25_btn.setFixedSize(46, 28)
+        t25_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #33aa55;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                border: 1px solid #44cc66;
+                border-radius: 3px;
+                margin: 0px;
+                padding-top: 0px;
+                padding-bottom: 4px;
+            }
+            QPushButton:hover {
+                background-color: #44dd77;
+            }
+            QPushButton:pressed {
+                background-color: #228844;
+            }
+        """)
         t25_btn.clicked.connect(lambda _, s=symbol: self._trail_by_points(s, 25))
         layout.addWidget(t25_btn)
 
         return widget
 
     def _create_exit_widget(self, pos: Dict[str, Any]) -> QWidget:
-        """Create exit buttons widget."""
+        """Create exit buttons widget - bigger buttons with clear text."""
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(2)
+        layout.setSpacing(4)
+        layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
+        # 50% exit - amber/orange
         exit_50 = QPushButton("50%")
-        exit_50.setMaximumWidth(35)
+        exit_50.setToolTip("Exit 50% of position")
+        exit_50.setFixedSize(48, 28)
+        exit_50.setStyleSheet("""
+            QPushButton {
+                background-color: #aa7700;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                border: 1px solid #cc9900;
+                border-radius: 3px;
+                margin: 0px;
+                padding-top: 0px;
+                padding-bottom: 4px;
+            }
+            QPushButton:hover {
+                background-color: #cc9900;
+            }
+            QPushButton:pressed {
+                background-color: #885500;
+            }
+        """)
         exit_50.clicked.connect(lambda _, p=pos: self._exit_position(p, 50))
         layout.addWidget(exit_50)
 
+        # Full EXIT - bright red, prominent
         exit_full = QPushButton("EXIT")
-        exit_full.setStyleSheet("background-color: #880000; color: white;")
-        exit_full.setMaximumWidth(40)
+        exit_full.setToolTip("Exit 100% - Close position")
+        exit_full.setFixedSize(52, 28)
+        exit_full.setStyleSheet("""
+            QPushButton {
+                background-color: #cc2222;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                border: 1px solid #ee3333;
+                border-radius: 3px;
+                margin: 0px;
+                padding-top: 0px;
+                padding-bottom: 4px;
+            }
+            QPushButton:hover {
+                background-color: #ee3333;
+            }
+            QPushButton:pressed {
+                background-color: #991111;
+            }
+        """)
         exit_full.clicked.connect(lambda _, p=pos: self._exit_position(p, 100))
         layout.addWidget(exit_full)
 
@@ -2008,7 +2640,7 @@ class MainWindow(QMainWindow):
             # Find position in cache
             pos = None
             for p in self._positions_cache:
-                if p.get('tradingSymbol', p.get('symbol', '')) == symbol:
+                if _get_position_symbol(p) == symbol:
                     pos = p
                     break
 
@@ -2016,18 +2648,18 @@ class MainWindow(QMainWindow):
                 self.log_message.emit(f"[SL] Position not found: {symbol}")
                 return
 
-            qty = abs(int(pos.get('qty', 0)))
+            qty = abs(_get_position_qty(pos))
             if qty == 0:
                 self.log_message.emit(f"[SL] No quantity to protect")
                 return
 
             # Determine exit direction
-            is_long = int(pos.get('qty', 0)) > 0
+            is_long = _get_position_qty(pos) > 0
             exit_type = 'S' if is_long else 'B'
 
             # Get prices for validation
-            entry_price = float(pos.get('averagePrice', pos.get('avgPrc', 0)) or 0)
-            ltp = float(pos.get('ltp', pos.get('lastPrice', entry_price)) or entry_price)
+            entry_price = _get_position_avg_price(pos)
+            ltp = _get_position_ltp(pos) or entry_price
 
             # Validate SL price
             min_distance = self.config.get('trailing_sl', {}).get('min_sl_distance', 5)
@@ -2043,10 +2675,19 @@ class MainWindow(QMainWindow):
             if tracked and tracked.sl_order_id:
                 # Modify existing SL
                 try:
-                    self.session.get_client().modify_order(
+                    result = self.session.get_client().modify_order(
                         order_id=tracked.sl_order_id,
                         trigger_price=str(new_sl)
                     )
+
+                    # Check if modification succeeded
+                    if result and result.get('stat', '').lower() in ['not_ok', 'error', 'rejected']:
+                        error_msg = result.get('errMsg') or result.get('message') or 'Modify failed'
+                        self.log_message.emit(f"[SL] Modify failed: {error_msg}")
+                        if self.sound:
+                            self.sound.play('error')
+                        return
+
                     self.pos_tracker.update_sl_order(symbol, new_sl_price=new_sl)
                     self.log_message.emit(f"[SL] {symbol}: Modified SL -> {new_sl:.2f}")
                     if self.sound:
@@ -2056,14 +2697,22 @@ class MainWindow(QMainWindow):
                     if self.trail_mgr and symbol in self.trail_mgr.positions:
                         self.trail_mgr.positions[symbol].current_sl = new_sl
 
+                    # Refresh orders table to show updated price
+                    self._force_next_orders_refresh()
+                    QTimer.singleShot(500, self._refresh_orders)
+
                 except Exception as e:
                     self.log_message.emit(f"[SL] Modify failed: {e}")
+                    if self.sound:
+                        self.sound.play('error')
             else:
                 # Place new SL order
                 try:
+                    exchange_seg = _get_position_exchange(pos)
+                    product = _get_position_product(pos)
                     sl_response = self.session.get_client().place_order(
-                        exchange_segment=pos.get('exchange_segment', pos.get('exchangeSegment', 'nse_fo')),
-                        product=pos.get('product', 'MIS'),
+                        exchange_segment=exchange_seg,
+                        product=product,
                         price="0",
                         order_type="SL-M",
                         quantity=str(qty),
@@ -2079,10 +2728,10 @@ class MainWindow(QMainWindow):
                     if sl_order_id:
                         # Track the position if not already tracked
                         if not tracked:
-                            avg_price = float(pos.get('averagePrice', pos.get('avgPrc', 0)) or 0)
+                            avg_price = _get_position_avg_price(pos)
                             self.pos_tracker.add_position(
                                 symbol=symbol,
-                                exchange_segment=pos.get('exchange_segment', pos.get('exchangeSegment', 'nse_fo')),
+                                exchange_segment=exchange_seg,
                                 quantity=qty,
                                 side='LONG' if is_long else 'SHORT',
                                 entry_price=avg_price
@@ -2093,11 +2742,11 @@ class MainWindow(QMainWindow):
 
                         # Register with trail manager
                         if self.trail_mgr:
-                            avg_price = float(pos.get('averagePrice', pos.get('avgPrc', 0)) or 0)
+                            avg_price = _get_position_avg_price(pos)
                             inst_token = str(pos.get('instrument_token', pos.get('token', '')))
                             self.trail_mgr.add_position(
                                 symbol=symbol,
-                                exchange_segment=pos.get('exchange_segment', pos.get('exchangeSegment', 'nse_fo')),
+                                exchange_segment=exchange_seg,
                                 entry_price=avg_price,
                                 quantity=qty,
                                 side='LONG' if is_long else 'SHORT',
@@ -2109,22 +2758,28 @@ class MainWindow(QMainWindow):
                         self.log_message.emit(f"[SL] {symbol}: Placed SL @ {new_sl:.2f} -> {sl_order_id}")
                         if self.sound:
                             self.sound.play('order_placed')
+
+                        # Refresh orders table to show new SL order
+                        self._force_next_orders_refresh()
+                        QTimer.singleShot(500, self._refresh_orders)
                     else:
                         self.log_message.emit(f"[SL] {symbol}: Order placed but no ID returned")
 
                 except Exception as e:
                     self.log_message.emit(f"[SL] Place failed: {e}")
+                    if self.sound:
+                        self.sound.play('error')
 
         except ValueError:
             self.log_message.emit(f"[SL] Invalid price format: {price_str}")
 
     def _trail_to_cost(self, symbol: str):
-        """Trail SL to breakeven."""
+        """Trail SL to TRUE breakeven (entry + charges)."""
         if self.trail_mgr:
             result = self.trail_mgr.trail_to_cost(symbol)
             if result['success']:
                 new_sl = result['new_sl']
-                self.log_message.emit(f"[TRAIL] {symbol}: SL moved to COST ({new_sl:.2f})")
+                self.log_message.emit(f"[TRAIL] {symbol}: SL → TRUE BE ({new_sl:.2f})")
                 # Sync new SL with position tracker
                 self.pos_tracker.update_sl_order(symbol, new_sl_price=new_sl)
                 if self.sound:
@@ -2150,58 +2805,80 @@ class MainWindow(QMainWindow):
         """Trail selected position to cost."""
         row = self.positions_table.currentRow()
         if row >= 0 and row < len(self._positions_cache):
-            symbol = self._filtered_positions_cache[row].get('tradingSymbol', self._filtered_positions_cache[row].get('symbol', ''))
+            symbol = _get_position_symbol(self._filtered_positions_cache[row])
             self._trail_to_cost(symbol)
 
     def _trail_selected_plus(self, points: float):
         """Trail selected position by points."""
         row = self.positions_table.currentRow()
         if row >= 0 and row < len(self._positions_cache):
-            symbol = self._filtered_positions_cache[row].get('tradingSymbol', self._filtered_positions_cache[row].get('symbol', ''))
+            symbol = _get_position_symbol(self._filtered_positions_cache[row])
             self._trail_by_points(symbol, points)
 
     def _exit_position(self, pos: Dict[str, Any], percent: int):
-        """Exit position by percentage - cancel SL/Target first to prevent ghost orders."""
-        symbol = pos.get('tradingSymbol', pos.get('symbol', ''))
-        qty = abs(int(pos.get('qty', 0)))
+        """Exit position by percentage - EXIT FIRST, then cancel SL/Target.
+
+        CRITICAL: Place exit order FIRST, only cancel SL/Target AFTER exit succeeds.
+        This prevents leaving positions unprotected if exit order fails.
+        """
+        symbol = _get_position_symbol(pos)
+        qty = abs(_get_position_qty(pos))
 
         # Calculate exit quantity
         exit_qty = int(qty * percent / 100)
         remaining_qty = qty - exit_qty
+        is_full_exit = percent == 100 or remaining_qty == 0
 
-        # For FULL exit (100%), cancel ALL pending orders first
-        if percent == 100 or remaining_qty == 0:
-            cancelled = self.pos_tracker.cancel_all_orders_for_position(symbol)
-            if cancelled.get('sl_cancelled'):
-                self.log_message.emit(f"[EXIT] Cancelled SL order: {cancelled['sl_cancelled']}")
-            if cancelled.get('target_cancelled'):
-                self.log_message.emit(f"[EXIT] Cancelled Target order: {cancelled['target_cancelled']}")
+        # For FULL exit, cancel pending ENTRY orders first (these don't have protection yet)
+        if is_full_exit:
+            if self.partial_fill_monitor:
+                cancelled_entry = self.partial_fill_monitor.cancel_pending_entry(symbol)
+                if cancelled_entry:
+                    self.log_message.emit(f"[EXIT] Cancelled pending entry: {cancelled_entry[-6:]}")
 
-            # Remove from trail manager
-            if self.trail_mgr and symbol in self.trail_mgr.positions:
-                del self.trail_mgr.positions[symbol]
-                self.log_message.emit(f"[EXIT] Removed {symbol} from trail manager")
-
-            # Remove from OCO monitor
-            if self.oco_monitor:
-                self.oco_monitor.remove_oco_pair(symbol)
-
-        # Place exit order
+        # CRITICAL: Place exit order FIRST
         result = self.orders.exit_position(pos, percent)
         if result.success:
             self.log_message.emit(f"[EXIT] {symbol} {percent}% ({exit_qty} qty) -> ID: {result.order_id}")
             if self.sound:
                 self.sound.play('order_placed')
 
+            # ONLY NOW (after exit succeeds) cancel SL/Target for FULL exits
+            if is_full_exit:
+                # Cancel SL/Target orders
+                cancelled = self.pos_tracker.cancel_all_orders_for_position(symbol)
+                if cancelled.get('sl_cancelled'):
+                    self.log_message.emit(f"[EXIT] Cancelled SL order: {cancelled['sl_cancelled']}")
+                if cancelled.get('target_cancelled'):
+                    self.log_message.emit(f"[EXIT] Cancelled Target order: {cancelled['target_cancelled']}")
+
+                # Remove from trail manager
+                if self.trail_mgr and symbol in self.trail_mgr.positions:
+                    del self.trail_mgr.positions[symbol]
+                    self.log_message.emit(f"[EXIT] Removed {symbol} from trail manager")
+
+                # Remove from OCO monitor
+                if self.oco_monitor:
+                    self.oco_monitor.remove_oco_pair(symbol)
+
+            # Schedule P&L recording after exit fill is confirmed
+            if self.pnl_tracker and result.order_id:
+                QTimer.singleShot(1000, lambda: self._record_exit_pnl(
+                    symbol=symbol,
+                    exit_order_id=result.order_id,
+                    exit_qty=exit_qty,
+                    exit_type='EXIT'
+                ))
+
             # For partial exit, modify SL order quantity using order_manager with retry logic
-            if percent < 100 and remaining_qty > 0:
+            if not is_full_exit and remaining_qty > 0:
                 tracked = self.pos_tracker.get_position(symbol)
                 if tracked and tracked.sl_order_id:
                     # Update tracker quantity
                     self.pos_tracker.reduce_position_qty(symbol, exit_qty)
 
                     # Determine exit type for SL
-                    is_long = int(pos.get('qty', 0)) > 0
+                    is_long = _get_position_qty(pos) > 0
                     exit_type = 'S' if is_long else 'B'
 
                     # Use order_manager's method with retry logic
@@ -2210,8 +2887,8 @@ class MainWindow(QMainWindow):
                         remaining_qty=remaining_qty,
                         sl_order_id=tracked.sl_order_id,
                         sl_price=tracked.sl_price,
-                        exchange_segment=pos.get('exchange_segment', pos.get('exchangeSegment', 'nse_fo')),
-                        product=pos.get('product', 'MIS'),
+                        exchange_segment=_get_position_exchange(pos),
+                        product=_get_position_product(pos),
                         transaction_type=exit_type,
                         position_tracker=self.pos_tracker,
                         oco_monitor=self.oco_monitor
@@ -2248,12 +2925,12 @@ class MainWindow(QMainWindow):
     def _recreate_sl_after_partial(self, symbol: str, sl_price: float, qty: int, pos: Dict[str, Any]):
         """Recreate SL order after partial exit when modify failed."""
         try:
-            is_long = int(pos.get('qty', 0)) > 0
+            is_long = _get_position_qty(pos) > 0
             exit_type = 'S' if is_long else 'B'
 
             sl_response = self.session.get_client().place_order(
-                exchange_segment=pos.get('exchange_segment', pos.get('exchangeSegment', 'nse_fo')),
-                product=pos.get('product', 'MIS'),
+                exchange_segment=_get_position_exchange(pos),
+                product=_get_position_product(pos),
                 price="0",
                 order_type="SL-M",
                 quantity=str(qty),
@@ -2284,57 +2961,234 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log_message.emit(f"[EXIT] SL recreation failed: {e}")
 
+    def _record_exit_pnl(self, symbol: str, exit_order_id: str, exit_qty: int,
+                          exit_type: str = 'EXIT', retry_count: int = 0):
+        """
+        Record exit P&L after order fills.
+        Called via QTimer after exit order placement.
+        """
+        max_retries = 3
+
+        try:
+            orders = self.orders.get_orders()
+            exit_order = None
+            for order in orders:
+                if order.get('nOrdNo') == exit_order_id:
+                    exit_order = order
+                    break
+
+            if not exit_order:
+                if retry_count < max_retries:
+                    QTimer.singleShot(1000, lambda: self._record_exit_pnl(
+                        symbol, exit_order_id, exit_qty, exit_type, retry_count + 1
+                    ))
+                return
+
+            status = exit_order.get('ordSt', '').lower()
+
+            if status in ['complete', 'traded', 'filled']:
+                # Get fill price
+                exit_price = float(exit_order.get('avgPrc', 0) or 0)
+                filled_qty = int(exit_order.get('fldQty', 0) or exit_qty)
+
+                if exit_price > 0 and self.pnl_tracker:
+                    result = self.pnl_tracker.record_exit(
+                        symbol=symbol,
+                        exit_price=exit_price,
+                        exit_qty=filled_qty,
+                        order_id=exit_order_id,
+                        exit_type=exit_type
+                    )
+
+                    pnl = result.get('pnl', 0)
+                    pnl_pct = result.get('pnl_percent', 0)
+                    self.log_message.emit(
+                        f"[PNL] {symbol} exit recorded: ₹{pnl:+,.2f} ({pnl_pct:+.2f}%)"
+                    )
+
+            elif status in ['pending', 'open', 'trigger pending']:
+                # Still pending - retry
+                if retry_count < max_retries:
+                    QTimer.singleShot(1000, lambda: self._record_exit_pnl(
+                        symbol, exit_order_id, exit_qty, exit_type, retry_count + 1
+                    ))
+
+        except Exception as e:
+            self.log_message.emit(f"[PNL] Error recording exit: {e}")
+
     def _exit_all_positions(self):
-        """Exit all positions - cancel ALL pending SL/Target orders first."""
+        """Exit all positions safely - exits FIRST, then clears trackers only for successful exits.
+
+        CRITICAL: Never clear trackers before confirming exits succeeded.
+        Failed exits keep their SL/Target protection intact.
+        """
         reply = QMessageBox.question(
             self, "Confirm Exit All",
-            "Are you sure you want to EXIT ALL positions?\n(This will cancel all SL/Target orders)",
+            "Are you sure you want to EXIT ALL positions?\n(SL/Target orders will be cancelled for successful exits only)",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
 
         if reply == QMessageBox.StandardButton.Yes:
-            # CRITICAL: Cancel all SL/Target orders BEFORE exiting positions
-            self.log_message.emit("[EXIT ALL] Cancelling all pending SL/Target orders...")
+            self.log_message.emit("[EXIT ALL] Starting safe exit sequence...")
 
-            # Cancel all tracked orders
-            cancelled_count = 0
-            for symbol in list(self.pos_tracker.positions.keys()):
-                cancelled = self.pos_tracker.cancel_all_orders_for_position(symbol)
-                if cancelled.get('sl_cancelled') or cancelled.get('target_cancelled'):
-                    cancelled_count += 1
-                    self.log_message.emit(f"[EXIT ALL] Cancelled orders for {symbol}")
+            # Step 1: Cancel pending ENTRY orders first (these don't have positions yet)
+            if self.partial_fill_monitor:
+                pending_entries = self.partial_fill_monitor.get_all_pending_entries()
+                for entry in pending_entries:
+                    cancelled = self.partial_fill_monitor.cancel_pending_entry(entry.symbol)
+                    if cancelled:
+                        self.log_message.emit(f"[EXIT ALL] Cancelled pending entry: {entry.symbol}")
 
-            self.log_message.emit(f"[EXIT ALL] Cancelled SL/Target for {cancelled_count} positions")
+            # Step 2: Get current positions BEFORE any exit attempts
+            tracked_symbols = list(self.pos_tracker.positions.keys())
+            self.log_message.emit(f"[EXIT ALL] Attempting to exit {len(tracked_symbols)} tracked positions...")
 
-            # Clear trail manager
-            if self.trail_mgr:
-                self.trail_mgr.positions.clear()
-                self.log_message.emit("[EXIT ALL] Cleared trail manager")
-
-            # Clear OCO monitor
-            if self.oco_monitor:
-                self.oco_monitor.clear_all()
-                self.log_message.emit("[EXIT ALL] Cleared OCO monitor")
-
-            # Clear position tracker
-            self.pos_tracker.positions.clear()
-
-            # Now exit all positions
+            # Step 3: EXIT POSITIONS FIRST - track successes and failures
             results = self.orders.exit_all_positions()
+
+            successful_exits = set()
+            failed_exits = set()
+
             for r in results:
-                self.log_message.emit(f"[EXIT ALL] {r.get('symbol', '')}: {r.get('status', 'unknown')}")
+                symbol = r.get('symbol', '')
+                status = r.get('status', 'unknown').lower()
+
+                if status in ['success', 'ok', 'complete', 'submitted']:
+                    successful_exits.add(symbol)
+                    self.log_message.emit(f"[EXIT ALL] ✓ {symbol}: EXIT OK")
+                else:
+                    failed_exits.add(symbol)
+                    self.log_message.emit(f"[EXIT ALL] ✗ {symbol}: EXIT FAILED - {status}")
+
+            # Step 4: ONLY clear trackers for SUCCESSFUL exits
+            cancelled_count = 0
+            for symbol in successful_exits:
+                # Cancel SL/Target orders for this position
+                if symbol in self.pos_tracker.positions:
+                    cancelled = self.pos_tracker.cancel_all_orders_for_position(symbol)
+                    if cancelled.get('sl_cancelled') or cancelled.get('target_cancelled'):
+                        cancelled_count += 1
+
+                # Clear from trail manager
+                if self.trail_mgr and symbol in self.trail_mgr.positions:
+                    del self.trail_mgr.positions[symbol]
+
+                # Clear from OCO monitor
+                if self.oco_monitor:
+                    self.oco_monitor.remove_pair_by_symbol(symbol)
+
+                # Clear from position tracker
+                if symbol in self.pos_tracker.positions:
+                    del self.pos_tracker.positions[symbol]
+
+            self.log_message.emit(f"[EXIT ALL] Cancelled SL/Target for {cancelled_count} exited positions")
+
+            # Step 5: ALERT if any exits failed - these positions still have protection!
+            if failed_exits:
+                failed_list = ', '.join(list(failed_exits)[:5])  # Show first 5
+                self.log_message.emit(f"[EXIT ALL] ⚠️ FAILED EXITS: {failed_list}")
+                self.log_message.emit(f"[EXIT ALL] ⚠️ {len(failed_exits)} positions STILL OPEN with SL/Target protection")
+
+                # Send Telegram alert for failed exits
+                if self.telegram:
+                    self.telegram.send(
+                        f"⚠️ EXIT ALL: {len(failed_exits)} positions FAILED to exit!\n"
+                        f"Positions: {failed_list}\n"
+                        f"SL/Target orders kept intact."
+                    )
+
+                # Show warning dialog
+                QMessageBox.warning(
+                    self, "Exit All - Partial Failure",
+                    f"{len(failed_exits)} positions FAILED to exit.\n\n"
+                    f"These positions still have SL/Target protection.\n"
+                    f"Please check and exit manually if needed."
+                )
+            else:
+                self.log_message.emit(f"[EXIT ALL] ✓ All {len(successful_exits)} positions exited successfully")
 
             if self.sound:
                 self.sound.play('position_exit')
 
+            self._force_next_orders_refresh()
             QTimer.singleShot(500, self._refresh_positions)
+            QTimer.singleShot(600, self._refresh_orders)
 
     # ==================== Order Management ====================
 
+    def _force_next_orders_refresh(self):
+        """Force the next orders refresh to happen (bypass optimization).
+
+        Call this after placing/modifying/cancelling any order.
+        """
+        self._force_orders_refresh = True
+
+    def _should_refresh_orders(self) -> bool:
+        """Check if order refresh is needed based on current state.
+
+        Returns True if:
+        - Force flag is set (after order action)
+        - Pending orders exist (from last check)
+        - Open positions exist (SL/Target may be pending)
+        - OCO monitor has active pairs
+        - Trailing SL has active positions
+        - PartialFillMonitor has pending entries
+        - Safety: every 6th call (30 seconds) regardless
+        """
+        # Check force flag first (set after order actions)
+        if getattr(self, '_force_orders_refresh', False):
+            self._force_orders_refresh = False
+            return True
+
+        # Safety counter - force refresh every 30 seconds
+        if not hasattr(self, '_orders_refresh_skip_count'):
+            self._orders_refresh_skip_count = 0
+
+        self._orders_refresh_skip_count += 1
+        if self._orders_refresh_skip_count >= 6:  # 6 × 5s = 30s
+            self._orders_refresh_skip_count = 0
+            return True
+
+        # Check for pending orders from last refresh
+        if hasattr(self, '_has_pending_orders') and self._has_pending_orders:
+            return True
+
+        # Check for open positions
+        if self.pos_tracker and self.pos_tracker.positions:
+            return True
+
+        # Check OCO monitor
+        if self.oco_monitor and hasattr(self.oco_monitor, 'pairs') and self.oco_monitor.pairs:
+            return True
+
+        # Check trailing SL manager
+        if self.trail_mgr and hasattr(self.trail_mgr, 'auto_trail_positions') and self.trail_mgr.auto_trail_positions:
+            return True
+
+        # Check partial fill monitor for pending entries
+        if self.partial_fill_monitor:
+            pending = self.partial_fill_monitor.get_all_pending_entries()
+            if pending:
+                return True
+
+        return False
+
     def _refresh_orders(self):
-        """Refresh orders from broker."""
+        """Refresh orders from broker (conditional - skips if nothing to track)."""
+        # Optimization: skip refresh if nothing to track
+        if not self._should_refresh_orders():
+            return
+
         try:
             orders = self.orders.get_orders()
+
+            # Track if any pending orders exist for next cycle optimization
+            self._has_pending_orders = any(
+                order.get('ordSt', order.get('status', '')).lower()
+                in ['pending', 'open', 'trigger pending', 'after market order req received']
+                for order in orders
+            )
+
             self.order_updated.emit(orders)
         except Exception as e:
             self.log_message.emit(f"[ERROR] Order refresh failed: {str(e)}")
@@ -2355,12 +3209,32 @@ class MainWindow(QMainWindow):
         return order_id
 
     def _update_orders_table(self, orders: List[Dict[str, Any]]):
-        """Update orders table with 7 columns: ID, Symbol, B/S, Qty, Price, Status, Time.
+        """Update orders table: Symbol, B/S, Qty, LTP, Price, Status, Time, X.
 
         Preserves user's sort selection across refreshes.
         """
+        # Check for SL fills (backup detection if WebSocket misses it)
+        if not hasattr(self, '_alerted_sl_orders'):
+            self._alerted_sl_orders = set()
+
+        for order in orders:
+            order_id = order.get('nOrdNo', order.get('orderId', ''))
+            status = order.get('ordSt', order.get('status', '')).lower()
+
+            # Check if this is a filled SL order we haven't alerted yet
+            if status in ['complete', 'completed', 'traded', 'filled', 'executed']:
+                if order_id not in self._alerted_sl_orders:
+                    for pos_symbol, pos in self.pos_tracker.positions.items():
+                        if pos.sl_order_id == order_id:
+                            self._alerted_sl_orders.add(order_id)
+                            self._show_sl_breach_alert(pos_symbol, pos.sl_price or 0)
+                            break
+
         # Show only recent orders (last 20)
         recent_orders = orders[-20:] if len(orders) > 20 else orders
+
+        # Block signals during update to avoid triggering cellChanged
+        self.orders_table.blockSignals(True)
 
         # Disable sorting during update for performance and to prevent mid-update re-sorts
         self.orders_table.setSortingEnabled(False)
@@ -2374,7 +3248,11 @@ class MainWindow(QMainWindow):
             action = 'B' if trans_type == 'B' else 'S'
             qty = order.get('qty', order.get('quantity', ''))
             price = order.get('prc', order.get('price', order.get('avgPrc', '')))
+            trigger_price = order.get('trgPrc', order.get('triggerPrice', ''))
+            order_type = order.get('ordTyp', order.get('prcTyp', order.get('orderType', '')))
+            ltp = order.get('ltp', order.get('lastPrice', order.get('lp', '')))
             status = order.get('ordSt', order.get('status', ''))
+            is_pending = status.lower() in ['pending', 'open', 'trigger pending', 'after market order req received']
             # NEO API uses 'ordDtTm' or 'exOrdTm' for order time
             raw_time = order.get('ordDtTm', order.get('exOrdTm', order.get('orderTime', '')))
             time_display = str(raw_time) if raw_time else ''
@@ -2387,39 +3265,129 @@ class MainWindow(QMainWindow):
                 if len(time_display) >= 5:
                     time_display = time_display[:5]  # Show HH:MM only
 
-            # Shorten order ID for display, store full ID in tooltip and UserRole
-            short_id = self._shorten_order_id(order_id)
-            id_item = QTableWidgetItem(short_id)
-            id_item.setToolTip(f"Full ID: {order_id}")  # Tooltip shows full ID on hover
-            id_item.setData(Qt.ItemDataRole.UserRole, order_id)  # Store full ID for reference
-            self.orders_table.setItem(row, 0, id_item)
-            self.orders_table.setItem(row, 1, QTableWidgetItem(symbol))
+            # Column 0: Symbol - store order data in UserRole for modify/cancel
+            symbol_item = QTableWidgetItem(symbol)
+            symbol_item.setToolTip(f"Order ID: {order_id}")
+            symbol_item.setData(Qt.ItemDataRole.UserRole, {
+                'order_id': order_id,
+                'order_type': order_type,
+                'trigger_price': trigger_price,
+                'price': price
+            })
+            symbol_item.setFlags(symbol_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.orders_table.setItem(row, 0, symbol_item)
 
-            # B/S with color
+            # Column 1: B/S with color
             action_item = QTableWidgetItem(action)
             if action == 'B':
                 action_item.setForeground(QBrush(QColor("#00ff88")))
             else:
                 action_item.setForeground(QBrush(QColor("#ff5555")))
-            self.orders_table.setItem(row, 2, action_item)
+            action_item.setFlags(action_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.orders_table.setItem(row, 1, action_item)
 
-            self.orders_table.setItem(row, 3, QTableWidgetItem(str(qty)))
-            self.orders_table.setItem(row, 4, QTableWidgetItem(str(price) if price else "--"))
+            # Column 2: Qty
+            qty_item = QTableWidgetItem(str(qty))
+            qty_item.setFlags(qty_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.orders_table.setItem(row, 2, qty_item)
 
-            # Status with color
-            status_item = QTableWidgetItem(status)
+            # Column 3: LTP
+            ltp_item = QTableWidgetItem(str(ltp) if ltp else "--")
+            ltp_item.setForeground(QBrush(QColor("#00ccff")))
+            ltp_item.setFlags(ltp_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.orders_table.setItem(row, 3, ltp_item)
+
+            # Column 4: Price - EDITABLE for pending orders
+            display_price = trigger_price if trigger_price and float(trigger_price) > 0 else price
+            price_item = QTableWidgetItem(str(display_price) if display_price else "--")
+            if is_pending:
+                # Make editable - yellow background to indicate editable
+                price_item.setFlags(price_item.flags() | Qt.ItemFlag.ItemIsEditable)
+                price_item.setBackground(QBrush(QColor("#333300")))
+                price_item.setToolTip("Double-click to edit price")
+            else:
+                price_item.setFlags(price_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.orders_table.setItem(row, 4, price_item)
+
+            # Column 5: Status with color and rejection reason
+            rej_reason = order.get('rejRsn') or order.get('rejectionReason') or \
+                         order.get('text') or order.get('remarks') or ''
+            status_display = status
+            status_tooltip = f"Status: {status}"
+
+            if status.lower() in ['rejected', 'cancelled'] and rej_reason:
+                # Show shortened reason in status column
+                status_display = f"REJ"
+                status_tooltip = f"REJECTED: {rej_reason}"
+                # Log rejection reason once (track by order_id)
+                if not hasattr(self, '_logged_rejections'):
+                    self._logged_rejections = set()
+                if order_id and order_id not in self._logged_rejections:
+                    self._logged_rejections.add(order_id)
+                    self.log_message.emit(f"[ORDER] {symbol} REJECTED: {rej_reason}")
+                    # Debug: log full order data for unhelpful rejection reasons
+                    if rej_reason.strip() in ['-', '', 'Unknown']:
+                        logger.warning(f"Unhelpful rejection reason. Full order: {order}")
+
+                    # Learn from this rejection
+                    if self.rejection_learner and status.lower() == 'rejected':
+                        order_details = {
+                            'product': order.get('prod', order.get('product', '')),
+                            'order_type': order_type,
+                            'price': price
+                        }
+                        learned = self.rejection_learner.learn_from_rejection(
+                            symbol, rej_reason, order_details
+                        )
+                        if learned:
+                            self.log_message.emit(
+                                f"[LEARNER] Learned: {learned.get('index') or symbol} -> "
+                                f"Use {learned['product']} ({learned['reason']})"
+                            )
+
+            status_item = QTableWidgetItem(status_display)
+            status_item.setToolTip(status_tooltip)
             if status.lower() in ['complete', 'traded', 'filled']:
                 status_item.setForeground(QBrush(QColor("#00ff88")))
             elif status.lower() in ['rejected', 'cancelled']:
                 status_item.setForeground(QBrush(QColor("#ff4444")))
             else:
                 status_item.setForeground(QBrush(QColor("#ffaa00")))
+            status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.orders_table.setItem(row, 5, status_item)
 
-            # Time column: display HH:MM but sort by full timestamp
+            # Column 6: Time - display HH:MM but sort by full timestamp
             time_item = SortableTableWidgetItem(time_display)
             time_item.setData(Qt.ItemDataRole.UserRole, time_sort_key)
+            time_item.setFlags(time_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.orders_table.setItem(row, 6, time_item)
+
+            # Column 7: Cancel button (X) for pending orders
+            if is_pending:
+                cancel_btn = QPushButton("X")
+                cancel_btn.setFixedSize(24, 20)
+                cancel_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #dd2222; color: white;
+                        font-weight: bold; font-size: 11px; border-radius: 3px;
+                        border: 1px solid #ff4444;
+                        margin: 0px;
+                padding-top: 0px;
+                padding-bottom: 4px;
+                    }
+                    QPushButton:hover { background-color: #ff3333; border: 1px solid #ff6666; }
+                """)
+                cancel_btn.setToolTip("Cancel order")
+                cancel_btn.clicked.connect(lambda checked, oid=order_id: self._cancel_single_order(oid))
+                self.orders_table.setCellWidget(row, 7, cancel_btn)
+            else:
+                # No cancel button for completed/cancelled orders
+                empty_item = QTableWidgetItem("")
+                empty_item.setFlags(empty_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.orders_table.setItem(row, 7, empty_item)
+
+        # Unblock signals
+        self.orders_table.blockSignals(False)
 
         # Re-enable sorting and restore user's sort preference
         self.orders_table.setSortingEnabled(True)
@@ -2427,6 +3395,15 @@ class MainWindow(QMainWindow):
 
     def _cancel_pending_orders(self):
         """Cancel all pending orders and clear tracker references."""
+        # First cancel pending ENTRY orders (not yet filled)
+        if self.partial_fill_monitor:
+            pending_entries = self.partial_fill_monitor.get_all_pending_entries()
+            for entry in pending_entries:
+                cancelled = self.partial_fill_monitor.cancel_pending_entry(entry.symbol)
+                if cancelled:
+                    self.log_message.emit(f"[CANCEL] Pending entry {entry.symbol}: cancelled")
+
+        # Cancel all other pending orders
         results = self.orders.cancel_pending_orders()
         cancelled_ids = set()
         for r in results:
@@ -2451,6 +3428,7 @@ class MainWindow(QMainWindow):
         if self.oco_monitor:
             self.oco_monitor.clear_all()
 
+        self._force_next_orders_refresh()
         QTimer.singleShot(500, self._refresh_orders)
 
     def _cancel_all_orders(self):
@@ -2545,8 +3523,8 @@ class MainWindow(QMainWindow):
         self.log_message.emit("[EOD] Auto-exit triggered - exiting all MIS positions")
         # Only exit MIS positions (not NRML)
         for pos in self._positions_cache:
-            product = pos.get('product', '').upper()
-            qty = int(pos.get('qty', 0))
+            product = _get_position_product(pos)
+            qty = _get_position_qty(pos)
             if product == 'MIS' and qty != 0:
                 self._exit_position(pos, 100)
 
@@ -2627,7 +3605,7 @@ class MainWindow(QMainWindow):
         try:
             # Get current positions from broker
             positions = self.orders.get_positions()
-            active_positions = [p for p in positions if int(p.get('qty', 0)) != 0]
+            active_positions = [p for p in positions if _get_position_qty(p) != 0]
 
             if not active_positions:
                 self.log_message.emit("[RECOVERY] No existing positions found")
@@ -2639,10 +3617,10 @@ class MainWindow(QMainWindow):
             pending_orders = self._get_pending_orders_by_symbol()
 
             for pos in active_positions:
-                symbol = pos.get('tradingSymbol', pos.get('symbol', ''))
-                qty = int(pos.get('qty', 0))
-                avg_price = float(pos.get('averagePrice', pos.get('avgPrc', 0)) or 0)
-                exchange_segment = pos.get('exchange_segment', pos.get('exchangeSegment', 'nse_fo'))
+                symbol = _get_position_symbol(pos)
+                qty = _get_position_qty(pos)
+                avg_price = _get_position_avg_price(pos)
+                exchange_segment = _get_position_exchange(pos)
                 is_long = qty > 0
 
                 self.log_message.emit(f"[RECOVERY] Position: {symbol} {'LONG' if is_long else 'SHORT'} {abs(qty)} @ {avg_price:.2f}")

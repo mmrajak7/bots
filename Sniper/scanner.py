@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Options Scanner - Multi-Timeframe Reversal Zone Strategy
+Swing Support Scanner - Finds swing lows for high-reward reversal trades
 
-FULL SCAN (multiple timeframes):
-  - 15m timeframe: Every 15 mins at :16, :31, :46 (30-day lookback)
-  - 1h timeframe: At :17, :47 (90-day lookback)
-  - Analyze reversal zones
-  - Calculate scores
-  - Mark broken zones
+Detects SWING LOWS (significant reversal points) on:
+- Option premium charts (CE/PE for ATM strikes)
+- Cross-validates with SPOT chart for higher confidence
 
-QUICK CHECK (every minute):
-  - Check if LTP near zones (within 2%)
-  - Send real-time entry alerts with timeframe badge
-  - Timeframe-specific cooldowns (15m: 1h, 1h: 2h)
-  - Each symbol/zone/timeframe tracked independently
+Indices: NIFTY, BANKNIFTY, SENSEX
+Timeframes: Daily, 1-Hour, 15-Minute (configurable)
 
-Cron Setup:
-    * 9-14 * * 1-5 cd /path/to/Sniper && python3 scanner.py >> logs/cron.log 2>&1
-    0-30 15 * * 1-5 cd /path/to/Sniper && python3 scanner.py >> logs/cron.log 2>&1
+Logic:
+1. Find SWING LOWS - candles whose low < surrounding N candles
+2. Group swing lows at similar prices = SUPPORT LEVEL
+3. Cross-check with SPOT for confluence
+4. Alert when price is 5-10 pts above support level
+
+Usage:
+    python scanner.py           # Normal mode
+    python scanner.py --test    # Test mode (show levels)
+    python scanner.py --force   # Force full scan
 """
 
 import json
@@ -26,8 +27,7 @@ import logging
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta, date, time
-from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from kiteconnect import KiteConnect
 
 # =============================================================================
@@ -35,39 +35,34 @@ from kiteconnect import KiteConnect
 # =============================================================================
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-HELPER_DIR = SCRIPT_DIR.parent if SCRIPT_DIR.name == 'helper' else SCRIPT_DIR
-BOTS_DIR = HELPER_DIR.parent
+BOTS_DIR = SCRIPT_DIR.parent
 DATA_DIR = BOTS_DIR / 'data'
-CACHE_DIR = HELPER_DIR / 'data' / 'cache'
-LOGS_DIR = HELPER_DIR / 'logs'
+CACHE_DIR = SCRIPT_DIR / 'data' / 'cache'
+LOGS_DIR = SCRIPT_DIR / 'logs'
 
 BOUNCER_CONFIG = BOTS_DIR / 'Bouncer' / 'config' / 'config.json'
-
 TOKEN_FILE = DATA_DIR / 'kite_access_token.json'
 INSTRUMENTS_CACHE = CACHE_DIR / 'instruments.pkl'
-ZONES_DB = CACHE_DIR / 'zones_db.pkl'
+LEVELS_DB = CACHE_DIR / 'levels_db.pkl'
 ALERTS_TRACKER = CACHE_DIR / 'alerts_tracker.pkl'
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # =============================================================================
-# LOGGING (Auto-rotates daily)
+# LOGGING
 # =============================================================================
 
 def setup_logging():
     today = datetime.now().strftime('%Y%m%d')
     log_file = LOGS_DIR / f'scanner_{today}.log'
 
-    # Clear old logs
     for old_log in LOGS_DIR.glob('scanner_*.log'):
         if old_log.stem != f'scanner_{today}':
             try:
                 old_log.unlink()
-            except (OSError, PermissionError) as e:
-                # Can't use logger yet (not set up), print to stderr
-                import sys
-                print(f"Warning: Could not delete old log {old_log}: {e}", file=sys.stderr)
+            except (OSError, PermissionError):
+                pass
 
     logging.basicConfig(
         level=logging.INFO,
@@ -82,61 +77,80 @@ def setup_logging():
 logger = setup_logging()
 
 # =============================================================================
-# CONFIG
+# TELEGRAM CONFIG
 # =============================================================================
 
 try:
     with open(BOUNCER_CONFIG) as f:
         BOUNCER_CFG = json.load(f)
-
     TELEGRAM_BOT_TOKEN = BOUNCER_CFG['telegram']['bot_token']
     TELEGRAM_CHAT_ID = BOUNCER_CFG['telegram']['chat_id']
+except Exception as e:
+    logger.error(f"Telegram config error: {e}")
+    TELEGRAM_BOT_TOKEN = None
+    TELEGRAM_CHAT_ID = None
 
-    # Validate config
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise ValueError("Telegram bot_token or chat_id is empty")
-
-except FileNotFoundError:
-    print(f"ERROR: Config file not found: {BOUNCER_CONFIG}", file=__import__('sys').stderr)
-    print("Ensure BOTS/Bouncer/config/config.json exists", file=__import__('sys').stderr)
-    __import__('sys').exit(1)
-except (json.JSONDecodeError, KeyError, ValueError) as e:
-    print(f"ERROR: Invalid config file: {e}", file=__import__('sys').stderr)
-    print(f"Check structure of {BOUNCER_CONFIG}", file=__import__('sys').stderr)
-    __import__('sys').exit(1)
+# =============================================================================
+# INDEX CONFIGURATION
+# =============================================================================
 
 INDICES = {
-    'BANKNIFTY': {'spot': 'NSE:NIFTY BANK', 'round_to': 1000},
-    'NIFTY': {'spot': 'NSE:NIFTY 50', 'round_to': 100},
-    'SENSEX': {'spot': 'BSE:SENSEX', 'round_to': 1000},
+    'NIFTY': {
+        'spot': 'NSE:NIFTY 50',
+        'spot_token': 256265,
+        'round_to': 100,
+        'exchange': 'NFO'
+    },
+    'BANKNIFTY': {
+        'spot': 'NSE:NIFTY BANK',
+        'spot_token': 260105,
+        'round_to': 100,
+        'exchange': 'NFO'
+    },
+    'SENSEX': {
+        'spot': 'BSE:SENSEX',
+        'spot_token': 265,
+        'round_to': 100,
+        'exchange': 'BFO'
+    }
 }
 
-# Scanning params
-MIN_BOUNCES = 5
-MIN_SCORE = 50
-BUFFER_PCT = 2.0
-MAX_ZONE_WIDTH = 10  # Maximum zone width in points (prevents over-merging)
+# =============================================================================
+# PARAMETERS - EASY TO TUNE
+# =============================================================================
 
-# Proximity alert params
-PROXIMITY_PCT = 2.0  # Alert when within 2% of zone
+# Swing detection
+SWING_LOOKBACK = 5       # A swing low must be lower than 5 candles on each side
+MIN_SWING_LOWS = 2       # Minimum swing lows to form a support level
+LEVEL_TOLERANCE = 20     # Swing lows within 20 pts = same level (for NIFTY spot)
+OPTION_TOLERANCE = 5     # For option premiums, within 5 pts = same level
 
-# Multi-Timeframe Configuration
+# Expiry selection
+MIN_DTE = 3              # Minimum days to expiry (switch to next month if less)
+
+# Alert trigger
+ALERT_DISTANCE = 10      # Alert when LTP is within 10 pts of support
+ALERT_COOLDOWN_HOURS = 2 # Don't re-alert same level for 2 hours
+
+# Timeframe configuration (set enabled=False to disable)
 TIMEFRAMES = {
-    '15m': {
-        'interval': '15minute',
-        'lookback_days': 30,        # How far back to fetch data
-        'max_bounce_age': 12,        # Only use bounces from last 12 days
-        'scan_minutes': [16, 31, 46],  # Every 15 mins
-        'cooldown_hours': 1,
+    'day': {
+        'interval': 'day',
+        'lookback_days': 180,
+        'scan_minutes': [16],      # Once per hour
         'enabled': True
     },
     '1h': {
         'interval': '60minute',
-        'lookback_days': 90,         # Need more history for hourly
-        'max_bounce_age': 20,        # Only use bounces from last 20 days
-        'scan_minutes': [17, 47],    # Offset from 15m scans
-        'cooldown_hours': 2,         # Longer cooldown for higher TF
+        'lookback_days': 60,
+        'scan_minutes': [17, 47],  # Twice per hour
         'enabled': True
+    },
+    '15m': {
+        'interval': '15minute',
+        'lookback_days': 20,
+        'scan_minutes': [16, 31, 46],  # 3x per hour
+        'enabled': False  # Disabled for now
     }
 }
 
@@ -148,208 +162,166 @@ def is_market_open() -> bool:
     now = datetime.now()
     if now.weekday() >= 5:
         return False
-    current_time = now.time()
-    return time(9, 15) <= current_time <= time(15, 30)
+    return time(9, 15) <= now.time() <= time(15, 30)
 
 def is_full_scan_time() -> bool:
-    """Check if current minute is a full scan minute for any enabled timeframe."""
-    current_minute = datetime.now().minute
-
-    for timeframe, config in TIMEFRAMES.items():
-        if config['enabled'] and current_minute in config['scan_minutes']:
+    minute = datetime.now().minute
+    for tf, config in TIMEFRAMES.items():
+        if config['enabled'] and minute in config['scan_minutes']:
             return True
-
     return False
 
 # =============================================================================
-# KITE
+# KITE CONNECTION
 # =============================================================================
 
 def get_kite() -> KiteConnect:
-    try:
-        with open(TOKEN_FILE) as f:
-            token_data = json.load(f)
-
-        # Validate token structure
-        required_keys = ['api_key', 'access_token']
-        for key in required_keys:
-            if key not in token_data or not token_data[key]:
-                raise ValueError(f"Missing or empty '{key}' in token file")
-
-        kite = KiteConnect(api_key=token_data['api_key'])
-        kite.set_access_token(token_data['access_token'])
-        return kite
-
-    except FileNotFoundError:
-        logger.error(f"Token file not found: {TOKEN_FILE}")
-        logger.error("Ensure BOTS/data/kite_access_token.json exists")
-        raise
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        logger.error(f"Invalid token file: {e}")
-        logger.error(f"Check structure of {TOKEN_FILE}")
-        raise
-
-# =============================================================================
-# INSTRUMENTS CACHE
-# =============================================================================
-
-def load_instruments() -> Optional[Dict]:
-    if not INSTRUMENTS_CACHE.exists():
-        return None
-
-    try:
-        cache_time = datetime.fromtimestamp(INSTRUMENTS_CACHE.stat().st_mtime)
-        if cache_time.date() < datetime.now().date():
-            return None
-
-        with open(INSTRUMENTS_CACHE, 'rb') as f:
-            return pickle.load(f)
-    except (pickle.UnpicklingError, EOFError, OSError, Exception) as e:
-        logger.warning(f"Corrupted instruments cache, will re-download: {e}")
-        return None
-
-def save_instruments(instruments: Dict):
-    try:
-        with open(INSTRUMENTS_CACHE, 'wb') as f:
-            pickle.dump(instruments, f)
-    except Exception as e:
-        logger.error(f"Failed to save instruments cache: {e}")
+    with open(TOKEN_FILE) as f:
+        token_data = json.load(f)
+    kite = KiteConnect(api_key=token_data['api_key'])
+    kite.set_access_token(token_data['access_token'])
+    return kite
 
 def fetch_instruments(kite: KiteConnect) -> Dict:
-    cached = load_instruments()
-    if cached:
-        return cached
+    """Fetch and cache instruments."""
+    if INSTRUMENTS_CACHE.exists():
+        cache_time = datetime.fromtimestamp(INSTRUMENTS_CACHE.stat().st_mtime)
+        if datetime.now() - cache_time < timedelta(hours=12):
+            with open(INSTRUMENTS_CACHE, 'rb') as f:
+                return pickle.load(f)
 
-    logger.info("Downloading instruments...")
     instruments = {}
-
     for exchange in ['NFO', 'BFO']:
-        for inst in kite.instruments(exchange):
-            if inst['instrument_type'] not in ('CE', 'PE'):
-                continue
-            if inst['name'] not in INDICES:
-                continue
+        try:
+            for inst in kite.instruments(exchange):
+                if inst['instrument_type'] in ['CE', 'PE']:
+                    key = (inst['name'], inst['strike'], inst['instrument_type'], inst['expiry'])
+                    instruments[key] = {
+                        'token': inst['instrument_token'],
+                        'symbol': inst['tradingsymbol'],
+                        'exchange': exchange
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to fetch {exchange}: {e}")
 
-            key = (inst['name'], inst['strike'], inst['instrument_type'], inst['expiry'])
-            instruments[key] = {
-                'symbol': inst['tradingsymbol'],
-                'token': inst['instrument_token'],
-                'exchange': inst['exchange']
-            }
+    with open(INSTRUMENTS_CACHE, 'wb') as f:
+        pickle.dump(instruments, f)
 
-    save_instruments(instruments)
-    logger.info(f"Cached {len(instruments)} instruments")
     return instruments
 
 # =============================================================================
-# ZONES DATABASE
+# SWING LOW DETECTION
 # =============================================================================
 
-def load_zones_db() -> Dict:
-    """Load zones database."""
-    if not ZONES_DB.exists():
-        return {}
+def find_swing_lows(data: List[Dict], lookback: int = SWING_LOOKBACK) -> List[Dict]:
+    """
+    Find SWING LOWS - significant local minima.
 
-    try:
-        with open(ZONES_DB, 'rb') as f:
-            db = pickle.load(f)
-    except (pickle.UnpicklingError, EOFError) as e:
-        logger.warning(f"Corrupted zones DB, resetting: {e}")
-        return {}
+    A swing low is a candle whose LOW is lower than:
+    - The LOW of `lookback` candles BEFORE it
+    - The LOW of `lookback` candles AFTER it
 
-    # Reset if new day or no date key
-    db_date = db.get('date')
-    if db_date is None or db_date != datetime.now().date():
-        if db_date is not None:
-            logger.info(f"Zones DB is from {db_date}, resetting for today")
-        return {}
+    This finds the "V" bottoms that stand out.
+    """
+    if len(data) < (lookback * 2 + 1):
+        return []
 
-    return db
+    swing_lows = []
 
-def save_zones_db(db: Dict):
-    """Save zones database."""
-    db['date'] = datetime.now().date()
-    with open(ZONES_DB, 'wb') as f:
-        pickle.dump(db, f)
+    for i in range(lookback, len(data) - lookback):
+        current_low = data[i]['low']
 
-# =============================================================================
-# ALERTS TRACKER
-# =============================================================================
+        # Get lows of surrounding candles
+        left_lows = [data[j]['low'] for j in range(i - lookback, i)]
+        right_lows = [data[j]['low'] for j in range(i + 1, i + lookback + 1)]
 
-def load_alerts_tracker() -> Dict:
-    """Load alerts tracker (cooldown management)."""
-    if not ALERTS_TRACKER.exists():
-        logger.info("Alerts tracker file not found, creating new tracker")
-        return {}
+        # Check if current is lower than ALL surrounding candles
+        if current_low < min(left_lows) and current_low < min(right_lows):
+            swing_lows.append({
+                'price': current_low,
+                'date': data[i]['date'],
+                'candle': data[i]
+            })
 
-    try:
-        with open(ALERTS_TRACKER, 'rb') as f:
-            tracker = pickle.load(f)
-    except (pickle.UnpicklingError, EOFError, Exception) as e:
-        logger.warning(f"Corrupted alerts tracker, resetting: {e}")
-        return {}
+    return swing_lows
 
-    # Clean old entries (> 2 hours old)
-    now = datetime.now()
-    cleaned = {}
 
-    for k, v in tracker.items():
-        # Validate timestamp is datetime
-        if not isinstance(v, datetime):
-            logger.warning(f"Invalid tracker entry {k}: not a datetime, skipping")
-            continue
+def find_support_levels(data: List[Dict], tolerance: float) -> List[Dict]:
+    """
+    Find support levels by grouping swing lows at similar prices.
 
-        try:
-            hours_old = (now - v).total_seconds() / 3600
-            if hours_old < 2:  # Keep entries < 2 hours old
-                cleaned[k] = v
-        except Exception as e:
-            logger.warning(f"Error processing tracker entry {k}: {e}")
-            continue
+    Two swing lows within `tolerance` points = same support level
+    """
+    swing_lows = find_swing_lows(data)
 
-    if len(cleaned) < len(tracker):
-        logger.info(f"Cleaned {len(tracker) - len(cleaned)} old/invalid alert entries")
+    if len(swing_lows) < MIN_SWING_LOWS:
+        return []
 
-    return cleaned
+    # Sort by price
+    swing_lows.sort(key=lambda x: x['price'])
 
-def save_alerts_tracker(tracker: Dict):
-    """Save alerts tracker to disk."""
-    try:
-        with open(ALERTS_TRACKER, 'wb') as f:
-            pickle.dump(tracker, f)
-        logger.debug(f"Saved alerts tracker ({len(tracker)} entries)")
-    except Exception as e:
-        logger.error(f"Failed to save alerts tracker: {e}")
+    # Group into levels
+    levels = []
+    current_group = [swing_lows[0]]
 
-def can_alert(symbol: str, zone_price: int, tracker: Dict, timeframe: str = '15m', cooldown_hours: float = 1.0) -> bool:
-    """Check if we can alert for this symbol/zone/timeframe."""
-    key = f"{symbol}_{zone_price}_{timeframe}"
-    if key not in tracker:
-        logger.debug(f"Can alert {key}: not in tracker")
-        return True
+    for sl in swing_lows[1:]:
+        group_low = min(s['price'] for s in current_group)
 
-    last_alert = tracker[key]
-    hours_since = (datetime.now() - last_alert).total_seconds() / 3600
+        if sl['price'] - group_low <= tolerance:
+            current_group.append(sl)
+        else:
+            if len(current_group) >= MIN_SWING_LOWS:
+                levels.append(current_group)
+            current_group = [sl]
 
-    can_send = hours_since >= cooldown_hours
-    if can_send:
-        logger.debug(f"Can alert {key}: {hours_since:.1f}h since last alert")
-    else:
-        logger.debug(f"Cooldown active {key}: {hours_since:.1f}h / {cooldown_hours}h")
+    if len(current_group) >= MIN_SWING_LOWS:
+        levels.append(current_group)
 
-    return can_send
+    # Convert to support level objects
+    support_levels = []
+    for group in levels:
+        prices = [s['price'] for s in group]
+        support_levels.append({
+            'price': round(sum(prices) / len(prices), 1),
+            'low': min(prices),
+            'high': max(prices),
+            'touches': len(group),
+            'last_touch': max(s['date'] for s in group),
+            'strength': 'strong' if len(group) >= 3 else 'moderate'
+        })
 
-def mark_alerted(symbol: str, zone_price: int, tracker: Dict, timeframe: str = '15m'):
-    """Mark this symbol/zone/timeframe as alerted."""
-    key = f"{symbol}_{zone_price}_{timeframe}"
-    tracker[key] = datetime.now()
-    logger.debug(f"Marked alerted: {key} at {tracker[key].strftime('%H:%M:%S')}")
+    return support_levels
 
 # =============================================================================
-# STRIKE CALCULATION
+# EXPIRY SELECTION
 # =============================================================================
 
-def get_monthly_expiry(index: str, instruments: Dict) -> Optional[date]:
+def get_monthly_expiries(expiries: set) -> List[date]:
+    """
+    Filter for MONTHLY expiries only.
+    Monthly expiry = last expiry of each month.
+    """
+    if not expiries:
+        return []
+
+    # Group expiries by year-month
+    by_month = {}
+    for exp in expiries:
+        key = (exp.year, exp.month)
+        if key not in by_month:
+            by_month[key] = []
+        by_month[key].append(exp)
+
+    # Get last expiry of each month (that's the monthly)
+    monthly = []
+    for key in by_month:
+        monthly.append(max(by_month[key]))
+
+    return sorted(monthly)
+
+
+def get_valid_expiry(index: str, instruments: Dict) -> Optional[date]:
+    """Get MONTHLY expiry with at least MIN_DTE days remaining."""
     expiries = set()
     for (idx, strike, opt_type, expiry) in instruments.keys():
         if idx == index:
@@ -359,258 +331,159 @@ def get_monthly_expiry(index: str, instruments: Dict) -> Optional[date]:
         return None
 
     today = date.today()
-    current_month = [e for e in expiries if e.year == today.year and e.month == today.month]
-    if current_month:
-        return max(current_month)
 
-    next_month = today.month + 1 if today.month < 12 else 1
-    next_year = today.year if today.month < 12 else today.year + 1
-    next_month_expiries = [e for e in expiries if e.year == next_year and e.month == next_month]
+    # Filter for monthly expiries only
+    monthly_expiries = get_monthly_expiries(expiries)
 
-    return max(next_month_expiries) if next_month_expiries else max(expiries)
+    for exp in monthly_expiries:
+        days_to_expiry = (exp - today).days
+        if days_to_expiry >= MIN_DTE:
+            return exp
+
+    return monthly_expiries[-1] if monthly_expiries else None
+
 
 def calculate_atm(ltp: float, index: str) -> int:
     round_to = INDICES[index]['round_to']
     return int(round(ltp / round_to) * round_to)
 
 # =============================================================================
-# REVERSAL ZONE DETECTION (FULL SCAN ONLY)
+# PERSISTENCE
 # =============================================================================
 
-def get_historical_data(kite: KiteConnect, token: int, timeframe: str = '15m') -> List[Dict]:
-    """Fetch historical data for specified timeframe."""
-    tf_config = TIMEFRAMES.get(timeframe, TIMEFRAMES['15m'])
+def load_levels_db() -> Dict:
+    if not LEVELS_DB.exists():
+        return {}
+    try:
+        with open(LEVELS_DB, 'rb') as f:
+            return pickle.load(f)
+    except Exception:
+        return {}
 
-    return kite.historical_data(
-        instrument_token=token,
-        from_date=datetime.now() - timedelta(days=tf_config['lookback_days']),
-        to_date=datetime.now(),
-        interval=tf_config['interval']
-    )
+def save_levels_db(db: Dict):
+    with open(LEVELS_DB, 'wb') as f:
+        pickle.dump(db, f)
 
-def find_reversal_zones(data: List[Dict], ltp: float, max_bounce_age_days: int = 30) -> List[Dict]:
-    """
-    Find reversal zones from historical data.
+def load_alerts_tracker() -> Dict:
+    if not ALERTS_TRACKER.exists():
+        return {}
+    try:
+        with open(ALERTS_TRACKER, 'rb') as f:
+            tracker = pickle.load(f)
+        now = datetime.now()
+        return {k: v for k, v in tracker.items()
+                if isinstance(v, datetime) and (now - v).total_seconds() < 7200}
+    except Exception:
+        return {}
 
-    Args:
-        data: Historical OHLC data
-        ltp: Last traded price
-        max_bounce_age_days: Only use bounces within this many days (default: 30)
-    """
-    bounces = []
-    cutoff_date = datetime.now() - timedelta(days=max_bounce_age_days)
+def save_alerts_tracker(tracker: Dict):
+    with open(ALERTS_TRACKER, 'wb') as f:
+        pickle.dump(tracker, f)
 
-    for candle in data:
-        # Validate candle has all required keys
-        required_keys = ['open', 'high', 'low', 'close', 'date']
-        if not all(k in candle for k in required_keys):
-            continue
-
-        # Filter by age - remove timezone info for comparison
-        candle_date = candle['date'].replace(tzinfo=None) if candle['date'].tzinfo else candle['date']
-        if candle_date < cutoff_date:
-            continue
-
-        open_price, high, low, close = candle['open'], candle['high'], candle['low'], candle['close']
-
-        # Validate OHLC values
-        if any(v is None or v < 0 for v in [open_price, high, low, close]):
-            continue
-
-        candle_range = high - low
-        if candle_range <= 0:
-            continue
-
-        close_position = (close - low) / candle_range
-        lower_wick = min(open_price, close) - low
-        wick_pct = lower_wick / candle_range
-
-        if close_position >= 0.4 or wick_pct >= 0.3:
-            bounces.append({
-                'low': low,
-                'date': candle['date'],
-                'strength': close_position
-            })
-
-    if not bounces:
-        return []
-
-    zone_data = defaultdict(list)
-    for b in bounces:
-        rounded = round(b['low'] / 10) * 10
-        zone_data[rounded].append(b)
-
-    zones = []
-    sorted_levels = sorted(zone_data.keys())
-    used = set()
-
-    for level in sorted_levels:
-        if level in used:
-            continue
-
-        merged = [level]
-
-        # Try to merge with level+10, but check zone width
-        if level + 10 in zone_data:
-            # Get all bounces from both levels to check width
-            test_bounces = zone_data[level] + zone_data[level + 10]
-            test_lows = [b['low'] for b in test_bounces]
-            zone_width = max(test_lows) - min(test_lows)
-
-            # Only merge if combined width is acceptable
-            if zone_width <= MAX_ZONE_WIDTH:
-                merged.append(level + 10)
-                used.add(level + 10)
-
-        all_bounces = []
-        for price_level in merged:
-            all_bounces.extend(zone_data[price_level])
-
-        if len(all_bounces) >= MIN_BOUNCES:
-            lows = [b['low'] for b in all_bounces]
-            zone_center = sum(merged) / len(merged)
-            zone_width = max(lows) - min(lows)
-
-            zones.append({
-                'price': int(zone_center),
-                'low': min(lows),
-                'high': max(lows),
-                'bounces': len(all_bounces),
-                'strength': sum(b['strength'] for b in all_bounces) / len(all_bounces),
-                'last_bounce': max(b['date'] for b in all_bounces),
-                'width': zone_width  # Track zone width for debugging
-            })
-
-        used.add(level)
-
-    return zones
-
-def score_zone(zone: Dict, ltp: float) -> float:
-    # Guard against invalid LTP
-    if ltp <= 0:
-        return 0.0
-
-    bounce_score = min(50, (zone['bounces'] / 50) * 50)
-    strength_score = zone['strength'] * 20
-    distance_pct = abs(zone['price'] - ltp) / ltp * 100
-    proximity_score = max(0, 20 - distance_pct)
-    days_ago = (datetime.now() - zone['last_bounce'].replace(tzinfo=None)).days
-    freshness_score = max(0, 10 - (days_ago / 7) * 10)
-
-    return round(bounce_score + strength_score + proximity_score + freshness_score, 1)
-
-def is_zone_broken(zone: Dict, ltp: float) -> bool:
-    if ltp < zone['low'] * 0.97:
+def can_alert(key: str, tracker: Dict) -> bool:
+    if key not in tracker:
         return True
-    if ltp > zone['high'] * 1.03:
-        return True
-    return False
+    hours_since = (datetime.now() - tracker[key]).total_seconds() / 3600
+    return hours_since >= ALERT_COOLDOWN_HOURS
+
+def mark_alerted(key: str, tracker: Dict):
+    tracker[key] = datetime.now()
 
 # =============================================================================
 # TELEGRAM
 # =============================================================================
 
-def send_telegram(message: str):
+def send_telegram(message: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram not configured")
+        return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
+        response = requests.post(url, json={
             'chat_id': TELEGRAM_CHAT_ID,
             'text': message,
             'parse_mode': 'HTML'
-        }
-        response = requests.post(url, json=payload, timeout=10)
+        }, timeout=10)
         return response.status_code == 200
     except Exception as e:
-        logger.error(f"Telegram failed: {e}")
+        logger.error(f"Telegram error: {e}")
         return False
 
-def format_proximity_alert(symbol: str, opt_type: str, zone: Dict, ltp: float, score: float, timeframe: str = '15m') -> str:
+
+def format_alert(symbol: str, opt_type: str, level: Dict, ltp: float,
+                 timeframe: str, spot_confluence: bool) -> str:
     """
-    Compact proximity alert with timeframe badge.
+    Format support level alert.
 
-    Format:
-        🎯 NIFTY 25900 PE [1H] [Score: 72]
-        Zone: 155-174 (24 bounces, 68% strength)
-        Entry: 151 | Stop: 148 | LTP: 158
-
-        ⚡ PRICE NEAR ZONE - Ready to enter
+    Example:
+        SWING SUPPORT - NIFTY26JAN25800CE [1H]
+        Support: 145.2-148.5 (3 touches, strong)
+        LTP: 152.3 | Entry: 148.5 | Stop: 143.7
+        Spot Confluence: YES
     """
-    buffer = zone['low'] * BUFFER_PCT / 100
-    entry = int(zone['low'] - buffer)
-    stop = int(entry - buffer)
-
     emoji = "🟢" if opt_type == "CE" else "🔴"
-    tf_badge = f"[{timeframe.upper()}]"
+    confluence = "YES" if spot_confluence else "NO"
 
-    msg = f"{emoji} <b>{symbol} {opt_type}</b> {tf_badge} [Score: {score:.0f}]\n"
-    msg += f"Zone: {int(zone['low'])}-{int(zone['high'])} ({zone['bounces']} bounces, {int(zone['strength']*100)}% strength)\n"
-    msg += f"Entry: {entry} | Stop: {stop} | LTP: {ltp:.0f}\n\n"
-    msg += "⚡ <b>PRICE NEAR ZONE</b> - Ready to enter"
+    entry = level['high']
+    stop = round(level['low'] - 2, 1)
+
+    msg = f"{emoji} <b>SWING SUPPORT</b> - {symbol} [{timeframe.upper()}]\n"
+    msg += f"Support: {level['low']:.1f}-{level['high']:.1f} ({level['touches']} touches, {level['strength']})\n"
+    msg += f"LTP: {ltp:.1f} | Entry: {entry:.1f} | Stop: {stop:.1f}\n"
+    msg += f"Spot Confluence: <b>{confluence}</b>"
 
     return msg
 
 # =============================================================================
-# FULL SCAN (Every 16, 31, 46)
+# FULL SCAN - Find Support Levels
 # =============================================================================
 
 def full_scan(kite: KiteConnect, instruments: Dict):
     """
-    Full reversal zone analysis for all enabled timeframes.
-    Updates zones database, NO alerts sent here.
+    Scan for swing support levels on option premiums.
+    Cross-validate with spot chart.
     """
-    logger.info("="*60)
+    logger.info("=" * 50)
     logger.info(f"FULL SCAN: {datetime.now().strftime('%H:%M:%S')}")
-    logger.info("="*60)
+    logger.info("=" * 50)
 
-    # Get index LTPs (shared across all timeframes)
-    index_ltps = {}
+    levels_db = {}
+
     for index, config in INDICES.items():
         try:
+            # Get spot price
             quote = kite.quote(config['spot'])
-            spot_symbol = config['spot']
-
-            # Validate quote structure
-            if spot_symbol not in quote or 'last_price' not in quote[spot_symbol]:
-                logger.error(f"{index}: Invalid quote structure")
-                continue
-
-            ltp = quote[spot_symbol]['last_price']
-
-            # Validate LTP value
-            if ltp is None or ltp <= 0:
-                logger.error(f"{index}: Invalid LTP: {ltp}")
-                continue
-
-            index_ltps[index] = ltp
-            logger.info(f"{index}: {ltp:.2f}")
-
-        except Exception as e:
-            logger.error(f"{index} failed: {e}")
-
-    # Scan zones for all enabled timeframes
-    zones_db = {}
-    current_minute = datetime.now().minute
-
-    for timeframe, tf_config in TIMEFRAMES.items():
-        if not tf_config['enabled']:
-            continue
-
-        # Check if this is a scan minute for this timeframe
-        if current_minute not in tf_config['scan_minutes']:
-            logger.info(f"Skipping {timeframe} scan (not a scan minute)")
-            continue
-
-        logger.info(f"\n--- Scanning {timeframe.upper()} timeframe ---")
-
-        for index, ltp in index_ltps.items():
-            atm = calculate_atm(ltp, index)
-            expiry = get_monthly_expiry(index, instruments)
+            spot_ltp = quote[config['spot']]['last_price']
+            atm = calculate_atm(spot_ltp, index)
+            expiry = get_valid_expiry(index, instruments)
 
             if not expiry:
+                logger.warning(f"{index}: No valid expiry found")
                 continue
 
-            logger.info(f"{index} ({timeframe}): ATM {atm}, Expiry {expiry.strftime('%d-%b')}")
+            dte = (expiry - date.today()).days
+            logger.info(f"\n{index}: Spot {spot_ltp:.0f}, ATM {atm}, Expiry {expiry} ({dte} DTE)")
 
+            # Get SPOT support levels for cross-validation
+            spot_levels = {}
+            for tf_name, tf_config in TIMEFRAMES.items():
+                if not tf_config['enabled']:
+                    continue
+
+                try:
+                    spot_data = kite.historical_data(
+                        instrument_token=config['spot_token'],
+                        from_date=datetime.now() - timedelta(days=tf_config['lookback_days']),
+                        to_date=datetime.now(),
+                        interval=tf_config['interval']
+                    )
+                    spot_levels[tf_name] = find_support_levels(spot_data, LEVEL_TOLERANCE)
+                    if spot_levels[tf_name]:
+                        logger.info(f"  SPOT [{tf_name}]: {len(spot_levels[tf_name])} support levels")
+                except Exception as e:
+                    logger.debug(f"  SPOT [{tf_name}] error: {e}")
+
+            # Scan CE and PE options
             for opt_type in ['CE', 'PE']:
                 key = (index, atm, opt_type, expiry)
                 if key not in instruments:
@@ -619,206 +492,193 @@ def full_scan(kite: KiteConnect, instruments: Dict):
                 inst = instruments[key]
                 symbol = inst['symbol']
 
+                # Get option LTP
+                quote_key = f"{inst['exchange']}:{symbol}"
                 try:
-                    # Get option quote
-                    quote_key = f"{inst['exchange']}:{symbol}"
-                    quote = kite.quote(quote_key)
+                    opt_quote = kite.quote(quote_key)
+                    opt_ltp = opt_quote[quote_key]['last_price']
+                except Exception:
+                    continue
 
-                    # Validate quote structure
-                    if quote_key not in quote or 'last_price' not in quote[quote_key]:
-                        logger.warning(f"{symbol}: Invalid quote structure")
+                if opt_ltp <= 0:
+                    continue
+
+                if symbol not in levels_db:
+                    levels_db[symbol] = {
+                        'index': index,
+                        'type': opt_type,
+                        'exchange': inst['exchange'],
+                        'token': inst['token'],
+                        'ltp': opt_ltp,
+                        'expiry': expiry,
+                        'timeframes': {}
+                    }
+
+                # Scan each timeframe
+                for tf_name, tf_config in TIMEFRAMES.items():
+                    if not tf_config['enabled']:
                         continue
 
-                    opt_ltp = quote[quote_key]['last_price']
+                    try:
+                        data = kite.historical_data(
+                            instrument_token=inst['token'],
+                            from_date=datetime.now() - timedelta(days=tf_config['lookback_days']),
+                            to_date=datetime.now(),
+                            interval=tf_config['interval']
+                        )
 
-                    # Validate LTP
-                    if opt_ltp is None or opt_ltp <= 0:
-                        logger.warning(f"{symbol}: Invalid LTP: {opt_ltp}")
-                        continue
+                        levels = find_support_levels(data, OPTION_TOLERANCE)
 
-                    # Fetch historical data for this timeframe
-                    data = get_historical_data(kite, inst['token'], timeframe)
+                        if levels:
+                            # Check spot confluence for each level
+                            for lvl in levels:
+                                lvl['spot_confluence'] = False
 
-                    # Get max bounce age for this timeframe
-                    max_bounce_age = tf_config.get('max_bounce_age', 30)
-                    zones = find_reversal_zones(data, opt_ltp, max_bounce_age)
+                                # For CE: support on CE premium = NIFTY near support
+                                # For PE: support on PE premium = NIFTY near resistance
+                                # Cross-check with spot levels
+                                if tf_name in spot_levels:
+                                    for spot_lvl in spot_levels[tf_name]:
+                                        # If spot has a support/resistance near current spot price
+                                        # and option has support, it's confluence
+                                        spot_distance = abs(spot_ltp - spot_lvl['price'])
+                                        if spot_distance < LEVEL_TOLERANCE * 2:
+                                            lvl['spot_confluence'] = True
+                                            break
 
-                    if not zones:
-                        continue
+                            levels_db[symbol]['timeframes'][tf_name] = {
+                                'levels': levels,
+                                'updated': datetime.now()
+                            }
 
-                    # Score zones
-                    for z in zones:
-                        z['score'] = score_zone(z, opt_ltp)
+                            logger.info(f"  {symbol} [{tf_name}]: {len(levels)} support levels")
+                            for lvl in levels[:3]:
+                                conf = "[SPOT]" if lvl.get('spot_confluence') else ""
+                                logger.info(f"    {lvl['low']:.1f}-{lvl['high']:.1f} ({lvl['touches']} touches) {conf}")
 
-                    # Remove broken zones
-                    zones = [z for z in zones if not is_zone_broken(z, opt_ltp)]
+                    except Exception as e:
+                        logger.debug(f"  {symbol} [{tf_name}] error: {str(e)[:30]}")
 
-                    # Keep only strong zones (score > MIN_SCORE)
-                    zones = [z for z in zones if z['score'] >= MIN_SCORE]
+        except Exception as e:
+            logger.error(f"{index} failed: {e}")
 
-                    # Sort by score
-                    zones.sort(key=lambda x: x['score'], reverse=True)
-
-                    if zones:
-                        # Initialize symbol dict if doesn't exist
-                        if symbol not in zones_db:
-                            zones_db[symbol] = {}
-
-                        # Store zones for this timeframe
-                        zones_db[symbol][timeframe] = {
-                            'ltp': opt_ltp,
-                            'token': inst['token'],
-                            'exchange': inst['exchange'],
-                            'type': opt_type,
-                            'zones': zones,
-                            'last_updated': datetime.now()
-                        }
-
-                        logger.info(f"{symbol} ({timeframe}): {len(zones)} zones tracked")
-
-                except Exception as e:
-                    logger.error(f"{symbol} ({timeframe}) failed: {str(e)[:50]}", exc_info=True)
-
-    # Save zones DB
-    save_zones_db(zones_db)
-
-    # Count timeframe entries (skip 'date' metadata)
-    total_tf_entries = sum(len(v) for k, v in zones_db.items() if k != 'date' and isinstance(v, dict))
-    symbol_count = len([k for k in zones_db.keys() if k != 'date'])
-
-    logger.info(f"Zones DB updated: {total_tf_entries} timeframe entries across {symbol_count} symbols")
-    logger.info("="*60)
+    save_levels_db(levels_db)
+    logger.info(f"\nSaved levels for {len(levels_db)} symbols")
+    logger.info("=" * 50)
 
 # =============================================================================
-# QUICK CHECK (Every minute)
+# QUICK CHECK - Alert on Proximity
 # =============================================================================
 
 def quick_check(kite: KiteConnect):
     """
-    Quick proximity check across all timeframes.
-    Fetches LTP, checks if near zones, sends alerts.
+    Check if price is approaching any support level.
+    Alert when within ALERT_DISTANCE points.
     """
     logger.info(f"Quick check: {datetime.now().strftime('%H:%M:%S')}")
 
-    # Load zones DB
-    zones_db = load_zones_db()
-    if not zones_db:
-        logger.info("No zones in DB, skipping")
+    levels_db = load_levels_db()
+    if not levels_db:
         return
 
-    # Load alerts tracker
     alerts_tracker = load_alerts_tracker()
-
     alerts_sent = 0
 
-    try:
-        for symbol, tf_data in zones_db.items():
-            # Skip metadata entries (like 'date')
-            if symbol == 'date' or not isinstance(tf_data, dict):
+    for symbol, data in levels_db.items():
+        try:
+            # Get current LTP
+            quote_key = f"{data['exchange']}:{symbol}"
+            quote = kite.quote(quote_key)
+            ltp = quote[quote_key]['last_price']
+
+            if ltp <= 0:
                 continue
 
-            try:
-                # Get current LTP once per symbol
-                quote_key = None
-                ltp = None
+            # Update stored LTP
+            data['ltp'] = ltp
 
-                # Find exchange from any timeframe
-                for tf_info in tf_data.values():
-                    if isinstance(tf_info, dict) and 'exchange' in tf_info:
-                        quote_key = f"{tf_info['exchange']}:{symbol}"
-                        break
-
-                if not quote_key:
+            # Check levels in each timeframe
+            for tf_name, tf_data in data.get('timeframes', {}).items():
+                if not isinstance(tf_data, dict) or 'levels' not in tf_data:
                     continue
 
-                quote = kite.quote(quote_key)
+                for level in tf_data['levels']:
+                    # Check if price is approaching support from above
+                    distance = ltp - level['high']
 
-                # Validate quote structure
-                if quote_key not in quote or 'last_price' not in quote[quote_key]:
-                    logger.warning(f"{symbol}: Invalid quote structure")
-                    continue
+                    # Alert if within ALERT_DISTANCE above the level
+                    if 0 < distance <= ALERT_DISTANCE:
+                        alert_key = f"{symbol}_{level['price']}_{tf_name}"
 
-                ltp = quote[quote_key]['last_price']
+                        if can_alert(alert_key, alerts_tracker):
+                            msg = format_alert(
+                                symbol, data['type'], level, ltp, tf_name,
+                                level.get('spot_confluence', False)
+                            )
+                            send_telegram(msg)
+                            mark_alerted(alert_key, alerts_tracker)
+                            alerts_sent += 1
 
-                # Validate LTP
-                if ltp is None or ltp <= 0:
-                    continue
+                            logger.info(f"ALERT: {symbol} [{tf_name}] near support {level['price']:.1f}")
 
-                # Check zones in each timeframe
-                for timeframe, data in tf_data.items():
-                    # Validate timeframe data structure
-                    if not isinstance(data, dict) or 'zones' not in data or 'type' not in data:
-                        continue
+                    # Invalidate level if price breaks below
+                    elif ltp < level['low'] - 5:
+                        level['broken'] = True
+                        logger.info(f"BROKEN: {symbol} [{tf_name}] support {level['price']:.1f}")
 
-                    # Get cooldown for this timeframe
-                    cooldown_hours = TIMEFRAMES.get(timeframe, {}).get('cooldown_hours', 1.0)
+        except Exception as e:
+            logger.debug(f"{symbol} check failed: {e}")
 
-                    # Check each zone
-                    for zone in data['zones']:
-                        # Validate zone structure
-                        if 'price' not in zone or 'low' not in zone or 'score' not in zone:
-                            continue
+    save_levels_db(levels_db)
+    save_alerts_tracker(alerts_tracker)
 
-                        # Check if price is within PROXIMITY_PCT of zone
-                        zone_center = zone['price']
+    if alerts_sent:
+        logger.info(f"Sent {alerts_sent} alerts")
 
-                        # Guard against invalid values
-                        if zone_center <= 0 or ltp <= 0:
-                            continue
+# =============================================================================
+# LEVEL MANAGEMENT
+# =============================================================================
 
-                        distance_pct = abs(ltp - zone_center) / zone_center * 100
+def cleanup_broken_levels():
+    """Remove broken/invalidated levels from DB."""
+    levels_db = load_levels_db()
 
-                        if distance_pct <= PROXIMITY_PCT:
-                            # Price is near zone!
-                            if can_alert(symbol, zone['price'], alerts_tracker, timeframe, cooldown_hours):
-                                # Send alert with timeframe info
-                                msg = format_proximity_alert(symbol, data['type'], zone, ltp, zone['score'], timeframe)
-                                send_telegram(msg)
+    for symbol, data in levels_db.items():
+        for tf_name, tf_data in data.get('timeframes', {}).items():
+            if 'levels' in tf_data:
+                # Keep only unbroken levels
+                tf_data['levels'] = [
+                    lvl for lvl in tf_data['levels']
+                    if not lvl.get('broken', False)
+                ]
 
-                                mark_alerted(symbol, zone['price'], alerts_tracker, timeframe)
-                                alerts_sent += 1
-
-                                logger.info(f"ALERT ({timeframe}): {symbol} @ {ltp:.0f} near zone {zone['price']} (Score: {zone['score']:.0f})")
-
-            except Exception as e:
-                logger.error(f"{symbol} quick check failed: {str(e)[:50]}", exc_info=True)
-
-    finally:
-        # ALWAYS save alerts tracker, even if there's an exception
-        save_alerts_tracker(alerts_tracker)
-
-    if alerts_sent > 0:
-        logger.info(f"Quick check: {alerts_sent} alerts sent")
+    save_levels_db(levels_db)
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def main(force=False):
+def main(force=False, test=False):
     """Main entry point."""
-
-    if not force and not is_market_open():
+    if test:
+        logger.info("TEST MODE - Ignoring market hours")
+    elif not force and not is_market_open():
         logger.info("Market closed")
         return
 
     kite = get_kite()
     instruments = fetch_instruments(kite)
 
-    # Determine mode
-    if force or is_full_scan_time():
-        # Full scan mode
+    if force or test or is_full_scan_time():
         full_scan(kite, instruments)
-    else:
-        # Quick check mode
+        cleanup_broken_levels()
+
+    if not test:
         quick_check(kite)
 
-if __name__ == "__main__":
-    import sys
-    force = '--test' in sys.argv or '--force' in sys.argv
 
-    try:
-        main(force=force)
-    except Exception as e:
-        logger.error(f"Scanner failed: {e}")
-        import traceback
-        traceback.print_exc()
+if __name__ == '__main__':
+    import sys
+    force = '--force' in sys.argv
+    test = '--test' in sys.argv
+    main(force=force, test=test)

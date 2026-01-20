@@ -7,12 +7,15 @@ Provides multiple ways to trail SL:
 3. Quick keyboard shortcuts for trail increments
 """
 
+import math
 import threading
 import time
 from typing import Dict, Optional, Callable, Any, List
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
+
+from core.charge_calculator import get_breakeven_points
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +59,26 @@ class TrailingSLManager:
     """Manages trailing stop losses for positions."""
 
     def __init__(self, neo_client, order_manager=None,
-                 sound_mgr=None, telegram_mgr=None, config: Dict[str, Any] = None):
+                 sound_mgr=None, telegram_mgr=None, config: Dict[str, Any] = None,
+                 position_tracker=None):
         self.client = neo_client
         self.order_mgr = order_manager
         self.sound = sound_mgr
         self.telegram = telegram_mgr
         self.config = config or {}
+        self.pos_tracker = position_tracker  # For checking exit locks
 
         self.positions: Dict[str, TrailingPosition] = {}
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._check_interval = 0.5  # Check every 500ms for fast trailing
+
+        # CRITICAL: Health monitoring for daemon thread
+        self._last_heartbeat: float = 0.0
+        self._heartbeat_timeout: float = 10.0  # Alert if no heartbeat for 10 seconds
+        self._consecutive_errors: int = 0
+        self._max_consecutive_errors: int = 5
 
         # Config
         trail_config = self.config.get('trailing_sl', {})
@@ -141,8 +152,11 @@ class TrailingSLManager:
 
     def trail_to_cost(self, symbol: str) -> Dict[str, Any]:
         """
-        One-click: Move SL to entry price (cost).
+        One-click: Move SL to TRUE BREAKEVEN (entry price + round-trip charges).
         Use when position is in profit and want to lock breakeven.
+
+        TRUE BE = Entry Price + Breakeven Points (charges/qty)
+        This ensures you don't lose money even after paying exit charges.
 
         Args:
             symbol: Symbol to trail
@@ -155,38 +169,51 @@ class TrailingSLManager:
             if not pos:
                 return {'success': False, 'error': 'Position not found'}
 
-            new_sl = pos.entry_price
+            # Calculate TRUE breakeven including round-trip transaction costs
+            be_points = get_breakeven_points(pos.entry_price, pos.quantity)
 
-            # CRITICAL: Validate that trailing to cost is favorable (position is in profit)
+            if pos.side == 'LONG':
+                # LONG: BE = entry + charges (need price to go UP to cover costs)
+                new_sl = pos.entry_price + be_points
+            else:
+                # SHORT: BE = entry - charges (need price to go DOWN to cover costs)
+                new_sl = pos.entry_price - be_points
+
+            # Round UP to tick size (0.1) - safer for SL
+            new_sl = math.ceil(new_sl / 0.1) * 0.1
+
+            logger.info(f"[TRAIL] {symbol}: TRUE BE = {pos.entry_price:.2f} + {be_points:.2f} = {new_sl:.2f}")
+
+            # CRITICAL: Validate that trailing to BE is favorable (position is in profit)
             # Otherwise the SL would trigger immediately or be worse than current SL
             if pos.side == 'LONG':
-                # For LONG: Entry must be below LTP to be a valid SL
-                if pos.last_ltp <= pos.entry_price:
+                # For LONG: LTP must be above BE price
+                if pos.last_ltp <= new_sl:
                     return {
                         'success': False,
-                        'error': f'Position not in profit (LTP {pos.last_ltp:.2f} <= Entry {pos.entry_price:.2f}). Cannot trail to cost.'
+                        'error': f'Position not in enough profit (LTP {pos.last_ltp:.2f} <= BE {new_sl:.2f}). Need +{be_points:.1f} pts profit.'
                     }
                 # Also verify it's better than current SL
                 if new_sl <= pos.current_sl:
                     return {
                         'success': False,
-                        'error': f'Cost ({new_sl:.2f}) is not better than current SL ({pos.current_sl:.2f})'
+                        'error': f'BE ({new_sl:.2f}) is not better than current SL ({pos.current_sl:.2f})'
                     }
             else:  # SHORT
-                # For SHORT: Entry must be above LTP to be a valid SL
-                if pos.last_ltp >= pos.entry_price:
+                # For SHORT: LTP must be below BE price
+                if pos.last_ltp >= new_sl:
                     return {
                         'success': False,
-                        'error': f'Position not in profit (LTP {pos.last_ltp:.2f} >= Entry {pos.entry_price:.2f}). Cannot trail to cost.'
+                        'error': f'Position not in enough profit (LTP {pos.last_ltp:.2f} >= BE {new_sl:.2f}). Need +{be_points:.1f} pts profit.'
                     }
                 # Also verify it's better than current SL
                 if new_sl >= pos.current_sl:
                     return {
                         'success': False,
-                        'error': f'Cost ({new_sl:.2f}) is not better than current SL ({pos.current_sl:.2f})'
+                        'error': f'BE ({new_sl:.2f}) is not better than current SL ({pos.current_sl:.2f})'
                     }
 
-            return self._update_sl(pos, new_sl, "TRAIL_TO_COST")
+            return self._update_sl(pos, new_sl, f"TRAIL_TO_BE(+{be_points:.1f})")
 
     def trail_by_points(self, symbol: str, points: float) -> Dict[str, Any]:
         """
@@ -287,13 +314,30 @@ class TrailingSLManager:
         logger.info("[TRAIL] Auto-trail stopped")
 
     def _auto_trail_loop(self):
-        """Background loop for auto-trailing."""
+        """Background loop for auto-trailing with health tracking."""
         while self._running:
             try:
+                # Update heartbeat
+                self._last_heartbeat = time.time()
                 self._process_auto_trails()
+                self._consecutive_errors = 0
             except Exception as e:
                 logger.error(f"[TRAIL] Error: {e}")
+                self._consecutive_errors += 1
+                if self._consecutive_errors >= self._max_consecutive_errors:
+                    logger.error(f"[TRAIL] CRITICAL: {self._consecutive_errors} consecutive errors!")
+                    if self.telegram:
+                        self.telegram.send(f"🚨 Trail Manager: {self._consecutive_errors} errors! Auto-trailing may fail!")
+                    self._consecutive_errors = 0
             time.sleep(self._check_interval)
+
+    def is_healthy(self) -> bool:
+        """Check if trail manager thread is healthy."""
+        if not self._running:
+            return True
+        if self._last_heartbeat == 0:
+            return True
+        return (time.time() - self._last_heartbeat) < self._heartbeat_timeout
 
     def _process_auto_trails(self):
         """Process all positions for auto-trailing."""
@@ -420,8 +464,15 @@ class TrailingSLManager:
                    reason: str) -> Dict[str, Any]:
         """Actually modify the SL order."""
         try:
-            # Round to tick size (0.05 for options)
-            new_sl = round(new_sl / 0.05) * 0.05
+            # CRITICAL: Check if position is locked for exit (OCO/Exit processing)
+            # If locked, Trail Manager should NOT modify - position is being closed
+            if self.pos_tracker and self.pos_tracker.is_locked_for_exit(pos.symbol):
+                logger.warning(f"[TRAIL] {pos.symbol} is locked for exit - skipping modification")
+                return {'success': False, 'error': 'Position locked for exit'}
+
+            # Round UP to tick size (0.1) - safer for SL
+            new_sl = math.ceil(new_sl / 0.1) * 0.1
+            old_sl = pos.current_sl
 
             # Validate minimum distance
             if pos.side == 'LONG':
@@ -439,7 +490,28 @@ class TrailingSLManager:
                 validity="DAY"
             )
 
-            old_sl = pos.current_sl
+            # Check if modification response indicates failure
+            if result and result.get('stat', '').lower() in ['not_ok', 'error', 'rejected']:
+                error_msg = result.get('errMsg') or result.get('message') or 'Modify failed'
+                logger.error(f"[TRAIL] Modify failed: {error_msg}")
+                return {'success': False, 'error': error_msg}
+
+            # CRITICAL: Verify the modification with broker
+            # The API may return OK but the order may not have been modified
+            verified = self._verify_sl_modification(pos.sl_order_id, new_sl)
+
+            if not verified:
+                logger.error(f"[TRAIL] CRITICAL: Modify returned OK but verification failed! "
+                           f"Expected SL={new_sl}, broker may have different value")
+                # DON'T update local state - keep old_sl as current
+                return {
+                    'success': False,
+                    'error': 'Modify verification failed - broker SL may differ from expected',
+                    'expected_sl': new_sl,
+                    'actual_sl': 'unknown'
+                }
+
+            # Verified - update local state
             pos.current_sl = new_sl
             pos.trail_history.append({
                 'time': time.time(),
@@ -448,7 +520,7 @@ class TrailingSLManager:
                 'reason': reason
             })
 
-            logger.info(f"[TRAIL] {pos.symbol}: SL {old_sl} -> {new_sl} ({reason})")
+            logger.info(f"[TRAIL] {pos.symbol}: SL {old_sl} -> {new_sl} ({reason}) [VERIFIED]")
 
             # Notify
             if self.sound:
@@ -462,6 +534,53 @@ class TrailingSLManager:
         except Exception as e:
             logger.error(f"[TRAIL] Failed: {e}")
             return {'success': False, 'error': str(e)}
+
+    def _verify_sl_modification(self, order_id: str, expected_trigger: float,
+                                 tolerance: float = 0.15) -> bool:
+        """
+        Verify that SL order modification actually took effect at broker.
+
+        CRITICAL: Prevents mismatch between code state and broker reality.
+
+        Args:
+            order_id: SL order ID
+            expected_trigger: Expected trigger price after modification
+            tolerance: Price tolerance for comparison (default 0.15 for tick rounding)
+
+        Returns:
+            True if broker order has the expected trigger price
+        """
+        try:
+            order_report = self.client.order_report()
+            orders = order_report.get('data', []) if order_report else []
+
+            for o in orders:
+                if o.get('nOrdNo') == order_id:
+                    actual_trigger = float(o.get('trgPrc', 0) or 0)
+                    status = o.get('ordSt', '').lower()
+
+                    # If order is no longer pending, can't verify modification
+                    if status in ['complete', 'traded', 'filled', 'cancelled', 'rejected']:
+                        logger.warning(f"[TRAIL] SL order {order_id} is {status}, cannot verify")
+                        # Return True - order executed, modification is moot
+                        return True
+
+                    # Check if trigger price matches expected (within tolerance)
+                    if abs(actual_trigger - expected_trigger) <= tolerance:
+                        logger.debug(f"[TRAIL] Verified: order {order_id} trigger={actual_trigger}")
+                        return True
+                    else:
+                        logger.error(f"[TRAIL] MISMATCH: order {order_id} "
+                                   f"expected={expected_trigger}, actual={actual_trigger}")
+                        return False
+
+            logger.warning(f"[TRAIL] Order {order_id} not found in order report")
+            return False
+
+        except Exception as e:
+            logger.error(f"[TRAIL] Verification error: {e}")
+            # On verification error, be conservative - assume it failed
+            return False
 
     def get_position_info(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get trailing position info for GUI."""

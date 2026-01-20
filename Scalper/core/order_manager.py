@@ -54,10 +54,12 @@ class OrderResult:
 class OrderManager:
     """Manages order execution with safety checks."""
 
-    def __init__(self, neo_client, config: Dict[str, Any], symbol_mapper=None):
+    def __init__(self, neo_client, config: Dict[str, Any], symbol_mapper=None,
+                 realized_pnl_tracker=None):
         self.client = neo_client
         self.config = config
         self.mapper = symbol_mapper
+        self.pnl_tracker = realized_pnl_tracker  # For accurate realized P&L
         self.recent_orders: List[Tuple[float, OrderParams]] = []
         self._lock = threading.Lock()
 
@@ -76,6 +78,10 @@ class OrderManager:
         # Track daily P&L
         self._daily_pnl = 0.0
         self._trading_halted = False
+        self._circuit_breaker_file = "data/circuit_breaker.json"
+
+        # CRITICAL: Load circuit breaker state from disk (survives restarts)
+        self._load_circuit_breaker_state()
 
         # Market hours configuration
         market_config = config.get('market_hours', {})
@@ -213,10 +219,34 @@ class OrderManager:
             # Record for duplicate prevention
             self._record_order(params)
 
-            # Extract order ID
+            # Extract order ID and check for rejection
             order_id = None
             if isinstance(response, dict):
                 order_id = response.get('nOrdNo') or response.get('orderId') or response.get('order_id')
+
+                # Check if order was rejected by broker
+                stat = str(response.get('stat', '')).lower()
+                if stat in ['rejected', 'not_ok', 'error', 'failed']:
+                    rej_reason = response.get('rejRsn') or response.get('rejectionReason') or \
+                                 response.get('errMsg') or response.get('message') or 'Unknown reason'
+                    logger.warning(f"Order REJECTED by broker: {params.symbol} - {rej_reason}")
+                    logger.warning(f"Full rejection response: {response}")
+                    return OrderResult(
+                        success=False,
+                        message=f"REJECTED: {rej_reason}",
+                        response=response
+                    )
+
+            # CRITICAL: Validate order ID is present
+            # If order placement returned OK but no order ID, SL/Target won't be placed
+            if not order_id or not str(order_id).strip():
+                logger.error(f"Order placed but NO order ID returned for {params.symbol}!")
+                logger.error(f"Response: {response}")
+                return OrderResult(
+                    success=False,
+                    message="Order may have been placed but no ID returned - check positions manually",
+                    response=response
+                )
 
             logger.info(f"Order placed: {params.symbol} {params.transaction_type} "
                        f"{params.quantity} @ {params.price} -> ID: {order_id}")
@@ -229,10 +259,15 @@ class OrderManager:
             )
 
         except Exception as e:
-            logger.error(f"Order placement failed: {str(e)}", exc_info=True)
+            error_msg = str(e)
+            # Try to extract rejection reason from exception message
+            if 'rejRsn' in error_msg or 'rejected' in error_msg.lower():
+                logger.warning(f"Order REJECTED: {params.symbol} - {error_msg}")
+            else:
+                logger.error(f"Order placement failed: {error_msg}", exc_info=True)
             return OrderResult(
                 success=False,
-                message=f"Order placement failed: {str(e)}"
+                message=f"Order failed: {error_msg}"
             )
 
     def place_bracket_order(self, params: BracketOrderParams) -> OrderResult:
@@ -646,19 +681,11 @@ class OrderManager:
         return results
 
     def get_positions(self) -> List[Dict[str, Any]]:
-        """Get current positions with P&L."""
+        """Get all positions (open and closed) with P&L."""
         try:
             response = self.client.positions()
             positions = response.get('data', []) if response else []
-
-            # Filter and format positions
-            result = []
-            for pos in positions:
-                qty = int(pos.get('qty', 0))
-                if qty != 0:  # Only include open positions
-                    result.append(pos)
-
-            return result
+            return positions  # Return all positions, UI will filter
         except Exception as e:
             logger.error(f"Failed to get positions: {e}")
             return []
@@ -733,21 +760,33 @@ class OrderManager:
             # Get required margin for this order
             required_margin = self.get_margin_required(params)
             if required_margin is None:
-                # Can't calculate - don't block but warn
+                # CRITICAL: Can't calculate margin - safer to block in 'block' mode
+                if margin_check_mode == 'block':
+                    return {
+                        'block': True,
+                        'warning': False,
+                        'message': 'Could not calculate required margin - order blocked for safety'
+                    }
                 return {
                     'block': False,
                     'warning': True,
-                    'message': 'Could not calculate required margin - proceeding anyway'
+                    'message': 'Could not calculate required margin - proceeding with caution'
                 }
 
             # Get available margin
             available_margin = self.get_available_margin()
             if available_margin is None:
-                # Can't check - don't block but warn
+                # CRITICAL: Can't check margin - safer to block in 'block' mode
+                if margin_check_mode == 'block':
+                    return {
+                        'block': True,
+                        'warning': False,
+                        'message': 'Could not fetch available margin - order blocked for safety'
+                    }
                 return {
                     'block': False,
                     'warning': True,
-                    'message': 'Could not fetch available margin - proceeding anyway'
+                    'message': 'Could not fetch available margin - proceeding with caution'
                 }
 
             # Check if sufficient
@@ -895,7 +934,7 @@ class OrderManager:
             logger.debug(f"Daily P&L check: Open={open_pnl:.2f}, Realized={realized_pnl:.2f}, Total={total_pnl:.2f}")
 
             if total_pnl < -self.max_loss_per_day:
-                self._trading_halted = True
+                self._set_trading_halted(True, f"Daily loss limit: {total_pnl:.2f} < -{self.max_loss_per_day}")
                 logger.warning(f"DAILY LOSS LIMIT REACHED: {total_pnl:.2f} (limit: -{self.max_loss_per_day})")
                 return False
 
@@ -904,66 +943,104 @@ class OrderManager:
         except Exception as e:
             # CRITICAL: Block trading if we can't verify loss limit
             logger.error(f"Loss limit check failed - BLOCKING: {e}")
-            self._trading_halted = True
+            self._set_trading_halted(True, f"Loss limit check failed: {e}")
             return False
+
+    def _set_trading_halted(self, halted: bool, reason: str = ""):
+        """Set trading halted state and persist to disk."""
+        self._trading_halted = halted
+        self._save_circuit_breaker_state(halted, reason)
+
+    def _save_circuit_breaker_state(self, halted: bool, reason: str):
+        """Save circuit breaker state to disk for persistence across restarts."""
+        try:
+            import json
+            import os
+            from datetime import datetime
+
+            os.makedirs(os.path.dirname(self._circuit_breaker_file), exist_ok=True)
+
+            state = {
+                'halted': halted,
+                'reason': reason,
+                'timestamp': datetime.now().isoformat(),
+                'date': datetime.now().strftime('%Y-%m-%d')
+            }
+
+            with open(self._circuit_breaker_file, 'w') as f:
+                json.dump(state, f, indent=2)
+
+            logger.info(f"[CIRCUIT] State saved: halted={halted}, reason={reason}")
+
+        except Exception as e:
+            logger.error(f"Failed to save circuit breaker state: {e}")
+
+    def _load_circuit_breaker_state(self):
+        """Load circuit breaker state from disk. Only applies if same day."""
+        try:
+            import json
+            import os
+            from datetime import datetime
+
+            if not os.path.exists(self._circuit_breaker_file):
+                return
+
+            with open(self._circuit_breaker_file, 'r') as f:
+                state = json.load(f)
+
+            saved_date = state.get('date', '')
+            today = datetime.now().strftime('%Y-%m-%d')
+
+            # Only restore if same day - new day = fresh start
+            if saved_date == today and state.get('halted', False):
+                self._trading_halted = True
+                logger.warning(f"[CIRCUIT] Restored halted state from disk: {state.get('reason', 'Unknown')}")
+            elif saved_date != today:
+                # Clear old state file on new day
+                os.remove(self._circuit_breaker_file)
+                logger.info("[CIRCUIT] New trading day - cleared old circuit breaker state")
+
+        except Exception as e:
+            logger.warning(f"Failed to load circuit breaker state: {e}")
 
     def _get_realized_pnl_today(self) -> float:
         """
         Get realized P&L from today's completed trades.
-        Parses order report to calculate P&L from filled exit orders.
+
+        Uses RealizedPnLTracker if available (accurate).
+        Falls back to broker API (less reliable).
         """
+        # PRIMARY: Use our tracker (accurate, tracks entry prices)
+        if self.pnl_tracker:
+            return self.pnl_tracker.get_realized_pnl_today()
+
+        # FALLBACK: Try to get from broker positions API (less accurate)
+        # NEO positions() sometimes includes realized P&L in dayPnl field
         try:
-            order_report = self.client.order_report()
-            orders = order_report.get('data', []) if order_report else []
+            positions_response = self.client.positions()
+            positions = positions_response.get('data', []) if positions_response else []
+
             realized_pnl = 0.0
-
-            # Get today's date for filtering
-            from datetime import datetime
-            today = datetime.now().strftime('%d-%b-%Y').upper()
-
-            for order in orders:
-                # Only count filled orders
-                status = order.get('ordSt', '').lower()
-                if status not in ['complete', 'traded', 'filled']:
-                    continue
-
-                # Check if order is from today
-                order_date = order.get('exOrdDt', order.get('ordDt', ''))
-                if today not in order_date.upper():
-                    continue
-
-                # Look for exit orders (tagged as SL, TARGET, EXIT)
-                tag = order.get('tag', '').upper()
-                if tag in ['SL', 'TARGET', 'EXIT', 'SQUARE_OFF']:
-                    # Calculate P&L based on average price
-                    avg_price = float(order.get('avgPrc', 0) or 0)
-                    qty = int(order.get('fldQty', order.get('qty', 0)) or 0)
-                    txn_type = order.get('tranType', order.get('transactionType', ''))
-
-                    # For exit orders, we can estimate P&L from the fill
-                    # Note: This is approximate - broker may provide better data
-                    # The actual P&L should come from trade book if available
-                    pass  # P&L from individual orders needs entry price reference
-
-            # Alternative: Try to get from trade book or settlement API
-            try:
-                # NEO API might have trade_report or settlement endpoint
-                trade_report = getattr(self.client, 'trade_report', None)
-                if trade_report:
-                    trades = trade_report()
-                    if trades and 'data' in trades:
-                        for trade in trades.get('data', []):
-                            pnl = float(trade.get('realizedPnl', 0) or
-                                       trade.get('pnl', 0) or 0)
-                            realized_pnl += pnl
-            except Exception:
-                pass  # Trade report not available
+            for pos in positions:
+                # Look for closed positions (qty = 0 but had trades)
+                qty = int(pos.get('qty', 0))
+                if qty == 0:
+                    # Closed position - dayPnl is realized
+                    day_pnl = float(pos.get('dayPnl', 0) or
+                                   pos.get('pnl', 0) or
+                                   pos.get('realizedPnl', 0) or 0)
+                    realized_pnl += day_pnl
 
             return realized_pnl
 
         except Exception as e:
             logger.warning(f"Could not get realized P&L: {e}")
-            return 0.0  # Return 0 if we can't get realized P&L (open P&L still checked)
+            return 0.0
+
+    def set_pnl_tracker(self, tracker):
+        """Set the realized P&L tracker (can be set after initialization)."""
+        self.pnl_tracker = tracker
+        logger.info("[ORDER] Realized P&L tracker attached")
 
     def reset_daily_limits(self):
         """Reset daily limits (call at start of day)."""
@@ -1293,12 +1370,17 @@ class OrderManager:
         except Exception as mod_e:
             logger.warning(f"SL modify failed for {symbol}: {mod_e}, attempting cancel + recreate")
 
+            # CRITICAL: Track state for recovery
+            cancel_succeeded = False
+            cancelled_sl_id = sl_order_id
+
             # Fallback: Cancel and recreate
             try:
                 self.client.cancel_order(order_id=sl_order_id)
+                cancel_succeeded = True
                 logger.info(f"Cancelled old SL for qty adjust: {sl_order_id}")
 
-                # Recreate SL with correct quantity
+                # Recreate SL with correct quantity - MORE retries for critical operation
                 new_sl = self._place_sl_with_retry(
                     exchange_segment=exchange_segment,
                     product=product,
@@ -1306,7 +1388,7 @@ class OrderManager:
                     trading_symbol=symbol,
                     transaction_type=transaction_type,
                     trigger_price=sl_price,
-                    max_retries=2
+                    max_retries=3  # Increased retries for critical operation
                 )
 
                 if new_sl.get('order_id'):
@@ -1323,15 +1405,40 @@ class OrderManager:
                     logger.info(f"SL recreated for {symbol}: {new_sl['order_id']} qty={remaining_qty}")
 
                 else:
+                    # CRITICAL: Cancel succeeded but recreate failed - NAKED POSITION!
                     result['action'] = 'recreate_failed'
                     result['error'] = new_sl.get('error')
                     result['critical'] = True
-                    logger.error(f"CRITICAL: Failed to recreate SL for {symbol} after partial exit!")
+                    result['cancelled_sl_id'] = cancelled_sl_id  # Track for recovery
+                    result['remaining_qty'] = remaining_qty
+                    result['sl_price'] = sl_price
+                    logger.error(f"CRITICAL: Failed to recreate SL for {symbol}! "
+                               f"Position has {remaining_qty} qty with NO SL protection!")
+
+                    # CRITICAL: Notify immediately
+                    if hasattr(self, 'telegram') and self.telegram:
+                        self.telegram.send(
+                            f"🚨 CRITICAL: SL FAILED for {symbol}!\n"
+                            f"Old SL cancelled but new SL failed!\n"
+                            f"Position qty: {remaining_qty}\n"
+                            f"Expected SL: {sl_price}\n"
+                            f"MANUAL INTERVENTION REQUIRED!"
+                        )
 
             except Exception as cancel_e:
-                result['action'] = 'cancel_failed'
-                result['error'] = f'Modify and cancel both failed: {cancel_e}'
-                result['critical'] = True
+                if cancel_succeeded:
+                    # Cancel worked but something else failed
+                    result['action'] = 'recreate_failed'
+                    result['critical'] = True
+                    result['cancelled_sl_id'] = cancelled_sl_id
+                    result['remaining_qty'] = remaining_qty
+                    result['sl_price'] = sl_price
+                else:
+                    # Cancel failed - SL might still be active (less critical)
+                    result['action'] = 'cancel_failed'
+                    result['critical'] = False  # SL might still be protecting
+
+                result['error'] = f'SL adjustment exception: {cancel_e}'
                 logger.error(f"CRITICAL: SL adjustment failed for {symbol}: {cancel_e}")
 
             return result

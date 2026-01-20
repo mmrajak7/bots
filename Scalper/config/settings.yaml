@@ -91,4 +91,4 @@ websocket:
   heartbeat_interval_sec: 30
 
 position_refresh:
-  interval_sec: 2
+  interval_sec: 1  # Reduced from 2s for faster updates during scalping

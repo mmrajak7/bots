@@ -1,0 +1,9 @@
+# Support Levels Analysis
+# Symbol: BANKNIFTY26JAN60000CE
+# Timeframe: 30min
+# Current Price (LTP): 506.5
+# Generated: 2026-01-08 13:34:35
+
+Price,Touches,First Touch,Last Touch,Polarity Flip,Avg Volume,Score,Distance %,Recommendation
+506.98,2,2025-12-18,2026-01-01,YES,232515,60,0.09%,STRONG BUY ZONE
+548.05,2,2025-12-18,2025-12-19,YES,25710,45,8.20%,GOOD SUPPORT

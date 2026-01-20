@@ -1,0 +1,57 @@
+C:\Users\mail2\AppData\Local\Programs\Python\Python38-32\lib\site-packages\OpenSSL\_util.py:8: UserWarning: You are using cryptography on a 32-bit Python on a 64-bit Windows Operating System. Cryptography will be significantly faster if you switch to using a 64-bit Python.
+  from cryptography.hazmat.bindings.openssl.binding import Binding
+Traceback (most recent call last):
+  File "force_scan_now.py", line 141, in <module>
+    show_zones()
+  File "force_scan_now.py", line 133, in show_zones
+    print("  \u2713 Zones are narrower (MAX_ZONE_WIDTH = 10 points)")
+  File "C:\Users\mail2\AppData\Local\Programs\Python\Python38-32\lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2713' in position 2: character maps to <undefined>
+================================================================================
+FORCED FULL SCAN - NEW ZONE DETECTION LOGIC
+================================================================================
+Time: 2026-01-09 15:21:21
+
+BANKNIFTY: 59240.60
+NIFTY: 25693.80
+SENSEX: 83611.71
+
+================================================================================
+
+================================================================================
+TIMEFRAME: 15M
+Lookback: 30 days | Bounce Age Filter: 12 days
+================================================================================
+
+--- BANKNIFTY (ATM: 59000, Expiry: 27-Jan) ---
+
+--- NIFTY (ATM: 25700, Expiry: 27-Jan) ---
+
+--- SENSEX (ATM: 84000, Expiry: 29-Jan) ---
+
+================================================================================
+Total zones found in 15m: 0
+================================================================================
+
+================================================================================
+TIMEFRAME: 1H
+Lookback: 90 days | Bounce Age Filter: 20 days
+================================================================================
+
+--- BANKNIFTY (ATM: 59000, Expiry: 27-Jan) ---
+
+--- NIFTY (ATM: 25700, Expiry: 27-Jan) ---
+
+--- SENSEX (ATM: 84000, Expiry: 29-Jan) ---
+
+================================================================================
+Total zones found in 1h: 0
+================================================================================
+
+================================================================================
+SCAN COMPLETE
+================================================================================
+
+Key Improvements with NEW Logic:
+ERROR: 'charmap' codec can't encode character '\u2713' in position 2: character maps to <undefined>

@@ -6,7 +6,7 @@ Ensures proper cleanup and prevents ghost orders.
 """
 
 import threading
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
@@ -35,6 +35,11 @@ class TrackedPosition:
     pnl: float = 0.0
     ltp: float = 0.0
 
+    # CRITICAL: Race condition prevention
+    # Set to True when OCO/Exit is processing - Trail Manager should NOT modify
+    locked_for_exit: bool = False
+    exit_started_at: Optional[float] = None  # timestamp when exit started
+
 
 class PositionTracker:
     """
@@ -42,11 +47,20 @@ class PositionTracker:
     Provides methods for proper cleanup on exit.
     """
 
-    def __init__(self, neo_client, order_manager=None):
+    def __init__(self, neo_client, order_manager=None, cancel_mgr=None):
         self.client = neo_client
         self.order_mgr = order_manager
+        self.cancel_mgr = cancel_mgr  # Centralized cancel manager (race condition prevention)
         self.positions: Dict[str, TrackedPosition] = {}
         self._lock = threading.Lock()
+
+        # Callbacks for cross-component notifications
+        self.on_position_removed: Optional[Callable] = None  # Called when position is removed
+        self.oco_monitor = None  # Reference to OCO monitor for cleanup
+
+    def set_cancel_mgr(self, mgr):
+        """Set the cancel manager (can be set after initialization)."""
+        self.cancel_mgr = mgr
 
     def add_position(self, symbol: str, exchange_segment: str,
                      quantity: int, side: str, entry_price: float) -> TrackedPosition:
@@ -123,10 +137,68 @@ class PositionTracker:
                 if new_sl_price:
                     pos.sl_price = new_sl_price
 
+    # ==================== Race Condition Prevention ====================
+
+    def lock_for_exit(self, symbol: str) -> bool:
+        """
+        Lock position for exit processing - prevents Trail Manager from modifying.
+
+        CRITICAL: Call this BEFORE cancelling orders in OCO or Exit handlers.
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            True if locked successfully, False if already locked or position not found
+        """
+        import time
+        with self._lock:
+            pos = self.positions.get(symbol)
+            if not pos:
+                return False
+            if pos.locked_for_exit:
+                logger.warning(f"[TRACKER] {symbol} already locked for exit")
+                return False
+
+            pos.locked_for_exit = True
+            pos.exit_started_at = time.time()
+            logger.info(f"[TRACKER] Locked {symbol} for exit")
+            return True
+
+    def unlock_for_exit(self, symbol: str):
+        """
+        Unlock position after exit processing completes or fails.
+
+        Args:
+            symbol: Trading symbol
+        """
+        with self._lock:
+            pos = self.positions.get(symbol)
+            if pos:
+                pos.locked_for_exit = False
+                pos.exit_started_at = None
+                logger.info(f"[TRACKER] Unlocked {symbol} from exit")
+
+    def is_locked_for_exit(self, symbol: str) -> bool:
+        """
+        Check if position is locked for exit (Trail Manager should NOT modify).
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            True if locked, False otherwise
+        """
+        with self._lock:
+            pos = self.positions.get(symbol)
+            if not pos:
+                return False
+            return pos.locked_for_exit
+
     def cancel_sl_order(self, symbol: str) -> Optional[str]:
         """
         Cancel SL order for position.
-        Handles race condition where OCO monitor may have already cancelled the order.
+        Uses centralized cancel manager to prevent race conditions with OCO monitor.
 
         Args:
             symbol: Trading symbol
@@ -139,7 +211,18 @@ class PositionTracker:
             if pos and pos.sl_order_id:
                 order_id = pos.sl_order_id
 
-                # Check order status first to avoid race condition with OCO monitor
+                # Use centralized cancel manager if available
+                if self.cancel_mgr:
+                    success, msg = self.cancel_mgr.cancel_order(
+                        order_id=order_id,
+                        reason=f"Tracker SL for {symbol}"
+                    )
+                    logger.info(f"[TRACKER] SL cancel via manager: {order_id} - {msg}")
+                    pos.sl_order_id = None
+                    pos.sl_price = None
+                    return order_id if success else None
+
+                # Fallback: direct cancel with status check
                 try:
                     order_report = self.client.order_report()
                     orders = order_report.get('data', []) if order_report else []
@@ -173,7 +256,7 @@ class PositionTracker:
     def cancel_target_order(self, symbol: str) -> Optional[str]:
         """
         Cancel Target order for position.
-        Handles race condition where OCO monitor may have already cancelled the order.
+        Uses centralized cancel manager to prevent race conditions with OCO monitor.
 
         Args:
             symbol: Trading symbol
@@ -186,7 +269,18 @@ class PositionTracker:
             if pos and pos.target_order_id:
                 order_id = pos.target_order_id
 
-                # Check order status first to avoid race condition with OCO monitor
+                # Use centralized cancel manager if available
+                if self.cancel_mgr:
+                    success, msg = self.cancel_mgr.cancel_order(
+                        order_id=order_id,
+                        reason=f"Tracker Target for {symbol}"
+                    )
+                    logger.info(f"[TRACKER] Target cancel via manager: {order_id} - {msg}")
+                    pos.target_order_id = None
+                    pos.target_price = None
+                    return order_id if success else None
+
+                # Fallback: direct cancel with status check
                 try:
                     order_report = self.client.order_report()
                     orders = order_report.get('data', []) if order_report else []
@@ -367,13 +461,33 @@ class PositionTracker:
                 if pos.sl_order_id:
                     try:
                         self.client.cancel_order(order_id=pos.sl_order_id)
-                    except:
-                        pass
+                        logger.info(f"[TRACKER] Cancelled orphan SL {pos.sl_order_id} for {symbol}")
+                    except Exception as e:
+                        # Log the failure - order might already be filled/cancelled
+                        logger.warning(f"[TRACKER] Failed to cancel orphan SL {pos.sl_order_id}: {e}")
                 if pos.target_order_id:
                     try:
                         self.client.cancel_order(order_id=pos.target_order_id)
-                    except:
-                        pass
+                        logger.info(f"[TRACKER] Cancelled orphan Target {pos.target_order_id} for {symbol}")
+                    except Exception as e:
+                        # Log the failure - order might already be filled/cancelled
+                        logger.warning(f"[TRACKER] Failed to cancel orphan Target {pos.target_order_id}: {e}")
+
+                # CRITICAL: Notify OCO monitor to remove pair for this position
+                if self.oco_monitor:
+                    try:
+                        self.oco_monitor.remove_pair_by_symbol(symbol)
+                        logger.info(f"[TRACKER] Notified OCO to remove pair for {symbol}")
+                    except Exception as e:
+                        logger.warning(f"[TRACKER] Failed to notify OCO: {e}")
+
+                # Fire callback if registered
+                if self.on_position_removed:
+                    try:
+                        self.on_position_removed(symbol)
+                    except Exception as e:
+                        logger.warning(f"[TRACKER] Position removed callback failed: {e}")
+
                 del self.positions[symbol]
 
     def has_sl(self, symbol: str) -> bool:
@@ -397,17 +511,24 @@ class PositionTracker:
     def clear_all(self):
         """Clear all tracked positions (for reset)."""
         with self._lock:
+            cancel_results = {'success': 0, 'failed': 0}
             # Cancel all pending orders first
             for symbol, pos in self.positions.items():
                 if pos.sl_order_id:
                     try:
                         self.client.cancel_order(order_id=pos.sl_order_id)
-                    except:
-                        pass
+                        logger.info(f"[TRACKER] Cancelled SL {pos.sl_order_id} for {symbol}")
+                        cancel_results['success'] += 1
+                    except Exception as e:
+                        logger.warning(f"[TRACKER] Failed to cancel SL {pos.sl_order_id}: {e}")
+                        cancel_results['failed'] += 1
                 if pos.target_order_id:
                     try:
                         self.client.cancel_order(order_id=pos.target_order_id)
-                    except:
-                        pass
+                        logger.info(f"[TRACKER] Cancelled Target {pos.target_order_id} for {symbol}")
+                        cancel_results['success'] += 1
+                    except Exception as e:
+                        logger.warning(f"[TRACKER] Failed to cancel Target {pos.target_order_id}: {e}")
+                        cancel_results['failed'] += 1
             self.positions.clear()
-            logger.info("[TRACKER] Cleared all positions")
+            logger.info(f"[TRACKER] Cleared all positions. Cancels: {cancel_results['success']} ok, {cancel_results['failed']} failed")

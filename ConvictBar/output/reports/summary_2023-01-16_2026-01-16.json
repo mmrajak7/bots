@@ -1,0 +1,305 @@
+{
+  "generated_at": "2026-01-16T13:46:13.640650",
+  "config": {
+    "start_date": "2023-01-16",
+    "end_date": "2026-01-16",
+    "symbol": "NIFTY 50",
+    "instrument_token": 256265
+  },
+  "performance_metrics": {
+    "total_trades": 557,
+    "winning_trades": 327,
+    "losing_trades": 230,
+    "breakeven_trades": 0,
+    "win_rate": 58.707360861759426,
+    "total_pnl_points": 1263.1500000000015,
+    "total_pnl_amount": 50176.25000000012,
+    "average_pnl_points": 2.2677737881508104,
+    "average_winner": 27.064220183486206,
+    "average_loser": -32.986304347826035,
+    "largest_winner": 48.0,
+    "largest_loser": -121.15000000000146,
+    "profit_factor": 1.1664920223808304,
+    "expectancy": 2.2677737881508104,
+    "max_drawdown_points": 617.7499999999927,
+    "max_drawdown_pct": 0.0,
+    "max_consecutive_wins": 11,
+    "max_consecutive_losses": 6,
+    "long_trades": 298,
+    "long_winners": 173,
+    "long_win_rate": 58.053691275167786,
+    "long_pnl": 552.7000000000044,
+    "short_trades": 259,
+    "short_winners": 154,
+    "short_win_rate": 59.45945945945946,
+    "short_pnl": 710.4499999999971,
+    "target_exits": 310,
+    "sl_exits": 180,
+    "ft_failure_exits": 63,
+    "time_exits": 4,
+    "avg_bars_held": 6.861759425493716,
+    "avg_winner_bars": 6.623853211009174,
+    "avg_loser_bars": 7.2
+  },
+  "monthly_breakdown": [
+    {
+      "month": "2023-01",
+      "trades": 6,
+      "winners": 5,
+      "pnl_points": 87.7,
+      "win_rate": 83.33
+    },
+    {
+      "month": "2023-02",
+      "trades": 24,
+      "winners": 17,
+      "pnl_points": 179.45,
+      "win_rate": 70.83
+    },
+    {
+      "month": "2023-03",
+      "trades": 19,
+      "winners": 10,
+      "pnl_points": 36.55,
+      "win_rate": 52.63
+    },
+    {
+      "month": "2023-04",
+      "trades": 17,
+      "winners": 9,
+      "pnl_points": -32.7,
+      "win_rate": 52.94
+    },
+    {
+      "month": "2023-05",
+      "trades": 20,
+      "winners": 9,
+      "pnl_points": -74.55,
+      "win_rate": 45.0
+    },
+    {
+      "month": "2023-06",
+      "trades": 21,
+      "winners": 11,
+      "pnl_points": -37.25,
+      "win_rate": 52.38
+    },
+    {
+      "month": "2023-07",
+      "trades": 21,
+      "winners": 12,
+      "pnl_points": 34.0,
+      "win_rate": 57.14
+    },
+    {
+      "month": "2023-08",
+      "trades": 20,
+      "winners": 11,
+      "pnl_points": 26.35,
+      "win_rate": 55.0
+    },
+    {
+      "month": "2023-09",
+      "trades": 19,
+      "winners": 10,
+      "pnl_points": -51.0,
+      "win_rate": 52.63
+    },
+    {
+      "month": "2023-10",
+      "trades": 7,
+      "winners": 3,
+      "pnl_points": -48.15,
+      "win_rate": 42.86
+    },
+    {
+      "month": "2023-11",
+      "trades": 13,
+      "winners": 5,
+      "pnl_points": -64.55,
+      "win_rate": 38.46
+    },
+    {
+      "month": "2023-12",
+      "trades": 15,
+      "winners": 10,
+      "pnl_points": 82.4,
+      "win_rate": 66.67
+    },
+    {
+      "month": "2024-01",
+      "trades": 19,
+      "winners": 11,
+      "pnl_points": 86.1,
+      "win_rate": 57.89
+    },
+    {
+      "month": "2024-02",
+      "trades": 20,
+      "winners": 10,
+      "pnl_points": -165.6,
+      "win_rate": 50.0
+    },
+    {
+      "month": "2024-03",
+      "trades": 14,
+      "winners": 6,
+      "pnl_points": -87.3,
+      "win_rate": 42.86
+    },
+    {
+      "month": "2024-04",
+      "trades": 12,
+      "winners": 8,
+      "pnl_points": 57.15,
+      "win_rate": 66.67
+    },
+    {
+      "month": "2024-05",
+      "trades": 18,
+      "winners": 9,
+      "pnl_points": -85.1,
+      "win_rate": 50.0
+    },
+    {
+      "month": "2024-06",
+      "trades": 14,
+      "winners": 6,
+      "pnl_points": -112.25,
+      "win_rate": 42.86
+    },
+    {
+      "month": "2024-07",
+      "trades": 15,
+      "winners": 9,
+      "pnl_points": 64.5,
+      "win_rate": 60.0
+    },
+    {
+      "month": "2024-08",
+      "trades": 19,
+      "winners": 14,
+      "pnl_points": 154.3,
+      "win_rate": 73.68
+    },
+    {
+      "month": "2024-09",
+      "trades": 15,
+      "winners": 8,
+      "pnl_points": -29.7,
+      "win_rate": 53.33
+    },
+    {
+      "month": "2024-10",
+      "trades": 15,
+      "winners": 8,
+      "pnl_points": -97.5,
+      "win_rate": 53.33
+    },
+    {
+      "month": "2024-11",
+      "trades": 3,
+      "winners": 2,
+      "pnl_points": 9.0,
+      "win_rate": 66.67
+    },
+    {
+      "month": "2024-12",
+      "trades": 19,
+      "winners": 13,
+      "pnl_points": 149.05,
+      "win_rate": 68.42
+    },
+    {
+      "month": "2025-01",
+      "trades": 14,
+      "winners": 9,
+      "pnl_points": 63.5,
+      "win_rate": 64.29
+    },
+    {
+      "month": "2025-02",
+      "trades": 6,
+      "winners": 2,
+      "pnl_points": -59.55,
+      "win_rate": 33.33
+    },
+    {
+      "month": "2025-03",
+      "trades": 7,
+      "winners": 4,
+      "pnl_points": 44.5,
+      "win_rate": 57.14
+    },
+    {
+      "month": "2025-04",
+      "trades": 5,
+      "winners": 3,
+      "pnl_points": 20.4,
+      "win_rate": 60.0
+    },
+    {
+      "month": "2025-05",
+      "trades": 12,
+      "winners": 10,
+      "pnl_points": 256.95,
+      "win_rate": 83.33
+    },
+    {
+      "month": "2025-06",
+      "trades": 11,
+      "winners": 8,
+      "pnl_points": 158.1,
+      "win_rate": 72.73
+    },
+    {
+      "month": "2025-07",
+      "trades": 22,
+      "winners": 12,
+      "pnl_points": 27.3,
+      "win_rate": 54.55
+    },
+    {
+      "month": "2025-08",
+      "trades": 15,
+      "winners": 11,
+      "pnl_points": 147.5,
+      "win_rate": 73.33
+    },
+    {
+      "month": "2025-09",
+      "trades": 14,
+      "winners": 10,
+      "pnl_points": 173.3,
+      "win_rate": 71.43
+    },
+    {
+      "month": "2025-10",
+      "trades": 23,
+      "winners": 18,
+      "pnl_points": 314.3,
+      "win_rate": 78.26
+    },
+    {
+      "month": "2025-11",
+      "trades": 7,
+      "winners": 2,
+      "pnl_points": -115.5,
+      "win_rate": 28.57
+    },
+    {
+      "month": "2025-12",
+      "trades": 26,
+      "winners": 17,
+      "pnl_points": 200.45,
+      "win_rate": 65.38
+    },
+    {
+      "month": "2026-01",
+      "trades": 10,
+      "winners": 5,
+      "pnl_points": -49.0,
+      "win_rate": 50.0
+    }
+  ]
+}

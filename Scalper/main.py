@@ -134,6 +134,10 @@ def main():
         from core.trailing_sl import TrailingSLManager
         from core.oco_monitor import OCOMonitor
         from core.websocket_handler import WebSocketHandler
+        from core.partial_fill_monitor import PartialFillMonitor
+        from core.realized_pnl_tracker import RealizedPnLTracker
+        from core.order_cancel_manager import OrderCancelManager
+        from core.rejection_learner import RejectionLearner
         from gui.main_window import MainWindow
 
         # Initialize Session Manager
@@ -170,9 +174,36 @@ def main():
             if not cache_success:
                 logger.warning(f"Mapping cache warning: {cache_msg}")
 
-        # Initialize Order Manager
+        # Initialize Realized P&L Tracker
+        logger.info("Initializing realized P&L tracker...")
+        pnl_tracker = RealizedPnLTracker()
+
+        # CRITICAL: Sync P&L tracker with broker positions on startup
+        # This ensures circuit breaker works correctly for positions opened before app start
+        if session.is_connected():
+            try:
+                logger.info("Syncing P&L tracker with broker positions...")
+                positions_response = session.get_client().positions()
+                broker_positions = positions_response.get('data', []) if positions_response else []
+                if broker_positions:
+                    pnl_tracker.sync_with_broker_positions(broker_positions)
+                    logger.info(f"P&L tracker synced: {len(pnl_tracker.positions)} positions tracked")
+                else:
+                    logger.info("No broker positions to sync")
+            except Exception as e:
+                logger.warning(f"Failed to sync P&L tracker with broker: {e}")
+
+        # Initialize Order Cancel Manager (prevents race conditions)
+        logger.info("Initializing order cancel manager...")
+        cancel_mgr = OrderCancelManager(session.get_client()) if session.is_connected() else None
+
+        # Initialize Rejection Learner (learns from order rejections)
+        logger.info("Initializing rejection learner...")
+        rejection_learner = RejectionLearner(data_dir="data")
+
+        # Initialize Order Manager with P&L tracker
         logger.info("Initializing order manager...")
-        order_mgr = OrderManager(session.get_client(), config, mapper)
+        order_mgr = OrderManager(session.get_client(), config, mapper, pnl_tracker)
 
         # Initialize Kite Spot Fetcher (pass mapper for expiry date lookups)
         logger.info("Initializing Kite spot fetcher...")
@@ -197,11 +228,25 @@ def main():
             config
         )
 
-        # Initialize OCO monitor
+        # Initialize OCO monitor with P&L tracker and cancel manager
         oco_monitor = OCOMonitor(
             session.get_client(),
             telegram_mgr,
-            sound_mgr
+            sound_mgr,
+            pnl_tracker,
+            cancel_mgr
+        )
+
+        # Initialize Partial Fill Monitor
+        logger.info("Initializing partial fill monitor...")
+        partial_fill_monitor = PartialFillMonitor(
+            neo_client=session.get_client(),
+            order_manager=order_mgr,
+            position_tracker=None,  # Will be set after MainWindow creates it
+            oco_monitor=oco_monitor,
+            trail_manager=trail_mgr,
+            telegram=telegram_mgr,
+            sound=sound_mgr
         )
 
         # Initialize WebSocket handler for real-time order updates
@@ -220,6 +265,8 @@ def main():
         if session.is_connected():
             trail_mgr.start_auto_trail()
             oco_monitor.start()
+            partial_fill_monitor.start()
+            logger.info("Background monitors started: trail, OCO, partial fill")
 
         # Create main window
         logger.info("Creating main window...")
@@ -234,8 +281,56 @@ def main():
             trade_logger=trade_logger,
             trail_mgr=trail_mgr,
             oco_monitor=oco_monitor,
-            ws_handler=ws_handler
+            ws_handler=ws_handler,
+            partial_fill_monitor=partial_fill_monitor,
+            pnl_tracker=pnl_tracker,
+            cancel_mgr=cancel_mgr,
+            rejection_learner=rejection_learner
         )
+
+        # Connect partial fill monitor to position tracker (created in MainWindow)
+        if partial_fill_monitor:
+            partial_fill_monitor.pos_tracker = window.pos_tracker
+
+        # Connect trail manager and OCO monitor to position tracker for race condition prevention
+        if trail_mgr:
+            trail_mgr.pos_tracker = window.pos_tracker
+        if oco_monitor:
+            oco_monitor.set_position_tracker(window.pos_tracker)
+
+        # CRITICAL: Start periodic position reconciliation (every 5 minutes)
+        # This ensures terminal state matches broker state
+        def periodic_reconciliation():
+            """Background thread for periodic position reconciliation."""
+            import time as time_module
+            reconciliation_interval = 300  # 5 minutes
+            while True:
+                time_module.sleep(reconciliation_interval)
+                try:
+                    if not session.is_connected():
+                        continue
+
+                    positions_response = session.get_client().positions()
+                    broker_positions = positions_response.get('data', []) if positions_response else []
+
+                    # Sync P&L tracker
+                    if pnl_tracker:
+                        pnl_tracker.sync_with_broker_positions(broker_positions)
+
+                    # Sync position tracker (removes closed positions, cancels orphan orders)
+                    if window.pos_tracker:
+                        window.pos_tracker.sync_with_broker_positions(broker_positions)
+
+                    logger.debug(f"[RECONCILIATION] Periodic sync completed: {len(broker_positions)} broker positions")
+
+                except Exception as e:
+                    logger.warning(f"[RECONCILIATION] Periodic sync failed: {e}")
+
+        if session.is_connected():
+            import threading
+            recon_thread = threading.Thread(target=periodic_reconciliation, daemon=True, name="PositionReconciler")
+            recon_thread.start()
+            logger.info("Periodic position reconciliation started (every 5 minutes)")
 
         window.show()
         logger.info("Application ready")

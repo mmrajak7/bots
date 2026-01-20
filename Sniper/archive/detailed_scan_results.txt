@@ -1,0 +1,144 @@
+C:\Users\mail2\AppData\Local\Programs\Python\Python38-32\lib\site-packages\OpenSSL\_util.py:8: UserWarning: You are using cryptography on a 32-bit Python on a 64-bit Windows Operating System. Cryptography will be significantly faster if you switch to using a 64-bit Python.
+  from cryptography.hazmat.bindings.openssl.binding import Binding
+================================================================================
+DETAILED ZONE ANALYSIS - NEW LOGIC
+================================================================================
+
+NIFTY: 25695.05
+ATM Strike: 25700
+Expiry: 27-Jan-2026
+
+
+================================================================================
+TIMEFRAME: 15M
+Lookback: 30 days | Bounce Filter: 12 days
+================================================================================
+
+NIFTY26JAN25500CE (LTP: 405.15)
+  Candles: 525
+  Without filter: 30 zones, 293 bounces
+  With 12d filter: 14 zones, 98 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25500PE (LTP: 102.80)
+  Candles: 525
+  Without filter: 13 zones, 313 bounces
+  With 12d filter: 6 zones, 151 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25600CE (LTP: 333.30)
+  Candles: 525
+  Without filter: 26 zones, 232 bounces
+  With 12d filter: 10 zones, 68 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25600PE (LTP: 131.60)
+  Candles: 525
+  Without filter: 15 zones, 318 bounces
+  With 12d filter: 8 zones, 149 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25700CE (LTP: 271.10)
+  Candles: 525
+  Without filter: 27 zones, 273 bounces
+  With 12d filter: 8 zones, 59 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25700PE (LTP: 168.70)
+  Candles: 525
+  Without filter: 16 zones, 313 bounces
+  With 12d filter: 9 zones, 145 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25800CE (LTP: 214.25)
+  Candles: 525
+  Without filter: 25 zones, 287 bounces
+  With 12d filter: 16 zones, 107 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25800PE (LTP: 211.90)
+  Candles: 525
+  Without filter: 19 zones, 313 bounces
+  With 12d filter: 9 zones, 136 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25900CE (LTP: 167.40)
+  Candles: 525
+  Without filter: 27 zones, 299 bounces
+  With 12d filter: 14 zones, 100 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25900PE (LTP: 263.70)
+  Candles: 525
+  Without filter: 22 zones, 316 bounces
+  With 12d filter: 11 zones, 135 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+================================================================================
+TIMEFRAME: 1H
+Lookback: 90 days | Bounce Filter: 20 days
+================================================================================
+
+NIFTY26JAN25500CE (LTP: 403.50)
+  Candles: 354
+  Without filter: 21 zones, 129 bounces
+  With 20d filter: 0 zones, 0 bounces
+  >> All zones filtered out by 20d age limit!
+
+NIFTY26JAN25500PE (LTP: 102.85)
+  Candles: 357
+  Without filter: 19 zones, 166 bounces
+  With 20d filter: 5 zones, 50 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25600CE (LTP: 332.80)
+  Candles: 319
+  Without filter: 13 zones, 80 bounces
+  With 20d filter: 1 zones, 5 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25600PE (LTP: 131.65)
+  Candles: 350
+  Without filter: 17 zones, 139 bounces
+  With 20d filter: 6 zones, 44 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25700CE (LTP: 272.00)
+  Candles: 344
+  Without filter: 15 zones, 88 bounces
+  With 20d filter: 2 zones, 11 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25700PE (LTP: 168.55)
+  Candles: 350
+  Without filter: 18 zones, 138 bounces
+  With 20d filter: 5 zones, 40 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25800CE (LTP: 214.80)
+  Candles: 343
+  Without filter: 16 zones, 105 bounces
+  With 20d filter: 3 zones, 17 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25800PE (LTP: 212.20)
+  Candles: 357
+  Without filter: 22 zones, 153 bounces
+  With 20d filter: 7 zones, 43 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25900CE (LTP: 167.55)
+  Candles: 346
+  Without filter: 18 zones, 121 bounces
+  With 20d filter: 3 zones, 17 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+NIFTY26JAN25900PE (LTP: 263.15)
+  Candles: 350
+  Without filter: 19 zones, 129 bounces
+  With 20d filter: 5 zones, 29 bounces
+  After scoring/filtering: 0 strong zones (score >= 50)
+
+================================================================================
+ANALYSIS COMPLETE
+================================================================================

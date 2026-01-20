@@ -1,0 +1,53 @@
+{
+  "generated_at": "2026-01-16T13:22:04.028764",
+  "config": {
+    "start_date": "2025-06-01",
+    "end_date": "2025-06-30",
+    "symbol": "NIFTY 50",
+    "instrument_token": 256265
+  },
+  "performance_metrics": {
+    "total_trades": 11,
+    "winning_trades": 8,
+    "losing_trades": 3,
+    "breakeven_trades": 0,
+    "win_rate": 72.72727272727273,
+    "total_pnl_points": 158.10000000000218,
+    "total_pnl_amount": 10977.500000000164,
+    "average_pnl_points": 14.372727272727472,
+    "average_winner": 27.3125,
+    "average_loser": -20.133333333332605,
+    "largest_winner": 47.900000000001455,
+    "largest_loser": -24.200000000000728,
+    "profit_factor": 3.617549668874303,
+    "expectancy": 14.372727272727472,
+    "max_drawdown_points": 24.200000000000728,
+    "max_drawdown_pct": 0.0,
+    "max_consecutive_wins": 3,
+    "max_consecutive_losses": 1,
+    "long_trades": 7,
+    "long_winners": 4,
+    "long_win_rate": 57.14285714285714,
+    "long_pnl": 62.900000000001455,
+    "short_trades": 4,
+    "short_winners": 4,
+    "short_win_rate": 100.0,
+    "short_pnl": 95.20000000000073,
+    "target_exits": 7,
+    "sl_exits": 1,
+    "ft_failure_exits": 3,
+    "time_exits": 0,
+    "avg_bars_held": 1.9090909090909092,
+    "avg_winner_bars": 2.25,
+    "avg_loser_bars": 1
+  },
+  "monthly_breakdown": [
+    {
+      "month": "2025-06",
+      "trades": 11,
+      "winners": 8,
+      "pnl_points": 158.1,
+      "win_rate": 72.73
+    }
+  ]
+}

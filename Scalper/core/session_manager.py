@@ -228,6 +228,79 @@ class SessionManager:
         except Exception as e:
             logger.warning(f"Logout error: {e}")
 
+    def get_session_data(self) -> Dict[str, Any]:
+        """Get current session data for sharing with other bots."""
+        session_data = {
+            'timestamp': datetime.now().isoformat(),
+            'valid_until': (datetime.now() + timedelta(hours=8)).isoformat(),
+            'date': datetime.now().strftime('%Y-%m-%d'),
+        }
+
+        if self.client and hasattr(self.client, '_access_token'):
+            session_data['access_token'] = self.client._access_token
+
+        return session_data
+
+    def restore_session(self, session_data: Dict[str, Any]) -> bool:
+        """
+        Restore session from provided data (for sharing between bots).
+
+        Args:
+            session_data: Session data dict with access_token, date, valid_until
+
+        Returns:
+            True if session restored successfully, False otherwise
+        """
+        try:
+            # Check if session is from today
+            session_date = session_data.get('date', '')
+            today = datetime.now().strftime('%Y-%m-%d')
+
+            if session_date != today:
+                logger.info("Session from previous day, needs fresh login")
+                return False
+
+            # Check if session is still valid
+            valid_until_str = session_data.get('valid_until', '')
+            if valid_until_str:
+                valid_until = datetime.fromisoformat(valid_until_str)
+                if datetime.now() >= valid_until:
+                    logger.info("Session expired, needs fresh login")
+                    return False
+
+            # Restore client with saved token
+            access_token = session_data.get('access_token')
+            if access_token:
+                neo_creds = self.config.get('neo_credentials', self.config)
+                self.client = NeoAPI(
+                    environment='prod',
+                    access_token=access_token,
+                    neo_fin_key=None,
+                    consumer_key=neo_creds.get('consumer_key', '')
+                )
+
+                # Verify session is actually working
+                if self._verify_session():
+                    self.session_valid_until = valid_until
+                    self._connected = True
+                    logger.info("Session restored from shared data")
+                    return True
+
+            return False
+
+        except Exception as e:
+            logger.warning(f"Failed to restore session from shared data: {e}")
+            return False
+
+    def login(self) -> bool:
+        """Convenience wrapper for auto_login."""
+        success, message = self.auto_login()
+        if success:
+            logger.info(message)
+        else:
+            logger.error(message)
+        return success
+
     def get_limits(self) -> Optional[Dict[str, Any]]:
         """Get trading limits/margins."""
         if not self.client:

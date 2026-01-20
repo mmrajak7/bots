@@ -1,0 +1,31 @@
+# Credentials - NEVER commit
+config/credentials.yaml
+*.env
+
+# Cache data
+data/
+*.cache
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

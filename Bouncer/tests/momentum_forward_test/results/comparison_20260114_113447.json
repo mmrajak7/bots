@@ -1,0 +1,88 @@
+{
+  "test_period": {
+    "start": "2026-01-01T00:00:00",
+    "end": "2026-01-14T15:30:00"
+  },
+  "results": {
+    "BASELINE": {
+      "total_trades": 104,
+      "winners": 35,
+      "losers": 69,
+      "win_rate": 33.65,
+      "total_pnl": -1089.45,
+      "avg_win": 38.6,
+      "avg_loss": -35.37,
+      "expectancy": -10.48
+    },
+    "INDEX_PATTERN": {
+      "total_trades": 104,
+      "winners": 35,
+      "losers": 69,
+      "win_rate": 33.65,
+      "total_pnl": -1089.45,
+      "avg_win": 38.6,
+      "avg_loss": -35.37,
+      "expectancy": -10.48
+    },
+    "PULLBACK": {
+      "total_trades": 37,
+      "winners": 4,
+      "losers": 33,
+      "win_rate": 10.81,
+      "total_pnl": -602.6,
+      "avg_win": 55.81,
+      "avg_loss": -25.03,
+      "expectancy": -16.29
+    },
+    "TREND_FILTER": {
+      "total_trades": 87,
+      "winners": 35,
+      "losers": 52,
+      "win_rate": 40.23,
+      "total_pnl": -289.6,
+      "avg_win": 38.6,
+      "avg_loss": -31.55,
+      "expectancy": -3.33
+    },
+    "TIME_FILTER": {
+      "total_trades": 76,
+      "winners": 30,
+      "losers": 46,
+      "win_rate": 39.47,
+      "total_pnl": 113.2,
+      "avg_win": 40.32,
+      "avg_loss": -23.84,
+      "expectancy": 1.49
+    },
+    "PROFIT_TARGET": {
+      "total_trades": 115,
+      "winners": 47,
+      "losers": 68,
+      "win_rate": 40.87,
+      "total_pnl": -610.92,
+      "avg_win": 40.38,
+      "avg_loss": -36.9,
+      "expectancy": -5.31
+    },
+    "ATM_STRIKE": {
+      "total_trades": 119,
+      "winners": 45,
+      "losers": 74,
+      "win_rate": 37.82,
+      "total_pnl": -888.45,
+      "avg_win": 51.23,
+      "avg_loss": -43.16,
+      "expectancy": -7.47
+    },
+    "COMBINED": {
+      "total_trades": 88,
+      "winners": 51,
+      "losers": 37,
+      "win_rate": 57.95,
+      "total_pnl": 1047.13,
+      "avg_win": 42.63,
+      "avg_loss": -30.47,
+      "expectancy": 11.9
+    }
+  }
+}

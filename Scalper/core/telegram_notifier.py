@@ -51,20 +51,48 @@ class TelegramNotifier:
             daemon=True
         ).start()
 
-    def _send_message(self, message: str, parse_mode: str):
-        """Internal message sender."""
-        try:
-            url = f"{self.base_url}/sendMessage"
-            payload = {
-                'chat_id': self.chat_id,
-                'text': message,
-                'parse_mode': parse_mode
-            }
-            response = self._session.post(url, json=payload, timeout=self._timeout)
-            if not response.ok:
-                logger.warning(f"[TG] Send failed: {response.text}")
-        except Exception as e:
-            logger.warning(f"[TG] Error: {e}")
+    def _send_message(self, message: str, parse_mode: str, max_retries: int = 3):
+        """Internal message sender with retry logic."""
+        import time as time_module
+
+        for attempt in range(max_retries):
+            try:
+                url = f"{self.base_url}/sendMessage"
+                payload = {
+                    'chat_id': self.chat_id,
+                    'text': message,
+                    'parse_mode': parse_mode
+                }
+                response = self._session.post(url, json=payload, timeout=self._timeout)
+
+                if response.ok:
+                    return  # Success
+
+                # Check for rate limiting (429)
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get('Retry-After', 5))
+                    logger.warning(f"[TG] Rate limited, waiting {retry_after}s")
+                    if attempt < max_retries - 1:
+                        time_module.sleep(retry_after)
+                        continue
+
+                # Server error (5xx) - retry with backoff
+                if response.status_code >= 500:
+                    logger.warning(f"[TG] Server error {response.status_code}, retrying...")
+                    if attempt < max_retries - 1:
+                        time_module.sleep(1 * (attempt + 1))  # Backoff: 1s, 2s
+                        continue
+
+                # Client error (4xx except 429) - don't retry
+                logger.warning(f"[TG] Send failed ({response.status_code}): {response.text[:200]}")
+                return
+
+            except Exception as e:
+                logger.warning(f"[TG] Attempt {attempt+1}/{max_retries} error: {e}")
+                if attempt < max_retries - 1:
+                    time_module.sleep(1 * (attempt + 1))
+
+        logger.error(f"[TG] Failed to send after {max_retries} attempts")
 
     def notify_order_placed(self, symbol: str, action: str, qty: int,
                            price: float, order_id: str):

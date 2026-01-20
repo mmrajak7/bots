@@ -1,0 +1,16 @@
+# ConvictBar - Requirements
+# =========================
+
+# Core dependencies
+pandas>=1.5.0
+numpy>=1.23.0
+pyyaml>=6.0
+
+# Kite Connect (for data and trading)
+kiteconnect>=4.0.0
+
+# Optional - for development
+python-dotenv>=1.0.0
+
+# Testing (optional)
+pytest>=7.0.0

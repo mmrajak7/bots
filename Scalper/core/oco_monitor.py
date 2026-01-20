@@ -36,10 +36,15 @@ class OCOMonitor:
     """
 
     def __init__(self, neo_client, telegram: Optional[Any] = None,
-                 sound: Optional[Any] = None):
+                 sound: Optional[Any] = None, pnl_tracker: Optional[Any] = None,
+                 cancel_mgr: Optional[Any] = None,
+                 position_tracker: Optional[Any] = None):
         self.client = neo_client
         self.telegram = telegram
         self.sound = sound
+        self.pnl_tracker = pnl_tracker  # For recording realized P&L on SL/Target hit
+        self.cancel_mgr = cancel_mgr  # Centralized cancel manager (race condition prevention)
+        self.pos_tracker = position_tracker  # For locking positions during exit
 
         self.oco_pairs: Dict[str, OCOPair] = {}  # keyed by position symbol
         self._running = False
@@ -47,9 +52,28 @@ class OCOMonitor:
         self._lock = threading.Lock()
         self._check_interval = 1  # seconds
 
+        # CRITICAL: Health monitoring for daemon thread
+        self._last_heartbeat: float = 0.0
+        self._heartbeat_timeout: float = 10.0  # Alert if no heartbeat for 10 seconds
+        self._consecutive_errors: int = 0
+        self._max_consecutive_errors: int = 5  # Alert after 5 consecutive errors
+
         # Callbacks
         self.on_sl_hit: Optional[Callable] = None
         self.on_target_hit: Optional[Callable] = None
+        self.on_health_alert: Optional[Callable] = None  # Called when thread appears unhealthy
+
+    def set_pnl_tracker(self, tracker):
+        """Set the P&L tracker (can be set after initialization)."""
+        self.pnl_tracker = tracker
+
+    def set_cancel_mgr(self, mgr):
+        """Set the cancel manager (can be set after initialization)."""
+        self.cancel_mgr = mgr
+
+    def set_position_tracker(self, tracker):
+        """Set the position tracker (can be set after initialization)."""
+        self.pos_tracker = tracker
 
     def add_oco_pair(self, position_symbol: str, sl_order_id: str,
                      target_order_id: str, sl_trigger: float,
@@ -57,6 +81,11 @@ class OCOMonitor:
                      entry_price: float = 0):
         """
         Register an OCO pair for monitoring.
+
+        NOTE: Uses position_symbol as key. In options trading, each strike/expiry
+        has a unique trading symbol (e.g., NIFTY23JAN25000CE), so collisions are
+        rare. The broker consolidates positions in the same symbol into one net
+        position, so only one OCO pair per symbol is valid at any time.
 
         Args:
             position_symbol: Trading symbol of the position
@@ -69,6 +98,14 @@ class OCOMonitor:
             entry_price: Entry price for P&L calculation
         """
         with self._lock:
+            # Check for existing pair - warn if overwriting
+            if position_symbol in self.oco_pairs:
+                old_pair = self.oco_pairs[position_symbol]
+                logger.warning(f"[OCO] OVERWRITING existing pair for {position_symbol}! "
+                              f"Old: SL={old_pair.sl_order_id} TGT={old_pair.target_order_id}")
+                # Note: This is expected when SL is modified (new order ID)
+                # but could indicate a bug if neither order ID matches
+
             pair = OCOPair(
                 position_symbol=position_symbol,
                 sl_order_id=sl_order_id,
@@ -89,6 +126,25 @@ class OCOMonitor:
             if position_symbol in self.oco_pairs:
                 del self.oco_pairs[position_symbol]
                 logger.info(f"[OCO] Removed: {position_symbol}")
+
+    def remove_order(self, order_id: str):
+        """Remove OCO pair by order ID (finds pair containing this order)."""
+        with self._lock:
+            symbol_to_remove = None
+            for symbol, pair in self.oco_pairs.items():
+                if pair.sl_order_id == order_id or pair.target_order_id == order_id:
+                    symbol_to_remove = symbol
+                    break
+            if symbol_to_remove:
+                del self.oco_pairs[symbol_to_remove]
+                logger.info(f"[OCO] Removed by order ID {order_id}: {symbol_to_remove}")
+
+    def remove_pair_by_symbol(self, symbol: str):
+        """Remove OCO pair directly by symbol."""
+        with self._lock:
+            if symbol in self.oco_pairs:
+                del self.oco_pairs[symbol]
+                logger.info(f"[OCO] Removed pair for: {symbol}")
 
     def update_sl_order(self, position_symbol: str, new_sl_order_id: str,
                         new_sl_trigger: float = None):
@@ -117,14 +173,55 @@ class OCOMonitor:
         logger.info("[OCO] Monitor stopped")
 
     def _monitor_loop(self):
-        """Main monitoring loop."""
+        """Main monitoring loop with health tracking."""
         while self._running:
             try:
+                # Update heartbeat BEFORE processing
+                self._last_heartbeat = time.time()
+
                 self._check_orders()
+
+                # Reset error counter on successful cycle
+                self._consecutive_errors = 0
+
             except Exception as e:
                 logger.error(f"[OCO] Error in monitor loop: {e}")
+                self._consecutive_errors += 1
+
+                # Alert if too many consecutive errors
+                if self._consecutive_errors >= self._max_consecutive_errors:
+                    logger.error(f"[OCO] CRITICAL: {self._consecutive_errors} consecutive errors!")
+                    if self.telegram:
+                        self.telegram.send(
+                            f"🚨 OCO Monitor: {self._consecutive_errors} consecutive errors!\n"
+                            f"Last error: {e}\n"
+                            f"OCO cancellations may not be working!"
+                        )
+                    if self.on_health_alert:
+                        self.on_health_alert('OCO', f'Consecutive errors: {self._consecutive_errors}')
+                    # Reset counter to avoid spamming
+                    self._consecutive_errors = 0
 
             time.sleep(self._check_interval)
+
+    def is_healthy(self) -> bool:
+        """Check if monitor thread is healthy (recent heartbeat)."""
+        if not self._running:
+            return True  # Not running is not unhealthy
+        if self._last_heartbeat == 0:
+            return True  # Just started
+        return (time.time() - self._last_heartbeat) < self._heartbeat_timeout
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get detailed health status."""
+        return {
+            'running': self._running,
+            'last_heartbeat': self._last_heartbeat,
+            'seconds_since_heartbeat': time.time() - self._last_heartbeat if self._last_heartbeat else 0,
+            'consecutive_errors': self._consecutive_errors,
+            'is_healthy': self.is_healthy(),
+            'active_pairs': len(self.oco_pairs)
+        }
 
     def _check_orders(self):
         """Check status of all OCO pairs."""
@@ -176,6 +273,9 @@ class OCOMonitor:
     def _cancel_order_with_retry(self, order_id: str, order_type: str, max_retries: int = 3) -> bool:
         """Cancel order with retry logic and exponential backoff.
 
+        Uses centralized cancel manager if available to prevent race conditions
+        with Position Tracker.
+
         Args:
             order_id: Order ID to cancel
             order_type: 'SL' or 'Target' for logging
@@ -184,6 +284,20 @@ class OCOMonitor:
         Returns:
             True if cancelled successfully, False otherwise
         """
+        # Use centralized cancel manager if available (prevents race conditions)
+        if self.cancel_mgr:
+            success, msg = self.cancel_mgr.cancel_order(
+                order_id=order_id,
+                reason=f"OCO {order_type}",
+                max_retries=max_retries
+            )
+            if success:
+                logger.info(f"[OCO] Cancelled {order_type} order {order_id}: {msg}")
+            else:
+                logger.error(f"[OCO] Failed to cancel {order_type} order {order_id}: {msg}")
+            return success
+
+        # Fallback: direct cancel with retry
         for attempt in range(max_retries):
             try:
                 self.client.cancel_order(order_id=order_id)
@@ -199,8 +313,12 @@ class OCOMonitor:
         return False
 
     def _handle_sl_hit(self, pair: OCOPair, sl_order: Dict[str, Any]):
-        """Handle SL order hit - cancel target."""
+        """Handle SL order hit - cancel target and record P&L."""
         logger.info(f"[OCO] SL HIT for {pair.position_symbol}")
+
+        # CRITICAL: Lock position to prevent Trail Manager from modifying during exit
+        if self.pos_tracker:
+            self.pos_tracker.lock_for_exit(pair.position_symbol)
 
         # Cancel target order with retry
         cancelled = self._cancel_order_with_retry(pair.target_order_id, "Target")
@@ -215,12 +333,28 @@ class OCOMonitor:
 
         # Calculate P&L
         fill_price = float(sl_order.get('avgPrc', pair.sl_trigger) or pair.sl_trigger)
+        filled_qty = int(sl_order.get('fldQty', pair.quantity) or pair.quantity)
+
         if pair.side == 'LONG':
-            pnl = (fill_price - pair.entry_price) * pair.quantity
+            pnl = (fill_price - pair.entry_price) * filled_qty
             pnl_pct = ((fill_price - pair.entry_price) / pair.entry_price * 100) if pair.entry_price else 0
         else:
-            pnl = (pair.entry_price - fill_price) * pair.quantity
+            pnl = (pair.entry_price - fill_price) * filled_qty
             pnl_pct = ((pair.entry_price - fill_price) / pair.entry_price * 100) if pair.entry_price else 0
+
+        # Record exit with P&L tracker
+        if self.pnl_tracker and fill_price > 0:
+            try:
+                self.pnl_tracker.record_exit(
+                    symbol=pair.position_symbol,
+                    exit_price=fill_price,
+                    exit_qty=filled_qty,
+                    order_id=pair.sl_order_id,
+                    exit_type='SL'
+                )
+                logger.info(f"[OCO] P&L recorded for SL hit: {pair.position_symbol} = {pnl:+.2f}")
+            except Exception as e:
+                logger.warning(f"[OCO] Failed to record P&L: {e}")
 
         # Notify
         if self.sound:
@@ -239,8 +373,12 @@ class OCOMonitor:
             self.on_sl_hit(pair.position_symbol, fill_price, pnl)
 
     def _handle_target_hit(self, pair: OCOPair, target_order: Dict[str, Any]):
-        """Handle target order hit - cancel SL."""
+        """Handle target order hit - cancel SL and record P&L."""
         logger.info(f"[OCO] TARGET HIT for {pair.position_symbol}")
+
+        # CRITICAL: Lock position to prevent Trail Manager from modifying during exit
+        if self.pos_tracker:
+            self.pos_tracker.lock_for_exit(pair.position_symbol)
 
         # Cancel SL order with retry
         cancelled = self._cancel_order_with_retry(pair.sl_order_id, "SL")
@@ -255,12 +393,28 @@ class OCOMonitor:
 
         # Calculate P&L
         fill_price = float(target_order.get('avgPrc', pair.target_price) or pair.target_price)
+        filled_qty = int(target_order.get('fldQty', pair.quantity) or pair.quantity)
+
         if pair.side == 'LONG':
-            pnl = (fill_price - pair.entry_price) * pair.quantity
+            pnl = (fill_price - pair.entry_price) * filled_qty
             pnl_pct = ((fill_price - pair.entry_price) / pair.entry_price * 100) if pair.entry_price else 0
         else:
-            pnl = (pair.entry_price - fill_price) * pair.quantity
+            pnl = (pair.entry_price - fill_price) * filled_qty
             pnl_pct = ((pair.entry_price - fill_price) / pair.entry_price * 100) if pair.entry_price else 0
+
+        # Record exit with P&L tracker
+        if self.pnl_tracker and fill_price > 0:
+            try:
+                self.pnl_tracker.record_exit(
+                    symbol=pair.position_symbol,
+                    exit_price=fill_price,
+                    exit_qty=filled_qty,
+                    order_id=pair.target_order_id,
+                    exit_type='TARGET'
+                )
+                logger.info(f"[OCO] P&L recorded for TARGET hit: {pair.position_symbol} = {pnl:+.2f}")
+            except Exception as e:
+                logger.warning(f"[OCO] Failed to record P&L: {e}")
 
         # Notify
         if self.sound:

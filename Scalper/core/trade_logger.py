@@ -245,12 +245,28 @@ class TradeLogger:
             logger.error(f"Failed to write CSV: {e}")
 
     def _save_json(self):
-        """Save trades to JSON file."""
+        """Save trades to JSON file atomically (write to temp, then rename)."""
         try:
-            with open(self._json_log, 'w') as f:
+            import tempfile
+
+            # Write to temp file first
+            temp_file = self._json_log + '.tmp'
+            with open(temp_file, 'w') as f:
                 json.dump(self.trades, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())  # Force write to disk
+
+            # Atomic rename (overwrites existing)
+            os.replace(temp_file, self._json_log)
+
         except Exception as e:
             logger.error(f"Failed to save JSON: {e}")
+            # Clean up temp file if it exists
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except:
+                pass
 
     def get_daily_summary(self) -> Dict[str, Any]:
         """
