@@ -494,35 +494,25 @@ class ExpiryTradingSystem:
             self._execute_exit(exit_signal.reason, quotes)
             return
 
-        # Check wing approach (with 15-minute cooldown to avoid alert flood)
+        # Check wing approach (logged only, no Telegram - only entry/exit alerts)
         wing_approach = self.position_manager.check_wing_approach(position, snapshot)
-        if wing_approach and self.state_manager.should_send_wing_alert(cooldown_mins=15):
+        if wing_approach:
             direction, proximity = wing_approach
             logger.warning(f"Wing approach: {direction} at {proximity:.0f}%")
-            self.telegram.send_wing_approach_alert(
-                direction, proximity,
-                snapshot.distance_to_ce_wing if direction == 'CE' else snapshot.distance_to_pe_wing,
-                snapshot.spot
-            )
-            self.state_manager.mark_wing_alert_sent()
+            # Wing alerts disabled - only entry/exit alerts sent
 
-        # Check VIX spike (with 15-minute cooldown to avoid alert flood)
+        # Check VIX spike (logged only, no Telegram - only entry/exit alerts)
         vix_spike = self.position_manager.check_vix_spike(snapshot.vix, position.vix_at_entry)
-        if vix_spike and self.state_manager.should_send_vix_alert(cooldown_mins=15):
+        if vix_spike:
             logger.warning(f"VIX spike: +{vix_spike:.1f}")
-            self.telegram.send_vix_spike_alert(snapshot.vix, position.vix_at_entry, vix_spike)
-            self.state_manager.mark_vix_alert_sent()
+            # VIX alerts disabled - only entry/exit alerts sent
 
-        # Send P&L chart if interval reached
-        telegram_config = self.config.get('telegram', {})
-        chart_interval = telegram_config.get('pnl_chart_interval_mins', 15)
-
-        if self.state_manager.should_send_chart(chart_interval):
-            chart_path = self.chart_generator.generate_pnl_chart(
+        # P&L chart updates disabled - only entry/exit alerts sent
+        # Chart still generated locally for logging purposes
+        if self._chart_data:
+            self.chart_generator.generate_pnl_chart(
                 self._chart_data, mtm_pnl, snapshot.spot
             )
-            self.telegram.send_pnl_update(position, snapshot, chart_path)
-            self.state_manager.mark_chart_sent()
 
     def _execute_exit(self, reason: Any, quotes: Dict) -> None:
         """Execute position exit."""

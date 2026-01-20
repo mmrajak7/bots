@@ -986,7 +986,8 @@ def check_and_update_positions(
 
                 alert = format_exit_alert(pos, ltp, 'SL Hit')
                 alerts.append(alert)
-                send_telegram(alert, test_mode)
+                # SL alerts tracked locally only (no Telegram)
+                log.info(f"SL exit tracked locally: {pos.option_symbol}")
                 continue
 
             # Get latest candles for trailing SL
