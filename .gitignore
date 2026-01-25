@@ -115,3 +115,13 @@ SNAIL/data/instruments.csv
 # Bouncer config (has Telegram token)
 Bouncer/config/config.json
 data/telegram_config.json
+
+# Sync folder (Pi <-> Windows file sync)
+data/sync/
+
+# FIFTY specific excludes
+FIFTY/data/kite_credentials.json
+FIFTY/data/kite_access_token.json
+FIFTY/config/config.yaml
+FIFTY/data/*.db
+FIFTY/data/.fifty_lock

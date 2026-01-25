@@ -1,0 +1,140 @@
+# FIFTY Bot Configuration Template
+# Copy this file to config.yaml and fill in your values
+# IMPORTANT: Never commit config.yaml to git (contains secrets)
+
+# Bot Instance Configuration
+bot:
+  instance_id: "fifty_main"
+  log_level: "INFO"
+
+# Kite API Configuration (for market data - shared token)
+kite_read:
+  token_file: "../data/kite_access_token.json"  # Shared token from SNAIL
+  validate_token_date: true
+
+# Kite API Configuration (for trading - dedicated account)
+kite_trade:
+  credentials_file: "data/kite_credentials.json"
+  token_file: "data/kite_access_token.json"
+  order_tag: "fifty"
+  rate_limit_delay: 1.0
+
+# Telegram Configuration
+telegram:
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"  # Get from @BotFather
+  chat_id: "YOUR_CHAT_ID"               # Get from @userinfobot
+  enabled: true
+  retry_attempts: 3
+  retry_delay: 5
+
+# Signal Source Configuration
+signals:
+  file_path: "/home/trustit/Desktop/Scripts/op_signals.csv"
+  filter_tf: "CSP"  # Filter for CSP signals only
+  ignore_list_file: "data/ignore_list.csv"
+  start_date: "2026-01-26"  # Only process signals after this date
+
+# Trading Parameters
+trading:
+  test_mode: 'X'  # 'X' for test mode (1 qty), '' for production
+  initial_capital: 100000
+  per_trade_amount: 20000
+  max_positions: 5
+  max_pending_orders: 3
+  initial_sl_percent: 20
+
+# Risk Management
+risk:
+  emergency_drop_percent: 30
+  trailing_sl_method: "monthly_low"
+  sl_gtt_limit_buffer_percent: 2.0
+
+# NIFTY Weekly Filter
+nifty_filter:
+  enabled: true
+  instrument_token: "256265"
+
+# SuperTrend Configuration
+supertrend:
+  period: 10
+  multiplier: 3
+  cache_expiry_minutes: 60
+
+# Historical Data Lookback
+historical_data:
+  monthly_lookback_years: 3.0
+  weekly_lookback_years: 1.5
+  daily_lookback_years: 1.0
+
+# Schedule (IST times)
+schedule:
+  morning_startup: "09:00"
+  market_open: "09:15"
+  market_close: "15:30"
+  hold_renotify: "09:30"
+  eod_sl_update: "15:50"
+  recovery: "16:00"
+  daily_report: "16:10"
+  weekly_report: "16:15"
+  monthly_cleanup: "16:25"
+  cron_interval_minutes: 5
+
+# Database Configuration
+database:
+  url: "sqlite:///data/trading.db"
+  echo: false
+
+# Logging Configuration
+logging:
+  log_dir: "logs"
+  file_path: "logs/fifty_{time:YYYY-MM-DD}.log"
+  level: "INFO"
+  rotation: "1 day"
+  retention: "45 days"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
+
+# Instruments Cache
+instruments:
+  cache_file: "data/instruments.csv"
+  max_age_hours: 24
+
+# Transaction Costs
+transaction_costs:
+  brokerage_delivery: 0.0
+  stt_percent: 0.001
+  exchange_charges_percent: 0.0000325
+  gst_percent: 0.18
+  sebi_charges_percent: 0.000001
+  stamp_duty_percent: 0.00015
+
+# API Resilience
+api_resilience:
+  retry:
+    max_attempts: 3
+    base_delay: 1.0
+    max_delay: 16.0
+    exponential_base: 2.0
+  circuit_breaker:
+    enabled: true
+    consecutive_failures:
+      critical_operations: 3
+      standard_operations: 5
+    failure_window: 300
+    auto_reset:
+      enabled: true
+      cooldown_minutes: 30
+    manual_reset_file: "data/circuit_breaker_reset.flag"
+    actions:
+      halt_trading: true
+      halt_order_placement: true
+      allow_exits: true
+      allow_gtt_updates: true
+      send_critical_alert: true
+
+# Market Hours (IST)
+market_hours:
+  pre_market_start: "09:00"
+  market_open: "09:15"
+  market_close: "15:30"
+  post_market_end: "16:00"
+  trading_days: [1, 2, 3, 4, 5]

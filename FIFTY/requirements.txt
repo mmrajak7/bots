@@ -1,0 +1,26 @@
+# FIFTY Bot Dependencies
+
+# Kite Connect API
+kiteconnect>=5.0.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Configuration
+pyyaml>=6.0
+
+# Database
+sqlalchemy>=2.0.0
+
+# Logging
+loguru>=0.7.0
+
+# Timezone
+pytz>=2023.3
+
+# HTTP Requests (for Telegram)
+requests>=2.31.0
+
+# TOTP Generation (for daily token auth)
+pyotp>=2.8.0

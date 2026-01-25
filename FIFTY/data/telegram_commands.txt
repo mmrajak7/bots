@@ -1,0 +1,8 @@
+positions - Open positions with P&L
+pending - Signals awaiting approval
+stats - Win rate & trading stats
+capital - Deployed vs free capital
+report - Daily summary
+weekly - Weekly HTML report
+kill - Emergency stop
+resume - Resume after kill

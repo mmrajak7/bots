@@ -1,0 +1,22 @@
+# ===========================================================================
+# FIFTY BOT - CRON JOB (Single orchestrator manages all)
+# ===========================================================================
+# To install: crontab -e -> paste contents -> save
+# To verify:  crontab -l
+# ===========================================================================
+#
+# FIFTY uses a single orchestrator that handles everything:
+# - 08:50-09:00: Token generation (auto-login with TOTP)
+# - 09:00-09:05: Morning startup (validate connections, capital)
+# - 09:15-15:30: Signal processing, order monitoring
+# - 09:30-09:35: Re-notify HOLD signals
+# - 15:50-15:55: Monthly SL trail (last trading day)
+# - 16:00-16:05: Recovery checks
+# - 16:15-16:20: Weekly report (Friday)
+# - 16:25-16:30: Month-end cleanup (last trading day)
+#
+# Uses CROCODILE's venv (all dependencies already installed)
+# ===========================================================================
+
+# FIFTY Bot - Every 5 mins, 8:50 AM - 4:30 PM (Mon-Fri)
+*/5 8-16 * * 1-5 cd /home/trustit/Desktop/BOTS/FIFTY && /home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python main.py >> logs/cron.log 2>&1
