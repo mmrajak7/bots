@@ -180,13 +180,39 @@ class SignalProcessor:
         return new_signals
 
     def _read_signals_csv(self) -> Optional[pd.DataFrame]:
-        """Read signals CSV file"""
+        """
+        Read signals CSV file.
+
+        Expected columns (case-insensitive):
+        - scrip/script/symbol: Stock symbol
+        - tf/timeframe/type: Signal timeframe (CSP)
+        - date/signal_date: Signal date (for filtering)
+        """
         if not self.signals_file or not os.path.exists(self.signals_file):
             logger.warning(f"Signals file not found: {self.signals_file}")
             return None
 
         try:
             df = pd.read_csv(self.signals_file)
+
+            if df.empty:
+                logger.debug("Signals CSV is empty")
+                return df
+
+            # Validate required columns exist
+            cols_lower = [c.lower() for c in df.columns]
+
+            # Check for script/symbol column
+            has_script = any(c in cols_lower for c in ['scrip', 'script', 'symbol', 'ticker', 'stock'])
+            if not has_script:
+                logger.error(f"Signals CSV missing script column. Found: {list(df.columns)}")
+                return None
+
+            # Check for timeframe column (needed for CSP filter)
+            has_tf = any(c in cols_lower for c in ['tf', 'timeframe', 'type'])
+            if not has_tf:
+                logger.warning(f"Signals CSV missing TF column. All signals will be processed.")
+
             return df
         except Exception as e:
             logger.error(f"Error reading signals CSV: {e}")
@@ -211,14 +237,21 @@ class SignalProcessor:
         Filter signals to only include those after configured start_date.
 
         This allows ignoring historical signals when starting the bot fresh.
+
+        Expected CSV columns for date: 'date', 'signal_date', 'dt', 'timestamp'
+        Expected config format: YYYY-MM-DD (e.g., '2026-01-26')
         """
         start_date_str = config.get('signals.start_date')
         if not start_date_str:
             return df  # No filter if not configured
 
         try:
-            from datetime import datetime
             start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            logger.warning(f"Invalid start_date format: {start_date_str} (expected YYYY-MM-DD)")
+            return df
+
+        try:
 
             # Look for date column in CSV
             date_columns = [col for col in df.columns if col.lower() in ['date', 'signal_date', 'dt', 'timestamp']]

@@ -73,10 +73,11 @@ class DualKiteClient(BrokerAdapter):
             return json.load(f)
 
     def _validate_token_date(self, token_data: Dict[str, Any]) -> bool:
-        """Validate that token is from today"""
+        """Validate that token was generated after 6 AM IST today (or 6 AM yesterday if before 6 AM now)"""
         generated_at = token_data.get('generated_at', '')
         if not generated_at:
-            return True  # Skip validation if no date
+            logger.warning("Token missing generated_at timestamp")
+            return False  # Require timestamp for validation
 
         try:
             token_time = datetime.fromisoformat(generated_at.replace('Z', '+00:00'))

@@ -22,7 +22,7 @@ from src.utils.timezone_helper import (
 from src.models.database import (
     is_kill_switch_active, get_bot_state, set_bot_state,
     get_session, OpenPosition, OpenOrder, SignalQueue,
-    PositionStatus, OrderStatus, SignalStatus
+    PositionStatus, OrderStatus, SignalStatus, ist_now_naive
 )
 from src.telegram.bot import telegram
 from src.telegram.approval_handler import approval_handler

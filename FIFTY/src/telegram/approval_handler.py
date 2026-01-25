@@ -39,9 +39,9 @@ class ApprovalHandler:
         """
         actions = []
 
-        # Load awaiting_price state from DB on first call (SYS-H5 fix)
-        if not self._loaded_from_db:
-            self._load_awaiting_price_from_db()
+        # Load awaiting_price state from DB on every call for crash recovery
+        # This ensures signals in AWAITING_PRICE status are recovered if bot restarts
+        self._load_awaiting_price_from_db()
 
         try:
             updates, is_error = telegram.get_updates(timeout=0)

@@ -296,7 +296,7 @@ def save_token(creds: Dict[str, str], access_token: str) -> bool:
             "access_token": access_token,
             "api_key": creds["api_key"],
             "user_id": creds["user_id"],
-            "generated_at": datetime.now().isoformat(),
+            "generated_at": now_ist().isoformat(),
             "valid_until": "6:00 AM IST next day"
         }
 
