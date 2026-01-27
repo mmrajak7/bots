@@ -122,11 +122,27 @@ python main.py
 ```
 
 ### 7. Setup Cron (Production)
+
+**IMPORTANT**: Use `run_bot.sh` wrapper script to ensure logs folder exists before redirection.
+
+```bash
+# First, make the script executable
+chmod +x /path/to/FIFTY/run_bot.sh
+```
+
 ```cron
 # Run every 5 minutes from 8:50 AM to 4:30 PM on weekdays
-50 8 * * 1-5 cd /path/to/FIFTY && python main.py >> logs/cron.log 2>&1
-55 8 * * 1-5 cd /path/to/FIFTY && python main.py >> logs/cron.log 2>&1
-*/5 9-16 * * 1-5 cd /path/to/FIFTY && python main.py >> logs/cron.log 2>&1
+# Using run_bot.sh ensures logs/ directory exists before output redirection
+50 8 * * 1-5 /path/to/FIFTY/run_bot.sh
+55 8 * * 1-5 /path/to/FIFTY/run_bot.sh
+*/5 9-16 * * 1-5 /path/to/FIFTY/run_bot.sh
+```
+
+Alternative (direct python call - but requires logs/ folder to exist):
+```cron
+50 8 * * 1-5 cd /path/to/FIFTY && mkdir -p logs && python main.py >> logs/cron.log 2>&1
+55 8 * * 1-5 cd /path/to/FIFTY && mkdir -p logs && python main.py >> logs/cron.log 2>&1
+*/5 9-16 * * 1-5 cd /path/to/FIFTY && mkdir -p logs && python main.py >> logs/cron.log 2>&1
 ```
 
 ## Important Notes

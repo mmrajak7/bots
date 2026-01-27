@@ -293,11 +293,17 @@ class Orchestrator:
             # Check if we can send notifications
             can_notify, reason = self.signal_processor.can_send_notification()
             if not can_notify:
-                logger.debug(f"Cannot send notifications: {reason}")
+                logger.info(f"Cannot send notifications: {reason}")
                 return
 
             # Get pending signals
             pending = self.signal_processor.get_pending_notifications()
+
+            if not pending:
+                logger.debug("No pending signals to notify")
+                return
+
+            logger.info(f"Found {len(pending)} pending signals to notify")
 
             for signal in pending[:3]:  # Max 3 at a time
                 self.signal_processor.send_signal_notification(signal['id'])

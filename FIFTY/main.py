@@ -21,6 +21,9 @@ from pathlib import Path
 os.chdir(Path(__file__).parent)
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Ensure logs directory exists BEFORE anything else (fixes cron redirection issue)
+Path("logs").mkdir(exist_ok=True)
+
 from loguru import logger
 
 

@@ -159,7 +159,7 @@ class SignalProcessor:
 
                 # Check if signal already exists for this month
                 if self._is_duplicate_signal(script):
-                    logger.debug(f"{script}: Already in queue for this month")
+                    logger.info(f"{script}: Skipped - already in queue for this month")
                     continue
 
                 # Calculate monthly SuperTrend level
