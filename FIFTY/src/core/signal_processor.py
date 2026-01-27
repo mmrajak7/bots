@@ -142,30 +142,44 @@ class SignalProcessor:
                 logger.debug("No CSP signals after start_date filter")
                 return []
 
-            logger.info(f"Found {len(csp_signals)} CSP signals in CSV")
+            # Get unique scripts (dedupe within CSV itself)
+            script_col = None
+            for col in csp_signals.columns:
+                if col.lower() in ['scrip', 'script', 'symbol', 'ticker', 'stock']:
+                    script_col = col
+                    break
 
-            # Process each signal
-            for _, row in csp_signals.iterrows():
-                script = row.get('scrip', row.get('script', row.get('symbol', '')))
+            if script_col:
+                unique_scripts = csp_signals[script_col].str.upper().str.strip().unique()
+            else:
+                unique_scripts = []
+
+            logger.info(f"Found {len(unique_scripts)} unique CSP signals in CSV")
+
+            # Track skip reasons for summary
+            skipped_ignored = []
+            skipped_duplicate = []
+            skipped_calc_failed = []
+
+            # Process each unique script
+            for script in unique_scripts:
                 if not script:
                     continue
 
-                script = script.upper().strip()
-
                 # Check ignore list (safety feature from CROCODILE)
                 if self.is_ignored(script):
-                    logger.info(f"{script}: Skipped - in ignore list")
+                    skipped_ignored.append(script)
                     continue
 
                 # Check if signal already exists for this month
                 if self._is_duplicate_signal(script):
-                    logger.info(f"{script}: Skipped - already in queue for this month")
+                    skipped_duplicate.append(script)
                     continue
 
                 # Calculate monthly SuperTrend level
                 signal_level = self._calculate_signal_level(script)
                 if signal_level is None:
-                    logger.warning(f"{script}: Could not calculate SuperTrend level")
+                    skipped_calc_failed.append(script)
                     continue
 
                 # Add to signal queue
@@ -173,6 +187,14 @@ class SignalProcessor:
                 if signal_data:
                     new_signals.append(signal_data)
                     logger.info(f"New signal: {script} @ {signal_level:.2f}")
+
+            # Log skip summary (only if something was skipped)
+            if skipped_ignored:
+                logger.info(f"Skipped (ignore list): {skipped_ignored}")
+            if skipped_duplicate:
+                logger.info(f"Skipped (already in queue): {skipped_duplicate}")
+            if skipped_calc_failed:
+                logger.warning(f"Skipped (SuperTrend calc failed): {skipped_calc_failed}")
 
         except Exception as e:
             logger.error(f"Error processing signals: {e}")
