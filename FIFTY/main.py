@@ -257,7 +257,7 @@ def _write_heartbeat():
 
 
 def _send_daemon_startup_message():
-    """Send professional daemon startup message"""
+    """Send professional service startup message"""
     from src.telegram.bot import telegram
     from src.models.database import get_session, OpenPosition, OpenOrder, ClosedPosition, PositionStatus, OrderStatus
     from src.utils.timezone_helper import today_ist
@@ -281,7 +281,7 @@ def _send_daemon_startup_message():
             deployed_capital = sum(p.capital_deployed for p in open_positions)
             available_capital = initial_capital - deployed_capital
 
-            # Get pending orders
+            # Get pending GTT entry orders
             pending_orders = session.query(OpenOrder).filter(
                 OpenOrder.status == OrderStatus.PENDING
             ).count()
@@ -291,27 +291,28 @@ def _send_daemon_startup_message():
             realized_pnl = sum(t.net_pnl for t in all_trades)
             total_return_pct = (realized_pnl / initial_capital * 100) if initial_capital > 0 else 0
 
-            # Build compact message
+            # Build compact message with emojis
             pnl_sign = "+" if realized_pnl >= 0 else ""
+            pnl_emoji = "" if realized_pnl >= 0 else ""
 
             message = (
-                f"<b>FIFTY Daemon Started</b>\n\n"
-                f"{date_str} ({day_name})\n"
-                f"Capital: Rs.{available_capital:,.0f} / {initial_capital:,.0f}\n"
-                f"Positions: {num_positions} | Pending: {pending_orders}\n"
-                f"P&L: {pnl_sign}{realized_pnl:,.0f} ({pnl_sign}{total_return_pct:.2f}%)\n"
-                f"Ready"
+                f"<b>FIFTY Service Started</b>\n\n"
+                f" {date_str} ({day_name})\n"
+                f" Rs.{available_capital:,.0f} / {initial_capital:,.0f}\n"
+                f" {num_positions} positions | {pending_orders} GTT orders\n"
+                f"{pnl_emoji} {pnl_sign}{realized_pnl:,.0f} ({pnl_sign}{total_return_pct:.2f}%)\n"
+                f" Ready"
             )
 
             telegram.send_alert(message)
-            logger.info("Daemon startup message sent")
+            logger.info("Service startup message sent")
 
         finally:
             session.close()
 
     except Exception as e:
-        logger.warning(f"Could not send daemon startup message: {e}")
-        telegram.send_alert("FIFTY Bot Daemon Started (24/7 mode)")
+        logger.warning(f"Could not send service startup message: {e}")
+        telegram.send_alert(" <b>FIFTY Service Started</b>")
 
 
 def run_daemon():
