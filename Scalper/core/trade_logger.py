@@ -7,6 +7,7 @@ Logs all trades to file for audit and analysis.
 import os
 import json
 import csv
+import threading
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 import logging
@@ -25,6 +26,9 @@ class TradeLogger:
         self._current_date = datetime.now().strftime('%Y-%m-%d')
         self._log_file = os.path.join(self.log_dir, f"trades_{self._current_date}.csv")
         self._json_log = os.path.join(self.log_dir, f"trades_{self._current_date}.json")
+
+        # Thread safety lock for file operations
+        self._lock = threading.Lock()
 
         # Initialize CSV file with headers if it doesn't exist
         self._init_csv()
@@ -122,12 +126,17 @@ class TradeLogger:
         self._check_date_rollover()
 
         # Find and update the order
+        found = False
         for trade in self.trades:
             if trade['order_id'] == order_id:
                 trade['status'] = 'FILLED'
                 trade['fill_price'] = fill_price
                 trade['fill_time'] = (fill_time or datetime.now()).isoformat()
+                found = True
                 break
+
+        if not found:
+            logger.warning(f"[LOG] Order {order_id} not found in trades, cannot update fill")
 
         self._save_json()
         logger.info(f"[LOG] Order filled: {order_id} @ {fill_price}")
@@ -143,11 +152,16 @@ class TradeLogger:
         self._check_date_rollover()
 
         # Find and update the order
+        found = False
         for trade in self.trades:
             if trade['order_id'] == order_id:
                 trade['status'] = 'REJECTED'
                 trade['notes'] = reason
+                found = True
                 break
+
+        if not found:
+            logger.debug(f"[LOG] Order {order_id} not found in trades (may be manual order)")
 
         self._save_json()
         logger.info(f"[LOG] Order rejected: {order_id} - {reason}")
@@ -161,10 +175,15 @@ class TradeLogger:
         """
         self._check_date_rollover()
 
+        found = False
         for trade in self.trades:
             if trade['order_id'] == order_id:
                 trade['status'] = 'CANCELLED'
+                found = True
                 break
+
+        if not found:
+            logger.debug(f"[LOG] Order {order_id} not found in trades (may be manual order)")
 
         self._save_json()
         logger.info(f"[LOG] Order cancelled: {order_id}")
@@ -220,53 +239,54 @@ class TradeLogger:
         self.log_position_exit(symbol, entry_price, exit_price, quantity, pnl, 'TARGET')
 
     def _write_csv(self, trade: Dict[str, Any]):
-        """Append trade to CSV file."""
-        try:
-            with open(self._log_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    trade['timestamp'],
-                    trade['order_id'],
-                    trade['symbol'],
-                    trade['exchange'],
-                    trade['action'],
-                    trade['quantity'],
-                    trade['price'],
-                    trade['order_type'],
-                    trade['product'],
-                    trade['status'],
-                    trade['fill_price'] or '',
-                    trade['fill_time'] or '',
-                    trade['tag'],
-                    trade['pnl'] or '',
-                    trade['notes']
-                ])
-        except Exception as e:
-            logger.error(f"Failed to write CSV: {e}")
+        """Append trade to CSV file (thread-safe)."""
+        with self._lock:
+            try:
+                with open(self._log_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        trade['timestamp'],
+                        trade['order_id'],
+                        trade['symbol'],
+                        trade['exchange'],
+                        trade['action'],
+                        trade['quantity'],
+                        trade['price'],
+                        trade['order_type'],
+                        trade['product'],
+                        trade['status'],
+                        trade['fill_price'] or '',
+                        trade['fill_time'] or '',
+                        trade['tag'],
+                        trade['pnl'] or '',
+                        trade['notes']
+                    ])
+            except Exception as e:
+                logger.error(f"Failed to write CSV: {e}")
 
     def _save_json(self):
-        """Save trades to JSON file atomically (write to temp, then rename)."""
-        try:
-            import tempfile
-
-            # Write to temp file first
-            temp_file = self._json_log + '.tmp'
-            with open(temp_file, 'w') as f:
-                json.dump(self.trades, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())  # Force write to disk
-
-            # Atomic rename (overwrites existing)
-            os.replace(temp_file, self._json_log)
-
-        except Exception as e:
-            logger.error(f"Failed to save JSON: {e}")
-            # Clean up temp file if it exists
+        """Save trades to JSON file atomically (write to temp, then rename). Thread-safe."""
+        temp_file = self._json_log + '.tmp'
+        with self._lock:
             try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-            except:
-                pass
+                # Write to temp file first
+                with open(temp_file, 'w') as f:
+                    json.dump(self.trades, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())  # Force write to disk
+
+                # Atomic rename (overwrites existing)
+                os.replace(temp_file, self._json_log)
+
+            except Exception as e:
+                logger.error(f"Failed to save JSON: {e}")
+                # Clean up temp file if it exists
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except OSError as cleanup_err:
+                    # S28: Log instead of silently ignoring
+                    logger.debug(f"[LOG] Failed to cleanup temp file: {cleanup_err}")
 
     def get_daily_summary(self) -> Dict[str, Any]:
         """
@@ -283,7 +303,11 @@ class TradeLogger:
         for trade in self.trades:
             if trade['status'] == 'EXIT' and trade['pnl'] is not None:
                 total_trades += 1
-                pnl = float(trade['pnl'])
+                # S27: Safe float conversion
+                try:
+                    pnl = float(trade['pnl'])
+                except (ValueError, TypeError):
+                    pnl = 0.0
                 total_pnl += pnl
                 if pnl >= 0:
                     winners += 1

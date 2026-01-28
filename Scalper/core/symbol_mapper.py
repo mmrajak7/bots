@@ -8,6 +8,7 @@ Downloads both Kite and NEO instruments at login, builds mapping cache.
 import pandas as pd
 import os
 import json
+import threading
 from datetime import datetime, date, timedelta
 import re
 import logging
@@ -15,9 +16,10 @@ from typing import Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Shared Kite instruments path
-KITE_INSTRUMENTS_PATH = "C:/Users/mail2/Documents/Projects/BOTS/data/index_options.csv"
-KITE_STOCK_INSTRUMENTS_PATH = "C:/Users/mail2/Documents/Projects/BOTS/data/stock_instruments.csv"
+# Default Kite instruments paths (configurable via settings)
+# These are fallbacks if not specified in config
+DEFAULT_KITE_INSTRUMENTS_PATH = "../data/index_options.csv"
+DEFAULT_KITE_STOCK_INSTRUMENTS_PATH = "../data/stock_instruments.csv"
 
 
 class SymbolMapper:
@@ -27,6 +29,7 @@ class SymbolMapper:
         self.client = neo_client
         self.config = config or {}
         self.cache_dir = self.config.get('paths', {}).get('scrip_master', 'data/scrip_master')
+        self.mapping_cache_file = os.path.join(self.cache_dir, 'mapping_cache.json')
         self.nse_fo_df: Optional[pd.DataFrame] = None
         self.nse_cm_df: Optional[pd.DataFrame] = None
         self.bse_fo_df: Optional[pd.DataFrame] = None
@@ -38,6 +41,9 @@ class SymbolMapper:
         # Pre-computed mapping: kite_tradingsymbol -> NEO params
         self.kite_to_neo_map: Dict[str, Dict[str, Any]] = {}
         self.mapping_ready = False
+
+        # Thread safety for map access (build_mapping_cache and search_and_map can run concurrently)
+        self._map_lock = threading.Lock()
 
         # Default lot sizes (fallback)
         self.lot_sizes = self.config.get('lot_sizes', {
@@ -63,10 +69,19 @@ class SymbolMapper:
         Build Kite to NEO mapping cache at login time.
         Should be called once at startup after NEO login.
 
+        If today's cache exists, loads from cache (fast).
+        Otherwise downloads fresh and saves to cache.
+
         Returns:
             Tuple of (success: bool, message: str)
         """
         try:
+            # Check if today's cache exists
+            if self._load_mapping_cache():
+                map_count = len(self.kite_to_neo_map)
+                self.mapping_ready = True
+                return True, f"Mapping loaded from cache: {map_count} symbols (fast)"
+
             # Step 1: Load Kite instruments
             kite_count = self._load_kite_instruments()
             if kite_count == 0:
@@ -78,6 +93,9 @@ class SymbolMapper:
             # Step 3: Build mapping
             map_count = self._build_mapping()
 
+            # Step 4: Save mapping cache for today
+            self._save_mapping_cache()
+
             self.mapping_ready = True
             return True, f"Mapping ready: {kite_count} Kite, {neo_count} NEO, {map_count} mapped"
 
@@ -85,25 +103,96 @@ class SymbolMapper:
             logger.error(f"Failed to build mapping cache: {e}", exc_info=True)
             return False, f"Mapping failed: {str(e)}"
 
+    def _load_mapping_cache(self) -> bool:
+        """
+        Load mapping from today's cache file if it exists.
+
+        Returns:
+            True if cache loaded successfully, False otherwise
+        """
+        try:
+            if not os.path.exists(self.mapping_cache_file):
+                logger.info("No mapping cache file found, will download fresh")
+                return False
+
+            with open(self.mapping_cache_file, 'r') as f:
+                cache_data = json.load(f)
+
+            # Check if cache is from today
+            cache_date = cache_data.get('date')
+            today = date.today().isoformat()
+
+            if cache_date != today:
+                logger.info(f"Mapping cache is from {cache_date}, need fresh for {today}")
+                return False
+
+            # Load the mapping
+            self.kite_to_neo_map = cache_data.get('mapping', {})
+
+            if not self.kite_to_neo_map:
+                logger.info("Mapping cache is empty, will download fresh")
+                return False
+
+            logger.info(f"Loaded {len(self.kite_to_neo_map)} mappings from today's cache (FAST)")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Failed to load mapping cache: {e}")
+            return False
+
+    def _save_mapping_cache(self) -> bool:
+        """
+        Save mapping to cache file with today's date.
+
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+
+            cache_data = {
+                'date': date.today().isoformat(),
+                'mapping': self.kite_to_neo_map
+            }
+
+            with open(self.mapping_cache_file, 'w') as f:
+                json.dump(cache_data, f)
+
+            logger.info(f"Saved {len(self.kite_to_neo_map)} mappings to cache")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Failed to save mapping cache: {e}")
+            return False
+
     def _load_kite_instruments(self) -> int:
         """Load Kite instruments from shared BOTS data folder."""
         try:
             dfs = []
 
+            # Get paths from config or use defaults
+            paths_config = self.config.get('paths', {})
+            kite_index_path = paths_config.get('kite_instruments', DEFAULT_KITE_INSTRUMENTS_PATH)
+            kite_stock_path = paths_config.get('kite_stock_instruments', DEFAULT_KITE_STOCK_INSTRUMENTS_PATH)
+
             # Load index options
-            if os.path.exists(KITE_INSTRUMENTS_PATH):
-                df = pd.read_csv(KITE_INSTRUMENTS_PATH, dtype=str)
+            if os.path.exists(kite_index_path):
+                df = pd.read_csv(kite_index_path, dtype=str)
                 dfs.append(df)
                 logger.info(f"Loaded {len(df)} index options from Kite")
+            else:
+                logger.debug(f"Kite index instruments file not found: {kite_index_path}")
 
             # Load stock instruments (F&O)
-            if os.path.exists(KITE_STOCK_INSTRUMENTS_PATH):
-                df = pd.read_csv(KITE_STOCK_INSTRUMENTS_PATH, dtype=str)
+            if os.path.exists(kite_stock_path):
+                df = pd.read_csv(kite_stock_path, dtype=str)
                 # Filter for F&O only
                 if 'segment' in df.columns:
                     df = df[df['segment'].isin(['NFO-OPT', 'NFO-FUT', 'BFO-OPT', 'BFO-FUT'])]
                 dfs.append(df)
                 logger.info(f"Loaded {len(df)} stock F&O from Kite")
+            else:
+                logger.debug(f"Kite stock instruments file not found: {kite_stock_path}")
 
             if dfs:
                 self.kite_instruments = pd.concat(dfs, ignore_index=True)
@@ -215,9 +304,10 @@ class SymbolMapper:
         """
         kite_symbol = kite_symbol.upper()
 
-        # Check pre-computed mapping only (instant)
-        if kite_symbol in self.kite_to_neo_map:
-            return self.kite_to_neo_map[kite_symbol]
+        # Check pre-computed mapping only (instant) - thread-safe read
+        with self._map_lock:
+            if kite_symbol in self.kite_to_neo_map:
+                return self.kite_to_neo_map[kite_symbol]
 
         # No live search fallback - return None immediately
         # Use search_and_map for weekly symbols
@@ -265,11 +355,47 @@ class SymbolMapper:
                 logger.warning(f"No NEO results for {underlying}")
                 return None
 
-            # Find matching instrument
+            # Get expiry from parsed symbol for matching
+            expiry = parsed.get('expiry', '')
+
+            # First try: exact symbol match (fastest, most reliable)
+            for item in results:
+                neo_symbol = item.get('pTrdSymbol', '').upper()
+                if neo_symbol == kite_symbol:
+                    lot_size = int(item.get('lLotSize', 1) or 1)
+                    lot_sizes = self.config.get('lot_sizes', {})
+                    if underlying in lot_sizes:
+                        lot_size = lot_sizes[underlying]
+
+                    mapping = {
+                        'kite_symbol': kite_symbol,
+                        'trading_symbol': item.get('pTrdSymbol', kite_symbol),
+                        'instrument_token': str(item.get('pSymbol', '')),
+                        'exchange_segment': exchange,
+                        'lot_size': lot_size,
+                        'underlying': underlying,
+                        'strike': strike,
+                        'option_type': opt_type
+                    }
+                    # Thread-safe write to map
+                    with self._map_lock:
+                        self.kite_to_neo_map[kite_symbol] = mapping
+                    logger.info(f"Live mapped (exact): {kite_symbol} -> {neo_symbol}")
+                    return mapping
+
+            # Second try: match by strike + option type + expiry
             for item in results:
                 neo_symbol = item.get('pTrdSymbol', item.get('tradingSymbol', ''))
-                neo_strike = str(item.get('dStrikePrice', item.get('strikePrice', ''))).replace('.0', '')
-                neo_opt = item.get('cOptionType', item.get('optionType', ''))
+                # NEO API has typo: 'dStrikePrice;' (with semicolon)
+                neo_strike_raw = item.get('dStrikePrice;', item.get('dStrikePrice', item.get('strikePrice', 0)))
+                # NEO stores strikes scaled by 100 (13400 -> 1340000.0)
+                try:
+                    neo_strike_scaled = float(neo_strike_raw)
+                    neo_strike = str(int(neo_strike_scaled / 100))
+                except (ValueError, TypeError):
+                    neo_strike = str(neo_strike_raw).replace('.0', '')
+                # NEO uses pOptionType, not cOptionType
+                neo_opt = item.get('pOptionType', item.get('cOptionType', item.get('optionType', '')))
 
                 # Match strike and option type
                 if neo_strike == strike and neo_opt == opt_type:
@@ -284,7 +410,8 @@ class SymbolMapper:
                     mapping = {
                         'kite_symbol': kite_symbol,
                         'trading_symbol': neo_symbol,
-                        'instrument_token': str(item.get('pInstToken', item.get('instrumentToken', ''))),
+                        # NEO uses pSymbol for instrument token
+                        'instrument_token': str(item.get('pSymbol', item.get('pInstToken', item.get('instrumentToken', '')))),
                         'exchange_segment': exchange,
                         'lot_size': lot_size,
                         'underlying': underlying,
@@ -292,8 +419,9 @@ class SymbolMapper:
                         'option_type': opt_type
                     }
 
-                    # Add to cache for future lookups
-                    self.kite_to_neo_map[kite_symbol] = mapping
+                    # Add to cache for future lookups - thread-safe write
+                    with self._map_lock:
+                        self.kite_to_neo_map[kite_symbol] = mapping
                     logger.info(f"Live mapped: {kite_symbol} -> {neo_symbol}")
                     return mapping
 
@@ -338,12 +466,16 @@ class SymbolMapper:
             logger.info("Downloading NSE F&O scrip master...")
             nse_fo_data = self.client.scrip_master(exchange_segment="nse_fo")
 
-            if nse_fo_data and 'data' in nse_fo_data:
+            if nse_fo_data and 'data' in nse_fo_data and isinstance(nse_fo_data['data'], list):
                 self.nse_fo_df = pd.DataFrame(nse_fo_data['data'])
             elif isinstance(nse_fo_data, list):
                 self.nse_fo_df = pd.DataFrame(nse_fo_data)
+            elif isinstance(nse_fo_data, dict) and nse_fo_data.get('stat', '').lower() in ['not_ok', 'error']:
+                # API returned error response
+                error_msg = nse_fo_data.get('error', nse_fo_data.get('message', 'Unknown error'))
+                raise Exception(f"NSE F&O scrip master API error: {error_msg}")
             else:
-                self.nse_fo_df = pd.DataFrame(nse_fo_data)
+                raise Exception(f"Unexpected scrip master response format: {type(nse_fo_data)}")
 
             nse_fo_file = os.path.join(self.cache_dir, f"nse_fo_{today}.csv")
             self.nse_fo_df.to_csv(nse_fo_file, index=False)
@@ -353,14 +485,19 @@ class SymbolMapper:
             try:
                 logger.info("Downloading NSE Cash scrip master...")
                 nse_cm_data = self.client.scrip_master(exchange_segment="nse_cm")
-                if nse_cm_data and 'data' in nse_cm_data:
+                if nse_cm_data and 'data' in nse_cm_data and isinstance(nse_cm_data['data'], list):
                     self.nse_cm_df = pd.DataFrame(nse_cm_data['data'])
+                    nse_cm_file = os.path.join(self.cache_dir, f"nse_cm_{today}.csv")
+                    self.nse_cm_df.to_csv(nse_cm_file, index=False)
                 elif isinstance(nse_cm_data, list):
                     self.nse_cm_df = pd.DataFrame(nse_cm_data)
+                    nse_cm_file = os.path.join(self.cache_dir, f"nse_cm_{today}.csv")
+                    self.nse_cm_df.to_csv(nse_cm_file, index=False)
+                elif isinstance(nse_cm_data, dict) and nse_cm_data.get('stat', '').lower() in ['not_ok', 'error']:
+                    error_msg = nse_cm_data.get('error', nse_cm_data.get('message', 'Unknown error'))
+                    logger.warning(f"NSE Cash scrip master API error: {error_msg}")
                 else:
-                    self.nse_cm_df = pd.DataFrame(nse_cm_data)
-                nse_cm_file = os.path.join(self.cache_dir, f"nse_cm_{today}.csv")
-                self.nse_cm_df.to_csv(nse_cm_file, index=False)
+                    logger.warning(f"Unexpected NSE Cash scrip master format: {type(nse_cm_data)}")
             except Exception as e:
                 logger.warning(f"NSE Cash download failed: {e}")
 
@@ -368,14 +505,19 @@ class SymbolMapper:
             try:
                 logger.info("Downloading BSE F&O scrip master...")
                 bse_fo_data = self.client.scrip_master(exchange_segment="bse_fo")
-                if bse_fo_data and 'data' in bse_fo_data:
+                if bse_fo_data and 'data' in bse_fo_data and isinstance(bse_fo_data['data'], list):
                     self.bse_fo_df = pd.DataFrame(bse_fo_data['data'])
+                    bse_fo_file = os.path.join(self.cache_dir, f"bse_fo_{today}.csv")
+                    self.bse_fo_df.to_csv(bse_fo_file, index=False)
                 elif isinstance(bse_fo_data, list):
                     self.bse_fo_df = pd.DataFrame(bse_fo_data)
+                    bse_fo_file = os.path.join(self.cache_dir, f"bse_fo_{today}.csv")
+                    self.bse_fo_df.to_csv(bse_fo_file, index=False)
+                elif isinstance(bse_fo_data, dict) and bse_fo_data.get('stat', '').lower() in ['not_ok', 'error']:
+                    error_msg = bse_fo_data.get('error', bse_fo_data.get('message', 'Unknown error'))
+                    logger.warning(f"BSE F&O scrip master API error: {error_msg}")
                 else:
-                    self.bse_fo_df = pd.DataFrame(bse_fo_data)
-                bse_fo_file = os.path.join(self.cache_dir, f"bse_fo_{today}.csv")
-                self.bse_fo_df.to_csv(bse_fo_file, index=False)
+                    logger.warning(f"Unexpected BSE F&O scrip master format: {type(bse_fo_data)}")
             except Exception as e:
                 logger.warning(f"BSE F&O download failed: {e}")
 
@@ -595,7 +737,15 @@ class SymbolMapper:
         instrument_token = str(row[token_col]) if token_col and token_col in row else ''
 
         lot_size = self._get_lot_size(row, lot_col, parsed['underlying'])
-        tick_size = float(row[tick_col]) if tick_col and tick_col in row else 0.05
+        # S22-M1: Guard tick_size conversion against NaN/invalid values
+        tick_size = 0.05  # default
+        if tick_col and tick_col in row:
+            try:
+                tick_val = row[tick_col]
+                if pd.notna(tick_val):
+                    tick_size = float(tick_val)
+            except (ValueError, TypeError):
+                pass  # Keep default 0.05
 
         return {
             'exchange_segment': exchange_segment,
@@ -672,10 +822,17 @@ class SymbolMapper:
                 break
 
         for _, row in matches.iterrows():
+            # S22-M2: Guard lot_size conversion against invalid values
+            lot_size = 0
+            if lot_col and pd.notna(row[lot_col]):
+                try:
+                    lot_size = int(float(row[lot_col]))
+                except (ValueError, TypeError):
+                    pass  # Keep default 0
             result = {
                 'trading_symbol': row[trading_col],
                 'token': row[token_col] if token_col else '',
-                'lot_size': int(float(row[lot_col])) if lot_col and pd.notna(row[lot_col]) else 0
+                'lot_size': lot_size
             }
             results.append(result)
 
@@ -766,12 +923,22 @@ class SymbolMapper:
 
     def _build_neo_result(self, item: Dict, exchange_segment: str) -> Dict[str, Any]:
         """Build result dict from NEO search_scrip response."""
+        # S27: Safe conversion for lot_size and tick_size
+        try:
+            lot_size = int(item.get('lLotSize', 1) or 1)
+        except (ValueError, TypeError):
+            lot_size = 1
+        try:
+            tick_size = float(item.get('dTickSize', 5) or 5) / 100
+        except (ValueError, TypeError):
+            tick_size = 0.05
+
         return {
             'trading_symbol': item.get('pTrdSymbol', ''),
             'exchange_segment': exchange_segment,
-            'lot_size': int(item.get('lLotSize', 1)),
+            'lot_size': lot_size,
             'instrument_token': str(item.get('pSymbol', '')),
-            'tick_size': float(item.get('dTickSize', 5)) / 100,  # Convert paise to rupees
+            'tick_size': tick_size,  # Convert paise to rupees
             'expiry_date': item.get('pScripRefKey', ''),
             'symbol_name': item.get('pSymbolName', ''),
             'instrument_type': item.get('pInstType', ''),
@@ -981,3 +1148,109 @@ class SymbolMapper:
         """
         expiries = self.get_available_expiries(underlying, use_monthly)
         return expiries[0] if expiries else None
+
+    def search_equity(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Search for an equity (cash market) symbol using NEO search_scrip API.
+
+        Args:
+            symbol: Equity symbol like 'ICICIBANK', 'RELIANCE', etc.
+
+        Returns:
+            Dict with NEO trading parameters or None if not found
+        """
+        if not self.client:
+            return None
+
+        # S31: Strip -EQ suffix if present (NEO uses plain symbol for search)
+        symbol = symbol.upper().strip()
+        if symbol.endswith('-EQ'):
+            symbol = symbol[:-3]
+
+        try:
+            # Search in NSE Cash Market segment
+            result = self.client.search_scrip(
+                exchange_segment='nse_cm',
+                symbol=symbol
+            )
+
+            if not result:
+                logger.warning(f"No equity results for {symbol}")
+                return None
+
+            # Find exact match from results
+            if isinstance(result, list):
+                for item in result:
+                    neo_symbol = item.get('pTrdSymbol', item.get('pSymbolName', '')).upper()
+                    # Exact match on symbol name
+                    if neo_symbol == symbol or neo_symbol.startswith(symbol + '-'):
+                        # Get lot size (typically 1 for equity)
+                        try:
+                            lot_size = int(item.get('lLotSize', 1) or 1)
+                        except (ValueError, TypeError):
+                            lot_size = 1
+
+                        # Get tick size
+                        try:
+                            tick_size_raw = float(item.get('dTickSize', 5) or 5)
+                            tick_size = tick_size_raw / 100  # Convert paise to rupees
+                        except (ValueError, TypeError):
+                            tick_size = 0.05
+
+                        mapping = {
+                            'kite_symbol': symbol,
+                            'trading_symbol': item.get('pTrdSymbol', symbol),
+                            'instrument_token': str(item.get('pSymbol', '')),
+                            'exchange_segment': 'nse_cm',  # NSE Cash Market
+                            'lot_size': lot_size,
+                            'tick_size': tick_size,
+                            'instrument_type': 'EQ',
+                            'symbol_name': item.get('pSymbolName', symbol),
+                            'series': item.get('pSeries', 'EQ'),
+                        }
+
+                        # Add to cache for future lookups
+                        with self._map_lock:
+                            self.kite_to_neo_map[symbol] = mapping
+
+                        logger.info(f"Equity mapped: {symbol} -> {mapping['trading_symbol']}")
+                        return mapping
+
+                # If no exact match, try first result
+                if result:
+                    item = result[0]
+                    try:
+                        lot_size = int(item.get('lLotSize', 1) or 1)
+                    except (ValueError, TypeError):
+                        lot_size = 1
+
+                    try:
+                        tick_size_raw = float(item.get('dTickSize', 5) or 5)
+                        tick_size = tick_size_raw / 100
+                    except (ValueError, TypeError):
+                        tick_size = 0.05
+
+                    mapping = {
+                        'kite_symbol': symbol,
+                        'trading_symbol': item.get('pTrdSymbol', symbol),
+                        'instrument_token': str(item.get('pSymbol', '')),
+                        'exchange_segment': 'nse_cm',
+                        'lot_size': lot_size,
+                        'tick_size': tick_size,
+                        'instrument_type': 'EQ',
+                        'symbol_name': item.get('pSymbolName', symbol),
+                        'series': item.get('pSeries', 'EQ'),
+                    }
+
+                    with self._map_lock:
+                        self.kite_to_neo_map[symbol] = mapping
+
+                    logger.info(f"Equity mapped (first match): {symbol} -> {mapping['trading_symbol']}")
+                    return mapping
+
+            logger.warning(f"No matching equity symbol found for: {symbol}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Equity search failed for {symbol}: {e}")
+            return None

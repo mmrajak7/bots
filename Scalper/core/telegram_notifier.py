@@ -8,6 +8,7 @@ import requests
 from typing import Optional, Dict, Any
 from datetime import datetime
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import logging
 
 logger = logging.getLogger(__name__)
@@ -30,13 +31,16 @@ class TelegramNotifier:
         self._session = requests.Session()
         self._timeout = 5
 
+        # Thread pool for non-blocking sends (max 3 concurrent to prevent overload)
+        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="tg-notify")
+
     def _should_send_trade_alert(self) -> bool:
         """Check if individual trade alerts should be sent based on alert_mode."""
         return self.alert_mode != 'eod_only'
 
     def send(self, message: str, parse_mode: str = 'HTML'):
         """
-        Send message to Telegram (non-blocking).
+        Send message to Telegram (non-blocking via thread pool).
 
         Args:
             message: Message text
@@ -45,11 +49,12 @@ class TelegramNotifier:
         if not self.enabled or not self.bot_token or not self.chat_id:
             return
 
-        threading.Thread(
-            target=self._send_message,
-            args=(message, parse_mode),
-            daemon=True
-        ).start()
+        # Use thread pool instead of spawning unlimited threads
+        try:
+            self._executor.submit(self._send_message, message, parse_mode)
+        except RuntimeError:
+            # Executor shut down - ignore
+            pass
 
     def _send_message(self, message: str, parse_mode: str, max_retries: int = 3):
         """Internal message sender with retry logic."""
@@ -70,7 +75,11 @@ class TelegramNotifier:
 
                 # Check for rate limiting (429)
                 if response.status_code == 429:
-                    retry_after = int(response.headers.get('Retry-After', 5))
+                    # S27: Safe int conversion for Retry-After header
+                    try:
+                        retry_after = int(response.headers.get('Retry-After', 5))
+                    except (ValueError, TypeError):
+                        retry_after = 5
                     logger.warning(f"[TG] Rate limited, waiting {retry_after}s")
                     if attempt < max_retries - 1:
                         time_module.sleep(retry_after)
@@ -369,3 +378,18 @@ Time: {datetime.now().strftime('%H:%M:%S')}
         """
         self.enabled = enabled
         logger.info(f"[TG] Notifications {'enabled' if enabled else 'disabled'}")
+
+    def shutdown(self):
+        """
+        Shutdown the executor gracefully.
+
+        Call this when the application is exiting to ensure pending messages
+        are sent and threads are properly cleaned up.
+        """
+        if hasattr(self, '_executor') and self._executor:
+            try:
+                # wait=True allows pending messages to complete (up to 5 seconds)
+                self._executor.shutdown(wait=True, cancel_futures=False)
+                logger.info("[TG] Executor shutdown complete")
+            except Exception as e:
+                logger.warning(f"[TG] Executor shutdown error: {e}")

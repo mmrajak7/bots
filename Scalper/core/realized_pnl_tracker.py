@@ -350,7 +350,7 @@ class RealizedPnLTracker:
         with self._lock:
             for pos in broker_positions:
                 symbol = pos.get('tradingSymbol', pos.get('symbol', ''))
-                qty = int(pos.get('qty', 0))
+                qty = int(float(pos.get('qty', 0) or 0))
 
                 if qty == 0:
                     continue
@@ -428,6 +428,7 @@ class RealizedPnLTracker:
                         'exit_price': t.exit_price,
                         'quantity': t.quantity,
                         'pnl': t.pnl,
+                        'pnl_percent': t.pnl_percent,  # Now persisted
                         'exit_type': t.exit_type,
                         'exit_time': t.exit_time.isoformat()
                     }
@@ -453,11 +454,18 @@ class RealizedPnLTracker:
             try:
                 if temp_file and os.path.exists(temp_file):
                     os.remove(temp_file)
-            except:
-                pass
+            except OSError as cleanup_err:
+                # S28: Log instead of silently ignoring
+                logger.debug(f"[PNL] Failed to cleanup temp file: {cleanup_err}")
 
     def _load_state(self):
-        """Load persisted state from file."""
+        """
+        Load persisted state from file.
+
+        NOTE: This is called ONLY from __init__, which runs before the object
+        is accessible to other threads. No lock needed - single-threaded context.
+        DO NOT call this method from any other context without adding lock protection.
+        """
         if not os.path.exists(self.persist_path):
             return
 
@@ -465,7 +473,12 @@ class RealizedPnLTracker:
             with open(self.persist_path, 'r') as f:
                 state = json.load(f)
 
-            saved_date = date.fromisoformat(state.get('date', '2000-01-01'))
+            # S27: Safe date parsing with validation
+            try:
+                saved_date = date.fromisoformat(state.get('date', '2000-01-01'))
+            except (ValueError, TypeError):
+                logger.warning(f"[PNL] Invalid date in saved state, treating as expired")
+                return  # Treat as expired - don't restore
             today = datetime.now().date()
 
             # Only restore if same day
@@ -493,7 +506,7 @@ class RealizedPnLTracker:
                         exit_price=t['exit_price'],
                         quantity=t['quantity'],
                         pnl=t['pnl'],
-                        pnl_percent=0,
+                        pnl_percent=t.get('pnl_percent', 0),  # Restore from saved state
                         exit_type=t.get('exit_type', 'EXIT'),
                         exit_time=datetime.fromisoformat(t['exit_time'])
                     ))

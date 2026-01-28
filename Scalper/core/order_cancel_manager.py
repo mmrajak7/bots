@@ -32,7 +32,7 @@ class OrderCancelManager:
 
     # Order statuses that indicate order is already terminal
     TERMINAL_STATUSES = {
-        'complete', 'traded', 'filled', 'cancelled', 'canceled', 'rejected'
+        'complete', 'traded', 'filled', 'cancelled', 'canceled', 'rejected', 'not_found'
     }
 
     def __init__(self, neo_client):
@@ -123,16 +123,35 @@ class OrderCancelManager:
             return False, f"Cancel error: {e}"
 
     def _check_order_status(self, order_id: str) -> Optional[str]:
-        """Check current order status."""
+        """
+        Check current order status.
+
+        Optimization: If order was recently cancelled by us, return 'cancelled'
+        without making an API call.
+        """
+        # Quick check: if we recently cancelled this order, no need to call API
+        with self._lock:
+            if order_id in self._recently_cancelled:
+                return 'cancelled'
+
+        # Also check if cancellation is already in progress
+        with self._lock:
+            if order_id in self._in_progress:
+                return None  # Let caller handle in-progress state
+
         try:
             order_report = self.client.order_report()
             orders = order_report.get('data', []) if order_report else []
+            # S27: Handle case where 'data' is None
+            if not isinstance(orders, list):
+                orders = []
 
             for order in orders:
                 if order.get('nOrdNo') == order_id:
                     return order.get('ordSt', '')
 
-            return None  # Order not found
+            # Order not found - might be old/archived, treat as terminal
+            return 'not_found'
 
         except Exception as e:
             logger.warning(f"[CANCEL] Failed to check status for {order_id}: {e}")

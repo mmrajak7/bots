@@ -32,6 +32,7 @@ class SoundAlertManager:
             'position_exit': 'ding.wav',
             'error': 'error.wav',
             'warning': 'alert.wav',
+            'price_alert': 'bell.wav',  # Price alert sound
         }
 
         # Frequency mapping for system beeps
@@ -44,6 +45,7 @@ class SoundAlertManager:
             'position_exit': 1000,
             'error': 350,
             'warning': 600,
+            'price_alert': 1000,  # Bell-like tone
         }
 
         # Duration mapping (ms)
@@ -56,6 +58,7 @@ class SoundAlertManager:
             'position_exit': 250,
             'error': 400,
             'warning': 300,
+            'price_alert': 200,  # Short bell for each ring
         }
 
         # Try to import sound library
@@ -210,3 +213,41 @@ class SoundAlertManager:
                 winsound.Beep(frequency, duration)
             except Exception as e:
                 logger.warning(f"Custom beep failed: {e}")
+
+    def play_price_alert(self):
+        """
+        Play price alert sound - 3 distinct bell tones.
+
+        Plays 3 sequential beeps with increasing frequency
+        to create an attention-grabbing alert sound.
+        Non-blocking (runs in background thread).
+        """
+        if not self.enabled:
+            return
+
+        # Play in background thread to not block UI
+        threading.Thread(
+            target=self._play_three_bells,
+            daemon=True
+        ).start()
+
+    def _play_three_bells(self):
+        """Internal: Play 3 ascending bell tones."""
+        import time
+
+        # Bell frequencies: C5, E5, G5 (ascending major chord)
+        bell_freqs = [523, 659, 784]  # Hz
+        bell_duration = 180  # ms
+
+        for freq in bell_freqs:
+            try:
+                if self._sound_lib == 'winsound':
+                    import winsound
+                    winsound.Beep(freq, bell_duration)
+                else:
+                    # Fallback to terminal bell
+                    print('\a', end='', flush=True)
+                time.sleep(0.1)  # 100ms gap between bells
+            except Exception as e:
+                logger.warning(f"Bell sound failed: {e}")
+                break

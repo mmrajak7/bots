@@ -11,6 +11,10 @@ from datetime import datetime
 import threading
 import time
 import logging
+import math
+
+from core.tick_utils import calculate_sl_limit_price, round_to_tick_str, round_trigger_price, format_price
+from core.order_tracker import OrderTracker, OrderType, get_order_tracker, TrackedOrder
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +59,17 @@ class OrderManager:
     """Manages order execution with safety checks."""
 
     def __init__(self, neo_client, config: Dict[str, Any], symbol_mapper=None,
-                 realized_pnl_tracker=None):
+                 realized_pnl_tracker=None, telegram=None):
         self.client = neo_client
         self.config = config
         self.mapper = symbol_mapper
         self.pnl_tracker = realized_pnl_tracker  # For accurate realized P&L
+        self.telegram = telegram  # For critical SL failure notifications
         self.recent_orders: List[Tuple[float, OrderParams]] = []
         self._lock = threading.Lock()
+
+        # S35: Order tracker for unique tag-based order identification
+        self.order_tracker = get_order_tracker()
 
         # Risk management settings
         risk_config = config.get('risk_management', {})
@@ -78,6 +86,7 @@ class OrderManager:
         # Track daily P&L
         self._daily_pnl = 0.0
         self._trading_halted = False
+        self._last_reset_date = datetime.now().date()  # Track last reset for new day detection
         self._circuit_breaker_file = "data/circuit_breaker.json"
 
         # CRITICAL: Load circuit breaker state from disk (survives restarts)
@@ -121,9 +130,11 @@ class OrderManager:
                 'error': f'Market closed at {market_close}. Current: {current_time}'
             }
 
-        # MIS-specific checks
-        if params.product == 'MIS':
+        # MIS-specific checks (only for NEW orders, not exits)
+        is_exit = params.tag == 'EXIT'
+        if params.product == 'MIS' and not is_exit:
             # Hard cutoff - block new MIS orders after cutoff time
+            # EXIT orders are always allowed (must be able to square off)
             if current_time >= self.mis_squareoff_cutoff:
                 return {
                     'allowed': False,
@@ -138,6 +149,112 @@ class OrderManager:
                 }
 
         return {'allowed': True}
+
+    def _verify_order_in_book(self, symbol: str, transaction_type: str,
+                               quantity: int, order_type: str = 'MKT',
+                               max_age_seconds: int = 10) -> Optional[str]:
+        """
+        S35: Verify if an order exists in order book (for 'error from core' recovery).
+
+        When NEO API returns error but order may have been placed, check order book
+        for recent orders matching the criteria.
+
+        CRITICAL FIX (S35): Now requires order_type match to prevent confusing
+        SL orders (SL/SL-L) with regular orders (MKT/L).
+
+        Args:
+            symbol: Trading symbol
+            transaction_type: 'B' or 'S'
+            quantity: Order quantity
+            order_type: Expected order type ('MKT', 'L', 'SL', 'SL-M')
+            max_age_seconds: How recent the order must be (default 10s)
+
+        Returns:
+            Order ID if found, None otherwise
+        """
+        import time
+        from datetime import datetime
+
+        try:
+            order_report = self.client.order_report()
+            orders = order_report.get('data', []) if order_report else []
+
+            if not orders:
+                return None
+
+            current_time = time.time()
+
+            for order in orders:
+                # Match symbol
+                order_symbol = order.get('trdSym', order.get('tradingSymbol', ''))
+                if order_symbol != symbol:
+                    continue
+
+                # Match transaction type
+                order_txn = order.get('trnsTp', order.get('transactionType', ''))
+                if order_txn != transaction_type:
+                    continue
+
+                # Match quantity
+                try:
+                    order_qty = int(float(order.get('qty', 0) or 0))
+                except (ValueError, TypeError):
+                    order_qty = 0
+                if order_qty != quantity:
+                    continue
+
+                # S35 CRITICAL: Match order type to prevent confusing SL with EXIT orders
+                # NEO API uses 'prcTp' for order type (L, MKT, SL, SL-M)
+                api_order_type = order.get('prcTp', order.get('orderType', '')).upper()
+                expected_type = order_type.upper()
+
+                # Normalize order types for comparison
+                # MKT orders should only match MKT, not SL/SL-M/SL-L
+                if expected_type == 'MKT':
+                    if api_order_type not in ['MKT', 'MARKET']:
+                        continue
+                elif expected_type in ['L', 'LIMIT']:
+                    if api_order_type not in ['L', 'LIMIT']:
+                        continue
+                elif expected_type in ['SL', 'SL-M', 'SL-L']:
+                    if api_order_type not in ['SL', 'SL-M', 'SL-L']:
+                        continue
+
+                # Check if order is recent (within max_age_seconds)
+                order_time_str = order.get('ordDtTm', order.get('orderDateTime', ''))
+                if order_time_str:
+                    try:
+                        # Parse order time (format: "23-Jan-2026 15:02:45")
+                        order_dt = datetime.strptime(order_time_str, "%d-%b-%Y %H:%M:%S")
+                        order_timestamp = order_dt.timestamp()
+                        age_seconds = current_time - order_timestamp
+
+                        if age_seconds > max_age_seconds:
+                            continue
+                    except (ValueError, TypeError):
+                        # If can't parse time, check status instead
+                        pass
+
+                # Check status - only accept completed/open orders
+                # S35: Also reject 'trigger pending' for MKT orders (those are SL orders)
+                status = str(order.get('ordSt', order.get('status', ''))).lower()
+                if status in ['rejected', 'cancelled', 'canceled']:
+                    continue
+                if expected_type == 'MKT' and status == 'trigger pending':
+                    continue  # MKT orders can't be "trigger pending" - that's an SL order
+
+                # Found matching order!
+                order_id = order.get('nOrdNo', order.get('orderId', order.get('order_id', '')))
+                if order_id:
+                    logger.info(f"[ORDER VERIFY] Found order in book: {symbol} {transaction_type} "
+                               f"qty={quantity} type={api_order_type} -> ID: {order_id} (status: {status})")
+                    return str(order_id)
+
+            return None
+
+        except Exception as e:
+            logger.warning(f"[ORDER VERIFY] Failed to check order book: {e}")
+            return None
 
     def place_order(self, params: OrderParams) -> OrderResult:
         """
@@ -201,10 +318,53 @@ class OrderManager:
 
         # Place the order
         try:
+            # CRITICAL: Properly format price and trigger_price based on order type
+            # - MKT: price="0", trigger="0"
+            # - L: price=tick-aligned, trigger="0"
+            # - SL/SL-M: Handled separately (see _place_sl_order)
+            if params.order_type == "MKT":
+                formatted_price = "0"
+                formatted_trigger = "0"
+            elif params.order_type == "L":
+                formatted_price = format_price(params.price, params.exchange_segment) if params.price else "0"
+                formatted_trigger = "0"
+            else:
+                # SL orders - format both price and trigger
+                formatted_price = format_price(params.price, params.exchange_segment) if params.price else "0"
+                formatted_trigger = round_trigger_price(params.trigger_price, params.exchange_segment) if params.trigger_price else "0"
+
+            # S35: Generate unique tag based on order type for tracking
+            # Determine order classification from params.tag hint
+            price_type = OrderType.ENTRY  # Default
+            if params.tag:
+                tag_upper = params.tag.upper()
+                if 'EXIT' in tag_upper or 'EXT' in tag_upper:
+                    price_type = OrderType.EXIT
+                elif 'SL' in tag_upper or 'STOP' in tag_upper:
+                    price_type = OrderType.SL
+                elif 'TGT' in tag_upper or 'TARGET' in tag_upper:
+                    price_type = OrderType.TARGET
+
+            # Generate unique tracking tag
+            tracking_tag = self.order_tracker.generate_tag(price_type, params.symbol)
+
+            # Register order BEFORE placing (so we can find it later)
+            self.order_tracker.register_order(
+                tag=tracking_tag,
+                symbol=params.symbol,
+                transaction_type=params.transaction_type,
+                quantity=params.quantity,
+                api_order_type=params.order_type,
+                price_type=price_type
+            )
+
+            logger.info(f"[ORDER] Placing {params.order_type}: {params.symbol} {params.transaction_type} "
+                       f"qty={params.quantity} price={formatted_price} trigger={formatted_trigger} tag={tracking_tag}")
+
             response = self.client.place_order(
                 exchange_segment=params.exchange_segment,
                 product=params.product,
-                price=str(params.price) if params.price else "0",
+                price=formatted_price,
                 order_type=params.order_type,
                 quantity=str(params.quantity),
                 validity=params.validity,
@@ -212,19 +372,62 @@ class OrderManager:
                 transaction_type=params.transaction_type,
                 amo="NO",
                 disclosed_quantity=str(params.disclosed_qty),
-                trigger_price=str(params.trigger_price) if params.trigger_price else "0",
-                tag=params.tag or ""
+                trigger_price=formatted_trigger,
+                tag=tracking_tag  # S35: Use our unique tracking tag
             )
 
             # Record for duplicate prevention
             self._record_order(params)
 
             # Extract order ID and check for rejection
+            # S29/S34: More robust order ID extraction - NEO API may return ID in different fields
             order_id = None
             if isinstance(response, dict):
-                order_id = response.get('nOrdNo') or response.get('orderId') or response.get('order_id')
+                # Try multiple possible field names (flat and nested)
+                order_id = (response.get('nOrdNo') or
+                           response.get('orderId') or
+                           response.get('order_id') or
+                           response.get('orderNo') or
+                           response.get('order_no'))
 
-                # Check if order was rejected by broker
+                # Check nested 'data' or 'result' objects
+                if not order_id:
+                    nested = response.get('data') or response.get('result')
+                    if isinstance(nested, dict):
+                        order_id = (nested.get('nOrdNo') or
+                                   nested.get('orderId') or
+                                   nested.get('order_id') or
+                                   nested.get('orderNo') or
+                                   nested.get('order_no'))
+                    # S34: Also check if nested is a list (API sometimes returns list)
+                    elif isinstance(nested, list) and len(nested) > 0:
+                        first = nested[0]
+                        if isinstance(first, dict):
+                            order_id = (first.get('nOrdNo') or
+                                       first.get('orderId') or
+                                       first.get('order_id'))
+
+                # S34: PRIORITIZE order_id - if we have one, treat as success even with error messages
+                # NEO API sometimes returns error message but still processes the order
+                if order_id and str(order_id).strip():
+                    # S35: Confirm order in tracker
+                    self.order_tracker.confirm_order(tracking_tag, str(order_id), response)
+
+                    # Check if there's also an error message (API quirk)
+                    error_msg = (response.get('errMsg') or response.get('error') or
+                                response.get('emsg') or response.get('Error'))
+                    if error_msg:
+                        logger.warning(f"Order {order_id} placed with API warning: {error_msg}")
+                    logger.info(f"Order placed: {params.symbol} {params.transaction_type} "
+                               f"{params.quantity} @ {formatted_price} -> ID: {order_id}")
+                    return OrderResult(
+                        success=True,
+                        order_id=order_id,
+                        message=f"Order placed successfully",
+                        response=response
+                    )
+
+                # No order ID - check if order was rejected by broker
                 stat = str(response.get('stat', '')).lower()
                 if stat in ['rejected', 'not_ok', 'error', 'failed']:
                     rej_reason = response.get('rejRsn') or response.get('rejectionReason') or \
@@ -237,24 +440,86 @@ class OrderManager:
                         response=response
                     )
 
-            # CRITICAL: Validate order ID is present
-            # If order placement returned OK but no order ID, SL/Target won't be placed
-            if not order_id or not str(order_id).strip():
-                logger.error(f"Order placed but NO order ID returned for {params.symbol}!")
-                logger.error(f"Response: {response}")
+            # CRITICAL: No order ID found - order may or may not have been placed
+            # S34: Log full response for debugging and give user actionable message
+            logger.error(f"Order placed but NO order ID returned for {params.symbol}!")
+            logger.error(f"Full response: {response}")
+            logger.error(f"Response type: {type(response)}, keys: {response.keys() if isinstance(response, dict) else 'N/A'}")
+
+            # Check for hidden error messages in response
+            error_msg = None
+            if isinstance(response, dict):
+                error_msg = (response.get('errMsg') or response.get('error') or
+                            response.get('message') or response.get('emsg') or
+                            response.get('Error') or response.get('Emsg'))
+                # Also check stat field for non-OK status
+                stat = str(response.get('stat', '')).lower()
+                if stat and stat not in ['ok', 'success', '']:
+                    error_msg = error_msg or f"Status: {stat}"
+
+            # S34: "error from core" without order ID - order MAY have been placed!
+            # Double-check order book before declaring failure
+            if error_msg:
+                if 'error from core' in str(error_msg).lower():
+                    logger.warning(f"NEO API returned 'error from core' - verifying by tag: {tracking_tag}")
+
+                    # S35 CRITICAL: Use TAG-BASED verification first (most reliable)
+                    import time
+                    time.sleep(0.5)  # Brief wait for order to appear in book
+
+                    # Method 1: Search by our unique tag (preferred)
+                    verified_order_id = self.order_tracker.verify_order_by_tag(
+                        self.client, tracking_tag, max_age_seconds=15
+                    )
+
+                    if verified_order_id:
+                        logger.info(f"[ORDER VERIFY] Order CONFIRMED by tag {tracking_tag}: {verified_order_id}")
+                        return OrderResult(
+                            success=True,
+                            order_id=verified_order_id,
+                            message=f"Order placed (verified by tag after API error)",
+                            response=response
+                        )
+
+                    # Method 2: Fallback to criteria-based search (less reliable)
+                    # This is kept as backup but with stricter matching
+                    logger.warning(f"[ORDER VERIFY] Tag not found, trying criteria match...")
+                    verified_order_id = self._verify_order_in_book(
+                        symbol=params.symbol,
+                        transaction_type=params.transaction_type,
+                        quantity=params.quantity,
+                        order_type=params.order_type,
+                        max_age_seconds=15
+                    )
+
+                    if verified_order_id:
+                        logger.info(f"[ORDER VERIFY] Order CONFIRMED by criteria: {verified_order_id}")
+                        self.order_tracker.confirm_order(tracking_tag, verified_order_id, response)
+                        return OrderResult(
+                            success=True,
+                            order_id=verified_order_id,
+                            message=f"Order placed (verified by criteria after API error)",
+                            response=response
+                        )
+                    else:
+                        logger.warning(f"[ORDER VERIFY] Order NOT found in book - API error is real")
+                        self.order_tracker.mark_failed(tracking_tag, "Not found in book")
+                        return OrderResult(
+                            success=False,
+                            message=f"API error (order not in book): {error_msg}",
+                            response=response
+                        )
+                # Mark as failed for other errors
+                self.order_tracker.mark_failed(tracking_tag, str(error_msg))
                 return OrderResult(
                     success=False,
-                    message="Order may have been placed but no ID returned - check positions manually",
+                    message=f"Order failed: {error_msg}",
                     response=response
                 )
 
-            logger.info(f"Order placed: {params.symbol} {params.transaction_type} "
-                       f"{params.quantity} @ {params.price} -> ID: {order_id}")
-
             return OrderResult(
-                success=True,
-                order_id=order_id,
-                message=f"Order placed successfully",
+                success=False,
+                message="Order may have been placed but no ID returned - check order book",
                 response=response
             )
 
@@ -292,17 +557,24 @@ class OrderManager:
             target_price = entry.price - params.target_points
 
         try:
+            # CRITICAL: Format price to tick size
+            formatted_price = format_price(entry.price, entry.exchange_segment)
+            formatted_trigger = round_trigger_price(sl_trigger, entry.exchange_segment)
+
+            logger.info(f"[BRACKET] Placing: {entry.symbol} {entry.transaction_type} "
+                       f"qty={entry.quantity} price={formatted_price} sl_trigger={formatted_trigger}")
+
             response = self.client.place_order(
                 exchange_segment=entry.exchange_segment,
                 product="BO",
-                price=str(entry.price),
+                price=formatted_price,
                 order_type="L",
                 quantity=str(entry.quantity),
                 validity="DAY",
                 trading_symbol=entry.symbol,
                 transaction_type=entry.transaction_type,
                 amo="NO",
-                trigger_price=str(sl_trigger),
+                trigger_price=formatted_trigger,
                 square_off_type="Absolute",
                 stop_loss_type="Absolute",
                 stop_loss_value=str(params.stop_loss_points),
@@ -387,11 +659,47 @@ class OrderManager:
             OrderResult
         """
         try:
+            # First fetch the order to get current details (NEO API requires order_type)
+            orders = self.get_orders()
+            current_order = None
+            for order in orders:
+                if order.get('nOrdNo') == order_id:
+                    current_order = order
+                    break
+
+            if not current_order:
+                return OrderResult(
+                    success=False,
+                    message=f"Order not found: {order_id}"
+                )
+
+            # Get current order details
+            current_price = current_order.get('prc', current_order.get('price', '0'))
+            current_qty = current_order.get('qty', current_order.get('quantity', '0'))
+            current_trigger = current_order.get('trgPrc', current_order.get('triggerPrice', '0'))
+            order_type = current_order.get('prcTp', current_order.get('orderType', 'L'))
+            exchange_segment = current_order.get('exSeg', current_order.get('exchange_segment', 'nse_fo'))
+
+            # Use new values or fall back to current
+            # S32: Round new prices to tick size for exchange
+            if new_price is not None:
+                price = format_price(new_price, exchange_segment)
+            else:
+                price = str(current_price)
+
+            quantity = str(new_quantity) if new_quantity is not None else str(current_qty)
+
+            if new_trigger is not None:
+                trigger_price = round_trigger_price(new_trigger, exchange_segment)
+            else:
+                trigger_price = str(current_trigger)
+
             response = self.client.modify_order(
                 order_id=order_id,
-                price=str(new_price) if new_price else "",
-                quantity=str(new_quantity) if new_quantity else "",
-                trigger_price=str(new_trigger) if new_trigger else "",
+                price=price,
+                order_type=order_type,
+                quantity=quantity,
+                trigger_price=trigger_price,
                 validity="DAY"
             )
 
@@ -448,22 +756,45 @@ class OrderManager:
         Returns:
             OrderResult
         """
-        qty = int(position.get('qty', 0))
+        # NEO API uses flBuyQty and flSellQty - calculate net position
+        # S35: Use int(float()) to handle string values like "150.5"
+        buy_qty = position.get('flBuyQty', position.get('buyQty', 0))
+        sell_qty = position.get('flSellQty', position.get('sellQty', 0))
+        try:
+            qty = int(float(buy_qty or 0)) - int(float(sell_qty or 0))
+        except (ValueError, TypeError):
+            try:
+                qty = int(float(position.get('qty', 0) or 0))
+            except (ValueError, TypeError):
+                qty = 0
+
         if qty == 0:
             return OrderResult(success=False, message="No position to exit")
 
         exit_qty = int(abs(qty) * exit_qty_percent / 100)
 
+        # S27: Validate exit_qty is positive
+        if exit_qty <= 0:
+            return OrderResult(
+                success=False,
+                message=f"Exit quantity too small: {abs(qty)} qty * {exit_qty_percent}% = {exit_qty} (need >0)"
+            )
+
         # Opposite transaction
         txn_type = 'S' if qty > 0 else 'B'
 
+        # NEO API uses 'trdSym' as primary key for trading symbol
+        symbol = position.get('trdSym', position.get('tradingSymbol', position.get('symbol', '')))
+        if not symbol:
+            return OrderResult(success=False, message="REJECTED: please provide valid symbol")
+
         params = OrderParams(
-            symbol=position.get('symbol', position.get('tradingSymbol', '')),
-            exchange_segment=position.get('exchange_segment', position.get('exchangeSegment', 'nse_fo')),
-            instrument_token=str(position.get('instrument_token', position.get('token', ''))),
+            symbol=symbol,
+            exchange_segment=position.get('exchange_segment', position.get('exchangeSegment', position.get('exSeg', 'nse_fo'))),
+            instrument_token=str(position.get('instrument_token', position.get('token', position.get('tok', '')))),
             transaction_type=txn_type,
             quantity=exit_qty,
-            product=position.get('product', self.default_product),
+            product=position.get('product', position.get('prd', self.default_product)),
             order_type='MKT',  # Market order for quick exit
             tag='EXIT'
         )
@@ -487,19 +818,24 @@ class OrderManager:
         results = []
 
         for pos in positions:
-            qty = int(pos.get('qty', 0))
+            # S35: Safe int conversion - handle "150.0" strings and None
+            try:
+                qty = int(float(pos.get('qty', 0) or 0))
+            except (ValueError, TypeError):
+                qty = 0
             if qty != 0:
+                symbol = pos.get('trdSym', pos.get('tradingSymbol', pos.get('symbol', '')))
                 try:
                     result = self.exit_position(pos)
                     results.append({
-                        'symbol': pos.get('symbol', pos.get('tradingSymbol', '')),
+                        'symbol': symbol,
                         'status': 'success' if result.success else 'failed',
                         'order_id': result.order_id,
                         'message': result.message
                     })
                 except Exception as e:
                     results.append({
-                        'symbol': pos.get('symbol', ''),
+                        'symbol': symbol,
                         'status': 'failed',
                         'error': str(e)
                     })
@@ -521,34 +857,57 @@ class OrderManager:
         Returns:
             Dict with 'valid' bool and 'error' message if invalid
         """
-        # Check 1: SL must be on correct side of entry
+        # Check 1: SL must be on correct side of LTP (not entry!)
+        # For LONG: SL triggers SELL when price DROPS to SL level → SL must be BELOW LTP
+        # For SHORT: SL triggers BUY when price RISES to SL level → SL must be ABOVE LTP
+        # NOTE: SL can be above/below entry for profitable positions (BE scenario)
         if is_long:
-            if sl_price >= entry_price:
-                return {'valid': False, 'error': f'LONG SL ({sl_price}) must be BELOW entry ({entry_price})'}
+            if sl_price >= ltp:
+                return {
+                    'valid': False,
+                    'reason': 'WRONG_DIRECTION',
+                    'error': f'WRONG DIRECTION: LONG SL ({sl_price:.2f}) must be BELOW LTP ({ltp:.2f})'
+                }
         else:
-            if sl_price <= entry_price:
-                return {'valid': False, 'error': f'SHORT SL ({sl_price}) must be ABOVE entry ({entry_price})'}
+            if sl_price <= ltp:
+                return {
+                    'valid': False,
+                    'reason': 'WRONG_DIRECTION',
+                    'error': f'WRONG DIRECTION: SHORT SL ({sl_price:.2f}) must be ABOVE LTP ({ltp:.2f})'
+                }
 
-        # Check 2: SL must be at least min_distance from LTP
-        # Add safety buffer (50% extra) to account for LTP movement between validation and order placement
-        # In fast markets, LTP can move significantly in milliseconds
-        safety_buffer = self.config.get('trailing_sl', {}).get('ltp_buffer', 10)
-        effective_min_distance = min_distance + safety_buffer
+        # Check 2: SL must not be triggered immediately
+        # Use percentage-based buffer for equity, fixed points for options
+        # Options: use fixed buffer (ltp_buffer config, default 10 points)
+        # Equity: use 0.3% of LTP as minimum safe buffer
+        fixed_buffer = self.config.get('trailing_sl', {}).get('ltp_buffer', 10)
+
+        # For equity (prices typically > 50), use percentage-based minimum
+        # For options (can be any price), use fixed minimum
+        if ltp > 50:
+            # Equity: 0.3% of LTP as safety buffer (e.g., ₹1350 * 0.003 = 4.05 pts)
+            safety_buffer = max(min_distance, ltp * 0.003)
+        else:
+            # Options: use fixed buffer
+            safety_buffer = fixed_buffer
 
         distance = abs(ltp - sl_price)
-        if distance < effective_min_distance:
+
+        # Only warn if SL would be triggered immediately (within safety buffer)
+        if is_long and sl_price >= (ltp - safety_buffer):
             return {
                 'valid': False,
-                'error': f'SL too close to LTP ({distance:.2f} < {effective_min_distance} points including {safety_buffer}pt safety buffer)'
+                'reason': 'IMMEDIATE_TRIGGER',
+                'error': f'IMMEDIATE TRIGGER: LONG SL ({sl_price:.2f}) too close to LTP ({ltp:.2f}). Min safe distance: {safety_buffer:.2f} pts'
+            }
+        if not is_long and sl_price <= (ltp + safety_buffer):
+            return {
+                'valid': False,
+                'reason': 'IMMEDIATE_TRIGGER',
+                'error': f'IMMEDIATE TRIGGER: SHORT SL ({sl_price:.2f}) too close to LTP ({ltp:.2f}). Min safe distance: {safety_buffer:.2f} pts'
             }
 
-        # Check 3: SL should not be triggered immediately (with buffer for LTP movement)
-        if is_long and sl_price >= (ltp - safety_buffer):
-            return {'valid': False, 'error': f'LONG SL ({sl_price}) too close to LTP ({ltp}), may trigger immediately'}
-        if not is_long and sl_price <= (ltp + safety_buffer):
-            return {'valid': False, 'error': f'SHORT SL ({sl_price}) too close to LTP ({ltp}), may trigger immediately'}
-
-        return {'valid': True, 'error': None}
+        return {'valid': True, 'reason': None, 'error': None}
 
     def validate_target_price(self, target_price: float, entry_price: float,
                               is_long: bool) -> Dict[str, Any]:
@@ -587,11 +946,11 @@ class OrderManager:
         Returns:
             Dict with SL and Target order IDs
         """
-        qty = abs(int(position.get('qty', 0)))
+        qty = abs(int(float(position.get('qty', 0) or 0)))
         if qty == 0:
             return {'success': False, 'error': 'No position quantity'}
 
-        pos_qty = int(position.get('qty', 0))
+        pos_qty = int(float(position.get('qty', 0) or 0))
         is_long = pos_qty > 0
         exit_type = 'S' if is_long else 'B'
 
@@ -617,12 +976,15 @@ class OrderManager:
                 logger.warning(f"Target validation failed: {target_validation['error']}")
                 # Continue with SL placement even if target is invalid
 
+        # NEO API uses 'trdSym' for trading symbol
+        trading_symbol = position.get('trdSym', position.get('tradingSymbol', position.get('symbol', '')))
+
         # Place SL order with retry logic
         sl_result = self._place_sl_with_retry(
-            exchange_segment=position.get('exchange_segment', 'nse_fo'),
-            product=position.get('product', self.default_product),
+            exchange_segment=position.get('exchange_segment', position.get('exSeg', 'nse_fo')),
+            product=position.get('product', position.get('prd', self.default_product)),
             quantity=qty,
-            trading_symbol=position.get('symbol', position.get('tradingSymbol', '')),
+            trading_symbol=trading_symbol,
             transaction_type=exit_type,
             trigger_price=sl_price,
             max_retries=3
@@ -635,20 +997,41 @@ class OrderManager:
         # Place Target order if provided and valid
         if target_price and 'target_error' not in result:
             try:
+                exchange_seg = position.get('exchange_segment', position.get('exSeg', 'nse_fo'))
+                # CRITICAL: Format target price to tick size
+                formatted_target_price = format_price(target_price, exchange_seg)
+
+                # S35: Generate unique tag for target order using tracker
+                target_tag = self.order_tracker.generate_tag(OrderType.TARGET, trading_symbol)
+                self.order_tracker.register_order(
+                    tag=target_tag,
+                    symbol=trading_symbol,
+                    transaction_type=exit_type,
+                    quantity=qty,
+                    api_order_type="L",
+                    price_type=OrderType.TARGET
+                )
+
+                logger.info(f"[TARGET] Placing: {trading_symbol} {exit_type} qty={qty} price={formatted_target_price}")
+
                 target_response = self.client.place_order(
-                    exchange_segment=position.get('exchange_segment', 'nse_fo'),
-                    product=position.get('product', self.default_product),
-                    price=str(target_price),
+                    exchange_segment=exchange_seg,
+                    product=position.get('product', position.get('prd', self.default_product)),
+                    price=formatted_target_price,
                     order_type="L",
                     quantity=str(qty),
                     validity="DAY",
-                    trading_symbol=position.get('symbol', position.get('tradingSymbol', '')),
+                    trading_symbol=trading_symbol,  # Use already extracted symbol
                     transaction_type=exit_type,
                     amo="NO",
-                    tag='TARGET'
+                    tag=target_tag  # S35: Use tracker-generated tag
                 )
                 result['target_order_id'] = target_response.get('nOrdNo') if target_response else None
-                logger.info(f"Target order placed: {result['target_order_id']} @ {target_price}")
+                if result['target_order_id']:
+                    self.order_tracker.confirm_order(target_tag, result['target_order_id'], target_response)
+                else:
+                    self.order_tracker.mark_failed(target_tag, "No order ID returned")
+                logger.info(f"[TARGET] Order placed: {result['target_order_id']} @ {formatted_target_price}")
             except Exception as e:
                 logger.error(f"Target order failed: {e}")
                 result['target_error'] = str(e)
@@ -702,9 +1085,10 @@ class OrderManager:
     def get_margin_required(self, params: OrderParams) -> Optional[float]:
         """Calculate margin required for an order."""
         try:
+            # S27: Use explicit None check - price of 0 is valid for market orders
             response = self.client.margin_required(
                 exchange_segment=params.exchange_segment,
-                price=str(params.price) if params.price else "0",
+                price=str(params.price) if params.price is not None else "0",
                 order_type=params.order_type,
                 product=params.product,
                 quantity=str(params.quantity),
@@ -726,13 +1110,19 @@ class OrderManager:
             response = self.client.limits()
             if response and 'data' in response:
                 data = response['data']
+                # S26: Use explicit None checks - margin of 0 is valid (though rare)
                 # NEO API returns limits in different formats - handle common fields
-                available = float(
-                    data.get('availableCash', 0) or
-                    data.get('net', 0) or
-                    data.get('available', {}).get('cash', 0) or 0
-                )
-                return available
+                available_cash = data.get('availableCash')
+                net = data.get('net')
+                cash_nested = data.get('available', {}).get('cash')
+
+                if available_cash is not None:
+                    return float(available_cash)
+                elif net is not None:
+                    return float(net)
+                elif cash_nested is not None:
+                    return float(cash_nested)
+                return 0.0
             return None
         except Exception as e:
             logger.warning(f"Failed to get available margin: {e}")
@@ -834,12 +1224,17 @@ class OrderManager:
                         order_params.transaction_type == params.transaction_type and
                         order_params.quantity == params.quantity):
                         # Also check price if available - different prices = intentional scaling
+                        # S27: Use explicit None checks - price of 0 is valid
                         if allow_scaling:
                             old_price = getattr(order_params, 'price', None)
                             new_price = getattr(params, 'price', None)
-                            if old_price and new_price and abs(float(old_price) - float(new_price)) > 0.5:
-                                # Different prices = likely intentional, allow
-                                return False
+                            if old_price is not None and new_price is not None:
+                                try:
+                                    if abs(float(old_price) - float(new_price)) > 0.5:
+                                        # Different prices = likely intentional, allow
+                                        return False
+                                except (ValueError, TypeError):
+                                    pass  # Can't compare, treat as duplicate
                         return True
             return False
 
@@ -855,7 +1250,7 @@ class OrderManager:
         """Check if new order exceeds position limits."""
         try:
             positions = self.get_positions()
-            open_count = len([p for p in positions if int(p.get('qty', 0)) != 0])
+            open_count = len([p for p in positions if int(float(p.get('qty', 0) or 0)) != 0])
             return open_count < self.max_open_positions
         except Exception as e:
             # CRITICAL: Block trading if we can't verify position limits
@@ -874,7 +1269,7 @@ class OrderManager:
         """
         try:
             positions = self.get_positions()
-            open_positions = [p for p in positions if int(p.get('qty', 0)) != 0]
+            open_positions = [p for p in positions if int(float(p.get('qty', 0) or 0)) != 0]
             open_count = len(open_positions)
 
             # Find if we have existing position in this symbol
@@ -886,7 +1281,7 @@ class OrderManager:
                     break
 
             if existing_pos:
-                existing_qty = int(existing_pos.get('qty', 0))
+                existing_qty = int(float(existing_pos.get('qty', 0) or 0))
                 is_existing_long = existing_qty > 0
 
                 # Check if this order is an exit (opposite direction)
@@ -919,9 +1314,16 @@ class OrderManager:
             positions = self.get_positions()
             open_pnl = 0.0
             for pos in positions:
-                pnl = float(pos.get('pnl', 0) or
-                           pos.get('dayPnl', 0) or
-                           pos.get('unrealizedPnl', 0) or 0)
+                # S28: Fix P&L cascade - explicit None checks to handle break-even (0) correctly
+                pnl_value = pos.get('pnl')
+                if pnl_value is None:
+                    pnl_value = pos.get('dayPnl')
+                if pnl_value is None:
+                    pnl_value = pos.get('unrealizedPnl')
+                try:
+                    pnl = float(pnl_value) if pnl_value is not None else 0.0
+                except (ValueError, TypeError):
+                    pnl = 0.0
                 open_pnl += pnl
 
             # Part 2: Get realized P&L from today's closed trades
@@ -1023,7 +1425,7 @@ class OrderManager:
             realized_pnl = 0.0
             for pos in positions:
                 # Look for closed positions (qty = 0 but had trades)
-                qty = int(pos.get('qty', 0))
+                qty = int(float(pos.get('qty', 0) or 0))
                 if qty == 0:
                     # Closed position - dayPnl is realized
                     day_pnl = float(pos.get('dayPnl', 0) or
@@ -1054,10 +1456,6 @@ class OrderManager:
     def check_and_reset_if_new_day(self):
         """Auto-reset daily limits if it's a new trading day."""
         today = datetime.now().date()
-        if not hasattr(self, '_last_reset_date'):
-            self._last_reset_date = today
-            return
-
         if today > self._last_reset_date:
             logger.info(f"New trading day detected: {today}")
             self.reset_daily_limits()
@@ -1077,8 +1475,10 @@ class OrderManager:
 
     def resume_trading(self):
         """Resume trading after manual halt (use with caution)."""
+        # S23-H1: Refresh P&L before checking (prevents stale value after app restart)
+        self._check_daily_loss_limit()
         if self._daily_pnl < -self.max_loss_per_day:
-            logger.warning("Cannot resume - daily loss limit still breached")
+            logger.warning(f"Cannot resume - daily loss limit still breached (P&L: {self._daily_pnl:.2f})")
             return False
         self._trading_halted = False
         logger.info("Trading resumed")
@@ -1110,32 +1510,59 @@ class OrderManager:
         """
         last_error = None
 
+        # CRITICAL: ALL OPTIONS (nse_fo, bse_fo) do NOT allow SL-M orders - must use SL-L
+        # S29: Kotak NEO rejects SL-M for ALL options, not just BSE
+        # S31: Fixed floating-point precision bug using tick_utils
+        sl_order_type, sl_limit_price = calculate_sl_limit_price(
+            trigger_price=trigger_price,
+            transaction_type=transaction_type,
+            exchange_segment=exchange_segment,
+            buffer_percent=0.5
+        )
+        if sl_order_type == "SL":
+            logger.info(f"[SL] Options detected - using SL-L: trigger={trigger_price}, limit={sl_limit_price}")
+
         for attempt in range(max_retries):
             try:
+                # S35: Generate unique tag for SL order using tracker
+                sl_tag = self.order_tracker.generate_tag(OrderType.SL, trading_symbol)
+                self.order_tracker.register_order(
+                    tag=sl_tag,
+                    symbol=trading_symbol,
+                    transaction_type=transaction_type,
+                    quantity=quantity,
+                    api_order_type=sl_order_type,
+                    price_type=OrderType.SL
+                )
+
                 sl_response = self.client.place_order(
                     exchange_segment=exchange_segment,
                     product=product,
-                    price="0",
-                    order_type="SL-M",
+                    price=sl_limit_price,
+                    order_type=sl_order_type,
                     quantity=str(quantity),
                     validity="DAY",
                     trading_symbol=trading_symbol,
                     transaction_type=transaction_type,
                     amo="NO",
-                    trigger_price=str(trigger_price),
-                    tag='SL'
+                    trigger_price=round_trigger_price(trigger_price, exchange_segment),
+                    tag=sl_tag  # S35: Use tracker-generated tag
                 )
 
                 order_id = sl_response.get('nOrdNo') if sl_response else None
                 if order_id:
+                    # S35: Confirm order with tracker
+                    self.order_tracker.confirm_order(sl_tag, order_id, sl_response)
                     logger.info(f"SL order placed: {order_id} @ {trigger_price} (attempt {attempt + 1})")
-                    return {'order_id': order_id, 'error': None, 'critical': False}
+                    return {'order_id': order_id, 'error': None, 'critical': False, 'tag': sl_tag}
                 else:
                     last_error = "No order ID returned"
+                    self.order_tracker.mark_failed(sl_tag, last_error)
                     logger.warning(f"SL attempt {attempt + 1}: {last_error}")
 
             except Exception as e:
                 last_error = str(e)
+                self.order_tracker.mark_failed(sl_tag, str(e))
                 logger.warning(f"SL attempt {attempt + 1} failed: {e}")
 
             # Exponential backoff: 0.5s, 1s, 2s
@@ -1148,7 +1575,8 @@ class OrderManager:
         return {
             'order_id': None,
             'error': f'SL FAILED after {max_retries} attempts: {last_error}',
-            'critical': True
+            'critical': True,
+            'tag': sl_tag  # Return tag for debugging/tracking
         }
 
     def handle_partial_fill(self, entry_order_id: str, sl_order_id: str,
@@ -1242,9 +1670,19 @@ class OrderManager:
 
             # Try to modify SL quantity
             try:
+                # Get SL order details for order_type (required by NEO API)
+                sl_order_type = sl_order.get('prcTp', sl_order.get('orderType', 'SL'))
+                # CRITICAL FIX (S25): Use different name to avoid shadowing sl_price parameter
+                sl_order_limit_price = sl_order.get('prc', sl_order.get('price', '0'))
+                sl_trigger = sl_order.get('trgPrc', sl_order.get('triggerPrice', '0'))
+
                 self.client.modify_order(
                     order_id=sl_order_id,
-                    quantity=str(filled_qty)
+                    order_type=sl_order_type,
+                    price=str(sl_order_limit_price),
+                    quantity=str(filled_qty),
+                    trigger_price=str(sl_trigger),
+                    validity="DAY"
                 )
                 logger.info(f"SL qty modified: {sl_qty} -> {filled_qty}")
                 result['action'] = 'modified'
@@ -1281,9 +1719,9 @@ class OrderManager:
                         result['new_sl_order_id'] = new_sl['order_id']
                         result['success'] = True
 
-                        # Update position tracker if provided
+                        # Update position tracker if provided (use symbol-based method)
                         if position_tracker:
-                            position_tracker.update_sl_order(symbol, new_sl['order_id'], sl_price)
+                            position_tracker.update_sl_order_by_symbol(symbol, new_sl_order_id=new_sl['order_id'], new_sl_price=sl_price)
 
                     else:
                         result['action'] = 'recreate_failed'
@@ -1344,11 +1782,11 @@ class OrderManager:
                 result['success'] = True
                 result['new_sl_order_id'] = None
 
-                # Update trackers
+                # Update trackers (use symbol-based methods)
                 if position_tracker:
-                    position_tracker.cancel_sl_order(symbol)
+                    position_tracker.cancel_sl_order_by_symbol(symbol)
                 if oco_monitor:
-                    oco_monitor.remove_oco_pair(symbol)
+                    oco_monitor.remove_pairs_by_symbol(symbol)
 
             except Exception as e:
                 result['error'] = f'Failed to cancel SL: {e}'
@@ -1358,9 +1796,29 @@ class OrderManager:
 
         # Try to modify SL quantity
         try:
+            # Fetch SL order to get order_type (required by NEO API)
+            orders = self.get_orders()
+            sl_order = None
+            for order in orders:
+                if order.get('nOrdNo') == sl_order_id:
+                    sl_order = order
+                    break
+
+            if not sl_order:
+                logger.warning(f"SL order {sl_order_id} not found in order book, cannot modify")
+                raise Exception(f"SL order {sl_order_id} not found")
+
+            sl_order_type = sl_order.get('prcTp', sl_order.get('orderType', 'SL'))
+            sl_order_price = sl_order.get('prc', sl_order.get('price', '0'))
+            sl_trigger_price = sl_order.get('trgPrc', sl_order.get('triggerPrice', str(sl_price)))
+
             self.client.modify_order(
                 order_id=sl_order_id,
-                quantity=str(remaining_qty)
+                order_type=sl_order_type,
+                price=str(sl_order_price),
+                quantity=str(remaining_qty),
+                trigger_price=str(sl_trigger_price),
+                validity="DAY"
             )
             logger.info(f"SL qty adjusted for {symbol}: -> {remaining_qty}")
             result['action'] = 'modified'
@@ -1396,11 +1854,11 @@ class OrderManager:
                     result['new_sl_order_id'] = new_sl['order_id']
                     result['success'] = True
 
-                    # Update trackers
+                    # Update trackers (use symbol-based methods)
                     if position_tracker:
-                        position_tracker.update_sl_order(symbol, new_sl['order_id'], sl_price)
+                        position_tracker.update_sl_order_by_symbol(symbol, new_sl_order_id=new_sl['order_id'], new_sl_price=sl_price)
                     if oco_monitor:
-                        oco_monitor.update_sl_order(symbol, new_sl['order_id'], sl_price)
+                        oco_monitor.update_sl_order_by_symbol(symbol, new_sl['order_id'], sl_price)
 
                     logger.info(f"SL recreated for {symbol}: {new_sl['order_id']} qty={remaining_qty}")
 
@@ -1416,7 +1874,8 @@ class OrderManager:
                                f"Position has {remaining_qty} qty with NO SL protection!")
 
                     # CRITICAL: Notify immediately
-                    if hasattr(self, 'telegram') and self.telegram:
+                    # S17-L2: telegram always initialized in __init__
+                    if self.telegram:
                         self.telegram.send(
                             f"🚨 CRITICAL: SL FAILED for {symbol}!\n"
                             f"Old SL cancelled but new SL failed!\n"

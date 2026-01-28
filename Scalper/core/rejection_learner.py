@@ -24,11 +24,16 @@ class RejectionLearner:
     - Other patterns can be added as discovered
     """
 
+    # Rule TTL: rules expire after this many days (broker policies change)
+    RULE_TTL_DAYS = 30
+
     def __init__(self, data_dir: str = "data"):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
         self.rules_file = self.data_dir / "rejection_rules.json"
         self.rules: Dict[str, Any] = self._load_rules()
+        # Clean up expired rules on init
+        self._cleanup_expired_rules()
 
         # Built-in pattern matchers (regex pattern -> rule to apply)
         self.pattern_matchers = [
@@ -77,6 +82,46 @@ class RejectionLearner:
             logger.info(f"[LEARNER] Rules saved to {self.rules_file}")
         except Exception as e:
             logger.error(f"[LEARNER] Failed to save rules: {e}")
+
+    def _is_rule_expired(self, rule: Dict) -> bool:
+        """Check if a rule has expired based on TTL."""
+        learned_at = rule.get('learned_at')
+        if not learned_at:
+            return True  # No timestamp = treat as expired
+
+        try:
+            learned_date = datetime.fromisoformat(learned_at)
+            age_days = (datetime.now() - learned_date).days
+            return age_days > self.RULE_TTL_DAYS
+        except (ValueError, TypeError):
+            return True
+
+    def _cleanup_expired_rules(self):
+        """Remove expired rules (older than RULE_TTL_DAYS)."""
+        cleaned = False
+
+        # Clean symbol rules
+        expired_symbols = [
+            symbol for symbol, rule in self.rules.get('symbol_rules', {}).items()
+            if self._is_rule_expired(rule)
+        ]
+        for symbol in expired_symbols:
+            del self.rules['symbol_rules'][symbol]
+            logger.info(f"[LEARNER] Expired rule removed for symbol: {symbol}")
+            cleaned = True
+
+        # Clean index rules
+        expired_indices = [
+            index for index, rule in self.rules.get('index_rules', {}).items()
+            if self._is_rule_expired(rule)
+        ]
+        for index in expired_indices:
+            del self.rules['index_rules'][index]
+            logger.info(f"[LEARNER] Expired rule removed for index: {index}")
+            cleaned = True
+
+        if cleaned:
+            self._save_rules()
 
     def learn_from_rejection(self, symbol: str, rejection_reason: str,
                              order_details: Optional[Dict] = None) -> Optional[Dict]:

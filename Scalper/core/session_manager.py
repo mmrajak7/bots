@@ -210,6 +210,33 @@ class SessionManager:
             return False
         return self._verify_session()
 
+    def refresh_if_needed(self) -> Tuple[bool, str]:
+        """
+        Check session health and refresh if needed.
+
+        Should be called periodically (e.g., every 30 minutes) during market hours
+        to ensure session remains active. If session is invalid, attempts re-login.
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if not self._connected:
+            return self.auto_login()
+
+        # Check if session will expire soon (within 1 hour)
+        if self.session_valid_until:
+            time_remaining = self.session_valid_until - datetime.now()
+            if time_remaining.total_seconds() < 3600:  # Less than 1 hour
+                logger.info("Session expiring soon, attempting refresh...")
+                return self.auto_login()
+
+        # Verify session is actually working
+        if not self._verify_session():
+            logger.warning("Session verification failed, attempting re-login...")
+            return self.auto_login()
+
+        return True, "Session healthy"
+
     def logout(self):
         """Logout and clear session."""
         try:
@@ -271,7 +298,8 @@ class SessionManager:
             # Restore client with saved token
             access_token = session_data.get('access_token')
             if access_token:
-                neo_creds = self.config.get('neo_credentials', self.config)
+                # S27: Use empty dict as fallback, not entire config
+                neo_creds = self.config.get('neo_credentials', {})
                 self.client = NeoAPI(
                     environment='prod',
                     access_token=access_token,

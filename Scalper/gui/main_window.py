@@ -10,6 +10,7 @@ PyQt6-based trading interface with:
 """
 
 import logging
+import math
 import re
 import sys
 from datetime import datetime
@@ -21,15 +22,19 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QTableWidget,
     QTableWidgetItem, QGroupBox, QTextEdit, QRadioButton, QButtonGroup,
-    QFrame, QSplitter, QHeaderView, QSpinBox, QMessageBox
+    QFrame, QSplitter, QHeaderView, QSpinBox, QMessageBox, QDialog,
+    QDialogButtonBox, QFormLayout
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QEvent
 from PyQt6.QtGui import QFont, QColor, QKeySequence, QShortcut, QBrush
 
 from core.order_manager import OrderParams, OrderManager
 from core.trailing_sl import TrailingSLManager, TrailMode
 from core.position_tracker import PositionTracker
 from core.charge_calculator import get_breakeven_points, calculate_charges
+from core.price_alert_manager import PriceAlertManager, PriceAlert
+from core.tick_utils import round_trigger_price, format_price
+from core.order_tracker import OrderType, get_order_tracker
 
 
 class SortableTableWidgetItem(QTableWidgetItem):
@@ -196,6 +201,352 @@ def _get_position_token(pos: Dict[str, Any]) -> str:
     return ''
 
 
+class QuickAddAlertDialog(QDialog):
+    """Quick-add alert popup dialog with pre-filled values."""
+
+    def __init__(self, parent=None, symbol: str = '', ltp: float = 0.0):
+        super().__init__(parent)
+        self.setWindowTitle("Add Price Alert")
+        self.setModal(True)
+        self.setFixedSize(320, 220)
+        self.ltp = ltp  # Store for validation
+
+        layout = QVBoxLayout(self)
+
+        # Form layout
+        form = QFormLayout()
+
+        # Symbol
+        self.symbol_input = QLineEdit(symbol)
+        self.symbol_input.setStyleSheet("font-weight: bold;")
+        form.addRow("Symbol:", self.symbol_input)
+
+        # LTP display (read-only)
+        ltp_label = QLabel(f"₹{ltp:.2f}" if ltp > 0 else "--")
+        ltp_label.setStyleSheet("color: #00ccff; font-weight: bold;")
+        form.addRow("LTP:", ltp_label)
+
+        # Condition
+        self.condition_combo = QComboBox()
+        self.condition_combo.addItems(["< (Below)", "> (Above)"])
+        form.addRow("Condition:", self.condition_combo)
+
+        # Price (default: LTP - 1.5%)
+        default_price = round(ltp * 0.985, 2) if ltp > 0 else 0.0
+        self.price_input = QLineEdit(f"{default_price:.2f}")
+        self.price_input.setStyleSheet("font-weight: bold; color: #ffcc00;")
+        form.addRow("Price:", self.price_input)
+
+        # Comments
+        self.comments_input = QLineEdit()
+        self.comments_input.setPlaceholderText("Optional note...")
+        form.addRow("Comments:", self.comments_input)
+
+        layout.addLayout(form)
+
+        # Error label
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: #ff4444; font-size: 10px;")
+        layout.addWidget(self.error_label)
+
+        # Buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _validate_and_accept(self):
+        """Validate alert before accepting."""
+        data = self.get_alert_data()
+
+        # Basic validation
+        if not data['symbol']:
+            self.error_label.setText("Symbol is required")
+            return
+
+        if data['trigger_price'] <= 0:
+            self.error_label.setText("Price must be positive")
+            return
+
+        # Validate against LTP if available
+        if self.ltp > 0:
+            if data['condition'] == '<' and data['trigger_price'] >= self.ltp:
+                self.error_label.setText(f"For '<' alert, price must be below LTP (₹{self.ltp:.2f})")
+                return
+            if data['condition'] == '>' and data['trigger_price'] <= self.ltp:
+                self.error_label.setText(f"For '>' alert, price must be above LTP (₹{self.ltp:.2f})")
+                return
+
+        self.accept()
+
+    def get_alert_data(self) -> Dict[str, Any]:
+        """Get alert data from dialog."""
+        condition_text = self.condition_combo.currentText()
+        condition = '<' if '<' in condition_text else '>'
+
+        try:
+            price = float(self.price_input.text().strip())
+        except ValueError:
+            price = 0.0
+
+        return {
+            'symbol': self.symbol_input.text().strip(),
+            'condition': condition,
+            'trigger_price': price,
+            'comments': self.comments_input.text().strip()
+        }
+
+
+class AlertsDialog(QDialog):
+    """Alerts manager dialog showing all active alerts."""
+
+    def __init__(self, parent=None, alert_manager: PriceAlertManager = None, get_ltp_func=None):
+        super().__init__(parent)
+        self.alert_manager = alert_manager
+        self.get_ltp_func = get_ltp_func  # Function to get LTP by symbol
+
+        self.setWindowTitle("Price Alerts")
+        self.setMinimumSize(600, 400)
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e2e; color: #ffffff; }
+            QTableWidget { background-color: #252535; color: #ffffff; gridline-color: #444; }
+            QHeaderView::section { background-color: #333348; color: #ffffff; font-weight: bold; padding: 4px; }
+            QPushButton { padding: 6px 12px; }
+        """)
+
+        layout = QVBoxLayout(self)
+
+        # Alerts table
+        self.alerts_table = QTableWidget()
+        self.alerts_table.setColumnCount(6)
+        self.alerts_table.setHorizontalHeaderLabels([
+            "Symbol", "LTP", "Cond", "Price", "Comments", "Actions"
+        ])
+
+        header = self.alerts_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)  # Symbol stretches
+        for i in range(1, 6):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.Fixed)
+        self.alerts_table.setColumnWidth(1, 70)   # LTP
+        self.alerts_table.setColumnWidth(2, 50)   # Cond
+        self.alerts_table.setColumnWidth(3, 70)   # Price
+        self.alerts_table.setColumnWidth(4, 150)  # Comments
+        self.alerts_table.setColumnWidth(5, 80)   # Actions
+
+        self.alerts_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.alerts_table.setAlternatingRowColors(True)
+
+        layout.addWidget(self.alerts_table)
+
+        # Bottom buttons
+        bottom = QHBoxLayout()
+
+        self.add_btn = QPushButton("+ Add Alert")
+        self.add_btn.setStyleSheet("background-color: #006644; color: white; font-weight: bold;")
+        self.add_btn.clicked.connect(self._add_alert)
+        bottom.addWidget(self.add_btn)
+
+        self.clear_btn = QPushButton("Clear All")
+        self.clear_btn.setStyleSheet("background-color: #664400; color: white;")
+        self.clear_btn.clicked.connect(self._clear_all)
+        bottom.addWidget(self.clear_btn)
+
+        bottom.addStretch()
+
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.close)
+        bottom.addWidget(self.close_btn)
+
+        layout.addLayout(bottom)
+
+        # Timer for LTP updates
+        self.ltp_timer = QTimer()
+        self.ltp_timer.timeout.connect(self._update_ltp_column)
+        self.ltp_timer.start(1000)  # Update every second
+
+        # Flag to prevent saving during table load
+        self._loading = False
+
+        # Connect cell edit signal
+        self.alerts_table.cellChanged.connect(self._on_cell_edited)
+
+        # Initial load
+        self._load_alerts()
+
+    def _load_alerts(self):
+        """Load alerts into table."""
+        if not self.alert_manager:
+            return
+
+        self._loading = True  # Prevent cellChanged from triggering saves
+
+        alerts = self.alert_manager.get_all_alerts()
+        self.alerts_table.setRowCount(len(alerts))
+
+        for row, alert in enumerate(alerts):
+            # Symbol (read-only)
+            symbol_item = QTableWidgetItem(alert.symbol)
+            symbol_item.setData(Qt.ItemDataRole.UserRole, alert.alert_id)  # Store alert_id
+            symbol_item.setFlags(symbol_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.alerts_table.setItem(row, 0, symbol_item)
+
+            # LTP (read-only, updated by timer)
+            ltp_item = QTableWidgetItem("--")
+            ltp_item.setForeground(QBrush(QColor("#00ccff")))
+            ltp_item.setFlags(ltp_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.alerts_table.setItem(row, 1, ltp_item)
+
+            # Condition (read-only)
+            cond_item = QTableWidgetItem(alert.condition)
+            cond_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            cond_item.setFlags(cond_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.alerts_table.setItem(row, 2, cond_item)
+
+            # Price (EDITABLE)
+            price_item = QTableWidgetItem(f"{alert.trigger_price:.2f}")
+            price_item.setForeground(QBrush(QColor("#ffcc00")))
+            self.alerts_table.setItem(row, 3, price_item)
+
+            # Comments (EDITABLE)
+            comments_item = QTableWidgetItem(alert.comments)
+            self.alerts_table.setItem(row, 4, comments_item)
+
+            # Delete button
+            del_btn = QPushButton("X")
+            del_btn.setFixedSize(30, 25)
+            del_btn.setStyleSheet("background-color: #cc3333; color: white; font-weight: bold;")
+            del_btn.clicked.connect(lambda _, aid=alert.alert_id: self._delete_alert(aid))
+            self.alerts_table.setCellWidget(row, 5, del_btn)
+
+        self._loading = False  # Re-enable cellChanged handling
+        self._update_ltp_column()
+
+    def _on_cell_edited(self, row: int, col: int):
+        """Handle cell edits - save changes to alert manager."""
+        if self._loading:
+            return  # Skip during table load
+
+        # Only Price (col 3) and Comments (col 4) are editable
+        if col not in (3, 4):
+            return
+
+        # Get alert ID from the symbol column
+        symbol_item = self.alerts_table.item(row, 0)
+        if not symbol_item:
+            return
+        alert_id = symbol_item.data(Qt.ItemDataRole.UserRole)
+        if not alert_id:
+            return
+
+        if col == 3:  # Price column
+            price_item = self.alerts_table.item(row, 3)
+            if price_item:
+                try:
+                    new_price = float(price_item.text())
+                    if new_price > 0:
+                        self.alert_manager.update_alert(alert_id, trigger_price=new_price)
+                except ValueError:
+                    # Invalid price - reload to restore original
+                    self._load_alerts()
+
+        elif col == 4:  # Comments column
+            comments_item = self.alerts_table.item(row, 4)
+            if comments_item:
+                new_comments = comments_item.text()
+                self.alert_manager.update_alert(alert_id, comments=new_comments)
+
+    def _update_ltp_column(self):
+        """Update LTP values for all alerts and validate."""
+        if not self.get_ltp_func:
+            return
+
+        for row in range(self.alerts_table.rowCount()):
+            symbol_item = self.alerts_table.item(row, 0)
+            if not symbol_item:
+                continue
+
+            symbol = symbol_item.text()
+            ltp = self.get_ltp_func(symbol)
+
+            # Update LTP column
+            ltp_item = self.alerts_table.item(row, 1)
+            if ltp_item:
+                if ltp is not None and ltp > 0:
+                    ltp_item.setText(f"{ltp:.2f}")
+                else:
+                    ltp_item.setText("--")
+
+            # Validate alert against LTP and highlight if invalid
+            cond_item = self.alerts_table.item(row, 2)
+            price_item = self.alerts_table.item(row, 3)
+
+            if cond_item and price_item and ltp is not None and ltp > 0:
+                try:
+                    condition = cond_item.text()
+                    trigger_price = float(price_item.text())
+
+                    # Check if alert is invalid
+                    is_invalid = False
+                    tooltip = ""
+
+                    if condition == '<' and trigger_price >= ltp:
+                        # Alert for "below X" but LTP is already below X
+                        is_invalid = True
+                        tooltip = f"Invalid: LTP ({ltp:.2f}) is already below {trigger_price:.2f}"
+                    elif condition == '>' and trigger_price <= ltp:
+                        # Alert for "above X" but LTP is already above X
+                        is_invalid = True
+                        tooltip = f"Invalid: LTP ({ltp:.2f}) is already above {trigger_price:.2f}"
+
+                    # Highlight invalid alerts
+                    if is_invalid:
+                        price_item.setForeground(QBrush(QColor("#ff4444")))  # Red
+                        price_item.setToolTip(tooltip)
+                    else:
+                        price_item.setForeground(QBrush(QColor("#ffcc00")))  # Normal yellow
+                        price_item.setToolTip("")
+
+                except (ValueError, AttributeError):
+                    pass
+
+    def _add_alert(self):
+        """Add a new alert via dialog."""
+        dialog = QuickAddAlertDialog(self, '', 0)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            data = dialog.get_alert_data()
+            if data['symbol'] and data['trigger_price'] > 0:
+                self.alert_manager.add_alert(
+                    symbol=data['symbol'],
+                    condition=data['condition'],
+                    trigger_price=data['trigger_price'],
+                    comments=data['comments']
+                )
+                self._load_alerts()
+
+    def _delete_alert(self, alert_id: str):
+        """Delete an alert."""
+        if self.alert_manager:
+            self.alert_manager.remove_alert(alert_id)
+            self._load_alerts()
+
+    def _clear_all(self):
+        """Clear all alerts."""
+        if self.alert_manager:
+            self.alert_manager.clear_all()
+            self._load_alerts()
+
+    def refresh(self):
+        """Refresh the alerts table (called from outside when alert is triggered)."""
+        self._load_alerts()
+
+    def closeEvent(self, event):
+        """Stop timer on close."""
+        self.ltp_timer.stop()
+        super().closeEvent(event)
+
+
 class MainWindow(QMainWindow):
     """Main trading terminal window."""
 
@@ -206,13 +557,16 @@ class MainWindow(QMainWindow):
     margin_updated = pyqtSignal(float)
     pnl_updated = pyqtSignal(float)
     ws_order_update = pyqtSignal(dict)  # WebSocket order update signal
+    index_price_updated = pyqtSignal(str, float)  # S30: Index price update (index_name, price)
+    ltp_updated = pyqtSignal(str, float)  # LTP update signal (token, price) for positions/orders
+    st_data_ready = pyqtSignal(dict)  # S35: Supertrend data ready signal
 
     def __init__(self, session_mgr, order_mgr: OrderManager, symbol_mapper,
                  kite_spot, config: Dict[str, Any],
                  sound_mgr=None, telegram_mgr=None, trade_logger=None,
                  trail_mgr: TrailingSLManager = None, oco_monitor=None,
                  ws_handler=None, partial_fill_monitor=None, pnl_tracker=None,
-                 cancel_mgr=None, rejection_learner=None):
+                 cancel_mgr=None, rejection_learner=None, kite_ws=None):
         super().__init__()
 
         # Core components
@@ -231,6 +585,7 @@ class MainWindow(QMainWindow):
         self.pnl_tracker = pnl_tracker
         self.cancel_mgr = cancel_mgr
         self.rejection_learner = rejection_learner
+        self.kite_ws = kite_ws  # Kite WebSocket for reliable LTP streaming
 
         # State
         self.basket_legs: List[Dict[str, Any]] = []
@@ -238,6 +593,31 @@ class MainWindow(QMainWindow):
         self.sl_inputs: Dict[str, QLineEdit] = {}
         self._positions_cache: List[Dict[str, Any]] = []
         self._filtered_positions_cache: List[Dict[str, Any]] = []
+
+        # CRITICAL FIX (E4): Debounce state for trail buttons
+        # Prevents multiple rapid API calls from accidental double-clicks
+        self._trail_debounce: Dict[str, float] = {}  # symbol -> last_trail_timestamp
+        self._trail_debounce_ms = 500  # Minimum ms between trail actions per symbol
+
+        # S17-M1: Initialize all state attributes (avoid hasattr anti-pattern)
+        self._pending_index_lookup: Optional[str] = None  # ATM dropdown lookup state
+        self._price_warning_acknowledged: bool = False  # Price deviation warning flag
+        # S30: Index spot prices for header display
+        self._index_prices: Dict[str, float] = {'NIFTY': 0.0, 'BANKNIFTY': 0.0, 'SENSEX': 0.0}
+        self._index_ws_last_update: Dict[str, float] = {}  # Track last WebSocket update time for fallback
+        self._index_labels: Dict[str, QLabel] = {}  # Populated in _create_header
+        # Kite WebSocket LTP cache for positions/orders
+        self._ltp_cache: Dict[str, float] = {}  # kite_token (str) -> LTP
+        self._token_to_symbol: Dict[str, str] = {}  # kite_token (str) -> trading symbol
+        self._symbol_to_kite_token: Dict[str, int] = {}  # trading symbol -> kite_token (int)
+        self._subscribed_position_tokens: set = set()  # Track subscribed Kite tokens
+        self._orders_refresh_skip_count: int = 0  # Refresh optimization counter
+        self._has_pending_orders: bool = False  # Order refresh optimization flag
+        self._alerted_sl_orders: set = set()  # SL alert deduplication set
+        self._eod_freeze_shown: bool = False  # EOD freeze dialog flag
+        self._eod_warning_shown: bool = False  # EOD warning dialog flag
+        self._recovery_completed: bool = False  # Position recovery flag
+        self._force_orders_refresh: bool = False  # Force refresh after order action
 
         # Position tracker for SL/Target order management (with cancel manager)
         self.pos_tracker = PositionTracker(
@@ -248,6 +628,13 @@ class MainWindow(QMainWindow):
         # Wire up OCO monitor reference for automatic cleanup on position removal
         if oco_monitor:
             self.pos_tracker.oco_monitor = oco_monitor
+
+        # S35: Order tracker for unique tags
+        self.order_tracker = get_order_tracker()
+
+        # Price alert manager
+        self.alert_manager = PriceAlertManager('data/alerts.json')
+        self.alerts_dialog: Optional[AlertsDialog] = None  # Lazy-loaded dialog
 
         # Setup UI
         self.init_ui()
@@ -352,6 +739,52 @@ class MainWindow(QMainWindow):
         self.time_label.setFont(QFont("Consolas", 9))
         self.time_label.setStyleSheet("color: #888888;")
         layout.addWidget(self.time_label)
+
+        layout.addWidget(self._create_separator())
+
+        # S30: Index spot prices in header (WebSocket-based) - larger font, brighter color
+        # S34: Index labels white, values yellow
+        # S35: Supertrend indicators below each index
+        index_style = "font-weight: bold; font-size: 14px; padding: 0 8px;"
+        self._st_dots: Dict[str, Dict[int, QLabel]] = {}  # {index: {timeframe: dot_label}}
+        st_timeframes = [5, 10, 15, 30, 60, 120]
+        st_timeframe_labels = ['5M', '10M', '15M', '30M', '1H', '2H']
+
+        for idx_name in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+            # Vertical container for index label + ST dots
+            idx_container = QWidget()
+            idx_layout = QVBoxLayout(idx_container)
+            idx_layout.setContentsMargins(0, 0, 0, 0)
+            idx_layout.setSpacing(2)
+
+            # Index price label
+            lbl = QLabel()
+            lbl.setStyleSheet(index_style)
+            lbl.setText(f"<span style='color: white;'>{idx_name}:</span> <span style='color: #ffff00;'>--</span>")
+            lbl.setToolTip(f"{idx_name} spot price (WebSocket)")
+            idx_layout.addWidget(lbl)
+            self._index_labels[idx_name] = lbl
+
+            # ST dots row - larger dots, tighter spacing
+            dots_widget = QWidget()
+            dots_layout = QHBoxLayout(dots_widget)
+            dots_layout.setContentsMargins(8, 0, 8, 0)
+            dots_layout.setSpacing(1)  # Reduced spacing
+
+            self._st_dots[idx_name] = {}
+            for tf, tf_label in zip(st_timeframes, st_timeframe_labels):
+                dot = QLabel("●")
+                dot.setStyleSheet("""
+                    QLabel { color: #555555; font-size: 16px; }
+                    QToolTip { background-color: #1a1a1a; color: white; border: 1px solid #333; padding: 4px; }
+                """)  # Gray = no data, black tooltip
+                dot.setToolTip(f"{tf_label}: --")
+                dot.setFixedWidth(18)
+                dots_layout.addWidget(dot)
+                self._st_dots[idx_name][tf] = dot
+
+            idx_layout.addWidget(dots_widget)
+            layout.addWidget(idx_container)
 
         # Trading halt indicator
         self.halt_label = QLabel("")
@@ -481,6 +914,8 @@ class MainWindow(QMainWindow):
         self.symbol_input.lineEdit().returnPressed.connect(self._on_symbol_entered)
         # When user selects from dropdown
         self.symbol_input.activated.connect(self._on_symbol_selected)
+        # Install event filter for right-click paste
+        self.symbol_input.lineEdit().installEventFilter(self)
         row1.addWidget(self.symbol_input)
         # Debounce timer for ATM lookup
         self._symbol_debounce_timer = QTimer()
@@ -506,12 +941,13 @@ class MainWindow(QMainWindow):
         lbl_lots.setStyleSheet("color: #cccccc;")
         row1.addWidget(lbl_lots)
 
-        self.lot_down_btn = QPushButton("▼")
+        self.lot_down_btn = QPushButton("-")
         self.lot_down_btn.setFixedSize(24, 24)
         self.lot_down_btn.setStyleSheet("""
             QPushButton {
                 background-color: #cc6600; color: white;
-                font-weight: bold; font-size: 12px; border-radius: 3px;
+                font-weight: bold; font-size: 20px; border-radius: 3px;
+                padding: 0px; margin: 0px; border: none;
             }
             QPushButton:hover { background-color: #ee8800; }
         """)
@@ -527,12 +963,13 @@ class MainWindow(QMainWindow):
         self.lots_spin.setStyleSheet("font-weight: bold; font-size: 11px;")
         row1.addWidget(self.lots_spin)
 
-        self.lot_up_btn = QPushButton("▲")
+        self.lot_up_btn = QPushButton("+")
         self.lot_up_btn.setFixedSize(24, 24)
         self.lot_up_btn.setStyleSheet("""
             QPushButton {
                 background-color: #cc6600; color: white;
-                font-weight: bold; font-size: 12px; border-radius: 3px;
+                font-weight: bold; font-size: 20px; border-radius: 3px;
+                padding: 0px; margin: 0px; border: none;
             }
             QPushButton:hover { background-color: #ee8800; }
         """)
@@ -547,6 +984,25 @@ class MainWindow(QMainWindow):
         self.qty_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.qty_label.setStyleSheet("color: #ffff00;")  # Yellow for visibility
         row1.addWidget(self.qty_label)
+
+        # Quick-add alert button (next to Qty)
+        self.quick_alert_btn = QPushButton("🔔")
+        self.quick_alert_btn.setFixedSize(24, 24)
+        self.quick_alert_btn.setToolTip("Add price alert for current symbol")
+        self.quick_alert_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4a4a6a;
+                color: #ffcc00;
+                font-weight: bold;
+                font-size: 12px;
+                border-radius: 12px;
+                padding: 0px;
+                margin: 0px;
+            }
+            QPushButton:hover { background-color: #6a6a8a; }
+        """)
+        self.quick_alert_btn.clicked.connect(self._show_quick_add_alert)
+        row1.addWidget(self.quick_alert_btn)
 
         row1.addWidget(self._create_separator())
 
@@ -576,6 +1032,23 @@ class MainWindow(QMainWindow):
         self.ask_label.setFixedWidth(50)
         self.ask_label.setStyleSheet("color: #ff6666; font-weight: bold;")
         row1.addWidget(self.ask_label)
+
+        # Alerts manager button (next to bid-ask)
+        self.alerts_btn = QPushButton("Alerts")
+        self.alerts_btn.setFixedSize(55, 24)
+        self.alerts_btn.setToolTip("Manage price alerts")
+        self.alerts_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4a4a6a;
+                color: #ffcc00;
+                font-weight: bold;
+                font-size: 10px;
+                border-radius: 3px;
+            }
+            QPushButton:hover { background-color: #6a6a8a; }
+        """)
+        self.alerts_btn.clicked.connect(self._show_alerts_dialog)
+        row1.addWidget(self.alerts_btn)
 
         row1.addStretch()
         layout.addLayout(row1)
@@ -779,7 +1252,7 @@ class MainWindow(QMainWindow):
         row2.addWidget(lbl_mgn)
         self.margin_preview = QLabel("₹0")
         self.margin_preview.setStyleSheet("color: #ffaa00; font-weight: bold;")
-        self.margin_preview.setToolTip("Required margin for current order")
+        self.margin_preview.setToolTip("Capital deployed in open positions")
         row2.addWidget(self.margin_preview)
 
         layout.addLayout(row2)
@@ -821,16 +1294,16 @@ class MainWindow(QMainWindow):
 
         # Positions table - Symbol STRETCHES, others fixed
         self.positions_table = QTableWidget()
-        self.positions_table.setColumnCount(9)
+        self.positions_table.setColumnCount(10)
         self.positions_table.setHorizontalHeaderLabels([
-            "Symbol", "Qty", "Avg", "LTP", "P&L", "%", "SL", "Trail", "Exit"
+            "Symbol", "Qty", "Avg", "LTP", "P&L", "%", "SL", "Status", "Trail", "Exit"
         ])
         header = self.positions_table.horizontalHeader()
         header.setStretchLastSection(False)
         # Symbol STRETCHES to absorb extra space - solves the empty space problem
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         # All other columns: FIXED with proper widths
-        for i in range(1, 9):
+        for i in range(1, 10):
             header.setSectionResizeMode(i, QHeaderView.ResizeMode.Fixed)
         self.positions_table.setColumnWidth(1, 45)   # Qty
         self.positions_table.setColumnWidth(2, 65)   # Avg
@@ -838,8 +1311,9 @@ class MainWindow(QMainWindow):
         self.positions_table.setColumnWidth(4, 75)   # P&L
         self.positions_table.setColumnWidth(5, 65)   # % (wider for +10.5%)
         self.positions_table.setColumnWidth(6, 65)   # SL input
-        self.positions_table.setColumnWidth(7, 155)  # Trail: BE + +10 + +25 (bigger buttons)
-        self.positions_table.setColumnWidth(8, 115)  # Exit: 50% + EXIT (bigger buttons)
+        self.positions_table.setColumnWidth(7, 70)   # Status (UNPROTECTED badge)
+        self.positions_table.setColumnWidth(8, 155)  # Trail: BE + +10 + +25 (bigger buttons)
+        self.positions_table.setColumnWidth(9, 115)  # Exit: 50% + EXIT (bigger buttons)
         self.positions_table.setAlternatingRowColors(True)
         self.positions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         # Set row height for button widgets (28px buttons + padding)
@@ -944,7 +1418,7 @@ class MainWindow(QMainWindow):
         self.orders_table.setColumnWidth(1, 35)   # B/S
         self.orders_table.setColumnWidth(2, 45)   # Qty
         self.orders_table.setColumnWidth(3, 60)   # LTP
-        self.orders_table.setColumnWidth(4, 65)   # Price (editable)
+        self.orders_table.setColumnWidth(4, 75)   # Price (editable) - wider for editing
         self.orders_table.setColumnWidth(5, 75)   # Status
         self.orders_table.setColumnWidth(6, 60)   # Time (HH:MM)
         self.orders_table.setColumnWidth(7, 30)   # X button
@@ -1028,10 +1502,19 @@ class MainWindow(QMainWindow):
             old_price = order_data.get('price', '')
 
             # Determine if this is an SL order (uses trigger price)
-            is_sl_order = 'SL' in order_type or (trigger_price and float(trigger_price) > 0)
+            # S28: Safe float conversion with try/except
+            try:
+                trigger_float = float(trigger_price) if trigger_price else 0.0
+            except (ValueError, TypeError):
+                trigger_float = 0.0
+            is_sl_order = 'SL' in order_type or trigger_float > 0
 
             # Get old price for comparison
-            old_price_val = float(trigger_price) if is_sl_order and trigger_price else float(old_price or 0)
+            # S28: Safe float conversion with try/except
+            try:
+                old_price_val = trigger_float if is_sl_order and trigger_price else float(old_price or 0)
+            except (ValueError, TypeError):
+                old_price_val = 0.0
 
             # Skip if price unchanged
             if abs(new_price - old_price_val) < 0.01:
@@ -1050,12 +1533,18 @@ class MainWindow(QMainWindow):
                 if self.sound:
                     self.sound.play('order_placed')
 
-                # Update tracker if this is a tracked SL order
-                for symbol, pos in self.pos_tracker.positions.items():
+                # Update tracker if this is a tracked SL order (use snapshot for thread safety)
+                for entry_id, pos in self.pos_tracker.get_all_positions_snapshot().items():
                     if pos.sl_order_id == order_id:
-                        pos.sl_price = new_price
-                        if self.trail_mgr and symbol in self.trail_mgr.positions:
-                            self.trail_mgr.positions[symbol].current_sl = new_price
+                        # S20-M2: Update pos_tracker state (snapshot modification was ineffective)
+                        self.pos_tracker.update_sl_order(entry_id, None, new_price)
+                        # S17-M2: Use thread-safe method instead of direct dict access
+                        if self.trail_mgr:
+                            self.trail_mgr.update_current_sl(entry_id, new_price)
+                        # CRITICAL: Sync OCO monitor sl_trigger (for P&L calculation on SL hit)
+                        if self.oco_monitor:
+                            self.oco_monitor.update_sl_order_by_symbol(pos.symbol, order_id, new_price)
+                        break  # Found the matching order, no need to continue
 
                 self._force_next_orders_refresh()
                 QTimer.singleShot(500, self._refresh_orders)
@@ -1083,14 +1572,21 @@ class MainWindow(QMainWindow):
                 if self.sound:
                     self.sound.play('order_placed')
 
-                # Clear tracker references if this was SL/Target order
-                for symbol, pos in list(self.pos_tracker.positions.items()):
+                # S20-M1: Find entry_id FIRST via snapshot (before clearing), then clear state
+                # Need to get entry_id before clear_cancelled_orders modifies the originals
+                entry_id_for_trail = None
+                for entry_id, pos in self.pos_tracker.get_all_positions_snapshot().items():
                     if pos.sl_order_id == order_id:
-                        pos.sl_order_id = None
-                        pos.sl_price = None
-                    if pos.target_order_id == order_id:
-                        pos.target_order_id = None
-                        pos.target_price = None
+                        entry_id_for_trail = entry_id
+                        break
+
+                # Now clear tracker references using thread-safe method
+                self.pos_tracker.clear_cancelled_orders({order_id})
+
+                # Clear from trail manager if this was an SL order
+                if entry_id_for_trail and self.trail_mgr:
+                    self.trail_mgr.clear_sl_tracking(entry_id_for_trail)
+                    self.log_message.emit(f"[CANCEL] Cleared SL from trail manager")
 
                 # Remove from OCO monitor if present
                 if self.oco_monitor:
@@ -1098,6 +1594,8 @@ class MainWindow(QMainWindow):
 
                 self._force_next_orders_refresh()
                 QTimer.singleShot(500, self._refresh_orders)
+                # Refresh margin after cancel
+                QTimer.singleShot(300, self._refresh_margin)
             else:
                 self.log_message.emit(f"[ERROR] Cancel failed: {result.message}")
                 if self.sound:
@@ -1200,6 +1698,23 @@ class MainWindow(QMainWindow):
         self.quote_timer.timeout.connect(self._refresh_quote)
         self.quote_timer.start(2000)
 
+        # Price alerts check every 1 second
+        self.alert_timer = QTimer()
+        self.alert_timer.timeout.connect(self._check_price_alerts)
+        self.alert_timer.start(1000)
+
+        # S30: Index price fallback refresh every 30 seconds (only if WebSocket not delivering)
+        self.index_timer = QTimer()
+        self.index_timer.timeout.connect(self._refresh_index_prices)
+        self.index_timer.start(30000)
+
+        # S35: Supertrend indicator timer - fires every minute, updates at 6th minute
+        self.st_timer = QTimer()
+        self.st_timer.timeout.connect(self._check_supertrend_update)
+        self.st_timer.start(60000)  # Check every minute
+        # Initial update after Kite connects (3 seconds delay)
+        QTimer.singleShot(3000, self._update_supertrend_indicators)
+
     def connect_signals(self):
         """Connect internal signals."""
         self.position_updated.connect(self._update_positions_table)
@@ -1208,16 +1723,141 @@ class MainWindow(QMainWindow):
         self.margin_updated.connect(self._update_margin_display)
         self.pnl_updated.connect(self._update_pnl_display)
         self.ws_order_update.connect(self._handle_ws_order_update)
+        self.index_price_updated.connect(self._update_index_price_display)  # S30: Index prices
+        self.ltp_updated.connect(self._update_position_ltp_display)  # Position/order LTP updates
+        self.st_data_ready.connect(self._apply_supertrend_display)  # S35: Supertrend display
 
-        # Setup WebSocket callbacks for real-time order updates
+        # Setup NEO WebSocket for order updates only (LTP via Kite WebSocket)
         if self.ws_handler:
             self.ws_handler.register_callback('order_update', self._on_ws_order_update)
-            self.ws_handler.register_callback('open', lambda msg: self.log_message.emit("[WS] Connected"))
-            self.ws_handler.register_callback('close', lambda msg: self.log_message.emit("[WS] Disconnected"))
+            # Reduce log noise - only log first connect/disconnect, not repeated ones
+            self.ws_handler.register_callback('open', self._on_ws_connected)
+            self.ws_handler.register_callback('close', self._on_ws_disconnected)
+
+        # Setup Kite WebSocket for reliable LTP streaming (indices + positions)
+        if self.kite_ws:
+            self.kite_ws.set_on_ltp(self._on_kite_ltp_update)
+            self.kite_ws.set_on_connect(self._on_kite_ws_connected)
+            # Subscribe to indices after connection
+            self.kite_ws.subscribe_indices(['NIFTY', 'BANKNIFTY', 'SENSEX'])
 
     def _on_ws_order_update(self, data: dict):
         """WebSocket callback - runs in WebSocket thread, emit signal for thread-safety."""
         self.ws_order_update.emit(data)
+
+    def _on_ws_connected(self, msg):
+        """Handle NEO WebSocket connect - debounced logging."""
+        import time
+        now = time.time()
+        # Only log if more than 60 seconds since last connect log
+        last_log = getattr(self, '_ws_connect_log_time', 0)
+        if now - last_log > 60:
+            self.log_message.emit("[NEO WS] Connected")
+            self._ws_connect_log_time = now
+
+    def _on_ws_disconnected(self, msg):
+        """Handle NEO WebSocket disconnect - debounced logging."""
+        import time
+        now = time.time()
+        # Only log if more than 60 seconds since last disconnect log
+        last_log = getattr(self, '_ws_disconnect_log_time', 0)
+        if now - last_log > 60:
+            self.log_message.emit("[NEO WS] Disconnected")
+            self._ws_disconnect_log_time = now
+
+    def _on_kite_ws_connected(self):
+        """Handle Kite WebSocket connected."""
+        self.log_message.emit("[KITE WS] Connected - Live LTP streaming")
+
+    def _on_kite_ltp_update(self, token: int, ltp: float):
+        """Handle Kite WebSocket LTP update - runs in Kite WS thread."""
+        try:
+            # Import KiteWebSocket for token mapping
+            from core.kite_spot import KiteWebSocket
+
+            # Check if this is an index token
+            index_name = KiteWebSocket.INDEX_TOKENS.get(token)
+            if index_name:
+                # Index LTP update - emit signal for thread-safe GUI update
+                self.index_price_updated.emit(index_name, ltp)
+            else:
+                # Position LTP - check if subscribed (token is int, set contains ints)
+                if token in self._subscribed_position_tokens:
+                    token_str = str(token)
+                    self._ltp_cache[token_str] = ltp
+                    self.ltp_updated.emit(token_str, ltp)
+        except Exception as e:
+            logger.debug(f"[KITE WS] LTP callback error: {e}")
+
+    def _update_index_price_display(self, index_name: str, price: float):
+        """S30: Update index price label in header (main thread)."""
+        if index_name in self._index_labels and price > 0:
+            import time
+            self._index_prices[index_name] = price
+            self._index_ws_last_update[index_name] = time.time()  # Track WebSocket update time
+            label = self._index_labels[index_name]
+            # S34: Label white, value yellow
+            label.setText(f"<span style='color: white;'>{index_name}:</span> <span style='color: #ffff00;'>{price:,.0f}</span>")
+
+    def _update_position_ltp_display(self, token: str, price: float):
+        """Update LTP cell in positions table for a specific Kite token (main thread)."""
+        if not hasattr(self, '_filtered_positions_cache') or not self._filtered_positions_cache:
+            return
+
+        # Get symbol for this Kite token
+        symbol = self._token_to_symbol.get(token)
+        if not symbol:
+            return
+
+        # Find the row with this symbol and update LTP + P&L cells
+        for row, pos in enumerate(self._filtered_positions_cache):
+            pos_symbol = _get_position_symbol(pos)
+            if pos_symbol == symbol:
+                qty = _get_position_qty(pos)
+                avg = _get_position_avg_price(pos)
+
+                # Update LTP cell
+                ltp_item = self.positions_table.item(row, 3)
+                if ltp_item:
+                    ltp_item.setText(f"{price:.2f}")
+
+                # Recalculate and update P&L
+                if qty != 0 and avg > 0:
+                    pnl = (price - avg) * qty
+                    pnl_pct = ((price - avg) / avg * 100)
+
+                    # Update P&L cell
+                    pnl_item = self.positions_table.item(row, 4)
+                    if pnl_item:
+                        pnl_item.setText(f"₹{pnl:,.0f}")
+                        pnl_item.setForeground(QBrush(QColor("#00ff88" if pnl >= 0 else "#ff4444")))
+
+                    # Update P&L % cell
+                    pct_item = self.positions_table.item(row, 5)
+                    if pct_item:
+                        pct_item.setText(f"{pnl_pct:+.1f}%")
+                        pct_item.setForeground(QBrush(QColor("#00ff88" if pnl_pct >= 0 else "#ff4444")))
+
+                    # Update position cache with new LTP for consistency
+                    pos['ltp'] = price
+                break
+
+        # Also update orders table for this symbol
+        self._update_order_ltp_by_symbol(symbol, price)
+
+    def _update_order_ltp_by_symbol(self, symbol: str, price: float):
+        """Update LTP cell in orders table for a specific symbol."""
+        if not hasattr(self, '_orders_cache') or not self._orders_cache:
+            return
+
+        for row in range(self.orders_table.rowCount()):
+            if row < len(self._orders_cache):
+                order = self._orders_cache[row]
+                order_symbol = order.get('trdSym', order.get('tradingSymbol', ''))
+                if order_symbol == symbol:
+                    ltp_item = self.orders_table.item(row, 3)  # LTP column
+                    if ltp_item:
+                        ltp_item.setText(f"{price:.2f}")
 
     def _handle_ws_order_update(self, data: dict):
         """Handle WebSocket order update in main thread."""
@@ -1233,17 +1873,17 @@ class MainWindow(QMainWindow):
                 if self.sound:
                     self.sound.play('order_filled')
 
-                # Check if this is an SL order - show popup alert
+                # Check if this is an SL order - show popup alert (use snapshot for thread safety)
                 is_sl_or_target = False
-                for pos_symbol, pos in self.pos_tracker.positions.items():
+                for entry_id, pos in self.pos_tracker.get_all_positions_snapshot().items():
                     if pos.sl_order_id == order_id:
                         # SL HIT! Show popup alert
-                        self._show_sl_breach_alert(pos_symbol, pos.sl_price)
+                        self._show_sl_breach_alert(pos.symbol, pos.sl_price)
                         is_sl_or_target = True
                         break
                     if pos.target_order_id == order_id:
                         # Target hit - just log
-                        self.log_message.emit(f"[ALERT] TARGET HIT: {pos_symbol}")
+                        self.log_message.emit(f"[ALERT] TARGET HIT: {pos.symbol}")
                         is_sl_or_target = True
                         break
 
@@ -1256,6 +1896,8 @@ class MainWindow(QMainWindow):
                 self._force_next_orders_refresh()
                 QTimer.singleShot(100, self._refresh_positions)
                 QTimer.singleShot(200, self._refresh_orders)
+                # Refresh margin on fill (margin used for position)
+                QTimer.singleShot(300, self._refresh_margin)
 
             elif status in ['rejected']:
                 reason = data.get('rejRsn') or data.get('rejectionReason') or \
@@ -1268,11 +1910,15 @@ class MainWindow(QMainWindow):
                     self.telegram.send(f"❌ ORDER REJECTED: {symbol}\n{reason}")
                 self._force_next_orders_refresh()
                 QTimer.singleShot(200, self._refresh_orders)
+                # Refresh margin on reject (margin released)
+                QTimer.singleShot(300, self._refresh_margin)
 
             elif status in ['cancelled']:
                 self.log_message.emit(f"[WS] Order {order_id[-6:]} CANCELLED: {symbol}")
                 self._force_next_orders_refresh()
                 QTimer.singleShot(200, self._refresh_orders)
+                # Refresh margin on cancel (margin released)
+                QTimer.singleShot(300, self._refresh_margin)
 
             elif status in ['open', 'pending', 'trigger pending']:
                 self.log_message.emit(f"[WS] Order {order_id[-6:]} PENDING: {symbol}")
@@ -1348,8 +1994,8 @@ class MainWindow(QMainWindow):
                 # Position was closed or doesn't exist - no alert needed
                 return
 
-            # Check position tracker for SL/Target
-            tracked = self.pos_tracker.get_position(symbol)
+            # Check position tracker for SL/Target (use symbol-based lookup)
+            tracked = self.pos_tracker.get_first_position_by_symbol(symbol)
 
             has_sl = tracked and tracked.sl_order_id
             has_target = tracked and tracked.target_order_id
@@ -1371,6 +2017,23 @@ class MainWindow(QMainWindow):
             self.log_message.emit(f"[ALERT] Error checking protection for {symbol}: {e}")
 
     # ==================== Event Handlers ====================
+
+    def eventFilter(self, obj, event):
+        """Handle events for installed filters - right-click paste on symbol input."""
+        # Check if this is a mouse press event on the symbol input's lineEdit
+        if obj == self.symbol_input.lineEdit() and event.type() == QEvent.Type.MouseButtonPress:
+            # Right-click: paste from clipboard and auto-MAP
+            if event.button() == Qt.MouseButton.RightButton:
+                clipboard = QApplication.clipboard()
+                text = clipboard.text().strip()
+                if text:
+                    # Set the text in symbol input
+                    self.symbol_input.setCurrentText(text)
+                    self.log_message.emit(f"[INFO] Pasted: {text}")
+                    # Auto-trigger MAP after a brief delay (allows UI to update)
+                    QTimer.singleShot(50, self._on_symbol_entered)
+                return True  # Event handled
+        return super().eventFilter(obj, event)
 
     def _on_symbol_entered(self):
         """Handle symbol input - map to NEO."""
@@ -1429,10 +2092,33 @@ class MainWindow(QMainWindow):
                             self.sound.play('error')
                         return
                 else:
-                    self.log_message.emit(f"[ERROR] Symbol not mapped: {symbol}")
-                    if self.sound:
-                        self.sound.play('error')
-                    return
+                    # Not a weekly pattern - check if it's a monthly pattern (SYMBOL + YYMM + STRIKE + CE/PE)
+                    monthly_pattern = r'^([A-Z]+)(\d{2}[A-Z]{3})(\d+)(CE|PE)$'
+                    monthly_match = re.match(monthly_pattern, symbol)
+
+                    if monthly_match:
+                        # Monthly symbol not in cache - try live search
+                        self.log_message.emit(f"[INFO] Searching for monthly symbol: {symbol}")
+                        live_mapping = self.mapper.search_and_map(symbol)
+                        if live_mapping:
+                            mapping = live_mapping
+                        else:
+                            self.log_message.emit(f"[ERROR] Symbol not found in NEO: {symbol}")
+                            if self.sound:
+                                self.sound.play('error')
+                            return
+                    else:
+                        # Not an option pattern - try equity search (e.g., ICICIBANK, RELIANCE)
+                        self.log_message.emit(f"[INFO] Searching for equity symbol: {symbol}")
+                        equity_mapping = self.mapper.search_equity(symbol)
+                        if equity_mapping:
+                            mapping = equity_mapping
+                            self.log_message.emit(f"[EQUITY] Found: {symbol} ({equity_mapping.get('exchange_segment', 'nse_cm')})")
+                        else:
+                            self.log_message.emit(f"[ERROR] Symbol not mapped: {symbol}")
+                            if self.sound:
+                                self.sound.play('error')
+                            return
 
             self.current_mapping = mapping
 
@@ -1457,7 +2143,8 @@ class MainWindow(QMainWindow):
                         if sell_depth:
                             ask = sell_depth[0].get('price')
 
-                        if ltp:
+                        # S27: Use explicit None check - LTP of 0 is technically valid
+                        if ltp is not None and ltp > 0:
                             self.ltp_label.setText(f"₹{ltp:.2f}")
                             self.ltp_label.setStyleSheet("color: #00ff88; font-weight: bold;")
                             # Auto-fill LTP to price field
@@ -1489,6 +2176,12 @@ class MainWindow(QMainWindow):
 
             ltp_str = f", LTP: ₹{ltp:.2f}" if ltp else ""
             self.log_message.emit(f"[MAP] {symbol} -> Lot: {lot_size}{ltp_str}")
+
+            # S29: ALWAYS auto-check Bracket on successful MAP to ensure SL/Target protection
+            # Previously only checked when LTP fetch succeeded, causing missed protection
+            if not self.bracket_check.isChecked():
+                self.bracket_check.setChecked(True)
+                self.log_message.emit("[BRACKET] Auto-enabled for protection")
 
             # Apply learned rules from rejection learner
             if self.rejection_learner:
@@ -1554,7 +2247,8 @@ class MainWindow(QMainWindow):
 
     def _fetch_atm_suggestions(self):
         """Fetch ATM strikes for the pending index and populate dropdown."""
-        if not hasattr(self, '_pending_index_lookup') or not self._pending_index_lookup:
+        # S17-L1: _pending_index_lookup now initialized in __init__
+        if not self._pending_index_lookup:
             return
 
         index_name = self._pending_index_lookup
@@ -1784,28 +2478,41 @@ class MainWindow(QMainWindow):
                                 if self.sound:
                                     self.sound.play('error')
                                 # Use flag to allow second press to proceed
-                                if not hasattr(self, '_price_warning_acknowledged'):
-                                    self._price_warning_acknowledged = False
+                                # S17-L1: _price_warning_acknowledged now initialized in __init__
                                 if not self._price_warning_acknowledged:
                                     self._price_warning_acknowledged = True
                                     return
                                 self._price_warning_acknowledged = False
                             else:
                                 self.price_input.setStyleSheet("")
-                                if hasattr(self, '_price_warning_acknowledged'):
-                                    self._price_warning_acknowledged = False
+                                self._price_warning_acknowledged = False
                     except ValueError:
                         pass
 
             # Map order type to NEO format
             type_map = {'LIMIT': 'L', 'MARKET': 'MKT', 'SL': 'SL', 'SL-M': 'SL-M'}
 
+            # S27: Safe int conversion with validation
+            try:
+                qty_text = self.qty_label.text().strip()
+                quantity = int(qty_text) if qty_text else 0
+                if quantity <= 0:
+                    self.log_message.emit("[ERROR] Invalid quantity")
+                    if self.sound:
+                        self.sound.play('error')
+                    return
+            except (ValueError, TypeError):
+                self.log_message.emit("[ERROR] Invalid quantity format")
+                if self.sound:
+                    self.sound.play('error')
+                return
+
             params = OrderParams(
                 symbol=self.current_mapping['trading_symbol'],
                 exchange_segment=self.current_mapping['exchange_segment'],
                 instrument_token=self.current_mapping['instrument_token'],
                 transaction_type=action,
-                quantity=int(self.qty_label.text()),
+                quantity=quantity,
                 product=self.product_combo.currentText(),
                 order_type=type_map.get(order_type, 'L'),
                 price=price if order_type == 'LIMIT' else None,
@@ -1821,6 +2528,9 @@ class MainWindow(QMainWindow):
                 if self.sound:
                     self.sound.play('order_placed')
 
+                # Refresh margin immediately after order placement
+                QTimer.singleShot(300, self._refresh_margin)
+
                 # Log to trade logger
                 if self.logger:
                     self.logger.log_order_placed(
@@ -1833,20 +2543,27 @@ class MainWindow(QMainWindow):
                         order_id=result.order_id or ''
                     )
 
-                # Get SL/Target prices before clearing
-                sl_text = self.entry_sl_input.text().strip()
-                target_text = self.target_input.text().strip()
-                sl_price_pending = float(sl_text) if sl_text else None
-                target_price_pending = float(target_text) if target_text else None
+                # Check if Bracket mode is enabled for SL/Target automation
+                use_bracket = self.bracket_check.isChecked()
 
-                # Clear SL/Target fields after order placed
-                self.entry_sl_input.clear()
-                self.target_input.clear()
-                self.sl_pct_label.clear()
-                self.tgt_pct_label.clear()
+                # Get SL/Target prices only if Bracket is checked
+                sl_price_pending = None
+                target_price_pending = None
+
+                if use_bracket:
+                    sl_text = self.entry_sl_input.text().strip()
+                    target_text = self.target_input.text().strip()
+                    sl_price_pending = float(sl_text) if sl_text else None
+                    target_price_pending = float(target_text) if target_text else None
+
+                    # Clear SL/Target fields only when bracket mode used
+                    self.entry_sl_input.clear()
+                    self.target_input.clear()
+                    self.sl_pct_label.clear()
+                    self.tgt_pct_label.clear()
+                    self.bracket_check.setChecked(False)  # Reset for next order
 
                 # Register entry order with PartialFillMonitor
-                # Monitor will place SL/Target automatically when entry fills (no timeout!)
                 if self.partial_fill_monitor and result.order_id:
                     side = 'LONG' if action == 'B' else 'SHORT'
                     self.partial_fill_monitor.register_entry(
@@ -1861,7 +2578,7 @@ class MainWindow(QMainWindow):
                         instrument_token=params.instrument_token or ""
                     )
                     if sl_price_pending or target_price_pending:
-                        self.log_message.emit(f"[INFO] Entry registered - SL/Target will be placed on fill")
+                        self.log_message.emit(f"[BRACKET] SL/Target will be placed on fill")
 
             else:
                 self.log_message.emit(f"[ERROR] {result.message}")
@@ -1925,7 +2642,11 @@ class MainWindow(QMainWindow):
 
                 sl_order_id = None
                 target_order_id = None
-                entry_price = float(entry_order.get('avgPrc', 0) or 0)
+                # S28: Safe float conversion for entry price
+                try:
+                    entry_price = float(entry_order.get('avgPrc') or 0)
+                except (ValueError, TypeError):
+                    entry_price = 0.0
 
                 # Record entry with P&L tracker for accurate realized P&L calculation
                 if self.pnl_tracker and entry_price > 0:
@@ -1979,43 +2700,65 @@ class MainWindow(QMainWindow):
                 if target_text:
                     try:
                         target_price = float(target_text)
+                        # CRITICAL: Format target price to tick size
+                        formatted_target_price = format_price(target_price, exchange_segment)
+
+                        # S35: Generate unique tag for target order using tracker
+                        target_tag = self.order_tracker.generate_tag(OrderType.TARGET, symbol)
+                        self.order_tracker.register_order(
+                            tag=target_tag,
+                            symbol=symbol,
+                            transaction_type=exit_type,
+                            quantity=quantity,
+                            api_order_type="L",
+                            price_type=OrderType.TARGET
+                        )
+
+                        logger.info(f"[TARGET] Placing: {symbol} {exit_type} qty={quantity} price={formatted_target_price}")
+
                         target_response = self.session.get_client().place_order(
                             exchange_segment=exchange_segment,
                             product=product,
-                            price=str(target_price),
+                            price=formatted_target_price,
                             order_type="L",
                             quantity=str(quantity),
                             validity="DAY",
                             trading_symbol=symbol,
                             transaction_type=exit_type,
                             amo="NO",
-                            tag='TARGET'
+                            tag=target_tag  # S35: Use tracker-generated tag
                         )
                         target_order_id = target_response.get('nOrdNo') if target_response else None
                         if target_order_id:
-                            self.log_message.emit(f"[SL/TGT] Target placed @ {target_price} -> {target_order_id}")
+                            self.order_tracker.confirm_order(target_tag, target_order_id, target_response)
+                            self.log_message.emit(f"[SL/TGT] Target placed @ {formatted_target_price} -> {target_order_id}")
+                        else:
+                            self.order_tracker.mark_failed(target_tag, "No order ID returned")
                     except Exception as e:
                         self.log_message.emit(f"[SL/TGT] Target placement failed: {e}")
 
-                # Track position
+                # Track position (keyed by entry_order_id for multi-level support)
                 if sl_order_id or target_order_id:
-                    tracked = self.pos_tracker.get_position(symbol)
+                    tracked = self.pos_tracker.get_position(entry_order_id)
                     if not tracked:
                         self.pos_tracker.add_position(
                             symbol=symbol,
+                            entry_order_id=entry_order_id,
                             exchange_segment=exchange_segment,
                             quantity=quantity,
                             side='LONG' if is_long else 'SHORT',
-                            entry_price=entry_price
+                            entry_price=entry_price,
+                            product=product  # For SL recovery
                         )
 
                     if sl_order_id:
                         sl_price = float(sl_text)
-                        self.pos_tracker.set_sl_order(symbol, sl_order_id, sl_price)
+                        self.pos_tracker.set_sl_order(entry_order_id, sl_order_id, sl_price)
 
                         # Also add to trail manager
                         if self.trail_mgr:
                             self.trail_mgr.add_position(
+                                entry_order_id=entry_order_id,
                                 symbol=symbol,
                                 exchange_segment=exchange_segment,
                                 entry_price=entry_price,
@@ -2023,29 +2766,39 @@ class MainWindow(QMainWindow):
                                 side='LONG' if is_long else 'SHORT',
                                 sl_price=sl_price,
                                 sl_order_id=sl_order_id,
-                                instrument_token=instrument_token
+                                instrument_token=instrument_token,
+                                product=product  # S23-C1: Pass product for SL recreation
                             )
 
                     if target_order_id:
                         target_price = float(target_text)
-                        self.pos_tracker.set_target_order(symbol, target_order_id, target_price)
+                        self.pos_tracker.set_target_order(entry_order_id, target_order_id, target_price)
 
-                    # Register OCO pair if both SL and Target are set
-                    if sl_order_id and target_order_id and self.oco_monitor:
+                    # Register OCO pair (target_order_id may be None for LTP monitoring)
+                    if sl_order_id and self.oco_monitor:
+                        target_price = float(target_text) if target_text else None
                         self.oco_monitor.add_oco_pair(
-                            position_symbol=symbol,
+                            entry_order_id=entry_order_id,
+                            symbol=symbol,
                             sl_order_id=sl_order_id,
-                            target_order_id=target_order_id,
+                            target_order_id=target_order_id,  # May be None for LTP monitoring
                             sl_trigger=float(sl_text),
-                            target_price=float(target_text),
+                            target_price=target_price,
                             quantity=quantity,
                             side='LONG' if is_long else 'SHORT',
                             entry_price=entry_price
                         )
-                        self.log_message.emit(f"[OCO] Registered SL/Target pair for {symbol}")
+                        if target_order_id:
+                            self.log_message.emit(f"[OCO] Registered SL/Target pair for {symbol}")
+                        elif target_price:
+                            self.log_message.emit(f"[OCO] Registered SL + Target LTP monitor for {symbol} @ {target_price:.2f}")
+                        else:
+                            self.log_message.emit(f"[OCO] Registered SL for {symbol} (no target)")
 
                 if self.sound:
                     self.sound.play('order_placed')
+                # Refresh margin after SL/Target placement
+                QTimer.singleShot(300, self._refresh_margin)
 
             elif status in ['rejected', 'cancelled', 'canceled']:
                 self.log_message.emit(f"[SL/TGT] Entry order {status} - skipping protection orders")
@@ -2091,7 +2844,21 @@ class MainWindow(QMainWindow):
             self.price_input.setStyleSheet("")  # Reset style
 
         price = float(price_text) if price_text else 0
-        qty = int(self.qty_label.text())
+
+        # S27: Safe int conversion with validation
+        try:
+            qty_text = self.qty_label.text().strip()
+            qty = int(qty_text) if qty_text else 0
+            if qty <= 0:
+                self.log_message.emit("[ERROR] Invalid quantity for basket")
+                if self.sound:
+                    self.sound.play('error')
+                return
+        except (ValueError, TypeError):
+            self.log_message.emit("[ERROR] Invalid quantity format for basket")
+            if self.sound:
+                self.sound.play('error')
+            return
 
         leg = {
             'symbol': self.current_mapping['trading_symbol'],
@@ -2175,9 +2942,11 @@ class MainWindow(QMainWindow):
 
         self._clear_basket()
         QTimer.singleShot(500, self._refresh_positions)
+        # Refresh margin after basket order
+        QTimer.singleShot(300, self._refresh_margin)
 
     def _load_preset(self, underlying: str, opt_type: str, strike_offset: int):
-        """Load preset ATM option based on Monthly/Weekly setting."""
+        """Load preset ATM option based on Monthly/Weekly setting with min 4 DTE."""
         if not self.kite or not self.kite.is_connected():
             self.log_message.emit("[ERROR] Kite not connected for spot price")
             return
@@ -2186,10 +2955,11 @@ class MainWindow(QMainWindow):
             # Get expiry type from combo box
             use_monthly = self.expiry_combo.currentText() == "Monthly"
 
-            # Get symbol with appropriate expiry
+            # S35: Get symbol with appropriate expiry, minimum 4 days to expiry
             symbol = self.kite.get_option_symbol(
                 underlying, opt_type, strike_offset,
-                use_monthly=use_monthly
+                use_monthly=use_monthly,
+                min_dte=4  # Ensure at least 4 days to expiry
             )
 
             # Clear price fields when loading new preset (keep lots)
@@ -2231,14 +3001,231 @@ class MainWindow(QMainWindow):
         self.sl_pct_label.setText("")
         self.tgt_pct_label.setText("")
 
+    # ==================== Price Alerts ====================
+
+    def _show_quick_add_alert(self):
+        """Show quick-add alert dialog with pre-filled values from current symbol."""
+        # Get current symbol from mapping
+        symbol = ''
+        ltp = 0.0
+
+        if self.current_mapping:
+            symbol = self.current_mapping.get('trading_symbol', '')
+            # Get LTP from label
+            try:
+                ltp_text = self.ltp_label.text().replace('₹', '').strip()
+                if ltp_text and ltp_text != '--':
+                    ltp = float(ltp_text)
+            except ValueError:
+                pass
+
+        if not symbol:
+            self.log_message.emit("[ALERT] Select a symbol first (use MAP)")
+            return
+
+        # Show quick-add dialog
+        dialog = QuickAddAlertDialog(self, symbol, ltp)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            data = dialog.get_alert_data()
+            if data['symbol'] and data['trigger_price'] > 0:
+                alert_id = self.alert_manager.add_alert(
+                    symbol=data['symbol'],
+                    condition=data['condition'],
+                    trigger_price=data['trigger_price'],
+                    comments=data['comments']
+                )
+                direction = "below" if data['condition'] == '<' else "above"
+                self.log_message.emit(
+                    f"[ALERT] Added: {data['symbol']} {direction} {data['trigger_price']:.2f}"
+                )
+            else:
+                self.log_message.emit("[ALERT] Invalid alert - symbol or price missing")
+
+    def _show_alerts_dialog(self):
+        """Show alerts manager dialog."""
+        # Create or reuse dialog
+        if self.alerts_dialog is None or not self.alerts_dialog.isVisible():
+            self.alerts_dialog = AlertsDialog(
+                self,
+                self.alert_manager,
+                self._get_ltp_for_symbol
+            )
+        self.alerts_dialog.refresh()
+        self.alerts_dialog.show()
+        self.alerts_dialog.raise_()
+        self.alerts_dialog.activateWindow()
+
+    def get_ltp_for_symbol(self, symbol: str) -> Optional[float]:
+        """
+        Get LTP for a symbol (public method for OCO monitor target monitoring).
+
+        First tries position cache, then Kite quotes.
+        """
+        return self._get_ltp_for_symbol(symbol)
+
+    def _get_ltp_for_symbol(self, symbol: str) -> Optional[float]:
+        """
+        Get LTP for a symbol (used by AlertsDialog for live updates).
+
+        First tries position cache, then Kite quotes.
+        """
+        # Try position cache first
+        for pos in self._positions_cache:
+            if _get_position_symbol(pos) == symbol:
+                ltp = _get_position_ltp(pos)
+                if ltp > 0:
+                    return ltp
+
+        # Try Kite spot for other symbols
+        if self.kite:
+            try:
+                quotes = self.kite.get_quotes_batch([symbol])
+                if symbol in quotes:
+                    return quotes[symbol].get('last_price')
+            except Exception:
+                pass
+
+        return None
+
+    def _check_price_alerts(self):
+        """
+        Check price alerts against current LTP values.
+
+        Called periodically by timer. Triggers sound and log for matched alerts.
+        """
+        try:
+            if not self.alert_manager:
+                return
+
+            # Build LTP map from positions
+            ltp_map: Dict[str, float] = {}
+
+            # From position cache
+            for pos in self._positions_cache:
+                symbol = _get_position_symbol(pos)
+                ltp = _get_position_ltp(pos)
+                if symbol and ltp > 0:
+                    ltp_map[symbol] = ltp
+
+            # Also add current mapping symbol if available
+            if self.current_mapping:
+                symbol = self.current_mapping.get('trading_symbol', '')
+                try:
+                    ltp_text = self.ltp_label.text().replace('₹', '').strip()
+                    if ltp_text and ltp_text != '--':
+                        ltp_map[symbol] = float(ltp_text)
+                except ValueError:
+                    pass
+
+            # Check for triggered alerts
+            triggered = self.alert_manager.check_alerts(ltp_map)
+
+            for alert in triggered:
+                direction = "dropped below" if alert.condition == '<' else "crossed above"
+                msg = f"[ALERT] {alert.symbol} {direction} {alert.trigger_price:.2f}"
+                if alert.comments:
+                    msg += f" - {alert.comments}"
+                self.log_message.emit(msg)
+
+                # Play 3 bells sound
+                if self.sound:
+                    self.sound.play_price_alert()
+
+                # Refresh alerts dialog if open
+                if self.alerts_dialog and self.alerts_dialog.isVisible():
+                    self.alerts_dialog.refresh()
+
+        except Exception as e:
+            logger.warning(f"[ALERTS] Check failed: {e}")
+
     # ==================== Position Management ====================
+
+    def _subscribe_position_tokens(self, symbols: List[str]):
+        """Subscribe to Kite WebSocket for position LTP updates."""
+        if not self.kite or not self.kite_ws:
+            return
+
+        # Get symbols not yet subscribed
+        new_symbols = [s for s in symbols if s not in self._symbol_to_kite_token]
+        if not new_symbols:
+            return
+
+        try:
+            # Fetch quotes to get instrument_tokens
+            quotes = self.kite.get_quotes_batch(new_symbols)
+
+            tokens_to_subscribe = []
+            for symbol in new_symbols:
+                if symbol in quotes:
+                    quote = quotes[symbol]
+                    kite_token = quote.get('instrument_token')
+                    if kite_token:
+                        # Store mappings
+                        self._symbol_to_kite_token[symbol] = kite_token
+                        self._token_to_symbol[str(kite_token)] = symbol
+
+                        # Store initial LTP in cache
+                        ltp = quote.get('last_price')
+                        if ltp is not None:
+                            self._ltp_cache[str(kite_token)] = ltp
+
+                        tokens_to_subscribe.append(kite_token)
+
+            # Subscribe to Kite WebSocket
+            if tokens_to_subscribe:
+                new_tokens = [t for t in tokens_to_subscribe if t not in self._subscribed_position_tokens]
+                if new_tokens:
+                    self.kite_ws.subscribe_tokens(new_tokens)
+                    self._subscribed_position_tokens.update(new_tokens)
+                    logger.info(f"[KITE WS] Subscribed to {len(new_tokens)} position tokens")
+
+        except Exception as e:
+            logger.warning(f"[KITE WS] Failed to subscribe position tokens: {e}")
 
     def _refresh_positions(self):
         """Refresh positions from broker and sync with tracker."""
         try:
             positions = self.orders.get_positions()
 
-            # Debug logging removed - was for initial field discovery only
+            # Enrich open positions with LTP from Kite WebSocket or API
+            if positions:
+                open_symbols = []
+                for pos in positions:
+                    qty = _get_position_qty(pos)
+                    if qty != 0:
+                        symbol = _get_position_symbol(pos)
+                        if symbol:
+                            open_symbols.append(symbol)
+
+                # Subscribe to Kite WebSocket for real-time LTP (if not already subscribed)
+                if open_symbols and self.kite_ws:
+                    self._subscribe_position_tokens(open_symbols)
+
+                # Get LTP - prefer WebSocket cache, fallback to API
+                for pos in positions:
+                    symbol = _get_position_symbol(pos)
+                    qty = _get_position_qty(pos)
+                    if qty != 0 and symbol:
+                        # Try WebSocket cache first
+                        kite_token = self._symbol_to_kite_token.get(symbol)
+                        cached_ltp = self._ltp_cache.get(str(kite_token)) if kite_token else None
+
+                        if cached_ltp is not None:
+                            pos['ltp'] = cached_ltp
+                            avg = _get_position_avg_price(pos)
+                            if avg > 0:
+                                pos['mtm'] = (cached_ltp - avg) * qty
+                        elif self.kite:
+                            # Fallback to API for initial LTP
+                            try:
+                                ltp = self.kite.get_option_ltp(symbol)
+                                if ltp and ltp > 0:
+                                    pos['ltp'] = ltp
+                                    avg = _get_position_avg_price(pos)
+                                    if avg > 0:
+                                        pos['mtm'] = (ltp - avg) * qty
+                            except Exception:
+                                pass
 
             self._positions_cache = positions
             self.position_updated.emit(positions)
@@ -2252,32 +3239,38 @@ class MainWindow(QMainWindow):
                 if qty != 0:  # Only active positions
                     broker_symbols.add(symbol)
 
-            # Find tracked positions that are no longer at broker
-            closed_symbols = []
-            for symbol in list(self.pos_tracker.positions.keys()):
-                if symbol not in broker_symbols:
-                    closed_symbols.append(symbol)
+            # Find tracked entry_order_ids whose symbol is no longer at broker
+            # (keyed by entry_order_id, but we check pos.symbol)
+            # Use snapshot for thread safety
+            closed_entry_ids = []
+            for entry_id, pos in self.pos_tracker.get_all_positions_snapshot().items():
+                if pos.symbol not in broker_symbols:
+                    closed_entry_ids.append((entry_id, pos.symbol))
 
             # Cleanup closed positions - cancel any orphan orders
-            for symbol in closed_symbols:
-                self.log_message.emit(f"[SYNC] Position closed: {symbol} - cleaning up orders")
-                cancelled = self.pos_tracker.cancel_all_orders_for_position(symbol)
+            for entry_id, symbol in closed_entry_ids:
+                self.log_message.emit(f"[SYNC] Position closed: {symbol} (entry={entry_id[-6:]}) - cleaning up orders")
+
+                # Remove from trail manager FIRST (before position is removed)
+                # Use thread-safe method instead of direct dict access
+                if self.trail_mgr:
+                    self.trail_mgr.remove_position(entry_id)
+
+                # Remove from OCO monitor
+                if self.oco_monitor:
+                    self.oco_monitor.remove_pair(entry_id)
+
+                # Use close_position which cancels orders and removes with proper locking
+                cancelled = self.pos_tracker.close_position(entry_id)
                 if cancelled.get('sl_cancelled'):
                     self.log_message.emit(f"[SYNC] Cancelled orphan SL: {cancelled['sl_cancelled']}")
                 if cancelled.get('target_cancelled'):
                     self.log_message.emit(f"[SYNC] Cancelled orphan Target: {cancelled['target_cancelled']}")
 
-                # Remove from trail manager
-                if self.trail_mgr and symbol in self.trail_mgr.positions:
-                    del self.trail_mgr.positions[symbol]
-
-                # Remove from OCO monitor
-                if self.oco_monitor:
-                    self.oco_monitor.remove_oco_pair(symbol)
-
-                # Remove from tracker
-                if symbol in self.pos_tracker.positions:
-                    del self.pos_tracker.positions[symbol]
+            # Cleanup _trail_debounce for symbols no longer in positions (prevents unbounded growth)
+            stale_symbols = [s for s in self._trail_debounce if s not in broker_symbols]
+            for s in stale_symbols:
+                del self._trail_debounce[s]
 
             # Calculate total P&L
             total_pnl = 0
@@ -2315,13 +3308,14 @@ class MainWindow(QMainWindow):
         self.pos_pnl_label.setText(label_map.get(filter_text, "P&L:"))
 
         # Refresh positions table with current filter
-        if hasattr(self, '_positions_cache') and self._positions_cache:
+        # S17-L1: _positions_cache now initialized in __init__
+        if self._positions_cache:
             self._update_positions_table(self._positions_cache)
 
     def _update_positions_table(self, positions: List[Dict[str, Any]]):
         """Update positions table with data based on filter."""
-        # Get current filter
-        filter_type = self.pos_filter_combo.currentText() if hasattr(self, 'pos_filter_combo') else "Open"
+        # Get current filter (pos_filter_combo always exists after init_ui)
+        filter_type = self.pos_filter_combo.currentText()
 
         # Filter positions based on selection
         if filter_type == "Open":
@@ -2329,7 +3323,25 @@ class MainWindow(QMainWindow):
         elif filter_type == "Closed":
             filtered_positions = [p for p in positions if _get_position_qty(p) == 0]
         else:  # All
-            filtered_positions = positions
+            filtered_positions = list(positions)  # Copy to avoid modifying original
+
+        # S34: Sort by symbol name for consistent order (prevents table "jumping")
+        filtered_positions.sort(key=lambda p: _get_position_symbol(p))
+
+        # CRITICAL: Preserve SL input state during refresh to prevent losing user's typing
+        # Find any SL input that has focus and save its state
+        focused_sl_symbol = None
+        focused_sl_text = None
+        focused_sl_cursor = 0
+        for symbol, sl_input in self.sl_inputs.items():
+            if sl_input.hasFocus():
+                focused_sl_symbol = symbol
+                focused_sl_text = sl_input.text()
+                focused_sl_cursor = sl_input.cursorPosition()
+                break
+
+        # Clear old sl_inputs references (widgets will be destroyed by setRowCount)
+        self.sl_inputs.clear()
 
         self.positions_table.setRowCount(len(filtered_positions))
         self._filtered_positions_cache = filtered_positions  # Store for cell widget access
@@ -2392,17 +3404,36 @@ class MainWindow(QMainWindow):
             pct_item.setFlags(pct_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.positions_table.setItem(row, 5, pct_item)
 
-            # SL Input
-            sl_widget = self._create_sl_widget(symbol, pos)
+            # S34: Handle closed positions (qty=0) differently
+            is_closed = (qty == 0)
+
+            # SL Input - disabled for closed positions
+            sl_widget = self._create_sl_widget(symbol, pos, disabled=is_closed)
             self.positions_table.setCellWidget(row, 6, sl_widget)
 
-            # Trail buttons
-            trail_widget = self._create_trail_widget(symbol)
-            self.positions_table.setCellWidget(row, 7, trail_widget)
+            # Status column
+            tracked = self.pos_tracker.get_first_position_by_symbol(symbol)
+            has_sl = tracked and tracked.sl_order_id is not None
+            if is_closed:
+                status_item = QTableWidgetItem("CLOSED")
+                status_item.setForeground(QBrush(QColor("#888888")))  # Gray
+                status_item.setToolTip("Position closed")
+            elif has_sl:
+                status_item = QTableWidgetItem("")  # Empty when protected
+            else:
+                status_item = QTableWidgetItem("NO SL")
+                status_item.setForeground(QBrush(QColor("#ff6600")))  # Warning orange
+                status_item.setToolTip("Position has no stop-loss protection!")
+            status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.positions_table.setItem(row, 7, status_item)
 
-            # Exit buttons
-            exit_widget = self._create_exit_widget(pos)
-            self.positions_table.setCellWidget(row, 8, exit_widget)
+            # Trail buttons - disabled for closed positions
+            trail_widget = self._create_trail_widget(symbol, disabled=is_closed)
+            self.positions_table.setCellWidget(row, 8, trail_widget)
+
+            # Exit buttons - disabled for closed positions
+            exit_widget = self._create_exit_widget(pos, disabled=is_closed)
+            self.positions_table.setCellWidget(row, 9, exit_widget)
 
             total_pnl += pnl
 
@@ -2410,7 +3441,15 @@ class MainWindow(QMainWindow):
         self.total_pnl.setText(f"₹{total_pnl:,.0f}")
         self.total_pnl.setStyleSheet(f"color: {'#00ff88' if total_pnl >= 0 else '#ff4444'};")
 
-    def _create_sl_widget(self, symbol: str, pos: Dict[str, Any]) -> QWidget:
+        # CRITICAL: Restore SL input focus and text after refresh (prevents losing user's typing)
+        if focused_sl_symbol and focused_sl_symbol in self.sl_inputs:
+            sl_input = self.sl_inputs[focused_sl_symbol]
+            if focused_sl_text is not None:
+                sl_input.setText(focused_sl_text)
+                sl_input.setCursorPosition(focused_sl_cursor)
+            sl_input.setFocus()
+
+    def _create_sl_widget(self, symbol: str, pos: Dict[str, Any], disabled: bool = False) -> QWidget:
         """Create compact SL input widget - just input field, Enter to set."""
         widget = QWidget()
         layout = QHBoxLayout(widget)
@@ -2419,12 +3458,30 @@ class MainWindow(QMainWindow):
         layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         sl_input = QLineEdit()
-        sl_input.setPlaceholderText("SL")
         sl_input.setFixedWidth(60)
         sl_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # Check if we have a tracked SL for this position
-        tracked = self.pos_tracker.get_position(symbol)
+        # S34: Disabled for closed positions
+        if disabled:
+            sl_input.setPlaceholderText("--")
+            sl_input.setEnabled(False)
+            sl_input.setStyleSheet("""
+                QLineEdit {
+                    background-color: #333333;
+                    border: 1px solid #444444;
+                    border-radius: 4px;
+                    color: #666666;
+                    font-size: 11px;
+                    padding: 3px;
+                }
+            """)
+            layout.addWidget(sl_input)
+            return widget
+
+        sl_input.setPlaceholderText("SL")
+
+        # Check if we have a tracked SL for this position (use symbol-based lookup)
+        tracked = self.pos_tracker.get_first_position_by_symbol(symbol)
         if tracked and tracked.sl_price:
             sl_input.setText(f"{tracked.sl_price:.2f}")
             sl_input.setStyleSheet("""
@@ -2479,7 +3536,7 @@ class MainWindow(QMainWindow):
         except ValueError:
             pass  # Invalid input, ignore
 
-    def _create_trail_widget(self, symbol: str) -> QWidget:
+    def _create_trail_widget(self, symbol: str, disabled: bool = False) -> QWidget:
         """Create trail buttons widget - bigger buttons with clear text."""
         widget = QWidget()
         layout = QHBoxLayout(widget)
@@ -2487,87 +3544,111 @@ class MainWindow(QMainWindow):
         layout.setSpacing(4)
         layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        # Breakeven button - cyan/teal
-        be_btn = QPushButton("BE")
-        be_btn.setToolTip("Trail to TRUE Breakeven (Entry + Charges)")
-        be_btn.setFixedSize(44, 28)
-        be_btn.setStyleSheet("""
+        # S34: Disabled style for closed positions
+        disabled_style = """
             QPushButton {
-                background-color: #006688;
-                color: #ffffff;
+                background-color: #444444;
+                color: #666666;
                 font-weight: bold;
                 font-size: 12px;
-                border: 1px solid #0088aa;
+                border: 1px solid #555555;
                 border-radius: 3px;
-                margin: 0px;
-                padding-top: 0px;
-                padding-bottom: 4px;
             }
-            QPushButton:hover {
-                background-color: #0099bb;
-            }
-            QPushButton:pressed {
-                background-color: #004466;
-            }
-        """)
-        be_btn.clicked.connect(lambda _, s=symbol: self._trail_to_cost(s))
+        """
+
+        # Breakeven button - cyan/teal
+        be_btn = QPushButton("BE")
+        be_btn.setToolTip("Trail to TRUE Breakeven (Entry + Charges)" if not disabled else "Position closed")
+        be_btn.setFixedSize(44, 28)
+        if disabled:
+            be_btn.setStyleSheet(disabled_style)
+            be_btn.setEnabled(False)
+        else:
+            be_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #006688;
+                    color: #ffffff;
+                    font-weight: bold;
+                    font-size: 12px;
+                    border: 1px solid #0088aa;
+                    border-radius: 3px;
+                    margin: 0px;
+                    padding-top: 0px;
+                    padding-bottom: 4px;
+                }
+                QPushButton:hover {
+                    background-color: #0099bb;
+                }
+                QPushButton:pressed {
+                    background-color: #004466;
+                }
+            """)
+            be_btn.clicked.connect(lambda _, s=symbol: self._trail_to_cost(s))
         layout.addWidget(be_btn)
 
         # +10 button - green
         t10_btn = QPushButton("+10")
-        t10_btn.setToolTip("Trail SL +10 points")
+        t10_btn.setToolTip("Trail SL +10 points" if not disabled else "Position closed")
         t10_btn.setFixedSize(46, 28)
-        t10_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #227744;
-                color: #ffffff;
-                font-weight: bold;
-                font-size: 12px;
-                border: 1px solid #33aa55;
-                border-radius: 3px;
-                margin: 0px;
-                padding-top: 0px;
-                padding-bottom: 4px;
-            }
-            QPushButton:hover {
-                background-color: #33bb66;
-            }
-            QPushButton:pressed {
-                background-color: #115533;
-            }
-        """)
-        t10_btn.clicked.connect(lambda _, s=symbol: self._trail_by_points(s, 10))
+        if disabled:
+            t10_btn.setStyleSheet(disabled_style)
+            t10_btn.setEnabled(False)
+        else:
+            t10_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #227744;
+                    color: #ffffff;
+                    font-weight: bold;
+                    font-size: 12px;
+                    border: 1px solid #33aa55;
+                    border-radius: 3px;
+                    margin: 0px;
+                    padding-top: 0px;
+                    padding-bottom: 4px;
+                }
+                QPushButton:hover {
+                    background-color: #33bb66;
+                }
+                QPushButton:pressed {
+                    background-color: #115533;
+                }
+            """)
+            t10_btn.clicked.connect(lambda _, s=symbol: self._trail_by_points(s, 10))
         layout.addWidget(t10_btn)
 
         # +25 button - bright green
         t25_btn = QPushButton("+25")
-        t25_btn.setToolTip("Trail SL +25 points")
+        t25_btn.setToolTip("Trail SL +25 points" if not disabled else "Position closed")
         t25_btn.setFixedSize(46, 28)
-        t25_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #33aa55;
-                color: #ffffff;
-                font-weight: bold;
-                font-size: 12px;
-                border: 1px solid #44cc66;
-                border-radius: 3px;
-                margin: 0px;
-                padding-top: 0px;
-                padding-bottom: 4px;
-            }
-            QPushButton:hover {
-                background-color: #44dd77;
-            }
-            QPushButton:pressed {
-                background-color: #228844;
-            }
-        """)
-        t25_btn.clicked.connect(lambda _, s=symbol: self._trail_by_points(s, 25))
+        if disabled:
+            t25_btn.setStyleSheet(disabled_style)
+            t25_btn.setEnabled(False)
+        else:
+            t25_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #33aa55;
+                    color: #ffffff;
+                    font-weight: bold;
+                    font-size: 12px;
+                    border: 1px solid #44cc66;
+                    border-radius: 3px;
+                    margin: 0px;
+                    padding-top: 0px;
+                    padding-bottom: 4px;
+                }
+                QPushButton:hover {
+                    background-color: #44dd77;
+                }
+                QPushButton:pressed {
+                    background-color: #228844;
+                }
+            """)
+            t25_btn.clicked.connect(lambda _, s=symbol: self._trail_by_points(s, 25))
         layout.addWidget(t25_btn)
 
         return widget
 
-    def _create_exit_widget(self, pos: Dict[str, Any]) -> QWidget:
+    def _create_exit_widget(self, pos: Dict[str, Any], disabled: bool = False) -> QWidget:
         """Create exit buttons widget - bigger buttons with clear text."""
         widget = QWidget()
         layout = QHBoxLayout(widget)
@@ -2575,56 +3656,76 @@ class MainWindow(QMainWindow):
         layout.setSpacing(4)
         layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        # 50% exit - amber/orange
-        exit_50 = QPushButton("50%")
-        exit_50.setToolTip("Exit 50% of position")
-        exit_50.setFixedSize(48, 28)
-        exit_50.setStyleSheet("""
+        # S34: Disabled style for closed positions
+        disabled_style = """
             QPushButton {
-                background-color: #aa7700;
-                color: #ffffff;
+                background-color: #444444;
+                color: #666666;
                 font-weight: bold;
                 font-size: 12px;
-                border: 1px solid #cc9900;
+                border: 1px solid #555555;
                 border-radius: 3px;
-                margin: 0px;
-                padding-top: 0px;
-                padding-bottom: 4px;
             }
-            QPushButton:hover {
-                background-color: #cc9900;
-            }
-            QPushButton:pressed {
-                background-color: #885500;
-            }
-        """)
-        exit_50.clicked.connect(lambda _, p=pos: self._exit_position(p, 50))
+        """
+
+        # 50% exit - amber/orange
+        exit_50 = QPushButton("50%")
+        exit_50.setToolTip("Exit 50% of position" if not disabled else "Position closed")
+        exit_50.setFixedSize(48, 28)
+        if disabled:
+            exit_50.setStyleSheet(disabled_style)
+            exit_50.setEnabled(False)
+        else:
+            exit_50.setStyleSheet("""
+                QPushButton {
+                    background-color: #aa7700;
+                    color: #ffffff;
+                    font-weight: bold;
+                    font-size: 12px;
+                    border: 1px solid #cc9900;
+                    border-radius: 3px;
+                    margin: 0px;
+                    padding-top: 0px;
+                    padding-bottom: 4px;
+                }
+                QPushButton:hover {
+                    background-color: #cc9900;
+                }
+                QPushButton:pressed {
+                    background-color: #885500;
+                }
+            """)
+            exit_50.clicked.connect(lambda _, p=pos: self._exit_position(p, 50))
         layout.addWidget(exit_50)
 
         # Full EXIT - bright red, prominent
         exit_full = QPushButton("EXIT")
-        exit_full.setToolTip("Exit 100% - Close position")
+        exit_full.setToolTip("Exit 100% - Close position" if not disabled else "Position closed")
         exit_full.setFixedSize(52, 28)
-        exit_full.setStyleSheet("""
-            QPushButton {
-                background-color: #cc2222;
-                color: #ffffff;
-                font-weight: bold;
-                font-size: 12px;
-                border: 1px solid #ee3333;
-                border-radius: 3px;
-                margin: 0px;
-                padding-top: 0px;
-                padding-bottom: 4px;
-            }
-            QPushButton:hover {
-                background-color: #ee3333;
-            }
-            QPushButton:pressed {
-                background-color: #991111;
-            }
-        """)
-        exit_full.clicked.connect(lambda _, p=pos: self._exit_position(p, 100))
+        if disabled:
+            exit_full.setStyleSheet(disabled_style)
+            exit_full.setEnabled(False)
+        else:
+            exit_full.setStyleSheet("""
+                QPushButton {
+                    background-color: #cc2222;
+                    color: #ffffff;
+                    font-weight: bold;
+                    font-size: 12px;
+                    border: 1px solid #ee3333;
+                    border-radius: 3px;
+                    margin: 0px;
+                    padding-top: 0px;
+                    padding-bottom: 4px;
+                }
+                QPushButton:hover {
+                    background-color: #ee3333;
+                }
+                QPushButton:pressed {
+                    background-color: #991111;
+                }
+            """)
+            exit_full.clicked.connect(lambda _, p=pos: self._exit_position(p, 100))
         layout.addWidget(exit_full)
 
         return widget
@@ -2632,10 +3733,15 @@ class MainWindow(QMainWindow):
     def _update_sl_from_input(self, symbol: str, price_str: str):
         """Update SL to manually entered price - place or modify SL order."""
         try:
+            if not price_str or not price_str.strip():
+                return  # Empty input, just ignore
+
             new_sl = float(price_str.strip())
             if new_sl <= 0:
                 self.log_message.emit(f"[SL] Invalid price: {price_str}")
                 return
+
+            self.log_message.emit(f"[SL] {symbol}: Setting SL to {new_sl:.2f}...")
 
             # Find position in cache
             pos = None
@@ -2659,43 +3765,50 @@ class MainWindow(QMainWindow):
 
             # Get prices for validation
             entry_price = _get_position_avg_price(pos)
-            ltp = _get_position_ltp(pos) or entry_price
+            ltp = _get_position_ltp(pos)
+            if ltp is None or ltp <= 0:
+                ltp = entry_price  # Fallback if LTP not available
 
-            # Validate SL price
+            # Validate SL price - but only warn, don't block manual placement
             min_distance = self.config.get('trailing_sl', {}).get('min_sl_distance', 5)
             validation = self.orders.validate_sl_price(new_sl, entry_price, ltp, is_long, min_distance)
             if not validation['valid']:
-                self.log_message.emit(f"[SL] INVALID: {validation['error']}")
-                if self.sound:
-                    self.sound.play('error')
-                return
+                # For manual SL, just warn but allow placement (user knows best)
+                self.log_message.emit(f"[SL] WARNING: {validation['error']}")
+                # Continue with placement - user explicitly requested this SL
 
             # Check if we already have SL order - modify it
-            tracked = self.pos_tracker.get_position(symbol)
+            # Use symbol-based lookup since we're coming from position table
+            tracked = self.pos_tracker.get_first_position_by_symbol(symbol)
             if tracked and tracked.sl_order_id:
-                # Modify existing SL
+                # Modify existing SL using order_manager wrapper (handles API params correctly)
                 try:
-                    result = self.session.get_client().modify_order(
+                    result = self.orders.modify_order(
                         order_id=tracked.sl_order_id,
-                        trigger_price=str(new_sl)
+                        new_trigger=new_sl
                     )
 
                     # Check if modification succeeded
-                    if result and result.get('stat', '').lower() in ['not_ok', 'error', 'rejected']:
-                        error_msg = result.get('errMsg') or result.get('message') or 'Modify failed'
-                        self.log_message.emit(f"[SL] Modify failed: {error_msg}")
+                    if not result.success:
+                        self.log_message.emit(f"[SL] Modify failed: {result.message}")
                         if self.sound:
                             self.sound.play('error')
                         return
 
-                    self.pos_tracker.update_sl_order(symbol, new_sl_price=new_sl)
+                    # Update using tracked position's entry_order_id
+                    self.pos_tracker.update_sl_order(tracked.entry_order_id, new_sl_price=new_sl)
                     self.log_message.emit(f"[SL] {symbol}: Modified SL -> {new_sl:.2f}")
                     if self.sound:
                         self.sound.play('order_placed')
 
-                    # Update trail manager if registered
-                    if self.trail_mgr and symbol in self.trail_mgr.positions:
-                        self.trail_mgr.positions[symbol].current_sl = new_sl
+                    # CRITICAL: Sync OCO monitor sl_trigger (for P&L calculation on SL hit)
+                    if self.oco_monitor and tracked.sl_order_id:
+                        self.oco_monitor.update_sl_order_by_symbol(symbol, tracked.sl_order_id, new_sl)
+
+                    # Update trail manager if registered (keyed by entry_order_id)
+                    # S17-M2: Use thread-safe method instead of direct dict access
+                    if self.trail_mgr:
+                        self.trail_mgr.update_current_sl(tracked.entry_order_id, new_sl)
 
                     # Refresh orders table to show updated price
                     self._force_next_orders_refresh()
@@ -2710,41 +3823,89 @@ class MainWindow(QMainWindow):
                 try:
                     exchange_seg = _get_position_exchange(pos)
                     product = _get_position_product(pos)
+
+                    # CRITICAL: Use centralized calculate_sl_limit_price() for ALL SL orders
+                    # S33: Always use SL-L with proper limit price (never SL-M)
+                    from core.tick_utils import calculate_sl_limit_price
+                    sl_order_type, sl_limit_price = calculate_sl_limit_price(
+                        trigger_price=float(new_sl),
+                        transaction_type=exit_type,
+                        exchange_segment=exchange_seg,
+                        buffer_percent=0.5
+                    )
+
+                    # Format trigger price to tick size
+                    formatted_trigger = round_trigger_price(new_sl, exchange_seg)
+
+                    # S34: Only log API details to file, not GUI (reduce noise)
+                    logger.info(f"[SL] Placing {sl_order_type}: {symbol} {exit_type} qty={qty} "
+                               f"trigger={formatted_trigger} limit={sl_limit_price}")
+
+                    # S35: Generate unique tag for SL order using tracker
+                    sl_tag = self.order_tracker.generate_tag(OrderType.SL, symbol)
+                    self.order_tracker.register_order(
+                        tag=sl_tag,
+                        symbol=symbol,
+                        transaction_type=exit_type,
+                        quantity=qty,
+                        api_order_type=sl_order_type,
+                        price_type=OrderType.SL
+                    )
+
                     sl_response = self.session.get_client().place_order(
                         exchange_segment=exchange_seg,
                         product=product,
-                        price="0",
-                        order_type="SL-M",
+                        price=sl_limit_price,
+                        order_type=sl_order_type,
                         quantity=str(qty),
                         validity="DAY",
                         trading_symbol=symbol,
                         transaction_type=exit_type,
                         amo="NO",
-                        trigger_price=str(new_sl),
-                        tag='SL'
+                        trigger_price=formatted_trigger,
+                        tag=sl_tag  # S35: Use tracker-generated tag
                     )
+
+                    logger.info(f"[SL] API response: {sl_response}")
 
                     sl_order_id = sl_response.get('nOrdNo') if sl_response else None
                     if sl_order_id:
+                        self.order_tracker.confirm_order(sl_tag, sl_order_id, sl_response)
                         # Track the position if not already tracked
+                        # CRITICAL FIX (T5): First check if ANY tracker entry exists for this symbol
+                        # to avoid creating duplicate synthetic entries on repeated manual SL placement
                         if not tracked:
-                            avg_price = _get_position_avg_price(pos)
-                            self.pos_tracker.add_position(
-                                symbol=symbol,
-                                exchange_segment=exchange_seg,
-                                quantity=qty,
-                                side='LONG' if is_long else 'SHORT',
-                                entry_price=avg_price
-                            )
+                            # Check if there's any existing tracker entry for this symbol
+                            existing_entry = self.pos_tracker.get_first_position_by_symbol(symbol)
+                            if existing_entry:
+                                # Use existing entry instead of creating new synthetic ID
+                                tracked = existing_entry
+                                logger.info(f"[SL] Using existing tracker entry: {tracked.entry_order_id}")
+                            else:
+                                # No existing tracker - create new synthetic entry
+                                avg_price = _get_position_avg_price(pos)
+                                import time
+                                manual_entry_id = f"manual_{symbol}_{int(time.time())}"
+                                self.pos_tracker.add_position(
+                                    symbol=symbol,
+                                    entry_order_id=manual_entry_id,
+                                    exchange_segment=exchange_seg,
+                                    quantity=qty,
+                                    side='LONG' if is_long else 'SHORT',
+                                    entry_price=avg_price,
+                                    product=product  # For SL recovery
+                                )
+                                tracked = self.pos_tracker.get_position(manual_entry_id)
 
-                        # Record SL order
-                        self.pos_tracker.set_sl_order(symbol, sl_order_id, new_sl)
+                        # Record SL order using entry_order_id
+                        self.pos_tracker.set_sl_order(tracked.entry_order_id, sl_order_id, new_sl)
 
                         # Register with trail manager
                         if self.trail_mgr:
                             avg_price = _get_position_avg_price(pos)
                             inst_token = str(pos.get('instrument_token', pos.get('token', '')))
                             self.trail_mgr.add_position(
+                                entry_order_id=tracked.entry_order_id,
                                 symbol=symbol,
                                 exchange_segment=exchange_seg,
                                 entry_price=avg_price,
@@ -2752,7 +3913,8 @@ class MainWindow(QMainWindow):
                                 side='LONG' if is_long else 'SHORT',
                                 sl_price=new_sl,
                                 sl_order_id=sl_order_id,
-                                instrument_token=inst_token
+                                instrument_token=inst_token,
+                                product=product  # S23-C1: Pass product for SL recreation
                             )
 
                         self.log_message.emit(f"[SL] {symbol}: Placed SL @ {new_sl:.2f} -> {sl_order_id}")
@@ -2762,40 +3924,186 @@ class MainWindow(QMainWindow):
                         # Refresh orders table to show new SL order
                         self._force_next_orders_refresh()
                         QTimer.singleShot(500, self._refresh_orders)
+                        # Refresh margin after manual SL placement
+                        QTimer.singleShot(300, self._refresh_margin)
                     else:
-                        self.log_message.emit(f"[SL] {symbol}: Order placed but no ID returned")
+                        # S34: Show API details only on failure
+                        error_msg = "Unknown error"
+                        if sl_response:
+                            error_msg = sl_response.get('errMsg') or sl_response.get('message') or sl_response.get('stat') or str(sl_response)
+                        # S35: Mark order as failed with tracker
+                        self.order_tracker.mark_failed(sl_tag, error_msg)
+                        self.log_message.emit(f"[SL] {symbol}: FAILED - {error_msg}")
+                        self.log_message.emit(f"[SL] Details: trigger={formatted_trigger} limit={sl_limit_price} seg={exchange_seg}")
+                        if self.sound:
+                            self.sound.play('error')
 
                 except Exception as e:
                     self.log_message.emit(f"[SL] Place failed: {e}")
+                    logger.error(f"[SL] Place order exception: {e}", exc_info=True)
                     if self.sound:
                         self.sound.play('error')
 
         except ValueError:
             self.log_message.emit(f"[SL] Invalid price format: {price_str}")
+        except Exception as e:
+            self.log_message.emit(f"[SL] Error: {e}")
+            logger.error(f"[SL] _update_sl_from_input exception: {e}", exc_info=True)
+
+    def _check_trail_debounce(self, symbol: str) -> bool:
+        """
+        Check if trail action is allowed (debounce protection).
+
+        CRITICAL FIX (E4): Prevents rapid button clicks from sending multiple
+        modify API calls. Returns True if action is allowed, False if blocked.
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            True if trail action is allowed, False if within debounce window
+        """
+        import time
+        current_time = time.time() * 1000  # Convert to ms
+
+        last_trail = self._trail_debounce.get(symbol, 0)
+        if current_time - last_trail < self._trail_debounce_ms:
+            logger.debug(f"[TRAIL] {symbol}: Debounce blocked - too fast")
+            return False
+
+        # Update last trail time
+        self._trail_debounce[symbol] = current_time
+        return True
+
+    def _fetch_fresh_ltp_for_trail(self, symbol: str) -> float:
+        """
+        Fetch fresh LTP from quotes API for accurate trail validation.
+
+        CRITICAL FIX (T3): Position cache LTP is often 0 or stale. Fetch directly
+        from broker to ensure accurate trail validation, especially for MANUAL mode
+        where auto-trail doesn't update last_ltp.
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            Fresh LTP or 0 if fetch fails
+        """
+        try:
+            # Get instrument token from trail manager position
+            # S17-M2: Use thread-safe method instead of direct dict access
+            entry_id = self.trail_mgr.get_first_entry_id_for_symbol(symbol) if self.trail_mgr else None
+            if entry_id and self.trail_mgr:
+                pos_data = self.trail_mgr.get_position_for_ltp_fetch(entry_id)
+                if pos_data:
+                    inst_token, exchange_seg = pos_data
+                    if inst_token:
+                        quotes = self.session.get_client().quotes(
+                            instrument_tokens=[{"instrument_token": inst_token, "exchange_segment": exchange_seg}],
+                            quote_type="ltp"
+                        )
+                        # S33: NEO API returns list directly, not {'data': [...]}
+                        # Handle both formats for safety
+                        quote_list = quotes if isinstance(quotes, list) else (quotes.get('data', []) if isinstance(quotes, dict) else [])
+                        for q in quote_list:
+                            if not isinstance(q, dict):
+                                continue
+                            ltp = q.get('ltp')
+                            if ltp is None:
+                                ltp = q.get('last_price')
+                            # S27: Use explicit None check - LTP of 0 is technically valid
+                            if ltp is not None:
+                                try:
+                                    ltp_float = float(ltp)
+                                    if ltp_float > 0:
+                                        logger.debug(f"[LTP] Fetched {symbol}: {ltp_float}")
+                                        return ltp_float
+                                except (ValueError, TypeError):
+                                    continue
+
+            # Fallback: try position cache
+            for pos in self._positions_cache:
+                if _get_position_symbol(pos) == symbol:
+                    ltp = _get_position_ltp(pos)
+                    if ltp and ltp > 0:
+                        return ltp
+                    break
+
+            return 0.0
+        except Exception as e:
+            logger.warning(f"[TRAIL] Failed to fetch fresh LTP for {symbol}: {e}")
+            return 0.0
 
     def _trail_to_cost(self, symbol: str):
         """Trail SL to TRUE breakeven (entry + charges)."""
         if self.trail_mgr:
-            result = self.trail_mgr.trail_to_cost(symbol)
+            # CRITICAL FIX (E4): Debounce check to prevent rapid button clicks
+            if not self._check_trail_debounce(symbol):
+                return
+
+            # Get LTP using existing reliable method
+            current_ltp = self._get_ltp_for_symbol(symbol) or 0.0
+
+            if current_ltp <= 0:
+                self.log_message.emit(f"[TRAIL] {symbol}: Cannot get LTP - try again")
+                return
+
+            logger.info(f"[TRAIL] BE for {symbol}: Using LTP={current_ltp:.2f}")
+
+            # Pass LTP directly to avoid stale cache issues
+            result = self.trail_mgr.trail_to_cost_by_symbol(symbol, current_ltp)
             if result['success']:
                 new_sl = result['new_sl']
-                self.log_message.emit(f"[TRAIL] {symbol}: SL → TRUE BE ({new_sl:.2f})")
-                # Sync new SL with position tracker
-                self.pos_tracker.update_sl_order(symbol, new_sl_price=new_sl)
+                new_order_id = result.get('order_id')
+                was_new = result.get('recreated', False)
+
+                if was_new:
+                    self.log_message.emit(f"[BE] {symbol}: NEW SL placed @ {new_sl:.2f}")
+                else:
+                    self.log_message.emit(f"[BE] {symbol}: SL modified -> {new_sl:.2f}")
+
+                # Sync new SL with position tracker (order_id may have changed if new SL placed)
+                if new_order_id:
+                    self.pos_tracker.update_sl_order_by_symbol(symbol, new_order_id, new_sl)
+                else:
+                    self.pos_tracker.update_sl_order_by_symbol(symbol, new_sl_price=new_sl)
+
+                # CRITICAL: Sync OCO monitor sl_trigger (for P&L calculation on SL hit)
+                if self.oco_monitor and new_order_id:
+                    self.oco_monitor.update_sl_order_by_symbol(symbol, new_order_id, new_sl)
+
                 if self.sound:
                     self.sound.play('order_placed')
             else:
-                self.log_message.emit(f"[TRAIL] {symbol}: Failed - {result.get('error', 'Unknown')}")
+                self.log_message.emit(f"[BE] {symbol}: Failed - {result.get('error', 'Unknown')}")
 
     def _trail_by_points(self, symbol: str, points: float):
         """Trail SL by points."""
         if self.trail_mgr:
-            result = self.trail_mgr.trail_by_points(symbol, points)
+            # CRITICAL FIX (E4): Debounce check to prevent rapid button clicks
+            if not self._check_trail_debounce(symbol):
+                return
+
+            # CRITICAL FIX (T3): Fetch FRESH LTP from quotes API instead of stale cache
+            # This ensures accurate validation, especially for MANUAL mode positions
+            current_ltp = self._fetch_fresh_ltp_for_trail(symbol)
+
+            # S17-M2: Use thread-safe method instead of direct dict access
+            entry_id = self.trail_mgr.get_first_entry_id_for_symbol(symbol)
+            if entry_id and current_ltp > 0:
+                self.trail_mgr.update_last_ltp(entry_id, current_ltp)
+
+            result = self.trail_mgr.trail_by_points_by_symbol(symbol, points)
             if result['success']:
                 new_sl = result['new_sl']
                 self.log_message.emit(f"[TRAIL] {symbol}: SL -> {new_sl:.2f} (+{points}pts)")
                 # Sync new SL with position tracker
-                self.pos_tracker.update_sl_order(symbol, new_sl_price=new_sl)
+                self.pos_tracker.update_sl_order_by_symbol(symbol, new_sl_price=new_sl)
+                # CRITICAL: Sync OCO monitor sl_trigger (for P&L calculation on SL hit)
+                if self.oco_monitor:
+                    tracked = self.pos_tracker.get_first_position_by_symbol(symbol)
+                    if tracked and tracked.sl_order_id:
+                        self.oco_monitor.update_sl_order_by_symbol(symbol, tracked.sl_order_id, new_sl)
                 if self.sound:
                     self.sound.play('order_placed')
             else:
@@ -2804,16 +4112,74 @@ class MainWindow(QMainWindow):
     def _trail_selected_to_cost(self):
         """Trail selected position to cost."""
         row = self.positions_table.currentRow()
-        if row >= 0 and row < len(self._positions_cache):
+        if row >= 0 and row < len(self._filtered_positions_cache):
             symbol = _get_position_symbol(self._filtered_positions_cache[row])
             self._trail_to_cost(symbol)
 
     def _trail_selected_plus(self, points: float):
         """Trail selected position by points."""
         row = self.positions_table.currentRow()
-        if row >= 0 and row < len(self._positions_cache):
+        if row >= 0 and row < len(self._filtered_positions_cache):
             symbol = _get_position_symbol(self._filtered_positions_cache[row])
             self._trail_by_points(symbol, points)
+
+    def _cleanup_position_structures(self, symbol: str) -> Dict[str, Any]:
+        """
+        Atomically clean up position from all tracking structures.
+
+        CRITICAL FIX (A2): Ensures consistent cleanup across trail_mgr, oco_monitor,
+        and pos_tracker even if one structure fails. Logs partial failures but
+        continues cleanup.
+
+        Args:
+            symbol: Trading symbol to clean up
+
+        Returns:
+            Dict with cleanup results for each structure
+        """
+        results = {
+            'pos_tracker': False,
+            'trail_mgr': False,
+            'oco_monitor': False,
+            'sl_cancelled': None,
+            'target_cancelled': None,
+            'errors': []
+        }
+
+        # 1. Cancel orders and close position tracker (most critical)
+        try:
+            cancelled = self.pos_tracker.cancel_all_orders_for_symbol(symbol)
+            results['sl_cancelled'] = cancelled.get('sl_cancelled')
+            results['target_cancelled'] = cancelled.get('target_cancelled')
+            self.pos_tracker.close_positions_by_symbol(symbol)
+            results['pos_tracker'] = True
+        except Exception as e:
+            results['errors'].append(f"pos_tracker: {e}")
+            logger.error(f"[CLEANUP] pos_tracker error for {symbol}: {e}")
+
+        # 2. Remove from trail manager
+        try:
+            if self.trail_mgr:
+                self.trail_mgr.remove_positions_by_symbol(symbol)
+                results['trail_mgr'] = True
+        except Exception as e:
+            results['errors'].append(f"trail_mgr: {e}")
+            logger.error(f"[CLEANUP] trail_mgr error for {symbol}: {e}")
+
+        # 3. Remove from OCO monitor
+        try:
+            if self.oco_monitor:
+                self.oco_monitor.remove_pairs_by_symbol(symbol)
+                results['oco_monitor'] = True
+        except Exception as e:
+            results['errors'].append(f"oco_monitor: {e}")
+            logger.error(f"[CLEANUP] oco_monitor error for {symbol}: {e}")
+
+        # Log if any cleanup failed
+        if results['errors']:
+            logger.warning(f"[CLEANUP] Partial cleanup for {symbol}: {results['errors']}")
+
+        return results
 
     def _exit_position(self, pos: Dict[str, Any], percent: int):
         """Exit position by percentage - EXIT FIRST, then cancel SL/Target.
@@ -2824,8 +4190,18 @@ class MainWindow(QMainWindow):
         symbol = _get_position_symbol(pos)
         qty = abs(_get_position_qty(pos))
 
-        # Calculate exit quantity
-        exit_qty = int(qty * percent / 100)
+        # Calculate exit quantity - minimum 1 lot for partial exits
+        if percent < 100:
+            exit_qty = int(qty * percent / 100)
+            # CRITICAL: If calculated exit_qty is 0, warn user and abort
+            if exit_qty == 0:
+                self.log_message.emit(f"[EXIT] Cannot exit {percent}% of {qty} qty - too small. Use EXIT for full exit.")
+                if self.sound:
+                    self.sound.play('error')
+                return
+        else:
+            exit_qty = qty
+
         remaining_qty = qty - exit_qty
         is_full_exit = percent == 100 or remaining_qty == 0
 
@@ -2845,21 +4221,17 @@ class MainWindow(QMainWindow):
 
             # ONLY NOW (after exit succeeds) cancel SL/Target for FULL exits
             if is_full_exit:
-                # Cancel SL/Target orders
-                cancelled = self.pos_tracker.cancel_all_orders_for_position(symbol)
-                if cancelled.get('sl_cancelled'):
-                    self.log_message.emit(f"[EXIT] Cancelled SL order: {cancelled['sl_cancelled']}")
-                if cancelled.get('target_cancelled'):
-                    self.log_message.emit(f"[EXIT] Cancelled Target order: {cancelled['target_cancelled']}")
+                # CRITICAL FIX (A2): Use atomic cleanup method for all structures
+                cleanup = self._cleanup_position_structures(symbol)
 
-                # Remove from trail manager
-                if self.trail_mgr and symbol in self.trail_mgr.positions:
-                    del self.trail_mgr.positions[symbol]
+                if cleanup['sl_cancelled']:
+                    self.log_message.emit(f"[EXIT] Cancelled SL orders: {cleanup['sl_cancelled']}")
+                if cleanup['target_cancelled']:
+                    self.log_message.emit(f"[EXIT] Cancelled Target orders: {cleanup['target_cancelled']}")
+                if cleanup['trail_mgr']:
                     self.log_message.emit(f"[EXIT] Removed {symbol} from trail manager")
-
-                # Remove from OCO monitor
-                if self.oco_monitor:
-                    self.oco_monitor.remove_oco_pair(symbol)
+                if cleanup['errors']:
+                    self.log_message.emit(f"[EXIT] Cleanup warnings: {cleanup['errors']}")
 
             # Schedule P&L recording after exit fill is confirmed
             if self.pnl_tracker and result.order_id:
@@ -2871,14 +4243,15 @@ class MainWindow(QMainWindow):
                 ))
 
             # For partial exit, modify SL order quantity using order_manager with retry logic
+            # CRITICAL: Update tracker quantities ONLY AFTER SL adjustment succeeds
+            # to prevent inconsistent state if SL modification fails
             if not is_full_exit and remaining_qty > 0:
-                tracked = self.pos_tracker.get_position(symbol)
+                tracked = self.pos_tracker.get_first_position_by_symbol(symbol)
                 if tracked and tracked.sl_order_id:
-                    # Update tracker quantity
-                    self.pos_tracker.reduce_position_qty(symbol, exit_qty)
-
-                    # Determine exit type for SL
-                    is_long = _get_position_qty(pos) > 0
+                    # CRITICAL FIX (T2): Use tracker's authoritative side value instead of
+                    # potentially stale cached position. This ensures correct SL direction
+                    # even if cache is outdated.
+                    is_long = tracked.side == 'LONG'
                     exit_type = 'S' if is_long else 'B'
 
                     # Use order_manager's method with retry logic
@@ -2899,15 +4272,25 @@ class MainWindow(QMainWindow):
                         new_sl_id = adjust_result.get('new_sl_order_id')
                         self.log_message.emit(f"[EXIT] SL qty adjusted to {remaining_qty} ({action}) -> {new_sl_id}")
 
+                        # ONLY NOW update tracker quantities (after SL adjustment confirmed)
+                        self.pos_tracker.reduce_position_qty_by_symbol(symbol, exit_qty)
+
+                        # Update trail manager quantity (thread-safe via method)
+                        if self.trail_mgr:
+                            self.trail_mgr.update_quantity_by_symbol(symbol, remaining_qty)
+
                         # Update trail manager with new SL order ID if recreated
-                        if action == 'recreated' and self.trail_mgr and symbol in self.trail_mgr.positions:
-                            self.trail_mgr.positions[symbol].sl_order_id = new_sl_id
+                        if action == 'recreated' and self.trail_mgr:
+                            entry_id = self.trail_mgr.get_first_entry_id_for_symbol(symbol)
+                            if entry_id:
+                                self.trail_mgr.update_sl_order_id(entry_id, new_sl_id)
                     else:
                         error_msg = adjust_result.get('error', 'Unknown error')
                         is_critical = adjust_result.get('critical', False)
                         if is_critical:
                             self.log_message.emit(f"[EXIT] CRITICAL: SL adjustment FAILED - {error_msg}")
                             self.log_message.emit(f"[EXIT] POSITION {symbol} MAY BE UNPROTECTED!")
+                            self.log_message.emit(f"[EXIT] Tracker quantities NOT updated - SL still has original qty")
                             if self.sound:
                                 self.sound.play('error')
                             if self.telegram:
@@ -2916,50 +4299,25 @@ class MainWindow(QMainWindow):
                             self.log_message.emit(f"[EXIT] SL adjustment failed - {error_msg}")
             else:
                 # Full exit - close position tracking
-                self.pos_tracker.close_position(symbol)
+                self.pos_tracker.close_positions_by_symbol(symbol)
         else:
-            self.log_message.emit(f"[EXIT] Failed - {result.message}")
+            # S34: Improved error message for common cases
+            error_msg = result.message or "Unknown error"
+            if "order not in book" in error_msg.lower():
+                # Order verified NOT in book - position may be closed by SL
+                self.log_message.emit(f"[EXIT] {symbol}: Failed (position may be closed by SL)")
+            elif "error from core" in error_msg.lower():
+                # Fallback for any remaining "error from core" messages
+                self.log_message.emit(f"[EXIT] {symbol}: API error - check order book manually")
+            else:
+                self.log_message.emit(f"[EXIT] {symbol}: Failed - {error_msg}")
 
         QTimer.singleShot(500, self._refresh_positions)
+        # Refresh margin after exit (margin released)
+        QTimer.singleShot(300, self._refresh_margin)
 
-    def _recreate_sl_after_partial(self, symbol: str, sl_price: float, qty: int, pos: Dict[str, Any]):
-        """Recreate SL order after partial exit when modify failed."""
-        try:
-            is_long = _get_position_qty(pos) > 0
-            exit_type = 'S' if is_long else 'B'
-
-            sl_response = self.session.get_client().place_order(
-                exchange_segment=_get_position_exchange(pos),
-                product=_get_position_product(pos),
-                price="0",
-                order_type="SL-M",
-                quantity=str(qty),
-                validity="DAY",
-                trading_symbol=symbol,
-                transaction_type=exit_type,
-                amo="NO",
-                trigger_price=str(sl_price),
-                tag='SL'
-            )
-
-            sl_order_id = sl_response.get('nOrdNo') if sl_response else None
-            if sl_order_id:
-                self.pos_tracker.set_sl_order(symbol, sl_order_id, sl_price)
-                self.log_message.emit(f"[EXIT] Recreated SL @ {sl_price} -> {sl_order_id}")
-
-                # Update trail manager
-                if self.trail_mgr and symbol in self.trail_mgr.positions:
-                    self.trail_mgr.positions[symbol].sl_order_id = sl_order_id
-
-                # Update OCO monitor with new SL order ID
-                if self.oco_monitor and self.oco_monitor.is_monitoring(symbol):
-                    self.oco_monitor.update_sl_order(symbol, sl_order_id, sl_price)
-                    self.log_message.emit(f"[EXIT] Updated OCO monitor with new SL")
-            else:
-                self.log_message.emit(f"[EXIT] SL recreation returned no order ID")
-
-        except Exception as e:
-            self.log_message.emit(f"[EXIT] SL recreation failed: {e}")
+    # NOTE: _recreate_sl_after_partial was removed in Session 14 (dead code)
+    # SL recreation after partial exit is now handled by orders.adjust_sl_after_partial_exit()
 
     def _record_exit_pnl(self, symbol: str, exit_order_id: str, exit_qty: int,
                           exit_type: str = 'EXIT', retry_count: int = 0):
@@ -2987,9 +4345,15 @@ class MainWindow(QMainWindow):
             status = exit_order.get('ordSt', '').lower()
 
             if status in ['complete', 'traded', 'filled']:
-                # Get fill price
-                exit_price = float(exit_order.get('avgPrc', 0) or 0)
-                filled_qty = int(exit_order.get('fldQty', 0) or exit_qty)
+                # Get fill price - S28: Safe conversions with try/except
+                try:
+                    exit_price = float(exit_order.get('avgPrc') or 0)
+                except (ValueError, TypeError):
+                    exit_price = 0.0
+                try:
+                    filled_qty = int(float(exit_order.get('fldQty') or exit_qty))
+                except (ValueError, TypeError):
+                    filled_qty = exit_qty
 
                 if exit_price > 0 and self.pnl_tracker:
                     result = self.pnl_tracker.record_exit(
@@ -3039,8 +4403,8 @@ class MainWindow(QMainWindow):
                     if cancelled:
                         self.log_message.emit(f"[EXIT ALL] Cancelled pending entry: {entry.symbol}")
 
-            # Step 2: Get current positions BEFORE any exit attempts
-            tracked_symbols = list(self.pos_tracker.positions.keys())
+            # Step 2: Get current positions BEFORE any exit attempts (thread-safe)
+            tracked_symbols = self.pos_tracker.get_all_entry_ids()
             self.log_message.emit(f"[EXIT ALL] Attempting to exit {len(tracked_symbols)} tracked positions...")
 
             # Step 3: EXIT POSITIONS FIRST - track successes and failures
@@ -3051,7 +4415,8 @@ class MainWindow(QMainWindow):
 
             for r in results:
                 symbol = r.get('symbol', '')
-                status = r.get('status', 'unknown').lower()
+                # S35: Handle None status - use 'or' to ensure non-None before .lower()
+                status = (r.get('status') or 'unknown').lower()
 
                 if status in ['success', 'ok', 'complete', 'submitted']:
                     successful_exits.add(symbol)
@@ -3061,29 +4426,46 @@ class MainWindow(QMainWindow):
                     self.log_message.emit(f"[EXIT ALL] ✗ {symbol}: EXIT FAILED - {status}")
 
             # Step 4: ONLY clear trackers for SUCCESSFUL exits
+            # Use symbol-based cleanup methods since we have symbols from exit results
             cancelled_count = 0
             for symbol in successful_exits:
-                # Cancel SL/Target orders for this position
-                if symbol in self.pos_tracker.positions:
-                    cancelled = self.pos_tracker.cancel_all_orders_for_position(symbol)
-                    if cancelled.get('sl_cancelled') or cancelled.get('target_cancelled'):
-                        cancelled_count += 1
+                # Cancel SL/Target orders for all positions with this symbol
+                cancelled = self.pos_tracker.cancel_all_orders_for_symbol(symbol)
+                if cancelled.get('sl_cancelled') or cancelled.get('target_cancelled'):
+                    cancelled_count += 1
 
                 # Clear from trail manager
-                if self.trail_mgr and symbol in self.trail_mgr.positions:
-                    del self.trail_mgr.positions[symbol]
+                if self.trail_mgr:
+                    self.trail_mgr.remove_positions_by_symbol(symbol)
 
                 # Clear from OCO monitor
                 if self.oco_monitor:
-                    self.oco_monitor.remove_pair_by_symbol(symbol)
+                    self.oco_monitor.remove_pairs_by_symbol(symbol)
 
                 # Clear from position tracker
-                if symbol in self.pos_tracker.positions:
-                    del self.pos_tracker.positions[symbol]
+                self.pos_tracker.close_positions_by_symbol(symbol)
 
             self.log_message.emit(f"[EXIT ALL] Cancelled SL/Target for {cancelled_count} exited positions")
 
-            # Step 5: ALERT if any exits failed - these positions still have protection!
+            # Step 5: S35-M3: Clean up stale tracker entries (positions not in API response)
+            # These are positions in trackers that were already closed before exit_all
+            api_symbols = successful_exits | failed_exits
+            stale_count = 0
+            for entry_id in list(tracked_symbols):  # Copy keys to avoid modification during iteration
+                tracked = self.pos_tracker.get_position(entry_id)
+                if tracked and tracked.symbol not in api_symbols:
+                    logger.info(f"[EXIT ALL] Cleaning stale tracker: {tracked.symbol} (not in API)")
+                    # Clean up stale entry from all trackers
+                    if self.trail_mgr:
+                        self.trail_mgr.remove_position(entry_id)
+                    if self.oco_monitor:
+                        self.oco_monitor.remove_pair(entry_id)
+                    self.pos_tracker.close_position(entry_id)
+                    stale_count += 1
+            if stale_count > 0:
+                self.log_message.emit(f"[EXIT ALL] Cleaned {stale_count} stale tracker entries")
+
+            # Step 6: ALERT if any exits failed - these positions still have protection!
             if failed_exits:
                 failed_list = ', '.join(list(failed_exits)[:5])  # Show first 5
                 self.log_message.emit(f"[EXIT ALL] ⚠️ FAILED EXITS: {failed_list}")
@@ -3136,33 +4518,33 @@ class MainWindow(QMainWindow):
         - Safety: every 6th call (30 seconds) regardless
         """
         # Check force flag first (set after order actions)
-        if getattr(self, '_force_orders_refresh', False):
+        # S17-L1: _force_orders_refresh now initialized in __init__
+        if self._force_orders_refresh:
             self._force_orders_refresh = False
             return True
 
         # Safety counter - force refresh every 30 seconds
-        if not hasattr(self, '_orders_refresh_skip_count'):
-            self._orders_refresh_skip_count = 0
-
+        # S17-L1: _orders_refresh_skip_count now initialized in __init__
         self._orders_refresh_skip_count += 1
         if self._orders_refresh_skip_count >= 6:  # 6 × 5s = 30s
             self._orders_refresh_skip_count = 0
             return True
 
         # Check for pending orders from last refresh
-        if hasattr(self, '_has_pending_orders') and self._has_pending_orders:
+        # S17-L1: _has_pending_orders now initialized in __init__
+        if self._has_pending_orders:
             return True
 
         # Check for open positions
         if self.pos_tracker and self.pos_tracker.positions:
             return True
 
-        # Check OCO monitor
-        if self.oco_monitor and hasattr(self.oco_monitor, 'pairs') and self.oco_monitor.pairs:
+        # Check OCO monitor (oco_pairs is always initialized in OCOMonitor.__init__)
+        if self.oco_monitor and self.oco_monitor.oco_pairs:
             return True
 
-        # Check trailing SL manager
-        if self.trail_mgr and hasattr(self.trail_mgr, 'auto_trail_positions') and self.trail_mgr.auto_trail_positions:
+        # Check trailing SL manager (positions is always initialized in TrailingSLManager.__init__)
+        if self.trail_mgr and self.trail_mgr.positions:
             return True
 
         # Check partial fill monitor for pending entries
@@ -3214,24 +4596,38 @@ class MainWindow(QMainWindow):
         Preserves user's sort selection across refreshes.
         """
         # Check for SL fills (backup detection if WebSocket misses it)
-        if not hasattr(self, '_alerted_sl_orders'):
-            self._alerted_sl_orders = set()
+        # S17-L1: _alerted_sl_orders now initialized in __init__
+
+        # Cleanup: Limit set size to prevent unbounded growth
+        # Keep only recent entries - if set grows too large, clear stale entries
+        if len(self._alerted_sl_orders) > 100:
+            # Keep only order IDs that are still being tracked (use snapshot for thread safety)
+            active_sl_ids = {pos.sl_order_id for pos in self.pos_tracker.get_all_positions_snapshot().values() if pos.sl_order_id}
+            self._alerted_sl_orders &= active_sl_ids
 
         for order in orders:
             order_id = order.get('nOrdNo', order.get('orderId', ''))
             status = order.get('ordSt', order.get('status', '')).lower()
 
-            # Check if this is a filled SL order we haven't alerted yet
+            # Check if this is a filled SL order we haven't alerted yet (use snapshot for thread safety)
             if status in ['complete', 'completed', 'traded', 'filled', 'executed']:
                 if order_id not in self._alerted_sl_orders:
-                    for pos_symbol, pos in self.pos_tracker.positions.items():
+                    for entry_id, pos in self.pos_tracker.get_all_positions_snapshot().items():
                         if pos.sl_order_id == order_id:
                             self._alerted_sl_orders.add(order_id)
-                            self._show_sl_breach_alert(pos_symbol, pos.sl_price or 0)
+                            self._show_sl_breach_alert(pos.symbol, pos.sl_price or 0)
                             break
 
         # Show only recent orders (last 20)
         recent_orders = orders[-20:] if len(orders) > 20 else orders
+
+        # Sort orders: Open/Pending first (actionable), then by time (newest first)
+        # This ensures traders see actionable orders at the top for quick action
+        open_statuses = {'pending', 'open', 'trigger pending', 'after market order req received'}
+        # Step 1: Sort by time descending (newest first)
+        recent_orders.sort(key=lambda o: o.get('ordDtTm', o.get('exOrdTm', o.get('orderTime', ''))) or '', reverse=True)
+        # Step 2: Stable sort by status (open first) - preserves time order within each group
+        recent_orders.sort(key=lambda o: 0 if o.get('ordSt', o.get('status', '')).lower() in open_statuses else 1)
 
         # Block signals during update to avoid triggering cellChanged
         self.orders_table.blockSignals(True)
@@ -3247,10 +4643,12 @@ class MainWindow(QMainWindow):
             trans_type = order.get('tranType', order.get('trnsTp', order.get('transactionType', '')))
             action = 'B' if trans_type == 'B' else 'S'
             qty = order.get('qty', order.get('quantity', ''))
-            price = order.get('prc', order.get('price', order.get('avgPrc', '')))
+            # FIX: For completed orders, avgPrc is the actual fill price
+            # For pending orders, prc is the limit price
+            limit_price = order.get('prc', order.get('price', ''))
+            avg_fill_price = order.get('avgPrc', order.get('averagePrice', ''))
             trigger_price = order.get('trgPrc', order.get('triggerPrice', ''))
             order_type = order.get('ordTyp', order.get('prcTyp', order.get('orderType', '')))
-            ltp = order.get('ltp', order.get('lastPrice', order.get('lp', '')))
             status = order.get('ordSt', order.get('status', ''))
             is_pending = status.lower() in ['pending', 'open', 'trigger pending', 'after market order req received']
             # NEO API uses 'ordDtTm' or 'exOrdTm' for order time
@@ -3272,7 +4670,7 @@ class MainWindow(QMainWindow):
                 'order_id': order_id,
                 'order_type': order_type,
                 'trigger_price': trigger_price,
-                'price': price
+                'price': limit_price
             })
             symbol_item.setFlags(symbol_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.orders_table.setItem(row, 0, symbol_item)
@@ -3291,14 +4689,47 @@ class MainWindow(QMainWindow):
             qty_item.setFlags(qty_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.orders_table.setItem(row, 2, qty_item)
 
-            # Column 3: LTP
-            ltp_item = QTableWidgetItem(str(ltp) if ltp else "--")
-            ltp_item.setForeground(QBrush(QColor("#00ccff")))
+            # Column 3: LTP - Fetch from Kite for open/pending orders
+            ltp_text = "--"
+            ltp_tooltip = "LTP not available"
+            ltp_color = "#666666"
+
+            if is_pending and self.kite and self.kite.is_connected():
+                try:
+                    ltp = self.kite.get_option_ltp(symbol)
+                    if ltp is not None:
+                        ltp_text = f"{ltp:.2f}"
+                        ltp_color = "#ffffff"
+                        # Show distance from limit price to help trader
+                        if limit_price and float(limit_price) > 0:
+                            diff = ltp - float(limit_price)
+                            ltp_tooltip = f"LTP: {ltp:.2f} | Limit: {limit_price} | Diff: {diff:+.2f}"
+                        else:
+                            ltp_tooltip = f"LTP: {ltp:.2f}"
+                except Exception:
+                    ltp_tooltip = "LTP fetch failed"
+
+            ltp_item = QTableWidgetItem(ltp_text)
+            ltp_item.setForeground(QBrush(QColor(ltp_color)))
+            ltp_item.setToolTip(ltp_tooltip)
             ltp_item.setFlags(ltp_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.orders_table.setItem(row, 3, ltp_item)
 
             # Column 4: Price - EDITABLE for pending orders
-            display_price = trigger_price if trigger_price and float(trigger_price) > 0 else price
+            # FIX: For completed orders, show avgPrc (actual fill price)
+            # For pending orders, show trigger_price (SL) or limit_price
+            is_completed = status.lower() in ['complete', 'completed', 'traded', 'filled', 'executed']
+            if is_completed:
+                # Show fill price for completed orders
+                display_price = avg_fill_price if avg_fill_price else limit_price
+            else:
+                # Show trigger price for SL orders, limit price otherwise
+                # S28: Safe float conversion with try/except
+                try:
+                    trigger_val = float(trigger_price) if trigger_price else 0.0
+                except (ValueError, TypeError):
+                    trigger_val = 0.0
+                display_price = trigger_price if trigger_price and trigger_val > 0 else limit_price
             price_item = QTableWidgetItem(str(display_price) if display_price else "--")
             if is_pending:
                 # Make editable - yellow background to indicate editable
@@ -3312,47 +4743,40 @@ class MainWindow(QMainWindow):
             # Column 5: Status with color and rejection reason
             rej_reason = order.get('rejRsn') or order.get('rejectionReason') or \
                          order.get('text') or order.get('remarks') or ''
-            status_display = status
+
+            # Normalize status display to proper case
+            status_lower = status.lower()
+            if status_lower in ['complete', 'completed', 'traded', 'filled', 'executed']:
+                status_display = "Complete"
+            elif status_lower in ['rejected']:
+                status_display = "Rejected"
+            elif status_lower in ['cancelled', 'canceled']:
+                status_display = "Cancelled"
+            elif status_lower in ['open', 'pending']:
+                status_display = "Open"
+            elif status_lower in ['trigger pending']:
+                status_display = "Trigger"
+            elif status_lower in ['after market order req received']:
+                status_display = "AMO"
+            else:
+                status_display = status.title()  # Fallback: capitalize first letter
+
             status_tooltip = f"Status: {status}"
 
-            if status.lower() in ['rejected', 'cancelled'] and rej_reason:
-                # Show shortened reason in status column
-                status_display = f"REJ"
+            if status_lower in ['rejected', 'cancelled', 'canceled'] and rej_reason:
+                # Show rejection reason in tooltip
                 status_tooltip = f"REJECTED: {rej_reason}"
-                # Log rejection reason once (track by order_id)
-                if not hasattr(self, '_logged_rejections'):
-                    self._logged_rejections = set()
-                if order_id and order_id not in self._logged_rejections:
-                    self._logged_rejections.add(order_id)
-                    self.log_message.emit(f"[ORDER] {symbol} REJECTED: {rej_reason}")
-                    # Debug: log full order data for unhelpful rejection reasons
-                    if rej_reason.strip() in ['-', '', 'Unknown']:
-                        logger.warning(f"Unhelpful rejection reason. Full order: {order}")
-
-                    # Learn from this rejection
-                    if self.rejection_learner and status.lower() == 'rejected':
-                        order_details = {
-                            'product': order.get('prod', order.get('product', '')),
-                            'order_type': order_type,
-                            'price': price
-                        }
-                        learned = self.rejection_learner.learn_from_rejection(
-                            symbol, rej_reason, order_details
-                        )
-                        if learned:
-                            self.log_message.emit(
-                                f"[LEARNER] Learned: {learned.get('index') or symbol} -> "
-                                f"Use {learned['product']} ({learned['reason']})"
-                            )
+                # NOTE: Don't log rejections here - WebSocket handler logs them in real-time
+                # This refresh only handles display, not logging old rejections from previous sessions
 
             status_item = QTableWidgetItem(status_display)
             status_item.setToolTip(status_tooltip)
-            if status.lower() in ['complete', 'traded', 'filled']:
-                status_item.setForeground(QBrush(QColor("#00ff88")))
-            elif status.lower() in ['rejected', 'cancelled']:
-                status_item.setForeground(QBrush(QColor("#ff4444")))
+            if status_lower in ['complete', 'completed', 'traded', 'filled', 'executed']:
+                status_item.setForeground(QBrush(QColor("#00ff88")))  # Green
+            elif status_lower in ['rejected', 'cancelled', 'canceled']:
+                status_item.setForeground(QBrush(QColor("#ff4444")))  # Red
             else:
-                status_item.setForeground(QBrush(QColor("#ffaa00")))
+                status_item.setForeground(QBrush(QColor("#ffaa00")))  # Orange (Open/Pending)
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.orders_table.setItem(row, 5, status_item)
 
@@ -3369,11 +4793,9 @@ class MainWindow(QMainWindow):
                 cancel_btn.setStyleSheet("""
                     QPushButton {
                         background-color: #dd2222; color: white;
-                        font-weight: bold; font-size: 11px; border-radius: 3px;
+                        font-weight: bold; font-size: 16px; border-radius: 3px;
                         border: 1px solid #ff4444;
-                        margin: 0px;
-                padding-top: 0px;
-                padding-bottom: 4px;
+                        padding: 0px; margin: 0px;
                     }
                     QPushButton:hover { background-color: #ff3333; border: 1px solid #ff6666; }
                 """)
@@ -3389,9 +4811,9 @@ class MainWindow(QMainWindow):
         # Unblock signals
         self.orders_table.blockSignals(False)
 
-        # Re-enable sorting and restore user's sort preference
-        self.orders_table.setSortingEnabled(True)
-        self.orders_table.sortByColumn(self._orders_sort_column, self._orders_sort_order)
+        # Keep sorting disabled - we pre-sort data with open orders first
+        # This ensures actionable orders always stay at top regardless of user clicks
+        self.orders_table.setSortingEnabled(False)
 
     def _cancel_pending_orders(self):
         """Cancel all pending orders and clear tracker references."""
@@ -3411,18 +4833,12 @@ class MainWindow(QMainWindow):
             if r.get('status') == 'cancelled':
                 cancelled_ids.add(r.get('order_id'))
 
-        # Clear tracker references for cancelled orders
-        for symbol, pos in list(self.pos_tracker.positions.items()):
-            if pos.sl_order_id in cancelled_ids:
-                pos.sl_order_id = None
-                pos.sl_price = None
-            if pos.target_order_id in cancelled_ids:
-                pos.target_order_id = None
-                pos.target_price = None
+        # Clear tracker references for cancelled orders (thread-safe - updates original)
+        self.pos_tracker.clear_cancelled_orders(cancelled_ids)
 
-        # Clear trail manager (SL orders cancelled)
+        # Clear trail manager (SL orders cancelled) - thread-safe
         if self.trail_mgr:
-            self.trail_mgr.positions.clear()
+            self.trail_mgr.clear_all()
 
         # Clear OCO monitor
         if self.oco_monitor:
@@ -3430,6 +4846,8 @@ class MainWindow(QMainWindow):
 
         self._force_next_orders_refresh()
         QTimer.singleShot(500, self._refresh_orders)
+        # Refresh margin after cancelling orders
+        QTimer.singleShot(300, self._refresh_margin)
 
     def _cancel_all_orders(self):
         """Cancel all pending orders with confirmation."""
@@ -3486,9 +4904,10 @@ class MainWindow(QMainWindow):
 
         # Final 10 minutes - FREEZE new orders
         if current_time >= freeze_time:
-            if not hasattr(self, '_eod_freeze_shown'):
+            # S17-L1: _eod_freeze_shown now initialized in __init__
+            if not self._eod_freeze_shown:
                 self._eod_freeze_shown = True
-                self.log_message.emit("[WARNING] Market closing in 10 min - New orders FROZEN")
+                self.log_message.emit("[WARNING] Market closing in 10 min - New MIS orders FROZEN (exits allowed)")
                 # Consider auto-exit here if configured
                 if self.config.get('risk_management', {}).get('auto_exit_before_close', False):
                     self._trigger_eod_exit()
@@ -3496,18 +4915,17 @@ class MainWindow(QMainWindow):
 
         # Warning zone (15-10 min before close)
         if current_time >= warning_time:
-            if not hasattr(self, '_eod_warning_shown'):
+            # S17-L1: _eod_warning_shown now initialized in __init__
+            if not self._eod_warning_shown:
                 self._eod_warning_shown = True
                 self.log_message.emit("[WARNING] Market closing soon - Square off MIS positions!")
                 if self.sound:
                     self.sound.play('alert')
             return f"CLOSE IN {self._time_to_close(now)}"
 
-        # Reset flags for next day
-        if hasattr(self, '_eod_warning_shown'):
-            del self._eod_warning_shown
-        if hasattr(self, '_eod_freeze_shown'):
-            del self._eod_freeze_shown
+        # Reset flags for next day (set to False instead of del since initialized in __init__)
+        self._eod_warning_shown = False
+        self._eod_freeze_shown = False
 
         return ""
 
@@ -3533,10 +4951,29 @@ class MainWindow(QMainWindow):
         if self.session and self.session.is_connected():
             limits = self.session.get_limits()
             if limits:
-                # NEO API returns flat dict with Net (available), MarginUsed, RmsPayInAmt
-                available = float(limits.get('Net', 0) or 0)
-                margin_used = float(limits.get('MarginUsed', 0) or 0)
+                # NEO API may return nested under 'data' or flat dict
+                data = limits.get('data', limits) if isinstance(limits, dict) else limits
+
+                # Try multiple field names (API versions differ)
+                available = float(
+                    data.get('Net') or data.get('marginAvailable') or
+                    data.get('availableMargin') or 0
+                )
+                margin_used = float(
+                    data.get('MarginUsed') or data.get('marginUsed') or
+                    data.get('usedMargin') or 0
+                )
+
                 self.margin_updated.emit(available)
+                # Update margin preview to show capital deployed (orders + positions)
+                # FIX: If margin_used is negative (broker returns profit as negative), show 0
+                # Negative margin means no capital is deployed (position closed with profit)
+                if margin_used < 0:
+                    self.margin_preview.setText("₹0")
+                    self.margin_preview.setToolTip(f"No capital deployed (P&L: ₹{abs(margin_used):,.0f})")
+                else:
+                    self.margin_preview.setText(f"₹{margin_used:,.0f}")
+                    self.margin_preview.setToolTip("Capital deployed in open positions")
 
     def _refresh_quote(self):
         """Refresh LTP/Bid/Ask for current symbol every 2 seconds."""
@@ -3556,7 +4993,8 @@ class MainWindow(QMainWindow):
                     buy_depth = depth.get('buy', [])
                     sell_depth = depth.get('sell', [])
 
-                    if ltp:
+                    # S27: Use explicit None check - LTP of 0 is technically valid
+                    if ltp is not None and ltp > 0:
                         self.ltp_label.setText(f"₹{ltp:.2f}")
                         self.ltp_label.setStyleSheet("color: #00ff88; font-weight: bold;")
 
@@ -3569,6 +5007,207 @@ class MainWindow(QMainWindow):
                         self.ask_label.setText(f"₹{ask:.2f}")
             except Exception:
                 pass  # Silent fail for quote refresh
+
+    def _refresh_index_prices(self):
+        """S30: Refresh index spot prices via API (fallback only if WebSocket not delivering)."""
+        if not self.kite or not self.kite.is_connected():
+            return
+
+        import time
+        current_time = time.time()
+        stale_threshold = 30.0  # Consider WebSocket stale if no update in 30 seconds
+
+        try:
+            for idx_name in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+                # Only fetch via API if WebSocket hasn't delivered recently
+                last_ws_update = self._index_ws_last_update.get(idx_name, 0)
+                if current_time - last_ws_update < stale_threshold:
+                    continue  # WebSocket is delivering, skip API call
+
+                try:
+                    spot = self.kite.get_spot_price(idx_name)
+                    if spot and spot > 0:
+                        self._index_prices[idx_name] = spot
+                        if idx_name in self._index_labels:
+                            # S34: Label white, value yellow
+                            self._index_labels[idx_name].setText(f"<span style='color: white;'>{idx_name}:</span> <span style='color: #ffff00;'>{spot:,.0f}</span>")
+                except Exception:
+                    pass  # Silent fail for individual index
+        except Exception:
+            pass  # Silent fail for index refresh
+
+    def _refresh_index_prices_immediate(self):
+        """Fetch index prices immediately via API (for startup, ignores WebSocket check)."""
+        if not self.kite or not self.kite.is_connected():
+            return
+
+        try:
+            for idx_name in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+                try:
+                    spot = self.kite.get_spot_price(idx_name)
+                    if spot and spot > 0:
+                        self._index_prices[idx_name] = spot
+                        if idx_name in self._index_labels:
+                            # S34: Label white, value yellow
+                            self._index_labels[idx_name].setText(f"<span style='color: white;'>{idx_name}:</span> <span style='color: #ffff00;'>{spot:,.0f}</span>")
+                except Exception:
+                    pass  # Silent fail for individual index
+        except Exception:
+            pass  # Silent fail for index refresh
+
+    def _check_supertrend_update(self):
+        """
+        S35: Check if it's time to update Supertrend indicators.
+
+        Updates at the 6th minute of each 5-minute interval (1, 6, 11, 16, 21, etc.)
+        to ensure the previous 5-minute candle is complete.
+        """
+        now = datetime.now()
+        minute = now.minute
+
+        # Update at 1, 6, 11, 16, 21, 26, 31, 36, 41, 46, 51, 56 (6th minute of each 5-min interval)
+        if minute % 5 == 1:
+            self._update_supertrend_indicators()
+
+    def _update_supertrend_indicators(self):
+        """
+        S35: Fetch and update Supertrend indicators for all indices.
+
+        Runs in a background thread to avoid blocking the GUI.
+        """
+        if not self.kite or not self.kite.is_connected():
+            logger.warning("[ST] Kite not connected - skipping ST update")
+            return
+
+        # Run in background thread
+        import threading
+        thread = threading.Thread(target=self._fetch_supertrend_data, daemon=True)
+        thread.start()
+
+    def _fetch_supertrend_data(self):
+        """
+        S35: Background thread to fetch Supertrend data for all indices.
+
+        OPTIMIZED: Uses single API call per index (3 total) instead of 18.
+        Fetches 5m candles and aggregates locally for all timeframes.
+        """
+        try:
+            logger.info("[ST] Fetching Supertrend data (optimized: 3 API calls)...")
+            st_data = {}
+
+            indices = ['NIFTY', 'BANKNIFTY', 'SENSEX']
+
+            for index_name in indices:
+                st_data[index_name] = {}
+                try:
+                    # Single API call per index - returns all 6 timeframes
+                    results = self.kite.get_index_supertrends_optimized(
+                        index_name, period=10, multiplier=3.0
+                    )
+
+                    for tf, result in results.items():
+                        if result:
+                            st_data[index_name][tf] = {
+                                'direction': result.direction,
+                                'value': round(result.value),
+                                'close': result.close  # LTP for distance calculation
+                            }
+                        else:
+                            st_data[index_name][tf] = None
+
+                    logger.info(f"[ST] {index_name} done (1 API call)")
+
+                except Exception as e:
+                    logger.warning(f"[ST] {index_name} failed: {e}")
+                    for tf in [5, 10, 15, 30, 60, 120]:
+                        st_data[index_name][tf] = None
+
+            # Emit signal to update GUI (thread-safe)
+            self.st_data_ready.emit(st_data)
+
+        except Exception as e:
+            logger.error(f"[ST] Failed to fetch Supertrend data: {e}", exc_info=True)
+
+    def _apply_supertrend_display(self, st_data: Dict[str, Dict[int, Any]]):
+        """
+        S35: Apply Supertrend data to GUI dots.
+        Dot size varies based on distance from LTP to ST level:
+        - Close to ST → Small dot (weak trend, near reversal)
+        - Far from ST → Big dot (strong trend)
+
+        Args:
+            st_data: {index_name: {timeframe: {'direction': str, 'value': int, 'close': float}}}
+        """
+        tf_labels = {5: '5M', 10: '10M', 15: '15M', 30: '30M', 60: '1H', 120: '2H'}
+
+        def get_dot_size(close: float, st_value: float) -> int:
+            """Calculate dot size based on distance percentage from ST level."""
+            if close <= 0 or st_value <= 0:
+                return 14  # Default
+
+            # Distance as percentage of price
+            distance_pct = abs(close - st_value) / close * 100
+
+            # Map distance to font size:
+            # 0-0.3% → 8px (very close, tiny dot)
+            # 0.3-0.6% → 10px
+            # 0.6-1.0% → 12px
+            # 1.0-1.5% → 14px
+            # 1.5-2.0% → 16px
+            # 2.0%+ → 18px (far away, big dot)
+            if distance_pct < 0.3:
+                return 8
+            elif distance_pct < 0.6:
+                return 10
+            elif distance_pct < 1.0:
+                return 12
+            elif distance_pct < 1.5:
+                return 14
+            elif distance_pct < 2.0:
+                return 16
+            else:
+                return 18
+
+        for index_name, tf_data in st_data.items():
+            if index_name not in self._st_dots:
+                continue
+
+            for tf, data in tf_data.items():
+                if tf not in self._st_dots[index_name]:
+                    continue
+
+                dot = self._st_dots[index_name][tf]
+                tf_label = tf_labels.get(tf, f'{tf}M')
+
+                # Black tooltip style for all states
+                tooltip_style = "QToolTip { background-color: #1a1a1a; color: white; border: 1px solid #333; padding: 4px; }"
+
+                if data and isinstance(data, dict):
+                    direction = data.get('direction')
+                    value = data.get('value', 0)
+                    close = data.get('close', 0)
+
+                    # Calculate dot size based on distance
+                    dot_size = get_dot_size(close, value)
+
+                    # Calculate distance for tooltip
+                    distance = abs(close - value) if close and value else 0
+                    distance_pct = (distance / close * 100) if close else 0
+
+                    if direction == 'UP':
+                        dot.setStyleSheet(f"QLabel {{ color: #00ff88; font-size: {dot_size}px; }} {tooltip_style}")
+                        dot.setToolTip(f"{tf_label}: {value:,} ({distance_pct:.1f}%)")
+                    elif direction == 'DOWN':
+                        dot.setStyleSheet(f"QLabel {{ color: #ff4444; font-size: {dot_size}px; }} {tooltip_style}")
+                        dot.setToolTip(f"{tf_label}: {value:,} ({distance_pct:.1f}%)")
+                    else:
+                        dot.setStyleSheet(f"QLabel {{ color: #555555; font-size: 14px; }} {tooltip_style}")
+                        dot.setToolTip(f"{tf_label}: --")
+                else:
+                    dot.setStyleSheet(f"QLabel {{ color: #555555; font-size: 14px; }} {tooltip_style}")
+                    dot.setToolTip(f"{tf_label}: --")
+
+        logger.info(f"[ST] Updated indicators at {datetime.now().strftime('%H:%M')}")
 
     def _update_margin_display(self, margin: float):
         """Update margin label."""
@@ -3591,15 +5230,28 @@ class MainWindow(QMainWindow):
     def refresh_all(self):
         """Refresh all data."""
         self._refresh_positions()
+        # FIX: Force orders refresh on initial load (bypass _should_refresh_orders check)
+        self._force_orders_refresh = True
         self._refresh_orders()
         self._refresh_margin()
+        # Fetch index prices immediately (don't wait for WebSocket/timer)
+        self._refresh_index_prices_immediate()
 
     def _recover_existing_positions(self):
         """
         Recover existing positions from broker on startup.
         Syncs positions with tracker and checks for existing SL/Target orders.
         CRITICAL: Prevents exposure without SL protection after app restart.
+
+        NOTE: This method is idempotent - calling it multiple times won't create
+        duplicate tracker entries for the same symbol.
         """
+        # Guard: Prevent duplicate recovery by tracking if already run
+        # S17-L1: _recovery_completed now initialized in __init__
+        if self._recovery_completed:
+            self.log_message.emit("[RECOVERY] Already completed - skipping")
+            return
+
         self.log_message.emit("[RECOVERY] Checking for existing positions...")
 
         try:
@@ -3609,6 +5261,7 @@ class MainWindow(QMainWindow):
 
             if not active_positions:
                 self.log_message.emit("[RECOVERY] No existing positions found")
+                self._recovery_completed = True
                 return
 
             self.log_message.emit(f"[RECOVERY] Found {len(active_positions)} existing positions")
@@ -3616,22 +5269,38 @@ class MainWindow(QMainWindow):
             # Get all pending orders to find existing SL/Target
             pending_orders = self._get_pending_orders_by_symbol()
 
+            # Get already tracked symbols to avoid duplicates (use snapshot for thread safety)
+            already_tracked_symbols = {
+                pos.symbol for pos in self.pos_tracker.get_all_positions_snapshot().values()
+            }
+
             for pos in active_positions:
                 symbol = _get_position_symbol(pos)
+
+                # Skip if already tracked (prevents duplicates if recovery called twice)
+                if symbol in already_tracked_symbols:
+                    self.log_message.emit(f"[RECOVERY] {symbol} already tracked - skipping")
+                    continue
+
                 qty = _get_position_qty(pos)
                 avg_price = _get_position_avg_price(pos)
                 exchange_segment = _get_position_exchange(pos)
+                product = _get_position_product(pos)  # S23-C1: Get product for SL recreation
                 is_long = qty > 0
 
                 self.log_message.emit(f"[RECOVERY] Position: {symbol} {'LONG' if is_long else 'SHORT'} {abs(qty)} @ {avg_price:.2f}")
 
-                # Add to position tracker
+                # Add to position tracker with synthetic entry_order_id for recovery
+                import time
+                recovery_entry_id = f"recovery_{symbol}_{int(time.time())}"
                 self.pos_tracker.add_position(
                     symbol=symbol,
+                    entry_order_id=recovery_entry_id,
                     exchange_segment=exchange_segment,
                     quantity=abs(qty),
                     side='LONG' if is_long else 'SHORT',
-                    entry_price=avg_price
+                    entry_price=avg_price,
+                    product=product  # For SL recovery
                 )
 
                 # Check for existing SL/Target orders
@@ -3639,26 +5308,56 @@ class MainWindow(QMainWindow):
                 sl_order = None
                 target_order = None
 
+                # S31: Log found orders for debugging
+                if symbol_orders:
+                    self.log_message.emit(f"[RECOVERY] Found {len(symbol_orders)} pending orders for {symbol}")
+
                 for order in symbol_orders:
                     order_type = order.get('ordTyp', order.get('orderType', '')).upper()
                     tag = order.get('tag', '').upper()
 
-                    if 'SL' in order_type or tag == 'SL':
+                    # S31: Match SL by order_type containing 'SL' OR tag containing 'SL'
+                    # Watchdog uses tag='SL_RECOVERY', initial uses tag='SL'
+                    if 'SL' in order_type or 'SL' in tag:
                         sl_order = order
+                        self.log_message.emit(f"[RECOVERY] Found SL order: {order.get('nOrdNo')} type={order_type} tag={tag}")
                     elif tag == 'TARGET' or (order_type == 'L' and tag != 'ENTRY'):
                         target_order = order
+                        self.log_message.emit(f"[RECOVERY] Found Target order: {order.get('nOrdNo')} type={order_type}")
 
                 # Register existing SL order
                 if sl_order:
                     sl_order_id = sl_order.get('nOrdNo', sl_order.get('orderId', ''))
                     sl_price = float(sl_order.get('trgPrc', sl_order.get('triggerPrice', 0)) or 0)
-                    self.pos_tracker.set_sl_order(symbol, sl_order_id, sl_price)
+                    self.pos_tracker.set_sl_order(recovery_entry_id, sl_order_id, sl_price)
                     self.log_message.emit(f"[RECOVERY] Found existing SL: {symbol} @ {sl_price}")
 
                     # Register with trail manager
                     if self.trail_mgr:
-                        inst_token = str(pos.get('instrument_token', pos.get('token', '')))
+                        # Try multiple field names that NEO API might use for instrument token
+                        inst_token = str(
+                            pos.get('pSymbol', '') or
+                            pos.get('instrument_token', '') or
+                            pos.get('token', '') or
+                            pos.get('tok', '') or
+                            pos.get('instToken', '') or
+                            ''
+                        )
+                        # Fallback: lookup from symbol_mapper if we have the symbol
+                        # S17-L1: mapper always initialized in __init__
+                        if not inst_token and self.mapper:
+                            try:
+                                neo_params = self.mapper.get_neo_params(symbol)
+                                if neo_params:
+                                    inst_token = str(neo_params.get('instrument_token', ''))
+                                    if inst_token:
+                                        self.log_message.emit(f"[RECOVERY] Got instrument_token from symbol_mapper: {symbol}")
+                            except Exception:
+                                pass
+                        if not inst_token:
+                            self.log_message.emit(f"[WARNING] Could not get instrument_token for {symbol} - auto-trailing may not work")
                         self.trail_mgr.add_position(
+                            entry_order_id=recovery_entry_id,
                             symbol=symbol,
                             exchange_segment=exchange_segment,
                             entry_price=avg_price,
@@ -3666,19 +5365,65 @@ class MainWindow(QMainWindow):
                             side='LONG' if is_long else 'SHORT',
                             sl_price=sl_price,
                             sl_order_id=sl_order_id,
-                            instrument_token=inst_token
+                            instrument_token=inst_token,
+                            product=product  # S23-C1: Pass product for SL recreation
                         )
                 else:
                     # WARNING: Position has no SL protection!
+                    # S31: Check all orders (including rejected) to understand why no SL found
+                    try:
+                        all_orders = self.orders.get_orders()
+                        symbol_all_orders = [o for o in all_orders if o.get('trdSym', '') == symbol]
+                        for o in symbol_all_orders:
+                            o_status = o.get('ordSt', 'unknown')
+                            o_type = o.get('ordTyp', '')
+                            o_tag = o.get('tag', '')
+                            o_id = o.get('nOrdNo', '')[:12]
+                            o_rej = o.get('rejRsn', '') if o_status == 'rejected' else ''
+                            if 'SL' in o_type.upper() or 'SL' in o_tag.upper():
+                                self.log_message.emit(f"[DEBUG] SL order found: {o_id} status={o_status} {o_rej}")
+                    except Exception:
+                        pass
                     self.log_message.emit(f"[WARNING] {symbol} has NO SL ORDER - SET SL IMMEDIATELY!")
                     if self.sound:
                         self.sound.play('alert')
+
+                    # Still add to trail manager for BE button to work (without SL order)
+                    if self.trail_mgr:
+                        inst_token = str(
+                            pos.get('pSymbol', '') or
+                            pos.get('instrument_token', '') or
+                            pos.get('token', '') or
+                            pos.get('tok', '') or
+                            pos.get('instToken', '') or
+                            ''
+                        )
+                        # S17-L1: mapper always initialized in __init__
+                        if not inst_token and self.mapper:
+                            try:
+                                neo_params = self.mapper.get_neo_params(symbol)
+                                if neo_params:
+                                    inst_token = str(neo_params.get('instrument_token', ''))
+                            except Exception:
+                                pass
+                        self.trail_mgr.add_position(
+                            entry_order_id=recovery_entry_id,
+                            symbol=symbol,
+                            exchange_segment=exchange_segment,
+                            entry_price=avg_price,
+                            quantity=abs(qty),
+                            side='LONG' if is_long else 'SHORT',
+                            sl_price=0,
+                            sl_order_id=None,
+                            instrument_token=inst_token,
+                            product=product  # S23-C1: Pass product for SL recreation
+                        )
 
                 # Register existing Target order
                 if target_order:
                     target_order_id = target_order.get('nOrdNo', target_order.get('orderId', ''))
                     target_price = float(target_order.get('prc', target_order.get('price', 0)) or 0)
-                    self.pos_tracker.set_target_order(symbol, target_order_id, target_price)
+                    self.pos_tracker.set_target_order(recovery_entry_id, target_order_id, target_price)
                     self.log_message.emit(f"[RECOVERY] Found existing Target: {symbol} @ {target_price}")
 
                 # Register OCO pair if both exist
@@ -3689,7 +5434,8 @@ class MainWindow(QMainWindow):
                     target_price = float(target_order.get('prc', target_order.get('price', 0)) or 0)
 
                     self.oco_monitor.add_oco_pair(
-                        position_symbol=symbol,
+                        entry_order_id=recovery_entry_id,
+                        symbol=symbol,
                         sl_order_id=sl_order_id,
                         target_order_id=target_order_id,
                         sl_trigger=sl_price,
@@ -3701,9 +5447,11 @@ class MainWindow(QMainWindow):
                     self.log_message.emit(f"[RECOVERY] Registered OCO pair for {symbol}")
 
             self.log_message.emit("[RECOVERY] Position recovery complete")
+            self._recovery_completed = True
 
         except Exception as e:
             self.log_message.emit(f"[ERROR] Position recovery failed: {e}")
+            # Don't set _recovery_completed on error - allow retry
 
     def _get_pending_orders_by_symbol(self) -> Dict[str, List[Dict[str, Any]]]:
         """Get pending orders grouped by symbol."""
@@ -3714,7 +5462,8 @@ class MainWindow(QMainWindow):
             for order in orders:
                 status = order.get('ordSt', '').lower()
                 if status in ['pending', 'open', 'trigger pending', 'after market order req received']:
-                    symbol = order.get('tradingSymbol', order.get('symbol', ''))
+                    # NEO API uses 'trdSym' for trading symbol
+                    symbol = order.get('trdSym', order.get('tradingSymbol', order.get('symbol', '')))
                     if symbol not in orders_by_symbol:
                         orders_by_symbol[symbol] = []
                     orders_by_symbol[symbol].append(order)
@@ -3781,6 +5530,13 @@ class MainWindow(QMainWindow):
             QTableWidget::item:selected {
                 background-color: #444477;
             }
+            QTableWidget QLineEdit {
+                background-color: #2a2a4e;
+                color: #ffffff;
+                border: 1px solid #5555aa;
+                padding: 2px;
+                font-size: 11px;
+            }
             QHeaderView::section {
                 background-color: #252540;
                 border: 1px solid #333355;
@@ -3820,12 +5576,14 @@ class MainWindow(QMainWindow):
         """
 
     def closeEvent(self, event):
-        """Handle window close."""
+        """Handle window close - graceful shutdown of all background components."""
         # Stop timers
         self.position_timer.stop()
         self.time_timer.stop()
         self.margin_timer.stop()
         self.orders_timer.stop()
+        # quote_timer always created in setup_timers()
+        self.quote_timer.stop()
 
         # Stop trail manager
         if self.trail_mgr:
@@ -3834,5 +5592,24 @@ class MainWindow(QMainWindow):
         # Stop OCO monitor
         if self.oco_monitor:
             self.oco_monitor.stop()
+
+        # Stop partial fill monitor
+        if self.partial_fill_monitor:
+            self.partial_fill_monitor.stop()
+
+        # Cleanup WebSocket handler
+        if self.ws_handler:
+            try:
+                self.ws_handler.stop_reconnect()  # Stop any reconnection attempts
+                self.ws_handler.unsubscribe_all()
+            except Exception:
+                pass  # Ignore errors during shutdown
+
+        # Shutdown Telegram notifier executor
+        if self.telegram:
+            try:
+                self.telegram.shutdown()
+            except Exception:
+                pass  # Ignore errors during shutdown
 
         event.accept()

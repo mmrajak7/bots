@@ -9,11 +9,49 @@ import sys
 import os
 import yaml
 import logging
+import subprocess
+import threading
 from datetime import datetime
+from pathlib import Path
 
 from PyQt6.QtWidgets import QApplication, QSplashScreen, QMessageBox
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap, QFont
+
+
+def sync_from_pi():
+    """Download latest Kite token files from Pi via Google Drive (async)."""
+    script_path = Path(r"C:\Users\mail2\Documents\Projects\BOTS\data\sync\src\gdrive_download.py")
+    if not script_path.exists():
+        logging.debug(f"[SYNC] Sync script not found: {script_path}")
+        return
+
+    process = None
+    try:
+        # Use Popen for better timeout/kill handling
+        process = subprocess.Popen(
+            [sys.executable, str(script_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        stdout, stderr = process.communicate(timeout=30)
+
+        if process.returncode != 0:
+            logging.warning(f"[SYNC] Pi sync warning: {stderr.strip() if stderr else 'unknown error'}")
+        else:
+            logging.info("[SYNC] Pi sync complete - Kite token updated")
+
+    except subprocess.TimeoutExpired:
+        logging.warning("[SYNC] Pi sync timed out after 30s - killing process")
+        if process:
+            process.kill()
+            process.wait()  # Clean up zombie
+    except Exception as e:
+        logging.warning(f"[SYNC] Pi sync failed: {e}")
+        if process and process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 def setup_logging():
@@ -98,6 +136,11 @@ def main():
     logger.info("Kayal v1.0 Starting...")
     logger.info("=" * 50)
 
+    # ASYNC: Sync Kite token from Pi via Google Drive (runs in background)
+    sync_thread = threading.Thread(target=sync_from_pi, daemon=True, name="PiSync")
+    sync_thread.start()
+    logger.info("Background sync started...")
+
     # Create Qt Application
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
@@ -127,7 +170,7 @@ def main():
         from core.session_manager import SessionManager
         from core.symbol_mapper import SymbolMapper
         from core.order_manager import OrderManager
-        from core.kite_spot import KiteSpotFetcher
+        from core.kite_spot import KiteSpotFetcher, KiteWebSocket
         from core.sound_alerts import SoundAlertManager
         from core.telegram_notifier import TelegramNotifier
         from core.trade_logger import TradeLogger
@@ -157,22 +200,24 @@ def main():
             if reply == QMessageBox.StandardButton.No:
                 return 1
 
-        # Initialize Symbol Mapper
+        # Initialize Symbol Mapper with mapping cache (fast if cached today)
         logger.info("Initializing symbol mapper...")
         mapper = SymbolMapper(session.get_client(), config)
-        success, msg = mapper.initialize()
-        logger.info(msg)
 
-        if not success:
-            logger.warning(f"Symbol mapper initialization warning: {msg}")
-
-        # Build Kite to NEO mapping cache for fast lookups during trading
         if session.is_connected():
-            logger.info("Building Kite to NEO mapping cache...")
+            # Build Kite to NEO mapping cache - loads from cache if available (fast)
+            # This is the slow part (~50s) when no cache exists
             cache_success, cache_msg = mapper.build_mapping_cache()
             logger.info(cache_msg)
             if not cache_success:
                 logger.warning(f"Mapping cache warning: {cache_msg}")
+
+            # Initialize scrip master (needed for order display, expiry lookups)
+            # Has its own daily CSV cache - fast if cache exists
+            success, msg = mapper.initialize()
+            logger.info(msg)
+            if not success:
+                logger.warning(f"Symbol mapper initialization warning: {msg}")
 
         # Initialize Realized P&L Tracker
         logger.info("Initializing realized P&L tracker...")
@@ -201,9 +246,15 @@ def main():
         logger.info("Initializing rejection learner...")
         rejection_learner = RejectionLearner(data_dir="data")
 
-        # Initialize Order Manager with P&L tracker
+        # Initialize auxiliary modules (before OrderManager - needed for critical alerts)
+        logger.info("Initializing auxiliary modules...")
+        sound_mgr = SoundAlertManager(config)
+        telegram_mgr = TelegramNotifier(config)
+        trade_logger = TradeLogger(config)
+
+        # Initialize Order Manager with P&L tracker and telegram for critical alerts
         logger.info("Initializing order manager...")
-        order_mgr = OrderManager(session.get_client(), config, mapper, pnl_tracker)
+        order_mgr = OrderManager(session.get_client(), config, mapper, pnl_tracker, telegram_mgr)
 
         # Initialize Kite Spot Fetcher (pass mapper for expiry date lookups)
         logger.info("Initializing Kite spot fetcher...")
@@ -213,11 +264,16 @@ def main():
         if not success:
             logger.warning("Kite not connected - ATM presets will not work")
 
-        # Initialize auxiliary modules
-        logger.info("Initializing auxiliary modules...")
-        sound_mgr = SoundAlertManager(config)
-        telegram_mgr = TelegramNotifier(config)
-        trade_logger = TradeLogger(config)
+        # Initialize Kite WebSocket for reliable LTP streaming (NEO WS is unreliable)
+        kite_ws = None
+        if kite_spot.is_connected():
+            logger.info("Initializing Kite WebSocket for LTP streaming...")
+            kite_ws = KiteWebSocket(config)
+            if kite_ws.connect():
+                logger.info("Kite WebSocket: Connecting...")
+            else:
+                logger.warning("Kite WebSocket: Connection failed")
+                kite_ws = None
 
         # Initialize trailing SL manager
         trail_mgr = TrailingSLManager(
@@ -261,12 +317,8 @@ def main():
             else:
                 logger.warning("WebSocket: Order feed subscription failed")
 
-        # Start background monitors
-        if session.is_connected():
-            trail_mgr.start_auto_trail()
-            oco_monitor.start()
-            partial_fill_monitor.start()
-            logger.info("Background monitors started: trail, OCO, partial fill")
+        # NOTE: Background monitors are started AFTER pos_tracker is wired up (see below)
+        # This prevents race conditions where monitors access pos_tracker before it's set
 
         # Create main window
         logger.info("Creating main window...")
@@ -285,7 +337,8 @@ def main():
             partial_fill_monitor=partial_fill_monitor,
             pnl_tracker=pnl_tracker,
             cancel_mgr=cancel_mgr,
-            rejection_learner=rejection_learner
+            rejection_learner=rejection_learner,
+            kite_ws=kite_ws
         )
 
         # Connect partial fill monitor to position tracker (created in MainWindow)
@@ -297,17 +350,44 @@ def main():
             trail_mgr.pos_tracker = window.pos_tracker
         if oco_monitor:
             oco_monitor.set_position_tracker(window.pos_tracker)
+            # Set LTP getter for target monitoring (avoids margin issues by not placing TARGET limit orders)
+            oco_monitor.set_ltp_getter(window.get_ltp_for_symbol)
 
-        # CRITICAL: Start periodic position reconciliation (every 5 minutes)
-        # This ensures terminal state matches broker state
+        # CRITICAL FIX: Start background monitors AFTER pos_tracker is wired up
+        # This prevents race conditions where monitors access pos_tracker before it's set
+        if session.is_connected():
+            trail_mgr.start_auto_trail()
+            oco_monitor.start()
+            partial_fill_monitor.start()
+            logger.info("Background monitors started: trail, OCO, partial fill")
+
+        # CRITICAL: Start periodic position reconciliation and session health check
+        # This ensures terminal state matches broker state AND session stays alive
         def periodic_reconciliation():
-            """Background thread for periodic position reconciliation."""
+            """Background thread for periodic position reconciliation and session health."""
             import time as time_module
             reconciliation_interval = 300  # 5 minutes
+            session_check_counter = 0
+
             while True:
                 time_module.sleep(reconciliation_interval)
+                session_check_counter += 1
+
                 try:
+                    # CRITICAL: Check and refresh session every 30 minutes (6 x 5min intervals)
+                    # This prevents session expiry during trading
+                    if session_check_counter >= 6:  # Every 30 minutes
+                        session_check_counter = 0
+                        success, msg = session.refresh_if_needed()
+                        if success:
+                            logger.info(f"[SESSION] Health check: {msg}")
+                        else:
+                            logger.error(f"[SESSION] Refresh failed: {msg}")
+                            if telegram_mgr and telegram_mgr.enabled:
+                                telegram_mgr.send(f"⚠️ SESSION WARNING: {msg}")
+
                     if not session.is_connected():
+                        logger.warning("[RECONCILIATION] Session not connected, skipping")
                         continue
 
                     positions_response = session.get_client().positions()
@@ -327,7 +407,6 @@ def main():
                     logger.warning(f"[RECONCILIATION] Periodic sync failed: {e}")
 
         if session.is_connected():
-            import threading
             recon_thread = threading.Thread(target=periodic_reconciliation, daemon=True, name="PositionReconciler")
             recon_thread.start()
             logger.info("Periodic position reconciliation started (every 5 minutes)")
