@@ -164,6 +164,53 @@ Send these commands in Telegram:
 
 ---
 
+## Step 8: Setup Watchdog (Recommended)
+
+The watchdog monitors the daemon and auto-restarts if frozen or crashed.
+
+### How it works:
+1. Daemon writes heartbeat timestamp every loop (~30 seconds)
+2. Watchdog cron checks every 5 minutes:
+   - Is service running?
+   - Is heartbeat fresh (< 5 minutes old)?
+3. If either fails → restart + Telegram alert
+
+### Setup:
+
+```bash
+# Make watchdog executable
+chmod +x /home/trustit/Desktop/BOTS/FIFTY/watchdog.sh
+
+# Create logs directory
+mkdir -p /home/trustit/Desktop/BOTS/FIFTY/logs
+
+# Add to cron
+crontab -e
+```
+
+Add this line:
+```cron
+*/5 * * * * /home/trustit/Desktop/BOTS/FIFTY/watchdog.sh >> /home/trustit/Desktop/BOTS/FIFTY/logs/watchdog.log 2>&1
+```
+
+### Verify watchdog:
+```bash
+# Check heartbeat file exists (after daemon starts)
+cat /home/trustit/Desktop/BOTS/FIFTY/data/.heartbeat
+
+# View watchdog logs
+tail -f /home/trustit/Desktop/BOTS/FIFTY/logs/watchdog.log
+```
+
+### What triggers restart:
+| Condition | Action |
+|-----------|--------|
+| Service not running | Restart + alert |
+| Heartbeat > 5 min old | Restart + alert (daemon frozen) |
+| Restart fails | CRITICAL alert for manual intervention |
+
+---
+
 ## Service Management Commands
 
 ```bash
@@ -182,43 +229,28 @@ sudo systemctl status fifty-daemon
 # View logs
 sudo journalctl -u fifty-daemon -f
 
+# View last 100 lines
+sudo journalctl -u fifty-daemon -n 100
+
 # Disable service (won't start on boot)
 sudo systemctl disable fifty-daemon
 ```
 
 ---
 
-## Step 8: Setup Watchdog (Optional but Recommended)
+## Schedule Summary
 
-The watchdog script monitors the daemon and restarts it if:
-1. Service is not running
-2. Heartbeat file is stale (daemon frozen)
-
-### Make watchdog executable:
-```bash
-chmod +x /home/trustit/Desktop/BOTS/FIFTY/watchdog.sh
-```
-
-### Add to cron (runs every 5 minutes):
-```bash
-crontab -e
-```
-
-Add this line:
-```cron
-*/5 * * * * /home/trustit/Desktop/BOTS/FIFTY/watchdog.sh
-```
-
-### What the watchdog does:
-- Checks if `fifty-daemon` service is running
-- Checks heartbeat file age (max 5 minutes old)
-- Restarts service if needed
-- Sends Telegram alert on restart
-
-### Watchdog logs:
-```bash
-tail -f /home/trustit/Desktop/BOTS/FIFTY/logs/watchdog.log
-```
+| Time (IST) | Task | Frequency |
+|------------|------|-----------|
+| 08:50-09:00 | Token generation | Daily |
+| 09:00-09:05 | Morning startup | Daily |
+| 09:15-15:30 | Signal processing, order monitoring | Market hours |
+| 09:30-09:35 | Re-notify HOLD signals | Daily |
+| 15:50-15:55 | Monthly SL trailing | Last trading day |
+| 16:00-16:05 | Recovery checks | Daily |
+| 16:15-16:20 | Weekly report | Friday |
+| 16:20-16:25 | Monthly report | Last trading day |
+| 16:25-16:30 | Month-end cleanup | Last trading day |
 
 ---
 
@@ -243,6 +275,7 @@ sudo chown -R trustit:trustit /home/trustit/Desktop/BOTS/FIFTY
 
 # Ensure correct permissions
 chmod +x /home/trustit/Desktop/BOTS/FIFTY/main.py
+chmod +x /home/trustit/Desktop/BOTS/FIFTY/watchdog.sh
 ```
 
 ### Token generation fails:
@@ -259,23 +292,22 @@ cd /home/trustit/Desktop/BOTS/FIFTY
 ```bash
 # Check if bot token and chat_id are correct
 cat /home/trustit/Desktop/BOTS/FIFTY/config/config.yaml | grep -A 3 telegram
+
+# Check daemon is running
+sudo systemctl status fifty-daemon
+
+# Check heartbeat is fresh
+cat /home/trustit/Desktop/BOTS/FIFTY/data/.heartbeat
 ```
 
----
+### Position imported without SL:
+```bash
+# Use /fix command in Telegram
+/fix SCRIPTNAME
 
-## Schedule Summary
-
-| Time (IST) | Task | Frequency |
-|------------|------|-----------|
-| 08:50-09:00 | Token generation | Daily |
-| 09:00-09:05 | Morning startup | Daily |
-| 09:15-15:30 | Signal processing, order monitoring | Market hours |
-| 09:30-09:35 | Re-notify HOLD signals | Daily |
-| 15:50-15:55 | Monthly SL trailing | Last trading day |
-| 16:00-16:05 | Recovery checks | Daily |
-| 16:15-16:20 | Weekly report | Friday |
-| 16:20-16:25 | **Monthly report** | Last trading day |
-| 16:25-16:30 | Month-end cleanup | Last trading day |
+# Or re-import (now auto-fixes)
+/import SCRIPTNAME
+```
 
 ---
 
@@ -287,6 +319,10 @@ If something goes wrong, revert to cron mode:
 # Stop daemon
 sudo systemctl stop fifty-daemon
 sudo systemctl disable fifty-daemon
+
+# Remove watchdog from cron
+crontab -e
+# Comment out the watchdog line
 
 # Restore cron
 crontab -e
@@ -306,12 +342,16 @@ Add back (every 5 minutes):
 | Command | Description |
 |---------|-------------|
 | `/positions` | Clean table with LTP, P&L, Age |
+| `/pending` | Pending signals and orders |
+| `/stats` | Win rate, P&L statistics |
+| `/capital` | Capital allocation status |
 | `/report` | Interactive: Daily/Weekly/Monthly/Overall |
 | `/sync` | Compare Zerodha vs DB |
 | `/import SCRIPT` | Import Zerodha position |
 | `/fix SCRIPT` | Fix unprotected position (place SL) |
 | `/kill` | Stop all operations |
 | `/resume` | Resume operations |
+| `/help` | Show all commands |
 
 ---
 
@@ -319,24 +359,40 @@ Add back (every 5 minutes):
 
 | File | Changes |
 |------|---------|
-| `main.py` | Daemon mode, report_type handling |
-| `orchestrator.py` | Monthly report, fixes |
-| `commands.py` | Interactive report, improved /positions |
-| `approval_handler.py` | Report callbacks, command fixes |
+| `main.py` | Daemon mode with heartbeat, long-polling |
+| `orchestrator.py` | Monthly report, compact startup message |
+| `commands.py` | /fix, /sync, /import, interactive /report |
+| `approval_handler.py` | Command routing, help text updates |
 | `report_generator.py` | Monthly/Overall reports, HTML→image |
 | `bot.py` | send_photo method |
 | `signal_processor.py` | NIFTY filter fix (CRITICAL) |
 | `order_manager.py` | SL failure alerts |
 | `exit_manager.py` | Emergency exit verification |
+| `watchdog.sh` | NEW - Auto-restart frozen daemon |
 
 ---
 
 ## Critical Fixes in This Release
 
 1. **NIFTY Filter was INVERTED** - Was blocking bullish, allowing bearish!
-2. **Position without SL** - Now sends CRITICAL alert
+2. **Position without SL** - Now sends CRITICAL alert + /fix command
 3. **Emergency exit** - Now verifies order with retries
 4. **Commands blocked when awaiting price** - Fixed
+5. **Unprotected positions** - /import and /fix now auto-place SL GTT
+6. **Duplicate report command** - Fixed unreachable code
+
+---
+
+## New Features
+
+- **Daemon Mode**: 24/7 long-polling for instant Telegram response
+- **Watchdog**: Auto-restart frozen/crashed daemon with alerts
+- **Heartbeat**: Daemon writes timestamp every loop for health check
+- **Interactive Reports**: /report shows buttons for Daily/Weekly/Monthly/Overall
+- **Position Sync**: /sync compares Zerodha vs DB positions
+- **Import Position**: /import SCRIPT adds existing Zerodha position
+- **Fix Position**: /fix SCRIPT places SL on unprotected position
+- **Monthly Report**: Auto-sends on last trading day
 
 ---
 
