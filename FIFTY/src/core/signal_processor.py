@@ -301,16 +301,34 @@ class SignalProcessor:
             return df
 
     def _is_duplicate_signal(self, script: str) -> bool:
-        """Check if signal already exists for this script this month"""
+        """
+        Check if signal already exists for this script this month.
+
+        FIX DI-3: Only check for ACTIVE signals that haven't completed their lifecycle.
+        A FILLED signal means position was opened and closed - allow new signal.
+        """
         session = get_session()
         try:
             today = today_ist()
             current_month = today.strftime('%Y-%m')
 
+            # Only check for signals that are still in progress
+            # FILLED means position opened - but if position closed, allow new signal
+            # For now, block if any non-terminal signal exists
+            active_statuses = [
+                SignalStatus.PENDING,
+                SignalStatus.NOTIFIED,
+                SignalStatus.HOLD,
+                SignalStatus.AWAITING_PRICE,
+                SignalStatus.APPROVED,
+                SignalStatus.ENTERED,
+                SignalStatus.FILLED  # Position still open from this signal
+            ]
+
             existing = session.query(SignalQueue).filter(
                 SignalQueue.script == script,
                 SignalQueue.signal_month == current_month,
-                SignalQueue.status.notin_([SignalStatus.REJECTED, SignalStatus.INVALIDATED, SignalStatus.EXPIRED])
+                SignalQueue.status.in_(active_statuses)
             ).first()
 
             return existing is not None
@@ -501,11 +519,12 @@ class SignalProcessor:
             # Calculate SuperTrend
             df_with_st = self._calculate_supertrend(df)
 
-            # Check trend (trend == -1 means bullish in SuperTrend)
-            current_trend = df_with_st['trend'].iloc[-1]
-            is_bullish = current_trend == -1
+            # Check trend: trend == 1 means UPTREND (bullish), trend == -1 means DOWNTREND (bearish)
+            # FIX TR-G2: Was inverted - blocking bullish, allowing bearish!
+            current_trend = int(df_with_st['trend'].iloc[-1])
+            is_bullish = current_trend == 1
 
-            logger.info(f"NIFTY weekly filter: {'BULLISH (allow)' if is_bullish else 'BEARISH (block)'}")
+            logger.info(f"NIFTY weekly filter: trend={current_trend}, {'BULLISH (allow)' if is_bullish else 'BEARISH (block)'}")
             return is_bullish
 
         except Exception as e:

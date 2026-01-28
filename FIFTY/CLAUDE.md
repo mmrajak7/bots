@@ -41,13 +41,17 @@ Daily capital snapshots.
 Key-value store for state (kill_switch, telegram_offset, etc.)
 
 ## Telegram Commands
-- `/positions` - List open positions
-- `/pending` - List pending signals
+- `/positions` - List open positions with current P&L
+- `/pending` - List pending signals and hold signals
 - `/stats` - Win rate, P&L statistics
 - `/capital` - Capital allocation
-- `/report` - Daily summary
+- `/report` - Daily summary (HTML)
+- `/weekly` - Weekly report (HTML)
+- `/sync` - Sync positions from Zerodha (shows DB vs Zerodha comparison)
+- `/import SCRIPT` - Import existing Zerodha position (e.g., `/import BALRAMCHIN`)
 - `/kill` - Activate kill switch
 - `/resume` - Deactivate kill switch
+- `/help` - Show command list
 
 ## Signal Approval Workflow
 1. Signal detected from CSV (CSP filter)
@@ -56,6 +60,22 @@ Key-value store for state (kill_switch, telegram_offset, etc.)
 4. Telegram notification with buttons: [Approve] [Reject] [Hold] [Revise]
 5. User response processed
 6. GTT entry order placed (if approved)
+
+### Button Actions
+
+| Button | Action | Result |
+|--------|--------|--------|
+| **Approve** | Accept signal at current level | GTT entry order placed at signal level |
+| **Reject** | Discard signal | Signal marked rejected, no action |
+| **Hold** | Decide later | Re-notified at 9:30 AM next day |
+| **Revise** | Change entry price | Bot asks for price, user types new price, auto-approves |
+
+### Revise Flow
+1. User clicks [Revise]
+2. Bot sends: "Enter revised price for SCRIPT (current: X.XX)"
+3. User types price (e.g., "2450.50" or "2,450.50")
+4. Signal auto-approved at user's price
+5. GTT entry placed at revised price
 
 ## SL Management
 - Initial SL: 20% below entry
@@ -118,10 +138,36 @@ python main.py --test-kite   # Test Kite API
 
 ### 6. Run
 ```bash
-python main.py
+python main.py              # Single execution (cron mode)
+python main.py --daemon     # 24/7 daemon mode (recommended)
 ```
 
-### 7. Setup Cron (Production)
+### 7a. Daemon Mode (Recommended)
+
+**Instant Telegram response** with 24/7 availability.
+
+```bash
+# Run as daemon (foreground for testing)
+python main.py --daemon
+
+# Production: Use systemd service
+sudo cp fifty-daemon.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable fifty-daemon
+sudo systemctl start fifty-daemon
+
+# Check status
+sudo systemctl status fifty-daemon
+sudo journalctl -u fifty-daemon -f
+```
+
+**Daemon Mode Features:**
+- Telegram commands processed instantly (30s long-polling)
+- Trading tasks run at scheduled time windows
+- Graceful shutdown on SIGINT/SIGTERM
+- Commands work 24/7 (even outside market hours)
+
+### 7b. Setup Cron (Alternative - Slower Response)
 
 **IMPORTANT**: Use `run_bot.sh` wrapper script to ensure logs folder exists before redirection.
 

@@ -559,11 +559,29 @@ class ExitManager:
                 OpenPosition.drop_alert_sent == False
             ).all()
 
+            if not positions:
+                return alerts
+
+            # FIX ERR-H1: Track API failures to detect systemic issues
+            api_failures = 0
+            api_successes = 0
+
             for position in positions:
                 try:
                     # Get current LTP
                     instrument_token = self.kite.get_instrument_token(position.script)
+                    if not instrument_token:
+                        logger.warning(f"No instrument token for {position.script}")
+                        api_failures += 1
+                        continue
+
                     ltp = self.kite.get_instrument_ltp(instrument_token)
+                    if ltp is None or ltp <= 0:
+                        logger.warning(f"Invalid LTP for {position.script}: {ltp}")
+                        api_failures += 1
+                        continue
+
+                    api_successes += 1
 
                     # Calculate drop
                     entry_price = position.entry_price
@@ -594,6 +612,17 @@ class ExitManager:
 
                 except Exception as e:
                     logger.error(f"Error checking drop for {position.script}: {e}")
+                    api_failures += 1
+
+            # FIX ERR-H1: Alert if ALL API calls failed (systemic issue)
+            if api_failures > 0 and api_successes == 0:
+                logger.error(f"ALL position drop checks failed ({api_failures} failures)")
+                telegram.send_alert(
+                    f"<b>WARNING: Position Monitoring Failed</b>\n\n"
+                    f"Could not check {api_failures} positions for drops.\n"
+                    f"API may be down. Check manually!",
+                    critical=True
+                )
 
         finally:
             session.close()
@@ -633,44 +662,91 @@ class ExitManager:
                 except Exception as e:
                     logger.warning(f"Failed to cancel SL GTT: {e}")
 
+            # FIX SAFE-2: Verify order placement before proceeding
             # Place market sell order
-            result = self.kite.place_order(
-                tradingsymbol=script,
-                exchange='NSE',
-                transaction_type='SELL',
-                quantity=quantity,
-                order_type='MARKET',
-                product='CNC'
-            )
-
-            order_id = result.get('order_id')
-            logger.info(f"Emergency exit order placed: {order_id}")
-
-            # Wait and check for fill
-            import time
-            time.sleep(2)
-
-            order_status = self.kite.get_order_status(order_id)
-
-            if order_status.get('status') == 'COMPLETE':
-                exit_price = float(order_status.get('average_price', 0))
-
-                # Close position
-                self._close_position(position, exit_price, 'EMERGENCY_EXIT')
-
-                telegram.send_alert(
-                    f"<b>Emergency Exit Complete</b>\n\n"
-                    f"{script} @ {exit_price:,.2f}\n"
-                    f"Qty: {quantity}"
+            try:
+                result = self.kite.place_order(
+                    tradingsymbol=script,
+                    exchange='NSE',
+                    transaction_type='SELL',
+                    quantity=quantity,
+                    order_type='MARKET',
+                    product='CNC'
                 )
-                return True
-            else:
+            except Exception as e:
+                logger.error(f"Emergency exit order placement failed: {e}")
                 telegram.send_alert(
-                    f"Emergency exit order pending: {script}\n"
-                    f"Order ID: {order_id}",
+                    f"<b>EMERGENCY EXIT ORDER FAILED</b>\n\n"
+                    f"{script}: {str(e)}\n"
+                    f"Position still has {quantity} shares!\n"
+                    f"MANUAL ACTION REQUIRED!",
                     critical=True
                 )
                 return False
+
+            # FIX SAFE-2: Verify we got a valid order_id
+            order_id = result.get('order_id') if isinstance(result, dict) else None
+            if not order_id:
+                logger.error(f"Emergency exit returned no order_id: {result}")
+                telegram.send_alert(
+                    f"<b>EMERGENCY EXIT FAILED - NO ORDER ID</b>\n\n"
+                    f"{script}\n"
+                    f"Response: {result}\n"
+                    f"MANUAL ACTION REQUIRED!",
+                    critical=True
+                )
+                return False
+
+            logger.info(f"Emergency exit order placed: {order_id}")
+
+            # Wait and check for fill with retry
+            import time
+            max_checks = 5
+            for check in range(max_checks):
+                time.sleep(2)
+                try:
+                    order_status = self.kite.get_order_status(order_id)
+                    status = order_status.get('status', 'UNKNOWN')
+
+                    if status == 'COMPLETE':
+                        exit_price = float(order_status.get('average_price', 0))
+
+                        # Close position
+                        self._close_position(position, exit_price, 'EMERGENCY_EXIT')
+
+                        telegram.send_alert(
+                            f"<b>Emergency Exit Complete</b>\n\n"
+                            f"{script} @ {exit_price:,.2f}\n"
+                            f"Qty: {quantity}"
+                        )
+                        return True
+
+                    elif status in ['REJECTED', 'CANCELLED']:
+                        reason = order_status.get('status_message', 'Unknown')
+                        telegram.send_alert(
+                            f"<b>EMERGENCY EXIT REJECTED</b>\n\n"
+                            f"{script}\n"
+                            f"Reason: {reason}\n"
+                            f"MANUAL ACTION REQUIRED!",
+                            critical=True
+                        )
+                        return False
+
+                    # Still pending, continue checking
+                    logger.info(f"Emergency exit check {check+1}/{max_checks}: status={status}")
+
+                except Exception as e:
+                    logger.warning(f"Error checking order status: {e}")
+
+            # Exhausted retries
+            telegram.send_alert(
+                f"<b>Emergency exit order pending</b>\n\n"
+                f"{script}\n"
+                f"Order ID: {order_id}\n"
+                f"Check Zerodha manually!",
+                critical=True
+            )
+            return False
 
         except Exception as e:
             logger.error(f"Emergency exit failed: {e}")

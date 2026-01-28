@@ -242,7 +242,12 @@ class Orchestrator:
                     self._handle_emergency_exit(action)
 
                 elif action_type == 'command':
-                    command_handler.execute_command(action.get('command'))
+                    command = action.get('command')
+                    # Handle commands with parameters
+                    if command == 'import':
+                        command_handler.execute_command(command, script=action.get('script'))
+                    else:
+                        command_handler.execute_command(command)
 
         except Exception as e:
             logger.error(f"Error processing Telegram callbacks: {e}")
@@ -493,9 +498,13 @@ class Orchestrator:
                     # Check if GTT was actually placed on Zerodha
                     found_gtt = None
                     for gtt in existing_gtts:
+                        # FIX LOG-1: Safe access to orders list (could be empty)
+                        orders = gtt.get('orders') or []
+                        transaction_type = orders[0].get('transaction_type') if orders else None
+
                         if (gtt.get('condition', {}).get('tradingsymbol') == order.script and
                             gtt.get('status') == 'active' and
-                            gtt.get('orders', [{}])[0].get('transaction_type') == 'BUY'):
+                            transaction_type == 'BUY'):
                             found_gtt = gtt
                             break
 

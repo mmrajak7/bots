@@ -229,9 +229,13 @@ class OrderManager:
             try:
                 existing_gtts = self.kite.get_gtt_orders()
                 for gtt in existing_gtts:
+                    # FIX LOG-1: Safe access to orders list (could be empty)
+                    orders = gtt.get('orders') or []
+                    transaction_type = orders[0].get('transaction_type') if orders else None
+
                     if (gtt.get('condition', {}).get('tradingsymbol') == script and
                         gtt.get('status') == 'active' and
-                        gtt.get('orders', [{}])[0].get('transaction_type') == 'BUY'):
+                        transaction_type == 'BUY'):
 
                         gtt_id = str(gtt.get('id'))
                         logger.warning(
@@ -669,9 +673,22 @@ class OrderManager:
             gtt_id = exit_manager.place_sl_gtt(position, session=session)
 
             if gtt_id is None:
-                logger.error(f"Failed to place SL GTT for {order.script}")
-                # Don't raise - position exists but unprotected
-                # Alert already sent by place_sl_gtt
+                # FIX TR-G1: Position without SL is CRITICAL - mark it clearly
+                logger.critical(f"POSITION {order.script} CREATED WITHOUT SL GTT - UNPROTECTED!")
+                position.gtt_verified = False
+                # Send critical alert for immediate attention
+                from src.telegram.bot import telegram
+                telegram.send_alert(
+                    f"<b>CRITICAL: UNPROTECTED POSITION</b>\n\n"
+                    f"{order.script} @ {fill_price:,.2f}\n"
+                    f"Qty: {fill_qty}\n\n"
+                    f"SL GTT placement FAILED!\n"
+                    f"Position has NO stop-loss protection.\n"
+                    f"Run /sync or check manually IMMEDIATELY.",
+                    critical=True
+                )
+            else:
+                position.gtt_verified = True
 
             return position
 

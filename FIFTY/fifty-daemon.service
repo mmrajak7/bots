@@ -1,0 +1,31 @@
+# FIFTY Bot Daemon Service
+# Copy to /etc/systemd/system/fifty-daemon.service
+# Then: systemctl daemon-reload && systemctl enable fifty-daemon && systemctl start fifty-daemon
+
+[Unit]
+Description=FIFTY Trading Bot Daemon (24/7 Telegram Service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trustit
+WorkingDirectory=/home/trustit/Desktop/Scripts/BOTS/FIFTY
+ExecStart=/usr/bin/python3 main.py --daemon
+Restart=always
+RestartSec=10
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging (systemd journal)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fifty-daemon
+
+# Resource limits
+MemoryMax=500M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

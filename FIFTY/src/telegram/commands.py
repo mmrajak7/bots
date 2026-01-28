@@ -29,8 +29,8 @@ from src.utils.config_manager import config
 class CommandHandler:
     """Handles Telegram slash commands"""
 
-    def execute_command(self, command: str) -> None:
-        """Execute a command"""
+    def execute_command(self, command: str, **kwargs) -> None:
+        """Execute a command with optional parameters"""
         try:
             if command == 'positions':
                 self._cmd_positions()
@@ -44,6 +44,14 @@ class CommandHandler:
                 self._cmd_report()
             elif command == 'weekly':
                 self._cmd_weekly()
+            elif command == 'sync':
+                self._cmd_sync()
+            elif command == 'import':
+                script = kwargs.get('script')
+                if script:
+                    self._cmd_import(script)
+                else:
+                    telegram.send_alert("Usage: /import SCRIPT")
             elif command == 'kill':
                 self._cmd_kill()
             elif command == 'resume':
@@ -420,6 +428,222 @@ class CommandHandler:
             "Normal operations resumed."
         )
         logger.info("Kill switch deactivated via Telegram command")
+
+    def _cmd_import(self, script: str) -> None:
+        """
+        Import an existing Zerodha position into FIFTY's database.
+
+        Args:
+            script: Trading symbol (e.g., BALRAMCHIN)
+        """
+        from src.utils.timezone_helper import today_ist
+        from src.models.database import ist_now_naive
+
+        session = get_session()
+        try:
+            script = script.upper().strip()
+
+            # Check if already in DB
+            existing = session.query(OpenPosition).filter(
+                OpenPosition.script == script,
+                OpenPosition.status == PositionStatus.OPEN
+            ).first()
+
+            if existing:
+                telegram.send_alert(
+                    f"<b>{script}</b> already exists in DB\n"
+                    f"Entry: {existing.entry_price:,.2f}\n"
+                    f"Qty: {existing.quantity}\n"
+                    f"SL: {existing.current_sl:,.2f}"
+                )
+                return
+
+            # Fetch from Zerodha
+            try:
+                from src.api.dual_kite_client import get_kite_client
+                kite = get_kite_client()
+                zerodha_positions = kite.get_positions()
+                net_positions = zerodha_positions.get('net', [])
+            except Exception as e:
+                logger.error(f"Could not fetch Zerodha positions: {e}")
+                telegram.send_alert(f"Error fetching Zerodha: {str(e)}")
+                return
+
+            # Find the position
+            zerodha_pos = None
+            for p in net_positions:
+                if p.get('tradingsymbol') == script and p.get('quantity', 0) > 0:
+                    zerodha_pos = p
+                    break
+
+            if not zerodha_pos:
+                telegram.send_alert(
+                    f"<b>{script}</b> not found in Zerodha positions\n"
+                    f"(or quantity is 0)"
+                )
+                return
+
+            # Extract position details
+            quantity = zerodha_pos.get('quantity', 0)
+            avg_price = zerodha_pos.get('average_price', 0)
+            exchange = zerodha_pos.get('exchange', 'NSE')
+
+            if quantity <= 0 or avg_price <= 0:
+                telegram.send_alert(f"Invalid position data for {script}")
+                return
+
+            # Calculate SL (20% below entry)
+            sl_percent = config.get('trading.initial_sl_percent', 20)
+            initial_sl = round(avg_price * (1 - sl_percent / 100), 2)
+            capital_deployed = avg_price * quantity
+
+            # Create position record
+            position = OpenPosition(
+                signal_id=0,  # No signal - manual import
+                script=script,
+                entry_date=today_ist(),
+                entry_price=avg_price,
+                quantity=quantity,
+                capital_deployed=capital_deployed,
+                initial_sl=initial_sl,
+                current_sl=initial_sl,
+                highest_sl=initial_sl,
+                sl_movements=0,
+                status=PositionStatus.OPEN,
+                days_held=0,
+                gtt_verified=False,
+                created_at=ist_now_naive(),
+                updated_at=ist_now_naive()
+            )
+            session.add(position)
+            session.commit()
+
+            position_id = position.id
+            logger.info(f"Imported position {script}: {quantity} @ {avg_price}, SL: {initial_sl}")
+
+            # Place SL GTT
+            telegram.send_alert(
+                f"<b>Importing {script}...</b>\n"
+                f"Qty: {quantity} @ {avg_price:,.2f}\n"
+                f"Initial SL: {initial_sl:,.2f} (-{sl_percent}%)\n\n"
+                f"Placing SL GTT..."
+            )
+
+            try:
+                from src.core.exit_manager import exit_manager
+                gtt_id = exit_manager.place_sl_gtt(position_id)
+
+                if gtt_id:
+                    telegram.send_alert(
+                        f"<b>{script} Imported Successfully</b>\n\n"
+                        f"Position ID: {position_id}\n"
+                        f"Entry: {avg_price:,.2f}\n"
+                        f"Qty: {quantity}\n"
+                        f"SL GTT: {initial_sl:,.2f}\n"
+                        f"GTT ID: {gtt_id}"
+                    )
+                else:
+                    telegram.send_alert(
+                        f"<b>WARNING: {script} imported but SL GTT FAILED</b>\n\n"
+                        f"Position is UNPROTECTED!\n"
+                        f"Check manually or run recovery.",
+                        critical=True
+                    )
+
+            except Exception as e:
+                logger.error(f"Failed to place SL GTT for imported {script}: {e}")
+                telegram.send_alert(
+                    f"<b>WARNING: {script} imported but SL GTT FAILED</b>\n\n"
+                    f"Error: {str(e)}\n"
+                    f"Position is UNPROTECTED!",
+                    critical=True
+                )
+
+        except Exception as e:
+            logger.error(f"Import error for {script}: {e}")
+            telegram.send_alert(f"Import failed: {str(e)}")
+            session.rollback()
+        finally:
+            session.close()
+
+    def _cmd_sync(self) -> None:
+        """
+        Sync positions from Zerodha.
+        Shows Zerodha positions vs DB positions and allows import.
+        """
+        session = get_session()
+        try:
+            # Get DB positions
+            db_positions = session.query(OpenPosition).filter(
+                OpenPosition.status == PositionStatus.OPEN
+            ).all()
+            db_scripts = {p.script for p in db_positions}
+
+            # Get Zerodha positions
+            try:
+                from src.api.dual_kite_client import get_kite_client
+                kite = get_kite_client()
+                zerodha_positions = kite.get_positions()
+                net_positions = zerodha_positions.get('net', [])
+            except Exception as e:
+                logger.error(f"Could not fetch Zerodha positions: {e}")
+                telegram.send_alert(f"Error fetching Zerodha positions: {str(e)}")
+                return
+
+            # Filter for actual holdings (quantity > 0)
+            zerodha_holdings = [
+                p for p in net_positions
+                if p.get('quantity', 0) > 0 and p.get('exchange') == 'NSE'
+            ]
+
+            lines = ["<b>Position Sync Status</b>\n"]
+
+            # Show DB positions
+            lines.append(f"<b>DB Positions:</b> {len(db_positions)}")
+            for p in db_positions:
+                lines.append(f"  - {p.script}: {p.quantity} @ {p.entry_price:,.2f}")
+
+            lines.append("")
+
+            # Show Zerodha positions
+            lines.append(f"<b>Zerodha Positions:</b> {len(zerodha_holdings)}")
+            missing_from_db = []
+            for p in zerodha_holdings:
+                symbol = p.get('tradingsymbol', 'UNKNOWN')
+                qty = p.get('quantity', 0)
+                avg_price = p.get('average_price', 0)
+                in_db = "DB" if symbol in db_scripts else "NOT IN DB"
+
+                if symbol not in db_scripts:
+                    missing_from_db.append({
+                        'script': symbol,
+                        'quantity': qty,
+                        'avg_price': avg_price
+                    })
+
+                lines.append(f"  - {symbol}: {qty} @ {avg_price:,.2f} [{in_db}]")
+
+            # Show import candidates
+            if missing_from_db:
+                lines.append("")
+                lines.append("<b>Can Import:</b>")
+                for m in missing_from_db:
+                    lines.append(
+                        f"  {m['script']}: {m['quantity']} @ {m['avg_price']:,.2f}"
+                    )
+                lines.append("")
+                lines.append("Use /import SCRIPT to add to tracking")
+            else:
+                lines.append("")
+                lines.append("All Zerodha positions are tracked")
+
+            telegram.send_alert('\n'.join(lines))
+
+        except Exception as e:
+            logger.error(f"Sync error: {e}")
+            telegram.send_alert(f"Sync error: {str(e)}")
+        finally:
+            session.close()
 
 
 # Singleton instance

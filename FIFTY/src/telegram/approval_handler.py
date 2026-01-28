@@ -33,7 +33,34 @@ class ApprovalHandler:
 
     def process_updates(self) -> List[Dict[str, Any]]:
         """
-        Fetch and process all pending Telegram updates
+        Fetch and process all pending Telegram updates (non-blocking)
+
+        Returns:
+            List of processed actions for further handling
+        """
+        return self._process_updates_internal(timeout=0)
+
+    def process_updates_long_poll(self, timeout: int = 30) -> List[Dict[str, Any]]:
+        """
+        Fetch and process Telegram updates with long-polling.
+
+        This method blocks for up to `timeout` seconds waiting for new updates.
+        Used in daemon mode for instant response.
+
+        Args:
+            timeout: Long-polling timeout in seconds (default 30)
+
+        Returns:
+            List of processed actions for further handling
+        """
+        return self._process_updates_internal(timeout=timeout)
+
+    def _process_updates_internal(self, timeout: int) -> List[Dict[str, Any]]:
+        """
+        Internal method to fetch and process Telegram updates.
+
+        Args:
+            timeout: Polling timeout (0 for non-blocking, >0 for long-polling)
 
         Returns:
             List of processed actions for further handling
@@ -45,7 +72,7 @@ class ApprovalHandler:
         self._load_awaiting_price_from_db()
 
         try:
-            updates, is_error = telegram.get_updates(timeout=0)
+            updates, is_error = telegram.get_updates(timeout=timeout)
 
             # Handle API failure (SYS-H3 fix)
             if is_error:
@@ -324,11 +351,13 @@ class ApprovalHandler:
         text = parsed['text'].strip()
         chat_id = parsed['chat_id']
 
+        # FIX: Check for commands FIRST - commands should always work
+        # regardless of awaiting_price state
+        if text.startswith('/'):
+            return self._handle_command(text, parsed['message_id'])
+
         # FIX SYS-C2: Check if we're awaiting a price for this chat using new mapping
         if chat_id not in self._chat_awaiting_signal:
-            # Check if it's a command
-            if text.startswith('/'):
-                return self._handle_command(text, parsed['message_id'])
             return None
 
         signal_id = self._chat_awaiting_signal[chat_id]
@@ -395,10 +424,23 @@ class ApprovalHandler:
             return {'type': 'command', 'command': 'capital'}
         elif cmd == '/report':
             return {'type': 'command', 'command': 'report'}
+        elif cmd == '/weekly':
+            return {'type': 'command', 'command': 'weekly'}
         elif cmd == '/kill':
             return {'type': 'command', 'command': 'kill'}
         elif cmd == '/resume':
             return {'type': 'command', 'command': 'resume'}
+        elif cmd == '/sync':
+            return {'type': 'command', 'command': 'sync'}
+        elif cmd.startswith('/import'):
+            # Extract script name from command (e.g., "/import BALRAMCHIN")
+            parts = command.strip().split()
+            if len(parts) >= 2:
+                script = parts[1].upper()
+                return {'type': 'command', 'command': 'import', 'script': script}
+            else:
+                telegram.send_alert("Usage: /import SCRIPT\nExample: /import BALRAMCHIN")
+                return None
         elif cmd == '/help':
             self._send_help()
             return None
@@ -414,6 +456,9 @@ class ApprovalHandler:
             "/stats - Win rate, avg P&L, total trades\n"
             "/capital - Show capital allocation\n"
             "/report - Generate today's summary\n"
+            "/weekly - Generate weekly report\n"
+            "/sync - Sync positions from Zerodha\n"
+            "/import SCRIPT - Import position from Zerodha\n"
             "/kill - Activate kill switch\n"
             "/resume - Deactivate kill switch\n"
             "/help - Show this help"
