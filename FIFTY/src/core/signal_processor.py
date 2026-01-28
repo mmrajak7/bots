@@ -355,18 +355,23 @@ class SignalProcessor:
             # Calculate SuperTrend
             df_with_st = self._calculate_supertrend(df)
 
+            # FIX TR-C4: Validate DataFrame has sufficient data
+            if df_with_st is None or len(df_with_st) < 2:
+                logger.warning(
+                    f"Insufficient data for SuperTrend calculation for {script}: "
+                    f"got {len(df_with_st) if df_with_st is not None else 0} rows, need at least 2"
+                )
+                return None
+
             # Get SuperTrend value from the previous COMPLETED candle
             # Current candle (iloc[-1]) is incomplete/running
             # Previous candle (iloc[-2]) is confirmed/completed
-            if len(df_with_st) >= 2:
-                signal_level = float(df_with_st['supertrend'].iloc[-2])
-                prev_trend = int(df_with_st['trend'].iloc[-2])
-                trend_str = "UP" if prev_trend == 1 else "DOWN"  # trend=1 is UP in TradingView style
-                logger.debug(
-                    f"ST calc for {script}: ST={signal_level:.2f} trend={trend_str}"
-                )
-            else:
-                signal_level = float(df_with_st['supertrend'].iloc[-1])
+            signal_level = float(df_with_st['supertrend'].iloc[-2])
+            prev_trend = int(df_with_st['trend'].iloc[-2])
+            trend_str = "UP" if prev_trend == 1 else "DOWN"  # trend=1 is UP in TradingView style
+            logger.debug(
+                f"ST calc for {script}: ST={signal_level:.2f} trend={trend_str}"
+            )
 
             return signal_level
 
@@ -493,11 +498,14 @@ class SignalProcessor:
 
     def check_nifty_weekly_filter(self) -> bool:
         """
-        Check NIFTY weekly SuperTrend for filter
+        Check NIFTY weekly SuperTrend for filter.
+
+        FIX TR-M2: Returns False (block) on error instead of True (allow).
+        Conservative approach - don't take entries when uncertain.
 
         Returns:
             True if NIFTY weekly trend is bullish (allow entries)
-            False if bearish (block entries)
+            False if bearish OR on error (block entries)
         """
         if not config.get('nifty_filter.enabled', True):
             return True
@@ -513,14 +521,14 @@ class SignalProcessor:
             )
 
             if df is None or df.empty:
-                logger.warning("Could not fetch NIFTY weekly data, allowing entries")
-                return True
+                # FIX TR-M2: Block entries if can't determine NIFTY trend
+                logger.warning("Could not fetch NIFTY weekly data - BLOCKING entries (safety)")
+                return False
 
             # Calculate SuperTrend
             df_with_st = self._calculate_supertrend(df)
 
             # Check trend: trend == 1 means UPTREND (bullish), trend == -1 means DOWNTREND (bearish)
-            # FIX TR-G2: Was inverted - blocking bullish, allowing bearish!
             current_trend = int(df_with_st['trend'].iloc[-1])
             is_bullish = current_trend == 1
 
@@ -528,8 +536,9 @@ class SignalProcessor:
             return is_bullish
 
         except Exception as e:
-            logger.error(f"Error checking NIFTY filter: {e}")
-            return True  # Allow on error
+            # FIX TR-M2: Block entries on error (safer than allowing)
+            logger.error(f"Error checking NIFTY filter: {e} - BLOCKING entries (safety)")
+            return False
 
     def can_send_notification(self) -> Tuple[bool, str]:
         """

@@ -21,7 +21,7 @@ from src.utils.timezone_helper import (
 )
 from src.models.database import (
     is_kill_switch_active, get_bot_state, set_bot_state,
-    get_session, OpenPosition, OpenOrder, SignalQueue,
+    get_session, OpenPosition, OpenOrder, SignalQueue, ClosedPosition,
     PositionStatus, OrderStatus, SignalStatus, ist_now_naive
 )
 from src.telegram.bot import telegram
@@ -1046,14 +1046,25 @@ class Orchestrator:
     # =========================================================================
 
     def _is_last_trading_day(self) -> bool:
-        """Check if today is the last trading day of the month"""
+        """
+        Check if today is the last trading day of the month.
+
+        FIX TR-H3: Now checks NSE holidays in addition to weekends.
+        """
+        from datetime import timedelta
+        from src.utils.timezone_helper import is_market_day_ist
+
         today = today_ist()
         month_end = get_month_end(today)
 
-        # Find last trading day (not weekend)
+        # Find last trading day (not weekend AND not NSE holiday)
         last_trading = month_end
-        while last_trading.weekday() >= 5:  # Saturday or Sunday
-            last_trading = last_trading.replace(day=last_trading.day - 1)
+        max_iterations = 10  # Safety limit
+        iterations = 0
+
+        while not is_market_day_ist(last_trading) and iterations < max_iterations:
+            last_trading = last_trading - timedelta(days=1)
+            iterations += 1
 
         return today == last_trading
 

@@ -451,6 +451,9 @@ def _run_scheduled_tasks(orchestrator, current) -> None:
     """
     Run scheduled tasks (same as cron mode but within daemon).
     Only runs tasks appropriate for current time window.
+
+    FIX OPS-H1: Each task is wrapped in try/catch to prevent one failure
+    from blocking subsequent tasks.
     """
     from src.utils.timezone_helper import in_time_window, is_market_hours, is_friday, is_market_day_ist
     from src.models.database import is_kill_switch_active, get_bot_state, set_bot_state
@@ -465,44 +468,52 @@ def _run_scheduled_tasks(orchestrator, current) -> None:
 
     orchestrator._lazy_load_processors()
 
+    def _safe_run(task_name: str, task_func):
+        """Run a task with error isolation"""
+        try:
+            task_func()
+        except Exception as e:
+            logger.error(f"Scheduled task '{task_name}' failed: {e}")
+            # Don't crash daemon - just log and continue
+
     # Early token generation (8:50-9:00)
     if is_market and in_time_window(current, "08:50", "09:00"):
-        orchestrator._ensure_token_ready()
+        _safe_run("token_generation", orchestrator._ensure_token_ready)
 
     # Morning startup (9:00-9:05)
     if is_market and in_time_window(current, "09:00", "09:05"):
-        orchestrator._morning_startup()
+        _safe_run("morning_startup", orchestrator._morning_startup)
 
     # Signal processing during market hours
     if is_market and is_market_hours(current):
-        orchestrator._process_signals()
-        orchestrator._send_pending_notifications()
-        orchestrator._monitor_orders()
-        orchestrator._monitor_positions_for_drops()
+        _safe_run("process_signals", orchestrator._process_signals)
+        _safe_run("send_notifications", orchestrator._send_pending_notifications)
+        _safe_run("monitor_orders", orchestrator._monitor_orders)
+        _safe_run("monitor_drops", orchestrator._monitor_positions_for_drops)
 
     # Hold signal re-notification (9:30-9:35)
     if is_market and in_time_window(current, "09:30", "09:35"):
-        orchestrator._resend_hold_signals()
+        _safe_run("resend_holds", orchestrator._resend_hold_signals)
 
     # EOD GTT Update (last trading day, 15:50-15:55)
     if is_market and in_time_window(current, "15:50", "15:55") and orchestrator._is_last_trading_day():
-        orchestrator._update_monthly_trailing_sl()
+        _safe_run("monthly_sl_trail", orchestrator._update_monthly_trailing_sl)
 
     # Recovery checks (16:00-16:05)
     if is_market and in_time_window(current, "16:00", "16:05"):
-        orchestrator._run_recovery_checks()
+        _safe_run("recovery_checks", orchestrator._run_recovery_checks)
 
     # Weekly report (Friday 16:15-16:20)
     if is_market and is_friday() and in_time_window(current, "16:15", "16:20"):
-        orchestrator._send_weekly_report()
+        _safe_run("weekly_report", orchestrator._send_weekly_report)
 
     # Monthly report (last trading day, 16:20-16:25)
     if is_market and in_time_window(current, "16:20", "16:25") and orchestrator._is_last_trading_day():
-        orchestrator._send_monthly_report()
+        _safe_run("monthly_report", orchestrator._send_monthly_report)
 
     # Month-end cleanup (last trading day, 16:25-16:30)
     if is_market and in_time_window(current, "16:25", "16:30") and orchestrator._is_last_trading_day():
-        orchestrator._month_end_cleanup()
+        _safe_run("month_cleanup", orchestrator._month_end_cleanup)
 
 
 def main():

@@ -262,6 +262,20 @@ class OrderManager:
             per_trade = config.get('trading.per_trade_amount', 20000)
             quantity = int(per_trade / entry_price) if entry_price > 0 else 1
 
+            # FIX TR-C3: Validate minimum quantity
+            if quantity <= 0:
+                logger.error(
+                    f"Calculated quantity is 0 for {script} "
+                    f"(per_trade={per_trade}, entry={entry_price})"
+                )
+                telegram.send_alert(
+                    f"<b>Entry Blocked - Zero Quantity</b>\n\n"
+                    f"{script}: Entry {entry_price:,.2f} exceeds per-trade {per_trade:,.0f}\n"
+                    f"Increase per_trade_amount or reject this signal.",
+                    critical=True
+                )
+                return None
+
             if config.is_test_mode():
                 quantity = 1
 
@@ -341,9 +355,10 @@ class OrderManager:
             session.flush()  # Get order.id without committing
             logger.debug(f"Created PLACING record for {script}, order_id={order.id}")
 
-            # Place GTT (with tick size error retry from CROCODILE)
-            max_retries = 2
+            # Place GTT (with tick size and "price too close" error retry)
+            max_retries = 3  # Increased for price adjustment retries
             gtt_id = None
+            price_adjusted = False  # Track if we adjusted for "too close" error
 
             for attempt in range(max_retries):
                 try:
@@ -362,6 +377,38 @@ class OrderManager:
 
                 except Exception as gtt_error:
                     error_msg = str(gtt_error).lower()
+
+                    # Check if it's a "price too close to LTP" error
+                    # Zerodha requires trigger to be >0.25% away from LTP
+                    price_too_close = (
+                        "too close" in error_msg or
+                        "0.25%" in error_msg or
+                        "difference should be more than" in error_msg
+                    )
+
+                    if attempt < max_retries - 1 and price_too_close and not price_adjusted:
+                        # AUTO-ADJUST: Reduce entry price by 0.5% to get away from LTP
+                        # This ensures we're well below the 0.25% threshold
+                        adjustment_pct = 0.005  # 0.5%
+                        old_trigger = trigger_price
+                        trigger_price = round_price_down(trigger_price * (1 - adjustment_pct))
+                        limit_price = trigger_price
+
+                        logger.warning(
+                            f"GTT 'price too close' for {script}. "
+                            f"Auto-adjusting entry: {old_trigger:.2f} -> {trigger_price:.2f} (-0.5%)"
+                        )
+
+                        # Update payload
+                        payload['condition']['trigger_values'] = [trigger_price]
+                        payload['orders'][0]['price'] = limit_price
+
+                        # Update order record with new price
+                        order.trigger_price = trigger_price
+                        order.limit_price = limit_price
+
+                        price_adjusted = True
+                        continue  # Retry with adjusted price
 
                     # Check if it's a tick size error (can retry)
                     if attempt < max_retries - 1 and "tick size" in error_msg:
@@ -386,7 +433,7 @@ class OrderManager:
                             logger.info(f"Corrected GTT prices for {script}: {trigger_price}")
                             continue  # Retry
 
-                    # Not a tick size error or already retried
+                    # Not a recoverable error or already retried
                     # Mark as REJECTED and rollback
                     order.status = OrderStatus.REJECTED
                     order.last_error = str(gtt_error)
@@ -410,10 +457,14 @@ class OrderManager:
             signal.status = SignalStatus.ENTERED
             session.commit()
 
-            # Send confirmation
+            # Send confirmation (with adjustment note if applicable)
+            adjustment_note = ""
+            if price_adjusted:
+                adjustment_note = f"\n(Auto-adjusted from {entry_price:,.2f} - LTP too close)"
+
             telegram.send_alert(
                 f"<b>Entry GTT Placed</b>\n\n"
-                f"{script} @ {trigger_price:,.2f}\n"
+                f"{script} @ {trigger_price:,.2f}{adjustment_note}\n"
                 f"Qty: {quantity} | Value: {capital_deployed:,.0f}"
             )
 
@@ -460,10 +511,26 @@ class OrderManager:
                 gtt = gtt_map.get(gtt_id)
 
                 if gtt is None:
-                    # GTT not found - might have been triggered
+                    # FIX TR-H1: GTT not found - could be triggered, cancelled, or expired
+                    # Don't assume triggered - verify with order check first
+                    logger.warning(f"GTT {gtt_id} for {order.script} not found in GTT list - investigating")
                     fill_result = self._check_if_gtt_triggered(order)
                     if fill_result:
                         filled_orders.append(fill_result)
+                    else:
+                        # GTT missing but no fill found - mark as potentially orphaned
+                        logger.warning(
+                            f"GTT {gtt_id} for {order.script} missing with no fill detected. "
+                            f"May have been cancelled/expired. Needs manual verification."
+                        )
+                        # Don't auto-mark as cancelled - could be a timing issue
+                        # Alert user for manual verification
+                        telegram.send_alert(
+                            f"<b>GTT Status Unknown</b>\n\n"
+                            f"{order.script}: GTT {gtt_id} not found\n"
+                            f"No fill detected. Please verify in Zerodha.\n"
+                            f"Use /sync to check status."
+                        )
                     continue
 
                 gtt_status = gtt.get('status', '')

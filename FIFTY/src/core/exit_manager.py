@@ -480,8 +480,17 @@ class ExitManager:
                 logger.warning(f"No monthly data for {script}")
                 return None
 
-            # Get this month's LOW
-            monthly_low = float(monthly_df['Low'].iloc[-1])
+            # FIX TR-C2: Get PREVIOUS completed month's LOW, not current incomplete candle
+            # On last trading day, the current month's candle is still forming
+            # We need at least 2 candles to use the completed one
+            if len(monthly_df) < 2:
+                logger.warning(f"Insufficient monthly data for {script} (need 2+ candles), skipping SL trail")
+                return None
+
+            # Use second-to-last row which is the completed month
+            monthly_low = float(monthly_df['Low'].iloc[-2])
+            candle_date = monthly_df['Date'].iloc[-2] if 'Date' in monthly_df.columns else 'unknown'
+            logger.debug(f"{script}: Using completed month LOW {monthly_low:.2f} from {candle_date}")
             new_sl = round_price_down(monthly_low)
 
             # Only trail upward (SL can only tighten)
@@ -491,13 +500,46 @@ class ExitManager:
 
             logger.info(f"{script}: Trailing SL from {current_sl:.2f} to {new_sl:.2f}")
 
-            # Cancel old GTT
+            # FIX ARCH-H3: Cancel old GTT and VERIFY before placing new one
+            # This prevents duplicate SL GTTs if cancel fails
             old_gtt_id = position.gtt_id
+            old_gtt_cleared = False
+
             if old_gtt_id:
                 try:
                     self.kite.cancel_gtt_order(old_gtt_id)
+                    old_gtt_cleared = True
+                    logger.info(f"Cancelled old GTT {old_gtt_id} for {script}")
                 except Exception as e:
                     logger.warning(f"Failed to cancel old GTT {old_gtt_id}: {e}")
+                    # Check if GTT is already gone (triggered/cancelled/rejected)
+                    try:
+                        gtt_status = self.kite.get_gtt_status(old_gtt_id)
+                        if gtt_status is None:
+                            old_gtt_cleared = True  # GTT doesn't exist, safe to proceed
+                            logger.info(f"Old GTT {old_gtt_id} no longer exists")
+                        elif gtt_status.get('status') in ('triggered', 'cancelled', 'rejected', 'disabled'):
+                            old_gtt_cleared = True  # GTT is terminal, safe to proceed
+                            logger.info(f"Old GTT {old_gtt_id} is terminal: {gtt_status.get('status')}")
+                        else:
+                            # GTT still active - dangerous to place new one
+                            logger.error(f"Old GTT {old_gtt_id} still active: {gtt_status.get('status')}")
+                    except Exception as check_err:
+                        logger.warning(f"Could not verify old GTT status: {check_err}")
+                        # Conservative: assume old GTT still exists
+                        old_gtt_cleared = False
+
+                if not old_gtt_cleared:
+                    telegram.send_alert(
+                        f"<b>SL Trail BLOCKED</b>\n\n"
+                        f"{script}: Could not cancel old GTT {old_gtt_id}\n"
+                        f"Risk of duplicate SL protection.\n"
+                        f"Manual intervention required.",
+                        critical=True
+                    )
+                    return None
+            else:
+                old_gtt_cleared = True  # No old GTT to cancel
 
             # Place new GTT - FIX SYS-C1: Pass session for atomicity
             position.current_sl = new_sl
@@ -856,11 +898,33 @@ class ExitManager:
         self,
         position: OpenPosition,
         exit_price: float,
-        exit_reason: str
+        exit_reason: str,
+        session=None
     ) -> Dict[str, Any]:
-        """Close position and create historical record"""
-        session = get_session()
+        """
+        Close position and create historical record.
+
+        FIX ARCH-C3: Accept session parameter for transaction atomicity.
+
+        Args:
+            position: OpenPosition to close
+            exit_price: Exit price
+            exit_reason: Reason for exit (SL_HIT, MANUAL, EMERGENCY_EXIT)
+            session: Optional existing session (for transaction atomicity)
+        """
+        own_session = session is None
+        if own_session:
+            session = get_session()
+
         try:
+            # Refresh position in this session if using own session
+            if own_session:
+                position = session.query(OpenPosition).filter(
+                    OpenPosition.id == position.id
+                ).first()
+                if not position:
+                    logger.error(f"Position not found in session")
+                    return None
             script = position.script
             entry_price = position.entry_price
             quantity = position.quantity
@@ -900,7 +964,9 @@ class ExitManager:
             position.exit_price = exit_price
             position.exit_reason = exit_reason
 
-            session.commit()
+            # Only commit if we own the session
+            if own_session:
+                session.commit()
 
             # Update CapitalLedger with realized P&L
             self._update_capital_ledger_pnl(pnl_data['net_pnl'], position.capital_deployed)
@@ -927,10 +993,12 @@ class ExitManager:
 
         except Exception as e:
             logger.error(f"Error closing position: {e}")
-            session.rollback()
+            if own_session:
+                session.rollback()
             return None
         finally:
-            session.close()
+            if own_session:
+                session.close()
 
     def _log_gtt_update(
         self,
