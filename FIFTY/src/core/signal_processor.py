@@ -336,7 +336,12 @@ class SignalProcessor:
             session.close()
 
     def _calculate_signal_level(self, script: str) -> Optional[float]:
-        """Calculate monthly SuperTrend value for signal level"""
+        """
+        Calculate monthly SuperTrend value for signal level.
+
+        FIX TR-001: Only returns signal level if stock is in UPTREND.
+        CSP signals are only valid when SuperTrend trend == 1 (bullish).
+        """
         try:
             # Get instrument token
             instrument_token = self.kite.get_instrument_token(script)
@@ -369,6 +374,16 @@ class SignalProcessor:
             signal_level = float(df_with_st['supertrend'].iloc[-2])
             prev_trend = int(df_with_st['trend'].iloc[-2])
             trend_str = "UP" if prev_trend == 1 else "DOWN"  # trend=1 is UP in TradingView style
+
+            # FIX TR-001: Only generate signals in UPTREND
+            # CSP signals are only valid when SuperTrend shows bullish trend
+            if prev_trend != 1:
+                logger.info(
+                    f"{script}: Skipping signal - SuperTrend is {trend_str} (need UPTREND). "
+                    f"ST level would have been {signal_level:.2f}"
+                )
+                return None
+
             logger.debug(
                 f"ST calc for {script}: ST={signal_level:.2f} trend={trend_str}"
             )
@@ -660,12 +675,16 @@ class SignalProcessor:
                 logger.error(f"Could not get LTP for {script}: {e}")
                 ltp = signal_level
 
-            # Calculate quantity
+            # FIX TR-004: Calculate quantity at notification and store it
+            # This ensures consistent position sizing even if capital/config changes
             per_trade = config.get('trading.per_trade_amount', 20000)
             quantity = int(per_trade / signal_level) if signal_level > 0 else 1
 
             if config.is_test_mode():
                 quantity = 1
+
+            # Store calculated quantity in signal record
+            signal.calculated_quantity = quantity
 
             position_value = quantity * signal_level
 

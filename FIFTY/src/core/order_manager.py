@@ -15,7 +15,7 @@ from loguru import logger
 
 from src.api.dual_kite_client import get_kite_client
 from src.models.database import (
-    get_session, SignalQueue, OpenOrder, OpenPosition,
+    get_session, SignalQueue, OpenOrder, OpenPosition, ClosedPosition,
     SignalStatus, OrderStatus, PositionStatus, ist_now_naive
 )
 from src.telegram.bot import telegram
@@ -25,6 +25,10 @@ from src.utils.price_rounder import round_price, round_price_down, PriceRounder
 
 # Order cutoff time - no orders after 3:29 PM (safety feature from CROCODILE)
 ORDER_CUTOFF_TIME = "15:29"
+
+# FIX RC-002: Lock for duplicate checking to prevent race conditions
+import threading
+_order_placement_lock = threading.Lock()
 
 
 class OrderManager:
@@ -146,6 +150,81 @@ class OrderManager:
 
         return False
 
+    def _check_portfolio_drawdown(self) -> Tuple[bool, float, str]:
+        """
+        FIX RM-001: Check if portfolio drawdown exceeds maximum allowed.
+
+        Returns:
+            (is_ok, current_drawdown_pct, message)
+            is_ok = True means drawdown is acceptable, False means halt new entries
+        """
+        max_drawdown_pct = config.get('risk.max_drawdown_percent', 15)
+        initial_capital = config.get('trading.initial_capital', 100000)
+
+        session = get_session()
+        try:
+            # Get all closed trades P&L
+            closed_trades = session.query(ClosedPosition).all()
+            realized_pnl = sum(t.net_pnl for t in closed_trades)
+
+            # Get unrealized P&L from open positions
+            unrealized_pnl = 0
+            positions = session.query(OpenPosition).filter(
+                OpenPosition.status == PositionStatus.OPEN
+            ).all()
+
+            for pos in positions:
+                try:
+                    instrument_token = self.kite.get_instrument_token(pos.script)
+                    ltp = self.kite.get_instrument_ltp(instrument_token)
+                    if ltp and ltp > 0:
+                        unrealized_pnl += (ltp - pos.entry_price) * pos.quantity
+                except Exception:
+                    # Conservative: assume worst case (initial SL hit)
+                    sl_loss = (pos.entry_price - pos.initial_sl) * pos.quantity
+                    unrealized_pnl -= sl_loss
+
+            # Calculate total P&L and drawdown
+            total_pnl = realized_pnl + unrealized_pnl
+            current_drawdown_pct = 0
+
+            if total_pnl < 0:
+                current_drawdown_pct = abs(total_pnl) / initial_capital * 100
+
+            if current_drawdown_pct >= max_drawdown_pct:
+                return False, current_drawdown_pct, f"Drawdown {current_drawdown_pct:.1f}% >= max {max_drawdown_pct}%"
+
+            return True, current_drawdown_pct, "OK"
+
+        finally:
+            session.close()
+
+    def _check_nifty_filter_at_entry(self) -> Tuple[bool, str]:
+        """
+        FIX TR-002: Re-check NIFTY weekly filter before placing entry order.
+
+        Signal may have been approved during bullish but market could turn bearish
+        before the entry is actually placed.
+
+        Returns:
+            (is_ok, message)
+        """
+        if not config.get('nifty_filter.enabled', True):
+            return True, "Filter disabled"
+
+        try:
+            from src.core.signal_processor import signal_processor
+            is_bullish = signal_processor.check_nifty_weekly_filter()
+
+            if not is_bullish:
+                return False, "NIFTY weekly turned bearish since approval"
+
+            return True, "NIFTY weekly still bullish"
+
+        except Exception as e:
+            # FIX TR-M2: Block on error (conservative)
+            return False, f"NIFTY filter check failed: {e}"
+
     def place_entry_gtt(self, signal_id: int, script: str, entry_price: float) -> Optional[str]:
         """
         Place GTT entry order for approved signal
@@ -168,6 +247,47 @@ class OrderManager:
             )
             return None
 
+        # FIX RM-001: Check portfolio drawdown before new entry
+        drawdown_ok, current_dd, dd_msg = self._check_portfolio_drawdown()
+        if not drawdown_ok:
+            logger.warning(f"Entry blocked for {script}: Portfolio drawdown limit reached - {dd_msg}")
+            telegram.send_alert(
+                f"<b>Entry Blocked - Drawdown Limit</b>\n\n"
+                f"{script} @ {entry_price:,.2f}\n"
+                f"Portfolio drawdown: {current_dd:.1f}%\n"
+                f"New entries halted until drawdown recovers.",
+                critical=True
+            )
+            return None
+
+        # FIX TR-002: Re-check NIFTY filter at entry time
+        nifty_ok, nifty_msg = self._check_nifty_filter_at_entry()
+        if not nifty_ok:
+            logger.warning(f"Entry blocked for {script}: {nifty_msg}")
+            telegram.send_alert(
+                f"<b>Entry Blocked - Market Condition</b>\n\n"
+                f"{script} @ {entry_price:,.2f}\n"
+                f"{nifty_msg}\n"
+                f"Signal will need re-approval if market turns bullish."
+            )
+            # Mark signal as HOLD so it can be re-notified
+            session = get_session()
+            try:
+                signal = session.query(SignalQueue).filter(SignalQueue.id == signal_id).first()
+                if signal:
+                    signal.status = SignalStatus.HOLD
+                    signal.notes = f"Auto-hold: {nifty_msg}"
+                    session.commit()
+            finally:
+                session.close()
+            return None
+
+        # FIX RC-002: Acquire lock to prevent race condition in duplicate check
+        with _order_placement_lock:
+            return self._place_entry_gtt_locked(signal_id, script, entry_price)
+
+    def _place_entry_gtt_locked(self, signal_id: int, script: str, entry_price: float) -> Optional[str]:
+        """Internal method - must be called with _order_placement_lock held"""
         session = get_session()
         try:
             # DUPLICATE POSITION CHECK (safety feature from CROCODILE)
@@ -258,9 +378,16 @@ class OrderManager:
                 logger.error(f"Signal {signal_id} not found")
                 return None
 
-            # Calculate quantity
-            per_trade = config.get('trading.per_trade_amount', 20000)
-            quantity = int(per_trade / entry_price) if entry_price > 0 else 1
+            # FIX TR-004: Use pre-calculated quantity from signal for consistency
+            # Only recalculate if not stored (backward compatibility)
+            if signal.calculated_quantity and signal.calculated_quantity > 0:
+                quantity = signal.calculated_quantity
+                logger.debug(f"Using pre-calculated quantity for {script}: {quantity}")
+            else:
+                # Fallback: calculate now (for old signals or manual entries)
+                per_trade = config.get('trading.per_trade_amount', 20000)
+                quantity = int(per_trade / entry_price) if entry_price > 0 else 1
+                logger.debug(f"Calculated quantity for {script}: {quantity}")
 
             # FIX TR-C3: Validate minimum quantity
             if quantity <= 0:

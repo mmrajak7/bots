@@ -541,18 +541,26 @@ class ExitManager:
             else:
                 old_gtt_cleared = True  # No old GTT to cancel
 
-            # Place new GTT - FIX SYS-C1: Pass session for atomicity
+            # FIX DB-002: Atomic SL update - only modify position.current_sl AFTER GTT placement succeeds
+            # Save old SL in case we need to rollback
+            old_current_sl = position.current_sl
+
+            # Temporarily set new SL for GTT placement (place_sl_gtt reads current_sl)
             position.current_sl = new_sl
             new_gtt_id = self.place_sl_gtt(position, session=session)
 
             if new_gtt_id:
-                # Update position (session commit handled by caller if own_session=False)
+                # GTT placement succeeded - keep new SL and update other fields
                 position.highest_sl = max(position.highest_sl or 0, new_sl)
                 position.sl_movements += 1
                 position.last_sl_update = ist_now_naive()
 
                 if own_session:
                     session.commit()
+            else:
+                # FIX DB-002: GTT placement failed - rollback current_sl to previous value
+                position.current_sl = old_current_sl
+                logger.warning(f"{script}: GTT placement failed, reverted current_sl to {old_current_sl:.2f}")
 
                 # Log update
                 self._log_gtt_update(

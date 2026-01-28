@@ -8,6 +8,7 @@ Handles:
 """
 
 from typing import Optional, Dict, Any, List
+import threading
 from loguru import logger
 
 from src.telegram.bot import telegram
@@ -30,6 +31,8 @@ class ApprovalHandler:
         # Also keep reverse mapping for text message handling
         self._chat_awaiting_signal: Dict[int, int] = {}  # chat_id -> signal_id (most recent)
         self._loaded_from_db = False
+        # FIX RC-001: Thread-safe access to in-memory state
+        self._state_lock = threading.Lock()
 
     def process_updates(self) -> List[Dict[str, Any]]:
         """
@@ -127,11 +130,13 @@ class ApprovalHandler:
 
                 chat_id = int(telegram.chat_id) if telegram.chat_id else 0
 
-                for signal in signals:
-                    # FIX SYS-C2: Store both mappings
-                    self._signal_awaiting_price[signal.id] = chat_id
-                    self._chat_awaiting_signal[chat_id] = signal.id  # Last one wins for text reply
-                    logger.info(f"Recovered awaiting_price state for signal {signal.id} ({signal.script})")
+                # FIX RC-001: Use lock when modifying in-memory state
+                with self._state_lock:
+                    for signal in signals:
+                        # FIX SYS-C2: Store both mappings
+                        self._signal_awaiting_price[signal.id] = chat_id
+                        self._chat_awaiting_signal[chat_id] = signal.id  # Last one wins for text reply
+                        logger.info(f"Recovered awaiting_price state for signal {signal.id} ({signal.script})")
 
                 self._loaded_from_db = True
 
@@ -203,12 +208,14 @@ class ApprovalHandler:
 
         # Handle cancel revise
         elif action == 'cancel':
-            # FIX SYS-C2: Clear awaiting price state using new mapping
-            if target_id in self._signal_awaiting_price:
-                chat_id = self._signal_awaiting_price.pop(target_id)
-                # Clear reverse mapping if it points to this signal
-                if self._chat_awaiting_signal.get(chat_id) == target_id:
-                    del self._chat_awaiting_signal[chat_id]
+            # FIX RC-001: Thread-safe state modification
+            with self._state_lock:
+                # FIX SYS-C2: Clear awaiting price state using new mapping
+                if target_id in self._signal_awaiting_price:
+                    chat_id = self._signal_awaiting_price.pop(target_id)
+                    # Clear reverse mapping if it points to this signal
+                    if self._chat_awaiting_signal.get(chat_id) == target_id:
+                        del self._chat_awaiting_signal[chat_id]
             telegram.edit_message(message_id, "Price revision cancelled.")
             return None
 
@@ -280,10 +287,12 @@ class ApprovalHandler:
                 # Send price request message
                 new_msg_id = telegram.send_price_request(signal_id, script, signal_level)
 
-                # FIX SYS-C2: Store awaiting state in both mappings
-                chat_id = int(telegram.chat_id)
-                self._signal_awaiting_price[signal_id] = chat_id
-                self._chat_awaiting_signal[chat_id] = signal_id
+                # FIX RC-001: Thread-safe state modification
+                with self._state_lock:
+                    # FIX SYS-C2: Store awaiting state in both mappings
+                    chat_id = int(telegram.chat_id)
+                    self._signal_awaiting_price[signal_id] = chat_id
+                    self._chat_awaiting_signal[chat_id] = signal_id
 
                 # Update original message
                 telegram.edit_message(
@@ -365,11 +374,12 @@ class ApprovalHandler:
         if text.startswith('/'):
             return self._handle_command(text, parsed['message_id'])
 
-        # FIX SYS-C2: Check if we're awaiting a price for this chat using new mapping
-        if chat_id not in self._chat_awaiting_signal:
-            return None
-
-        signal_id = self._chat_awaiting_signal[chat_id]
+        # FIX RC-001: Thread-safe state access
+        with self._state_lock:
+            # FIX SYS-C2: Check if we're awaiting a price for this chat using new mapping
+            if chat_id not in self._chat_awaiting_signal:
+                return None
+            signal_id = self._chat_awaiting_signal[chat_id]
 
         # Try to parse price
         try:
@@ -393,11 +403,13 @@ class ApprovalHandler:
                     signal.status = SignalStatus.APPROVED
                     session.commit()
 
-                    # FIX SYS-C2: Clear both mappings
-                    if signal_id in self._signal_awaiting_price:
-                        del self._signal_awaiting_price[signal_id]
-                    if chat_id in self._chat_awaiting_signal:
-                        del self._chat_awaiting_signal[chat_id]
+                    # FIX RC-001: Thread-safe state modification
+                    with self._state_lock:
+                        # FIX SYS-C2: Clear both mappings
+                        if signal_id in self._signal_awaiting_price:
+                            del self._signal_awaiting_price[signal_id]
+                        if chat_id in self._chat_awaiting_signal:
+                            del self._chat_awaiting_signal[chat_id]
 
                     telegram.send_alert(
                         f"<b>{signal.script}</b> APPROVED @ {price:,.2f}\n"
@@ -486,24 +498,30 @@ class ApprovalHandler:
 
     def set_awaiting_price(self, chat_id: int, signal_id: int) -> None:
         """Set awaiting price state (for external use)"""
-        # FIX SYS-C2: Update both mappings
-        self._signal_awaiting_price[signal_id] = chat_id
-        self._chat_awaiting_signal[chat_id] = signal_id
+        # FIX RC-001: Thread-safe state modification
+        with self._state_lock:
+            # FIX SYS-C2: Update both mappings
+            self._signal_awaiting_price[signal_id] = chat_id
+            self._chat_awaiting_signal[chat_id] = signal_id
 
     def clear_awaiting_price(self, chat_id: int) -> None:
         """Clear awaiting price state"""
-        # FIX SYS-C2: Clear from both mappings
-        if chat_id in self._chat_awaiting_signal:
-            signal_id = self._chat_awaiting_signal.pop(chat_id)
-            if signal_id in self._signal_awaiting_price:
-                del self._signal_awaiting_price[signal_id]
+        # FIX RC-001: Thread-safe state modification
+        with self._state_lock:
+            # FIX SYS-C2: Clear from both mappings
+            if chat_id in self._chat_awaiting_signal:
+                signal_id = self._chat_awaiting_signal.pop(chat_id)
+                if signal_id in self._signal_awaiting_price:
+                    del self._signal_awaiting_price[signal_id]
 
     def clear_awaiting_price_for_signal(self, signal_id: int) -> None:
         """Clear awaiting price state for a specific signal"""
-        if signal_id in self._signal_awaiting_price:
-            chat_id = self._signal_awaiting_price.pop(signal_id)
-            if self._chat_awaiting_signal.get(chat_id) == signal_id:
-                del self._chat_awaiting_signal[chat_id]
+        # FIX RC-001: Thread-safe state modification
+        with self._state_lock:
+            if signal_id in self._signal_awaiting_price:
+                chat_id = self._signal_awaiting_price.pop(signal_id)
+                if self._chat_awaiting_signal.get(chat_id) == signal_id:
+                    del self._chat_awaiting_signal[chat_id]
 
 
 # Singleton instance

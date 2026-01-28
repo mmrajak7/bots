@@ -99,13 +99,23 @@ class CircuitBreaker:
             return False
 
     def record_success(self) -> None:
-        """Record a successful call"""
+        """
+        Record a successful call.
+
+        FIX API-005: Don't reset failure count completely on single success.
+        Use decay approach - each success decrements failure count by 1.
+        This prevents rapid failure accumulation after a lucky success.
+        """
         with self._state_lock:
-            self.failure_count = 0
+            # Decay failure count instead of resetting
+            if self.failure_count > 0:
+                self.failure_count -= 1
+
             self.last_success_time = datetime.now()
 
             if self.state == CircuitState.HALF_OPEN:
                 self.state = CircuitState.CLOSED
+                self.failure_count = 0  # Full reset only when recovering from OPEN state
                 logger.info(f"CircuitBreaker '{self.name}': HALF_OPEN -> CLOSED (recovered)")
 
     def record_failure(self) -> None:

@@ -75,6 +75,9 @@ class SignalQueue(Base):
     telegram_msg_id = Column(Integer, nullable=True)  # For button handling
     notes = Column(Text, nullable=True)
 
+    # FIX TR-004: Store quantity at notification time for consistent position sizing
+    calculated_quantity = Column(Integer, nullable=True)  # Quantity calculated at notification
+
     # Processing metadata
     nifty_filter_passed = Column(Boolean, nullable=True)  # NIFTY weekly filter result
     rejection_reason = Column(String(255), nullable=True)
@@ -278,27 +281,39 @@ class TelegramCallback(Base):
 
 
 # Database Engine and Session Management
+# FIX DB-003: Thread-safe session factory initialization
+import threading
 
 _engine = None
 _SessionLocal = None
+_db_lock = threading.Lock()
 
 
 def get_engine():
-    """Get database engine from config"""
+    """Get database engine from config (thread-safe)"""
     global _engine
     if _engine is None:
-        db_url = config.get('database.url', 'sqlite:///data/trading.db')
-        echo = config.get('database.echo', False)
-        _engine = create_engine(db_url, echo=echo)
+        with _db_lock:
+            if _engine is None:
+                db_url = config.get('database.url', 'sqlite:///data/trading.db')
+                echo = config.get('database.echo', False)
+                _engine = create_engine(db_url, echo=echo)
     return _engine
 
 
 def get_session():
-    """Get database session"""
+    """
+    Get database session (thread-safe).
+
+    FIX DB-003: Each call returns an independent session.
+    Caller MUST close the session after use.
+    """
     global _SessionLocal
     if _SessionLocal is None:
-        engine = get_engine()
-        _SessionLocal = sessionmaker(bind=engine)
+        with _db_lock:
+            if _SessionLocal is None:
+                engine = get_engine()
+                _SessionLocal = sessionmaker(bind=engine)
     return _SessionLocal()
 
 

@@ -8,8 +8,9 @@ Trade account: Dedicated account for FIFTY (for orders, positions)
 import json
 import os
 import time
+import threading
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
 from loguru import logger
@@ -18,6 +19,9 @@ from src.api.broker_adapter import BrokerAdapter
 from src.utils.config_manager import config
 from src.utils.timezone_helper import now_ist, today_ist, IST
 from src.utils.circuit_breaker import get_kite_breaker, CircuitBreakerOpenError
+
+# FIX RC-004: Thread-safe singleton initialization lock
+_singleton_lock = threading.Lock()
 
 try:
     from kiteconnect import KiteConnect
@@ -50,6 +54,8 @@ class DualKiteClient(BrokerAdapter):
         self._trade_credentials_file = config.get('kite_trade.credentials_file')
         self._order_tag = config.get('kite_trade.order_tag', 'fifty')
         self._rate_limit_delay = config.get('kite_trade.rate_limit_delay', 1.0)
+        # FIX API-002: Separate rate limit for historical data to prevent rate limit violations
+        self._rate_limit_delay_historical = config.get('kite_trade.rate_limit_delay_historical', 0.5)
 
         # Instruments cache
         self._instruments_cache: Dict[str, str] = {}  # tradingsymbol -> token
@@ -140,6 +146,10 @@ class DualKiteClient(BrokerAdapter):
     def _rate_limit(self):
         """Apply rate limiting before API calls"""
         time.sleep(self._rate_limit_delay)
+
+    def _rate_limit_historical(self):
+        """FIX API-002: Apply rate limiting for historical data calls"""
+        time.sleep(self._rate_limit_delay_historical)
 
     # =========================================================================
     # CONNECTION & VALIDATION
@@ -283,7 +293,8 @@ class DualKiteClient(BrokerAdapter):
             except Exception as e:
                 logger.warning(f"Failed to fetch data for year {year}: {e}")
 
-            time.sleep(0.1)
+            # FIX API-002: Use proper rate limiting between year fetches
+            self._rate_limit_historical()
 
         if not daily_data_list:
             return pd.DataFrame()
@@ -341,6 +352,9 @@ class DualKiteClient(BrokerAdapter):
                     logger.debug(f"LTP query failed for {tradingsymbol}: {e}")
 
             # Fallback: Get from historical data (already circuit breaker protected)
+            # FIX API-001: Add staleness check to prevent using old data as LTP
+            max_staleness_hours = config.get('risk.ltp_max_staleness_hours', 2)
+
             today = now_ist().strftime('%Y-%m-%d')
             df = self.get_historical_data(instrument_token, today, today, 'minute')
 
@@ -351,6 +365,21 @@ class DualKiteClient(BrokerAdapter):
 
             if df is None or df.empty:
                 raise Exception(f"No LTP data available for {instrument_token}")
+
+            # FIX API-001: Check data staleness before using as LTP
+            last_data_time = pd.to_datetime(df['Date'].iloc[-1])
+            if last_data_time.tzinfo is None:
+                last_data_time = last_data_time.tz_localize(IST)
+            data_age = now_ist() - last_data_time
+            data_age_hours = data_age.total_seconds() / 3600
+
+            if data_age_hours > max_staleness_hours:
+                logger.warning(
+                    f"LTP data for {instrument_token} is stale ({data_age_hours:.1f}h old, max {max_staleness_hours}h). "
+                    f"Using anyway but flagging as potentially inaccurate."
+                )
+                # Note: We still return the value but logged the warning
+                # In critical operations, caller should handle CircuitBreakerOpenError instead
 
             return float(df['Close'].iloc[-1])
 
@@ -523,10 +552,37 @@ class DualKiteClient(BrokerAdapter):
         return True
 
     def get_gtt_orders(self) -> List[Dict[str, Any]]:
-        """Get all active GTT orders using trade client"""
+        """
+        Get all active GTT orders using trade client.
+
+        Returns:
+            List of GTT orders. Empty list if no GTTs exist.
+
+        Raises:
+            Exception: If API call fails (caller can distinguish from empty list)
+        """
         self._rate_limit()
         kite = self._get_trade_client()
         return kite.get_gtts() or []
+
+    def get_gtt_orders_safe(self) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        FIX API-003: Get all active GTT orders with error distinction.
+
+        Returns:
+            Tuple of (gtt_list, is_error)
+            - ([], False) = Success, no GTTs
+            - ([...], False) = Success, GTTs found
+            - ([], True) = Error, could not fetch
+        """
+        try:
+            self._rate_limit()
+            kite = self._get_trade_client()
+            gtts = kite.get_gtts() or []
+            return gtts, False
+        except Exception as e:
+            logger.error(f"Failed to fetch GTT orders: {e}")
+            return [], True
 
     def get_gtt_status(self, gtt_id: str) -> Optional[Dict[str, Any]]:
         """Get status of a specific GTT"""
@@ -535,6 +591,25 @@ class DualKiteClient(BrokerAdapter):
             if str(gtt.get('id')) == str(gtt_id):
                 return gtt
         return None
+
+    def get_gtt_status_safe(self, gtt_id: str) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """
+        FIX API-003: Get status of a specific GTT with error distinction.
+
+        Returns:
+            Tuple of (gtt_dict or None, is_error)
+            - (None, False) = Success, GTT not found
+            - ({...}, False) = Success, GTT found
+            - (None, True) = Error, could not fetch
+        """
+        gtts, is_error = self.get_gtt_orders_safe()
+        if is_error:
+            return None, True
+
+        for gtt in gtts:
+            if str(gtt.get('id')) == str(gtt_id):
+                return gtt, False
+        return None, False
 
     # =========================================================================
     # PORTFOLIO & MARGIN (uses trade client)
@@ -690,8 +765,15 @@ _kite_client: Optional[DualKiteClient] = None
 
 
 def get_kite_client() -> DualKiteClient:
-    """Get singleton DualKiteClient instance"""
+    """
+    Get singleton DualKiteClient instance.
+
+    FIX RC-004: Thread-safe singleton initialization using double-checked locking.
+    """
     global _kite_client
     if _kite_client is None:
-        _kite_client = DualKiteClient()
+        with _singleton_lock:
+            # Double-check inside lock to prevent race condition
+            if _kite_client is None:
+                _kite_client = DualKiteClient()
     return _kite_client

@@ -237,12 +237,19 @@ def run_bot():
 # ============================================================================
 
 _daemon_running = True
+# FIX OP-004: Track in-progress API calls for graceful shutdown
+_shutdown_in_progress = False
+_active_api_operations = 0
+_api_operation_lock = None  # Initialized in run_daemon
+
+import threading
 
 
 def _signal_handler(signum, frame):
     """Handle shutdown signals gracefully"""
-    global _daemon_running
-    logger.info(f"Received signal {signum}, shutting down daemon...")
+    global _daemon_running, _shutdown_in_progress
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    _shutdown_in_progress = True
     _daemon_running = False
 
 
@@ -502,6 +509,11 @@ def _run_scheduled_tasks(orchestrator, current) -> None:
     # Recovery checks (16:00-16:05)
     if is_market and in_time_window(current, "16:00", "16:05"):
         _safe_run("recovery_checks", orchestrator._run_recovery_checks)
+
+    # FIX ER-001: Immediate recovery for late-day positions (15:30-16:00)
+    # Positions opened after 15:00 need immediate recovery check, not waiting until next day
+    if is_market and in_time_window(current, "15:30", "16:00"):
+        _safe_run("late_day_recovery", orchestrator._run_recovery_checks)
 
     # Weekly report (Friday 16:15-16:20)
     if is_market and is_friday() and in_time_window(current, "16:15", "16:20"):
