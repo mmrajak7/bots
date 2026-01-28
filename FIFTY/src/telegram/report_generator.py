@@ -35,7 +35,16 @@ class ReportGenerator:
         self.reports_dir = ensure_reports_dir()
 
     def _get_compact_styles(self) -> str:
-        """Compact CSS optimized for Telegram image display"""
+        """
+        Compact CSS optimized for Telegram image display.
+
+        Color philosophy:
+        - GREEN (#22c55e): Positive P&L, wins, profits ONLY
+        - RED (#ef4444): Negative P&L, losses ONLY
+        - CYAN (#06b6d4): Section headers, accents (neutral)
+        - SLATE (#64748b, #94a3b8): Labels, secondary text
+        - WHITE (#fff, #e8e8e8): Primary text, values
+        """
         return """
         <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -52,9 +61,10 @@ class ReportGenerator:
                 justify-content: space-between;
                 align-items: center;
                 padding: 8px 12px;
-                background: linear-gradient(90deg, #e94560, #0f3460);
+                background: linear-gradient(90deg, #0f3460, #16213e);
                 border-radius: 6px;
                 margin-bottom: 10px;
+                border-left: 3px solid #06b6d4;
             }
             .header h1 {
                 font-size: 16px;
@@ -63,7 +73,10 @@ class ReportGenerator:
             }
             .header .date {
                 font-size: 11px;
-                color: rgba(255,255,255,0.8);
+                color: rgba(255,255,255,0.7);
+                background: rgba(255,255,255,0.1);
+                padding: 2px 8px;
+                border-radius: 4px;
             }
             .section {
                 background: rgba(255,255,255,0.05);
@@ -74,7 +87,7 @@ class ReportGenerator:
             }
             .section-title {
                 font-size: 11px;
-                color: #e94560;
+                color: #06b6d4;
                 text-transform: uppercase;
                 letter-spacing: 1px;
                 margin-bottom: 8px;
@@ -112,7 +125,7 @@ class ReportGenerator:
             }
             .row:last-child { border-bottom: none; }
             .row-label { color: #94a3b8; font-size: 12px; }
-            .row-value { font-weight: 600; font-size: 12px; }
+            .row-value { font-weight: 600; font-size: 12px; color: #e8e8e8; }
             .positive { color: #22c55e; }
             .negative { color: #ef4444; }
             table {
@@ -121,8 +134,8 @@ class ReportGenerator:
                 font-size: 11px;
             }
             th {
-                background: rgba(233,69,96,0.15);
-                color: #e94560;
+                background: rgba(6,182,212,0.1);
+                color: #06b6d4;
                 font-weight: 600;
                 padding: 6px 8px;
                 text-align: left;
@@ -142,7 +155,7 @@ class ReportGenerator:
             }
             .badge-win { background: rgba(34,197,94,0.2); color: #22c55e; }
             .badge-loss { background: rgba(239,68,68,0.2); color: #ef4444; }
-            .badge-pending { background: rgba(245,158,11,0.2); color: #f59e0b; }
+            .badge-pending { background: rgba(6,182,212,0.2); color: #06b6d4; }
             .footer {
                 text-align: center;
                 color: #64748b;
@@ -159,7 +172,7 @@ class ReportGenerator:
             .progress-fill {
                 height: 100%;
                 border-radius: 2px;
-                background: linear-gradient(90deg, #e94560, #22c55e);
+                background: linear-gradient(90deg, #06b6d4, #22c55e);
             }
             .empty { color: #64748b; text-align: center; padding: 12px; font-style: italic; }
         </style>
