@@ -422,6 +422,10 @@ def _run_scheduled_tasks(orchestrator, current) -> None:
     if is_market and is_friday() and in_time_window(current, "16:15", "16:20"):
         orchestrator._send_weekly_report()
 
+    # Monthly report (last trading day, 16:20-16:25)
+    if is_market and in_time_window(current, "16:20", "16:25") and orchestrator._is_last_trading_day():
+        orchestrator._send_monthly_report()
+
     # Month-end cleanup (last trading day, 16:25-16:30)
     if is_market and in_time_window(current, "16:25", "16:30") and orchestrator._is_last_trading_day():
         orchestrator._month_end_cleanup()

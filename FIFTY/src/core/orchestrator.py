@@ -153,7 +153,11 @@ class Orchestrator:
             if is_friday() and in_time_window(current, "16:15", "16:20"):
                 self._send_weekly_report()
 
-            # 11. Month-end cleanup (last trading day, 16:25-16:30)
+            # 11. Monthly report (last trading day, 16:20-16:25) - BEFORE cleanup
+            if in_time_window(current, "16:20", "16:25") and self._is_last_trading_day():
+                self._send_monthly_report()
+
+            # 12. Month-end cleanup (last trading day, 16:25-16:30)
             if in_time_window(current, "16:25", "16:30") and self._is_last_trading_day():
                 self._month_end_cleanup()
 
@@ -708,6 +712,131 @@ class Orchestrator:
 
         except Exception as e:
             logger.error(f"Error sending weekly text report: {e}")
+
+    # =========================================================================
+    # MONTHLY REPORT (Last Trading Day)
+    # =========================================================================
+
+    def _send_monthly_report(self) -> None:
+        """Send monthly performance report on last trading day (before cleanup)"""
+        # Check if already run today
+        last_report = get_bot_state('last_monthly_report')
+        today_str = today_ist().isoformat()
+
+        if last_report == today_str:
+            return
+
+        logger.info("Sending monthly report")
+
+        try:
+            from src.telegram.report_generator import report_generator
+
+            # Generate monthly HTML report
+            filepath = report_generator.generate_monthly_report()
+
+            if filepath:
+                # Try to convert to image
+                image_path = report_generator.html_to_image(filepath)
+
+                if image_path:
+                    telegram.send_photo(image_path, caption="<b>FIFTY Monthly Report</b>")
+                    report_generator.delete_report(image_path)
+                    report_generator.delete_report(filepath)
+                    logger.info("Monthly report image sent successfully")
+                else:
+                    # Fallback to HTML document
+                    telegram.send_html_report(filepath, report_type="Monthly")
+                    logger.info("Monthly HTML report sent successfully")
+
+            # Also send text summary
+            self._send_monthly_text_report()
+
+            set_bot_state('last_monthly_report', today_str)
+
+        except Exception as e:
+            logger.error(f"Error sending monthly report: {e}")
+            # Try text report as fallback
+            self._send_monthly_text_report()
+
+    def _send_monthly_text_report(self) -> None:
+        """Send text-based monthly report as backup"""
+        try:
+            session = get_session()
+            try:
+                today = today_ist()
+                month_start = today.replace(day=1)
+                month_name = today.strftime('%B %Y')
+
+                # Month's trades
+                month_trades_list = session.query(ClosedPosition).filter(
+                    ClosedPosition.exit_date >= month_start
+                ).all()
+                month_trades = len(month_trades_list)
+                month_pnl = sum(t.net_pnl for t in month_trades_list)
+                month_winners = sum(1 for t in month_trades_list if t.net_pnl > 0)
+
+                # All-time stats
+                all_trades = session.query(ClosedPosition).all()
+                total_trades = len(all_trades)
+                total_pnl = sum(t.net_pnl for t in all_trades)
+                total_winners = sum(1 for t in all_trades if t.net_pnl > 0)
+                win_rate = (total_winners / total_trades * 100) if total_trades > 0 else 0
+
+                # Current status
+                open_positions = session.query(OpenPosition).filter(
+                    OpenPosition.status == PositionStatus.OPEN
+                ).all()
+                num_positions = len(open_positions)
+                total_deployed = sum(p.capital_deployed for p in open_positions)
+
+                pending_orders = session.query(OpenOrder).filter(
+                    OpenOrder.status == OrderStatus.PENDING
+                ).count()
+
+                # ROI
+                initial_capital = config.get('trading.initial_capital', 100000)
+                month_roi = (month_pnl / initial_capital * 100) if initial_capital > 0 else 0
+                total_roi = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0
+
+                month_pnl_sign = '+' if month_pnl >= 0 else ''
+                total_pnl_sign = '+' if total_pnl >= 0 else ''
+                month_roi_sign = '+' if month_roi >= 0 else ''
+                total_roi_sign = '+' if total_roi >= 0 else ''
+
+                # Build positions table
+                positions_table = ""
+                if open_positions:
+                    positions_table = "\n<code>Script       Qty   Entry      SL    Days</code>\n<code>───────────────────────────────────────</code>\n"
+                    for pos in open_positions:
+                        script_name = pos.script[:12].ljust(12)
+                        positions_table += f"<code>{script_name} {pos.quantity:3d} {pos.entry_price:7.2f} {pos.current_sl:7.2f} {pos.days_held:4d}d</code>\n"
+
+                report = (
+                    f"<b>FIFTY Monthly Report - {month_name}</b>\n\n"
+                    f"<b>This Month</b>\n"
+                    f"Trades Closed: {month_trades}\n"
+                    f"P&L: {month_pnl_sign}{month_pnl:,.0f}\n"
+                    f"ROI: {month_roi_sign}{month_roi:.2f}%\n"
+                    f"Winners: {month_winners}/{month_trades}\n\n"
+                    f"<b>All Time</b>\n"
+                    f"Total Trades: {total_trades}\n"
+                    f"Total P&L: {total_pnl_sign}{total_pnl:,.0f}\n"
+                    f"Total ROI: {total_roi_sign}{total_roi:.2f}%\n"
+                    f"Win Rate: {win_rate:.1f}%\n\n"
+                    f"<b>Current Status</b>\n"
+                    f"Open Positions: {num_positions}\n"
+                    f"Deployed: {total_deployed:,.0f}\n"
+                    f"Pending Orders: {pending_orders}"
+                    f"{positions_table}"
+                )
+
+                telegram.send_alert(report)
+
+            finally:
+                session.close()
+
+        except Exception as e:
+            logger.error(f"Error sending monthly text report: {e}")
 
     # =========================================================================
     # MONTH-END CLEANUP

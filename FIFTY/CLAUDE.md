@@ -90,9 +90,10 @@ Key-value store for state (kill_switch, telegram_offset, etc.)
 - 15:50-15:55: Monthly SL trail (last trading day)
 - 16:00-16:05: Recovery checks
 - 16:15-16:20: Weekly report (Friday)
+- 16:20-16:25: Monthly report (last trading day)
 - 16:25-16:30: Month-end cleanup (last trading day)
 
-Note: Daily report disabled per user preference (weekly/monthly only)
+Note: Daily report disabled per user preference (weekly/monthly only). Use `/report` for on-demand reports.
 
 ## Configuration
 See `config/config.yaml` for all settings:
