@@ -337,9 +337,16 @@ class SignalProcessor:
             # Calculate SuperTrend
             df_with_st = self._calculate_supertrend(df)
 
-            # Get current SuperTrend value (use completed candle)
+            # Get SuperTrend value from the previous COMPLETED candle
+            # Current candle (iloc[-1]) is incomplete/running
+            # Previous candle (iloc[-2]) is confirmed/completed
             if len(df_with_st) >= 2:
                 signal_level = float(df_with_st['supertrend'].iloc[-2])
+                prev_trend = int(df_with_st['trend'].iloc[-2])
+                trend_str = "UP" if prev_trend == 1 else "DOWN"  # trend=1 is UP in TradingView style
+                logger.debug(
+                    f"ST calc for {script}: ST={signal_level:.2f} trend={trend_str}"
+                )
             else:
                 signal_level = float(df_with_st['supertrend'].iloc[-1])
 
@@ -350,67 +357,86 @@ class SignalProcessor:
             return None
 
     def _calculate_supertrend(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate SuperTrend indicator"""
+        """
+        Calculate SuperTrend indicator (TradingView-compatible)
+
+        SuperTrend 10,3 means: period=10, multiplier=3
+        Convention:
+        - trend = 1: UPTREND (bullish), SuperTrend = lower band (green support line)
+        - trend = -1: DOWNTREND (bearish), SuperTrend = upper band (red resistance line)
+
+        Key: Compare current close to PREVIOUS bands for trend determination
+        """
+        import numpy as np
         df = df.copy()
 
-        # Calculate ATR
+        # Calculate ATR using Wilder's smoothing (RMA)
         df['prev_close'] = df['Close'].shift(1)
-        df['tr1'] = df['High'] - df['Low']
-        df['tr2'] = abs(df['High'] - df['prev_close'])
-        df['tr3'] = abs(df['Low'] - df['prev_close'])
-        df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+        df['tr'] = pd.concat([
+            df['High'] - df['Low'],
+            abs(df['High'] - df['prev_close']),
+            abs(df['Low'] - df['prev_close'])
+        ], axis=1).max(axis=1)
         atr = df['tr'].ewm(alpha=1/self.st_period, adjust=False).mean()
 
         # Calculate basic bands
         hl2 = (df['High'] + df['Low']) / 2
-        df['basic_ub'] = hl2 + (self.st_multiplier * atr)
-        df['basic_lb'] = hl2 - (self.st_multiplier * atr)
+        df['basic_lb'] = hl2 - (self.st_multiplier * atr)  # Lower band
+        df['basic_ub'] = hl2 + (self.st_multiplier * atr)  # Upper band
 
-        # Initialize final bands
-        df['final_ub'] = 0.0
-        df['final_lb'] = 0.0
-        df['supertrend'] = 0.0
-        df['trend'] = 0
+        # Initialize arrays
+        n = len(df)
+        final_lb = np.zeros(n)
+        final_ub = np.zeros(n)
+        trend = np.zeros(n)
+        supertrend = np.zeros(n)
 
-        # Calculate final bands
-        for i in range(len(df)):
-            if i == 0:
-                df.iloc[i, df.columns.get_loc('final_ub')] = df.iloc[i]['basic_ub']
-                df.iloc[i, df.columns.get_loc('final_lb')] = df.iloc[i]['basic_lb']
+        # First candle
+        final_lb[0] = df.iloc[0]['basic_lb']
+        final_ub[0] = df.iloc[0]['basic_ub']
+        trend[0] = 1  # Start assuming uptrend
+        supertrend[0] = final_lb[0]
+
+        for i in range(1, n):
+            curr_basic_lb = df.iloc[i]['basic_lb']
+            curr_basic_ub = df.iloc[i]['basic_ub']
+            prev_close = df.iloc[i-1]['Close']
+            curr_close = df.iloc[i]['Close']
+
+            # Final Lower Band: trails up in uptrend
+            # TradingView: up := close[1] > up[1] ? max(up, up[1]) : up
+            if prev_close > final_lb[i-1]:
+                final_lb[i] = max(curr_basic_lb, final_lb[i-1])
             else:
-                # Final Upper Band
-                if df.iloc[i]['basic_ub'] < df.iloc[i-1]['final_ub'] or df.iloc[i-1]['Close'] > df.iloc[i-1]['final_ub']:
-                    df.iloc[i, df.columns.get_loc('final_ub')] = df.iloc[i]['basic_ub']
-                else:
-                    df.iloc[i, df.columns.get_loc('final_ub')] = df.iloc[i-1]['final_ub']
+                final_lb[i] = curr_basic_lb
 
-                # Final Lower Band
-                if df.iloc[i]['basic_lb'] > df.iloc[i-1]['final_lb'] or df.iloc[i-1]['Close'] < df.iloc[i-1]['final_lb']:
-                    df.iloc[i, df.columns.get_loc('final_lb')] = df.iloc[i]['basic_lb']
-                else:
-                    df.iloc[i, df.columns.get_loc('final_lb')] = df.iloc[i-1]['final_lb']
-
-        # Calculate SuperTrend and Trend
-        for i in range(len(df)):
-            if i == 0:
-                df.iloc[i, df.columns.get_loc('supertrend')] = df.iloc[i]['final_ub']
-                df.iloc[i, df.columns.get_loc('trend')] = 1
+            # Final Upper Band: trails down in downtrend
+            # TradingView: dn := close[1] < dn[1] ? min(dn, dn[1]) : dn
+            if prev_close < final_ub[i-1]:
+                final_ub[i] = min(curr_basic_ub, final_ub[i-1])
             else:
-                if df.iloc[i-1]['supertrend'] == df.iloc[i-1]['final_ub'] and df.iloc[i]['Close'] <= df.iloc[i]['final_ub']:
-                    df.iloc[i, df.columns.get_loc('trend')] = 1
-                elif df.iloc[i-1]['supertrend'] == df.iloc[i-1]['final_ub'] and df.iloc[i]['Close'] > df.iloc[i]['final_ub']:
-                    df.iloc[i, df.columns.get_loc('trend')] = -1
-                elif df.iloc[i-1]['supertrend'] == df.iloc[i-1]['final_lb'] and df.iloc[i]['Close'] >= df.iloc[i]['final_lb']:
-                    df.iloc[i, df.columns.get_loc('trend')] = -1
-                elif df.iloc[i-1]['supertrend'] == df.iloc[i-1]['final_lb'] and df.iloc[i]['Close'] < df.iloc[i]['final_lb']:
-                    df.iloc[i, df.columns.get_loc('trend')] = 1
-                else:
-                    df.iloc[i, df.columns.get_loc('trend')] = df.iloc[i-1]['trend']
+                final_ub[i] = curr_basic_ub
 
-                if df.iloc[i]['trend'] == 1:
-                    df.iloc[i, df.columns.get_loc('supertrend')] = df.iloc[i]['final_ub']
-                else:
-                    df.iloc[i, df.columns.get_loc('supertrend')] = df.iloc[i]['final_lb']
+            # Trend determination: compare CURRENT close to PREVIOUS bands
+            # TradingView: trend := close > dn[1] ? 1 : close < up[1] ? -1 : trend[1]
+            if curr_close > final_ub[i-1]:
+                trend[i] = 1   # Switch/stay in UPTREND
+            elif curr_close < final_lb[i-1]:
+                trend[i] = -1  # Switch/stay in DOWNTREND
+            else:
+                trend[i] = trend[i-1]  # Keep previous trend
+
+            # Set SuperTrend value based on trend
+            if trend[i] == 1:
+                supertrend[i] = final_lb[i]  # Uptrend: ST is lower band (support)
+            else:
+                supertrend[i] = final_ub[i]  # Downtrend: ST is upper band (resistance)
+
+        # Assign to dataframe
+        df['final_lb'] = final_lb
+        df['final_ub'] = final_ub
+        df['supertrend'] = supertrend
+        df['trend'] = trend
 
         return df
 

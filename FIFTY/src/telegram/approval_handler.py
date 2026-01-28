@@ -15,6 +15,7 @@ from src.models.database import (
     get_session, SignalQueue, OpenPosition, TelegramCallback,
     SignalStatus, PositionStatus, ist_now_naive
 )
+from src.api.dual_kite_client import get_kite_client
 
 
 class ApprovalHandler:

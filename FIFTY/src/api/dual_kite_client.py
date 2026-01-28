@@ -298,8 +298,8 @@ class DualKiteClient(BrokerAdapter):
             daily_df.reset_index(inplace=True)
             return daily_df
 
-        # Resample
-        resample_freq = 'ME' if timeframe == 'monthly' else 'W'
+        # Resample (use 'M' for monthly - compatible with all pandas versions)
+        resample_freq = 'M' if timeframe == 'monthly' else 'W'
         resampled_df = daily_df.resample(resample_freq).agg({
             'Open': 'first',
             'High': 'max',
