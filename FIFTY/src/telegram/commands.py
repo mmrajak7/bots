@@ -52,6 +52,9 @@ class CommandHandler:
                     self._cmd_import(script)
                 else:
                     telegram.send_alert("Usage: /import SCRIPT")
+            elif command == 'report':
+                report_type = kwargs.get('report_type')
+                self._cmd_report(report_type)
             elif command == 'kill':
                 self._cmd_kill()
             elif command == 'resume':
@@ -63,7 +66,7 @@ class CommandHandler:
             telegram.send_alert(f"Error executing /{command}: {str(e)}")
 
     def _cmd_positions(self) -> None:
-        """List all open positions with current P&L"""
+        """List all open positions with current P&L in a clean table format"""
         session = get_session()
         try:
             positions = session.query(OpenPosition).filter(
@@ -75,14 +78,19 @@ class CommandHandler:
                 return
 
             # Get Kite client for LTP
+            kite = None
             try:
                 from src.api.dual_kite_client import get_kite_client
                 kite = get_kite_client()
             except Exception as e:
                 logger.warning(f"Could not get Kite client: {e}")
-                kite = None
 
-            lines = ["<b>Open Positions</b>\n"]
+            # Build table header
+            lines = [
+                "<b>Open Positions</b>",
+                "<code>Script       Qty   Entry     LTP      SL    P&L   Age</code>",
+                "<code>─────────────────────────────────────────────────────</code>"
+            ]
 
             total_deployed = 0
             total_unrealized = 0
@@ -90,7 +98,6 @@ class CommandHandler:
             for pos in positions:
                 ltp = None
                 unrealized_pnl = 0
-                pnl_pct = 0
 
                 # Try to get current LTP
                 if kite is not None:
@@ -100,30 +107,42 @@ class CommandHandler:
                             ltp = kite.get_instrument_ltp(instrument_token)
                             if ltp is not None:
                                 unrealized_pnl = (ltp - pos.entry_price) * pos.quantity
-                                pnl_pct = ((ltp - pos.entry_price) / pos.entry_price) * 100
                                 total_unrealized += unrealized_pnl
                     except Exception as e:
                         logger.debug(f"Could not get LTP for {pos.script}: {e}")
 
-                # Build position line
-                pnl_str = ""
-                if ltp is not None:
-                    pnl_sign = "+" if unrealized_pnl >= 0 else ""
-                    pnl_str = f"LTP: {ltp:,.2f} | P&L: {pnl_sign}{unrealized_pnl:,.0f} ({pnl_sign}{pnl_pct:.1f}%)\n"
+                # Format script name (truncate/pad to 12 chars)
+                script_name = pos.script[:12].ljust(12)
 
+                # Format age
+                if pos.days_held == 0:
+                    age_str = "Today"
+                elif pos.days_held == 1:
+                    age_str = "  1d"
+                else:
+                    age_str = f"{pos.days_held:3d}d"
+
+                # Format P&L
+                if ltp is not None:
+                    pnl_str = f"{unrealized_pnl:+5.0f}"
+                    ltp_str = f"{ltp:7.2f}"
+                else:
+                    pnl_str = "  N/A"
+                    ltp_str = "    N/A"
+
+                # Build row
                 lines.append(
-                    f"<b>{pos.script}</b>\n"
-                    f"Entry: {pos.entry_price:,.2f} ({pos.entry_date})\n"
-                    f"Qty: {pos.quantity} | SL: {pos.current_sl:,.2f}\n"
-                    f"{pnl_str}"
-                    f"SL Moves: {pos.sl_movements} | Days: {pos.days_held}\n"
+                    f"<code>{script_name} {pos.quantity:3d} {pos.entry_price:7.2f} {ltp_str} {pos.current_sl:7.2f} {pnl_str} {age_str}</code>"
                 )
                 total_deployed += pos.capital_deployed
 
-            lines.append(f"\n<b>Total Deployed:</b> {total_deployed:,.0f}")
-            if total_unrealized != 0:
-                pnl_sign = "+" if total_unrealized >= 0 else ""
-                lines.append(f"<b>Unrealized P&L:</b> {pnl_sign}{total_unrealized:,.0f}")
+            # Summary
+            lines.append("<code>─────────────────────────────────────────────────────</code>")
+            lines.append(f"<b>Deployed:</b> {total_deployed:,.0f}")
+
+            pnl_sign = "+" if total_unrealized >= 0 else ""
+            pnl_emoji = "" if total_unrealized >= 0 else ""
+            lines.append(f"<b>Unrealized:</b> {pnl_sign}{total_unrealized:,.0f} {pnl_emoji}")
 
             telegram.send_alert('\n'.join(lines))
 
@@ -281,41 +300,98 @@ class CommandHandler:
         finally:
             session.close()
 
-    def _cmd_report(self, html: bool = True) -> None:
+    def _cmd_report(self, report_type: str = None) -> None:
         """
-        Generate today's summary report.
+        Generate report - either show menu or generate specific type.
 
         Args:
-            html: If True, generate and send HTML report. If False, send text summary.
+            report_type: 'daily', 'weekly', 'monthly', 'overall', or None for menu
         """
-        if html:
-            self._cmd_report_html()
+        if report_type is None:
+            # Show interactive menu with buttons
+            self._show_report_menu()
         else:
-            self._cmd_report_text()
+            self._generate_report(report_type)
 
-    def _cmd_report_html(self) -> None:
-        """Generate and send HTML daily report"""
+    def _show_report_menu(self) -> None:
+        """Show interactive report type selection"""
+        buttons = [
+            [
+                {'text': 'Daily', 'callback_data': 'report_daily'},
+                {'text': 'Weekly', 'callback_data': 'report_weekly'}
+            ],
+            [
+                {'text': 'Monthly', 'callback_data': 'report_monthly'},
+                {'text': 'Overall', 'callback_data': 'report_overall'}
+            ]
+        ]
+        reply_markup = telegram.create_inline_keyboard(buttons)
+
+        telegram.send_message(
+            "<b>Select Report Type</b>\n\n"
+            "Daily - Today's summary\n"
+            "Weekly - Last 7 days\n"
+            "Monthly - This month\n"
+            "Overall - All-time stats",
+            reply_markup=reply_markup
+        )
+
+    def _generate_report(self, report_type: str) -> None:
+        """Generate and send the specified report type"""
         try:
             from src.telegram.report_generator import report_generator
 
-            # Generate HTML report
-            filepath = report_generator.generate_daily_report()
-
-            if filepath:
-                # Send via Telegram (deletes after send)
-                success = telegram.send_html_report(filepath, report_type="Daily")
-                if success:
-                    logger.info("Daily HTML report sent successfully")
-                else:
-                    logger.warning("Failed to send HTML report, falling back to text")
-                    self._cmd_report_text()
+            # Generate report based on type
+            if report_type == 'daily':
+                filepath = report_generator.generate_daily_report()
+                type_name = "Daily"
+            elif report_type == 'weekly':
+                filepath = report_generator.generate_weekly_report()
+                type_name = "Weekly"
+            elif report_type == 'monthly':
+                filepath = report_generator.generate_monthly_report()
+                type_name = "Monthly"
+            elif report_type == 'overall':
+                filepath = report_generator.generate_overall_report()
+                type_name = "Overall"
             else:
-                logger.warning("Failed to generate HTML report, falling back to text")
-                self._cmd_report_text()
+                telegram.send_alert(f"Unknown report type: {report_type}")
+                return
+
+            if not filepath:
+                telegram.send_alert(f"Failed to generate {type_name} report")
+                return
+
+            # Try to convert to image first
+            image_path = report_generator.html_to_image(filepath)
+
+            if image_path:
+                # Send image
+                success = telegram.send_photo(image_path, caption=f"<b>FIFTY {type_name} Report</b>")
+                # Delete both image and HTML
+                report_generator.delete_report(image_path)
+                report_generator.delete_report(filepath)
+
+                if success:
+                    logger.info(f"{type_name} report image sent successfully")
+                else:
+                    # Fallback to HTML
+                    telegram.send_alert(f"Failed to send image, report saved at {filepath}")
+            else:
+                # Send HTML document
+                success = telegram.send_html_report(filepath, report_type=type_name)
+                if success:
+                    logger.info(f"{type_name} HTML report sent successfully")
+                else:
+                    telegram.send_alert(f"Failed to send {type_name} report")
 
         except Exception as e:
-            logger.error(f"Error generating HTML report: {e}")
-            self._cmd_report_text()
+            logger.error(f"Error generating {report_type} report: {e}")
+            telegram.send_alert(f"Report error: {str(e)}")
+
+    def _cmd_report_html(self) -> None:
+        """Generate and send HTML daily report (legacy method)"""
+        self._generate_report('daily')
 
     def _cmd_report_text(self) -> None:
         """Generate text-based summary report (fallback)"""

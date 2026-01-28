@@ -229,6 +229,72 @@ class TelegramBot:
 
         return None
 
+    def send_photo(
+        self,
+        file_path: str,
+        caption: str = None,
+        disable_notification: bool = False
+    ) -> bool:
+        """
+        Send a photo/image to Telegram.
+
+        Args:
+            file_path: Path to image file
+            caption: Optional caption (supports HTML)
+            disable_notification: Silent notification
+
+        Returns:
+            True if sent successfully
+        """
+        if not self.enabled:
+            return False
+
+        url = f"{self.base_url}/sendPhoto"
+
+        try:
+            with open(file_path, 'rb') as f:
+                files = {'photo': f}
+                data = {
+                    'chat_id': self.chat_id,
+                    'disable_notification': disable_notification
+                }
+                if caption:
+                    if config.is_test_mode():
+                        caption = "[TEST] " + caption
+                    data['caption'] = caption
+                    data['parse_mode'] = 'HTML'
+
+                for attempt in range(self.retry_attempts):
+                    try:
+                        response = requests.post(url, data=data, files=files, timeout=60)
+                        response.raise_for_status()
+                        result = response.json()
+
+                        if result.get('ok'):
+                            return True
+                        else:
+                            logger.error(f"Telegram sendPhoto error: {result}")
+                            return False
+
+                    except Exception as e:
+                        logger.warning(f"sendPhoto attempt {attempt + 1}/{self.retry_attempts} failed: {e}")
+                        if attempt < self.retry_attempts - 1:
+                            import time
+                            time.sleep(self.retry_delay)
+                            f.seek(0)
+                        else:
+                            logger.error(f"All sendPhoto attempts failed: {e}")
+                            return False
+
+        except FileNotFoundError:
+            logger.error(f"Image file not found: {file_path}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending photo: {e}")
+            return False
+
+        return False
+
     def send_html_report(
         self,
         file_path: str,

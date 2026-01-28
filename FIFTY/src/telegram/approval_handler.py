@@ -192,6 +192,15 @@ class ApprovalHandler:
         elif action in ['hodl', 'exit']:
             return self._handle_position_action(action, target_id, message_id)
 
+        # Handle report type selection
+        elif action == 'report':
+            # target_id here is actually the report type from callback_data "report_daily"
+            report_type = parsed['raw_data'].split('_')[1] if '_' in parsed['raw_data'] else None
+            if report_type:
+                telegram.edit_message(message_id, f"Generating {report_type} report...")
+                return {'type': 'command', 'command': 'report', 'report_type': report_type}
+            return None
+
         # Handle cancel revise
         elif action == 'cancel':
             # FIX SYS-C2: Clear awaiting price state using new mapping

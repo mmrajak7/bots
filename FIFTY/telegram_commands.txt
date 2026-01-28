@@ -1,0 +1,13 @@
+# FIFTY Bot - Telegram Command List
+# Copy these to BotFather via /setcommands
+
+positions - List open positions with P&L
+pending - Show pending signals and orders
+stats - Trading statistics and win rate
+capital - Capital allocation status
+report - Generate reports (Daily/Weekly/Monthly/Overall)
+sync - Compare Zerodha vs DB positions
+import - Import position from Zerodha (usage: /import SCRIPT)
+kill - Activate kill switch (stop all operations)
+resume - Deactivate kill switch
+help - Show all commands

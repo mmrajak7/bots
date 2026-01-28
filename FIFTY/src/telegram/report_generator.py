@@ -554,6 +554,431 @@ class ReportGenerator:
             session.close()
 
     # =========================================================================
+    # MONTHLY REPORT
+    # =========================================================================
+
+    def generate_monthly_report(self) -> Optional[str]:
+        """
+        Generate monthly summary HTML report.
+
+        Returns:
+            Path to generated HTML file, or None on error
+        """
+        session = get_session()
+        try:
+            today = today_ist()
+            month_start = today.replace(day=1)
+            report_date = today.strftime('%Y-%m-%d')
+            month_name = today.strftime('%B %Y')
+
+            # Get month's closed trades
+            month_trades = session.query(ClosedPosition).filter(
+                ClosedPosition.exit_date >= month_start
+            ).all()
+
+            # All-time stats
+            all_trades = session.query(ClosedPosition).all()
+
+            # Current positions
+            open_positions = session.query(OpenPosition).filter(
+                OpenPosition.status == PositionStatus.OPEN
+            ).all()
+
+            # Calculate month stats
+            month_count = len(month_trades)
+            month_pnl = sum(t.net_pnl for t in month_trades) if month_trades else 0
+            month_winners = sum(1 for t in month_trades if t.net_pnl > 0)
+            month_win_rate = (month_winners / month_count * 100) if month_count > 0 else 0
+
+            # All-time stats
+            total_count = len(all_trades)
+            total_pnl = sum(t.net_pnl for t in all_trades) if all_trades else 0
+            total_winners = sum(1 for t in all_trades if t.net_pnl > 0)
+            total_win_rate = (total_winners / total_count * 100) if total_count > 0 else 0
+
+            # Capital
+            initial_capital = config.get('trading.initial_capital', 100000)
+            deployed = sum(p.capital_deployed for p in open_positions)
+
+            # ROI calculation
+            month_roi = (month_pnl / initial_capital * 100) if initial_capital > 0 else 0
+            total_roi = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0
+
+            # Build HTML
+            html = f"""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>FIFTY Monthly Report - {month_name}</title>
+                {self._get_base_styles()}
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>FIFTY Bot</h1>
+                        <div class="subtitle">Monthly Report | {month_name}</div>
+                    </div>
+
+                    <!-- This Month Summary -->
+                    <div class="card">
+                        <div class="card-title">This Month</div>
+                        <div class="metric-grid">
+                            <div class="metric">
+                                <div class="metric-value">{month_count}</div>
+                                <div class="metric-label">Trades Closed</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'pnl-positive' if month_pnl >= 0 else 'pnl-negative'}">
+                                    {'+' if month_pnl >= 0 else ''}{month_pnl:,.0f}
+                                </div>
+                                <div class="metric-label">Month P&L</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{month_win_rate:.1f}%</div>
+                                <div class="metric-label">Win Rate</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'pnl-positive' if month_roi >= 0 else 'pnl-negative'}">
+                                    {'+' if month_roi >= 0 else ''}{month_roi:.2f}%
+                                </div>
+                                <div class="metric-label">Month ROI</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- All-Time Stats -->
+                    <div class="card">
+                        <div class="card-title">All-Time Performance</div>
+                        <div class="metric-grid">
+                            <div class="metric">
+                                <div class="metric-value">{total_count}</div>
+                                <div class="metric-label">Total Trades</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'pnl-positive' if total_pnl >= 0 else 'pnl-negative'}">
+                                    {'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}
+                                </div>
+                                <div class="metric-label">Total P&L</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{total_win_rate:.1f}%</div>
+                                <div class="metric-label">Win Rate</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'pnl-positive' if total_roi >= 0 else 'pnl-negative'}">
+                                    {'+' if total_roi >= 0 else ''}{total_roi:.2f}%
+                                </div>
+                                <div class="metric-label">Total ROI</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Current Status -->
+                    <div class="card">
+                        <div class="card-title">Current Status</div>
+                        <div class="summary-row">
+                            <span>Open Positions</span>
+                            <span>{len(open_positions)}</span>
+                        </div>
+                        <div class="summary-row">
+                            <span>Capital Deployed</span>
+                            <span>{deployed:,.0f}</span>
+                        </div>
+                        <div class="summary-row">
+                            <span>Utilization</span>
+                            <span>{deployed / initial_capital * 100:.1f}%</span>
+                        </div>
+                    </div>
+
+                    <!-- Month's Trades -->
+                    {self._generate_closed_trades_table(month_trades, f"{month_name} Trades")}
+
+                    <div class="footer">
+                        Generated at {now_ist().strftime('%H:%M:%S IST')} | FIFTY Trading Bot
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+
+            # Save to file
+            filename = f"monthly_report_{report_date}.html"
+            filepath = self.reports_dir / filename
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(html)
+
+            logger.info(f"Monthly report generated: {filepath}")
+            return str(filepath)
+
+        except Exception as e:
+            logger.error(f"Error generating monthly report: {e}")
+            return None
+        finally:
+            session.close()
+
+    # =========================================================================
+    # OVERALL REPORT
+    # =========================================================================
+
+    def generate_overall_report(self) -> Optional[str]:
+        """
+        Generate overall/lifetime summary HTML report.
+
+        Returns:
+            Path to generated HTML file, or None on error
+        """
+        session = get_session()
+        try:
+            today = today_ist()
+            report_date = today.strftime('%Y-%m-%d')
+
+            # All closed trades
+            all_trades = session.query(ClosedPosition).order_by(
+                ClosedPosition.exit_date.desc()
+            ).all()
+
+            # Current positions
+            open_positions = session.query(OpenPosition).filter(
+                OpenPosition.status == PositionStatus.OPEN
+            ).all()
+
+            # Calculate all-time stats
+            total_count = len(all_trades)
+            total_pnl = sum(t.net_pnl for t in all_trades) if all_trades else 0
+            total_winners = sum(1 for t in all_trades if t.net_pnl > 0)
+            total_losers = total_count - total_winners
+            win_rate = (total_winners / total_count * 100) if total_count > 0 else 0
+
+            # Averages
+            avg_winner = sum(t.net_pnl for t in all_trades if t.net_pnl > 0) / total_winners if total_winners > 0 else 0
+            avg_loser = sum(t.net_pnl for t in all_trades if t.net_pnl <= 0) / total_losers if total_losers > 0 else 0
+            avg_pnl = total_pnl / total_count if total_count > 0 else 0
+            avg_days = sum(t.days_held for t in all_trades) / total_count if total_count > 0 else 0
+
+            # Best/Worst trades
+            best_trade = max(all_trades, key=lambda t: t.net_pnl) if all_trades else None
+            worst_trade = min(all_trades, key=lambda t: t.net_pnl) if all_trades else None
+
+            # Profit factor
+            gross_profit = sum(t.net_pnl for t in all_trades if t.net_pnl > 0)
+            gross_loss = abs(sum(t.net_pnl for t in all_trades if t.net_pnl <= 0))
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+
+            # Capital
+            initial_capital = config.get('trading.initial_capital', 100000)
+            deployed = sum(p.capital_deployed for p in open_positions)
+            total_roi = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0
+
+            # Get unrealized P&L
+            unrealized_pnl = 0
+            try:
+                from src.api.dual_kite_client import get_kite_client
+                kite = get_kite_client()
+                for pos in open_positions:
+                    try:
+                        token = kite.get_instrument_token(pos.script)
+                        if token:
+                            ltp = kite.get_instrument_ltp(token)
+                            if ltp:
+                                unrealized_pnl += (ltp - pos.entry_price) * pos.quantity
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Build HTML
+            html = f"""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>FIFTY Overall Report</title>
+                {self._get_base_styles()}
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>FIFTY Bot</h1>
+                        <div class="subtitle">Overall Performance Report</div>
+                    </div>
+
+                    <!-- Key Metrics -->
+                    <div class="card">
+                        <div class="card-title">Lifetime Performance</div>
+                        <div class="metric-grid">
+                            <div class="metric">
+                                <div class="metric-value">{total_count}</div>
+                                <div class="metric-label">Total Trades</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'pnl-positive' if total_pnl >= 0 else 'pnl-negative'}">
+                                    {'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}
+                                </div>
+                                <div class="metric-label">Total P&L</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{win_rate:.1f}%</div>
+                                <div class="metric-label">Win Rate</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'pnl-positive' if total_roi >= 0 else 'pnl-negative'}">
+                                    {'+' if total_roi >= 0 else ''}{total_roi:.2f}%
+                                </div>
+                                <div class="metric-label">Total ROI</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Trade Statistics -->
+                    <div class="card">
+                        <div class="card-title">Trade Statistics</div>
+                        <div class="summary-row">
+                            <span>Winners / Losers</span>
+                            <span>{total_winners} / {total_losers}</span>
+                        </div>
+                        <div class="summary-row">
+                            <span>Average Winner</span>
+                            <span class="pnl-positive">+{avg_winner:,.0f}</span>
+                        </div>
+                        <div class="summary-row">
+                            <span>Average Loser</span>
+                            <span class="pnl-negative">{avg_loser:,.0f}</span>
+                        </div>
+                        <div class="summary-row">
+                            <span>Average P&L per Trade</span>
+                            <span class="{'pnl-positive' if avg_pnl >= 0 else 'pnl-negative'}">{'+' if avg_pnl >= 0 else ''}{avg_pnl:,.0f}</span>
+                        </div>
+                        <div class="summary-row">
+                            <span>Profit Factor</span>
+                            <span>{profit_factor:.2f}x</span>
+                        </div>
+                        <div class="summary-row">
+                            <span>Avg Days Held</span>
+                            <span>{avg_days:.1f} days</span>
+                        </div>
+                    </div>
+
+                    <!-- Best & Worst -->
+                    <div class="card">
+                        <div class="card-title">Notable Trades</div>
+                        {"" if not best_trade else f'''
+                        <div class="summary-row">
+                            <span>Best Trade</span>
+                            <span class="pnl-positive">{best_trade.script}: +{best_trade.net_pnl:,.0f}</span>
+                        </div>
+                        '''}
+                        {"" if not worst_trade else f'''
+                        <div class="summary-row">
+                            <span>Worst Trade</span>
+                            <span class="pnl-negative">{worst_trade.script}: {worst_trade.net_pnl:,.0f}</span>
+                        </div>
+                        '''}
+                    </div>
+
+                    <!-- Current Status -->
+                    <div class="card">
+                        <div class="card-title">Current Status</div>
+                        <div class="summary-row">
+                            <span>Open Positions</span>
+                            <span>{len(open_positions)}</span>
+                        </div>
+                        <div class="summary-row">
+                            <span>Capital Deployed</span>
+                            <span>{deployed:,.0f}</span>
+                        </div>
+                        <div class="summary-row">
+                            <span>Unrealized P&L</span>
+                            <span class="{'pnl-positive' if unrealized_pnl >= 0 else 'pnl-negative'}">{'+' if unrealized_pnl >= 0 else ''}{unrealized_pnl:,.0f}</span>
+                        </div>
+                        <div class="summary-row">
+                            <span>Total (Realized + Unrealized)</span>
+                            <span class="{'pnl-positive' if (total_pnl + unrealized_pnl) >= 0 else 'pnl-negative'}">{'+' if (total_pnl + unrealized_pnl) >= 0 else ''}{(total_pnl + unrealized_pnl):,.0f}</span>
+                        </div>
+                    </div>
+
+                    <!-- Open Positions -->
+                    {self._generate_positions_table(open_positions)}
+
+                    <!-- Recent Trades (last 10) -->
+                    {self._generate_closed_trades_table(all_trades[:10], "Recent Trades")}
+
+                    <div class="footer">
+                        Generated at {now_ist().strftime('%H:%M:%S IST')} | FIFTY Trading Bot
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+
+            # Save to file
+            filename = f"overall_report_{report_date}.html"
+            filepath = self.reports_dir / filename
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(html)
+
+            logger.info(f"Overall report generated: {filepath}")
+            return str(filepath)
+
+        except Exception as e:
+            logger.error(f"Error generating overall report: {e}")
+            return None
+        finally:
+            session.close()
+
+    # =========================================================================
+    # HTML TO IMAGE CONVERSION
+    # =========================================================================
+
+    def html_to_image(self, html_path: str) -> Optional[str]:
+        """
+        Convert HTML report to PNG image.
+
+        Uses imgkit (wkhtmltoimage) for conversion.
+        Falls back to sending HTML if conversion fails.
+
+        Args:
+            html_path: Path to HTML file
+
+        Returns:
+            Path to PNG image, or None on failure
+        """
+        try:
+            import imgkit
+            from pathlib import Path
+
+            html_file = Path(html_path)
+            image_path = html_file.with_suffix('.png')
+
+            options = {
+                'format': 'png',
+                'width': 800,
+                'quality': 90,
+                'enable-local-file-access': None,
+                'quiet': ''
+            }
+
+            imgkit.from_file(str(html_file), str(image_path), options=options)
+
+            if image_path.exists():
+                logger.info(f"HTML converted to image: {image_path}")
+                return str(image_path)
+            else:
+                logger.warning("Image conversion produced no output")
+                return None
+
+        except ImportError:
+            logger.warning("imgkit not installed, sending HTML instead")
+            return None
+        except Exception as e:
+            logger.warning(f"HTML to image conversion failed: {e}")
+            return None
+
+    # =========================================================================
     # HELPER METHODS
     # =========================================================================
 
