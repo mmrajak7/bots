@@ -246,6 +246,16 @@ def _signal_handler(signum, frame):
     _daemon_running = False
 
 
+def _write_heartbeat():
+    """Write heartbeat file for watchdog monitoring"""
+    try:
+        heartbeat_file = Path(__file__).parent / "data" / ".heartbeat"
+        heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
+        heartbeat_file.write_text(str(time.time()))
+    except Exception:
+        pass  # Don't crash on heartbeat failure
+
+
 def _send_daemon_startup_message():
     """Send professional daemon startup message"""
     from src.telegram.bot import telegram
@@ -368,6 +378,9 @@ def run_daemon():
             except Exception as e:
                 logger.error(f"Error processing Telegram updates: {e}")
                 time.sleep(5)  # Back off on error
+
+            # Write heartbeat for watchdog monitoring
+            _write_heartbeat()
 
             # 2. Run scheduled tasks every 5 minutes (similar to cron)
             now_ts = time.time()

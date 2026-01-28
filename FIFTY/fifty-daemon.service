@@ -1,4 +1,4 @@
-# FIFTY Bot Daemon Service
+# FIFTY Bot Daemon Service with Watchdog
 # Copy to /etc/systemd/system/fifty-daemon.service
 # Then: systemctl daemon-reload && systemctl enable fifty-daemon && systemctl start fifty-daemon
 
@@ -6,19 +6,24 @@
 Description=FIFTY Trading Bot Daemon (24/7 Telegram Service)
 After=network-online.target
 Wants=network-online.target
+# Limit restart attempts: max 5 restarts in 300 seconds
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=trustit
-WorkingDirectory=/home/trustit/Desktop/Scripts/BOTS/FIFTY
-ExecStart=/usr/bin/python3 main.py --daemon
+WorkingDirectory=/home/trustit/Desktop/BOTS/FIFTY
+ExecStart=/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python main.py --daemon
+
+# Auto-restart on failure
 Restart=always
 RestartSec=10
 
 # Environment
 Environment=PYTHONUNBUFFERED=1
 
-# Logging (systemd journal)
+# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=fifty-daemon
@@ -26,6 +31,10 @@ SyslogIdentifier=fifty-daemon
 # Resource limits
 MemoryMax=500M
 CPUQuota=50%
+
+# Graceful shutdown timeout
+TimeoutStopSec=30
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target
