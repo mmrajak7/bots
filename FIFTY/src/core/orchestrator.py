@@ -220,12 +220,82 @@ class Orchestrator:
             # Run reconciliation
             self._reconcile_positions()
 
+            # Send professional startup message
+            self._send_startup_message(kite)
+
             set_bot_state('last_morning_startup', today_str)
-            telegram.send_alert("FIFTY Bot: Morning startup complete")
 
         except Exception as e:
             logger.error(f"Morning startup failed: {e}")
             telegram.send_alert(f"Morning startup FAILED: {str(e)}", critical=True)
+
+    def _send_startup_message(self, kite) -> None:
+        """Send professional startup message like CROCODILE"""
+        try:
+            session = get_session()
+            try:
+                today = today_ist()
+                day_name = today.strftime('%A')
+                date_str = today.strftime('%d %b %Y')
+
+                # Get capital info
+                initial_capital = config.get('trading.initial_capital', 100000)
+
+                # Get open positions
+                open_positions = session.query(OpenPosition).filter(
+                    OpenPosition.status == PositionStatus.OPEN
+                ).all()
+                num_positions = len(open_positions)
+                deployed_capital = sum(p.capital_deployed for p in open_positions)
+                available_capital = initial_capital - deployed_capital
+
+                # Get pending orders
+                pending_orders = session.query(OpenOrder).filter(
+                    OpenOrder.status == OrderStatus.PENDING
+                ).count()
+
+                # Calculate unrealized P&L
+                unrealized_pnl = 0
+                try:
+                    for pos in open_positions:
+                        token = kite.get_instrument_token(pos.script)
+                        if token:
+                            ltp = kite.get_instrument_ltp(token)
+                            if ltp:
+                                unrealized_pnl += (ltp - pos.entry_price) * pos.quantity
+                except Exception:
+                    pass
+
+                # Get realized P&L from closed trades
+                all_trades = session.query(ClosedPosition).all()
+                realized_pnl = sum(t.net_pnl for t in all_trades)
+
+                # Calculate total return
+                total_pnl = realized_pnl + unrealized_pnl
+                total_return_pct = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0
+
+                # Build compact message
+                pnl_sign = "+" if total_pnl >= 0 else ""
+
+                message = (
+                    f"<b>Good Morning - FIFTY Started</b>\n\n"
+                    f"{date_str} ({day_name})\n"
+                    f"Capital: Rs.{available_capital:,.0f} / {initial_capital:,.0f}\n"
+                    f"Positions: {num_positions} | Pending: {pending_orders}\n"
+                    f"P&L: {pnl_sign}{total_pnl:,.0f} ({pnl_sign}{total_return_pct:.2f}%)\n"
+                    f"Ready"
+                )
+
+                telegram.send_alert(message)
+                logger.info("Startup message sent")
+
+            finally:
+                session.close()
+
+        except Exception as e:
+            logger.warning(f"Could not send startup message: {e}")
+            # Fallback to simple message
+            telegram.send_alert("FIFTY Bot: Morning startup complete")
 
     # =========================================================================
     # TELEGRAM CALLBACK PROCESSING

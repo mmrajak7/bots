@@ -246,6 +246,64 @@ def _signal_handler(signum, frame):
     _daemon_running = False
 
 
+def _send_daemon_startup_message():
+    """Send professional daemon startup message"""
+    from src.telegram.bot import telegram
+    from src.models.database import get_session, OpenPosition, OpenOrder, ClosedPosition, PositionStatus, OrderStatus
+    from src.utils.timezone_helper import today_ist
+    from src.utils.config_manager import config
+
+    try:
+        session = get_session()
+        try:
+            today = today_ist()
+            day_name = today.strftime('%A')
+            date_str = today.strftime('%d %b %Y')
+
+            # Get capital info
+            initial_capital = config.get('trading.initial_capital', 100000)
+
+            # Get open positions
+            open_positions = session.query(OpenPosition).filter(
+                OpenPosition.status == PositionStatus.OPEN
+            ).all()
+            num_positions = len(open_positions)
+            deployed_capital = sum(p.capital_deployed for p in open_positions)
+            available_capital = initial_capital - deployed_capital
+
+            # Get pending orders
+            pending_orders = session.query(OpenOrder).filter(
+                OpenOrder.status == OrderStatus.PENDING
+            ).count()
+
+            # Get realized P&L
+            all_trades = session.query(ClosedPosition).all()
+            realized_pnl = sum(t.net_pnl for t in all_trades)
+            total_return_pct = (realized_pnl / initial_capital * 100) if initial_capital > 0 else 0
+
+            # Build compact message
+            pnl_sign = "+" if realized_pnl >= 0 else ""
+
+            message = (
+                f"<b>FIFTY Daemon Started</b>\n\n"
+                f"{date_str} ({day_name})\n"
+                f"Capital: Rs.{available_capital:,.0f} / {initial_capital:,.0f}\n"
+                f"Positions: {num_positions} | Pending: {pending_orders}\n"
+                f"P&L: {pnl_sign}{realized_pnl:,.0f} ({pnl_sign}{total_return_pct:.2f}%)\n"
+                f"Ready"
+            )
+
+            telegram.send_alert(message)
+            logger.info("Daemon startup message sent")
+
+        finally:
+            session.close()
+
+    except Exception as e:
+        logger.warning(f"Could not send daemon startup message: {e}")
+        telegram.send_alert("FIFTY Bot Daemon Started (24/7 mode)")
+
+
 def run_daemon():
     """
     Run the bot in daemon mode - 24/7 long-polling service.
@@ -272,7 +330,8 @@ def run_daemon():
     logger.info("24/7 Telegram service with instant response")
     logger.info("=" * 50)
 
-    telegram.send_alert("FIFTY Bot Daemon Started (24/7 mode)")
+    # Send professional daemon startup message
+    _send_daemon_startup_message()
 
     # Track last scheduled task run
     last_scheduled_run = None

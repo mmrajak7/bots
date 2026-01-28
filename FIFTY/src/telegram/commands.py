@@ -592,37 +592,38 @@ class CommandHandler:
                 updated_at=ist_now_naive()
             )
             session.add(position)
-            session.commit()
+            session.flush()  # Get position.id without committing yet
 
             position_id = position.id
             logger.info(f"Imported position {script}: {quantity} @ {avg_price}, SL: {initial_sl}")
 
             # Place SL GTT
             telegram.send_alert(
-                f"<b>Importing {script}...</b>\n"
+                f"Importing {script}...\n"
                 f"Qty: {quantity} @ {avg_price:,.2f}\n"
-                f"Initial SL: {initial_sl:,.2f} (-{sl_percent}%)\n\n"
-                f"Placing SL GTT..."
+                f"SL: {initial_sl:,.2f} (-{sl_percent}%)"
             )
 
             try:
                 from src.core.exit_manager import exit_manager
-                gtt_id = exit_manager.place_sl_gtt(position_id)
+                # FIX: Pass position object, not position_id
+                gtt_id = exit_manager.place_sl_gtt(position, session=session)
 
                 if gtt_id:
+                    position.gtt_verified = True
+                    session.commit()
                     telegram.send_alert(
-                        f"<b>{script} Imported Successfully</b>\n\n"
-                        f"Position ID: {position_id}\n"
-                        f"Entry: {avg_price:,.2f}\n"
-                        f"Qty: {quantity}\n"
-                        f"SL GTT: {initial_sl:,.2f}\n"
-                        f"GTT ID: {gtt_id}"
+                        f"<b>{script} Imported</b>\n\n"
+                        f"Entry: {avg_price:,.2f} x {quantity}\n"
+                        f"SL: {initial_sl:,.2f}\n"
+                        f"GTT: {gtt_id}"
                     )
                 else:
+                    session.commit()  # Commit position even if GTT failed
                     telegram.send_alert(
                         f"<b>WARNING: {script} imported but SL GTT FAILED</b>\n\n"
                         f"Position is UNPROTECTED!\n"
-                        f"Check manually or run recovery.",
+                        f"Run recovery or place SL manually.",
                         critical=True
                     )
 
