@@ -80,7 +80,7 @@ class CommandHandler:
             ).all()
 
             if not positions:
-                telegram.send_alert("No open positions")
+                telegram.send_alert("📊 No open positions")
                 return
 
             # Get Kite client for LTP
@@ -156,51 +156,52 @@ class CommandHandler:
             session.close()
 
     def _cmd_pending(self) -> None:
-        """List pending approvals and hold signals"""
+        """List pending signals and GTT entry orders"""
         session = get_session()
         try:
-            pending_signals = session.query(SignalQueue).filter(
+            # Get scripts that already have positions (to filter out stale orders)
+            position_scripts = {p.script for p in session.query(OpenPosition).filter(
+                OpenPosition.status == PositionStatus.OPEN
+            ).all()}
+
+            # Awaiting approval (notified/hold)
+            awaiting_signals = session.query(SignalQueue).filter(
                 SignalQueue.status.in_([
-                    SignalStatus.PENDING,
                     SignalStatus.NOTIFIED,
                     SignalStatus.HOLD,
                     SignalStatus.AWAITING_PRICE
                 ])
             ).all()
 
+            # Pending GTT entry orders (exclude scripts with positions)
             pending_orders = session.query(OpenOrder).filter(
                 OpenOrder.status == OrderStatus.PENDING
             ).all()
+            pending_orders = [o for o in pending_orders if o.script not in position_scripts]
 
-            lines = ["<b>Pending Items</b>\n"]
+            lines = ["📋 <b>Pending</b>"]
 
-            if pending_signals:
-                lines.append("<b>Signals:</b>")
-                for sig in pending_signals:
-                    status_emoji = {
-                        SignalStatus.PENDING: "",
-                        SignalStatus.NOTIFIED: "",
-                        SignalStatus.HOLD: "",
-                        SignalStatus.AWAITING_PRICE: ""
+            # Signals awaiting response
+            if awaiting_signals:
+                lines.append("")
+                lines.append(f"🔔 <b>Awaiting Response ({len(awaiting_signals)})</b>")
+                for sig in awaiting_signals:
+                    status_tag = {
+                        SignalStatus.NOTIFIED: "NEW",
+                        SignalStatus.HOLD: "HOLD",
+                        SignalStatus.AWAITING_PRICE: "PRICE?"
                     }.get(sig.status, "")
+                    lines.append(f"  • {sig.script} @ {sig.signal_level:,.0f} [{status_tag}]")
 
-                    lines.append(
-                        f"{status_emoji} {sig.script} @ {sig.signal_level:,.2f}\n"
-                        f"   Status: {sig.status.value}"
-                    )
-                lines.append("")
-
+            # GTT orders waiting to fill
             if pending_orders:
-                lines.append("<b>Entry Orders:</b>")
-                for order in pending_orders:
-                    lines.append(
-                        f" {order.script} @ {order.limit_price:,.2f}\n"
-                        f"   Qty: {order.quantity}"
-                    )
                 lines.append("")
+                lines.append(f"⏳ <b>GTT Orders ({len(pending_orders)})</b>")
+                for order in pending_orders:
+                    lines.append(f"  • {order.script} @ {order.limit_price:,.0f} x{order.quantity}")
 
-            if not pending_signals and not pending_orders:
-                lines.append("No pending items")
+            if not awaiting_signals and not pending_orders:
+                lines.append("\n✅ No pending items")
 
             telegram.send_alert('\n'.join(lines))
 
@@ -211,11 +212,10 @@ class CommandHandler:
         """Show trading statistics"""
         session = get_session()
         try:
-            # Get closed positions for stats
             closed = session.query(ClosedPosition).all()
 
             if not closed:
-                telegram.send_alert("No closed trades yet")
+                telegram.send_alert("📊 No closed trades yet")
                 return
 
             total_trades = len(closed)
@@ -225,24 +225,19 @@ class CommandHandler:
 
             total_pnl = sum(c.net_pnl for c in closed)
             avg_pnl = total_pnl / total_trades if total_trades > 0 else 0
-
             avg_winner = sum(c.net_pnl for c in closed if c.net_pnl > 0) / winners if winners > 0 else 0
             avg_loser = sum(c.net_pnl for c in closed if c.net_pnl <= 0) / losers if losers > 0 else 0
-
             avg_days = sum(c.days_held for c in closed) / total_trades if total_trades > 0 else 0
 
+            pnl_emoji = "📈" if total_pnl >= 0 else "📉"
+
             text = (
-                "<b>Trading Statistics</b>\n\n"
-                f"Total Trades: {total_trades}\n"
-                f"Win Rate: {win_rate:.1f}%\n"
-                f"Winners: {winners} | Losers: {losers}\n\n"
-                f"<b>P&L</b>\n"
-                f"Total: {total_pnl:+,.0f}\n"
-                f"Average: {avg_pnl:+,.0f}\n"
-                f"Avg Winner: {avg_winner:+,.0f}\n"
-                f"Avg Loser: {avg_loser:+,.0f}\n\n"
-                f"<b>Duration</b>\n"
-                f"Avg Days Held: {avg_days:.1f}"
+                f"📊 <b>Stats</b>\n\n"
+                f"🎯 {total_trades} trades | {win_rate:.0f}% win rate\n"
+                f"✅ {winners}W / ❌ {losers}L\n\n"
+                f"{pnl_emoji} <b>P&L:</b> {total_pnl:+,.0f}\n"
+                f"   Avg: {avg_pnl:+,.0f} | Win: {avg_winner:+,.0f} | Loss: {avg_loser:+,.0f}\n\n"
+                f"⏱️ Avg hold: {avg_days:.0f} days"
             )
 
             telegram.send_alert(text)
@@ -254,51 +249,40 @@ class CommandHandler:
         """Show capital allocation"""
         session = get_session()
         try:
-            # Get today's capital ledger
-            today = today_ist()
-            ledger = session.query(CapitalLedger).filter(
-                CapitalLedger.date == today
-            ).first()
-
-            # Count positions and orders
-            open_positions = session.query(OpenPosition).filter(
-                OpenPosition.status == PositionStatus.OPEN
-            ).count()
-
-            pending_orders = session.query(OpenOrder).filter(
-                OpenOrder.status == OrderStatus.PENDING
-            ).count()
-
             # Get config values
             initial_capital = config.get('trading.initial_capital', 100000)
             per_trade = config.get('trading.per_trade_amount', 20000)
             max_positions = config.get('trading.max_positions', 5)
 
-            if ledger:
-                deployed = ledger.deployed_capital
-                free = ledger.free_capital
-                realized = ledger.realized_pnl
-            else:
-                # Calculate from positions
-                positions = session.query(OpenPosition).filter(
-                    OpenPosition.status == PositionStatus.OPEN
-                ).all()
-                deployed = sum(p.capital_deployed for p in positions)
-                free = initial_capital - deployed
-                realized = 0
+            # Get positions
+            positions = session.query(OpenPosition).filter(
+                OpenPosition.status == PositionStatus.OPEN
+            ).all()
+            position_scripts = {p.script for p in positions}
+            num_positions = len(positions)
+            deployed = sum(p.capital_deployed for p in positions)
+            free = initial_capital - deployed
+
+            # Get pending GTT orders (exclude scripts with positions)
+            all_orders = session.query(OpenOrder).filter(
+                OpenOrder.status == OrderStatus.PENDING
+            ).all()
+            pending_orders = len([o for o in all_orders if o.script not in position_scripts])
+
+            # Get realized P&L
+            all_trades = session.query(ClosedPosition).all()
+            realized = sum(t.net_pnl for t in all_trades)
+
+            pnl_emoji = "📈" if realized >= 0 else "📉"
+            utilization = (deployed / initial_capital * 100) if initial_capital > 0 else 0
 
             text = (
-                "<b>Capital Allocation</b>\n\n"
-                f"Initial Capital: {initial_capital:,.0f}\n"
-                f"Per Trade: {per_trade:,.0f}\n"
-                f"Max Positions: {max_positions}\n\n"
-                f"<b>Current Status</b>\n"
-                f"Deployed: {deployed:,.0f}\n"
-                f"Free: {free:,.0f}\n"
-                f"Realized P&L: {realized:+,.0f}\n\n"
-                f"<b>Counts</b>\n"
-                f"Open Positions: {open_positions}/{max_positions}\n"
-                f"Pending Orders: {pending_orders}"
+                f"💰 <b>Capital</b>\n\n"
+                f"💵 {initial_capital:,.0f} @ {per_trade:,.0f}/trade\n"
+                f"🔒 {deployed:,.0f} deployed ({utilization:.0f}%)\n"
+                f"✅ {free:,.0f} available\n\n"
+                f"📊 {num_positions}/{max_positions} positions | {pending_orders} GTT pending\n"
+                f"{pnl_emoji} Realized: {realized:+,.0f}"
             )
 
             telegram.send_alert(text)
@@ -532,47 +516,25 @@ class CommandHandler:
             ).first()
 
             if existing:
-                # Check if position has SL GTT - if not, offer to place it
+                # Check if position has SL GTT - if not, place it
                 if not existing.gtt_id or not existing.gtt_verified:
-                    telegram.send_alert(
-                        f"<b>{script}</b> exists but NO SL GTT!\n"
-                        f"Entry: {existing.entry_price:,.2f}\n"
-                        f"Qty: {existing.quantity}\n"
-                        f"SL: {existing.current_sl:,.2f}\n\n"
-                        f"Placing SL GTT now..."
-                    )
-                    # Try to place SL GTT
+                    telegram.send_alert(f"⚠️ {script} unprotected, placing SL...")
                     try:
                         from src.core.exit_manager import exit_manager
                         gtt_id = exit_manager.place_sl_gtt(existing, session=session)
                         if gtt_id:
                             existing.gtt_verified = True
                             session.commit()
-                            telegram.send_alert(
-                                f"<b>{script} SL GTT Placed</b>\n"
-                                f"GTT: {gtt_id}\n"
-                                f"SL: {existing.current_sl:,.2f}"
-                            )
+                            telegram.send_alert(f"🛡️ {script} protected | GTT: {gtt_id}")
                         else:
-                            telegram.send_alert(
-                                f"<b>FAILED to place SL for {script}</b>\n"
-                                f"Position still UNPROTECTED!",
-                                critical=True
-                            )
+                            telegram.send_alert(f"🔴 {script} SL FAILED - UNPROTECTED!", critical=True)
                     except Exception as e:
-                        telegram.send_alert(
-                            f"<b>SL GTT Error for {script}</b>\n"
-                            f"{str(e)}",
-                            critical=True
-                        )
+                        telegram.send_alert(f"🔴 {script} SL error: {str(e)}", critical=True)
                     return
                 else:
                     telegram.send_alert(
-                        f"<b>{script}</b> already exists\n"
-                        f"Entry: {existing.entry_price:,.2f}\n"
-                        f"Qty: {existing.quantity}\n"
-                        f"SL: {existing.current_sl:,.2f}\n"
-                        f"GTT: {existing.gtt_id}"
+                        f"✅ {script} already tracked\n"
+                        f"   📊 {existing.quantity} x {existing.entry_price:,.0f} | SL: {existing.current_sl:,.0f}"
                     )
                     return
 
@@ -595,10 +557,7 @@ class CommandHandler:
                     break
 
             if not zerodha_pos:
-                telegram.send_alert(
-                    f"<b>{script}</b> not found in Zerodha positions\n"
-                    f"(or quantity is 0)"
-                )
+                telegram.send_alert(f"❌ {script} not in Zerodha (or qty=0)")
                 return
 
             # Extract position details
@@ -640,43 +599,27 @@ class CommandHandler:
             logger.info(f"Imported position {script}: {quantity} @ {avg_price}, SL: {initial_sl}")
 
             # Place SL GTT
-            telegram.send_alert(
-                f"Importing {script}...\n"
-                f"Qty: {quantity} @ {avg_price:,.2f}\n"
-                f"SL: {initial_sl:,.2f} (-{sl_percent}%)"
-            )
+            telegram.send_alert(f"⏳ Importing {script}...")
 
             try:
                 from src.core.exit_manager import exit_manager
-                # FIX: Pass position object, not position_id
                 gtt_id = exit_manager.place_sl_gtt(position, session=session)
 
                 if gtt_id:
                     position.gtt_verified = True
                     session.commit()
                     telegram.send_alert(
-                        f"<b>{script} Imported</b>\n\n"
-                        f"Entry: {avg_price:,.2f} x {quantity}\n"
-                        f"SL: {initial_sl:,.2f}\n"
-                        f"GTT: {gtt_id}"
+                        f"✅ <b>{script} Imported</b>\n"
+                        f"   📊 {quantity} x {avg_price:,.0f} | 🛡️ SL: {initial_sl:,.0f} | GTT: {gtt_id}"
                     )
                 else:
-                    session.commit()  # Commit position even if GTT failed
-                    telegram.send_alert(
-                        f"<b>WARNING: {script} imported but SL GTT FAILED</b>\n\n"
-                        f"Position is UNPROTECTED!\n"
-                        f"Run recovery or place SL manually.",
-                        critical=True
-                    )
+                    session.commit()
+                    telegram.send_alert(f"🔴 {script} imported but SL FAILED - UNPROTECTED!", critical=True)
 
             except Exception as e:
+                session.commit()
                 logger.error(f"Failed to place SL GTT for imported {script}: {e}")
-                telegram.send_alert(
-                    f"<b>WARNING: {script} imported but SL GTT FAILED</b>\n\n"
-                    f"Error: {str(e)}\n"
-                    f"Position is UNPROTECTED!",
-                    critical=True
-                )
+                telegram.send_alert(f"🔴 {script} imported but SL error: {str(e)}", critical=True)
 
         except Exception as e:
             logger.error(f"Import error for {script}: {e}")
@@ -686,37 +629,25 @@ class CommandHandler:
             session.close()
 
     def _cmd_fix(self, script: str) -> None:
-        """
-        Fix unprotected position by placing SL GTT.
-
-        Args:
-            script: Trading symbol (e.g., BALRAMCHIN)
-        """
+        """Fix unprotected position by placing SL GTT"""
         session = get_session()
         try:
             script = script.upper().strip()
 
-            # Find position
             position = session.query(OpenPosition).filter(
                 OpenPosition.script == script,
                 OpenPosition.status == PositionStatus.OPEN
             ).first()
 
             if not position:
-                telegram.send_alert(f"No open position for {script}")
+                telegram.send_alert(f"❌ No position for {script}")
                 return
 
-            # Check if already has verified GTT
             if position.gtt_id and position.gtt_verified:
-                telegram.send_alert(
-                    f"<b>{script}</b> already protected\n"
-                    f"GTT: {position.gtt_id}\n"
-                    f"SL: {position.current_sl:,.2f}"
-                )
+                telegram.send_alert(f"🛡️ {script} already protected | GTT: {position.gtt_id}")
                 return
 
-            # Position needs SL GTT
-            telegram.send_alert(f"Placing SL GTT for {script}...")
+            telegram.send_alert(f"⏳ Placing SL for {script}...")
 
             try:
                 from src.core.exit_manager import exit_manager
@@ -725,29 +656,17 @@ class CommandHandler:
                 if gtt_id:
                     position.gtt_verified = True
                     session.commit()
-                    telegram.send_alert(
-                        f"<b>{script} PROTECTED</b>\n"
-                        f"GTT: {gtt_id}\n"
-                        f"SL: {position.current_sl:,.2f}"
-                    )
+                    telegram.send_alert(f"🛡️ {script} protected | SL: {position.current_sl:,.0f} | GTT: {gtt_id}")
                 else:
-                    telegram.send_alert(
-                        f"<b>FAILED to place SL for {script}</b>\n"
-                        f"Position still UNPROTECTED!",
-                        critical=True
-                    )
+                    telegram.send_alert(f"🔴 {script} SL FAILED - UNPROTECTED!", critical=True)
 
             except Exception as e:
                 logger.error(f"Failed to place SL GTT for {script}: {e}")
-                telegram.send_alert(
-                    f"<b>SL GTT Error for {script}</b>\n"
-                    f"{str(e)}",
-                    critical=True
-                )
+                telegram.send_alert(f"🔴 {script} SL error: {str(e)}", critical=True)
 
         except Exception as e:
             logger.error(f"Fix error for {script}: {e}")
-            telegram.send_alert(f"Fix failed: {str(e)}")
+            telegram.send_alert(f"🔴 Fix failed: {str(e)}")
         finally:
             session.close()
 
@@ -781,46 +700,37 @@ class CommandHandler:
                 if p.get('quantity', 0) > 0 and p.get('exchange') == 'NSE'
             ]
 
-            lines = ["<b>Position Sync Status</b>\n"]
+            lines = ["🔄 <b>Sync</b>"]
 
-            # Show DB positions
-            lines.append(f"<b>DB Positions:</b> {len(db_positions)}")
-            for p in db_positions:
-                lines.append(f"  - {p.script}: {p.quantity} @ {p.entry_price:,.2f}")
-
-            lines.append("")
-
-            # Show Zerodha positions
-            lines.append(f"<b>Zerodha Positions:</b> {len(zerodha_holdings)}")
+            # Categorize positions
             missing_from_db = []
             for p in zerodha_holdings:
                 symbol = p.get('tradingsymbol', 'UNKNOWN')
-                qty = p.get('quantity', 0)
-                avg_price = p.get('average_price', 0)
-                in_db = "DB" if symbol in db_scripts else "NOT IN DB"
-
                 if symbol not in db_scripts:
                     missing_from_db.append({
                         'script': symbol,
-                        'quantity': qty,
-                        'avg_price': avg_price
+                        'quantity': p.get('quantity', 0),
+                        'avg_price': p.get('average_price', 0)
                     })
 
-                lines.append(f"  - {symbol}: {qty} @ {avg_price:,.2f} [{in_db}]")
+            # Summary
+            lines.append(f"\n📊 DB: {len(db_positions)} | Zerodha: {len(zerodha_holdings)}")
 
-            # Show import candidates
+            # Show what's tracked
+            if db_positions:
+                lines.append("\n✅ <b>Tracked:</b>")
+                for p in db_positions:
+                    gtt_status = "🛡️" if p.gtt_verified else "⚠️"
+                    lines.append(f"  {gtt_status} {p.script} x{p.quantity}")
+
+            # Show what's missing
             if missing_from_db:
-                lines.append("")
-                lines.append("<b>Can Import:</b>")
+                lines.append("\n❌ <b>Not Tracked:</b>")
                 for m in missing_from_db:
-                    lines.append(
-                        f"  {m['script']}: {m['quantity']} @ {m['avg_price']:,.2f}"
-                    )
-                lines.append("")
-                lines.append("Use /import SCRIPT to add to tracking")
+                    lines.append(f"  • {m['script']} x{m['quantity']} @ {m['avg_price']:,.0f}")
+                lines.append("\n💡 <i>/import SCRIPT to add</i>")
             else:
-                lines.append("")
-                lines.append("All Zerodha positions are tracked")
+                lines.append("\n✅ All synced")
 
             telegram.send_alert('\n'.join(lines))
 

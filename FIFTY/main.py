@@ -277,31 +277,32 @@ def _send_daemon_startup_message():
             open_positions = session.query(OpenPosition).filter(
                 OpenPosition.status == PositionStatus.OPEN
             ).all()
+            position_scripts = {p.script for p in open_positions}
             num_positions = len(open_positions)
             deployed_capital = sum(p.capital_deployed for p in open_positions)
             available_capital = initial_capital - deployed_capital
 
-            # Get pending GTT entry orders
-            pending_orders = session.query(OpenOrder).filter(
+            # Get pending GTT entry orders (exclude scripts with positions - stale entries)
+            all_orders = session.query(OpenOrder).filter(
                 OpenOrder.status == OrderStatus.PENDING
-            ).count()
+            ).all()
+            pending_orders = len([o for o in all_orders if o.script not in position_scripts])
 
             # Get realized P&L
             all_trades = session.query(ClosedPosition).all()
             realized_pnl = sum(t.net_pnl for t in all_trades)
             total_return_pct = (realized_pnl / initial_capital * 100) if initial_capital > 0 else 0
 
-            # Build compact message with emojis
+            # Build compact message like CROCODILE
             pnl_sign = "+" if realized_pnl >= 0 else ""
-            pnl_emoji = "" if realized_pnl >= 0 else ""
 
             message = (
-                f"<b>FIFTY Service Started</b>\n\n"
-                f" {date_str} ({day_name})\n"
-                f" Rs.{available_capital:,.0f} / {initial_capital:,.0f}\n"
-                f" {num_positions} positions | {pending_orders} GTT orders\n"
-                f"{pnl_emoji} {pnl_sign}{realized_pnl:,.0f} ({pnl_sign}{total_return_pct:.2f}%)\n"
-                f" Ready"
+                f"🌅 <b>FIFTY Service Started</b>\n\n"
+                f"📅 {date_str} ({day_name})\n"
+                f"💰 Rs.{available_capital:,.0f} / {initial_capital:,.0f}\n"
+                f"📊 {num_positions} positions | {pending_orders} GTT pending\n"
+                f"📈 P&L: {pnl_sign}{realized_pnl:,.0f} ({pnl_sign}{total_return_pct:.2f}%)\n"
+                f"✅ Ready"
             )
 
             telegram.send_alert(message)
@@ -312,7 +313,7 @@ def _send_daemon_startup_message():
 
     except Exception as e:
         logger.warning(f"Could not send service startup message: {e}")
-        telegram.send_alert(" <b>FIFTY Service Started</b>")
+        telegram.send_alert("🌅 <b>FIFTY Service Started</b>")
 
 
 def run_daemon():

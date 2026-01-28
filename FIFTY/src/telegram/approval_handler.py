@@ -468,18 +468,19 @@ class ApprovalHandler:
     def _send_help(self) -> None:
         """Send help message"""
         text = (
-            "<b>FIFTY Bot Commands</b>\n\n"
-            "/positions - List open positions\n"
-            "/pending - List pending approvals\n"
-            "/stats - Win rate, avg P&L, total trades\n"
-            "/capital - Show capital allocation\n"
-            "/report - Generate reports (Daily/Weekly/Monthly/Overall)\n"
-            "/sync - Compare Zerodha vs DB positions\n"
-            "/import SCRIPT - Import position from Zerodha\n"
-            "/fix SCRIPT - Fix unprotected position (place SL)\n"
-            "/kill - Activate kill switch\n"
-            "/resume - Deactivate kill switch\n"
-            "/help - Show this help"
+            "📚 <b>FIFTY Commands</b>\n\n"
+            "📊 <b>View</b>\n"
+            "/positions - Open positions + P&L\n"
+            "/pending - Signals & GTT orders\n"
+            "/stats - Trading statistics\n"
+            "/capital - Capital allocation\n"
+            "/report - Reports menu\n\n"
+            "⚡ <b>Actions</b>\n"
+            "/sync - Zerodha vs DB diff\n"
+            "/import SCRIPT - Add position\n"
+            "/fix SCRIPT - Place missing SL\n"
+            "/kill - Stop operations\n"
+            "/resume - Resume operations"
         )
         telegram.send_alert(text)
 
