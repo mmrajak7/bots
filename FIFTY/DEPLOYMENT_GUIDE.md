@@ -52,6 +52,7 @@ capital - Capital allocation status
 report - Generate reports (Daily/Weekly/Monthly/Overall)
 sync - Compare Zerodha vs DB positions
 import - Import position from Zerodha
+fix - Fix unprotected position (place SL)
 kill - Activate kill switch
 resume - Deactivate kill switch
 help - Show all commands
@@ -308,6 +309,7 @@ Add back (every 5 minutes):
 | `/report` | Interactive: Daily/Weekly/Monthly/Overall |
 | `/sync` | Compare Zerodha vs DB |
 | `/import SCRIPT` | Import Zerodha position |
+| `/fix SCRIPT` | Fix unprotected position (place SL) |
 | `/kill` | Stop all operations |
 | `/resume` | Resume operations |
 

@@ -2,12 +2,14 @@
 Telegram Commands Handler - Handles slash commands for FIFTY bot
 
 Commands:
-- /positions - List all open positions
+- /positions - List all open positions with P&L
 - /pending - List pending approvals and hold signals
 - /stats - Win rate, avg P&L, total trades
 - /capital - Show capital allocation
-- /report - Generate and send today's summary (HTML)
-- /weekly - Generate and send weekly report (HTML)
+- /report - Generate reports (Daily/Weekly/Monthly/Overall)
+- /sync - Compare Zerodha vs DB positions
+- /import SCRIPT - Import position from Zerodha
+- /fix SCRIPT - Fix unprotected position (place SL GTT)
 - /kill - Activate kill switch
 - /resume - Deactivate kill switch
 """
@@ -41,7 +43,8 @@ class CommandHandler:
             elif command == 'capital':
                 self._cmd_capital()
             elif command == 'report':
-                self._cmd_report()
+                report_type = kwargs.get('report_type')
+                self._cmd_report(report_type)
             elif command == 'weekly':
                 self._cmd_weekly()
             elif command == 'sync':
@@ -52,9 +55,12 @@ class CommandHandler:
                     self._cmd_import(script)
                 else:
                     telegram.send_alert("Usage: /import SCRIPT")
-            elif command == 'report':
-                report_type = kwargs.get('report_type')
-                self._cmd_report(report_type)
+            elif command == 'fix':
+                script = kwargs.get('script')
+                if script:
+                    self._cmd_fix(script)
+                else:
+                    telegram.send_alert("Usage: /fix SCRIPT")
             elif command == 'kill':
                 self._cmd_kill()
             elif command == 'resume':
@@ -526,13 +532,49 @@ class CommandHandler:
             ).first()
 
             if existing:
-                telegram.send_alert(
-                    f"<b>{script}</b> already exists in DB\n"
-                    f"Entry: {existing.entry_price:,.2f}\n"
-                    f"Qty: {existing.quantity}\n"
-                    f"SL: {existing.current_sl:,.2f}"
-                )
-                return
+                # Check if position has SL GTT - if not, offer to place it
+                if not existing.gtt_id or not existing.gtt_verified:
+                    telegram.send_alert(
+                        f"<b>{script}</b> exists but NO SL GTT!\n"
+                        f"Entry: {existing.entry_price:,.2f}\n"
+                        f"Qty: {existing.quantity}\n"
+                        f"SL: {existing.current_sl:,.2f}\n\n"
+                        f"Placing SL GTT now..."
+                    )
+                    # Try to place SL GTT
+                    try:
+                        from src.core.exit_manager import exit_manager
+                        gtt_id = exit_manager.place_sl_gtt(existing, session=session)
+                        if gtt_id:
+                            existing.gtt_verified = True
+                            session.commit()
+                            telegram.send_alert(
+                                f"<b>{script} SL GTT Placed</b>\n"
+                                f"GTT: {gtt_id}\n"
+                                f"SL: {existing.current_sl:,.2f}"
+                            )
+                        else:
+                            telegram.send_alert(
+                                f"<b>FAILED to place SL for {script}</b>\n"
+                                f"Position still UNPROTECTED!",
+                                critical=True
+                            )
+                    except Exception as e:
+                        telegram.send_alert(
+                            f"<b>SL GTT Error for {script}</b>\n"
+                            f"{str(e)}",
+                            critical=True
+                        )
+                    return
+                else:
+                    telegram.send_alert(
+                        f"<b>{script}</b> already exists\n"
+                        f"Entry: {existing.entry_price:,.2f}\n"
+                        f"Qty: {existing.quantity}\n"
+                        f"SL: {existing.current_sl:,.2f}\n"
+                        f"GTT: {existing.gtt_id}"
+                    )
+                    return
 
             # Fetch from Zerodha
             try:
@@ -640,6 +682,72 @@ class CommandHandler:
             logger.error(f"Import error for {script}: {e}")
             telegram.send_alert(f"Import failed: {str(e)}")
             session.rollback()
+        finally:
+            session.close()
+
+    def _cmd_fix(self, script: str) -> None:
+        """
+        Fix unprotected position by placing SL GTT.
+
+        Args:
+            script: Trading symbol (e.g., BALRAMCHIN)
+        """
+        session = get_session()
+        try:
+            script = script.upper().strip()
+
+            # Find position
+            position = session.query(OpenPosition).filter(
+                OpenPosition.script == script,
+                OpenPosition.status == PositionStatus.OPEN
+            ).first()
+
+            if not position:
+                telegram.send_alert(f"No open position for {script}")
+                return
+
+            # Check if already has verified GTT
+            if position.gtt_id and position.gtt_verified:
+                telegram.send_alert(
+                    f"<b>{script}</b> already protected\n"
+                    f"GTT: {position.gtt_id}\n"
+                    f"SL: {position.current_sl:,.2f}"
+                )
+                return
+
+            # Position needs SL GTT
+            telegram.send_alert(f"Placing SL GTT for {script}...")
+
+            try:
+                from src.core.exit_manager import exit_manager
+                gtt_id = exit_manager.place_sl_gtt(position, session=session)
+
+                if gtt_id:
+                    position.gtt_verified = True
+                    session.commit()
+                    telegram.send_alert(
+                        f"<b>{script} PROTECTED</b>\n"
+                        f"GTT: {gtt_id}\n"
+                        f"SL: {position.current_sl:,.2f}"
+                    )
+                else:
+                    telegram.send_alert(
+                        f"<b>FAILED to place SL for {script}</b>\n"
+                        f"Position still UNPROTECTED!",
+                        critical=True
+                    )
+
+            except Exception as e:
+                logger.error(f"Failed to place SL GTT for {script}: {e}")
+                telegram.send_alert(
+                    f"<b>SL GTT Error for {script}</b>\n"
+                    f"{str(e)}",
+                    critical=True
+                )
+
+        except Exception as e:
+            logger.error(f"Fix error for {script}: {e}")
+            telegram.send_alert(f"Fix failed: {str(e)}")
         finally:
             session.close()
 

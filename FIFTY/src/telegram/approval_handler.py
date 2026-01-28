@@ -450,6 +450,15 @@ class ApprovalHandler:
             else:
                 telegram.send_alert("Usage: /import SCRIPT\nExample: /import BALRAMCHIN")
                 return None
+        elif cmd.startswith('/fix'):
+            # Extract script name from command (e.g., "/fix BALRAMCHIN")
+            parts = command.strip().split()
+            if len(parts) >= 2:
+                script = parts[1].upper()
+                return {'type': 'command', 'command': 'fix', 'script': script}
+            else:
+                telegram.send_alert("Usage: /fix SCRIPT\nFixes unprotected position by placing SL GTT")
+                return None
         elif cmd == '/help':
             self._send_help()
             return None
@@ -464,10 +473,10 @@ class ApprovalHandler:
             "/pending - List pending approvals\n"
             "/stats - Win rate, avg P&L, total trades\n"
             "/capital - Show capital allocation\n"
-            "/report - Generate today's summary\n"
-            "/weekly - Generate weekly report\n"
-            "/sync - Sync positions from Zerodha\n"
+            "/report - Generate reports (Daily/Weekly/Monthly/Overall)\n"
+            "/sync - Compare Zerodha vs DB positions\n"
             "/import SCRIPT - Import position from Zerodha\n"
+            "/fix SCRIPT - Fix unprotected position (place SL)\n"
             "/kill - Activate kill switch\n"
             "/resume - Deactivate kill switch\n"
             "/help - Show this help"
