@@ -1,13 +1,8 @@
 """
-HTML Report Generator for FIFTY Bot
+HTML Report Generator for FIFTY Bot - Compact Modern Design
 
-Generates professional HTML reports for:
-- Daily summary
-- Weekly summary
-- Position details
-- Trade history
-
-Reports are saved to reports/ folder, sent via Telegram, then deleted.
+Generates professional, compact HTML reports optimized for Telegram display.
+All reports filter stale data and calculate metrics fresh from database.
 """
 
 import os
@@ -24,7 +19,6 @@ from src.utils.timezone_helper import today_ist, now_ist
 from src.utils.config_manager import config
 
 
-# Report output directory
 REPORTS_DIR = Path(__file__).parent.parent.parent / "reports"
 
 
@@ -35,182 +29,173 @@ def ensure_reports_dir() -> Path:
 
 
 class ReportGenerator:
-    """Generates HTML reports for FIFTY bot"""
+    """Generates compact HTML reports for FIFTY bot"""
 
     def __init__(self):
-        """Initialize report generator"""
         self.reports_dir = ensure_reports_dir()
 
-    # =========================================================================
-    # CSS STYLES
-    # =========================================================================
-
-    def _get_base_styles(self) -> str:
-        """Get common CSS styles for all reports"""
+    def _get_compact_styles(self) -> str:
+        """Compact CSS optimized for Telegram image display"""
         return """
         <style>
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
+            * { margin: 0; padding: 0; box-sizing: border-box; }
             body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+                background: #1a1a2e;
                 color: #e8e8e8;
-                padding: 20px;
-                min-height: 100vh;
-            }
-            .container {
-                max-width: 800px;
-                margin: 0 auto;
+                padding: 12px;
+                font-size: 13px;
+                line-height: 1.4;
             }
             .header {
-                text-align: center;
-                padding: 30px 0;
-                border-bottom: 2px solid #0f3460;
-                margin-bottom: 30px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 8px 12px;
+                background: linear-gradient(90deg, #e94560, #0f3460);
+                border-radius: 6px;
+                margin-bottom: 10px;
             }
             .header h1 {
-                font-size: 2.5em;
+                font-size: 16px;
+                color: #fff;
+                font-weight: 700;
+            }
+            .header .date {
+                font-size: 11px;
+                color: rgba(255,255,255,0.8);
+            }
+            .section {
+                background: rgba(255,255,255,0.05);
+                border-radius: 6px;
+                padding: 10px;
+                margin-bottom: 8px;
+                border: 1px solid rgba(255,255,255,0.08);
+            }
+            .section-title {
+                font-size: 11px;
                 color: #e94560;
-                margin-bottom: 10px;
                 text-transform: uppercase;
-                letter-spacing: 3px;
+                letter-spacing: 1px;
+                margin-bottom: 8px;
+                font-weight: 600;
             }
-            .header .subtitle {
-                color: #94a3b8;
-                font-size: 1.1em;
-            }
-            .card {
-                background: rgba(255, 255, 255, 0.05);
-                border-radius: 12px;
-                padding: 25px;
-                margin-bottom: 20px;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                backdrop-filter: blur(10px);
-            }
-            .card-title {
-                color: #e94560;
-                font-size: 1.3em;
-                margin-bottom: 20px;
-                padding-bottom: 10px;
-                border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            }
-            .metric-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-                gap: 15px;
+            .metrics {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
             }
             .metric {
-                background: rgba(0, 0, 0, 0.2);
-                padding: 15px;
-                border-radius: 8px;
+                flex: 1;
+                min-width: 70px;
+                background: rgba(0,0,0,0.3);
+                padding: 8px;
+                border-radius: 4px;
                 text-align: center;
             }
             .metric-value {
-                font-size: 1.8em;
-                font-weight: bold;
+                font-size: 18px;
+                font-weight: 700;
                 color: #fff;
             }
             .metric-label {
-                font-size: 0.85em;
+                font-size: 9px;
                 color: #94a3b8;
-                margin-top: 5px;
+                margin-top: 2px;
+                text-transform: uppercase;
             }
+            .row {
+                display: flex;
+                justify-content: space-between;
+                padding: 4px 0;
+                border-bottom: 1px solid rgba(255,255,255,0.05);
+            }
+            .row:last-child { border-bottom: none; }
+            .row-label { color: #94a3b8; font-size: 12px; }
+            .row-value { font-weight: 600; font-size: 12px; }
             .positive { color: #22c55e; }
             .negative { color: #ef4444; }
-            .neutral { color: #f59e0b; }
             table {
                 width: 100%;
                 border-collapse: collapse;
-                margin-top: 15px;
-            }
-            th, td {
-                padding: 12px 15px;
-                text-align: left;
-                border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+                font-size: 11px;
             }
             th {
-                background: rgba(233, 69, 96, 0.2);
+                background: rgba(233,69,96,0.15);
                 color: #e94560;
                 font-weight: 600;
+                padding: 6px 8px;
+                text-align: left;
+                font-size: 10px;
                 text-transform: uppercase;
-                font-size: 0.85em;
-                letter-spacing: 1px;
             }
-            tr:hover {
-                background: rgba(255, 255, 255, 0.05);
+            td {
+                padding: 6px 8px;
+                border-bottom: 1px solid rgba(255,255,255,0.05);
             }
             .badge {
                 display: inline-block;
-                padding: 4px 10px;
-                border-radius: 4px;
-                font-size: 0.8em;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-size: 9px;
                 font-weight: 600;
             }
-            .badge-success { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
-            .badge-danger { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
-            .badge-warning { background: rgba(245, 158, 11, 0.2); color: #f59e0b; }
-            .badge-info { background: rgba(59, 130, 246, 0.2); color: #3b82f6; }
+            .badge-win { background: rgba(34,197,94,0.2); color: #22c55e; }
+            .badge-loss { background: rgba(239,68,68,0.2); color: #ef4444; }
+            .badge-pending { background: rgba(245,158,11,0.2); color: #f59e0b; }
             .footer {
                 text-align: center;
-                padding: 20px;
                 color: #64748b;
-                font-size: 0.85em;
-                margin-top: 30px;
-                border-top: 1px solid rgba(255, 255, 255, 0.1);
+                font-size: 9px;
+                padding-top: 8px;
+                border-top: 1px solid rgba(255,255,255,0.05);
             }
-            .pnl-positive { color: #22c55e; }
-            .pnl-negative { color: #ef4444; }
             .progress-bar {
-                height: 8px;
-                background: rgba(255, 255, 255, 0.1);
-                border-radius: 4px;
-                overflow: hidden;
-                margin-top: 5px;
+                height: 4px;
+                background: rgba(255,255,255,0.1);
+                border-radius: 2px;
+                margin-top: 4px;
             }
             .progress-fill {
                 height: 100%;
-                border-radius: 4px;
-                transition: width 0.3s ease;
+                border-radius: 2px;
+                background: linear-gradient(90deg, #e94560, #22c55e);
             }
-            .summary-row {
-                display: flex;
-                justify-content: space-between;
-                padding: 10px 0;
-                border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-            }
-            .summary-row:last-child {
-                border-bottom: none;
-            }
+            .empty { color: #64748b; text-align: center; padding: 12px; font-style: italic; }
         </style>
         """
 
-    # =========================================================================
-    # DAILY REPORT
-    # =========================================================================
+    def _get_position_scripts(self, session) -> set:
+        """Get set of scripts that have open positions"""
+        positions = session.query(OpenPosition).filter(
+            OpenPosition.status == PositionStatus.OPEN
+        ).all()
+        return {p.script for p in positions}
+
+    def _filter_stale_orders(self, orders: List, position_scripts: set) -> List:
+        """Filter out orders for scripts that already have positions"""
+        return [o for o in orders if o.script not in position_scripts]
+
+    def _calculate_deployed_capital(self, open_positions: List) -> float:
+        """Calculate deployed capital from open positions"""
+        return sum(p.capital_deployed for p in open_positions)
 
     def generate_daily_report(self) -> Optional[str]:
-        """
-        Generate daily summary HTML report.
-
-        Returns:
-            Path to generated HTML file, or None on error
-        """
+        """Generate compact daily report"""
         session = get_session()
         try:
             today = today_ist()
-            report_date = today.strftime('%Y-%m-%d')
 
-            # Gather data
+            # Get data
             open_positions = session.query(OpenPosition).filter(
                 OpenPosition.status == PositionStatus.OPEN
             ).all()
+            position_scripts = {p.script for p in open_positions}
 
-            pending_orders = session.query(OpenOrder).filter(
+            all_orders = session.query(OpenOrder).filter(
                 OpenOrder.status == OrderStatus.PENDING
             ).all()
+            pending_orders = self._filter_stale_orders(all_orders, position_scripts)
 
             signals_today = session.query(SignalQueue).filter(
                 SignalQueue.signal_date == today
@@ -220,733 +205,473 @@ class ReportGenerator:
                 ClosedPosition.exit_date == today
             ).all()
 
-            # Capital
-            ledger = session.query(CapitalLedger).filter(
-                CapitalLedger.date == today
-            ).first()
-
+            # Calculate fresh
             initial_capital = config.get('trading.initial_capital', 100000)
-            deployed = ledger.deployed_capital if ledger else sum(p.capital_deployed for p in open_positions)
-            free = ledger.free_capital if ledger else (initial_capital - deployed)
-            realized_pnl = ledger.realized_pnl if ledger else 0
+            deployed = self._calculate_deployed_capital(open_positions)
+            available = initial_capital - deployed
+            utilization = (deployed / initial_capital * 100) if initial_capital > 0 else 0
 
-            # Today's P&L from closed trades
             today_pnl = sum(t.net_pnl for t in trades_closed_today) if trades_closed_today else 0
+            all_trades = session.query(ClosedPosition).all()
+            total_pnl = sum(t.net_pnl for t in all_trades) if all_trades else 0
 
-            # Get LTP for unrealized P&L
-            unrealized_pnl = 0
-            try:
-                from src.api.dual_kite_client import get_kite_client
-                kite = get_kite_client()
-                for pos in open_positions:
-                    try:
-                        token = kite.get_instrument_token(pos.script)
-                        if token:
-                            ltp = kite.get_instrument_ltp(token)
-                            if ltp:
-                                unrealized_pnl += (ltp - pos.entry_price) * pos.quantity
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            # Unrealized P&L
+            unrealized = self._get_unrealized_pnl(open_positions)
 
-            # Build HTML
             html = f"""
             <!DOCTYPE html>
-            <html lang="en">
-            <head>
+            <html><head>
                 <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>FIFTY Daily Report - {report_date}</title>
-                {self._get_base_styles()}
-            </head>
-            <body>
-                <div class="container">
-                    <div class="header">
-                        <h1>FIFTY Bot</h1>
-                        <div class="subtitle">Daily Report | {today.strftime('%B %d, %Y')}</div>
-                    </div>
+                <title>FIFTY Daily</title>
+                {self._get_compact_styles()}
+            </head><body>
+                <div class="header">
+                    <h1>📊 FIFTY Daily</h1>
+                    <div class="date">{today.strftime('%d %b %Y')}</div>
+                </div>
 
-                    <!-- Summary Metrics -->
-                    <div class="card">
-                        <div class="card-title">Today's Summary</div>
-                        <div class="metric-grid">
-                            <div class="metric">
-                                <div class="metric-value">{len(open_positions)}</div>
-                                <div class="metric-label">Open Positions</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">{len(pending_orders)}</div>
-                                <div class="metric-label">Pending Orders</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">{len(signals_today)}</div>
-                                <div class="metric-label">Signals Today</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">{len(trades_closed_today)}</div>
-                                <div class="metric-label">Trades Closed</div>
-                            </div>
+                <div class="section">
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-value">{len(open_positions)}</div>
+                            <div class="metric-label">Positions</div>
                         </div>
-                    </div>
-
-                    <!-- P&L Card -->
-                    <div class="card">
-                        <div class="card-title">Profit & Loss</div>
-                        <div class="metric-grid">
-                            <div class="metric">
-                                <div class="metric-value {'pnl-positive' if today_pnl >= 0 else 'pnl-negative'}">
-                                    {'+' if today_pnl >= 0 else ''}{today_pnl:,.0f}
-                                </div>
-                                <div class="metric-label">Today's Realized</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value {'pnl-positive' if unrealized_pnl >= 0 else 'pnl-negative'}">
-                                    {'+' if unrealized_pnl >= 0 else ''}{unrealized_pnl:,.0f}
-                                </div>
-                                <div class="metric-label">Unrealized P&L</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value {'pnl-positive' if realized_pnl >= 0 else 'pnl-negative'}">
-                                    {'+' if realized_pnl >= 0 else ''}{realized_pnl:,.0f}
-                                </div>
-                                <div class="metric-label">Total Realized</div>
-                            </div>
+                        <div class="metric">
+                            <div class="metric-value">{len(pending_orders)}</div>
+                            <div class="metric-label">GTT Pending</div>
                         </div>
-                    </div>
-
-                    <!-- Capital Allocation -->
-                    <div class="card">
-                        <div class="card-title">Capital Allocation</div>
-                        <div class="summary-row">
-                            <span>Initial Capital</span>
-                            <span>{initial_capital:,.0f}</span>
+                        <div class="metric">
+                            <div class="metric-value">{len(signals_today)}</div>
+                            <div class="metric-label">Signals</div>
                         </div>
-                        <div class="summary-row">
-                            <span>Deployed</span>
-                            <span>{deployed:,.0f}</span>
+                        <div class="metric">
+                            <div class="metric-value">{len(trades_closed_today)}</div>
+                            <div class="metric-label">Closed</div>
                         </div>
-                        <div class="summary-row">
-                            <span>Available</span>
-                            <span>{free:,.0f}</span>
-                        </div>
-                        <div class="progress-bar">
-                            <div class="progress-fill" style="width: {min(100, deployed / initial_capital * 100):.1f}%; background: linear-gradient(90deg, #e94560, #0f3460);"></div>
-                        </div>
-                        <div style="text-align: right; font-size: 0.85em; color: #94a3b8; margin-top: 5px;">
-                            {deployed / initial_capital * 100:.1f}% deployed
-                        </div>
-                    </div>
-
-                    <!-- Open Positions -->
-                    {self._generate_positions_table(open_positions)}
-
-                    <!-- Pending Orders -->
-                    {self._generate_orders_table(pending_orders)}
-
-                    <!-- Trades Closed Today -->
-                    {self._generate_closed_trades_table(trades_closed_today, "Today's Closed Trades")}
-
-                    <div class="footer">
-                        Generated at {now_ist().strftime('%H:%M:%S IST')} | FIFTY Trading Bot
                     </div>
                 </div>
-            </body>
-            </html>
+
+                <div class="section">
+                    <div class="section-title">P&L</div>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-value {'positive' if today_pnl >= 0 else 'negative'}">{'+' if today_pnl >= 0 else ''}{today_pnl:,.0f}</div>
+                            <div class="metric-label">Today</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value {'positive' if unrealized >= 0 else 'negative'}">{'+' if unrealized >= 0 else ''}{unrealized:,.0f}</div>
+                            <div class="metric-label">Unrealized</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value {'positive' if total_pnl >= 0 else 'negative'}">{'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}</div>
+                            <div class="metric-label">Total</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-title">Capital</div>
+                    <div class="row">
+                        <span class="row-label">Deployed</span>
+                        <span class="row-value">{deployed:,.0f} ({utilization:.0f}%)</span>
+                    </div>
+                    <div class="row">
+                        <span class="row-label">Available</span>
+                        <span class="row-value">{available:,.0f}</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: {min(100, utilization):.0f}%"></div>
+                    </div>
+                </div>
+
+                {self._positions_table(open_positions)}
+                {self._orders_table(pending_orders)}
+
+                <div class="footer">Generated {now_ist().strftime('%H:%M IST')} | FIFTY Bot</div>
+            </body></html>
             """
 
-            # Save to file
-            filename = f"daily_report_{report_date}.html"
-            filepath = self.reports_dir / filename
-
+            filepath = self.reports_dir / f"daily_{today.strftime('%Y%m%d')}.html"
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(html)
 
-            logger.info(f"Daily report generated: {filepath}")
+            logger.info(f"Daily report: {filepath}")
             return str(filepath)
 
         except Exception as e:
-            logger.error(f"Error generating daily report: {e}")
+            logger.error(f"Daily report error: {e}")
             return None
         finally:
             session.close()
 
-    # =========================================================================
-    # WEEKLY REPORT
-    # =========================================================================
-
     def generate_weekly_report(self) -> Optional[str]:
-        """
-        Generate weekly summary HTML report.
-
-        Returns:
-            Path to generated HTML file, or None on error
-        """
+        """Generate compact weekly report"""
         session = get_session()
         try:
             today = today_ist()
             week_start = today - timedelta(days=7)
-            report_date = today.strftime('%Y-%m-%d')
 
-            # Get week's closed trades
             week_trades = session.query(ClosedPosition).filter(
                 ClosedPosition.exit_date >= week_start
             ).all()
 
-            # All-time stats
             all_trades = session.query(ClosedPosition).all()
-
-            # Current positions
             open_positions = session.query(OpenPosition).filter(
                 OpenPosition.status == PositionStatus.OPEN
             ).all()
 
-            # Calculate stats
+            # Week stats
             week_count = len(week_trades)
             week_pnl = sum(t.net_pnl for t in week_trades) if week_trades else 0
             week_winners = sum(1 for t in week_trades if t.net_pnl > 0)
             week_win_rate = (week_winners / week_count * 100) if week_count > 0 else 0
 
+            # All-time stats
             total_count = len(all_trades)
             total_pnl = sum(t.net_pnl for t in all_trades) if all_trades else 0
             total_winners = sum(1 for t in all_trades if t.net_pnl > 0)
             total_win_rate = (total_winners / total_count * 100) if total_count > 0 else 0
 
-            # Average metrics
-            avg_winner = sum(t.net_pnl for t in all_trades if t.net_pnl > 0) / total_winners if total_winners > 0 else 0
-            avg_loser = sum(t.net_pnl for t in all_trades if t.net_pnl <= 0) / (total_count - total_winners) if (total_count - total_winners) > 0 else 0
-            avg_days = sum(t.days_held for t in all_trades) / total_count if total_count > 0 else 0
-
-            # Capital
             initial_capital = config.get('trading.initial_capital', 100000)
-            deployed = sum(p.capital_deployed for p in open_positions)
+            deployed = self._calculate_deployed_capital(open_positions)
 
-            # Build HTML
             html = f"""
             <!DOCTYPE html>
-            <html lang="en">
-            <head>
+            <html><head>
                 <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>FIFTY Weekly Report - {report_date}</title>
-                {self._get_base_styles()}
-            </head>
-            <body>
-                <div class="container">
-                    <div class="header">
-                        <h1>FIFTY Bot</h1>
-                        <div class="subtitle">Weekly Report | {week_start.strftime('%b %d')} - {today.strftime('%b %d, %Y')}</div>
-                    </div>
+                <title>FIFTY Weekly</title>
+                {self._get_compact_styles()}
+            </head><body>
+                <div class="header">
+                    <h1>📈 FIFTY Weekly</h1>
+                    <div class="date">{week_start.strftime('%d %b')} - {today.strftime('%d %b %Y')}</div>
+                </div>
 
-                    <!-- This Week Summary -->
-                    <div class="card">
-                        <div class="card-title">This Week</div>
-                        <div class="metric-grid">
-                            <div class="metric">
-                                <div class="metric-value">{week_count}</div>
-                                <div class="metric-label">Trades Closed</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value {'pnl-positive' if week_pnl >= 0 else 'pnl-negative'}">
-                                    {'+' if week_pnl >= 0 else ''}{week_pnl:,.0f}
-                                </div>
-                                <div class="metric-label">Week P&L</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">{week_winners}/{week_count}</div>
-                                <div class="metric-label">Winners</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">{week_win_rate:.1f}%</div>
-                                <div class="metric-label">Win Rate</div>
-                            </div>
+                <div class="section">
+                    <div class="section-title">This Week</div>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-value">{week_count}</div>
+                            <div class="metric-label">Trades</div>
                         </div>
-                    </div>
-
-                    <!-- All-Time Stats -->
-                    <div class="card">
-                        <div class="card-title">All-Time Performance</div>
-                        <div class="metric-grid">
-                            <div class="metric">
-                                <div class="metric-value">{total_count}</div>
-                                <div class="metric-label">Total Trades</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value {'pnl-positive' if total_pnl >= 0 else 'pnl-negative'}">
-                                    {'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}
-                                </div>
-                                <div class="metric-label">Total P&L</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">{total_win_rate:.1f}%</div>
-                                <div class="metric-label">Win Rate</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">{avg_days:.1f}</div>
-                                <div class="metric-label">Avg Days Held</div>
-                            </div>
+                        <div class="metric">
+                            <div class="metric-value {'positive' if week_pnl >= 0 else 'negative'}">{'+' if week_pnl >= 0 else ''}{week_pnl:,.0f}</div>
+                            <div class="metric-label">P&L</div>
                         </div>
-                    </div>
-
-                    <!-- Trade Metrics -->
-                    <div class="card">
-                        <div class="card-title">Trade Metrics</div>
-                        <div class="summary-row">
-                            <span>Average Winner</span>
-                            <span class="pnl-positive">+{avg_winner:,.0f}</span>
+                        <div class="metric">
+                            <div class="metric-value">{week_win_rate:.0f}%</div>
+                            <div class="metric-label">Win Rate</div>
                         </div>
-                        <div class="summary-row">
-                            <span>Average Loser</span>
-                            <span class="pnl-negative">{avg_loser:,.0f}</span>
+                        <div class="metric">
+                            <div class="metric-value">{week_winners}/{week_count}</div>
+                            <div class="metric-label">W/L</div>
                         </div>
-                        <div class="summary-row">
-                            <span>Winners / Losers</span>
-                            <span>{total_winners} / {total_count - total_winners}</span>
-                        </div>
-                        <div class="summary-row">
-                            <span>Profit Factor</span>
-                            <span>{abs(avg_winner / avg_loser):.2f}x</span>
-                        </div>
-                    </div>
-
-                    <!-- Current Status -->
-                    <div class="card">
-                        <div class="card-title">Current Status</div>
-                        <div class="summary-row">
-                            <span>Open Positions</span>
-                            <span>{len(open_positions)}</span>
-                        </div>
-                        <div class="summary-row">
-                            <span>Capital Deployed</span>
-                            <span>{deployed:,.0f}</span>
-                        </div>
-                        <div class="summary-row">
-                            <span>Utilization</span>
-                            <span>{deployed / initial_capital * 100:.1f}%</span>
-                        </div>
-                    </div>
-
-                    <!-- Week's Trades -->
-                    {self._generate_closed_trades_table(week_trades, "This Week's Trades")}
-
-                    <div class="footer">
-                        Generated at {now_ist().strftime('%H:%M:%S IST')} | FIFTY Trading Bot
                     </div>
                 </div>
-            </body>
-            </html>
+
+                <div class="section">
+                    <div class="section-title">All-Time</div>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-value">{total_count}</div>
+                            <div class="metric-label">Trades</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value {'positive' if total_pnl >= 0 else 'negative'}">{'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}</div>
+                            <div class="metric-label">P&L</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value">{total_win_rate:.0f}%</div>
+                            <div class="metric-label">Win Rate</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-title">Current</div>
+                    <div class="row">
+                        <span class="row-label">Open Positions</span>
+                        <span class="row-value">{len(open_positions)}</span>
+                    </div>
+                    <div class="row">
+                        <span class="row-label">Deployed</span>
+                        <span class="row-value">{deployed:,.0f}</span>
+                    </div>
+                </div>
+
+                {self._closed_trades_table(week_trades, "Week's Trades")}
+
+                <div class="footer">Generated {now_ist().strftime('%H:%M IST')} | FIFTY Bot</div>
+            </body></html>
             """
 
-            # Save to file
-            filename = f"weekly_report_{report_date}.html"
-            filepath = self.reports_dir / filename
-
+            filepath = self.reports_dir / f"weekly_{today.strftime('%Y%m%d')}.html"
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(html)
 
-            logger.info(f"Weekly report generated: {filepath}")
+            logger.info(f"Weekly report: {filepath}")
             return str(filepath)
 
         except Exception as e:
-            logger.error(f"Error generating weekly report: {e}")
+            logger.error(f"Weekly report error: {e}")
             return None
         finally:
             session.close()
 
-    # =========================================================================
-    # MONTHLY REPORT
-    # =========================================================================
-
     def generate_monthly_report(self) -> Optional[str]:
-        """
-        Generate monthly summary HTML report.
-
-        Returns:
-            Path to generated HTML file, or None on error
-        """
+        """Generate compact monthly report"""
         session = get_session()
         try:
             today = today_ist()
             month_start = today.replace(day=1)
-            report_date = today.strftime('%Y-%m-%d')
             month_name = today.strftime('%B %Y')
 
-            # Get month's closed trades
             month_trades = session.query(ClosedPosition).filter(
                 ClosedPosition.exit_date >= month_start
             ).all()
 
-            # All-time stats
             all_trades = session.query(ClosedPosition).all()
-
-            # Current positions
             open_positions = session.query(OpenPosition).filter(
                 OpenPosition.status == PositionStatus.OPEN
             ).all()
 
-            # Calculate month stats
+            # Month stats
             month_count = len(month_trades)
             month_pnl = sum(t.net_pnl for t in month_trades) if month_trades else 0
             month_winners = sum(1 for t in month_trades if t.net_pnl > 0)
             month_win_rate = (month_winners / month_count * 100) if month_count > 0 else 0
 
-            # All-time stats
+            # All-time
             total_count = len(all_trades)
             total_pnl = sum(t.net_pnl for t in all_trades) if all_trades else 0
-            total_winners = sum(1 for t in all_trades if t.net_pnl > 0)
-            total_win_rate = (total_winners / total_count * 100) if total_count > 0 else 0
+            total_win_rate = (sum(1 for t in all_trades if t.net_pnl > 0) / total_count * 100) if total_count > 0 else 0
 
-            # Capital
             initial_capital = config.get('trading.initial_capital', 100000)
-            deployed = sum(p.capital_deployed for p in open_positions)
-
-            # ROI calculation
+            deployed = self._calculate_deployed_capital(open_positions)
             month_roi = (month_pnl / initial_capital * 100) if initial_capital > 0 else 0
             total_roi = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0
 
-            # Build HTML
             html = f"""
             <!DOCTYPE html>
-            <html lang="en">
-            <head>
+            <html><head>
                 <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>FIFTY Monthly Report - {month_name}</title>
-                {self._get_base_styles()}
-            </head>
-            <body>
-                <div class="container">
-                    <div class="header">
-                        <h1>FIFTY Bot</h1>
-                        <div class="subtitle">Monthly Report | {month_name}</div>
-                    </div>
+                <title>FIFTY Monthly</title>
+                {self._get_compact_styles()}
+            </head><body>
+                <div class="header">
+                    <h1>📅 FIFTY Monthly</h1>
+                    <div class="date">{month_name}</div>
+                </div>
 
-                    <!-- This Month Summary -->
-                    <div class="card">
-                        <div class="card-title">This Month</div>
-                        <div class="metric-grid">
-                            <div class="metric">
-                                <div class="metric-value">{month_count}</div>
-                                <div class="metric-label">Trades Closed</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value {'pnl-positive' if month_pnl >= 0 else 'pnl-negative'}">
-                                    {'+' if month_pnl >= 0 else ''}{month_pnl:,.0f}
-                                </div>
-                                <div class="metric-label">Month P&L</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">{month_win_rate:.1f}%</div>
-                                <div class="metric-label">Win Rate</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value {'pnl-positive' if month_roi >= 0 else 'pnl-negative'}">
-                                    {'+' if month_roi >= 0 else ''}{month_roi:.2f}%
-                                </div>
-                                <div class="metric-label">Month ROI</div>
-                            </div>
+                <div class="section">
+                    <div class="section-title">This Month</div>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-value">{month_count}</div>
+                            <div class="metric-label">Trades</div>
                         </div>
-                    </div>
-
-                    <!-- All-Time Stats -->
-                    <div class="card">
-                        <div class="card-title">All-Time Performance</div>
-                        <div class="metric-grid">
-                            <div class="metric">
-                                <div class="metric-value">{total_count}</div>
-                                <div class="metric-label">Total Trades</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value {'pnl-positive' if total_pnl >= 0 else 'pnl-negative'}">
-                                    {'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}
-                                </div>
-                                <div class="metric-label">Total P&L</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">{total_win_rate:.1f}%</div>
-                                <div class="metric-label">Win Rate</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value {'pnl-positive' if total_roi >= 0 else 'pnl-negative'}">
-                                    {'+' if total_roi >= 0 else ''}{total_roi:.2f}%
-                                </div>
-                                <div class="metric-label">Total ROI</div>
-                            </div>
+                        <div class="metric">
+                            <div class="metric-value {'positive' if month_pnl >= 0 else 'negative'}">{'+' if month_pnl >= 0 else ''}{month_pnl:,.0f}</div>
+                            <div class="metric-label">P&L</div>
                         </div>
-                    </div>
-
-                    <!-- Current Status -->
-                    <div class="card">
-                        <div class="card-title">Current Status</div>
-                        <div class="summary-row">
-                            <span>Open Positions</span>
-                            <span>{len(open_positions)}</span>
+                        <div class="metric">
+                            <div class="metric-value">{month_win_rate:.0f}%</div>
+                            <div class="metric-label">Win</div>
                         </div>
-                        <div class="summary-row">
-                            <span>Capital Deployed</span>
-                            <span>{deployed:,.0f}</span>
+                        <div class="metric">
+                            <div class="metric-value {'positive' if month_roi >= 0 else 'negative'}">{'+' if month_roi >= 0 else ''}{month_roi:.1f}%</div>
+                            <div class="metric-label">ROI</div>
                         </div>
-                        <div class="summary-row">
-                            <span>Utilization</span>
-                            <span>{deployed / initial_capital * 100:.1f}%</span>
-                        </div>
-                    </div>
-
-                    <!-- Month's Trades -->
-                    {self._generate_closed_trades_table(month_trades, f"{month_name} Trades")}
-
-                    <div class="footer">
-                        Generated at {now_ist().strftime('%H:%M:%S IST')} | FIFTY Trading Bot
                     </div>
                 </div>
-            </body>
-            </html>
+
+                <div class="section">
+                    <div class="section-title">All-Time</div>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-value">{total_count}</div>
+                            <div class="metric-label">Trades</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value {'positive' if total_pnl >= 0 else 'negative'}">{'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}</div>
+                            <div class="metric-label">P&L</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value">{total_win_rate:.0f}%</div>
+                            <div class="metric-label">Win</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value {'positive' if total_roi >= 0 else 'negative'}">{'+' if total_roi >= 0 else ''}{total_roi:.1f}%</div>
+                            <div class="metric-label">ROI</div>
+                        </div>
+                    </div>
+                </div>
+
+                {self._positions_table(open_positions)}
+                {self._closed_trades_table(month_trades, "Month's Trades")}
+
+                <div class="footer">Generated {now_ist().strftime('%H:%M IST')} | FIFTY Bot</div>
+            </body></html>
             """
 
-            # Save to file
-            filename = f"monthly_report_{report_date}.html"
-            filepath = self.reports_dir / filename
-
+            filepath = self.reports_dir / f"monthly_{today.strftime('%Y%m%d')}.html"
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(html)
 
-            logger.info(f"Monthly report generated: {filepath}")
+            logger.info(f"Monthly report: {filepath}")
             return str(filepath)
 
         except Exception as e:
-            logger.error(f"Error generating monthly report: {e}")
+            logger.error(f"Monthly report error: {e}")
             return None
         finally:
             session.close()
 
-    # =========================================================================
-    # OVERALL REPORT
-    # =========================================================================
-
     def generate_overall_report(self) -> Optional[str]:
-        """
-        Generate overall/lifetime summary HTML report.
-
-        Returns:
-            Path to generated HTML file, or None on error
-        """
+        """Generate compact overall/lifetime report"""
         session = get_session()
         try:
             today = today_ist()
-            report_date = today.strftime('%Y-%m-%d')
 
-            # All closed trades
             all_trades = session.query(ClosedPosition).order_by(
                 ClosedPosition.exit_date.desc()
             ).all()
 
-            # Current positions
             open_positions = session.query(OpenPosition).filter(
                 OpenPosition.status == PositionStatus.OPEN
             ).all()
 
-            # Calculate all-time stats
+            # Stats
             total_count = len(all_trades)
             total_pnl = sum(t.net_pnl for t in all_trades) if all_trades else 0
             total_winners = sum(1 for t in all_trades if t.net_pnl > 0)
             total_losers = total_count - total_winners
             win_rate = (total_winners / total_count * 100) if total_count > 0 else 0
 
-            # Averages
             avg_winner = sum(t.net_pnl for t in all_trades if t.net_pnl > 0) / total_winners if total_winners > 0 else 0
             avg_loser = sum(t.net_pnl for t in all_trades if t.net_pnl <= 0) / total_losers if total_losers > 0 else 0
-            avg_pnl = total_pnl / total_count if total_count > 0 else 0
             avg_days = sum(t.days_held for t in all_trades) / total_count if total_count > 0 else 0
 
-            # Best/Worst trades
-            best_trade = max(all_trades, key=lambda t: t.net_pnl) if all_trades else None
-            worst_trade = min(all_trades, key=lambda t: t.net_pnl) if all_trades else None
-
-            # Profit factor
             gross_profit = sum(t.net_pnl for t in all_trades if t.net_pnl > 0)
             gross_loss = abs(sum(t.net_pnl for t in all_trades if t.net_pnl <= 0))
-            profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
 
-            # Capital
             initial_capital = config.get('trading.initial_capital', 100000)
-            deployed = sum(p.capital_deployed for p in open_positions)
+            deployed = self._calculate_deployed_capital(open_positions)
             total_roi = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0
+            unrealized = self._get_unrealized_pnl(open_positions)
 
-            # Get unrealized P&L
-            unrealized_pnl = 0
-            try:
-                from src.api.dual_kite_client import get_kite_client
-                kite = get_kite_client()
-                for pos in open_positions:
-                    try:
-                        token = kite.get_instrument_token(pos.script)
-                        if token:
-                            ltp = kite.get_instrument_ltp(token)
-                            if ltp:
-                                unrealized_pnl += (ltp - pos.entry_price) * pos.quantity
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            best = max(all_trades, key=lambda t: t.net_pnl) if all_trades else None
+            worst = min(all_trades, key=lambda t: t.net_pnl) if all_trades else None
 
-            # Build HTML
             html = f"""
             <!DOCTYPE html>
-            <html lang="en">
-            <head>
+            <html><head>
                 <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>FIFTY Overall Report</title>
-                {self._get_base_styles()}
-            </head>
-            <body>
-                <div class="container">
-                    <div class="header">
-                        <h1>FIFTY Bot</h1>
-                        <div class="subtitle">Overall Performance Report</div>
-                    </div>
+                <title>FIFTY Overall</title>
+                {self._get_compact_styles()}
+            </head><body>
+                <div class="header">
+                    <h1>🏆 FIFTY Overall</h1>
+                    <div class="date">Lifetime Performance</div>
+                </div>
 
-                    <!-- Key Metrics -->
-                    <div class="card">
-                        <div class="card-title">Lifetime Performance</div>
-                        <div class="metric-grid">
-                            <div class="metric">
-                                <div class="metric-value">{total_count}</div>
-                                <div class="metric-label">Total Trades</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value {'pnl-positive' if total_pnl >= 0 else 'pnl-negative'}">
-                                    {'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}
-                                </div>
-                                <div class="metric-label">Total P&L</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">{win_rate:.1f}%</div>
-                                <div class="metric-label">Win Rate</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value {'pnl-positive' if total_roi >= 0 else 'pnl-negative'}">
-                                    {'+' if total_roi >= 0 else ''}{total_roi:.2f}%
-                                </div>
-                                <div class="metric-label">Total ROI</div>
-                            </div>
+                <div class="section">
+                    <div class="section-title">Performance</div>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-value">{total_count}</div>
+                            <div class="metric-label">Trades</div>
                         </div>
-                    </div>
-
-                    <!-- Trade Statistics -->
-                    <div class="card">
-                        <div class="card-title">Trade Statistics</div>
-                        <div class="summary-row">
-                            <span>Winners / Losers</span>
-                            <span>{total_winners} / {total_losers}</span>
+                        <div class="metric">
+                            <div class="metric-value {'positive' if total_pnl >= 0 else 'negative'}">{'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}</div>
+                            <div class="metric-label">P&L</div>
                         </div>
-                        <div class="summary-row">
-                            <span>Average Winner</span>
-                            <span class="pnl-positive">+{avg_winner:,.0f}</span>
+                        <div class="metric">
+                            <div class="metric-value">{win_rate:.0f}%</div>
+                            <div class="metric-label">Win</div>
                         </div>
-                        <div class="summary-row">
-                            <span>Average Loser</span>
-                            <span class="pnl-negative">{avg_loser:,.0f}</span>
+                        <div class="metric">
+                            <div class="metric-value {'positive' if total_roi >= 0 else 'negative'}">{'+' if total_roi >= 0 else ''}{total_roi:.1f}%</div>
+                            <div class="metric-label">ROI</div>
                         </div>
-                        <div class="summary-row">
-                            <span>Average P&L per Trade</span>
-                            <span class="{'pnl-positive' if avg_pnl >= 0 else 'pnl-negative'}">{'+' if avg_pnl >= 0 else ''}{avg_pnl:,.0f}</span>
-                        </div>
-                        <div class="summary-row">
-                            <span>Profit Factor</span>
-                            <span>{profit_factor:.2f}x</span>
-                        </div>
-                        <div class="summary-row">
-                            <span>Avg Days Held</span>
-                            <span>{avg_days:.1f} days</span>
-                        </div>
-                    </div>
-
-                    <!-- Best & Worst -->
-                    <div class="card">
-                        <div class="card-title">Notable Trades</div>
-                        {"" if not best_trade else f'''
-                        <div class="summary-row">
-                            <span>Best Trade</span>
-                            <span class="pnl-positive">{best_trade.script}: +{best_trade.net_pnl:,.0f}</span>
-                        </div>
-                        '''}
-                        {"" if not worst_trade else f'''
-                        <div class="summary-row">
-                            <span>Worst Trade</span>
-                            <span class="pnl-negative">{worst_trade.script}: {worst_trade.net_pnl:,.0f}</span>
-                        </div>
-                        '''}
-                    </div>
-
-                    <!-- Current Status -->
-                    <div class="card">
-                        <div class="card-title">Current Status</div>
-                        <div class="summary-row">
-                            <span>Open Positions</span>
-                            <span>{len(open_positions)}</span>
-                        </div>
-                        <div class="summary-row">
-                            <span>Capital Deployed</span>
-                            <span>{deployed:,.0f}</span>
-                        </div>
-                        <div class="summary-row">
-                            <span>Unrealized P&L</span>
-                            <span class="{'pnl-positive' if unrealized_pnl >= 0 else 'pnl-negative'}">{'+' if unrealized_pnl >= 0 else ''}{unrealized_pnl:,.0f}</span>
-                        </div>
-                        <div class="summary-row">
-                            <span>Total (Realized + Unrealized)</span>
-                            <span class="{'pnl-positive' if (total_pnl + unrealized_pnl) >= 0 else 'pnl-negative'}">{'+' if (total_pnl + unrealized_pnl) >= 0 else ''}{(total_pnl + unrealized_pnl):,.0f}</span>
-                        </div>
-                    </div>
-
-                    <!-- Open Positions -->
-                    {self._generate_positions_table(open_positions)}
-
-                    <!-- Recent Trades (last 10) -->
-                    {self._generate_closed_trades_table(all_trades[:10], "Recent Trades")}
-
-                    <div class="footer">
-                        Generated at {now_ist().strftime('%H:%M:%S IST')} | FIFTY Trading Bot
                     </div>
                 </div>
-            </body>
-            </html>
+
+                <div class="section">
+                    <div class="section-title">Statistics</div>
+                    <div class="row">
+                        <span class="row-label">Win/Loss</span>
+                        <span class="row-value">{total_winners}W / {total_losers}L</span>
+                    </div>
+                    <div class="row">
+                        <span class="row-label">Avg Winner</span>
+                        <span class="row-value positive">+{avg_winner:,.0f}</span>
+                    </div>
+                    <div class="row">
+                        <span class="row-label">Avg Loser</span>
+                        <span class="row-value negative">{avg_loser:,.0f}</span>
+                    </div>
+                    <div class="row">
+                        <span class="row-label">Profit Factor</span>
+                        <span class="row-value">{profit_factor:.2f}x</span>
+                    </div>
+                    <div class="row">
+                        <span class="row-label">Avg Hold</span>
+                        <span class="row-value">{avg_days:.0f} days</span>
+                    </div>
+                </div>
+
+                {f'''<div class="section">
+                    <div class="section-title">Notable</div>
+                    <div class="row">
+                        <span class="row-label">Best Trade</span>
+                        <span class="row-value positive">{best.script}: +{best.net_pnl:,.0f}</span>
+                    </div>
+                    <div class="row">
+                        <span class="row-label">Worst Trade</span>
+                        <span class="row-value negative">{worst.script}: {worst.net_pnl:,.0f}</span>
+                    </div>
+                </div>''' if best and worst else ''}
+
+                <div class="section">
+                    <div class="section-title">Current</div>
+                    <div class="row">
+                        <span class="row-label">Open Positions</span>
+                        <span class="row-value">{len(open_positions)}</span>
+                    </div>
+                    <div class="row">
+                        <span class="row-label">Deployed</span>
+                        <span class="row-value">{deployed:,.0f}</span>
+                    </div>
+                    <div class="row">
+                        <span class="row-label">Unrealized</span>
+                        <span class="row-value {'positive' if unrealized >= 0 else 'negative'}">{'+' if unrealized >= 0 else ''}{unrealized:,.0f}</span>
+                    </div>
+                </div>
+
+                {self._positions_table(open_positions)}
+                {self._closed_trades_table(all_trades[:5], "Recent Trades")}
+
+                <div class="footer">Generated {now_ist().strftime('%H:%M IST')} | FIFTY Bot</div>
+            </body></html>
             """
 
-            # Save to file
-            filename = f"overall_report_{report_date}.html"
-            filepath = self.reports_dir / filename
-
+            filepath = self.reports_dir / f"overall_{today.strftime('%Y%m%d')}.html"
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(html)
 
-            logger.info(f"Overall report generated: {filepath}")
+            logger.info(f"Overall report: {filepath}")
             return str(filepath)
 
         except Exception as e:
-            logger.error(f"Error generating overall report: {e}")
+            logger.error(f"Overall report error: {e}")
             return None
         finally:
             session.close()
 
-    # =========================================================================
-    # HTML TO IMAGE CONVERSION
-    # =========================================================================
-
     def html_to_image(self, html_path: str) -> Optional[str]:
-        """
-        Convert HTML report to PNG image.
-
-        Uses imgkit (wkhtmltoimage) for conversion.
-        Falls back to sending HTML if conversion fails.
-
-        Args:
-            html_path: Path to HTML file
-
-        Returns:
-            Path to PNG image, or None on failure
-        """
+        """Convert HTML to high-quality PNG image"""
         try:
             import imgkit
             from pathlib import Path
@@ -954,204 +679,138 @@ class ReportGenerator:
             html_file = Path(html_path)
             image_path = html_file.with_suffix('.png')
 
+            # High quality options for Telegram
             options = {
                 'format': 'png',
-                'width': 800,
-                'quality': 90,
+                'width': 450,
+                'quality': 100,
                 'enable-local-file-access': None,
-                'quiet': ''
+                'quiet': '',
+                'zoom': 2,  # 2x for retina-like quality
             }
 
             imgkit.from_file(str(html_file), str(image_path), options=options)
 
-            if image_path.exists():
-                logger.info(f"HTML converted to image: {image_path}")
+            if image_path.exists() and image_path.stat().st_size > 0:
+                logger.info(f"Image created: {image_path}")
                 return str(image_path)
-            else:
-                logger.warning("Image conversion produced no output")
-                return None
+            return None
 
         except ImportError:
-            logger.warning("imgkit not installed, sending HTML instead")
+            logger.warning("imgkit not installed")
             return None
         except Exception as e:
-            logger.warning(f"HTML to image conversion failed: {e}")
+            logger.warning(f"Image conversion failed: {e}")
             return None
 
-    # =========================================================================
-    # HELPER METHODS
-    # =========================================================================
-
-    def _generate_positions_table(self, positions: List) -> str:
-        """Generate HTML table for open positions"""
-        if not positions:
-            return """
-            <div class="card">
-                <div class="card-title">Open Positions</div>
-                <p style="color: #94a3b8; text-align: center; padding: 20px;">No open positions</p>
-            </div>
-            """
-
-        rows = []
-        for pos in positions:
-            rows.append(f"""
-                <tr>
-                    <td><strong>{pos.script}</strong></td>
-                    <td>{pos.entry_price:,.2f}</td>
-                    <td>{pos.quantity}</td>
-                    <td>{pos.current_sl:,.2f}</td>
-                    <td>{pos.capital_deployed:,.0f}</td>
-                    <td>{pos.days_held}d</td>
-                </tr>
-            """)
-
-        return f"""
-        <div class="card">
-            <div class="card-title">Open Positions ({len(positions)})</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Script</th>
-                        <th>Entry</th>
-                        <th>Qty</th>
-                        <th>SL</th>
-                        <th>Capital</th>
-                        <th>Days</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {''.join(rows)}
-                </tbody>
-            </table>
-        </div>
-        """
-
-    def _generate_orders_table(self, orders: List) -> str:
-        """Generate HTML table for pending orders"""
-        if not orders:
-            return ""
-
-        rows = []
-        for order in orders:
-            rows.append(f"""
-                <tr>
-                    <td><strong>{order.script}</strong></td>
-                    <td>{order.trigger_price:,.2f}</td>
-                    <td>{order.quantity}</td>
-                    <td>{order.capital_deployed:,.0f}</td>
-                    <td><span class="badge badge-warning">PENDING</span></td>
-                </tr>
-            """)
-
-        return f"""
-        <div class="card">
-            <div class="card-title">Pending Entry Orders ({len(orders)})</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Script</th>
-                        <th>Trigger</th>
-                        <th>Qty</th>
-                        <th>Capital</th>
-                        <th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {''.join(rows)}
-                </tbody>
-            </table>
-        </div>
-        """
-
-    def _generate_closed_trades_table(self, trades: List, title: str) -> str:
-        """Generate HTML table for closed trades"""
-        if not trades:
-            return ""
-
-        rows = []
-        for trade in trades:
-            pnl_class = 'pnl-positive' if trade.net_pnl >= 0 else 'pnl-negative'
-            pnl_sign = '+' if trade.net_pnl >= 0 else ''
-            badge_class = 'badge-success' if trade.net_pnl >= 0 else 'badge-danger'
-
-            rows.append(f"""
-                <tr>
-                    <td><strong>{trade.script}</strong></td>
-                    <td>{trade.entry_price:,.2f}</td>
-                    <td>{trade.exit_price:,.2f}</td>
-                    <td class="{pnl_class}">{pnl_sign}{trade.net_pnl:,.0f}</td>
-                    <td class="{pnl_class}">{pnl_sign}{trade.pnl_percent:.1f}%</td>
-                    <td>{trade.days_held}d</td>
-                    <td><span class="badge {badge_class}">{trade.exit_reason}</span></td>
-                </tr>
-            """)
-
-        return f"""
-        <div class="card">
-            <div class="card-title">{title} ({len(trades)})</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Script</th>
-                        <th>Entry</th>
-                        <th>Exit</th>
-                        <th>P&L</th>
-                        <th>%</th>
-                        <th>Days</th>
-                        <th>Reason</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {''.join(rows)}
-                </tbody>
-            </table>
-        </div>
-        """
-
-    def cleanup_old_reports(self, days: int = 7) -> int:
-        """
-        Delete reports older than specified days.
-
-        Args:
-            days: Delete reports older than this
-
-        Returns:
-            Number of files deleted
-        """
-        deleted = 0
-        cutoff = datetime.now() - timedelta(days=days)
-
+    def _get_unrealized_pnl(self, positions: List) -> float:
+        """Calculate unrealized P&L for positions"""
+        unrealized = 0
         try:
-            for filepath in self.reports_dir.glob("*.html"):
-                if filepath.stat().st_mtime < cutoff.timestamp():
-                    filepath.unlink()
-                    deleted += 1
-                    logger.debug(f"Deleted old report: {filepath.name}")
-        except Exception as e:
-            logger.error(f"Error cleaning up reports: {e}")
+            from src.api.dual_kite_client import get_kite_client
+            kite = get_kite_client()
+            for pos in positions:
+                try:
+                    token = kite.get_instrument_token(pos.script)
+                    if token:
+                        ltp = kite.get_instrument_ltp(token)
+                        if ltp:
+                            unrealized += (ltp - pos.entry_price) * pos.quantity
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return unrealized
 
-        return deleted
+    def _positions_table(self, positions: List) -> str:
+        """Compact positions table"""
+        if not positions:
+            return '<div class="section"><div class="empty">No open positions</div></div>'
+
+        rows = ''.join([
+            f'<tr><td><b>{p.script}</b></td><td>{p.entry_price:,.0f}</td><td>{p.quantity}</td>'
+            f'<td>{p.current_sl:,.0f}</td><td>{p.capital_deployed:,.0f}</td><td>{p.days_held}d</td></tr>'
+            for p in positions
+        ])
+
+        return f'''
+        <div class="section">
+            <div class="section-title">Open Positions ({len(positions)})</div>
+            <table>
+                <tr><th>Script</th><th>Entry</th><th>Qty</th><th>SL</th><th>Capital</th><th>Days</th></tr>
+                {rows}
+            </table>
+        </div>
+        '''
+
+    def _orders_table(self, orders: List) -> str:
+        """Compact pending orders table"""
+        if not orders:
+            return ''
+
+        rows = ''.join([
+            f'<tr><td><b>{o.script}</b></td><td>{o.trigger_price:,.0f}</td><td>{o.quantity}</td>'
+            f'<td>{o.capital_deployed:,.0f}</td><td><span class="badge badge-pending">PENDING</span></td></tr>'
+            for o in orders
+        ])
+
+        return f'''
+        <div class="section">
+            <div class="section-title">GTT Orders ({len(orders)})</div>
+            <table>
+                <tr><th>Script</th><th>Trigger</th><th>Qty</th><th>Capital</th><th>Status</th></tr>
+                {rows}
+            </table>
+        </div>
+        '''
+
+    def _closed_trades_table(self, trades: List, title: str) -> str:
+        """Compact closed trades table"""
+        if not trades:
+            return ''
+
+        rows = ''.join([
+            f'<tr><td><b>{t.script}</b></td><td>{t.entry_price:,.0f}</td><td>{t.exit_price:,.0f}</td>'
+            f'<td class="{"positive" if t.net_pnl >= 0 else "negative"}">{("+" if t.net_pnl >= 0 else "")}{t.net_pnl:,.0f}</td>'
+            f'<td class="{"positive" if t.pnl_percent >= 0 else "negative"}">{("+" if t.pnl_percent >= 0 else "")}{t.pnl_percent:.1f}%</td>'
+            f'<td><span class="badge {"badge-win" if t.net_pnl >= 0 else "badge-loss"}">{t.exit_reason}</span></td></tr>'
+            for t in trades
+        ])
+
+        return f'''
+        <div class="section">
+            <div class="section-title">{title} ({len(trades)})</div>
+            <table>
+                <tr><th>Script</th><th>Entry</th><th>Exit</th><th>P&L</th><th>%</th><th>Exit</th></tr>
+                {rows}
+            </table>
+        </div>
+        '''
 
     def delete_report(self, filepath: str) -> bool:
-        """
-        Delete a specific report file.
-
-        Args:
-            filepath: Path to report file
-
-        Returns:
-            True if deleted successfully
-        """
+        """Delete a report file"""
         try:
             path = Path(filepath)
             if path.exists():
                 path.unlink()
-                logger.debug(f"Deleted report: {filepath}")
                 return True
-        except Exception as e:
-            logger.warning(f"Could not delete report {filepath}: {e}")
+        except Exception:
+            pass
         return False
 
+    def cleanup_old_reports(self, days: int = 7) -> int:
+        """Delete reports older than specified days"""
+        deleted = 0
+        cutoff = datetime.now() - timedelta(days=days)
+        try:
+            for f in self.reports_dir.glob("*.*"):
+                if f.stat().st_mtime < cutoff.timestamp():
+                    f.unlink()
+                    deleted += 1
+        except Exception:
+            pass
+        return deleted
 
-# Singleton instance
+
+# Singleton
 report_generator = ReportGenerator()
