@@ -817,7 +817,9 @@ class OrderManager:
             ordered_qty = int(order_status.get('quantity', order.quantity))
 
             if filled_qty == 0:
-                logger.warning(f"GTT triggered but no fills for {order.script}")
+                # GTT triggered but order never filled (price moved away, cancelled at EOD)
+                logger.warning(f"GTT triggered but no fills for {order.script} (order status: {status})")
+                self._handle_triggered_unfilled(order, session, f"order {status}")
                 return None
 
             fill_price = float(order_status.get('average_price', order.limit_price))
@@ -874,15 +876,84 @@ class OrderManager:
             }
 
         except Exception as e:
-            logger.error(f"Error processing triggered GTT: {e}")
+            logger.error(f"Error processing triggered GTT for {order.script}: {e}")
             session.rollback()
-            telegram.send_alert(
-                f"ERROR processing fill for {order.script}: {e}",
-                critical=True
-            )
+
+            # Day 2+ case: order_history fails for prior-day orders.
+            # If GTT is triggered and we can't look up the order, check if
+            # position exists in Zerodha. If not → order never filled.
+            if 'order history' in str(e).lower() or 'no order' in str(e).lower():
+                try:
+                    # Re-open session after rollback
+                    session2 = get_session()
+                    order2 = session2.query(OpenOrder).filter(OpenOrder.id == order.id).first()
+                    if order2 and order2.status == OrderStatus.PENDING:
+                        # Check if position exists in Zerodha (confirms no fill)
+                        has_position = self._check_zerodha_has_position(order2.script)
+                        if not has_position:
+                            self._handle_triggered_unfilled(order2, session2, "order history unavailable (prior day)")
+                        else:
+                            # Position exists in Zerodha but not in DB — use existing reconciliation
+                            logger.info(f"{order2.script} found in Zerodha — fill may exist, use /sync")
+                    session2.close()
+                except Exception as e2:
+                    logger.error(f"Error handling stale triggered GTT for {order.script}: {e2}")
+            else:
+                telegram.send_alert(
+                    f"ERROR processing fill for {order.script}: {e}",
+                    critical=True
+                )
             return None
         finally:
             session.close()
+
+    def _handle_triggered_unfilled(self, order: OpenOrder, session, reason: str) -> None:
+        """
+        Handle a GTT that triggered but the resulting order never filled.
+        Marks order CANCELLED, resets signal to PENDING for re-approval.
+        """
+        order.status = OrderStatus.CANCELLED
+        order.last_error = f"GTT triggered but unfilled ({reason})"
+
+        # Reset signal to PENDING so user gets re-notified for fresh approval
+        signal = session.query(SignalQueue).filter(
+            SignalQueue.id == order.signal_id
+        ).first()
+
+        signal_reset = False
+        if signal and signal.status == SignalStatus.ENTERED:
+            signal.status = SignalStatus.PENDING
+            signal.telegram_msg_id = None
+            signal_reset = True
+            logger.info(f"Signal {signal.id} ({signal.script}) reset to PENDING for re-approval")
+
+        session.commit()
+
+        reset_msg = "\nSignal reset — will re-notify for approval." if signal_reset else ""
+        telegram.send_alert(
+            f"<b>Entry Missed</b>\n\n"
+            f"{order.script}: GTT triggered but order never filled\n"
+            f"Reason: {reason}{reset_msg}"
+        )
+        logger.warning(f"Triggered-unfilled resolved for {order.script}: {reason}")
+
+    def _check_zerodha_has_position(self, script: str) -> bool:
+        """Check if script exists in Zerodha holdings or positions"""
+        try:
+            holdings = self.kite.get_holdings()
+            for h in holdings:
+                if h.get('tradingsymbol') == script and (h.get('quantity', 0) + h.get('t1_quantity', 0)) > 0:
+                    return True
+
+            positions = self.kite.get_positions()
+            for p in positions.get('net', []):
+                if p.get('tradingsymbol') == script and p.get('quantity', 0) > 0:
+                    return True
+
+            return False
+        except Exception as e:
+            logger.warning(f"Could not check Zerodha positions for {script}: {e}")
+            return True  # Assume position exists on API failure (safer — don't reset signal)
 
     def _create_position_from_order(
         self,
