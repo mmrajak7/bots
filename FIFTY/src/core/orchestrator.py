@@ -131,6 +131,7 @@ class Orchestrator:
                 self._process_signals()
                 self._send_pending_notifications()
                 self._monitor_orders()
+                self._monitor_sl_hits()
                 self._monitor_positions_for_drops()
 
             # 6. Hold signal re-notification (9:30-9:35)
@@ -420,6 +421,15 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Error monitoring orders: {e}")
 
+    def _monitor_sl_hits(self) -> None:
+        """Check if any SL GTTs have triggered during market hours"""
+        try:
+            closed = self.exit_manager.check_sl_hits()
+            if closed:
+                logger.info(f"Detected {len(closed)} SL hit(s)")
+        except Exception as e:
+            logger.error(f"Error monitoring SL hits: {e}")
+
     # =========================================================================
     # POSITION MONITORING
     # =========================================================================
@@ -474,6 +484,9 @@ class Orchestrator:
             # Verify all positions have active SL GTT protection (TR-C2 fix)
             self._verify_gtt_protection()
 
+            # Clean up orphan GTTs (no matching position or order)
+            self._cleanup_orphan_gtts()
+
             # FIX ARCH-C1: Clean up stale PLACING orders (crashed mid-placement)
             self._cleanup_stale_placing_orders()
 
@@ -504,6 +517,86 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Error verifying GTT protection: {e}")
             telegram.send_alert(f"GTT verification error: {e}", critical=True)
+
+    def _cleanup_orphan_gtts(self) -> None:
+        """
+        Cancel active GTTs that don't belong to any open position or pending order.
+
+        Orphan GTTs can occur when:
+        - A position was closed manually but GTT wasn't cancelled
+        - An order was cancelled but its entry GTT wasn't cleaned up
+        - Process crashed between closing position and cancelling GTT
+        """
+        try:
+            from src.api.dual_kite_client import get_kite_client
+            kite = get_kite_client()
+
+            # Get all active GTTs from Zerodha
+            all_gtts = kite.get_gtt_orders()
+            active_gtts = [g for g in all_gtts if g.get('status') == 'active']
+
+            if not active_gtts:
+                logger.debug("No active GTTs found")
+                return
+
+            # Get all known GTT IDs from open positions and pending orders
+            session = get_session()
+            try:
+                open_positions = session.query(OpenPosition).filter(
+                    OpenPosition.status == PositionStatus.OPEN
+                ).all()
+                position_gtt_ids = {p.gtt_id for p in open_positions if p.gtt_id}
+
+                pending_orders = session.query(OpenOrder).filter(
+                    OpenOrder.status == OrderStatus.PENDING
+                ).all()
+                order_gtt_ids = {o.gtt_id for o in pending_orders if o.gtt_id}
+
+                known_gtt_ids = position_gtt_ids | order_gtt_ids
+
+                orphan_count = 0
+                for gtt in active_gtts:
+                    gtt_id = str(gtt.get('id', ''))
+                    tradingsymbol = gtt.get('condition', {}).get('tradingsymbol', 'UNKNOWN')
+
+                    if gtt_id in known_gtt_ids:
+                        continue
+
+                    # Determine GTT type from order transaction_type
+                    orders = gtt.get('orders') or []
+                    txn_type = orders[0].get('transaction_type', '') if orders else ''
+
+                    # Only cancel GTTs that look like they belong to FIFTY
+                    # (SELL = SL protection, BUY = entry order)
+                    if txn_type not in ('BUY', 'SELL'):
+                        continue
+
+                    gtt_type = "SL" if txn_type == 'SELL' else "Entry"
+                    logger.warning(
+                        f"Orphan {gtt_type} GTT found: {gtt_id} for {tradingsymbol} "
+                        f"(not linked to any position or order)"
+                    )
+
+                    try:
+                        kite.cancel_gtt_order(gtt_id)
+                        orphan_count += 1
+                        logger.info(f"Cancelled orphan GTT {gtt_id} ({tradingsymbol})")
+                    except Exception as cancel_err:
+                        logger.error(f"Failed to cancel orphan GTT {gtt_id}: {cancel_err}")
+
+                if orphan_count > 0:
+                    telegram.send_alert(
+                        f"<b>Orphan GTT Cleanup</b>\n\n"
+                        f"Cancelled {orphan_count} orphan GTT(s)"
+                    )
+                else:
+                    logger.debug("No orphan GTTs found")
+
+            finally:
+                session.close()
+
+        except Exception as e:
+            logger.error(f"Error cleaning up orphan GTTs: {e}")
 
     def _reconcile_positions(self) -> None:
         """

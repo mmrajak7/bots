@@ -197,8 +197,28 @@ class CommandHandler:
             if pending_orders:
                 lines.append("")
                 lines.append(f"⏳ <b>GTT Orders ({len(pending_orders)})</b>")
+
+                # Fetch LTP for pending orders
+                kite = None
+                try:
+                    from src.api.dual_kite_client import get_kite_client
+                    kite = get_kite_client()
+                except Exception as e:
+                    logger.debug(f"Could not get Kite client for LTP: {e}")
+
                 for order in pending_orders:
-                    lines.append(f"  • {order.script} @ {order.limit_price:,.0f} x{order.quantity}")
+                    ltp_info = ""
+                    if kite is not None:
+                        try:
+                            token = kite.get_instrument_token(order.script)
+                            if token:
+                                ltp = kite.get_instrument_ltp(token)
+                                if ltp is not None and order.limit_price > 0:
+                                    dist_pct = ((ltp - order.limit_price) / order.limit_price) * 100
+                                    ltp_info = f" | LTP: {ltp:,.0f} ({dist_pct:+.1f}%)"
+                        except Exception:
+                            pass
+                    lines.append(f"  • {order.script} @ {order.limit_price:,.0f} x{order.quantity}{ltp_info}")
 
             if not awaiting_signals and not pending_orders:
                 lines.append("\n✅ No pending items")
