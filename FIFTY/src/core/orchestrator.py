@@ -556,12 +556,30 @@ class Orchestrator:
 
                 known_gtt_ids = position_gtt_ids | order_gtt_ids
 
+                # Only touch GTTs for symbols currently active in the bot
+                bot_symbols = set()
+                bot_symbols.update(p.script for p in open_positions)
+                bot_symbols.update(o.script for o in pending_orders)
+                active_signals = session.query(SignalQueue.script).filter(
+                    SignalQueue.status.in_([
+                        SignalStatus.PENDING, SignalStatus.NOTIFIED,
+                        SignalStatus.APPROVED, SignalStatus.HOLD,
+                        SignalStatus.AWAITING_PRICE, SignalStatus.ENTERED
+                    ])
+                ).all()
+                bot_symbols.update(r[0] for r in active_signals)
+
                 orphan_count = 0
+                cancelled_details = []
                 for gtt in active_gtts:
                     gtt_id = str(gtt.get('id', ''))
                     tradingsymbol = gtt.get('condition', {}).get('tradingsymbol', 'UNKNOWN')
 
                     if gtt_id in known_gtt_ids:
+                        continue
+
+                    # Skip GTTs for symbols not currently managed by the bot
+                    if tradingsymbol not in bot_symbols:
                         continue
 
                     # Determine GTT type from order transaction_type
@@ -582,14 +600,18 @@ class Orchestrator:
                     try:
                         kite.cancel_gtt_order(gtt_id)
                         orphan_count += 1
+                        gtt_price = orders[0].get('price', '') if orders else ''
+                        price_str = f" @ {gtt_price}" if gtt_price else ''
+                        cancelled_details.append(f"• {tradingsymbol} ({gtt_type}{price_str})")
                         logger.info(f"Cancelled orphan GTT {gtt_id} ({tradingsymbol})")
                     except Exception as cancel_err:
                         logger.error(f"Failed to cancel orphan GTT {gtt_id}: {cancel_err}")
 
                 if orphan_count > 0:
+                    details_str = "\n".join(cancelled_details)
                     telegram.send_alert(
                         f"<b>Orphan GTT Cleanup</b>\n\n"
-                        f"Cancelled {orphan_count} orphan GTT(s)"
+                        f"Cancelled {orphan_count} orphan GTT(s):\n{details_str}"
                     )
                 else:
                     logger.debug("No orphan GTTs found")
