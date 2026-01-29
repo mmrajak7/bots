@@ -17,6 +17,8 @@ import argparse
 import atexit
 import signal
 import time
+import queue
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -242,7 +244,9 @@ _shutdown_in_progress = False
 _active_api_operations = 0
 _api_operation_lock = None  # Initialized in run_daemon
 
-import threading
+
+_action_queue: queue.Queue = queue.Queue()
+_telegram_thread: threading.Thread | None = None
 
 
 def _signal_handler(signum, frame):
@@ -323,22 +327,99 @@ def _send_daemon_startup_message():
         telegram.send_alert("🌅 <b>FIFTY Service Started</b>")
 
 
+def _telegram_poll_loop():
+    """
+    Background thread: continuously long-polls Telegram for updates.
+
+    Parsed actions are placed on _action_queue for the main thread to process.
+    This thread performs NO business logic — only polling and queue insertion.
+    """
+    from src.telegram.approval_handler import approval_handler
+
+    logger.info("Telegram poll thread started")
+    consecutive_errors = 0
+    MAX_BACKOFF = 60  # Cap backoff at 60 seconds
+
+    while _daemon_running:
+        try:
+            actions = approval_handler.process_updates_long_poll(timeout=30)
+            consecutive_errors = 0  # Reset on success
+
+            for action in actions:
+                _action_queue.put(action)
+
+        except Exception as e:
+            consecutive_errors += 1
+            backoff = min(5 * consecutive_errors, MAX_BACKOFF)
+            logger.error(f"Telegram poll error ({consecutive_errors}): {e}, backing off {backoff}s")
+            # Sleep in 1s increments so we can exit quickly on shutdown
+            for _ in range(backoff):
+                if not _daemon_running:
+                    break
+                time.sleep(1)
+
+    logger.info("Telegram poll thread stopped")
+
+
+def _start_telegram_thread() -> threading.Thread:
+    """Start (or restart) the Telegram polling background thread."""
+    t = threading.Thread(target=_telegram_poll_loop, name="telegram-poll", daemon=True)
+    t.start()
+    return t
+
+
+def _drain_action_queue(orchestrator, command_handler) -> None:
+    """
+    Process all pending actions from the Telegram poll thread.
+
+    Runs in the main thread to avoid thread-safety issues with
+    orchestrator / order_manager / exit_manager.
+    """
+    while True:
+        try:
+            action = _action_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        action_type = action.get('type')
+
+        try:
+            if action_type == 'signal_approved':
+                _handle_signal_approved_daemon(action, orchestrator)
+
+            elif action_type == 'emergency_exit':
+                _handle_emergency_exit_daemon(action, orchestrator)
+
+            elif action_type == 'command':
+                command = action.get('command')
+                if command in ('import', 'release', 'fix'):
+                    command_handler.execute_command(command, script=action.get('script'))
+                elif command == 'report':
+                    command_handler.execute_command(command, report_type=action.get('report_type'))
+                else:
+                    command_handler.execute_command(command)
+        except Exception as e:
+            logger.error(f"Error processing queued action {action_type}: {e}")
+
+
 def run_daemon():
     """
     Run the bot in daemon mode - 24/7 long-polling service.
 
-    - Telegram commands processed instantly (30s long-polling)
-    - Trading tasks run at scheduled time windows
-    - Graceful shutdown on SIGINT/SIGTERM
+    Architecture:
+      - Background thread: Telegram long-polling (always responsive)
+      - Main thread: scheduled tasks + drains action queue
+      - Communication: thread-safe queue.Queue
+
+    Telegram commands are processed instantly even while scheduled tasks
+    (signal processing, order monitoring) are running.
     """
-    global _daemon_running
+    global _daemon_running, _telegram_thread
 
     from src.core.orchestrator import orchestrator
-    from src.telegram.approval_handler import approval_handler
     from src.telegram.commands import command_handler
     from src.telegram.bot import telegram
-    from src.utils.timezone_helper import now_ist, in_time_window, is_market_day_ist
-    from src.models.database import is_kill_switch_active
+    from src.utils.timezone_helper import now_ist
 
     # Setup signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, _signal_handler)
@@ -352,6 +433,10 @@ def run_daemon():
     # Send professional daemon startup message
     _send_daemon_startup_message()
 
+    # Start Telegram polling in background thread
+    _telegram_thread = _start_telegram_thread()
+    logger.info("Telegram background thread launched")
+
     # Track last scheduled task run
     last_scheduled_run = None
     SCHEDULED_INTERVAL = 300  # Run scheduled tasks every 5 minutes
@@ -360,33 +445,8 @@ def run_daemon():
         while _daemon_running:
             current = now_ist()
 
-            # 1. Process Telegram updates with long-polling (instant response)
-            # This blocks for up to 30 seconds waiting for updates
-            try:
-                actions = approval_handler.process_updates_long_poll(timeout=30)
-
-                for action in actions:
-                    action_type = action.get('type')
-
-                    if action_type == 'signal_approved':
-                        _handle_signal_approved_daemon(action, orchestrator)
-
-                    elif action_type == 'emergency_exit':
-                        _handle_emergency_exit_daemon(action, orchestrator)
-
-                    elif action_type == 'command':
-                        command = action.get('command')
-                        # Handle commands with parameters
-                        if command in ('import', 'release', 'fix'):
-                            command_handler.execute_command(command, script=action.get('script'))
-                        elif command == 'report':
-                            command_handler.execute_command(command, report_type=action.get('report_type'))
-                        else:
-                            command_handler.execute_command(command)
-
-            except Exception as e:
-                logger.error(f"Error processing Telegram updates: {e}")
-                time.sleep(5)  # Back off on error
+            # 1. Drain queued Telegram actions (non-blocking)
+            _drain_action_queue(orchestrator, command_handler)
 
             # Write heartbeat for watchdog monitoring
             _write_heartbeat()
@@ -400,12 +460,28 @@ def run_daemon():
                 except Exception as e:
                     logger.error(f"Error running scheduled tasks: {e}")
 
+            # 3. Monitor telegram thread health - restart if crashed
+            if _telegram_thread is not None and not _telegram_thread.is_alive():
+                logger.warning("Telegram thread died - restarting")
+                _telegram_thread = _start_telegram_thread()
+
+            # 4. Sleep in 1s increments, draining queue between sleeps
+            #    This keeps action processing latency under ~1s
+            for _ in range(5):
+                if not _daemon_running:
+                    break
+                time.sleep(1)
+                _drain_action_queue(orchestrator, command_handler)
+
     except Exception as e:
         logger.error(f"Daemon error: {e}")
         telegram.send_alert(f"FIFTY Daemon Error: {str(e)}", critical=True)
         raise
     finally:
         logger.info("Daemon shutting down...")
+        # Wait for telegram thread to finish (it checks _daemon_running)
+        if _telegram_thread is not None and _telegram_thread.is_alive():
+            _telegram_thread.join(timeout=35)  # Slightly longer than poll timeout
         telegram.send_alert("FIFTY Bot Daemon Stopped")
 
 
