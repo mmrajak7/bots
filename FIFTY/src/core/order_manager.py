@@ -641,7 +641,7 @@ class OrderManager:
                     # FIX TR-H1: GTT not found - could be triggered, cancelled, or expired
                     # Don't assume triggered - verify with order check first
                     logger.warning(f"GTT {gtt_id} for {order.script} not found in GTT list - investigating")
-                    fill_result = self._check_if_gtt_triggered(order)
+                    fill_result = self._check_if_gtt_triggered(order, session)
                     if fill_result:
                         filled_orders.append(fill_result)
                     else:
@@ -702,13 +702,17 @@ class OrderManager:
 
         return filled_orders
 
-    def _check_if_gtt_triggered(self, order: OpenOrder) -> Optional[Dict[str, Any]]:
+    def _check_if_gtt_triggered(self, order: OpenOrder, session) -> Optional[Dict[str, Any]]:
         """
         Check if entry GTT was triggered when it's no longer in get_gtts().
 
         Checks two sources:
         1. Today's orders — for same-day fills
         2. OpenPosition table — for prior-day fills (entry GTT already gone from Kite)
+
+        Args:
+            order: The OpenOrder to check (bound to caller's session)
+            session: Caller's DB session (avoids dual-session conflicts)
         """
         try:
             # Check 1: Today's orders for a matching BUY fill
@@ -717,43 +721,36 @@ class OrderManager:
                 for zerodha_order in all_orders:
                     if (zerodha_order.get('tradingsymbol') == order.script and
                         zerodha_order.get('transaction_type') == 'BUY' and
-                        zerodha_order.get('status') == 'COMPLETE'):
+                        zerodha_order.get('status') == 'COMPLETE' and
+                        zerodha_order.get('quantity') == order.quantity):
                         return self._process_triggered_gtt(order, zerodha_order.get('order_id'))
             except Exception as e:
                 logger.warning(f"Could not check today's orders for {order.script}: {e}")
 
             # Check 2: Position already exists (filled on a prior day)
-            session = get_session()
-            try:
-                existing_position = session.query(OpenPosition).filter(
-                    OpenPosition.script == order.script,
-                    OpenPosition.status == PositionStatus.OPEN
-                ).first()
+            existing_position = session.query(OpenPosition).filter(
+                OpenPosition.script == order.script,
+                OpenPosition.status == PositionStatus.OPEN
+            ).first()
 
-                if existing_position:
-                    # Position exists — mark stale order as FILLED (DB only, no GTT changes)
-                    stale_order = session.query(OpenOrder).filter(
-                        OpenOrder.id == order.id
-                    ).first()
-                    if stale_order:
-                        stale_order.status = OrderStatus.FILLED
-                        stale_order.position_created = True
-                        stale_order.fill_price = existing_position.entry_price
-                        stale_order.filled_at = ist_now_naive()
-                        session.commit()
-                        logger.info(
-                            f"Stale order reconciled: {order.script} — "
-                            f"position already exists (id={existing_position.id})"
-                        )
-                        return {
-                            'script': order.script,
-                            'fill_price': existing_position.entry_price,
-                            'quantity': existing_position.quantity,
-                            'position_id': existing_position.id,
-                            'reconciled': True
-                        }
-            finally:
-                session.close()
+            if existing_position:
+                # Position exists — mark stale order as FILLED (DB only, no GTT changes)
+                order.status = OrderStatus.FILLED
+                order.position_created = True
+                order.fill_price = existing_position.entry_price
+                order.filled_at = ist_now_naive()
+                session.commit()
+                logger.info(
+                    f"Stale order reconciled: {order.script} — "
+                    f"position already exists (id={existing_position.id})"
+                )
+                return {
+                    'script': order.script,
+                    'fill_price': existing_position.entry_price,
+                    'quantity': existing_position.quantity,
+                    'position_id': existing_position.id,
+                    'reconciled': True
+                }
 
             return None
 

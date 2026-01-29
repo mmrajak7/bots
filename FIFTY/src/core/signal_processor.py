@@ -568,15 +568,15 @@ class SignalProcessor:
         try:
             max_positions = config.get('trading.max_positions', 5)
 
-            open_count = session.query(OpenPosition).filter(
+            # Single query for open positions
+            open_positions = session.query(OpenPosition).filter(
                 OpenPosition.status == PositionStatus.OPEN
-            ).count()
+            ).all()
+            open_count = len(open_positions)
 
             # Exclude pending orders for scripts that already have an open position
             # (stale orders that haven't been reconciled yet)
-            position_scripts = {p.script for p in session.query(OpenPosition).filter(
-                OpenPosition.status == PositionStatus.OPEN
-            ).all()}
+            position_scripts = {p.script for p in open_positions}
 
             all_pending = session.query(OpenOrder).filter(
                 OpenOrder.status == OrderStatus.PENDING
