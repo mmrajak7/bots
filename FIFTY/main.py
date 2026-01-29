@@ -379,6 +379,8 @@ def run_daemon():
                         # Handle commands with parameters
                         if command == 'import':
                             command_handler.execute_command(command, script=action.get('script'))
+                        elif command == 'release':
+                            command_handler.execute_command(command, script=action.get('script'))
                         elif command == 'report':
                             command_handler.execute_command(command, report_type=action.get('report_type'))
                         else:
