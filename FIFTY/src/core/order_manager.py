@@ -675,6 +675,27 @@ class OrderManager:
 
                     gtt_status = gtt.get('status', '')
 
+                    # Sync entry prices from Zerodha GTT to local DB
+                    if gtt_status == 'active':
+                        try:
+                            z_trigger = gtt.get('condition', {}).get('trigger_values', [None])[0]
+                            z_orders = gtt.get('orders', [])
+                            z_limit = z_orders[0].get('price') if z_orders else None
+                            if z_trigger and z_limit:
+                                updated = False
+                                if abs(order.trigger_price - z_trigger) > 0.01:
+                                    logger.info(f"{order.script}: trigger price sync {order.trigger_price} -> {z_trigger}")
+                                    order.trigger_price = z_trigger
+                                    updated = True
+                                if abs(order.limit_price - z_limit) > 0.01:
+                                    logger.info(f"{order.script}: limit price sync {order.limit_price} -> {z_limit}")
+                                    order.limit_price = z_limit
+                                    updated = True
+                                if updated:
+                                    session.commit()
+                        except Exception as e:
+                            logger.warning(f"Price sync failed for {order.script}: {e}")
+
                     if gtt_status == 'triggered':
                         # GTT triggered - check order status
                         gtt_orders_list = gtt.get('orders', [])
