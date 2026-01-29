@@ -705,6 +705,31 @@ class Orchestrator:
                 else:
                     logger.info(f"Reconciliation: All {kept_count} positions verified in Zerodha")
 
+                # Reconcile stale OpenOrders: if a PENDING order's script already has
+                # an OPEN position, the GTT filled but the order wasn't updated
+                position_scripts = {p.script for p in db_positions if p.status == PositionStatus.OPEN}
+
+                stale_orders = session.query(OpenOrder).filter(
+                    OpenOrder.status == OrderStatus.PENDING
+                ).all()
+
+                stale_fixed = 0
+                for order in stale_orders:
+                    if order.script in position_scripts:
+                        order.status = OrderStatus.FILLED
+                        order.position_created = True
+                        order.filled_at = ist_now_naive()
+                        stale_fixed += 1
+                        logger.info(f"Stale order reconciled: {order.script} (GTT {order.gtt_id}) - position exists")
+
+                if stale_fixed > 0:
+                    session.commit()
+                    telegram.send_alert(
+                        f"<b>Order Reconciliation</b>\n\n"
+                        f"Fixed {stale_fixed} stale PENDING order(s) "
+                        f"(position already exists)"
+                    )
+
             finally:
                 session.close()
 
