@@ -557,37 +557,30 @@ class SignalProcessor:
 
     def can_send_notification(self) -> Tuple[bool, str]:
         """
-        Check if we can send new signal notifications.
-
-        Uses combined limit: open_positions + pending_orders <= max_positions.
-        This ensures total capital deployment (actual + committed) stays within bounds.
+        Check if we can send new signal notifications
 
         Returns:
             (can_notify, reason)
         """
         session = get_session()
         try:
+            # Check position count
             max_positions = config.get('trading.max_positions', 5)
-
-            # Count open positions
             open_count = session.query(OpenPosition).filter(
                 OpenPosition.status == PositionStatus.OPEN
             ).count()
 
-            # Count pending orders (exclude orders for scripts that already have positions)
-            position_scripts = {p.script for p in session.query(OpenPosition).filter(
-                OpenPosition.status == PositionStatus.OPEN
-            ).all()}
+            if open_count >= max_positions:
+                return False, f"Max positions reached ({open_count}/{max_positions})"
 
-            all_pending = session.query(OpenOrder).filter(
+            # Check pending orders count
+            max_pending = config.get('trading.max_pending_orders', 3)
+            pending_count = session.query(OpenOrder).filter(
                 OpenOrder.status == OrderStatus.PENDING
-            ).all()
-            pending_count = len([o for o in all_pending if o.script not in position_scripts])
+            ).count()
 
-            # Combined limit: positions + pending <= max_positions
-            total_deployed = open_count + pending_count
-            if total_deployed >= max_positions:
-                return False, f"Max deployment reached ({open_count} open + {pending_count} pending = {total_deployed}/{max_positions})"
+            if pending_count >= max_pending:
+                return False, f"Max pending orders reached ({pending_count}/{max_pending})"
 
             # Check NIFTY filter
             if not self.check_nifty_weekly_filter():
