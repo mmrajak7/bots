@@ -37,6 +37,11 @@ class SignalProcessor:
         self.filter_tf = config.get('signals.filter_tf', 'CSP')
         self.kite = get_kite_client()
 
+        # NIFTY filter cache (avoid duplicate API calls per cycle)
+        self._nifty_filter_cache: Optional[bool] = None
+        self._nifty_filter_cache_time: Optional[datetime] = None
+        self._nifty_filter_cache_ttl = 300  # 5 minutes
+
         # SuperTrend parameters
         self.st_period = config.get('supertrend.period', 10)
         self.st_multiplier = config.get('supertrend.multiplier', 3)
@@ -525,6 +530,14 @@ class SignalProcessor:
         if not config.get('nifty_filter.enabled', True):
             return True
 
+        # Return cached result if still fresh (prevents duplicate API calls per cycle)
+        now = datetime.now()
+        if (self._nifty_filter_cache is not None and
+                self._nifty_filter_cache_time is not None and
+                (now - self._nifty_filter_cache_time).total_seconds() < self._nifty_filter_cache_ttl):
+            logger.debug(f"NIFTY filter cache hit: {'BULLISH' if self._nifty_filter_cache else 'BEARISH'}")
+            return self._nifty_filter_cache
+
         try:
             nifty_token = config.get('nifty_filter.instrument_token', '256265')
 
@@ -548,11 +561,16 @@ class SignalProcessor:
             is_bullish = current_trend == 1
 
             logger.info(f"NIFTY weekly filter: trend={current_trend}, {'BULLISH (allow)' if is_bullish else 'BEARISH (block)'}")
+            self._nifty_filter_cache = is_bullish
+            self._nifty_filter_cache_time = datetime.now()
             return is_bullish
 
         except Exception as e:
             # FIX TR-M2: Block entries on error (safer than allowing)
             logger.error(f"Error checking NIFTY filter: {e} - BLOCKING entries (safety)")
+            # Cache the failure too so we don't hammer a hanging API
+            self._nifty_filter_cache = False
+            self._nifty_filter_cache_time = datetime.now()
             return False
 
     def can_send_notification(self) -> Tuple[bool, str]:

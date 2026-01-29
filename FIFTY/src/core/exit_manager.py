@@ -344,6 +344,9 @@ class ExitManager:
             for pos_info in unprotected:
                 self._attempt_gtt_recovery(pos_info, session)
 
+            # Commit any GTT recovery updates (place_sl_gtt with external session doesn't commit)
+            session.commit()
+
             return unprotected
 
         except Exception as e:
@@ -557,12 +560,8 @@ class ExitManager:
 
                 if own_session:
                     session.commit()
-            else:
-                # FIX DB-002: GTT placement failed - rollback current_sl to previous value
-                position.current_sl = old_current_sl
-                logger.warning(f"{script}: GTT placement failed, reverted current_sl to {old_current_sl:.2f}")
 
-                # Log update
+                # Log successful trail
                 self._log_gtt_update(
                     position_id=position.id,
                     script=script,
@@ -580,8 +579,23 @@ class ExitManager:
                     'new_sl': new_sl,
                     'monthly_low': monthly_low
                 }
+            else:
+                # FIX DB-002: GTT placement failed - rollback current_sl to previous value
+                position.current_sl = old_current_sl
+                logger.warning(f"{script}: GTT placement failed, reverted current_sl to {old_current_sl:.2f}")
 
-            return None
+                self._log_gtt_update(
+                    position_id=position.id,
+                    script=script,
+                    old_sl=current_sl,
+                    new_sl=new_sl,
+                    old_gtt_id=old_gtt_id,
+                    new_gtt_id=new_gtt_id,
+                    status='FAILED',
+                    reason='MONTHLY_TRAIL'
+                )
+
+                return None
 
         except Exception as e:
             logger.error(f"Error trailing SL for {position.script}: {e}")
@@ -872,12 +886,13 @@ class ExitManager:
             for order in all_orders:
                 if (order.get('tradingsymbol') == position.script and
                     order.get('transaction_type') == 'SELL' and
-                    order.get('status') == 'COMPLETE'):
+                    order.get('status') == 'COMPLETE' and
+                    order.get('quantity') == position.quantity):
 
                     exit_price = float(order.get('average_price', 0))
 
-                    # Check if this looks like an SL exit
-                    if exit_price <= position.current_sl * 1.02:  # Within 2% of SL
+                    # Check if this looks like an SL exit (within 2% of SL level)
+                    if exit_price <= position.current_sl * 1.02:
                         return self._close_position(position, exit_price, 'SL_HIT')
 
             return None

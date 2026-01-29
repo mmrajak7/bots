@@ -382,7 +382,7 @@ class Orchestrator:
             pending = self.signal_processor.get_pending_notifications()
 
             if not pending:
-                logger.debug("No pending signals to notify")
+                logger.info("No pending signals to notify")
                 return
 
             logger.info(f"Found {len(pending)} pending signals to notify")

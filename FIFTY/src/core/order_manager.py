@@ -406,10 +406,6 @@ class OrderManager:
             if config.is_test_mode():
                 quantity = 1
 
-            # Round price to tick size
-            trigger_price = round_price(entry_price)
-            limit_price = round_price(entry_price)
-
             # Get instrument token
             instrument_token = self.kite.get_instrument_token(script)
 
@@ -418,6 +414,17 @@ class OrderManager:
                 ltp = self.kite.get_instrument_ltp(instrument_token)
             except Exception:
                 ltp = entry_price
+
+            # If LTP is below signal level, use LTP as entry (buy cheaper)
+            # Signal level validates the setup, but no reason to wait for price to rise
+            effective_price = entry_price
+            if ltp and ltp < entry_price:
+                logger.info(f"{script}: LTP {ltp:.2f} < signal level {entry_price:.2f}, using LTP for cheaper entry")
+                effective_price = ltp
+
+            # Round price to tick size
+            trigger_price = round_price(effective_price)
+            limit_price = round_price(effective_price)
 
             # === COMPREHENSIVE PRE-ORDER VALIDATION (from CROCODILE) ===
             is_valid, validation_msg, corrected_price = self._validate_order_params(
@@ -465,7 +472,7 @@ class OrderManager:
 
             # FIX ARCH-C1: Create order record BEFORE API call (idempotency)
             # This ensures no duplicate orders if crash occurs after API success but before DB commit
-            capital_deployed = quantity * entry_price
+            capital_deployed = quantity * effective_price
             order = OpenOrder(
                 signal_id=signal_id,
                 gtt_id=None,  # Will be set after API success
@@ -586,7 +593,9 @@ class OrderManager:
 
             # Send confirmation (with adjustment note if applicable)
             adjustment_note = ""
-            if price_adjusted:
+            if effective_price < entry_price:
+                adjustment_note = f"\n(LTP {effective_price:,.2f} < signal {entry_price:,.2f} - cheaper entry)"
+            elif price_adjusted:
                 adjustment_note = f"\n(Auto-adjusted from {entry_price:,.2f} - LTP too close)"
 
             telegram.send_alert(
