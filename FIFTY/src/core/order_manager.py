@@ -883,6 +883,7 @@ class OrderManager:
             # If GTT is triggered and we can't look up the order, check if
             # position exists in Zerodha. If not → order never filled.
             if 'order history' in str(e).lower() or 'no order' in str(e).lower():
+                session2 = None
                 try:
                     # Re-open session after rollback
                     session2 = get_session()
@@ -893,11 +894,22 @@ class OrderManager:
                         if not has_position:
                             self._handle_triggered_unfilled(order2, session2, "order history unavailable (prior day)")
                         else:
-                            # Position exists in Zerodha but not in DB — use existing reconciliation
-                            logger.info(f"{order2.script} found in Zerodha — fill may exist, use /sync")
-                    session2.close()
+                            # Position exists in Zerodha but not in DB — needs /sync or /import
+                            dedup_key = f"GTT_TRIGGERED_HAS_POS_{order2.gtt_id}"
+                            if order2.last_error != dedup_key:
+                                order2.last_error = dedup_key
+                                session2.commit()
+                                telegram.send_alert(
+                                    f"<b>GTT Triggered — Position Found</b>\n\n"
+                                    f"{order2.script}: GTT triggered, position exists in Zerodha "
+                                    f"but not in DB.\nUse /sync or /import {order2.script} to reconcile."
+                                )
+                            logger.info(f"{order2.script} found in Zerodha — awaiting /sync or /import")
                 except Exception as e2:
                     logger.error(f"Error handling stale triggered GTT for {order.script}: {e2}")
+                finally:
+                    if session2:
+                        session2.close()
             else:
                 telegram.send_alert(
                     f"ERROR processing fill for {order.script}: {e}",
