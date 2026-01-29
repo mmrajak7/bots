@@ -673,7 +673,10 @@ class CommandHandler:
     def _cmd_sync(self) -> None:
         """
         Sync positions from Zerodha.
-        Shows Zerodha positions vs DB positions and allows import.
+        Checks BOTH holdings() and positions() APIs to get complete picture:
+        - holdings(): T+1 settled and T+2+ shares
+        - positions(): T+0 day trades (bought today)
+        Shows comparison and detects manually closed positions.
         """
         session = get_session()
         try:
@@ -683,54 +686,102 @@ class CommandHandler:
             ).all()
             db_scripts = {p.script for p in db_positions}
 
-            # Get Zerodha positions
+            # Get Zerodha holdings + positions
             try:
                 from src.api.dual_kite_client import get_kite_client
                 kite = get_kite_client()
+
+                # Holdings (T+1 onwards)
+                holdings = kite.get_holdings()
+                holdings_map = {}
+                for h in holdings:
+                    symbol = h.get('tradingsymbol', '')
+                    qty = h.get('quantity', 0)
+                    t1_qty = h.get('t1_quantity', 0)
+                    total_qty = qty + t1_qty
+                    if total_qty > 0:
+                        holdings_map[symbol] = {
+                            'quantity': total_qty,
+                            'avg_price': h.get('average_price', 0)
+                        }
+
+                # Day positions (T+0, bought today)
                 zerodha_positions = kite.get_positions()
-                net_positions = zerodha_positions.get('net', [])
+                day_pos_map = {}
+                for p in zerodha_positions.get('net', []):
+                    symbol = p.get('tradingsymbol', '')
+                    qty = p.get('quantity', 0)
+                    if qty > 0 and p.get('exchange') == 'NSE':
+                        day_pos_map[symbol] = {
+                            'quantity': qty,
+                            'avg_price': p.get('average_price', 0)
+                        }
+
             except Exception as e:
-                logger.error(f"Could not fetch Zerodha positions: {e}")
-                telegram.send_alert(f"Error fetching Zerodha positions: {str(e)}")
+                logger.error(f"Could not fetch Zerodha data: {e}")
+                telegram.send_alert(f"Error fetching Zerodha data: {str(e)}")
                 return
 
-            # Filter for actual holdings (quantity > 0)
-            zerodha_holdings = [
-                p for p in net_positions
-                if p.get('quantity', 0) > 0 and p.get('exchange') == 'NSE'
-            ]
+            # Merge holdings + day positions (holdings take precedence)
+            zerodha_all = {}
+            for symbol, data in day_pos_map.items():
+                zerodha_all[symbol] = data
+            for symbol, data in holdings_map.items():
+                zerodha_all[symbol] = data  # Overwrite day pos if in holdings too
 
-            lines = ["🔄 <b>Sync</b>"]
+            zerodha_scripts = set(zerodha_all.keys())
 
-            # Categorize positions
+            lines = ["<b>Sync</b>"]
+
+            # Categorize
             missing_from_db = []
-            for p in zerodha_holdings:
-                symbol = p.get('tradingsymbol', 'UNKNOWN')
+            missing_from_zerodha = []
+
+            for symbol, data in zerodha_all.items():
                 if symbol not in db_scripts:
+                    source = "holdings" if symbol in holdings_map else "day pos"
                     missing_from_db.append({
                         'script': symbol,
-                        'quantity': p.get('quantity', 0),
-                        'avg_price': p.get('average_price', 0)
+                        'quantity': data['quantity'],
+                        'avg_price': data['avg_price'],
+                        'source': source
                     })
 
+            for p in db_positions:
+                if p.script not in zerodha_scripts:
+                    missing_from_zerodha.append(p)
+
             # Summary
-            lines.append(f"\n📊 DB: {len(db_positions)} | Zerodha: {len(zerodha_holdings)}")
+            lines.append(f"\nDB: {len(db_positions)} | Zerodha: {len(zerodha_all)}")
+            lines.append(f"(Holdings: {len(holdings_map)} | Day Positions: {len(day_pos_map)})")
 
-            # Show what's tracked
+            # Show what's tracked and verified
             if db_positions:
-                lines.append("\n✅ <b>Tracked:</b>")
+                lines.append("\n<b>Tracked:</b>")
                 for p in db_positions:
-                    gtt_status = "🛡️" if p.gtt_verified else "⚠️"
-                    lines.append(f"  {gtt_status} {p.script} x{p.quantity}")
+                    in_zerodha = p.script in zerodha_scripts
+                    gtt_icon = "Y" if p.gtt_verified else "N"
+                    status_icon = "OK" if in_zerodha else "MISSING"
+                    lines.append(f"  [{status_icon}] {p.script} x{p.quantity} GTT:{gtt_icon}")
 
-            # Show what's missing
+            # Show positions in DB but NOT in Zerodha (manually closed)
+            if missing_from_zerodha:
+                lines.append("\n<b>In DB but NOT in Zerodha (manually closed?):</b>")
+                for p in missing_from_zerodha:
+                    lines.append(f"  {p.script} x{p.quantity} @ {p.entry_price:,.0f}")
+                lines.append("\n<i>These will be auto-closed at next reconciliation</i>")
+
+            # Show positions in Zerodha but NOT in DB
             if missing_from_db:
-                lines.append("\n❌ <b>Not Tracked:</b>")
+                lines.append("\n<b>Not Tracked (in Zerodha):</b>")
                 for m in missing_from_db:
-                    lines.append(f"  • {m['script']} x{m['quantity']} @ {m['avg_price']:,.0f}")
-                lines.append("\n💡 <i>/import SCRIPT to add</i>")
-            else:
-                lines.append("\n✅ All synced")
+                    lines.append(
+                        f"  {m['script']} x{m['quantity']} @ {m['avg_price']:,.0f} ({m['source']})"
+                    )
+                lines.append("\n<i>/import SCRIPT to add</i>")
+
+            if not missing_from_db and not missing_from_zerodha:
+                lines.append("\nAll synced")
 
             telegram.send_alert('\n'.join(lines))
 

@@ -966,8 +966,18 @@ class ExitManager:
             )
             session.add(closed)
 
+            # Cancel SL GTT if still active (prevents orphan GTTs)
+            if position.gtt_id:
+                try:
+                    self.kite.cancel_gtt_order(position.gtt_id)
+                    logger.info(f"Cancelled SL GTT {position.gtt_id} for closed position {script}")
+                except Exception as gtt_err:
+                    # GTT may already be triggered/cancelled/expired - not critical
+                    logger.debug(f"Could not cancel GTT {position.gtt_id} for {script}: {gtt_err}")
+
             # Update position status
-            position.status = PositionStatus.CLOSED_SL if exit_reason == 'SL_HIT' else PositionStatus.CLOSED_MANUAL
+            sl_reasons = ('SL_HIT', 'GTT_SL_TRIGGERED')
+            position.status = PositionStatus.CLOSED_SL if exit_reason in sl_reasons else PositionStatus.CLOSED_MANUAL
             position.exit_date = exit_date
             position.exit_price = exit_price
             position.exit_reason = exit_reason

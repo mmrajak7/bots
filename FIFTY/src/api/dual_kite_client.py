@@ -621,6 +621,18 @@ class DualKiteClient(BrokerAdapter):
         kite = self._get_trade_client()
         return kite.positions()
 
+    def get_holdings(self) -> List[Dict[str, Any]]:
+        """
+        Get holdings using trade client.
+
+        Returns list of holdings including t1_quantity (pending settlement).
+        On entry day (T+0), stock appears in positions() but NOT in holdings().
+        From T+1 onwards, it appears in holdings() with t1_quantity or quantity.
+        """
+        self._rate_limit()
+        kite = self._get_trade_client()
+        return kite.holdings() or []
+
     def get_margins(self) -> Dict[str, Any]:
         """Get margins using trade client"""
         self._rate_limit()

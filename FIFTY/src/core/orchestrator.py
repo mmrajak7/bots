@@ -506,38 +506,118 @@ class Orchestrator:
             telegram.send_alert(f"GTT verification error: {e}", critical=True)
 
     def _reconcile_positions(self) -> None:
-        """Reconcile DB positions with Zerodha"""
+        """
+        Reconcile DB positions with actual Zerodha holdings.
+
+        Checks BOTH holdings() and positions() APIs:
+        - holdings(): Shows T+1 settled and T+2+ shares (quantity + t1_quantity)
+        - positions(): Shows T+0 day trades (bought today, not yet in holdings)
+
+        If a DB position is not found in either API, it was manually closed
+        or SL triggered while bot was offline. Auto-closes it in DB.
+        """
         try:
             from src.api.dual_kite_client import get_kite_client
             kite = get_kite_client()
 
-            # Get Zerodha positions
-            zerodha_positions = kite.get_positions()
-            net_positions = zerodha_positions.get('net', [])
+            # 1. Get holdings (T+1 and settled shares)
+            holdings = kite.get_holdings()
+            holdings_map = {}
+            for h in holdings:
+                symbol = h.get('tradingsymbol', '')
+                qty = h.get('quantity', 0)
+                t1_qty = h.get('t1_quantity', 0)
+                total_qty = qty + t1_qty
+                if total_qty > 0:
+                    holdings_map[symbol] = total_qty
 
-            # Get DB positions
+            # 2. Get day positions (bought today, pending settlement tomorrow)
+            zerodha_positions = kite.get_positions()
+            day_pos_map = {}
+            for p in zerodha_positions.get('net', []):
+                symbol = p.get('tradingsymbol', '')
+                qty = p.get('quantity', 0)
+                if qty > 0:
+                    day_pos_map[symbol] = qty
+
+            # 3. Get today's sell orders (for exit price of stopped out positions)
+            try:
+                all_orders = kite.get_all_orders()
+                today_sells = {}
+                for o in all_orders:
+                    if (o.get('transaction_type') == 'SELL' and
+                            o.get('status') == 'COMPLETE'):
+                        symbol = o.get('tradingsymbol', '')
+                        today_sells[symbol] = o.get('average_price', 0)
+            except Exception as e:
+                logger.warning(f"Could not fetch today's orders for exit prices: {e}")
+                today_sells = {}
+
+            # 4. Reconcile each DB position
             session = get_session()
             try:
                 db_positions = session.query(OpenPosition).filter(
                     OpenPosition.status == PositionStatus.OPEN
                 ).all()
 
-                # Simple reconciliation - check counts
-                zerodha_count = len([p for p in net_positions if p.get('quantity', 0) > 0])
-                db_count = len(db_positions)
+                if not db_positions:
+                    logger.info("No open positions in DB to reconcile")
+                    return
 
-                if zerodha_count != db_count:
-                    logger.warning(f"Position mismatch: Zerodha={zerodha_count}, DB={db_count}")
+                closed_count = 0
+                kept_count = 0
+
+                for position in db_positions:
+                    total_hld = holdings_map.get(position.script, 0)
+                    day_qty = day_pos_map.get(position.script, 0)
+
+                    # Position is active if in holdings OR bought today (day positions)
+                    if total_hld > 0 or day_qty > 0:
+                        kept_count += 1
+                        continue
+
+                    # Position NOT in Zerodha - was manually closed or SL triggered offline
+                    sold_today = position.script in today_sells
+
+                    if sold_today:
+                        exit_price = today_sells[position.script]
+                        exit_reason = 'GTT_SL_TRIGGERED'
+                    else:
+                        # Sold on prior day - use entry price as fallback
+                        exit_price = position.entry_price
+                        exit_reason = 'STALE_POSITION_SYNC'
+
+                    logger.warning(
+                        f"RECONCILE: {position.script} not found in Zerodha "
+                        f"(holdings={total_hld}, day_pos={day_qty}). "
+                        f"Closing with reason={exit_reason}, exit_price={exit_price:.2f}"
+                    )
+
+                    # Close the position in DB
+                    self._lazy_load_processors()
+                    self.exit_manager._close_position(
+                        position, exit_price, exit_reason, session=session
+                    )
+                    closed_count += 1
+
+                session.commit()
+
+                if closed_count > 0:
                     telegram.send_alert(
-                        f"Position mismatch: Zerodha={zerodha_count}, DB={db_count}",
+                        f"<b>Position Reconciliation</b>\n\n"
+                        f"Closed {closed_count} position(s) not found in Zerodha\n"
+                        f"Active: {kept_count}",
                         critical=True
                     )
+                else:
+                    logger.info(f"Reconciliation: All {kept_count} positions verified in Zerodha")
 
             finally:
                 session.close()
 
         except Exception as e:
             logger.error(f"Reconciliation error: {e}")
+            telegram.send_alert(f"Reconciliation error: {str(e)}", critical=True)
 
     def _cleanup_stale_placing_orders(self) -> None:
         """
