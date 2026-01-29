@@ -849,29 +849,55 @@ class ExitManager:
             gtt_map = {str(g.get('id')): g for g in gtts}
 
             for position in positions:
-                gtt_id = position.gtt_id
-                gtt = gtt_map.get(gtt_id)
+                try:
+                    gtt_id = position.gtt_id
+                    gtt = gtt_map.get(gtt_id)
 
-                if gtt is None:
-                    # GTT not found - might have been triggered
-                    closed_pos = self._check_if_sl_triggered(position)
-                    if closed_pos:
-                        closed.append(closed_pos)
-                    continue
+                    if gtt is None:
+                        # GTT not found - might have been triggered
+                        closed_pos = self._check_if_sl_triggered(position)
+                        if closed_pos:
+                            closed.append(closed_pos)
+                        continue
 
-                gtt_status = gtt.get('status', '')
+                    gtt_status = gtt.get('status', '')
 
-                if gtt_status == 'triggered':
-                    orders = gtt.get('orders', [])
-                    if orders:
-                        gtt_order = orders[0]
-                        order_result = gtt_order.get('result', {})
-                        order_id = order_result.get('order_id')
-
-                        if order_id:
-                            closed_pos = self._process_sl_trigger(position, order_id)
+                    if gtt_status == 'triggered':
+                        gtt_orders_list = gtt.get('orders', [])
+                        if not gtt_orders_list:
+                            logger.warning(
+                                f"SL GTT {gtt_id} for {position.script} triggered but empty orders list. "
+                                f"Falling back to today's orders check."
+                            )
+                            closed_pos = self._check_if_sl_triggered(position)
                             if closed_pos:
                                 closed.append(closed_pos)
+                            else:
+                                self._alert_sl_unfilled(position, "triggered but no order details")
+                            continue
+
+                        gtt_order = gtt_orders_list[0]
+                        order_result = gtt_order.get('result') or {}
+                        order_id = order_result.get('order_id')
+
+                        if not order_id:
+                            logger.warning(
+                                f"SL GTT {gtt_id} for {position.script} triggered but order_id missing "
+                                f"(result={order_result}). Falling back to today's orders check."
+                            )
+                            closed_pos = self._check_if_sl_triggered(position)
+                            if closed_pos:
+                                closed.append(closed_pos)
+                            else:
+                                self._alert_sl_unfilled(position, "triggered but order_id missing")
+                            continue
+
+                        closed_pos = self._process_sl_trigger(position, order_id)
+                        if closed_pos:
+                            closed.append(closed_pos)
+
+                except Exception as e:
+                    logger.error(f"Error checking SL for {position.script} (GTT {position.gtt_id}): {e}")
 
         finally:
             session.close()
@@ -906,16 +932,63 @@ class ExitManager:
         try:
             order_status = self.kite.get_order_status(order_id)
 
-            if order_status.get('status') != 'COMPLETE':
+            status = order_status.get('status', '')
+            filled_qty = int(order_status.get('filled_quantity', 0))
+
+            if status == 'COMPLETE' and filled_qty > 0:
+                exit_price = float(order_status.get('average_price', position.current_sl))
+                return self._close_position(position, exit_price, 'SL_HIT')
+
+            if status in ('OPEN', 'PENDING', 'TRIGGER PENDING'):
+                # SL order still live — wait
                 return None
 
-            exit_price = float(order_status.get('average_price', position.current_sl))
-
-            return self._close_position(position, exit_price, 'SL_HIT')
+            # SL order is terminal (CANCELLED/REJECTED) but didn't fill
+            # Position is now UNPROTECTED
+            self._alert_sl_unfilled(position, f"SL sell order {status} (filled: {filled_qty})")
+            return None
 
         except Exception as e:
-            logger.error(f"Error processing SL trigger: {e}")
+            logger.error(f"Error processing SL trigger for {position.script}: {e}")
+            # Day 2+: order_history unavailable for prior-day orders
+            if 'order history' in str(e).lower() or 'no order' in str(e).lower():
+                self._alert_sl_unfilled(position, "SL order history unavailable (prior day)")
             return None
+
+    def _alert_sl_unfilled(self, position: OpenPosition, reason: str) -> None:
+        """
+        Alert that SL GTT triggered but sell order didn't fill.
+        Position is UNPROTECTED. Clear GTT so recovery can re-place.
+
+        Dedup: Only fires once — after clearing gtt_id/gtt_verified, subsequent
+        check_sl_hits() cycles won't find this position (filtered by gtt_id.isnot(None)).
+        Recovery check will detect unprotected position and re-place SL GTT.
+        """
+        session = get_session()
+        try:
+            pos = session.query(OpenPosition).filter(
+                OpenPosition.id == position.id
+            ).first()
+            if pos and pos.gtt_id is not None:
+                old_gtt_id = pos.gtt_id
+                pos.gtt_verified = False  # Mark unprotected so recovery re-places SL
+                pos.gtt_id = None         # Clear dead GTT reference
+                session.commit()
+                telegram.send_alert(
+                    f"<b>CRITICAL: SL NOT FILLED</b>\n\n"
+                    f"{pos.script}: SL GTT triggered but sell order failed!\n"
+                    f"Reason: {reason}\n"
+                    f"GTT {old_gtt_id} is dead.\n"
+                    f"Position is UNPROTECTED.\n"
+                    f"Recovery will attempt to re-place SL GTT.\n"
+                    f"Use /fix {pos.script} for immediate fix.",
+                    critical=True
+                )
+                logger.critical(f"SL unfilled for {pos.script}: {reason}. Position UNPROTECTED.")
+        except Exception as e:
+            logger.error(f"Error alerting SL unfilled for {position.script}: {e}")
+        finally:
+            session.close()
 
     def _close_position(
         self,

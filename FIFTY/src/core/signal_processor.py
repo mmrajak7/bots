@@ -747,22 +747,22 @@ class SignalProcessor:
             session.close()
 
     def resend_hold_signals(self) -> int:
-        """Re-send notifications for signals on HOLD"""
+        """Re-send notifications for signals on HOLD or stale NOTIFIED (no response)"""
         session = get_session()
         try:
-            hold_signals = session.query(SignalQueue).filter(
-                SignalQueue.status == SignalStatus.HOLD
+            stale_signals = session.query(SignalQueue).filter(
+                SignalQueue.status.in_([SignalStatus.HOLD, SignalStatus.NOTIFIED])
             ).all()
 
             count = 0
-            for signal in hold_signals:
+            for signal in stale_signals:
                 # Reset status to pending for re-notification
                 signal.status = SignalStatus.PENDING
                 signal.telegram_msg_id = None
                 count += 1
 
             session.commit()
-            logger.info(f"Reset {count} HOLD signals for re-notification")
+            logger.info(f"Reset {count} HOLD/NOTIFIED signals for re-notification")
             return count
 
         finally:

@@ -708,16 +708,25 @@ class OrderManager:
 
                     elif gtt_status == 'cancelled':
                         order.status = OrderStatus.CANCELLED
+                        # Reset signal so user can re-approve
+                        self._reset_signal_for_reapproval(order.signal_id, session)
                         session.commit()
-                        telegram.send_alert(f"Entry GTT cancelled: {order.script}")
+                        telegram.send_alert(
+                            f"Entry GTT cancelled: {order.script}\n"
+                            f"Signal reset — will re-notify for approval."
+                        )
 
                     elif gtt_status == 'rejected':
+                        rejection_reason = gtt.get('meta', {}).get('rejection_reason', 'Unknown')
                         order.status = OrderStatus.REJECTED
-                        order.last_error = gtt.get('meta', {}).get('rejection_reason', 'Unknown')
+                        order.last_error = rejection_reason
+                        # Reset signal so user can re-approve
+                        self._reset_signal_for_reapproval(order.signal_id, session)
                         session.commit()
                         telegram.send_alert(
                             f"Entry GTT rejected: {order.script}\n"
-                            f"Reason: {order.last_error}",
+                            f"Reason: {rejection_reason}\n"
+                            f"Signal reset — will re-notify for approval.",
                             critical=True
                         )
 
@@ -918,6 +927,16 @@ class OrderManager:
             return None
         finally:
             session.close()
+
+    def _reset_signal_for_reapproval(self, signal_id: int, session) -> None:
+        """Reset signal from ENTERED back to PENDING so user gets re-notified"""
+        signal = session.query(SignalQueue).filter(
+            SignalQueue.id == signal_id
+        ).first()
+        if signal and signal.status == SignalStatus.ENTERED:
+            signal.status = SignalStatus.PENDING
+            signal.telegram_msg_id = None
+            logger.info(f"Signal {signal.id} ({signal.script}) reset to PENDING for re-approval")
 
     def _handle_triggered_unfilled(self, order: OpenOrder, session, reason: str) -> None:
         """
