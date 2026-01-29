@@ -624,38 +624,6 @@ class OrderManager:
             if not pending:
                 return []
 
-            # Pre-check: cancel redundant orders where position already exists
-            position_scripts = {p.script for p in session.query(OpenPosition).filter(
-                OpenPosition.status == PositionStatus.OPEN
-            ).all()}
-
-            active_pending = []
-            for order in pending:
-                if order.script in position_scripts:
-                    # Position already exists - this entry order is redundant
-                    logger.info(f"Redundant entry order: {order.script} already has open position")
-                    order.status = OrderStatus.FILLED
-                    order.position_created = True
-                    order.filled_at = ist_now_naive()
-                    # Cancel the entry GTT on Zerodha if still active
-                    if order.gtt_id:
-                        try:
-                            self.kite.cancel_gtt_order(order.gtt_id)
-                            logger.info(f"Cancelled redundant entry GTT {order.gtt_id} for {order.script}")
-                        except Exception as e:
-                            logger.debug(f"Could not cancel GTT {order.gtt_id}: {e}")
-                    session.commit()
-                    telegram.send_alert(
-                        f"<b>Entry Order Closed</b>\n\n"
-                        f"{order.script}: Position already exists\n"
-                        f"Entry GTT {order.gtt_id} cancelled"
-                    )
-                else:
-                    active_pending.append(order)
-
-            if not active_pending:
-                return []
-
             # Get all GTTs from Zerodha
             try:
                 gtts = self.kite.get_gtt_orders()
@@ -665,7 +633,7 @@ class OrderManager:
 
             gtt_map = {str(g.get('id')): g for g in gtts}
 
-            for order in active_pending:
+            for order in pending:
                 gtt_id = order.gtt_id
                 gtt = gtt_map.get(gtt_id)
 
@@ -738,16 +706,13 @@ class OrderManager:
         """
         Check if GTT was triggered by looking at multiple sources.
 
-        Called when GTT is not found in get_gtts() response. Possible reasons:
-        - GTT triggered and Kite dropped it from the list
-        - GTT was cancelled/expired by Zerodha
-        - Kite API issue
-
-        Note: Redundant orders (position already exists) are handled upstream
-        in check_order_fills() before this method is called.
+        Kite API drops triggered GTTs after some time, so we need fallbacks:
+        1. Check today's orders for a matching BUY fill
+        2. Check if an OpenPosition already exists for this script (filled on a prior day)
+        3. Check holdings for the stock (filled but position creation failed)
         """
         try:
-            # Method 1: Check today's orders for matching BUY fill
+            # Method 1: Check today's orders for matching fill
             try:
                 all_orders = self.kite.get_all_orders()
                 for zerodha_order in all_orders:
@@ -758,7 +723,40 @@ class OrderManager:
             except Exception as e:
                 logger.warning(f"Could not check today's orders for {order.script}: {e}")
 
-            # Method 2: Check holdings (GTT filled on prior day, position creation failed)
+            # Method 2: Check if OpenPosition already exists (GTT filled on a prior day)
+            session = get_session()
+            try:
+                existing_position = session.query(OpenPosition).filter(
+                    OpenPosition.script == order.script,
+                    OpenPosition.status == PositionStatus.OPEN
+                ).first()
+
+                if existing_position:
+                    # Position exists - mark this stale order as FILLED
+                    stale_order = session.query(OpenOrder).filter(
+                        OpenOrder.id == order.id
+                    ).first()
+                    if stale_order:
+                        stale_order.status = OrderStatus.FILLED
+                        stale_order.position_created = True
+                        stale_order.fill_price = existing_position.entry_price
+                        stale_order.filled_at = ist_now_naive()
+                        session.commit()
+                        logger.info(
+                            f"Stale order reconciled: {order.script} GTT {order.gtt_id} "
+                            f"- position already exists (id={existing_position.id})"
+                        )
+                        return {
+                            'script': order.script,
+                            'fill_price': existing_position.entry_price,
+                            'quantity': existing_position.quantity,
+                            'position_id': existing_position.id,
+                            'reconciled': True
+                        }
+            finally:
+                session.close()
+
+            # Method 3: Check holdings (filled but position creation may have failed)
             try:
                 holdings = self.kite.get_holdings()
                 for h in holdings:

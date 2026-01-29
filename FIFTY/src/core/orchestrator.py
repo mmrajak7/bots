@@ -705,8 +705,8 @@ class Orchestrator:
                 else:
                     logger.info(f"Reconciliation: All {kept_count} positions verified in Zerodha")
 
-                # Reconcile redundant OpenOrders: if a PENDING order's script already has
-                # an OPEN position, the entry order is redundant — cancel GTT and close order
+                # Reconcile stale OpenOrders: if a PENDING order's script already has
+                # an OPEN position, the GTT filled but the order wasn't updated
                 position_scripts = {p.script for p in db_positions if p.status == PositionStatus.OPEN}
 
                 stale_orders = session.query(OpenOrder).filter(
@@ -719,22 +719,15 @@ class Orchestrator:
                         order.status = OrderStatus.FILLED
                         order.position_created = True
                         order.filled_at = ist_now_naive()
-                        # Cancel entry GTT on Zerodha (redundant now)
-                        if order.gtt_id:
-                            try:
-                                kite.cancel_gtt_order(order.gtt_id)
-                                logger.info(f"Cancelled redundant entry GTT {order.gtt_id} for {order.script}")
-                            except Exception as gtt_err:
-                                logger.debug(f"Could not cancel GTT {order.gtt_id}: {gtt_err}")
                         stale_fixed += 1
-                        logger.info(f"Redundant order closed: {order.script} (GTT {order.gtt_id}) - position exists")
+                        logger.info(f"Stale order reconciled: {order.script} (GTT {order.gtt_id}) - position exists")
 
                 if stale_fixed > 0:
                     session.commit()
                     telegram.send_alert(
                         f"<b>Order Reconciliation</b>\n\n"
-                        f"Closed {stale_fixed} redundant entry order(s)\n"
-                        f"(position already exists, entry GTT cancelled)"
+                        f"Fixed {stale_fixed} stale PENDING order(s) "
+                        f"(position already exists)"
                     )
 
             finally:
