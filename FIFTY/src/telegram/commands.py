@@ -10,6 +10,7 @@ Commands:
 - /sync - Compare Zerodha vs DB positions
 - /import SCRIPT - Import position from Zerodha
 - /fix SCRIPT - Fix unprotected position (place SL GTT)
+- /release SCRIPT - Release signal from HOLD (or /release ALL)
 - /kill - Activate kill switch
 - /resume - Deactivate kill switch
 """
@@ -55,6 +56,12 @@ class CommandHandler:
                     self._cmd_import(script)
                 else:
                     telegram.send_alert("Usage: /import SCRIPT")
+            elif command == 'release':
+                script = kwargs.get('script')
+                if script:
+                    self._cmd_release(script)
+                else:
+                    telegram.send_alert("Usage: /release SCRIPT or /release ALL")
             elif command == 'fix':
                 script = kwargs.get('script')
                 if script:
@@ -644,6 +651,52 @@ class CommandHandler:
         except Exception as e:
             logger.error(f"Import error for {script}: {e}")
             telegram.send_alert(f"Import failed: {str(e)}")
+            session.rollback()
+        finally:
+            session.close()
+
+    def _cmd_release(self, script: str) -> None:
+        """Release signal(s) from HOLD back to PENDING for re-notification"""
+        session = get_session()
+        try:
+            script = script.upper().strip()
+
+            if script == 'ALL':
+                hold_signals = session.query(SignalQueue).filter(
+                    SignalQueue.status == SignalStatus.HOLD
+                ).all()
+            else:
+                hold_signals = session.query(SignalQueue).filter(
+                    SignalQueue.script == script,
+                    SignalQueue.status == SignalStatus.HOLD
+                ).all()
+
+            if not hold_signals:
+                if script == 'ALL':
+                    telegram.send_alert("No signals on HOLD")
+                else:
+                    telegram.send_alert(f"No HOLD signal for {script}")
+                return
+
+            released = []
+            for signal in hold_signals:
+                signal.status = SignalStatus.PENDING
+                signal.telegram_msg_id = None
+                released.append(signal.script)
+
+            session.commit()
+
+            if len(released) == 1:
+                telegram.send_alert(f"{released[0]} released from HOLD\nWill re-notify next cycle.")
+            else:
+                scripts_str = ', '.join(released)
+                telegram.send_alert(f"Released {len(released)} signals: {scripts_str}\nWill re-notify next cycle.")
+
+            logger.info(f"Released {len(released)} HOLD signals via /release: {released}")
+
+        except Exception as e:
+            logger.error(f"Release error: {e}")
+            telegram.send_alert(f"Release failed: {str(e)}")
             session.rollback()
         finally:
             session.close()

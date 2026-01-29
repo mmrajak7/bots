@@ -643,64 +643,87 @@ class OrderManager:
             gtt_map = {str(g.get('id')): g for g in gtts}
 
             for order in pending:
-                gtt_id = order.gtt_id
-                gtt = gtt_map.get(gtt_id)
+                try:
+                    gtt_id = order.gtt_id
+                    gtt = gtt_map.get(gtt_id)
 
-                if gtt is None:
-                    # FIX TR-H1: GTT not found - could be triggered, cancelled, or expired
-                    # Don't assume triggered - verify with order check first
-                    logger.warning(f"GTT {gtt_id} for {order.script} not found in GTT list - investigating")
-                    fill_result = self._check_if_gtt_triggered(order, session)
-                    if fill_result:
-                        filled_orders.append(fill_result)
-                    else:
-                        # GTT missing but no fill found
-                        # Only alert once per order (use last_error as dedup marker)
-                        dedup_marker = f"GTT_MISSING_{gtt_id}"
-                        if order.last_error != dedup_marker:
+                    if gtt is None:
+                        # FIX TR-H1: GTT not found - could be triggered, cancelled, or expired
+                        # Don't assume triggered - verify with order check first
+                        logger.warning(f"GTT {gtt_id} for {order.script} not found in GTT list - investigating")
+                        fill_result = self._check_if_gtt_triggered(order, session)
+                        if fill_result:
+                            filled_orders.append(fill_result)
+                        else:
+                            # GTT missing but no fill found
+                            # Only alert once per order (use last_error as dedup marker)
+                            dedup_marker = f"GTT_MISSING_{gtt_id}"
+                            if order.last_error != dedup_marker:
+                                logger.warning(
+                                    f"GTT {gtt_id} for {order.script} missing with no fill detected. "
+                                    f"May have been cancelled/expired. Needs manual verification."
+                                )
+                                order.last_error = dedup_marker
+                                session.commit()
+                                telegram.send_alert(
+                                    f"<b>GTT Status Unknown</b>\n\n"
+                                    f"{order.script}: GTT {gtt_id} not found\n"
+                                    f"No fill detected. Please verify in Zerodha.\n"
+                                    f"Use /sync to check status."
+                                )
+                        continue
+
+                    gtt_status = gtt.get('status', '')
+
+                    if gtt_status == 'triggered':
+                        # GTT triggered - check order status
+                        gtt_orders_list = gtt.get('orders', [])
+                        if not gtt_orders_list:
                             logger.warning(
-                                f"GTT {gtt_id} for {order.script} missing with no fill detected. "
-                                f"May have been cancelled/expired. Needs manual verification."
+                                f"GTT {gtt_id} for {order.script} is triggered but has empty orders list. "
+                                f"Falling back to today's orders check."
                             )
-                            order.last_error = dedup_marker
-                            session.commit()
-                            telegram.send_alert(
-                                f"<b>GTT Status Unknown</b>\n\n"
-                                f"{order.script}: GTT {gtt_id} not found\n"
-                                f"No fill detected. Please verify in Zerodha.\n"
-                                f"Use /sync to check status."
-                            )
-                    continue
-
-                gtt_status = gtt.get('status', '')
-
-                if gtt_status == 'triggered':
-                    # GTT triggered - check order status
-                    orders = gtt.get('orders', [])
-                    if orders:
-                        gtt_order = orders[0]
-                        order_result = gtt_order.get('result', {})
-                        order_id = order_result.get('order_id')
-
-                        if order_id:
-                            fill_result = self._process_triggered_gtt(order, order_id)
+                            fill_result = self._check_if_gtt_triggered(order, session)
                             if fill_result:
                                 filled_orders.append(fill_result)
+                            continue
 
-                elif gtt_status == 'cancelled':
-                    order.status = OrderStatus.CANCELLED
-                    session.commit()
-                    telegram.send_alert(f"Entry GTT cancelled: {order.script}")
+                        gtt_order = gtt_orders_list[0]
+                        order_result = gtt_order.get('result') or {}
+                        order_id = order_result.get('order_id')
 
-                elif gtt_status == 'rejected':
-                    order.status = OrderStatus.REJECTED
-                    order.last_error = gtt.get('meta', {}).get('rejection_reason', 'Unknown')
-                    session.commit()
-                    telegram.send_alert(
-                        f"Entry GTT rejected: {order.script}\n"
-                        f"Reason: {order.last_error}",
-                        critical=True
-                    )
+                        if not order_id:
+                            logger.warning(
+                                f"GTT {gtt_id} for {order.script} is triggered but order_id missing "
+                                f"(result={order_result}). Falling back to today's orders check."
+                            )
+                            fill_result = self._check_if_gtt_triggered(order, session)
+                            if fill_result:
+                                filled_orders.append(fill_result)
+                            continue
+
+                        fill_result = self._process_triggered_gtt(order, order_id)
+                        if fill_result:
+                            filled_orders.append(fill_result)
+
+                    elif gtt_status == 'cancelled':
+                        order.status = OrderStatus.CANCELLED
+                        session.commit()
+                        telegram.send_alert(f"Entry GTT cancelled: {order.script}")
+
+                    elif gtt_status == 'rejected':
+                        order.status = OrderStatus.REJECTED
+                        order.last_error = gtt.get('meta', {}).get('rejection_reason', 'Unknown')
+                        session.commit()
+                        telegram.send_alert(
+                            f"Entry GTT rejected: {order.script}\n"
+                            f"Reason: {order.last_error}",
+                            critical=True
+                        )
+
+                except Exception as e:
+                    logger.error(f"Error checking fill for {order.script} (GTT {order.gtt_id}): {e}")
+                    # Continue to next order instead of aborting entire fill check
 
         except Exception as e:
             logger.error(f"Error checking order fills: {e}")

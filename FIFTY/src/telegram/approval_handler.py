@@ -462,6 +462,14 @@ class ApprovalHandler:
             else:
                 telegram.send_alert("Usage: /import SCRIPT\nExample: /import BALRAMCHIN")
                 return None
+        elif cmd.startswith('/release'):
+            parts = command.strip().split()
+            if len(parts) >= 2:
+                script = parts[1].upper()
+                return {'type': 'command', 'command': 'release', 'script': script}
+            else:
+                telegram.send_alert("Usage: /release SCRIPT or /release ALL")
+                return None
         elif cmd.startswith('/fix'):
             # Extract script name from command (e.g., "/fix BALRAMCHIN")
             parts = command.strip().split()
@@ -491,6 +499,7 @@ class ApprovalHandler:
             "/sync - Zerodha vs DB diff\n"
             "/import SCRIPT - Add position\n"
             "/fix SCRIPT - Place missing SL\n"
+            "/release SCRIPT - Release HOLD signal\n"
             "/kill - Stop operations\n"
             "/resume - Resume operations"
         )
