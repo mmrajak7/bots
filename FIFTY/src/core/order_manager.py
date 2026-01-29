@@ -645,19 +645,22 @@ class OrderManager:
                     if fill_result:
                         filled_orders.append(fill_result)
                     else:
-                        # GTT missing but no fill found - mark as potentially orphaned
-                        logger.warning(
-                            f"GTT {gtt_id} for {order.script} missing with no fill detected. "
-                            f"May have been cancelled/expired. Needs manual verification."
-                        )
-                        # Don't auto-mark as cancelled - could be a timing issue
-                        # Alert user for manual verification
-                        telegram.send_alert(
-                            f"<b>GTT Status Unknown</b>\n\n"
-                            f"{order.script}: GTT {gtt_id} not found\n"
-                            f"No fill detected. Please verify in Zerodha.\n"
-                            f"Use /sync to check status."
-                        )
+                        # GTT missing but no fill found
+                        # Only alert once per order (use last_error as dedup marker)
+                        dedup_marker = f"GTT_MISSING_{gtt_id}"
+                        if order.last_error != dedup_marker:
+                            logger.warning(
+                                f"GTT {gtt_id} for {order.script} missing with no fill detected. "
+                                f"May have been cancelled/expired. Needs manual verification."
+                            )
+                            order.last_error = dedup_marker
+                            session.commit()
+                            telegram.send_alert(
+                                f"<b>GTT Status Unknown</b>\n\n"
+                                f"{order.script}: GTT {gtt_id} not found\n"
+                                f"No fill detected. Please verify in Zerodha.\n"
+                                f"Use /sync to check status."
+                            )
                     continue
 
                 gtt_status = gtt.get('status', '')
@@ -700,21 +703,57 @@ class OrderManager:
         return filled_orders
 
     def _check_if_gtt_triggered(self, order: OpenOrder) -> Optional[Dict[str, Any]]:
-        """Check if GTT was triggered by looking at regular orders"""
+        """
+        Check if entry GTT was triggered when it's no longer in get_gtts().
+
+        Checks two sources:
+        1. Today's orders — for same-day fills
+        2. OpenPosition table — for prior-day fills (entry GTT already gone from Kite)
+        """
         try:
-            # Get today's orders
-            all_orders = self.kite.get_all_orders()
-
-            # Look for matching order
-            for zerodha_order in all_orders:
-                if (zerodha_order.get('tradingsymbol') == order.script and
-                    zerodha_order.get('transaction_type') == 'BUY' and
-                    zerodha_order.get('tag') == self.order_tag):
-
-                    status = zerodha_order.get('status', '')
-
-                    if status == 'COMPLETE':
+            # Check 1: Today's orders for a matching BUY fill
+            try:
+                all_orders = self.kite.get_all_orders()
+                for zerodha_order in all_orders:
+                    if (zerodha_order.get('tradingsymbol') == order.script and
+                        zerodha_order.get('transaction_type') == 'BUY' and
+                        zerodha_order.get('status') == 'COMPLETE'):
                         return self._process_triggered_gtt(order, zerodha_order.get('order_id'))
+            except Exception as e:
+                logger.warning(f"Could not check today's orders for {order.script}: {e}")
+
+            # Check 2: Position already exists (filled on a prior day)
+            session = get_session()
+            try:
+                existing_position = session.query(OpenPosition).filter(
+                    OpenPosition.script == order.script,
+                    OpenPosition.status == PositionStatus.OPEN
+                ).first()
+
+                if existing_position:
+                    # Position exists — mark stale order as FILLED (DB only, no GTT changes)
+                    stale_order = session.query(OpenOrder).filter(
+                        OpenOrder.id == order.id
+                    ).first()
+                    if stale_order:
+                        stale_order.status = OrderStatus.FILLED
+                        stale_order.position_created = True
+                        stale_order.fill_price = existing_position.entry_price
+                        stale_order.filled_at = ist_now_naive()
+                        session.commit()
+                        logger.info(
+                            f"Stale order reconciled: {order.script} — "
+                            f"position already exists (id={existing_position.id})"
+                        )
+                        return {
+                            'script': order.script,
+                            'fill_price': existing_position.entry_price,
+                            'quantity': existing_position.quantity,
+                            'position_id': existing_position.id,
+                            'reconciled': True
+                        }
+            finally:
+                session.close()
 
             return None
 
