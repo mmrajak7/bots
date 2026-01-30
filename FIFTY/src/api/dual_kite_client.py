@@ -62,6 +62,10 @@ class DualKiteClient(BrokerAdapter):
         self._token_to_symbol_cache: Dict[str, str] = {}  # token -> tradingsymbol
         self._instruments_file = config.get('instruments.cache_file', 'data/instruments.csv')
 
+        # F&O symbols cache (scripts that have NFO contracts)
+        self._fno_symbols: Optional[set] = None
+        self._fno_cache_file = 'data/fno_symbols.csv'
+
         # Data cache
         self._data_cache: Dict[str, Any] = {}
 
@@ -761,6 +765,70 @@ class DualKiteClient(BrokerAdapter):
         except Exception as e:
             logger.error(f"Failed to fetch instruments: {e}")
             return False
+
+    # =========================================================================
+    # F&O SYMBOLS LOOKUP
+    # =========================================================================
+
+    def is_fno(self, script: str) -> bool:
+        """Check if a script has F&O (NFO) contracts on NSE"""
+        if self._fno_symbols is None:
+            self._load_fno_cache()
+        return script.upper().strip() in (self._fno_symbols or set())
+
+    def _load_fno_cache(self) -> None:
+        """Load F&O symbols from local cache, fetch from API if stale/missing"""
+        try:
+            if os.path.exists(self._fno_cache_file):
+                file_age_hours = (time.time() - os.path.getmtime(self._fno_cache_file)) / 3600
+                # Refresh monthly (720 hours) — F&O list changes rarely
+                if file_age_hours < 720:
+                    df = pd.read_csv(self._fno_cache_file)
+                    if not df.empty and 'tradingsymbol' in df.columns:
+                        self._fno_symbols = set(df['tradingsymbol'].str.upper().str.strip())
+                        logger.info(f"Loaded {len(self._fno_symbols)} F&O symbols from cache")
+                        return
+
+            self._fetch_fno_symbols()
+        except Exception as e:
+            logger.error(f"Error loading F&O cache: {e}")
+            self._fno_symbols = set()
+
+    def _fetch_fno_symbols(self) -> None:
+        """Fetch NFO instruments from Kite API and extract unique underlying symbols"""
+        try:
+            self._rate_limit()
+            kite = self._get_read_client()
+
+            nfo_instruments = kite.instruments("NFO")
+
+            # Extract unique underlying equity symbols (futures have segment=NFO-FUT)
+            # Use 'name' field which holds the underlying tradingsymbol
+            fno_names = set()
+            for i in nfo_instruments:
+                name = i.get('tradingsymbol', '')
+                # NFO tradingsymbols are like RELIANCE24JANFUT, RELIANCE24JAN2800CE
+                # The 'name' field holds the clean underlying name
+                underlying = i.get('name', '').upper().strip()
+                if underlying:
+                    fno_names.add(underlying)
+
+            if not fno_names:
+                logger.warning("No F&O symbols found from NFO instruments")
+                self._fno_symbols = set()
+                return
+
+            # Save to cache file
+            os.makedirs(os.path.dirname(self._fno_cache_file) or '.', exist_ok=True)
+            df = pd.DataFrame({'tradingsymbol': sorted(fno_names)})
+            df.to_csv(self._fno_cache_file, index=False)
+
+            self._fno_symbols = fno_names
+            logger.info(f"Fetched {len(fno_names)} F&O symbols from NFO segment")
+
+        except Exception as e:
+            logger.error(f"Failed to fetch F&O symbols: {e}")
+            self._fno_symbols = set()
 
     # =========================================================================
     # PROPERTIES

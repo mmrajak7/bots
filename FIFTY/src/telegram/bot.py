@@ -381,7 +381,8 @@ class TelegramBot:
         ltp: float,
         quantity: int,
         position_value: float,
-        available_capital: float
+        available_capital: float,
+        is_fno: bool = False
     ) -> Optional[int]:
         """
         Send signal notification with approval buttons
@@ -392,8 +393,10 @@ class TelegramBot:
         distance_pct = ((ltp - signal_level) / signal_level) * 100 if signal_level > 0 else 0
         distance_sign = "+" if distance_pct >= 0 else ""
 
+        fno_tag = " [NFO]" if is_fno else ""
+
         text = (
-            f"<b>{script}</b> @ {signal_level:,.2f}\n"
+            f"<b>{script}</b>{fno_tag} @ {signal_level:,.2f}\n"
             f"LTP: {ltp:,.2f} ({distance_sign}{distance_pct:.1f}%)\n"
             f"Qty: {quantity} / Value: {position_value:,.0f}\n\n"
             f"Capital: {available_capital:,.0f}"

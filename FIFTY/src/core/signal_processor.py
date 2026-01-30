@@ -719,6 +719,9 @@ class SignalProcessor:
             deployed = sum(p.capital_deployed for p in positions)
             available = initial_capital - deployed
 
+            # Check if script is in F&O segment
+            is_fno = self.kite.is_fno(script)
+
             # Send notification
             msg_id = telegram.send_signal_notification(
                 signal_id=signal.id,
@@ -727,7 +730,8 @@ class SignalProcessor:
                 ltp=ltp,
                 quantity=quantity,
                 position_value=position_value,
-                available_capital=available
+                available_capital=available,
+                is_fno=is_fno
             )
 
             if msg_id:
