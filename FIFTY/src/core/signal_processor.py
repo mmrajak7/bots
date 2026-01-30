@@ -747,22 +747,34 @@ class SignalProcessor:
             session.close()
 
     def resend_hold_signals(self) -> int:
-        """Re-send notifications for signals on HOLD or stale NOTIFIED (no response)"""
+        """Re-send notifications for signals on HOLD or stale NOTIFIED (no response).
+
+        Only resets signals notified BEFORE today to avoid resetting freshly-notified
+        signals in the same trading session (which causes duplicate Telegram alerts).
+        """
         session = get_session()
         try:
-            stale_signals = session.query(SignalQueue).filter(
-                SignalQueue.status.in_([SignalStatus.HOLD, SignalStatus.NOTIFIED])
+            today_start = datetime.combine(today_ist(), datetime.min.time())
+
+            # HOLD signals: always re-notify (user explicitly chose to defer)
+            hold_signals = session.query(SignalQueue).filter(
+                SignalQueue.status == SignalStatus.HOLD
+            ).all()
+
+            # NOTIFIED signals: only re-notify if notified BEFORE today (stale/no response)
+            stale_notified = session.query(SignalQueue).filter(
+                SignalQueue.status == SignalStatus.NOTIFIED,
+                SignalQueue.last_notified_at < today_start
             ).all()
 
             count = 0
-            for signal in stale_signals:
-                # Reset status to pending for re-notification
+            for signal in hold_signals + stale_notified:
                 signal.status = SignalStatus.PENDING
                 signal.telegram_msg_id = None
                 count += 1
 
             session.commit()
-            logger.info(f"Reset {count} HOLD/NOTIFIED signals for re-notification")
+            logger.info(f"Reset {count} HOLD/stale-NOTIFIED signals for re-notification")
             return count
 
         finally:
