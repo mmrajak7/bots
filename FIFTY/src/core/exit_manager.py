@@ -483,17 +483,15 @@ class ExitManager:
                 logger.warning(f"No monthly data for {script}")
                 return None
 
-            # FIX TR-C2: Get PREVIOUS completed month's LOW, not current incomplete candle
-            # On last trading day, the current month's candle is still forming
-            # We need at least 2 candles to use the completed one
-            if len(monthly_df) < 2:
-                logger.warning(f"Insufficient monthly data for {script} (need 2+ candles), skipping SL trail")
+            # This runs on the last trading day AFTER market close (15:50, verified above).
+            # The current month's candle is complete, so use iloc[-1].
+            if len(monthly_df) < 1:
+                logger.warning(f"No monthly data for {script}, skipping SL trail")
                 return None
 
-            # Use second-to-last row which is the completed month
-            monthly_low = float(monthly_df['Low'].iloc[-2])
-            candle_date = monthly_df['Date'].iloc[-2] if 'Date' in monthly_df.columns else 'unknown'
-            logger.debug(f"{script}: Using completed month LOW {monthly_low:.2f} from {candle_date}")
+            monthly_low = float(monthly_df['Low'].iloc[-1])
+            candle_date = monthly_df['Date'].iloc[-1] if 'Date' in monthly_df.columns else 'unknown'
+            logger.debug(f"{script}: Current month LOW {monthly_low:.2f} from {candle_date}")
             new_sl = round_price_down(monthly_low)
 
             # Only trail upward (SL can only tighten)
@@ -575,9 +573,11 @@ class ExitManager:
 
                 return {
                     'script': script,
+                    'entry_price': position.entry_price,
                     'old_sl': current_sl,
                     'new_sl': new_sl,
-                    'monthly_low': monthly_low
+                    'monthly_low': monthly_low,
+                    'quantity': position.quantity,
                 }
             else:
                 # FIX DB-002: GTT placement failed - rollback current_sl to previous value

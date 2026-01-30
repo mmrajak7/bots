@@ -101,8 +101,8 @@ class CommandHandler:
             # Build table header
             lines = [
                 "<b>Open Positions</b>",
-                "<code>Script       Qty   Entry     LTP      SL    P&L   Age</code>",
-                "<code>─────────────────────────────────────────────────────</code>"
+                "<code>Script       Qty  Entry    LTP     SL   P&L  Age</code>",
+                "<code>────────────────────────────────────────────────</code>"
             ]
 
             total_deployed = 0
@@ -138,19 +138,19 @@ class CommandHandler:
                 # Format P&L
                 if ltp is not None:
                     pnl_str = f"{unrealized_pnl:+5.0f}"
-                    ltp_str = f"{ltp:7.2f}"
+                    ltp_str = f"{ltp:6.0f}"
                 else:
                     pnl_str = "  N/A"
-                    ltp_str = "    N/A"
+                    ltp_str = "   N/A"
 
                 # Build row
                 lines.append(
-                    f"<code>{script_name} {pos.quantity:3d} {pos.entry_price:7.2f} {ltp_str} {pos.current_sl:7.2f} {pnl_str} {age_str}</code>"
+                    f"<code>{script_name} {pos.quantity:3d} {pos.entry_price:5.0f} {ltp_str} {pos.current_sl:6.0f} {pnl_str} {age_str}</code>"
                 )
                 total_deployed += pos.capital_deployed
 
             # Summary
-            lines.append("<code>─────────────────────────────────────────────────────</code>")
+            lines.append("<code>────────────────────────────────────────────────</code>")
             lines.append(f"<b>Deployed:</b> {total_deployed:,.0f}")
 
             pnl_sign = "+" if total_unrealized >= 0 else ""

@@ -459,7 +459,21 @@ class Orchestrator:
             set_bot_state('last_monthly_sl_update', today_str)
 
             if updates:
-                telegram.send_alert(f"Monthly SL Updated: {len(updates)} positions")
+                lines = [
+                    f"🔄 <b>Monthly SL Trail — {len(updates)} position{'s' if len(updates) > 1 else ''}</b>",
+                    "",
+                    "<code>Script       Entry  Old SL  New SL  Status</code>",
+                    "<code>─────────────────────────────────────────────</code>"
+                ]
+                for u in updates:
+                    script_name = u['script'][:12].ljust(12)
+                    is_be = u['new_sl'] >= u['entry_price']
+                    status = "✅ BE" if is_be else f"🛡️ {((u['entry_price'] - u['new_sl']) / u['entry_price'] * 100):.0f}%↓"
+                    lines.append(
+                        f"<code>{script_name} {u['entry_price']:5.0f}   {u['old_sl']:5.0f}   {u['new_sl']:5.0f}</code>  {status}"
+                    )
+                lines.append("<code>─────────────────────────────────────────────</code>")
+                telegram.send_alert('\n'.join(lines))
         except Exception as e:
             logger.error(f"Error updating monthly SL: {e}")
             telegram.send_alert(f"Monthly SL update FAILED: {str(e)}", critical=True)
