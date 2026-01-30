@@ -1081,10 +1081,15 @@ class OrderManager:
             logger.error(f"Error creating position from order: {e}")
             return None
 
-    def cancel_unfilled_entry_gtts(self) -> int:
-        """Cancel all unfilled entry GTTs (month-end cleanup)"""
+    def cancel_unfilled_entry_gtts(self) -> Tuple[int, List[str]]:
+        """Cancel all unfilled entry GTTs (month-end cleanup).
+
+        Returns:
+            Tuple of (cancelled_count, list of cancelled script names)
+        """
         session = get_session()
         cancelled = 0
+        cancelled_scripts: List[str] = []
 
         try:
             pending = session.query(OpenOrder).filter(
@@ -1098,6 +1103,7 @@ class OrderManager:
 
                     order.status = OrderStatus.EXPIRED
                     cancelled += 1
+                    cancelled_scripts.append(order.script)
 
                     # Update signal
                     signal = session.query(SignalQueue).filter(
@@ -1111,7 +1117,7 @@ class OrderManager:
                     order.last_error = str(e)
 
             session.commit()
-            logger.info(f"Cancelled {cancelled} unfilled entry GTTs")
+            logger.info(f"Cancelled {cancelled} unfilled entry GTTs: {cancelled_scripts}")
 
         except Exception as e:
             logger.error(f"Error cancelling unfilled GTTs: {e}")
@@ -1120,7 +1126,7 @@ class OrderManager:
         finally:
             session.close()
 
-        return cancelled
+        return cancelled, cancelled_scripts
 
     def _get_gtt_expiry(self) -> str:
         """Get GTT expiry date (1 year from now)"""

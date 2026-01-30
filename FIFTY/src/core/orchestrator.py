@@ -11,7 +11,7 @@ Runs via cron every 5 minutes. Handles:
 """
 
 from datetime import date
-from typing import Optional
+from typing import List, Optional, Tuple
 from loguru import logger
 
 from src.utils.config_manager import config
@@ -697,6 +697,7 @@ class Orchestrator:
 
                 closed_count = 0
                 kept_count = 0
+                closed_details: List[str] = []
 
                 for position in db_positions:
                     total_hld = holdings_map.get(position.script, 0)
@@ -718,6 +719,12 @@ class Orchestrator:
                         exit_price = position.entry_price
                         exit_reason = 'STALE_POSITION_SYNC'
 
+                    pnl = (exit_price - position.entry_price) * position.quantity
+                    closed_details.append(
+                        f"  • {position.script}: Entry {position.entry_price:,.2f} → "
+                        f"Exit {exit_price:,.2f} | P&L: {pnl:+,.0f} | {exit_reason}"
+                    )
+
                     logger.warning(
                         f"RECONCILE: {position.script} not found in Zerodha "
                         f"(holdings={total_hld}, day_pos={day_qty}). "
@@ -734,10 +741,12 @@ class Orchestrator:
                 session.commit()
 
                 if closed_count > 0:
+                    details_str = "\n".join(closed_details)
                     telegram.send_alert(
                         f"<b>Position Reconciliation</b>\n\n"
-                        f"Closed {closed_count} position(s) not found in Zerodha\n"
-                        f"Active: {kept_count}",
+                        f"Closed {closed_count} position(s) not found in Zerodha:\n"
+                        f"{details_str}\n\n"
+                        f"Active: {kept_count} position(s) verified",
                         critical=True
                     )
                 else:
@@ -814,8 +823,10 @@ class Orchestrator:
                         )
                         telegram.send_alert(
                             f"<b>Stale Order Cleaned Up</b>\n\n"
-                            f"{order.script}: Entry GTT placement failed\n"
-                            f"Please re-approve if needed"
+                            f"Script: {order.script}\n"
+                            f"Trigger: {order.trigger_price:,.2f}\n"
+                            f"Qty: {order.quantity}\n"
+                            f"Entry GTT placement failed — re-approve if needed"
                         )
 
                 except Exception as e:
@@ -914,8 +925,22 @@ class Orchestrator:
             return
 
         try:
-            # Use HTML report generator
-            command_handler.execute_command('weekly')
+            from src.telegram.report_generator import report_generator
+
+            filepath = report_generator.generate_weekly_report()
+            if filepath:
+                image_path = report_generator.html_to_image(filepath)
+
+                if image_path:
+                    telegram.send_photo(image_path, caption="<b>FIFTY Weekly Report</b>")
+                    report_generator.delete_report(image_path)
+                    report_generator.delete_report(filepath)
+                    logger.info("Weekly report image sent successfully")
+                else:
+                    # Fallback to HTML document
+                    telegram.send_html_report(filepath, report_type="Weekly")
+                    logger.info("Weekly HTML report sent successfully")
+
             set_bot_state('last_weekly_report', today_str)
 
         except Exception as e:
@@ -1029,9 +1054,6 @@ class Orchestrator:
                     telegram.send_html_report(filepath, report_type="Monthly")
                     logger.info("Monthly HTML report sent successfully")
 
-            # Also send text summary
-            self._send_monthly_text_report()
-
             set_bot_state('last_monthly_report', today_str)
 
         except Exception as e:
@@ -1136,16 +1158,36 @@ class Orchestrator:
 
         try:
             # Cancel unfilled entry GTTs
-            cancelled = self.order_manager.cancel_unfilled_entry_gtts()
+            cancelled, cancelled_scripts = self.order_manager.cancel_unfilled_entry_gtts()
 
             # Invalidate pending signals
-            invalidated = self._invalidate_pending_signals()
+            inv_count, inv_scripts, exp_count, exp_scripts = self._invalidate_pending_signals()
 
-            telegram.send_alert(
-                f"<b>Month-End Cleanup</b>\n\n"
-                f"Entry GTTs Cancelled: {cancelled}\n"
-                f"Signals Invalidated: {invalidated}"
-            )
+            # Build detailed cleanup message
+            lines = ["<b>Month-End Cleanup</b>", ""]
+
+            if cancelled > 0:
+                lines.append(f"<b>Entry GTTs Cancelled:</b> {cancelled}")
+                for s in cancelled_scripts:
+                    lines.append(f"  • {s}")
+                lines.append("")
+            else:
+                lines.append("Entry GTTs Cancelled: 0")
+
+            if inv_count > 0:
+                lines.append(f"<b>Signals Invalidated:</b> {inv_count} (close &lt; SuperTrend)")
+                for s in inv_scripts:
+                    lines.append(f"  • {s}")
+                lines.append("")
+
+            if exp_count > 0:
+                lines.append(f"<b>Signals Expired:</b> {exp_count} (month ended)")
+                for s in exp_scripts:
+                    lines.append(f"  • {s}")
+            elif inv_count == 0:
+                lines.append("Signals Invalidated: 0")
+
+            telegram.send_alert("\n".join(lines))
 
             set_bot_state('last_month_cleanup', today_str)
 
@@ -1153,7 +1195,7 @@ class Orchestrator:
             logger.error(f"Month-end cleanup failed: {e}")
             telegram.send_alert(f"Month-end cleanup FAILED: {str(e)}", critical=True)
 
-    def _invalidate_pending_signals(self) -> int:
+    def _invalidate_pending_signals(self) -> Tuple[int, List[str], int, List[str]]:
         """
         Invalidate pending/notified/hold signals at month end.
 
@@ -1173,11 +1215,13 @@ class Orchestrator:
             ).all()
 
             if not signals:
-                return 0
+                return 0, [], 0, []
 
             kite = get_kite_client()
             invalidated_count = 0
+            invalidated_scripts: List[str] = []
             expired_count = 0
+            expired_scripts: List[str] = []
 
             for signal in signals:
                 try:
@@ -1187,6 +1231,7 @@ class Orchestrator:
                         logger.warning(f"No token for {signal.script}, expiring signal")
                         signal.status = SignalStatus.EXPIRED
                         expired_count += 1
+                        expired_scripts.append(signal.script)
                         continue
 
                     monthly_df = kite.get_historical_data_sampled(
@@ -1199,6 +1244,7 @@ class Orchestrator:
                         logger.warning(f"No monthly data for {signal.script}, expiring signal")
                         signal.status = SignalStatus.EXPIRED
                         expired_count += 1
+                        expired_scripts.append(signal.script)
                         continue
 
                     # FIX TR-C4: Get COMPLETED month's close, not current incomplete candle
@@ -1219,6 +1265,7 @@ class Orchestrator:
                         # Price closed below SuperTrend level - INVALIDATE
                         signal.status = SignalStatus.INVALIDATED
                         invalidated_count += 1
+                        invalidated_scripts.append(signal.script)
                         logger.info(
                             f"{signal.script}: INVALIDATED - "
                             f"monthly close {monthly_close:.2f} < level {signal_level:.2f}"
@@ -1234,6 +1281,7 @@ class Orchestrator:
                         # Price still above level but month ended - just expire
                         signal.status = SignalStatus.EXPIRED
                         expired_count += 1
+                        expired_scripts.append(signal.script)
                         logger.info(
                             f"{signal.script}: Expired (still valid) - "
                             f"monthly close {monthly_close:.2f} >= level {signal_level:.2f}"
@@ -1243,11 +1291,12 @@ class Orchestrator:
                     logger.error(f"Error checking {signal.script}: {e}")
                     signal.status = SignalStatus.EXPIRED
                     expired_count += 1
+                    expired_scripts.append(signal.script)
 
             session.commit()
 
             logger.info(f"Month-end: {invalidated_count} invalidated, {expired_count} expired")
-            return invalidated_count
+            return invalidated_count, invalidated_scripts, expired_count, expired_scripts
 
         finally:
             session.close()

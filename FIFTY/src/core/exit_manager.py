@@ -203,8 +203,10 @@ class ExitManager:
 
             if not verified:
                 telegram.send_alert(
-                    f"WARNING: SL GTT for {script} placed but NOT VERIFIED\n"
+                    f"<b>WARNING: SL GTT Not Verified</b>\n\n"
+                    f"Script: {script}\n"
                     f"GTT ID: {gtt_id}\n"
+                    f"SL Price: {position.current_sl:,.2f}\n"
                     f"Error: {verify_error}\n"
                     f"Will retry verification next run.",
                     critical=True
@@ -217,9 +219,13 @@ class ExitManager:
             if own_session:
                 session.rollback()
             telegram.send_alert(
-                f"CRITICAL: Failed to place SL GTT for {position.script}\n"
-                f"Position UNPROTECTED!\n"
-                f"Error: {str(e)}",
+                f"<b>CRITICAL: Failed to place SL GTT</b>\n\n"
+                f"Script: {position.script}\n"
+                f"Entry: {position.entry_price:,.2f}\n"
+                f"Qty: {position.quantity}\n"
+                f"Intended SL: {position.current_sl:,.2f}\n"
+                f"Error: {str(e)}\n\n"
+                f"⚠️ Position is UNPROTECTED!",
                 critical=True
             )
             return None
@@ -382,16 +388,22 @@ class ExitManager:
 
             if new_gtt_id:
                 telegram.send_alert(
-                    f"GTT RECOVERED: {position.script}\n"
-                    f"New GTT ID: {new_gtt_id}\n"
-                    f"SL: {position.current_sl:,.2f}"
+                    f"<b>GTT Recovered</b>\n\n"
+                    f"Script: {position.script}\n"
+                    f"Entry: {position.entry_price:,.2f}\n"
+                    f"SL: {position.current_sl:,.2f}\n"
+                    f"GTT ID: {new_gtt_id}"
                 )
                 return True
             else:
                 telegram.send_alert(
-                    f"CRITICAL: GTT RECOVERY FAILED for {position.script}\n"
-                    f"Position remains UNPROTECTED!\n"
-                    f"Manual intervention required.",
+                    f"<b>CRITICAL: GTT RECOVERY FAILED</b>\n\n"
+                    f"Script: {position.script}\n"
+                    f"Entry: {position.entry_price:,.2f}\n"
+                    f"Current SL: {position.current_sl:,.2f}\n"
+                    f"Qty: {position.quantity}\n\n"
+                    f"⚠️ Position UNPROTECTED — no SL active!\n"
+                    f"Manually place SL GTT in Zerodha.",
                     critical=True
                 )
                 return False

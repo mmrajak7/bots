@@ -474,26 +474,8 @@ class CommandHandler:
             session.close()
 
     def _cmd_weekly(self) -> None:
-        """Generate and send HTML weekly report"""
-        try:
-            from src.telegram.report_generator import report_generator
-
-            # Generate HTML report
-            filepath = report_generator.generate_weekly_report()
-
-            if filepath:
-                # Send via Telegram (deletes after send)
-                success = telegram.send_html_report(filepath, report_type="Weekly")
-                if success:
-                    logger.info("Weekly HTML report sent successfully")
-                else:
-                    telegram.send_alert("Failed to send weekly HTML report")
-            else:
-                telegram.send_alert("Failed to generate weekly report")
-
-        except Exception as e:
-            logger.error(f"Error generating weekly report: {e}")
-            telegram.send_alert(f"Error generating weekly report: {str(e)}")
+        """Generate and send weekly report as PNG image"""
+        self._generate_report('weekly')
 
     def _cmd_kill(self) -> None:
         """Activate kill switch"""

@@ -347,6 +347,7 @@ class ReportGenerator:
 
             initial_capital = config.get('trading.initial_capital', 100000)
             deployed = self._calculate_deployed_capital(open_positions)
+            unrealized_pnl = self._get_unrealized_pnl(open_positions)
 
             html = f"""
             <!DOCTYPE html>
@@ -410,8 +411,13 @@ class ReportGenerator:
                         <span class="row-label">Deployed</span>
                         <span class="row-value">{deployed:,.0f}</span>
                     </div>
+                    <div class="row">
+                        <span class="row-label">Unrealized P&L</span>
+                        <span class="row-value {'positive' if unrealized_pnl >= 0 else 'negative'}">{unrealized_pnl:+,.0f}</span>
+                    </div>
                 </div>
 
+                {self._positions_table(open_positions)}
                 {self._closed_trades_table(week_trades, "Week's Trades")}
 
                 <div class="footer">Generated {now_ist().strftime('%H:%M IST')} | FIFTY Bot</div>
@@ -736,21 +742,48 @@ class ReportGenerator:
         return unrealized
 
     def _positions_table(self, positions: List) -> str:
-        """Compact positions table"""
+        """Compact positions table with dynamic days_held and unrealized P&L"""
         if not positions:
             return '<div class="section"><div class="empty">No open positions</div></div>'
 
-        rows = ''.join([
-            f'<tr><td><b>{p.script}</b></td><td>{p.entry_price:,.0f}</td><td>{p.quantity}</td>'
-            f'<td>{p.current_sl:,.0f}</td><td>{p.capital_deployed:,.0f}</td><td>{p.days_held}d</td></tr>'
-            for p in positions
-        ])
+        # Fetch LTPs for unrealized P&L
+        ltp_map: dict = {}
+        try:
+            from src.api.dual_kite_client import get_kite_client
+            kite = get_kite_client()
+            for p in positions:
+                try:
+                    token = kite.get_instrument_token(p.script)
+                    if token:
+                        ltp = kite.get_instrument_ltp(token)
+                        if ltp:
+                            ltp_map[p.script] = ltp
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        today = today_ist()
+        rows = ''
+        for p in positions:
+            days = (today - p.entry_date).days if p.entry_date else 0
+            ltp = ltp_map.get(p.script)
+            if ltp:
+                unrealized = (ltp - p.entry_price) * p.quantity
+                pnl_class = 'positive' if unrealized >= 0 else 'negative'
+                pnl_str = f'<span class="{pnl_class}">{unrealized:+,.0f}</span>'
+            else:
+                pnl_str = '-'
+            rows += (
+                f'<tr><td><b>{p.script}</b></td><td>{p.entry_price:,.0f}</td><td>{p.quantity}</td>'
+                f'<td>{p.current_sl:,.0f}</td><td>{pnl_str}</td><td>{days}d</td></tr>'
+            )
 
         return f'''
         <div class="section">
             <div class="section-title">Open Positions ({len(positions)})</div>
             <table>
-                <tr><th>Script</th><th>Entry</th><th>Qty</th><th>SL</th><th>Capital</th><th>Days</th></tr>
+                <tr><th>Script</th><th>Entry</th><th>Qty</th><th>SL</th><th>Unrl P&L</th><th>Days</th></tr>
                 {rows}
             </table>
         </div>
