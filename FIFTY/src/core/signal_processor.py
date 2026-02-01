@@ -722,6 +722,14 @@ class SignalProcessor:
             # Check if script is in F&O segment
             is_fno = self.kite.is_fno(script)
 
+            # Get company snapshot (graceful degradation - must not block notification)
+            company_snapshot = None
+            try:
+                from src.utils.company_insights import get_compact_snapshot
+                company_snapshot = get_compact_snapshot(script)
+            except Exception as e:
+                logger.warning(f"Company snapshot failed for {script}: {e}")
+
             # Send notification
             msg_id = telegram.send_signal_notification(
                 signal_id=signal.id,
@@ -731,7 +739,8 @@ class SignalProcessor:
                 quantity=quantity,
                 position_value=position_value,
                 available_capital=available,
-                is_fno=is_fno
+                is_fno=is_fno,
+                company_snapshot=company_snapshot
             )
 
             if msg_id:

@@ -382,7 +382,8 @@ class TelegramBot:
         quantity: int,
         position_value: float,
         available_capital: float,
-        is_fno: bool = False
+        is_fno: bool = False,
+        company_snapshot: Optional[str] = None
     ) -> Optional[int]:
         """
         Send signal notification with approval buttons
@@ -402,6 +403,9 @@ class TelegramBot:
             f"Capital: {available_capital:,.0f}"
         )
 
+        if company_snapshot:
+            text += f"\n\n{company_snapshot}"
+
         # Create approval buttons
         buttons = [
             [
@@ -411,6 +415,9 @@ class TelegramBot:
             [
                 {'text': 'Hold', 'callback_data': f'hold_{signal_id}'},
                 {'text': 'Revise', 'callback_data': f'revise_{signal_id}'}
+            ],
+            [
+                {'text': '\U0001f4ca Full Report', 'callback_data': f'details_{signal_id}'}
             ]
         ]
         reply_markup = self.create_inline_keyboard(buttons)

@@ -193,6 +193,10 @@ class ApprovalHandler:
         if action in ['approve', 'reject', 'hold', 'revise']:
             return self._handle_signal_action(action, target_id, message_id)
 
+        # Handle details button (full company report)
+        elif action == 'details':
+            return self._handle_details_request(target_id)
+
         # Handle position actions (30% drop)
         elif action in ['hodl', 'exit']:
             return self._handle_position_action(action, target_id, message_id)
@@ -218,6 +222,37 @@ class ApprovalHandler:
                         del self._chat_awaiting_signal[chat_id]
             telegram.edit_message(message_id, "Price revision cancelled.")
             return None
+
+        return None
+
+    def _handle_details_request(self, signal_id: int) -> None:
+        """Handle 'Full Report' button click - send full screener.in report."""
+        session = get_session()
+        try:
+            signal = session.query(SignalQueue).filter(
+                SignalQueue.id == signal_id
+            ).first()
+
+            if not signal:
+                telegram.send_alert(f"Signal #{signal_id} not found.")
+                return None
+
+            try:
+                from src.utils.company_insights import get_full_report
+                report = get_full_report(signal.script)
+            except Exception as e:
+                logger.warning(f"Full report failed for {signal.script}: {e}")
+                report = None
+
+            if report:
+                telegram.send_alert(report)
+            else:
+                telegram.send_alert(f"Could not fetch report for {signal.script}")
+
+        except Exception as e:
+            logger.error(f"Error handling details request: {e}")
+        finally:
+            session.close()
 
         return None
 
