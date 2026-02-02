@@ -154,9 +154,7 @@ def reconcile_positions_with_zerodha():
             pnl_details = cost_calculator.calculate_pnl(
                 entry_price=p.entry_price,
                 exit_price=exit_price,
-                quantity=p.quantity,
-                entry_date=p.entry_date,
-                exit_date=date.today()
+                quantity=p.quantity
             )
 
             # Create closed position record
