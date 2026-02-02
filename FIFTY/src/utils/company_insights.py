@@ -7,38 +7,30 @@ the Helper/helper/stock_report.py scraper.
 Uses in-memory cache with 24h TTL to avoid repeat scrapes.
 """
 
-import sys
-import os
 import time
-import importlib.util
 from typing import Dict, Optional, Tuple
 
 from loguru import logger
 
-# Import stock_report directly by file path (avoids __init__.py / namespace issues)
-_stock_report_path = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), '..', '..', '..', 'Helper', 'helper', 'stock_report.py')
-)
+# Import stock_report from local copy (src/utils/stock_report.py)
 _IMPORT_OK = False
 try:
-    _spec = importlib.util.spec_from_file_location("stock_report", _stock_report_path)
-    _stock_report = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_stock_report)
-
-    fetch_best_page = _stock_report.fetch_best_page
-    extract_top_ratios = _stock_report.extract_top_ratios
-    extract_sector_info = _stock_report.extract_sector_info
-    extract_shareholding = _stock_report.extract_shareholding
-    extract_quarterly_results = _stock_report.extract_quarterly_results
-    extract_balance_sheet_highlights = _stock_report.extract_balance_sheet_highlights
-    build_telegram_message = _stock_report.build_telegram_message
-    parse_number = _stock_report.parse_number
-    clean_ratio = _stock_report.clean_ratio
-    ensure_pct = _stock_report.ensure_pct
-    shareholding_signal = _stock_report.shareholding_signal
+    from src.utils.stock_report import (
+        fetch_best_page,
+        extract_top_ratios,
+        extract_sector_info,
+        extract_shareholding,
+        extract_quarterly_results,
+        extract_balance_sheet_highlights,
+        build_telegram_message,
+        parse_number,
+        clean_ratio,
+        ensure_pct,
+        shareholding_signal,
+    )
     _IMPORT_OK = True
 except Exception as e:
-    logger.error(f"Failed to import stock_report from {_stock_report_path}: {e}")
+    logger.error(f"Failed to import stock_report: {e}")
 
 # Cache: {symbol: (compact_snapshot, full_report, timestamp)}
 _cache: Dict[str, Tuple[Optional[str], Optional[str], float]] = {}
