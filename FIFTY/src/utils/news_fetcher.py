@@ -41,6 +41,8 @@ def _fetch_moneycontrol_news(symbol: str) -> List[Dict[str, str]]:
     """
     Fetch news from MoneyControl for a given stock symbol.
 
+    Uses the news/tags endpoint which works with NSE symbols.
+
     Args:
         symbol: Stock symbol (e.g., 'RELIANCE', 'TCS')
 
@@ -50,28 +52,33 @@ def _fetch_moneycontrol_news(symbol: str) -> List[Dict[str, str]]:
     headlines = []
 
     try:
-        # MoneyControl search URL
-        search_url = f"https://www.moneycontrol.com/stocks/company_info/stock_news.php?sc_id={symbol}&durationType=Y"
+        # MoneyControl tags/search endpoint - works better with NSE symbols
+        # Try multiple URL patterns
+        urls_to_try = [
+            f"https://www.moneycontrol.com/news/tags/{symbol.lower()}.html",
+            f"https://www.moneycontrol.com/news/tags/{symbol.lower()}-share-price.html",
+            f"https://www.moneycontrol.com/company-article/{symbol.lower()}/news/",
+        ]
 
-        # Try direct stock page first
-        resp = requests.get(search_url, headers=HEADERS, timeout=10)
+        soup = None
+        for search_url in urls_to_try:
+            try:
+                resp = requests.get(search_url, headers=HEADERS, timeout=5)  # Reduced timeout
+                if resp.status_code == 200 and len(resp.text) > 1000:
+                    soup = BeautifulSoup(resp.text, 'html.parser')
+                    break
+            except requests.RequestException:
+                continue
 
-        if resp.status_code != 200:
-            # Try search approach
-            search_url = f"https://www.moneycontrol.com/news/tags/{symbol.lower()}.html"
-            resp = requests.get(search_url, headers=HEADERS, timeout=10)
-
-        if resp.status_code != 200:
-            logger.debug(f"MoneyControl returned {resp.status_code} for {symbol}")
+        if not soup:
+            logger.debug(f"MoneyControl: No valid response for {symbol}")
             return []
-
-        soup = BeautifulSoup(resp.text, 'html.parser')
 
         # Look for news items in various MoneyControl formats
         news_items = []
 
-        # Format 1: News list items
-        for item in soup.select('li.clearfix, div.news_item, div.article_box'):
+        # Format 1: News list items (common across MC pages)
+        for item in soup.select('li.clearfix, div.news_item, div.article_box, li.list_item'):
             title_el = item.select_one('a, h2 a, h3 a')
             if title_el:
                 title = title_el.get_text(strip=True)
@@ -84,8 +91,8 @@ def _fetch_moneycontrol_news(symbol: str) -> List[Dict[str, str]]:
                         'date': ''
                     })
 
-        # Format 2: Search results
-        for item in soup.select('div.searchNews_wrp li, div.search_news li'):
+        # Format 2: Search results / tag pages
+        for item in soup.select('div.searchNews_wrp li, div.search_news li, div.news_list li'):
             title_el = item.select_one('a')
             if title_el:
                 title = title_el.get_text(strip=True)

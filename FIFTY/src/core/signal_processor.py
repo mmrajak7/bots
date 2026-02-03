@@ -506,15 +506,24 @@ class SignalProcessor:
 
                 if ltp and signal_level > 0:
                     max_ltp = signal_level * (1 + proximity_threshold)
+                    pct_diff = ((ltp / signal_level) - 1) * 100
+
                     if ltp > max_ltp:
                         # LTP too far above signal level - watch for price to come down
-                        pct_above = ((ltp / signal_level) - 1) * 100
                         status = SignalStatus.WATCHING
                         logger.info(
-                            f"{script}: LTP {ltp:.2f} is {pct_above:.1f}% above signal level {signal_level:.2f} "
+                            f"{script}: LTP {ltp:.2f} is {pct_diff:.1f}% above signal level {signal_level:.2f} "
                             f"(threshold: {proximity_threshold*100:.1f}%) - adding as WATCHING"
                         )
+                    elif ltp < signal_level * 0.90:
+                        # LTP is >10% BELOW signal level - unusual, warn but proceed
+                        # Could indicate stock crashed or signal level is stale
+                        logger.warning(
+                            f"{script}: LTP {ltp:.2f} is {abs(pct_diff):.1f}% BELOW signal level {signal_level:.2f} - "
+                            f"proceeding with caution (verify setup is still valid)"
+                        )
                     else:
+                        # LTP within acceptable range (below signal level or up to threshold above)
                         logger.debug(f"{script}: LTP {ltp:.2f} within range of signal level {signal_level:.2f} - PENDING")
             except Exception as e:
                 # If LTP check fails, default to PENDING (will be checked again at notification)
@@ -531,6 +540,19 @@ class SignalProcessor:
 
             session.add(signal)
             session.commit()
+
+            # Send Telegram alert for WATCHING signals so trader knows signal is detected but waiting
+            if status == SignalStatus.WATCHING:
+                try:
+                    pct_above = ((ltp / signal_level) - 1) * 100 if ltp else 0
+                    telegram.send_alert(
+                        f"<b>Signal Watching</b>\n\n"
+                        f"{script} @ {signal_level:.2f}\n"
+                        f"LTP: {ltp:.2f} ({pct_above:+.1f}%)\n\n"
+                        f"<i>Waiting for price to come within {proximity_threshold*100:.1f}% of entry level</i>"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send WATCHING alert for {script}: {e}")
 
             return {
                 'id': signal.id,
@@ -810,7 +832,21 @@ class SignalProcessor:
             proximity_threshold = config.get('signals.ltp_proximity_threshold', 0.015)
             promoted_count = 0
 
+            # Rate limit: small delay between LTP calls to avoid hammering API
+            import time as time_module
+            from datetime import timedelta
+
+            stale_threshold = timedelta(days=7)  # Warn if watching for > 7 days
+
             for signal in watching_signals:
+                # Check for stale signals (watching too long)
+                if signal.first_seen_at:
+                    age = ist_now_naive() - signal.first_seen_at
+                    if age > stale_threshold:
+                        logger.warning(
+                            f"{signal.script}: WATCHING for {age.days} days - "
+                            f"consider manual review (signal level may be stale)"
+                        )
                 try:
                     instrument_token = self.kite.get_instrument_token(signal.script)
                     ltp = self.kite.get_instrument_ltp(instrument_token)
@@ -819,22 +855,24 @@ class SignalProcessor:
                         continue
 
                     max_ltp = signal.signal_level * (1 + proximity_threshold)
+                    pct_diff = ((ltp / signal.signal_level) - 1) * 100
 
                     if ltp <= max_ltp:
                         # Price is now in range - promote to PENDING
-                        pct_above = ((ltp / signal.signal_level) - 1) * 100
                         signal.status = SignalStatus.PENDING
                         signal.telegram_msg_id = None  # Clear for fresh notification
                         promoted_count += 1
                         logger.info(
                             f"{signal.script}: LTP {ltp:.2f} now in range "
-                            f"({pct_above:.1f}% above ST {signal.signal_level:.2f}) - promoted to PENDING"
+                            f"({pct_diff:+.1f}% vs ST {signal.signal_level:.2f}) - promoted to PENDING"
                         )
                     else:
-                        pct_above = ((ltp / signal.signal_level) - 1) * 100
                         logger.debug(
-                            f"{signal.script}: Still watching - LTP {ltp:.2f} is {pct_above:.1f}% above ST {signal.signal_level:.2f}"
+                            f"{signal.script}: Still watching - LTP {ltp:.2f} is {pct_diff:+.1f}% vs ST {signal.signal_level:.2f}"
                         )
+
+                    # Small delay to avoid rate limiting (100ms between calls)
+                    time_module.sleep(0.1)
 
                 except Exception as e:
                     logger.warning(f"Error checking LTP for watching signal {signal.script}: {e}")
@@ -881,11 +919,16 @@ class SignalProcessor:
             reset_count = 0
             watch_count = 0
 
+            import time as time_module
+
             for signal in hold_signals + stale_notified:
                 # Check if LTP has moved away from signal level
                 try:
                     instrument_token = self.kite.get_instrument_token(signal.script)
                     ltp = self.kite.get_instrument_ltp(instrument_token)
+
+                    # Rate limit: small delay between API calls
+                    time_module.sleep(0.1)
 
                     if ltp and signal.signal_level > 0:
                         max_ltp = signal.signal_level * (1 + proximity_threshold)
