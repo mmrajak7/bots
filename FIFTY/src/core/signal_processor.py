@@ -322,6 +322,7 @@ class SignalProcessor:
             # For now, block if any non-terminal signal exists
             active_statuses = [
                 SignalStatus.PENDING,
+                SignalStatus.WATCHING,  # Also block if watching for price
                 SignalStatus.NOTIFIED,
                 SignalStatus.HOLD,
                 SignalStatus.AWAITING_PRICE,
@@ -484,17 +485,46 @@ class SignalProcessor:
         return df
 
     def _add_to_queue(self, script: str, signal_level: float) -> Optional[Dict[str, Any]]:
-        """Add new signal to queue"""
+        """
+        Add new signal to queue.
+
+        Checks LTP proximity - if LTP is too far above signal level,
+        adds as WATCHING instead of PENDING.
+        """
         session = get_session()
         try:
             today = today_ist()
             current_month = today.strftime('%Y-%m')
 
+            # Check LTP proximity to decide initial status
+            status = SignalStatus.PENDING
+            proximity_threshold = config.get('signals.ltp_proximity_threshold', 0.015)
+
+            try:
+                instrument_token = self.kite.get_instrument_token(script)
+                ltp = self.kite.get_instrument_ltp(instrument_token)
+
+                if ltp and signal_level > 0:
+                    max_ltp = signal_level * (1 + proximity_threshold)
+                    if ltp > max_ltp:
+                        # LTP too far above signal level - watch for price to come down
+                        pct_above = ((ltp / signal_level) - 1) * 100
+                        status = SignalStatus.WATCHING
+                        logger.info(
+                            f"{script}: LTP {ltp:.2f} is {pct_above:.1f}% above signal level {signal_level:.2f} "
+                            f"(threshold: {proximity_threshold*100:.1f}%) - adding as WATCHING"
+                        )
+                    else:
+                        logger.debug(f"{script}: LTP {ltp:.2f} within range of signal level {signal_level:.2f} - PENDING")
+            except Exception as e:
+                # If LTP check fails, default to PENDING (will be checked again at notification)
+                logger.warning(f"{script}: Could not check LTP for proximity ({e}) - defaulting to PENDING")
+
             signal = SignalQueue(
                 script=script,
                 signal_date=today,
                 signal_level=signal_level,
-                status=SignalStatus.PENDING,
+                status=status,
                 first_seen_at=ist_now_naive(),
                 signal_month=current_month
             )
@@ -506,7 +536,7 @@ class SignalProcessor:
                 'id': signal.id,
                 'script': script,
                 'signal_level': signal_level,
-                'status': SignalStatus.PENDING.value
+                'status': status.value
             }
 
         except Exception as e:
@@ -759,15 +789,83 @@ class SignalProcessor:
         finally:
             session.close()
 
+    def process_watching_signals(self) -> int:
+        """
+        Check WATCHING signals and promote to PENDING if LTP is now in range.
+
+        Called every cycle to check if price has come down to signal level.
+
+        Returns:
+            Number of signals promoted to PENDING
+        """
+        session = get_session()
+        try:
+            watching_signals = session.query(SignalQueue).filter(
+                SignalQueue.status == SignalStatus.WATCHING
+            ).all()
+
+            if not watching_signals:
+                return 0
+
+            proximity_threshold = config.get('signals.ltp_proximity_threshold', 0.015)
+            promoted_count = 0
+
+            for signal in watching_signals:
+                try:
+                    instrument_token = self.kite.get_instrument_token(signal.script)
+                    ltp = self.kite.get_instrument_ltp(instrument_token)
+
+                    if not ltp or signal.signal_level <= 0:
+                        continue
+
+                    max_ltp = signal.signal_level * (1 + proximity_threshold)
+
+                    if ltp <= max_ltp:
+                        # Price is now in range - promote to PENDING
+                        pct_above = ((ltp / signal.signal_level) - 1) * 100
+                        signal.status = SignalStatus.PENDING
+                        signal.telegram_msg_id = None  # Clear for fresh notification
+                        promoted_count += 1
+                        logger.info(
+                            f"{signal.script}: LTP {ltp:.2f} now in range "
+                            f"({pct_above:.1f}% above ST {signal.signal_level:.2f}) - promoted to PENDING"
+                        )
+                    else:
+                        pct_above = ((ltp / signal.signal_level) - 1) * 100
+                        logger.debug(
+                            f"{signal.script}: Still watching - LTP {ltp:.2f} is {pct_above:.1f}% above ST {signal.signal_level:.2f}"
+                        )
+
+                except Exception as e:
+                    logger.warning(f"Error checking LTP for watching signal {signal.script}: {e}")
+                    continue
+
+            if promoted_count > 0:
+                session.commit()
+                logger.info(f"Promoted {promoted_count} WATCHING signals to PENDING")
+
+            return promoted_count
+
+        except Exception as e:
+            logger.error(f"Error processing watching signals: {e}")
+            session.rollback()
+            return 0
+        finally:
+            session.close()
+
     def resend_hold_signals(self) -> int:
         """Re-send notifications for signals on HOLD or stale NOTIFIED (no response).
 
         Only resets signals notified BEFORE today to avoid resetting freshly-notified
         signals in the same trading session (which causes duplicate Telegram alerts).
+
+        Also checks if LTP has moved away from NOTIFIED/HOLD signals - if so,
+        moves them back to WATCHING state.
         """
         session = get_session()
         try:
             today_start = datetime.combine(today_ist(), datetime.min.time())
+            proximity_threshold = config.get('signals.ltp_proximity_threshold', 0.015)
 
             # HOLD signals: always re-notify (user explicitly chose to defer)
             hold_signals = session.query(SignalQueue).filter(
@@ -780,15 +878,45 @@ class SignalProcessor:
                 SignalQueue.last_notified_at < today_start
             ).all()
 
-            count = 0
+            reset_count = 0
+            watch_count = 0
+
             for signal in hold_signals + stale_notified:
+                # Check if LTP has moved away from signal level
+                try:
+                    instrument_token = self.kite.get_instrument_token(signal.script)
+                    ltp = self.kite.get_instrument_ltp(instrument_token)
+
+                    if ltp and signal.signal_level > 0:
+                        max_ltp = signal.signal_level * (1 + proximity_threshold)
+
+                        if ltp > max_ltp:
+                            # LTP moved away - move to WATCHING instead of PENDING
+                            pct_above = ((ltp / signal.signal_level) - 1) * 100
+                            signal.status = SignalStatus.WATCHING
+                            signal.telegram_msg_id = None
+                            watch_count += 1
+                            logger.info(
+                                f"{signal.script}: LTP {ltp:.2f} moved away ({pct_above:.1f}% above ST) - moving to WATCHING"
+                            )
+                            continue
+
+                except Exception as e:
+                    logger.warning(f"Could not check LTP for {signal.script}: {e} - will reset to PENDING")
+
+                # LTP still in range (or couldn't check) - reset to PENDING
                 signal.status = SignalStatus.PENDING
                 signal.telegram_msg_id = None
-                count += 1
+                reset_count += 1
 
             session.commit()
-            logger.info(f"Reset {count} HOLD/stale-NOTIFIED signals for re-notification")
-            return count
+
+            if reset_count > 0:
+                logger.info(f"Reset {reset_count} HOLD/stale-NOTIFIED signals for re-notification")
+            if watch_count > 0:
+                logger.info(f"Moved {watch_count} signals to WATCHING (LTP moved away)")
+
+            return reset_count
 
         finally:
             session.close()

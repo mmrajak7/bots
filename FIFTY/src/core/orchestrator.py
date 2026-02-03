@@ -363,11 +363,18 @@ class Orchestrator:
     # =========================================================================
 
     def _process_signals(self) -> None:
-        """Process new CSP signals from CSV"""
+        """Process new CSP signals from CSV and check watching signals"""
         try:
+            # Process new signals from CSV
             new_signals = self.signal_processor.process_new_signals()
             if new_signals:
                 logger.info(f"Processed {len(new_signals)} new signals")
+
+            # Check WATCHING signals - promote to PENDING if LTP now in range
+            promoted = self.signal_processor.process_watching_signals()
+            if promoted:
+                logger.info(f"Promoted {promoted} watching signals to pending")
+
         except Exception as e:
             logger.error(f"Error processing signals: {e}")
 
@@ -1209,6 +1216,7 @@ class Orchestrator:
             signals = session.query(SignalQueue).filter(
                 SignalQueue.status.in_([
                     SignalStatus.PENDING,
+                    SignalStatus.WATCHING,  # Include watching signals in cleanup
                     SignalStatus.NOTIFIED,
                     SignalStatus.HOLD
                 ])

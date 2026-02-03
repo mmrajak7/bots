@@ -20,6 +20,7 @@ Base = declarative_base()
 class SignalStatus(enum.Enum):
     """Signal lifecycle status"""
     PENDING = "pending"           # New signal, not yet notified
+    WATCHING = "watching"         # Signal valid but LTP too far from entry level - waiting for price
     NOTIFIED = "notified"         # Telegram notification sent, awaiting response
     APPROVED = "approved"         # User approved, ready for order
     REJECTED = "rejected"         # User rejected

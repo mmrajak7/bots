@@ -2,7 +2,9 @@
 Company Insights - Screener.in integration for signal notifications
 
 Provides compact company snapshots and full reports by leveraging
-the Helper/helper/stock_report.py scraper.
+the local stock_report.py scraper.
+
+Also integrates news from MoneyControl/Google News.
 
 Uses in-memory cache with 24h TTL to avoid repeat scrapes.
 """
@@ -11,6 +13,14 @@ import time
 from typing import Dict, Optional, Tuple
 
 from loguru import logger
+
+# Import news fetcher
+try:
+    from src.utils.news_fetcher import get_stock_news, format_news_compact, format_news_full
+    _NEWS_AVAILABLE = True
+except Exception as e:
+    logger.warning(f"News fetcher not available: {e}")
+    _NEWS_AVAILABLE = False
 
 # Import stock_report from local copy (src/utils/stock_report.py)
 _IMPORT_OK = False
@@ -158,6 +168,22 @@ def _build_compact_snapshot(symbol: str) -> Tuple[Optional[str], Optional[str]]:
         lines.append(f"\u2705 {' | '.join(pros)}")
     if cons:
         lines.append(f"\u26a0\ufe0f {' | '.join(cons)}")
+
+    # Add news to compact snapshot (2 headlines)
+    if _NEWS_AVAILABLE:
+        try:
+            headlines = get_stock_news(symbol, max_headlines=7)
+            news_compact = format_news_compact(headlines, max_items=2)
+            if news_compact:
+                lines.append("")  # Empty line separator
+                lines.append(news_compact)
+
+            # Add detailed news to full report (5-7 headlines)
+            news_full = format_news_full(headlines, max_items=7)
+            if news_full and full_report:
+                full_report = full_report + "\n" + news_full
+        except Exception as e:
+            logger.debug(f"News fetch failed for {symbol}: {e}")
 
     compact = "\n".join(lines)
     return compact, full_report
