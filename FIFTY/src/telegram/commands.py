@@ -759,53 +759,58 @@ class CommandHandler:
 
     def _cmd_exit(self, script: str) -> None:
         """Exit position at market price"""
-        session = get_session()
         try:
             script = script.upper().strip()
 
-            position = session.query(OpenPosition).filter(
-                OpenPosition.script == script,
-                OpenPosition.status == PositionStatus.OPEN
-            ).first()
+            # First check if position exists
+            session = get_session()
+            try:
+                position = session.query(OpenPosition).filter(
+                    OpenPosition.script == script,
+                    OpenPosition.status == PositionStatus.OPEN
+                ).first()
 
-            if not position:
-                telegram.send_alert(f"❌ No open position for {script}")
-                return
+                if not position:
+                    telegram.send_alert(f"❌ No open position for {script}")
+                    return
 
-            position_id = position.id
-            quantity = position.quantity
-            entry_price = position.entry_price
+                position_id = position.id
+                quantity = position.quantity
+                entry_price = position.entry_price
+            finally:
+                session.close()
 
             telegram.send_alert(f"⏳ Exiting {script} at MARKET...")
 
-            # Use exit_manager to execute market exit
+            # Use exit_manager to execute market exit (notify=False, we'll send our own)
             from src.core.exit_manager import exit_manager
-            success = exit_manager.emergency_exit(position_id)
+            success = exit_manager.emergency_exit(position_id, notify=False)
 
             if success:
-                # Refresh to get exit details
-                session.expire_all()
-                closed = session.query(ClosedPosition).filter(
-                    ClosedPosition.script == script
-                ).order_by(ClosedPosition.closed_at.desc()).first()
+                # Fetch closed position from fresh session for P&L details
+                session = get_session()
+                try:
+                    closed = session.query(ClosedPosition).filter(
+                        ClosedPosition.script == script
+                    ).order_by(ClosedPosition.closed_at.desc()).first()
 
-                if closed:
-                    pnl_sign = '+' if closed.net_pnl >= 0 else ''
-                    telegram.send_alert(
-                        f"✅ <b>{script} EXITED</b>\n"
-                        f"   📊 {quantity} x {entry_price:,.0f} → {closed.exit_price:,.0f}\n"
-                        f"   💰 P&L: {pnl_sign}{closed.net_pnl:,.0f} ({pnl_sign}{closed.pnl_percent:.1f}%)"
-                    )
-                else:
-                    telegram.send_alert(f"✅ {script} exit order placed")
-            else:
-                telegram.send_alert(f"🔴 {script} exit FAILED - check manually!", critical=True)
+                    if closed:
+                        pnl_class = '🟢' if closed.net_pnl >= 0 else '🔴'
+                        pnl_sign = '+' if closed.net_pnl >= 0 else ''
+                        telegram.send_alert(
+                            f"✅ <b>{script} EXITED</b>\n\n"
+                            f"📊 {quantity} @ {entry_price:,.2f} → {closed.exit_price:,.2f}\n"
+                            f"{pnl_class} P&L: {pnl_sign}{closed.net_pnl:,.0f} ({pnl_sign}{closed.pnl_percent:.1f}%)"
+                        )
+                    else:
+                        telegram.send_alert(f"✅ {script} exit order filled")
+                finally:
+                    session.close()
+            # Note: emergency_exit already sends alerts for failures
 
         except Exception as e:
-            logger.error(f"Exit error for {script}: {e}")
-            telegram.send_alert(f"🔴 Exit failed: {str(e)}")
-        finally:
-            session.close()
+            logger.error(f"Exit command error for {script}: {e}")
+            telegram.send_alert(f"🔴 Exit error: {str(e)}")
 
     def _cmd_sync(self) -> None:
         """

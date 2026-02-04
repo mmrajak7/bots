@@ -705,12 +705,13 @@ class ExitManager:
 
         return alerts
 
-    def emergency_exit(self, position_id: int) -> bool:
+    def emergency_exit(self, position_id: int, notify: bool = True) -> bool:
         """
         Execute emergency market exit for a position
 
         Args:
             position_id: Position to exit
+            notify: If True, send success notification (errors always notified)
 
         Returns:
             True if successful
@@ -790,11 +791,12 @@ class ExitManager:
                         # Close position
                         self._close_position(position, exit_price, 'EMERGENCY_EXIT')
 
-                        telegram.send_alert(
-                            f"<b>Emergency Exit Complete</b>\n\n"
-                            f"{script} @ {exit_price:,.2f}\n"
-                            f"Qty: {quantity}"
-                        )
+                        if notify:
+                            telegram.send_alert(
+                                f"<b>Emergency Exit Complete</b>\n\n"
+                                f"{script} @ {exit_price:,.2f}\n"
+                                f"Qty: {quantity}"
+                            )
                         return True
 
                     elif status in ['REJECTED', 'CANCELLED']:
