@@ -45,6 +45,42 @@ class TelegramBot:
             self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
             logger.info(f"Telegram bot initialized - Chat ID: {self.chat_id}")
 
+    def register_commands(self) -> bool:
+        """
+        Register bot commands with Telegram (appears in / menu).
+
+        Returns:
+            True if successful
+        """
+        if not self.enabled:
+            return False
+
+        commands = [
+            # View commands
+            {"command": "positions", "description": "Open positions with P&L"},
+            {"command": "pending", "description": "Signals & GTT orders"},
+            {"command": "stats", "description": "Trading statistics"},
+            {"command": "capital", "description": "Capital allocation"},
+            {"command": "report", "description": "Generate reports"},
+            # Action commands
+            {"command": "sync", "description": "Zerodha vs DB comparison"},
+            {"command": "import", "description": "Import position (e.g. /import RELIANCE)"},
+            {"command": "fix", "description": "Place missing SL GTT"},
+            {"command": "exit", "description": "Exit position at market"},
+            {"command": "release", "description": "Release HOLD signal"},
+            {"command": "kill", "description": "Stop all operations"},
+            {"command": "resume", "description": "Resume operations"},
+            {"command": "help", "description": "Show all commands"},
+        ]
+
+        result = self._make_request('setMyCommands', {'commands': commands})
+        if result is not None:
+            logger.info(f"Registered {len(commands)} commands with Telegram")
+            return True
+        else:
+            logger.warning("Failed to register commands with Telegram")
+            return False
+
     def _make_request(
         self,
         method: str,
