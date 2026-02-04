@@ -625,11 +625,11 @@ class ReportGenerator:
                     </div>
                     <div class="row">
                         <span class="row-label">Avg Winner</span>
-                        <span class="row-value positive">+{avg_winner:,.0f}</span>
+                        <span class="row-value {'positive' if total_winners > 0 else ''}">{f'+{avg_winner:,.0f}' if total_winners > 0 else 'N/A'}</span>
                     </div>
                     <div class="row">
                         <span class="row-label">Avg Loser</span>
-                        <span class="row-value negative">{avg_loser:,.0f}</span>
+                        <span class="row-value {'negative' if total_losers > 0 else ''}">{f'{avg_loser:,.0f}' if total_losers > 0 else 'N/A'}</span>
                     </div>
                     <div class="row">
                         <span class="row-label">Profit Factor</span>
@@ -645,11 +645,11 @@ class ReportGenerator:
                     <div class="section-title">Notable</div>
                     <div class="row">
                         <span class="row-label">Best Trade</span>
-                        <span class="row-value positive">{best.script}: +{best.net_pnl:,.0f}</span>
+                        <span class="row-value {'positive' if best.net_pnl >= 0 else 'negative'}">{best.script}: {'+' if best.net_pnl >= 0 else ''}{best.net_pnl:,.0f}</span>
                     </div>
                     <div class="row">
                         <span class="row-label">Worst Trade</span>
-                        <span class="row-value negative">{worst.script}: {worst.net_pnl:,.0f}</span>
+                        <span class="row-value {'positive' if worst.net_pnl >= 0 else 'negative'}">{worst.script}: {'+' if worst.net_pnl >= 0 else ''}{worst.net_pnl:,.0f}</span>
                     </div>
                 </div>''' if best and worst else ''}
 
