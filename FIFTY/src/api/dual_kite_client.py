@@ -795,23 +795,41 @@ class DualKiteClient(BrokerAdapter):
             self._fno_symbols = set()
 
     def _fetch_fno_symbols(self) -> None:
-        """Fetch NFO instruments from Kite API and extract unique underlying symbols"""
+        """Fetch NFO instruments from Kite API and extract unique underlying symbols.
+
+        Uses FUT instruments (instrument_type=FUT) whose tradingsymbols follow
+        the pattern: SYMBOL + YYMMM + FUT (e.g., RELIANCE26JANFUT).
+        Cross-references against NSE EQ instruments for reliable matching.
+        """
         try:
             self._rate_limit()
             kite = self._get_read_client()
 
+            # Get NSE EQ symbols as the ground truth set
+            if not self._instruments_cache:
+                self._load_instruments_cache()
+            eq_symbols = set(s.upper() for s in self._instruments_cache.keys())
+
+            self._rate_limit()
             nfo_instruments = kite.instruments("NFO")
 
-            # Extract unique underlying equity symbols (futures have segment=NFO-FUT)
-            # Use 'name' field which holds the underlying tradingsymbol
+            # Extract underlying symbols from FUT contracts by matching against EQ list
             fno_names = set()
             for i in nfo_instruments:
-                name = i.get('tradingsymbol', '')
-                # NFO tradingsymbols are like RELIANCE24JANFUT, RELIANCE24JAN2800CE
-                # The 'name' field holds the clean underlying name
-                underlying = i.get('name', '').upper().strip()
-                if underlying:
-                    fno_names.add(underlying)
+                if i.get('instrument_type') != 'FUT':
+                    continue
+                ts = (i.get('tradingsymbol') or '').upper()
+                # FUT tradingsymbol format: SYMBOL + YYMMM + FUT (e.g., RELIANCE26JANFUT)
+                # Strip trailing "FUT" and then strip the YYMMM expiry suffix
+                if not ts.endswith('FUT'):
+                    continue
+                base = ts[:-3]  # remove "FUT"
+                # Try matching progressively shorter prefixes against EQ symbols
+                for end in range(len(base), 0, -1):
+                    candidate = base[:end]
+                    if candidate in eq_symbols:
+                        fno_names.add(candidate)
+                        break
 
             if not fno_names:
                 logger.warning("No F&O symbols found from NFO instruments")
