@@ -176,9 +176,10 @@ class CommandHandler:
                 SignalQueue.status == SignalStatus.WATCHING
             ).all()
 
-            # Awaiting approval (notified/hold)
+            # Awaiting approval (pending/notified/hold)
             awaiting_signals = session.query(SignalQueue).filter(
                 SignalQueue.status.in_([
+                    SignalStatus.PENDING,  # Ready for notification
                     SignalStatus.NOTIFIED,
                     SignalStatus.HOLD,
                     SignalStatus.AWAITING_PRICE
@@ -225,6 +226,7 @@ class CommandHandler:
                 lines.append(f"🔔 <b>Awaiting Response ({len(awaiting_signals)})</b>")
                 for sig in awaiting_signals:
                     status_tag = {
+                        SignalStatus.PENDING: "QUEUE",
                         SignalStatus.NOTIFIED: "NEW",
                         SignalStatus.HOLD: "HOLD",
                         SignalStatus.AWAITING_PRICE: "PRICE?"
