@@ -347,7 +347,9 @@ class ReportGenerator:
 
             initial_capital = config.get('trading.initial_capital', 100000)
             deployed = self._calculate_deployed_capital(open_positions)
+            deployed_pct = (deployed / initial_capital * 100) if initial_capital > 0 else 0
             unrealized_pnl = self._get_unrealized_pnl(open_positions)
+            unrealized_pct = (unrealized_pnl / deployed * 100) if deployed > 0 else 0
 
             html = f"""
             <!DOCTYPE html>
@@ -409,11 +411,11 @@ class ReportGenerator:
                     </div>
                     <div class="row">
                         <span class="row-label">Deployed</span>
-                        <span class="row-value">{deployed:,.0f}</span>
+                        <span class="row-value">{deployed:,.0f} ({deployed_pct:.0f}%)</span>
                     </div>
                     <div class="row">
                         <span class="row-label">Unrealized P&L</span>
-                        <span class="row-value {'positive' if unrealized_pnl >= 0 else 'negative'}">{unrealized_pnl:+,.0f}</span>
+                        <span class="row-value {'positive' if unrealized_pnl >= 0 else 'negative'}">{unrealized_pnl:+,.0f} ({'+' if unrealized_pct >= 0 else ''}{unrealized_pct:.1f}%)</span>
                     </div>
                 </div>
 
@@ -577,8 +579,10 @@ class ReportGenerator:
 
             initial_capital = config.get('trading.initial_capital', 100000)
             deployed = self._calculate_deployed_capital(open_positions)
+            deployed_pct = (deployed / initial_capital * 100) if initial_capital > 0 else 0
             total_roi = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0
             unrealized = self._get_unrealized_pnl(open_positions)
+            unrealized_pct = (unrealized / deployed * 100) if deployed > 0 else 0
 
             best = max(all_trades, key=lambda t: t.net_pnl) if all_trades else None
             worst = min(all_trades, key=lambda t: t.net_pnl) if all_trades else None
@@ -661,11 +665,11 @@ class ReportGenerator:
                     </div>
                     <div class="row">
                         <span class="row-label">Deployed</span>
-                        <span class="row-value">{deployed:,.0f}</span>
+                        <span class="row-value">{deployed:,.0f} ({deployed_pct:.0f}%)</span>
                     </div>
                     <div class="row">
                         <span class="row-label">Unrealized</span>
-                        <span class="row-value {'positive' if unrealized >= 0 else 'negative'}">{'+' if unrealized >= 0 else ''}{unrealized:,.0f}</span>
+                        <span class="row-value {'positive' if unrealized >= 0 else 'negative'}">{'+' if unrealized >= 0 else ''}{unrealized:,.0f} ({'+' if unrealized_pct >= 0 else ''}{unrealized_pct:.1f}%)</span>
                     </div>
                 </div>
 
@@ -764,26 +768,31 @@ class ReportGenerator:
             pass
 
         today = today_ist()
+        initial_capital = config.get('trading.initial_capital', 100000)
         rows = ''
         for p in positions:
             days = (today - p.entry_date).days if p.entry_date else 0
             ltp = ltp_map.get(p.script)
+            # Capital % of total
+            cap_pct = (p.capital_deployed / initial_capital * 100) if initial_capital > 0 else 0
             if ltp:
                 unrealized = (ltp - p.entry_price) * p.quantity
+                pnl_pct = (unrealized / p.capital_deployed * 100) if p.capital_deployed > 0 else 0
                 pnl_class = 'positive' if unrealized >= 0 else 'negative'
-                pnl_str = f'<span class="{pnl_class}">{unrealized:+,.0f}</span>'
+                pnl_sign = '+' if pnl_pct >= 0 else ''
+                pnl_str = f'<span class="{pnl_class}">{unrealized:+,.0f} ({pnl_sign}{pnl_pct:.1f}%)</span>'
             else:
                 pnl_str = '-'
             rows += (
                 f'<tr><td><b>{p.script}</b></td><td>{p.entry_price:,.0f}</td><td>{p.quantity}</td>'
-                f'<td>{p.current_sl:,.0f}</td><td>{pnl_str}</td><td>{days}d</td></tr>'
+                f'<td>{p.current_sl:,.0f}</td><td>{pnl_str}</td><td>{cap_pct:.0f}%</td><td>{days}d</td></tr>'
             )
 
         return f'''
         <div class="section">
             <div class="section-title">Open Positions ({len(positions)})</div>
             <table>
-                <tr><th>Script</th><th>Entry</th><th>Qty</th><th>SL</th><th>Unrl P&L</th><th>Days</th></tr>
+                <tr><th>Script</th><th>Entry</th><th>Qty</th><th>SL</th><th>Unrl P&L</th><th>Cap%</th><th>Days</th></tr>
                 {rows}
             </table>
         </div>
