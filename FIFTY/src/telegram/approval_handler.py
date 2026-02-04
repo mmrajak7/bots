@@ -514,6 +514,15 @@ class ApprovalHandler:
             else:
                 telegram.send_alert("Usage: /fix SCRIPT\nFixes unprotected position by placing SL GTT")
                 return None
+        elif cmd.startswith('/exit'):
+            # Extract script name from command (e.g., "/exit BALRAMCHIN")
+            parts = command.strip().split()
+            if len(parts) >= 2:
+                script = parts[1].upper()
+                return {'type': 'command', 'command': 'exit', 'script': script}
+            else:
+                telegram.send_alert("Usage: /exit SCRIPT\nExits position at market price")
+                return None
         elif cmd == '/help':
             self._send_help()
             return None
@@ -534,6 +543,7 @@ class ApprovalHandler:
             "/sync - Zerodha vs DB diff\n"
             "/import SCRIPT - Add position\n"
             "/fix SCRIPT - Place missing SL\n"
+            "/exit SCRIPT - Exit at market\n"
             "/release SCRIPT - Release HOLD signal\n"
             "/kill - Stop operations\n"
             "/resume - Resume operations"

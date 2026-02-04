@@ -10,6 +10,7 @@ Commands:
 - /sync - Compare Zerodha vs DB positions
 - /import SCRIPT - Import position from Zerodha
 - /fix SCRIPT - Fix unprotected position (place SL GTT)
+- /exit SCRIPT - Exit position at market price
 - /release SCRIPT - Release signal from HOLD (or /release ALL)
 - /kill - Activate kill switch
 - /resume - Deactivate kill switch
@@ -68,6 +69,12 @@ class CommandHandler:
                     self._cmd_fix(script)
                 else:
                     telegram.send_alert("Usage: /fix SCRIPT")
+            elif command == 'exit':
+                script = kwargs.get('script')
+                if script:
+                    self._cmd_exit(script)
+                else:
+                    telegram.send_alert("Usage: /exit SCRIPT")
             elif command == 'kill':
                 self._cmd_kill()
             elif command == 'resume':
@@ -747,6 +754,56 @@ class CommandHandler:
         except Exception as e:
             logger.error(f"Fix error for {script}: {e}")
             telegram.send_alert(f"🔴 Fix failed: {str(e)}")
+        finally:
+            session.close()
+
+    def _cmd_exit(self, script: str) -> None:
+        """Exit position at market price"""
+        session = get_session()
+        try:
+            script = script.upper().strip()
+
+            position = session.query(OpenPosition).filter(
+                OpenPosition.script == script,
+                OpenPosition.status == PositionStatus.OPEN
+            ).first()
+
+            if not position:
+                telegram.send_alert(f"❌ No open position for {script}")
+                return
+
+            position_id = position.id
+            quantity = position.quantity
+            entry_price = position.entry_price
+
+            telegram.send_alert(f"⏳ Exiting {script} at MARKET...")
+
+            # Use exit_manager to execute market exit
+            from src.core.exit_manager import exit_manager
+            success = exit_manager.emergency_exit(position_id)
+
+            if success:
+                # Refresh to get exit details
+                session.expire_all()
+                closed = session.query(ClosedPosition).filter(
+                    ClosedPosition.script == script
+                ).order_by(ClosedPosition.closed_at.desc()).first()
+
+                if closed:
+                    pnl_sign = '+' if closed.net_pnl >= 0 else ''
+                    telegram.send_alert(
+                        f"✅ <b>{script} EXITED</b>\n"
+                        f"   📊 {quantity} x {entry_price:,.0f} → {closed.exit_price:,.0f}\n"
+                        f"   💰 P&L: {pnl_sign}{closed.net_pnl:,.0f} ({pnl_sign}{closed.pnl_percent:.1f}%)"
+                    )
+                else:
+                    telegram.send_alert(f"✅ {script} exit order placed")
+            else:
+                telegram.send_alert(f"🔴 {script} exit FAILED - check manually!", critical=True)
+
+        except Exception as e:
+            logger.error(f"Exit error for {script}: {e}")
+            telegram.send_alert(f"🔴 Exit failed: {str(e)}")
         finally:
             session.close()
 
