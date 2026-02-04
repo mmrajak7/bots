@@ -426,6 +426,19 @@ class OrderManager:
             trigger_price = round_price(effective_price)
             limit_price = round_price(effective_price)
 
+            # GTT trigger cannot equal LTP - Zerodha rejects "trigger price equal to last price"
+            # If trigger is too close to LTP, adjust down slightly (0.3%) so GTT can be placed
+            # The GTT will trigger almost immediately when price touches the trigger
+            if ltp and abs(trigger_price - ltp) / ltp < 0.003:  # Within 0.3% of LTP
+                adjusted_trigger = round_price(ltp * 0.997)  # Set trigger 0.3% below LTP
+                logger.info(
+                    f"{script}: Trigger {trigger_price:.2f} too close to LTP {ltp:.2f}, "
+                    f"adjusting to {adjusted_trigger:.2f} (-0.3%)"
+                )
+                trigger_price = adjusted_trigger
+                # Keep limit_price at or slightly above trigger for fill
+                limit_price = round_price(adjusted_trigger * 1.002)  # 0.2% buffer for execution
+
             # === COMPREHENSIVE PRE-ORDER VALIDATION (from CROCODILE) ===
             is_valid, validation_msg, corrected_price = self._validate_order_params(
                 script=script,

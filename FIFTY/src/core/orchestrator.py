@@ -340,7 +340,26 @@ class Orchestrator:
         logger.info(f"Processing approved signal: {script} @ {entry_price}")
 
         try:
-            self.order_manager.place_entry_gtt(signal_id, script, entry_price)
+            gtt_id = self.order_manager.place_entry_gtt(signal_id, script, entry_price)
+
+            # If GTT placement failed (returned None), reset signal to HOLD for retry
+            if gtt_id is None:
+                logger.warning(f"{script}: GTT placement returned None, resetting to HOLD for retry")
+                session = get_session()
+                try:
+                    signal = session.query(SignalQueue).filter(SignalQueue.id == signal_id).first()
+                    if signal and signal.status == SignalStatus.APPROVED:
+                        signal.status = SignalStatus.HOLD
+                        signal.notes = "Auto-hold: GTT placement failed, will retry"
+                        session.commit()
+                        telegram.send_alert(
+                            f"<b>Entry GTT Failed</b>\n\n"
+                            f"{script}: Order placement failed\n"
+                            f"Signal moved to HOLD - will retry at 9:30 AM"
+                        )
+                finally:
+                    session.close()
+
         except Exception as e:
             logger.error(f"Failed to place entry order for {script}: {e}")
             telegram.send_alert(f"Failed to place entry for {script}: {str(e)}", critical=True)
