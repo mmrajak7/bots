@@ -163,13 +163,18 @@ class CommandHandler:
             session.close()
 
     def _cmd_pending(self) -> None:
-        """List pending signals and GTT entry orders"""
+        """List pending signals, watching signals, and GTT entry orders"""
         session = get_session()
         try:
             # Get scripts that already have positions (to filter out stale orders)
             position_scripts = {p.script for p in session.query(OpenPosition).filter(
                 OpenPosition.status == PositionStatus.OPEN
             ).all()}
+
+            # Signals watching for price (LTP too far from entry)
+            watching_signals = session.query(SignalQueue).filter(
+                SignalQueue.status == SignalStatus.WATCHING
+            ).all()
 
             # Awaiting approval (notified/hold)
             awaiting_signals = session.query(SignalQueue).filter(
@@ -188,6 +193,32 @@ class CommandHandler:
 
             lines = ["📋 <b>Pending</b>"]
 
+            # Get Kite client for LTP info
+            kite = None
+            try:
+                from src.api.dual_kite_client import get_kite_client
+                kite = get_kite_client()
+            except Exception as e:
+                logger.debug(f"Could not get Kite client for LTP: {e}")
+
+            # Signals watching for price
+            if watching_signals:
+                lines.append("")
+                lines.append(f"👁 <b>Watching Price ({len(watching_signals)})</b>")
+                for sig in watching_signals:
+                    ltp_info = ""
+                    if kite is not None:
+                        try:
+                            token = kite.get_instrument_token(sig.script)
+                            if token:
+                                ltp = kite.get_instrument_ltp(token)
+                                if ltp is not None and sig.signal_level > 0:
+                                    dist_pct = ((ltp / sig.signal_level) - 1) * 100
+                                    ltp_info = f" | LTP: {ltp:,.0f} ({dist_pct:+.1f}%)"
+                        except Exception:
+                            pass
+                    lines.append(f"  • {sig.script} @ {sig.signal_level:,.0f}{ltp_info}")
+
             # Signals awaiting response
             if awaiting_signals:
                 lines.append("")
@@ -205,14 +236,6 @@ class CommandHandler:
                 lines.append("")
                 lines.append(f"⏳ <b>GTT Orders ({len(pending_orders)})</b>")
 
-                # Fetch LTP for pending orders
-                kite = None
-                try:
-                    from src.api.dual_kite_client import get_kite_client
-                    kite = get_kite_client()
-                except Exception as e:
-                    logger.debug(f"Could not get Kite client for LTP: {e}")
-
                 for order in pending_orders:
                     ltp_info = ""
                     if kite is not None:
@@ -227,7 +250,7 @@ class CommandHandler:
                             pass
                     lines.append(f"  • {order.script} @ {order.limit_price:,.0f} x{order.quantity}{ltp_info}")
 
-            if not awaiting_signals and not pending_orders:
+            if not watching_signals and not awaiting_signals and not pending_orders:
                 lines.append("\n✅ No pending items")
 
             telegram.send_alert('\n'.join(lines))
