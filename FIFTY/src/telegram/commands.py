@@ -17,7 +17,7 @@ Commands:
 """
 
 from typing import Dict, Any, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from loguru import logger
 
 from src.telegram.bot import telegram
@@ -134,13 +134,14 @@ class CommandHandler:
                 # Format script name (truncate/pad to 12 chars)
                 script_name = pos.script[:12].ljust(12)
 
-                # Format age
-                if pos.days_held == 0:
+                # Format age (calculate from entry_date)
+                days_held = (date.today() - pos.entry_date).days
+                if days_held == 0:
                     age_str = "Today"
-                elif pos.days_held == 1:
+                elif days_held == 1:
                     age_str = "  1d"
                 else:
-                    age_str = f"{pos.days_held:3d}d"
+                    age_str = f"{days_held:3d}d"
 
                 # Format P&L and P&L %
                 if ltp is not None:
@@ -148,7 +149,8 @@ class CommandHandler:
                     ltp_str = f"{ltp:6.0f}"
                     # Calculate P&L % based on capital deployed
                     pnl_pct = (unrealized_pnl / pos.capital_deployed * 100) if pos.capital_deployed > 0 else 0
-                    pct_str = f"{pnl_pct:+3.0f}%" if pnl_pct != 0 else "  0%"
+                    pnl_pct_rounded = round(pnl_pct)
+                    pct_str = f"{pnl_pct_rounded:+3d}%" if pnl_pct_rounded != 0 else "  0%"
                 else:
                     pnl_str = "  N/A"
                     ltp_str = "   N/A"
