@@ -808,31 +808,29 @@ class ReportGenerator:
             pass
 
         today = today_ist()
-        initial_capital = config.get('trading.initial_capital', 100000)
         rows = ''
         for p in positions:
             days = (today - p.entry_date).days if p.entry_date else 0
+            days_str = "Today" if days == 0 else f"{days}d"
             ltp = ltp_map.get(p.script)
-            # Capital % of total
-            cap_pct = (p.capital_deployed / initial_capital * 100) if initial_capital > 0 else 0
             if ltp:
                 unrealized = (ltp - p.entry_price) * p.quantity
                 pnl_pct = (unrealized / p.capital_deployed * 100) if p.capital_deployed > 0 else 0
                 pnl_class = 'positive' if unrealized >= 0 else 'negative'
                 pnl_sign = '+' if pnl_pct >= 0 else ''
-                pnl_str = f'<span class="{pnl_class}">{unrealized:+,.0f} ({pnl_sign}{pnl_pct:.1f}%)</span>'
+                pnl_str = f'<span class="{pnl_class}">{unrealized:+,.0f} ({pnl_sign}{pnl_pct:.0f}%)</span>'
             else:
                 pnl_str = '-'
             rows += (
                 f'<tr><td><b>{p.script}</b></td><td>{p.entry_price:,.0f}</td><td>{p.quantity}</td>'
-                f'<td>{p.current_sl:,.0f}</td><td>{pnl_str}</td><td>{cap_pct:.0f}%</td><td>{days}d</td></tr>'
+                f'<td>{p.current_sl:,.0f}</td><td>{pnl_str}</td><td>{p.capital_deployed:,.0f}</td><td>{days_str}</td></tr>'
             )
 
         return f'''
         <div class="section">
             <div class="section-title">Open Positions ({len(positions)})</div>
             <table>
-                <tr><th>Script</th><th>Entry</th><th>Qty</th><th>SL</th><th>Unrl P&L</th><th>Cap%</th><th>Days</th></tr>
+                <tr><th>Script</th><th>Entry</th><th>Qty</th><th>SL</th><th>Unrl P&L</th><th>Capital</th><th>Age</th></tr>
                 {rows}
             </table>
         </div>
