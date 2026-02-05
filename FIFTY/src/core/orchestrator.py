@@ -275,16 +275,16 @@ class Orchestrator:
                 total_pnl = realized_pnl + unrealized_pnl
                 total_return_pct = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0
 
-                # Build compact message
+                # Build compact message with emojis
                 pnl_sign = "+" if total_pnl >= 0 else ""
 
                 message = (
-                    f"<b>Good Morning - FIFTY Started</b>\n\n"
-                    f"{date_str} ({day_name})\n"
-                    f"Capital: Rs.{available_capital:,.0f} / {initial_capital:,.0f}\n"
-                    f"Positions: {num_positions} | Pending: {pending_orders}\n"
-                    f"P&L: {pnl_sign}{total_pnl:,.0f} ({pnl_sign}{total_return_pct:.2f}%)\n"
-                    f"Ready"
+                    f"🌅 <b>FIFTY Service Started</b>\n\n"
+                    f"📅 {date_str} ({day_name})\n"
+                    f"💰 Rs.{available_capital:,.0f} / {initial_capital:,.0f}\n"
+                    f"📊 {num_positions} positions | {pending_orders} GTT pending\n"
+                    f"📈 P&L: {pnl_sign}{total_pnl:,.0f} ({pnl_sign}{total_return_pct:.2f}%)\n"
+                    f"✅ Ready"
                 )
 
                 telegram.send_alert(message)

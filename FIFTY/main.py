@@ -430,8 +430,8 @@ def run_daemon():
     logger.info("24/7 Telegram service with instant response")
     logger.info("=" * 50)
 
-    # Send professional daemon startup message
-    _send_daemon_startup_message()
+    # Note: Startup message is sent by morning_startup at 09:00 after token validation
+    # No separate daemon startup message to avoid duplicates
 
     # Start Telegram polling in background thread
     _telegram_thread = _start_telegram_thread()
