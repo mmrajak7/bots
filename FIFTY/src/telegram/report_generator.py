@@ -1,7 +1,8 @@
 """
-HTML Report Generator for FIFTY Bot - Compact Modern Design
+HTML Report Generator for FIFTY Bot - Landscape Modern Design
 
-Generates professional, compact HTML reports optimized for Telegram display.
+Generates professional, landscape-oriented HTML reports optimized for
+Telegram display with improved readability and larger fonts.
 All reports filter stale data and calculate metrics fresh from database.
 """
 
@@ -29,14 +30,14 @@ def ensure_reports_dir() -> Path:
 
 
 class ReportGenerator:
-    """Generates compact HTML reports for FIFTY bot"""
+    """Generates landscape HTML reports for FIFTY bot"""
 
     def __init__(self):
         self.reports_dir = ensure_reports_dir()
 
     def _get_compact_styles(self) -> str:
         """
-        Compact CSS optimized for Telegram image display.
+        Landscape CSS optimized for Telegram image display.
 
         Color philosophy:
         - GREEN (#22c55e): Positive P&L, wins, profits ONLY
@@ -52,105 +53,119 @@ class ReportGenerator:
                 font-family: 'Segoe UI', Roboto, Arial, sans-serif;
                 background: #1a1a2e;
                 color: #e8e8e8;
-                padding: 12px;
-                font-size: 13px;
-                line-height: 1.4;
+                padding: 20px;
+                font-size: 16px;
+                line-height: 1.5;
+                min-width: 900px;
             }
             .header {
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                padding: 8px 12px;
+                padding: 12px 20px;
                 background: linear-gradient(90deg, #0f3460, #16213e);
-                border-radius: 6px;
-                margin-bottom: 10px;
-                border-left: 3px solid #06b6d4;
+                border-radius: 8px;
+                margin-bottom: 16px;
+                border-left: 4px solid #06b6d4;
             }
             .header h1 {
-                font-size: 16px;
+                font-size: 24px;
                 color: #fff;
                 font-weight: 700;
             }
             .header .date {
-                font-size: 11px;
-                color: rgba(255,255,255,0.7);
+                font-size: 14px;
+                color: rgba(255,255,255,0.8);
                 background: rgba(255,255,255,0.1);
-                padding: 2px 8px;
+                padding: 4px 12px;
                 border-radius: 4px;
+            }
+            .grid-2 {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 16px;
+                margin-bottom: 16px;
+            }
+            .grid-3 {
+                display: grid;
+                grid-template-columns: 1fr 1fr 1fr;
+                gap: 16px;
+                margin-bottom: 16px;
             }
             .section {
                 background: rgba(255,255,255,0.05);
-                border-radius: 6px;
-                padding: 10px;
-                margin-bottom: 8px;
+                border-radius: 8px;
+                padding: 16px;
+                margin-bottom: 16px;
                 border: 1px solid rgba(255,255,255,0.08);
             }
             .section-title {
-                font-size: 11px;
+                font-size: 13px;
                 color: #06b6d4;
                 text-transform: uppercase;
-                letter-spacing: 1px;
-                margin-bottom: 8px;
+                letter-spacing: 1.5px;
+                margin-bottom: 12px;
                 font-weight: 600;
             }
             .metrics {
                 display: flex;
-                gap: 8px;
+                gap: 12px;
                 flex-wrap: wrap;
             }
             .metric {
                 flex: 1;
-                min-width: 70px;
+                min-width: 100px;
                 background: rgba(0,0,0,0.3);
-                padding: 8px;
-                border-radius: 4px;
+                padding: 12px 16px;
+                border-radius: 6px;
                 text-align: center;
             }
             .metric-value {
-                font-size: 18px;
+                font-size: 28px;
                 font-weight: 700;
                 color: #fff;
             }
             .metric-label {
-                font-size: 9px;
+                font-size: 11px;
                 color: #94a3b8;
-                margin-top: 2px;
+                margin-top: 4px;
                 text-transform: uppercase;
+                letter-spacing: 0.5px;
             }
             .row {
                 display: flex;
                 justify-content: space-between;
-                padding: 4px 0;
+                padding: 8px 0;
                 border-bottom: 1px solid rgba(255,255,255,0.05);
             }
             .row:last-child { border-bottom: none; }
-            .row-label { color: #94a3b8; font-size: 12px; }
-            .row-value { font-weight: 600; font-size: 12px; color: #e8e8e8; }
+            .row-label { color: #94a3b8; font-size: 15px; }
+            .row-value { font-weight: 600; font-size: 15px; color: #e8e8e8; }
             .positive { color: #22c55e; }
             .negative { color: #ef4444; }
             table {
                 width: 100%;
                 border-collapse: collapse;
-                font-size: 11px;
+                font-size: 14px;
             }
             th {
                 background: rgba(6,182,212,0.1);
                 color: #06b6d4;
                 font-weight: 600;
-                padding: 6px 8px;
+                padding: 10px 12px;
                 text-align: left;
-                font-size: 10px;
+                font-size: 12px;
                 text-transform: uppercase;
             }
             td {
-                padding: 6px 8px;
+                padding: 10px 12px;
                 border-bottom: 1px solid rgba(255,255,255,0.05);
             }
             .badge {
                 display: inline-block;
-                padding: 2px 6px;
-                border-radius: 3px;
-                font-size: 9px;
+                padding: 4px 10px;
+                border-radius: 4px;
+                font-size: 11px;
                 font-weight: 600;
             }
             .badge-win { background: rgba(34,197,94,0.2); color: #22c55e; }
@@ -159,22 +174,23 @@ class ReportGenerator:
             .footer {
                 text-align: center;
                 color: #64748b;
-                font-size: 9px;
-                padding-top: 8px;
+                font-size: 12px;
+                padding-top: 12px;
+                margin-top: 8px;
                 border-top: 1px solid rgba(255,255,255,0.05);
             }
             .progress-bar {
-                height: 4px;
+                height: 6px;
                 background: rgba(255,255,255,0.1);
-                border-radius: 2px;
-                margin-top: 4px;
+                border-radius: 3px;
+                margin-top: 8px;
             }
             .progress-fill {
                 height: 100%;
-                border-radius: 2px;
+                border-radius: 3px;
                 background: linear-gradient(90deg, #06b6d4, #22c55e);
             }
-            .empty { color: #64748b; text-align: center; padding: 12px; font-style: italic; }
+            .empty { color: #64748b; text-align: center; padding: 16px; font-style: italic; }
         </style>
         """
 
@@ -239,51 +255,54 @@ class ReportGenerator:
                 {self._get_compact_styles()}
             </head><body>
                 <div class="header">
-                    <h1>📊 FIFTY Daily</h1>
+                    <h1>FIFTY Daily Report</h1>
                     <div class="date">{today.strftime('%d %b %Y')}</div>
                 </div>
 
-                <div class="section">
-                    <div class="metrics">
-                        <div class="metric">
-                            <div class="metric-value">{len(open_positions)}</div>
-                            <div class="metric-label">Positions</div>
+                <div class="grid-2">
+                    <div class="section">
+                        <div class="section-title">Overview</div>
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="metric-value">{len(open_positions)}</div>
+                                <div class="metric-label">Positions</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{len(pending_orders)}</div>
+                                <div class="metric-label">GTT Pending</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{len(signals_today)}</div>
+                                <div class="metric-label">Signals</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{len(trades_closed_today)}</div>
+                                <div class="metric-label">Closed</div>
+                            </div>
                         </div>
-                        <div class="metric">
-                            <div class="metric-value">{len(pending_orders)}</div>
-                            <div class="metric-label">GTT Pending</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">{len(signals_today)}</div>
-                            <div class="metric-label">Signals</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">{len(trades_closed_today)}</div>
-                            <div class="metric-label">Closed</div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">P&L Summary</div>
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="metric-value {'positive' if today_pnl >= 0 else 'negative'}">{'+' if today_pnl >= 0 else ''}{today_pnl:,.0f}</div>
+                                <div class="metric-label">Today</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'positive' if unrealized >= 0 else 'negative'}">{'+' if unrealized >= 0 else ''}{unrealized:,.0f}</div>
+                                <div class="metric-label">Unrealized</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'positive' if total_pnl >= 0 else 'negative'}">{'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}</div>
+                                <div class="metric-label">Total</div>
+                            </div>
                         </div>
                     </div>
                 </div>
 
-                <div class="section">
-                    <div class="section-title">P&L</div>
-                    <div class="metrics">
-                        <div class="metric">
-                            <div class="metric-value {'positive' if today_pnl >= 0 else 'negative'}">{'+' if today_pnl >= 0 else ''}{today_pnl:,.0f}</div>
-                            <div class="metric-label">Today</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value {'positive' if unrealized >= 0 else 'negative'}">{'+' if unrealized >= 0 else ''}{unrealized:,.0f}</div>
-                            <div class="metric-label">Unrealized</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value {'positive' if total_pnl >= 0 else 'negative'}">{'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}</div>
-                            <div class="metric-label">Total</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="section">
-                    <div class="section-title">Capital</div>
+                <div class="section" style="margin-bottom: 16px;">
+                    <div class="section-title">Capital Utilization</div>
                     <div class="row">
                         <span class="row-label">Deployed</span>
                         <span class="row-value">{deployed:,.0f} ({utilization:.0f}%)</span>
@@ -359,58 +378,60 @@ class ReportGenerator:
                 {self._get_compact_styles()}
             </head><body>
                 <div class="header">
-                    <h1>📈 FIFTY Weekly</h1>
+                    <h1>FIFTY Weekly Report</h1>
                     <div class="date">{week_start.strftime('%d %b')} - {today.strftime('%d %b %Y')}</div>
                 </div>
 
-                <div class="section">
-                    <div class="section-title">This Week</div>
-                    <div class="metrics">
-                        <div class="metric">
-                            <div class="metric-value">{week_count}</div>
-                            <div class="metric-label">Trades</div>
+                <div class="grid-2">
+                    <div class="section">
+                        <div class="section-title">This Week</div>
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="metric-value">{week_count}</div>
+                                <div class="metric-label">Trades</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'positive' if week_pnl >= 0 else 'negative'}">{'+' if week_pnl >= 0 else ''}{week_pnl:,.0f}</div>
+                                <div class="metric-label">P&L</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{week_win_rate:.0f}%</div>
+                                <div class="metric-label">Win Rate</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{week_winners}/{week_count}</div>
+                                <div class="metric-label">W/L</div>
+                            </div>
                         </div>
-                        <div class="metric">
-                            <div class="metric-value {'positive' if week_pnl >= 0 else 'negative'}">{'+' if week_pnl >= 0 else ''}{week_pnl:,.0f}</div>
-                            <div class="metric-label">P&L</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">{week_win_rate:.0f}%</div>
-                            <div class="metric-label">Win Rate</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">{week_winners}/{week_count}</div>
-                            <div class="metric-label">W/L</div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">All-Time Performance</div>
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="metric-value">{total_count}</div>
+                                <div class="metric-label">Trades</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'positive' if total_pnl >= 0 else 'negative'}">{'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}</div>
+                                <div class="metric-label">P&L</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{total_win_rate:.0f}%</div>
+                                <div class="metric-label">Win Rate</div>
+                            </div>
                         </div>
                     </div>
                 </div>
 
                 <div class="section">
-                    <div class="section-title">All-Time</div>
-                    <div class="metrics">
-                        <div class="metric">
-                            <div class="metric-value">{total_count}</div>
-                            <div class="metric-label">Trades</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value {'positive' if total_pnl >= 0 else 'negative'}">{'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}</div>
-                            <div class="metric-label">P&L</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">{total_win_rate:.0f}%</div>
-                            <div class="metric-label">Win Rate</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="section">
-                    <div class="section-title">Current</div>
+                    <div class="section-title">Current Status</div>
                     <div class="row">
                         <span class="row-label">Open Positions</span>
                         <span class="row-value">{len(open_positions)}</span>
                     </div>
                     <div class="row">
-                        <span class="row-label">Deployed</span>
+                        <span class="row-label">Deployed Capital</span>
                         <span class="row-value">{deployed:,.0f} ({deployed_pct:.0f}%)</span>
                     </div>
                     <div class="row">
@@ -480,50 +501,52 @@ class ReportGenerator:
                 {self._get_compact_styles()}
             </head><body>
                 <div class="header">
-                    <h1>📅 FIFTY Monthly</h1>
+                    <h1>FIFTY Monthly Report</h1>
                     <div class="date">{month_name}</div>
                 </div>
 
-                <div class="section">
-                    <div class="section-title">This Month</div>
-                    <div class="metrics">
-                        <div class="metric">
-                            <div class="metric-value">{month_count}</div>
-                            <div class="metric-label">Trades</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value {'positive' if month_pnl >= 0 else 'negative'}">{'+' if month_pnl >= 0 else ''}{month_pnl:,.0f}</div>
-                            <div class="metric-label">P&L</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">{month_win_rate:.0f}%</div>
-                            <div class="metric-label">Win</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value {'positive' if month_roi >= 0 else 'negative'}">{'+' if month_roi >= 0 else ''}{month_roi:.1f}%</div>
-                            <div class="metric-label">ROI</div>
+                <div class="grid-2">
+                    <div class="section">
+                        <div class="section-title">This Month</div>
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="metric-value">{month_count}</div>
+                                <div class="metric-label">Trades</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'positive' if month_pnl >= 0 else 'negative'}">{'+' if month_pnl >= 0 else ''}{month_pnl:,.0f}</div>
+                                <div class="metric-label">P&L</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{month_win_rate:.0f}%</div>
+                                <div class="metric-label">Win Rate</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'positive' if month_roi >= 0 else 'negative'}">{'+' if month_roi >= 0 else ''}{month_roi:.1f}%</div>
+                                <div class="metric-label">ROI</div>
+                            </div>
                         </div>
                     </div>
-                </div>
 
-                <div class="section">
-                    <div class="section-title">All-Time</div>
-                    <div class="metrics">
-                        <div class="metric">
-                            <div class="metric-value">{total_count}</div>
-                            <div class="metric-label">Trades</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value {'positive' if total_pnl >= 0 else 'negative'}">{'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}</div>
-                            <div class="metric-label">P&L</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">{total_win_rate:.0f}%</div>
-                            <div class="metric-label">Win</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value {'positive' if total_roi >= 0 else 'negative'}">{'+' if total_roi >= 0 else ''}{total_roi:.1f}%</div>
-                            <div class="metric-label">ROI</div>
+                    <div class="section">
+                        <div class="section-title">All-Time Performance</div>
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="metric-value">{total_count}</div>
+                                <div class="metric-label">Trades</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'positive' if total_pnl >= 0 else 'negative'}">{'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}</div>
+                                <div class="metric-label">P&L</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{total_win_rate:.0f}%</div>
+                                <div class="metric-label">Win Rate</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value {'positive' if total_roi >= 0 else 'negative'}">{'+' if total_roi >= 0 else ''}{total_roi:.1f}%</div>
+                                <div class="metric-label">ROI</div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -595,24 +618,24 @@ class ReportGenerator:
                 {self._get_compact_styles()}
             </head><body>
                 <div class="header">
-                    <h1>🏆 FIFTY Overall</h1>
-                    <div class="date">Lifetime Performance</div>
+                    <h1>FIFTY Overall Performance</h1>
+                    <div class="date">Lifetime Report</div>
                 </div>
 
                 <div class="section">
-                    <div class="section-title">Performance</div>
+                    <div class="section-title">Performance Summary</div>
                     <div class="metrics">
                         <div class="metric">
                             <div class="metric-value">{total_count}</div>
-                            <div class="metric-label">Trades</div>
+                            <div class="metric-label">Total Trades</div>
                         </div>
                         <div class="metric">
                             <div class="metric-value {'positive' if total_pnl >= 0 else 'negative'}">{'+' if total_pnl >= 0 else ''}{total_pnl:,.0f}</div>
-                            <div class="metric-label">P&L</div>
+                            <div class="metric-label">Net P&L</div>
                         </div>
                         <div class="metric">
                             <div class="metric-value">{win_rate:.0f}%</div>
-                            <div class="metric-label">Win</div>
+                            <div class="metric-label">Win Rate</div>
                         </div>
                         <div class="metric">
                             <div class="metric-value {'positive' if total_roi >= 0 else 'negative'}">{'+' if total_roi >= 0 else ''}{total_roi:.1f}%</div>
@@ -621,55 +644,53 @@ class ReportGenerator:
                     </div>
                 </div>
 
-                <div class="section">
-                    <div class="section-title">Statistics</div>
-                    <div class="row">
-                        <span class="row-label">Win/Loss</span>
-                        <span class="row-value">{total_winners}W / {total_losers}L</span>
+                <div class="grid-2">
+                    <div class="section">
+                        <div class="section-title">Statistics</div>
+                        <div class="row">
+                            <span class="row-label">Win/Loss Record</span>
+                            <span class="row-value">{total_winners}W / {total_losers}L</span>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Avg Winner</span>
+                            <span class="row-value {'positive' if total_winners > 0 else ''}">{f'+{avg_winner:,.0f}' if total_winners > 0 else 'N/A'}</span>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Avg Loser</span>
+                            <span class="row-value {'negative' if total_losers > 0 else ''}">{f'{avg_loser:,.0f}' if total_losers > 0 else 'N/A'}</span>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Profit Factor</span>
+                            <span class="row-value">{profit_factor:.2f}x</span>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Avg Hold Period</span>
+                            <span class="row-value">{avg_days:.0f} days</span>
+                        </div>
                     </div>
-                    <div class="row">
-                        <span class="row-label">Avg Winner</span>
-                        <span class="row-value {'positive' if total_winners > 0 else ''}">{f'+{avg_winner:,.0f}' if total_winners > 0 else 'N/A'}</span>
-                    </div>
-                    <div class="row">
-                        <span class="row-label">Avg Loser</span>
-                        <span class="row-value {'negative' if total_losers > 0 else ''}">{f'{avg_loser:,.0f}' if total_losers > 0 else 'N/A'}</span>
-                    </div>
-                    <div class="row">
-                        <span class="row-label">Profit Factor</span>
-                        <span class="row-value">{profit_factor:.2f}x</span>
-                    </div>
-                    <div class="row">
-                        <span class="row-label">Avg Hold</span>
-                        <span class="row-value">{avg_days:.0f} days</span>
-                    </div>
-                </div>
 
-                {f'''<div class="section">
-                    <div class="section-title">Notable</div>
-                    <div class="row">
-                        <span class="row-label">Best Trade</span>
-                        <span class="row-value {'positive' if best.net_pnl >= 0 else 'negative'}">{best.script}: {'+' if best.net_pnl >= 0 else ''}{best.net_pnl:,.0f}</span>
-                    </div>
-                    <div class="row">
-                        <span class="row-label">Worst Trade</span>
-                        <span class="row-value {'positive' if worst.net_pnl >= 0 else 'negative'}">{worst.script}: {'+' if worst.net_pnl >= 0 else ''}{worst.net_pnl:,.0f}</span>
-                    </div>
-                </div>''' if best and worst else ''}
-
-                <div class="section">
-                    <div class="section-title">Current</div>
-                    <div class="row">
-                        <span class="row-label">Open Positions</span>
-                        <span class="row-value">{len(open_positions)}</span>
-                    </div>
-                    <div class="row">
-                        <span class="row-label">Deployed</span>
-                        <span class="row-value">{deployed:,.0f} ({deployed_pct:.0f}%)</span>
-                    </div>
-                    <div class="row">
-                        <span class="row-label">Unrealized</span>
-                        <span class="row-value {'positive' if unrealized >= 0 else 'negative'}">{'+' if unrealized >= 0 else ''}{unrealized:,.0f} ({'+' if unrealized_pct >= 0 else ''}{unrealized_pct:.1f}%)</span>
+                    <div class="section">
+                        <div class="section-title">Current Status</div>
+                        <div class="row">
+                            <span class="row-label">Open Positions</span>
+                            <span class="row-value">{len(open_positions)}</span>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Deployed Capital</span>
+                            <span class="row-value">{deployed:,.0f} ({deployed_pct:.0f}%)</span>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Unrealized P&L</span>
+                            <span class="row-value {'positive' if unrealized >= 0 else 'negative'}">{'+' if unrealized >= 0 else ''}{unrealized:,.0f} ({'+' if unrealized_pct >= 0 else ''}{unrealized_pct:.1f}%)</span>
+                        </div>
+                        {f'''<div class="row">
+                            <span class="row-label">Best Trade</span>
+                            <span class="row-value {'positive' if best.net_pnl >= 0 else 'negative'}">{best.script}: {'+' if best.net_pnl >= 0 else ''}{best.net_pnl:,.0f}</span>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Worst Trade</span>
+                            <span class="row-value {'positive' if worst.net_pnl >= 0 else 'negative'}">{worst.script}: {'+' if worst.net_pnl >= 0 else ''}{worst.net_pnl:,.0f}</span>
+                        </div>''' if best and worst else ''}
                     </div>
                 </div>
 
@@ -694,7 +715,7 @@ class ReportGenerator:
             session.close()
 
     def html_to_image(self, html_path: str) -> Optional[str]:
-        """Convert HTML to high-quality PNG image"""
+        """Convert HTML to high-quality PNG image (landscape)"""
         try:
             import imgkit
             from pathlib import Path
@@ -702,14 +723,14 @@ class ReportGenerator:
             html_file = Path(html_path)
             image_path = html_file.with_suffix('.png')
 
-            # High quality options for Telegram
+            # High quality landscape options for Telegram
             options = {
                 'format': 'png',
-                'width': 450,
+                'width': 1000,  # Landscape width
                 'quality': 100,
                 'enable-local-file-access': None,
                 'quiet': '',
-                'zoom': 2,  # 2x for retina-like quality
+                'zoom': 1.5,  # Good balance of quality and size
             }
 
             imgkit.from_file(str(html_file), str(image_path), options=options)
