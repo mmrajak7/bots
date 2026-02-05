@@ -108,8 +108,8 @@ class CommandHandler:
             # Build table header
             lines = [
                 "<b>Open Positions</b>",
-                "<code>Script       Qty  Entry    LTP     SL   P&L  Age</code>",
-                "<code>────────────────────────────────────────────────</code>"
+                "<code>Script       Qty  Entry    LTP     SL   P&L   %  Age</code>",
+                "<code>───────────────────────────────────────────────────</code>"
             ]
 
             total_deployed = 0
@@ -142,27 +142,33 @@ class CommandHandler:
                 else:
                     age_str = f"{pos.days_held:3d}d"
 
-                # Format P&L
+                # Format P&L and P&L %
                 if ltp is not None:
                     pnl_str = f"{unrealized_pnl:+5.0f}"
                     ltp_str = f"{ltp:6.0f}"
+                    # Calculate P&L % based on capital deployed
+                    pnl_pct = (unrealized_pnl / pos.capital_deployed * 100) if pos.capital_deployed > 0 else 0
+                    pct_str = f"{pnl_pct:+3.0f}%" if pnl_pct != 0 else "  0%"
                 else:
                     pnl_str = "  N/A"
                     ltp_str = "   N/A"
+                    pct_str = " N/A"
 
                 # Build row
                 lines.append(
-                    f"<code>{script_name} {pos.quantity:3d} {pos.entry_price:5.0f} {ltp_str} {pos.current_sl:6.0f} {pnl_str} {age_str}</code>"
+                    f"<code>{script_name} {pos.quantity:3d} {pos.entry_price:5.0f} {ltp_str} {pos.current_sl:6.0f} {pnl_str} {pct_str} {age_str}</code>"
                 )
                 total_deployed += pos.capital_deployed
 
             # Summary
-            lines.append("<code>────────────────────────────────────────────────</code>")
+            lines.append("<code>───────────────────────────────────────────────────</code>")
             lines.append(f"<b>Deployed:</b> {total_deployed:,.0f}")
 
-            pnl_sign = "+" if total_unrealized >= 0 else ""
+            pnl_sign = "+" if total_unrealized > 0 else ""
             pnl_emoji = "" if total_unrealized >= 0 else ""
-            lines.append(f"<b>Unrealized:</b> {pnl_sign}{total_unrealized:,.0f} {pnl_emoji}")
+            unrealized_pct = (total_unrealized / total_deployed * 100) if total_deployed > 0 else 0
+            pct_sign = "+" if unrealized_pct > 0 else ""
+            lines.append(f"<b>Unrealized:</b> {pnl_sign}{total_unrealized:,.0f} ({pct_sign}{unrealized_pct:.0f}%) {pnl_emoji}")
 
             telegram.send_alert('\n'.join(lines))
 
