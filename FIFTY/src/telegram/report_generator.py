@@ -53,144 +53,144 @@ class ReportGenerator:
                 font-family: 'Segoe UI', Roboto, Arial, sans-serif;
                 background: #1a1a2e;
                 color: #e8e8e8;
-                padding: 40px;
-                font-size: 32px;
-                line-height: 1.5;
-                min-width: 1400px;
+                padding: 60px;
+                font-size: 48px;
+                line-height: 1.4;
+                width: 2400px;
             }
             .header {
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                padding: 24px 40px;
+                padding: 40px 60px;
                 background: linear-gradient(90deg, #0f3460, #16213e);
-                border-radius: 16px;
-                margin-bottom: 32px;
-                border-left: 8px solid #06b6d4;
+                border-radius: 20px;
+                margin-bottom: 50px;
+                border-left: 12px solid #06b6d4;
             }
             .header h1 {
-                font-size: 48px;
+                font-size: 72px;
                 color: #fff;
                 font-weight: 700;
             }
             .header .date {
-                font-size: 28px;
-                color: rgba(255,255,255,0.8);
-                background: rgba(255,255,255,0.1);
-                padding: 8px 24px;
-                border-radius: 8px;
+                font-size: 42px;
+                color: rgba(255,255,255,0.9);
+                background: rgba(255,255,255,0.15);
+                padding: 15px 35px;
+                border-radius: 12px;
             }
             .grid-2 {
                 display: grid;
                 grid-template-columns: 1fr 1fr;
-                gap: 32px;
-                margin-bottom: 32px;
+                gap: 50px;
+                margin-bottom: 50px;
             }
             .grid-3 {
                 display: grid;
                 grid-template-columns: 1fr 1fr 1fr;
-                gap: 32px;
-                margin-bottom: 32px;
+                gap: 50px;
+                margin-bottom: 50px;
             }
             .section {
                 background: rgba(255,255,255,0.05);
-                border-radius: 16px;
-                padding: 32px;
-                margin-bottom: 32px;
-                border: 2px solid rgba(255,255,255,0.08);
+                border-radius: 20px;
+                padding: 45px;
+                margin-bottom: 50px;
+                border: 3px solid rgba(255,255,255,0.1);
             }
             .section-title {
-                font-size: 26px;
+                font-size: 38px;
                 color: #06b6d4;
                 text-transform: uppercase;
-                letter-spacing: 3px;
-                margin-bottom: 24px;
-                font-weight: 600;
+                letter-spacing: 4px;
+                margin-bottom: 35px;
+                font-weight: 700;
             }
             .metrics {
                 display: flex;
-                gap: 24px;
+                gap: 40px;
                 flex-wrap: wrap;
             }
             .metric {
                 flex: 1;
-                min-width: 200px;
-                background: rgba(0,0,0,0.3);
-                padding: 24px 32px;
-                border-radius: 12px;
+                min-width: 280px;
+                background: rgba(0,0,0,0.35);
+                padding: 35px 45px;
+                border-radius: 16px;
                 text-align: center;
             }
             .metric-value {
-                font-size: 56px;
+                font-size: 84px;
                 font-weight: 700;
                 color: #fff;
             }
             .metric-label {
-                font-size: 22px;
+                font-size: 32px;
                 color: #94a3b8;
-                margin-top: 8px;
+                margin-top: 12px;
                 text-transform: uppercase;
-                letter-spacing: 1px;
+                letter-spacing: 2px;
             }
             .row {
                 display: flex;
                 justify-content: space-between;
-                padding: 16px 0;
-                border-bottom: 2px solid rgba(255,255,255,0.05);
+                padding: 22px 0;
+                border-bottom: 3px solid rgba(255,255,255,0.06);
             }
             .row:last-child { border-bottom: none; }
-            .row-label { color: #94a3b8; font-size: 30px; }
-            .row-value { font-weight: 600; font-size: 30px; color: #e8e8e8; }
+            .row-label { color: #94a3b8; font-size: 44px; }
+            .row-value { font-weight: 600; font-size: 44px; color: #e8e8e8; }
             .positive { color: #22c55e; }
             .negative { color: #ef4444; }
             table {
                 width: 100%;
                 border-collapse: collapse;
-                font-size: 28px;
+                font-size: 40px;
             }
             th {
-                background: rgba(6,182,212,0.1);
+                background: rgba(6,182,212,0.12);
                 color: #06b6d4;
-                font-weight: 600;
-                padding: 20px 24px;
+                font-weight: 700;
+                padding: 28px 35px;
                 text-align: left;
-                font-size: 24px;
+                font-size: 36px;
                 text-transform: uppercase;
             }
             td {
-                padding: 20px 24px;
-                border-bottom: 2px solid rgba(255,255,255,0.05);
+                padding: 28px 35px;
+                border-bottom: 3px solid rgba(255,255,255,0.06);
             }
             .badge {
                 display: inline-block;
-                padding: 8px 20px;
-                border-radius: 8px;
-                font-size: 22px;
+                padding: 12px 28px;
+                border-radius: 10px;
+                font-size: 32px;
                 font-weight: 600;
             }
-            .badge-win { background: rgba(34,197,94,0.2); color: #22c55e; }
-            .badge-loss { background: rgba(239,68,68,0.2); color: #ef4444; }
-            .badge-pending { background: rgba(6,182,212,0.2); color: #06b6d4; }
+            .badge-win { background: rgba(34,197,94,0.25); color: #22c55e; }
+            .badge-loss { background: rgba(239,68,68,0.25); color: #ef4444; }
+            .badge-pending { background: rgba(6,182,212,0.25); color: #06b6d4; }
             .footer {
                 text-align: center;
                 color: #64748b;
-                font-size: 24px;
-                padding-top: 24px;
-                margin-top: 16px;
-                border-top: 2px solid rgba(255,255,255,0.05);
+                font-size: 36px;
+                padding-top: 35px;
+                margin-top: 25px;
+                border-top: 3px solid rgba(255,255,255,0.06);
             }
             .progress-bar {
-                height: 12px;
+                height: 18px;
                 background: rgba(255,255,255,0.1);
-                border-radius: 6px;
-                margin-top: 16px;
+                border-radius: 9px;
+                margin-top: 20px;
             }
             .progress-fill {
                 height: 100%;
-                border-radius: 6px;
+                border-radius: 9px;
                 background: linear-gradient(90deg, #06b6d4, #22c55e);
             }
-            .empty { color: #64748b; text-align: center; padding: 32px; font-style: italic; }
+            .empty { color: #64748b; text-align: center; padding: 50px; font-style: italic; font-size: 40px; }
         </style>
         """
 
@@ -723,11 +723,11 @@ class ReportGenerator:
             html_file = Path(html_path)
             image_path = html_file.with_suffix('.jpg')
 
-            # Optimized for Telegram (must be under 10MB)
+            # Large landscape image with readable fonts
             options = {
                 'format': 'jpg',
-                'width': 1400,  # Landscape width
-                'quality': 85,  # Good quality, smaller file
+                'width': 2400,  # Match CSS body width for landscape
+                'quality': 80,  # Balance quality and size
                 'enable-local-file-access': None,
                 'quiet': '',
             }
@@ -738,10 +738,10 @@ class ReportGenerator:
                 size_mb = image_path.stat().st_size / (1024 * 1024)
                 logger.info(f"Image created: {image_path} ({size_mb:.1f}MB)")
 
-                # If still too large, reduce quality further
+                # If too large for Telegram, reduce quality
                 if size_mb > 9:
                     logger.warning(f"Image too large ({size_mb:.1f}MB), reducing quality")
-                    options['quality'] = 60
+                    options['quality'] = 50
                     imgkit.from_file(str(html_file), str(image_path), options=options)
                     size_mb = image_path.stat().st_size / (1024 * 1024)
                     logger.info(f"Reduced image: {size_mb:.1f}MB")
