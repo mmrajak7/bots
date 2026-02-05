@@ -715,28 +715,37 @@ class ReportGenerator:
             session.close()
 
     def html_to_image(self, html_path: str) -> Optional[str]:
-        """Convert HTML to high-quality PNG image (landscape)"""
+        """Convert HTML to JPEG image (landscape, optimized for Telegram <10MB)"""
         try:
             import imgkit
             from pathlib import Path
 
             html_file = Path(html_path)
-            image_path = html_file.with_suffix('.png')
+            image_path = html_file.with_suffix('.jpg')
 
-            # High quality landscape options for Telegram
+            # Optimized for Telegram (must be under 10MB)
             options = {
-                'format': 'png',
-                'width': 1600,  # Landscape width for large fonts
-                'quality': 100,
+                'format': 'jpg',
+                'width': 1400,  # Landscape width
+                'quality': 85,  # Good quality, smaller file
                 'enable-local-file-access': None,
                 'quiet': '',
-                'zoom': 1.0,  # No zoom needed with larger fonts
             }
 
             imgkit.from_file(str(html_file), str(image_path), options=options)
 
             if image_path.exists() and image_path.stat().st_size > 0:
-                logger.info(f"Image created: {image_path}")
+                size_mb = image_path.stat().st_size / (1024 * 1024)
+                logger.info(f"Image created: {image_path} ({size_mb:.1f}MB)")
+
+                # If still too large, reduce quality further
+                if size_mb > 9:
+                    logger.warning(f"Image too large ({size_mb:.1f}MB), reducing quality")
+                    options['quality'] = 60
+                    imgkit.from_file(str(html_file), str(image_path), options=options)
+                    size_mb = image_path.stat().st_size / (1024 * 1024)
+                    logger.info(f"Reduced image: {size_mb:.1f}MB")
+
                 return str(image_path)
             return None
 
