@@ -56,7 +56,9 @@ class ReportGenerator:
                 padding: 60px;
                 font-size: 48px;
                 line-height: 1.4;
-                width: 2400px;
+                width: 2400px !important;
+                min-width: 2400px !important;
+                max-width: 2400px !important;
             }
             .header {
                 display: flex;
@@ -81,16 +83,24 @@ class ReportGenerator:
                 border-radius: 12px;
             }
             .grid-2 {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
+                display: flex !important;
+                flex-direction: row !important;
                 gap: 50px;
                 margin-bottom: 50px;
             }
+            .grid-2 > .section {
+                flex: 1 1 50%;
+                margin-bottom: 0;
+            }
             .grid-3 {
-                display: grid;
-                grid-template-columns: 1fr 1fr 1fr;
+                display: flex !important;
+                flex-direction: row !important;
                 gap: 50px;
                 margin-bottom: 50px;
+            }
+            .grid-3 > .section {
+                flex: 1 1 33%;
+                margin-bottom: 0;
             }
             .section {
                 background: rgba(255,255,255,0.05);
