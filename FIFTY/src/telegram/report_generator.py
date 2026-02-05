@@ -53,119 +53,119 @@ class ReportGenerator:
                 font-family: 'Segoe UI', Roboto, Arial, sans-serif;
                 background: #1a1a2e;
                 color: #e8e8e8;
-                padding: 20px;
-                font-size: 16px;
+                padding: 40px;
+                font-size: 32px;
                 line-height: 1.5;
-                min-width: 900px;
+                min-width: 1400px;
             }
             .header {
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                padding: 12px 20px;
+                padding: 24px 40px;
                 background: linear-gradient(90deg, #0f3460, #16213e);
-                border-radius: 8px;
-                margin-bottom: 16px;
-                border-left: 4px solid #06b6d4;
+                border-radius: 16px;
+                margin-bottom: 32px;
+                border-left: 8px solid #06b6d4;
             }
             .header h1 {
-                font-size: 24px;
+                font-size: 48px;
                 color: #fff;
                 font-weight: 700;
             }
             .header .date {
-                font-size: 14px;
+                font-size: 28px;
                 color: rgba(255,255,255,0.8);
                 background: rgba(255,255,255,0.1);
-                padding: 4px 12px;
-                border-radius: 4px;
+                padding: 8px 24px;
+                border-radius: 8px;
             }
             .grid-2 {
                 display: grid;
                 grid-template-columns: 1fr 1fr;
-                gap: 16px;
-                margin-bottom: 16px;
+                gap: 32px;
+                margin-bottom: 32px;
             }
             .grid-3 {
                 display: grid;
                 grid-template-columns: 1fr 1fr 1fr;
-                gap: 16px;
-                margin-bottom: 16px;
+                gap: 32px;
+                margin-bottom: 32px;
             }
             .section {
                 background: rgba(255,255,255,0.05);
-                border-radius: 8px;
-                padding: 16px;
-                margin-bottom: 16px;
-                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 16px;
+                padding: 32px;
+                margin-bottom: 32px;
+                border: 2px solid rgba(255,255,255,0.08);
             }
             .section-title {
-                font-size: 13px;
+                font-size: 26px;
                 color: #06b6d4;
                 text-transform: uppercase;
-                letter-spacing: 1.5px;
-                margin-bottom: 12px;
+                letter-spacing: 3px;
+                margin-bottom: 24px;
                 font-weight: 600;
             }
             .metrics {
                 display: flex;
-                gap: 12px;
+                gap: 24px;
                 flex-wrap: wrap;
             }
             .metric {
                 flex: 1;
-                min-width: 100px;
+                min-width: 200px;
                 background: rgba(0,0,0,0.3);
-                padding: 12px 16px;
-                border-radius: 6px;
+                padding: 24px 32px;
+                border-radius: 12px;
                 text-align: center;
             }
             .metric-value {
-                font-size: 28px;
+                font-size: 56px;
                 font-weight: 700;
                 color: #fff;
             }
             .metric-label {
-                font-size: 11px;
+                font-size: 22px;
                 color: #94a3b8;
-                margin-top: 4px;
+                margin-top: 8px;
                 text-transform: uppercase;
-                letter-spacing: 0.5px;
+                letter-spacing: 1px;
             }
             .row {
                 display: flex;
                 justify-content: space-between;
-                padding: 8px 0;
-                border-bottom: 1px solid rgba(255,255,255,0.05);
+                padding: 16px 0;
+                border-bottom: 2px solid rgba(255,255,255,0.05);
             }
             .row:last-child { border-bottom: none; }
-            .row-label { color: #94a3b8; font-size: 15px; }
-            .row-value { font-weight: 600; font-size: 15px; color: #e8e8e8; }
+            .row-label { color: #94a3b8; font-size: 30px; }
+            .row-value { font-weight: 600; font-size: 30px; color: #e8e8e8; }
             .positive { color: #22c55e; }
             .negative { color: #ef4444; }
             table {
                 width: 100%;
                 border-collapse: collapse;
-                font-size: 14px;
+                font-size: 28px;
             }
             th {
                 background: rgba(6,182,212,0.1);
                 color: #06b6d4;
                 font-weight: 600;
-                padding: 10px 12px;
+                padding: 20px 24px;
                 text-align: left;
-                font-size: 12px;
+                font-size: 24px;
                 text-transform: uppercase;
             }
             td {
-                padding: 10px 12px;
-                border-bottom: 1px solid rgba(255,255,255,0.05);
+                padding: 20px 24px;
+                border-bottom: 2px solid rgba(255,255,255,0.05);
             }
             .badge {
                 display: inline-block;
-                padding: 4px 10px;
-                border-radius: 4px;
-                font-size: 11px;
+                padding: 8px 20px;
+                border-radius: 8px;
+                font-size: 22px;
                 font-weight: 600;
             }
             .badge-win { background: rgba(34,197,94,0.2); color: #22c55e; }
@@ -174,23 +174,23 @@ class ReportGenerator:
             .footer {
                 text-align: center;
                 color: #64748b;
-                font-size: 12px;
-                padding-top: 12px;
-                margin-top: 8px;
-                border-top: 1px solid rgba(255,255,255,0.05);
+                font-size: 24px;
+                padding-top: 24px;
+                margin-top: 16px;
+                border-top: 2px solid rgba(255,255,255,0.05);
             }
             .progress-bar {
-                height: 6px;
+                height: 12px;
                 background: rgba(255,255,255,0.1);
-                border-radius: 3px;
-                margin-top: 8px;
+                border-radius: 6px;
+                margin-top: 16px;
             }
             .progress-fill {
                 height: 100%;
-                border-radius: 3px;
+                border-radius: 6px;
                 background: linear-gradient(90deg, #06b6d4, #22c55e);
             }
-            .empty { color: #64748b; text-align: center; padding: 16px; font-style: italic; }
+            .empty { color: #64748b; text-align: center; padding: 32px; font-style: italic; }
         </style>
         """
 
@@ -726,11 +726,11 @@ class ReportGenerator:
             # High quality landscape options for Telegram
             options = {
                 'format': 'png',
-                'width': 1000,  # Landscape width
+                'width': 1600,  # Landscape width for large fonts
                 'quality': 100,
                 'enable-local-file-access': None,
                 'quiet': '',
-                'zoom': 1.5,  # Good balance of quality and size
+                'zoom': 1.0,  # No zoom needed with larger fonts
             }
 
             imgkit.from_file(str(html_file), str(image_path), options=options)
