@@ -659,18 +659,24 @@ def reset_trailing_state(position_id: int) -> None:
     Reset trailing profit state for a position.
 
     Called when position is closed or needs to start fresh.
+    Uses direct SQL to NULL out peak/floor fields because
+    update_trailing_state() skips None values by design.
 
     Args:
         position_id: Position ID
     """
-    update_trailing_state(
-        position_id=position_id,
-        peak_pnl_pct=None,
-        peak_pnl_amount=None,
-        trailing_active=False,
-        trailing_floor_pct=None,
-        breakeven_locked=False
-    )
+    with get_db_session() as conn:
+        conn.execute(
+            """UPDATE positions SET
+               trailing_active = 0,
+               trailing_floor_pct = NULL,
+               peak_pnl_pct = NULL,
+               peak_pnl_amount = NULL,
+               breakeven_locked = 0,
+               updated_at = ?
+               WHERE id = ?""",
+            (datetime.now().isoformat(), position_id)
+        )
     logger.info(f"Trailing state reset for position {position_id}")
 
 

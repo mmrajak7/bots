@@ -996,6 +996,27 @@ _Fetching P&L data..._"""
                 logger.info(f"Monitor: P&L snapshot saved: ₹{snapshot.current_pnl:,.0f} ({current_pnl_pct:+.2f}% ROM)")
 
                 # =============================================================
+                # HARD CAP PROFIT TARGET (absolute INR amount)
+                # =============================================================
+                # Fires before trailing/fixed TP - guarantees exit at fixed INR
+                # regardless of margin deployed or trailing state
+                profit_target_amount = self.trading_config.get('exit', {}).get('profit_target_amount', 0)
+                if profit_target_amount > 0 and snapshot.current_pnl >= profit_target_amount:
+                    logger.info(
+                        f"HARD CAP TP HIT! P&L: ₹{snapshot.current_pnl:,.0f} >= ₹{profit_target_amount:,.0f}"
+                    )
+                    result = self.exit_manager.execute_exit(
+                        reason=ExitReason.PROFIT_TARGET,
+                        position=position
+                    )
+                    if result.success:
+                        reset_trailing_state(position.id)
+                        self._stats.exits_triggered += 1
+                        return
+                    else:
+                        logger.error(f"Hard cap TP exit failed: {result.error}")
+
+                # =============================================================
                 # TRAILING PROFIT CHECK (runs before fixed TP/SL)
                 # =============================================================
                 trailing_config = self.trading_config.get('exit', {}).get('trailing', {})

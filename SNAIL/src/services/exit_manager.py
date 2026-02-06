@@ -46,7 +46,9 @@ from src.utils.db import (
     clear_all_pending_decisions,
     # Exit in progress guard (prevents duplicate exits)
     set_exit_in_progress,
-    clear_exit_in_progress
+    clear_exit_in_progress,
+    # Trailing state cleanup (defense-in-depth on all exit paths)
+    reset_trailing_state
 )
 from src.utils.config import get_trading_config, load_config
 
@@ -628,6 +630,11 @@ class ExitManager:
                 reason=reason,
                 realized_pnl=realized_pnl
             )
+
+            # Clean up trailing state (defense-in-depth)
+            # Ensures ALL exit paths clear trailing_active, peak, floor
+            # even if the caller forgets to call reset_trailing_state()
+            reset_trailing_state(position.id)
 
             # Set cooldown (1 day after exit)
             # ISSUE-FIX: Skip cooldown on Friday - weekend is enough buffer
