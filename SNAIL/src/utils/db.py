@@ -702,10 +702,13 @@ def set_exit_in_progress(position_id: int) -> bool:
     """
     with get_db_session() as conn:
         # Atomic check-and-set using WHERE clause
+        # Also checks status='active' to prevent acquiring lock on closed positions
+        # (guards against stale position objects triggering duplicate exits)
         cursor = conn.execute(
             """UPDATE positions
                SET exit_in_progress = 1, updated_at = ?
-               WHERE id = ? AND (exit_in_progress = 0 OR exit_in_progress IS NULL)""",
+               WHERE id = ? AND status = 'active'
+               AND (exit_in_progress = 0 OR exit_in_progress IS NULL)""",
             (datetime.now().isoformat(), position_id)
         )
 
@@ -713,13 +716,29 @@ def set_exit_in_progress(position_id: int) -> bool:
             logger.info(f"Exit in progress SET for position {position_id}")
             return True
         else:
-            logger.warning(f"Exit already in progress for position {position_id} - blocking duplicate")
+            # Check why it failed for better logging
+            check = conn.execute(
+                "SELECT status, exit_in_progress FROM positions WHERE id = ?",
+                (position_id,)
+            )
+            row = check.fetchone()
+            if row and row['status'] != 'active':
+                logger.warning(
+                    f"Exit blocked for position {position_id} - position already {row['status']}"
+                )
+            else:
+                logger.warning(
+                    f"Exit already in progress for position {position_id} - blocking duplicate"
+                )
             return False
 
 
 def is_exit_in_progress(position_id: int) -> bool:
     """
     Check if an exit is already in progress for a position.
+
+    Includes stale detection: if exit_in_progress has been set for >2 minutes,
+    auto-clears the flag (exit should complete in <60s; >2min means crash/hang).
 
     Args:
         position_id: Position ID
@@ -729,7 +748,7 @@ def is_exit_in_progress(position_id: int) -> bool:
     """
     with get_db_session() as conn:
         cursor = conn.execute(
-            "SELECT exit_in_progress FROM positions WHERE id = ?",
+            "SELECT exit_in_progress, updated_at FROM positions WHERE id = ?",
             (position_id,)
         )
         row = cursor.fetchone()
@@ -737,7 +756,26 @@ def is_exit_in_progress(position_id: int) -> bool:
         if not row:
             return False
 
-        return bool(row['exit_in_progress']) if row['exit_in_progress'] is not None else False
+        is_active = bool(row['exit_in_progress']) if row['exit_in_progress'] is not None else False
+
+        if is_active and row['updated_at']:
+            try:
+                updated_at = datetime.fromisoformat(row['updated_at'])
+                age_seconds = (datetime.now() - updated_at).total_seconds()
+                if age_seconds > 120:  # 2 minutes (exit should complete in <60s)
+                    logger.warning(
+                        f"Exit in progress flag is STALE ({age_seconds:.0f}s old) "
+                        f"for position {position_id} - auto-clearing"
+                    )
+                    conn.execute(
+                        "UPDATE positions SET exit_in_progress = 0, updated_at = ? WHERE id = ?",
+                        (datetime.now().isoformat(), position_id)
+                    )
+                    return False
+            except (ValueError, TypeError):
+                pass  # Can't parse timestamp, treat as active
+
+        return is_active
 
 
 def clear_exit_in_progress(position_id: int) -> None:
@@ -1576,8 +1614,9 @@ def set_pending_decision(decision_type: str, position_id: int) -> None:
         position_id: Position ID this decision is for
     """
     cooldown_type = f"pending_{decision_type}"
-    # Set 7-day expiry (effectively "until user responds")
-    duration = 7 * 24 * 3600  # 7 days in seconds
+    # Set 2-hour expiry — if user doesn't respond within 2 hours,
+    # the alert can be re-sent. Prevents silent suppression of critical alerts.
+    duration = 2 * 3600  # 2 hours in seconds
 
     with get_db_session() as conn:
         cooldown_end = datetime.now() + timedelta(seconds=duration)

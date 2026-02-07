@@ -531,6 +531,16 @@ class EntryManager:
                 error="Entry already in progress - blocking duplicate"
             )
 
+        # Re-check for active position AFTER acquiring lock (defense-in-depth)
+        # Prevents race: pre-check passes, another process creates position, we proceed
+        active_after_lock = get_active_position()
+        if active_after_lock:
+            set_entry_in_progress(False)
+            return EntryResult(
+                success=False,
+                error=f"Active position exists after lock acquired (ID: {active_after_lock.id}) - race detected"
+            )
+
         logger.info("Starting Iron Fly entry execution...")
 
         try:

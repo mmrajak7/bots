@@ -539,7 +539,7 @@ def calculate_position_pnl(
 
     # Calculate P&L percentage based on margin deployed (Return on Margin)
     # This is more meaningful than % of max_profit since max_profit is rarely achieved
-    if margin_deployed > 0:
+    if margin_deployed and margin_deployed > 0:
         pnl_pct = (pnl / margin_deployed * 100)
     else:
         # Fallback: use max_profit if margin not available (legacy behavior)

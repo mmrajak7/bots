@@ -281,6 +281,11 @@ class PositionMonitor:
             logger.error("Position has invalid lot_size")
             return None
 
+        # Validate margin_deployed (required for ROM-based P&L calculation)
+        if position.margin_deployed is None or position.margin_deployed <= 0:
+            logger.error(f"Position has invalid margin_deployed: {position.margin_deployed}")
+            return None
+
         # Validate legs have entry prices
         for leg in legs:
             if leg.entry_price is None:

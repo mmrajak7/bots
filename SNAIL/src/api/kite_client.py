@@ -208,25 +208,33 @@ class SNAILKiteClient:
         result = self.kite.ltp(instruments)
         return {inst: data.get('last_price', 0) for inst, data in result.items()}
 
-    def get_nifty_spot(self) -> float:
+    def get_nifty_spot(self) -> Optional[float]:
         """
         Get current NIFTY spot price.
 
         Returns:
-            NIFTY 50 last traded price
+            NIFTY 50 last traded price, or None if unavailable
         """
         result = self.ltp(["NSE:NIFTY 50"])
-        return result.get("NSE:NIFTY 50", 0)
+        value = result.get("NSE:NIFTY 50", 0)
+        if not value or value <= 0:
+            logger.warning("get_nifty_spot() returned invalid value, returning None")
+            return None
+        return value
 
-    def get_india_vix(self) -> float:
+    def get_india_vix(self) -> Optional[float]:
         """
         Get current India VIX.
 
         Returns:
-            India VIX value
+            India VIX value, or None if unavailable
         """
         result = self.ltp(["NSE:INDIA VIX"])
-        return result.get("NSE:INDIA VIX", 0)
+        value = result.get("NSE:INDIA VIX", 0)
+        if not value or value <= 0:
+            logger.warning("get_india_vix() returned invalid value, returning None")
+            return None
+        return value
 
     def get_nifty_futures_ltp(self, futures_symbol: str) -> float:
         """

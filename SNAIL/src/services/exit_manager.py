@@ -302,7 +302,7 @@ class ExitManager:
         india_vix = self.kite.get_india_vix()
         vix_hard_exit_threshold = self.trading_config.get('exit', {}).get('vix_hard_exit', 20)
 
-        if india_vix > vix_hard_exit_threshold:
+        if india_vix is not None and india_vix > vix_hard_exit_threshold:
             logger.warning(f"VIX breach detected! VIX={india_vix:.2f} > {vix_hard_exit_threshold}")
             return ExitCondition(
                 should_exit=True,
@@ -431,36 +431,54 @@ class ExitManager:
         # The atomic set_exit_in_progress() returns False if already in progress.
         if not set_exit_in_progress(position.id):
             logger.warning(
-                f"EXIT BLOCKED: Exit already in progress for position {position.id}. "
+                f"EXIT BLOCKED: Exit already in progress or position not active for {position.id}. "
                 f"Ignoring duplicate {reason.value} trigger."
             )
             return ExitResult(
                 success=False,
-                error="Exit already in progress - duplicate trigger blocked"
+                error="Exit already in progress or position not active - duplicate trigger blocked"
+            )
+
+        # Re-verify position is still active after acquiring lock (defense-in-depth)
+        # The position object passed in may be stale - re-fetch from DB to confirm
+        fresh_position = get_active_position()
+        if fresh_position is None or fresh_position.id != position.id:
+            logger.warning(
+                f"EXIT BLOCKED: Position {position.id} is no longer active after lock acquired. "
+                f"Stale position object detected for {reason.value} trigger."
+            )
+            clear_exit_in_progress(position.id)
+            return ExitResult(
+                success=False,
+                error="Position no longer active - stale object detected"
             )
 
         logger.info(f"Executing exit for position {position.id}, reason: {reason.value}")
 
         # Notify user that exit is starting
-        reason_emoji = {
-            ExitReason.PROFIT_TARGET: "🎯",
-            ExitReason.STOP_LOSS: "🛑",
-            ExitReason.TRAILING_STOP: "📉",
-            ExitReason.MANUAL: "👤",
-            ExitReason.FRIDAY_CLOSE: "📅",
-            ExitReason.VIX_BREACH: "⚡",
-            ExitReason.WING_BREACH: "🚨",
-            ExitReason.EXPIRY: "⏰",
-            ExitReason.GAP_OPEN: "📉",
-            ExitReason.CLAUDE_ADVISORY: "🤖"
-        }
-        emoji = reason_emoji.get(reason, "🔄")
-        self.telegram.send(
-            f"{emoji} *Exit Started*\n\n"
-            f"Reason: {reason.value.replace('_', ' ').title()}\n"
-            f"Placing LIMIT orders for all 4 legs...\n\n"
-            f"_Will notify on completion or if action needed._"
-        )
+        # Wrapped in try/except: Telegram failure must NEVER block exit execution
+        try:
+            reason_emoji = {
+                ExitReason.PROFIT_TARGET: "🎯",
+                ExitReason.STOP_LOSS: "🛑",
+                ExitReason.TRAILING_STOP: "📉",
+                ExitReason.MANUAL: "👤",
+                ExitReason.FRIDAY_CLOSE: "📅",
+                ExitReason.VIX_BREACH: "⚡",
+                ExitReason.WING_BREACH: "🚨",
+                ExitReason.EXPIRY: "⏰",
+                ExitReason.GAP_OPEN: "📉",
+                ExitReason.CLAUDE_ADVISORY: "🤖"
+            }
+            emoji = reason_emoji.get(reason, "🔄")
+            self.telegram.send(
+                f"{emoji} *Exit Started*\n\n"
+                f"Reason: {reason.value.replace('_', ' ').title()}\n"
+                f"Placing LIMIT orders for all 4 legs...\n\n"
+                f"_Will notify on completion or if action needed._"
+            )
+        except Exception as e:
+            logger.warning(f"Pre-exit Telegram notification failed (non-blocking): {e}")
 
         try:
             # Get current quotes
@@ -623,13 +641,53 @@ class ExitManager:
             charges = calculate_transaction_charges(buy_value, sell_value)
 
             # Update position in database
-            self._record_exit(
-                position=position,
-                legs=legs,
-                orders=orders,
-                reason=reason,
-                realized_pnl=realized_pnl
-            )
+            # CRITICAL: Orders are already filled at this point. If DB write fails,
+            # position is closed on exchange but still 'active' in DB.
+            # We must record this failure and alert the user.
+            try:
+                self._record_exit(
+                    position=position,
+                    legs=legs,
+                    orders=orders,
+                    reason=reason,
+                    realized_pnl=realized_pnl
+                )
+            except Exception as record_err:
+                logger.critical(
+                    f"CRITICAL: _record_exit() failed AFTER orders filled! "
+                    f"Position {position.id} is CLOSED on exchange but DB not updated. "
+                    f"Error: {record_err}"
+                )
+                # Record as failed exit so position isn't stuck as 'active'
+                try:
+                    record_failed_exit(
+                        position_id=position.id,
+                        legs_closed=[leg.leg_type for leg in legs],
+                        legs_failed={},
+                        error=f"DB record_exit failed: {record_err}",
+                        partial=False
+                    )
+                except Exception:
+                    logger.critical(f"record_failed_exit also failed for position {position.id}")
+                # Alert user - this is a critical situation
+                try:
+                    self.telegram.send(
+                        f"🚨 *CRITICAL: Exit DB Recording Failed!*\n\n"
+                        f"Position {position.id} is CLOSED on exchange\n"
+                        f"but database was NOT updated.\n\n"
+                        f"Error: {str(record_err)[:200]}\n\n"
+                        f"⚠️ *Manual DB correction required!*"
+                    )
+                except Exception:
+                    pass  # Don't let Telegram failure compound the issue
+                # Still return success - the EXIT itself worked, only DB recording failed
+                return ExitResult(
+                    success=True,
+                    reason=reason,
+                    realized_pnl=realized_pnl,
+                    orders=orders,
+                    error=f"Exit orders filled but DB recording failed: {record_err}"
+                )
 
             # Clean up trailing state (defense-in-depth)
             # Ensures ALL exit paths clear trailing_active, peak, floor
