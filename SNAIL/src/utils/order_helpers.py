@@ -530,6 +530,10 @@ def place_order_with_retry(
     """
     Place order with retry logic.
 
+    CRITICAL: Before retrying, checks today's orders for ghost orders
+    (orders that were placed on exchange but client got network error).
+    This prevents duplicate orders on the same symbol.
+
     Args:
         kite: Kite client instance
         params: Order parameters
@@ -545,6 +549,18 @@ def place_order_with_retry(
 
     for attempt in range(max_retries):
         try:
+            # Before retry (attempt > 0), check for ghost orders from previous attempt
+            if attempt > 0:
+                ghost_id = _check_for_ghost_order(
+                    kite, params.tradingsymbol, params.transaction_type, params.quantity
+                )
+                if ghost_id:
+                    logger.warning(
+                        f"Ghost order found on retry: {ghost_id} for {params.tradingsymbol}. "
+                        f"Using existing order instead of placing duplicate."
+                    )
+                    return ghost_id
+
             order_id = kite.place_order(
                 tradingsymbol=params.tradingsymbol,
                 transaction_type=params.transaction_type,
@@ -564,6 +580,48 @@ def place_order_with_retry(
                 time.sleep(RETRY_DELAY_SECONDS)
 
     raise OrderExecutionError(f"Failed after {max_retries} attempts: {last_error}")
+
+
+def _check_for_ghost_order(
+    kite: SNAILKiteClient,
+    symbol: str,
+    txn_type: str,
+    quantity: int
+) -> Optional[str]:
+    """
+    Check today's orders for a ghost order matching the given parameters.
+
+    A ghost order is one placed on exchange but client received network error.
+
+    Returns:
+        order_id if ghost found, None otherwise
+    """
+    try:
+        from datetime import datetime as dt
+        all_orders = kite.orders()
+        now = dt.now()
+
+        for order in all_orders:
+            if (order.get('tradingsymbol') == symbol
+                    and order.get('transaction_type') == txn_type
+                    and order.get('quantity') == quantity
+                    and order.get('status') in ('OPEN', 'COMPLETE', 'PENDING')):
+                order_time = order.get('order_timestamp')
+                if order_time:
+                    try:
+                        if isinstance(order_time, str):
+                            order_dt = dt.fromisoformat(order_time)
+                        else:
+                            order_dt = order_time
+                        age_seconds = (now - order_dt).total_seconds()
+                        if age_seconds <= 120:  # 2 minutes
+                            return order.get('order_id')
+                    except (ValueError, TypeError):
+                        pass
+        return None
+    except Exception as e:
+        logger.warning(f"Ghost order check failed: {e}")
+        return None
 
 
 def wait_for_order_completion(

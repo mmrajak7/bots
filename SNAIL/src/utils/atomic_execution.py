@@ -394,6 +394,50 @@ class AtomicIronFlyExecutor:
         Returns:
             ExecutedLeg with execution result
         """
+        # PRE-FLIGHT: Check for ghost orders on this symbol from earlier failed attempts
+        # This prevents double orders when place_order() succeeds on exchange but
+        # throws network error on client side, then we retry
+        ghost = self._check_ghost_orders(symbol, txn_type, quantity)
+        if ghost:
+            logger.warning(
+                f"  ⚠ GHOST ORDER detected for {leg_type}: order_id={ghost['order_id']}, "
+                f"status={ghost['status']}, filled_qty={ghost.get('filled_quantity', 0)}"
+            )
+            filled_qty = ghost.get('filled_quantity', 0) or 0
+            if ghost['status'] == 'COMPLETE' or filled_qty >= quantity:
+                # Ghost order already filled - use it instead of placing new order
+                avg_price = ghost.get('average_price', 0)
+                logger.info(f"  ✓ Using ghost order fill @ {avg_price:.2f}")
+                return ExecutedLeg(
+                    leg_type=leg_type,
+                    symbol=symbol,
+                    txn_type=txn_type,
+                    status=LegStatus.FILLED,
+                    order_id=ghost['order_id'],
+                    fill_price=avg_price,
+                    quantity=filled_qty or quantity
+                )
+            elif ghost['status'] in ('OPEN', 'PENDING', 'TRIGGER PENDING'):
+                # Ghost order still open - wait for it instead of placing new one
+                logger.info(f"  Waiting for ghost order {ghost['order_id']} to fill...")
+                fill_result = self._wait_for_fill(ghost['order_id'], LEG_TIMEOUT_SECONDS)
+                if fill_result['filled']:
+                    avg_price = fill_result['avg_price']
+                    actual_qty = fill_result.get('filled_quantity', quantity)
+                    logger.info(f"  ✓ Ghost order filled @ {avg_price:.2f}")
+                    return ExecutedLeg(
+                        leg_type=leg_type,
+                        symbol=symbol,
+                        txn_type=txn_type,
+                        status=LegStatus.FILLED,
+                        order_id=ghost['order_id'],
+                        fill_price=avg_price,
+                        quantity=actual_qty
+                    )
+                # Ghost order didn't fill - cancel it and place fresh
+                self._cancel_order_safe(ghost['order_id'])
+                logger.info(f"  Ghost order cancelled, placing fresh order")
+
         # Calculate limit price based on transaction type
         if txn_type == 'BUY':
             # For buys (wings), use ask + slippage (aggressive to ensure fill)
@@ -423,7 +467,25 @@ class AtomicIronFlyExecutor:
 
             if fill_result['filled']:
                 avg_price = fill_result['avg_price']
+                actual_qty = fill_result.get('filled_quantity', quantity)
+                is_partial = fill_result.get('partial', False)
                 slippage = abs(avg_price - base_price)
+
+                if is_partial:
+                    logger.warning(
+                        f"  ⚠ PARTIAL FILL @ {avg_price:.2f} "
+                        f"({actual_qty}/{quantity} qty, slippage: {slippage:.2f})"
+                    )
+                    return ExecutedLeg(
+                        leg_type=leg_type,
+                        symbol=symbol,
+                        txn_type=txn_type,
+                        status=LegStatus.PARTIALLY_FILLED,
+                        order_id=order_id,
+                        fill_price=avg_price,
+                        quantity=actual_qty
+                    )
+
                 logger.info(f"  ✓ FILLED @ {avg_price:.2f} (slippage: {slippage:.2f})")
 
                 return ExecutedLeg(
@@ -433,7 +495,7 @@ class AtomicIronFlyExecutor:
                     status=LegStatus.FILLED,
                     order_id=order_id,
                     fill_price=avg_price,
-                    quantity=quantity
+                    quantity=actual_qty
                 )
             else:
                 # Order not filled - attempt cancel and verify final status
@@ -445,8 +507,24 @@ class AtomicIronFlyExecutor:
                 final_status = self._get_final_order_status(order_id)
 
                 if final_status.get('filled'):
-                    # Order actually filled! (race condition - filled during cancel attempt)
                     avg_price = final_status.get('avg_price', 0)
+                    actual_qty = final_status.get('filled_quantity', quantity)
+                    is_partial = final_status.get('partial', False)
+
+                    if is_partial:
+                        logger.warning(
+                            f"  ⚠ Partial fill during cancel: {actual_qty}/{quantity} @ {avg_price:.2f}"
+                        )
+                        return ExecutedLeg(
+                            leg_type=leg_type,
+                            symbol=symbol,
+                            txn_type=txn_type,
+                            status=LegStatus.PARTIALLY_FILLED,
+                            order_id=order_id,
+                            fill_price=avg_price,
+                            quantity=actual_qty
+                        )
+
                     logger.info(f"  ✓ Order filled during cancel (race condition): {avg_price:.2f}")
                     return ExecutedLeg(
                         leg_type=leg_type,
@@ -455,7 +533,7 @@ class AtomicIronFlyExecutor:
                         status=LegStatus.FILLED,
                         order_id=order_id,
                         fill_price=avg_price,
-                        quantity=quantity
+                        quantity=actual_qty
                     )
 
                 error = fill_result.get('error', 'Order not filled within timeout')
@@ -471,7 +549,29 @@ class AtomicIronFlyExecutor:
                 )
 
         except Exception as e:
-            logger.error(f"  ✗ EXCEPTION: {e}")
+            logger.error(f"  ✗ EXCEPTION placing order: {e}")
+            # CRITICAL: If place_order threw, the order MAY have been placed on exchange
+            # Check today's orders for this symbol to detect ghost orders
+            logger.info(f"  Checking for ghost order after exception...")
+            ghost = self._check_ghost_orders(symbol, txn_type, quantity)
+            if ghost and (ghost['status'] == 'COMPLETE' or (ghost.get('filled_quantity', 0) or 0) > 0):
+                filled_qty = ghost.get('filled_quantity', 0) or 0
+                avg_price = ghost.get('average_price', 0)
+                logger.warning(
+                    f"  ⚠ GHOST ORDER found after exception! order_id={ghost['order_id']}, "
+                    f"filled_qty={filled_qty}, avg_price={avg_price}"
+                )
+                status = LegStatus.FILLED if filled_qty >= quantity else LegStatus.PARTIALLY_FILLED
+                return ExecutedLeg(
+                    leg_type=leg_type,
+                    symbol=symbol,
+                    txn_type=txn_type,
+                    status=status,
+                    order_id=ghost['order_id'],
+                    fill_price=avg_price,
+                    quantity=filled_qty
+                )
+
             return ExecutedLeg(
                 leg_type=leg_type,
                 symbol=symbol,
@@ -493,7 +593,7 @@ class AtomicIronFlyExecutor:
             timeout_seconds: Maximum wait time
 
         Returns:
-            Dict with 'filled', 'avg_price', 'status', 'error'
+            Dict with 'filled', 'avg_price', 'status', 'error', 'filled_quantity'
         """
         start_time = time.time()
 
@@ -502,18 +602,36 @@ class AtomicIronFlyExecutor:
                 status = self.kite.get_order_status(order_id)
 
                 order_status = status.get('status', '')
+                filled_qty = status.get('filled_quantity', 0) or 0
 
                 if order_status == 'COMPLETE':
                     return {
                         'filled': True,
                         'avg_price': status.get('average_price', 0),
-                        'status': order_status
+                        'status': order_status,
+                        'filled_quantity': filled_qty
                     }
                 elif order_status in ('REJECTED', 'CANCELLED'):
+                    # CRITICAL: Check for partial fills on cancelled orders
+                    # An order can be cancelled AFTER some quantity was filled
+                    if filled_qty > 0:
+                        logger.warning(
+                            f"Order {order_id} {order_status} but has {filled_qty} filled qty! "
+                            f"Treating as partial fill."
+                        )
+                        return {
+                            'filled': True,
+                            'partial': True,
+                            'avg_price': status.get('average_price', 0),
+                            'status': order_status,
+                            'filled_quantity': filled_qty,
+                            'error': f'Partial fill: {filled_qty} filled before {order_status}'
+                        }
                     return {
                         'filled': False,
                         'status': order_status,
-                        'error': status.get('status_message', order_status)
+                        'error': status.get('status_message', order_status),
+                        'filled_quantity': 0
                     }
 
                 time.sleep(ORDER_POLL_INTERVAL)
@@ -525,7 +643,8 @@ class AtomicIronFlyExecutor:
         return {
             'filled': False,
             'status': 'TIMEOUT',
-            'error': f'Order not filled within {timeout_seconds}s'
+            'error': f'Order not filled within {timeout_seconds}s',
+            'filled_quantity': 0
         }
 
     def _cancel_order_safe(self, order_id: str) -> bool:
@@ -538,36 +657,114 @@ class AtomicIronFlyExecutor:
             logger.warning(f"  Could not cancel order {order_id}: {e}")
             return False
 
+    def _check_ghost_orders(
+        self,
+        symbol: str,
+        txn_type: str,
+        quantity: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check today's orders for ghost orders on the same symbol.
+
+        A ghost order is one that was placed on the exchange but the client
+        didn't receive the order_id (network timeout during place_order).
+        Without this check, a retry would create a DUPLICATE order.
+
+        Args:
+            symbol: Trading symbol to check
+            txn_type: BUY or SELL
+            quantity: Expected quantity
+
+        Returns:
+            Order dict if ghost found, None otherwise
+        """
+        try:
+            all_orders = self.kite.orders()
+
+            # Look for recent orders on same symbol with same direction and quantity
+            for order in all_orders:
+                if (order.get('tradingsymbol') == symbol
+                        and order.get('transaction_type') == txn_type
+                        and order.get('quantity') == quantity
+                        and order.get('status') in ('OPEN', 'COMPLETE', 'PENDING',
+                                                     'TRIGGER PENDING')):
+                    # Check if this order was placed recently (within last 5 minutes)
+                    order_time = order.get('order_timestamp')
+                    if order_time:
+                        try:
+                            if isinstance(order_time, str):
+                                from datetime import datetime as dt
+                                order_dt = dt.fromisoformat(order_time)
+                            else:
+                                order_dt = order_time
+                            age_seconds = (datetime.now() - order_dt).total_seconds()
+                            if age_seconds <= 300:  # 5 minutes
+                                # Check this order_id is NOT one we already know about
+                                known_ids = {leg.order_id for leg in self.executed_legs if leg.order_id}
+                                if order.get('order_id') not in known_ids:
+                                    logger.warning(
+                                        f"Ghost order found: {order.get('order_id')} "
+                                        f"({symbol} {txn_type} {quantity}) "
+                                        f"placed {age_seconds:.0f}s ago"
+                                    )
+                                    return order
+                        except (ValueError, TypeError):
+                            pass  # Can't parse timestamp, skip
+
+            return None
+
+        except Exception as e:
+            logger.warning(f"Ghost order check failed (non-blocking): {e}")
+            return None
+
     def _get_final_order_status(self, order_id: str) -> Dict[str, Any]:
         """
         Get final order status after cancel attempt.
 
         AE-004 Fix: Checks if order filled during the cancel race condition.
+        Also detects partial fills on cancelled orders.
 
         Args:
             order_id: Kite order ID
 
         Returns:
-            Dict with 'filled', 'avg_price', 'status'
+            Dict with 'filled', 'avg_price', 'status', 'filled_quantity', 'partial'
         """
         try:
             status = self.kite.get_order_status(order_id)
             order_status = status.get('status', '')
+            filled_qty = status.get('filled_quantity', 0) or 0
 
             if order_status == 'COMPLETE':
                 return {
                     'filled': True,
                     'avg_price': status.get('average_price', 0),
-                    'status': order_status
+                    'status': order_status,
+                    'filled_quantity': filled_qty
+                }
+
+            # CRITICAL: Check for partial fills on cancelled orders
+            if filled_qty > 0:
+                logger.warning(
+                    f"Order {order_id} status={order_status} but filled_quantity={filled_qty}! "
+                    f"Partial fill detected after cancel."
+                )
+                return {
+                    'filled': True,
+                    'partial': True,
+                    'avg_price': status.get('average_price', 0),
+                    'status': order_status,
+                    'filled_quantity': filled_qty
                 }
 
             return {
                 'filled': False,
-                'status': order_status
+                'status': order_status,
+                'filled_quantity': 0
             }
         except Exception as e:
             logger.warning(f"Error getting final order status: {e}")
-            return {'filled': False, 'status': 'UNKNOWN', 'error': str(e)}
+            return {'filled': False, 'status': 'UNKNOWN', 'error': str(e), 'filled_quantity': 0}
 
     def _handle_failure(
         self,
@@ -627,9 +824,11 @@ class AtomicIronFlyExecutor:
         Returns:
             PositionState enum value
         """
+        # Include both FILLED and PARTIALLY_FILLED legs - any fill means
+        # we have a position on the exchange that must be accounted for
         filled_legs = {
             leg.leg_type for leg in self.executed_legs
-            if leg.status == LegStatus.FILLED
+            if leg.status in (LegStatus.FILLED, LegStatus.PARTIALLY_FILLED)
         }
 
         if not filled_legs:
