@@ -24,6 +24,7 @@ import requests
 from loguru import logger
 
 from src.api.telegram_alerts import get_telegram
+from src.utils.calculations import NIFTY_LOT_SIZE
 
 
 # =============================================================================
@@ -744,7 +745,7 @@ _P&L data pending - monitor will update soon_""")
 
  BE: {be_lower:.0f} ←──→ {be_upper:.0f}
  Max Loss: ₹{position.max_loss:,.0f}
- Exp: {expiry_str} | {position.lot_size // 75} lot ({position.lot_size} qty)
+ Exp: {expiry_str} | {position.lot_size // NIFTY_LOT_SIZE} lot ({position.lot_size} qty)
  Margin: {margin_text}
 ```"""
 

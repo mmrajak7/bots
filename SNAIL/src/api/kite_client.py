@@ -397,7 +397,7 @@ class SNAILKiteClient:
             return {
                 'order_id': order_id,
                 'status': 'COMPLETE',
-                'filled_quantity': 75,
+                'filled_quantity': 65,
                 'average_price': 100.0
             }
 

@@ -160,8 +160,9 @@ class ExpiryChecker:
             options = options[options['expiry'] == expiry_date]
 
         if options.empty:
-            logger.warning("No options found, using default lot size 75")
-            return 75
+            from src.state_manager import NIFTY_LOT_SIZE
+            logger.warning(f"No options found, using default lot size {NIFTY_LOT_SIZE}")
+            return NIFTY_LOT_SIZE
 
         # Get lot size from first matching option
         lot_size = int(options.iloc[0]['lot_size'])

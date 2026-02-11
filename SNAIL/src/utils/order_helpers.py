@@ -19,6 +19,7 @@ from enum import Enum
 from loguru import logger
 
 from src.api.kite_client import SNAILKiteClient, Quote, OrderExecutionError
+from src.utils.calculations import NIFTY_LOT_SIZE
 
 
 class SlippageTierConfig(TypedDict):
@@ -370,8 +371,8 @@ def validate_order_params(params: OrderParams) -> Tuple[bool, List[str]]:
     # Validate quantity
     if params.quantity <= 0:
         errors.append(f"Invalid quantity: {params.quantity}")
-    elif params.quantity % 75 != 0:
-        errors.append(f"Quantity must be multiple of lot size (75): {params.quantity}")
+    elif params.quantity % NIFTY_LOT_SIZE != 0:
+        errors.append(f"Quantity must be multiple of lot size ({NIFTY_LOT_SIZE}): {params.quantity}")
 
     # Validate price for LIMIT orders
     if params.order_type == "LIMIT":
@@ -455,7 +456,7 @@ def validate_bid_ask_spreads(
         SpreadValidationResult with validation status and details
 
     Example:
-        >>> result = validate_bid_ask_spreads(quotes, 75)
+        >>> result = validate_bid_ask_spreads(quotes, 65)
         >>> if not result.valid:
         ...     for block in result.blocks:
         ...         print(f"BLOCKED: {block}")
@@ -1416,7 +1417,7 @@ if __name__ == '__main__':
     valid_params = OrderParams(
         tradingsymbol="NIFTY2511424000CE",
         transaction_type="SELL",
-        quantity=75,
+        quantity=NIFTY_LOT_SIZE,
         price=150.0
     )
     is_valid, errors = validate_order_params(valid_params)
@@ -1425,7 +1426,7 @@ if __name__ == '__main__':
     invalid_params = OrderParams(
         tradingsymbol="NIFTY2511424000CE",
         transaction_type="SELL",
-        quantity=50,  # Not multiple of 75
+        quantity=50,  # Not multiple of NIFTY_LOT_SIZE
         price=150.0
     )
     is_valid, errors = validate_order_params(invalid_params)

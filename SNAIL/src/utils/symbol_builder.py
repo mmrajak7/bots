@@ -33,8 +33,9 @@ MONTH_CODES = {
 # NIFTY strike interval
 NIFTY_STRIKE_INTERVAL = 50  # ATM rounds to nearest 50 (changed from 100)
 
-# Default lot size (verify from instruments)
-DEFAULT_LOT_SIZE = 75
+# Default lot size (verify from instruments) — sourced from calculations.py
+from src.utils.calculations import NIFTY_LOT_SIZE
+DEFAULT_LOT_SIZE = NIFTY_LOT_SIZE
 
 
 # =============================================================================
@@ -410,7 +411,7 @@ def get_lot_size_from_instruments(
         expiry: Target expiry date
 
     Returns:
-        Lot size (e.g., 75 for NIFTY)
+        Lot size (e.g., 65 for NIFTY)
     """
     # Convert expiry to match CSV format
     expiry_str = expiry.strftime('%Y-%m-%d')

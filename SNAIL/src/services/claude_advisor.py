@@ -25,6 +25,7 @@ from src.api.claude_client import (
     ClaudeResponse,
     get_claude_client
 )
+from src.utils.calculations import NIFTY_LOT_SIZE
 from src.utils.db import (
     Position,
     PositionLeg,
@@ -466,7 +467,7 @@ class ClaudeAdvisor:
             import traceback
             traceback.print_exc()
             # Fallback - use defaults
-            lot_size = 75
+            lot_size = NIFTY_LOT_SIZE
             wing_distance = 300
             html = f"""<b>🦋 IRON FLY</b>
 <code>

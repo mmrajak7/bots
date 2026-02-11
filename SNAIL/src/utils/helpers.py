@@ -22,6 +22,7 @@ import threading
 from loguru import logger
 
 from src.utils.config import PROJECT_ROOT
+from src.utils.calculations import NIFTY_LOT_SIZE
 
 
 # =============================================================================
@@ -609,13 +610,13 @@ def validate_strike_price(strike: int) -> bool:
     return 10000 <= strike <= 50000
 
 
-def validate_quantity(quantity: int, lot_size: int = 75) -> bool:
+def validate_quantity(quantity: int, lot_size: int = NIFTY_LOT_SIZE) -> bool:
     """
     Validate order quantity.
 
     Args:
         quantity: Order quantity
-        lot_size: Lot size (default 75)
+        lot_size: Lot size (default NIFTY_LOT_SIZE)
 
     Returns:
         True if valid (positive multiple of lot size)

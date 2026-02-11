@@ -17,6 +17,9 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from loguru import logger
 
+# NIFTY lot size — keep in sync with SNAIL/src/utils/calculations.py:NIFTY_LOT_SIZE
+NIFTY_LOT_SIZE = 65
+
 
 class TradingStatus(str, Enum):
     """Trading session status."""
@@ -57,7 +60,7 @@ class Position:
     total_credit: float = 0.0
     target_pnl: float = 0.0
     stop_loss_pnl: float = 0.0
-    lot_size: int = 75
+    lot_size: int = NIFTY_LOT_SIZE
     num_lots: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
@@ -88,7 +91,7 @@ class Position:
             total_credit=data.get("total_credit", 0.0),
             target_pnl=data.get("target_pnl", 0.0),
             stop_loss_pnl=data.get("stop_loss_pnl", 0.0),
-            lot_size=data.get("lot_size", 75),
+            lot_size=data.get("lot_size", NIFTY_LOT_SIZE),
             num_lots=data.get("num_lots", 1)
         )
 
@@ -414,7 +417,7 @@ def save_trade_record(
         "vix_at_entry": state.position.vix_at_entry if state.position else 0,
         "wing_distance": state.position.wing_distance if state.position else 0,
         "total_credit": state.position.total_credit if state.position else 0,
-        "lot_size": state.position.lot_size if state.position else 75,
+        "lot_size": state.position.lot_size if state.position else NIFTY_LOT_SIZE,
         "num_lots": state.position.num_lots if state.position else 1,
         "legs": [asdict(leg) for leg in state.position.legs] if state.position else [],
         "gross_pnl": gross_pnl,

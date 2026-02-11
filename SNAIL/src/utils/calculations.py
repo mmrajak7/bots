@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 # =============================================================================
 
 # NIFTY lot size
-NIFTY_LOT_SIZE = 75
+NIFTY_LOT_SIZE = 65
 
 # Strike interval
 NIFTY_STRIKE_INTERVAL = 50  # ATM rounds to nearest 50 (changed from 100)
@@ -1115,7 +1115,7 @@ if __name__ == '__main__':
         pe_sell_price=130,
         wing_ce_buy_price=45,
         wing_pe_buy_price=35,
-        quantity=75
+        quantity=NIFTY_LOT_SIZE
     )
     print(f"    Entry credit: ₹{metrics.entry_credit:,.2f}")
     print(f"    Max profit: ₹{metrics.max_profit:,.2f}")
@@ -1131,7 +1131,7 @@ if __name__ == '__main__':
         straddle_pe_premium=130,
         wing_ce_premium=45,
         wing_pe_premium=35,
-        quantity=75
+        quantity=NIFTY_LOT_SIZE
     )
     print(f"    STT: ₹{charges.stt:,.2f}")
     print(f"    Exchange: ₹{charges.exchange_txn:,.2f}")

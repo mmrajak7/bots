@@ -1796,8 +1796,8 @@ if __name__ == '__main__':
 
     # Test helper functions
     print("\n[2] Testing helper functions...")
-    print(f"    should_use_scaled_execution(75, config): "
-          f"{should_use_scaled_execution(75, test_config)}")
+    print(f"    should_use_scaled_execution(65, config): "
+          f"{should_use_scaled_execution(65, test_config)}")
     print(f"    should_use_scaled_execution(7500, config): "
           f"{should_use_scaled_execution(7500, test_config)}")
 

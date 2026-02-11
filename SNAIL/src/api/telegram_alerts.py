@@ -18,6 +18,8 @@ from typing import Optional, Dict, List, Union
 import requests
 from loguru import logger
 
+from src.utils.calculations import NIFTY_LOT_SIZE
+
 
 # =============================================================================
 # MARKDOWN ESCAPING
@@ -316,9 +318,8 @@ class TelegramAlerts:
         straddle_total = short_ce + short_pe
         wings_total = long_ce + long_pe
 
-        # Calculate lots (NIFTY lot size is 75)
-        nifty_lot_size = 75
-        num_lots = lot_size // nifty_lot_size if lot_size >= nifty_lot_size else 1
+        # Calculate lots from NIFTY lot size
+        num_lots = lot_size // NIFTY_LOT_SIZE if lot_size >= NIFTY_LOT_SIZE else 1
 
         message = f"""🦋 *ENTRY: Iron Fly*
 

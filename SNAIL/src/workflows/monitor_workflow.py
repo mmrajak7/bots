@@ -1009,12 +1009,20 @@ _Fetching P&L data..._"""
                 # checks below (stop loss, VIX breach, expiry).
                 # =============================================================
 
-                # ----- HARD CAP PROFIT TARGET (absolute INR amount) -----
+                # ----- HARD CAP PROFIT TARGET (absolute INR amount, scaled by lots) -----
                 try:
-                    profit_target_amount = self.trading_config.get('exit', {}).get('profit_target_amount', 0)
+                    profit_target_per_lot = self.trading_config.get('exit', {}).get('profit_target_amount', 0)
+                    if profit_target_per_lot > 0:
+                        # Scale target by number of lots in the open position
+                        from src.utils.calculations import NIFTY_LOT_SIZE
+                        num_lots = max(1, position.lot_size // NIFTY_LOT_SIZE)
+                        profit_target_amount = profit_target_per_lot * num_lots
+                        logger.debug(f"Hard cap target: ₹{profit_target_per_lot:,.0f}/lot × {num_lots} lots = ₹{profit_target_amount:,.0f}")
+                    else:
+                        profit_target_amount = 0
                     if profit_target_amount > 0 and snapshot.current_pnl >= profit_target_amount:
                         logger.info(
-                            f"HARD CAP TP HIT! P&L: ₹{snapshot.current_pnl:,.0f} >= ₹{profit_target_amount:,.0f}"
+                            f"HARD CAP TP HIT! P&L: ₹{snapshot.current_pnl:,.0f} >= ₹{profit_target_amount:,.0f} ({num_lots} lots × ₹{profit_target_per_lot:,.0f})"
                         )
                         result = self.exit_manager.execute_exit(
                             reason=ExitReason.PROFIT_TARGET,

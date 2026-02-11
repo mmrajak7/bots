@@ -49,12 +49,13 @@ ROLLBACK_TIMEOUT_SECONDS = 60
 REQUIRED_LEGS = {'wing_ce', 'straddle_ce', 'wing_pe', 'straddle_pe'}
 
 # Default lot sizes by instrument (can be overridden by config)
+from src.utils.calculations import NIFTY_LOT_SIZE
 DEFAULT_LOT_SIZES = {
-    'NIFTY': 75,
+    'NIFTY': NIFTY_LOT_SIZE,
     'BANKNIFTY': 15,
     'FINNIFTY': 40,
 }
-DEFAULT_LOT_SIZE = 75  # Fallback if instrument not found
+DEFAULT_LOT_SIZE = NIFTY_LOT_SIZE  # Fallback if instrument not found
 
 # Module-level lock for concurrent execution protection (thread-safe initialization)
 _EXECUTION_LOCK = threading.Lock()
@@ -269,7 +270,7 @@ class AtomicIronFlyExecutor:
 
         Args:
             symbols: Dict mapping leg_type to trading symbol
-            quantity: Order quantity (total contracts, e.g., 75 for 1 NIFTY lot)
+            quantity: Order quantity (total contracts, e.g., 65 for 1 NIFTY lot)
             quotes: Dict mapping leg_type to Quote
 
         Returns:
@@ -1041,7 +1042,7 @@ class AtomicIronFlyExecutor:
                     warnings.append(f"{leg_type}: Elevated spread ({spread_pct:.2f}%)")
 
         # 4. Check liquidity
-        # quantity is already total contracts (e.g., 75 for 1 lot NIFTY)
+        # quantity is already total contracts (e.g., 65 for 1 lot NIFTY)
         for leg_type, quote in quotes.items():
             if hasattr(quote, 'bid_qty') and hasattr(quote, 'ask_qty'):
                 if quote.bid_qty < quantity or quote.ask_qty < quantity:

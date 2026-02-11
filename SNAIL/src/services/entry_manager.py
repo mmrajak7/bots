@@ -54,7 +54,8 @@ from src.utils.calculations import (
     calculate_iron_fly_metrics,
     calculate_iron_fly_charges,
     IronFlyMetrics,
-    get_atm_strike_futures_based
+    get_atm_strike_futures_based,
+    NIFTY_LOT_SIZE
 )
 from src.utils.db import (
     Position,
@@ -954,12 +955,12 @@ class EntryManager:
             if not nifty_df.empty:
                 lot_size = int(nifty_df['lot_size'].iloc[0])
             else:
-                lot_size = 75  # Default NIFTY lot size
+                lot_size = NIFTY_LOT_SIZE  # Default NIFTY lot size
 
         # Validate lot_size to prevent division by zero or invalid quantities
         if lot_size <= 0:
-            logger.error(f"Invalid lot_size: {lot_size}, using default 75")
-            lot_size = 75  # NIFTY default
+            logger.error(f"Invalid lot_size: {lot_size}, using default {NIFTY_LOT_SIZE}")
+            lot_size = NIFTY_LOT_SIZE  # NIFTY default
 
         if lots <= 0:
             logger.error(f"Invalid lots config: {lots}, using default 1")

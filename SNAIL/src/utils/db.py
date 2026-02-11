@@ -19,6 +19,7 @@ from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
 from contextlib import contextmanager
 from loguru import logger
+from src.utils.calculations import NIFTY_LOT_SIZE
 
 
 # =============================================================================
@@ -942,7 +943,7 @@ def save_position(position: Any) -> int:
                 data.get('expiry', data.get('expiry_date', date.today())).isoformat() if isinstance(data.get('expiry', data.get('expiry_date')), date) else data.get('expiry', data.get('expiry_date')),
                 data.get('atm_strike', 0),
                 data.get('wing_distance', 0),
-                data.get('quantity', data.get('lot_size', 75)),
+                data.get('quantity', data.get('lot_size', NIFTY_LOT_SIZE)),
                 data.get('entry_credit', data.get('entry_premium', 0)),
                 data.get('entry_credit', data.get('straddle_credit', 0)),
                 data.get('wing_debit', 0),
@@ -1029,7 +1030,7 @@ def save_position_with_legs(position: Any, legs: List[Any]) -> int:
                 pos_data.get('expiry', pos_data.get('expiry_date', date.today())).isoformat() if isinstance(pos_data.get('expiry', pos_data.get('expiry_date')), date) else pos_data.get('expiry', pos_data.get('expiry_date')),
                 pos_data.get('atm_strike', 0),
                 pos_data.get('wing_distance', 0),
-                pos_data.get('quantity', pos_data.get('lot_size', 75)),
+                pos_data.get('quantity', pos_data.get('lot_size', NIFTY_LOT_SIZE)),
                 pos_data.get('entry_credit', pos_data.get('entry_premium', 0)),
                 pos_data.get('entry_credit', pos_data.get('straddle_credit', 0)),
                 pos_data.get('wing_debit', 0),
