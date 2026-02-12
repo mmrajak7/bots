@@ -1070,6 +1070,36 @@ def save_position_with_legs(position: Any, legs: List[Any]) -> int:
         return position_id
 
 
+def _normalize_order_status(status: Optional[str]) -> str:
+    """
+    Map Kite API order statuses to DB-compatible lowercase values.
+
+    Kite returns uppercase: PENDING, OPEN, COMPLETE, CANCELLED, REJECTED, TRIGGER PENDING
+    DB CHECK constraint expects: pending, placed, filled, cancelled, rejected
+    """
+    if not status:
+        return 'pending'
+
+    mapping = {
+        'COMPLETE': 'filled',
+        'OPEN': 'placed',
+        'PENDING': 'pending',
+        'CANCELLED': 'cancelled',
+        'REJECTED': 'rejected',
+        'TRIGGER PENDING': 'pending',
+    }
+
+    normalized = mapping.get(status.upper().strip(), status.lower().strip())
+
+    # Final guard: ensure value is valid for CHECK constraint
+    valid = {'pending', 'placed', 'filled', 'cancelled', 'rejected'}
+    if normalized not in valid:
+        logger.warning(f"Unknown order status '{status}' mapped to 'pending'")
+        return 'pending'
+
+    return normalized
+
+
 def save_order(order: Any) -> int:
     """
     Save an order to database.
@@ -1102,7 +1132,7 @@ def save_order(order: Any) -> int:
                 data.get('option_type', ''),
                 data.get('price'),
                 data.get('quantity'),
-                data.get('status'),
+                _normalize_order_status(data.get('status')),
                 data.get('fill_price'),
                 data.get('slippage')
             )

@@ -38,6 +38,7 @@ from src.utils.db import (
     get_active_position,
     get_position_legs,
     update_position_status,
+    update_leg_exit_price,
     record_failed_exit,
     save_order,
     Order,
@@ -912,6 +913,10 @@ class ExitManager:
                     slippage=order.slippage
                 )
                 save_order(order_record)
+
+                # Record exit price on the leg itself
+                if order.fill_price is not None:
+                    update_leg_exit_price(matching_leg.id, order.fill_price)
 
     def _send_exit_alert(
         self,
