@@ -824,8 +824,14 @@ class SameDayRecovery:
         try:
             logger.info(f"AUTO-FIX: Placing missing GTT for {position.script} {position.timeframe}...")
 
-            # Use current SL if available, otherwise use entry price - 10%
-            sl_price = position.current_sl if position.current_sl else position.entry_price * 0.90
+            # Use current SL if available, then ATR-based, then fixed 10% fallback
+            if position.current_sl:
+                sl_price = position.current_sl
+            elif position.entry_atr:
+                atr_mult = config.get('trading.sl_strategy.initial_atr_multiplier', 2.0)
+                sl_price = position.entry_price - (atr_mult * position.entry_atr)
+            else:
+                sl_price = position.entry_price * 0.90
 
             # Place GTT with verification
             success, gtt_id, error = exit_manager.place_dummy_gtt(

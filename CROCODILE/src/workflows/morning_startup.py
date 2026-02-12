@@ -81,23 +81,23 @@ def check_missed_gtt_updates(session) -> Dict[str, List[str]]:
                             f"Updating now with last week's LOW."
                         )
 
-                        # Calculate trailing LOW for last week
-                        trailing_low = exit_manager.get_trailing_low_for_timeframe(
+                        # Calculate trailing SL for last week
+                        trailing_sl = exit_manager.get_trailing_sl_for_timeframe(
                             position,
                             last_friday
                         )
 
-                        if trailing_low:
+                        if trailing_sl:
                             # Update GTT now
-                            success, error = exit_manager.update_gtt_with_trailing_low(
+                            success, error, _ = exit_manager.update_gtt_with_trailing_sl(
                                 position,
-                                trailing_low,
+                                trailing_sl,
                                 session
                             )
 
                             if success:
                                 results['weekly_fixed'].append(position.script)
-                                logger.info(f"✅ Catch-up update for {position.script}: Rs.{trailing_low:.2f}")
+                                logger.info(f"✅ Catch-up update for {position.script}: Rs.{trailing_sl:.2f}")
                             else:
                                 results['errors'].append(f"{position.script} (W): {error}")
                                 logger.error(f"Failed catch-up for {position.script}: {error}")
@@ -134,23 +134,23 @@ def check_missed_gtt_updates(session) -> Dict[str, List[str]]:
                             f"Updating now with last month's LOW."
                         )
 
-                        # Calculate trailing LOW for last month
-                        trailing_low = exit_manager.get_trailing_low_for_timeframe(
+                        # Calculate trailing SL for last month
+                        trailing_sl = exit_manager.get_trailing_sl_for_timeframe(
                             position,
                             last_trading_day_prev_month
                         )
 
-                        if trailing_low:
+                        if trailing_sl:
                             # Update GTT now
-                            success, error = exit_manager.update_gtt_with_trailing_low(
+                            success, error, _ = exit_manager.update_gtt_with_trailing_sl(
                                 position,
-                                trailing_low,
+                                trailing_sl,
                                 session
                             )
 
                             if success:
                                 results['monthly_fixed'].append(position.script)
-                                logger.info(f"✅ Catch-up update for {position.script}: Rs.{trailing_low:.2f}")
+                                logger.info(f"✅ Catch-up update for {position.script}: Rs.{trailing_sl:.2f}")
                             else:
                                 results['errors'].append(f"{position.script} (M): {error}")
                                 logger.error(f"Failed catch-up for {position.script}: {error}")

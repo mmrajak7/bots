@@ -237,6 +237,28 @@ class OrderMonitor:
             session.add(position)
             session.flush()  # Get position.id
 
+            # Calculate and store entry ATR for Weekly positions (ATR-based SL strategy)
+            sl_config = config.get('trading.sl_strategy', {})
+            if sl_config.get('enabled', False) and open_order.timeframe.upper() == 'W':
+                try:
+                    atr_value = exit_manager._calculate_weekly_atr(
+                        zerodha_symbol,
+                        sl_config.get('atr_period', 14)
+                    )
+                    if atr_value is not None:
+                        position.entry_atr = atr_value
+                        logger.info(
+                            f"{zerodha_symbol} W: entry_atr stored = Rs.{atr_value:.2f} "
+                            f"(Initial SL will be Entry - {sl_config.get('initial_atr_multiplier', 2.0)}×ATR)"
+                        )
+                    else:
+                        logger.warning(
+                            f"{zerodha_symbol} W: ATR calculation failed - "
+                            f"entry_atr=NULL, will use fallback SL percent"
+                        )
+                except Exception as atr_err:
+                    logger.error(f"{zerodha_symbol} W: ATR calculation error: {atr_err}")
+
             # Create transaction history entry
             transaction = TransactionHistory(
                 bot_instance_id=config.get_bot_instance_id(),
@@ -793,7 +815,8 @@ class OrderMonitor:
                 pnl_percent=pnl_details['pnl_percent'],
                 days_held=days_held,
                 sl_movements=position.sl_movements,
-                highest_sl_achieved=position.highest_sl
+                highest_sl_achieved=position.highest_sl,
+                entry_atr=position.entry_atr
             )
 
             # Create transaction history

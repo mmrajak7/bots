@@ -77,8 +77,9 @@ def update_gtt_eod():
                 qty = update['quantity']
                 change = new_sl - update['old_sl']
 
-                # Script with timeframe in bracket
-                script_tf = f"{update['script']}({update['timeframe']})"
+                # Script with timeframe in bracket + strategy indicator
+                atr_tag = "*" if update.get('entry_atr') else ""
+                script_tf = f"{update['script']}({update['timeframe']}){atr_tag}"
 
                 # TSL Upd. = points at risk from entry (entry - new_sl)
                 # Negative means SL is below entry (at risk), positive means SL above entry (protected)
@@ -109,6 +110,11 @@ def update_gtt_eod():
                 )
 
             lines.append("</pre>")
+
+            # ATR strategy legend
+            has_atr = any(u.get('entry_atr') for u in stats['updates'])
+            if has_atr:
+                lines.append("_* = ATR-based SL strategy_")
 
             # Add summary footer
             if stats['no_change'] > 0 or stats['skipped'] > 0:

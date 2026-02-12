@@ -177,6 +177,7 @@ def reconcile_positions_with_zerodha():
                 days_held=pnl_details['days_held'],
                 sl_movements=p.sl_movements if hasattr(p, 'sl_movements') else 0,
                 highest_sl_achieved=p.highest_sl if hasattr(p, 'highest_sl') else None,
+                entry_atr=p.entry_atr if hasattr(p, 'entry_atr') else None,
                 closed_at=ist_now_naive()
             )
 

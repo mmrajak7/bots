@@ -6,6 +6,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import enum
+from loguru import logger
 
 from src.utils.config_manager import config
 from src.utils.timezone_helper import ist_now_naive
@@ -112,6 +113,7 @@ class OpenPosition(Base):
     current_sl = Column(Float, nullable=False)  # Current stop loss price
     initial_sl = Column(Float, nullable=False)  # Entry day LOW (never changes)
     highest_sl = Column(Float, nullable=True)  # Highest SL ever achieved
+    entry_atr = Column(Float, nullable=True)  # Weekly ATR at entry (for ATR-based SL strategy)
     sl_movements = Column(Integer, default=0)  # Count of SL updates
     last_sl_update = Column(DateTime, nullable=True)
 
@@ -168,6 +170,7 @@ class ClosedPosition(Base):
     days_held = Column(Integer, nullable=False)
     sl_movements = Column(Integer, default=0)  # How many times SL trailed
     highest_sl_achieved = Column(Float, nullable=True)
+    entry_atr = Column(Float, nullable=True)  # Weekly ATR at entry (for ATR-based SL strategy)
 
     # Timestamps
     closed_at = Column(DateTime, default=ist_now_naive, nullable=False)
@@ -297,8 +300,36 @@ def get_session():
     return Session()
 
 
+def _migrate_database(engine):
+    """Run database migrations for schema changes.
+
+    Adds new columns to existing tables if they don't exist.
+    Safe to call multiple times - checks column existence before ALTER.
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    migrations = [
+        ('open_positions', 'entry_atr', 'FLOAT'),
+        ('closed_positions', 'entry_atr', 'FLOAT'),
+    ]
+
+    with engine.connect() as conn:
+        for table_name, column_name, column_type in migrations:
+            if table_name not in inspector.get_table_names():
+                continue
+            existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
+            if column_name not in existing_columns:
+                logger.info(f"Migration: Adding column {column_name} to {table_name}")
+                conn.execute(text(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                ))
+                conn.commit()
+
+
 def init_database():
     """Initialize database tables"""
     engine = get_engine()
+    _migrate_database(engine)
     Base.metadata.create_all(engine)
     return engine

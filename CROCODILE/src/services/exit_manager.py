@@ -40,6 +40,22 @@ class ExitManager:
         self.dummy_sl_percent = config.get('trading.dummy_sl_percent', 15) / 100
         self.gtt_expiry_days = 365  # 1 year
 
+        # ATR-based SL strategy settings
+        sl_config = config.get('trading.sl_strategy', {})
+        self.sl_strategy_enabled = sl_config.get('enabled', False)
+        self.initial_atr_multiplier = sl_config.get('initial_atr_multiplier', 2.0)
+        self.trailing_activation_multiplier = sl_config.get('trailing_activation_multiplier', 1.5)
+        self.trailing_atr_multiplier = sl_config.get('trailing_atr_multiplier', 2.0)
+        self.atr_period = sl_config.get('atr_period', 14)
+        self.fallback_sl_percent = sl_config.get('fallback_sl_percent', 10) / 100
+
+        if self.sl_strategy_enabled:
+            logger.info(
+                f"ATR SL Strategy: Enabled | Initial={self.initial_atr_multiplier}×ATR, "
+                f"TrailActivation={self.trailing_activation_multiplier}×ATR, "
+                f"Trailing={self.trailing_atr_multiplier}×ATR, Period={self.atr_period}"
+            )
+
         # GTT verification settings
         self.gtt_verification_enabled = config.get('api_resilience.gtt_verification.enabled', True)
         self.gtt_initial_delay = config.get('api_resilience.gtt_verification.initial_delay', 2.0)
@@ -147,6 +163,71 @@ class ExitManager:
         logger.error(error_msg)
         return False, error_msg
 
+    # ==================== ATR CALCULATION ====================
+
+    def _calculate_weekly_atr(self, script: str, period: Optional[int] = None) -> Optional[float]:
+        """
+        Calculate current Weekly ATR for a given script using Wilder's smoothing.
+
+        Fetches weekly resampled data via broker API and computes ATR.
+        Uses the same formula as supertrend_calculator.py for consistency.
+
+        Args:
+            script: Trading symbol (e.g., 'RELIANCE')
+            period: ATR period (default: from config, typically 14)
+
+        Returns:
+            Float ATR value, or None if calculation fails
+        """
+        if period is None:
+            period = self.atr_period
+
+        try:
+            instrument_token = self.kite_client.get_instrument_token(script)
+
+            # Fetch weekly resampled data (needs enough history for ATR smoothing)
+            # 1.5 years gives ~78 weekly candles, plenty for 14-period ATR
+            df = self.kite_client.get_historical_data_sampled(
+                instrument_token=instrument_token,
+                timeframe='weekly',
+                years_back=1.5
+            )
+
+            if df is None or df.empty:
+                logger.warning(f"No weekly data for {script} - ATR calculation failed")
+                return None
+
+            if len(df) < period:
+                logger.warning(
+                    f"Insufficient weekly data for {script}: {len(df)} candles < {period} period"
+                )
+                return None
+
+            # True Range calculation (Wilder's method - same as supertrend_calculator.py)
+            df = df.copy()
+            df['prev_close'] = df['Close'].shift(1)
+            df['tr1'] = df['High'] - df['Low']
+            df['tr2'] = abs(df['High'] - df['prev_close'])
+            df['tr3'] = abs(df['Low'] - df['prev_close'])
+            df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+
+            # ATR using Wilder's smoothing (EMA with alpha=1/period)
+            atr_series = df['tr'].ewm(alpha=1/period, adjust=False).mean()
+
+            # Return the latest ATR value
+            current_atr = float(atr_series.iloc[-1])
+
+            if current_atr <= 0:
+                logger.warning(f"Invalid ATR value for {script}: {current_atr}")
+                return None
+
+            logger.info(f"{script}: Weekly ATR({period}) = Rs.{current_atr:.2f}")
+            return current_atr
+
+        except Exception as e:
+            logger.error(f"ATR calculation failed for {script}: {e}")
+            return None
+
     # ==================== HELPER METHODS FOR TIMEFRAME-BASED UPDATES ====================
 
     def _is_last_trading_day_of_week(self, check_date: date) -> bool:
@@ -253,73 +334,87 @@ class ExitManager:
             logger.warning(f"Unknown timeframe '{position.timeframe}' for {position.script}, skipping update")
             return False
 
-    def get_trailing_low_for_timeframe(
+    def get_trailing_sl_for_timeframe(
         self,
         position: OpenPosition,
         check_date: date
     ) -> Optional[float]:
         """
-        Get the appropriate trailing LOW based on position's timeframe
+        Get the appropriate trailing SL based on position's timeframe and strategy.
 
-        - Daily (D): Today's LOW
-        - Weekly (W): FULL week's LOW (Monday to Friday) - even if entered mid-week
-        - Monthly (M): FULL month's LOW (1st to end) - even if entered mid-month
+        For Weekly positions with entry_atr (ATR strategy):
+          - Check activation gate: friday_close > entry + 1.5 * entry_atr
+          - If not activated: return current_sl (no change)
+          - If activated: return friday_close - 2.0 * current_weekly_atr
 
-        This respects the timeframe's full volatility context, giving positions
-        appropriate room regardless of when they were entered.
+        For Weekly positions without entry_atr (legacy):
+          - Use week's LOW (Mon-Fri) as trailing SL
+
+        For Daily/Monthly: unchanged (period LOW)
 
         Args:
             position: OpenPosition object
             check_date: Current date (typically today)
 
         Returns:
-            Trailing LOW price, or None if data unavailable
+            Trailing SL price, or None if data unavailable
         """
         try:
             instrument_token = self.kite_client.get_instrument_token(position.script)
             timeframe = position.timeframe.upper()
 
             if timeframe == 'D':
-                # Daily: Get today's LOW
-                start_date = check_date
-                end_date = check_date
+                # Daily: Get today's LOW (unchanged)
+                return self._get_period_low(instrument_token, position, check_date, check_date)
 
             elif timeframe == 'W':
-                # Weekly: ALWAYS use full week's LOW from Monday to Friday
-                # Respects weekly timeframe volatility regardless of entry timing
-                week_start = check_date - timedelta(days=check_date.weekday())  # This Monday
-                start_date = week_start
-                end_date = check_date
-
-                if position.entry_date > week_start:
-                    logger.debug(
-                        f"{position.script} {position.timeframe}: Position entered mid-week "
-                        f"({position.entry_date}), but using full week LOW from {week_start}"
-                    )
+                # Weekly: ATR-based or legacy LOW-based
+                if self.sl_strategy_enabled and position.entry_atr is not None and position.entry_atr > 0:
+                    return self._get_atr_trailing_sl(instrument_token, position, check_date)
+                else:
+                    # Legacy: week's LOW
+                    week_start = check_date - timedelta(days=check_date.weekday())
+                    if position.entry_date > week_start:
+                        logger.debug(
+                            f"{position.script} {position.timeframe}: Position entered mid-week "
+                            f"({position.entry_date}), but using full week LOW from {week_start}"
+                        )
+                    return self._get_period_low(instrument_token, position, week_start, check_date)
 
             elif timeframe == 'M':
-                # Monthly: ALWAYS use full month's LOW from 1st to end
-                # Respects monthly timeframe volatility regardless of entry timing
+                # Monthly: month's LOW (unchanged)
                 month_start = check_date.replace(day=1)
-                start_date = month_start
-                end_date = check_date
-
                 if position.entry_date > month_start:
                     logger.debug(
                         f"{position.script} {position.timeframe}: Position entered mid-month "
                         f"({position.entry_date}), but using full month LOW from {month_start}"
                     )
+                return self._get_period_low(instrument_token, position, month_start, check_date)
 
             else:
                 logger.error(f"Unknown timeframe '{timeframe}' for {position.script}")
                 return None
 
-            # Fetch historical daily data for the period
+        except Exception as e:
+            logger.error(
+                f"Error getting trailing SL for {position.script} {position.timeframe}: {e}"
+            )
+            return None
+
+    def _get_period_low(
+        self,
+        instrument_token: str,
+        position: OpenPosition,
+        start_date: date,
+        end_date: date
+    ) -> Optional[float]:
+        """Get the minimum LOW price for a date range (used by Daily/Monthly/legacy Weekly)."""
+        try:
             df = self.kite_client.get_historical_data(
                 instrument_token=instrument_token,
                 start_date=start_date.strftime('%Y-%m-%d'),
                 end_date=end_date.strftime('%Y-%m-%d'),
-                interval='day'  # Always fetch daily data, we'll calculate LOW ourselves
+                interval='day'
             )
 
             if df is None or df.empty:
@@ -328,7 +423,6 @@ class ExitManager:
                 )
                 return None
 
-            # Calculate the trailing LOW (minimum LOW of the period)
             trailing_low = float(df['Low'].min())
 
             logger.info(
@@ -341,8 +435,74 @@ class ExitManager:
 
         except Exception as e:
             logger.error(
-                f"Error getting trailing LOW for {position.script} {position.timeframe}: {e}"
+                f"Error getting period LOW for {position.script}: {e}"
             )
+            return None
+
+    def _get_atr_trailing_sl(
+        self,
+        instrument_token: str,
+        position: OpenPosition,
+        check_date: date
+    ) -> Optional[float]:
+        """
+        ATR-based trailing SL for Weekly positions.
+
+        Logic:
+        1. Get Friday close (current LTP on Friday EOD)
+        2. Check activation: friday_close > entry + activation_multiplier * entry_atr
+        3. If not activated: return current_sl (triggers "no_change" in caller)
+        4. If activated: compute friday_close - trailing_multiplier * current_weekly_atr
+
+        Falls back to entry_atr if current ATR calculation fails.
+        """
+        try:
+            script = position.script
+            entry_price = position.entry_price
+            entry_atr = position.entry_atr
+
+            # Get Friday close price (LTP at EOD)
+            friday_close = self.kite_client.get_instrument_ltp(instrument_token)
+
+            if friday_close is None or friday_close <= 0:
+                logger.warning(f"{script}: Could not get Friday close price for ATR trailing")
+                return None
+
+            # Activation gate: has the position moved enough to start trailing?
+            activation_threshold = entry_price + (self.trailing_activation_multiplier * entry_atr)
+
+            if friday_close <= activation_threshold:
+                logger.info(
+                    f"{script} W [ATR]: Trailing NOT activated - "
+                    f"Close Rs.{friday_close:.2f} <= Threshold Rs.{activation_threshold:.2f} "
+                    f"(Entry {entry_price:.2f} + {self.trailing_activation_multiplier}×ATR {entry_atr:.2f})"
+                )
+                # Return current SL to trigger "no_change" path in caller
+                return position.current_sl
+
+            # Trailing activated - calculate new SL
+            # Try to get current weekly ATR (may differ from entry ATR if volatility changed)
+            current_atr = self._calculate_weekly_atr(script, self.atr_period)
+
+            if current_atr is None:
+                # Fallback to entry ATR if current calc fails
+                current_atr = entry_atr
+                logger.warning(
+                    f"{script} W [ATR]: Current ATR calc failed, using entry_atr Rs.{entry_atr:.2f}"
+                )
+
+            new_sl = friday_close - (self.trailing_atr_multiplier * current_atr)
+
+            logger.info(
+                f"{script} W [ATR]: Trailing ACTIVATED - "
+                f"Close Rs.{friday_close:.2f} > Threshold Rs.{activation_threshold:.2f} | "
+                f"New SL = {friday_close:.2f} - {self.trailing_atr_multiplier}×{current_atr:.2f} = Rs.{new_sl:.2f}"
+            )
+
+            return new_sl
+
+        except Exception as e:
+            logger.error(f"ATR trailing SL calculation failed for {position.script}: {e}")
             return None
 
     # ==================== GTT PLACEMENT METHODS ====================
@@ -376,13 +536,34 @@ class ExitManager:
             # Use Zerodha symbol if provided, otherwise fall back to position.script
             trading_symbol = zerodha_symbol if zerodha_symbol else position.script
 
-            # Calculate dummy SL (15% below entry)
-            dummy_sl = entry_price * (1 - self.dummy_sl_percent)
+            # Calculate initial SL based on strategy
+            if self.sl_strategy_enabled and position.entry_atr is not None and position.entry_atr > 0:
+                # ATR-based initial SL: Entry - multiplier * ATR
+                dummy_sl = entry_price - (self.initial_atr_multiplier * position.entry_atr)
+                sl_label = f"ATR-based ({self.initial_atr_multiplier}×{position.entry_atr:.2f})"
+            elif self.sl_strategy_enabled and position.entry_atr is None:
+                # ATR calc failed at entry - use fallback percentage
+                dummy_sl = entry_price * (1 - self.fallback_sl_percent)
+                sl_label = f"Fallback ({self.fallback_sl_percent*100:.0f}%)"
+            else:
+                # Legacy: fixed percentage SL
+                dummy_sl = entry_price * (1 - self.dummy_sl_percent)
+                sl_label = f"Legacy ({self.dummy_sl_percent*100:.0f}%)"
+
+            # Safety floor: SL never more than 50% below entry
+            min_sl = entry_price * 0.50
+            if dummy_sl < min_sl:
+                logger.warning(
+                    f"SL Rs.{dummy_sl:.2f} exceeds 50% floor for {trading_symbol}, "
+                    f"capping at Rs.{min_sl:.2f}"
+                )
+                dummy_sl = min_sl
+
             dummy_sl_rounded = round_price(dummy_sl)
 
             logger.info(
-                f"Placing dummy GTT for {trading_symbol} {position.timeframe}: "
-                f"Entry=Rs.{entry_price:.2f}, Dummy SL=Rs.{dummy_sl_rounded:.2f}"
+                f"Placing initial GTT for {trading_symbol} {position.timeframe}: "
+                f"Entry=Rs.{entry_price:.2f}, SL=Rs.{dummy_sl_rounded:.2f} ({sl_label})"
             )
 
             # Get current LTP for GTT placement
@@ -602,17 +783,18 @@ class ExitManager:
             logger.error(f"Failed to cancel GTT {gtt_id}: {e}")
             return False
 
-    def update_gtt_with_trailing_low(
+    def update_gtt_with_trailing_sl(
         self,
         position: OpenPosition,
-        trailing_low: float,
+        trailing_sl: float,
         session: Session
     ) -> Tuple[bool, Optional[str], Optional[Dict]]:
         """
-        Update GTT with timeframe-appropriate trailing LOW (with verification)
+        Update GTT with timeframe-appropriate trailing SL (with verification)
 
         - Daily: Today's LOW
-        - Weekly: Week's LOW (Mon-Fri)
+        - Weekly (ATR): ATR-based trailing SL with activation gate
+        - Weekly (legacy): Week's LOW (Mon-Fri)
         - Monthly: Month's LOW
 
         CRITICAL WORKFLOW:
@@ -624,7 +806,7 @@ class ExitManager:
 
         Args:
             position: OpenPosition object
-            trailing_low: Trailing LOW price for the timeframe
+            trailing_sl: Trailing SL price for the timeframe
             session: Database session
 
         Returns:
@@ -632,16 +814,16 @@ class ExitManager:
             - update_details: Dict with {'old_sl': float, 'new_sl': float} when updated, None otherwise
         """
         try:
-            trailing_low_rounded = round_price(trailing_low)
+            new_sl_rounded = round_price(trailing_sl)
 
             # Store original SL before any modifications
             original_sl = position.current_sl
 
-            # Check if trailing LOW > current SL (only trail UP, never DOWN)
-            if trailing_low_rounded <= position.current_sl:
+            # Check if new SL > current SL (only trail UP, never DOWN)
+            if new_sl_rounded <= position.current_sl:
                 logger.info(
                     f"No GTT update needed for {position.script} {position.timeframe}: "
-                    f"Trailing LOW=Rs.{trailing_low_rounded:.2f} <= Current SL=Rs.{position.current_sl:.2f}"
+                    f"New SL=Rs.{new_sl_rounded:.2f} <= Current SL=Rs.{position.current_sl:.2f}"
                 )
                 return True, "no_change", None  # Success but no update needed
 
@@ -650,7 +832,7 @@ class ExitManager:
 
             logger.info(
                 f"Updating GTT for {position.script} {position.timeframe}: "
-                f"SL Rs.{old_sl:.2f} → Rs.{trailing_low_rounded:.2f}"
+                f"SL Rs.{old_sl:.2f} → Rs.{new_sl_rounded:.2f}"
             )
 
             # Step 1: Cancel old GTT
@@ -682,7 +864,7 @@ class ExitManager:
                 success, gtt_id, error = self._place_gtt_order(
                     script=position.script,
                     quantity=position.quantity,
-                    sl_price=trailing_low_rounded,
+                    sl_price=new_sl_rounded,
                     current_ltp=current_ltp
                 )
 
@@ -733,11 +915,11 @@ class ExitManager:
                     f"• Capital Deployed: Rs.{position.capital_deployed:,.2f}\n\n"
                     f"**GTT Update Issue:**\n"
                     f"• Old SL: Rs.{old_sl:.2f} (GTT {'✓ cancelled' if old_gtt_cancelled else '✗ failed to cancel'})\n"
-                    f"• New SL: Rs.{trailing_low_rounded:.2f} (✗ GTT placement failed)\n"
+                    f"• New SL: Rs.{new_sl_rounded:.2f} (✗ GTT placement failed)\n"
                     f"• Placement attempts: {self.gtt_max_placement_attempts}\n"
                     f"• Error: {last_error}\n\n"
                     f"⚠️ **URGENT:** Position is UNPROTECTED!\n"
-                    f"**Action:** Manually place GTT @ Rs.{trailing_low_rounded:.2f} or exit position"
+                    f"**Action:** Manually place GTT @ Rs.{new_sl_rounded:.2f} or exit position"
                 )
                 logger.critical(critical_error)
 
@@ -748,7 +930,7 @@ class ExitManager:
                 self._log_gtt_update(
                     position=position,
                     old_sl=old_sl,
-                    new_sl=trailing_low_rounded,
+                    new_sl=new_sl_rounded,
                     old_gtt_id=old_gtt_id,
                     new_gtt_id=None,
                     status="FAILED_VERIFICATION",
@@ -759,19 +941,18 @@ class ExitManager:
                 return False, critical_error, None
 
             # Step 3: Update position
-            position.current_sl = trailing_low_rounded
+            position.current_sl = new_sl_rounded
             position.current_gtt_id = new_gtt_id
             position.sl_movements += 1
             position.last_sl_update = ist_now_naive()
 
             # Update highest SL if applicable
-            if position.highest_sl is None or trailing_low_rounded > position.highest_sl:
-                position.highest_sl = trailing_low_rounded
+            if position.highest_sl is None or new_sl_rounded > position.highest_sl:
+                position.highest_sl = new_sl_rounded
 
-            # Set initial_sl if first EOD update (replacing dummy SL)
-            if position.initial_sl == position.current_sl - (position.entry_price * self.dummy_sl_percent):
-                # This was dummy SL, now update with first real trailing LOW
-                position.initial_sl = trailing_low_rounded
+            # Set initial_sl on first real SL update (replacing dummy/initial SL)
+            if position.sl_movements == 1:
+                position.initial_sl = new_sl_rounded
 
             session.commit()
 
@@ -779,7 +960,7 @@ class ExitManager:
             self._log_gtt_update(
                 position=position,
                 old_sl=old_sl,
-                new_sl=trailing_low_rounded,
+                new_sl=new_sl_rounded,
                 old_gtt_id=old_gtt_id,
                 new_gtt_id=new_gtt_id,
                 status="SUCCESS",
@@ -789,13 +970,13 @@ class ExitManager:
 
             logger.info(
                 f"✅ GTT updated and verified for {position.script}: "
-                f"Rs.{old_sl:.2f} → Rs.{trailing_low_rounded:.2f} (GTT: {new_gtt_id})"
+                f"Rs.{old_sl:.2f} → Rs.{new_sl_rounded:.2f} (GTT: {new_gtt_id})"
             )
 
             # Return update details for telegram reporting
             update_details = {
                 'old_sl': original_sl,
-                'new_sl': trailing_low_rounded
+                'new_sl': new_sl_rounded
             }
             return True, None, update_details
 
@@ -823,7 +1004,7 @@ class ExitManager:
             self._log_gtt_update(
                 position=position,
                 old_sl=position.current_sl,
-                new_sl=trailing_low_rounded if 'trailing_low_rounded' in locals() else 0,
+                new_sl=new_sl_rounded if 'new_sl_rounded' in locals() else 0,
                 old_gtt_id=position.current_gtt_id,
                 new_gtt_id=None,
                 status="FAILED",
@@ -910,7 +1091,8 @@ class ExitManager:
                 pnl_percent=pnl_details['pnl_percent'],
                 days_held=days_held,
                 sl_movements=position.sl_movements,
-                highest_sl_achieved=position.highest_sl
+                highest_sl_achieved=position.highest_sl,
+                entry_atr=position.entry_atr
             )
 
             # Update OpenPosition status
@@ -1018,20 +1200,20 @@ class ExitManager:
                         stats['skipped'] += 1
                         continue
 
-                    # Get the appropriate trailing LOW for this position's timeframe
-                    trailing_low = self.get_trailing_low_for_timeframe(position, today)
+                    # Get the appropriate trailing SL for this position's timeframe
+                    trailing_sl = self.get_trailing_sl_for_timeframe(position, today)
 
-                    if trailing_low is None:
+                    if trailing_sl is None:
                         logger.warning(
-                            f"Could not get trailing LOW for {position.script} {position.timeframe}, "
+                            f"Could not get trailing SL for {position.script} {position.timeframe}, "
                             f"skipping GTT update"
                         )
                         stats['failed'] += 1
                         stats['errors'].append(f"{position.script}: No historical data")
                         continue
 
-                    # Update GTT with trailing LOW
-                    success, error, update_details = self.update_gtt_with_trailing_low(position, trailing_low, session)
+                    # Update GTT with trailing SL
+                    success, error, update_details = self.update_gtt_with_trailing_sl(position, trailing_sl, session)
 
                     if success:
                         if error == "no_change":  # Success but no update needed
@@ -1045,7 +1227,8 @@ class ExitManager:
                                 'old_sl': update_details['old_sl'],
                                 'new_sl': update_details['new_sl'],
                                 'entry_price': position.entry_price,
-                                'quantity': position.quantity
+                                'quantity': position.quantity,
+                                'entry_atr': position.entry_atr
                             })
                     else:
                         stats['failed'] += 1

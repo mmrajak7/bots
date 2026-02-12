@@ -113,8 +113,19 @@ trading:
   position_size_pct: 20  # Base % (used for drawdown calculations and fallback)
   enable_slot_based_sizing: true  # OPTIMIZED: Use available/remaining_slots formula
   min_position_value: 10000  # Minimum position value in INR
-  dummy_sl_percent: 15  # Protective stop loss % until EOD update
+  dummy_sl_percent: 15  # Protective stop loss % until EOD update (legacy, kept for backward compat)
   price_tick_size: 0.05  # NSE tick size for price rounding
+
+  # ATR-Based Adaptive Stop Loss Strategy (S4-Refined)
+  # Replaces fixed trailing LOW with volatility-aware SL for Weekly positions
+  # Existing positions with entry_atr=NULL fall back to legacy week-LOW trailing
+  sl_strategy:
+    enabled: true
+    initial_atr_multiplier: 2.0       # Initial SL = Entry - N * ATR
+    trailing_activation_multiplier: 1.5 # Trail only after Close > Entry + N * ATR
+    trailing_atr_multiplier: 2.0       # Trailing SL = Close - N * ATR
+    atr_period: 14                     # Weekly ATR period (Wilder's smoothing)
+    fallback_sl_percent: 10            # If ATR calc fails (entry_atr=NULL)
 
   # OPTIMIZATION NOTES:
   # - When enable_slot_based_sizing=true with max_positions=5:
