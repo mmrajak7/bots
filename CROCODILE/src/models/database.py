@@ -293,9 +293,16 @@ def get_engine():
     return create_engine(db_url, echo=echo)
 
 
+_migration_done = False
+
+
 def get_session():
-    """Get database session"""
+    """Get database session (runs migration on first call)"""
+    global _migration_done
     engine = get_engine()
+    if not _migration_done:
+        _migrate_database(engine)
+        _migration_done = True
     Session = sessionmaker(bind=engine)
     return Session()
 
