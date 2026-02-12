@@ -336,7 +336,9 @@ def _migrate_database(engine):
 
 def init_database():
     """Initialize database tables"""
+    global _migration_done
     engine = get_engine()
     _migrate_database(engine)
+    _migration_done = True
     Base.metadata.create_all(engine)
     return engine

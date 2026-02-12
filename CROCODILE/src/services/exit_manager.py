@@ -449,7 +449,7 @@ class ExitManager:
         ATR-based trailing SL for Weekly positions.
 
         Logic:
-        1. Get Friday close (current LTP on Friday EOD)
+        1. Get Friday close (LTP on Friday EOD, or historical close for catch-up)
         2. Check activation: friday_close > entry + activation_multiplier * entry_atr
         3. If not activated: return current_sl (triggers "no_change" in caller)
         4. If activated: compute friday_close - trailing_multiplier * current_weekly_atr
@@ -461,8 +461,32 @@ class ExitManager:
             entry_price = position.entry_price
             entry_atr = position.entry_atr
 
-            # Get Friday close price (LTP at EOD)
-            friday_close = self.kite_client.get_instrument_ltp(instrument_token)
+            # Get Friday close price
+            today = date.today()
+            if check_date == today:
+                # Real-time (Friday EOD at 3:50 PM): LTP IS the close price
+                friday_close = self.kite_client.get_instrument_ltp(instrument_token)
+            else:
+                # Catch-up (e.g., Monday morning for missed Friday update):
+                # Use historical data to get the actual close for that date
+                df = self.kite_client.get_historical_data(
+                    instrument_token=instrument_token,
+                    start_date=check_date.strftime('%Y-%m-%d'),
+                    end_date=check_date.strftime('%Y-%m-%d'),
+                    interval='day'
+                )
+                if df is not None and not df.empty:
+                    friday_close = float(df['Close'].iloc[-1])
+                    logger.info(
+                        f"{script} W [ATR]: Catch-up mode - using historical close "
+                        f"Rs.{friday_close:.2f} for {check_date}"
+                    )
+                else:
+                    logger.warning(
+                        f"{script}: Could not get historical close for {check_date}, "
+                        f"falling back to current LTP"
+                    )
+                    friday_close = self.kite_client.get_instrument_ltp(instrument_token)
 
             if friday_close is None or friday_close <= 0:
                 logger.warning(f"{script}: Could not get Friday close price for ATR trailing")
