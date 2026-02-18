@@ -1192,6 +1192,10 @@ _Fetching P&L data..._"""
                                 trailing_active = True
                                 current_peak_pct = current_pnl_pct
                                 current_floor_pct = floor_pct
+                                # Update cache so fixed TP check below knows trailing is now active
+                                # (prevents both trailing and fixed TP from firing in same iteration)
+                                trailing_state_cached = trailing_state_cached or {}
+                                trailing_state_cached['trailing_active'] = True
 
                         else:
                             # Position too young for trailing activation
