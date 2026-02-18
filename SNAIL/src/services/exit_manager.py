@@ -108,7 +108,7 @@ class ExitCondition:
         should_exit: Whether position should be exited
         reason: Exit reason
         current_pnl: Current P&L
-        pnl_percentage: P&L as % of max profit
+        pnl_percentage: P&L as % of margin deployed (ROM)
         details: Additional details
     """
     should_exit: bool
@@ -929,11 +929,11 @@ class ExitManager:
         net_pnl = realized_pnl - charges
         exit_time = datetime.now()
 
-        # Calculate P&L percentage (of max profit if positive, max loss if negative)
-        if net_pnl >= 0 and position.max_profit and position.max_profit > 0:
-            pnl_percent = (net_pnl / position.max_profit) * 100
-        elif net_pnl < 0 and position.max_loss and position.max_loss > 0:
-            pnl_percent = (abs(net_pnl) / position.max_loss) * 100 * -1
+        # Calculate P&L percentage as ROM (Return on Margin)
+        # This is consistent with how all internal logic (trailing, TP, SL) calculates %
+        # BUG FIX: was using max_profit which showed inflated % (e.g. 7.8% instead of 1.5%)
+        if position.margin_deployed and position.margin_deployed > 0:
+            pnl_percent = (net_pnl / position.margin_deployed) * 100
         else:
             pnl_percent = 0
 

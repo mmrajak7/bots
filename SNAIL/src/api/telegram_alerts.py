@@ -352,7 +352,7 @@ class TelegramAlerts:
 
         message = f"""🚪 *EXIT: {exit_reason.replace('_', ' ').title()}* {result_emoji}
 
-{emoji} P&L: *{pnl_sign}₹{net_pnl:,.0f}* ({pnl_sign}{pnl_percent:.1f}%)
+{emoji} P&L: *{pnl_sign}₹{net_pnl:,.0f}* ({pnl_sign}{pnl_percent:.1f}% ROM)
 ⏱️ Duration: {hours}h {mins}m"""
 
         return self.send(message)

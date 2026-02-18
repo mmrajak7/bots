@@ -109,7 +109,7 @@ class MonitorSnapshot:
         nifty_spot: NIFTY spot price
         india_vix: India VIX
         current_pnl: Current P&L
-        pnl_percentage: P&L as % of max profit
+        pnl_percentage: P&L as % of margin deployed (ROM)
         straddle_value: Current straddle value
         wing_value: Current wing value
         quotes: Leg quotes

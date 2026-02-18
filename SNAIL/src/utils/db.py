@@ -524,7 +524,8 @@ def activate_trailing(
     position_id: int,
     current_pnl_pct: float,
     current_pnl_amount: float,
-    trail_pct: float
+    trail_pct: float,
+    lock_breakeven_at: float = 0.0
 ) -> float:
     """
     Activate trailing profit for a position.
@@ -536,11 +537,17 @@ def activate_trailing(
         current_pnl_pct: Current P&L percentage (becomes initial peak)
         current_pnl_amount: Current P&L amount
         trail_pct: Trailing percentage from config
+        lock_breakeven_at: Breakeven lock threshold (if P&L already at/above, lock immediately)
 
     Returns:
         Initial trailing floor percentage
     """
     floor_pct = round(current_pnl_pct - trail_pct, 4)
+
+    # If P&L already at or above breakeven lock threshold, enforce floor >= 0
+    should_lock = lock_breakeven_at > 0 and current_pnl_pct >= lock_breakeven_at
+    if should_lock:
+        floor_pct = max(0.0, floor_pct)
 
     update_trailing_state(
         position_id=position_id,
@@ -549,12 +556,13 @@ def activate_trailing(
         peak_pnl_time=datetime.now(),
         trailing_active=True,
         trailing_floor_pct=floor_pct,
-        breakeven_locked=False
+        breakeven_locked=should_lock
     )
 
+    lock_msg = " (breakeven LOCKED at activation)" if should_lock else ""
     logger.info(
         f"Trailing ACTIVATED for position {position_id}: "
-        f"peak={current_pnl_pct:.2f}%, floor={floor_pct:.2f}%"
+        f"peak={current_pnl_pct:.2f}%, floor={floor_pct:.2f}%{lock_msg}"
     )
 
     return floor_pct
@@ -566,23 +574,28 @@ def update_trailing_peak(
     new_peak_amount: float,
     trail_pct: float,
     lock_breakeven_at: float,
-    current_breakeven_locked: bool
+    current_breakeven_locked: bool,
+    current_floor_pct: float = None
 ) -> Tuple[float, bool]:
     """
     Update trailing peak when a new high is reached.
+
+    Floor is MONOTONIC - it can only increase, never decrease.
+    This is critical when trail_pct changes dynamically (VIX-adaptive).
 
     Args:
         position_id: Position ID
         new_peak_pct: New peak P&L percentage
         new_peak_amount: New peak P&L amount
-        trail_pct: Trailing percentage from config
+        trail_pct: Trailing percentage (may vary with VIX)
         lock_breakeven_at: Threshold to lock breakeven
         current_breakeven_locked: Whether breakeven is already locked
+        current_floor_pct: Current floor from caller's cached state (avoids extra DB read)
 
     Returns:
         Tuple of (new_floor_pct, breakeven_locked)
     """
-    # Calculate new floor
+    # Calculate new floor from new peak and current trail width
     new_floor = round(new_peak_pct - trail_pct, 4)
 
     # Check if breakeven should be locked
@@ -591,6 +604,19 @@ def update_trailing_peak(
     # If breakeven is locked, floor can never go below 0
     if should_lock_breakeven or current_breakeven_locked:
         new_floor = max(0.0, new_floor)
+
+    # MONOTONIC FLOOR: floor can NEVER decrease
+    # Critical for VIX-adaptive trailing where trail_pct may widen
+    # (e.g. VIX drops from 14 to 11, trail widens from 1.0% to 1.5%)
+    # Without this guard, floor could drop when trail width increases
+    if current_floor_pct is not None:
+        new_floor = max(new_floor, current_floor_pct)
+    else:
+        # Fallback: read from DB if caller didn't pass current floor
+        current_state = get_trailing_state(position_id)
+        current_floor = current_state.get('trailing_floor_pct')
+        if current_floor is not None:
+            new_floor = max(new_floor, current_floor)
 
     update_trailing_state(
         position_id=position_id,

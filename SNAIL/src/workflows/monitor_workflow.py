@@ -279,32 +279,32 @@ class MonitorWorkflow:
                 breached_wing = upper_wing if nifty_spot > upper_wing else lower_wing
                 distance_beyond = abs(nifty_spot - breached_wing)
 
+                gap_info['severity'] = 'CRITICAL'
+
+                # Get Claude advisory (if enabled)
+                use_claude = self.trading_config.get('entry', {}).get('use_claude_advisory', False)
+                if use_claude:
+                    advisory = self.claude_advisor.get_gap_open_advisory(
+                        gap_size=distance_beyond,
+                        gap_direction=gap_direction,
+                        opened_beyond_wing=True
+                    )
+                    gap_info['claude_decision'] = advisory.decision.value if advisory else 'UNKNOWN'
+                    gap_info['claude_reasoning'] = advisory.reasoning[:300] if advisory else ''
+                    claude_text = f"\n\n🤖 *Analysis:* {advisory.reasoning[:500] if advisory else 'N/A'}"
+                else:
+                    gap_info['claude_decision'] = 'UNKNOWN'
+                    gap_info['claude_reasoning'] = ''
+                    claude_text = ""
+
                 self.telegram.send(
                     f"🚨 *CRITICAL: Gap Beyond Wing!*\n\n"
                     f"NIFTY opened at ₹{nifty_spot:,.0f}\n"
                     f"Gap: {gap_direction} {gap_percent:.1%} ({gap_points:.0f} pts)\n"
                     f"Position wings: {lower_wing} - {upper_wing}\n"
                     f"Distance beyond wing: {distance_beyond:.0f} pts\n\n"
-                    f"⚠️ *Position is at MAX LOSS*\n\n"
-                    f"Analyzing with Claude..."
-                )
-
-                # Get Claude advisory (user decides, NO auto-exit)
-                advisory = self.claude_advisor.get_gap_open_advisory(
-                    gap_size=distance_beyond,
-                    gap_direction=gap_direction,
-                    opened_beyond_wing=True
-                )
-
-                gap_info['claude_decision'] = advisory.decision.value if advisory else 'UNKNOWN'
-                gap_info['claude_reasoning'] = advisory.reasoning[:300] if advisory else ''
-                gap_info['severity'] = 'CRITICAL'
-
-                # Send Claude's analysis
-                self.telegram.send(
-                    f"🤖 *Claude Analysis:*\n\n"
-                    f"{advisory.reasoning[:1000] if advisory else 'Analysis unavailable'}\n\n"
-                    f"Recommendation: *{gap_info['claude_decision']}*\n\n"
+                    f"⚠️ *Position is at MAX LOSS*"
+                    f"{claude_text}\n\n"
                     f"_User decision required - use /exit or /hold_"
                 )
 
@@ -312,30 +312,33 @@ class MonitorWorkflow:
                 return gap_info
 
             elif gap_percent >= 0.01:  # 1% or more
-                # Significant gap - Claude advisory
+                # Significant gap
                 logger.warning(f"Significant gap at open: {gap_percent:.1%} {gap_direction}")
+
+                gap_info['severity'] = 'HIGH'
+
+                # Get Claude advisory (if enabled)
+                use_claude = self.trading_config.get('entry', {}).get('use_claude_advisory', False)
+                claude_text = ""
+                if use_claude:
+                    advisory = self.claude_advisor.get_gap_open_advisory(
+                        gap_size=gap_points,
+                        gap_direction=gap_direction,
+                        opened_beyond_wing=False
+                    )
+                    gap_info['claude_decision'] = advisory.decision.value if advisory else 'UNKNOWN'
+                    gap_info['claude_reasoning'] = advisory.reasoning[:300] if advisory else ''
+                    claude_text = f"\n\n🤖 *Analysis:* {advisory.reasoning[:500] if advisory else 'N/A'}"
+                else:
+                    gap_info['claude_decision'] = 'UNKNOWN'
+                    gap_info['claude_reasoning'] = ''
 
                 self.telegram.send(
                     f"⚠️ *Significant Gap Detected*\n\n"
                     f"NIFTY opened at ₹{nifty_spot:,.0f}\n"
                     f"Previous close: ₹{previous_close:,.0f}\n"
-                    f"Gap: {gap_direction} {gap_percent:.1%} ({gap_points:.0f} pts)\n\n"
-                    f"Requesting Claude analysis..."
-                )
-
-                # Get Claude advisory
-                advisory = self.claude_advisor.get_gap_open_advisory(
-                    gap_size=gap_points,
-                    gap_direction=gap_direction,
-                    opened_beyond_wing=False
-                )
-
-                gap_info['claude_decision'] = advisory.decision.value if advisory else 'UNKNOWN'
-                gap_info['claude_reasoning'] = advisory.reasoning[:300] if advisory else ''
-                gap_info['severity'] = 'HIGH'
-
-                self.telegram.send(
-                    f"🤖 *Claude's Take:*\n{advisory.reasoning[:1000] if advisory else 'Analysis unavailable'}"
+                    f"Gap: {gap_direction} {gap_percent:.1%} ({gap_points:.0f} pts)"
+                    f"{claude_text}"
                 )
 
                 self._stats.alerts_sent += 1
@@ -702,14 +705,19 @@ _Fetching P&L data..._"""
             logger.debug("Waiting for user VIX warning decision...")
             return False
 
-        # Get Claude VIX advisory (use spike advisory with 0 previous to indicate warning)
-        advisory = self.claude_advisor.get_vix_spike_advisory(snapshot.india_vix, 0)
+        # Get Claude VIX advisory (if enabled)
+        use_claude = self.trading_config.get('entry', {}).get('use_claude_advisory', False)
+        advice_text = "VIX elevated. Monitor closely."
+        if use_claude:
+            advisory = self.claude_advisor.get_vix_spike_advisory(snapshot.india_vix, 0)
+            if advisory:
+                advice_text = advisory.reasoning[:1000]
 
         # Send decision buttons via Telegram bot
         if self.telegram_bot:
             self.telegram_bot.send_vix_warning_decision(
                 current_vix=snapshot.india_vix,
-                claude_advice=advisory.reasoning[:1000] if advisory else "VIX elevated. Monitor closely.",
+                claude_advice=advice_text,
                 position_id=position.id
             )
             set_pending_decision('vix_warning', position.id)
@@ -754,15 +762,20 @@ _Fetching P&L data..._"""
             logger.debug("Waiting for user wing approach decision...")
             return False
 
-        # Get Claude wing approach advisory
-        advisory = self.claude_advisor.get_wing_approach_advisory(direction)
+        # Get Claude wing approach advisory (if enabled)
+        use_claude = self.trading_config.get('entry', {}).get('use_claude_advisory', False)
+        advice_text = f"Price approaching {direction} wing."
+        if use_claude:
+            advisory = self.claude_advisor.get_wing_approach_advisory(direction)
+            if advisory:
+                advice_text = advisory.reasoning[:1000]
 
         # Send decision buttons via Telegram bot
         if self.telegram_bot:
             self.telegram_bot.send_wing_approach_decision(
                 direction=direction,
                 proximity_percent=proximity_pct,
-                claude_advice=advisory.reasoning[:1000] if advisory else f"Price approaching {direction} wing.",
+                claude_advice=advice_text,
                 position_id=position.id
             )
             set_pending_decision('wing_approach', position.id)
@@ -779,7 +792,7 @@ _Fetching P&L data..._"""
 
     def _handle_stop_loss(self, snapshot: MonitorSnapshot) -> bool:
         """
-        Handle stop loss condition with Claude advisory and user decision.
+        Handle stop loss condition with user decision buttons.
 
         Uses hybrid architecture: sends alert with buttons and waits for user action.
 
@@ -807,8 +820,13 @@ _Fetching P&L data..._"""
             logger.debug("Waiting for user stop loss decision...")
             return False
 
-        # Get Claude stop loss advisory
-        advisory = self.claude_advisor.get_stop_loss_advisory()
+        # Get Claude stop loss advisory (if enabled)
+        use_claude = self.trading_config.get('entry', {}).get('use_claude_advisory', False)
+        advice_text = "Stop loss level reached. Review position and decide."
+        if use_claude:
+            advisory = self.claude_advisor.get_stop_loss_advisory()
+            if advisory:
+                advice_text = advisory.reasoning[:1000]
 
         # Calculate loss percentage
         loss_percent = abs(snapshot.pnl_percentage) if snapshot.pnl_percentage < 0 else 0
@@ -818,25 +836,16 @@ _Fetching P&L data..._"""
             self.telegram_bot.send_stop_loss_decision(
                 current_pnl=snapshot.current_pnl,
                 loss_percent=loss_percent,
-                claude_advice=advisory.reasoning[:1000] if advisory else "Analysis unavailable",
+                claude_advice=advice_text,
                 position_id=position.id
             )
             set_pending_decision('stop_loss', position.id)
             logger.info("Stop loss decision sent to user via Telegram")
             return False
         else:
-            # Fallback: use Claude's recommendation directly
-            if advisory and advisory.action_required:
-                logger.info("Claude recommends exit at stop loss level (no Telegram bot)")
-                result = self.exit_manager.execute_exit(
-                    reason=ExitReason.STOP_LOSS,
-                    position=position
-                )
-                return result.success
-
-        # Claude recommends hold
-        logger.info("Claude recommends holding at stop loss level")
-        return False
+            # No Telegram bot - log and continue holding
+            logger.warning("Stop loss level reached (no Telegram bot for buttons)")
+            return False
 
     # =========================================================================
     # FRIDAY HANDLING
@@ -874,8 +883,13 @@ _Fetching P&L data..._"""
         current_time_str = datetime.now().strftime('%H:%M')
 
         if current_time_str >= friday_exit_time:
-            # Get Claude decision
-            advisory = self.claude_advisor.get_friday_decision()
+            # Get Claude decision (if enabled)
+            use_claude = self.trading_config.get('entry', {}).get('use_claude_advisory', False)
+            advice_text = "Friday close. Consider weekend risk vs theta opportunity."
+            if use_claude:
+                advisory = self.claude_advisor.get_friday_decision()
+                if advisory:
+                    advice_text = advisory.reasoning[:1000]
 
             # Get current P&L
             snapshot = get_latest_pnl_snapshot(position.id)
@@ -889,21 +903,16 @@ _Fetching P&L data..._"""
                 self.telegram_bot.send_friday_decision(
                     current_pnl=current_pnl,
                     dte=dte,
-                    claude_advice=advisory.reasoning[:1000] if advisory else "Analysis unavailable",
+                    claude_advice=advice_text,
                     position_id=position.id
                 )
                 set_pending_decision('friday', position.id)
                 logger.info("Friday decision sent to user via Telegram")
                 return False
             else:
-                # Fallback: use Claude's recommendation
-                if advisory and advisory.action_required:
-                    logger.info("Friday close: Exiting position (no Telegram bot)")
-                    result = self.exit_manager.execute_exit(
-                        reason=ExitReason.FRIDAY_CLOSE,
-                        position=position
-                    )
-                    return result.success
+                # No Telegram bot - log and continue holding
+                logger.warning("Friday close time reached (no Telegram bot for buttons)")
+                return False
 
         return False
 
@@ -1037,7 +1046,7 @@ _Fetching P&L data..._"""
                 except Exception as e:
                     logger.error(f"Hard cap TP check error (continuing to next check): {e}")
 
-                # ----- TRAILING PROFIT CHECK -----
+                # ----- TRAILING PROFIT CHECK (VIX-Adaptive) -----
                 trailing_state_cached = None  # Cache for reuse in fixed TP check
                 trailing_enabled = False      # Safe default if trailing check throws
                 try:
@@ -1045,98 +1054,147 @@ _Fetching P&L data..._"""
                     trailing_enabled = trailing_config.get('enabled', False)
 
                     if trailing_enabled:
-                        activation_pct = trailing_config.get('activation_pct', 2.0)
-                        lock_breakeven_at = trailing_config.get('lock_breakeven_at', 2.5)
-                        trail_pct = trailing_config.get('trail_pct', 0.8)
-                        min_holding_minutes = trailing_config.get('min_holding_minutes', 30)
+                        activation_pct = trailing_config.get('activation_pct', 2.5)
+                        lock_breakeven_at = trailing_config.get('lock_breakeven_at', 3.0)
+                        default_trail_pct = trailing_config.get('trail_pct', 1.0)
+                        min_holding_minutes = trailing_config.get('min_holding_minutes', 60)
                         expiry_day_trail_pct = trailing_config.get('expiry_day_trail_pct', 0.5)
+                        above_target_trail_pct = trailing_config.get('above_target_trail_pct', None)
 
+                        # ---- Determine effective trail width ----
+                        # Priority: expiry_day > above_target > vix_adaptive > default
+                        trail_pct = default_trail_pct
+
+                        # VIX-adaptive trail width
+                        vix_adaptive = trailing_config.get('vix_adaptive', {})
+                        current_vix = snapshot.india_vix if snapshot.india_vix else None
+                        vix_regime = "unknown"
+                        if vix_adaptive.get('enabled', False) and current_vix is not None:
+                            low_vix_threshold = vix_adaptive.get('low_vix_threshold', 13)
+                            if current_vix < low_vix_threshold:
+                                trail_pct = vix_adaptive.get('low_vix_trail_pct', 1.5)
+                                vix_regime = f"low (VIX {current_vix:.1f} < {low_vix_threshold})"
+                            else:
+                                trail_pct = vix_adaptive.get('normal_trail_pct', 1.0)
+                                vix_regime = f"normal (VIX {current_vix:.1f} >= {low_vix_threshold})"
+
+                        # Above-target tightening: lock gains once past profit target
+                        profit_target_pct = self.trading_config.get('exit', {}).get('profit_target_pct', 3)
+                        is_above_target = above_target_trail_pct is not None and current_pnl_pct >= profit_target_pct
+                        if is_above_target:
+                            trail_pct = above_target_trail_pct
+                            vix_regime = f"TIGHT (above {profit_target_pct}% target)"
+
+                        # Expiry day: use tightest of expiry trail and current trail
                         is_expiry_day = position.expiry_date and position.expiry_date == date.today()
-                        effective_trail_pct = expiry_day_trail_pct if is_expiry_day else trail_pct
+                        effective_trail_pct = min(expiry_day_trail_pct, trail_pct) if is_expiry_day else trail_pct
+
                         position_age_minutes = (datetime.now() - position.entry_time).total_seconds() / 60
 
-                        if position_age_minutes >= min_holding_minutes:
-                            trailing_state_cached = get_trailing_state(position.id)
-                            trailing_active = trailing_state_cached.get('trailing_active', False)
-                            current_peak_pct = trailing_state_cached.get('peak_pnl_pct')
-                            current_floor_pct = trailing_state_cached.get('trailing_floor_pct')
-                            breakeven_locked = trailing_state_cached.get('breakeven_locked', False)
+                        # ALWAYS read trailing state - exit checks must run regardless of position age
+                        # (trailing may have been activated before a config change increased min_holding_minutes)
+                        trailing_state_cached = get_trailing_state(position.id)
+                        trailing_active = trailing_state_cached.get('trailing_active', False)
+                        current_peak_pct = trailing_state_cached.get('peak_pnl_pct')
+                        current_floor_pct = trailing_state_cached.get('trailing_floor_pct')
+                        breakeven_locked = trailing_state_cached.get('breakeven_locked', False)
 
-                            if not trailing_active:
-                                if current_pnl_pct > 0 and current_pnl_pct >= activation_pct:
-                                    floor_pct = activate_trailing(
-                                        position_id=position.id,
-                                        current_pnl_pct=current_pnl_pct,
-                                        current_pnl_amount=snapshot.current_pnl,
-                                        trail_pct=effective_trail_pct
+                        if trailing_active:
+                            # ---- ACTIVE TRAILING: peak update + exit check ----
+                            # Runs regardless of position age (trailing was already activated)
+                            if current_peak_pct is None:
+                                logger.warning(f"Trailing active but peak is None - initializing to {current_pnl_pct:.2f}%")
+                                current_peak_pct = current_pnl_pct
+
+                            if current_pnl_pct > 0 and current_pnl_pct > current_peak_pct:
+                                new_floor_pct, new_breakeven_locked = update_trailing_peak(
+                                    position_id=position.id,
+                                    new_peak_pct=current_pnl_pct,
+                                    new_peak_amount=snapshot.current_pnl,
+                                    trail_pct=effective_trail_pct,
+                                    lock_breakeven_at=lock_breakeven_at,
+                                    current_breakeven_locked=breakeven_locked,
+                                    current_floor_pct=current_floor_pct
+                                )
+
+                                if new_breakeven_locked and not breakeven_locked:
+                                    self.telegram.send(
+                                        f"🔒 *Breakeven LOCKED*\n\n"
+                                        f"P&L: ₹{snapshot.current_pnl:,.0f} ({current_pnl_pct:.2f}% ROM)\n"
+                                        f"Lock at: {lock_breakeven_at}% | Floor: {new_floor_pct:.2f}%\n\n"
+                                        f"_Profit protected - no loss possible_"
+                                    )
+
+                                # Log trail tightening when crossing target threshold
+                                if is_above_target and current_floor_pct is not None and new_floor_pct > current_floor_pct:
+                                    logger.info(
+                                        f"Trail TIGHTENED above target: trail={effective_trail_pct:.1f}%, "
+                                        f"floor {current_floor_pct:.2f}% -> {new_floor_pct:.2f}%"
+                                    )
+
+                                current_floor_pct = new_floor_pct
+                                breakeven_locked = new_breakeven_locked
+
+                            if current_floor_pct is None:
+                                logger.warning("Trailing active but floor is None - skipping exit check")
+                            elif round(current_pnl_pct, 2) <= round(current_floor_pct, 2):
+                                if is_exit_in_progress(position.id):
+                                    logger.debug(
+                                        "Trailing stop condition met but exit already in progress - skipping"
+                                    )
+                                else:
+                                    pnl_inr = snapshot.current_pnl
+                                    peak_inr = (current_peak_pct / 100 * position.margin_deployed) if position.margin_deployed else 0
+                                    logger.warning(
+                                        f"TRAILING STOP HIT! P&L: {current_pnl_pct:.2f}% (₹{pnl_inr:,.0f}) "
+                                        f"<= floor {current_floor_pct:.2f}% "
+                                        f"(peak was {current_peak_pct:.2f}%, ₹{peak_inr:,.0f})"
                                     )
                                     self.telegram.send(
-                                        f"📈 *Trailing Profit ACTIVATED*\n\n"
-                                        f"P&L hit {current_pnl_pct:.2f}% (activation: {activation_pct}%)\n"
-                                        f"Peak: {current_pnl_pct:.2f}%\n"
-                                        f"Floor: {floor_pct:.2f}%\n"
-                                        f"{'🔒 Expiry day - tighter trail' if is_expiry_day else ''}\n\n"
-                                        f"_Will exit if P&L drops below floor_"
+                                        f"📉 *Trailing Stop TRIGGERED*\n\n"
+                                        f"P&L: ₹{pnl_inr:,.0f} ({current_pnl_pct:.2f}% ROM)\n"
+                                        f"Floor: {current_floor_pct:.2f}%\n"
+                                        f"Peak was: {current_peak_pct:.2f}% (₹{peak_inr:,.0f})\n\n"
+                                        f"_Executing exit..._"
                                     )
-                                    trailing_active = True
-                                    current_peak_pct = current_pnl_pct
-                                    current_floor_pct = floor_pct
-                            else:
-                                if current_peak_pct is None:
-                                    logger.warning(f"Trailing active but peak is None - initializing to {current_pnl_pct:.2f}%")
-                                    current_peak_pct = current_pnl_pct
-
-                                if current_pnl_pct > 0 and current_pnl_pct > current_peak_pct:
-                                    new_floor_pct, new_breakeven_locked = update_trailing_peak(
-                                        position_id=position.id,
-                                        new_peak_pct=current_pnl_pct,
-                                        new_peak_amount=snapshot.current_pnl,
-                                        trail_pct=effective_trail_pct,
-                                        lock_breakeven_at=lock_breakeven_at,
-                                        current_breakeven_locked=breakeven_locked
+                                    result = self.exit_manager.execute_exit(
+                                        reason=ExitReason.TRAILING_STOP,
+                                        position=position
                                     )
-
-                                    if new_breakeven_locked and not breakeven_locked:
-                                        self.telegram.send(
-                                            f"🔒 *Breakeven LOCKED*\n\n"
-                                            f"P&L hit {current_pnl_pct:.2f}% (lock at: {lock_breakeven_at}%)\n"
-                                            f"Floor: {new_floor_pct:.2f}% (can never go below 0%)\n\n"
-                                            f"_Profit protected - no loss possible_"
-                                        )
-
-                                    current_floor_pct = new_floor_pct
-                                    breakeven_locked = new_breakeven_locked
-
-                                if current_floor_pct is None:
-                                    logger.warning("Trailing active but floor is None - skipping exit check")
-                                elif round(current_pnl_pct, 2) <= round(current_floor_pct, 2):
-                                    if is_exit_in_progress(position.id):
-                                        logger.debug(
-                                            "Trailing stop condition met but exit already in progress - skipping"
-                                        )
+                                    if result.success:
+                                        reset_trailing_state(position.id)
+                                        self._stats.exits_triggered += 1
+                                        return
                                     else:
-                                        logger.warning(
-                                            f"TRAILING STOP HIT! P&L: {current_pnl_pct:.2f}% <= floor {current_floor_pct:.2f}% "
-                                            f"(peak was {current_peak_pct:.2f}%)"
-                                        )
-                                        self.telegram.send(
-                                            f"📉 *Trailing Stop TRIGGERED*\n\n"
-                                            f"P&L dropped to {current_pnl_pct:.2f}%\n"
-                                            f"Floor was: {current_floor_pct:.2f}%\n"
-                                            f"Peak was: {current_peak_pct:.2f}%\n\n"
-                                            f"_Executing exit..._"
-                                        )
-                                        result = self.exit_manager.execute_exit(
-                                            reason=ExitReason.TRAILING_STOP,
-                                            position=position
-                                        )
-                                        if result.success:
-                                            reset_trailing_state(position.id)
-                                            self._stats.exits_triggered += 1
-                                            return
-                                        else:
-                                            logger.error(f"Trailing stop exit failed: {result.error}")
+                                        logger.error(f"Trailing stop exit failed: {result.error}")
+
+                        elif position_age_minutes >= min_holding_minutes:
+                            # ---- ACTIVATION CHECK (age-gated) ----
+                            # Only activate trailing for mature positions
+                            if current_pnl_pct > 0 and current_pnl_pct >= activation_pct:
+                                floor_pct = activate_trailing(
+                                    position_id=position.id,
+                                    current_pnl_pct=current_pnl_pct,
+                                    current_pnl_amount=snapshot.current_pnl,
+                                    trail_pct=effective_trail_pct,
+                                    lock_breakeven_at=lock_breakeven_at
+                                )
+                                pnl_inr = snapshot.current_pnl
+                                vix_info = f"VIX {current_vix:.1f} | " if current_vix else ""
+                                self.telegram.send(
+                                    f"📈 *Trailing Profit ACTIVATED*\n\n"
+                                    f"P&L: ₹{pnl_inr:,.0f} ({current_pnl_pct:.2f}% ROM)\n"
+                                    f"Peak: {current_pnl_pct:.2f}% | Floor: {floor_pct:.2f}%\n"
+                                    f"{vix_info}Trail: {effective_trail_pct:.1f}% ({vix_regime})\n"
+                                    f"{'🔒 Expiry day - tighter trail' if is_expiry_day else ''}\n\n"
+                                    f"_Will exit if P&L drops below floor_"
+                                )
+                                trailing_active = True
+                                current_peak_pct = current_pnl_pct
+                                current_floor_pct = floor_pct
+
                         else:
+                            # Position too young for trailing activation
                             if current_pnl_pct >= activation_pct:
                                 logger.debug(
                                     f"Trailing would activate but position too young "
@@ -1147,7 +1205,7 @@ _Fetching P&L data..._"""
 
                 # ----- FIXED PROFIT TARGET CHECK -----
                 try:
-                    profit_target_pct = self.trading_config.get('exit', {}).get('profit_target_pct', 2.6)
+                    profit_target_pct = self.trading_config.get('exit', {}).get('profit_target_pct', 3)
                     auto_exit_on_tp = self.trading_config.get('exit', {}).get('auto_exit_on_tp', True)
 
                     use_fixed_tp = not trailing_enabled or not (trailing_state_cached or {}).get('trailing_active', False)
