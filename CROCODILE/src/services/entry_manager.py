@@ -16,6 +16,7 @@ from src.api.broker_factory import get_broker
 from src.utils.config_manager import config
 from src.utils.price_rounder import round_price, PriceRounder
 from src.reporting.telegram_client import telegram
+from src.services.sector_filter import sector_filter
 
 
 class Signal:
@@ -785,6 +786,16 @@ class EntryManager:
             # Return with "Duplicate:" prefix so CSV status detection marks it as 'D'
             return False, f"Duplicate: {dup_reason}"
 
+        # ====== SECTOR CONCENTRATION CHECK ======
+        # Check sector limits BEFORE position limit (cheap check, avoids wasting slots)
+        is_sector_blocked, sector_reason = sector_filter.check_sector_limit(signal.script, session)
+        if is_sector_blocked:
+            logger.info(
+                f"⏸️  Sector limit reached for {signal.script}({signal.timeframe}), "
+                f"holding for retry: {sector_reason}"
+            )
+            return False, sector_reason
+
         # ====== EARLY POSITION LIMIT CHECK (OPTIMIZATION) ======
         # Check position limits BEFORE expensive validation work
         # If no slots available, gracefully skip and retry later
@@ -1002,7 +1013,8 @@ class EntryManager:
                 # Check if this is a retryable condition - DON'T update CSV, leave blank for retry
                 is_retryable = ("position limit reached" in message.lower() or
                                "pending order limit reached" in message.lower() or
-                               "insufficient margin" in message.lower())
+                               "insufficient margin" in message.lower() or
+                               "sector concentration limit" in message.lower())
 
                 if is_retryable:
                     # Retryable condition - skip CSV update, leave signal blank for next cycle
