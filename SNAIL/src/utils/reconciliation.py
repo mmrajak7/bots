@@ -107,7 +107,7 @@ def reconcile_positions(
         for p in net_positions:
             symbol = p.get('tradingsymbol', '')
             qty = p.get('quantity', 0)
-            if 'NIFTY' in symbol and qty != 0:
+            if symbol.startswith('NIFTY') and qty != 0:
                 kite_nifty[symbol] = qty
 
         result.kite_nifty_positions = len(kite_nifty)

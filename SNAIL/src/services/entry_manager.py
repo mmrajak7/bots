@@ -301,7 +301,7 @@ class EntryManager:
             kite_positions = self.kite.positions().get('net', [])
             nifty_options = [
                 p for p in kite_positions
-                if 'NIFTY' in p.get('tradingsymbol', '') and p.get('quantity', 0) != 0
+                if p.get('tradingsymbol', '').startswith('NIFTY') and p.get('quantity', 0) != 0
             ]
             if nifty_options:
                 symbols = [f"{p['tradingsymbol']}({p['quantity']})" for p in nifty_options]
