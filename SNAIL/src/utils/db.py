@@ -256,6 +256,110 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     except Exception as e:
         logger.warning(f"Migration 2 check failed: {e}")
 
+    # Migration 4: Add 'partial' to positions status CHECK constraint
+    # SQLite requires table recreation to modify CHECK constraints
+    try:
+        cursor = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='positions'"
+        )
+        row = cursor.fetchone()
+        if row:
+            create_sql = row[0]
+            if "'partial'" not in create_sql and '"partial"' not in create_sql:
+                logger.info("Running migration 4: Adding 'partial' status to positions CHECK constraint")
+                _migrate_positions_add_partial_status(conn)
+                logger.info("Migration 4 complete: 'partial' status added to positions table")
+    except Exception as e:
+        logger.warning(f"Migration 4 check failed: {e}")
+
+
+def _migrate_positions_add_partial_status(conn: sqlite3.Connection) -> None:
+    """
+    Recreate positions table with 'partial' in the status CHECK constraint.
+
+    SQLite does not support ALTER CONSTRAINT, so we must:
+    1. Create new table with updated constraint
+    2. Copy all data
+    3. Drop old table
+    4. Rename new table
+    5. Recreate indexes
+    """
+    # Get column names from existing table for safe data copy
+    cursor = conn.execute("PRAGMA table_info(positions)")
+    existing_columns = [row[1] for row in cursor.fetchall()]
+
+    # Columns that exist in both old and new schema
+    base_columns = [
+        'id', 'status', 'entry_time', 'exit_time', 'expiry_date',
+        'atm_strike', 'wing_distance', 'lot_size', 'entry_premium',
+        'straddle_credit', 'wing_debit', 'max_profit', 'max_loss',
+        'margin_deployed', 'entry_charges', 'exit_premium', 'exit_charges',
+        'net_pnl', 'pnl_percent', 'exit_reason', 'verified',
+        'created_at', 'updated_at'
+    ]
+
+    # Include migration-added columns that may exist
+    optional_columns = [
+        'peak_pnl_pct', 'peak_pnl_amount', 'peak_pnl_time',
+        'trailing_active', 'trailing_floor_pct', 'breakeven_locked',
+        'exit_in_progress'
+    ]
+
+    copy_columns = [c for c in base_columns + optional_columns if c in existing_columns]
+    cols_str = ', '.join(copy_columns)
+
+    # Build optional column definitions for the new table
+    optional_col_defs = []
+    for col in optional_columns:
+        if col in existing_columns:
+            if col in ('trailing_active', 'breakeven_locked', 'exit_in_progress'):
+                optional_col_defs.append(f"    {col} INTEGER DEFAULT 0")
+            elif col == 'peak_pnl_time':
+                optional_col_defs.append(f"    {col} DATETIME")
+            else:
+                optional_col_defs.append(f"    {col} REAL")
+
+    optional_sql = ',\n' + ',\n'.join(optional_col_defs) if optional_col_defs else ''
+
+    conn.execute(f"""
+        CREATE TABLE positions_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'partial', 'exiting', 'closed')),
+            entry_time DATETIME NOT NULL,
+            exit_time DATETIME,
+            expiry_date DATE NOT NULL,
+            atm_strike INTEGER NOT NULL,
+            wing_distance INTEGER NOT NULL,
+            lot_size INTEGER NOT NULL,
+            entry_premium REAL NOT NULL,
+            straddle_credit REAL NOT NULL,
+            wing_debit REAL NOT NULL,
+            max_profit REAL NOT NULL,
+            max_loss REAL NOT NULL,
+            margin_deployed REAL NOT NULL,
+            entry_charges REAL NOT NULL,
+            exit_premium REAL,
+            exit_charges REAL,
+            net_pnl REAL,
+            pnl_percent REAL,
+            exit_reason TEXT CHECK(exit_reason IN (
+                'profit_target', 'stop_loss', 'friday_exit',
+                'vix_spike', 'manual', 'timeout', 'adjustment', 'expiry_day'
+            )),
+            verified BOOLEAN DEFAULT TRUE,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP{optional_sql}
+        )
+    """)
+    conn.execute(f"INSERT INTO positions_new ({cols_str}) SELECT {cols_str} FROM positions")
+    conn.execute("DROP TABLE positions")
+    conn.execute("ALTER TABLE positions_new RENAME TO positions")
+
+    # Recreate indexes
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_entry_time ON positions(entry_time)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_exit_time ON positions(exit_time)")
+
 
 _migrations_run = False  # Track if migrations have been run this session
 
@@ -331,6 +435,87 @@ def get_active_position() -> Optional[Position]:
         if row:
             return _row_to_position(row)
         return None
+
+
+def get_non_closed_positions() -> List[Position]:
+    """
+    Get all positions that are not 'closed' (active, partial, exiting).
+
+    Returns:
+        List of Position objects with active/partial/exiting status
+    """
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            "SELECT * FROM positions WHERE status IN ('active', 'partial', 'exiting')"
+        )
+        return [_row_to_position(row) for row in cursor.fetchall()]
+
+
+def has_blocking_position() -> bool:
+    """Check if any non-closed position exists that should block new entry."""
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE status IN ('active', 'partial', 'exiting')"
+        )
+        return cursor.fetchone()[0] > 0
+
+
+def get_blocking_position_summary() -> Optional[str]:
+    """Get summary of blocking position for log/alert messages."""
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            "SELECT id, status FROM positions WHERE status IN ('active', 'partial', 'exiting') LIMIT 1"
+        )
+        row = cursor.fetchone()
+        if row:
+            return f"Position {row[0]} (status={row[1]})"
+        return None
+
+
+def get_exiting_positions(max_age_hours: int = 12) -> List[Position]:
+    """
+    Get 'exiting' positions older than max_age_hours.
+
+    These are positions where exit was attempted but not fully completed.
+    After max_age_hours, they are considered stale and need resolution.
+
+    Args:
+        max_age_hours: Maximum age before position is considered stale
+
+    Returns:
+        List of stale exiting Position objects
+    """
+    cutoff = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
+    with get_db_session() as conn:
+        cursor = conn.execute(
+            "SELECT * FROM positions WHERE status = 'exiting' AND updated_at < ?",
+            (cutoff,)
+        )
+        return [_row_to_position(row) for row in cursor.fetchall()]
+
+
+def close_stale_exiting_position(position_id: int) -> None:
+    """
+    Transition a stale 'exiting' position to 'closed' with exit_reason='manual'.
+
+    Called when reconciliation confirms no legs remain on Kite for a
+    position stuck in 'exiting' state.
+
+    Args:
+        position_id: Position ID to close
+    """
+    now = datetime.now().isoformat()
+    with get_db_session() as conn:
+        conn.execute(
+            """UPDATE positions SET
+                status = 'closed',
+                exit_reason = 'manual',
+                exit_time = ?,
+                updated_at = ?
+            WHERE id = ? AND status = 'exiting'""",
+            (now, now, position_id)
+        )
+    logger.info(f"Stale exiting position {position_id} closed (manual)")
 
 
 def get_position_by_id(position_id: int) -> Optional[Position]:
@@ -416,6 +601,150 @@ def create_position(
         )
         position_id = cursor.lastrowid
         logger.info(f"Created position {position_id}")
+        return position_id
+
+
+def save_partial_position(
+    entry_time: datetime,
+    expiry_date: date,
+    atm_strike: int,
+    wing_distance: int,
+    lot_size: int,
+    filled_legs: List[Dict[str, Any]],
+    position_state: str,
+    error: str
+) -> int:
+    """
+    Save a partial position (incomplete Iron Fly) to database.
+
+    Records only the legs that actually filled. Status='partial' indicates
+    this position requires manual intervention - no automated monitoring
+    or exit triggers will act on it.
+
+    Args:
+        entry_time: When execution was attempted
+        expiry_date: Option expiry date
+        atm_strike: ATM strike price
+        wing_distance: Wing distance in points
+        lot_size: Lot size (quantity per leg)
+        filled_legs: List of ExecutedLeg-like dicts with keys:
+            leg_type, symbol, txn_type, fill_price, quantity, order_id
+        position_state: Resulting position state name (e.g. 'BEAR_CALL_SPREAD')
+        error: Error description for audit trail
+
+    Returns:
+        New position ID
+    """
+    # Calculate partial premiums from filled legs only
+    straddle_credit = 0.0
+    wing_debit = 0.0
+    for leg in filled_legs:
+        price = leg.get('fill_price', 0) or 0
+        leg_type = leg.get('leg_type', '')
+        if leg_type.startswith('straddle'):
+            straddle_credit += price
+        elif leg_type.startswith('wing'):
+            wing_debit += price
+
+    entry_premium = (straddle_credit - wing_debit) * lot_size
+
+    with get_db_session() as conn:
+        # Insert position with 'partial' status
+        cursor = conn.execute(
+            """INSERT INTO positions (
+                status, entry_time, expiry_date, atm_strike, wing_distance,
+                lot_size, entry_premium, straddle_credit, wing_debit,
+                max_profit, max_loss, margin_deployed, entry_charges, verified
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                'partial',
+                entry_time.isoformat(),
+                expiry_date.isoformat(),
+                atm_strike,
+                wing_distance,
+                lot_size,
+                entry_premium,
+                straddle_credit,
+                wing_debit,
+                0.0,   # max_profit: can't calculate for partial structure
+                0.0,   # max_loss: can't calculate for partial structure
+                0.0,   # margin_deployed: unknown for partial
+                0.0,   # entry_charges: will be calculated on manual exit
+                False  # verified=False since incomplete
+            )
+        )
+        position_id = cursor.lastrowid
+
+        # Insert position legs for each filled leg
+        for leg in filled_legs:
+            leg_type = leg.get('leg_type', '')
+            symbol = leg.get('symbol', '')
+            fill_price = leg.get('fill_price', 0) or 0
+            quantity = leg.get('quantity', lot_size) or lot_size
+
+            # Derive option_type and strike from leg_type and symbol
+            option_type = 'CE' if 'ce' in leg_type.lower() else 'PE'
+            strike = atm_strike
+            if 'wing_ce' == leg_type:
+                strike = atm_strike + wing_distance
+            elif 'wing_pe' == leg_type:
+                strike = atm_strike - wing_distance
+
+            conn.execute(
+                """INSERT INTO position_legs (
+                    position_id, leg_type, option_type, strike,
+                    tradingsymbol, entry_price, quantity, instrument_token
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    position_id,
+                    leg_type,
+                    option_type,
+                    strike,
+                    symbol,
+                    fill_price,
+                    quantity,
+                    ''  # instrument_token not available from atomic execution
+                )
+            )
+
+        # Save orders for audit trail
+        for leg in filled_legs:
+            order_id = leg.get('order_id', '')
+            if order_id:
+                leg_type = leg.get('leg_type', '')
+                option_type = 'CE' if 'ce' in leg_type.lower() else 'PE'
+                strike = atm_strike
+                if 'wing_ce' == leg_type:
+                    strike = atm_strike + wing_distance
+                elif 'wing_pe' == leg_type:
+                    strike = atm_strike - wing_distance
+
+                conn.execute(
+                    """INSERT INTO orders (
+                        position_id, kite_order_id, order_type, transaction_type,
+                        tradingsymbol, strike, option_type, price, quantity, status,
+                        fill_price, slippage
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        position_id,
+                        order_id,
+                        'LIMIT',
+                        leg.get('txn_type', 'BUY'),
+                        leg.get('symbol', ''),
+                        strike,
+                        option_type,
+                        leg.get('fill_price', 0) or 0,
+                        leg.get('quantity', lot_size) or lot_size,
+                        'filled',
+                        leg.get('fill_price', 0) or 0,
+                        0.0
+                    )
+                )
+
+        logger.critical(
+            f"PARTIAL POSITION SAVED: id={position_id}, state={position_state}, "
+            f"legs={len(filled_legs)}, error={error}"
+        )
         return position_id
 
 

@@ -28,6 +28,10 @@ from src.api.telegram_alerts import TelegramAlerts, get_telegram
 from src.api.telegram_bot import TelegramBot, get_telegram_bot, CallbackAction
 from src.utils.db import (
     get_active_position,
+    get_non_closed_positions,
+    get_exiting_positions,
+    get_position_legs,
+    close_stale_exiting_position,
     get_latest_pnl_snapshot,
     get_today_market_data,
     capture_day_open,
@@ -60,6 +64,11 @@ MAIN_LOOP_INTERVAL = 60      # seconds
 ACTIVE_POSITION_INTERVAL = 30 # seconds when position exists
 GAP_CHECK_TIME = dt_time(9, 16)
 MARKET_CLOSE_TIME = dt_time(15, 30)
+
+# Stale exit / partial position periodic checks
+STALE_EXIT_CHECK_INTERVAL_MINUTES = 30
+STALE_EXIT_AGE_HOURS = 2  # More aggressive than startup's 12h
+PARTIAL_ALERT_INTERVAL_MINUTES = 30
 
 
 # =============================================================================
@@ -166,6 +175,10 @@ class MonitorWorkflow:
         self._running = False
         self._stats = MonitorLoopStats(start_time=datetime.now())
         self._previous_close = None
+
+        # Periodic check timestamps for stale exits and partial positions
+        self._last_stale_exit_check: Optional[datetime] = None
+        self._last_partial_alert: Optional[datetime] = None
 
         # NOTE: Pending user decisions are now tracked in DB via has_pending_decision()
         # This survives process restarts (cron-based execution)
@@ -917,6 +930,128 @@ _Fetching P&L data..._"""
         return False
 
     # =========================================================================
+    # PERIODIC HEALTH CHECKS (Stale exits, partial positions)
+    # =========================================================================
+
+    def _should_check_stale_exits(self) -> bool:
+        """Check if enough time has passed for stale exit check."""
+        if self._last_stale_exit_check is None:
+            return True
+        elapsed = (datetime.now() - self._last_stale_exit_check).total_seconds() / 60
+        return elapsed >= STALE_EXIT_CHECK_INTERVAL_MINUTES
+
+    def _should_alert_partial(self) -> bool:
+        """Check if enough time has passed for partial position alert."""
+        if self._last_partial_alert is None:
+            return True
+        elapsed = (datetime.now() - self._last_partial_alert).total_seconds() / 60
+        return elapsed >= PARTIAL_ALERT_INTERVAL_MINUTES
+
+    def _check_stale_exits(self) -> None:
+        """
+        Check for and resolve stale 'exiting' positions mid-day.
+
+        More aggressive than startup (2h vs 12h threshold).
+        If no legs remain on Kite, auto-close in DB.
+        If legs still open, alert via Telegram.
+        """
+        self._last_stale_exit_check = datetime.now()
+
+        try:
+            stale = get_exiting_positions(max_age_hours=STALE_EXIT_AGE_HOURS)
+            if not stale:
+                return
+
+            logger.warning(f"Monitor: Found {len(stale)} stale exiting position(s)")
+            kite = self.entry_manager.kite if hasattr(self.entry_manager, 'kite') else None
+
+            for position in stale:
+                legs = get_position_legs(position.id)
+
+                if kite:
+                    try:
+                        kite_positions = kite.positions().get('net', [])
+                        leg_symbols = {leg.tradingsymbol for leg in legs}
+                        still_open = [
+                            p for p in kite_positions
+                            if p.get('tradingsymbol') in leg_symbols
+                            and p.get('quantity', 0) != 0
+                        ]
+
+                        if not still_open:
+                            close_stale_exiting_position(position.id)
+                            logger.info(f"Monitor: Auto-closed stale exiting position {position.id} (no legs on Kite)")
+                            try:
+                                self.telegram.send(
+                                    f"Position {position.id} (exiting) auto-closed: no legs found on Kite"
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            symbols = [f"{p['tradingsymbol']}({p['quantity']})" for p in still_open]
+                            logger.warning(
+                                f"Monitor: Stale exiting position {position.id} still has legs: {', '.join(symbols)}"
+                            )
+                            try:
+                                self.telegram.send(
+                                    f"⚠️ *Stale Exit: Position {position.id}*\n\n"
+                                    f"Status `exiting` for >{STALE_EXIT_AGE_HOURS}h\n"
+                                    f"Open legs: {', '.join(symbols)}\n\n"
+                                    f"Manual intervention may be required."
+                                )
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.warning(f"Monitor: Kite check failed for stale exit {position.id}: {e}")
+                else:
+                    logger.warning(f"Monitor: Cannot check stale exit {position.id} - no Kite client")
+
+        except Exception as e:
+            logger.error(f"Monitor: Stale exit check error: {e}")
+
+    def _check_orphaned_positions(self) -> None:
+        """
+        Alert on partial positions that need user resolution.
+
+        Queries DB for status='partial' and sends periodic Telegram reminders.
+        """
+        self._last_partial_alert = datetime.now()
+
+        try:
+            non_closed = get_non_closed_positions()
+            partial_positions = [p for p in non_closed if p.status == 'partial']
+
+            if not partial_positions:
+                return
+
+            for pos in partial_positions:
+                legs = get_position_legs(pos.id)
+                leg_details = []
+                for leg in legs:
+                    leg_details.append(f"{leg.leg_type}: {leg.tradingsymbol} (qty={leg.quantity})")
+
+                logger.warning(
+                    f"Monitor: Partial position {pos.id} detected - "
+                    f"{len(legs)} leg(s): {', '.join(leg_details)}"
+                )
+
+                try:
+                    msg = (
+                        f"⚠️ *Partial Position Alert: ID {pos.id}*\n\n"
+                        f"Status: `partial` (entry incomplete)\n"
+                        f"Legs on DB:\n"
+                    )
+                    for detail in leg_details:
+                        msg += f"• {detail}\n"
+                    msg += f"\n⚠️ *Action required:* Verify Kite and resolve manually."
+                    self.telegram.send(msg)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.error(f"Monitor: Orphaned position check error: {e}")
+
+    # =========================================================================
     # MAIN LOOP
     # =========================================================================
 
@@ -962,6 +1097,14 @@ _Fetching P&L data..._"""
                 logger.info("Monitor: Market closed, skipping")
                 self._state = MonitorWorkflowState.IDLE
                 return
+
+            # Periodic stale exit check (every 30 min)
+            if self._should_check_stale_exits():
+                self._check_stale_exits()
+
+            # Periodic partial position alert (every 30 min)
+            if self._should_alert_partial():
+                self._check_orphaned_positions()
 
             # Check for active position
             position = get_active_position()

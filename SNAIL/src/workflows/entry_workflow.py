@@ -22,7 +22,7 @@ from src.services.entry_manager import EntryManager, EntryConditions, EntryResul
 from src.services.claude_advisor import ClaudeAdvisor, AdvisoryResult, get_claude_advisor
 from src.api.telegram_alerts import TelegramAlerts, get_telegram
 from src.api.response_handler import TelegramResponseHandler, get_response_handler
-from src.utils.db import get_active_position, is_on_cooldown, check_system_ready
+from src.utils.db import get_active_position, get_blocking_position_summary, is_on_cooldown, check_system_ready
 from src.utils.helpers import is_trading_day
 from src.utils.config import get_trading_config, load_config
 
@@ -168,10 +168,10 @@ class EntryWorkflow:
         if current_time > ENTRY_WINDOW_END:
             return False, f"After entry window (closed at {ENTRY_WINDOW_END})"
 
-        # Check for existing position
-        active = get_active_position()
-        if active:
-            return False, f"Active position exists (ID: {active.id})"
+        # Check for any blocking position (active, partial, or exiting)
+        blocking = get_blocking_position_summary()
+        if blocking:
+            return False, f"Entry blocked: {blocking}"
 
         # Check cooldown
         if is_on_cooldown('entry'):

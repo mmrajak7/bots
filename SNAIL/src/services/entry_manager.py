@@ -61,7 +61,9 @@ from src.utils.db import (
     Position,
     PositionLeg,
     save_position_with_legs,
+    save_partial_position,
     get_active_position,
+    get_blocking_position_summary,
     is_on_cooldown,
     clear_cooldown
 )
@@ -223,12 +225,12 @@ class EntryManager:
         """
         logger.info("Checking entry conditions...")
 
-        # Check for existing position
-        active = get_active_position()
-        if active:
+        # Check for any blocking position (active, partial, or exiting)
+        blocking = get_blocking_position_summary()
+        if blocking:
             return EntryConditions(
                 can_enter=False,
-                reason=f"Active position exists (ID: {active.id})"
+                reason=f"Blocking position: {blocking}"
             )
 
         # Check cooldown
@@ -292,6 +294,24 @@ class EntryManager:
                 can_enter=False,
                 reason=f"Market data unavailable: {e}"
             )
+
+        # Cross-check Kite for orphaned NIFTY option positions
+        # Placed after ensure_authenticated() so the API call succeeds
+        try:
+            kite_positions = self.kite.positions().get('net', [])
+            nifty_options = [
+                p for p in kite_positions
+                if 'NIFTY' in p.get('tradingsymbol', '') and p.get('quantity', 0) != 0
+            ]
+            if nifty_options:
+                symbols = [f"{p['tradingsymbol']}({p['quantity']})" for p in nifty_options]
+                return EntryConditions(
+                    can_enter=False,
+                    reason=f"Live NIFTY positions on Kite: {', '.join(symbols)}"
+                )
+        except Exception as e:
+            # Don't block entry on Kite API failure, but log warning
+            logger.warning(f"Kite position cross-check failed: {e}")
 
         # Check VIX range with soft buffer (TDD Section 5.2)
         vix_config = self.trading_config.get('entry', {}).get('vix_range', {})
@@ -781,12 +801,48 @@ class EntryManager:
                             f"{'🔄 Rollback performed' if atomic_result.rollback_performed else 'No rollback needed (defined risk)'}"
                         )
 
-                        # Record partial position for tracking
-                        # Note: Need to handle this specially in database
+                        # Save partial position to DB for tracking
+                        filled_legs = [
+                            {
+                                'leg_type': leg.leg_type,
+                                'symbol': leg.symbol,
+                                'txn_type': leg.txn_type,
+                                'fill_price': leg.fill_price,
+                                'quantity': leg.quantity,
+                                'order_id': leg.order_id,
+                            }
+                            for leg in atomic_result.legs
+                            if leg.status in (LegStatus.FILLED, LegStatus.PARTIALLY_FILLED)
+                        ]
+
+                        partial_position_id = None
+                        try:
+                            partial_position_id = save_partial_position(
+                                entry_time=datetime.now(),
+                                expiry_date=conditions.expiry,
+                                atm_strike=conditions.atm_strike,
+                                wing_distance=conditions.wing_distance,
+                                lot_size=quantity,
+                                filled_legs=filled_legs,
+                                position_state=atomic_result.position_state.name,
+                                error=atomic_result.error or "Partial execution"
+                            )
+                            logger.critical(f"Partial position saved to DB: ID={partial_position_id}")
+                        except Exception as db_err:
+                            logger.critical(f"FAILED to save partial position to DB: {db_err}")
+
+                        # Run reconciliation after partial failure
+                        try:
+                            from src.utils.reconciliation import reconcile_positions
+                            reconcile_positions(kite=self.kite, telegram=self.telegram)
+                        except Exception as recon_err:
+                            logger.error(f"Post-failure reconciliation error: {recon_err}")
+
                         return EntryResult(
                             success=False,
                             error=f"Partial execution: {atomic_result.position_state.name} - {atomic_result.error}",
-                            partial_position_state=atomic_result.position_state.name
+                            partial_position_state=atomic_result.position_state.name,
+                            position_id=partial_position_id
                         )
                     else:
                         return EntryResult(success=False, error=atomic_result.error or "Unknown atomic execution error")

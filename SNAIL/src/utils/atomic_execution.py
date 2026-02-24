@@ -57,6 +57,13 @@ DEFAULT_LOT_SIZES = {
 }
 DEFAULT_LOT_SIZE = NIFTY_LOT_SIZE  # Fallback if instrument not found
 
+# Last leg aggressive fill settings (3-phase escalation for completing leg)
+LAST_LEG_PHASE1_SECONDS = 15     # Standard LIMIT
+LAST_LEG_PHASE2_SECONDS = 10     # Wider LIMIT (+5 ticks from original quote)
+LAST_LEG_PHASE3_SECONDS = 5      # MARKET order
+LAST_LEG_WIDER_SLIPPAGE_TICKS = 5
+LAST_LEG_INDEX = 3               # straddle_pe is 4th leg (0-indexed)
+
 # Module-level lock for concurrent execution protection (thread-safe initialization)
 _EXECUTION_LOCK = threading.Lock()
 
@@ -332,19 +339,34 @@ class AtomicIronFlyExecutor:
                 logger.warning(f"Pre-validation warning: {warning}")
 
         # Execute in safe order
-        for leg_type, txn_type in self.SAFE_EXECUTION_ORDER:
+        for leg_index, (leg_type, txn_type) in enumerate(self.SAFE_EXECUTION_ORDER):
             symbol = symbols[leg_type]
             quote = quotes[leg_type]
 
             logger.info(f"Step {len(self.executed_legs) + 1}/4: {txn_type} {leg_type}")
 
-            result = self._execute_leg(
-                leg_type=leg_type,
-                symbol=symbol,
-                txn_type=txn_type,
-                quantity=quantity,
-                quote=quote
+            # Last leg gets aggressive 3-phase fill escalation
+            is_last_leg = (
+                leg_index == LAST_LEG_INDEX
+                and len(self.executed_legs) == LAST_LEG_INDEX
             )
+
+            if is_last_leg:
+                result = self._execute_last_leg_aggressive(
+                    leg_type=leg_type,
+                    symbol=symbol,
+                    txn_type=txn_type,
+                    quantity=quantity,
+                    quote=quote
+                )
+            else:
+                result = self._execute_leg(
+                    leg_type=leg_type,
+                    symbol=symbol,
+                    txn_type=txn_type,
+                    quantity=quantity,
+                    quote=quote
+                )
 
             self.executed_legs.append(result)
 
@@ -580,6 +602,263 @@ class AtomicIronFlyExecutor:
                 status=LegStatus.FAILED,
                 error=str(e)
             )
+
+    def _execute_last_leg_aggressive(
+        self,
+        leg_type: str,
+        symbol: str,
+        txn_type: str,
+        quantity: int,
+        quote: Quote
+    ) -> ExecutedLeg:
+        """
+        Execute the last (completing) leg with 3-phase price escalation.
+
+        3 legs are already live on exchange, so this leg MUST fill.
+        - Phase 1 (0-15s): Standard LIMIT with normal slippage
+        - Phase 2 (15-25s): modify_order to wider slippage (+5 ticks from quote)
+        - Phase 3 (25-30s): modify_order to MARKET order
+        - After 30s: Cancel + race condition check
+
+        Args:
+            leg_type: Type of leg (should be straddle_pe)
+            symbol: Trading symbol
+            txn_type: BUY or SELL
+            quantity: Order quantity
+            quote: Current quote
+
+        Returns:
+            ExecutedLeg with execution result
+        """
+        logger.warning(f"  🔥 LAST LEG AGGRESSIVE MODE: {leg_type} (3 legs already live)")
+
+        # PRE-FLIGHT: Check for ghost orders (same as _execute_leg)
+        ghost = self._check_ghost_orders(symbol, txn_type, quantity)
+        if ghost:
+            ghost_result = self._resolve_ghost_order(ghost, leg_type, symbol, txn_type, quantity)
+            if ghost_result is not None:
+                return ghost_result
+
+        # Calculate initial limit price (same as _execute_leg)
+        if txn_type == 'BUY':
+            base_price = quote.ask
+            price = round_to_tick(base_price + (self.slippage_ticks * TICK_SIZE))
+        else:
+            base_price = quote.bid
+            price = round_to_tick(base_price - (self.slippage_ticks * TICK_SIZE))
+
+        logger.info(f"  Phase 1: {symbol} {txn_type} {quantity} @ {price:.2f} (LIMIT, {LAST_LEG_PHASE1_SECONDS}s)")
+
+        try:
+            # Place initial LIMIT order
+            order_id = self.kite.place_order(
+                tradingsymbol=symbol,
+                transaction_type=txn_type,
+                quantity=quantity,
+                price=price,
+                order_type='LIMIT'
+            )
+            logger.info(f"  Order placed: {order_id}")
+
+            # PHASE 1: Wait with standard LIMIT (0 to PHASE1 seconds)
+            fill_result = self._wait_for_fill(order_id, LAST_LEG_PHASE1_SECONDS)
+
+            if fill_result['filled']:
+                return self._build_filled_leg(
+                    leg_type, symbol, txn_type, order_id,
+                    fill_result, quantity, base_price, phase="Phase 1"
+                )
+
+            # PHASE 2: Widen limit price (+5 ticks from original quote)
+            if txn_type == 'BUY':
+                wider_price = round_to_tick(
+                    base_price + ((self.slippage_ticks + LAST_LEG_WIDER_SLIPPAGE_TICKS) * TICK_SIZE)
+                )
+            else:
+                wider_price = round_to_tick(
+                    base_price - ((self.slippage_ticks + LAST_LEG_WIDER_SLIPPAGE_TICKS) * TICK_SIZE)
+                )
+
+            logger.warning(
+                f"  Phase 2: Modifying to wider price {wider_price:.2f} "
+                f"(+{LAST_LEG_WIDER_SLIPPAGE_TICKS} ticks, {LAST_LEG_PHASE2_SECONDS}s)"
+            )
+
+            try:
+                self.kite.modify_order(order_id=order_id, price=wider_price)
+            except Exception as e:
+                logger.warning(f"  Phase 2 modify failed: {e} (order may have filled)")
+
+            fill_result = self._wait_for_fill(order_id, LAST_LEG_PHASE2_SECONDS)
+
+            if fill_result['filled']:
+                return self._build_filled_leg(
+                    leg_type, symbol, txn_type, order_id,
+                    fill_result, quantity, base_price, phase="Phase 2"
+                )
+
+            # PHASE 3: Escalate to MARKET order
+            logger.critical(
+                f"  Phase 3: Escalating to MARKET order ({LAST_LEG_PHASE3_SECONDS}s)"
+            )
+
+            try:
+                self.kite.modify_order(order_id=order_id, order_type='MARKET', price=0)
+            except Exception as e:
+                logger.warning(f"  Phase 3 modify to MARKET failed: {e}")
+
+            fill_result = self._wait_for_fill(order_id, LAST_LEG_PHASE3_SECONDS)
+
+            if fill_result['filled']:
+                return self._build_filled_leg(
+                    leg_type, symbol, txn_type, order_id,
+                    fill_result, quantity, base_price, phase="Phase 3 (MARKET)"
+                )
+
+            # ALL PHASES EXHAUSTED — cancel and check for race condition fill
+            logger.critical(f"  ✗ All 3 phases failed for last leg {leg_type}")
+            self._cancel_order_safe(order_id)
+            time.sleep(0.5)
+
+            final_status = self._get_final_order_status(order_id)
+            if final_status.get('filled'):
+                return self._build_filled_leg(
+                    leg_type, symbol, txn_type, order_id,
+                    final_status, quantity, base_price, phase="Race condition"
+                )
+
+            error = fill_result.get('error', 'Last leg: all 3 phases exhausted without fill')
+            logger.critical(f"  ✗ LAST LEG FAILED: {error}")
+
+            return ExecutedLeg(
+                leg_type=leg_type,
+                symbol=symbol,
+                txn_type=txn_type,
+                status=LegStatus.FAILED,
+                order_id=order_id,
+                error=error
+            )
+
+        except Exception as e:
+            logger.error(f"  ✗ EXCEPTION in last leg aggressive: {e}")
+            # Check for ghost order (same pattern as _execute_leg)
+            ghost = self._check_ghost_orders(symbol, txn_type, quantity)
+            if ghost and (ghost['status'] == 'COMPLETE' or (ghost.get('filled_quantity', 0) or 0) > 0):
+                filled_qty = ghost.get('filled_quantity', 0) or 0
+                avg_price = ghost.get('average_price', 0)
+                status = LegStatus.FILLED if filled_qty >= quantity else LegStatus.PARTIALLY_FILLED
+                return ExecutedLeg(
+                    leg_type=leg_type,
+                    symbol=symbol,
+                    txn_type=txn_type,
+                    status=status,
+                    order_id=ghost['order_id'],
+                    fill_price=avg_price,
+                    quantity=filled_qty
+                )
+
+            return ExecutedLeg(
+                leg_type=leg_type,
+                symbol=symbol,
+                txn_type=txn_type,
+                status=LegStatus.FAILED,
+                error=str(e)
+            )
+
+    def _build_filled_leg(
+        self,
+        leg_type: str,
+        symbol: str,
+        txn_type: str,
+        order_id: str,
+        fill_result: Dict[str, Any],
+        quantity: int,
+        base_price: float,
+        phase: str = ""
+    ) -> ExecutedLeg:
+        """Build an ExecutedLeg from a fill result, handling partial fills."""
+        avg_price = fill_result.get('avg_price', 0)
+        actual_qty = fill_result.get('filled_quantity', quantity)
+        is_partial = fill_result.get('partial', False)
+        slippage = abs(avg_price - base_price)
+
+        if is_partial:
+            logger.warning(
+                f"  ⚠ PARTIAL FILL ({phase}) @ {avg_price:.2f} "
+                f"({actual_qty}/{quantity} qty, slippage: {slippage:.2f})"
+            )
+            return ExecutedLeg(
+                leg_type=leg_type,
+                symbol=symbol,
+                txn_type=txn_type,
+                status=LegStatus.PARTIALLY_FILLED,
+                order_id=order_id,
+                fill_price=avg_price,
+                quantity=actual_qty
+            )
+
+        logger.info(f"  ✓ FILLED ({phase}) @ {avg_price:.2f} (slippage: {slippage:.2f})")
+        return ExecutedLeg(
+            leg_type=leg_type,
+            symbol=symbol,
+            txn_type=txn_type,
+            status=LegStatus.FILLED,
+            order_id=order_id,
+            fill_price=avg_price,
+            quantity=actual_qty
+        )
+
+    def _resolve_ghost_order(
+        self,
+        ghost: Dict[str, Any],
+        leg_type: str,
+        symbol: str,
+        txn_type: str,
+        quantity: int
+    ) -> Optional[ExecutedLeg]:
+        """
+        Attempt to resolve a ghost order. Returns ExecutedLeg if resolved, None to continue.
+        """
+        logger.warning(
+            f"  ⚠ GHOST ORDER detected for {leg_type}: order_id={ghost['order_id']}, "
+            f"status={ghost['status']}, filled_qty={ghost.get('filled_quantity', 0)}"
+        )
+        filled_qty = ghost.get('filled_quantity', 0) or 0
+
+        if ghost['status'] == 'COMPLETE' or filled_qty >= quantity:
+            avg_price = ghost.get('average_price', 0)
+            logger.info(f"  ✓ Using ghost order fill @ {avg_price:.2f}")
+            return ExecutedLeg(
+                leg_type=leg_type,
+                symbol=symbol,
+                txn_type=txn_type,
+                status=LegStatus.FILLED,
+                order_id=ghost['order_id'],
+                fill_price=avg_price,
+                quantity=filled_qty or quantity
+            )
+
+        if ghost['status'] in ('OPEN', 'PENDING', 'TRIGGER PENDING'):
+            logger.info(f"  Waiting for ghost order {ghost['order_id']} to fill...")
+            fill_result = self._wait_for_fill(ghost['order_id'], LEG_TIMEOUT_SECONDS)
+            if fill_result['filled']:
+                avg_price = fill_result['avg_price']
+                actual_qty = fill_result.get('filled_quantity', quantity)
+                logger.info(f"  ✓ Ghost order filled @ {avg_price:.2f}")
+                return ExecutedLeg(
+                    leg_type=leg_type,
+                    symbol=symbol,
+                    txn_type=txn_type,
+                    status=LegStatus.FILLED,
+                    order_id=ghost['order_id'],
+                    fill_price=avg_price,
+                    quantity=actual_qty
+                )
+            # Ghost order didn't fill - cancel it and let caller place fresh
+            self._cancel_order_safe(ghost['order_id'])
+            logger.info(f"  Ghost order cancelled, placing fresh order")
+
+        return None
 
     def _wait_for_fill(
         self,
