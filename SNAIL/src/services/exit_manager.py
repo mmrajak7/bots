@@ -620,6 +620,13 @@ class ExitManager:
                     f"Position marked as '{('partial_exit' if legs_closed else 'exit_failed')}' in DB."
                 )
 
+                # Run reconciliation after exit failure
+                try:
+                    from src.utils.reconciliation import reconcile_positions
+                    reconcile_positions(kite=self.kite, telegram=self.telegram)
+                except Exception as recon_err:
+                    logger.error(f"Post-exit-failure reconciliation error: {recon_err}")
+
                 # Return partial success - orders placed but not verified
                 return ExitResult(
                     success=False,

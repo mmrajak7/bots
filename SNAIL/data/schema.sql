@@ -21,7 +21,7 @@ PRAGMA synchronous=NORMAL;
 -- Positions: Main position tracking table
 CREATE TABLE IF NOT EXISTS positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'exiting', 'closed')),
+    status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'partial', 'exiting', 'closed')),
     entry_time DATETIME NOT NULL,
     exit_time DATETIME,
     expiry_date DATE NOT NULL,

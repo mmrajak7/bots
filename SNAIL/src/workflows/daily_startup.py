@@ -43,7 +43,9 @@ from src.utils.db import (
     get_active_position,
     get_position_legs,
     get_db_session,
-    cleanup_old_data
+    cleanup_old_data,
+    get_exiting_positions,
+    close_stale_exiting_position
 )
 from src.utils.config import (
     load_config,
@@ -560,6 +562,111 @@ class DailyStartup:
                 critical=False
             ), None
 
+    def _reconcile_positions(self) -> StartupCheck:
+        """Reconcile DB positions against Kite positions."""
+        if self.kite is None:
+            return StartupCheck(
+                name="Position Reconciliation",
+                passed=True,
+                message="Skipped (no Kite client)"
+            )
+
+        try:
+            from src.utils.reconciliation import reconcile_positions
+            result = reconcile_positions(kite=self.kite, telegram=self.telegram)
+
+            if result.has_mismatches:
+                return StartupCheck(
+                    name="Position Reconciliation",
+                    passed=False,
+                    message=f"MISMATCHES: {result.summary}",
+                    critical=False  # Don't block startup, but alert
+                )
+
+            return StartupCheck(
+                name="Position Reconciliation",
+                passed=True,
+                message=(
+                    f"DB and Kite positions match "
+                    f"({result.kite_nifty_positions} Kite, {result.db_positions_checked} DB)"
+                )
+            )
+
+        except Exception as e:
+            return StartupCheck(
+                name="Position Reconciliation",
+                passed=True,  # Don't block startup on reconciliation error
+                message=f"Reconciliation error: {e}"
+            )
+
+    def _resolve_stale_exits(self) -> StartupCheck:
+        """Check for and resolve stale 'exiting' positions."""
+        try:
+            stale = get_exiting_positions(max_age_hours=12)
+
+            if not stale:
+                return StartupCheck(
+                    name="Stale Exits",
+                    passed=True,
+                    message="No stale exiting positions"
+                )
+
+            resolved = []
+            needs_attention = []
+
+            for position in stale:
+                legs = get_position_legs(position.id)
+
+                # Check Kite for remaining legs
+                if self.kite:
+                    try:
+                        kite_positions = self.kite.positions().get('net', [])
+                        leg_symbols = {leg.tradingsymbol for leg in legs}
+
+                        still_open = [
+                            p for p in kite_positions
+                            if p.get('tradingsymbol') in leg_symbols
+                            and p.get('quantity', 0) != 0
+                        ]
+
+                        if not still_open:
+                            # No legs on Kite - position fully exited, close in DB
+                            close_stale_exiting_position(position.id)
+                            resolved.append(position.id)
+                        else:
+                            symbols = [f"{p['tradingsymbol']}({p['quantity']})" for p in still_open]
+                            needs_attention.append((position.id, f"Open legs: {', '.join(symbols)}"))
+                    except Exception as e:
+                        needs_attention.append((position.id, f"Kite check failed: {e}"))
+                else:
+                    needs_attention.append((position.id, "Kite unavailable"))
+
+            # Alert on anything needing attention
+            if needs_attention:
+                msg = "🚨 *Stale Exits Needing Attention*\n\n"
+                for pid, detail in needs_attention:
+                    msg += f"• Position {pid}: {detail}\n"
+                if self.telegram:
+                    try:
+                        self.telegram.send(msg)
+                    except Exception:
+                        pass
+
+            summary = f"Resolved: {len(resolved)}, Needs attention: {len(needs_attention)}"
+            return StartupCheck(
+                name="Stale Exits",
+                passed=len(needs_attention) == 0,
+                message=summary,
+                critical=False
+            )
+
+        except Exception as e:
+            return StartupCheck(
+                name="Stale Exits",
+                passed=True,  # Don't block startup
+                message=f"Stale exit check error: {e}"
+            )
+
     def _get_market_data(self) -> Tuple[StartupCheck, Optional[Dict]]:
         """Get current market data."""
         if self.kite is None:
@@ -681,12 +788,24 @@ class DailyStartup:
         if not claude_check.passed:
             warnings.append(f"Claude: {claude_check.message}")
 
-        # 10. Active position check
+        # 10. Resolve stale exiting positions (before active position check)
+        stale_exit_check = self._resolve_stale_exits()
+        checks.append(stale_exit_check)
+        if not stale_exit_check.passed:
+            warnings.append(f"Stale Exits: {stale_exit_check.message}")
+
+        # 11. Active position check
         position_check, active_position = self._check_active_position()
         checks.append(position_check)
         result.active_position = active_position
 
-        # 11. Market data
+        # 12. Position reconciliation (after Kite auth and active position check)
+        reconciliation_check = self._reconcile_positions()
+        checks.append(reconciliation_check)
+        if not reconciliation_check.passed:
+            warnings.append(f"Reconciliation: {reconciliation_check.message}")
+
+        # 13. Market data
         market_check, market_data = self._get_market_data()
         checks.append(market_check)
         result.market_data = market_data
