@@ -12,6 +12,7 @@ Unified wrapper for Kite Connect API with automatic authentication.
 """
 
 import os
+import time
 import threading
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, List, Any
@@ -164,6 +165,38 @@ class SNAILKiteClient:
         return self._kite
 
     # =========================================================================
+    # RATE LIMIT HANDLING
+    # =========================================================================
+
+    @staticmethod
+    def _is_rate_limit_error(error: Exception) -> bool:
+        """Check if an exception is a Kite API rate limit error (HTTP 429)."""
+        if hasattr(error, 'code') and error.code == 429:
+            return True
+        return 'too many requests' in str(error).lower()
+
+    def _call_with_rate_limit_retry(self, func, *args, max_retries: int = 2, **kwargs):
+        """
+        Call a Kite API function with automatic retry on rate limit (429) errors.
+
+        Waits 1s on first retry, 2s on second retry (linear backoff).
+        Non-rate-limit errors are raised immediately without retry.
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                if self._is_rate_limit_error(e) and attempt < max_retries:
+                    wait_time = 1 + attempt  # 1s, 2s
+                    logger.warning(
+                        f"Kite rate limit hit (attempt {attempt + 1}/{max_retries + 1}), "
+                        f"retrying in {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+                raise
+
+    # =========================================================================
     # QUOTE OPERATIONS
     # =========================================================================
 
@@ -177,7 +210,7 @@ class SNAILKiteClient:
         Returns:
             Dict mapping instrument to Quote object
         """
-        raw_quotes = self.kite.quote(instruments)
+        raw_quotes = self._call_with_rate_limit_retry(self.kite.quote, instruments)
 
         result = {}
         for inst, data in raw_quotes.items():
@@ -205,7 +238,7 @@ class SNAILKiteClient:
         Returns:
             Dict mapping instrument to LTP
         """
-        result = self.kite.ltp(instruments)
+        result = self._call_with_rate_limit_retry(self.kite.ltp, instruments)
         return {inst: data.get('last_price', 0) for inst, data in result.items()}
 
     def get_nifty_spot(self) -> Optional[float]:

@@ -928,9 +928,27 @@ class EntryManager:
 
         except Exception as e:
             logger.error(f"Entry failed: {e}")
-            import traceback
             traceback.print_exc()
-            return EntryResult(success=False, error=str(e))
+
+            # Notify user via Telegram (was silent before - user had no idea entry failed)
+            error_msg = str(e)
+            is_rate_limit = 'too many requests' in error_msg.lower() or (
+                hasattr(e, 'code') and getattr(e, 'code', 0) == 429
+            )
+            if is_rate_limit:
+                self.telegram.send(
+                    f"⚠️ *Entry Failed: Kite Rate Limit*\n\n"
+                    f"Too many API requests in quick succession.\n"
+                    f"Will retry at next scheduled entry window.\n\n"
+                    f"_This is transient - no action needed._"
+                )
+            else:
+                self.telegram.send_error_alert(
+                    error=error_msg,
+                    module="entry_manager",
+                    function="execute_entry"
+                )
+            return EntryResult(success=False, error=error_msg)
 
         finally:
             # ALWAYS release entry lock, even on error

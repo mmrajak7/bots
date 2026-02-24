@@ -13,6 +13,7 @@ Main entry point for the SNAIL trading system.
 
 import sys
 import os
+import time
 import argparse
 from datetime import datetime
 from pathlib import Path
@@ -273,6 +274,9 @@ def _cmd_entry_with_lock(args, config):
                 logger.warning(f"ATM strike changed during wait, proceeding with new strike")
 
             # Use fresh conditions for entry
+            # Brief pause to avoid Kite API rate limit (conditions check just made several API calls)
+            time.sleep(2)
+
             print(f"\n🚀 Executing entry with fresh conditions...")
             print(f"   ATM: {fresh_conditions.atm_strike}, Wing: {fresh_conditions.wing_distance}")
 
