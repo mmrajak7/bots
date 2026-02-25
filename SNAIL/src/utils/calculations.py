@@ -29,7 +29,8 @@ if TYPE_CHECKING:
 # CONSTANTS
 # =============================================================================
 
-# NIFTY lot size
+# NIFTY lot size (source of truth - update when NSE changes lot size)
+# Last verified: 2025-12-04
 NIFTY_LOT_SIZE = 65
 
 # Strike interval
@@ -201,7 +202,7 @@ def get_atm_strike_futures_based(
 
     # Step 1: Get spot price
     spot_price = kite.get_nifty_spot()
-    if spot_price <= 0:
+    if not spot_price or spot_price <= 0:
         raise ValueError("Failed to fetch NIFTY spot price")
 
     logger.info(f"[STRIKE SELECTION] Spot: {spot_price:.2f}")
@@ -556,6 +557,7 @@ def calculate_position_pnl(
 def calculate_transaction_charges(
     buy_value: float,
     sell_value: float,
+    num_orders: int = 1,
     config: Optional[Dict] = None
 ) -> TransactionCharges:
     """
@@ -564,6 +566,7 @@ def calculate_transaction_charges(
     Args:
         buy_value: Total buy side value (premium paid)
         sell_value: Total sell side value (premium received)
+        num_orders: Number of orders (Iron Fly = 4 legs = 4 orders per side)
         config: Optional charges config (uses default if None)
 
     Returns:
@@ -580,6 +583,10 @@ def calculate_transaction_charges(
     stamp_rate = config.get('stamp_duty_buy_rate', DEFAULT_STAMP_DUTY_RATE)
     brokerage_per_order = config.get('brokerage_per_order', 0)
 
+    # Total brokerage = per-order fee × number of orders
+    # Iron Fly has 4 legs (sell CE, sell PE, buy wing CE, buy wing PE) = 4 orders
+    total_brokerage = brokerage_per_order * num_orders
+
     turnover = buy_value + sell_value
 
     # STT on sell side premium only (for options)
@@ -595,9 +602,9 @@ def calculate_transaction_charges(
     stamp_duty = buy_value * stamp_rate
 
     # GST on brokerage + exchange charges
-    gst = (brokerage_per_order + exchange_txn) * gst_rate
+    gst = (total_brokerage + exchange_txn) * gst_rate
 
-    total = stt + exchange_txn + gst + sebi_charges + stamp_duty + brokerage_per_order
+    total = stt + exchange_txn + gst + sebi_charges + stamp_duty + total_brokerage
 
     return TransactionCharges(
         stt=round(stt, 2),
@@ -636,7 +643,7 @@ def calculate_iron_fly_charges(
     sell_value = (straddle_ce_premium + straddle_pe_premium) * quantity
     buy_value = (wing_ce_premium + wing_pe_premium) * quantity
 
-    return calculate_transaction_charges(buy_value, sell_value)
+    return calculate_transaction_charges(buy_value, sell_value, num_orders=4)
 
 
 # =============================================================================

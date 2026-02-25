@@ -69,9 +69,12 @@ def _substitute_env_vars(value: Any) -> Any:
             elif default is not None:
                 return default
             else:
-                # Return original if no env var and no default
-                logger.warning(f"Environment variable {var_name} not set")
-                return match.group(0)
+                # Raise error instead of returning raw ${VAR_NAME} string
+                # Raw strings pass non-empty validation and cause cryptic runtime errors
+                raise ValueError(
+                    f"Required environment variable '{var_name}' is not set. "
+                    f"Set it or provide a default in config: ${{{var_name}:default_value}}"
+                )
 
         return re.sub(pattern, replace, value)
 
@@ -265,8 +268,41 @@ def validate_config(config: Optional[Dict] = None) -> Dict[str, list]:
 
     entry = trading.get('entry', {})
     vix_range = entry.get('vix_range', {})
-    if vix_range.get('min', 0) < 8 or vix_range.get('max', 0) > 20:
+    vix_min = vix_range.get('min', 0)
+    vix_max = vix_range.get('max', 0)
+    if vix_min < 8 or vix_max > 25:
         warnings.append("VIX range may be too wide for Iron Fly")
+    if vix_min >= vix_max:
+        errors.append(f"VIX range invalid: min ({vix_min}) >= max ({vix_max})")
+
+    # Validate exit time windows ordering
+    exit_config = trading.get('exit', {})
+    time_fields = {
+        'friday_check_time': exit_config.get('friday_check_time', '15:00'),
+        'friday_exit_time': exit_config.get('friday_exit_time', '15:15'),
+        'expiry_exit_time': exit_config.get('expiry_exit_time', '15:20'),
+    }
+    for name, val in time_fields.items():
+        try:
+            datetime.strptime(val, '%H:%M')
+        except (ValueError, TypeError):
+            errors.append(f"Invalid time format for {name}: '{val}' (expected HH:MM)")
+
+    # Validate time ordering: friday_check < friday_exit < expiry_exit
+    try:
+        from datetime import datetime as dt
+        times = {k: dt.strptime(v, '%H:%M') for k, v in time_fields.items()}
+        if times['friday_check_time'] >= times['friday_exit_time']:
+            warnings.append("friday_check_time should be before friday_exit_time")
+        if times['friday_exit_time'] >= times['expiry_exit_time']:
+            warnings.append("friday_exit_time should be before expiry_exit_time")
+    except (ValueError, TypeError):
+        pass  # Already flagged above
+
+    # Validate capital type
+    capital_type = trading.get('capital', {}).get('type', '')
+    if capital_type and capital_type not in ('fixed', 'percentage', 'dynamic'):
+        warnings.append(f"Unknown capital type: '{capital_type}'")
 
     # Check paths exist
     paths = config.get('paths', {})

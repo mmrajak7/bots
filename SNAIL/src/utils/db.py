@@ -272,6 +272,22 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     except Exception as e:
         logger.warning(f"Migration 4 check failed: {e}")
 
+    # Migration 5: Add missing indexes for performance
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pnl_position_created ON pnl_snapshots(position_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_position_legs_position ON position_legs(position_id, leg_type)")
+    except Exception as e:
+        logger.warning(f"Migration 5 (indexes) failed: {e}")
+
+    # Migration 6: Add UNIQUE constraint on position_legs(position_id, leg_type)
+    # SQLite cannot add UNIQUE constraint to existing table, so we create a unique index
+    try:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_position_legs_unique ON position_legs(position_id, leg_type)")
+    except Exception as e:
+        # May fail if duplicate data exists - log but don't crash
+        logger.warning(f"Migration 6 (unique constraint) failed: {e}")
+
 
 def _migrate_positions_add_partial_status(conn: sqlite3.Connection) -> None:
     """
@@ -379,7 +395,7 @@ def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=NORMAL")
 
     # Run migrations once per session
@@ -1096,6 +1112,9 @@ def is_exit_in_progress(position_id: int) -> bool:
     Includes stale detection: if exit_in_progress has been set for >2 minutes,
     auto-clears the flag (exit should complete in <60s; >2min means crash/hang).
 
+    RACE-SAFE: Stale flag clearing uses atomic UPDATE with WHERE clause to prevent
+    the window where Thread A clears the flag and Thread B+C both acquire it.
+
     Args:
         position_id: Position ID
 
@@ -1119,15 +1138,28 @@ def is_exit_in_progress(position_id: int) -> bool:
                 updated_at = datetime.fromisoformat(row['updated_at'])
                 age_seconds = (datetime.now() - updated_at).total_seconds()
                 if age_seconds > 120:  # 2 minutes (exit should complete in <60s)
-                    logger.warning(
-                        f"Exit in progress flag is STALE ({age_seconds:.0f}s old) "
-                        f"for position {position_id} - auto-clearing"
+                    # ATOMIC stale clear: only clear if updated_at hasn't changed
+                    # (prevents race where multiple threads detect stale simultaneously)
+                    result = conn.execute(
+                        """UPDATE positions SET exit_in_progress = 0, updated_at = ?
+                           WHERE id = ? AND exit_in_progress = 1 AND updated_at = ?""",
+                        (datetime.now().isoformat(), position_id, row['updated_at'])
                     )
-                    conn.execute(
-                        "UPDATE positions SET exit_in_progress = 0, updated_at = ? WHERE id = ?",
-                        (datetime.now().isoformat(), position_id)
-                    )
-                    return False
+                    if result.rowcount > 0:
+                        logger.warning(
+                            f"Exit in progress flag is STALE ({age_seconds:.0f}s old) "
+                            f"for position {position_id} - auto-cleared"
+                        )
+                        return False
+                    else:
+                        # Another thread already cleared or re-acquired
+                        # Re-read to get current state
+                        recheck = conn.execute(
+                            "SELECT exit_in_progress FROM positions WHERE id = ?",
+                            (position_id,)
+                        )
+                        rerow = recheck.fetchone()
+                        return bool(rerow['exit_in_progress']) if rerow and rerow['exit_in_progress'] else False
             except (ValueError, TypeError):
                 pass  # Can't parse timestamp, treat as active
 

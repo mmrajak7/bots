@@ -11,7 +11,7 @@
 
 -- Database configuration
 PRAGMA journal_mode=WAL;
-PRAGMA busy_timeout=5000;
+PRAGMA busy_timeout=30000;
 PRAGMA synchronous=NORMAL;
 
 -- ============================================================================
@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS positions (
 -- Position Legs: Individual option legs of each position
 CREATE TABLE IF NOT EXISTS position_legs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    position_id INTEGER NOT NULL REFERENCES positions(id),
+    position_id INTEGER NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
     leg_type TEXT NOT NULL CHECK(leg_type IN ('straddle_ce', 'straddle_pe', 'wing_ce', 'wing_pe')),
     option_type TEXT NOT NULL CHECK(option_type IN ('CE', 'PE')),
     strike INTEGER NOT NULL,
@@ -68,13 +68,14 @@ CREATE TABLE IF NOT EXISTS position_legs (
     exit_price REAL,
     quantity INTEGER NOT NULL,
     instrument_token TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(position_id, leg_type)
 );
 
 -- Orders: All order records for audit trail
 CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    position_id INTEGER REFERENCES positions(id),
+    position_id INTEGER REFERENCES positions(id) ON DELETE SET NULL,
     kite_order_id TEXT NOT NULL,
     order_type TEXT NOT NULL CHECK(order_type IN ('LIMIT', 'MARKET')),
     transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL')),
@@ -97,7 +98,7 @@ CREATE TABLE IF NOT EXISTS orders (
 -- P&L Snapshots: Point-in-time P&L records
 CREATE TABLE IF NOT EXISTS pnl_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    position_id INTEGER NOT NULL REFERENCES positions(id),
+    position_id INTEGER NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
     current_pnl REAL NOT NULL,
     pnl_percent REAL NOT NULL,
     nifty_spot REAL NOT NULL,
@@ -116,7 +117,7 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
 -- Claude Decisions: AI advisory logs
 CREATE TABLE IF NOT EXISTS claude_decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    position_id INTEGER REFERENCES positions(id),
+    position_id INTEGER REFERENCES positions(id) ON DELETE SET NULL,
     trigger_type TEXT NOT NULL CHECK(trigger_type IN (
         'pre_entry', 'stop_loss_advisory', 'wing_approach',
         'vix_spike', 'eod_decision', 'friday_decision',
@@ -197,7 +198,7 @@ CREATE TABLE IF NOT EXISTS alert_cooldowns (
 -- Cooldowns: Post-exit cooldown tracking
 CREATE TABLE IF NOT EXISTS cooldowns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    position_id INTEGER REFERENCES positions(id),
+    position_id INTEGER REFERENCES positions(id) ON DELETE CASCADE,
     cooldown_type TEXT NOT NULL DEFAULT 'entry',
     exit_date DATE NOT NULL,
     cooldown_end DATE NOT NULL,
@@ -234,9 +235,11 @@ CREATE INDEX IF NOT EXISTS idx_positions_entry_time ON positions(entry_time);
 CREATE INDEX IF NOT EXISTS idx_positions_exit_time ON positions(exit_time);
 CREATE INDEX IF NOT EXISTS idx_pnl_position ON pnl_snapshots(position_id);
 CREATE INDEX IF NOT EXISTS idx_pnl_created ON pnl_snapshots(created_at);
+CREATE INDEX IF NOT EXISTS idx_pnl_position_created ON pnl_snapshots(position_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_orders_position ON orders(position_id);
 CREATE INDEX IF NOT EXISTS idx_orders_kite_id ON orders(kite_order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON alert_queue(status);
 CREATE INDEX IF NOT EXISTS idx_alerts_created ON alert_queue(created_at);
 CREATE INDEX IF NOT EXISTS idx_cooldowns_end ON cooldowns(cooldown_end);
@@ -244,6 +247,7 @@ CREATE INDEX IF NOT EXISTS idx_alert_cooldowns ON alert_cooldowns(position_id, a
 CREATE INDEX IF NOT EXISTS idx_market_data_date ON market_data(date);
 CREATE INDEX IF NOT EXISTS idx_entry_attempts_time ON entry_attempts(attempt_time);
 CREATE INDEX IF NOT EXISTS idx_claude_decisions_position ON claude_decisions(position_id);
+CREATE INDEX IF NOT EXISTS idx_position_legs_position ON position_legs(position_id, leg_type);
 
 -- ============================================================================
 -- INITIAL DATA

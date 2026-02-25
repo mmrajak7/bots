@@ -456,6 +456,17 @@ class ExitManager:
 
         logger.info(f"Executing exit for position {position.id}, reason: {reason.value}")
 
+        # Set entry cooldown EARLY (before placing orders) to prevent re-entry race
+        # If exit fails, cooldown is harmless (blocks entry for a few hours, not days)
+        try:
+            today = datetime.now()
+            if today.weekday() != 4:  # Skip on Friday (weekend is buffer)
+                cooldown_hours = self.trading_config.get('exit', {}).get('cooldown_hours', 24)
+                set_cooldown('entry', cooldown_hours * 3600)
+                logger.info(f"Entry cooldown set early ({cooldown_hours}h) before exit execution")
+        except Exception as e:
+            logger.warning(f"Failed to set early cooldown (non-fatal): {e}")
+
         # Notify user that exit is starting
         # Wrapped in try/except: Telegram failure must NEVER block exit execution
         try:
@@ -643,10 +654,10 @@ class ExitManager:
 
             realized_pnl = entry_credit - exit_debit
 
-            # Calculate charges
+            # Calculate charges (4 orders: buy back straddle CE+PE, sell wings CE+PE)
             sell_value = (orders.wing_ce.fill_price + orders.wing_pe.fill_price) * position.lot_size
             buy_value = (orders.straddle_ce.fill_price + orders.straddle_pe.fill_price) * position.lot_size
-            charges = calculate_transaction_charges(buy_value, sell_value)
+            charges = calculate_transaction_charges(buy_value, sell_value, num_orders=4)
 
             # Update position in database
             # CRITICAL: Orders are already filled at this point. If DB write fails,
@@ -702,15 +713,8 @@ class ExitManager:
             # even if the caller forgets to call reset_trailing_state()
             reset_trailing_state(position.id)
 
-            # Set cooldown (1 day after exit)
-            # ISSUE-FIX: Skip cooldown on Friday - weekend is enough buffer
-            # and we don't want Friday exit to block Monday entry
-            today = datetime.now()
-            if today.weekday() == 4:  # Friday
-                logger.info("Friday exit - skipping cooldown (weekend provides buffer)")
-            else:
-                cooldown_hours = self.trading_config.get('exit', {}).get('cooldown_hours', 24)
-                set_cooldown('entry', cooldown_hours * 3600)
+            # Cooldown already set early (before exit orders placed)
+            # No need to set again here - early set prevents re-entry race
 
             # Clear hold cooldowns (no longer relevant after position exit)
             for cooldown_type in ['wing_hold', 'stop_loss_hold', 'vix_hold']:

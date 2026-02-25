@@ -195,13 +195,15 @@ class ClaudeAdvisor:
             lower_wing = position.atm_strike - position.wing_distance
 
             # P&L percentages
+            # Profit: % of max_profit | Loss: negative % of max_loss
             pnl_percent = 0.0
             if context.max_profit > 0 and current_pnl >= 0:
                 pnl_percent = (current_pnl / context.max_profit) * 100
             elif context.max_loss > 0 and current_pnl < 0:
-                pnl_percent = (current_pnl / context.max_loss) * 100
+                # Negative sign preserved: -3000 / 10000 = -30% (lost 30% of max loss)
+                pnl_percent = -(abs(current_pnl) / context.max_loss) * 100
 
-            # Loss as % of max loss (for stop loss scenarios)
+            # Loss as % of max loss (always positive, for stop loss scenarios)
             loss_pct_of_max = 0.0
             if context.max_loss > 0 and current_pnl < 0:
                 loss_pct_of_max = (abs(current_pnl) / context.max_loss) * 100
@@ -312,7 +314,8 @@ class ClaudeAdvisor:
 
         pnl, _ = calculate_position_pnl(
             entry_straddle, entry_wing, current_straddle, current_wing,
-            position.lot_size
+            position.lot_size,
+            margin_deployed=position.margin_deployed or 0.0
         )
 
         return pnl
@@ -466,7 +469,8 @@ class ClaudeAdvisor:
             logger.warning(f"Could not fetch option quotes: {e}")
             import traceback
             traceback.print_exc()
-            # Fallback - use defaults
+            # Return max_profit=0 which signals to caller that R:R cannot be validated
+            # Caller MUST check max_profit and block entry when 0
             lot_size = NIFTY_LOT_SIZE
             wing_distance = 300
             html = f"""<b>🦋 IRON FLY</b>
@@ -542,7 +546,18 @@ ATM: {atm_strike} | Wings: ±{wing_distance}
 
             logger.info(f"Pre-entry metrics: straddle={straddle_premium:.2f}, wing={wing_distance}, credit={net_credit:.2f}, R:R={rr_display}")
 
-            # Step 2: R:R Filter (HIGHEST PRIORITY)
+            # Step 2a: Block entry if quotes unavailable (max_profit=0 means no quotes)
+            if max_profit <= 0 and require_good_rr:
+                logger.warning("Cannot validate R:R - option quotes unavailable, blocking entry")
+                return AdvisoryResult(
+                    decision=ClaudeDecision.SKIP,
+                    reasoning="Option quotes unavailable - cannot validate Risk:Reward ratio",
+                    confidence=1.0,
+                    action_required=True,
+                    suggested_action="Skip - quotes unavailable for R:R validation"
+                )
+
+            # Step 2b: R:R Filter (HIGHEST PRIORITY)
             if require_good_rr and rr_ratio > min_rr_ratio:
                 # R:R not met - log and skip silently (no Telegram message)
                 logger.info(f"R:R filter not met: {rr_display} > required 1:{1/min_rr_ratio:.0f} - skipping entry alert")

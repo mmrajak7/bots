@@ -1177,13 +1177,20 @@ class EntryManager:
 
         # Get margin deployed after entry orders
         # This captures the actual span + exposure margin blocked for the position
+        # CRITICAL: Must be accurate - used for ROM% exit thresholds
         try:
             margin_deployed = self.kite.get_margin_utilised()
+            if margin_deployed <= 0:
+                raise ValueError(f"Invalid margin value: {margin_deployed}")
             logger.info(f"Margin deployed after entry: ₹{margin_deployed:,.2f}")
         except Exception as e:
-            logger.warning(f"Could not fetch margin utilised: {e}")
-            # Fallback: estimate from max_loss (typical margin requirement for Iron Fly)
-            margin_deployed = metrics.max_loss * 0.8  # Conservative estimate
+            # No fallback - margin accuracy is critical for exit thresholds
+            # Use max_loss as conservative upper bound (margin is always <= max_loss for Iron Fly)
+            margin_deployed = metrics.max_loss
+            logger.warning(
+                f"Could not fetch margin utilised: {e}. "
+                f"Using max_loss (₹{margin_deployed:,.2f}) as conservative margin estimate"
+            )
 
         # Note: conditions.expiry and atm_strike validated at function start
         assert conditions.expiry is not None  # For mypy - validated above

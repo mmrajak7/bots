@@ -212,7 +212,10 @@ class PositionMonitor:
 
     def get_current_quotes(self) -> Dict[str, Quote]:
         """
-        Fetch current quotes for all position legs.
+        Fetch current quotes for all position legs with retry.
+
+        Retries up to 3 times with 2s backoff on failure.
+        Returns empty dict only after all retries exhausted.
 
         Returns:
             Dict of quotes by leg type (empty dict on error)
@@ -220,32 +223,42 @@ class PositionMonitor:
         if not self.state.legs:
             return {}
 
-        try:
-            instruments = []
-            leg_map = {}
+        instruments = []
+        leg_map = {}
 
-            for leg in self.state.legs:
-                inst = f"NFO:{leg.tradingsymbol}"
-                instruments.append(inst)
-                leg_map[inst] = leg.leg_type
+        for leg in self.state.legs:
+            inst = f"NFO:{leg.tradingsymbol}"
+            instruments.append(inst)
+            leg_map[inst] = leg.leg_type
 
-            raw_quotes = self.kite.quote(instruments)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                raw_quotes = self.kite.quote(instruments)
 
-            if not raw_quotes:
-                logger.warning("Empty quote response from Kite API")
-                return {}
+                if not raw_quotes:
+                    logger.warning(f"Empty quote response from Kite API (attempt {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                        continue
+                    return {}
 
-            quotes = {}
-            for inst, quote in raw_quotes.items():
-                leg_type = leg_map.get(inst)
-                if leg_type:
-                    quotes[leg_type] = quote
+                quotes = {}
+                for inst, quote in raw_quotes.items():
+                    leg_type = leg_map.get(inst)
+                    if leg_type:
+                        quotes[leg_type] = quote
 
-            return quotes
+                return quotes
 
-        except Exception as e:
-            logger.error(f"Error fetching quotes from Kite API: {e}")
-            return {}
+            except Exception as e:
+                logger.error(f"Error fetching quotes (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                else:
+                    logger.error("All quote fetch retries exhausted - monitoring blind this cycle")
+
+        return {}
 
     # =========================================================================
     # SNAPSHOT GENERATION
@@ -369,8 +382,11 @@ class PositionMonitor:
             logger.warning("Cannot save snapshot: no active position")
             return
 
-        # Update margin from Zerodha (changes daily based on SPAN)
-        self._update_margin()
+        # NOTE: _update_margin() was removed here. It was overwriting
+        # margin_deployed (entry capital-at-risk) with Kite's daily SPAN margin,
+        # causing ROM-based profit targets to trigger prematurely when SPAN
+        # margin decreased (e.g., 96K entry margin replaced with 77K SPAN
+        # made 2.5% ROM appear as 3.1%, triggering early exit).
 
         # Extract bid/ask from quotes
         quotes = snapshot.quotes
@@ -666,7 +682,7 @@ class PositionMonitor:
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
             name="PositionMonitor",
-            daemon=True
+            daemon=False  # Non-daemon: ensures cleanup runs on app exit
         )
         self._monitor_thread.start()
         logger.info("Position monitor started")

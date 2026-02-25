@@ -67,7 +67,7 @@ MARKET_CLOSE_TIME = dt_time(15, 30)
 
 # Stale exit / partial position periodic checks
 STALE_EXIT_CHECK_INTERVAL_MINUTES = 30
-STALE_EXIT_AGE_HOURS = 2  # More aggressive than startup's 12h
+STALE_EXIT_AGE_HOURS = 2  # Mid-day: aggressive (2h). Startup uses 12h for overnight recovery.
 PARTIAL_ALERT_INTERVAL_MINUTES = 30
 
 

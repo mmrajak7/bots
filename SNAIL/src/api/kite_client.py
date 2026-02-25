@@ -175,11 +175,11 @@ class SNAILKiteClient:
             return True
         return 'too many requests' in str(error).lower()
 
-    def _call_with_rate_limit_retry(self, func, *args, max_retries: int = 2, **kwargs):
+    def _call_with_rate_limit_retry(self, func, *args, max_retries: int = 3, **kwargs):
         """
         Call a Kite API function with automatic retry on rate limit (429) errors.
 
-        Waits 1s on first retry, 2s on second retry (linear backoff).
+        Uses exponential backoff: 1s, 2s, 4s (capped at 30s).
         Non-rate-limit errors are raised immediately without retry.
         """
         for attempt in range(max_retries + 1):
@@ -187,7 +187,7 @@ class SNAILKiteClient:
                 return func(*args, **kwargs)
             except Exception as e:
                 if self._is_rate_limit_error(e) and attempt < max_retries:
-                    wait_time = 1 + attempt  # 1s, 2s
+                    wait_time = min(2 ** attempt, 30)  # 1s, 2s, 4s, ... capped at 30s
                     logger.warning(
                         f"Kite rate limit hit (attempt {attempt + 1}/{max_retries + 1}), "
                         f"retrying in {wait_time}s..."
