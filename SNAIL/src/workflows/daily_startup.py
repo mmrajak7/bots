@@ -705,6 +705,74 @@ class DailyStartup:
                 critical=False
             ), None
 
+    def _check_margin(self, market_data: Dict[str, Any]) -> StartupCheck:
+        """
+        Check if available margin is sufficient for configured lot size.
+
+        Uses same formula as atomic_execution pre-flight:
+            required = min_available × num_lots × 1.2
+
+        Sends a dedicated Telegram alert if margin is insufficient,
+        giving the user time to transfer funds before market open.
+        """
+        try:
+            available = market_data.get('available_margin', 0)
+            capital_config = self.trading_config.get('capital', {})
+            num_lots = capital_config.get('num_lots', 1)
+            min_available = capital_config.get('min_available', 100000)
+
+            required = min_available * num_lots * 1.2
+            comfortable = min_available * num_lots * 1.5
+
+            if available < required:
+                shortfall = required - available
+                # Send dedicated urgent Telegram alert
+                alert_msg = (
+                    f"⚠️ *MARGIN INSUFFICIENT FOR {num_lots}-LOT ENTRY*\n\n"
+                    f"Available: ₹{available:,.0f}\n"
+                    f"Required:  ₹{required:,.0f} "
+                    f"(₹{min_available:,.0f}/lot × {num_lots} × 1.2 buffer)\n"
+                    f"Shortfall: ₹{shortfall:,.0f}\n\n"
+                    f"Transfer funds before 9:15 AM to enable entry today."
+                )
+                try:
+                    self.telegram.send(alert_msg)
+                except Exception as e:
+                    logger.warning(f"Failed to send margin alert: {e}")
+
+                return StartupCheck(
+                    name="Margin Sufficiency",
+                    passed=False,
+                    message=(
+                        f"Insufficient: ₹{available:,.0f} < ₹{required:,.0f} "
+                        f"(shortfall ₹{shortfall:,.0f})"
+                    ),
+                    critical=False  # Don't block startup, but flag clearly
+                )
+
+            if available < comfortable:
+                return StartupCheck(
+                    name="Margin Sufficiency",
+                    passed=True,
+                    message=(
+                        f"Low buffer: ₹{available:,.0f} "
+                        f"(recommend ₹{comfortable:,.0f} for {num_lots} lot(s))"
+                    )
+                )
+
+            return StartupCheck(
+                name="Margin Sufficiency",
+                passed=True,
+                message=f"₹{available:,.0f} available (need ₹{required:,.0f})"
+            )
+
+        except Exception as e:
+            return StartupCheck(
+                name="Margin Sufficiency",
+                passed=True,  # Don't block on check error
+                message=f"Margin check error: {e}"
+            )
+
     # =========================================================================
     # MAIN STARTUP PROCEDURE
     # =========================================================================
@@ -809,6 +877,13 @@ class DailyStartup:
         market_check, market_data = self._get_market_data()
         checks.append(market_check)
         result.market_data = market_data
+
+        # 14. Margin sufficiency check
+        if market_data:
+            margin_check = self._check_margin(market_data)
+            checks.append(margin_check)
+            if not margin_check.passed:
+                warnings.append(f"Margin: {margin_check.message}")
 
         # Compile results
         result.checks = checks
