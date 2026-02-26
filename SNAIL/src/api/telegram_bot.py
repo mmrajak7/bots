@@ -320,6 +320,11 @@ class TelegramBot:
 
             response = requests.get(url, params=params, timeout=DEFAULT_TIMEOUT + 5)
 
+            if response.status_code == 409:
+                logger.warning("getUpdates conflict (HTTP 409) - another poller may be running")
+                time.sleep(5)  # Back off to reduce spam
+                return []
+
             if response.status_code != 200:
                 logger.error(f"getUpdates failed: HTTP {response.status_code}")
                 return []

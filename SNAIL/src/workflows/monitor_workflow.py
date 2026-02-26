@@ -515,7 +515,10 @@ class MonitorWorkflow:
                 logger.info("User confirmed HOLD via /hold command")
                 return False
 
-        # Then check in-memory queue (for backward compat when bot runs in same process)
+        # In-memory queue: only populated when telegram_bot.start_polling() runs
+        # in the same process. In the current cron + daemon architecture, this path
+        # is never reached because polling runs in the separate snail-telegram service.
+        # Kept for backward compat if someone runs `main.py run` (continuous mode).
         if not self.telegram_bot:
             return None
 
@@ -1494,16 +1497,15 @@ _Fetching P&L data..._"""
         Run the main monitoring loop.
 
         Runs until stop() is called or signal received.
-        Starts Telegram polling for user commands and decisions.
+        Telegram polling is handled by the snail-telegram daemon (systemd service).
         """
         logger.info("Starting monitor workflow loop")
         self._running = True
         self._stats = MonitorLoopStats(start_time=datetime.now())
 
-        # Start Telegram polling
-        if self.telegram_bot:
-            self.telegram_bot.start_polling()
-            logger.info("Telegram polling started")
+        # NOTE: Do NOT start telegram polling here - the telegram_poller daemon
+        # (systemd service) owns the polling connection. Starting a second poller
+        # causes HTTP 409 Conflict errors from Telegram API.
 
         try:
             while self._running:
@@ -1526,11 +1528,6 @@ _Fetching P&L data..._"""
             logger.error(f"Monitor workflow error: {e}")
 
         finally:
-            # Stop Telegram polling
-            if self.telegram_bot and self.telegram_bot.is_running:
-                self.telegram_bot.stop_polling()
-                logger.info("Telegram polling stopped")
-
             self._state = MonitorWorkflowState.STOPPED
             self._running = False
             logger.info("Monitor workflow stopped")

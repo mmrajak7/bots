@@ -316,7 +316,10 @@ class TelegramResponseHandler:
                     queue_file.write_text('[]')
                     logger.debug("Cleared shared queue file")
 
-                    # Filter out stale responses (older than 60 seconds)
+                    # Filter out stale responses (older than response timeout).
+                    # The primary staleness guard is clear_shared_queue() called
+                    # before each new prompt. This is a secondary safety net —
+                    # use the same timeout as DEFAULT_RESPONSE_TIMEOUT (300s).
                     valid_responses = []
                     now = datetime.now()
                     for resp in responses:
@@ -325,7 +328,7 @@ class TelegramResponseHandler:
                             try:
                                 resp_time = datetime.fromisoformat(ts)
                                 age_seconds = (now - resp_time).total_seconds()
-                                if age_seconds <= 60:
+                                if age_seconds <= DEFAULT_RESPONSE_TIMEOUT:
                                     valid_responses.append(resp)
                                 else:
                                     logger.warning(f"Rejecting stale response (age={age_seconds:.0f}s): {resp}")
@@ -847,7 +850,7 @@ class TelegramResponseHandler:
         Wait synchronously for a user response.
 
         This blocks until response is received or timeout.
-        Checks both direct polling and shared queue (for daemon mode).
+        Reads from shared queue file (written by telegram_poller daemon).
 
         Args:
             prompt_id: Unique prompt identifier
@@ -866,11 +869,26 @@ class TelegramResponseHandler:
         )
 
         deadline = datetime.now() + timedelta(seconds=timeout_seconds)
-        poll_conflict_count = 0
         logger.info(f"Waiting for response '{prompt_id}' with timeout {timeout_seconds}s, valid_choices={valid_choices}")
 
+        # Verify telegram_poller daemon is running — without it, no responses will arrive
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["systemctl", "is-active", "snail-telegram"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.stdout.strip() != "active":
+                logger.critical("telegram_poller daemon is NOT running! User responses will not be received. Run: sudo systemctl start snail-telegram")
+                self.telegram.send("⚠️ SYSTEM ERROR: Telegram poller daemon is down. Responses may not be received.\nRun: sudo systemctl start snail-telegram")
+        except Exception as e:
+            logger.warning(f"Could not check telegram daemon status: {e}")
+
         while datetime.now() < deadline:
-            # First check shared response queue (from telegram_poller daemon)
+            # Read from shared response queue (written by telegram_poller daemon)
+            # NOTE: Do NOT call getUpdates here - the telegram_poller daemon owns
+            # the polling connection. Calling getUpdates from multiple processes
+            # causes HTTP 409 Conflict errors.
             shared_responses = self._read_shared_responses()
             for resp in shared_responses:
                 # Create a fake message dict and process it
@@ -881,16 +899,6 @@ class TelegramResponseHandler:
                 }
                 logger.info(f"Processing shared response: text='{resp.get('text')}', chat_id={resp.get('chat_id')}")
                 self._process_message(fake_message)
-
-            # Then try direct polling (with short timeout to not conflict)
-            messages = self.poll_updates(short_poll=True)
-
-            # If we get 409 conflict, the daemon is running - rely on shared queue
-            if not messages and poll_conflict_count < 3:
-                poll_conflict_count += 1
-
-            for message in messages:
-                self._process_message(message)
 
             # Check if our response was received
             pending = self.pending_responses.get(prompt_id)
