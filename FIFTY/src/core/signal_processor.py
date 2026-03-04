@@ -782,6 +782,9 @@ class SignalProcessor:
             except Exception as e:
                 logger.warning(f"Company snapshot failed for {script}: {e}")
 
+            # Record that NIFTY filter was passed (for audit trail)
+            signal.nifty_filter_passed = True
+
             # Send notification
             msg_id = telegram.send_signal_notification(
                 signal_id=signal.id,
