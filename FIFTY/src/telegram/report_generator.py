@@ -124,16 +124,18 @@ class ReportGenerator:
             }
             .metric {
                 flex: 1;
-                min-width: 280px;
+                min-width: 160px;
                 background: rgba(0,0,0,0.35);
-                padding: 35px 45px;
+                padding: 35px 40px;
                 border-radius: 16px;
                 text-align: center;
+                overflow: hidden;
             }
             .metric-value {
-                font-size: 84px;
+                font-size: 64px;
                 font-weight: 700;
                 color: #fff;
+                white-space: nowrap;
             }
             .metric-label {
                 font-size: 32px;
@@ -254,8 +256,9 @@ class ReportGenerator:
             all_trades = session.query(ClosedPosition).all()
             total_pnl = sum(t.net_pnl for t in all_trades) if all_trades else 0
 
-            # Unrealized P&L
+            # Unrealized P&L (None = LTP unavailable)
             unrealized = self._get_unrealized_pnl(open_positions)
+            unrl_str = self._format_pnl_metric(unrealized)
 
             html = f"""
             <!DOCTYPE html>
@@ -300,7 +303,7 @@ class ReportGenerator:
                                 <div class="metric-label">Today</div>
                             </div>
                             <div class="metric">
-                                <div class="metric-value {'positive' if unrealized >= 0 else 'negative'}">{'+' if unrealized >= 0 else ''}{unrealized:,.0f}</div>
+                                <div class="metric-value {unrl_str[0]}">{unrl_str[1]}</div>
                                 <div class="metric-label">Unrealized</div>
                             </div>
                             <div class="metric">
@@ -378,7 +381,8 @@ class ReportGenerator:
             deployed = self._calculate_deployed_capital(open_positions)
             deployed_pct = (deployed / initial_capital * 100) if initial_capital > 0 else 0
             unrealized_pnl = self._get_unrealized_pnl(open_positions)
-            unrealized_pct = (unrealized_pnl / deployed * 100) if deployed > 0 else 0
+            unrealized_pct = (unrealized_pnl / deployed * 100) if (unrealized_pnl is not None and deployed > 0) else 0
+            unrl_row = self._format_pnl_with_pct(unrealized_pnl, unrealized_pct)
 
             html = f"""
             <!DOCTYPE html>
@@ -446,7 +450,7 @@ class ReportGenerator:
                     </div>
                     <div class="row">
                         <span class="row-label">Unrealized P&L</span>
-                        <span class="row-value {'positive' if unrealized_pnl >= 0 else 'negative'}">{unrealized_pnl:+,.0f} ({'+' if unrealized_pct >= 0 else ''}{unrealized_pct:.1f}%)</span>
+                        <span class="row-value {unrl_row[0]}">{unrl_row[1]}</span>
                     </div>
                 </div>
 
@@ -608,14 +612,14 @@ class ReportGenerator:
 
             gross_profit = sum(t.net_pnl for t in all_trades if t.net_pnl > 0)
             gross_loss = abs(sum(t.net_pnl for t in all_trades if t.net_pnl <= 0))
-            profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf') if gross_profit > 0 else 0
 
             initial_capital = config.get('trading.initial_capital', 100000)
             deployed = self._calculate_deployed_capital(open_positions)
             deployed_pct = (deployed / initial_capital * 100) if initial_capital > 0 else 0
             total_roi = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0
             unrealized = self._get_unrealized_pnl(open_positions)
-            unrealized_pct = (unrealized / deployed * 100) if deployed > 0 else 0
+            unrealized_pct = (unrealized / deployed * 100) if (unrealized is not None and deployed > 0) else 0
 
             best = max(all_trades, key=lambda t: t.net_pnl) if all_trades else None
             worst = min(all_trades, key=lambda t: t.net_pnl) if all_trades else None
@@ -671,7 +675,7 @@ class ReportGenerator:
                         </div>
                         <div class="row">
                             <span class="row-label">Profit Factor</span>
-                            <span class="row-value">{profit_factor:.2f}x</span>
+                            <span class="row-value">{'∞' if profit_factor == float('inf') else f'{profit_factor:.2f}x'}</span>
                         </div>
                         <div class="row">
                             <span class="row-label">Avg Hold Period</span>
@@ -691,7 +695,7 @@ class ReportGenerator:
                         </div>
                         <div class="row">
                             <span class="row-label">Unrealized P&L</span>
-                            <span class="row-value {'positive' if unrealized >= 0 else 'negative'}">{'+' if unrealized >= 0 else ''}{unrealized:,.0f} ({'+' if unrealized_pct >= 0 else ''}{unrealized_pct:.1f}%)</span>
+                            <span class="row-value {self._format_pnl_with_pct(unrealized, unrealized_pct)[0]}">{self._format_pnl_with_pct(unrealized, unrealized_pct)[1]}</span>
                         </div>
                         {f'''<div class="row">
                             <span class="row-label">Best Trade</span>
@@ -766,9 +770,28 @@ class ReportGenerator:
             logger.warning(f"Image conversion failed: {e}")
             return None
 
-    def _get_unrealized_pnl(self, positions: List) -> float:
-        """Calculate unrealized P&L for positions"""
-        unrealized = 0
+    def _format_pnl_metric(self, value: Optional[float]) -> tuple:
+        """Return (css_class, display_text) for a P&L metric value. Handles None (no data)."""
+        if value is None:
+            return ('', '-')
+        css = 'positive' if value >= 0 else 'negative'
+        sign = '+' if value >= 0 else ''
+        return (css, f'{sign}{value:,.0f}')
+
+    def _format_pnl_with_pct(self, value: Optional[float], pct: float) -> tuple:
+        """Return (css_class, display_text) for P&L with percentage. Handles None."""
+        if value is None:
+            return ('', '-')
+        css = 'positive' if value >= 0 else 'negative'
+        pct_sign = '+' if pct >= 0 else ''
+        return (css, f'{value:+,.0f} ({pct_sign}{pct:.1f}%)')
+
+    def _get_unrealized_pnl(self, positions: List) -> Optional[float]:
+        """Calculate unrealized P&L for positions. Returns None if no LTP data available."""
+        if not positions:
+            return 0.0
+        unrealized = 0.0
+        got_any = False
         try:
             from src.api.dual_kite_client import get_kite_client
             kite = get_kite_client()
@@ -779,11 +802,12 @@ class ReportGenerator:
                         ltp = kite.get_instrument_ltp(token)
                         if ltp:
                             unrealized += (ltp - pos.entry_price) * pos.quantity
+                            got_any = True
                 except Exception:
                     pass
         except Exception:
             pass
-        return unrealized
+        return unrealized if got_any else None
 
     def _positions_table(self, positions: List) -> str:
         """Compact positions table with dynamic days_held and unrealized P&L"""
