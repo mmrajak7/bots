@@ -294,6 +294,8 @@ class OCOMonitor:
             target_ltp_hits = []  # List of (pair, ltp) - target reached via LTP monitoring (no limit order)
             sl_failures = []  # List of (pair, sl_order, rejection_reason) tuples - CRITICAL
             pairs_to_remove = []
+            ltp_check_pairs = []  # S37: Pairs needing LTP check (done outside lock)
+            double_exit_alerts = []  # S37: Telegram alerts to send outside lock
 
             with self._lock:
                 for entry_order_id, pair in self.oco_pairs.items():
@@ -315,25 +317,8 @@ class OCOMonitor:
                         sl_hits.append((pair, sl_order, True))  # True = double_exit flag
                         pairs_to_remove.append(entry_order_id)
 
-                        # Send critical alert
-                        # S27/S35: Use explicit None checks and safe float conversion for avgPrc
-                        if self.telegram:
-                            sl_avg = sl_order.get('avgPrc')
-                            tgt_avg = target_order.get('avgPrc')
-                            try:
-                                sl_price = float(sl_avg) if sl_avg is not None else 0.0
-                            except (ValueError, TypeError):
-                                sl_price = 0.0
-                            try:
-                                tgt_price = float(tgt_avg) if tgt_avg is not None else 0.0
-                            except (ValueError, TypeError):
-                                tgt_price = 0.0
-                            self.telegram.send(
-                                f"🚨 CRITICAL: DOUBLE EXIT on {pair.symbol}!\n"
-                                f"Both SL ({sl_price:.2f}) and Target ({tgt_price:.2f}) filled!\n"
-                                f"This means position was DOUBLE-EXITED.\n"
-                                f"Check broker positions immediately!"
-                            )
+                        # S37: Collect telegram alerts to send OUTSIDE lock
+                        double_exit_alerts.append((pair, sl_order, target_order))
                         continue
 
                     # Check if SL hit (normal case)
@@ -347,20 +332,9 @@ class OCOMonitor:
                         pairs_to_remove.append(entry_order_id)
 
                     # Check if Target reached via LTP monitoring (no target order placed)
-                    # This avoids margin issues by not placing TARGET limit order upfront
+                    # S37: Collect pairs needing LTP check, will check OUTSIDE lock
                     elif pair.target_order_id is None and pair.target_price and self._get_ltp:
-                        ltp = self._get_ltp(pair.symbol)
-                        if ltp is not None and ltp > 0:
-                            target_reached = False
-                            if pair.side == 'LONG' and ltp >= pair.target_price:
-                                target_reached = True
-                            elif pair.side == 'SHORT' and ltp <= pair.target_price:
-                                target_reached = True
-
-                            if target_reached:
-                                logger.info(f"[OCO] TARGET REACHED via LTP: {pair.symbol} LTP={ltp:.2f} >= Target={pair.target_price:.2f}")
-                                target_ltp_hits.append((pair, ltp))
-                                pairs_to_remove.append(entry_order_id)
+                        ltp_check_pairs.append((entry_order_id, pair))
 
                     # CRITICAL: Check if SL cancelled/rejected - attempt recovery!
                     elif sl_status in ['cancelled', 'rejected'] and not target_filled:
@@ -376,8 +350,48 @@ class OCOMonitor:
                         # Do NOT remove pair yet - will attempt recovery in step 2
 
                     elif target_status in ['cancelled', 'rejected'] and not sl_filled:
-                        logger.info(f"[OCO] Target cancelled/rejected for {pair.symbol} (entry={entry_order_id})")
-                        pairs_to_remove.append(entry_order_id)
+                        # S37: Don't remove the pair - clear target fields but keep SL monitoring
+                        # Otherwise SL hits would go unrecorded (no P&L, no cleanup)
+                        logger.info(f"[OCO] Target cancelled/rejected for {pair.symbol} - keeping SL monitoring")
+                        pair.target_order_id = None
+                        pair.target_price = None
+
+            # S37: LTP checks OUTSIDE lock (calls external _get_ltp)
+            for entry_order_id, pair in ltp_check_pairs:
+                try:
+                    ltp = self._get_ltp(pair.symbol)
+                    if ltp is not None and ltp > 0:
+                        target_reached = False
+                        if pair.side == 'LONG' and ltp >= pair.target_price:
+                            target_reached = True
+                        elif pair.side == 'SHORT' and ltp <= pair.target_price:
+                            target_reached = True
+
+                        if target_reached:
+                            logger.info(f"[OCO] TARGET REACHED via LTP: {pair.symbol} LTP={ltp:.2f} >= Target={pair.target_price:.2f}")
+                            target_ltp_hits.append((pair, ltp))
+                            pairs_to_remove.append(entry_order_id)
+                except Exception as e:
+                    logger.warning(f"[OCO] LTP check failed for {pair.symbol}: {e}")
+
+            # S37: Send double-exit alerts OUTSIDE lock
+            for pair, sl_order, target_order in double_exit_alerts:
+                if self.telegram:
+                    sl_avg = sl_order.get('avgPrc')
+                    tgt_avg = target_order.get('avgPrc')
+                    try:
+                        sl_price = float(sl_avg) if sl_avg is not None else 0.0
+                    except (ValueError, TypeError):
+                        sl_price = 0.0
+                    try:
+                        tgt_price = float(tgt_avg) if tgt_avg is not None else 0.0
+                    except (ValueError, TypeError):
+                        tgt_price = 0.0
+                    self.telegram.send(
+                        f"CRITICAL: DOUBLE EXIT on {pair.symbol}!\n"
+                        f"Both SL ({sl_price:.2f}) and Target ({tgt_price:.2f}) filled!\n"
+                        f"Check broker positions immediately!"
+                    )
 
             # Step 2: Handle events OUTSIDE lock (may call external components)
             for pair, sl_order, is_double_exit in sl_hits:
@@ -502,6 +516,7 @@ class OCOMonitor:
             )
 
         # Attempt to re-place SL
+        sl_tag = None  # S37: Initialize before try block to prevent UnboundLocalError
         try:
             # Get position details from tracker for exchange_segment and product
             position = None
@@ -593,7 +608,9 @@ class OCOMonitor:
 
         except Exception as e:
             # S35: Mark order as failed with tracker
-            self.order_tracker.mark_failed(sl_tag, str(e))
+            # S37: Only mark if sl_tag was assigned (may fail before tag generation)
+            if sl_tag:
+                self.order_tracker.mark_failed(sl_tag, str(e))
             logger.error(f"[OCO] SL recovery exception for {pair.symbol}: {e}")
             if self.telegram:
                 self.telegram.send(f"❌ SL recovery FAILED for {pair.symbol}: {e}\nPOSITION IS UNPROTECTED!")
@@ -832,8 +849,9 @@ class OCOMonitor:
         # Get position details for order placement
         # S35: Use getattr for safety in case position is dict or missing attributes
         position = self.pos_tracker.get_position(pair.entry_order_id) if self.pos_tracker else None
-        exchange_segment = getattr(position, 'exchange_segment', None) or 'nse_fo' if position else 'nse_fo'
-        product = getattr(position, 'product', None) or 'MIS' if position else 'MIS'
+        # S37: Fix operator precedence - add explicit parentheses
+        exchange_segment = (getattr(position, 'exchange_segment', None) or 'nse_fo') if position else 'nse_fo'
+        product = (getattr(position, 'product', None) or 'MIS') if position else 'MIS'
 
         try:
             # S35: Generate unique tag for target exit order using tracker

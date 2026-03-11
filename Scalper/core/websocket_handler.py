@@ -334,7 +334,10 @@ class WebSocketHandler:
                 while elapsed < max_wait:
                     time_mod.sleep(poll_interval)
                     elapsed += poll_interval
-                    if self._connected:
+                    # S37: Read _connected under lock for thread safety
+                    with self._lock:
+                        connected = self._connected
+                    if connected:
                         logger.info(f"[WS] Reconnection successful - verified after {elapsed:.1f}s")
                         self._reconnect_attempts = 0
                         return
@@ -395,8 +398,17 @@ class LTPCache:
         with self._lock:
             data = self._cache.get(token, {})
             # S26: Use explicit None check - price of 0 is valid (rare but possible)
+            # S37: NEO API sends 'lp' (last price) not 'ltp' in WebSocket
             ltp = data.get('ltp')
-            return ltp if ltp is not None else data.get('last_price')
+            if ltp is not None:
+                return ltp
+            lp = data.get('lp')
+            if lp is not None:
+                try:
+                    return float(lp)
+                except (ValueError, TypeError):
+                    pass
+            return data.get('last_price')
 
     def get_all(self) -> Dict[str, Dict[str, Any]]:
         """Get all cached data."""

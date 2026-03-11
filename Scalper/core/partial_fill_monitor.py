@@ -12,6 +12,7 @@ import threading
 import time
 import math
 from typing import Dict, List, Optional, Any, Callable
+from core import broker_utils
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
@@ -789,53 +790,68 @@ class PartialFillMonitor:
 
         self._last_watchdog_check = current_time
 
+        # S37: Phase 1 - Collect retry candidates inside lock (fast)
+        retry_candidates = []  # (entry_order_id, entry) tuples
+        alert_candidates = []  # (symbol, duration) for telegram alerts
+
         with self._lock:
             if not self.unprotected_positions:
                 return
 
             logger.warning(f"[WATCHDOG] Checking {len(self.unprotected_positions)} unprotected positions")
 
-            # CRITICAL FIX (S24): Iterate by entry_order_id, not symbol
             for entry_order_id, entry in list(self.unprotected_positions.items()):
-                symbol = entry.symbol  # For logging
+                symbol = entry.symbol
 
-                # Check if max retries exceeded
                 if entry.sl_retry_count >= self._max_sl_retries:
                     unprotected_duration = current_time - (entry.unprotected_since or current_time)
                     logger.error(f"[WATCHDOG] {symbol}: Max retries ({self._max_sl_retries}) exceeded! "
                                 f"Unprotected for {unprotected_duration:.0f}s")
 
-                    # Send periodic reminder (every 30 seconds)
+                    # S37: Use exponential backoff retry instead of giving up permanently
+                    # Retry every 30s after max retries (was: never retry again)
+                    backoff_interval = 30
+                    if int(unprotected_duration) % backoff_interval < self._watchdog_interval:
+                        entry.sl_retry_count = self._max_sl_retries - 1  # Allow one more attempt
+                        retry_candidates.append((entry_order_id, entry))
+
                     if int(unprotected_duration) % 30 == 0:
-                        if self.telegram:
-                            self.telegram.send(
-                                f"🚨🚨 URGENT: {symbol} STILL UNPROTECTED!\n"
-                                f"Duration: {unprotected_duration:.0f}s\n"
-                                f"Manual intervention required!\n"
-                                f"Place SL manually or exit position!"
-                            )
+                        alert_candidates.append((symbol, unprotected_duration))
                     continue
 
-                # Attempt to place SL
-                logger.info(f"[WATCHDOG] Attempting SL recovery for {symbol} "
-                           f"(retry {entry.sl_retry_count + 1}/{self._max_sl_retries})")
+                retry_candidates.append((entry_order_id, entry))
 
-                success = self._retry_sl_placement(entry)
+        # S37: Phase 2 - Execute API calls OUTSIDE lock (slow network I/O)
+        for entry_order_id, entry in retry_candidates:
+            symbol = entry.symbol
+            logger.info(f"[WATCHDOG] Attempting SL recovery for {symbol} "
+                       f"(retry {entry.sl_retry_count + 1}/{self._max_sl_retries})")
 
-                if success:
-                    logger.info(f"[WATCHDOG] SL recovery SUCCESS for {symbol}")
-                    del self.unprotected_positions[entry_order_id]
+            success = self._retry_sl_placement(entry)
 
-                    if self.telegram:
-                        self.telegram.send(
-                            f"✅ SL RECOVERED for {symbol}!\n"
-                            f"Position now protected."
-                        )
-                else:
-                    # NOTE: Retry count already incremented inside _retry_sl_placement
-                    # Removed duplicate increment here (S25 fix for PFM-8)
-                    logger.warning(f"[WATCHDOG] SL recovery FAILED for {symbol} "
-                                  f"(retry {entry.sl_retry_count}/{self._max_sl_retries})")
+            if success:
+                logger.info(f"[WATCHDOG] SL recovery SUCCESS for {symbol}")
+                with self._lock:
+                    self.unprotected_positions.pop(entry_order_id, None)
+
+                if self.telegram:
+                    self.telegram.send(
+                        f"SL RECOVERED for {symbol}!\n"
+                        f"Position now protected."
+                    )
+            else:
+                logger.warning(f"[WATCHDOG] SL recovery FAILED for {symbol} "
+                              f"(retry {entry.sl_retry_count}/{self._max_sl_retries})")
+
+        # Phase 3 - Send alerts outside lock
+        for symbol, duration in alert_candidates:
+            if self.telegram:
+                self.telegram.send(
+                    f"URGENT: {symbol} STILL UNPROTECTED!\n"
+                    f"Duration: {duration:.0f}s\n"
+                    f"Manual intervention required!\n"
+                    f"Place SL manually or exit position!"
+                )
 
     def _check_existing_sl_for_symbol(self, symbol: str, side: str) -> bool:
         """
@@ -860,7 +876,8 @@ class PartialFillMonitor:
 
             for order in orders:
                 order_symbol = order.get('trdSym', '') or order.get('tradingSymbol', '')
-                order_type = order.get('ordTyp', '').upper()
+                # S37: NEO API uses 'prcTp' for order type, not 'ordTyp'
+                order_type = order.get('prcTp', order.get('ordTyp', '')).upper()
                 txn_type = order.get('trnsTp', '').upper()
                 status = order.get('ordSt', '').lower()
 
@@ -886,11 +903,9 @@ class PartialFillMonitor:
             pos_list = positions.get('data', []) if positions else []
 
             for pos in pos_list:
-                pos_symbol = pos.get('trdSym', '') or pos.get('tradingSymbol', '')
+                pos_symbol = broker_utils.get_symbol(pos)
                 if pos_symbol == symbol:
-                    buy_qty = int(float(pos.get('flBuyQty', 0) or 0))
-                    sell_qty = int(float(pos.get('flSellQty', 0) or 0))
-                    net_qty = buy_qty - sell_qty
+                    net_qty = broker_utils.get_net_qty(pos)
                     # For LONG, net_qty should be positive; for SHORT, negative
                     if side == 'LONG' and net_qty > 0:
                         return net_qty
@@ -1129,8 +1144,10 @@ class PartialFillMonitor:
             logger.info(f"[PARTIAL] Target monitoring enabled: {entry.symbol} @ {entry.target_price:.2f} (will exit at MARKET when reached)")
             target_order_id = None  # No limit order placed
 
-        # Register with position tracker
-        if self.pos_tracker and (sl_order_id or target_order_id):
+        # S37: ALWAYS register with position tracker when entry fills,
+        # regardless of whether SL placement succeeded. This ensures the position
+        # is visible to exit_all, reconciliation, and GUI even if SL failed.
+        if self.pos_tracker:
             self.pos_tracker.add_position(
                 symbol=entry.symbol,
                 entry_order_id=entry.entry_order_id,

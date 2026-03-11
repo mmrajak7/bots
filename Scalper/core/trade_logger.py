@@ -107,7 +107,9 @@ class TradeLogger:
             'notes': ''
         }
 
-        self.trades.append(trade)
+        # S38: Thread-safe - lock protects self.trades list AND file writes
+        with self._lock:
+            self.trades.append(trade)
         self._write_csv(trade)
         self._save_json()
 
@@ -125,15 +127,16 @@ class TradeLogger:
         """
         self._check_date_rollover()
 
-        # Find and update the order
+        # S38: Thread-safe - lock protects self.trades list
         found = False
-        for trade in self.trades:
-            if trade['order_id'] == order_id:
-                trade['status'] = 'FILLED'
-                trade['fill_price'] = fill_price
-                trade['fill_time'] = (fill_time or datetime.now()).isoformat()
-                found = True
-                break
+        with self._lock:
+            for trade in self.trades:
+                if trade['order_id'] == order_id:
+                    trade['status'] = 'FILLED'
+                    trade['fill_price'] = fill_price
+                    trade['fill_time'] = (fill_time or datetime.now()).isoformat()
+                    found = True
+                    break
 
         if not found:
             logger.warning(f"[LOG] Order {order_id} not found in trades, cannot update fill")
@@ -151,14 +154,15 @@ class TradeLogger:
         """
         self._check_date_rollover()
 
-        # Find and update the order
+        # S38: Thread-safe - lock protects self.trades list
         found = False
-        for trade in self.trades:
-            if trade['order_id'] == order_id:
-                trade['status'] = 'REJECTED'
-                trade['notes'] = reason
-                found = True
-                break
+        with self._lock:
+            for trade in self.trades:
+                if trade['order_id'] == order_id:
+                    trade['status'] = 'REJECTED'
+                    trade['notes'] = reason
+                    found = True
+                    break
 
         if not found:
             logger.debug(f"[LOG] Order {order_id} not found in trades (may be manual order)")
@@ -175,12 +179,14 @@ class TradeLogger:
         """
         self._check_date_rollover()
 
+        # S38: Thread-safe - lock protects self.trades list
         found = False
-        for trade in self.trades:
-            if trade['order_id'] == order_id:
-                trade['status'] = 'CANCELLED'
-                found = True
-                break
+        with self._lock:
+            for trade in self.trades:
+                if trade['order_id'] == order_id:
+                    trade['status'] = 'CANCELLED'
+                    found = True
+                    break
 
         if not found:
             logger.debug(f"[LOG] Order {order_id} not found in trades (may be manual order)")
@@ -222,7 +228,8 @@ class TradeLogger:
             'notes': f"Entry: {entry_price}, Exit: {exit_price}"
         }
 
-        self.trades.append(trade)
+        with self._lock:
+            self.trades.append(trade)
         self._write_csv(trade)
         self._save_json()
 
@@ -300,7 +307,11 @@ class TradeLogger:
         losers = 0
         total_pnl = 0.0
 
-        for trade in self.trades:
+        # S38: Thread-safe snapshot
+        with self._lock:
+            trades_snapshot = list(self.trades)
+
+        for trade in trades_snapshot:
             if trade['status'] == 'EXIT' and trade['pnl'] is not None:
                 total_trades += 1
                 # S27: Safe float conversion
@@ -327,11 +338,13 @@ class TradeLogger:
 
     def get_trades_for_symbol(self, symbol: str) -> List[Dict[str, Any]]:
         """Get all trades for a specific symbol."""
-        return [t for t in self.trades if t['symbol'] == symbol]
+        with self._lock:
+            return [t for t in self.trades if t['symbol'] == symbol]
 
     def get_all_trades(self) -> List[Dict[str, Any]]:
         """Get all trades for the day."""
-        return self.trades.copy()
+        with self._lock:
+            return list(self.trades)
 
     def export_to_csv(self, filepath: str = None) -> str:
         """

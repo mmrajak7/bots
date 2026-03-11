@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 
+from core import broker_utils
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +67,10 @@ class PositionTracker:
         # Callbacks for cross-component notifications
         self.on_position_removed: Optional[Callable] = None  # Called when position is removed
         self.oco_monitor = None  # Reference to OCO monitor for cleanup
+
+        # Strike-count confirmation: require N consecutive absences before orphan cleanup
+        self._absent_count: Dict[str, int] = {}  # entry_order_id -> consecutive absent count
+        self._reconciliation_cleanup_threshold: int = 2  # default; can be overridden
 
     def set_cancel_mgr(self, mgr):
         """Set the cancel manager (can be set after initialization)."""
@@ -538,6 +544,7 @@ class PositionTracker:
                 pos.is_active = False
                 symbol = pos.symbol
                 del self.positions[entry_order_id]
+                self._absent_count.pop(entry_order_id, None)
                 logger.info(f"[TRACKER] Position closed: {symbol} (entry={entry_order_id})")
 
         result['position_removed'] = True
@@ -561,22 +568,53 @@ class PositionTracker:
         """
         broker_symbols = set()
         for pos in broker_positions:
-            symbol = pos.get('tradingSymbol', pos.get('symbol', ''))
-            qty = int(float(pos.get('qty', 0) or 0))
-            if qty != 0:
+            symbol = broker_utils.get_symbol(pos)
+            net = broker_utils.get_net_qty(pos)
+            if net != 0 and symbol:
                 broker_symbols.add(symbol)
 
-        # Phase 1: Collect entries to remove and their order IDs inside lock (fast)
-        orders_to_cancel = []  # List of (entry_order_id, symbol, sl_order_id, target_order_id)
+        # CRITICAL: If broker returned no positions but we have tracked positions,
+        # this is likely an API failure. Skip sync to avoid false orphan cleanup.
         with self._lock:
-            for entry_order_id, pos in self.positions.items():
+            has_tracked = len(self.positions) > 0
+        if has_tracked and not broker_positions:
+            logger.warning("[TRACKER] Broker returned empty positions — skipping reconciliation (possible API failure)")
+            return
+
+        # Phase 1: Strike-count confirmation — require N consecutive absences
+        # to guard against transient broker API glitches leaving positions naked
+        orders_to_cancel = []
+        with self._lock:
+            for entry_order_id, pos in list(self.positions.items()):
                 if pos.symbol not in broker_symbols:
-                    orders_to_cancel.append({
-                        'entry_order_id': entry_order_id,
-                        'symbol': pos.symbol,
-                        'sl_order_id': pos.sl_order_id,
-                        'target_order_id': pos.target_order_id
-                    })
+                    self._absent_count[entry_order_id] = self._absent_count.get(entry_order_id, 0) + 1
+                    count = self._absent_count[entry_order_id]
+                    if count < self._reconciliation_cleanup_threshold:
+                        logger.warning(
+                            f"[TRACKER] Position missing from broker ({count}/{self._reconciliation_cleanup_threshold}): "
+                            f"{pos.symbol} (entry={entry_order_id})"
+                        )
+                    else:
+                        orders_to_cancel.append({
+                            'entry_order_id': entry_order_id,
+                            'symbol': pos.symbol,
+                            'sl_order_id': pos.sl_order_id,
+                            'target_order_id': pos.target_order_id
+                        })
+                else:
+                    # Position reappeared — reset counter
+                    prev = self._absent_count.pop(entry_order_id, 0)
+                    if prev > 0:
+                        logger.info(
+                            f"[TRACKER] Position reappeared at broker after {prev} absent checks: "
+                            f"{pos.symbol} (entry={entry_order_id})"
+                        )
+
+        # Cleanup stale absent counts for entries removed by other paths (e.g., GUI cleanup)
+        with self._lock:
+            stale = [eid for eid in self._absent_count if eid not in self.positions]
+            for eid in stale:
+                del self._absent_count[eid]
 
         if not orders_to_cancel:
             return
@@ -618,12 +656,13 @@ class PositionTracker:
                 except Exception as e:
                     logger.warning(f"[TRACKER] Position removed callback failed: {e}")
 
-        # Phase 3: Delete entries from positions dict (re-acquire lock)
+        # Phase 3: Delete entries from positions dict and clean up absent counts (re-acquire lock)
         with self._lock:
             for order_data in orders_to_cancel:
                 entry_order_id = order_data['entry_order_id']
                 if entry_order_id in self.positions:
                     del self.positions[entry_order_id]
+                self._absent_count.pop(entry_order_id, None)
 
     def has_sl(self, entry_order_id: str) -> bool:
         """Check if position has SL order."""
@@ -680,9 +719,10 @@ class PositionTracker:
                     logger.warning(f"[TRACKER] Failed to cancel Target {order_data['target_order_id']}: {e}")
                     cancel_results['failed'] += 1
 
-        # Phase 3: Clear positions inside lock
+        # Phase 3: Clear positions and absent counts inside lock
         with self._lock:
             self.positions.clear()
+            self._absent_count.clear()
 
         logger.info(f"[TRACKER] Cleared all positions. Cancels: {cancel_results['success']} ok, {cancel_results['failed']} failed")
 

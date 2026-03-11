@@ -11,6 +11,7 @@ import os
 import json
 import logging
 import threading
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple, Callable
 
@@ -78,7 +79,7 @@ class KiteSpotFetcher:
                     paths_config.get('kite_token', '../data/kite_access_token.json'),
                     paths_config.get('kite_token_backup', ''),
                     '../data/kite_access_token.json',  # Relative fallback
-                    'C:/Users/mail2/Documents/Projects/BOTS/data/kite_access_token.json',  # Absolute fallback
+                    str(Path(__file__).resolve().parent.parent.parent / 'data' / 'kite_access_token.json'),  # S38: Derived absolute fallback
                 ]
 
                 for token_path in token_paths:

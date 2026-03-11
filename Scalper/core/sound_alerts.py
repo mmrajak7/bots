@@ -61,6 +61,9 @@ class SoundAlertManager:
             'price_alert': 200,  # Short bell for each ring
         }
 
+        # S38: Limit concurrent sound threads to prevent accumulation under rapid events
+        self._sound_semaphore = threading.Semaphore(3)
+
         # Try to import sound library
         self._sound_lib: Optional[str] = None
         self._init_sound_library()
@@ -106,12 +109,23 @@ class SoundAlertManager:
         if not self.enabled or not self._sound_lib:
             return
 
+        # S38: Use semaphore to limit concurrent sound threads
+        if not self._sound_semaphore.acquire(blocking=False):
+            return  # Skip if too many sounds playing
+
         # Play in background thread to not block
         threading.Thread(
-            target=self._play_sound,
+            target=self._play_sound_with_release,
             args=(event_type,),
             daemon=True
         ).start()
+
+    def _play_sound_with_release(self, event_type: str):
+        """Play sound and release semaphore when done."""
+        try:
+            self._play_sound(event_type)
+        finally:
+            self._sound_semaphore.release()
 
     def _play_sound(self, event_type: str):
         """Internal sound player."""

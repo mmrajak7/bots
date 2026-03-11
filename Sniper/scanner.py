@@ -608,6 +608,10 @@ def quick_check(kite: KiteConnect):
 
                     # Alert if within ALERT_DISTANCE above the level
                     if 0 < distance <= ALERT_DISTANCE:
+                        # Only alert when spot confluence is confirmed
+                        if not level.get('spot_confluence', False):
+                            continue
+
                         alert_key = f"{symbol}_{level['price']}_{tf_name}"
 
                         if can_alert(alert_key, alerts_tracker):

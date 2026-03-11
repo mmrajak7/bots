@@ -18,7 +18,7 @@ from enum import Enum
 import logging
 
 from core.charge_calculator import get_breakeven_points
-from core.tick_utils import calculate_sl_limit_price, round_trigger_price
+from core.tick_utils import calculate_sl_limit_price, round_trigger_price, get_tick_size, round_to_tick
 from core.order_tracker import OrderType, get_order_tracker
 
 logger = logging.getLogger(__name__)
@@ -78,6 +78,7 @@ class TrailingSLManager:
         self.telegram = telegram_mgr
         self.config = config or {}
         self.pos_tracker = position_tracker  # For checking exit locks
+        self.oco_monitor = None  # Set after construction (circular dependency)
         self.order_tracker = get_order_tracker()  # S35: Order tracking
 
         self.positions: Dict[str, TrailingPosition] = {}  # keyed by entry_order_id
@@ -234,9 +235,10 @@ class TrailingSLManager:
                 # SHORT: BE = entry - charges
                 calculated_be = pos.entry_price - be_points
 
-            # Round to tick size (0.1)
-            calculated_be = round(calculated_be / 0.1) * 0.1
-            entry_rounded = round(pos.entry_price / 0.1) * 0.1
+            # S38: Round to actual tick size (was hardcoded 0.1, should use exchange tick size)
+            tick = get_tick_size(pos.exchange_segment)
+            calculated_be = round_to_tick(calculated_be, tick, direction='nearest')
+            entry_rounded = round_to_tick(pos.entry_price, tick, direction='nearest')
 
             # S34: Determine best SL price based on LTP
             if pos.side == 'LONG':
@@ -487,6 +489,10 @@ class TrailingSLManager:
         for pdata in positions_data:
             ltp = ltp_map.get(str(pdata['instrument_token']), pdata['last_ltp'])
 
+            # S38: Skip positions with invalid LTP - prevents false trail triggers
+            if ltp is None or ltp <= 0:
+                continue
+
             # Calculate current profit in points
             if pdata['side'] == 'LONG':
                 profit_points = ltp - pdata['entry_price']
@@ -629,12 +635,13 @@ class TrailingSLManager:
                 logger.warning(f"[TRAIL] {symbol} (entry={entry_order_id}) is locked for exit - skipping modification")
                 return {'success': False, 'error': 'Position locked for exit'}
 
-            # Round UP to tick size (0.1) - safer for SL
-            new_sl = math.ceil(new_sl / 0.1) * 0.1
+            # S38: Round to tick size using integer arithmetic (was hardcoded 0.1)
+            tick = get_tick_size(exchange_segment)
+            new_sl = round_to_tick(new_sl, tick, direction='up')
 
             # CRITICAL FIX (E1): Skip unnecessary API call if new SL equals current SL
             # This prevents redundant modify calls from rapid button clicks or identical trails
-            if abs(new_sl - old_sl) < 0.05:  # Within tick tolerance
+            if abs(new_sl - old_sl) < tick:  # Within tick tolerance
                 logger.debug(f"[TRAIL] {symbol}: Skipping modify - SL unchanged ({old_sl:.2f})")
                 return {'success': True, 'new_sl': old_sl, 'order_id': sl_order_id, 'skipped': True}
 
@@ -719,6 +726,13 @@ class TrailingSLManager:
                         pos.trail_history = pos.trail_history[-100:]
 
             logger.info(f"[TRAIL] {symbol} (entry={entry_order_id}): SL {old_sl} -> {new_sl} ({reason}) [VERIFIED]")
+
+            # S38: Propagate SL update to pos_tracker and oco_monitor
+            # Without this, those modules have stale SL prices causing incorrect behavior
+            if self.pos_tracker:
+                self.pos_tracker.update_sl_order(entry_order_id, sl_order_id, new_sl)
+            if self.oco_monitor:
+                self.oco_monitor.update_sl_order(entry_order_id, sl_order_id, new_sl)
 
             # Notify (outside lock)
             if self.sound:

@@ -80,7 +80,9 @@ class SessionManager:
                 totp=current_totp
             )
 
-            logger.info(f"TOTP login response: {login_response}")
+            # S37: Redact API response to avoid logging sensitive tokens
+            login_status = 'success' if login_response else 'failed'
+            logger.info(f"TOTP login: {login_status}")
 
             # Step 2: MPIN Validation
             mpin = neo_creds.get('mpin', '')
@@ -88,7 +90,9 @@ class SessionManager:
                 return False, "MPIN not configured"
 
             validate_response = self.client.totp_validate(mpin=mpin)
-            logger.info(f"MPIN validation response: {validate_response}")
+            # S37: Redact API response to avoid logging sensitive tokens
+            validate_status = 'success' if validate_response else 'failed'
+            logger.info(f"MPIN validation: {validate_status}")
 
             # Check if session establishment required
             if hasattr(self.client, 'session_2fa'):
@@ -98,6 +102,8 @@ class SessionManager:
             # Save session for reuse
             self._save_session()
             self._connected = True
+            # S37: Set session_valid_until on fresh login for proactive refresh
+            self.session_valid_until = datetime.now() + timedelta(hours=8)
 
             return True, f"Login successful at {datetime.now().strftime('%H:%M:%S')}"
 
@@ -189,9 +195,13 @@ class SessionManager:
         try:
             # Quick API call to verify session
             limits_response = self.client.limits()
-            if limits_response and not limits_response.get('error'):
-                return True
-            return False
+            if not limits_response:
+                return False
+            # S37: NEO API returns errors with varying field names
+            if (limits_response.get('error') or limits_response.get('Error') or
+                    str(limits_response.get('stat', '')).lower() in ('not_ok', 'error')):
+                return False
+            return True
         except Exception as e:
             logger.warning(f"Session verification failed: {e}")
             return False

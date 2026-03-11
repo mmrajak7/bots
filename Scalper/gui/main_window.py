@@ -35,6 +35,7 @@ from core.charge_calculator import get_breakeven_points, calculate_charges
 from core.price_alert_manager import PriceAlertManager, PriceAlert
 from core.tick_utils import round_trigger_price, format_price
 from core.order_tracker import OrderType, get_order_tracker
+from core import broker_utils
 
 
 class SortableTableWidgetItem(QTableWidgetItem):
@@ -53,152 +54,32 @@ class SortableTableWidgetItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+# Thin wrappers around core.broker_utils for backward compatibility.
+# All extraction logic lives in broker_utils — these just preserve the
+# module-level function names used throughout this file.
 def _get_position_qty(pos: Dict[str, Any]) -> int:
-    """Extract NET position quantity from NEO API response.
-
-    NEO API returns flBuyQty and flSellQty separately.
-    Net position = flBuyQty - flSellQty (positive = long, negative = short, 0 = closed)
-    """
-    # Calculate from buy/sell quantities (NEO API primary method)
-    buy_qty = pos.get('flBuyQty', pos.get('buyQty', 0))
-    sell_qty = pos.get('flSellQty', pos.get('sellQty', 0))
-    try:
-        net = int(buy_qty or 0) - int(sell_qty or 0)
-        if net != 0:
-            return net
-    except (ValueError, TypeError):
-        pass
-
-    # Fallback: Try direct qty field
-    qty = pos.get('qty')
-    if qty is not None and str(qty).strip():
-        try:
-            return int(qty)
-        except (ValueError, TypeError):
-            pass
-
-    # Fallback: Try netQty
-    net_qty = pos.get('netQty')
-    if net_qty is not None and str(net_qty).strip():
-        try:
-            return int(net_qty)
-        except (ValueError, TypeError):
-            pass
-
-    return 0
-
+    return broker_utils.get_net_qty(pos)
 
 def _get_position_symbol(pos: Dict[str, Any]) -> str:
-    """Extract trading symbol from NEO API position response."""
-    # NEO API uses 'trdSym' as primary field
-    for field in ['trdSym', 'tradingSymbol', 'symbol', 'tsym', 'scrip', 'scripName']:
-        val = pos.get(field)
-        if val and str(val).strip():
-            return str(val).strip()
-    return ''
-
+    return broker_utils.get_symbol(pos)
 
 def _get_position_avg_price(pos: Dict[str, Any]) -> float:
-    """Extract/calculate average price from NEO API position response.
-
-    NEO API doesn't provide avgPrice directly - calculate from buyAmt/flBuyQty.
-    """
-    # Try direct fields first
-    for field in ['averagePrice', 'avgPrc', 'avgPrice', 'buyAvgPrc', 'netAvgPrc']:
-        val = pos.get(field)
-        if val is not None:
-            try:
-                price = float(val)
-                if price > 0:
-                    return price
-            except (ValueError, TypeError):
-                pass
-
-    # NEO API: Calculate from buyAmt / flBuyQty
-    try:
-        buy_amt = float(pos.get('buyAmt', 0) or 0)
-        buy_qty = int(pos.get('flBuyQty', 0) or 0)
-        if buy_qty > 0 and buy_amt > 0:
-            return round(buy_amt / buy_qty, 2)
-    except (ValueError, TypeError):
-        pass
-
-    return 0.0
-
+    return broker_utils.get_avg_price(pos)
 
 def _get_position_ltp(pos: Dict[str, Any]) -> float:
-    """Extract LTP from NEO API position response.
-
-    Note: NEO positions API doesn't return LTP - it comes from websocket/quotes.
-    """
-    for field in ['ltp', 'lastPrice', 'lp', 'lastTradedPrice', 'ltP']:
-        val = pos.get(field)
-        if val is not None:
-            try:
-                price = float(val)
-                if price > 0:
-                    return price
-            except (ValueError, TypeError):
-                pass
-    return 0.0
-
+    return broker_utils.get_ltp(pos)
 
 def _get_position_pnl(pos: Dict[str, Any]) -> float:
-    """Extract/calculate P&L from NEO API position response.
-
-    NEO API: For closed positions, P&L = sellAmt - buyAmt
-    For open positions, need LTP to calculate MTM.
-    """
-    # Try direct P&L fields first
-    for field in ['pnl', 'dayPnl', 'mtm', 'realizedPnl', 'urmtom', 'unrealizedPnl', 'netPnl']:
-        val = pos.get(field)
-        if val is not None:
-            try:
-                pnl = float(val)
-                if pnl != 0:
-                    return pnl
-            except (ValueError, TypeError):
-                pass
-
-    # NEO API: Calculate realized P&L from sellAmt - buyAmt
-    try:
-        buy_amt = float(pos.get('buyAmt', 0) or 0)
-        sell_amt = float(pos.get('sellAmt', 0) or 0)
-        if sell_amt > 0:  # Has some sells
-            return round(sell_amt - buy_amt, 2)
-    except (ValueError, TypeError):
-        pass
-
-    return 0.0
-
+    return broker_utils.get_pnl(pos)
 
 def _get_position_product(pos: Dict[str, Any]) -> str:
-    """Extract product type from NEO API position response."""
-    # NEO API uses 'prod'
-    for field in ['prod', 'product', 'prd', 'productType']:
-        val = pos.get(field)
-        if val and str(val).strip():
-            return str(val).strip().upper()
-    return 'MIS'
-
+    return broker_utils.get_product(pos)
 
 def _get_position_exchange(pos: Dict[str, Any]) -> str:
-    """Extract exchange segment from NEO API position response."""
-    # NEO API uses 'exSeg'
-    for field in ['exSeg', 'exchange_segment', 'exchangeSegment', 'exchange', 'exch']:
-        val = pos.get(field)
-        if val and str(val).strip():
-            return str(val).strip()
-    return 'nse_fo'
-
+    return broker_utils.get_exchange(pos)
 
 def _get_position_token(pos: Dict[str, Any]) -> str:
-    """Extract instrument token from NEO API position response."""
-    for field in ['tok', 'token', 'instrument_token', 'instrumentToken']:
-        val = pos.get(field)
-        if val and str(val).strip():
-            return str(val).strip()
-    return ''
+    return broker_utils.get_token(pos)
 
 
 class QuickAddAlertDialog(QDialog):
@@ -560,6 +441,7 @@ class MainWindow(QMainWindow):
     index_price_updated = pyqtSignal(str, float)  # S30: Index price update (index_name, price)
     ltp_updated = pyqtSignal(str, float)  # LTP update signal (token, price) for positions/orders
     st_data_ready = pyqtSignal(dict)  # S35: Supertrend data ready signal
+    oco_exit_signal = pyqtSignal(str, str, float, float)  # S38: OCO exit (symbol, entry_id, price, pnl)
 
     def __init__(self, session_mgr, order_mgr: OrderManager, symbol_mapper,
                  kite_spot, config: Dict[str, Any],
@@ -599,6 +481,10 @@ class MainWindow(QMainWindow):
         self._trail_debounce: Dict[str, float] = {}  # symbol -> last_trail_timestamp
         self._trail_debounce_ms = 500  # Minimum ms between trail actions per symbol
 
+        # S38: Debounce for BUY/SELL buttons - prevents accidental double-click orders
+        self._last_order_time: float = 0.0
+        self._order_debounce_ms = 1000  # Minimum ms between order placements
+
         # S17-M1: Initialize all state attributes (avoid hasattr anti-pattern)
         self._pending_index_lookup: Optional[str] = None  # ATM dropdown lookup state
         self._price_warning_acknowledged: bool = False  # Price deviation warning flag
@@ -607,6 +493,9 @@ class MainWindow(QMainWindow):
         self._index_ws_last_update: Dict[str, float] = {}  # Track last WebSocket update time for fallback
         self._index_labels: Dict[str, QLabel] = {}  # Populated in _create_header
         # Kite WebSocket LTP cache for positions/orders
+        # S38: Protected by _ltp_lock - written from Kite WS thread, read from main thread
+        import threading as _threading
+        self._ltp_lock = _threading.Lock()
         self._ltp_cache: Dict[str, float] = {}  # kite_token (str) -> LTP
         self._token_to_symbol: Dict[str, str] = {}  # kite_token (str) -> trading symbol
         self._symbol_to_kite_token: Dict[str, int] = {}  # trading symbol -> kite_token (int)
@@ -619,11 +508,21 @@ class MainWindow(QMainWindow):
         self._recovery_completed: bool = False  # Position recovery flag
         self._force_orders_refresh: bool = False  # Force refresh after order action
 
+        # Strike-count confirmation: require N consecutive absences before orphan cleanup
+        # Prevents transient broker API glitches from stripping SL off open positions
+        self._position_absent_count: Dict[str, int] = {}  # entry_id -> consecutive absent count
+        pos_refresh_cfg = config.get('position_refresh', {})
+        self._orphan_cleanup_threshold: int = int(pos_refresh_cfg.get('orphan_cleanup_threshold', 3))
+
         # Position tracker for SL/Target order management (with cancel manager)
         self.pos_tracker = PositionTracker(
             session_mgr.get_client() if session_mgr else None,
             order_mgr,
             cancel_mgr
+        )
+        # Wire config threshold for reconciliation cleanup
+        self.pos_tracker._reconciliation_cleanup_threshold = int(
+            pos_refresh_cfg.get('reconciliation_cleanup_threshold', 2)
         )
         # Wire up OCO monitor reference for automatic cleanup on position removal
         if oco_monitor:
@@ -1663,9 +1562,9 @@ class MainWindow(QMainWindow):
         # Quick focus
         QShortcut(QKeySequence("Ctrl+L"), self, lambda: self.symbol_input.lineEdit().setFocus())
 
-        # Trailing shortcuts
-        QShortcut(QKeySequence("T"), self, self._trail_selected_to_cost)
-        QShortcut(QKeySequence("Shift+T"), self, lambda: self._trail_selected_plus(10))
+        # Trailing shortcuts - S38: Only fire when no text input has focus
+        QShortcut(QKeySequence("T"), self, self._trail_shortcut_handler)
+        QShortcut(QKeySequence("Shift+T"), self, self._trail_shift_shortcut_handler)
 
         # Escape to clear
         QShortcut(QKeySequence("Escape"), self, self._clear_inputs)
@@ -1726,6 +1625,12 @@ class MainWindow(QMainWindow):
         self.index_price_updated.connect(self._update_index_price_display)  # S30: Index prices
         self.ltp_updated.connect(self._update_position_ltp_display)  # Position/order LTP updates
         self.st_data_ready.connect(self._apply_supertrend_display)  # S35: Supertrend display
+        self.oco_exit_signal.connect(self._on_oco_exit)  # S38: OCO exit handling
+
+        # S38: Wire OCO monitor callbacks (fire from OCO thread -> signal -> main thread)
+        if self.oco_monitor:
+            self.oco_monitor.on_sl_hit = self._on_oco_sl_hit
+            self.oco_monitor.on_target_hit = self._on_oco_target_hit
 
         # Setup NEO WebSocket for order updates only (LTP via Kite WebSocket)
         if self.ws_handler:
@@ -1740,6 +1645,22 @@ class MainWindow(QMainWindow):
             self.kite_ws.set_on_connect(self._on_kite_ws_connected)
             # Subscribe to indices after connection
             self.kite_ws.subscribe_indices(['NIFTY', 'BANKNIFTY', 'SENSEX'])
+
+    def _on_oco_sl_hit(self, symbol: str, entry_order_id: str, fill_price: float, pnl: float):
+        """S38: OCO SL hit callback - runs in OCO thread, emit signal for thread-safety."""
+        self.oco_exit_signal.emit(symbol, entry_order_id, fill_price, pnl)
+        self.log_message.emit(f"[OCO] SL HIT: {symbol} @ {fill_price:.2f} (P&L: {pnl:+.2f})")
+
+    def _on_oco_target_hit(self, symbol: str, entry_order_id: str, fill_price: float, pnl: float):
+        """S38: OCO target hit callback - runs in OCO thread, emit signal for thread-safety."""
+        self.oco_exit_signal.emit(symbol, entry_order_id, fill_price, pnl)
+        self.log_message.emit(f"[OCO] TARGET HIT: {symbol} @ {fill_price:.2f} (P&L: {pnl:+.2f})")
+
+    def _on_oco_exit(self, symbol: str, entry_order_id: str, fill_price: float, pnl: float):
+        """S38: Handle OCO exit in main thread - cleanup position structures and refresh."""
+        self._cleanup_position_structures(symbol)
+        # Force refresh positions table to reflect the exit
+        self._force_orders_refresh = True
 
     def _on_ws_order_update(self, data: dict):
         """WebSocket callback - runs in WebSocket thread, emit signal for thread-safety."""
@@ -1784,7 +1705,9 @@ class MainWindow(QMainWindow):
                 # Position LTP - check if subscribed (token is int, set contains ints)
                 if token in self._subscribed_position_tokens:
                     token_str = str(token)
-                    self._ltp_cache[token_str] = ltp
+                    # S38: Thread-safe write - this runs in Kite WS thread
+                    with self._ltp_lock:
+                        self._ltp_cache[token_str] = ltp
                     self.ltp_updated.emit(token_str, ltp)
         except Exception as e:
             logger.debug(f"[KITE WS] LTP callback error: {e}")
@@ -2443,6 +2366,14 @@ class MainWindow(QMainWindow):
         if not self.current_mapping:
             self.log_message.emit("[ERROR] No symbol selected. Enter symbol first.")
             return
+
+        # S38: Debounce protection - prevent accidental double-click orders
+        import time as _time
+        now_ms = _time.time() * 1000
+        if now_ms - self._last_order_time < self._order_debounce_ms:
+            self.log_message.emit("[WARN] Order blocked - too fast (double-click protection)")
+            return
+        self._last_order_time = now_ms
 
         try:
             price_text = self.price_input.text().strip()
@@ -3167,7 +3098,8 @@ class MainWindow(QMainWindow):
                         # Store initial LTP in cache
                         ltp = quote.get('last_price')
                         if ltp is not None:
-                            self._ltp_cache[str(kite_token)] = ltp
+                            with self._ltp_lock:
+                                self._ltp_cache[str(kite_token)] = ltp
 
                         tokens_to_subscribe.append(kite_token)
 
@@ -3206,9 +3138,10 @@ class MainWindow(QMainWindow):
                     symbol = _get_position_symbol(pos)
                     qty = _get_position_qty(pos)
                     if qty != 0 and symbol:
-                        # Try WebSocket cache first
+                        # Try WebSocket cache first (S38: thread-safe read)
                         kite_token = self._symbol_to_kite_token.get(symbol)
-                        cached_ltp = self._ltp_cache.get(str(kite_token)) if kite_token else None
+                        with self._ltp_lock:
+                            cached_ltp = self._ltp_cache.get(str(kite_token)) if kite_token else None
 
                         if cached_ltp is not None:
                             pos['ltp'] = cached_ltp
@@ -3227,6 +3160,16 @@ class MainWindow(QMainWindow):
                             except Exception:
                                 pass
 
+            # Take a single snapshot for the entire sync cycle (prevents TOCTOU between guard and loop)
+            snapshot = self.pos_tracker.get_all_positions_snapshot()
+
+            # CRITICAL: If broker returned no positions at all but we have tracked positions,
+            # this is likely an API failure (returns [] on exception). Skip entire refresh —
+            # do NOT update UI cache, emit P&L=0, or increment absent counts.
+            if len(snapshot) > 0 and not positions:
+                self.log_message.emit("[SYNC] Broker returned empty positions — skipping refresh (possible API failure)")
+                return
+
             self._positions_cache = positions
             self.position_updated.emit(positions)
 
@@ -3239,16 +3182,35 @@ class MainWindow(QMainWindow):
                 if qty != 0:  # Only active positions
                     broker_symbols.add(symbol)
 
-            # Find tracked entry_order_ids whose symbol is no longer at broker
-            # (keyed by entry_order_id, but we check pos.symbol)
-            # Use snapshot for thread safety
-            closed_entry_ids = []
-            for entry_id, pos in self.pos_tracker.get_all_positions_snapshot().items():
+            # Strike-count confirmation: require N consecutive absences before cleanup
+            # to guard against transient broker API glitches leaving positions naked
+            confirmed_closed = []
+            for entry_id, pos in snapshot.items():
                 if pos.symbol not in broker_symbols:
-                    closed_entry_ids.append((entry_id, pos.symbol))
+                    self._position_absent_count[entry_id] = self._position_absent_count.get(entry_id, 0) + 1
+                    count = self._position_absent_count[entry_id]
+                    if count < self._orphan_cleanup_threshold:
+                        # Log first and last pre-cleanup checks (avoid spam at 1s interval)
+                        if count == 1 or count == self._orphan_cleanup_threshold - 1:
+                            self.log_message.emit(
+                                f"[SYNC] Position missing from broker ({count}/{self._orphan_cleanup_threshold}): "
+                                f"{pos.symbol} (entry={entry_id[-6:]})"
+                            )
+                    else:
+                        confirmed_closed.append((entry_id, pos.symbol))
+                else:
+                    # Position reappeared — reset counter
+                    if entry_id in self._position_absent_count:
+                        prev = self._position_absent_count.pop(entry_id)
+                        if prev > 0:
+                            self.log_message.emit(
+                                f"[SYNC] Position reappeared at broker after {prev} absent checks: "
+                                f"{pos.symbol} (entry={entry_id[-6:]})"
+                            )
 
-            # Cleanup closed positions - cancel any orphan orders
-            for entry_id, symbol in closed_entry_ids:
+            # Cleanup confirmed-closed positions - cancel any orphan orders
+            for entry_id, symbol in confirmed_closed:
+                self._position_absent_count.pop(entry_id, None)
                 self.log_message.emit(f"[SYNC] Position closed: {symbol} (entry={entry_id[-6:]}) - cleaning up orders")
 
                 # Remove from trail manager FIRST (before position is removed)
@@ -3266,6 +3228,11 @@ class MainWindow(QMainWindow):
                     self.log_message.emit(f"[SYNC] Cancelled orphan SL: {cancelled['sl_cancelled']}")
                 if cancelled.get('target_cancelled'):
                     self.log_message.emit(f"[SYNC] Cancelled orphan Target: {cancelled['target_cancelled']}")
+
+            # Cleanup absent counts for entries no longer tracked (prevents unbounded growth)
+            stale_absent = [eid for eid in self._position_absent_count if eid not in snapshot]
+            for eid in stale_absent:
+                del self._position_absent_count[eid]
 
             # Cleanup _trail_debounce for symbols no longer in positions (prevents unbounded growth)
             stale_symbols = [s for s in self._trail_debounce if s not in broker_symbols]
@@ -4108,6 +4075,21 @@ class MainWindow(QMainWindow):
                     self.sound.play('order_placed')
             else:
                 self.log_message.emit(f"[TRAIL] {symbol}: Failed - {result.get('error', 'Unknown')}")
+
+    def _is_text_input_focused(self) -> bool:
+        """S38: Check if any text input widget has keyboard focus."""
+        focused = QApplication.focusWidget()
+        return isinstance(focused, (QLineEdit, QTextEdit, QSpinBox, QComboBox))
+
+    def _trail_shortcut_handler(self):
+        """S38: Trail to cost - only if no text input has focus."""
+        if not self._is_text_input_focused():
+            self._trail_selected_to_cost()
+
+    def _trail_shift_shortcut_handler(self):
+        """S38: Trail +10 - only if no text input has focus."""
+        if not self._is_text_input_focused():
+            self._trail_selected_plus(10)
 
     def _trail_selected_to_cost(self):
         """Trail selected position to cost."""
@@ -5334,15 +5316,7 @@ class MainWindow(QMainWindow):
 
                     # Register with trail manager
                     if self.trail_mgr:
-                        # Try multiple field names that NEO API might use for instrument token
-                        inst_token = str(
-                            pos.get('pSymbol', '') or
-                            pos.get('instrument_token', '') or
-                            pos.get('token', '') or
-                            pos.get('tok', '') or
-                            pos.get('instToken', '') or
-                            ''
-                        )
+                        inst_token = broker_utils.get_token(pos)
                         # Fallback: lookup from symbol_mapper if we have the symbol
                         # S17-L1: mapper always initialized in __init__
                         if not inst_token and self.mapper:
@@ -5390,14 +5364,7 @@ class MainWindow(QMainWindow):
 
                     # Still add to trail manager for BE button to work (without SL order)
                     if self.trail_mgr:
-                        inst_token = str(
-                            pos.get('pSymbol', '') or
-                            pos.get('instrument_token', '') or
-                            pos.get('token', '') or
-                            pos.get('tok', '') or
-                            pos.get('instToken', '') or
-                            ''
-                        )
+                        inst_token = broker_utils.get_token(pos)
                         # S17-L1: mapper always initialized in __init__
                         if not inst_token and self.mapper:
                             try:
@@ -5577,13 +5544,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close - graceful shutdown of all background components."""
-        # Stop timers
+        # Stop ALL timers (S38: added alert_timer, index_timer, st_timer, _symbol_debounce_timer)
         self.position_timer.stop()
         self.time_timer.stop()
         self.margin_timer.stop()
         self.orders_timer.stop()
-        # quote_timer always created in setup_timers()
         self.quote_timer.stop()
+        self.alert_timer.stop()
+        self.index_timer.stop()
+        self.st_timer.stop()
+        if hasattr(self, '_symbol_debounce_timer'):
+            self._symbol_debounce_timer.stop()
 
         # Stop trail manager
         if self.trail_mgr:

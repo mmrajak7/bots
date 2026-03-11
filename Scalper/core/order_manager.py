@@ -15,6 +15,7 @@ import math
 
 from core.tick_utils import calculate_sl_limit_price, round_to_tick_str, round_trigger_price, format_price
 from core.order_tracker import OrderTracker, OrderType, get_order_tracker, TrackedOrder
+from core import broker_utils
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,15 @@ class OrderManager:
         self.max_loss_per_day = risk_config.get('max_loss_per_day', 10000)
         self.max_open_positions = risk_config.get('max_open_positions', 5)
         self.duplicate_window = risk_config.get('duplicate_order_window_sec', 5)
+        # S37: Fat finger protection - max lots per single order
+        self.max_lots_per_order = risk_config.get('max_lots_per_order', 20)
+        self.max_order_value = risk_config.get('max_order_value', 500000)  # INR 5 lakh
+
+        # S37: Log active risk parameters on startup for trader verification
+        logger.info(f"[RISK] Daily loss limit: INR {self.max_loss_per_day}")
+        logger.info(f"[RISK] Max open positions: {self.max_open_positions}")
+        logger.info(f"[RISK] Max lots per order: {self.max_lots_per_order}")
+        logger.info(f"[RISK] Max order value: INR {self.max_order_value}")
 
         # Trading defaults
         trading_defaults = config.get('trading_defaults', {})
@@ -267,7 +277,9 @@ class OrderManager:
             OrderResult with success status and order ID
         """
         # Safety Check 1: Trading halt check
-        if self._trading_halted:
+        # S37: EXIT orders MUST bypass trading halt - cannot lock trader into losing positions
+        is_exit_order = (params.tag == 'EXIT')
+        if self._trading_halted and not is_exit_order:
             return OrderResult(
                 success=False,
                 message="Trading halted - Daily loss limit reached"
@@ -306,7 +318,14 @@ class OrderManager:
                 message="Daily loss limit reached - trading halted"
             )
 
-        # Safety Check 6: Margin check (configurable)
+        # Safety Check 6: Fat finger protection (S37)
+        if not is_exit_order and self._check_fat_finger(params):
+            return OrderResult(
+                success=False,
+                message=f"Fat finger protection: qty={params.quantity} exceeds max_lots_per_order={self.max_lots_per_order}"
+            )
+
+        # Safety Check 7: Margin check (configurable)
         margin_check = self._check_margin_for_order(params)
         if margin_check.get('block'):
             return OrderResult(
@@ -745,6 +764,19 @@ class OrderManager:
                 message=f"Cancellation failed: {str(e)}"
             )
 
+    def _get_lot_size_for_position(self, position: Dict[str, Any]) -> int:
+        """S37: Get lot size for a position (for partial exit alignment)."""
+        try:
+            if self.mapper:
+                symbol = broker_utils.get_symbol(position)
+                lot_size = self.mapper.get_lot_size(symbol)
+                if lot_size and lot_size > 0:
+                    return lot_size
+        except Exception:
+            pass
+        # Fallback: try to infer from total qty (common lot sizes)
+        return 1  # Default - no alignment needed
+
     def exit_position(self, position: Dict[str, Any], exit_qty_percent: int = 100) -> OrderResult:
         """
         Exit a position by placing opposite order.
@@ -756,22 +788,29 @@ class OrderManager:
         Returns:
             OrderResult
         """
-        # NEO API uses flBuyQty and flSellQty - calculate net position
-        # S35: Use int(float()) to handle string values like "150.5"
-        buy_qty = position.get('flBuyQty', position.get('buyQty', 0))
-        sell_qty = position.get('flSellQty', position.get('sellQty', 0))
-        try:
-            qty = int(float(buy_qty or 0)) - int(float(sell_qty or 0))
-        except (ValueError, TypeError):
-            try:
-                qty = int(float(position.get('qty', 0) or 0))
-            except (ValueError, TypeError):
-                qty = 0
-
+        qty = broker_utils.get_net_qty(position)
         if qty == 0:
             return OrderResult(success=False, message="No position to exit")
 
-        exit_qty = int(abs(qty) * exit_qty_percent / 100)
+        raw_exit_qty = int(abs(qty) * exit_qty_percent / 100)
+
+        # S37: Align exit quantity to lot size for options
+        # Options must be traded in multiples of lot size
+        exchange_seg = broker_utils.get_exchange(position)
+        if exchange_seg and exchange_seg.lower() in ('nse_fo', 'bse_fo', 'nfo', 'bfo'):
+            lot_size = self._get_lot_size_for_position(position)
+            if lot_size > 1 and raw_exit_qty > 0:
+                aligned_qty = (raw_exit_qty // lot_size) * lot_size
+                if aligned_qty == 0:
+                    # Can't exit less than 1 lot
+                    aligned_qty = lot_size if raw_exit_qty > 0 else 0
+                if aligned_qty > abs(qty):
+                    aligned_qty = abs(qty)
+                exit_qty = aligned_qty
+            else:
+                exit_qty = raw_exit_qty
+        else:
+            exit_qty = raw_exit_qty
 
         # S27: Validate exit_qty is positive
         if exit_qty <= 0:
@@ -783,18 +822,17 @@ class OrderManager:
         # Opposite transaction
         txn_type = 'S' if qty > 0 else 'B'
 
-        # NEO API uses 'trdSym' as primary key for trading symbol
-        symbol = position.get('trdSym', position.get('tradingSymbol', position.get('symbol', '')))
+        symbol = broker_utils.get_symbol(position)
         if not symbol:
             return OrderResult(success=False, message="REJECTED: please provide valid symbol")
 
         params = OrderParams(
             symbol=symbol,
-            exchange_segment=position.get('exchange_segment', position.get('exchangeSegment', position.get('exSeg', 'nse_fo'))),
-            instrument_token=str(position.get('instrument_token', position.get('token', position.get('tok', '')))),
+            exchange_segment=broker_utils.get_exchange(position),
+            instrument_token=broker_utils.get_token(position),
             transaction_type=txn_type,
             quantity=exit_qty,
-            product=position.get('product', position.get('prd', self.default_product)),
+            product=broker_utils.get_product(position, self.default_product),
             order_type='MKT',  # Market order for quick exit
             tag='EXIT'
         )
@@ -818,13 +856,9 @@ class OrderManager:
         results = []
 
         for pos in positions:
-            # S35: Safe int conversion - handle "150.0" strings and None
-            try:
-                qty = int(float(pos.get('qty', 0) or 0))
-            except (ValueError, TypeError):
-                qty = 0
+            qty = broker_utils.get_net_qty(pos)
             if qty != 0:
-                symbol = pos.get('trdSym', pos.get('tradingSymbol', pos.get('symbol', '')))
+                symbol = broker_utils.get_symbol(pos)
                 try:
                     result = self.exit_position(pos)
                     results.append({
@@ -946,16 +980,17 @@ class OrderManager:
         Returns:
             Dict with SL and Target order IDs
         """
-        qty = abs(int(float(position.get('qty', 0) or 0)))
+        pos_qty = broker_utils.get_net_qty(position)
+        qty = abs(pos_qty)
         if qty == 0:
             return {'success': False, 'error': 'No position quantity'}
 
-        pos_qty = int(float(position.get('qty', 0) or 0))
         is_long = pos_qty > 0
         exit_type = 'S' if is_long else 'B'
 
-        entry_price = float(position.get('averagePrice', position.get('avgPrc', 0)) or 0)
-        ltp = float(position.get('ltp', position.get('lastPrice', entry_price)) or entry_price)
+        entry_price = broker_utils.get_avg_price(position)
+        ltp_val = broker_utils.get_ltp(position)
+        ltp = ltp_val if ltp_val > 0 else entry_price
 
         result = {'sl_order_id': None, 'target_order_id': None}
 
@@ -976,13 +1011,12 @@ class OrderManager:
                 logger.warning(f"Target validation failed: {target_validation['error']}")
                 # Continue with SL placement even if target is invalid
 
-        # NEO API uses 'trdSym' for trading symbol
-        trading_symbol = position.get('trdSym', position.get('tradingSymbol', position.get('symbol', '')))
+        trading_symbol = broker_utils.get_symbol(position)
 
         # Place SL order with retry logic
         sl_result = self._place_sl_with_retry(
-            exchange_segment=position.get('exchange_segment', position.get('exSeg', 'nse_fo')),
-            product=position.get('product', position.get('prd', self.default_product)),
+            exchange_segment=broker_utils.get_exchange(position),
+            product=broker_utils.get_product(position, self.default_product),
             quantity=qty,
             trading_symbol=trading_symbol,
             transaction_type=exit_type,
@@ -997,7 +1031,7 @@ class OrderManager:
         # Place Target order if provided and valid
         if target_price and 'target_error' not in result:
             try:
-                exchange_seg = position.get('exchange_segment', position.get('exSeg', 'nse_fo'))
+                exchange_seg = broker_utils.get_exchange(position)
                 # CRITICAL: Format target price to tick size
                 formatted_target_price = format_price(target_price, exchange_seg)
 
@@ -1016,7 +1050,7 @@ class OrderManager:
 
                 target_response = self.client.place_order(
                     exchange_segment=exchange_seg,
-                    product=position.get('product', position.get('prd', self.default_product)),
+                    product=broker_utils.get_product(position, self.default_product),
                     price=formatted_target_price,
                     order_type="L",
                     quantity=str(qty),
@@ -1127,6 +1161,27 @@ class OrderManager:
         except Exception as e:
             logger.warning(f"Failed to get available margin: {e}")
             return None
+
+    def _check_fat_finger(self, params: OrderParams) -> bool:
+        """S37: Fat finger protection - reject obviously oversized orders."""
+        try:
+            # Check lot count (for F&O)
+            if self.mapper and params.exchange_segment.lower() in ('nse_fo', 'bse_fo', 'nfo', 'bfo'):
+                lot_size = self.mapper.get_lot_size(params.symbol)
+                if lot_size and lot_size > 0:
+                    lots = params.quantity / lot_size
+                    if lots > self.max_lots_per_order:
+                        logger.error(f"[FAT FINGER] Order blocked: {lots:.0f} lots > max {self.max_lots_per_order}")
+                        return True
+            # Check order value (for all segments)
+            if params.price and params.price > 0:
+                order_value = params.price * params.quantity
+                if order_value > self.max_order_value:
+                    logger.error(f"[FAT FINGER] Order blocked: value INR {order_value:.0f} > max {self.max_order_value}")
+                    return True
+        except Exception as e:
+            logger.warning(f"[FAT FINGER] Check failed (allowing order): {e}")
+        return False
 
     def _check_margin_for_order(self, params: OrderParams) -> Dict[str, Any]:
         """
@@ -1250,7 +1305,7 @@ class OrderManager:
         """Check if new order exceeds position limits."""
         try:
             positions = self.get_positions()
-            open_count = len([p for p in positions if int(float(p.get('qty', 0) or 0)) != 0])
+            open_count = len([p for p in positions if broker_utils.get_net_qty(p) != 0])
             return open_count < self.max_open_positions
         except Exception as e:
             # CRITICAL: Block trading if we can't verify position limits
@@ -1269,19 +1324,19 @@ class OrderManager:
         """
         try:
             positions = self.get_positions()
-            open_positions = [p for p in positions if int(float(p.get('qty', 0) or 0)) != 0]
+            open_positions = [p for p in positions if broker_utils.get_net_qty(p) != 0]
             open_count = len(open_positions)
 
             # Find if we have existing position in this symbol
             existing_pos = None
             for p in open_positions:
-                sym = p.get('tradingSymbol', p.get('symbol', ''))
+                sym = broker_utils.get_symbol(p)
                 if sym == params.symbol:
                     existing_pos = p
                     break
 
             if existing_pos:
-                existing_qty = int(float(existing_pos.get('qty', 0) or 0))
+                existing_qty = broker_utils.get_net_qty(existing_pos)
                 is_existing_long = existing_qty > 0
 
                 # Check if this order is an exit (opposite direction)
@@ -1314,17 +1369,8 @@ class OrderManager:
             positions = self.get_positions()
             open_pnl = 0.0
             for pos in positions:
-                # S28: Fix P&L cascade - explicit None checks to handle break-even (0) correctly
-                pnl_value = pos.get('pnl')
-                if pnl_value is None:
-                    pnl_value = pos.get('dayPnl')
-                if pnl_value is None:
-                    pnl_value = pos.get('unrealizedPnl')
-                try:
-                    pnl = float(pnl_value) if pnl_value is not None else 0.0
-                except (ValueError, TypeError):
-                    pnl = 0.0
-                open_pnl += pnl
+                # S28/S37: Use get_raw_pnl — preserves 0 as valid (break-even)
+                open_pnl += broker_utils.get_raw_pnl(pos)
 
             # Part 2: Get realized P&L from today's closed trades
             realized_pnl = self._get_realized_pnl_today()
@@ -1369,8 +1415,13 @@ class OrderManager:
                 'date': datetime.now().strftime('%Y-%m-%d')
             }
 
-            with open(self._circuit_breaker_file, 'w') as f:
+            # S37: Atomic write to prevent corruption on crash
+            temp_file = self._circuit_breaker_file + '.tmp'
+            with open(temp_file, 'w') as f:
                 json.dump(state, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, self._circuit_breaker_file)
 
             logger.info(f"[CIRCUIT] State saved: halted={halted}, reason={reason}")
 
@@ -1425,12 +1476,10 @@ class OrderManager:
             realized_pnl = 0.0
             for pos in positions:
                 # Look for closed positions (qty = 0 but had trades)
-                qty = int(float(pos.get('qty', 0) or 0))
+                qty = broker_utils.get_net_qty(pos)
                 if qty == 0:
                     # Closed position - dayPnl is realized
-                    day_pnl = float(pos.get('dayPnl', 0) or
-                                   pos.get('pnl', 0) or
-                                   pos.get('realizedPnl', 0) or 0)
+                    day_pnl = broker_utils.get_pnl(pos)
                     realized_pnl += day_pnl
 
             return realized_pnl
@@ -1470,7 +1519,8 @@ class OrderManager:
 
     def force_halt_trading(self, reason: str = "Manual halt"):
         """Force halt trading immediately."""
-        self._trading_halted = True
+        # S37: Persist to disk so halt survives app restart
+        self._set_trading_halted(True, reason)
         logger.warning(f"Trading HALTED: {reason}")
 
     def resume_trading(self):

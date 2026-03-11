@@ -21,7 +21,8 @@ from PyQt6.QtGui import QPixmap, QFont
 
 def sync_from_pi():
     """Download latest Kite token files from Pi via Google Drive (async)."""
-    script_path = Path(r"C:\Users\mail2\Documents\Projects\BOTS\data\sync\src\gdrive_download.py")
+    # S38: Use relative path from project root instead of hardcoded absolute
+    script_path = Path(__file__).resolve().parent.parent / "data" / "sync" / "src" / "gdrive_download.py"
     if not script_path.exists():
         logging.debug(f"[SYNC] Sync script not found: {script_path}")
         return
@@ -165,6 +166,27 @@ def main():
             logger.warning("Credentials not configured")
 
         config = merge_configs(config, creds)
+
+        # S38: Validate critical config keys exist
+        missing_keys = []
+        neo_creds = config.get('neo_credentials', {})
+        if not neo_creds.get('consumer_key') or neo_creds['consumer_key'] == 'YOUR_CONSUMER_KEY':
+            missing_keys.append('neo_credentials.consumer_key')
+        if not neo_creds.get('totp_secret') or neo_creds['totp_secret'] == 'YOUR_TOTP_SECRET':
+            missing_keys.append('neo_credentials.totp_secret')
+        if not neo_creds.get('mobile_number'):
+            missing_keys.append('neo_credentials.mobile_number')
+        if not neo_creds.get('mpin'):
+            missing_keys.append('neo_credentials.mpin')
+
+        if missing_keys:
+            logger.warning(f"Missing/placeholder credentials: {', '.join(missing_keys)}")
+
+        # Validate trading config has reasonable defaults
+        trading_cfg = config.get('trading', {})
+        if not trading_cfg:
+            logger.warning("No 'trading' section in config - using defaults")
+            config['trading'] = {}
 
         # Import core modules
         from core.session_manager import SessionManager
@@ -348,6 +370,8 @@ def main():
         # Connect trail manager and OCO monitor to position tracker for race condition prevention
         if trail_mgr:
             trail_mgr.pos_tracker = window.pos_tracker
+            # S38: Wire oco_monitor so trail updates propagate SL prices
+            trail_mgr.oco_monitor = oco_monitor
         if oco_monitor:
             oco_monitor.set_position_tracker(window.pos_tracker)
             # Set LTP getter for target monitoring (avoids margin issues by not placing TARGET limit orders)
@@ -391,7 +415,10 @@ def main():
                         continue
 
                     positions_response = session.get_client().positions()
-                    broker_positions = positions_response.get('data', []) if positions_response else []
+                    if not positions_response or not isinstance(positions_response, dict):
+                        logger.warning("[RECONCILIATION] Broker positions() returned invalid response — skipping cycle")
+                        continue
+                    broker_positions = positions_response.get('data', []) or []
 
                     # Sync P&L tracker
                     if pnl_tracker:

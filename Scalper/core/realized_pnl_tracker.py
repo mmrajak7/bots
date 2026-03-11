@@ -10,6 +10,7 @@ We must track this ourselves to ensure accurate daily loss circuit breaker.
 
 import threading
 from typing import Dict, Optional, Any, List
+from core import broker_utils
 from dataclasses import dataclass, field
 from datetime import datetime, date
 import json
@@ -349,14 +350,14 @@ class RealizedPnLTracker:
         """
         with self._lock:
             for pos in broker_positions:
-                symbol = pos.get('tradingSymbol', pos.get('symbol', ''))
-                qty = int(float(pos.get('qty', 0) or 0))
+                symbol = broker_utils.get_symbol(pos)
+                qty = broker_utils.get_net_qty(pos)
 
                 if qty == 0:
                     continue
 
                 side = 'LONG' if qty > 0 else 'SHORT'
-                avg_price = float(pos.get('averagePrice', pos.get('avgPrc', 0)) or 0)
+                avg_price = broker_utils.get_avg_price(pos)
 
                 if symbol not in self.positions and avg_price > 0:
                     # Position exists at broker but not tracked - add it

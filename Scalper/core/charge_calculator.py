@@ -4,12 +4,13 @@ F&O Options Charge Calculator for NSE
 Calculates trading charges for round-trip (buy + sell) trades.
 Brokerage is zero (Kotak Neo API).
 
-Charge rates as per 2024:
-- Exchange Transaction Charge: 0.0355% on total turnover
-- STT (Securities Transaction Tax): 0.1% on sell side only
+Charge rates updated S37 (Feb 2026):
+- Exchange Transaction Charge: 0.03503% on total turnover (revised Oct 2024)
+- STT (Securities Transaction Tax): 0.1% on sell side (increases to 0.15% from Apr 2026)
 - Stamp Duty: 0.003% on buy side only
 - SEBI Charges: ₹10 per crore (0.0001%)
 - GST: 18% on (Exchange charges + SEBI charges)
+- IPFT: ₹50 per crore (0.0005%) -- included for accuracy
 """
 
 from dataclasses import dataclass
@@ -17,11 +18,12 @@ from typing import Optional
 
 
 # Charge rates (as percentages, multiply by 100 for display)
-EXCHANGE_TXN_RATE = 0.000355      # 0.0355%
-STT_RATE = 0.001                   # 0.1% on sell side
+EXCHANGE_TXN_RATE = 0.0003503     # 0.03503% (revised Oct 2024)
+STT_RATE = 0.001                   # 0.1% on sell side (TODO: update to 0.0015 from Apr 1, 2026)
 STAMP_DUTY_RATE = 0.00003          # 0.003% on buy side
 SEBI_RATE = 0.000001               # ₹10 per crore = 0.0001%
-GST_RATE = 0.18                    # 18% on (exchange + SEBI)
+IPFT_RATE = 0.000005               # ₹50 per crore = 0.0005%
+GST_RATE = 0.18                    # 18% on (exchange + SEBI + IPFT)
 
 
 @dataclass
@@ -65,12 +67,13 @@ def calculate_charges(
     stt = sell_turnover * STT_RATE  # STT only on sell side
     stamp_duty = buy_turnover * STAMP_DUTY_RATE  # Stamp only on buy side
     sebi = total_turnover * SEBI_RATE
+    ipft = total_turnover * IPFT_RATE
 
-    # GST on exchange charges + SEBI (not on STT/stamp duty)
-    gst = (exchange_txn + sebi) * GST_RATE
+    # GST on exchange charges + SEBI + IPFT (not on STT/stamp duty)
+    gst = (exchange_txn + sebi + ipft) * GST_RATE
 
     # Total charges
-    total = exchange_txn + stt + stamp_duty + sebi + gst
+    total = exchange_txn + stt + stamp_duty + sebi + ipft + gst
 
     # Breakeven points = charges / quantity
     breakeven_points = total / quantity if quantity > 0 else 0

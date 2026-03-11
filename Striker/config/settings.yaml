@@ -1,0 +1,57 @@
+# Striker CLI - Configuration
+# ============================================
+# SHARED RESOURCES WITH SCALPER:
+# - credentials.yaml (API keys from ../Scalper/config/)
+# - session.json (NEO session from ../Scalper/data/)
+# - kite_access_token.json (Kite token from ../data/)
+#
+# Both Scalper and Striker share the same session to avoid
+# creating multiple API logins.
+# ============================================
+
+# Default trading preferences
+trading:
+  default_lots: 1
+  product: "MIS"               # MIS for intraday
+  default_width_multiplier: 2  # Strike width = gap * multiplier
+
+# Expiry preferences
+expiry:
+  # Weekly expiry for these indices (more liquid)
+  weekly_indices: ["NIFTY", "SENSEX"]
+  # Monthly for stocks to avoid gamma risk
+  stock_min_dte: 3             # Minimum DTE for stock options
+
+# Strategy defaults
+strategies:
+  iron_condor:
+    otm_strikes: 2             # Strikes OTM for short legs
+    wing_width: 1              # Wing width in strikes
+  strangle:
+    otm_strikes: 2
+  spread:
+    default_width: 2           # Strikes wide
+
+# Risk management
+risk:
+  max_loss_per_trade: 5000     # Max loss per strategy
+  warn_unlimited_risk: true    # Warn for unlimited risk strategies
+  daily_loss_limit: 10000      # Session loss limit (0 to disable)
+
+# Liquidity thresholds
+liquidity:
+  min_oi: 1000                 # Minimum OI for trading
+  min_volume: 100              # Minimum volume
+  max_spread_pct: 5            # Max bid-ask spread %
+  warn_illiquid: true          # Show liquidity warnings
+
+# Paths (relative to Scalper)
+paths:
+  scalper_config: "../Scalper/config"
+  kite_token: "../data/kite_access_token.json"
+
+# Display
+display:
+  color_enabled: true
+  show_greeks: true            # Show delta, theta
+  show_bid_ask: true           # Show bid-ask spread
