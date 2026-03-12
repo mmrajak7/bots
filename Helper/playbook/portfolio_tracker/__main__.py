@@ -12,10 +12,29 @@ from playbook.portfolio_tracker.decision_store import get_decision_store
 from playbook.portfolio_tracker.journal import get_journal
 
 
+# Account shortcuts for convenience
+ACCOUNT_ALIASES = {
+    'investment': 'QSK814',
+    'inv': 'QSK814',
+    'holdings': 'QSK814',
+    'options': 'YL6478',
+    'opt': 'YL6478',
+    'trading': 'YL6478',
+}
+
+
+def _resolve_account(account_str):
+    """Resolve account alias or ID."""
+    if not account_str:
+        return None
+    return ACCOUNT_ALIASES.get(account_str.lower(), account_str.upper())
+
+
 def cmd_list(args):
     """List decisions."""
     store = get_decision_store()
-    store.list_decisions(status_filter=args.status)
+    account = _resolve_account(args.account)
+    store.list_decisions(status_filter=args.status, account_id=account)
 
 
 def cmd_add(args):
@@ -30,6 +49,17 @@ def cmd_add(args):
         'thesis': args.thesis,
     }
 
+    account = _resolve_account(args.account)
+    if account:
+        data['account_id'] = account
+        # Resolve account name from config
+        cfg_path = Path(__file__).resolve().parent.parent.parent / 'config' / 'portfolio_config.json'
+        if cfg_path.exists():
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            acct_cfg = cfg.get('accounts', {}).get(account, {})
+            data['account_name'] = acct_cfg.get('name', account)
+
     if args.entry_price:
         data['entry_price'] = args.entry_price
     if args.target:
@@ -38,9 +68,10 @@ def cmd_add(args):
         data['stop_loss'] = args.sl
 
     decision = store.add_decision(data)
-    print("Decision #%d saved: %s %s (score: %.1f)" % (
+    acct_label = f" [{data.get('account_name', account)}]" if account else ""
+    print("Decision #%d saved: %s %s (score: %.1f)%s" % (
         decision['id'], decision['verdict'], decision['symbol'],
-        decision['composite_score']
+        decision['composite_score'], acct_label
     ))
 
 
@@ -104,7 +135,8 @@ def cmd_journal(args):
     """Show journal entries."""
     journal = get_journal()
     if args.symbol:
-        entries = journal.search(symbol=args.symbol)
+        account = _resolve_account(args.account)
+        entries = journal.search(symbol=args.symbol, account_id=account)
         for e in entries:
             print(f"[{e.get('date')}] {e.get('type')}: {e.get('summary')}")
     else:
@@ -115,13 +147,17 @@ def cmd_journal_add(args):
     """Add a journal entry."""
     journal = get_journal()
     symbols = [s.strip().upper() for s in args.symbols.split(',')] if args.symbols else []
-    entry = journal.add_entry({
+    data = {
         'type': args.type or 'analysis',
         'symbols': symbols,
         'summary': args.summary,
         'details': args.details or '',
         'tags': [t.strip() for t in args.tags.split(',')] if args.tags else [],
-    })
+    }
+    account = _resolve_account(args.account)
+    if account:
+        data['account_id'] = account
+    entry = journal.add_entry(data)
     print("Journal #%d saved: %s" % (entry['id'], entry['summary'][:50]))
 
 
@@ -131,7 +167,36 @@ def cmd_json(args):
     decisions = store.load_decisions()
     if args.status:
         decisions = [d for d in decisions if d.get('status') == args.status]
+    account = _resolve_account(args.account)
+    if account:
+        decisions = [d for d in decisions if d.get('account_id') == account]
     print(json.dumps(decisions, indent=2, default=str))
+
+
+def cmd_accounts(args):
+    """Show configured accounts."""
+    cfg_path = Path(__file__).resolve().parent.parent.parent / 'config' / 'portfolio_config.json'
+    if not cfg_path.exists():
+        print("No portfolio config found.")
+        return
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    accounts = cfg.get('accounts', {})
+    defaults = cfg.get('default_account', {})
+
+    print("\n  CONFIGURED ACCOUNTS")
+    print("=" * 60)
+    for acct_id, info in accounts.items():
+        is_default_holdings = '(default for holdings)' if defaults.get('holdings') == acct_id else ''
+        is_default_options = '(default for options)' if defaults.get('options') == acct_id else ''
+        default_tag = is_default_holdings or is_default_options
+        print(f"  {acct_id:<10} {info.get('name', 'N/A'):<25} {default_tag}")
+        print(f"             Purpose: {info.get('purpose', 'N/A')}")
+        print(f"             Strategies: {', '.join(info.get('strategies', []))}")
+        print()
+    print("  Aliases: investment/inv/holdings -> %s" % defaults.get('holdings', '?'))
+    print("           options/opt/trading -> %s" % defaults.get('options', '?'))
+    print("=" * 60)
 
 
 def main():
@@ -144,6 +209,7 @@ def main():
     # list
     p_list = sub.add_parser('list', help='List decisions')
     p_list.add_argument('--status', choices=['accepted', 'rejected', 'watching', 'exited'])
+    p_list.add_argument('--account', help='Account ID or alias (investment, options)')
 
     # add
     p_add = sub.add_parser('add', help='Add decision')
@@ -155,6 +221,7 @@ def main():
     p_add.add_argument('--target', type=float)
     p_add.add_argument('--sl', type=float)
     p_add.add_argument('--date')
+    p_add.add_argument('--account', help='Account ID or alias (investment, options)')
 
     # accept
     p_accept = sub.add_parser('accept', help='Accept decision')
@@ -176,10 +243,14 @@ def main():
     # scorecard
     sub.add_parser('scorecard', help='Decision scorecard')
 
+    # accounts
+    sub.add_parser('accounts', help='Show configured accounts')
+
     # journal
     p_journal = sub.add_parser('journal', help='Show journal')
     p_journal.add_argument('--symbol')
     p_journal.add_argument('--limit', type=int, default=20)
+    p_journal.add_argument('--account', help='Account ID or alias')
 
     # journal-add
     p_jadd = sub.add_parser('journal-add', help='Add journal entry')
@@ -188,10 +259,12 @@ def main():
     p_jadd.add_argument('--type', default='analysis')
     p_jadd.add_argument('--details')
     p_jadd.add_argument('--tags')
+    p_jadd.add_argument('--account', help='Account ID or alias')
 
     # json
     p_json = sub.add_parser('json', help='Export as JSON')
     p_json.add_argument('--status')
+    p_json.add_argument('--account', help='Account ID or alias')
 
     args = parser.parse_args()
 
@@ -206,6 +279,7 @@ def main():
         'reject': cmd_reject,
         'exit': cmd_exit,
         'scorecard': cmd_scorecard,
+        'accounts': cmd_accounts,
         'journal': cmd_journal,
         'journal-add': cmd_journal_add,
         'json': cmd_json,

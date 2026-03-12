@@ -238,11 +238,15 @@ class DecisionStore:
             raise
 
     def _migrate_decisions(self):
-        """Backfill version field on legacy entries."""
+        """Backfill version and account_id fields on legacy entries."""
         changed = False
         for d in self._decisions:
             if 'version' not in d:
                 d['version'] = 1
+                changed = True
+            if 'account_id' not in d:
+                d['account_id'] = None
+                d['account_name'] = None
                 changed = True
         if changed:
             self._save_local()
@@ -271,6 +275,16 @@ class DecisionStore:
     def get_by_verdict(self, verdict: str) -> list:
         """All decisions with given verdict."""
         return [d for d in self._decisions if d.get('verdict') == verdict.upper()]
+
+    def get_by_account(self, account_id: str) -> list:
+        """All decisions for a specific account."""
+        return [d for d in self._decisions if d.get('account_id') == account_id]
+
+    def get_active_by_account(self, account_id: str) -> list:
+        """Active decisions (accepted/watching) for a specific account."""
+        return [d for d in self._decisions
+                if d.get('account_id') == account_id
+                and d.get('status') in ('accepted', 'watching')]
 
     def find_decision(self, decision_id: int) -> Optional[dict]:
         """Find decision by ID."""
@@ -314,6 +328,8 @@ class DecisionStore:
         data['id'] = self.next_id()
         data['version'] = 1
         data['symbol'] = data['symbol'].upper().strip()
+        data.setdefault('account_id', None)  # e.g. "YL6478" or "QSK814"
+        data.setdefault('account_name', None)  # e.g. "Investment Portfolio"
         data.setdefault('status', 'watching')
         data.setdefault('scores', {})
         data.setdefault('entry_price', None)
@@ -531,11 +547,13 @@ class DecisionStore:
 
     # ── Display ───────────────────────────────────────────────────────────
 
-    def list_decisions(self, status_filter: str = None, limit: int = 50):
+    def list_decisions(self, status_filter: str = None, account_id: str = None, limit: int = 50):
         """Print formatted table of decisions."""
         decisions = self._decisions
         if status_filter:
             decisions = [d for d in decisions if d.get('status') == status_filter]
+        if account_id:
+            decisions = [d for d in decisions if d.get('account_id') == account_id]
 
         if not decisions:
             print("No decisions found.")
@@ -543,10 +561,16 @@ class DecisionStore:
 
         decisions = decisions[-limit:]  # Most recent
 
+        if account_id:
+            # Resolve account name from config
+            cfg = self._config.get('accounts', {})
+            acct_name = cfg.get(account_id, {}).get('name', account_id)
+            print(f"\n  Account: {acct_name} ({account_id})")
+
         print(f"\n{'ID':>3}  {'Symbol':<12} {'Verdict':<6} {'Status':<10} "
               f"{'Score':>6} {'Entry':>8} {'Current':>8} {'P&L%':>7} "
-              f"{'Date':<12}")
-        print("-" * 95)
+              f"{'Date':<12} {'Acct':<8}")
+        print("-" * 103)
 
         for d in decisions:
             pnl = d.get('pnl_pct')
@@ -556,11 +580,12 @@ class DecisionStore:
             curr = d.get('current_price')
             curr_str = f"{curr:.1f}" if curr else "N/A"
 
+            acct = d.get('account_id', '-') or '-'
             print(f"{d['id']:>3}  {d['symbol']:<12} {d['verdict']:<6} "
                   f"{d.get('status', '?'):<10} "
                   f"{d['composite_score']:>6.1f} {entry_str:>8} "
                   f"{curr_str:>8} {pnl_str:>7} "
-                  f"{d['decision_date']:<12}")
+                  f"{d['decision_date']:<12} {acct:<8}")
 
         # Summary
         scorecard = self.get_scorecard()

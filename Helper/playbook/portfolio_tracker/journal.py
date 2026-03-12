@@ -180,6 +180,7 @@ class InvestmentJournal:
         data['version'] = 1
         data.setdefault('date', datetime.now().strftime('%Y-%m-%d'))
         data.setdefault('type', 'analysis')  # analysis, trade, review, research, decision
+        data.setdefault('account_id', None)  # e.g. "QSK814" or "YL6478"
         data.setdefault('symbols', [])
         data.setdefault('decision_ids', [])
         data.setdefault('details', '')
@@ -220,10 +221,12 @@ class InvestmentJournal:
     # ── Queries ───────────────────────────────────────────────────────────
 
     def search(self, symbol: str = None, tag: str = None,
-               entry_type: str = None,
+               entry_type: str = None, account_id: str = None,
                date_from: str = None, date_to: str = None) -> list:
         """Search journal entries."""
         results = self._entries
+        if account_id:
+            results = [e for e in results if e.get('account_id') == account_id]
         if symbol:
             s = symbol.upper()
             results = [e for e in results if s in [x.upper() for x in e.get('symbols', [])]]

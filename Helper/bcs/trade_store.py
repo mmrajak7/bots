@@ -397,6 +397,7 @@ class TradeStore:
         # Assign metadata
         trade_dict['id'] = self.next_trade_id()
         trade_dict['version'] = 1
+        trade_dict.setdefault('account_id', None)  # e.g. "YL6478"
         trade_dict.setdefault('status', 'open')
         trade_dict.setdefault('exit', None)
 

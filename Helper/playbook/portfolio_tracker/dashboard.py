@@ -50,7 +50,8 @@ def generate_dashboard(holdings: list,
                        bcs_trades: list = None,
                        fh_trades: list = None,
                        watchlist: list = None,
-                       config: dict = None) -> dict:
+                       config: dict = None,
+                       account_id: str = None) -> dict:
     """Generate portfolio dashboard from pre-fetched data.
 
     Args:
@@ -62,6 +63,7 @@ def generate_dashboard(holdings: list,
         fh_trades: List of Fallen Hero trades (open only).
         watchlist: List of active watchlist items.
         config: Portfolio config dict.
+        account_id: Filter to specific account (e.g. "QSK814").
 
     Returns:
         Dashboard dict with summary, tier allocation, enriched holdings,
@@ -72,6 +74,11 @@ def generate_dashboard(holdings: list,
     bcs_trades = bcs_trades or []
     fh_trades = fh_trades or []
     watchlist = watchlist or []
+
+    # Filter decisions by account if specified
+    if account_id:
+        decisions = [d for d in decisions
+                     if d.get('account_id') == account_id or d.get('account_id') is None]
 
     # Build decision lookup by symbol
     decision_by_symbol = {}
@@ -213,8 +220,19 @@ def generate_dashboard(holdings: list,
     # Active watchlist
     active_alerts = [w for w in watchlist if w.get('status') == 'watching']
 
+    # Resolve account metadata
+    acct_info = {}
+    if account_id:
+        accts = cfg.get('accounts', {})
+        acct_info = accts.get(account_id, {'name': account_id, 'user_id': account_id})
+
     return {
         'generated_at': datetime.now().isoformat(),
+        'account': {
+            'id': account_id,
+            'name': acct_info.get('name', 'All Accounts'),
+            'purpose': acct_info.get('purpose', ''),
+        },
         'portfolio_summary': {
             'total_value': round(total_value, 2),
             'total_invested': round(total_invested, 2),
@@ -246,8 +264,13 @@ def format_dashboard_terminal(dashboard: dict) -> str:
     lines = []
     hr = "=" * 80
 
+    acct = dashboard.get('account', {})
+    acct_label = acct.get('name', 'All Accounts')
+    if acct.get('id'):
+        acct_label += f" ({acct['id']})"
+
     lines.append(hr)
-    lines.append("  PORTFOLIO DASHBOARD")
+    lines.append(f"  PORTFOLIO DASHBOARD — {acct_label}")
     lines.append(hr)
 
     # Summary

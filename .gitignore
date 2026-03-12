@@ -101,6 +101,7 @@ desktop.ini
 *.tmp
 *.temp
 *.bak
+temp.txt
 
 # Token files
 *token*.txt
