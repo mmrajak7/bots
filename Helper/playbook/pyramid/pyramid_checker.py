@@ -1,7 +1,9 @@
-"""Pyramid month-end checker — update SLs, check level triggers, send alerts.
+"""Pyramid checker — month-end SL updates + daily breach detection + Telegram alerts.
 
-Monthly cadence, NOT integrated into spread_monitor's 5-second poll loop.
-Run manually or via monthly cron: python -m playbook.pyramid check
+Two modes:
+  - check:  Month-end (run 1st of each month). Updates SLs, flags level triggers.
+  - breach: Daily (cron every 5 min during market hours). Checks intraday low vs SL.
+            De-duplicated: alerts once per position per day, not every 5 minutes.
 """
 
 import json
@@ -15,6 +17,7 @@ from .pyramid_store import PyramidStore
 logger = logging.getLogger(__name__)
 
 BOTS_ROOT = Path(__file__).resolve().parents[2].parent  # BOTS/
+BREACH_ALERT_FILE = BOTS_ROOT / 'Helper' / 'logs' / 'pyramid_breach_alerts.json'
 
 
 def _default_log(msg: str):
@@ -178,13 +181,49 @@ def check_month_end(
         telegram_fn(msg)
 
 
+def _load_breach_alerts() -> dict:
+    """Load breach alert state: {position_id: last_alerted_date}."""
+    if not BREACH_ALERT_FILE.exists():
+        return {}
+    try:
+        with open(BREACH_ALERT_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_breach_alerts(state: dict):
+    """Save breach alert state atomically."""
+    BREACH_ALERT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = BREACH_ALERT_FILE.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
+        json.dump(state, f, indent=2)
+    tmp.replace(BREACH_ALERT_FILE)
+
+
+def _is_market_hours() -> bool:
+    """Check if within NSE trading hours (9:15 - 15:30 IST)."""
+    now = datetime.now().time()
+    from datetime import time as dt_time
+    return dt_time(9, 15) <= now < dt_time(15, 30)
+
+
 def check_sl_breaches(
     kite,
     store: PyramidStore,
     log_fn: Callable = _default_log,
     telegram_fn: Callable = _default_telegram,
 ):
-    """Check current price vs SL for all active positions. Send alerts on breach."""
+    """Check current price vs SL for all active positions. Send alerts on breach.
+
+    De-duplicated: each position is alerted at most once per calendar day.
+    Skips silently outside market hours (9:15-15:30 IST).
+    """
+    # Skip outside market hours
+    if not _is_market_hours():
+        log_fn("Outside market hours, skipping breach check.")
+        return
+
     active = store.get_active()
     if not active:
         log_fn("No active pyramid positions.")
@@ -201,6 +240,10 @@ def check_sl_breaches(
     except Exception as e:
         log_fn(f"OHLC fetch failed: {e}")
         return
+
+    # Load de-duplication state
+    alert_state = _load_breach_alerts()
+    today = datetime.now().strftime('%Y-%m-%d')
 
     breaches = []
     for pos in active:
@@ -219,6 +262,14 @@ def check_sl_breaches(
         check_price = day_low if day_low > 0 else price
 
         if check_price <= sl:
+            pos_key = str(pos['id'])
+
+            # De-duplicate: skip if already alerted today for this position
+            if alert_state.get(pos_key) == today:
+                log_fn(f"  SL BREACH #{pos['id']} {pos['symbol']}: "
+                       f"already alerted today, skipping Telegram")
+                continue
+
             breaches.append({
                 'symbol': pos['symbol'],
                 'id': pos['id'],
@@ -237,7 +288,7 @@ def check_sl_breaches(
                 store._find(b['id'])['total_quantity']
             ), 2)
             msg = (
-                f"PYRAMID SL BREACH\n"
+                f"🔴 PYRAMID SL BREACH\n"
                 f"{b['symbol']} #{b['id']}\n"
                 f"Day Low: {b['day_low']:.2f} <= SL: {b['sl']:.2f}\n"
                 f"LTP: {b['ltp']:.2f}\n"
@@ -247,6 +298,11 @@ def check_sl_breaches(
                 f"ACTION: EXIT immediately"
             )
             telegram_fn(msg)
+            # Mark as alerted today
+            alert_state[str(b['id'])] = today
+
+        # Persist de-duplication state
+        _save_breach_alerts(alert_state)
     else:
         log_fn("No SL breaches.")
 
