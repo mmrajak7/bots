@@ -126,7 +126,7 @@ def main():
         print(f"  {'-'*54}")
         if not st:
             print("  Insufficient data to compute Supertrend.")
-            return
+            continue
 
         for row in st[-8:]:
             dt = row['date'][:10]

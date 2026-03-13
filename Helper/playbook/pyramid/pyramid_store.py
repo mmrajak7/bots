@@ -416,6 +416,8 @@ class PyramidStore:
 
     def update_sl(self, position_id: int, new_sl: float) -> dict:
         """Manual SL override."""
+        if new_sl <= 0:
+            raise ValueError(f"SL must be positive, got {new_sl}")
         pos = self._find(position_id)
         if not pos:
             raise ValueError(f"Position #{position_id} not found")
@@ -435,6 +437,8 @@ class PyramidStore:
     def close_position(self, position_id: int, exit_price: float,
                        reason: str) -> dict:
         """Mark position as exited, compute realized P&L."""
+        if exit_price <= 0:
+            raise ValueError(f"Exit price must be positive, got {exit_price}")
         pos = self._find(position_id)
         if not pos:
             raise ValueError(f"Position #{position_id} not found")

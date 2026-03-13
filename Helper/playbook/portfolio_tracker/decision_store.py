@@ -503,7 +503,6 @@ class DecisionStore:
                 changed = True
 
         if changed:
-            self._version += 1
             self._save_local()
             self._upload_to_drive()
 
