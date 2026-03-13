@@ -562,7 +562,11 @@ class Orchestrator:
 
     def _cleanup_orphan_gtts(self) -> None:
         """
-        Cancel active GTTs that don't belong to any open position or pending order.
+        Cancel active GTTs that the bot created but are no longer needed.
+
+        Only cancels GTTs whose IDs exist in the bot's database (open_orders
+        or open_positions) but are NOT linked to any active position/order.
+        GTTs not in the database are NEVER touched — they may be user-placed.
 
         Orphan GTTs can occur when:
         - A position was closed manually but GTT wasn't cancelled
@@ -581,33 +585,32 @@ class Orchestrator:
                 logger.debug("No active GTTs found")
                 return
 
-            # Get all known GTT IDs from open positions and pending orders
             session = get_session()
             try:
+                # GTT IDs that SHOULD remain active (current positions + pending orders)
                 open_positions = session.query(OpenPosition).filter(
                     OpenPosition.status == PositionStatus.OPEN
                 ).all()
-                position_gtt_ids = {p.gtt_id for p in open_positions if p.gtt_id}
+                active_position_gtt_ids = {p.gtt_id for p in open_positions if p.gtt_id}
 
                 pending_orders = session.query(OpenOrder).filter(
                     OpenOrder.status == OrderStatus.PENDING
                 ).all()
-                order_gtt_ids = {o.gtt_id for o in pending_orders if o.gtt_id}
+                active_order_gtt_ids = {o.gtt_id for o in pending_orders if o.gtt_id}
 
-                known_gtt_ids = position_gtt_ids | order_gtt_ids
+                needed_gtt_ids = active_position_gtt_ids | active_order_gtt_ids
 
-                # Only touch GTTs for symbols currently active in the bot
-                bot_symbols = set()
-                bot_symbols.update(p.script for p in open_positions)
-                bot_symbols.update(o.script for o in pending_orders)
-                active_signals = session.query(SignalQueue.script).filter(
-                    SignalQueue.status.in_([
-                        SignalStatus.PENDING, SignalStatus.NOTIFIED,
-                        SignalStatus.APPROVED, SignalStatus.HOLD,
-                        SignalStatus.AWAITING_PRICE, SignalStatus.ENTERED
-                    ])
-                ).all()
-                bot_symbols.update(r[0] for r in active_signals)
+                # ALL GTT IDs ever created by the bot (all statuses)
+                # If a GTT ID is in DB, the bot created it. If not, it's user-placed.
+                all_position_gtt_ids = {
+                    p.gtt_id for p in session.query(OpenPosition).all()
+                    if p.gtt_id
+                }
+                all_order_gtt_ids = {
+                    o.gtt_id for o in session.query(OpenOrder).all()
+                    if o.gtt_id
+                }
+                bot_created_gtt_ids = all_position_gtt_ids | all_order_gtt_ids
 
                 orphan_count = 0
                 cancelled_details = []
@@ -615,26 +618,26 @@ class Orchestrator:
                     gtt_id = str(gtt.get('id', ''))
                     tradingsymbol = gtt.get('condition', {}).get('tradingsymbol', 'UNKNOWN')
 
-                    if gtt_id in known_gtt_ids:
+                    # Still needed — skip
+                    if gtt_id in needed_gtt_ids:
                         continue
 
-                    # Skip GTTs for symbols not currently managed by the bot
-                    if tradingsymbol not in bot_symbols:
+                    # Not created by the bot — NEVER touch
+                    if gtt_id not in bot_created_gtt_ids:
+                        logger.debug(
+                            f"Skipping GTT {gtt_id} for {tradingsymbol} "
+                            f"(not created by bot)"
+                        )
                         continue
 
-                    # Determine GTT type from order transaction_type
+                    # Bot created this GTT but it's no longer needed — orphan
                     orders = gtt.get('orders') or []
                     txn_type = orders[0].get('transaction_type', '') if orders else ''
-
-                    # Only cancel GTTs that look like they belong to FIFTY
-                    # (SELL = SL protection, BUY = entry order)
-                    if txn_type not in ('BUY', 'SELL'):
-                        continue
-
                     gtt_type = "SL" if txn_type == 'SELL' else "Entry"
+
                     logger.warning(
                         f"Orphan {gtt_type} GTT found: {gtt_id} for {tradingsymbol} "
-                        f"(not linked to any position or order)"
+                        f"(bot-created but no longer linked to active position/order)"
                     )
 
                     try:
