@@ -110,7 +110,7 @@ def cmd_exit(args):
             args.id, result['symbol'], args.price or 0
         ))
         if result.get('realized_pnl') is not None:
-            print("Realized P&L: Rs %+,.0f" % result['realized_pnl'])
+            print(f"Realized P&L: Rs {result['realized_pnl']:+,.0f}")
 
 
 def cmd_scorecard(args):

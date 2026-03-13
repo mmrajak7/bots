@@ -194,10 +194,21 @@ def cmd_status(args):
 
 
 def _init_kite():
-    """Initialize Kite client from shared token file."""
+    """Initialize Kite client from QSK814 (investment account) token.
+
+    Pyramid positions are in QSK814, whose token lives in BOTS/FIFTY/data/.
+    Falls back to BOTS/data/ (YL6478) if FIFTY token not found.
+    """
     try:
         from kiteconnect import KiteConnect
-        token_path = Path(__file__).resolve().parents[2].parent / 'data' / 'kite_access_token.json'
+        bots_root = Path(__file__).resolve().parents[2].parent  # BOTS/
+
+        # QSK814 token (investment account) — primary
+        token_path = bots_root / 'FIFTY' / 'data' / 'kite_access_token.json'
+        if not token_path.exists():
+            # Fallback to shared token (YL6478)
+            token_path = bots_root / 'data' / 'kite_access_token.json'
+
         if not token_path.exists():
             print(f"Token file not found: {token_path}")
             return None
@@ -205,6 +216,8 @@ def _init_kite():
             token_data = json.load(f)
         kite = KiteConnect(api_key=token_data['api_key'])
         kite.set_access_token(token_data['access_token'])
+        print(f"Kite initialized: {token_data.get('user_id', '?')} "
+              f"(from {token_path.parent.parent.name}/{token_path.parent.name})")
         return kite
     except Exception as e:
         print(f"Kite init error: {e}")

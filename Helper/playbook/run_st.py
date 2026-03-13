@@ -73,17 +73,39 @@ def print_supertrend(name, candles, timeframe, period=10, multiplier=3, last_n=1
 
 
 def main():
-    base = r"C:\Users\mail2\.claude\projects\C--Users-mail2-Documents-Projects-BOTS-Helper-playbook\38289d05-09a7-4ccd-87bf-c28c830bf67d\tool-results"
+    import argparse
+    parser = argparse.ArgumentParser(description="Run ST on saved Kite data files")
+    parser.add_argument('base_dir', nargs='?', help="Directory containing mcp-kite data files")
+    parser.add_argument('--names', nargs='+', help="Instrument names matching files (sorted order)")
+    cli_args = parser.parse_args()
+
+    if not cli_args.base_dir:
+        print("Usage: python run_st.py <data_dir> [--names NAME1 NAME2 ...]")
+        print("  data_dir: folder with mcp-kite*.json files from Kite MCP")
+        return
+
+    base = cli_args.base_dir
+    if not os.path.isdir(base):
+        print(f"Directory not found: {base}")
+        return
 
     # Map files to names (sorted by timestamp in filename)
     files = sorted([f for f in os.listdir(base) if f.startswith('mcp-kite')])
 
-    # Order from the parallel calls: MINDSPACE, EMBASSY, BIRET, NXST, PVTBANIETF, NIFTYBEES
-    names = ['MINDSPACE-RR', 'EMBASSY-RR', 'BIRET-RR', 'NXST-RR', 'PVTBANIETF', 'NIFTYBEES']
+    if not files:
+        print(f"No mcp-kite* files found in {base}")
+        return
+
+    if cli_args.names:
+        names = cli_args.names
+    else:
+        # Default: use filenames as labels
+        names = [os.path.splitext(f)[0] for f in files]
 
     if len(files) != len(names):
-        print(f"Expected {len(names)} files, found {len(files)}")
+        print(f"Expected {len(names)} names, found {len(files)} files")
         print("Files found:", files)
+        print("Provide --names with exactly one name per file")
         return
 
     for name, fname in zip(names, files):

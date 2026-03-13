@@ -344,19 +344,20 @@ def main():
                 all_results.append(result)
 
                 c = result['config']
-                flush_print(f"  {c['max_holdings']:>5} {c['per_stock_cap_pct']:>4.0f}% "
-                      f"{result['cagr_pct']['median']:>+7.1f}% "
-                      f"{result['cagr_pct']['p10']:>+7.1f}% "
-                      f"{result['cagr_pct']['p90']:>+7.1f}% "
-                      f"{result['max_drawdown_pct']['median']:>5.1f}% "
-                      f"{result['max_drawdown_pct']['p90']:>5.1f}% "
-                      f"{result['final_capital']['median']/100000:>9.1f}L "
-                      f"{result['final_capital']['p10']/100000:>9.1f}L "
-                      f"{result['final_capital']['p90']/100000:>9.1f}L "
-                      f"{result['profit_factor']['median']:>5.2f} "
-                      f"{result['rr_ratio']['median']:>4.1f} "
-                      f"{result['trades_per_sim']:>6.0f} " if 'trades_per_sim' in result else "",
-                      end="")
+                row = (f"  {c['max_holdings']:>5} {c['per_stock_cap_pct']:>4.0f}% "
+                       f"{result['cagr_pct']['median']:>+7.1f}% "
+                       f"{result['cagr_pct']['p10']:>+7.1f}% "
+                       f"{result['cagr_pct']['p90']:>+7.1f}% "
+                       f"{result['max_drawdown_pct']['median']:>5.1f}% "
+                       f"{result['max_drawdown_pct']['p90']:>5.1f}% "
+                       f"{result['final_capital']['median']/100000:>9.1f}L "
+                       f"{result['final_capital']['p10']/100000:>9.1f}L "
+                       f"{result['final_capital']['p90']/100000:>9.1f}L "
+                       f"{result['profit_factor']['median']:>5.2f} "
+                       f"{result['rr_ratio']['median']:>4.1f} ")
+                if 'trades_per_sim' in result:
+                    row += f"{result['trades_per_sim']:>6.0f} "
+                flush_print(row, end="")
                 # Get trade count from a sample run
                 sample = run_single_simulation(config, random.Random(42))
                 flush_print(f"{sample['total_trades']:>5} "

@@ -233,7 +233,7 @@ def check_sl_breaches(
 
     if breaches:
         for b in breaches:
-            pnl = round((b['price'] - b['avg_cost']) * (
+            pnl = round((b['ltp'] - b['avg_cost']) * (
                 store._find(b['id'])['total_quantity']
             ), 2)
             msg = (

@@ -124,6 +124,10 @@ def main():
         print(f"\n  Last 8 weeks:")
         print(f"  {'Date':<14} {'Close':>8} {'ST':>8} {'Dir':>5} {'ATR':>8} {'Gap%':>7}")
         print(f"  {'-'*54}")
+        if not st:
+            print("  Insufficient data to compute Supertrend.")
+            return
+
         for row in st[-8:]:
             dt = row['date'][:10]
             gap_pct = ((row['close'] - row['supertrend']) / row['supertrend']) * 100
