@@ -1,10 +1,10 @@
-"""CLI for pyramid position management.
+"""CLI for position management.
 
 Usage:
     python -m playbook.pyramid list
-    python -m playbook.pyramid add MARUTI --price 11000 --qty 27 --sector Auto --thesis "ST touch"
-    python -m playbook.pyramid fill 1 --level 2 --price 11880 --qty 25
+    python -m playbook.pyramid add MARUTI --price 11000 --qty 45 --sector Auto --thesis "ST touch"
     python -m playbook.pyramid check [--month YYYY-MM] [--force]
+    python -m playbook.pyramid breach
     python -m playbook.pyramid sl 1 --price 10500
     python -m playbook.pyramid close 1 --price 12000 --reason "SL hit"
     python -m playbook.pyramid status
@@ -35,59 +35,27 @@ def cmd_add(args):
         'price': args.price,
         'quantity': args.qty,
     }
-    if args.target_amount:
-        data['target_amount'] = args.target_amount
+    if args.sl:
+        data['touch_month_low'] = args.sl
     if args.account:
         data['account_id'] = args.account
     if args.decision_id:
         data['decision_id'] = args.decision_id
+    if args.entry_date:
+        data['entry_date'] = args.entry_date
 
     pos = store.add_position(data)
 
-    print(f"\nPyramid position #{pos['id']} created: {pos['symbol']}")
-    print(f"  Sector: {pos['sector']}")
-    print(f"  Target: Rs {pos['target_amount']:,.0f}")
-    print(f"  L1: FILLED @ {pos['levels'][0]['price']:.2f} x{pos['levels'][0]['quantity']} "
-          f"= Rs {pos['levels'][0]['amount']:,.0f}")
-
-    for lvl in pos['levels'][1:]:
-        trigger = (f"trigger={lvl['trigger_price']:.2f}"
-                   if lvl['trigger_price'] else
-                   f"+{lvl['trigger_pct']}% from prev fill")
-        print(f"  L{lvl['level']}: PENDING ({trigger}, budget Rs {lvl['amount']:,.0f})")
-
-    print(f"  Avg cost: {pos['avg_cost']:.2f}")
-    sl_display = "-" if pos['current_sl'] is None else f"{pos['current_sl']:.2f}"
-    print(f"  SL: {sl_display}")
-    print(f"  Thesis: {pos['thesis']}")
-
-
-def cmd_fill(args):
-    store = get_pyramid_store()
-    pos = store.fill_level(
-        args.id, args.level, args.price, args.qty,
-        date=args.date,
-    )
-
-    filled_lvl = pos['levels'][args.level - 1]
-    print(f"\nPyramid #{pos['id']} {pos['symbol']} - Level {args.level} FILLED")
-    print(f"  Price: {filled_lvl['price']:.2f} x{filled_lvl['quantity']} "
-          f"= Rs {filled_lvl['amount']:,.0f}")
-    print(f"  Total invested: Rs {pos['total_invested']:,.0f}")
-    print(f"  Total quantity: {pos['total_quantity']}")
-    print(f"  Avg cost: {pos['avg_cost']:.2f}")
-    sl_display = "-" if pos['current_sl'] is None else f"{pos['current_sl']:.2f}"
-    print(f"  SL: {sl_display}")
-    print(f"  Status: {pos['status']}")
-
-    # Show next pending level
-    for lvl in pos['levels']:
-        if lvl['status'] == 'pending':
-            trigger = (f"trigger={lvl['trigger_price']:.2f}"
-                       if lvl['trigger_price'] else
-                       f"+{lvl['trigger_pct']}% from prev fill")
-            print(f"  Next: L{lvl['level']} ({trigger}, budget Rs {lvl['amount']:,.0f})")
-            break
+    print(f"\nPosition #{pos['id']} created: {pos['symbol']}")
+    print(f"  Sector:  {pos['sector']}")
+    print(f"  Entry:   {pos['entry_price']:.2f} x {pos['entry_quantity']} "
+          f"= Rs {pos['entry_amount']:,.0f}")
+    sl_display = f"{pos['current_sl']:.2f}" if pos['current_sl'] else "-"
+    print(f"  SL:      {sl_display}")
+    print(f"  Thesis:  {pos['thesis']}")
+    if not args.sl:
+        print(f"  WARNING: No initial SL set. Position unprotected until "
+              f"first month-end check (`python -m playbook.pyramid check`).")
 
 
 def cmd_check(args):
@@ -95,7 +63,6 @@ def cmd_check(args):
 
     store = get_pyramid_store()
 
-    # Initialize Kite
     kite = _init_kite()
     if not kite:
         print("ERROR: Could not initialize Kite. Check token.")
@@ -126,30 +93,30 @@ def cmd_breach(args):
 def cmd_sl(args):
     store = get_pyramid_store()
     pos = store.update_sl(args.id, args.price)
-    print(f"Pyramid #{pos['id']} {pos['symbol']}: SL set to {pos['current_sl']:.2f}")
+    print(f"Position #{pos['id']} {pos['symbol']}: SL set to {pos['current_sl']:.2f}")
 
 
 def cmd_close(args):
     store = get_pyramid_store()
     pos = store.close_position(args.id, args.price, args.reason)
     ex = pos['exit']
-    print(f"\nPyramid #{pos['id']} {pos['symbol']} CLOSED")
-    print(f"  Exit: {ex['price']:.2f}")
-    print(f"  Invested: Rs {pos['total_invested']:,.0f}")
-    print(f"  Exit value: Rs {ex['total_exit_value']:,.0f}")
-    print(f"  P&L: Rs {ex['realized_pnl']:,.0f} ({ex['pnl_pct']:.1f}%)")
-    print(f"  Reason: {ex['reason']}")
+    invested = pos.get('entry_amount') or pos.get('total_invested', 0)
+    print(f"\nPosition #{pos['id']} {pos['symbol']} CLOSED")
+    print(f"  Exit:     {ex['price']:.2f}")
+    print(f"  Invested: Rs {invested:,.0f}")
+    print(f"  Exit val: Rs {ex['total_exit_value']:,.0f}")
+    print(f"  P&L:      Rs {ex['realized_pnl']:,.0f} ({ex['pnl_pct']:.1f}%)")
+    print(f"  Reason:   {ex['reason']}")
 
 
 def cmd_status(args):
     store = get_pyramid_store()
     active = store.get_active()
-    pending = store.get_pending_adds()
     all_pos = store.load_positions()
     exited = [p for p in all_pos if p['status'] == 'exited']
 
-    total_invested = sum(p['total_invested'] for p in active)
-    max_per_position = store._config.get('max_per_position', 1000000)
+    total_invested = sum(p.get('entry_amount') or p.get('total_invested', 0) for p in active)
+    position_size = store._config.get('position_size', 500000)
 
     # Sector breakdown
     sectors = {}
@@ -158,33 +125,21 @@ def cmd_status(args):
         sectors[s] = sectors.get(s, 0) + 1
 
     max_per_sector = store._config.get('max_per_sector', 3)
-    max_positions = store._config.get('max_positions', 20)
+    max_positions = store._config.get('max_positions', 25)
 
     print(f"\n{'='*50}")
-    print(f"  PYRAMID STATUS")
+    print(f"  POSITION STATUS")
     print(f"{'='*50}")
     print(f"  Active positions: {len(active)} / {max_positions}")
-    print(f"  Pending adds:     {len(pending)}")
-    print(f"  Exited:           {len(exited)}")
+    print(f"  Position size:    Rs {position_size:,.0f}")
     print(f"  Total invested:   Rs {total_invested:,.0f}")
-    print(f"  Max per position: Rs {max_per_position:,.0f}")
+    print(f"  Max deployable:   Rs {max_positions * position_size:,.0f}")
+    print(f"  Exited:           {len(exited)}")
 
     if sectors:
         print(f"\n  Sectors:")
         for s, count in sorted(sectors.items()):
             print(f"    {s}: {count} / {max_per_sector}")
-
-    if pending:
-        print(f"\n  Pending Level Fills:")
-        for p in pending:
-            for lvl in p['levels']:
-                if lvl['status'] == 'pending':
-                    trigger = (f">{lvl['trigger_price']:.2f}"
-                               if lvl['trigger_price'] else
-                               f"+{lvl['trigger_pct']}%")
-                    print(f"    {p['symbol']} L{lvl['level']}: "
-                          f"{trigger} (Rs {lvl['amount']:,.0f})")
-                    break  # Show only next pending per position
 
     if exited:
         total_pnl = sum(p['exit']['realized_pnl'] for p in exited)
@@ -226,52 +181,42 @@ def _init_kite():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Pyramid position management (3-level scaling)",
+        description="Position management (flat 5L per trade)",
         prog="python -m playbook.pyramid",
     )
     sub = parser.add_subparsers(dest='command')
 
     # list
-    p_list = sub.add_parser('list', help='List all pyramid positions')
-    p_list.add_argument('--status', choices=['active', 'completed', 'exited'],
+    p_list = sub.add_parser('list', help='List all positions')
+    p_list.add_argument('--status', choices=['active', 'exited'],
                         help='Filter by status')
 
     # add
-    p_add = sub.add_parser('add', help='Create new pyramid position (L1 filled)')
+    p_add = sub.add_parser('add', help='Create new position')
     p_add.add_argument('symbol', help='Stock symbol (e.g., MARUTI)')
     p_add.add_argument('--price', type=float, required=True,
-                       help='L1 fill price')
+                       help='Entry price')
     p_add.add_argument('--qty', type=int, required=True,
-                       help='L1 quantity (shares)')
+                       help='Quantity (shares)')
     p_add.add_argument('--sector', required=True,
                        help='Sector (e.g., Auto, IT, Banking)')
     p_add.add_argument('--thesis', required=True,
                        help='Investment thesis')
-    p_add.add_argument('--target-amount', type=int, default=None,
-                       help='Target full position (default: Rs 10L from config)')
+    p_add.add_argument('--sl', type=float, default=None,
+                       help='Initial SL (touch month low)')
     p_add.add_argument('--account', default=None,
                        help='Account ID (default: QSK814)')
     p_add.add_argument('--decision-id', type=int, default=None,
                        help='Link to portfolio_tracker decision ID')
-
-    # fill
-    p_fill = sub.add_parser('fill', help='Fill a pending pyramid level')
-    p_fill.add_argument('id', type=int, help='Position ID')
-    p_fill.add_argument('--level', type=int, required=True,
-                        help='Level number (2 or 3)')
-    p_fill.add_argument('--price', type=float, required=True,
-                        help='Fill price')
-    p_fill.add_argument('--qty', type=int, required=True,
-                        help='Quantity (shares)')
-    p_fill.add_argument('--date', default=None,
-                        help='Fill date YYYY-MM-DD (default: today)')
+    p_add.add_argument('--entry-date', default=None,
+                       help='Entry date YYYY-MM-DD (default: today)')
 
     # check
-    p_check = sub.add_parser('check', help='Run month-end checks')
+    p_check = sub.add_parser('check', help='Run month-end SL checks')
     p_check.add_argument('--month', default=None,
                          help='Target month YYYY-MM (default: previous month)')
     p_check.add_argument('--force', action='store_true',
-                         help='Override idempotency (re-check even if already done)')
+                         help='Override idempotency')
 
     # sl
     p_sl = sub.add_parser('sl', help='Manual SL update')
@@ -302,7 +247,6 @@ def main():
     cmd_map = {
         'list': cmd_list,
         'add': cmd_add,
-        'fill': cmd_fill,
         'check': cmd_check,
         'breach': cmd_breach,
         'sl': cmd_sl,

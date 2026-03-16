@@ -1,4 +1,4 @@
-"""Pyramid position management for Active basket — 3-level scaling into winners."""
+"""Position management for Active basket — flat 5L per trade."""
 
 from .pyramid_store import PyramidStore, get_pyramid_store
 

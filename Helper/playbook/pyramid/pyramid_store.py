@@ -1,4 +1,7 @@
-"""Pyramid position store — CRUD + Drive sync for 3-level scaling positions.
+"""Position store — CRUD + Drive sync for flat equity positions.
+
+Flat 5L model: one entry per stock, no pyramid levels.
+SL: touch month low -> ATR(1.5x) trail, only moves up.
 
 Mirrors zerodha/watchlist.py pattern: local-first, Drive-secondary, atomic writes,
 version-based merge, singleton access via get_pyramid_store().
@@ -53,7 +56,7 @@ REQUIRED_FIELDS = [
 
 
 class PyramidStore:
-    """Manages pyramid positions with local JSON + Google Drive sync."""
+    """Manages flat equity positions with local JSON + Google Drive sync."""
 
     def __init__(self, config: Optional[dict] = None):
         self._config = config or _load_config()
@@ -81,7 +84,7 @@ class PyramidStore:
             self._load_local()
 
         active = sum(1 for p in self._positions
-                     if p.get('status') in ('active', 'completed'))
+                     if p.get('status') == 'active')
         logger.info(
             "PyramidStore initialized: %d positions (%d active), drive=%s",
             len(self._positions), active,
@@ -95,12 +98,10 @@ class PyramidStore:
         return self._positions
 
     def add_position(self, data: dict) -> dict:
-        """Create a new pyramid position with Level 1 filled.
+        """Create a new flat position.
 
-        Required in data: symbol, spot_symbol, sector, thesis, and L1 price + quantity.
-        Also requires: price (L1 fill price), quantity (L1 shares bought).
-        Optional: target_amount (defaults to config max_per_position = Rs 10L),
-                  account_id (defaults to 'QSK814'), decision_id.
+        Required in data: symbol, spot_symbol, sector, thesis, price, quantity.
+        Optional: account_id (defaults to 'QSK814'), decision_id, touch_month_low.
         """
         # Validate required fields
         missing = [f for f in REQUIRED_FIELDS if f not in data]
@@ -108,18 +109,17 @@ class PyramidStore:
             raise ValueError(f"Missing required fields: {missing}")
 
         if 'price' not in data or 'quantity' not in data:
-            raise ValueError("L1 price and quantity are required")
+            raise ValueError("price and quantity are required")
 
         if data['price'] <= 0 or data['quantity'] <= 0:
             raise ValueError("price and quantity must be positive")
 
-        # Duplicate symbol check — can't pyramid same stock twice
+        # Duplicate symbol check
         symbol = data['symbol']
         for p in self.get_active():
             if p['symbol'] == symbol:
                 raise ValueError(
-                    f"Active pyramid already exists for {symbol} (#{p['id']}). "
-                    f"Use 'fill' to add to existing position, not 'add'."
+                    f"Active position already exists for {symbol} (#{p['id']})."
                 )
 
         # Sector cap check
@@ -133,7 +133,7 @@ class PyramidStore:
             )
 
         # Max positions check
-        max_positions = self._config.get('max_positions', 20)
+        max_positions = self._config.get('max_positions', 25)
         active_count = len(self.get_active())
         if active_count >= max_positions:
             raise ValueError(
@@ -141,69 +141,11 @@ class PyramidStore:
                 f"(max {max_positions})"
             )
 
-        # Read level config
-        level_config = self._config.get('levels', [
-            {"pct": 30, "trigger_pct": 0},
-            {"pct": 30, "trigger_pct": 8},
-            {"pct": 40, "trigger_pct": 8},
-        ])
-
-        target_amount = data.get('target_amount',
-                                 self._config.get('max_per_position', 1000000))
-        l1_price = data['price']
-        l1_qty = data['quantity']
-        l1_amount = round(l1_price * l1_qty, 2)
+        entry_price = data['price']
+        entry_qty = data['quantity']
+        entry_amount = round(entry_price * entry_qty, 2)
         today = data.get('entry_date', datetime.now().strftime('%Y-%m-%d'))
         entry_month = today[:7]  # YYYY-MM
-
-        # Build levels
-        levels = []
-        for i, lc in enumerate(level_config):
-            level_num = i + 1
-            pct = lc['pct']
-            amount = round(target_amount * pct / 100, 2)
-            trigger_pct = lc['trigger_pct']
-
-            if level_num == 1:
-                # L1 is filled at entry
-                levels.append({
-                    "level": 1,
-                    "pct": pct,
-                    "status": "filled",
-                    "date": today,
-                    "price": l1_price,
-                    "amount": l1_amount,
-                    "quantity": l1_qty,
-                    "trigger_pct": trigger_pct,
-                    "trigger_price": None,
-                })
-            elif level_num == 2:
-                # L2 trigger = L1 price + trigger_pct%
-                trigger_price = round(l1_price * (1 + trigger_pct / 100), 2)
-                levels.append({
-                    "level": level_num,
-                    "pct": pct,
-                    "status": "pending",
-                    "date": None,
-                    "price": None,
-                    "amount": amount,
-                    "quantity": None,
-                    "trigger_pct": trigger_pct,
-                    "trigger_price": trigger_price,
-                })
-            else:
-                # L3+ trigger computed after L2 fills
-                levels.append({
-                    "level": level_num,
-                    "pct": pct,
-                    "status": "pending",
-                    "date": None,
-                    "price": None,
-                    "amount": amount,
-                    "quantity": None,
-                    "trigger_pct": trigger_pct,
-                    "trigger_price": None,
-                })
 
         position = {
             "id": self._next_id(),
@@ -213,13 +155,11 @@ class PyramidStore:
             "spot_symbol": data['spot_symbol'],
             "account_id": data.get('account_id', 'QSK814'),
             "sector": sector,
-            "target_amount": target_amount,
-            "levels": levels,
-            "total_invested": l1_amount,
-            "total_quantity": l1_qty,
-            "avg_cost": l1_price,
-            "current_sl": None,
-            "sl_type": "monthly_low",
+            "entry_price": entry_price,
+            "entry_quantity": entry_qty,
+            "entry_amount": entry_amount,
+            "current_sl": data.get('touch_month_low'),
+            "sl_type": "atr_trail",
             "monthly_lows": {},
             "last_checked_month": None,
             "decision_id": data.get('decision_id'),
@@ -234,121 +174,19 @@ class PyramidStore:
         self._upload_to_drive()
 
         logger.info(
-            "Added pyramid #%d: %s L1@%.2f x%d = Rs %.0f, sector=%s",
-            position['id'], data['symbol'], l1_price, l1_qty,
-            l1_amount, sector
+            "Added position #%d: %s @%.2f x%d = Rs %.0f, sector=%s",
+            position['id'], data['symbol'], entry_price, entry_qty,
+            entry_amount, sector
         )
         return position
 
-    def fill_level(self, position_id: int, level: int,
-                   price: float, quantity: int,
-                   date: Optional[str] = None) -> dict:
-        """Record a level fill. Recomputes avg_cost, total_invested,
-        total_quantity. Applies SL precedence (cost-cost floor after L2).
-        Auto-computes next level's trigger_price.
-        """
-        pos = self._find(position_id)
-        if not pos:
-            raise ValueError(f"Position #{position_id} not found")
-        if pos['status'] == 'exited':
-            raise ValueError(f"Position #{position_id} is already exited")
+    def record_monthly_low(self, position_id: int, month: str,
+                           low: float, persist: bool = True) -> dict:
+        """Record a month's intraday low for data tracking.
 
-        if level < 1 or level > len(pos['levels']):
-            raise ValueError(f"Invalid level {level}, position has {len(pos['levels'])} levels")
-
-        lvl = pos['levels'][level - 1]
-        if lvl['status'] == 'filled':
-            raise ValueError(f"Level {level} is already filled")
-
-        # Check levels are filled in order
-        for i in range(level - 1):
-            if pos['levels'][i]['status'] != 'filled':
-                raise ValueError(
-                    f"Cannot fill level {level}: level {i + 1} is not filled yet"
-                )
-
-        if price <= 0 or quantity <= 0:
-            raise ValueError("price and quantity must be positive")
-
-        fill_date = date or datetime.now().strftime('%Y-%m-%d')
-        fill_amount = round(price * quantity, 2)
-
-        # Update level
-        lvl['status'] = 'filled'
-        lvl['date'] = fill_date
-        lvl['price'] = price
-        lvl['quantity'] = quantity
-        lvl['amount'] = fill_amount
-
-        # Recompute aggregates
-        total_invested = 0
-        total_qty = 0
-        for l in pos['levels']:
-            if l['status'] == 'filled':
-                total_invested += l['amount']
-                total_qty += l['quantity']
-
-        pos['total_invested'] = round(total_invested, 2)
-        pos['total_quantity'] = total_qty
-        pos['avg_cost'] = round(total_invested / total_qty, 2) if total_qty > 0 else 0
-
-        # Auto-compute next level trigger_price
-        next_level_idx = level  # 0-indexed for next level
-        if next_level_idx < len(pos['levels']):
-            next_lvl = pos['levels'][next_level_idx]
-            if next_lvl['status'] == 'pending' and next_lvl['trigger_pct'] > 0:
-                next_lvl['trigger_price'] = round(
-                    price * (1 + next_lvl['trigger_pct'] / 100), 2
-                )
-
-        # Check if all levels filled -> status = completed
-        all_filled = all(l['status'] == 'filled' for l in pos['levels'])
-        if all_filled:
-            pos['status'] = 'completed'
-
-        # Apply SL precedence: after L2, avg_cost becomes SL floor
-        # BUT: skip SL setting during entry month — let the position breathe.
-        # Cost-cost floor activates when entry month has closed (monthly_lows has entry_month).
-        filled_count = sum(1 for l in pos['levels'] if l['status'] == 'filled')
-        entry_month = pos.get('entry_month', '')
-        entry_month_closed = entry_month in pos.get('monthly_lows', {})
-
-        if filled_count >= 2 and entry_month_closed:
-            # Cost-cost floor: SL can never go below avg_cost after L2
-            candidate = pos['avg_cost']
-            current_sl = pos['current_sl']
-            if current_sl is None:
-                pos['current_sl'] = candidate
-            else:
-                pos['current_sl'] = max(current_sl, candidate)
-        elif filled_count >= 2 and not entry_month_closed:
-            logger.info(
-                "Pyramid #%d: L2 filled in entry month %s — SL deferred "
-                "until month-end close. Cost-cost floor (%.2f) will activate then.",
-                position_id, entry_month, pos['avg_cost']
-            )
-
-        pos['version'] = pos.get('version', 0) + 1
-        self._save_local()
-        self._upload_to_drive()
-
-        logger.info(
-            "Filled pyramid #%d L%d: %.2f x%d = Rs %.0f, avg=%.2f, SL=%s",
-            position_id, level, price, quantity, fill_amount,
-            pos['avg_cost'], pos['current_sl']
-        )
-        return pos
-
-    def update_monthly_low(self, position_id: int, month: str,
-                           low: float) -> dict:
-        """Record a month's intraday low. Apply SL precedence rules.
-        Sets last_checked_month.
-
-        SL precedence:
-        1. Entry month (Month 1): current_sl = null
-        2. After Month 1: current_sl = entry_month_low
-        3. Each subsequent month: max(current_sl, that_month_low)
-        4. After Level 2+: max(current_sl, avg_cost) — cost-cost floor
+        Sets last_checked_month. Does NOT modify current_sl.
+        SL is set exclusively by the ATR trail computation in pyramid_checker.
+        Pass persist=False during batch operations, then call flush() once.
         """
         pos = self._find(position_id)
         if not pos:
@@ -356,66 +194,46 @@ class PyramidStore:
 
         pos['monthly_lows'][month] = low
         pos['last_checked_month'] = month
-
-        entry_month = pos['entry_month']
-
-        if month == entry_month:
-            # Entry month: no SL yet, just record the low
-            pos['version'] = pos.get('version', 0) + 1
-            self._save_local()
-            self._upload_to_drive()
-            logger.info(
-                "Pyramid #%d: entry month %s low=%.2f recorded (no SL yet)",
-                position_id, month, low
-            )
-            return pos
-
-        # Month 2+: compute SL
-        # Gather all completed month lows (excluding entry month for initial SL calc)
-        sorted_months = sorted(pos['monthly_lows'].keys())
-
-        # Start with entry month low as base SL
-        base_sl = pos['monthly_lows'].get(entry_month, 0)
-
-        # Trail upward through each subsequent month
-        new_sl = base_sl
-        for m in sorted_months:
-            if m == entry_month:
-                continue
-            candidate = pos['monthly_lows'][m]
-            new_sl = max(new_sl, candidate)
-
-        # Cost-cost floor after Level 2
-        filled_count = sum(1 for l in pos['levels'] if l['status'] == 'filled')
-        if filled_count >= 2:
-            new_sl = max(new_sl, pos['avg_cost'])
-
-        # SL only moves up
-        if pos['current_sl'] is not None:
-            new_sl = max(new_sl, pos['current_sl'])
-
-        old_sl = pos['current_sl']
-        pos['current_sl'] = round(new_sl, 2)
         pos['version'] = pos.get('version', 0) + 1
 
-        self._save_local()
-        self._upload_to_drive()
+        if persist:
+            self._save_local()
+            self._upload_to_drive()
 
-        if old_sl != pos['current_sl']:
+        logger.info(
+            "Position #%d %s: month %s low=%.2f recorded",
+            position_id, pos['symbol'], month, low
+        )
+        return pos
+
+    def update_peak(self, position_id: int, peak_price: float,
+                    persist: bool = True) -> dict:
+        """Update stored peak price (only moves up). Used for ATR trail.
+        Pass persist=False during batch operations, then call flush() once.
+        """
+        pos = self._find(position_id)
+        if not pos:
+            raise ValueError(f"Position #{position_id} not found")
+
+        old_peak = pos.get('peak_price', 0) or 0
+        new_peak = max(old_peak, peak_price)
+        if new_peak != old_peak:
+            pos['peak_price'] = round(new_peak, 2)
+            pos['version'] = pos.get('version', 0) + 1
+            if persist:
+                self._save_local()
+                self._upload_to_drive()
             logger.info(
-                "Pyramid #%d %s: SL updated %.2f -> %.2f (month %s low=%.2f)",
-                position_id, pos['symbol'], old_sl or 0,
-                pos['current_sl'], month, low
-            )
-        else:
-            logger.info(
-                "Pyramid #%d %s: SL unchanged at %.2f (month %s low=%.2f)",
-                position_id, pos['symbol'], pos['current_sl'], month, low
+                "Position #%d %s: peak %.2f -> %.2f",
+                position_id, pos['symbol'], old_peak, new_peak
             )
         return pos
 
-    def update_sl(self, position_id: int, new_sl: float) -> dict:
-        """Manual SL override."""
+    def update_sl(self, position_id: int, new_sl: float,
+                  persist: bool = True) -> dict:
+        """Set SL (from ATR trail or manual override).
+        Pass persist=False during batch operations, then call flush() once.
+        """
         if new_sl <= 0:
             raise ValueError(f"SL must be positive, got {new_sl}")
         pos = self._find(position_id)
@@ -425,14 +243,23 @@ class PyramidStore:
         old_sl = pos['current_sl']
         pos['current_sl'] = round(new_sl, 2)
         pos['version'] = pos.get('version', 0) + 1
-        self._save_local()
-        self._upload_to_drive()
+
+        if persist:
+            self._save_local()
+            self._upload_to_drive()
 
         logger.info(
-            "Pyramid #%d %s: SL manually set %.2f -> %.2f",
+            "Position #%d %s: SL set %.2f -> %.2f",
             position_id, pos['symbol'], old_sl or 0, new_sl
         )
         return pos
+
+    def flush(self):
+        """Persist current in-memory state to local + Drive.
+        Call after a batch of persist=False operations.
+        """
+        self._save_local()
+        self._upload_to_drive()
 
     def close_position(self, position_id: int, exit_price: float,
                        reason: str) -> dict:
@@ -445,11 +272,13 @@ class PyramidStore:
         if pos['status'] == 'exited':
             raise ValueError(f"Position #{position_id} is already exited")
 
-        total_exit = round(exit_price * pos['total_quantity'], 2)
-        realized_pnl = round(total_exit - pos['total_invested'], 2)
+        qty = pos.get('entry_quantity') or pos.get('total_quantity', 0)
+        amt = pos.get('entry_amount') or pos.get('total_invested', 0)
+        total_exit = round(exit_price * qty, 2)
+        realized_pnl = round(total_exit - amt, 2)
         pnl_pct = round(
-            (realized_pnl / pos['total_invested']) * 100, 2
-        ) if pos['total_invested'] > 0 else 0
+            (realized_pnl / amt) * 100, 2
+        ) if amt > 0 else 0
 
         pos['status'] = 'exited'
         pos['exit'] = {
@@ -466,24 +295,14 @@ class PyramidStore:
         self._upload_to_drive()
 
         logger.info(
-            "Pyramid #%d %s CLOSED: exit=%.2f, P&L=Rs %.0f (%.1f%%), reason=%s",
+            "Position #%d %s CLOSED: exit=%.2f, P&L=Rs %.0f (%.1f%%), reason=%s",
             position_id, pos['symbol'], exit_price, realized_pnl, pnl_pct, reason
         )
         return pos
 
     def get_active(self) -> list:
-        """Positions still holding (active or completed = all levels filled)."""
-        return [p for p in self._positions
-                if p.get('status') in ('active', 'completed')]
-
-    def get_pending_adds(self) -> list:
-        """Active positions with at least one pending level."""
-        result = []
-        for p in self.get_active():
-            has_pending = any(l['status'] == 'pending' for l in p['levels'])
-            if has_pending:
-                result.append(p)
-        return result
+        """Positions still holding."""
+        return [p for p in self._positions if p.get('status') == 'active']
 
     def count_sector(self, sector: str) -> int:
         """Count active positions in a sector."""
@@ -499,38 +318,27 @@ class PyramidStore:
             positions = [p for p in positions if p['status'] == status_filter]
 
         if not positions:
-            print("No pyramid positions found.")
+            print("No positions found.")
             return
 
         # Header
-        print(f"\n{'ID':>3} {'Symbol':<12} {'Status':<10} {'Sector':<10} "
-              f"{'Levels':<8} {'Invested':>10} {'Avg Cost':>10} "
+        print(f"\n{'ID':>3} {'Symbol':<12} {'Status':<8} {'Sector':<10} "
+              f"{'Entry':>10} {'Qty':>6} {'Amount':>10} "
               f"{'SL':>10} {'Thesis':<30}")
-        print("-" * 115)
+        print("-" * 110)
 
         for p in positions:
-            filled = sum(1 for l in p['levels'] if l['status'] == 'filled')
-            total = len(p['levels'])
-            sl_str = f"{p['current_sl']:.2f}" if p['current_sl'] else "-"
+            sl_str = f"{p['current_sl']:.2f}" if p.get('current_sl') else "-"
             thesis = (p.get('thesis', '')[:28] + '..') if len(p.get('thesis', '')) > 30 else p.get('thesis', '')
+            # Handle legacy positions (pre-flat format)
+            entry_price = p.get('entry_price') or p.get('avg_cost', 0)
+            entry_qty = p.get('entry_quantity') or p.get('total_quantity', 0)
+            entry_amt = p.get('entry_amount') or p.get('total_invested', 0)
 
-            print(f"{p['id']:>3} {p['symbol']:<12} {p['status']:<10} "
-                  f"{p['sector']:<10} {filled}/{total:<5} "
-                  f"{p['total_invested']:>10,.0f} {p['avg_cost']:>10,.2f} "
+            print(f"{p['id']:>3} {p['symbol']:<12} {p['status']:<8} "
+                  f"{p.get('sector', '-'):<10} {entry_price:>10,.2f} "
+                  f"{entry_qty:>6} {entry_amt:>10,.0f} "
                   f"{sl_str:>10} {thesis:<30}")
-
-            # Show level details
-            for l in p['levels']:
-                if l['status'] == 'filled':
-                    print(f"     L{l['level']}: FILLED {l['date']} "
-                          f"@ {l['price']:.2f} x{l['quantity']} "
-                          f"= Rs {l['amount']:,.0f}")
-                else:
-                    trigger = (f"trigger={l['trigger_price']:.2f}"
-                               if l['trigger_price'] else
-                               f"+{l['trigger_pct']}% from prev fill")
-                    print(f"     L{l['level']}: PENDING "
-                          f"({trigger}, budget Rs {l['amount']:,.0f})")
 
             if p.get('exit'):
                 ex = p['exit']
@@ -603,7 +411,7 @@ class PyramidStore:
                     logger.info("Merge diverged from Drive, re-uploading")
                     self._upload_to_drive()
             else:
-                logger.info("No pyramid file on Drive yet, loading local")
+                logger.info("No positions file on Drive yet, loading local")
                 self._load_local()
         except Exception as e:
             logger.warning("Drive sync failed: %s. Using local.", e)
@@ -652,7 +460,7 @@ class PyramidStore:
         if self._positions:
             logger.info("Loaded %d positions from local", len(self._positions))
         else:
-            logger.info("No local pyramid file, starting empty")
+            logger.info("No local positions file, starting empty")
 
     @staticmethod
     def _merge(base: list, incoming: list) -> list:
