@@ -1,5 +1,6 @@
-"""Position store — CRUD + Drive sync for flat equity positions.
+"""Active basket position store — CRUD + Drive sync for flat equity positions.
 
+ACTIVE BASKET ONLY. Core & Tactical are tracked in Kite holdings, not here.
 Flat 5L model: one entry per stock, no pyramid levels.
 SL: touch month low -> ATR(1.5x) trail, only moves up.
 

@@ -1,4 +1,6 @@
-"""CLI for position management.
+"""CLI for Active basket position management.
+
+ACTIVE BASKET ONLY. Core & Tactical use plain ST touch (no pyramid tracker).
 
 Usage:
     python -m playbook.pyramid list

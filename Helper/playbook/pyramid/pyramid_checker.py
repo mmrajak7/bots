@@ -1,4 +1,6 @@
-"""Position checker — month-end ATR trail SL + daily breach detection + Telegram alerts.
+"""Active basket position checker — month-end ATR trail SL + daily breach detection.
+
+ACTIVE BASKET ONLY. Core & Tactical use plain ST touch (no ATR, no breach monitor).
 
 Two modes:
   - check:  Month-end (run 1st of each month). Computes ATR(14) trailing SL.
