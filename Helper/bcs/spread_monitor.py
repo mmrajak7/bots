@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unified Spread Monitor — BCS + Fallen Hero
+Unified Spread Monitor — BCS + Bear Put Spread + Fallen Hero
 
 Monitors spot price and spread value for BCS and Fallen Hero trades.
 Auto-closes on target hit or stop-loss trigger.
@@ -47,6 +47,7 @@ from kiteconnect import KiteConnect
 
 from .trade_store import get_store
 from fallen_hero import get_store as get_fh_store
+from bear_put import get_store as get_bps_store
 from zerodha.alert_checker import check_watchlist_alerts
 from zerodha.watchlist import get_watchlist_store
 
@@ -187,7 +188,14 @@ def get_spread_value(kite: KiteConnect, trade: dict) -> dict:
 # ── Strategy Detection ───────────────────────────────────────────────────────
 
 def get_strategy(trade: dict) -> str:
-    """Detect strategy from trade fields. FH has long_put_symbol, BCS has long_symbol."""
+    """Detect strategy from trade fields.
+
+    FH has long_put_symbol + short_call_symbol.
+    BPS has _store_type='bps' (same field names as BCS).
+    BCS is the default.
+    """
+    if trade.get('_store_type') == 'bps':
+        return 'BPS'
     return 'FH' if 'long_put_symbol' in trade else 'BCS'
 
 
@@ -627,10 +635,12 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
 
 
 def close_spread(kite: KiteConnect, trade: dict, spot: float,
-                 reason: str, dry_run: bool) -> bool:
+                 reason: str, dry_run: bool, store=None,
+                 strategy_label: str = 'BCS') -> bool:
     """
     Close the full spread. Short FIRST, then long (margin rules).
-    Updates TradeStore on success (local + Drive).
+    Works for both BCS and BPS (same 2-leg structure).
+    Updates the provided TradeStore on success (local + Drive).
     Returns True if fully closed, False if any leg failed.
 
     Safety checks:
@@ -642,7 +652,9 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
       - On partial failure: marks trade 'partial_close' (not 'open')
       - Sends Telegram alerts on trigger, success, and failure
     """
-    store = get_store()
+    if store is None:
+        store = get_store()  # Default to BCS store for backward compat
+    label = strategy_label
     stock = trade['stock']
 
     log("")
@@ -657,7 +669,7 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
         log(f"  LATE-DAY GUARD: {now_t.strftime('%H:%M')} > {LAST_ORDER_TIME.strftime('%H:%M')}.")
         log(f"  Too close to market close. Not placing orders — manual intervention needed.")
         send_telegram(
-            f"BCS {reason} TRIGGERED {stock} @ {spot}\n"
+            f"{label} {reason} TRIGGERED {stock} @ {spot}\n"
             f"BUT past {LAST_ORDER_TIME.strftime('%H:%M')} — NOT auto-closing.\n"
             f"Close manually in Kite!"
         )
@@ -672,10 +684,10 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
         close_lock_acquired = True
 
     try:
-        return _close_spread_inner(kite, store, trade, spot, reason, dry_run)
+        return _close_spread_inner(kite, store, trade, spot, reason, dry_run, label)
     except Exception as e:
         log(f"  EXCEPTION during close_spread: {e}")
-        send_telegram(f"BCS {stock}: EXCEPTION during {reason} close! {e}\nManual intervention needed!")
+        send_telegram(f"{label} {stock}: EXCEPTION during {reason} close! {e}\nManual intervention needed!")
         if close_lock_acquired:
             try:
                 store.set_trade_status(trade['id'], 'partial_close',
@@ -686,7 +698,7 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
         return False
 
 
-def _close_spread_inner(kite, store, trade, spot, reason, dry_run):
+def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS'):
     """Inner close logic, separated so close_spread() can wrap with try/except."""
     stock = trade['stock']
     short_sym = trade['short_symbol']
@@ -694,7 +706,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run):
     qty = trade['quantity']
     exchange = trade['exchange']
 
-    send_telegram(f"BCS {reason} TRIGGERED\n{stock} spot={spot}\nClosing spread...")
+    send_telegram(f"{label} {reason} TRIGGERED\n{stock} spot={spot}\nClosing spread...")
 
     # ── Pre-flight: Check actual position state ──────────────────────────
     if not dry_run:
@@ -731,7 +743,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run):
         if not dry_run:
             store.update_trade_exit(trade['id'], exit_data)
             log(f"  Trade #{trade['id']} marked closed (already flat)")
-        send_telegram(f"BCS {stock}: {reason} triggered but both legs already flat. Marked closed.")
+        send_telegram(f"{label} {stock}: {reason} triggered but both legs already flat. Marked closed.")
         return True
 
     short_fill = 0.0
@@ -768,7 +780,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run):
         if short_result['status'] == 'PARTIAL':
             remaining = close_qty - short_result.get('filled_quantity', 0)
             log(f"  WARNING: Short leg partially filled. {remaining} qty still short!")
-            send_telegram(f"BCS {stock}: Short leg partial fill. {remaining} still short!")
+            send_telegram(f"{label} {stock}: Short leg partial fill. {remaining} still short!")
     else:
         log(f"\n  SHORT leg {short_sym} already flat/long (qty={short_qty}). Skipping BUY.")
 
@@ -835,7 +847,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run):
     log("=" * 70)
 
     send_telegram(
-        f"BCS CLOSED: {stock}\n"
+        f"{label} CLOSED: {stock}\n"
         f"Reason: {reason}\n"
         f"Exit spread: {exit_net:.2f} | Entry: {entry_net:.2f}\n"
         f"P&L: Rs {total_pnl:+,.0f}\n"
@@ -1389,8 +1401,8 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
 
 # ── Cron Mode (All Open Trades — BCS + FH) ──────────────────────────────────
 
-def _load_all_trades(bcs_store, fh_store) -> list:
-    """Load and tag open trades from both stores.
+def _load_all_trades(bcs_store, fh_store, bps_store=None) -> list:
+    """Load and tag open trades from all stores.
 
     Returns shallow copies with _strategy/_store_type tags to avoid
     polluting the store's in-memory trade dicts (which get persisted).
@@ -1401,6 +1413,12 @@ def _load_all_trades(bcs_store, fh_store) -> list:
         tagged['_strategy'] = 'BCS'
         tagged['_store_type'] = 'bcs'
         all_trades.append(tagged)
+    if bps_store:
+        for t in bps_store.get_open_trades():
+            tagged = dict(t)
+            tagged['_strategy'] = 'BPS'
+            tagged['_store_type'] = 'bps'
+            all_trades.append(tagged)
     for t in fh_store.get_open_trades():
         tagged = dict(t)
         tagged['_strategy'] = 'FH'
@@ -1409,32 +1427,39 @@ def _load_all_trades(bcs_store, fh_store) -> list:
     return all_trades
 
 
-def _get_store_for(trade, bcs_store, fh_store):
+def _get_store_for(trade, bcs_store, fh_store, bps_store=None):
     """Return the correct store for a trade based on its _store_type tag."""
-    return fh_store if trade.get('_store_type') == 'fh' else bcs_store
+    st = trade.get('_store_type')
+    if st == 'fh':
+        return fh_store
+    if st == 'bps' and bps_store:
+        return bps_store
+    return bcs_store
 
 
 def monitor_all(kite: KiteConnect, dry_run: bool):
     """
-    Monitor ALL open trades (BCS + Fallen Hero) in a single loop.
+    Monitor ALL open trades (BCS + BPS + Fallen Hero) in a single loop.
     Designed to be run as a scheduled task during market hours.
 
     BCS: 4-layer SL (SL_SPOT <=, SL_SPREAD, SL_TRAIL, TP >=)
+    BPS: 4-layer SL (SL_SPOT >=, SL_SPREAD, SL_TRAIL, TP <=) — REVERSED direction
     FH:  spot-only SL (SL_SPOT >=) + expiry force-close
     """
     bcs_store = get_store()
     fh_store = get_fh_store()
+    bps_store = get_bps_store()
     wl_store = get_watchlist_store()
     set_log_file(LOG_DIR / f"spread_monitor_cron_{date.today().strftime('%Y%m%d')}.log")
 
     # ── Recover trades stuck in 'closing' from a previous crash ─────────
-    for label, store in [('BCS', bcs_store), ('FH', fh_store)]:
+    for label, store in [('BCS', bcs_store), ('BPS', bps_store), ('FH', fh_store)]:
         for t in store.get_closing_trades():
             log(f"  RECOVERY: {label} #{t['id']} {t['stock']} stuck in 'closing'. Resetting to 'open'.")
             send_telegram(f"{label} #{t['id']} {t['stock']}: Recovered from 'closing' (previous crash). Re-monitoring.")
             store.recover_closing_trade(t['id'])
 
-    all_trades = _load_all_trades(bcs_store, fh_store)
+    all_trades = _load_all_trades(bcs_store, fh_store, bps_store)
     wl_active = wl_store.get_active()
 
     if not all_trades and not wl_active:
@@ -1442,17 +1467,18 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
         return
 
     bcs_count = sum(1 for t in all_trades if t['_strategy'] == 'BCS')
+    bps_count = sum(1 for t in all_trades if t['_strategy'] == 'BPS')
     fh_count = sum(1 for t in all_trades if t['_strategy'] == 'FH')
     wl_count = len(wl_active)
 
     log("")
     log("=" * 70)
-    log("  SPREAD MONITOR — ALL OPEN TRADES (BCS + FH) + WATCHLIST")
+    log("  SPREAD MONITOR — ALL OPEN TRADES (BCS + BPS + FH) + WATCHLIST")
     log("=" * 70)
     log(f"  Mode:   {'DRY RUN' if dry_run else 'LIVE EXECUTION'}")
-    log(f"  Trades: {len(all_trades)} open (BCS: {bcs_count}, FH: {fh_count})")
+    log(f"  Trades: {len(all_trades)} open (BCS: {bcs_count}, BPS: {bps_count}, FH: {fh_count})")
     log(f"  Watchlist: {wl_count} active alert(s)")
-    log(f"  Drive:  BCS={'on' if bcs_store._drive_enabled else 'off'} | FH={'on' if fh_store._drive_enabled else 'off'} | WL={'on' if wl_store._drive_enabled else 'off'}")
+    log(f"  Drive:  BCS={'on' if bcs_store._drive_enabled else 'off'} | BPS={'on' if bps_store._drive_enabled else 'off'} | FH={'on' if fh_store._drive_enabled else 'off'} | WL={'on' if wl_store._drive_enabled else 'off'}")
     log(f"  Poll:   Every {POLL_INTERVAL_SEC}s | Status every {STATUS_PRINT_INTERVAL_SEC}s")
     log("=" * 70)
 
@@ -1475,6 +1501,19 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             log(f"  BCS #{t['id']} {t['stock']} {t['long_symbol']}/{t['short_symbol']} "
                 f"| Lots: {lots_str} "
                 f"| TP: {t['target_spot']} | SL: {t['sl_spot']} | SL Spread: {t['sl_spread']:.2f}")
+        elif strat == 'BPS':
+            entry_net = t['net_debit']
+            trail_state[('BPS', t['id'])] = {
+                'peak': t.get('trail_peak', 0.0),
+                'trail': t.get('trail_sl', 0.0),
+                'active': t.get('trail_active', False),
+                'engage_level': entry_net * TRAIL_ENGAGE_MULTIPLIER,
+            }
+            if trail_state[('BPS', t['id'])]['active']:
+                log(f"  BPS #{t['id']} {t['stock']}: Restored trail: peak={t.get('trail_peak', 0):.2f}, trail={t.get('trail_sl', 0):.2f}")
+            log(f"  BPS #{t['id']} {t['stock']} {t['long_symbol']}/{t['short_symbol']} "
+                f"| Lots: {lots_str} "
+                f"| TP: spot<={t['target_spot']} | SL: spot>={t['sl_spot']} | SL Spread: {t['sl_spread']:.2f}")
         else:
             # FH: credit strategy, spot-only SL (reversed direction)
             log(f"  FH  #{t['id']} {t['stock']} SC:{t['short_call_symbol']} SP:{t['short_put_symbol']} "
@@ -1496,6 +1535,14 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     f"(long={'OK' if long_found else 'MISSING'}, short={'OK' if short_found else 'MISSING'})")
             else:
                 log(f"  BCS #{t['id']} {t['stock']} — positions verified")
+        elif strat == 'BPS':
+            long_found = any(p['tradingsymbol'] == t['long_symbol'] and p['quantity'] > 0 for p in positions)
+            short_found = any(p['tradingsymbol'] == t['short_symbol'] and p['quantity'] < 0 for p in positions)
+            if not long_found or not short_found:
+                log(f"  WARNING: BPS #{t['id']} {t['stock']} — positions missing! "
+                    f"(long={'OK' if long_found else 'MISSING'}, short={'OK' if short_found else 'MISSING'})")
+            else:
+                log(f"  BPS #{t['id']} {t['stock']} — positions verified")
         else:
             # FH: verify 3-4 legs
             sc_ok = any(p['tradingsymbol'] == t['short_call_symbol'] and p['quantity'] < 0 for p in positions)
@@ -1548,9 +1595,10 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
 
             # Periodic Drive sync (picks up trades added from other machines)
             bcs_store.maybe_sync()
+            bps_store.maybe_sync()
             fh_store.maybe_sync()
             wl_store.maybe_sync()
-            all_trades = _load_all_trades(bcs_store, fh_store)
+            all_trades = _load_all_trades(bcs_store, fh_store, bps_store)
             wl_active = wl_store.get_active()
 
             if not all_trades and not wl_active:
@@ -1567,7 +1615,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 stock = trade['stock']
                 strat = trade['_strategy']
                 sl_spot_val = trade['sl_spot']
-                trade_store = _get_store_for(trade, bcs_store, fh_store)
+                trade_store = _get_store_for(trade, bcs_store, fh_store, bps_store)
 
                 # Skip trades where close is already in progress
                 # Use (strategy, id) as key since BCS and FH IDs are independent
@@ -1577,7 +1625,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         log(f"  {strat} #{tid} {stock}: CLOSE IN PROGRESS ({closing_in_progress[close_key]}). Skipping.")
                     continue
 
-                # ── BCS-specific fields ──────────────────────────────────
+                # ── BCS/BPS-specific fields ────────────────────────────────
                 if strat == 'BCS':
                     target = trade['target_spot']
                     sl_spread_val = trade['sl_spread']
@@ -1593,6 +1641,21 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                             expiry_trades[close_key] = True
                             log(f"  BCS #{tid} {stock}: EXPIRY DAY (added mid-session)")
                             send_telegram(f"BCS #{tid} {stock}: EXPIRY DAY (added mid-session). Force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
+                elif strat == 'BPS':
+                    target = trade['target_spot']
+                    sl_spread_val = trade['sl_spread']
+                    entry_net = trade['net_debit']
+
+                    # Initialize trail state for new BPS trades added mid-session
+                    if close_key not in trail_state:
+                        trail_state[close_key] = {
+                            'peak': 0.0, 'trail': 0.0, 'active': False,
+                            'engage_level': entry_net * TRAIL_ENGAGE_MULTIPLIER,
+                        }
+                        if is_expiry_day(trade):
+                            expiry_trades[close_key] = True
+                            log(f"  BPS #{tid} {stock}: EXPIRY DAY (added mid-session)")
+                            send_telegram(f"BPS #{tid} {stock}: EXPIRY DAY (added mid-session). Force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
                 else:
                     # FH: check for new expiry-day trades added mid-session
                     if close_key not in expiry_trades and is_expiry_day(trade):
@@ -1606,7 +1669,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     log(f"  {strat} #{tid} {stock}: spot fetch failed: {e}")
                     continue
 
-                # ── BCS: Fetch spread + update trailing SL ───────────────
+                # ── BCS/BPS: Fetch spread + update trailing SL ────────────
                 spread_val = None
                 spread_data = None
                 fh_val = None
@@ -1631,6 +1694,29 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                             ts['peak'] = spread_val
                             ts['trail'] = ts['peak'] * TRAIL_PERCENT
                             log(f"  BCS #{tid} {stock} ** TRAIL UPDATED ** peak={ts['peak']:.2f} | trail={ts['trail']:.2f}")
+                            trade_store.update_trade_fields(tid,
+                                                            trail_peak=ts['peak'], trail_sl=ts['trail'])
+                elif strat == 'BPS':
+                    try:
+                        spread_data = get_spread_value(kite, trade)
+                        spread_val = spread_data['spread']
+                    except Exception:
+                        pass
+
+                    ts = trail_state[close_key]
+                    if settled and spread_val is not None:
+                        if not ts['active'] and spread_val >= ts['engage_level']:
+                            ts['active'] = True
+                            ts['peak'] = spread_val
+                            ts['trail'] = ts['peak'] * TRAIL_PERCENT
+                            log(f"  BPS #{tid} {stock} ** TRAIL ENGAGED ** spread={spread_val:.2f} | trail={ts['trail']:.2f}")
+                            trade_store.update_trade_fields(tid,
+                                                            trail_active=True, trail_peak=ts['peak'], trail_sl=ts['trail'])
+
+                        if ts['active'] and spread_val > ts['peak']:
+                            ts['peak'] = spread_val
+                            ts['trail'] = ts['peak'] * TRAIL_PERCENT
+                            log(f"  BPS #{tid} {stock} ** TRAIL UPDATED ** peak={ts['peak']:.2f} | trail={ts['trail']:.2f}")
                             trade_store.update_trade_fields(tid,
                                                             trail_peak=ts['peak'], trail_sl=ts['trail'])
                 else:
@@ -1659,6 +1745,24 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                                 )
                             else:
                                 log(f"  BCS #{tid} {stock}: Spot={spot:.2f} | TP:{target}({target - spot:>+.1f}) | SL:{sl_spot_val}({spot - sl_spot_val:>+.1f}){settle_tag}{expiry_tag}")
+                        elif strat == 'BPS':
+                            # BPS status: REVERSED — gap to target = spot - target (positive = above target = not yet profitable)
+                            # Buffer above SL = sl_spot - spot (positive = below SL = safe)
+                            gap_to_target = spot - target  # positive when above target
+                            buf_above_sl = sl_spot_val - spot  # positive when below SL = safe
+                            if spread_data and spread_val is not None:
+                                unrealized = (spread_val - entry_net) * trade['quantity']
+                                ts = trail_state[close_key]
+                                trail_str = f" | Trail: {ts['trail']:.2f}" if ts['active'] else ""
+                                log(
+                                    f"  BPS #{tid} {stock}: Spot={spot:.2f} | "
+                                    f"TP:{target}(gap:{gap_to_target:>+.1f}) | "
+                                    f"SL:{sl_spot_val}(buf:{buf_above_sl:>+.1f}) | "
+                                    f"Spread:{spread_val:.2f} | "
+                                    f"P&L: Rs {unrealized:>+,.0f}{trail_str}{settle_tag}{expiry_tag}"
+                                )
+                            else:
+                                log(f"  BPS #{tid} {stock}: Spot={spot:.2f} | TP:{target}(gap:{gap_to_target:>+.1f}) | SL:{sl_spot_val}(buf:{buf_above_sl:>+.1f}){settle_tag}{expiry_tag}")
                         else:
                             # FH status: spot vs SL (upside), breakeven, P&L
                             be = trade['breakeven']
@@ -1682,7 +1786,11 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         log(f"\n  {strat} #{tid} {stock} *** EXPIRY FORCE CLOSE: {datetime.now().strftime('%H:%M')} >= {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
                         closing_in_progress[close_key] = "EXPIRY_FORCE_CLOSE"
                         if strat == 'BCS':
-                            success = close_spread(kite, trade, spot, "EXPIRY_FORCE_CLOSE", dry_run)
+                            success = close_spread(kite, trade, spot, "EXPIRY_FORCE_CLOSE", dry_run,
+                                                   store=trade_store, strategy_label='BCS')
+                        elif strat == 'BPS':
+                            success = close_spread(kite, trade, spot, "EXPIRY_FORCE_CLOSE", dry_run,
+                                                   store=trade_store, strategy_label='BPS')
                         else:
                             success = close_fh_position(kite, trade, spot, "EXPIRY_FORCE_CLOSE", dry_run)
                         if not success:
@@ -1699,7 +1807,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     if spot <= sl_spot_val:
                         log(f"\n  BCS #{tid} {stock} *** SL_SPOT HIT: {spot:.2f} <= {sl_spot_val} ***")
                         closing_in_progress[close_key] = "SL_SPOT"
-                        success = close_spread(kite, trade, spot, "SL_SPOT", dry_run)
+                        success = close_spread(kite, trade, spot, "SL_SPOT", dry_run,
+                                               store=trade_store, strategy_label='BCS')
                         closed = True
                         if not success:
                             log(f"  BCS #{tid} {stock}: Close failed. Trade locked — manual intervention needed.")
@@ -1713,7 +1822,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     if not closed and spread_val is not None and spread_val <= sl_spread_val:
                         log(f"\n  BCS #{tid} {stock} *** SL_SPREAD HIT: {spread_val:.2f} <= {sl_spread_val:.2f} ***")
                         closing_in_progress[close_key] = "SL_SPREAD"
-                        success = close_spread(kite, trade, spot, "SL_SPREAD", dry_run)
+                        success = close_spread(kite, trade, spot, "SL_SPREAD", dry_run,
+                                               store=trade_store, strategy_label='BCS')
                         closed = True
                         if not success:
                             log(f"  BCS #{tid} {stock}: Close failed — manual intervention needed.")
@@ -1724,7 +1834,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     if not closed and ts['active'] and spread_val is not None and spread_val <= ts['trail']:
                         log(f"\n  BCS #{tid} {stock} *** SL_TRAIL HIT: {spread_val:.2f} <= {ts['trail']:.2f} ***")
                         closing_in_progress[close_key] = "SL_TRAIL"
-                        success = close_spread(kite, trade, spot, "SL_TRAIL", dry_run)
+                        success = close_spread(kite, trade, spot, "SL_TRAIL", dry_run,
+                                               store=trade_store, strategy_label='BCS')
                         closed = True
                         if not success:
                             log(f"  BCS #{tid} {stock}: Close failed — manual intervention needed.")
@@ -1734,11 +1845,62 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     if not closed and spot >= target:
                         log(f"\n  BCS #{tid} {stock} *** TP HIT: {spot:.2f} >= {target} ***")
                         closing_in_progress[close_key] = "TP"
-                        success = close_spread(kite, trade, spot, "TP", dry_run)
+                        success = close_spread(kite, trade, spot, "TP", dry_run,
+                                               store=trade_store, strategy_label='BCS')
                         closed = True
                         if not success:
                             log(f"  BCS #{tid} {stock}: Close failed — manual intervention needed.")
                             send_telegram(f"BCS #{tid} {stock}: TP close FAILED. Manual intervention needed!")
+
+                elif strat == 'BPS':
+                    # ── BPS SL_SPOT: spot >= sl_spot (bullish risk — stock rising is BAD) ──
+                    if spot >= sl_spot_val:
+                        log(f"\n  BPS #{tid} {stock} *** SL_SPOT HIT: {spot:.2f} >= {sl_spot_val} ***")
+                        closing_in_progress[close_key] = "SL_SPOT"
+                        success = close_spread(kite, trade, spot, "SL_SPOT", dry_run,
+                                               store=trade_store, strategy_label='BPS')
+                        closed = True
+                        if not success:
+                            log(f"  BPS #{tid} {stock}: Close failed — manual intervention needed.")
+                            send_telegram(f"BPS #{tid} {stock}: SL_SPOT close FAILED. Manual intervention needed!")
+
+                    # Cooldown gate
+                    if not closed and not settled:
+                        continue
+
+                    # CHECK 2: SL_SPREAD (spread shrinking = bad, same as BCS)
+                    if not closed and spread_val is not None and spread_val <= sl_spread_val:
+                        log(f"\n  BPS #{tid} {stock} *** SL_SPREAD HIT: {spread_val:.2f} <= {sl_spread_val:.2f} ***")
+                        closing_in_progress[close_key] = "SL_SPREAD"
+                        success = close_spread(kite, trade, spot, "SL_SPREAD", dry_run,
+                                               store=trade_store, strategy_label='BPS')
+                        closed = True
+                        if not success:
+                            log(f"  BPS #{tid} {stock}: Close failed — manual intervention needed.")
+                            send_telegram(f"BPS #{tid} {stock}: SL_SPREAD close FAILED. Manual intervention needed!")
+
+                    # CHECK 3: SL_TRAIL (spread shrinking = bad, same as BCS)
+                    ts = trail_state[close_key]
+                    if not closed and ts['active'] and spread_val is not None and spread_val <= ts['trail']:
+                        log(f"\n  BPS #{tid} {stock} *** SL_TRAIL HIT: {spread_val:.2f} <= {ts['trail']:.2f} ***")
+                        closing_in_progress[close_key] = "SL_TRAIL"
+                        success = close_spread(kite, trade, spot, "SL_TRAIL", dry_run,
+                                               store=trade_store, strategy_label='BPS')
+                        closed = True
+                        if not success:
+                            log(f"  BPS #{tid} {stock}: Close failed — manual intervention needed.")
+                            send_telegram(f"BPS #{tid} {stock}: SL_TRAIL close FAILED. Manual intervention needed!")
+
+                    # CHECK 4: TP — spot <= target (stock DROPPING to target is good for BPS)
+                    if not closed and spot <= target:
+                        log(f"\n  BPS #{tid} {stock} *** TP HIT: {spot:.2f} <= {target} ***")
+                        closing_in_progress[close_key] = "TP"
+                        success = close_spread(kite, trade, spot, "TP", dry_run,
+                                               store=trade_store, strategy_label='BPS')
+                        closed = True
+                        if not success:
+                            log(f"  BPS #{tid} {stock}: Close failed — manual intervention needed.")
+                            send_telegram(f"BPS #{tid} {stock}: TP close FAILED. Manual intervention needed!")
 
                 else:
                     # ── FH SL_SPOT: spot >= sl_spot (upside/bullish risk) ──
@@ -1766,7 +1928,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
 
         except KeyboardInterrupt:
             log("\nCron monitor stopped by user (Ctrl+C)")
-            remaining = _load_all_trades(bcs_store, fh_store)
+            remaining = _load_all_trades(bcs_store, fh_store, bps_store)
             log(f"Remaining open trades: {len(remaining)}")
             return
         except Exception as e:
@@ -1775,13 +1937,13 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             err_str = str(e).lower()
             if 'token' in err_str or 'invalidtoken' in err_str or 'sessionexpired' in err_str:
                 log("FATAL: Kite token appears expired. Cannot continue.")
-                remaining = _load_all_trades(bcs_store, fh_store)
+                remaining = _load_all_trades(bcs_store, fh_store, bps_store)
                 stocks = ', '.join(f"{t['_strategy']}:{t['stock']}" for t in remaining)
                 send_telegram(f"SPREAD MONITOR FATAL: Kite token expired! Unmonitored: {stocks}")
                 return
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 log(f"FATAL: {MAX_CONSECUTIVE_ERRORS} consecutive errors. Exiting.")
-                remaining = _load_all_trades(bcs_store, fh_store)
+                remaining = _load_all_trades(bcs_store, fh_store, bps_store)
                 stocks = ', '.join(f"{t['_strategy']}:{t['stock']}" for t in remaining)
                 send_telegram(f"SPREAD MONITOR FATAL: {MAX_CONSECUTIVE_ERRORS} errors. Unmonitored: {stocks}")
                 return
@@ -1794,7 +1956,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Unified Spread Monitor — BCS + Fallen Hero with strategy-aware SL'
+        description='Unified Spread Monitor — BCS + Bear Put Spread + Fallen Hero with strategy-aware SL'
     )
     parser.add_argument('stock', nargs='?', default=None,
                         help='Stock name (e.g., ICICIBANK). Required unless --list.')
@@ -1845,6 +2007,9 @@ def main():
     if args.list:
         print("\n=== BCS Trades ===")
         bcs_store.list_trades()
+        bps_store_inst = get_bps_store()
+        print("\n=== Bear Put Spread Trades ===")
+        bps_store_inst.list_trades()
         fh_store_inst = get_fh_store()
         print("\n=== Fallen Hero Trades ===")
         fh_store_inst.list_trades()
@@ -1864,9 +2029,13 @@ def main():
 
     stock = args.stock.upper()
 
-    # ── Look up trade (search BCS first, then FH) ──────────────────────
+    # ── Look up trade (search BCS first, then BPS, then FH) ─────────────
     trade = bcs_store.find_open_trade(stock, args.trade_id)
     trade_strategy = 'BCS'
+    if not trade:
+        bps_store_inst = get_bps_store()
+        trade = bps_store_inst.find_open_trade(stock, args.trade_id)
+        trade_strategy = 'BPS'
     if not trade:
         fh_store_inst = get_fh_store()
         trade = fh_store_inst.find_open_trade(stock, args.trade_id)
@@ -1895,6 +2064,11 @@ def main():
         monitor(kite, trade, target, sl_spot, sl_spread, args.dry_run,
                 cli_target=args.target, cli_sl_spot=args.sl_spot,
                 cli_sl_spread=args.sl_spread)
+    elif trade_strategy == 'BPS':
+        # ── BPS: Delegate to cron monitor (reversed SL/TP direction) ─────
+        log(f"Loaded BPS trade #{trade['id']}: {stock} {trade['long_symbol']}/{trade['short_symbol']}")
+        log(f"  BPS single-trade mode delegates to cron monitor (reversed SL/TP).")
+        monitor_all(kite, args.dry_run)
     else:
         # ── FH: Use cron-style monitoring for single FH trade ────────────
         log(f"Loaded FH trade #{trade['id']}: {stock} SC:{trade['short_call_symbol']} "
