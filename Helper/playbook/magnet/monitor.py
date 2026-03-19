@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 IST = pytz.timezone('Asia/Kolkata')
 
+# ── Peak Premium Tracker (in-memory, resets on restart) ───────────────────
+_peak_premiums = {}  # {trade_id: peak_premium_value}
+
+
 # ── NFO Instrument Cache ──────────────────────────────────────────────────
 _nfo_instruments = None
 
@@ -118,6 +122,33 @@ def get_sell_price(kite, symbol: str) -> float:
     if bid <= 0:
         return 0
     return round(bid * (1 - cfg.SLIPPAGE_PCT), 2)
+
+
+# ── Spot OHLC ────────────────────────────────────────────────────────────
+
+def get_spot_ohlc(kite, symbols):
+    """Get LTP + intraday HIGH/LOW for spot symbols.
+
+    Returns {symbol: {ltp, high, low}}. Uses kite.ohlc() for day's range.
+    """
+    if not symbols:
+        return {}
+    instruments = [f"NSE:{s}" for s in symbols]
+    try:
+        data = kite.ohlc(instruments)
+        result = {}
+        for key, val in data.items():
+            sym = key.replace('NSE:', '')
+            ohlc = val.get('ohlc', {})
+            result[sym] = {
+                'ltp': val.get('last_price', 0),
+                'high': ohlc.get('high', 0),
+                'low': ohlc.get('low', 0),
+            }
+        return result
+    except Exception as e:
+        logger.error("OHLC fetch failed: %s", e)
+        return {}
 
 
 # ── Option Selection ──────────────────────────────────────────────────────
@@ -318,33 +349,49 @@ def check_watching_signals(store, kite):
 # ── Monitor: Open Trades ─────────────────────────────────────────────────
 
 def check_open_trades(store, kite):
-    """Check entered trades for TP/SL/time exit conditions."""
+    """Check entered trades for TP/SL/time/trail exit conditions.
+
+    TP logic: checks intraday HIGH/LOW (not just LTP) to catch wicks.
+    Trail: once in profit, trails at 50% of peak premium gain.
+    """
     entered = store.get_entered()
     if not entered:
         return
 
+    # Use OHLC for spot — gives intraday high/low for wick detection
     stocks = list({t['stock'] for t in entered})
-    ltps = get_ltp(kite, stocks)
+    spot_data = get_spot_ohlc(kite, stocks)
 
     for trade in entered:
         stock = trade['stock']
-        price = ltps.get(stock)
-        if not price:
+        sd = spot_data.get(stock)
+        if not sd:
             continue
 
+        price = sd['ltp']
+        day_high = sd['high']
+        day_low = sd['low']
         st_val = trade['st_value']
         side = trade['side']
         sl_spot = trade.get('sl_spot', 0)
+        trade_id = trade['id']
 
         # Get current premiums (with slippage) for P&L tracking
         option_symbol = trade.get('option_symbol')
         long_exit = get_sell_price(kite, option_symbol) if option_symbol else 0
         adj_exit = None
         if trade.get('adjusted') and trade.get('adj_symbol'):
-            adj_exit = get_buy_price(kite, trade['adj_symbol'])  # buy back short leg
+            adj_exit = get_buy_price(kite, trade['adj_symbol'])
 
         # Gap from ST (for adjustment trigger)
         gap = abs(price - st_val) / st_val
+
+        # === TRACK PEAK PREMIUM (for trailing SL) ===
+        entry_prem = trade.get('option_premium', 0) or 0
+        if long_exit > 0 and entry_prem > 0:
+            old_peak = _peak_premiums.get(trade_id, entry_prem)
+            new_peak = max(old_peak, long_exit)
+            _peak_premiums[trade_id] = new_peak
 
         # === CHECK ADJUSTMENT: gap reached 3.5%, not yet adjusted ===
         if (not trade.get('adjusted') and gap >= cfg.ADJ_GAP
@@ -352,7 +399,6 @@ def check_open_trades(store, kite):
             adj_result = _try_adjustment(kite, trade, price, gap)
             if adj_result:
                 store.adjust_trade(trade['id'], adj_result)
-                entry_prem = trade.get('option_premium', 0)
                 msg = (
                     f"MAGNET ADJUST (PAPER): {stock}\n"
                     f"Gap widened to {gap:.1%} — adding short leg\n"
@@ -364,30 +410,59 @@ def check_open_trades(store, kite):
                 )
                 send_telegram(msg)
                 logger.info("ADJUST: %s", msg.replace('\n', ' | '))
-                # Refresh adj_exit for TP/SL checks below
                 adj_exit = get_buy_price(kite, adj_result['adj_symbol'])
 
-        # === CHECK TP: spot crossed ST line ===
+        # === CHECK TP: spot crossed ST line (using intraday HIGH/LOW) ===
         tp_hit = False
         if side == 'above':
-            tp_hit = price <= st_val
+            # Bought PUT, expect decline. Touch = low ≤ ST
+            tp_hit = day_low <= st_val
         else:
-            tp_hit = price >= st_val
+            # Bought CALL, expect rally. Touch = high ≥ ST
+            tp_hit = day_high >= st_val
 
         if tp_hit:
-            store.exit_trade(trade['id'], price, long_exit, 'tp', adj_exit)
+            store.exit_trade(trade_id, price, long_exit, 'tp', adj_exit)
+            _peak_premiums.pop(trade_id, None)
             pnl = trade.get('pnl', 0)
             adj_str = f" [SPREAD: bought back short @{adj_exit:.2f}]" if adj_exit else ""
+            wick_note = ""
+            if side == 'above' and price > st_val:
+                wick_note = f"\nWick detected: day low {day_low:.2f} touched ST, current {price:.2f}"
+            elif side == 'below' and price < st_val:
+                wick_note = f"\nWick detected: day high {day_high:.2f} touched ST, current {price:.2f}"
             msg = (
                 f"MAGNET TP HIT (PAPER): {stock}\n"
-                f"Spot: Rs {price:,.2f} crossed ST: Rs {st_val:,.2f}\n"
-                f"Long exit: {trade.get('option_premium', 0):.2f} -> {long_exit:.2f}{adj_str}\n"
+                f"Spot: Rs {price:,.2f} | ST: Rs {st_val:,.2f}\n"
+                f"Long exit: {entry_prem:.2f} -> {long_exit:.2f}{adj_str}\n"
                 f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)\n"
-                f"Days held: {trade.get('days_held', 0)}"
+                f"Days held: {trade.get('days_held', 0)}{wick_note}"
             )
             send_telegram(msg)
             logger.info("TP: %s", msg.replace('\n', ' | '))
             continue
+
+        # === CHECK TRAILING PREMIUM SL: 50% of peak gain ===
+        peak = _peak_premiums.get(trade_id, entry_prem)
+        if peak > entry_prem:  # only trail when in profit
+            gain = peak - entry_prem
+            trail_level = entry_prem + gain * cfg.TRAIL_PCT
+            if long_exit <= trail_level and long_exit > 0:
+                store.exit_trade(trade_id, price, long_exit, 'tp_trail', adj_exit)
+                _peak_premiums.pop(trade_id, None)
+                pnl = trade.get('pnl', 0)
+                msg = (
+                    f"MAGNET TRAIL TP (PAPER): {stock}\n"
+                    f"Premium dropped below 50% trail\n"
+                    f"Peak: Rs {peak:.2f} | Trail: Rs {trail_level:.2f} | "
+                    f"Current: Rs {long_exit:.2f}\n"
+                    f"Entry: Rs {entry_prem:.2f} -> Exit: Rs {long_exit:.2f}\n"
+                    f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)\n"
+                    f"Days held: {trade.get('days_held', 0)}"
+                )
+                send_telegram(msg)
+                logger.info("TRAIL: %s", msg.replace('\n', ' | '))
+                continue
 
         # === CHECK SL: spot gap widened to 5% ===
         sl_hit = False
@@ -397,9 +472,10 @@ def check_open_trades(store, kite):
             sl_hit = price <= sl_spot
 
         if sl_hit:
-            store.exit_trade(trade['id'], price, long_exit, 'sl_spot', adj_exit)
+            store.exit_trade(trade_id, price, long_exit, 'sl_spot', adj_exit)
+            _peak_premiums.pop(trade_id, None)
             pnl = trade.get('pnl', 0)
-            adj_str = f" [SPREAD]" if trade.get('adjusted') else ""
+            adj_str = " [SPREAD]" if trade.get('adjusted') else ""
             msg = (
                 f"MAGNET SL HIT (PAPER): {stock}{adj_str}\n"
                 f"Spot: Rs {price:,.2f} hit SL: Rs {sl_spot:,.2f}\n"
@@ -424,7 +500,8 @@ def check_open_trades(store, kite):
                     biz_days += 1
                 d += timedelta(days=1)
             if biz_days >= cfg.SL_TIME_DAYS:
-                store.exit_trade(trade['id'], price, long_exit, 'sl_time', adj_exit)
+                store.exit_trade(trade_id, price, long_exit, 'sl_time', adj_exit)
+                _peak_premiums.pop(trade_id, None)
                 pnl = trade.get('pnl', 0)
                 msg = (
                     f"MAGNET TIME SL (PAPER): {stock}\n"

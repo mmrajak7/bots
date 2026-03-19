@@ -51,6 +51,7 @@ _DEFAULTS = {
     'sl_time_days': 5,            # exit if no touch within 5 trading days
     'freshness_days': 5,          # signal invalid if price was <2% within last N days
     'slippage_pct': 0.02,         # 2% of premium (buy: +slippage, sell: -slippage)
+    'trail_pct': 0.50,            # trail at 50% of peak premium gains
     'min_dte': 10,                # minimum days to expiry for option selection
     'lots_per_trade': 1,          # lots per trade (start small)
     'max_open_trades': 10,        # max concurrent magnet trades
@@ -88,6 +89,7 @@ FRESHNESS_DAYS = _runtime['freshness_days']
 
 # ── Slippage ──────────────────────────────────────────────────────────────
 SLIPPAGE_PCT = _runtime['slippage_pct']
+TRAIL_PCT = _runtime.get('trail_pct', 0.50)
 
 # ── Option selection ──────────────────────────────────────────────────────
 MIN_DTE = _runtime['min_dte']
