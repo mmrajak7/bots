@@ -46,7 +46,8 @@ _DEFAULTS = {
     'signal_gap_max': 0.03,       # 3% — Chartink fires within this range
     'entry_gap': 0.02,            # 2% — buy option when gap shrinks to this
     'entry_gap_min': 0.005,       # 0.5% — too close, already past entry zone
-    'adj_gap': 0.035,             # 3.5% — sell OTM to create spread (damage control)
+    'cost_sl_gap': 0.01,           # 1% — move SL to cost+0.10 when stock reaches this gap
+    'premium_sl_pct': 0.40,       # 40% — exit if premium drops 40% from entry (before cost SL)
     'sl_gap': 0.05,               # 5% — if gap widens to this, thesis dead
     'sl_time_days': 5,            # exit if no touch within 5 trading days
     'freshness_days': 5,          # signal invalid if price was <2% within last N days
@@ -82,8 +83,9 @@ _runtime = _load_runtime()
 SIGNAL_GAP_MAX = _runtime['signal_gap_max']
 ENTRY_GAP = _runtime['entry_gap']
 ENTRY_GAP_MIN = _runtime['entry_gap_min']
-ADJ_GAP = _runtime['adj_gap']
-SL_GAP = _runtime['sl_gap']
+COST_SL_GAP = _runtime.get('cost_sl_gap', 0.01)
+PREMIUM_SL_PCT = _runtime.get('premium_sl_pct', 0.40)
+SL_GAP = _runtime.get('sl_gap', 0.05)
 SL_TIME_DAYS = _runtime['sl_time_days']
 FRESHNESS_DAYS = _runtime['freshness_days']
 
