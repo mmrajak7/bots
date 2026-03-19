@@ -83,6 +83,36 @@ def is_market_hours() -> bool:
     return market_open <= now <= market_close
 
 
+# ── Bid-Ask Pricing ──────────────────────────────────────────────────────
+
+def get_option_ask(kite, symbol: str) -> float:
+    """Get best ASK price for buying an option. Falls back to LTP."""
+    try:
+        data = kite.quote([f"NFO:{symbol}"])
+        q = list(data.values())[0]
+        depth = q.get('depth', {})
+        sellers = depth.get('sell', [])
+        if sellers and sellers[0].get('price', 0) > 0:
+            return sellers[0]['price']
+        return q.get('last_price', 0)
+    except Exception:
+        return 0
+
+
+def get_option_bid(kite, symbol: str) -> float:
+    """Get best BID price for selling an option. Falls back to LTP."""
+    try:
+        data = kite.quote([f"NFO:{symbol}"])
+        q = list(data.values())[0]
+        depth = q.get('depth', {})
+        buyers = depth.get('buy', [])
+        if buyers and buyers[0].get('price', 0) > 0:
+            return buyers[0]['price']
+        return q.get('last_price', 0)
+    except Exception:
+        return 0
+
+
 # ── Option Selection ──────────────────────────────────────────────────────
 
 def select_option(kite, stock: str, direction: str, spot: float) -> dict:
@@ -119,12 +149,8 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
                     candidates.sort(key=lambda x: abs(x['strike'] - spot))
                     best = candidates[0]
 
-                    # Get premium via LTP
-                    try:
-                        ltp_data = kite.ltp([f"NFO:{best['symbol']}"])
-                        premium = list(ltp_data.values())[0]['last_price']
-                    except Exception:
-                        premium = 0
+                    # Get premium via ASK (what we pay to buy)
+                    premium = get_option_ask(kite, best['symbol'])
 
                     return {
                         'strike': best['strike'],
@@ -165,12 +191,8 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
         same_expiry.sort(key=lambda x: abs(x['strike'] - spot))
         best = same_expiry[0]
 
-        # Get premium
-        try:
-            ltp_data = kite.ltp([f"NFO:{best['tradingsymbol']}"])
-            premium = list(ltp_data.values())[0]['last_price']
-        except Exception:
-            premium = 0
+        # Get premium via ASK (what we pay to buy)
+        premium = get_option_ask(kite, best['tradingsymbol'])
 
         return {
             'strike': best['strike'],
@@ -295,15 +317,11 @@ def check_open_trades(store, kite):
         side = trade['side']
         sl_spot = trade.get('sl_spot', 0)
 
-        # Get current option premium for P&L tracking
+        # Get current option premium for P&L tracking (BID = what we'd sell for)
         option_symbol = trade.get('option_symbol')
         current_premium = 0
         if option_symbol:
-            try:
-                ltp_data = kite.ltp([f"NFO:{option_symbol}"])
-                current_premium = list(ltp_data.values())[0]['last_price']
-            except Exception:
-                pass
+            current_premium = get_option_bid(kite, option_symbol)
 
         # === CHECK TP: spot crossed ST line ===
         tp_hit = False

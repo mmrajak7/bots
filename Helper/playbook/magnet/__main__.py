@@ -119,14 +119,11 @@ def cmd_close(args):
             ltps = get_ltp(kite, [trade['stock']])
             spot = ltps.get(trade['stock'], 0)
 
-            # Get current option premium
+            # Get current option premium (BID = what we'd sell for)
             premium = 0
             if trade.get('option_symbol'):
-                try:
-                    ltp_data = kite.ltp([f"NFO:{trade['option_symbol']}"])
-                    premium = list(ltp_data.values())[0]['last_price']
-                except Exception:
-                    pass
+                from .monitor import get_option_bid
+                premium = get_option_bid(kite, trade['option_symbol'])
         except Exception:
             spot = trade.get('entry_spot', 0)
             premium = 0
