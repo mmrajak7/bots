@@ -99,12 +99,14 @@ class MagnetStore:
         stock = data['stock']
         timeframe = data['timeframe']
 
-        # Dedup: already watching or entered for same stock + timeframe?
+        # Dedup: already watching or entered for same stock (ANY timeframe)?
+        # Prevents double exposure from weekly + monthly signals on same stock
         for t in self._trades:
-            if (t['stock'] == stock and t['timeframe'] == timeframe
+            if (t['stock'] == stock
                     and t['status'] in ('watching', 'entered')):
-                logger.info("Duplicate signal: %s (%s) already active as #%d",
-                            stock, timeframe, t['id'])
+                logger.info("Duplicate signal: %s already active as #%d (%s), "
+                            "skipping %s signal",
+                            stock, t['id'], t['timeframe'], timeframe)
                 return t
 
         st_val = data['st_value']
@@ -135,6 +137,7 @@ class MagnetStore:
             "option_symbol": None,
             "option_premium": None,
             "option_type": cfg.OPTION_TYPE_MAP[side],
+            "option_expiry": None,
             "product": cfg.PRODUCT,
             "quantity": None,
             "lot_size": None,

@@ -154,7 +154,7 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
                 if candidates:
                     # Filter to nearest expiry with >= 7 DTE
                     today = datetime.now().strftime('%Y-%m-%d')
-                    min_dte = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+                    min_dte = (datetime.now() + timedelta(days=cfg.MIN_DTE)).strftime('%Y-%m-%d')
                     valid_expiry = [c for c in candidates if c['expiry'] >= min_dte]
                     if not valid_expiry:
                         valid_expiry = [c for c in candidates if c['expiry'] >= today]
@@ -198,7 +198,7 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
             return {}
 
         # Filter to nearest expiry with >=7 DTE
-        min_dte = now.date() + timedelta(days=7)
+        min_dte = now.date() + timedelta(days=cfg.MIN_DTE)
         near_expiry = [c for c in candidates if c['expiry'] >= min_dte]
         if not near_expiry:
             near_expiry = candidates
@@ -662,6 +662,12 @@ def run(dry_run: bool = False):
 
     except KeyboardInterrupt:
         logger.info("Monitor stopped by user")
+    finally:
+        # Flush store to ensure last state is persisted
+        try:
+            store.flush()
+        except Exception:
+            pass
 
     # End of day summary
     watching = len(store.get_watching())
