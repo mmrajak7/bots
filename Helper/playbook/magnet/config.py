@@ -44,9 +44,13 @@ SCANNERS = [
 SIGNAL_GAP_MAX = 0.03       # 3% — Chartink fires within this range
 ENTRY_GAP = 0.02            # 2% — buy option when gap shrinks to this
 ENTRY_GAP_MIN = 0.005       # 0.5% — too close, already past entry zone
+ADJ_GAP = 0.035             # 3.5% — sell OTM to create spread (damage control)
 SL_GAP = 0.05               # 5% — if gap widens to this, thesis dead
 SL_TIME_DAYS = 5             # exit if no touch within 5 trading days
 FRESHNESS_DAYS = 5           # signal invalid if price was <2% within last N days
+
+# ── Slippage ──────────────────────────────────────────────────────────────
+SLIPPAGE_PCT = 0.02          # 2% of premium added to ask (buy) / removed from bid (sell)
 
 # ── Supertrend ────────────────────────────────────────────────────────────
 ST_PERIOD = 10
@@ -60,7 +64,7 @@ MARKET_OPEN = (9, 15)        # 9:15 AM IST
 MARKET_CLOSE = (15, 30)      # 3:30 PM IST
 
 # ── Position sizing (paper mode — notional) ───────────────────────────────
-POSITION_SIZE = 100000       # Rs 1L per paper trade (small for testing)
+LOTS_PER_TRADE = 1           # 1 lot per trade (fixed, increase later)
 MAX_OPEN_TRADES = 10         # max concurrent magnet trades
 
 # ── Option selection ──────────────────────────────────────────────────────

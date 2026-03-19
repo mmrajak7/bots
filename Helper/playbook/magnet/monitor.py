@@ -85,32 +85,39 @@ def is_market_hours() -> bool:
 
 # ── Bid-Ask Pricing ──────────────────────────────────────────────────────
 
-def get_option_ask(kite, symbol: str) -> float:
-    """Get best ASK price for buying an option. Falls back to LTP."""
-    try:
-        data = kite.quote([f"NFO:{symbol}"])
-        q = list(data.values())[0]
-        depth = q.get('depth', {})
-        sellers = depth.get('sell', [])
-        if sellers and sellers[0].get('price', 0) > 0:
-            return sellers[0]['price']
-        return q.get('last_price', 0)
-    except Exception:
-        return 0
-
-
-def get_option_bid(kite, symbol: str) -> float:
-    """Get best BID price for selling an option. Falls back to LTP."""
+def get_option_quote(kite, symbol: str) -> dict:
+    """Get full bid/ask/LTP for an option. Returns {bid, ask, ltp, spread}."""
     try:
         data = kite.quote([f"NFO:{symbol}"])
         q = list(data.values())[0]
         depth = q.get('depth', {})
         buyers = depth.get('buy', [])
-        if buyers and buyers[0].get('price', 0) > 0:
-            return buyers[0]['price']
-        return q.get('last_price', 0)
+        sellers = depth.get('sell', [])
+        bid = buyers[0]['price'] if buyers and buyers[0].get('price', 0) > 0 else 0
+        ask = sellers[0]['price'] if sellers and sellers[0].get('price', 0) > 0 else 0
+        ltp = q.get('last_price', 0)
+        spread = round(ask - bid, 2) if bid > 0 and ask > 0 else 0
+        return {'bid': bid, 'ask': ask, 'ltp': ltp, 'spread': spread}
     except Exception:
+        return {'bid': 0, 'ask': 0, 'ltp': 0, 'spread': 0}
+
+
+def get_buy_price(kite, symbol: str) -> float:
+    """ASK + slippage — what we actually pay to buy."""
+    q = get_option_quote(kite, symbol)
+    ask = q['ask'] or q['ltp']
+    if ask <= 0:
         return 0
+    return round(ask * (1 + cfg.SLIPPAGE_PCT), 2)
+
+
+def get_sell_price(kite, symbol: str) -> float:
+    """BID - slippage — what we actually receive selling."""
+    q = get_option_quote(kite, symbol)
+    bid = q['bid'] or q['ltp']
+    if bid <= 0:
+        return 0
+    return round(bid * (1 - cfg.SLIPPAGE_PCT), 2)
 
 
 # ── Option Selection ──────────────────────────────────────────────────────
@@ -149,8 +156,8 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
                     candidates.sort(key=lambda x: abs(x['strike'] - spot))
                     best = candidates[0]
 
-                    # Get premium via ASK (what we pay to buy)
-                    premium = get_option_ask(kite, best['symbol'])
+                    # Get premium via ASK + slippage (what we actually pay)
+                    premium = get_buy_price(kite, best['symbol'])
 
                     return {
                         'strike': best['strike'],
@@ -191,8 +198,8 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
         same_expiry.sort(key=lambda x: abs(x['strike'] - spot))
         best = same_expiry[0]
 
-        # Get premium via ASK (what we pay to buy)
-        premium = get_option_ask(kite, best['tradingsymbol'])
+        # Get premium via ASK + slippage (what we actually pay)
+        premium = get_buy_price(kite, best['tradingsymbol'])
 
         return {
             'strike': best['strike'],
@@ -256,11 +263,8 @@ def check_watching_signals(store, kite):
         lot_size = option['lot_size']
         premium = option.get('premium', 0)
 
-        # Position sizing: POSITION_SIZE / (premium * lot_size), minimum 1 lot
-        if premium > 0 and lot_size > 0:
-            qty = max(lot_size, int(cfg.POSITION_SIZE / (premium * lot_size)) * lot_size)
-        else:
-            qty = lot_size
+        # Fixed lots per trade
+        qty = lot_size * cfg.LOTS_PER_TRADE
 
         # Compute SL spot: price at 5% gap from ST on the same side
         side = trade['side']
@@ -317,28 +321,50 @@ def check_open_trades(store, kite):
         side = trade['side']
         sl_spot = trade.get('sl_spot', 0)
 
-        # Get current option premium for P&L tracking (BID = what we'd sell for)
+        # Get current premiums (with slippage) for P&L tracking
         option_symbol = trade.get('option_symbol')
-        current_premium = 0
-        if option_symbol:
-            current_premium = get_option_bid(kite, option_symbol)
+        long_exit = get_sell_price(kite, option_symbol) if option_symbol else 0
+        adj_exit = None
+        if trade.get('adjusted') and trade.get('adj_symbol'):
+            adj_exit = get_buy_price(kite, trade['adj_symbol'])  # buy back short leg
+
+        # Gap from ST (for adjustment trigger)
+        gap = abs(price - st_val) / st_val
+
+        # === CHECK ADJUSTMENT: gap reached 3.5%, not yet adjusted ===
+        if (not trade.get('adjusted') and gap >= cfg.ADJ_GAP
+                and gap < cfg.SL_GAP):
+            adj_result = _try_adjustment(kite, trade, price, gap)
+            if adj_result:
+                store.adjust_trade(trade['id'], adj_result)
+                entry_prem = trade.get('option_premium', 0)
+                msg = (
+                    f"MAGNET ADJUST (PAPER): {stock}\n"
+                    f"Gap widened to {gap:.1%} — adding short leg\n"
+                    f"Sell {adj_result['adj_symbol']} @ Rs {adj_result['adj_premium']:.2f}\n"
+                    f"Spread: {trade['option_strike']} / {adj_result['adj_strike']}\n"
+                    f"Max loss: Rs {trade.get('adj_max_loss', entry_prem):.2f}/sh "
+                    f"(was Rs {entry_prem:.2f})\n"
+                    f"Saved: {((entry_prem - trade.get('adj_max_loss', entry_prem)) / entry_prem):.0%} of premium"
+                )
+                send_telegram(msg)
+                logger.info("ADJUST: %s", msg.replace('\n', ' | '))
 
         # === CHECK TP: spot crossed ST line ===
         tp_hit = False
         if side == 'above':
-            # Price above ST, bought PUT, target = price drops to ST
             tp_hit = price <= st_val
         else:
-            # Price below ST, bought CALL, target = price rises to ST
             tp_hit = price >= st_val
 
         if tp_hit:
-            store.exit_trade(trade['id'], price, current_premium, 'tp')
+            store.exit_trade(trade['id'], price, long_exit, 'tp', adj_exit)
             pnl = trade.get('pnl', 0)
+            adj_str = f" [SPREAD: bought back short @{adj_exit:.2f}]" if adj_exit else ""
             msg = (
                 f"MAGNET TP HIT (PAPER): {stock}\n"
                 f"Spot: Rs {price:,.2f} crossed ST: Rs {st_val:,.2f}\n"
-                f"Premium: {trade.get('option_premium', 0):.2f} -> {current_premium:.2f}\n"
+                f"Long exit: {trade.get('option_premium', 0):.2f} -> {long_exit:.2f}{adj_str}\n"
                 f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)\n"
                 f"Days held: {trade.get('days_held', 0)}"
             )
@@ -349,18 +375,19 @@ def check_open_trades(store, kite):
         # === CHECK SL: spot gap widened to 5% ===
         sl_hit = False
         if side == 'above' and sl_spot:
-            sl_hit = price >= sl_spot  # price moved further UP (wrong direction)
+            sl_hit = price >= sl_spot
         elif side == 'below' and sl_spot:
-            sl_hit = price <= sl_spot  # price moved further DOWN (wrong direction)
+            sl_hit = price <= sl_spot
 
         if sl_hit:
-            store.exit_trade(trade['id'], price, current_premium, 'sl_spot')
+            store.exit_trade(trade['id'], price, long_exit, 'sl_spot', adj_exit)
             pnl = trade.get('pnl', 0)
+            adj_str = f" [SPREAD]" if trade.get('adjusted') else ""
             msg = (
-                f"MAGNET SL HIT (PAPER): {stock}\n"
+                f"MAGNET SL HIT (PAPER): {stock}{adj_str}\n"
                 f"Spot: Rs {price:,.2f} hit SL: Rs {sl_spot:,.2f}\n"
-                f"Thesis failed — gap widened past 5%\n"
-                f"Premium: {trade.get('option_premium', 0):.2f} -> {current_premium:.2f}\n"
+                f"Long exit: {long_exit:.2f}" +
+                (f" | Short buyback: {adj_exit:.2f}" if adj_exit else "") + "\n"
                 f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)\n"
                 f"Days held: {trade.get('days_held', 0)}"
             )
@@ -373,26 +400,121 @@ def check_open_trades(store, kite):
         if entry_date:
             entry_dt = datetime.strptime(entry_date, '%Y-%m-%d')
             now = datetime.now()
-            # Count business days accurately (exclude Sat/Sun)
             biz_days = 0
             d = entry_dt + timedelta(days=1)
             while d <= now:
-                if d.weekday() < 5:  # Mon-Fri
+                if d.weekday() < 5:
                     biz_days += 1
                 d += timedelta(days=1)
             if biz_days >= cfg.SL_TIME_DAYS:
-                store.exit_trade(trade['id'], price, current_premium, 'sl_time')
+                store.exit_trade(trade['id'], price, long_exit, 'sl_time', adj_exit)
                 pnl = trade.get('pnl', 0)
                 msg = (
                     f"MAGNET TIME SL (PAPER): {stock}\n"
                     f"Held {biz_days} trading days without touching ST\n"
                     f"Spot: Rs {price:,.2f} | ST: Rs {st_val:,.2f}\n"
-                    f"Premium: {trade.get('option_premium', 0):.2f} -> {current_premium:.2f}\n"
+                    f"Long exit: {long_exit:.2f}" +
+                    (f" | Short buyback: {adj_exit:.2f}" if adj_exit else "") + "\n"
                     f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)"
                 )
                 send_telegram(msg)
                 logger.info("TIME SL: %s", msg.replace('\n', ' | '))
                 continue
+
+
+# ── Adjustment: Sell OTM to Create Spread ─────────────────────────────────
+
+def _try_adjustment(kite, trade: dict, current_spot: float,
+                    current_gap: float) -> dict:
+    """Find nearest OTM option to sell (1 strike away from long leg).
+
+    For PE (bought PUT at strike X): sell PUT at strike X - interval
+    For CE (bought CALL at strike X): sell CALL at strike X + interval
+
+    Returns adj_data dict or None if no suitable option found.
+    """
+    import csv
+
+    stock = trade['stock']
+    direction = trade['direction']  # CE or PE
+    long_strike = trade['option_strike']
+    option_csv = cfg.PROJECT_ROOT / 'nse_stocks_options.csv'
+
+    candidates = []
+
+    # Try CSV first
+    if option_csv.exists():
+        try:
+            with open(option_csv, newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if (row.get('stock_symbol', '') == stock
+                            and row.get('option_type', '') == direction):
+                        strike = float(row.get('option_strike', 0))
+                        candidates.append({
+                            'strike': strike,
+                            'symbol': row.get('option_tradingsymbol', ''),
+                            'lot_size': int(row.get('option_lot_size', 0)),
+                        })
+        except Exception:
+            pass
+
+    # Fallback: NFO instruments
+    if not candidates:
+        try:
+            instruments = _get_nfo_instruments(kite)
+            for inst in instruments:
+                if (inst['name'] == stock
+                        and inst['instrument_type'] == direction):
+                    candidates.append({
+                        'strike': inst['strike'],
+                        'symbol': inst['tradingsymbol'],
+                        'lot_size': inst['lot_size'],
+                    })
+        except Exception:
+            pass
+
+    if not candidates:
+        logger.warning("No OTM strikes found for %s %s adjustment", stock, direction)
+        return None
+
+    # Find 1 strike OTM from our long strike
+    if direction == 'PE':
+        # Long PUT at X, sell PUT at X - interval (lower strike = more OTM)
+        otm = [c for c in candidates if c['strike'] < long_strike]
+        if not otm:
+            return None
+        otm.sort(key=lambda x: x['strike'], reverse=True)  # nearest lower
+        best = otm[0]
+        spread_width = long_strike - best['strike']
+    else:
+        # Long CALL at X, sell CALL at X + interval (higher strike = more OTM)
+        otm = [c for c in candidates if c['strike'] > long_strike]
+        if not otm:
+            return None
+        otm.sort(key=lambda x: x['strike'])  # nearest higher
+        best = otm[0]
+        spread_width = best['strike'] - long_strike
+
+    if spread_width <= 0:
+        return None
+
+    # Get BID - slippage for selling
+    credit = get_sell_price(kite, best['symbol'])
+    if credit <= 0:
+        logger.warning("No bid for %s, skipping adjustment", best['symbol'])
+        return None
+
+    logger.info("Adjustment candidate: sell %s @%.2f (bid-slippage), spread_width=%.0f",
+                best['symbol'], credit, spread_width)
+
+    return {
+        'adj_strike': best['strike'],
+        'adj_symbol': best['symbol'],
+        'adj_premium': credit,
+        'adj_gap_pct': round(current_gap * 100, 2),
+        'adj_spread_width': spread_width,
+    }
 
 
 # ── Stale Signal Cleanup ──────────────────────────────────────────────────

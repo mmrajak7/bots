@@ -143,11 +143,22 @@ class MagnetStore:
             "sl_spot": None,  # set at entry: price at 5% gap from ST
             "sl_time_deadline": None,  # set at entry: 5 trading days
             "days_held": 0,
+            # Adjustment (1:1 spread — sell OTM at 3.5% gap)
+            "adjusted": False,
+            "adj_strike": None,
+            "adj_symbol": None,
+            "adj_premium": None,       # credit received (BID - slippage)
+            "adj_date": None,
+            "adj_time": None,
+            "adj_gap_pct": None,       # gap when adjustment triggered
+            "adj_spread_width": None,  # strike distance (long - short for PE, short - long for CE)
+            "adj_max_loss": None,      # net debit per share after credit
             # Exit
             "exit_spot": None,
             "exit_date": None,
             "exit_time": None,
-            "exit_premium": None,
+            "exit_premium": None,      # long leg exit (BID)
+            "exit_adj_premium": None,  # short leg buyback (ASK) — None if not adjusted
             "exit_reason": None,
             "pnl": None,
             "pnl_pct": None,
@@ -203,9 +214,55 @@ class MagnetStore:
         )
         return trade
 
+    def adjust_trade(self, trade_id: int, adj_data: dict) -> dict:
+        """Add short leg to convert naked buy into 1:1 debit spread.
+
+        adj_data: adj_strike, adj_symbol, adj_premium (credit received),
+                  adj_gap_pct, adj_spread_width
+        """
+        trade = self._find(trade_id)
+        if not trade:
+            raise ValueError(f"Trade #{trade_id} not found")
+        if trade['status'] != 'entered':
+            raise ValueError(f"Trade #{trade_id} is {trade['status']}, not entered")
+        if trade.get('adjusted'):
+            raise ValueError(f"Trade #{trade_id} is already adjusted")
+
+        now = datetime.now()
+        trade['adjusted'] = True
+        trade['adj_strike'] = adj_data.get('adj_strike')
+        trade['adj_symbol'] = adj_data.get('adj_symbol')
+        trade['adj_premium'] = adj_data.get('adj_premium')
+        trade['adj_date'] = now.strftime('%Y-%m-%d')
+        trade['adj_time'] = now.strftime('%H:%M:%S')
+        trade['adj_gap_pct'] = adj_data.get('adj_gap_pct')
+        trade['adj_spread_width'] = adj_data.get('adj_spread_width')
+
+        # Net debit = entry premium - credit received
+        entry_prem = trade.get('option_premium', 0) or 0
+        credit = adj_data.get('adj_premium', 0) or 0
+        trade['adj_max_loss'] = round(entry_prem - credit, 2)
+
+        trade['version'] += 1
+        self._save_local()
+        self._upload_to_drive()
+
+        logger.info(
+            "ADJUST #%d: %s sell %s @%.2f, net debit=%.2f (was %.2f), spread=%s",
+            trade_id, trade['stock'], trade['adj_symbol'],
+            credit, trade['adj_max_loss'], entry_prem,
+            trade['adj_spread_width']
+        )
+        return trade
+
     def exit_trade(self, trade_id: int, exit_spot: float,
-                   exit_premium: float, reason: str) -> dict:
-        """Transition entered → exited."""
+                   exit_premium: float, reason: str,
+                   exit_adj_premium: float = None) -> dict:
+        """Transition entered → exited. Handles both naked and spread exits.
+
+        exit_premium: long leg exit price (BID - slippage)
+        exit_adj_premium: short leg buyback price (ASK + slippage), None if not adjusted
+        """
         trade = self._find(trade_id)
         if not trade:
             raise ValueError(f"Trade #{trade_id} not found")
@@ -218,13 +275,28 @@ class MagnetStore:
         trade['exit_date'] = now.strftime('%Y-%m-%d')
         trade['exit_time'] = now.strftime('%H:%M:%S')
         trade['exit_premium'] = round(exit_premium, 2)
+        trade['exit_adj_premium'] = round(exit_adj_premium, 2) if exit_adj_premium is not None else None
         trade['exit_reason'] = reason
 
-        # P&L on option premium
+        # P&L calculation
         entry_prem = trade.get('option_premium', 0) or 0
         qty = trade.get('quantity', 0) or 0
+
         if entry_prem > 0 and qty > 0:
-            pnl_per_share = exit_premium - entry_prem
+            if trade.get('adjusted') and exit_adj_premium is not None:
+                # Spread P&L:
+                # Paid: entry_prem (bought long leg)
+                # Received: adj_premium (sold short leg at entry)
+                # Exit: receive exit_premium (sell long leg)
+                # Exit: pay exit_adj_premium (buy back short leg)
+                adj_credit = trade.get('adj_premium', 0) or 0
+                net_entry = entry_prem - adj_credit  # net debit
+                net_exit = exit_premium - exit_adj_premium  # net credit on close
+                pnl_per_share = net_exit - net_entry
+            else:
+                # Naked P&L: simple premium diff
+                pnl_per_share = exit_premium - entry_prem
+
             trade['pnl'] = round(pnl_per_share * qty, 2)
             trade['pnl_pct'] = round((pnl_per_share / entry_prem) * 100, 2)
 
@@ -238,9 +310,10 @@ class MagnetStore:
         self._upload_to_drive()
 
         logger.info(
-            "EXIT #%d: %s reason=%s, P&L=Rs %.0f (%.1f%%)",
+            "EXIT #%d: %s reason=%s, P&L=Rs %.0f (%.1f%%)%s",
             trade_id, trade['stock'], reason,
-            trade.get('pnl', 0), trade.get('pnl_pct', 0)
+            trade.get('pnl', 0), trade.get('pnl_pct', 0),
+            ' [SPREAD]' if trade.get('adjusted') else ''
         )
         return trade
 
@@ -298,10 +371,18 @@ class MagnetStore:
                   f"{entry_str:>10} {t['target_spot']:>10,.2f} "
                   f"{sl_str:>10} {pnl_str:>10}")
 
+            if t.get('adjusted'):
+                print(f"     ADJ: sell {t.get('adj_symbol', '?')} @{t.get('adj_premium', 0):.2f} "
+                      f"| max_loss={t.get('adj_max_loss', 0):.2f}/sh "
+                      f"| spread={t.get('adj_spread_width', 0)}")
+
             if t.get('exit_reason'):
+                adj_str = ""
+                if t.get('exit_adj_premium') is not None:
+                    adj_str = f" short_buyback={t['exit_adj_premium']:.2f}"
                 print(f"     EXIT: {t.get('exit_date', '')} "
                       f"reason={t['exit_reason']} "
-                      f"days={t.get('days_held', 0)}")
+                      f"days={t.get('days_held', 0)}{adj_str}")
         print()
 
     # ── Sync ──────────────────────────────────────────────────────────────

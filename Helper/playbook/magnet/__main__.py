@@ -84,11 +84,16 @@ def cmd_status(args):
     if entered:
         print(f"\n  --- Open Trades ---")
         for t in entered:
+            adj = " [SPREAD]" if t.get('adjusted') else ""
             print(f"  #{t['id']} {t['stock']:<12} {t['direction']:<4} "
                   f"entry={t.get('entry_spot', 0):.2f} "
                   f"target={t['target_spot']:.2f} "
                   f"sl={t.get('sl_spot', 0):.2f} "
-                  f"option={t.get('option_symbol', '?')}")
+                  f"option={t.get('option_symbol', '?')}{adj}")
+            if t.get('adjusted'):
+                print(f"       Short: {t.get('adj_symbol', '?')} @{t.get('adj_premium', 0):.2f} "
+                      f"| Max loss: Rs {t.get('adj_max_loss', 0):.2f}/sh "
+                      f"(was Rs {t.get('option_premium', 0):.2f})")
 
     print()
 
@@ -115,21 +120,25 @@ def cmd_close(args):
         # Get current spot for paper exit
         try:
             from .scanner import _get_kite, get_ltp
+            from .monitor import get_sell_price, get_buy_price
             kite = _get_kite()
             ltps = get_ltp(kite, [trade['stock']])
             spot = ltps.get(trade['stock'], 0)
 
-            # Get current option premium (BID = what we'd sell for)
-            premium = 0
-            if trade.get('option_symbol'):
-                from .monitor import get_option_bid
-                premium = get_option_bid(kite, trade['option_symbol'])
+            # Long leg: sell at BID - slippage
+            premium = get_sell_price(kite, trade['option_symbol']) if trade.get('option_symbol') else 0
+
+            # Short leg (if adjusted): buy back at ASK + slippage
+            adj_premium = None
+            if trade.get('adjusted') and trade.get('adj_symbol'):
+                adj_premium = get_buy_price(kite, trade['adj_symbol'])
         except Exception:
             spot = trade.get('entry_spot', 0)
             premium = 0
+            adj_premium = None
 
         store.exit_trade(trade_id, spot, premium,
-                         args.reason or 'manual close')
+                         args.reason or 'manual close', adj_premium)
         # Re-read to get computed P&L
         for t in store.load_trades():
             if t['id'] == trade_id:
