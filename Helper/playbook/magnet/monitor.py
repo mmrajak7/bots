@@ -495,17 +495,22 @@ def check_open_trades(store, kite):
             sl_hit = price <= sl_spot
 
         if sl_hit:
-            store.exit_trade(trade_id, price, long_exit, 'sl_spot', adj_exit)
+            # Detect gap — exit price significantly past SL level
+            sl_gap_pct = abs(price - sl_spot) / sl_spot * 100
+            exit_reason = 'sl_spot_gap' if sl_gap_pct > 1.0 else 'sl_spot'
+            store.exit_trade(trade_id, price, long_exit, exit_reason, adj_exit)
             _peak_premiums.pop(trade_id, None)
             pnl = trade.get('pnl', 0)
             adj_str = " [SPREAD]" if trade.get('adjusted') else ""
+            gap_warn = (f"\nGAP WARNING: spot {price:.2f} is {sl_gap_pct:.1f}% past "
+                        f"SL {sl_spot:.2f}") if sl_gap_pct > 1.0 else ""
             msg = (
                 f"MAGNET SL HIT (PAPER): {stock}{adj_str}\n"
                 f"Spot: Rs {price:,.2f} hit SL: Rs {sl_spot:,.2f}\n"
                 f"Long exit: {long_exit:.2f}" +
                 (f" | Short buyback: {adj_exit:.2f}" if adj_exit else "") + "\n"
                 f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)\n"
-                f"Days held: {trade.get('days_held', 0)}"
+                f"Days held: {trade.get('days_held', 0)}{gap_warn}"
             )
             send_telegram(msg)
             logger.info("SL: %s", msg.replace('\n', ' | '))
