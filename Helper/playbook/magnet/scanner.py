@@ -401,9 +401,8 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
         stock = sig['stock']
         timeframe = sig['timeframe']
 
-        # Already watching/entered?
-        existing = [t for t in store.get_open()
-                    if t['stock'] == stock and t['timeframe'] == timeframe]
+        # Already watching/entered for this stock (any timeframe)?
+        existing = [t for t in store.get_open() if t['stock'] == stock]
         if existing:
             skipped_reasons['already_active'] += 1
             continue
