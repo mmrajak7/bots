@@ -198,6 +198,7 @@ class MagnetStore:
         trade['option_strike'] = entry_data.get('option_strike')
         trade['option_symbol'] = entry_data.get('option_symbol')
         trade['option_premium'] = entry_data.get('option_premium')
+        trade['option_expiry'] = entry_data.get('option_expiry')
         trade['lot_size'] = entry_data.get('lot_size')
         trade['quantity'] = entry_data.get('quantity')
         trade['sl_spot'] = entry_data.get('sl_spot')

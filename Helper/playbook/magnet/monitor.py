@@ -152,9 +152,23 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
                         })
 
                 if candidates:
-                    # ATM: nearest strike to spot
-                    candidates.sort(key=lambda x: abs(x['strike'] - spot))
-                    best = candidates[0]
+                    # Filter to nearest expiry with >= 7 DTE
+                    today = datetime.now().strftime('%Y-%m-%d')
+                    min_dte = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+                    valid_expiry = [c for c in candidates if c['expiry'] >= min_dte]
+                    if not valid_expiry:
+                        valid_expiry = [c for c in candidates if c['expiry'] >= today]
+                    if not valid_expiry:
+                        valid_expiry = candidates
+
+                    # Group by nearest expiry
+                    valid_expiry.sort(key=lambda x: x['expiry'])
+                    target_exp = valid_expiry[0]['expiry']
+                    same_exp = [c for c in valid_expiry if c['expiry'] == target_exp]
+
+                    # ATM: nearest strike to spot within same expiry
+                    same_exp.sort(key=lambda x: abs(x['strike'] - spot))
+                    best = same_exp[0]
 
                     # Get premium via ASK + slippage (what we actually pay)
                     premium = get_buy_price(kite, best['symbol'])
@@ -281,6 +295,7 @@ def check_watching_signals(store, kite):
             'option_strike': option['strike'],
             'option_symbol': option['symbol'],
             'option_premium': premium,
+            'option_expiry': option.get('expiry', ''),
             'lot_size': lot_size,
             'quantity': qty,
             'sl_spot': sl_spot,
@@ -349,6 +364,8 @@ def check_open_trades(store, kite):
                 )
                 send_telegram(msg)
                 logger.info("ADJUST: %s", msg.replace('\n', ' | '))
+                # Refresh adj_exit for TP/SL checks below
+                adj_exit = get_buy_price(kite, adj_result['adj_symbol'])
 
         # === CHECK TP: spot crossed ST line ===
         tp_hit = False
@@ -438,11 +455,12 @@ def _try_adjustment(kite, trade: dict, current_spot: float,
     stock = trade['stock']
     direction = trade['direction']  # CE or PE
     long_strike = trade['option_strike']
+    long_expiry = trade.get('option_expiry', '')  # MUST match
     option_csv = cfg.PROJECT_ROOT / 'nse_stocks_options.csv'
 
     candidates = []
 
-    # Try CSV first
+    # Try CSV first — filter to SAME EXPIRY as long leg
     if option_csv.exists():
         try:
             with open(option_csv, newline='') as f:
@@ -450,6 +468,10 @@ def _try_adjustment(kite, trade: dict, current_spot: float,
                 for row in reader:
                     if (row.get('stock_symbol', '') == stock
                             and row.get('option_type', '') == direction):
+                        expiry = row.get('option_expiry', '')
+                        # Must match long leg expiry
+                        if long_expiry and expiry != long_expiry:
+                            continue
                         strike = float(row.get('option_strike', 0))
                         candidates.append({
                             'strike': strike,
@@ -459,13 +481,17 @@ def _try_adjustment(kite, trade: dict, current_spot: float,
         except Exception:
             pass
 
-    # Fallback: NFO instruments
+    # Fallback: NFO instruments — filter to SAME EXPIRY
     if not candidates:
         try:
             instruments = _get_nfo_instruments(kite)
             for inst in instruments:
                 if (inst['name'] == stock
                         and inst['instrument_type'] == direction):
+                    # Match expiry
+                    inst_expiry = str(inst.get('expiry', ''))
+                    if long_expiry and inst_expiry != long_expiry:
+                        continue
                     candidates.append({
                         'strike': inst['strike'],
                         'symbol': inst['tradingsymbol'],
