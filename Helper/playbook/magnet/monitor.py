@@ -399,14 +399,17 @@ def check_open_trades(store, kite):
         sl_spot = trade.get('sl_spot', 0)
         trade_id = trade['id']
 
-        # Get current option premium (BID - slippage = what we'd sell for)
+        # Get current option premiums
         option_symbol = trade.get('option_symbol')
         long_exit = get_sell_price(kite, option_symbol) if option_symbol else 0
+        hedge_exit = None
+        if trade.get('hedged') and trade.get('hedge_symbol'):
+            hedge_exit = get_buy_price(kite, trade['hedge_symbol'])
 
         # Gap from ST
         gap = abs(price - st_val) / st_val
 
-        # === TRACK PEAK PREMIUM (for trailing SL) ===
+        # === TRACK PEAK PREMIUM (for trailing SL — long leg only) ===
         entry_prem = trade.get('option_premium', 0) or 0
         if long_exit > 0 and entry_prem > 0:
             old_peak = _peak_premiums.get(trade_id, entry_prem)
@@ -426,6 +429,25 @@ def check_open_trades(store, kite):
             send_telegram(msg)
             logger.info("COST SL: %s", msg.replace('\n', ' | '))
 
+        # === HEDGE: gap widened back to 3% (reversal) — add short beyond ST ===
+        if (not trade.get('hedged') and gap >= cfg.HEDGE_GAP
+                and gap < cfg.SL_GAP):
+            hedge_result = _find_hedge_strike(kite, trade, price)
+            if hedge_result:
+                store.add_hedge(trade_id, hedge_result)
+                msg = (
+                    f"MAGNET HEDGE (PAPER): {trade['stock']}\n"
+                    f"Stock reversed, gap back to {gap:.1%}\n"
+                    f"Short {hedge_result['hedge_symbol']} "
+                    f"@ Rs {hedge_result['hedge_premium']:.2f}\n"
+                    f"Net debit: Rs {trade.get('hedge_net_debit', entry_prem):.2f} "
+                    f"(was Rs {entry_prem:.2f})\n"
+                    f"Max loss capped at Rs {trade.get('hedge_net_debit', entry_prem):.2f}/sh"
+                )
+                send_telegram(msg)
+                logger.info("HEDGE: %s", msg.replace('\n', ' | '))
+                hedge_exit = get_buy_price(kite, hedge_result['hedge_symbol'])
+
         # === CHECK TP: spot crossed ST line (using 5-min HIGH/LOW) ===
         tp_hit = False
         if side == 'above':
@@ -436,7 +458,7 @@ def check_open_trades(store, kite):
             tp_hit = day_high >= st_val
 
         if tp_hit:
-            store.exit_trade(trade_id, price, long_exit, 'tp')
+            store.exit_trade(trade_id, price, long_exit, 'tp', hedge_exit)
             _peak_premiums.pop(trade_id, None)
             pnl = trade.get('pnl', 0)
             wick_note = ""
@@ -444,8 +466,9 @@ def check_open_trades(store, kite):
                 wick_note = f"\nWick: 5m low {day_low:.2f} touched ST, current {price:.2f}"
             elif side == 'below' and price < st_val:
                 wick_note = f"\nWick: 5m high {day_high:.2f} touched ST, current {price:.2f}"
+            hedge_str = f" [HEDGED]" if trade.get('hedged') else ""
             msg = (
-                f"MAGNET TP HIT (PAPER): {stock}\n"
+                f"MAGNET TP HIT (PAPER): {stock}{hedge_str}\n"
                 f"Spot: Rs {price:,.2f} | ST: Rs {st_val:,.2f}\n"
                 f"Premium: {entry_prem:.2f} -> {long_exit:.2f}\n"
                 f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)\n"
@@ -464,7 +487,7 @@ def check_open_trades(store, kite):
             cost_sl = trade.get('cost_sl_level', 0) or 0
             effective_trail = max(trail_level, cost_sl)
             if long_exit <= effective_trail:
-                store.exit_trade(trade_id, price, long_exit, 'tp_trail')
+                store.exit_trade(trade_id, price, long_exit, 'tp_trail', hedge_exit)
                 _peak_premiums.pop(trade_id, None)
                 pnl = trade.get('pnl', 0)
                 msg = (
@@ -484,7 +507,7 @@ def check_open_trades(store, kite):
         if trade.get('cost_sl_active') and long_exit > 0:
             cost_sl = trade.get('cost_sl_level', 0) or 0
             if long_exit <= cost_sl:
-                store.exit_trade(trade_id, price, long_exit, 'sl_cost')
+                store.exit_trade(trade_id, price, long_exit, 'sl_cost', hedge_exit)
                 _peak_premiums.pop(trade_id, None)
                 pnl = trade.get('pnl', 0)
                 msg = (
@@ -506,7 +529,7 @@ def check_open_trades(store, kite):
                 actual_loss_pct = (entry_prem - long_exit) / entry_prem
                 is_gap = actual_loss_pct > (cfg.PREMIUM_SL_PCT + 0.15)  # 55%+ loss = gap
                 exit_reason = 'sl_premium_gap' if is_gap else 'sl_premium'
-                store.exit_trade(trade_id, price, long_exit, exit_reason)
+                store.exit_trade(trade_id, price, long_exit, exit_reason, hedge_exit)
                 _peak_premiums.pop(trade_id, None)
                 pnl = trade.get('pnl', 0)
                 gap_warn = (f"\nGAP: premium {long_exit:.2f} is {actual_loss_pct:.0%} "
@@ -533,7 +556,7 @@ def check_open_trades(store, kite):
         if sl_hit:
             sl_gap_pct = abs(price - sl_spot) / sl_spot * 100
             exit_reason = 'sl_spot_gap' if sl_gap_pct > 1.0 else 'sl_spot'
-            store.exit_trade(trade_id, price, long_exit, exit_reason)
+            store.exit_trade(trade_id, price, long_exit, exit_reason, hedge_exit)
             _peak_premiums.pop(trade_id, None)
             pnl = trade.get('pnl', 0)
             gap_warn = (f"\nGAP: spot {price:.2f} is {sl_gap_pct:.1f}% past "
@@ -561,7 +584,7 @@ def check_open_trades(store, kite):
                     biz_days += 1
                 d += timedelta(days=1)
             if biz_days >= cfg.SL_TIME_DAYS:
-                store.exit_trade(trade_id, price, long_exit, 'sl_time')
+                store.exit_trade(trade_id, price, long_exit, 'sl_time', hedge_exit)
                 _peak_premiums.pop(trade_id, None)
                 pnl = trade.get('pnl', 0)
                 msg = (
@@ -574,6 +597,116 @@ def check_open_trades(store, kite):
                 send_telegram(msg)
                 logger.info("TIME SL: %s", msg.replace('\n', ' | '))
                 continue
+
+
+# ── Hedge: Short Leg Beyond ST ─────────────────────────────────────────────
+
+def _find_hedge_strike(kite, trade: dict, current_spot: float) -> dict:
+    """Find nearest strike BEYOND ST to sell as hedge.
+
+    For PE (price above ST): sell PUT with strike BELOW ST
+    For CE (price below ST): sell CALL with strike ABOVE ST
+
+    This ensures short leg is OTM at target → no TV problem.
+    Returns hedge_data dict or None.
+    """
+    import csv
+
+    stock = trade['stock']
+    direction = trade['direction']  # CE or PE
+    long_strike = trade['option_strike']
+    long_expiry = trade.get('option_expiry', '')
+    st_val = trade['st_value']
+    entry_prem = trade.get('option_premium', 0) or 0
+    option_csv = cfg.PROJECT_ROOT / 'nse_stocks_options.csv'
+
+    candidates = []
+
+    # Try CSV — filter to same expiry
+    if option_csv.exists():
+        try:
+            with open(option_csv, newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if (row.get('stock_symbol', '') == stock
+                            and row.get('option_type', '') == direction):
+                        expiry = row.get('option_expiry', '')
+                        if long_expiry and expiry != long_expiry:
+                            continue
+                        strike = float(row.get('option_strike', 0))
+                        candidates.append({
+                            'strike': strike,
+                            'symbol': row.get('option_tradingsymbol', ''),
+                        })
+        except Exception:
+            pass
+
+    # Fallback: NFO instruments
+    if not candidates:
+        try:
+            instruments = _get_nfo_instruments(kite)
+            for inst in instruments:
+                if (inst['name'] == stock
+                        and inst['instrument_type'] == direction):
+                    inst_expiry = str(inst.get('expiry', ''))
+                    if long_expiry and inst_expiry != long_expiry:
+                        continue
+                    candidates.append({
+                        'strike': inst['strike'],
+                        'symbol': inst['tradingsymbol'],
+                    })
+        except Exception:
+            pass
+
+    if not candidates:
+        return None
+
+    # KEY RULE: short strike must be BEYOND ST
+    if direction == 'PE':
+        # Long PUT, target is decline to ST. Short PUT below ST.
+        beyond = [c for c in candidates if c['strike'] < st_val]
+        if not beyond:
+            return None
+        # Nearest strike below ST (maximize credit, minimize spread width)
+        beyond.sort(key=lambda x: x['strike'], reverse=True)
+        best = beyond[0]
+        spread_width = long_strike - best['strike']
+    else:
+        # Long CALL, target is rally to ST. Short CALL above ST.
+        beyond = [c for c in candidates if c['strike'] > st_val]
+        if not beyond:
+            return None
+        # Nearest strike above ST
+        beyond.sort(key=lambda x: x['strike'])
+        best = beyond[0]
+        spread_width = best['strike'] - long_strike
+
+    if spread_width <= 0:
+        return None
+
+    # Get credit (BID - slippage)
+    credit = get_sell_price(kite, best['symbol'])
+    if credit <= 0:
+        logger.warning("No bid for hedge %s, skipping", best['symbol'])
+        return None
+
+    # Check debit ratio
+    net_debit = entry_prem - credit
+    debit_ratio = net_debit / spread_width if spread_width > 0 else 1.0
+    if debit_ratio > cfg.HEDGE_MAX_DEBIT_RATIO:
+        logger.info("Hedge debit ratio %.1f%% > max %.0f%%, skipping (fallback to premium SL)",
+                     debit_ratio * 100, cfg.HEDGE_MAX_DEBIT_RATIO * 100)
+        return None
+
+    logger.info("Hedge: sell %s @%.2f, width=%.0f, net_debit=%.2f, ratio=%.1f%%",
+                best['symbol'], credit, spread_width, net_debit, debit_ratio * 100)
+
+    return {
+        'hedge_strike': best['strike'],
+        'hedge_symbol': best['symbol'],
+        'hedge_premium': credit,
+        'hedge_spread_width': spread_width,
+    }
 
 
 # ── Stale Signal Cleanup ──────────────────────────────────────────────────

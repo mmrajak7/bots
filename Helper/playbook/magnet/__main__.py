@@ -84,14 +84,16 @@ def cmd_status(args):
     if entered:
         print(f"\n  --- Open Trades ---")
         for t in entered:
-            cost_sl = ""
+            flags = ""
+            if t.get('hedged'):
+                flags += f" [HEDGED: {t.get('hedge_symbol', '?')}]"
             if t.get('cost_sl_active'):
-                cost_sl = f" [COST SL: {t.get('cost_sl_level', 0):.2f}]"
+                flags += f" [COST SL: {t.get('cost_sl_level', 0):.2f}]"
             print(f"  #{t['id']} {t['stock']:<12} {t['direction']:<4} "
                   f"entry={t.get('entry_spot', 0):.2f} "
                   f"target={t['target_spot']:.2f} "
                   f"sl={t.get('sl_spot', 0):.2f} "
-                  f"option={t.get('option_symbol', '?')}{cost_sl}")
+                  f"option={t.get('option_symbol', '?')}{flags}")
 
     print()
 
@@ -118,19 +120,24 @@ def cmd_close(args):
         # Get current spot for paper exit
         try:
             from .scanner import _get_kite, get_ltp
-            from .monitor import get_sell_price
+            from .monitor import get_sell_price, get_buy_price
             kite = _get_kite()
             ltps = get_ltp(kite, [trade['stock']])
             spot = ltps.get(trade['stock'], 0)
 
-            # Sell at BID - slippage
+            # Long leg: sell at BID - slippage
             premium = get_sell_price(kite, trade['option_symbol']) if trade.get('option_symbol') else 0
+            # Short leg (if hedged): buy back at ASK + slippage
+            hedge_prem = None
+            if trade.get('hedged') and trade.get('hedge_symbol'):
+                hedge_prem = get_buy_price(kite, trade['hedge_symbol'])
         except Exception:
             spot = trade.get('entry_spot', 0)
             premium = 0
+            hedge_prem = None
 
         store.exit_trade(trade_id, spot, premium,
-                         args.reason or 'manual close')
+                         args.reason or 'manual close', hedge_prem)
         # Re-read to get computed P&L
         for t in store.load_trades():
             if t['id'] == trade_id:

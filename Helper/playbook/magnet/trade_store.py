@@ -150,11 +150,20 @@ class MagnetStore:
             "cost_sl_active": False,
             "cost_sl_level": None,     # entry_premium + 0.10
             "cost_sl_activated_at": None,
+            # Hedge (short leg beyond ST, added on reversal at 3% gap)
+            "hedged": False,
+            "hedge_strike": None,
+            "hedge_symbol": None,
+            "hedge_premium": None,     # credit received (BID - slippage)
+            "hedge_date": None,
+            "hedge_net_debit": None,   # entry_premium - hedge_credit
+            "hedge_spread_width": None,
             # Exit
             "exit_spot": None,
             "exit_date": None,
             "exit_time": None,
-            "exit_premium": None,
+            "exit_premium": None,      # long leg exit
+            "exit_hedge_premium": None, # short leg buyback (None if not hedged)
             "exit_reason": None,
             "pnl": None,
             "pnl_pct": None,
@@ -211,6 +220,42 @@ class MagnetStore:
         )
         return trade
 
+    def add_hedge(self, trade_id: int, hedge_data: dict) -> dict:
+        """Add short leg beyond ST to cap losses on reversal.
+
+        hedge_data: hedge_strike, hedge_symbol, hedge_premium (credit),
+                    hedge_spread_width
+        """
+        trade = self._find(trade_id)
+        if not trade:
+            raise ValueError(f"Trade #{trade_id} not found")
+        if trade['status'] != 'entered':
+            raise ValueError(f"Trade #{trade_id} is {trade['status']}, not entered")
+        if trade.get('hedged'):
+            return trade  # already hedged
+
+        entry_prem = trade.get('option_premium', 0) or 0
+        credit = hedge_data.get('hedge_premium', 0) or 0
+
+        trade['hedged'] = True
+        trade['hedge_strike'] = hedge_data.get('hedge_strike')
+        trade['hedge_symbol'] = hedge_data.get('hedge_symbol')
+        trade['hedge_premium'] = credit
+        trade['hedge_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        trade['hedge_net_debit'] = round(entry_prem - credit, 2)
+        trade['hedge_spread_width'] = hedge_data.get('hedge_spread_width')
+        trade['version'] += 1
+
+        self._save_local()
+        self._upload_to_drive()
+
+        logger.info(
+            "HEDGE #%d: %s sell %s @%.2f, net debit %.2f (was %.2f)",
+            trade_id, trade['stock'], trade['hedge_symbol'],
+            credit, trade['hedge_net_debit'], entry_prem
+        )
+        return trade
+
     def activate_cost_sl(self, trade_id: int) -> dict:
         """Activate cost SL when gap shrinks to 1%. SL = entry premium + 0.10."""
         trade = self._find(trade_id)
@@ -235,8 +280,13 @@ class MagnetStore:
         return trade
 
     def exit_trade(self, trade_id: int, exit_spot: float,
-                   exit_premium: float, reason: str) -> dict:
-        """Transition entered → exited. Naked option P&L."""
+                   exit_premium: float, reason: str,
+                   exit_hedge_premium: float = None) -> dict:
+        """Transition entered → exited. Handles naked and hedged P&L.
+
+        exit_premium: long leg sell price (BID - slippage)
+        exit_hedge_premium: short leg buyback (ASK + slippage), None if not hedged
+        """
         trade = self._find(trade_id)
         if not trade:
             raise ValueError(f"Trade #{trade_id} not found")
@@ -249,13 +299,19 @@ class MagnetStore:
         trade['exit_date'] = now.strftime('%Y-%m-%d')
         trade['exit_time'] = now.strftime('%H:%M:%S')
         trade['exit_premium'] = round(exit_premium, 2)
+        trade['exit_hedge_premium'] = (round(exit_hedge_premium, 2)
+                                       if exit_hedge_premium is not None else None)
         trade['exit_reason'] = reason
 
-        # P&L: simple premium diff (naked)
         entry_prem = trade.get('option_premium', 0) or 0
         qty = trade.get('quantity', 0) or 0
         if entry_prem > 0 and qty > 0:
-            pnl_per_share = exit_premium - entry_prem
+            if trade.get('hedged') and exit_hedge_premium is not None:
+                # Spread P&L: (long_exit - short_buyback) - (long_entry - short_credit)
+                hedge_credit = trade.get('hedge_premium', 0) or 0
+                pnl_per_share = (exit_premium - exit_hedge_premium) - (entry_prem - hedge_credit)
+            else:
+                pnl_per_share = exit_premium - entry_prem
             trade['pnl'] = round(pnl_per_share * qty, 2)
             trade['pnl_pct'] = round((pnl_per_share / entry_prem) * 100, 2)
 
@@ -328,14 +384,22 @@ class MagnetStore:
                   f"{entry_str:>10} {t['target_spot']:>10,.2f} "
                   f"{sl_str:>10} {pnl_str:>10}")
 
+            if t.get('hedged'):
+                print(f"     HEDGE: short {t.get('hedge_symbol', '?')} "
+                      f"@{t.get('hedge_premium', 0):.2f} "
+                      f"| net debit={t.get('hedge_net_debit', 0):.2f} "
+                      f"| width={t.get('hedge_spread_width', 0)}")
             if t.get('cost_sl_active'):
                 print(f"     COST SL: Rs {t.get('cost_sl_level', 0):.2f} "
                       f"(activated {t.get('cost_sl_activated_at', '?')})")
 
             if t.get('exit_reason'):
+                hedge_str = ""
+                if t.get('exit_hedge_premium') is not None:
+                    hedge_str = f" short_buyback={t['exit_hedge_premium']:.2f}"
                 print(f"     EXIT: {t.get('exit_date', '')} "
                       f"reason={t['exit_reason']} "
-                      f"days={t.get('days_held', 0)}")
+                      f"days={t.get('days_held', 0)}{hedge_str}")
         print()
 
     # ── Sync ──────────────────────────────────────────────────────────────
