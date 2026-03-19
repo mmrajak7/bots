@@ -126,29 +126,52 @@ def get_sell_price(kite, symbol: str) -> float:
 
 # ── Spot OHLC ────────────────────────────────────────────────────────────
 
-def get_spot_ohlc(kite, symbols):
-    """Get LTP + intraday HIGH/LOW for spot symbols.
+def get_spot_with_recent_range(kite, symbols, instrument_tokens=None):
+    """Get LTP + recent HIGH/LOW for spot symbols.
 
-    Returns {symbol: {ltp, high, low}}. Uses kite.ohlc() for day's range.
+    Uses LTP for current price, then fetches last 5 minute-candles
+    to find recent high/low (catches wicks between 30s polls).
+    Falls back to LTP-only if minute data unavailable.
+
+    Returns {symbol: {ltp, high, low}}.
     """
     if not symbols:
         return {}
+
+    # Step 1: Get LTP for all
     instruments = [f"NSE:{s}" for s in symbols]
+    result = {}
     try:
-        data = kite.ohlc(instruments)
-        result = {}
-        for key, val in data.items():
+        ltp_data = kite.ltp(instruments)
+        for key, val in ltp_data.items():
             sym = key.replace('NSE:', '')
-            ohlc = val.get('ohlc', {})
-            result[sym] = {
-                'ltp': val.get('last_price', 0),
-                'high': ohlc.get('high', 0),
-                'low': ohlc.get('low', 0),
-            }
-        return result
+            ltp = val['last_price']
+            result[sym] = {'ltp': ltp, 'high': ltp, 'low': ltp}
     except Exception as e:
-        logger.error("OHLC fetch failed: %s", e)
+        logger.error("LTP fetch failed: %s", e)
         return {}
+
+    # Step 2: Get last 5 minute candles for recent high/low
+    from .scanner import get_instrument_token
+    now = datetime.now()
+    from_time = now - timedelta(minutes=5)
+
+    for sym in symbols:
+        try:
+            token = get_instrument_token(kite, sym)
+            candles = kite.historical_data(
+                token, from_time.strftime('%Y-%m-%d %H:%M:%S'),
+                now.strftime('%Y-%m-%d %H:%M:%S'), 'minute'
+            )
+            if candles:
+                recent_high = max(c['high'] for c in candles)
+                recent_low = min(c['low'] for c in candles)
+                result[sym]['high'] = recent_high
+                result[sym]['low'] = recent_low
+        except Exception:
+            pass  # keep LTP as fallback
+
+    return result
 
 
 # ── Option Selection ──────────────────────────────────────────────────────
@@ -358,9 +381,9 @@ def check_open_trades(store, kite):
     if not entered:
         return
 
-    # Use OHLC for spot — gives intraday high/low for wick detection
+    # Get LTP + last 5 min high/low for wick detection
     stocks = list({t['stock'] for t in entered})
-    spot_data = get_spot_ohlc(kite, stocks)
+    spot_data = get_spot_with_recent_range(kite, stocks)
 
     for trade in entered:
         stock = trade['stock']
