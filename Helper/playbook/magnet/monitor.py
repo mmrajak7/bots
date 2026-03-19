@@ -430,8 +430,9 @@ def check_open_trades(store, kite):
             logger.info("COST SL: %s", msg.replace('\n', ' | '))
 
         # === HEDGE: gap widened back to 3% (reversal) — add short beyond ST ===
-        if (not trade.get('hedged') and gap >= cfg.HEDGE_GAP
-                and gap < cfg.SL_GAP):
+        # Skip if cost SL already active (trade was near ST, cost SL handles exit)
+        if (not trade.get('hedged') and not trade.get('cost_sl_active')
+                and gap >= cfg.HEDGE_GAP and gap < cfg.SL_GAP):
             hedge_result = _find_hedge_strike(kite, trade, price)
             if hedge_result:
                 store.add_hedge(trade_id, hedge_result)
@@ -521,8 +522,8 @@ def check_open_trades(store, kite):
                 logger.info("COST SL: %s", msg.replace('\n', ' | '))
                 continue
 
-        # === CHECK PREMIUM SL: 40% loss (only BEFORE cost SL activates) ===
-        if not trade.get('cost_sl_active') and long_exit > 0:
+        # === CHECK PREMIUM SL: 40% loss (fallback — only if NOT cost SL and NOT hedged) ===
+        if not trade.get('cost_sl_active') and not trade.get('hedged') and long_exit > 0:
             premium_sl = entry_prem * (1 - cfg.PREMIUM_SL_PCT)
             if long_exit <= premium_sl:
                 # Detect gap — actual loss much worse than 40%
