@@ -502,16 +502,22 @@ def check_open_trades(store, kite):
         if not trade.get('cost_sl_active') and long_exit > 0:
             premium_sl = entry_prem * (1 - cfg.PREMIUM_SL_PCT)
             if long_exit <= premium_sl:
-                store.exit_trade(trade_id, price, long_exit, 'sl_premium')
+                # Detect gap — actual loss much worse than 40%
+                actual_loss_pct = (entry_prem - long_exit) / entry_prem
+                is_gap = actual_loss_pct > (cfg.PREMIUM_SL_PCT + 0.15)  # 55%+ loss = gap
+                exit_reason = 'sl_premium_gap' if is_gap else 'sl_premium'
+                store.exit_trade(trade_id, price, long_exit, exit_reason)
                 _peak_premiums.pop(trade_id, None)
                 pnl = trade.get('pnl', 0)
+                gap_warn = (f"\nGAP: premium {long_exit:.2f} is {actual_loss_pct:.0%} "
+                            f"below entry (SL was {cfg.PREMIUM_SL_PCT:.0%})") if is_gap else ""
                 msg = (
                     f"MAGNET PREMIUM SL (PAPER): {stock}\n"
-                    f"Premium dropped {cfg.PREMIUM_SL_PCT:.0%} from entry\n"
+                    f"Premium dropped {actual_loss_pct:.0%} from entry\n"
                     f"Entry: Rs {entry_prem:.2f} -> Current: Rs {long_exit:.2f} "
                     f"(SL: Rs {premium_sl:.2f})\n"
                     f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)\n"
-                    f"Days held: {trade.get('days_held', 0)}"
+                    f"Days held: {trade.get('days_held', 0)}{gap_warn}"
                 )
                 send_telegram(msg)
                 logger.info("PREM SL: %s", msg.replace('\n', ' | '))
