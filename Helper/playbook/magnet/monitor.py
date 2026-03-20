@@ -9,7 +9,6 @@ Responsibilities:
 
 import json
 import logging
-import sys
 import time
 from datetime import datetime, timedelta
 
@@ -67,8 +66,8 @@ def send_telegram(msg: str):
             json={'chat_id': _telegram_cfg['chat_id'], 'text': msg},
             timeout=10,
         )
-    except Exception:
-        pass  # best-effort
+    except Exception as e:
+        logger.debug("Telegram send failed: %s", e)
 
 
 # ── Market Hours ──────────────────────────────────────────────────────────
@@ -153,7 +152,7 @@ def get_spot_with_recent_range(kite, symbols, instrument_tokens=None):
 
     # Step 2: Get last 5 minute candles for recent high/low
     from .scanner import get_instrument_token
-    now = datetime.now()
+    now = datetime.now(IST)
     from_time = now - timedelta(minutes=5)
 
     for sym in symbols:
@@ -206,9 +205,10 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
                         })
 
                 if candidates:
-                    # Filter to nearest expiry with >= 7 DTE
-                    today = datetime.now().strftime('%Y-%m-%d')
-                    min_dte = (datetime.now() + timedelta(days=cfg.MIN_DTE)).strftime('%Y-%m-%d')
+                    # Filter to nearest expiry with >= MIN_DTE days
+                    now_dt = datetime.now()
+                    today = now_dt.strftime('%Y-%m-%d')
+                    min_dte = (now_dt + timedelta(days=cfg.MIN_DTE)).strftime('%Y-%m-%d')
                     valid_expiry = [c for c in candidates if c['expiry'] >= min_dte]
                     if not valid_expiry:
                         valid_expiry = [c for c in candidates if c['expiry'] >= today]
@@ -288,6 +288,13 @@ def check_watching_signals(store, kite):
     """Check watching signals: if gap shrinks to ≤2%, enter paper trade."""
     watching = store.get_watching()
     if not watching:
+        return
+
+    # Capacity check: don't exceed max open trades
+    entered_count = len(store.get_entered())
+    if entered_count >= cfg.MAX_OPEN_TRADES:
+        logger.info("At capacity (%d/%d entered), skipping watching checks",
+                     entered_count, cfg.MAX_OPEN_TRADES)
         return
 
     stocks = list({t['stock'] for t in watching})
@@ -578,10 +585,18 @@ def check_open_trades(store, kite):
         if entry_date:
             entry_dt = datetime.strptime(entry_date, '%Y-%m-%d')
             now = datetime.now()
+            # Count trading days (weekdays excluding known Indian market holidays)
+            _market_holidays_2026 = {
+                '2026-01-26', '2026-03-14', '2026-03-17', '2026-03-31',
+                '2026-04-01', '2026-04-14', '2026-04-18', '2026-05-01',
+                '2026-06-26', '2026-07-17', '2026-08-15', '2026-08-28',
+                '2026-10-02', '2026-10-20', '2026-10-21', '2026-10-23',
+                '2026-11-04', '2026-11-05', '2026-12-25',
+            }
             biz_days = 0
             d = entry_dt + timedelta(days=1)
             while d <= now:
-                if d.weekday() < 5:
+                if d.weekday() < 5 and d.strftime('%Y-%m-%d') not in _market_holidays_2026:
                     biz_days += 1
                 d += timedelta(days=1)
             if biz_days >= cfg.SL_TIME_DAYS:
@@ -758,11 +773,6 @@ def run(dry_run: bool = False):
     entered = len(store.get_entered())
     logger.info("Magnet monitor started: %d watching, %d entered, dry_run=%s",
                 watching, entered, dry_run)
-    send_telegram(
-        f"Magnet monitor started\n"
-        f"Watching: {watching} | Entered: {entered}\n"
-        f"Mode: {'DRY RUN' if dry_run else 'PAPER'}"
-    )
 
     if not is_market_hours():
         logger.info("Market closed. Exiting.")

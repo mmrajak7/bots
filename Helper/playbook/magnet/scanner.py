@@ -15,7 +15,6 @@ import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Dict, List, Tuple
 
 import requests

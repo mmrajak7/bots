@@ -63,6 +63,9 @@ _DEFAULTS = {
 }
 
 import json as _json
+import logging as _logging
+
+_cfg_logger = _logging.getLogger(__name__)
 
 def _load_runtime() -> dict:
     """Load runtime config from magnet_config.json, merged with defaults."""
@@ -75,8 +78,12 @@ def _load_runtime() -> dict:
             for key in _DEFAULTS:
                 if key in file_cfg:
                     cfg[key] = file_cfg[key]
-        except Exception:
-            pass
+            # Warn about unrecognized keys (typos in config)
+            unknown = [k for k in file_cfg if k not in _DEFAULTS and k != 'google_drive']
+            if unknown:
+                _cfg_logger.warning("magnet_config.json: unknown keys ignored: %s", unknown)
+        except Exception as e:
+            _cfg_logger.warning("Failed to load %s, using defaults: %s", CONFIG_FILE, e)
     return cfg
 
 _runtime = _load_runtime()
@@ -111,6 +118,10 @@ LOTS_PER_TRADE = _runtime['lots_per_trade']
 MAX_OPEN_TRADES = _runtime['max_open_trades']
 
 # ── Option selection ──────────────────────────────────────────────────────
+# ── Supertrend parameters ───────────────────────────────────────────────
+ST_PERIOD = 10
+ST_MULTIPLIER = 3
+
 PRODUCT = 'NRML'             # positional, not intraday
 OPTION_TYPE_MAP = {
     # price > ST (above support) → expect decline to ST → buy PUT
