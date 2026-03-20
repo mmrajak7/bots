@@ -35,9 +35,19 @@ CHARTINK_WEEKLY = (
     ' ) )'
 )
 
+# Daily: F&O stocks within +/-3.1% of Daily ST(10,3)
+# Default timeframe on Chartink is daily — no prefix needed
+CHARTINK_DAILY = (
+    '( {33489} ( '
+    ' close <=  supertrend( 10 , 3 ) *  1.031'
+    ' and  close >=  supertrend( 10 , 3 ) *  0.969'
+    ' ) )'
+)
+
 SCANNERS = [
     {'name': 'monthly', 'clause': CHARTINK_MONTHLY, 'timeframe': 'monthly'},
     {'name': 'weekly',  'clause': CHARTINK_WEEKLY,  'timeframe': 'weekly'},
+    {'name': 'daily',   'clause': CHARTINK_DAILY,   'timeframe': 'daily'},
 ]
 
 # ── Defaults (overridden by magnet_config.json if present) ────────────────
@@ -60,6 +70,10 @@ _DEFAULTS = {
     'max_open_trades': 10,        # max concurrent magnet trades
     'scan_interval_sec': 300,     # 5 minutes between Chartink scans
     'monitor_interval_sec': 30,   # 30 seconds between LTP checks
+    # ── Daily velocity filters (from backtest: 80% hit rate when all pass) ──
+    'daily_velocity_3d_max': -0.5, # 3-day gap change must be < this (negative = closing)
+    'daily_momentum_min': 60,      # % of last 5 days gap was closing (>=60%)
+    'daily_gap_max': 0.02,         # stricter gap for daily (2% vs 3% for W/M)
 }
 
 import json as _json
@@ -121,6 +135,11 @@ MAX_OPEN_TRADES = _runtime['max_open_trades']
 # ── Supertrend parameters ───────────────────────────────────────────────
 ST_PERIOD = 10
 ST_MULTIPLIER = 3
+
+# ── Daily velocity thresholds ───────────────────────────────────────────
+DAILY_VELOCITY_3D_MAX = _runtime.get('daily_velocity_3d_max', -0.5)
+DAILY_MOMENTUM_MIN = _runtime.get('daily_momentum_min', 60)
+DAILY_GAP_MAX = _runtime.get('daily_gap_max', 0.02)
 
 PRODUCT = 'NRML'             # positional, not intraday
 OPTION_TYPE_MAP = {

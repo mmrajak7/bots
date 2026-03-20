@@ -48,7 +48,7 @@ _telegram_cfg_loaded = False
 
 
 def send_telegram(msg: str):
-    """Send Telegram alert. Best-effort: never blocks or crashes."""
+    """Send Telegram alert with HTML parse mode. Best-effort: never blocks or crashes."""
     global _telegram_cfg, _telegram_cfg_loaded
 
     try:
@@ -63,11 +63,22 @@ def send_telegram(msg: str):
 
         requests.post(
             f"https://api.telegram.org/bot{_telegram_cfg['bot_token']}/sendMessage",
-            json={'chat_id': _telegram_cfg['chat_id'], 'text': msg},
+            json={'chat_id': _telegram_cfg['chat_id'], 'text': msg,
+                  'parse_mode': 'HTML'},
             timeout=10,
         )
     except Exception as e:
         logger.debug("Telegram send failed: %s", e)
+
+
+def _tf_tag(timeframe: str) -> str:
+    """Short timeframe tag: [M] [W] [D]."""
+    return {'monthly': '[M]', 'weekly': '[W]', 'daily': '[D]'}.get(timeframe, '[?]')
+
+
+def _dir_icon(direction: str) -> str:
+    """Red circle for PE (put), green for CE (call)."""
+    return '\U0001f534' if direction == 'PE' else '\U0001f7e2'  # red/green circle
 
 
 # ── Market Hours ──────────────────────────────────────────────────────────
@@ -320,9 +331,9 @@ def check_watching_signals(store, kite):
             logger.info("Signal #%d %s: gap %.1f%% too narrow, cancelling",
                         trade['id'], stock, gap * 100)
             store.cancel_signal(trade['id'], f"gap narrowed to {gap:.1%}, past entry zone")
+            tf = _tf_tag(trade.get('timeframe', ''))
             send_telegram(
-                f"MAGNET CANCEL: {stock}\n"
-                f"Gap narrowed to {gap:.1%}, missed entry window"
+                f"\u274c <b>CANCEL</b> {tf} {stock} | gap {gap:.1%}, missed window"
             )
             continue
 
@@ -369,15 +380,13 @@ def check_watching_signals(store, kite):
             'sl_spot': sl_spot,
         })
 
+        icon = _dir_icon(trade['direction'])
+        tf = _tf_tag(trade['timeframe'])
         msg = (
-            f"MAGNET ENTRY (PAPER): {stock}\n"
-            f"Direction: {trade['direction']} ({side} ST)\n"
-            f"Spot: Rs {price:,.2f} | ST: Rs {st_val:,.2f} | Gap: {gap:.1%}\n"
-            f"Option: {option['symbol']} @ Rs {premium:.2f}\n"
-            f"Qty: {qty} (lot={lot_size})\n"
-            f"Target: Rs {st_val:,.2f} (ST line)\n"
-            f"SL Spot: Rs {sl_spot:,.2f} (5% gap)\n"
-            f"Timeframe: {trade['timeframe']}"
+            f"{icon} <b>ENTRY</b> {tf} {stock}\n"
+            f"Spot {price:,.1f} | ST {st_val:,.1f} | Gap {gap:.1%}\n"
+            f"<code>{option['symbol']}</code> @ {premium:.2f}\n"
+            f"Qty {qty} | SL {sl_spot:,.1f}"
         )
         send_telegram(msg)
         logger.info(msg.replace('\n', ' | '))
@@ -433,12 +442,10 @@ def check_open_trades(store, kite):
         # === ACTIVATE COST SL: gap shrinks to 1% (stock halfway to target) ===
         if not trade.get('cost_sl_active') and gap <= cfg.COST_SL_GAP:
             store.activate_cost_sl(trade_id)
+            cost_lvl = trade.get('cost_sl_level', 0)
             msg = (
-                f"MAGNET COST SL ACTIVE: {stock}\n"
-                f"Gap reached {gap:.1%} — SL moved to cost+0.10\n"
-                f"SL floor: Rs {trade.get('cost_sl_level', 0):.2f} "
-                f"(entry was Rs {entry_prem:.2f})\n"
-                f"ZERO RISK from here"
+                f"\U0001f6e1 COST SL {stock} | gap {gap:.1%}\n"
+                f"Floor {cost_lvl:.2f} (entry {entry_prem:.2f}) ZERO RISK"
             )
             send_telegram(msg)
             logger.info("COST SL: %s", msg.replace('\n', ' | '))
@@ -450,14 +457,12 @@ def check_open_trades(store, kite):
             hedge_result = _find_hedge_strike(kite, trade, price)
             if hedge_result:
                 store.add_hedge(trade_id, hedge_result)
+                nd = trade.get('hedge_net_debit', entry_prem)
                 msg = (
-                    f"MAGNET HEDGE (PAPER): {trade['stock']}\n"
-                    f"Stock reversed, gap back to {gap:.1%}\n"
-                    f"Short {hedge_result['hedge_symbol']} "
-                    f"@ Rs {hedge_result['hedge_premium']:.2f}\n"
-                    f"Net debit: Rs {trade.get('hedge_net_debit', entry_prem):.2f} "
-                    f"(was Rs {entry_prem:.2f})\n"
-                    f"Max loss capped at Rs {trade.get('hedge_net_debit', entry_prem):.2f}/sh"
+                    f"\U0001f6e1 HEDGE {stock} | gap {gap:.1%}\n"
+                    f"Short <code>{hedge_result['hedge_symbol']}</code> "
+                    f"@ {hedge_result['hedge_premium']:.2f}\n"
+                    f"Net debit {nd:.2f} | Max loss capped"
                 )
                 send_telegram(msg)
                 logger.info("HEDGE: %s", msg.replace('\n', ' | '))
@@ -481,13 +486,14 @@ def check_open_trades(store, kite):
                 wick_note = f"\nWick: 5m low {day_low:.2f} touched ST, current {price:.2f}"
             elif side == 'below' and price < st_val:
                 wick_note = f"\nWick: 5m high {day_high:.2f} touched ST, current {price:.2f}"
-            hedge_str = f" [HEDGED]" if trade.get('hedged') else ""
+            h = " H" if trade.get('hedged') else ""
+            pnl_icon = '\u2705' if pnl >= 0 else '\u274c'
+            tf = _tf_tag(trade.get('timeframe', ''))
             msg = (
-                f"MAGNET TP HIT (PAPER): {stock}{hedge_str}\n"
-                f"Spot: Rs {price:,.2f} | ST: Rs {st_val:,.2f}\n"
-                f"Premium: {entry_prem:.2f} -> {long_exit:.2f}\n"
-                f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)\n"
-                f"Days held: {trade.get('days_held', 0)}{wick_note}"
+                f"{pnl_icon} <b>TP</b> {tf} {stock}{h}\n"
+                f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
+                f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%) "
+                f"{trade.get('days_held', 0)}d"
             )
             send_telegram(msg)
             logger.info("TP: %s", msg.replace('\n', ' | '))
@@ -505,14 +511,14 @@ def check_open_trades(store, kite):
                 store.exit_trade(trade_id, price, long_exit, 'tp_trail', hedge_exit)
                 _peak_premiums.pop(trade_id, None)
                 pnl = trade.get('pnl', 0)
+                pnl_icon = '\u2705' if pnl >= 0 else '\u274c'
+                tf = _tf_tag(trade.get('timeframe', ''))
                 msg = (
-                    f"MAGNET TRAIL TP (PAPER): {stock}\n"
-                    f"Premium dropped below 50% trail\n"
-                    f"Peak: Rs {peak:.2f} | Trail: Rs {trail_level:.2f} | "
-                    f"Current: Rs {long_exit:.2f}\n"
-                    f"Entry: Rs {entry_prem:.2f} -> Exit: Rs {long_exit:.2f}\n"
-                    f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)\n"
-                    f"Days held: {trade.get('days_held', 0)}"
+                    f"{pnl_icon} <b>TRAIL</b> {tf} {stock}\n"
+                    f"Peak {peak:.2f} | Trail {trail_level:.2f}\n"
+                    f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
+                    f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%) "
+                    f"{trade.get('days_held', 0)}d"
                 )
                 send_telegram(msg)
                 logger.info("TRAIL: %s", msg.replace('\n', ' | '))
@@ -525,12 +531,11 @@ def check_open_trades(store, kite):
                 store.exit_trade(trade_id, price, long_exit, 'sl_cost', hedge_exit)
                 _peak_premiums.pop(trade_id, None)
                 pnl = trade.get('pnl', 0)
+                tf = _tf_tag(trade.get('timeframe', ''))
                 msg = (
-                    f"MAGNET COST SL (PAPER): {stock}\n"
-                    f"Premium hit cost SL: Rs {long_exit:.2f} <= Rs {cost_sl:.2f}\n"
-                    f"Entry: Rs {entry_prem:.2f} -> Exit: Rs {long_exit:.2f}\n"
-                    f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%) ~breakeven\n"
-                    f"Days held: {trade.get('days_held', 0)}"
+                    f"\U0001f7f0 <b>COST SL</b> {tf} {stock}\n"
+                    f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
+                    f"<b>Rs {pnl:+,.0f}</b> ~BE {trade.get('days_held', 0)}d"
                 )
                 send_telegram(msg)
                 logger.info("COST SL: %s", msg.replace('\n', ' | '))
@@ -549,13 +554,13 @@ def check_open_trades(store, kite):
                 pnl = trade.get('pnl', 0)
                 gap_warn = (f"\nGAP: premium {long_exit:.2f} is {actual_loss_pct:.0%} "
                             f"below entry (SL was {cfg.PREMIUM_SL_PCT:.0%})") if is_gap else ""
+                tf = _tf_tag(trade.get('timeframe', ''))
+                gap_tag = " GAP!" if is_gap else ""
                 msg = (
-                    f"MAGNET PREMIUM SL (PAPER): {stock}\n"
-                    f"Premium dropped {actual_loss_pct:.0%} from entry\n"
-                    f"Entry: Rs {entry_prem:.2f} -> Current: Rs {long_exit:.2f} "
-                    f"(SL: Rs {premium_sl:.2f})\n"
-                    f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)\n"
-                    f"Days held: {trade.get('days_held', 0)}{gap_warn}"
+                    f"\u274c <b>PREM SL</b> {tf} {stock}{gap_tag}\n"
+                    f"{entry_prem:.2f}\u2192{long_exit:.2f} ({actual_loss_pct:.0%})\n"
+                    f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%) "
+                    f"{trade.get('days_held', 0)}d"
                 )
                 send_telegram(msg)
                 logger.info("PREM SL: %s", msg.replace('\n', ' | '))
@@ -576,12 +581,14 @@ def check_open_trades(store, kite):
             pnl = trade.get('pnl', 0)
             gap_warn = (f"\nGAP: spot {price:.2f} is {sl_gap_pct:.1f}% past "
                         f"SL {sl_spot:.2f}") if sl_gap_pct > 1.0 else ""
+            tf = _tf_tag(trade.get('timeframe', ''))
+            gap_tag = " GAP!" if sl_gap_pct > 1.0 else ""
             msg = (
-                f"MAGNET SPOT SL (PAPER): {stock}\n"
-                f"Spot: Rs {price:,.2f} hit SL: Rs {sl_spot:,.2f}\n"
-                f"Premium: Rs {entry_prem:.2f} -> Rs {long_exit:.2f}\n"
-                f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)\n"
-                f"Days held: {trade.get('days_held', 0)}{gap_warn}"
+                f"\u274c <b>SPOT SL</b> {tf} {stock}{gap_tag}\n"
+                f"Spot {price:,.1f} hit SL {sl_spot:,.1f}\n"
+                f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
+                f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%) "
+                f"{trade.get('days_held', 0)}d"
             )
             send_telegram(msg)
             logger.info("SL: %s", msg.replace('\n', ' | '))
@@ -610,12 +617,11 @@ def check_open_trades(store, kite):
                 store.exit_trade(trade_id, price, long_exit, 'sl_time', hedge_exit)
                 _peak_premiums.pop(trade_id, None)
                 pnl = trade.get('pnl', 0)
+                tf = _tf_tag(trade.get('timeframe', ''))
                 msg = (
-                    f"MAGNET TIME SL (PAPER): {stock}\n"
-                    f"Held {biz_days} trading days without touching ST\n"
-                    f"Spot: Rs {price:,.2f} | ST: Rs {st_val:,.2f}\n"
-                    f"Premium: Rs {entry_prem:.2f} -> Rs {long_exit:.2f}\n"
-                    f"P&L: Rs {pnl:,.0f} ({trade.get('pnl_pct', 0):.1f}%)"
+                    f"\u23f0 <b>TIME SL</b> {tf} {stock} ({biz_days}d)\n"
+                    f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
+                    f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%)"
                 )
                 send_telegram(msg)
                 logger.info("TIME SL: %s", msg.replace('\n', ' | '))
@@ -803,12 +809,12 @@ def run(dry_run: bool = False):
                     if added:
                         for sig in added:
                             if not sig.get('dry_run'):
+                                icon = _dir_icon(sig['direction'])
+                                tf = _tf_tag(sig['timeframe'])
                                 send_telegram(
-                                    f"MAGNET SIGNAL: {sig['stock']}\n"
-                                    f"Timeframe: {sig['timeframe']}\n"
-                                    f"Gap: {sig['signal_gap_pct']:.1f}%\n"
-                                    f"ST: Rs {sig['st_value']:,.2f} ({sig['st_direction']})\n"
-                                    f"Direction: {sig['direction']}\n"
+                                    f"{icon} <b>SIGNAL</b> {tf} {sig['stock']}\n"
+                                    f"ST {sig['st_value']:,.1f} ({sig['st_direction']}) "
+                                    f"| Gap {sig['signal_gap_pct']:.1f}%\n"
                                     f"Watching for 2% entry..."
                                 )
                     kite_error_count = 0  # reset on success
@@ -860,10 +866,11 @@ def run(dry_run: bool = False):
                     if t.get('exit_date') == datetime.now().strftime('%Y-%m-%d')]
     total_pnl = sum(t.get('pnl', 0) or 0 for t in exited_today)
 
+    pnl_icon = '\u2705' if total_pnl >= 0 else '\u274c'
     summary = (
-        f"Magnet EOD Summary\n"
-        f"Watching: {watching} | Open: {entered}\n"
-        f"Exited today: {len(exited_today)} | P&L: Rs {total_pnl:,.0f}"
+        f"\U0001f4ca <b>Magnet EOD</b>\n"
+        f"Watch {watching} | Open {entered} | "
+        f"Exit {len(exited_today)} | {pnl_icon} <b>Rs {total_pnl:+,.0f}</b>"
     )
     logger.info(summary.replace('\n', ' | '))
     send_telegram(summary)
