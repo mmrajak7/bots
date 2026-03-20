@@ -73,7 +73,7 @@ _DEFAULTS = {
     # ── Daily velocity filters (from backtest: 80% hit rate when all pass) ──
     'daily_velocity_3d_max': -0.5, # 3-day gap change must be < this (negative = closing)
     'daily_momentum_min': 60,      # % of last 5 days gap was closing (>=60%)
-    'daily_gap_max': 0.02,         # stricter gap for daily (2% vs 3% for W/M)
+    'daily_gap_max': 0.03,         # same 3% scan range; velocity filter is the quality gate
 }
 
 import json as _json

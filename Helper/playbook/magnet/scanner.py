@@ -370,8 +370,12 @@ def compute_daily_velocity(kite, symbol: str, st_value: float,
     Measures how fast the gap is closing over the last 3-5 trading days.
     Returns dict with velocity metrics, or empty dict on failure.
 
-    Backtest-validated filter: vel_3d < -0.5 AND momentum >= 60% AND gap < 2%
+    Backtest-validated filter: vel_3d < -0.5 AND momentum >= 60%
     yields 80% hit rate (touch+flip), 70% win rate, +10% avg PnL.
+
+    Note: uses today's ST value for all historical gap computations.
+    Daily ST shifts slightly each day, so this is an approximation.
+    Directionally correct for filtering fast vs slow approach.
     """
     try:
         token = get_instrument_token(kite, symbol)
@@ -536,7 +540,9 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
         st_val = st_info['st']
         gap = abs(price - st_val) / st_val
 
-        # Daily signals use stricter gap threshold (2% vs 3% for W/M)
+        # Signal acceptance range: gap must be between ENTRY_GAP (2%) and max_gap (3%)
+        # For daily: same 3% range — velocity filter is the daily-specific quality gate
+        # Lifecycle: signal at 2-3% (watching) → gap shrinks to <2% → monitor enters
         max_gap = cfg.DAILY_GAP_MAX if timeframe == 'daily' else cfg.SIGNAL_GAP_MAX
 
         # Verify gap is in valid range
