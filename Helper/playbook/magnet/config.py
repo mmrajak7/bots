@@ -44,7 +44,7 @@ CHARTINK_DAILY = (
     ' ) )'
 )
 
-SCANNERS = [
+_ALL_SCANNERS = [
     {'name': 'monthly', 'clause': CHARTINK_MONTHLY, 'timeframe': 'monthly'},
     {'name': 'weekly',  'clause': CHARTINK_WEEKLY,  'timeframe': 'weekly'},
     {'name': 'daily',   'clause': CHARTINK_DAILY,   'timeframe': 'daily'},
@@ -74,6 +74,7 @@ _DEFAULTS = {
     'daily_velocity_3d_max': -0.5, # 3-day gap change must be < this (negative = closing)
     'daily_momentum_min': 60,      # % of last 5 days gap was closing (>=60%)
     'daily_gap_max': 0.03,         # same 3% scan range; velocity filter is the quality gate
+    'enabled_timeframes': ['monthly', 'weekly', 'daily'],  # toggle scanners on/off
 }
 
 import json as _json
@@ -139,7 +140,11 @@ ST_MULTIPLIER = 3
 # ── Daily velocity thresholds ───────────────────────────────────────────
 DAILY_VELOCITY_3D_MAX = _runtime.get('daily_velocity_3d_max', -0.5)
 DAILY_MOMENTUM_MIN = _runtime.get('daily_momentum_min', 60)
-DAILY_GAP_MAX = _runtime.get('daily_gap_max', 0.02)
+DAILY_GAP_MAX = _runtime.get('daily_gap_max', 0.03)
+ENABLED_TIMEFRAMES = _runtime.get('enabled_timeframes', ['monthly', 'weekly', 'daily'])
+
+# Filter scanners to only enabled timeframes
+SCANNERS = [s for s in _ALL_SCANNERS if s['timeframe'] in ENABLED_TIMEFRAMES]
 
 PRODUCT = 'NRML'             # positional, not intraday
 OPTION_TYPE_MAP = {
