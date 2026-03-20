@@ -213,7 +213,9 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
                     if not valid_expiry:
                         valid_expiry = [c for c in candidates if c['expiry'] >= today]
                     if not valid_expiry:
-                        valid_expiry = candidates
+                        logger.warning("No valid expiry for %s %s — CSV may be stale (run kite_nse_options.py)",
+                                       stock, option_type)
+                        return {}
 
                     # Group by nearest expiry
                     valid_expiry.sort(key=lambda x: x['expiry'])
@@ -337,6 +339,11 @@ def check_watching_signals(store, kite):
 
         lot_size = option['lot_size']
         premium = option.get('premium', 0)
+
+        if premium <= 0:
+            logger.warning("SKIP ENTRY %s: premium is Rs 0 for %s — option expired or illiquid",
+                           stock, option.get('symbol', '?'))
+            continue
 
         # Fixed lots per trade
         qty = lot_size * cfg.LOTS_PER_TRADE
