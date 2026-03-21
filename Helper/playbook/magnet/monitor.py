@@ -541,13 +541,15 @@ def check_open_trades(store, kite):
                 logger.info("COST SL: %s", msg.replace('\n', ' | '))
                 continue
 
-        # === CHECK PREMIUM SL: 40% loss (fallback — only if NOT cost SL and NOT hedged) ===
+        # === CHECK PREMIUM SL: 25% for daily (intraday), 40% for W/M ===
+        # Daily: tighter SL because no day-2 recovery. Backtest: +80L at 25% vs +63L at none.
         if not trade.get('cost_sl_active') and not trade.get('hedged') and long_exit > 0:
-            premium_sl = entry_prem * (1 - cfg.PREMIUM_SL_PCT)
+            sl_pct = (cfg.DAILY_PREMIUM_SL_PCT if trade.get('timeframe') == 'daily'
+                      else cfg.PREMIUM_SL_PCT)
+            premium_sl = entry_prem * (1 - sl_pct)
             if long_exit <= premium_sl:
-                # Detect gap — actual loss much worse than 40%
                 actual_loss_pct = (entry_prem - long_exit) / entry_prem
-                is_gap = actual_loss_pct > (cfg.PREMIUM_SL_PCT + 0.15)  # 55%+ loss = gap
+                is_gap = actual_loss_pct > (sl_pct + 0.15)
                 exit_reason = 'sl_premium_gap' if is_gap else 'sl_premium'
                 store.exit_trade(trade_id, price, long_exit, exit_reason, hedge_exit)
                 _peak_premiums.pop(trade_id, None)
