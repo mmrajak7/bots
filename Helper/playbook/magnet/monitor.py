@@ -594,7 +594,40 @@ def check_open_trades(store, kite):
             logger.info("SL: %s", msg.replace('\n', ' | '))
             continue
 
-        # === CHECK TIME SL: 5 trading days ===
+        # === CHECK EOD EXIT: daily trades are intraday-only ===
+        # Backtest: day1 = +63L (77% win), day2+ = -37L (39% win). Theta kills overnight.
+        # Exit same-day trades at 15:15. Exit prior-day daily trades immediately.
+        if trade.get('timeframe') == 'daily':
+            now_dt = datetime.now()
+            entry_date_str = trade.get('entry_date', '')
+            today_str = now_dt.strftime('%Y-%m-%d')
+            should_eod = False
+
+            if entry_date_str and entry_date_str < today_str:
+                # Entered yesterday or earlier — exit immediately (stale daily trade)
+                should_eod = True
+            elif (entry_date_str == today_str
+                    and (now_dt.hour, now_dt.minute) >= (cfg.DAILY_EOD_EXIT_HOUR, cfg.DAILY_EOD_EXIT_MIN)):
+                # Same day, past EOD exit time
+                should_eod = True
+
+            if should_eod:
+                reason = 'eod_daily' if entry_date_str == today_str else 'eod_daily_stale'
+                store.exit_trade(trade_id, price, long_exit, reason, hedge_exit)
+                _peak_premiums.pop(trade_id, None)
+                pnl = trade.get('pnl', 0)
+                pnl_icon = '\u2705' if pnl >= 0 else '\u274c'
+                stale = " (stale)" if entry_date_str != today_str else ""
+                msg = (
+                    f"{pnl_icon} <b>EOD EXIT</b> [D] {stock}{stale}\n"
+                    f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
+                    f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%)"
+                )
+                send_telegram(msg)
+                logger.info("EOD: %s", msg.replace('\n', ' | '))
+                continue
+
+        # === CHECK TIME SL: 5 trading days (weekly/monthly only now) ===
         entry_date = trade.get('entry_date')
         if entry_date:
             entry_dt = datetime.strptime(entry_date, '%Y-%m-%d')

@@ -75,6 +75,7 @@ _DEFAULTS = {
     'daily_momentum_min': 60,      # % of last 5 days gap was closing (>=60%)
     'daily_gap_max': 0.03,         # same 3% scan range; velocity filter is the quality gate
     'enabled_timeframes': ['monthly', 'weekly', 'daily'],  # toggle scanners on/off
+    'daily_eod_exit_time': [15, 15],   # [hour, minute] — force-exit daily trades (backtest: day1=+63L, day2+=-37L)
 }
 
 import json as _json
@@ -142,6 +143,9 @@ DAILY_VELOCITY_3D_MAX = _runtime.get('daily_velocity_3d_max', -0.5)
 DAILY_MOMENTUM_MIN = _runtime.get('daily_momentum_min', 60)
 DAILY_GAP_MAX = _runtime.get('daily_gap_max', 0.03)
 ENABLED_TIMEFRAMES = _runtime.get('enabled_timeframes', ['monthly', 'weekly', 'daily'])
+_eod = _runtime.get('daily_eod_exit_time', [15, 15])
+DAILY_EOD_EXIT_HOUR = _eod[0]
+DAILY_EOD_EXIT_MIN = _eod[1]
 
 # Filter scanners to only enabled timeframes
 SCANNERS = [s for s in _ALL_SCANNERS if s['timeframe'] in ENABLED_TIMEFRAMES]
