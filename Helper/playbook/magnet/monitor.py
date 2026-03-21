@@ -897,33 +897,52 @@ def _find_hedge_strike(kite, trade: dict, current_spot: float) -> dict:
 # ── Stale Signal Cleanup ──────────────────────────────────────────────────
 
 def cleanup_stale_signals(store):
-    """Cancel stale watching signals.
+    """Cancel stale watching signals at end of their timeframe lifecycle.
 
-    Daily: cancel same day if not entered (ST changes daily, stale by tomorrow).
-    Weekly/Monthly: cancel after 3 days (ST stable within period).
+    Daily:   cancel next day (ST recomputes daily, yesterday's signal is stale).
+    Weekly:  cancel when current ISO week differs from signal week (Monday = fresh).
+    Monthly: cancel when current month differs from signal month (1st = fresh).
     """
-    today_str = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.now()
+    today_str = now.strftime('%Y-%m-%d')
+    current_week = now.isocalendar()[:2]       # (year, week_number)
+    current_month = (now.year, now.month)
+
     for trade in store.get_watching():
         sig_date = trade.get('signal_date', '')
         if not sig_date:
             continue
 
         timeframe = trade.get('timeframe', '')
-
-        # Daily signals: cancel if not entered today (ST will be different tomorrow)
-        if timeframe == 'daily' and sig_date < today_str:
-            store.cancel_signal(trade['id'], "daily signal stale (ST changes daily)")
-            logger.info("Cleaned stale daily signal #%d %s (from %s)",
-                        trade['id'], trade['stock'], sig_date)
-            continue
-
-        # Weekly/Monthly: cancel after 3 days
         sig_dt = datetime.strptime(sig_date, '%Y-%m-%d')
-        days_old = (datetime.now() - sig_dt).days
-        if days_old > 3:
-            store.cancel_signal(trade['id'], f"stale after {days_old} days")
-            logger.info("Cleaned stale signal #%d %s (%d days old)",
-                        trade['id'], trade['stock'], days_old)
+
+        stale = False
+        reason = ''
+
+        if timeframe == 'daily':
+            # Daily: stale if signal is from a previous day
+            if sig_date < today_str:
+                stale = True
+                reason = "daily signal stale (new day, ST recomputed)"
+
+        elif timeframe == 'weekly':
+            # Weekly: stale if signal is from a previous ISO week
+            sig_week = sig_dt.isocalendar()[:2]
+            if sig_week != current_week:
+                stale = True
+                reason = f"weekly signal stale (week {sig_week[1]} -> {current_week[1]})"
+
+        elif timeframe == 'monthly':
+            # Monthly: stale if signal is from a previous month
+            sig_month = (sig_dt.year, sig_dt.month)
+            if sig_month != current_month:
+                stale = True
+                reason = f"monthly signal stale ({sig_dt.strftime('%b')} -> {now.strftime('%b')})"
+
+        if stale:
+            store.cancel_signal(trade['id'], reason)
+            logger.info("Cleaned stale %s signal #%d %s (from %s): %s",
+                        timeframe, trade['id'], trade['stock'], sig_date, reason)
 
 
 # ── Main Run Loop ────────────────────────────────────────────────────────

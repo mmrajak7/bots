@@ -5,14 +5,25 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 
-def aggregate_to_weekly(daily_data):
-    """Convert daily OHLC to weekly OHLC (Mon-Fri weeks)."""
+def aggregate_to_weekly(daily_data, exclude_current=False):
+    """Convert daily OHLC to weekly OHLC (Mon-Fri weeks).
+
+    Args:
+        exclude_current: If True, drop current incomplete week so ST
+                         is computed only from confirmed (closed) candles.
+    """
     weeks = defaultdict(list)
     for candle in daily_data:
         dt = datetime.fromisoformat(candle['date'].replace('+05:30', ''))
         # ISO week: (year, week_number)
         week_key = dt.isocalendar()[:2]
         weeks[week_key].append(candle)
+
+    # Drop current week if requested (partial data distorts ST)
+    if exclude_current:
+        now = datetime.now()
+        current_key = now.isocalendar()[:2]
+        weeks.pop(current_key, None)
 
     weekly = []
     for key in sorted(weeks.keys()):
@@ -114,7 +125,7 @@ def main():
     data = json.load(sys.stdin)
 
     for name, daily in data.items():
-        weekly = aggregate_to_weekly(daily)
+        weekly = aggregate_to_weekly(daily, exclude_current=True)
         st = compute_supertrend(weekly, period=10, multiplier=3)
 
         print(f"\n{'='*60}")

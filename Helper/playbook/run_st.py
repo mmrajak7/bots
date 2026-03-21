@@ -8,7 +8,11 @@ from compute_st import aggregate_to_weekly, compute_supertrend
 
 
 def aggregate_to_monthly(daily_data):
-    """Convert daily OHLC to monthly OHLC."""
+    """Convert daily OHLC to monthly OHLC, excluding current incomplete month.
+
+    Current month's partial data distorts ATR and ST bands — only
+    completed months produce confirmed ST values.
+    """
     from collections import defaultdict
     from datetime import datetime
 
@@ -17,6 +21,11 @@ def aggregate_to_monthly(daily_data):
         dt = datetime.fromisoformat(candle['date'].replace('+05:30', ''))
         month_key = (dt.year, dt.month)
         months[month_key].append(candle)
+
+    # Exclude current month (incomplete — close/high/low not final)
+    now = datetime.now()
+    current_key = (now.year, now.month)
+    months.pop(current_key, None)
 
     monthly = []
     for key in sorted(months.keys()):
@@ -61,9 +70,9 @@ def print_supertrend(name, candles, timeframe, period=10, multiplier=3, last_n=1
         print(f"  {dt:<14} {row['close']:>8.2f} {row['supertrend']:>8.2f} {row['direction']:>5} {row['atr']:>8.2f} {gap_pct:>+6.1f}%")
 
     latest = st[-1]
-    print(f"\n  >>> CURRENT: Close={latest['close']:.2f}, ST={latest['supertrend']:.2f}, Direction={latest['direction']}")
+    print(f"\n  >>> LAST CONFIRMED: Close={latest['close']:.2f}, ST={latest['supertrend']:.2f}, Direction={latest['direction']}")
     gap = ((latest['close'] - latest['supertrend']) / latest['supertrend']) * 100
-    print(f"  >>> Gap from ST: {gap:+.1f}%")
+    print(f"  >>> Gap from ST: {gap:+.1f}% (vs last close — use LTP for live gap)")
 
     if latest['direction'] == 'UP':
         touch_price = latest['supertrend']
@@ -112,8 +121,8 @@ def main():
         filepath = os.path.join(base, fname)
         daily = load_kite_data(filepath)
 
-        # Weekly ST
-        weekly = aggregate_to_weekly(daily)
+        # Weekly ST (exclude current incomplete week)
+        weekly = aggregate_to_weekly(daily, exclude_current=True)
         print_supertrend(name, weekly, "Weekly")
 
         # Monthly ST (for ETFs, also useful for comparison)
