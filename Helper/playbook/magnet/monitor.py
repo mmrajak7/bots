@@ -103,7 +103,7 @@ def is_market_hours() -> bool:
 # ── Bid-Ask Pricing ──────────────────────────────────────────────────────
 
 def get_option_quote(kite, symbol: str) -> dict:
-    """Get full bid/ask/LTP for an option. Returns {bid, ask, ltp, spread}."""
+    """Get full quote for an option: bid, ask, OI, volume, depth qty."""
     try:
         data = kite.quote([f"NFO:{symbol}"])
         q = list(data.values())[0]
@@ -112,11 +112,53 @@ def get_option_quote(kite, symbol: str) -> dict:
         sellers = depth.get('sell', [])
         bid = buyers[0]['price'] if buyers and buyers[0].get('price', 0) > 0 else 0
         ask = sellers[0]['price'] if sellers and sellers[0].get('price', 0) > 0 else 0
+        bid_qty = buyers[0].get('quantity', 0) if buyers else 0
+        ask_qty = sellers[0].get('quantity', 0) if sellers else 0
         ltp = q.get('last_price', 0)
         spread = round(ask - bid, 2) if bid > 0 and ask > 0 else 0
-        return {'bid': bid, 'ask': ask, 'ltp': ltp, 'spread': spread}
+        oi = q.get('oi', 0)
+        volume = q.get('volume', 0)
+        return {
+            'bid': bid, 'ask': ask, 'ltp': ltp, 'spread': spread,
+            'bid_qty': bid_qty, 'ask_qty': ask_qty,
+            'oi': oi, 'volume': volume,
+        }
     except Exception:
-        return {'bid': 0, 'ask': 0, 'ltp': 0, 'spread': 0}
+        return {'bid': 0, 'ask': 0, 'ltp': 0, 'spread': 0,
+                'bid_qty': 0, 'ask_qty': 0, 'oi': 0, 'volume': 0}
+
+
+def check_option_liquidity(quote: dict, premium: float) -> tuple:
+    """Check if option is liquid enough for entry.
+
+    Returns (is_liquid, reason).
+    Rules:
+    - Must have both BID and ASK (no one-sided market)
+    - Spread < Rs 2.00 or < 10% of premium (whichever is larger)
+    - OI > 500 contracts (some open interest exists)
+    - ASK qty > 0 (sellers available)
+    """
+    bid = quote.get('bid', 0)
+    ask = quote.get('ask', 0)
+    spread = quote.get('spread', 0)
+    oi = quote.get('oi', 0)
+    ask_qty = quote.get('ask_qty', 0)
+
+    if bid <= 0 or ask <= 0:
+        return False, "no bid or ask"
+
+    if ask_qty <= 0:
+        return False, "no sellers at ask"
+
+    # Spread check: absolute Rs 2.00 cap OR 10% of premium
+    max_spread = max(2.00, premium * 0.10) if premium > 0 else 2.00
+    if spread > max_spread:
+        return False, f"spread Rs {spread:.2f} > limit Rs {max_spread:.2f}"
+
+    if oi < 500:
+        return False, f"OI {oi} < 500 (illiquid contract)"
+
+    return True, f"liquid (spread={spread:.2f}, OI={oi}, ask_qty={ask_qty})"
 
 
 _tick_cache: dict = {}  # {symbol: tick_size} — populated from NFO instruments
@@ -274,19 +316,38 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
                     same_exp = [c for c in valid_expiry if c['expiry'] == target_exp]
 
                     # ATM: nearest strike to spot within same expiry
+                    # Try ATM first, then nearby strikes if illiquid
                     same_exp.sort(key=lambda x: abs(x['strike'] - spot))
-                    best = same_exp[0]
 
-                    # Get premium via ASK + slippage (what we actually pay)
-                    premium = get_buy_price(kite, best['symbol'])
+                    for candidate in same_exp[:5]:  # check up to 5 nearest strikes
+                        quote = get_option_quote(kite, candidate['symbol'])
+                        premium = quote['ask']
+                        if premium <= 0:
+                            continue
 
-                    return {
-                        'strike': best['strike'],
-                        'symbol': best['symbol'],
-                        'lot_size': best['lot_size'],
-                        'premium': premium,
-                        'expiry': best['expiry'],
-                    }
+                        # Apply tick-size rounding
+                        tick = _get_tick_size(candidate['symbol'])
+                        premium = _round_up_tick(premium + tick, tick)
+
+                        # Liquidity check
+                        is_liquid, liq_reason = check_option_liquidity(quote, premium)
+                        if not is_liquid:
+                            logger.info("SKIP %s %s: %s", stock, candidate['symbol'], liq_reason)
+                            continue
+
+                        logger.info("SELECT %s: %s (spread=%.2f, OI=%d)",
+                                     stock, candidate['symbol'], quote['spread'], quote['oi'])
+                        return {
+                            'strike': candidate['strike'],
+                            'symbol': candidate['symbol'],
+                            'lot_size': candidate['lot_size'],
+                            'premium': premium,
+                            'expiry': candidate['expiry'],
+                        }
+
+                    logger.warning("No liquid option for %s %s in %s expiry",
+                                   stock, option_type, target_exp)
+                    return {}
         except Exception as e:
             logger.warning("CSV option lookup failed: %s", e)
 
@@ -315,20 +376,36 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
         target_expiry = near_expiry[0]['expiry']
         same_expiry = [c for c in near_expiry if c['expiry'] == target_expiry]
 
-        # ATM strike
+        # ATM strike — try nearest strikes, skip illiquid
         same_expiry.sort(key=lambda x: abs(x['strike'] - spot))
-        best = same_expiry[0]
 
-        # Get premium via ASK + slippage (what we actually pay)
-        premium = get_buy_price(kite, best['tradingsymbol'])
+        for candidate in same_expiry[:5]:
+            sym = candidate['tradingsymbol']
+            quote = get_option_quote(kite, sym)
+            premium = quote['ask']
+            if premium <= 0:
+                continue
 
-        return {
-            'strike': best['strike'],
-            'symbol': best['tradingsymbol'],
-            'lot_size': best['lot_size'],
-            'premium': premium,
-            'expiry': str(best['expiry']),
-        }
+            tick = _get_tick_size(sym)
+            premium = _round_up_tick(premium + tick, tick)
+
+            is_liquid, liq_reason = check_option_liquidity(quote, premium)
+            if not is_liquid:
+                logger.info("SKIP %s %s: %s", stock, sym, liq_reason)
+                continue
+
+            logger.info("SELECT %s: %s (spread=%.2f, OI=%d)",
+                         stock, sym, quote['spread'], quote['oi'])
+            return {
+                'strike': candidate['strike'],
+                'symbol': sym,
+                'lot_size': candidate['lot_size'],
+                'premium': premium,
+                'expiry': str(candidate['expiry']),
+            }
+
+        logger.warning("No liquid option for %s %s via NFO instruments", stock, option_type)
+        return {}
 
     except Exception as e:
         logger.error("Instrument search failed for %s: %s", stock, e)
