@@ -63,7 +63,7 @@ _DEFAULTS = {
     'sl_gap': 0.05,               # 5% — if gap widens to this, thesis dead
     'sl_time_days': 5,            # exit if no touch within 5 trading days
     'freshness_days': 5,          # signal invalid if price was <2% within last N days
-    'slippage_pct': 0.02,         # 2% of premium (buy: +slippage, sell: -slippage)
+    'slippage_pct': 0.0,          # deprecated: now using tick-size rounding (±1 tick)
     'trail_pct': 0.50,            # trail at 50% of peak premium gains
     'min_dte': 10,                # minimum days to expiry for option selection
     'lots_per_trade': 1,          # lots per trade (start small)

@@ -26,8 +26,12 @@ logger = logging.getLogger(__name__)
 
 # ── Caches ────────────────────────────────────────────────────────────────
 _st_cache: dict = {}               # {(stock, timeframe): {st, direction, atr, computed_at}}
+_raw_daily_cache: dict = {}        # {symbol: [daily candles]} — reused by velocity
 _instrument_cache: dict = {}       # {symbol: instrument_token}
 _instrument_cache_loaded = False
+
+# Data duration per timeframe (years of daily data to fetch)
+_DATA_YEARS = {'monthly': 6, 'weekly': 3, 'daily': 1}
 
 
 # ── Chartink Scraper ──────────────────────────────────────────────────────
@@ -213,6 +217,9 @@ def compute_st_for_stock(kite, symbol: str, timeframe: str) -> dict:
     cache_file = cfg.BACKTEST_CACHE / f"{symbol}.json"
     daily_data = None
 
+    # Determine data duration: 6Y monthly, 3Y weekly, 1Y daily
+    data_years = _DATA_YEARS.get(timeframe, 6)
+
     if cache_file.exists():
         try:
             with open(cache_file) as f:
@@ -230,8 +237,7 @@ def compute_st_for_stock(kite, symbol: str, timeframe: str) -> dict:
                                  symbol, days_stale)
                     daily_data = None  # force fresh fetch
                 else:
-                    # Filter to last 6 years
-                    cutoff = (datetime.now() - timedelta(days=365 * 6)).strftime('%Y-%m-%d')
+                    cutoff = (datetime.now() - timedelta(days=365 * data_years)).strftime('%Y-%m-%d')
                     daily_data = [c for c in daily_data
                                   if (c['date'] if isinstance(c['date'], str)
                                       else c['date'].isoformat())[:10] >= cutoff]
@@ -239,22 +245,30 @@ def compute_st_for_stock(kite, symbol: str, timeframe: str) -> dict:
             daily_data = None
 
     if not daily_data:
-        # Fetch from Kite API (2 chunks to avoid 2000-day limit)
+        # Fetch from Kite API
         try:
             token = get_instrument_token(kite, symbol)
             now = datetime.now()
-            mid = now - timedelta(days=365 * 3)
-            start = now - timedelta(days=365 * 6)
+            start = now - timedelta(days=365 * data_years)
 
-            chunk1 = kite.historical_data(
-                token, start.strftime('%Y-%m-%d'),
-                mid.strftime('%Y-%m-%d'), 'day'
-            )
-            chunk2 = kite.historical_data(
-                token, (mid + timedelta(days=1)).strftime('%Y-%m-%d'),
-                now.strftime('%Y-%m-%d'), 'day'
-            )
-            daily_data = chunk1 + chunk2
+            if data_years > 5:
+                # 6Y: 2 chunks to avoid 2000-day limit
+                mid = now - timedelta(days=365 * 3)
+                chunk1 = kite.historical_data(
+                    token, start.strftime('%Y-%m-%d'),
+                    mid.strftime('%Y-%m-%d'), 'day'
+                )
+                chunk2 = kite.historical_data(
+                    token, (mid + timedelta(days=1)).strftime('%Y-%m-%d'),
+                    now.strftime('%Y-%m-%d'), 'day'
+                )
+                daily_data = chunk1 + chunk2
+            else:
+                # 3Y or 1Y: single chunk (well within 2000-day limit)
+                daily_data = kite.historical_data(
+                    token, start.strftime('%Y-%m-%d'),
+                    now.strftime('%Y-%m-%d'), 'day'
+                )
 
             # Normalize date format
             for c in daily_data:
@@ -264,6 +278,9 @@ def compute_st_for_stock(kite, symbol: str, timeframe: str) -> dict:
         except Exception as e:
             logger.error("Historical data fetch failed for %s: %s", symbol, e)
             return {}
+
+    # Cache raw daily data for velocity reuse
+    _raw_daily_cache[symbol] = daily_data
 
     # Aggregate to timeframe (daily uses raw candles — no aggregation)
     if timeframe == 'monthly':
@@ -373,22 +390,28 @@ def compute_daily_velocity(kite, symbol: str, st_value: float,
     Backtest-validated filter: vel_3d < -0.5 AND momentum >= 60%
     yields 80% hit rate (touch+flip), 70% win rate, +10% avg PnL.
 
-    Note: uses today's ST value for all historical gap computations.
-    Daily ST shifts slightly each day, so this is an approximation.
-    Directionally correct for filtering fast vs slow approach.
+    Reuses raw daily data from compute_st_for_stock() cache (no extra API call).
+    Uses today's ST value for all historical gap computations (approximation —
+    daily ST shifts slightly each day, directionally correct for filtering).
     """
     try:
-        token = get_instrument_token(kite, symbol)
-        now = datetime.now()
-        start = now - timedelta(days=15)  # 15 calendar ≈ 10 trading days
-
-        daily = kite.historical_data(
-            token, start.strftime('%Y-%m-%d'),
-            now.strftime('%Y-%m-%d'), 'day'
-        )
+        # Reuse data already fetched by compute_st_for_stock()
+        daily = _raw_daily_cache.get(symbol)
+        if not daily:
+            # Fallback: fetch from Kite (shouldn't happen if ST was computed first)
+            token = get_instrument_token(kite, symbol)
+            now = datetime.now()
+            start = now - timedelta(days=15)
+            daily = kite.historical_data(
+                token, start.strftime('%Y-%m-%d'),
+                now.strftime('%Y-%m-%d'), 'day'
+            )
 
         if not daily or len(daily) < 4:
             return {}
+
+        # Use last 10 entries only (velocity is recent momentum)
+        daily = daily[-10:]
 
         # Compute gap series (last N days)
         gaps = []

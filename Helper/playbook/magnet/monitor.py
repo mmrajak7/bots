@@ -116,22 +116,55 @@ def get_option_quote(kite, symbol: str) -> dict:
         return {'bid': 0, 'ask': 0, 'ltp': 0, 'spread': 0}
 
 
+def _get_tick_size(symbol: str) -> float:
+    """Get tick size for an NFO instrument from cached instruments.
+
+    Default 0.05 (standard for NSE options). Uses actual tick_size from
+    Kite instruments if available.
+    """
+    if _nfo_instruments:
+        for inst in _nfo_instruments:
+            if inst.get('tradingsymbol') == symbol:
+                return inst.get('tick_size', 0.05)
+    return 0.05
+
+
+def _round_up_tick(price: float, tick: float) -> float:
+    """Round price UP to nearest tick (for buying)."""
+    import math
+    return round(math.ceil(price / tick) * tick, 2)
+
+
+def _round_down_tick(price: float, tick: float) -> float:
+    """Round price DOWN to nearest tick (for selling)."""
+    import math
+    return round(math.floor(price / tick) * tick, 2)
+
+
 def get_buy_price(kite, symbol: str) -> float:
-    """ASK + slippage — what we actually pay to buy."""
+    """ASK + 1 tick — what we actually pay to buy.
+
+    Uses tick size from instruments (typically Rs 0.05 for options).
+    """
     q = get_option_quote(kite, symbol)
     ask = q['ask'] or q['ltp']
     if ask <= 0:
         return 0
-    return round(ask * (1 + cfg.SLIPPAGE_PCT), 2)
+    tick = _get_tick_size(symbol)
+    return _round_up_tick(ask + tick, tick)
 
 
 def get_sell_price(kite, symbol: str) -> float:
-    """BID - slippage — what we actually receive selling."""
+    """BID - 1 tick — what we actually receive selling.
+
+    Uses tick size from instruments (typically Rs 0.05 for options).
+    """
     q = get_option_quote(kite, symbol)
     bid = q['bid'] or q['ltp']
     if bid <= 0:
         return 0
-    return round(bid * (1 - cfg.SLIPPAGE_PCT), 2)
+    tick = _get_tick_size(symbol)
+    return _round_down_tick(bid - tick, tick)
 
 
 # ── Spot OHLC ────────────────────────────────────────────────────────────
