@@ -554,8 +554,6 @@ def check_open_trades(store, kite):
                 store.exit_trade(trade_id, price, long_exit, exit_reason, hedge_exit)
                 _peak_premiums.pop(trade_id, None)
                 pnl = trade.get('pnl', 0)
-                gap_warn = (f"\nGAP: premium {long_exit:.2f} is {actual_loss_pct:.0%} "
-                            f"below entry (SL was {cfg.PREMIUM_SL_PCT:.0%})") if is_gap else ""
                 tf = _tf_tag(trade.get('timeframe', ''))
                 gap_tag = " GAP!" if is_gap else ""
                 msg = (
@@ -776,11 +774,27 @@ def _find_hedge_strike(kite, trade: dict, current_spot: float) -> dict:
 # ── Stale Signal Cleanup ──────────────────────────────────────────────────
 
 def cleanup_stale_signals(store):
-    """Cancel watching signals older than 3 days (never reached 2% entry)."""
+    """Cancel stale watching signals.
+
+    Daily: cancel same day if not entered (ST changes daily, stale by tomorrow).
+    Weekly/Monthly: cancel after 3 days (ST stable within period).
+    """
+    today_str = datetime.now().strftime('%Y-%m-%d')
     for trade in store.get_watching():
         sig_date = trade.get('signal_date', '')
         if not sig_date:
             continue
+
+        timeframe = trade.get('timeframe', '')
+
+        # Daily signals: cancel if not entered today (ST will be different tomorrow)
+        if timeframe == 'daily' and sig_date < today_str:
+            store.cancel_signal(trade['id'], "daily signal stale (ST changes daily)")
+            logger.info("Cleaned stale daily signal #%d %s (from %s)",
+                        trade['id'], trade['stock'], sig_date)
+            continue
+
+        # Weekly/Monthly: cancel after 3 days
         sig_dt = datetime.strptime(sig_date, '%Y-%m-%d')
         days_old = (datetime.now() - sig_dt).days
         if days_old > 3:
