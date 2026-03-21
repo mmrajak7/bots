@@ -9,6 +9,7 @@ Responsibilities:
 
 import json
 import logging
+import math
 import time
 from datetime import datetime, timedelta
 
@@ -37,7 +38,9 @@ def _get_nfo_instruments(kite):
     if _nfo_instruments is None:
         logger.info("Loading NFO instrument list (one-time)...")
         _nfo_instruments = kite.instruments('NFO')
-        logger.info("Cached %d NFO instruments", len(_nfo_instruments))
+        _build_tick_cache()
+        logger.info("Cached %d NFO instruments, %d tick sizes",
+                     len(_nfo_instruments), len(_tick_cache))
     return _nfo_instruments
 
 
@@ -116,28 +119,30 @@ def get_option_quote(kite, symbol: str) -> dict:
         return {'bid': 0, 'ask': 0, 'ltp': 0, 'spread': 0}
 
 
-def _get_tick_size(symbol: str) -> float:
-    """Get tick size for an NFO instrument from cached instruments.
+_tick_cache: dict = {}  # {symbol: tick_size} — populated from NFO instruments
 
-    Default 0.05 (standard for NSE options). Uses actual tick_size from
-    Kite instruments if available.
-    """
+
+def _get_tick_size(symbol: str) -> float:
+    """Get tick size from cache. O(1) lookup. Default 0.05 for NSE options."""
+    return _tick_cache.get(symbol, 0.05)
+
+
+def _build_tick_cache():
+    """Populate tick cache from NFO instruments (called once after load)."""
     if _nfo_instruments:
         for inst in _nfo_instruments:
-            if inst.get('tradingsymbol') == symbol:
-                return inst.get('tick_size', 0.05)
-    return 0.05
+            sym = inst.get('tradingsymbol', '')
+            if sym:
+                _tick_cache[sym] = inst.get('tick_size', 0.05)
 
 
 def _round_up_tick(price: float, tick: float) -> float:
     """Round price UP to nearest tick (for buying)."""
-    import math
     return round(math.ceil(price / tick) * tick, 2)
 
 
 def _round_down_tick(price: float, tick: float) -> float:
     """Round price DOWN to nearest tick (for selling)."""
-    import math
     return round(math.floor(price / tick) * tick, 2)
 
 
@@ -145,11 +150,12 @@ def get_buy_price(kite, symbol: str) -> float:
     """ASK + 1 tick — what we actually pay to buy.
 
     Uses tick size from instruments (typically Rs 0.05 for options).
+    Returns 0 if no ASK available (do NOT fallback to stale LTP).
     """
     q = get_option_quote(kite, symbol)
-    ask = q['ask'] or q['ltp']
+    ask = q['ask']
     if ask <= 0:
-        return 0
+        return 0  # no sellers — caller must handle (skip entry/exit)
     tick = _get_tick_size(symbol)
     return _round_up_tick(ask + tick, tick)
 
@@ -158,11 +164,12 @@ def get_sell_price(kite, symbol: str) -> float:
     """BID - 1 tick — what we actually receive selling.
 
     Uses tick size from instruments (typically Rs 0.05 for options).
+    Returns 0 if no BID available (do NOT fallback to stale LTP).
     """
     q = get_option_quote(kite, symbol)
-    bid = q['bid'] or q['ltp']
+    bid = q['bid']
     if bid <= 0:
-        return 0
+        return 0  # no buyers — caller must handle (skip exit, retry)
     tick = _get_tick_size(symbol)
     return _round_down_tick(bid - tick, tick)
 
@@ -461,6 +468,12 @@ def check_open_trades(store, kite):
         hedge_exit = None
         if trade.get('hedged') and trade.get('hedge_symbol'):
             hedge_exit = get_buy_price(kite, trade['hedge_symbol'])
+
+        # Guard: skip exit checks if option has no bid (illiquid)
+        # Prevents false exits at premium=0 which would book max loss
+        if long_exit <= 0 and option_symbol:
+            logger.debug("SKIP %s: no bid for %s, retry next cycle", stock, option_symbol)
+            continue
 
         # Gap from ST
         gap = abs(price - st_val) / st_val

@@ -117,8 +117,7 @@ SL_GAP = _runtime.get('sl_gap', 0.05)
 SL_TIME_DAYS = _runtime['sl_time_days']
 FRESHNESS_DAYS = _runtime['freshness_days']
 
-# ── Slippage ──────────────────────────────────────────────────────────────
-SLIPPAGE_PCT = _runtime['slippage_pct']
+# ── Trail ────────────────────────────────────────────────────────────────
 TRAIL_PCT = _runtime.get('trail_pct', 0.50)
 
 # ── Option selection ──────────────────────────────────────────────────────
