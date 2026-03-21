@@ -19,19 +19,19 @@ CHARTINK_SCAN_URL = 'https://chartink.com/screener/process'
 CHARTINK_BACKTEST_URL = 'https://chartink.com/backtest/process'
 CHARTINK_URL = CHARTINK_SCAN_URL  # both endpoints work; screener is proven
 
-# Monthly: F&O stocks within +/-3.1% of Monthly ST(10,3)
+# Monthly: F&O stocks within +/-5.1% of Monthly ST(10,3)
 CHARTINK_MONTHLY = (
     '( {33489} ( '
-    ' monthly close <=  monthly supertrend( 10 , 3 ) *  1.031'
-    ' and  monthly close >=  monthly supertrend( 10 , 3 ) *  0.969'
+    ' monthly close <=  monthly supertrend( 10 , 3 ) *  1.051'
+    ' and  monthly close >=  monthly supertrend( 10 , 3 ) *  0.949'
     ' ) )'
 )
 
-# Weekly: F&O stocks within +/-3.1% of Weekly ST(10,3)
+# Weekly: F&O stocks within +/-5.1% of Weekly ST(10,3)
 CHARTINK_WEEKLY = (
     '( {33489} ( '
-    ' weekly close <=  weekly supertrend( 10 , 3 ) *  1.031'
-    ' and  weekly close >=  weekly supertrend( 10 , 3 ) *  0.969'
+    ' weekly close <=  weekly supertrend( 10 , 3 ) *  1.051'
+    ' and  weekly close >=  weekly supertrend( 10 , 3 ) *  0.949'
     ' ) )'
 )
 
@@ -53,7 +53,7 @@ _ALL_SCANNERS = [
 # ── Defaults (overridden by magnet_config.json if present) ────────────────
 # These are compile-time defaults. Runtime values come from _load_runtime().
 _DEFAULTS = {
-    'signal_gap_max': 0.03,       # 3% — Chartink fires within this range
+    'signal_gap_max': 0.05,       # 5% — W/M magnet pulls from further away (backtest validated)
     'entry_gap': 0.02,            # 2% — buy option when gap shrinks to this
     'entry_gap_min': 0.005,       # 0.5% — too close, already past entry zone
     'cost_sl_gap': 0.01,           # 1% — move SL to cost+0.10 when stock reaches this gap
