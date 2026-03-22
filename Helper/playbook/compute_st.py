@@ -1,8 +1,44 @@
-"""Compute Weekly Supertrend (10,3) from daily OHLC data."""
+"""Compute Supertrend (10,3) from daily OHLC data — weekly and monthly."""
 import json
 import sys
 from datetime import datetime, timedelta
 from collections import defaultdict
+
+
+def aggregate_to_monthly(daily_data, exclude_current=False):
+    """Convert daily OHLC to monthly OHLC.
+
+    Args:
+        exclude_current: If True, drop current incomplete month so ST
+                         is computed only from confirmed (closed) candles.
+    """
+    months = defaultdict(list)
+    for candle in daily_data:
+        dt = candle['date']
+        if isinstance(dt, str):
+            dt = datetime.fromisoformat(dt.replace('+05:30', ''))
+        month_key = (dt.year, dt.month)
+        months[month_key].append(candle)
+
+    # Drop current month if requested (partial data distorts ST)
+    if exclude_current:
+        now = datetime.now()
+        current_key = (now.year, now.month)
+        months.pop(current_key, None)
+
+    monthly = []
+    for key in sorted(months.keys()):
+        candles = months[key]
+        monthly.append({
+            'date': candles[0]['date'] if isinstance(candles[0]['date'], str)
+                    else candles[0]['date'].isoformat(),
+            'open': candles[0]['open'],
+            'high': max(c['high'] for c in candles),
+            'low': min(c['low'] for c in candles),
+            'close': candles[-1]['close'],
+            'volume': sum(c.get('volume', 0) for c in candles),
+        })
+    return monthly
 
 
 def aggregate_to_weekly(daily_data, exclude_current=False):
@@ -14,7 +50,9 @@ def aggregate_to_weekly(daily_data, exclude_current=False):
     """
     weeks = defaultdict(list)
     for candle in daily_data:
-        dt = datetime.fromisoformat(candle['date'].replace('+05:30', ''))
+        dt = candle['date']
+        if isinstance(dt, str):
+            dt = datetime.fromisoformat(dt.replace('+05:30', ''))
         # ISO week: (year, week_number)
         week_key = dt.isocalendar()[:2]
         weeks[week_key].append(candle)
@@ -29,12 +67,13 @@ def aggregate_to_weekly(daily_data, exclude_current=False):
     for key in sorted(weeks.keys()):
         candles = weeks[key]
         weekly.append({
-            'date': candles[0]['date'],
+            'date': candles[0]['date'] if isinstance(candles[0]['date'], str)
+                    else candles[0]['date'].isoformat(),
             'open': candles[0]['open'],
             'high': max(c['high'] for c in candles),
             'low': min(c['low'] for c in candles),
             'close': candles[-1]['close'],
-            'volume': sum(c['volume'] for c in candles),
+            'volume': sum(c.get('volume', 0) for c in candles),
         })
     return weekly
 
