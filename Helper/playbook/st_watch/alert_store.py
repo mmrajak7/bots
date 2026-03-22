@@ -191,10 +191,7 @@ class AlertStore:
             results = [a for a in results if a['timeframe'] == timeframe]
 
         if days:
-            cutoff = datetime.now(IST).isoformat()[:10]
-            from datetime import timedelta
-            cutoff_dt = datetime.now(IST) - timedelta(days=days)
-            cutoff = cutoff_dt.isoformat()
+            cutoff = (datetime.now(IST) - timedelta(days=days)).isoformat()
             results = [a for a in results if a['timestamp'] >= cutoff]
 
         return results

@@ -110,7 +110,7 @@ def _fetch_daily_data(kite, symbol: str) -> list:
         return cached['data']
 
     token = _get_token(kite, symbol)
-    now = datetime.now()
+    now = datetime.now(IST)
     start = now - timedelta(days=365 * cfg.DATA_YEARS)
 
     # 6Y needs 2 chunks (Kite limit: 2000 days)
