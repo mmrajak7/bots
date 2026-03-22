@@ -14,6 +14,7 @@ BOTS_ROOT = PROJECT_ROOT.parent                       # BOTS/
 LOG_DIR = PROJECT_ROOT / 'logs'
 CONFIG_FILE = PROJECT_ROOT / 'config' / 'st_watch_config.json'
 STATE_FILE = LOG_DIR / 'st_watch_state.json'
+ALERT_LOG_FILE = LOG_DIR / 'st_watch_alerts.json'
 KITE_TOKEN_FILE = BOTS_ROOT / 'data' / 'kite_access_token.json'
 TELEGRAM_CONFIG = BOTS_ROOT / 'data' / 'telegram_config.json'
 
@@ -43,12 +44,15 @@ def load_config() -> dict:
                 if key in file_cfg:
                     cfg[key] = file_cfg[key]
             cfg['symbols'] = file_cfg.get('symbols', {})
+            cfg['google_drive'] = file_cfg.get('google_drive', {})
         except Exception as e:
             logger.warning("Failed to load %s, using defaults: %s", CONFIG_FILE, e)
             cfg['symbols'] = {}
+            cfg['google_drive'] = {}
     else:
         logger.warning("Config not found: %s", CONFIG_FILE)
         cfg['symbols'] = {}
+        cfg['google_drive'] = {}
     return cfg
 
 

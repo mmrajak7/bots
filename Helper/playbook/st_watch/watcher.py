@@ -389,6 +389,21 @@ def _format_alert(symbol: str, basket: str, timeframe: str,
     return msg
 
 
+# ── Alert history logging ────────────────────────────────────────────────
+
+def _log_alert(symbol: str, basket: str, timeframe: str,
+               ltp: float, st_val: float, gap_pct: float,
+               direction: str, threshold: int, prev_gap: float = None):
+    """Record alert in persistent history (local + Drive). Best-effort."""
+    try:
+        from .alert_store import get_alert_store
+        store = get_alert_store()
+        store.log_alert(symbol, basket, timeframe, ltp, st_val,
+                        gap_pct, direction, threshold, prev_gap)
+    except Exception as e:
+        logger.warning("Failed to log alert to history: %s", e)
+
+
 # ── Main scan logic ──────────────────────────────────────────────────────
 
 def scan(dry_run: bool = False, symbol_filter: str = None) -> list:
@@ -495,6 +510,10 @@ def scan(dry_run: bool = False, symbol_filter: str = None) -> list:
                     _send_telegram(msg)
                     logger.info("Alert: %s %s gap=%.1f%% (threshold=%d%%)",
                                 symbol, tf, gap_pct, alert_at)
+
+                # Log to alert history (both dry-run and live)
+                _log_alert(symbol, sym_info['basket'], tf,
+                           ltp, st_val, gap_pct, direction, alert_at, prev_gap)
 
                 state[cache_key] = {
                     'last_threshold': alert_at,

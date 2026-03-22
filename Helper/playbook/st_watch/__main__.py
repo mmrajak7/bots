@@ -122,6 +122,13 @@ def cmd_cron(args):
         time.sleep(SCAN_INTERVAL)
 
 
+def cmd_history(args):
+    """Show alert history from persistent log."""
+    from .alert_store import get_alert_store
+    store = get_alert_store()
+    store.list_alerts(days=args.days, symbol=args.symbol)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='python -m playbook.st_watch',
@@ -142,6 +149,12 @@ def main():
     p_status = sub.add_parser('status', help='Show gap status (no alerts)')
     p_status.add_argument('--symbol', help='Check only this symbol')
     p_status.set_defaults(func=cmd_status)
+
+    # history (alert log)
+    p_hist = sub.add_parser('history', help='Show alert history')
+    p_hist.add_argument('--days', type=int, default=7, help='Days to look back (default: 7)')
+    p_hist.add_argument('--symbol', help='Filter by symbol')
+    p_hist.set_defaults(func=cmd_history)
 
     # run (single invocation, market hours check — for hourly cron)
     p_run = sub.add_parser('run', help='Single scan with market hours check (cron target)')
