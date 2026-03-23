@@ -65,7 +65,9 @@ _DEFAULTS = {
     'freshness_days': 5,          # signal invalid if price was <2% within last N days
     'slippage_pct': 0.0,          # deprecated: now using tick-size rounding (±1 tick)
     'trail_pct': 0.50,            # trail at 50% of peak premium gains
-    'min_dte': 10,                # minimum days to expiry for option selection
+    'trail_min_gain_pct': 0.15,   # trail only activates after 15% gain (avoids bid-ask noise)
+    'entry_max_retries': 5,       # cancel signal after N failed option lookups
+    'min_dte': 3,                 # minimum days to expiry (current month liquidity is good)
     'lots_per_trade': 1,          # lots per trade (start small)
     'max_open_trades': 10,        # max concurrent magnet trades
     'scan_interval_sec': 300,     # 5 minutes between Chartink scans
@@ -119,9 +121,11 @@ FRESHNESS_DAYS = _runtime['freshness_days']
 
 # ── Trail ────────────────────────────────────────────────────────────────
 TRAIL_PCT = _runtime.get('trail_pct', 0.50)
+TRAIL_MIN_GAIN_PCT = _runtime.get('trail_min_gain_pct', 0.15)
 
 # ── Option selection ──────────────────────────────────────────────────────
 MIN_DTE = _runtime['min_dte']
+ENTRY_MAX_RETRIES = _runtime.get('entry_max_retries', 5)
 
 # ── Scan / monitor intervals ─────────────────────────────────────────────
 SCAN_INTERVAL_SEC = _runtime['scan_interval_sec']

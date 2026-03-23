@@ -26,6 +26,8 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # ── Peak Premium Tracker (in-memory, resets on restart) ───────────────────
 _peak_premiums = {}  # {trade_id: peak_premium_value}
+_expiry_warned = set()  # {trade_id} — dedup expiry-day midday alerts
+_entry_retries = {}  # {trade_id: count} — track failed option lookups
 
 
 # ── NFO Instrument Cache ──────────────────────────────────────────────────
@@ -448,10 +450,6 @@ def check_watching_signals(store, kite):
             logger.info("Signal #%d %s: gap %.1f%% too narrow, cancelling",
                         trade['id'], stock, gap * 100)
             store.cancel_signal(trade['id'], f"gap narrowed to {gap:.1%}, past entry zone")
-            tf = _tf_tag(trade.get('timeframe', ''))
-            send_telegram(
-                f"\u274c <b>CANCEL</b> {tf} {stock} | gap {gap:.1%}, missed window"
-            )
             continue
 
         # === ENTRY ZONE: gap is between 0.5% and 2% ===
@@ -461,16 +459,32 @@ def check_watching_signals(store, kite):
         option = select_option(kite, stock, trade['direction'], price)
 
         if not option or not option.get('symbol'):
-            logger.warning("No option found for %s %s, skipping entry",
-                           stock, trade['direction'])
+            retries = _entry_retries.get(trade['id'], 0) + 1
+            _entry_retries[trade['id']] = retries
+            if retries >= cfg.ENTRY_MAX_RETRIES:
+                logger.warning("No liquid option for %s after %d attempts, cancelling signal",
+                               stock, retries)
+                store.cancel_signal(trade['id'], f"no liquid option after {retries} attempts")
+                _entry_retries.pop(trade['id'], None)
+            else:
+                logger.warning("No option found for %s %s, attempt %d/%d",
+                               stock, trade['direction'], retries, cfg.ENTRY_MAX_RETRIES)
             continue
 
         lot_size = option['lot_size']
         premium = option.get('premium', 0)
 
         if premium <= 0:
-            logger.warning("SKIP ENTRY %s: premium is Rs 0 for %s — option expired or illiquid",
-                           stock, option.get('symbol', '?'))
+            retries = _entry_retries.get(trade['id'], 0) + 1
+            _entry_retries[trade['id']] = retries
+            if retries >= cfg.ENTRY_MAX_RETRIES:
+                logger.warning("SKIP ENTRY %s: premium Rs 0 after %d attempts, cancelling",
+                               stock, retries)
+                store.cancel_signal(trade['id'], f"premium Rs 0 after {retries} attempts")
+                _entry_retries.pop(trade['id'], None)
+            else:
+                logger.warning("SKIP ENTRY %s: premium is Rs 0 for %s, attempt %d/%d",
+                               stock, option.get('symbol', '?'), retries, cfg.ENTRY_MAX_RETRIES)
             continue
 
         # Fixed lots per trade
@@ -496,6 +510,7 @@ def check_watching_signals(store, kite):
             'quantity': qty,
             'sl_spot': sl_spot,
         })
+        _entry_retries.pop(trade['id'], None)  # clear retry counter on success
 
         icon = _dir_icon(trade['direction'])
         tf = _tf_tag(trade['timeframe'])
@@ -551,6 +566,31 @@ def check_open_trades(store, kite):
         if long_exit <= 0 and option_symbol:
             logger.debug("SKIP %s: no bid for %s, retry next cycle", stock, option_symbol)
             continue
+
+        # === EXPIRY DAY ALERT: warn at midday to close (liquidity dries up) ===
+        option_expiry = trade.get('option_expiry', '')
+        now_dt = datetime.now()
+        today_str = now_dt.strftime('%Y-%m-%d')
+        if (option_expiry and option_expiry == today_str
+                and trade_id not in _expiry_warned
+                and (now_dt.hour, now_dt.minute) >= (12, 30)):
+            entry_prem_exp = trade.get('option_premium', 0) or 0
+            tf = _tf_tag(trade.get('timeframe', ''))
+            pnl_exp = 0
+            if long_exit > 0 and entry_prem_exp > 0:
+                qty = trade.get('quantity', 0)
+                pnl_exp = (long_exit - entry_prem_exp) * qty
+            pnl_icon = '\u2705' if pnl_exp >= 0 else '\u274c'
+            msg = (
+                f"\u26a0\ufe0f <b>EXPIRY TODAY</b> {tf} {stock}\n"
+                f"<code>{option_symbol}</code> expires today!\n"
+                f"Entry {entry_prem_exp:.2f} | Bid {long_exit:.2f} | "
+                f"<b>Rs {pnl_exp:+,.0f}</b>\n"
+                f"Expiring worthless if not closed. Consider rolling to next expiry."
+            )
+            send_telegram(msg)
+            logger.info("EXPIRY WARN: %s", msg.replace('\n', ' | '))
+            _expiry_warned.add(trade_id)
 
         # Gap from ST
         gap = abs(price - st_val) / st_val
@@ -623,8 +663,10 @@ def check_open_trades(store, kite):
             continue
 
         # === CHECK TRAILING PREMIUM SL: 50% of peak gain ===
+        # Trail only activates after minimum gain threshold (avoids bid-ask noise exits)
         peak = _peak_premiums.get(trade_id, entry_prem)
-        if peak > entry_prem and long_exit > 0:
+        min_gain = entry_prem * cfg.TRAIL_MIN_GAIN_PCT  # e.g., 15% of entry
+        if peak >= entry_prem + min_gain and long_exit > 0:
             gain = peak - entry_prem
             trail_level = entry_prem + gain * cfg.TRAIL_PCT
             # Trail must be above cost SL if active
@@ -997,17 +1039,6 @@ def run(dry_run: bool = False):
                 logger.info("--- Scan cycle %d ---", cycle)
                 try:
                     added = validate_and_add_signals(store, kite, dry_run=dry_run)
-                    if added:
-                        for sig in added:
-                            if not sig.get('dry_run'):
-                                icon = _dir_icon(sig['direction'])
-                                tf = _tf_tag(sig['timeframe'])
-                                send_telegram(
-                                    f"{icon} <b>SIGNAL</b> {tf} {sig['stock']}\n"
-                                    f"ST {sig['st_value']:,.1f} ({sig['st_direction']}) "
-                                    f"| Gap {sig['signal_gap_pct']:.1f}%\n"
-                                    f"Watching for 2% entry..."
-                                )
                     kite_error_count = 0  # reset on success
                 except Exception as e:
                     logger.error("Scan error: %s", e)

@@ -50,12 +50,12 @@ def cmd_run(args):
         logging.info("Outside market hours (%s) — skipping", now.strftime('%H:%M'))
         return
 
-    logging.info("Market open, running ST Watch scan...")
+    logging.info("Market open, running support level scan...")
     from .watcher import scan
     results = scan(dry_run=args.dry_run)
 
     close_count = sum(1 for r in results if abs(r['gap_pct']) <= 5)
-    logging.info("Scan complete: %d checks, %d within 5%% of ST",
+    logging.info("Scan complete: %d checks, %d within 5%% of support",
                  len(results), close_count)
 
 
@@ -64,7 +64,7 @@ def cmd_cron(args):
 
     Alternative to cron — runs continuously, sleeping between scans.
     """
-    logging.info("ST Watch cron mode started (hourly scans)")
+    logging.info("Support level monitor started (hourly scans)")
 
     while True:
         now = datetime.now(IST)
@@ -132,7 +132,7 @@ def cmd_history(args):
 def main():
     parser = argparse.ArgumentParser(
         prog='python -m playbook.st_watch',
-        description='ST Watch — Core & Tactical basket ST touch monitor'
+        description='Support Level Monitor — Core & Tactical basket monitor'
     )
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Debug logging')

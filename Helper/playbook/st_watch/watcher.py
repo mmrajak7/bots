@@ -345,11 +345,9 @@ def _format_alert(symbol: str, basket: str, timeframe: str,
 
     # Urgency based on proximity
     if abs_gap <= 1:
-        urgency = "\U0001f534 ST TOUCH"
-    elif abs_gap <= 3:
-        urgency = "\U0001f7e1 NEAR ST"
+        urgency = "\U0001f534 SUPPORT LEVEL"
     else:
-        urgency = "\U0001f7e2 APPROACHING"
+        urgency = "\U0001f7e1 NEAR SUPPORT LEVEL"
 
     # Direction context
     if direction == 'DOWN':
@@ -367,24 +365,23 @@ def _format_alert(symbol: str, basket: str, timeframe: str,
             trend = f" (was {prev_gap:+.1f}%, widening)"
 
     msg = (
-        f"<b>{urgency} -- {symbol}</b>\n"
-        f"Basket: {basket_label} | {tf_label} ST\n"
-        f"LTP: Rs {ltp:,.2f} | ST: Rs {st_val:,.2f}\n"
-        f"Gap: {gap_pct:+.1f}%{trend}\n"
-        f"Direction: {direction}"
+        f"<b>{urgency} — {symbol}</b>\n"
+        f"Basket: {basket_label} | {tf_label}\n"
+        f"LTP: Rs {ltp:,.2f} | Support: Rs {st_val:,.2f}\n"
+        f"Gap: {gap_pct:+.1f}%{trend}"
     )
 
     # Action guidance based on direction and basket
     if abs_gap <= 1:
         if direction == 'UP':
             if basket.startswith('core'):
-                msg += "\n\n<i>CORE: ST support touch. Buy on dip. Hold forever.</i>"
+                msg += "\n\n<i>CORE: At support level. Buy on dip. Hold forever.</i>"
             elif 'reit' in basket:
-                msg += f"\n\n<i>REIT: {tf_label} ST touch. Check for entry.</i>"
+                msg += f"\n\n<i>REIT: {tf_label} support level. Check for entry.</i>"
             else:
-                msg += f"\n\n<i>TACTICAL: {tf_label} ST touch. Check for entry.</i>"
+                msg += f"\n\n<i>TACTICAL: {tf_label} support level. Check for entry.</i>"
         else:
-            msg += "\n\n<i>ST DOWN -- price approaching from below. Potential trend flip. Watch closely.</i>"
+            msg += "\n\n<i>Price approaching support from below. Potential trend flip. Watch closely.</i>"
 
     return msg
 
@@ -547,10 +544,10 @@ def print_status(results: list = None):
     results.sort(key=lambda r: abs(r['gap_pct']))
 
     print(f"\n{'='*82}")
-    print(f"  ST WATCH -- Core & Tactical Basket Monitor")
+    print(f"  Support Level Monitor — Core & Tactical Baskets")
     print(f"  {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}")
     print(f"{'='*82}")
-    print(f"  {'Symbol':<14} {'Basket':<15} {'TF':<8} {'LTP':>9} {'ST':>9} {'Gap%':>7} {'Dir':>5}")
+    print(f"  {'Symbol':<14} {'Basket':<15} {'TF':<8} {'LTP':>9} {'Support':>9} {'Gap%':>7} {'Dir':>5}")
     print(f"  {'-'*74}")
 
     for r in results:
@@ -577,5 +574,5 @@ def print_status(results: list = None):
     touch = [r for r in results if abs(r['gap_pct']) <= 1]
 
     print(f"\n  Within 5%: {len(within5)} | Within 3%: {len(within3)} | Touch (<1%): {len(touch)}")
-    print(f"  Total: {len(results)} checks ({unique_count} symbols x M+W)")
+    print(f"  Total: {len(results)} checks ({unique_count} symbols x Monthly+Weekly)")
     print()

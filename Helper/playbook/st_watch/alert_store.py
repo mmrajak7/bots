@@ -206,11 +206,11 @@ class AlertStore:
             return
 
         print(f"\n{'='*85}")
-        print(f"  ST WATCH ALERT HISTORY (last {days} days"
+        print(f"  Support Level Alert History (last {days} days"
               + (f", {symbol}" if symbol else "") + ")")
         print(f"{'='*85}")
         print(f"  {'ID':>4} {'Timestamp':<20} {'Symbol':<14} {'TF':<8} "
-              f"{'LTP':>9} {'ST':>9} {'Gap%':>7} {'Thr':>4} {'Dir':>5}")
+              f"{'LTP':>9} {'Support':>9} {'Gap%':>7} {'Thr':>4} {'Dir':>5}")
         print(f"  {'-'*81}")
 
         for a in alerts:
