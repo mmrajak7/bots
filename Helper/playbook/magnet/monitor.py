@@ -554,6 +554,24 @@ def check_open_trades(store, kite):
         sl_spot = trade.get('sl_spot', 0)
         trade_id = trade['id']
 
+        # === AUTO-CLOSE: option already expired ===
+        option_expiry = trade.get('option_expiry', '')
+        today_str = datetime.now(IST).strftime('%Y-%m-%d')
+        if option_expiry and option_expiry < today_str:
+            entry_prem = trade.get('option_premium', 0) or 0
+            qty = trade.get('quantity', 0) or 0
+            store.exit_trade(trade_id, price, 0, 'option_expired')
+            tf = _tf_tag(trade.get('timeframe', ''))
+            pnl = -entry_prem * qty if entry_prem > 0 else 0
+            send_telegram(
+                f"\u23f0 <b>EXPIRED</b> {tf} {stock}\n"
+                f"Option {trade.get('option_symbol', '?')} expired {option_expiry}\n"
+                f"<b>Rs {pnl:+,.0f}</b> (total loss)"
+            )
+            logger.info("EXPIRED: %s option %s expired %s, P&L Rs %+.0f",
+                        stock, trade.get('option_symbol', '?'), option_expiry, pnl)
+            continue
+
         # Get current option premiums
         option_symbol = trade.get('option_symbol')
         long_exit = get_sell_price(kite, option_symbol) if option_symbol else 0
@@ -568,9 +586,8 @@ def check_open_trades(store, kite):
             continue
 
         # === EXPIRY DAY ALERT: warn at midday to close (liquidity dries up) ===
-        option_expiry = trade.get('option_expiry', '')
-        now_dt = datetime.now()
-        today_str = now_dt.strftime('%Y-%m-%d')
+        # option_expiry and today_str already computed above (auto-close block)
+        now_dt = datetime.now(IST)
         if (option_expiry and option_expiry == today_str
                 and trade_id not in _expiry_warned
                 and (now_dt.hour, now_dt.minute) >= (12, 30)):
