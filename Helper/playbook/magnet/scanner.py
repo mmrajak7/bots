@@ -525,22 +525,40 @@ def _add_to_skip_cache(stock: str, timeframe: str, reason: str):
     _skip_cache[(stock, timeframe)] = reason
 
 
-# ── Watching Telegram (dedicated channel, separate from trade alerts) ─────
+# ── Watching Telegram (dedicated channel, from magnet_config.json) ────────
 
-_WATCHING_BOT_TOKEN = 'REDACTED_TELEGRAM_TOKEN_3'
-_WATCHING_CHAT_ID = 'REDACTED_CHAT_ID'
+_watching_tg_cfg = None
+_watching_tg_loaded = False
 
 
 def _send_watching_alert(msg: str):
-    """Send to the dedicated Watching channel. Best-effort."""
+    """Send to the dedicated Watching channel. Best-effort.
+
+    Bot token loaded from magnet_config.json 'telegram_watching' section.
+    """
+    global _watching_tg_cfg, _watching_tg_loaded
     try:
-        import requests as _req
-        resp = _req.post(
-            f"https://api.telegram.org/bot{_WATCHING_BOT_TOKEN}/sendMessage",
-            json={'chat_id': _WATCHING_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'},
+        if not _watching_tg_loaded:
+            import json as _json
+            if cfg.CONFIG_FILE.exists():
+                with open(cfg.CONFIG_FILE) as f:
+                    file_cfg = _json.load(f)
+                tg = file_cfg.get('telegram_watching', {})
+                if tg.get('bot_token') and tg.get('chat_id'):
+                    _watching_tg_cfg = tg
+            _watching_tg_loaded = True
+
+        if not _watching_tg_cfg:
+            logger.info("Watching Telegram not configured, skipping")
+            return
+
+        resp = requests.post(
+            f"https://api.telegram.org/bot{_watching_tg_cfg['bot_token']}/sendMessage",
+            json={'chat_id': _watching_tg_cfg['chat_id'], 'text': msg,
+                  'parse_mode': 'HTML'},
             timeout=10,
         )
-        bot_id = _WATCHING_BOT_TOKEN.split(':')[0]
+        bot_id = _watching_tg_cfg['bot_token'].split(':')[0]
         if resp.ok:
             logger.info("Watching alert sent (bot=%s): %s", bot_id, msg[:120])
         else:
@@ -568,12 +586,11 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
 
     logger.info("Raw signals: %d", len(raw_signals))
 
-    # Max entered trades cap (watching signals are free — they're just candidates)
+    # Log capacity (scanner always discovers signals; monitor gates actual entries)
     entered_count = len(store.get_entered())
     if entered_count >= cfg.MAX_OPEN_TRADES:
-        logger.info("Max entered trades reached (%d/%d), skipping scan",
+        logger.info("At entry capacity (%d/%d) — scanning for watching signals only",
                      entered_count, cfg.MAX_OPEN_TRADES)
-        return []
 
     # Dedup raw signals (Chartink may return same stock in both scanners)
     seen = set()

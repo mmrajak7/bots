@@ -24,10 +24,9 @@ logger = logging.getLogger(__name__)
 
 IST = pytz.timezone('Asia/Kolkata')
 
-# ── Peak Premium Tracker (in-memory, resets on restart) ───────────────────
-_peak_premiums = {}  # {trade_id: peak_premium_value}
-_expiry_warned = set()  # {trade_id} — dedup expiry-day midday alerts
-_entry_retries = {}  # {trade_id: count} — track failed option lookups
+# Peak premiums + entry retries now persisted in trade dict (survive restarts).
+# See trade_store.update_peak_premium() and update_entry_retries().
+_expiry_warned = set()  # {trade_id} — dedup expiry-day midday alerts (ok to reset)
 
 
 # ── NFO Instrument Cache ──────────────────────────────────────────────────
@@ -459,13 +458,12 @@ def check_watching_signals(store, kite):
         option = select_option(kite, stock, trade['direction'], price)
 
         if not option or not option.get('symbol'):
-            retries = _entry_retries.get(trade['id'], 0) + 1
-            _entry_retries[trade['id']] = retries
+            retries = (trade.get('entry_retries') or 0) + 1
+            store.update_entry_retries(trade['id'], retries)
             if retries >= cfg.ENTRY_MAX_RETRIES:
                 logger.warning("No liquid option for %s after %d attempts, cancelling signal",
                                stock, retries)
                 store.cancel_signal(trade['id'], f"no liquid option after {retries} attempts")
-                _entry_retries.pop(trade['id'], None)
             else:
                 logger.warning("No option found for %s %s, attempt %d/%d",
                                stock, trade['direction'], retries, cfg.ENTRY_MAX_RETRIES)
@@ -475,13 +473,12 @@ def check_watching_signals(store, kite):
         premium = option.get('premium', 0)
 
         if premium <= 0:
-            retries = _entry_retries.get(trade['id'], 0) + 1
-            _entry_retries[trade['id']] = retries
+            retries = (trade.get('entry_retries') or 0) + 1
+            store.update_entry_retries(trade['id'], retries)
             if retries >= cfg.ENTRY_MAX_RETRIES:
                 logger.warning("SKIP ENTRY %s: premium Rs 0 after %d attempts, cancelling",
                                stock, retries)
                 store.cancel_signal(trade['id'], f"premium Rs 0 after {retries} attempts")
-                _entry_retries.pop(trade['id'], None)
             else:
                 logger.warning("SKIP ENTRY %s: premium is Rs 0 for %s, attempt %d/%d",
                                stock, option.get('symbol', '?'), retries, cfg.ENTRY_MAX_RETRIES)
@@ -510,7 +507,8 @@ def check_watching_signals(store, kite):
             'quantity': qty,
             'sl_spot': sl_spot,
         })
-        _entry_retries.pop(trade['id'], None)  # clear retry counter on success
+        if trade.get('entry_retries', 0) > 0:
+            store.update_entry_retries(trade['id'], 0)  # clear on success
 
         icon = _dir_icon(trade['direction'])
         tf = _tf_tag(trade['timeframe'])
@@ -615,9 +613,10 @@ def check_open_trades(store, kite):
         # === TRACK PEAK PREMIUM (for trailing SL — long leg only) ===
         entry_prem = trade.get('option_premium', 0) or 0
         if long_exit > 0 and entry_prem > 0:
-            old_peak = _peak_premiums.get(trade_id, entry_prem)
+            old_peak = trade.get('peak_premium') or entry_prem
             new_peak = max(old_peak, long_exit)
-            _peak_premiums[trade_id] = new_peak
+            if new_peak > old_peak:
+                store.update_peak_premium(trade_id, new_peak)
 
         # === ACTIVATE COST SL: gap shrinks to 1% (stock halfway to target) ===
         if not trade.get('cost_sl_active') and gap <= cfg.COST_SL_GAP:
@@ -659,7 +658,7 @@ def check_open_trades(store, kite):
 
         if tp_hit:
             store.exit_trade(trade_id, price, long_exit, 'tp', hedge_exit)
-            _peak_premiums.pop(trade_id, None)
+            # peak_premium persisted in trade dict — kept as historical record
             pnl = trade.get('pnl', 0)
             wick_note = ""
             if side == 'above' and price > st_val:
@@ -681,7 +680,7 @@ def check_open_trades(store, kite):
 
         # === CHECK TRAILING PREMIUM SL: 50% of peak gain ===
         # Trail only activates after minimum gain threshold (avoids bid-ask noise exits)
-        peak = _peak_premiums.get(trade_id, entry_prem)
+        peak = trade.get('peak_premium') or entry_prem
         min_gain = entry_prem * cfg.TRAIL_MIN_GAIN_PCT  # e.g., 15% of entry
         if peak >= entry_prem + min_gain and long_exit > 0:
             gain = peak - entry_prem
@@ -691,7 +690,7 @@ def check_open_trades(store, kite):
             effective_trail = max(trail_level, cost_sl)
             if long_exit <= effective_trail:
                 store.exit_trade(trade_id, price, long_exit, 'tp_trail', hedge_exit)
-                _peak_premiums.pop(trade_id, None)
+                # peak_premium persisted in trade dict — kept as historical record
                 pnl = trade.get('pnl', 0)
                 pnl_icon = '\u2705' if pnl >= 0 else '\u274c'
                 tf = _tf_tag(trade.get('timeframe', ''))
@@ -711,7 +710,7 @@ def check_open_trades(store, kite):
             cost_sl = trade.get('cost_sl_level', 0) or 0
             if long_exit <= cost_sl:
                 store.exit_trade(trade_id, price, long_exit, 'sl_cost', hedge_exit)
-                _peak_premiums.pop(trade_id, None)
+                # peak_premium persisted in trade dict — kept as historical record
                 pnl = trade.get('pnl', 0)
                 tf = _tf_tag(trade.get('timeframe', ''))
                 msg = (
@@ -734,7 +733,7 @@ def check_open_trades(store, kite):
                 is_gap = actual_loss_pct > (sl_pct + 0.15)
                 exit_reason = 'sl_premium_gap' if is_gap else 'sl_premium'
                 store.exit_trade(trade_id, price, long_exit, exit_reason, hedge_exit)
-                _peak_premiums.pop(trade_id, None)
+                # peak_premium persisted in trade dict — kept as historical record
                 pnl = trade.get('pnl', 0)
                 tf = _tf_tag(trade.get('timeframe', ''))
                 gap_tag = " GAP!" if is_gap else ""
@@ -759,7 +758,7 @@ def check_open_trades(store, kite):
             sl_gap_pct = abs(price - sl_spot) / sl_spot * 100
             exit_reason = 'sl_spot_gap' if sl_gap_pct > 1.0 else 'sl_spot'
             store.exit_trade(trade_id, price, long_exit, exit_reason, hedge_exit)
-            _peak_premiums.pop(trade_id, None)
+            # peak_premium persisted in trade dict — kept as historical record
             pnl = trade.get('pnl', 0)
             gap_warn = (f"\nGAP: spot {price:.2f} is {sl_gap_pct:.1f}% past "
                         f"SL {sl_spot:.2f}") if sl_gap_pct > 1.0 else ""
@@ -796,7 +795,7 @@ def check_open_trades(store, kite):
             if should_eod:
                 reason = 'eod_daily' if entry_date_str == today_eod else 'eod_daily_stale'
                 store.exit_trade(trade_id, price, long_exit, reason, hedge_exit)
-                _peak_premiums.pop(trade_id, None)
+                # peak_premium persisted in trade dict — kept as historical record
                 pnl = trade.get('pnl', 0)
                 pnl_icon = '\u2705' if pnl >= 0 else '\u274c'
                 stale = " (stale)" if entry_date_str != today_eod else ""
@@ -830,7 +829,7 @@ def check_open_trades(store, kite):
                 d += timedelta(days=1)
             if biz_days >= cfg.SL_TIME_DAYS:
                 store.exit_trade(trade_id, price, long_exit, 'sl_time', hedge_exit)
-                _peak_premiums.pop(trade_id, None)
+                # peak_premium persisted in trade dict — kept as historical record
                 pnl = trade.get('pnl', 0)
                 tf = _tf_tag(trade.get('timeframe', ''))
                 msg = (
@@ -1079,13 +1078,17 @@ def run(dry_run: bool = False):
                 # Periodic Drive sync
                 store.maybe_sync()
 
-            # Monitor prices every MONITOR_INTERVAL_SEC
-            try:
-                if not dry_run:
+            # Monitor prices every MONITOR_INTERVAL_SEC (independent error boundaries)
+            if not dry_run:
+                try:
                     check_watching_signals(store, kite)
+                except Exception as e:
+                    logger.error("Watching monitor error: %s", e, exc_info=True)
+
+                try:
                     check_open_trades(store, kite)
-            except Exception as e:
-                logger.error("Monitor error: %s", e)
+                except Exception as e:
+                    logger.error("Trade monitor error: %s", e, exc_info=True)
 
             time.sleep(cfg.MONITOR_INTERVAL_SEC)
 

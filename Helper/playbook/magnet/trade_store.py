@@ -146,6 +146,8 @@ class MagnetStore:
             "sl_spot": None,  # set at entry: price at 5% gap from ST
             "sl_time_deadline": None,  # set at entry: 5 trading days
             "days_held": 0,
+            "peak_premium": None,       # highest observed long leg premium (trail SL)
+            "entry_retries": 0,         # failed option lookup count (survives restarts)
             # Cost SL (activated when gap < 1%)
             "cost_sl_active": False,
             "cost_sl_level": None,     # entry_premium + 0.10
@@ -203,6 +205,7 @@ class MagnetStore:
         trade['option_strike'] = entry_data.get('option_strike')
         trade['option_symbol'] = entry_data.get('option_symbol')
         trade['option_premium'] = entry_data.get('option_premium')
+        trade['peak_premium'] = entry_data.get('option_premium')  # initialize peak = entry
         trade['option_expiry'] = entry_data.get('option_expiry')
         trade['lot_size'] = entry_data.get('lot_size')
         trade['quantity'] = entry_data.get('quantity')
@@ -278,6 +281,29 @@ class MagnetStore:
             trade_id, trade['stock'], trade['cost_sl_level']
         )
         return trade
+
+    def update_peak_premium(self, trade_id: int, peak: float) -> None:
+        """Update peak premium for trailing SL. Local save only (Drive via maybe_sync).
+
+        Called every 30s monitor cycle when peak changes. Bumps version so
+        Drive merge picks up the latest peak on sync.
+        """
+        trade = self._find(trade_id)
+        if not trade:
+            return
+        old_peak = trade.get('peak_premium') or 0
+        if peak > old_peak:
+            trade['peak_premium'] = round(peak, 2)
+            trade['version'] += 1
+            self._save_local()
+
+    def update_entry_retries(self, trade_id: int, retries: int) -> None:
+        """Persist entry retry count. Local save only, no version bump."""
+        trade = self._find(trade_id)
+        if not trade:
+            return
+        trade['entry_retries'] = retries
+        self._save_local()
 
     def exit_trade(self, trade_id: int, exit_spot: float,
                    exit_premium: float, reason: str,
