@@ -496,30 +496,140 @@ def check_watching_signals(store, kite):
             # Price is below ST, we expect rally. SL = ST * 0.95 (price goes further down)
             sl_spot = round(st_val * (1 - cfg.SL_GAP), 2)
 
-        # Enter paper trade
-        store.enter_trade(trade['id'], {
-            'entry_spot': price,
-            'option_strike': option['strike'],
-            'option_symbol': option['symbol'],
-            'option_premium': premium,
-            'option_expiry': option.get('expiry', ''),
-            'lot_size': lot_size,
-            'quantity': qty,
-            'sl_spot': sl_spot,
-        })
-        if trade.get('entry_retries', 0) > 0:
-            store.update_entry_retries(trade['id'], 0)  # clear on success
+        # === ENTRY PATH: direct or via confidence tracker ===
+        if cfg.USE_CONFIDENCE_TRACKER:
+            # Delegate to confidence tracker — it will wait for pullback,
+            # score the signal, and alert when entry timing is right.
+            _delegate_to_confidence_tracker(
+                store, kite, trade, stock, price, st_val, gap,
+                option, qty, sl_spot)
+        else:
+            # Direct entry (original behavior)
+            store.enter_trade(trade['id'], {
+                'entry_spot': price,
+                'option_strike': option['strike'],
+                'option_symbol': option['symbol'],
+                'option_premium': premium,
+                'option_expiry': option.get('expiry', ''),
+                'lot_size': lot_size,
+                'quantity': qty,
+                'sl_spot': sl_spot,
+            })
+            if trade.get('entry_retries', 0) > 0:
+                store.update_entry_retries(trade['id'], 0)
 
-        icon = _dir_icon(trade['direction'])
-        tf = _tf_tag(trade['timeframe'])
+            icon = _dir_icon(trade['direction'])
+            tf = _tf_tag(trade['timeframe'])
+            msg = (
+                f"{icon} <b>ENTRY</b> {tf} {stock}\n"
+                f"Spot {price:,.1f} | ST {st_val:,.1f} | Gap {gap:.1%}\n"
+                f"<code>{option['symbol']}</code> @ {premium:.2f}\n"
+                f"Qty {qty} | SL {sl_spot:,.1f}"
+            )
+            send_telegram(msg)
+            logger.info(msg.replace('\n', ' | '))
+
+
+def _delegate_to_confidence_tracker(store, kite, trade, stock, price, st_val,
+                                     gap, option, qty, sl_spot):
+    """Hand off entry to confidence tracker for pullback-timed entry.
+
+    Instead of entering immediately, creates a confidence tracker signal.
+    The confidence monitor will score the signal, wait for pullback entry
+    timing, and alert the user when conditions are right.
+    """
+    from .confidence_tracker import (
+        get_tracker, format_watch_alert, _send_telegram as ct_send,
+    )
+    from .confidence import (
+        _get_instrument_token, _fetch_daily, _fetch_hourly, _fetch_15min,
+        _compute_all_st, score_signal,
+    )
+
+    premium = option.get('premium', 0)
+    direction = trade['direction']
+    timeframe = trade['timeframe']
+
+    # Mark the magnet signal as entered (so magnet doesn't re-process it)
+    # We use a special status to indicate it's delegated
+    store.enter_trade(trade['id'], {
+        'entry_spot': price,
+        'option_strike': option['strike'],
+        'option_symbol': option['symbol'],
+        'option_premium': premium,
+        'option_expiry': option.get('expiry', ''),
+        'lot_size': option['lot_size'],
+        'quantity': qty,
+        'sl_spot': sl_spot,
+        'delegated_to_confidence': True,
+    })
+    if trade.get('entry_retries', 0) > 0:
+        store.update_entry_retries(trade['id'], 0)
+
+    # Run confidence scorer
+    try:
+        tok = _get_instrument_token(kite, stock)
+        daily = _fetch_daily(kite, tok)
+        hourly = _fetch_hourly(kite, tok)
+        m15 = _fetch_15min(kite, tok)
+        st_data = _compute_all_st(daily)
+        result = score_signal(stock, price, st_data, daily, hourly, m15,
+                              target_tf=timeframe, kite=kite)
+    except Exception as e:
+        logger.warning("Confidence score failed for %s: %s", stock, e)
+        result = None
+
+    score = result.get('total_score', 0) if result and 'error' not in result else 0
+    grade = result.get('grade', '') if result and 'error' not in result else ''
+    sq = result.get('sq_total', 0) if result and 'error' not in result else 0
+    et = result.get('et_total', 0) if result and 'error' not in result else 0
+
+    # Add to confidence tracker
+    tracker = get_tracker()
+    need_up = direction == 'CE'
+    target_label = 'resistance' if need_up else 'support'
+
+    sig = tracker.add(
+        symbol=stock,
+        timeframe=timeframe,
+        target_st=st_val,
+        direction=direction,
+        option_symbol=option['symbol'],
+        option_price=premium,
+        quantity=qty,
+        sl_spot=sl_spot,
+        signal_price=price,
+        score=score,
+        grade=grade,
+        sq=sq,
+        et=et,
+        target_label=target_label,
+    )
+
+    # Send WATCHING alert (confidence tracker will send ENTER when timing is right)
+    icon = _dir_icon(direction)
+    tf = _tf_tag(timeframe)
+
+    if result and 'error' not in result:
+        msg = format_watch_alert(result, option={
+            'symbol': option['symbol'],
+            'price': premium,
+            'qty': qty,
+        })
+        ct_send(msg)
+    else:
+        # Fallback alert if scoring failed
         msg = (
-            f"{icon} <b>ENTRY</b> {tf} {stock}\n"
+            f"{icon} <b>WATCHING</b> {tf} {stock}\n"
             f"Spot {price:,.1f} | ST {st_val:,.1f} | Gap {gap:.1%}\n"
             f"<code>{option['symbol']}</code> @ {premium:.2f}\n"
-            f"Qty {qty} | SL {sl_spot:,.1f}"
+            f"Qty {qty} | SL {sl_spot:,.1f}\n"
+            f"Waiting for pullback entry..."
         )
         send_telegram(msg)
-        logger.info(msg.replace('\n', ' | '))
+
+    logger.info("Delegated %s %s to confidence tracker (signal #%d, score %d)",
+                stock, direction, sig['id'], score)
 
 
 # ── Monitor: Open Trades ─────────────────────────────────────────────────
@@ -1036,11 +1146,21 @@ def run(dry_run: bool = False):
     store = get_store()
     kite = _get_kite()
 
+    # Confidence tracker setup (if enabled)
+    ct_tracker = None
+    if cfg.USE_CONFIDENCE_TRACKER:
+        from .confidence_tracker import get_tracker, monitor_once as ct_monitor_once
+        ct_tracker = get_tracker()
+        logger.info("Confidence tracker ENABLED (poll every %ds)", cfg.CONFIDENCE_POLL_SEC)
+
     # Startup summary
     watching = len(store.get_watching())
     entered = len(store.get_entered())
-    logger.info("Magnet monitor started: %d watching, %d entered, dry_run=%s",
-                watching, entered, dry_run)
+    ct_watching = len(ct_tracker.get_watching()) + len(ct_tracker.get_ready()) if ct_tracker else 0
+    ct_entered = len(ct_tracker.get_entered()) if ct_tracker else 0
+    logger.info("Magnet monitor started: %d watching, %d entered, "
+                "ct_watching=%d, ct_entered=%d, dry_run=%s",
+                watching, entered, ct_watching, ct_entered, dry_run)
 
     if not is_market_hours():
         logger.info("Market closed. Exiting.")
@@ -1048,6 +1168,7 @@ def run(dry_run: bool = False):
         return
 
     last_scan_time = 0
+    last_ct_time = 0  # last confidence tracker poll
     cycle = 0
     kite_error_count = 0
 
@@ -1091,10 +1212,20 @@ def run(dry_run: bool = False):
                 except Exception as e:
                     logger.error("Watching monitor error: %s", e, exc_info=True)
 
+                if not cfg.USE_CONFIDENCE_TRACKER:
+                    # Original exit monitoring (disabled when confidence tracker owns exits)
+                    try:
+                        check_open_trades(store, kite)
+                    except Exception as e:
+                        logger.error("Trade monitor error: %s", e, exc_info=True)
+
+            # Confidence tracker: poll for entry timing + exhaustion
+            if ct_tracker and not dry_run and (now - last_ct_time) >= cfg.CONFIDENCE_POLL_SEC:
                 try:
-                    check_open_trades(store, kite)
+                    ct_monitor_once(kite, ct_tracker, dry_run=False)
                 except Exception as e:
-                    logger.error("Trade monitor error: %s", e, exc_info=True)
+                    logger.error("Confidence tracker error: %s", e, exc_info=True)
+                last_ct_time = now
 
             time.sleep(cfg.MONITOR_INTERVAL_SEC)
 

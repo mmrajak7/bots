@@ -79,6 +79,8 @@ _DEFAULTS = {
     'enabled_timeframes': ['monthly', 'weekly', 'daily'],  # toggle scanners on/off
     'daily_eod_exit_time': [15, 15],   # [hour, minute] — force-exit daily trades (backtest: day1=+63L, day2+=-37L)
     'daily_premium_sl_pct': 0.25,      # 25% — tighter for intraday (backtest: +80L vs +63L at 40%)
+    'use_confidence_tracker': False,   # True = delegate entry/exit to confidence tracker (pullback timing)
+    'confidence_poll_sec': 300,        # 5 min — how often confidence tracker checks entry timing
 }
 
 import json as _json
@@ -152,6 +154,8 @@ DAILY_PREMIUM_SL_PCT = _runtime.get('daily_premium_sl_pct', 0.25)
 _eod = _runtime.get('daily_eod_exit_time', [15, 15])
 DAILY_EOD_EXIT_HOUR = _eod[0]
 DAILY_EOD_EXIT_MIN = _eod[1]
+USE_CONFIDENCE_TRACKER = _runtime.get('use_confidence_tracker', False)
+CONFIDENCE_POLL_SEC = _runtime.get('confidence_poll_sec', 300)
 
 # Filter scanners to only enabled timeframes
 SCANNERS = [s for s in _ALL_SCANNERS if s['timeframe'] in ENABLED_TIMEFRAMES]
