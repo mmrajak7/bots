@@ -30,6 +30,12 @@ _raw_daily_cache: dict = {}        # {symbol: [daily candles]} — reused by vel
 _instrument_cache: dict = {}       # {symbol: instrument_token}
 _instrument_cache_loaded = False
 
+# Daily skip cache — stocks skipped for reasons that won't change intraday
+# (not_fresh, velocity_filter, st_computation_failed).
+# Key: (stock, timeframe), Value: reason string.  Cleared on new day.
+_skip_cache: dict = {}
+_skip_cache_date: str = ''
+
 # Data duration per timeframe (years of daily data to fetch)
 _DATA_YEARS = {'monthly': 6, 'weekly': 3, 'daily': 1}
 
@@ -497,6 +503,32 @@ def check_daily_velocity(velocity: dict) -> Tuple[bool, str]:
                   f"consec={velocity['consecutive_closing']}")
 
 
+# ── Daily Skip Cache ─────────────────────────────────────────────────────
+
+# Reasons that are stable intraday (historical data doesn't change):
+_CACHEABLE_SKIPS = {'not_fresh', 'velocity_filter', 'st_computation_failed'}
+
+
+def _check_skip_cache(stock: str, timeframe: str):
+    """Return cached skip reason if stock was already rejected today, else None."""
+    global _skip_cache, _skip_cache_date
+    today = datetime.now().strftime('%Y-%m-%d')
+    if _skip_cache_date != today:
+        _skip_cache = {}
+        _skip_cache_date = today
+    return _skip_cache.get((stock, timeframe))
+
+
+def _add_to_skip_cache(stock: str, timeframe: str, reason: str):
+    """Cache a skip decision for the rest of the day."""
+    global _skip_cache, _skip_cache_date
+    today = datetime.now().strftime('%Y-%m-%d')
+    if _skip_cache_date != today:
+        _skip_cache = {}
+        _skip_cache_date = today
+    _skip_cache[(stock, timeframe)] = reason
+
+
 # ── Main Scan Pipeline ────────────────────────────────────────────────────
 
 def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[dict]:
@@ -558,10 +590,18 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
             skipped_reasons['no_ltp'] += 1
             continue
 
+        # Daily skip cache — avoid re-running expensive checks for stocks
+        # already rejected today for reasons that won't change intraday
+        cached_skip = _check_skip_cache(stock, timeframe)
+        if cached_skip:
+            skipped_reasons[cached_skip] += 1
+            continue
+
         # Compute ST
         st_info = compute_st_for_stock(kite, stock, timeframe)
         if not st_info:
             skipped_reasons['st_computation_failed'] += 1
+            _add_to_skip_cache(stock, timeframe, 'st_computation_failed')
             continue
 
         st_val = st_info['st']
@@ -587,7 +627,8 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
         is_fresh, reason = check_freshness(kite, stock, st_val, timeframe)
         if not is_fresh:
             skipped_reasons['not_fresh'] += 1
-            logger.info("SKIP %s (%s): %s", stock, timeframe, reason)
+            _add_to_skip_cache(stock, timeframe, 'not_fresh')
+            logger.info("SKIP %s (%s): %s [cached for today]", stock, timeframe, reason)
             continue
 
         # Daily signals: velocity filter (backtest-validated, 80% hit rate)
@@ -598,7 +639,8 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
             vel_ok, vel_reason = check_daily_velocity(velocity)
             if not vel_ok:
                 skipped_reasons['velocity_filter'] += 1
-                logger.info("SKIP %s (daily): %s", stock, vel_reason)
+                _add_to_skip_cache(stock, timeframe, 'velocity_filter')
+                logger.info("SKIP %s (daily): %s [cached for today]", stock, vel_reason)
                 continue
             logger.info("PASS %s (daily): %s", stock, vel_reason)
 
@@ -634,10 +676,13 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
                      trade['id'], stock, timeframe, gap * 100, st_val,
                      st_info['direction'], trade['direction'])
 
-    # Summary
+    # Summary — show cache hits separately so we can see savings
+    cache_hits = sum(v for k, v in skipped_reasons.items()
+                     if k in _CACHEABLE_SKIPS and _skip_cache)
     logger.info(
-        "Scan complete: %d raw, %d unique, %d added, skipped: %s",
+        "Scan complete: %d raw, %d unique, %d added, skipped: %s (skip_cache: %d entries)",
         len(raw_signals), len(unique_signals), len(added),
-        dict(skipped_reasons) if skipped_reasons else 'none'
+        dict(skipped_reasons) if skipped_reasons else 'none',
+        len(_skip_cache),
     )
     return added
