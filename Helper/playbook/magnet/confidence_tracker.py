@@ -131,8 +131,15 @@ def _dim_line(dims: dict, key: str, label: str) -> str:
     return f"  {icon} {label}: {detail}"
 
 
-def format_watch_alert(result: dict, option: Optional[dict] = None) -> str:
-    """Format WATCHING alert for Telegram — comprehensive view."""
+def format_watch_alert(result: dict, option: Optional[dict] = None,
+                       corr_block: str = '') -> str:
+    """Format WATCHING alert for Telegram — comprehensive view.
+
+    Args:
+        result:     Output of score_signal()
+        option:     Option info dict (symbol, price, qty)
+        corr_block: Pre-formatted correlation HTML block (from correlation.py)
+    """
     s = result
     sym = s['symbol']
     opt = s['option_type']
@@ -168,6 +175,11 @@ def format_watch_alert(result: dict, option: Optional[dict] = None) -> str:
         lines.append("")
         for r in risks[:2]:
             lines.append(f"- {r}")
+
+    # Market correlation block (3-month stock vs NIFTY + other watched stocks)
+    if corr_block:
+        lines.append("")
+        lines.append(corr_block)
 
     lines.append("")
     lines.append("Waiting for pullback...")

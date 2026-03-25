@@ -197,13 +197,58 @@ def cmd_ctrack(args):
         from .confidence import print_detail
         print_detail(result)
 
+        # Compute market correlation (3M: stock vs NIFTY + other watched stocks)
+        corr_block = ''
+        try:
+            from .correlation import compute_correlations, format_correlation_block
+
+            # Gather other symbols from tracker + magnet store
+            other_syms = set()
+            for s_sig in tracker.get_watching() + tracker.get_entered():
+                other_syms.add(s_sig['symbol'])
+            try:
+                from . import get_store as _get_magnet_store
+                for t in _get_magnet_store().load_trades():
+                    if t.get('status') in ('watching', 'entered'):
+                        other_syms.add(t['stock'])
+            except Exception:
+                pass  # magnet store unavailable, proceed with tracker only
+            other_syms.discard(sym)
+
+            corr_data = compute_correlations(
+                symbol=sym,
+                kite=kite,
+                get_token_fn=_get_instrument_token,
+                other_symbols=list(other_syms),
+                daily_data=daily,
+            )
+            market_sc = result.get('sq_dims', {}).get('market', (4, 7, ''))[0]
+            corr_block = format_correlation_block(corr_data, market_score=market_sc)
+
+            # Print correlation to console
+            if corr_data.get('nifty'):
+                nc = corr_data['nifty']
+                print(f"\n  Correlation (3M): vs NIFTY {nc['corr']:+.2f} ({nc['label']})")
+                for cs, cd in sorted(corr_data.get('stocks', {}).items(),
+                                     key=lambda x: abs(x[1]['corr']), reverse=True):
+                    tag = ' <-- same trade!' if abs(cd['corr']) >= 0.75 else ''
+                    print(f"    vs {cs}: {cd['corr']:+.2f} ({cd['label']}){tag}")
+                from .correlation import _build_verdict
+                verdict = _build_verdict(nc['corr'], market_sc)
+                if verdict:
+                    # Strip unicode for console safety
+                    safe_verdict = verdict.encode('ascii', errors='replace').decode('ascii')
+                    print(f"  Verdict: {safe_verdict}")
+        except Exception as e:
+            print(f"  Correlation computation skipped: {e}")
+
         # Send WATCHING Telegram alert
         opt_info = {
             'symbol': args.ctrack_option,
             'price': args.ctrack_price,
             'qty': args.ctrack_qty,
         }
-        msg = format_watch_alert(result, option=opt_info)
+        msg = format_watch_alert(result, option=opt_info, corr_block=corr_block)
         dry = getattr(args, 'dry_run', False)
         from .confidence_tracker import _send_telegram
         _send_telegram(msg, dry_run=dry)
