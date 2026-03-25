@@ -543,6 +543,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
         print("  No active signals to monitor.")
         return
 
+    log.info("CT monitor_once: %d watching, %d entered", len(watching), len(entered))
     print(f"\n  [ctrack] {datetime.now().strftime('%H:%M:%S')} -- "
           f"{len(watching)} watching, {len(entered)} entered")
 

@@ -1271,6 +1271,9 @@ def run(dry_run: bool = False):
 
             # Confidence tracker: poll for entry timing + exhaustion
             if ct_tracker and not dry_run and (now - last_ct_time) >= cfg.CONFIDENCE_POLL_SEC:
+                ct_w = len(ct_tracker.get_watching()) + len(ct_tracker.get_ready())
+                ct_e = len(ct_tracker.get_entered())
+                logger.info("CT poll: %d watching, %d entered", ct_w, ct_e)
                 try:
                     ct_monitor_once(kite, ct_tracker, dry_run=False)
                 except Exception as e:
@@ -1281,7 +1284,6 @@ def run(dry_run: bool = False):
                     _sync_ct_exits_to_magnet(store, ct_tracker)
                 except Exception as e:
                     logger.error("CT->magnet sync error: %s", e, exc_info=True)
-
                 last_ct_time = now
 
             time.sleep(cfg.MONITOR_INTERVAL_SEC)
