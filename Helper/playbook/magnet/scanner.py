@@ -325,7 +325,7 @@ def compute_st_for_stock(kite, symbol: str, timeframe: str) -> dict:
 
 # ── Freshness Check ───────────────────────────────────────────────────────
 
-def check_freshness(kite, symbol: str, st_value: float,
+def check_freshness(symbol: str, st_value: float,
                     timeframe: str) -> Tuple[bool, str]:
     """Check if the signal is a fresh approach, not a bounce from <2% zone.
 
@@ -334,17 +334,12 @@ def check_freshness(kite, symbol: str, st_value: float,
     Rules:
     - If price is already below 2% gap → NOT fresh (too late)
     - If price was below 2% gap in the last 5 trading days → NOT fresh (bounce)
+
+    Reuses _raw_daily_cache (populated by compute_st_for_stock) — zero API calls.
     """
     try:
-        # Get last 10 days of daily data for freshness check
-        token = get_instrument_token(kite, symbol)
-        now = datetime.now()
-        start = now - timedelta(days=15)  # 15 calendar days ≈ 10 trading days
-
-        daily = kite.historical_data(
-            token, start.strftime('%Y-%m-%d'),
-            now.strftime('%Y-%m-%d'), 'day'
-        )
+        # Reuse daily data already fetched by compute_st_for_stock()
+        daily = _raw_daily_cache.get(symbol)
 
         if not daily:
             return True, "no recent data, treating as fresh"
@@ -504,9 +499,10 @@ def check_daily_velocity(velocity: dict) -> Tuple[bool, str]:
 
 
 # ── Daily Skip Cache ─────────────────────────────────────────────────────
-
-# Reasons that are stable intraday (historical data doesn't change):
-_CACHEABLE_SKIPS = {'not_fresh', 'velocity_filter', 'st_computation_failed'}
+# Caches stocks rejected for reasons that won't change intraday:
+#   not_fresh      — bounce in last 5 days (historical, frozen)
+#   velocity_filter — daily close momentum (frozen once computed)
+# NOT cached: st_computation_failed (transient API glitch), gap checks (price moves)
 
 
 def _check_skip_cache(stock: str, timeframe: str):
@@ -597,11 +593,10 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
             skipped_reasons[cached_skip] += 1
             continue
 
-        # Compute ST
+        # Compute ST (not cached in skip_cache — failures could be transient API glitches)
         st_info = compute_st_for_stock(kite, stock, timeframe)
         if not st_info:
             skipped_reasons['st_computation_failed'] += 1
-            _add_to_skip_cache(stock, timeframe, 'st_computation_failed')
             continue
 
         st_val = st_info['st']
@@ -624,7 +619,7 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
             continue
 
         # Freshness check
-        is_fresh, reason = check_freshness(kite, stock, st_val, timeframe)
+        is_fresh, reason = check_freshness(stock, st_val, timeframe)
         if not is_fresh:
             skipped_reasons['not_fresh'] += 1
             _add_to_skip_cache(stock, timeframe, 'not_fresh')
@@ -676,9 +671,7 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
                      trade['id'], stock, timeframe, gap * 100, st_val,
                      st_info['direction'], trade['direction'])
 
-    # Summary — show cache hits separately so we can see savings
-    cache_hits = sum(v for k, v in skipped_reasons.items()
-                     if k in _CACHEABLE_SKIPS and _skip_cache)
+    # Summary
     logger.info(
         "Scan complete: %d raw, %d unique, %d added, skipped: %s (skip_cache: %d entries)",
         len(raw_signals), len(unique_signals), len(added),
