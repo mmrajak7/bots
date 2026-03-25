@@ -45,14 +45,17 @@ def load_config() -> dict:
                     cfg[key] = file_cfg[key]
             cfg['symbols'] = file_cfg.get('symbols', {})
             cfg['google_drive'] = file_cfg.get('google_drive', {})
+            cfg['telegram'] = file_cfg.get('telegram', {})
         except Exception as e:
             logger.warning("Failed to load %s, using defaults: %s", CONFIG_FILE, e)
             cfg['symbols'] = {}
             cfg['google_drive'] = {}
+            cfg['telegram'] = {}
     else:
         logger.warning("Config not found: %s", CONFIG_FILE)
         cfg['symbols'] = {}
         cfg['google_drive'] = {}
+        cfg['telegram'] = {}
     return cfg
 
 

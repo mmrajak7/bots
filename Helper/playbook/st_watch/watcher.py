@@ -306,12 +306,22 @@ _telegram_cfg_loaded = False
 
 
 def _send_telegram(msg: str):
-    """Send Telegram alert. Best-effort: never blocks or crashes."""
+    """Send Telegram alert. Best-effort: never blocks or crashes.
+
+    Uses st_watch_config.json 'telegram' section (dedicated bot for Watch alerts).
+    Falls back to shared BOTS/data/telegram_config.json if not configured.
+    """
     global _telegram_cfg, _telegram_cfg_loaded
 
     try:
         if not _telegram_cfg_loaded:
-            if cfg.TELEGRAM_CONFIG.exists():
+            # Priority 1: dedicated telegram config in st_watch_config.json
+            watch_cfg = cfg.load_config()
+            tg = watch_cfg.get('telegram')
+            if tg and tg.get('bot_token') and tg.get('chat_id'):
+                _telegram_cfg = tg
+            # Priority 2: shared telegram_config.json
+            elif cfg.TELEGRAM_CONFIG.exists():
                 with open(cfg.TELEGRAM_CONFIG) as f:
                     _telegram_cfg = json.load(f)
             _telegram_cfg_loaded = True
