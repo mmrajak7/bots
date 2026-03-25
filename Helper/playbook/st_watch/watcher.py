@@ -337,14 +337,16 @@ def _send_telegram(msg: str):
                   'parse_mode': 'HTML'},
             timeout=10,
         )
+        bot_id = _telegram_cfg['bot_token'].split(':')[0]
         if resp.ok:
-            logger.info("Telegram alert sent")
+            logger.info("Telegram sent (bot=%s): %s", bot_id, msg[:120])
         else:
-            logger.warning("Telegram API returned %d: %s", resp.status_code, resp.text)
+            logger.warning("Telegram FAILED (bot=%s) %d: %s\nMsg: %s",
+                           bot_id, resp.status_code, resp.text, msg[:200])
     except ImportError:
         logger.info("Telegram skipped: 'requests' not installed")
     except Exception as e:
-        logger.warning("Telegram alert failed: %s", e)
+        logger.warning("Telegram alert failed: %s\nMsg: %s", e, msg[:200])
 
 
 def _format_alert(symbol: str, basket: str, timeframe: str,
