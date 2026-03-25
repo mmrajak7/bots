@@ -144,24 +144,15 @@ def format_watch_alert(result: dict, option: Optional[dict] = None) -> str:
 
     lines = [
         f"{stars} <b>WATCHING</b> <code>{sym}</code> {opt} | {s['total_score']}/100",
+        f"Spot {s['ltp']:,.0f} | {tgt_word} {s['target_st']:,.0f} ({gap_abs:.1f}%)",
         "",
-        f"Spot: {s['ltp']:,.0f} | {tgt_word} at {s['target_st']:,.0f} ({gap_abs:.1f}%)",
-        f"Signal: {s['sq_total']}/60 | Entry: {s['et_total']}/40",
-        "",
-        "<b>Signal Quality:</b>",
         _dim_line(sq, 'higher_tf', 'Trend'),
-        _dim_line(sq, 'tf_align', 'Alignment'),
-        _dim_line(sq, 'gap', 'Gap'),
-        _dim_line(sq, 'atr_reach', 'Reach'),
+        _dim_line(sq, 'tf_align', 'TF'),
         _dim_line(sq, 'velocity', 'Velocity'),
         _dim_line(sq, 'market', 'Market'),
-        "",
-        "<b>Entry Timing:</b>",
         _dim_line(et, 'pullback', 'Pullback'),
         _dim_line(et, 'intraday', 'Intraday'),
-        _dim_line(et, 'volume', 'Volume'),
         _dim_line(et, 'support', 'Support'),
-        _dim_line(et, 'reversal', 'Candle'),
     ]
 
     if option:
@@ -169,18 +160,17 @@ def format_watch_alert(result: dict, option: Optional[dict] = None) -> str:
         opt_price = option.get('price', 0)
         opt_qty = option.get('qty', '')
         lines.append("")
-        lines.append(f"Trade: <code>{opt_sym}</code> @ {opt_price:.2f} | Qty {opt_qty}")
+        lines.append(f"<code>{opt_sym}</code> @ {opt_price:.2f} | Qty {opt_qty}")
 
-    # Risks
+    # Risks — only show weak/bad dimensions
     risks = s.get('risks', [])
     if risks:
         lines.append("")
-        lines.append("<b>Risks:</b>")
-        for r in risks[:3]:
-            lines.append(f"  - {r}")
+        for r in risks[:2]:
+            lines.append(f"- {r}")
 
     lines.append("")
-    lines.append("Waiting for pullback entry...")
+    lines.append("Waiting for pullback...")
 
     return "\n".join(lines)
 
@@ -198,19 +188,12 @@ def format_enter_alert(result: dict, option: Optional[dict] = None) -> str:
 
     lines = [
         f"{stars} <b>ENTER</b> <code>{sym}</code> {opt} | {s['total_score']}/100",
+        f"Spot {s['ltp']:,.0f} -> {tgt_word} {s['target_st']:,.0f} ({gap_abs:.1f}%)",
         "",
-        f"Spot: {s['ltp']:,.0f} -> {tgt_word} at {s['target_st']:,.0f} ({gap_abs:.1f}%)",
-        "",
-        "<b>Why enter now:</b>",
         _dim_line(et, 'pullback', 'Pullback'),
         _dim_line(et, 'intraday', 'Intraday'),
-        _dim_line(et, 'volume', 'Volume'),
         _dim_line(et, 'support', 'Support'),
-        _dim_line(et, 'reversal', 'Candle'),
-        "",
-        "<b>Signal:</b>",
         _dim_line(sq, 'higher_tf', 'Trend'),
-        _dim_line(sq, 'tf_align', 'Alignment'),
         _dim_line(sq, 'velocity', 'Velocity'),
         _dim_line(sq, 'market', 'Market'),
     ]
@@ -220,18 +203,15 @@ def format_enter_alert(result: dict, option: Optional[dict] = None) -> str:
         opt_price = option.get('price', 0)
         opt_qty = option.get('qty', '')
         sl_spot = option.get('sl_spot', 0)
+        sl_str = f" | SL {sl_spot:,.0f}" if sl_spot else ""
         lines.append("")
-        sl_str = f" | SL: {sl_spot:,.0f}" if sl_spot else ""
-        lines.append(f"Trade: <code>{opt_sym}</code> @ {opt_price:.2f}")
-        lines.append(f"Qty: {opt_qty}{sl_str}")
+        lines.append(f"<code>{opt_sym}</code> @ {opt_price:.2f} | Qty {opt_qty}{sl_str}")
 
-    # Risks (if any)
     risks = s.get('risks', [])
     if risks:
         lines.append("")
-        lines.append("<b>Risks:</b>")
         for r in risks[:2]:
-            lines.append(f"  - {r}")
+            lines.append(f"- {r}")
 
     return "\n".join(lines)
 

@@ -193,17 +193,24 @@ def _compute_market_outlook(kite):
 
         nifty_close = nifty_daily[-1]['close']
 
-        # RSI(14)
+        # RSI(14) — used for scoring, not shown to user
         nifty_rsi = _rsi(nifty_daily)
 
         # 50 DMA
         closes_50 = [c['close'] for c in nifty_daily[-50:]]
         dma50 = sum(closes_50) / len(closes_50)
         above_50dma = nifty_close > dma50
+        dma_gap = (nifty_close - dma50) / dma50 * 100
 
         # Daily ST direction
         nifty_st = compute_supertrend(nifty_daily, 10, 3)
         nifty_st_dir = nifty_st[-1]['direction'] if nifty_st else None
+
+        # 3-day NIFTY trend
+        n3d_chg = 0
+        if len(nifty_daily) >= 4:
+            n3d_chg = ((nifty_close - nifty_daily[-4]['close'])
+                       / nifty_daily[-4]['close'] * 100)
 
         # Count bullish signals
         signals_on = 0
@@ -214,30 +221,29 @@ def _compute_market_outlook(kite):
         if nifty_st_dir == 'UP':
             signals_on += 1
 
+        # Build description — no RSI, add 3d trend
+        dma_str = f"{'above' if above_50dma else 'below'} 50DMA ({dma_gap:+.1f}%)"
+        trend_str = f"3d: {n3d_chg:+.1f}%"
+        st_str = f"ST {nifty_st_dir or '?'}"
+
         if signals_on == 3:
             sc = 7
-            desc = (f"NIFTY healthy: RSI {nifty_rsi:.0f}, "
-                    f"above 50DMA, ST UP")
+            desc = f"NIFTY bullish -- {dma_str}, {st_str}, {trend_str}"
         elif signals_on == 2:
             sc = 5
-            desc = (f"NIFTY mixed ({signals_on}/3): RSI {nifty_rsi:.0f}, "
-                    f"{'above' if above_50dma else 'below'} 50DMA, "
-                    f"ST {nifty_st_dir or '?'}")
+            desc = f"NIFTY mixed -- {dma_str}, {st_str}, {trend_str}"
         elif signals_on == 1:
             sc = 3
-            desc = (f"NIFTY weak ({signals_on}/3): RSI {nifty_rsi:.0f}, "
-                    f"{'above' if above_50dma else 'below'} 50DMA, "
-                    f"ST {nifty_st_dir or '?'}")
+            desc = f"NIFTY weak -- {dma_str}, {st_str}, {trend_str}"
         else:
             sc = 1
-            desc = (f"NIFTY bearish (0/3): RSI {nifty_rsi:.0f}, "
-                    f"below 50DMA, ST DOWN")
+            desc = f"NIFTY bearish -- {dma_str}, {st_str}, {trend_str}"
 
         _nifty_cache_ts = _time.time()
         _nifty_cache = {
             'score': sc, 'detail': desc,
             'nifty_rsi': nifty_rsi, 'above_50dma': above_50dma,
-            'nifty_st_dir': nifty_st_dir,
+            'nifty_st_dir': nifty_st_dir, 'nifty_3d_chg': n3d_chg,
         }
         return _nifty_cache
     except Exception as e:
@@ -943,9 +949,10 @@ def score_signal(symbol, ltp, st_data, daily, hourly=None, m15=None,
     elif total >= 35: grade = 'LOW'
     else:             grade = 'SKIP'
 
-    # Thesis
+    # Thesis — exclude RSI from user-facing strengths/risks
     all_dims = {**sq, **et}
-    sorted_d = sorted(all_dims.items(),
+    visible_dims = {k: v for k, v in all_dims.items() if k != 'rsi'}
+    sorted_d = sorted(visible_dims.items(),
                       key=lambda x: x[1][0] / x[1][1], reverse=True)
     strengths = [d[1][2] for d in sorted_d if d[1][0] / d[1][1] >= 0.7][:4]
     risks = [d[1][2] for d in sorted_d if d[1][0] / d[1][1] < 0.45][:3]
