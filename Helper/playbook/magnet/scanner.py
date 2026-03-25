@@ -719,7 +719,7 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
             direction = trade.get('direction', '?')
             icon = '\U0001f7e2' if direction == 'CE' else '\U0001f534'
             _send_watching_alert(
-                f"{icon} <b>WATCHING</b> [{tf_short}] {stock}\n"
+                f"{icon} <b>WATCHING</b> [{tf_short}] <code>{stock}</code>\n"
                 f"Spot {price:,.1f} | ST {st_val:,.1f} | Gap {gap*100:.1f}%\n"
                 f"Dir: {st_info['direction']} \u2192 {direction} | Waiting for \u22642% entry"
             )

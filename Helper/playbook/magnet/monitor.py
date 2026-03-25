@@ -521,7 +521,7 @@ def check_watching_signals(store, kite):
             icon = _dir_icon(trade['direction'])
             tf = _tf_tag(trade['timeframe'])
             msg = (
-                f"{icon} <b>ENTRY</b> {tf} {stock}\n"
+                f"{icon} <b>ENTRY</b> {tf} <code>{stock}</code>\n"
                 f"Spot {price:,.1f} | ST {st_val:,.1f} | Gap {gap:.1%}\n"
                 f"<code>{option['symbol']}</code> @ {premium:.2f}\n"
                 f"Qty {qty} | SL {sl_spot:,.1f}"
@@ -629,7 +629,7 @@ def _delegate_to_confidence_tracker(store, kite, trade, stock, price, st_val,
     else:
         # Fallback alert if scoring failed
         msg = (
-            f"{icon} <b>WATCHING</b> {tf} {stock}\n"
+            f"{icon} <b>WATCHING</b> {tf} <code>{stock}</code>\n"
             f"Spot {price:,.1f} | ST {st_val:,.1f} | Gap {gap:.1%}\n"
             f"<code>{option['symbol']}</code> @ {premium:.2f}\n"
             f"Qty {qty} | SL {sl_spot:,.1f}\n"
@@ -723,7 +723,7 @@ def check_open_trades(store, kite):
             tf = _tf_tag(trade.get('timeframe', ''))
             pnl = -entry_prem * qty if entry_prem > 0 else 0
             send_telegram(
-                f"\u23f0 <b>EXPIRED</b> {tf} {stock}\n"
+                f"\u23f0 <b>EXPIRED</b> {tf} <code>{stock}</code>\n"
                 f"Option {trade.get('option_symbol', '?')} expired {option_expiry}\n"
                 f"<b>Rs {pnl:+,.0f}</b> (total loss)"
             )
@@ -758,7 +758,7 @@ def check_open_trades(store, kite):
                 pnl_exp = (long_exit - entry_prem_exp) * qty
             pnl_icon = '\u2705' if pnl_exp >= 0 else '\u274c'
             msg = (
-                f"\u26a0\ufe0f <b>EXPIRY TODAY</b> {tf} {stock}\n"
+                f"\u26a0\ufe0f <b>EXPIRY TODAY</b> {tf} <code>{stock}</code>\n"
                 f"<code>{option_symbol}</code> expires today!\n"
                 f"Entry {entry_prem_exp:.2f} | Bid {long_exit:.2f} | "
                 f"<b>Rs {pnl_exp:+,.0f}</b>\n"
@@ -784,7 +784,7 @@ def check_open_trades(store, kite):
             store.activate_cost_sl(trade_id)
             cost_lvl = trade.get('cost_sl_level', 0)
             msg = (
-                f"\U0001f6e1 COST SL {stock} | gap {gap:.1%}\n"
+                f"\U0001f6e1 COST SL <code>{stock}</code> | gap {gap:.1%}\n"
                 f"Floor {cost_lvl:.2f} (entry {entry_prem:.2f}) ZERO RISK"
             )
             send_telegram(msg)
@@ -799,7 +799,7 @@ def check_open_trades(store, kite):
                 store.add_hedge(trade_id, hedge_result)
                 nd = trade.get('hedge_net_debit', entry_prem)
                 msg = (
-                    f"\U0001f6e1 HEDGE {stock} | gap {gap:.1%}\n"
+                    f"\U0001f6e1 HEDGE <code>{stock}</code> | gap {gap:.1%}\n"
                     f"Short <code>{hedge_result['hedge_symbol']}</code> "
                     f"@ {hedge_result['hedge_premium']:.2f}\n"
                     f"Net debit {nd:.2f} | Max loss capped"
@@ -830,7 +830,7 @@ def check_open_trades(store, kite):
             pnl_icon = '\u2705' if pnl >= 0 else '\u274c'
             tf = _tf_tag(trade.get('timeframe', ''))
             msg = (
-                f"{pnl_icon} <b>TP</b> {tf} {stock}{h}\n"
+                f"{pnl_icon} <b>TP</b> {tf} <code>{stock}</code>{h}\n"
                 f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
                 f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%) "
                 f"{trade.get('days_held', 0)}d"
@@ -856,7 +856,7 @@ def check_open_trades(store, kite):
                 pnl_icon = '\u2705' if pnl >= 0 else '\u274c'
                 tf = _tf_tag(trade.get('timeframe', ''))
                 msg = (
-                    f"{pnl_icon} <b>TRAIL</b> {tf} {stock}\n"
+                    f"{pnl_icon} <b>TRAIL</b> {tf} <code>{stock}</code>\n"
                     f"Peak {peak:.2f} | Trail {trail_level:.2f}\n"
                     f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
                     f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%) "
@@ -875,7 +875,7 @@ def check_open_trades(store, kite):
                 pnl = trade.get('pnl', 0)
                 tf = _tf_tag(trade.get('timeframe', ''))
                 msg = (
-                    f"\U0001f7f0 <b>COST SL</b> {tf} {stock}\n"
+                    f"\U0001f7f0 <b>COST SL</b> {tf} <code>{stock}</code>\n"
                     f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
                     f"<b>Rs {pnl:+,.0f}</b> ~BE {trade.get('days_held', 0)}d"
                 )
@@ -899,7 +899,7 @@ def check_open_trades(store, kite):
                 tf = _tf_tag(trade.get('timeframe', ''))
                 gap_tag = " GAP!" if is_gap else ""
                 msg = (
-                    f"\u274c <b>PREM SL</b> {tf} {stock}{gap_tag}\n"
+                    f"\u274c <b>PREM SL</b> {tf} <code>{stock}</code>{gap_tag}\n"
                     f"{entry_prem:.2f}\u2192{long_exit:.2f} ({actual_loss_pct:.0%})\n"
                     f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%) "
                     f"{trade.get('days_held', 0)}d"
@@ -926,7 +926,7 @@ def check_open_trades(store, kite):
             tf = _tf_tag(trade.get('timeframe', ''))
             gap_tag = " GAP!" if sl_gap_pct > 1.0 else ""
             msg = (
-                f"\u274c <b>SPOT SL</b> {tf} {stock}{gap_tag}\n"
+                f"\u274c <b>SPOT SL</b> {tf} <code>{stock}</code>{gap_tag}\n"
                 f"Spot {price:,.1f} hit SL {sl_spot:,.1f}\n"
                 f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
                 f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%) "
@@ -961,7 +961,7 @@ def check_open_trades(store, kite):
                 pnl_icon = '\u2705' if pnl >= 0 else '\u274c'
                 stale = " (stale)" if entry_date_str != today_eod else ""
                 msg = (
-                    f"{pnl_icon} <b>EOD EXIT</b> [D] {stock}{stale}\n"
+                    f"{pnl_icon} <b>EOD EXIT</b> [D] <code>{stock}</code>{stale}\n"
                     f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
                     f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%)"
                 )
@@ -994,7 +994,7 @@ def check_open_trades(store, kite):
                 pnl = trade.get('pnl', 0)
                 tf = _tf_tag(trade.get('timeframe', ''))
                 msg = (
-                    f"\u23f0 <b>TIME SL</b> {tf} {stock} ({biz_days}d)\n"
+                    f"\u23f0 <b>TIME SL</b> {tf} <code>{stock}</code> ({biz_days}d)\n"
                     f"{entry_prem:.2f}\u2192{long_exit:.2f} | "
                     f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%)"
                 )

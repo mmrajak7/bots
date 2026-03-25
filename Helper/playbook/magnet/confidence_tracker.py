@@ -132,7 +132,7 @@ def format_watch_alert(result: dict, option: Optional[dict] = None) -> str:
     gap_abs = abs(s['gap_pct'])
 
     lines = [
-        f"{stars} <b>WATCHING {sym} {opt}</b> | {s['total_score']}/100",
+        f"{stars} <b>WATCHING</b> <code>{sym}</code> {opt} | {s['total_score']}/100",
         "",
         f"Approaching {tgt_word} at {s['target_st']:,.0f} ({gap_abs:.1f}%)",
         f"Signal: {s['sq_total']}/60 | Entry: {s['et_total']}/40",
@@ -144,7 +144,7 @@ def format_watch_alert(result: dict, option: Optional[dict] = None) -> str:
         opt_price = option.get('price', 0)
         opt_qty = option.get('qty', '')
         lines.append("")
-        lines.append(f"Trade: {opt_sym} @ {opt_price:.2f} | Qty {opt_qty}")
+        lines.append(f"Trade: <code>{opt_sym}</code> @ {opt_price:.2f} | Qty {opt_qty}")
 
     # Setup summary from strengths
     if s.get('strengths'):
@@ -163,7 +163,7 @@ def format_enter_alert(result: dict, option: Optional[dict] = None) -> str:
     gap_abs = abs(s['gap_pct'])
 
     lines = [
-        f"{stars} <b>ENTER {sym} {opt}</b> | {s['total_score']}/100",
+        f"{stars} <b>ENTER</b> <code>{sym}</code> {opt} | {s['total_score']}/100",
         "",
         f"Spot: {s['ltp']:,.0f} -> {tgt_word} at {s['target_st']:,.0f} ({gap_abs:.1f}%)",
     ]
@@ -197,7 +197,7 @@ def format_enter_alert(result: dict, option: Optional[dict] = None) -> str:
         sl_spot = option.get('sl_spot', 0)
         lines.append("")
         sl_str = f" | SL: {sl_spot:,.0f}" if sl_spot else ""
-        lines.append(f"Trade: {opt_sym} @ {opt_price:.2f}")
+        lines.append(f"Trade: <code>{opt_sym}</code> @ {opt_price:.2f}")
         lines.append(f"Qty: {opt_qty}{sl_str}")
 
     return "\n".join(lines)
@@ -222,9 +222,9 @@ def format_exit_alert(symbol: str, direction: str, entry_price: float,
     is_profit = spot_move > 0
 
     if is_profit:
-        header = f"!! <b>{symbol} {direction} - TAKE PROFIT</b>"
+        header = f"!! <b>TAKE PROFIT</b> <code>{symbol}</code> {direction}"
     else:
-        header = f"XX <b>{symbol} {direction} - EXIT</b>"
+        header = f"XX <b>EXIT</b> <code>{symbol}</code> {direction}"
 
     lines = [
         header,
@@ -610,7 +610,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                         tracker.cancel(sig['id'],
                                        f'stale: watching {days_waiting:.0f}d (max {max_days}d for {tf})')
                         _send_telegram(
-                            f"[X] {sym} {sig['direction']} CANCELLED\n"
+                            f"[X] <code>{sym}</code> {sig['direction']} CANCELLED\n"
                             f"Watching for {days_waiting:.0f} days (max {max_days} for {tf})",
                             dry_run=dry_run)
                         print(f"  #{sig['id']} {sym}: AUTO-CANCELLED (stale {days_waiting:.0f}d)")
@@ -619,7 +619,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                         sig['theta_warned'] = True
                         tracker._save()
                         _send_telegram(
-                            f"[!] {sym} {sig['direction']} watching for {days_waiting:.1f} days\n"
+                            f"[!] <code>{sym}</code> {sig['direction']} watching for {days_waiting:.1f} days\n"
                             f"Option theta decaying. Consider cancelling.",
                             dry_run=dry_run)
                         print(f"  #{sig['id']} {sym}: THETA WARNING sent ({days_waiting:.1f}d)")
@@ -659,8 +659,8 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                     tracker.cancel(sig['id'],
                                    f'option {sig["option_symbol"]} expired/delisted')
                     _send_telegram(
-                        f"[X] {sym} {sig['direction']} CANCELLED\n"
-                        f"Option {sig['option_symbol']} no longer tradeable",
+                        f"[X] <code>{sym}</code> {sig['direction']} CANCELLED\n"
+                        f"Option <code>{sig['option_symbol']}</code> no longer tradeable",
                         dry_run=dry_run)
                     print(f"  #{sig['id']} {sym}: option expired, cancelled")
                     continue
@@ -789,7 +789,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                             pass
                     if cooldown_ok:
                         caution_msg = (
-                            f"[!] <b>CAUTION {sym} {sig['direction']}</b>\n"
+                            f"[!] <b>CAUTION</b> <code>{sym}</code> {sig['direction']}\n"
                             f"\n{reason}\nLTP: {ltp:,.0f} | Move: {move_pct:+.1f}%"
                         )
                         _send_telegram(caution_msg, dry_run=dry_run, channel='trade')
