@@ -458,14 +458,30 @@ def _analyze_15min_pullback(m15, need_up):
     cur_close = cur['close']
 
     # --- 1. Pullback depth ---
+    # Use max drawdown within window (not just current depth).
+    # This catches pullbacks that already recovered — the dip still happened.
+    window_hi = max(c['high'] for c in window)
+    window_lo = min(c['low'] for c in window)
     if need_up:
-        window_hi = max(c['high'] for c in window)
-        window_lo = min(c['low'] for c in window)
-        depth_pct = (window_hi - cur_close) / window_hi * 100 if window_hi > 0 else 0
+        # Current depth (how far below window high now)
+        cur_depth = (window_hi - cur_close) / window_hi * 100 if window_hi > 0 else 0
+        # Max drawdown: deepest dip from the running high within the window
+        running_hi = window[0]['high']
+        max_dd = 0
+        for c in window:
+            running_hi = max(running_hi, c['high'])
+            dd = (running_hi - c['low']) / running_hi * 100 if running_hi > 0 else 0
+            max_dd = max(max_dd, dd)
+        depth_pct = max(cur_depth, max_dd)  # use whichever is larger
     else:
-        window_hi = max(c['high'] for c in window)
-        window_lo = min(c['low'] for c in window)
-        depth_pct = (cur_close - window_lo) / window_lo * 100 if window_lo > 0 else 0
+        cur_depth = (cur_close - window_lo) / window_lo * 100 if window_lo > 0 else 0
+        running_lo = window[0]['low']
+        max_dd = 0
+        for c in window:
+            running_lo = min(running_lo, c['low'])
+            dd = (c['high'] - running_lo) / running_lo * 100 if running_lo > 0 else 0
+            max_dd = max(max_dd, dd)
+        depth_pct = max(cur_depth, max_dd)
     result['depth_pct'] = round(depth_pct, 2)
 
     # --- 2. Pullback duration (count against-direction candles in window) ---
@@ -601,9 +617,12 @@ def _analyze_intraday(hourly, m15, need_up, daily_dir):
         elif daily_aligned and h_dir == 'DOWN':
             sc = 5
             d = "D UP + 1hr pulling back, wait for 15min setup"
-        elif daily_aligned and h_dir == 'UP' and m15_quality >= 4:
+        elif daily_aligned and h_dir == 'UP' and m15_quality >= 3:
             sc = 6
             d = f"All UP + {m15_detail}"
+        elif daily_aligned and h_dir == 'UP' and m15_has_pullback:
+            sc = 5
+            d = f"All UP + shallow 15min dip"
         elif daily_aligned and h_dir == 'UP':
             sc = 4
             d = "D+1hr UP, running = no dip for entry"
@@ -624,9 +643,12 @@ def _analyze_intraday(hourly, m15, need_up, daily_dir):
         elif daily_aligned and h_dir == 'UP':
             sc = 5
             d = "D DOWN + 1hr bouncing, wait for 15min setup"
-        elif daily_aligned and h_dir == 'DOWN' and m15_quality >= 4:
+        elif daily_aligned and h_dir == 'DOWN' and m15_quality >= 3:
             sc = 6
             d = f"All DOWN + {m15_detail}"
+        elif daily_aligned and h_dir == 'DOWN' and m15_has_pullback:
+            sc = 5
+            d = f"All DOWN + shallow 15min bounce"
         elif daily_aligned and h_dir == 'DOWN':
             sc = 4
             d = "D+1hr DOWN, running = no bounce for entry"
@@ -824,9 +846,13 @@ def score_signal(symbol, ltp, st_data, daily, hourly=None, m15=None,
             s7 = 6
             d7 = f"-{pb_pct:.1f}% pullback zone, awaiting bounce"
         elif pb_pct < 1 and m15_pb['quality_score'] >= 4:
-            # Daily near highs but 15min shows intraday pullback = entry window
+            # Daily near highs but 15min shows solid pullback = entry window
             s7 = 7
             d7 = f"Intraday dip ({m15_pb['depth_pct']:.1f}%) in daily uptrend"
+        elif pb_pct < 1 and m15_pb['quality_score'] >= 2:
+            # Daily near highs, 15min shows shallow but real dip = acceptable entry
+            s7 = 6
+            d7 = f"Shallow intraday dip ({m15_pb['depth_pct']:.1f}%) -- acceptable"
         elif pb_pct < 1:
             s7 = 3
             d7 = f"Near highs ({pb_pct:.1f}% off), no dip for entry"
@@ -846,6 +872,9 @@ def score_signal(symbol, ltp, st_data, daily, hourly=None, m15=None,
         elif pb_pct < 1 and m15_pb['quality_score'] >= 4:
             s7 = 7
             d7 = f"Intraday bounce ({m15_pb['depth_pct']:.1f}%) in daily downtrend"
+        elif pb_pct < 1 and m15_pb['quality_score'] >= 2:
+            s7 = 6
+            d7 = f"Shallow intraday bounce ({m15_pb['depth_pct']:.1f}%) -- acceptable"
         elif pb_pct < 1:
             s7 = 3
             d7 = f"Near lows ({pb_pct:.1f}%), no bounce for entry"
