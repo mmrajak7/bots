@@ -568,11 +568,11 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
 
     logger.info("Raw signals: %d", len(raw_signals))
 
-    # Max open trades cap
-    open_count = len(store.get_open())
-    if open_count >= cfg.MAX_OPEN_TRADES:
-        logger.info("Max open trades reached (%d/%d), skipping scan",
-                     open_count, cfg.MAX_OPEN_TRADES)
+    # Max entered trades cap (watching signals are free — they're just candidates)
+    entered_count = len(store.get_entered())
+    if entered_count >= cfg.MAX_OPEN_TRADES:
+        logger.info("Max entered trades reached (%d/%d), skipping scan",
+                     entered_count, cfg.MAX_OPEN_TRADES)
         return []
 
     # Dedup raw signals (Chartink may return same stock in both scanners)
