@@ -540,6 +540,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
     entered = tracker.get_entered()
 
     if not watching and not entered:
+        log.info("CT monitor_once: no active signals")
         print("  No active signals to monitor.")
         return
 
@@ -558,6 +559,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
             ltp_data = kite.ltp([f'NSE:{sym}'])
             ltp = ltp_data.get(f'NSE:{sym}', {}).get('last_price')
             if ltp is None:
+                log.warning("CT #%s %s: no LTP", sig['id'], sym)
                 print(f"  #{sig['id']} {sym}: SKIP -- no LTP from Kite")
                 continue
 
@@ -566,6 +568,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                                   target_tf=sig['timeframe'], kite=kite)
 
             if 'error' in result:
+                log.warning("CT #%s %s: score error: %s", sig['id'], sym, result['error'])
                 print(f"  #{sig['id']} {sym}: score error -- {result['error']}")
                 continue
 
@@ -589,6 +592,8 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                     msg = format_exit_alert(sym, sig['direction'], sig['signal_price'],
                                             ltp_val, f'SL hit at {sl:,.0f} before entry')
                     _send_telegram(msg, dry_run=dry_run)
+                    log.warning("CT #%s %s: SL hit while watching (spot %.1f, SL %.1f)",
+                                sig['id'], sym, ltp_val, sl)
                     print(f"  #{sig['id']} {sym}: SL HIT while watching -> cancelled")
                     continue
 
@@ -597,6 +602,8 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
             gap_abs = abs(result.get('gap_pct', 99))
             if not ready and gap_abs < 0.5 and sq_v >= 45:
                 ready = True  # override -- about to touch, can't wait
+                log.info("CT #%s %s: momentum override (gap %.1f%%, SQ=%d)",
+                         sig['id'], sym, gap_abs, sq_v)
 
             # --- Gap 3: Stale signal auto-cancel + theta Telegram alert ---
             signal_at = sig.get('signal_at', '')
@@ -614,6 +621,8 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                             f"[X] <code>{sym}</code> {sig['direction']} CANCELLED\n"
                             f"Watching for {days_waiting:.0f} days (max {max_days} for {tf})",
                             dry_run=dry_run)
+                        log.info("CT #%s %s: auto-cancelled (stale %.0fd)",
+                                 sig['id'], sym, days_waiting)
                         print(f"  #{sig['id']} {sym}: AUTO-CANCELLED (stale {days_waiting:.0f}d)")
                         continue
                     elif days_waiting > 3 and not sig.get('theta_warned'):
@@ -623,10 +632,15 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                             f"[!] <code>{sym}</code> {sig['direction']} watching for {days_waiting:.1f} days\n"
                             f"Option theta decaying. Consider cancelling.",
                             dry_run=dry_run)
+                        log.info("CT #%s %s: theta warning (%.1fd)",
+                                 sig['id'], sym, days_waiting)
                         print(f"  #{sig['id']} {sym}: THETA WARNING sent ({days_waiting:.1f}d)")
                 except Exception:
                     pass
 
+            log.info("CT #%s %s: SQ=%d ET=%d Total=%d pb=%d gap=%.1f%% %s",
+                     sig['id'], sym, sq_v, et_v, total, pb_score, gap_abs,
+                     'ENTER' if ready else 'watching')
             print(f"  #{sig['id']} {sym} {sig['direction']:<3} "
                   f"SQ={sq_v}/60 ET={et_v}/40 Total={total}/100 "
                   f"pb={pb_score}/8 gap={gap_abs:.1f}% "
@@ -636,6 +650,8 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
             if not ready and sig['status'] == 'ready':
                 sig['status'] = 'watching'
                 tracker._save()
+                log.info("CT #%s %s: timing degraded, reverted to watching",
+                         sig['id'], sym)
                 print(f"  #{sig['id']} {sym}: timing degraded, reverted to watching")
 
             if ready and sig['status'] == 'watching':
@@ -663,6 +679,8 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                         f"[X] <code>{sym}</code> {sig['direction']} CANCELLED\n"
                         f"Option <code>{sig['option_symbol']}</code> no longer tradeable",
                         dry_run=dry_run)
+                    log.warning("CT #%s %s: option expired/delisted, cancelled",
+                                sig['id'], sym)
                     print(f"  #{sig['id']} {sym}: option expired, cancelled")
                     continue
 
@@ -674,6 +692,8 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                 }
                 msg = format_enter_alert(result, option=opt_info)
                 _send_telegram(msg, dry_run=dry_run, channel='trade')
+                log.info("CT #%s %s: ENTER alert sent (score=%d, opt=%s @ %.2f)",
+                         sig['id'], sym, total, sig['option_symbol'], opt_price)
                 print(f"  -> ENTER alert sent for #{sig['id']} {sym}")
 
         except Exception as e:
@@ -692,6 +712,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
             ltp_data = kite.ltp([f'NSE:{sym}'])
             ltp = ltp_data.get(f'NSE:{sym}', {}).get('last_price')
             if ltp is None:
+                log.warning("CT #%s %s: no LTP (entered)", sig['id'], sym)
                 print(f"  #{sig['id']} {sym}: SKIP -- no LTP from Kite")
                 continue
 
@@ -699,6 +720,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
             need_up = sig['direction'] == 'CE'
 
             if not entry_price:
+                log.warning("CT #%s %s: no entry price", sig['id'], sym)
                 print(f"  #{sig['id']} {sym}: SKIP -- no entry price")
                 continue
 
@@ -713,6 +735,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                 _send_telegram(msg, dry_run=dry_run, channel='trade')
                 tracker.mark_exited(sig['id'], 'eod_daily',
                                     exit_spot=ltp, exit_option_price=opt_ltp)
+                log.info("CT #%s %s: EOD daily exit", sig['id'], sym)
                 print(f"  #{sig['id']} {sym}: EOD daily exit")
                 continue
 
@@ -737,6 +760,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                         _send_telegram(msg, dry_run=dry_run, channel='trade')
                         tracker.mark_exited(sig['id'], f'time_sl_{biz_days}d',
                                             exit_spot=ltp, exit_option_price=opt_ltp)
+                        log.info("CT #%s %s: time SL (%dd)", sig['id'], sym, biz_days)
                         print(f"  #{sig['id']} {sym}: TIME SL ({biz_days}d)")
                         continue
                 except Exception:
@@ -752,6 +776,9 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                         if need_up
                         else (entry_price - ltp) / entry_price * 100)
 
+            log.info("CT #%s %s: entry=%.0f ltp=%.0f move=%.1f%% -> %s",
+                     sig['id'], sym, entry_price, ltp, move_pct,
+                     result['action'] if result else 'holding')
             print(f"  #{sig['id']} {sym} {sig['direction']:<3} "
                   f"entry={entry_price:,.0f} ltp={ltp:,.0f} "
                   f"move={move_pct:+.1f}% "
@@ -777,6 +804,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                     # FIX: Auto-mark as exited (prevents duplicate alerts)
                     tracker.mark_exited(sig['id'], f'{action}: {reason}',
                                         exit_spot=ltp, exit_option_price=opt_ltp)
+                    log.info("CT #%s %s: %s alert sent", sig['id'], sym, action)
                     print(f"  -> {action} #{sig['id']} {sym} -- auto-closed")
                 elif action == 'CAUTION':
                     # FIX: Dedup CAUTION alerts (30 min cooldown)
@@ -796,6 +824,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                         _send_telegram(caution_msg, dry_run=dry_run, channel='trade')
                         sig['last_caution_at'] = now_dt.isoformat(timespec='seconds')
                         tracker._save()
+                        log.info("CT #%s %s: CAUTION alert sent", sig['id'], sym)
                         print(f"  -> CAUTION #{sig['id']} {sym}")
 
         except Exception as e:
