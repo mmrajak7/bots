@@ -122,21 +122,46 @@ def _target_word(need_up: bool) -> str:
 #  Alert formatters
 # ---------------------------------------------------------------------------
 
+def _dim_line(dims: dict, key: str, label: str) -> str:
+    """Format a single dimension as 'Label: detail (score/max)'."""
+    d = dims.get(key, (0, 1, ''))
+    sc, mx, detail = d[0], d[1], d[2]
+    pct = int(sc / mx * 100) if mx > 0 else 0
+    icon = '+' if pct >= 70 else '~' if pct >= 40 else '-'
+    return f"  {icon} {label}: {detail}"
+
+
 def format_watch_alert(result: dict, option: Optional[dict] = None) -> str:
-    """Format WATCHING alert for Telegram."""
+    """Format WATCHING alert for Telegram — comprehensive view."""
     s = result
     sym = s['symbol']
     opt = s['option_type']
     stars = _tg_stars(s['total_score'])
     tgt_word = _target_word(s['need_up'])
     gap_abs = abs(s['gap_pct'])
+    sq = s.get('sq_dims', {})
+    et = s.get('et_dims', {})
 
     lines = [
         f"{stars} <b>WATCHING</b> <code>{sym}</code> {opt} | {s['total_score']}/100",
         "",
-        f"Approaching {tgt_word} at {s['target_st']:,.0f} ({gap_abs:.1f}%)",
+        f"Spot: {s['ltp']:,.0f} | {tgt_word} at {s['target_st']:,.0f} ({gap_abs:.1f}%)",
         f"Signal: {s['sq_total']}/60 | Entry: {s['et_total']}/40",
-        "Waiting for pullback...",
+        "",
+        "<b>Signal Quality:</b>",
+        _dim_line(sq, 'higher_tf', 'Trend'),
+        _dim_line(sq, 'tf_align', 'Alignment'),
+        _dim_line(sq, 'gap', 'Gap'),
+        _dim_line(sq, 'atr_reach', 'Reach'),
+        _dim_line(sq, 'velocity', 'Velocity'),
+        _dim_line(sq, 'market', 'Market'),
+        "",
+        "<b>Entry Timing:</b>",
+        _dim_line(et, 'pullback', 'Pullback'),
+        _dim_line(et, 'intraday', 'Intraday'),
+        _dim_line(et, 'volume', 'Volume'),
+        _dim_line(et, 'support', 'Support'),
+        _dim_line(et, 'reversal', 'Candle'),
     ]
 
     if option:
@@ -146,49 +171,49 @@ def format_watch_alert(result: dict, option: Optional[dict] = None) -> str:
         lines.append("")
         lines.append(f"Trade: <code>{opt_sym}</code> @ {opt_price:.2f} | Qty {opt_qty}")
 
-    # Setup summary from strengths
-    if s.get('strengths'):
-        lines.append(f"Setup: {s['strengths'][0]}")
+    # Risks
+    risks = s.get('risks', [])
+    if risks:
+        lines.append("")
+        lines.append("<b>Risks:</b>")
+        for r in risks[:3]:
+            lines.append(f"  - {r}")
+
+    lines.append("")
+    lines.append("Waiting for pullback entry...")
 
     return "\n".join(lines)
 
 
 def format_enter_alert(result: dict, option: Optional[dict] = None) -> str:
-    """Format ENTER NOW alert for Telegram."""
+    """Format ENTER NOW alert for Telegram — comprehensive view."""
     s = result
     sym = s['symbol']
     opt = s['option_type']
     stars = _tg_stars(s['total_score'])
     tgt_word = _target_word(s['need_up'])
     gap_abs = abs(s['gap_pct'])
+    sq = s.get('sq_dims', {})
+    et = s.get('et_dims', {})
 
     lines = [
         f"{stars} <b>ENTER</b> <code>{sym}</code> {opt} | {s['total_score']}/100",
         "",
         f"Spot: {s['ltp']:,.0f} -> {tgt_word} at {s['target_st']:,.0f} ({gap_abs:.1f}%)",
+        "",
+        "<b>Why enter now:</b>",
+        _dim_line(et, 'pullback', 'Pullback'),
+        _dim_line(et, 'intraday', 'Intraday'),
+        _dim_line(et, 'volume', 'Volume'),
+        _dim_line(et, 'support', 'Support'),
+        _dim_line(et, 'reversal', 'Candle'),
+        "",
+        "<b>Signal:</b>",
+        _dim_line(sq, 'higher_tf', 'Trend'),
+        _dim_line(sq, 'tf_align', 'Alignment'),
+        _dim_line(sq, 'velocity', 'Velocity'),
+        _dim_line(sq, 'market', 'Market'),
     ]
-
-    # Pullback description (ET pullback detail)
-    pb_detail = s.get('et_dims', {}).get('pullback', (0, 8, ''))[2]
-    if pb_detail:
-        lines.append(pb_detail)
-
-    # Support pattern (ET support detail)
-    sup_detail = s.get('et_dims', {}).get('support', (0, 8, ''))[2]
-    if sup_detail and 'No clear' not in sup_detail:
-        lines.append(sup_detail)
-
-    # Market health -- extract from score dimension detail
-    mkt_dim = s.get('sq_dims', {}).get('market', (0, 7, ''))
-    mkt_score = mkt_dim[0]
-    if mkt_score >= 6:
-        lines.append("Market: NIFTY healthy")
-    elif mkt_score >= 4:
-        lines.append("Market: NIFTY mixed")
-    elif mkt_score >= 2:
-        lines.append("Market: NIFTY weak")
-    else:
-        lines.append("Market: NIFTY bearish -- caution")
 
     if option:
         opt_sym = option.get('symbol', '')
@@ -199,6 +224,14 @@ def format_enter_alert(result: dict, option: Optional[dict] = None) -> str:
         sl_str = f" | SL: {sl_spot:,.0f}" if sl_spot else ""
         lines.append(f"Trade: <code>{opt_sym}</code> @ {opt_price:.2f}")
         lines.append(f"Qty: {opt_qty}{sl_str}")
+
+    # Risks (if any)
+    risks = s.get('risks', [])
+    if risks:
+        lines.append("")
+        lines.append("<b>Risks:</b>")
+        for r in risks[:2]:
+            lines.append(f"  - {r}")
 
     return "\n".join(lines)
 
