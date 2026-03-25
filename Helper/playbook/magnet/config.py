@@ -98,7 +98,8 @@ def _load_runtime() -> dict:
                 if key in file_cfg:
                     cfg[key] = file_cfg[key]
             # Warn about unrecognized keys (typos in config)
-            unknown = [k for k in file_cfg if k not in _DEFAULTS and k != 'google_drive']
+            unknown = [k for k in file_cfg if k not in _DEFAULTS
+                       and k not in ('google_drive', 'telegram_watching')]
             if unknown:
                 _cfg_logger.warning("magnet_config.json: unknown keys ignored: %s", unknown)
         except Exception as e:

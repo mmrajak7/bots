@@ -539,6 +539,7 @@ def check_open_trades(store, kite):
     spot_data = get_spot_with_recent_range(kite, stocks)
 
     for trade in entered:
+      try:
         stock = trade['stock']
         sd = spot_data.get(stock)
         if not sd:
@@ -840,6 +841,11 @@ def check_open_trades(store, kite):
                 send_telegram(msg)
                 logger.info("TIME SL: %s", msg.replace('\n', ' | '))
                 continue
+
+      except Exception as e:
+          logger.error("Error monitoring trade #%d %s: %s",
+                       trade.get('id', 0), trade.get('stock', '?'), e,
+                       exc_info=True)
 
 
 # ── Hedge: Short Leg Beyond ST ─────────────────────────────────────────────
