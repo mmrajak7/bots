@@ -50,28 +50,44 @@ _PULLBACK_ENTER_MIN = 6   # pullback dimension >= 6/8 to trigger ENTER alert
 #  Telegram helpers
 # ---------------------------------------------------------------------------
 
-def _load_tg_config():
-    """Load Telegram bot config from magnet_config.json."""
+_MAGNET_TG_CONFIG = _BOTS / 'data' / 'telegram_config.json'  # trade alerts
+
+
+def _load_tg_config(channel='watching'):
+    """Load Telegram bot config.
+
+    channel='watching' -> telegram_watching from magnet_config.json (WATCHING, CANCELLED)
+    channel='trade'    -> data/telegram_config.json (ENTER, EXIT, TP, CAUTION)
+    """
     try:
-        with open(_CONFIG_PATH) as f:
-            cfg = json.load(f)
-        tg = cfg.get('telegram_watching', {})
+        if channel == 'trade':
+            with open(_MAGNET_TG_CONFIG) as f:
+                tg = json.load(f)
+        else:
+            with open(_CONFIG_PATH) as f:
+                cfg = json.load(f)
+            tg = cfg.get('telegram_watching', {})
         return tg.get('bot_token'), tg.get('chat_id')
     except Exception as e:
-        log.warning("Could not load Telegram config: %s", e)
+        log.warning("Could not load Telegram config (%s): %s", channel, e)
         return None, None
 
 
-def _send_telegram(msg: str, dry_run: bool = False) -> bool:
-    """Send a Telegram message. Returns True on success."""
+def _send_telegram(msg: str, dry_run: bool = False,
+                   channel: str = 'watching') -> bool:
+    """Send Telegram message to specified channel.
+
+    channel='watching' -> scanner/watching alerts (WATCHING, CANCELLED)
+    channel='trade'    -> trade alerts (ENTER, EXIT, TP, CAUTION)
+    """
     if dry_run:
-        # Strip Unicode for Windows console
         safe = msg.encode('ascii', errors='replace').decode('ascii')
-        print(f"[DRY RUN] Telegram:\n{safe}\n")
+        tag = '[TRADE]' if channel == 'trade' else '[WATCH]'
+        print(f"[DRY RUN] {tag} Telegram:\n{safe}\n")
         return True
-    bot_token, chat_id = _load_tg_config()
+    bot_token, chat_id = _load_tg_config(channel)
     if not bot_token or not chat_id:
-        log.warning("Telegram config missing -- skipping alert")
+        log.warning("Telegram config missing (%s) -- skipping alert", channel)
         return False
     try:
         import requests
@@ -636,7 +652,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                     'sl_spot': sig['sl_spot'],
                 }
                 msg = format_enter_alert(result, option=opt_info)
-                _send_telegram(msg, dry_run=dry_run)
+                _send_telegram(msg, dry_run=dry_run, channel='trade')
                 print(f"  -> ENTER alert sent for #{sig['id']} {sym}")
 
         except Exception as e:
@@ -673,7 +689,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                     sym, sig['direction'], entry_price, ltp,
                     'EOD exit -- daily trade closing at 15:15',
                     option_ltp=opt_ltp, entry_option_price=entry_opt or None)
-                _send_telegram(msg, dry_run=dry_run)
+                _send_telegram(msg, dry_run=dry_run, channel='trade')
                 tracker.mark_exited(sig['id'], 'eod_daily',
                                     exit_spot=ltp, exit_option_price=opt_ltp)
                 print(f"  #{sig['id']} {sym}: EOD daily exit")
@@ -697,7 +713,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                             sym, sig['direction'], entry_price, ltp,
                             f'Time SL -- held {biz_days} trading days',
                             option_ltp=opt_ltp, entry_option_price=entry_opt or None)
-                        _send_telegram(msg, dry_run=dry_run)
+                        _send_telegram(msg, dry_run=dry_run, channel='trade')
                         tracker.mark_exited(sig['id'], f'time_sl_{biz_days}d',
                                             exit_spot=ltp, exit_option_price=opt_ltp)
                         print(f"  #{sig['id']} {sym}: TIME SL ({biz_days}d)")
@@ -736,7 +752,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                         option_ltp=opt_ltp if opt_ltp else None,
                         entry_option_price=entry_opt_price if entry_opt_price else None,
                     )
-                    _send_telegram(msg, dry_run=dry_run)
+                    _send_telegram(msg, dry_run=dry_run, channel='trade')
                     # FIX: Auto-mark as exited (prevents duplicate alerts)
                     tracker.mark_exited(sig['id'], f'{action}: {reason}',
                                         exit_spot=ltp, exit_option_price=opt_ltp)
@@ -756,7 +772,7 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                             f"[!] <b>CAUTION {sym} {sig['direction']}</b>\n"
                             f"\n{reason}\nLTP: {ltp:,.0f} | Move: {move_pct:+.1f}%"
                         )
-                        _send_telegram(caution_msg, dry_run=dry_run)
+                        _send_telegram(caution_msg, dry_run=dry_run, channel='trade')
                         sig['last_caution_at'] = now_dt.isoformat(timespec='seconds')
                         tracker._save()
                         print(f"  -> CAUTION #{sig['id']} {sym}")
