@@ -525,6 +525,31 @@ def _add_to_skip_cache(stock: str, timeframe: str, reason: str):
     _skip_cache[(stock, timeframe)] = reason
 
 
+# ── Watching Telegram (dedicated channel, separate from trade alerts) ─────
+
+_WATCHING_BOT_TOKEN = 'REDACTED_TELEGRAM_TOKEN_3'
+_WATCHING_CHAT_ID = 'REDACTED_CHAT_ID'
+
+
+def _send_watching_alert(msg: str):
+    """Send to the dedicated Watching channel. Best-effort."""
+    try:
+        import requests as _req
+        resp = _req.post(
+            f"https://api.telegram.org/bot{_WATCHING_BOT_TOKEN}/sendMessage",
+            json={'chat_id': _WATCHING_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'},
+            timeout=10,
+        )
+        bot_id = _WATCHING_BOT_TOKEN.split(':')[0]
+        if resp.ok:
+            logger.info("Watching alert sent (bot=%s): %s", bot_id, msg[:120])
+        else:
+            logger.warning("Watching alert FAILED (bot=%s) %d: %s",
+                           bot_id, resp.status_code, resp.text)
+    except Exception as e:
+        logger.warning("Watching alert failed: %s", e)
+
+
 # ── Main Scan Pipeline ────────────────────────────────────────────────────
 
 def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[dict]:
@@ -671,13 +696,12 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
                      trade['id'], stock, timeframe, gap * 100, st_val,
                      st_info['direction'], trade['direction'])
 
-        # Telegram: notify new watching signal
+        # Telegram: notify new watching signal (dedicated watching channel)
         try:
-            from .monitor import send_telegram
             tf_short = {'monthly': 'M', 'weekly': 'W', 'daily': 'D'}.get(timeframe, timeframe)
             direction = trade.get('direction', '?')
             icon = '\U0001f7e2' if direction == 'CE' else '\U0001f534'
-            send_telegram(
+            _send_watching_alert(
                 f"{icon} <b>WATCHING</b> [{tf_short}] {stock}\n"
                 f"Spot {price:,.1f} | ST {st_val:,.1f} | Gap {gap*100:.1f}%\n"
                 f"Dir: {st_info['direction']} \u2192 {direction} | Waiting for \u22642% entry"
