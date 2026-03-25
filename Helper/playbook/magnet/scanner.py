@@ -671,6 +671,20 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
                      trade['id'], stock, timeframe, gap * 100, st_val,
                      st_info['direction'], trade['direction'])
 
+        # Telegram: notify new watching signal
+        try:
+            from .monitor import send_telegram
+            tf_short = {'monthly': 'M', 'weekly': 'W', 'daily': 'D'}.get(timeframe, timeframe)
+            direction = trade.get('direction', '?')
+            icon = '\U0001f7e2' if direction == 'CE' else '\U0001f534'
+            send_telegram(
+                f"{icon} <b>WATCHING</b> [{tf_short}] {stock}\n"
+                f"Spot {price:,.1f} | ST {st_val:,.1f} | Gap {gap*100:.1f}%\n"
+                f"Dir: {st_info['direction']} \u2192 {direction} | Waiting for \u22642% entry"
+            )
+        except Exception:
+            pass  # best-effort, never block scanner
+
     # Summary
     logger.info(
         "Scan complete: %d raw, %d unique, %d added, skipped: %s (skip_cache: %d entries)",
