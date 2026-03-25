@@ -849,8 +849,12 @@ def score_signal(symbol, ltp, st_data, daily, hourly=None, m15=None,
             # Daily near highs but 15min shows solid pullback = entry window
             s7 = 7
             d7 = f"Intraday dip ({m15_pb['depth_pct']:.1f}%) in daily uptrend"
-        elif pb_pct < 1 and m15_pb['quality_score'] >= 2:
-            # Daily near highs, 15min shows shallow but real dip = acceptable entry
+        elif pb_pct < 1 and m15_pb['quality_score'] >= 4:
+            # Daily near highs, solid 15min pullback = entry window
+            s7 = 7
+            d7 = f"Intraday dip ({m15_pb['depth_pct']:.1f}%) in daily uptrend"
+        elif pb_pct < 1 and m15_pb['quality_score'] >= 3:
+            # Shallow but confirmed 15min dip = acceptable
             s7 = 6
             d7 = f"Shallow intraday dip ({m15_pb['depth_pct']:.1f}%) -- acceptable"
         elif pb_pct < 1:
@@ -872,7 +876,7 @@ def score_signal(symbol, ltp, st_data, daily, hourly=None, m15=None,
         elif pb_pct < 1 and m15_pb['quality_score'] >= 4:
             s7 = 7
             d7 = f"Intraday bounce ({m15_pb['depth_pct']:.1f}%) in daily downtrend"
-        elif pb_pct < 1 and m15_pb['quality_score'] >= 2:
+        elif pb_pct < 1 and m15_pb['quality_score'] >= 3:
             s7 = 6
             d7 = f"Shallow intraday bounce ({m15_pb['depth_pct']:.1f}%) -- acceptable"
         elif pb_pct < 1:
