@@ -65,6 +65,9 @@ def _load_instrument_cache(kite):
         return
     logger.info("Loading NSE instrument list (one-time)...")
     instruments = kite.instruments('NSE')
+    if not instruments:
+        raise RuntimeError("Kite instruments('NSE') returned empty list — "
+                           "token may be expired or API may be down")
     _instrument_cache = {inst['tradingsymbol']: inst['instrument_token']
                          for inst in instruments}
     _instrument_cache_loaded = True
@@ -288,9 +291,12 @@ def _find_alert_threshold(gap_pct: float, thresholds: list,
     if matched == last_threshold and last_alert_time:
         try:
             last_dt = datetime.fromisoformat(last_alert_time)
-            hours_since = (datetime.now(IST) - last_dt.replace(
-                tzinfo=IST if last_dt.tzinfo is None else last_dt.tzinfo
-            )).total_seconds() / 3600
+            # Ensure timezone-aware comparison
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=IST)
+            else:
+                last_dt = last_dt.astimezone(IST)
+            hours_since = (datetime.now(IST) - last_dt).total_seconds() / 3600
             if hours_since >= cooldown_hours:
                 return matched
         except (ValueError, TypeError):
@@ -422,7 +428,8 @@ def scan(dry_run: bool = False, symbol_filter: str = None) -> list:
     Returns list of result dicts, one per (symbol, timeframe) pair.
     """
     config = cfg.load_config()
-    thresholds = sorted(config.get('alert_thresholds', [5, 3, 1]), reverse=True)
+    thresholds = sorted(config.get('alert_thresholds', cfg._DEFAULTS['alert_thresholds']),
+                         reverse=True)
     cooldown = config.get('alert_cooldown_hours', 6)
     symbols = cfg.get_all_symbols(config)
 

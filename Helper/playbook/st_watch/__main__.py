@@ -35,28 +35,109 @@ def cmd_status(args):
     print_status(results)
 
 
+def _run_breadth_scan(dry_run: bool = False):
+    """Scan Chartink for live breadth, record, and check for alerts."""
+    try:
+        from .breadth_tracker import scan_and_record
+        reading = scan_and_record(dry_run=dry_run)
+        if reading:
+            logging.info("Breadth: %.1f%% (%d/%d)",
+                         reading['breadth_pct'], reading['above'], reading['total'])
+        else:
+            logging.warning("Breadth scan returned no data")
+    except Exception as e:
+        logging.error("Breadth scan failed: %s", e, exc_info=True)
+
+
+def _send_morning_briefing(dry_run: bool = False):
+    """Send morning briefing if not already sent today."""
+    from .regime_monitor import load_state
+    state = load_state()
+    today = datetime.now(IST).strftime('%Y-%m-%d')
+
+    if state.get('last_briefing_date') == today:
+        logging.debug("Morning briefing already sent today")
+        return
+
+    logging.info("Sending morning briefing...")
+    try:
+        from .breadth_tracker import build_morning_briefing
+        msg = build_morning_briefing(dry_run=dry_run)
+        if msg:
+            # Mark as sent in regime state
+            from .regime_monitor import save_state
+            state['last_briefing_date'] = today
+            save_state(state)
+    except Exception as e:
+        logging.error("Morning briefing failed: %s", e, exc_info=True)
+
+
+def _run_regime_check(kite=None, dry_run: bool = False):
+    """Run regime check — called every scan cycle.
+
+    Recomputes signals using live NIFTY LTP (fast, cached NIFTY history + breadth).
+    Alerts at most once per day per transition type.
+    """
+    from .regime_monitor import check_regime
+    if kite is None:
+        from .watcher import _get_kite
+        try:
+            kite = _get_kite()
+        except Exception as e:
+            logging.error("Kite init failed for regime: %s", e)
+            kite = None
+    try:
+        check_regime(kite, dry_run=dry_run)
+    except Exception as e:
+        logging.error("Regime check failed: %s", e, exc_info=True)
+
+
 def cmd_run(args):
-    """Single scan with market hours check — designed for hourly cron."""
+    """Single scan with market hours check — designed for hourly cron.
+
+    Timeline:
+      9:00-9:14  → Morning briefing (once/day) + breadth scan
+      9:15-15:30 → ST scan + breadth scan + regime check
+      15:30+     → Skip
+    """
     now = datetime.now(IST)
 
     if now.weekday() >= 5:
         logging.info("Weekend — skipping")
         return
 
+    pre_market = now.replace(hour=9, minute=0, second=0, microsecond=0)
     market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
-    if now < market_open or now > market_close:
+    # Pre-market window (9:00-9:14): morning briefing + first breadth scan
+    if pre_market <= now < market_open:
+        logging.info("Pre-market — sending morning briefing")
+        _send_morning_briefing(dry_run=args.dry_run)
+        _run_breadth_scan(dry_run=args.dry_run)
+        return
+
+    if now < pre_market or now > market_close:
         logging.info("Outside market hours (%s) — skipping", now.strftime('%H:%M'))
         return
 
-    logging.info("Market open, running support level scan...")
-    from .watcher import scan
-    results = scan(dry_run=args.dry_run)
+    # Market hours: full scan cycle
+    # Morning briefing if not sent yet (e.g., 9:00 cron was missed)
+    _send_morning_briefing(dry_run=args.dry_run)
 
-    close_count = sum(1 for r in results if abs(r['gap_pct']) <= 5)
-    logging.info("Scan complete: %d checks, %d within 5%% of support",
-                 len(results), close_count)
+    logging.info("Market open, running ST scan + breadth + regime...")
+    try:
+        from .watcher import scan
+        results = scan(dry_run=args.dry_run)
+        close_count = sum(1 for r in results if abs(r['gap_pct']) <= 5)
+        logging.info("Scan complete: %d checks, %d within 5%% of support",
+                     len(results), close_count)
+    except Exception as e:
+        logging.error("ST scan failed: %s", e, exc_info=True)
+
+    # Breadth scan (Chartink) + regime check — every scan cycle
+    _run_breadth_scan(dry_run=args.dry_run)
+    _run_regime_check(dry_run=args.dry_run)
 
 
 def cmd_cron(args):
@@ -87,23 +168,41 @@ def cmd_cron(args):
         market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
         if now < market_open:
+            # Send morning briefing at 9:00+ if not sent yet
+            pre_market = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            if now >= pre_market:
+                _send_morning_briefing(dry_run=args.dry_run)
+                _run_breadth_scan(dry_run=args.dry_run)
             wait = (market_open - now).total_seconds()
             logging.info("Waiting %.0f min for market open...", wait / 60)
             time.sleep(max(wait, 60))
             continue
 
         if now > market_close:
-            logging.info("Market closed — exiting cron mode")
+            logging.info("Market closed — final regime check before exit")
+            _run_regime_check(dry_run=args.dry_run)
+            logging.info("Exiting cron mode")
             break
 
-        # Run scan
+        # Run ST scan + regime check
         try:
             from .watcher import scan
             results = scan(dry_run=args.dry_run)
             close_count = sum(1 for r in results if abs(r['gap_pct']) <= 5)
             logging.info("Scan done: %d checks, %d within 5%%", len(results), close_count)
         except Exception as e:
-            logging.error("Scan failed: %s", e, exc_info=True)
+            logging.error("ST scan failed: %s", e, exc_info=True)
+
+        # Breadth scan + regime check
+        try:
+            _run_breadth_scan(dry_run=args.dry_run)
+        except Exception as e:
+            logging.error("Breadth scan failed: %s", e, exc_info=True)
+
+        try:
+            _run_regime_check(dry_run=args.dry_run)
+        except Exception as e:
+            logging.error("Regime check failed: %s", e, exc_info=True)
 
         # Sleep until next scan, but ensure a final scan near market close
         now_after = datetime.now(IST)
@@ -120,6 +219,53 @@ def cmd_cron(args):
             break
 
         time.sleep(SCAN_INTERVAL)
+
+
+def cmd_briefing(args):
+    """Send morning briefing (manual trigger)."""
+    from .breadth_tracker import build_morning_briefing
+    msg = build_morning_briefing(dry_run=args.dry_run)
+    if msg:
+        # Print for visibility
+        print(msg.replace('<b>', '').replace('</b>', '')
+              .replace('<i>', '').replace('</i>', ''))
+    else:
+        print("No breadth data available for briefing.")
+
+
+def cmd_breadth(args):
+    """Breadth tracker — live F&O stocks above 50DMA via Chartink."""
+    from .breadth_tracker import scan_and_record, print_breadth_status
+
+    if args.scan:
+        reading = scan_and_record()
+        if reading:
+            print(f"Breadth: {reading['breadth_pct']}% "
+                  f"({reading['above']}/{reading['total']}) at {reading['time']}")
+        else:
+            print("Chartink scan failed")
+            return
+
+    print_breadth_status()
+
+
+def cmd_regime(args):
+    """Check or display regime status."""
+    from .regime_monitor import check_regime, print_regime_status, load_state
+
+    if args.check:
+        # Compute signals + update state + alert on transitions
+        from .watcher import _get_kite
+        try:
+            kite = _get_kite()
+        except Exception as e:
+            logging.error("Kite init failed: %s (using cache fallback)", e)
+            kite = None
+        state = check_regime(kite, dry_run=args.dry_run)
+        print_regime_status(state)
+    else:
+        # Just display last known state
+        print_regime_status()
 
 
 def cmd_history(args):
@@ -155,6 +301,26 @@ def main():
     p_hist.add_argument('--days', type=int, default=7, help='Days to look back (default: 7)')
     p_hist.add_argument('--symbol', help='Filter by symbol')
     p_hist.set_defaults(func=cmd_history)
+
+    # briefing (morning briefing — manual trigger)
+    p_brief = sub.add_parser('briefing', help='Send morning briefing')
+    p_brief.add_argument('--dry-run', action='store_true',
+                         help='Show without sending Telegram')
+    p_brief.set_defaults(func=cmd_briefing)
+
+    # breadth (live F&O breadth tracking)
+    p_breadth = sub.add_parser('breadth', help='Breadth tracker (F&O stocks above 50DMA)')
+    p_breadth.add_argument('--scan', action='store_true',
+                           help='Fetch live breadth from Chartink and record')
+    p_breadth.set_defaults(func=cmd_breadth)
+
+    # regime (check or display regime PAUSE/UNPAUSE status)
+    p_regime = sub.add_parser('regime', help='Regime PAUSE/UNPAUSE status')
+    p_regime.add_argument('--check', action='store_true',
+                          help='Compute signals and check for transitions (daily)')
+    p_regime.add_argument('--dry-run', action='store_true',
+                          help='Show alerts without sending Telegram')
+    p_regime.set_defaults(func=cmd_regime)
 
     # run (single invocation, market hours check — for hourly cron)
     p_run = sub.add_parser('run', help='Single scan with market hours check (cron target)')

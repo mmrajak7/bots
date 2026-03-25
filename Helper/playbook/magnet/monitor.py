@@ -1185,6 +1185,182 @@ def _setup_file_logging():
     return log_file
 
 
+# ── EOD Summary ──────────────────────────────────────────────────────────────
+
+
+def _fmt_val(val: float) -> str:
+    """Format Rs value compactly: 2,450 / 31.8K / 10.0L."""
+    av = abs(val)
+    s = '' if val >= 0 else '-'
+    if av >= 1000000:
+        return f"{s}{av / 100000:.1f}L"
+    if av >= 10000:
+        return f"{s}{av / 1000:.1f}K"
+    return f"{val:,.0f}"
+
+
+def _short_reason(reason: str) -> str:
+    """Abbreviate exit reason for table display."""
+    return {
+        'tp': 'TP', 'tp_trail': 'TRL', 'sl_cost': 'CSL',
+        'sl_premium': 'PSL', 'sl_premium_gap': 'PSL',
+        'sl_spot': 'SSL', 'sl_spot_gap': 'SSL', 'sl_time': 'TSL',
+        'eod_daily': 'EOD', 'eod_stale': 'EOD',
+        'option_expired': 'EXP', 'manual': 'MAN',
+        'weekly signal stale': 'STL', 'monthly signal stale': 'STL',
+        'ct_exit': 'CTX', 'ct_cancel': 'CTC',
+    }.get(reason, reason[:3].upper() if reason else '?')
+
+
+def build_eod_html(store) -> str:
+    """Build rich HTML EOD summary table for Telegram.
+
+    Sections:
+    1. Exits today — full table with buy/sell/P&L/%/reason
+    2. Entries today (still open) — option symbol + capital deployed
+    3. Open positions — invested vs peak, days held
+    4. Footer — day P&L, ROI%, open/watch counts
+    """
+    today = datetime.now().strftime('%Y-%m-%d')
+    today_disp = datetime.now().strftime('%d-%b')
+
+    all_trades = store.load_trades()
+    exited_today = sorted(
+        [t for t in all_trades
+         if t.get('exit_date') == today and t.get('status') == 'exited'],
+        key=lambda t: t.get('exit_time', ''),
+    )
+    # Entries today that are still open at EOD
+    entered_today = sorted(
+        [t for t in all_trades
+         if t.get('entry_date') == today and t.get('status') == 'entered'],
+        key=lambda t: t.get('entry_time', ''),
+    )
+    open_trades = store.get_entered()
+    watching = store.get_watching()
+    cancelled_today = [t for t in all_trades
+                       if t.get('status') == 'cancelled'
+                       and t.get('exit_date', t.get('signal_date', '')) == today]
+
+    parts = [f"\U0001f4ca <b>MAGNET EOD</b> | {today_disp}\n"]
+
+    # ── Exits table ──
+    day_buy = day_pnl = 0
+    if exited_today:
+        parts.append(f"<b>\U0001f4e4 Exits ({len(exited_today)})</b>")
+        rows = [
+            f"{'Exit':<5} {'Symbol':<10} {'Buy':>6} {'Sell':>6} {'P&L':>7} {'%':>5} {'':>3}",
+            "\u2500" * 48,
+        ]
+        for t in exited_today:
+            stk = (t.get('stock') or '?')[:7]
+            d = (t.get('direction') or '?')[0]
+            tf = {'monthly': 'M', 'weekly': 'W', 'daily': 'D'}.get(
+                t.get('timeframe'), '?')
+            sym = f"{stk:<7} {d}{tf}"
+
+            etime = (t.get('exit_time') or '??:??')[:5]
+            ep = t.get('option_premium', 0) or 0
+            qty = t.get('quantity', 0) or 0
+            pnl = t.get('pnl', 0) or 0
+            pct = t.get('pnl_pct', 0) or 0
+
+            bv = ep * qty
+            sv = bv + pnl  # effective proceeds = cost + P&L
+            rsn = _short_reason(t.get('exit_reason', ''))
+            h = '*' if t.get('hedged') else ''
+
+            day_buy += bv
+            day_pnl += pnl
+
+            rows.append(
+                f"{etime:<5} {sym:<10} {_fmt_val(bv):>6} {_fmt_val(sv):>6} "
+                f"{pnl:>+7,.0f} {pct:>+5.1f} {rsn}{h}"
+            )
+
+        rows.append("\u2500" * 48)
+        rows.append(
+            f"{'':5} {'TOTAL':<10} {_fmt_val(day_buy):>6} {_fmt_val(day_buy + day_pnl):>6} "
+            f"{day_pnl:>+7,.0f}"
+        )
+        parts.append("<pre>" + "\n".join(rows) + "</pre>")
+    else:
+        parts.append("No exits today.")
+
+    # ── Entries today (still open at EOD) ──
+    # Only show if there are new entries NOT already covered in exits
+    if entered_today:
+        parts.append(f"\n<b>\U0001f4e5 Entries ({len(entered_today)})</b>")
+        rows = [
+            f"{'Time':<5} {'Stock':<8} {'Option':<20} {'Capital':>7}",
+            "\u2500" * 44,
+        ]
+        for t in entered_today:
+            stk = (t.get('stock') or '?')[:8]
+            etime = (t.get('entry_time') or '??:??')[:5]
+            opt = (t.get('option_symbol') or '?')[:20]
+            ep = t.get('option_premium', 0) or 0
+            qty = t.get('quantity', 0) or 0
+            cap = ep * qty
+            rows.append(f"{etime:<5} {stk:<8} {opt:<20} {_fmt_val(cap):>7}")
+        parts.append("<pre>" + "\n".join(rows) + "</pre>")
+
+    # ── Open positions (exclude today's entries to avoid duplication) ──
+    entered_ids = {t.get('id') for t in entered_today}
+    carry_trades = [t for t in open_trades if t.get('id') not in entered_ids]
+    if carry_trades:
+        total_inv = sum(
+            (t.get('option_premium', 0) or 0) * (t.get('quantity', 0) or 0)
+            for t in carry_trades)
+        parts.append(
+            f"\n<b>\U0001f4c2 Carry ({len(carry_trades)})"
+            f" | \u20b9{_fmt_val(total_inv)}</b>"
+        )
+        rows = [
+            f"{'Symbol':<10} {'Invested':>8} {'Peak':>8} {'Days':>4}",
+            "\u2500" * 34,
+        ]
+        for t in carry_trades:
+            stk = (t.get('stock') or '?')[:7]
+            d = (t.get('direction') or '?')[0]
+            tf = {'monthly': 'M', 'weekly': 'W', 'daily': 'D'}.get(
+                t.get('timeframe'), '?')
+            sym = f"{stk:<7} {d}{tf}"
+
+            ep = t.get('option_premium', 0) or 0
+            qty = t.get('quantity', 0) or 0
+            inv = ep * qty
+            pk = (t.get('peak_premium', 0) or 0) * qty
+
+            days = ''
+            if t.get('entry_date'):
+                try:
+                    ed = datetime.strptime(t['entry_date'], '%Y-%m-%d')
+                    days = f"{(datetime.now() - ed).days}d"
+                except Exception:
+                    days = '?'
+
+            rows.append(
+                f"{sym:<10} {_fmt_val(inv):>8} {_fmt_val(pk):>8} {days:>4}"
+            )
+        parts.append("<pre>" + "\n".join(rows) + "</pre>")
+
+    # ── Footer summary ──
+    pnl_icon = '\u2705' if day_pnl >= 0 else '\u274c'
+    footer = [f"{pnl_icon} <b>\u20b9{day_pnl:+,.0f}</b>"]
+    if day_buy:
+        footer.append(f"on \u20b9{_fmt_val(day_buy)} ({day_pnl / day_buy * 100:+.1f}%)")
+    footer.append(f"Open {len(open_trades)}")
+    if watching:
+        footer.append(f"Watch {len(watching)}")
+    if cancelled_today:
+        footer.append(f"Cancel {len(cancelled_today)}")
+
+    parts.append("\n" + " | ".join(footer))
+
+    return "\n".join(parts)
+
+
 def run(dry_run: bool = False):
     """Main loop: scan every 5 min + monitor every 30s.
 
@@ -1297,20 +1473,9 @@ def run(dry_run: bool = False):
         except Exception:
             pass
 
-    # End of day summary
-    watching = len(store.get_watching())
-    entered = len(store.get_entered())
-    exited_today = [t for t in store.load_trades()
-                    if t.get('exit_date') == datetime.now().strftime('%Y-%m-%d')]
-    total_pnl = sum(t.get('pnl', 0) or 0 for t in exited_today)
-
-    pnl_icon = '\u2705' if total_pnl >= 0 else '\u274c'
-    summary = (
-        f"\U0001f4ca <b>Magnet EOD</b>\n"
-        f"Watch {watching} | Open {entered} | "
-        f"Exit {len(exited_today)} | {pnl_icon} <b>Rs {total_pnl:+,.0f}</b>"
-    )
-    logger.info(summary.replace('\n', ' | '))
+    # End of day summary — rich HTML table
+    summary = build_eod_html(store)
+    logger.info("EOD summary sent")
     send_telegram(summary)
 
 

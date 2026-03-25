@@ -18,6 +18,24 @@ ALERT_LOG_FILE = LOG_DIR / 'st_watch_alerts.json'
 KITE_TOKEN_FILE = BOTS_ROOT / 'data' / 'kite_access_token.json'
 TELEGRAM_CONFIG = BOTS_ROOT / 'data' / 'telegram_config.json'
 
+# ── Regime monitor paths ─────────────────────────────────────────────────
+REGIME_STATE_FILE = LOG_DIR / 'regime_state.json'
+BACKTEST_CACHE_DIR = PLAYBOOK_DIR / 'backtest_cache'
+NIFTY_CACHE_FILE = BACKTEST_CACHE_DIR / '_nifty50_daily.json'
+
+# ── Regime defaults ──────────────────────────────────────────────────────
+REGIME_DEFAULTS = {
+    'enabled': True,
+    'rsi_period': 14,
+    'rsi_threshold': 50,
+    'breadth_threshold': 40,
+    'sma_period': 50,
+    'unpause_days': 7,
+    'nifty_data_days': 100,
+    'alert_on_count_progress': True,
+    'alert_on_count_reset': True,
+}
+
 # ── Supertrend parameters ────────────────────────────────────────────────
 ST_PERIOD = 10
 ST_MULTIPLIER = 3
@@ -59,22 +77,40 @@ def load_config() -> dict:
     return cfg
 
 
+def load_regime_config() -> dict:
+    """Load regime config section, merged with defaults."""
+    cfg = dict(REGIME_DEFAULTS)
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                file_cfg = json.load(f)
+            regime = file_cfg.get('regime', {})
+            for key in REGIME_DEFAULTS:
+                if key in regime:
+                    cfg[key] = regime[key]
+        except Exception as e:
+            logger.warning("Failed to load regime config: %s", e)
+    return cfg
+
+
 def get_all_symbols(cfg: dict) -> list:
     """Flatten symbol config into list of unique symbols with metadata.
 
     Every symbol is scanned on BOTH monthly and weekly timeframes.
     Returns one entry per symbol (timeframe expansion happens in watcher).
     Deduplicates if same symbol appears in multiple baskets.
+    Symbols are uppercased to match Kite API expectations.
     """
     symbols = []
     seen = set()
     for basket, items in cfg.get('symbols', {}).items():
         for symbol, meta in items.items():
-            if symbol not in seen:
-                seen.add(symbol)
+            sym_upper = symbol.upper()
+            if sym_upper not in seen:
+                seen.add(sym_upper)
                 symbols.append({
-                    'symbol': symbol,
-                    'exchange': meta.get('exchange', 'NSE'),
+                    'symbol': sym_upper,
+                    'exchange': meta.get('exchange', 'NSE').upper(),
                     'basket': basket,
                 })
     return symbols

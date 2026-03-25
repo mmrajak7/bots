@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import platform
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -152,7 +152,7 @@ class AlertStore:
     def _next_id(self) -> int:
         if not self._alerts:
             return 1
-        return max(a['id'] for a in self._alerts) + 1
+        return max((a.get('id', 0) for a in self._alerts), default=0) + 1
 
     # ── Public API ────────────────────────────────────────────────────────
 
