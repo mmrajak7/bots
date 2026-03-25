@@ -210,6 +210,8 @@ class MagnetStore:
         trade['lot_size'] = entry_data.get('lot_size')
         trade['quantity'] = entry_data.get('quantity')
         trade['sl_spot'] = entry_data.get('sl_spot')
+        if entry_data.get('delegated_to_confidence'):
+            trade['delegated_to_confidence'] = True
         trade['version'] += 1
 
         self._save_local()
@@ -221,6 +223,33 @@ class MagnetStore:
             trade['entry_spot'] or 0, trade['option_premium'] or 0,
             trade['target_spot'], trade['sl_spot'] or 0
         )
+        return trade
+
+    def revert_to_watching(self, trade_id: int, reason: str = '') -> dict:
+        """Revert an entered trade back to watching (e.g., delegation failure).
+
+        Only allowed for trades with delegated_to_confidence=True that were
+        never actually entered by the user.
+        """
+        trade = self._find(trade_id)
+        if not trade:
+            raise ValueError(f"Trade #{trade_id} not found")
+        if trade['status'] != 'entered':
+            raise ValueError(f"Trade #{trade_id} is {trade['status']}, not entered")
+
+        trade['status'] = 'watching'
+        # Clear entry fields that were set during delegation
+        for key in ('entry_spot', 'entry_date', 'entry_time', 'option_strike',
+                    'option_symbol', 'option_premium', 'peak_premium',
+                    'option_expiry', 'lot_size', 'quantity', 'sl_spot',
+                    'delegated_to_confidence'):
+            trade.pop(key, None)
+        trade['version'] += 1
+
+        self._save_local()
+        self._upload_to_drive()
+        logger.info("REVERT #%d: %s back to watching (%s)",
+                     trade_id, trade['stock'], reason or 'delegation failed')
         return trade
 
     def add_hedge(self, trade_id: int, hedge_data: dict) -> dict:

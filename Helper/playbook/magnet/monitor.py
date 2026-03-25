@@ -584,27 +584,36 @@ def _delegate_to_confidence_tracker(store, kite, trade, stock, price, st_val,
     sq = result.get('sq_total', 0) if result and 'error' not in result else 0
     et = result.get('et_total', 0) if result and 'error' not in result else 0
 
-    # Add to confidence tracker
-    tracker = get_tracker()
-    need_up = direction == 'CE'
-    target_label = 'resistance' if need_up else 'support'
+    # Add to confidence tracker (revert magnet trade if this fails)
+    try:
+        tracker = get_tracker()
+        need_up = direction == 'CE'
+        target_label = 'resistance' if need_up else 'support'
 
-    sig = tracker.add(
-        symbol=stock,
-        timeframe=timeframe,
-        target_st=st_val,
-        direction=direction,
-        option_symbol=option['symbol'],
-        option_price=premium,
-        quantity=qty,
-        sl_spot=sl_spot,
-        signal_price=price,
-        score=score,
-        grade=grade,
-        sq=sq,
-        et=et,
-        target_label=target_label,
-    )
+        sig = tracker.add(
+            symbol=stock,
+            timeframe=timeframe,
+            target_st=st_val,
+            direction=direction,
+            option_symbol=option['symbol'],
+            option_price=premium,
+            quantity=qty,
+            sl_spot=sl_spot,
+            signal_price=price,
+            score=score,
+            grade=grade,
+            sq=sq,
+            et=et,
+            target_label=target_label,
+        )
+    except Exception as e:
+        # Tracker add failed — revert magnet trade to watching so it can retry
+        logger.error("Confidence tracker add failed for %s: %s, reverting magnet trade", stock, e)
+        try:
+            store.revert_to_watching(trade['id'], f'tracker add failed: {e}')
+        except Exception as re:
+            logger.error("Revert also failed for #%d %s: %s", trade['id'], stock, re)
+        return
 
     # Send WATCHING alert (confidence tracker will send ENTER when timing is right)
     icon = _dir_icon(direction)
@@ -630,6 +639,47 @@ def _delegate_to_confidence_tracker(store, kite, trade, stock, price, st_val,
 
     logger.info("Delegated %s %s to confidence tracker (signal #%d, score %d)",
                 stock, direction, sig['id'], score)
+
+
+def _sync_ct_exits_to_magnet(store, ct_tracker):
+    """Close magnet trades whose confidence tracker signals have exited.
+
+    When CT marks a signal as exited/cancelled, the corresponding magnet trade
+    (status='entered', delegated_to_confidence=True) should also be closed.
+    Prevents orphaned 'entered' trades from accumulating and hitting MAX_OPEN_TRADES.
+    """
+    # Get all 'entered' magnet trades that were delegated
+    delegated = [t for t in store.get_entered()
+                 if t.get('delegated_to_confidence')]
+    if not delegated:
+        return
+
+    # Get all exited/cancelled CT signals
+    ct_done = ct_tracker.list_all()
+    ct_done = [s for s in ct_done if s['status'] in ('exited', 'cancelled')]
+
+    # Match by stock + option_symbol
+    ct_done_keys = {(s['symbol'], s.get('option_symbol', '')) for s in ct_done}
+
+    for trade in delegated:
+        key = (trade['stock'], trade.get('option_symbol', ''))
+        if key in ct_done_keys:
+            # Find matching CT signal for exit details
+            ct_sig = next((s for s in ct_done
+                           if s['symbol'] == trade['stock']
+                           and s.get('option_symbol', '') == trade.get('option_symbol', '')),
+                          None)
+            exit_spot = ct_sig.get('exit_spot', 0) if ct_sig else 0
+            exit_opt = ct_sig.get('exit_option_price', 0) if ct_sig else 0
+            reason = ct_sig.get('exit_reason', 'ct_closed') if ct_sig else 'ct_closed'
+            try:
+                store.exit_trade(trade['id'], exit_spot, exit_opt,
+                                 f'ct:{reason}')
+                logger.info("Synced CT exit to magnet #%d %s: %s",
+                            trade['id'], trade['stock'], reason)
+            except Exception as e:
+                logger.warning("Failed to sync CT exit for #%d %s: %s",
+                               trade['id'], trade['stock'], e)
 
 
 # ── Monitor: Open Trades ─────────────────────────────────────────────────
@@ -1225,6 +1275,13 @@ def run(dry_run: bool = False):
                     ct_monitor_once(kite, ct_tracker, dry_run=False)
                 except Exception as e:
                     logger.error("Confidence tracker error: %s", e, exc_info=True)
+
+                # Sync: close magnet trades whose CT signals have been exited/cancelled
+                try:
+                    _sync_ct_exits_to_magnet(store, ct_tracker)
+                except Exception as e:
+                    logger.error("CT->magnet sync error: %s", e, exc_info=True)
+
                 last_ct_time = now
 
             time.sleep(cfg.MONITOR_INTERVAL_SEC)

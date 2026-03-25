@@ -445,14 +445,19 @@ def check_exhaustion(ltp: float, entry_price: float, target_st: float,
     # 3. Within 1% of target -- check reversal candle
     if dist_pct <= 1.0 and daily and len(daily) >= 2:
         _ensure_confidence_imports()
-        # For CE near resistance: look for bearish candle (reversal from UP)
-        rc_name, rc_str = _detect_reversal_candle(daily[-3:], not need_up)
-        if rc_str >= 5:
-            return {'action': 'TAKE PROFIT',
-                    'reason': (f'Reversal candle ({rc_name.replace("_", " ")}) '
-                               f'near {tgt_word}')}
+        # Skip daily candle reversal before 14:00 -- today's candle (daily[-1])
+        # is incomplete and cached from first morning fetch, giving false signals.
+        # Hourly candles (below) update every hour and are more reliable intraday.
+        now_hour = datetime.now().hour
+        if now_hour >= 14:
+            # For CE near resistance: look for bearish candle (reversal from UP)
+            rc_name, rc_str = _detect_reversal_candle(daily[-3:], not need_up)
+            if rc_str >= 5:
+                return {'action': 'TAKE PROFIT',
+                        'reason': (f'Reversal candle ({rc_name.replace("_", " ")}) '
+                                   f'near {tgt_word}')}
 
-        # Also check hourly
+        # Also check hourly (preferred intraday -- completes every hour)
         if hourly and len(hourly) >= 2:
             hrc_name, hrc_str = _detect_reversal_candle(hourly[-3:], not need_up)
             if hrc_str >= 5:
@@ -635,15 +640,30 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
             if ready and sig['status'] == 'watching':
                 # Only send ENTER alert on watching -> ready transition
                 tracker.mark_ready(sig['id'])
-                # Fetch fresh option price
+                # Fetch fresh option price + validate option is still tradeable
                 opt_price = sig['option_price']
+                opt_valid = True
                 try:
                     ltp_opt = kite.ltp([f"NFO:{sig['option_symbol']}"])
                     fresh = ltp_opt.get(f"NFO:{sig['option_symbol']}", {}).get('last_price')
-                    if fresh is not None:
+                    if fresh is not None and fresh > 0:
                         opt_price = fresh
+                    else:
+                        # Option expired or delisted (no LTP)
+                        opt_valid = False
                 except Exception:
-                    pass
+                    # API error fetching option -- option may be expired
+                    opt_valid = False
+
+                if not opt_valid:
+                    tracker.cancel(sig['id'],
+                                   f'option {sig["option_symbol"]} expired/delisted')
+                    _send_telegram(
+                        f"[X] {sym} {sig['direction']} CANCELLED\n"
+                        f"Option {sig['option_symbol']} no longer tradeable",
+                        dry_run=dry_run)
+                    print(f"  #{sig['id']} {sym}: option expired, cancelled")
+                    continue
 
                 opt_info = {
                     'symbol': sig['option_symbol'],
