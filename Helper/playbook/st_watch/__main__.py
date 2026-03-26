@@ -292,7 +292,7 @@ def cmd_unmapped(args):
     print(f"  {'─' * 40}")
     for sym in unmapped:
         print(f"  {sym}")
-    print(f"\n  Add to: playbook/backtest_cache/_sector_mapping.py")
+    print(f"\n  Add to: playbook/sector_mapping.py")
     print(f"  Then re-run breadth scan to verify.\n")
 
 

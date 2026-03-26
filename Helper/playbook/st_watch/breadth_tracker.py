@@ -111,7 +111,7 @@ def _compute_sector_breadth(above_stocks: list, total_stocks: list) -> tuple:
           Only sectors with >= 3 total stocks included (filter noise).
         - unmapped: sorted list of F&O stock symbols not in sector mapping.
     """
-    from playbook.backtest_cache._sector_mapping import get_sector
+    from playbook.sector_mapping import get_sector
 
     # Count total per sector + collect unmapped
     sector_total = {}

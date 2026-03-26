@@ -220,7 +220,7 @@ def get_sector_breadth(symbol: str) -> dict:
     vel_5d = 5-day sector breadth change (momentum direction). None if insufficient data.
     """
     try:
-        from playbook.backtest_cache._sector_mapping import get_sector
+        from playbook.sector_mapping import get_sector
         from playbook.st_watch.breadth_tracker import (
             get_latest, SECTOR_LABELS, _load_readings,
         )
