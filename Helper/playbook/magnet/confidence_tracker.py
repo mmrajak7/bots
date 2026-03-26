@@ -44,6 +44,7 @@ def _ensure_confidence_imports():
 # Entry timing thresholds
 _ET_ENTER_MIN = 28        # ET >= 28/40 to trigger ENTER alert
 _PULLBACK_ENTER_MIN = 6   # pullback dimension >= 6/8 to trigger ENTER alert
+_MIN_TOTAL_SCORE = 50     # minimum total score (SQ+ET) to allow entry — prevents LOW-grade entries
 
 
 # ---------------------------------------------------------------------------
@@ -284,13 +285,20 @@ def format_exit_alert(symbol: str, direction: str, entry_price: float,
 # ---------------------------------------------------------------------------
 
 class ConfidenceTracker:
-    """Stores and manages confidence tracker signals."""
+    """Stores and manages confidence tracker signals.
+
+    Drive sync: uploads to Google Drive alongside magnet_trades.json.
+    """
 
     def __init__(self, path: Path = _TRACKER_PATH):
         self.path = path
         self._signals: list = []
         self._next_id: int = 1
+        self._drive_service = None
+        self._drive_file_id = None
+        self._drive_enabled = False
         self._load()
+        self._init_drive()
 
     def _load(self):
         if self.path.exists():
@@ -299,6 +307,17 @@ class ConfidenceTracker:
                     data = json.load(f)
                 self._signals = data.get('signals', [])
                 self._next_id = data.get('next_id', 1)
+            except (json.JSONDecodeError, ValueError) as e:
+                # Back up corrupt file before resetting
+                backup = self.path.with_suffix(
+                    f'.corrupt.{int(time.time())}.json')
+                try:
+                    self.path.rename(backup)
+                    log.critical("Tracker file CORRUPT (%s). Backed up to %s", e, backup)
+                except OSError:
+                    log.critical("Tracker file CORRUPT (%s). Backup rename failed.", e)
+                self._signals = []
+                self._next_id = 1
             except Exception as e:
                 log.warning("Failed to load tracker: %s", e)
                 self._signals = []
@@ -308,12 +327,67 @@ class ConfidenceTracker:
             self._next_id = 1
 
     def _save(self):
+        import os
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix('.tmp')
         with open(tmp, 'w') as f:
             json.dump({'next_id': self._next_id, 'signals': self._signals},
                       f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(self.path)
+        self._upload_to_drive()
+
+    def _init_drive(self):
+        """Initialize Google Drive sync (best-effort, never blocks)."""
+        try:
+            if not _CONFIG_PATH.exists():
+                return
+            with open(_CONFIG_PATH) as f:
+                cfg = json.load(f)
+            drive_cfg = cfg.get('google_drive', {})
+            if not drive_cfg.get('enabled', False):
+                return
+
+            import platform
+            if platform.system() == 'Windows':
+                creds = drive_cfg.get('credentials_path_windows')
+            else:
+                creds = drive_cfg.get('credentials_path_linux')
+            import os
+            env_creds = os.environ.get('MAGNET_GOOGLE_CREDS')
+            if env_creds:
+                creds = env_creds
+            if not creds or not Path(creds).exists():
+                return
+
+            from bcs.drive_store import get_drive_service, find_file
+            self._drive_service = get_drive_service(Path(creds))
+            folder_id = drive_cfg['folder_id']
+            file_name = drive_cfg.get('confidence_file_name', 'confidence_tracker.json')
+            self._drive_file_id = find_file(self._drive_service, folder_id, file_name)
+            self._drive_enabled = True
+            log.info("CT Drive sync enabled, file_id=%s", self._drive_file_id)
+        except Exception as e:
+            log.warning("CT Drive init failed: %s. Local-only.", e)
+
+    def _upload_to_drive(self):
+        """Upload tracker data to Drive (best-effort)."""
+        if not self._drive_enabled:
+            return
+        try:
+            from bcs.drive_store import upload_json
+            with open(_CONFIG_PATH) as f:
+                cfg = json.load(f)
+            drive_cfg = cfg.get('google_drive', {})
+            folder_id = drive_cfg['folder_id']
+            file_name = drive_cfg.get('confidence_file_name', 'confidence_tracker.json')
+            data = {'next_id': self._next_id, 'signals': self._signals}
+            self._drive_file_id = upload_json(
+                self._drive_service, folder_id, file_name,
+                data, self._drive_file_id)
+        except Exception as e:
+            log.warning("CT Drive upload failed: %s", e)
 
     def add(self, symbol: str, timeframe: str, target_st: float,
             direction: str, option_symbol: str, option_price: float,
@@ -394,7 +468,8 @@ class ConfidenceTracker:
         if not sig:
             return
         if not entry_price or entry_price <= 0:
-            log.warning("mark_entered #%s: invalid spot price %s", sig_id, entry_price)
+            log.error("mark_entered #%s: invalid spot price %s — BLOCKED", sig_id, entry_price)
+            return
         sig['status'] = 'entered'
         sig['entry_price'] = entry_price
         sig['entry_option_price'] = entry_option_price
@@ -438,8 +513,15 @@ class ConfidenceTracker:
         return list(self._signals)
 
 
+_tracker_instance: ConfidenceTracker = None
+
+
 def get_tracker() -> ConfidenceTracker:
-    return ConfidenceTracker()
+    """Get or create singleton ConfidenceTracker."""
+    global _tracker_instance
+    if _tracker_instance is None:
+        _tracker_instance = ConfidenceTracker()
+    return _tracker_instance
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +696,9 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
 
             # Get pullback score from dims
             pb_score = result.get('et_dims', {}).get('pullback', (0, 8, ''))[0]
-            ready = (et_v >= _ET_ENTER_MIN and pb_score >= _PULLBACK_ENTER_MIN)
+            ready = (total >= _MIN_TOTAL_SCORE
+                     and et_v >= _ET_ENTER_MIN
+                     and pb_score >= _PULLBACK_ENTER_MIN)
 
             # --- Gap 1: SL invalidation while watching ---
             ltp_val = result.get('ltp', ltp)

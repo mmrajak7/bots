@@ -1,8 +1,11 @@
 """Compute Supertrend (10,3) from daily OHLC data — weekly and monthly."""
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+
+# IST timezone (UTC+5:30) — used for month/week boundary determination
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def aggregate_to_monthly(daily_data, exclude_current=False):
@@ -22,7 +25,7 @@ def aggregate_to_monthly(daily_data, exclude_current=False):
 
     # Drop current month if requested (partial data distorts ST)
     if exclude_current:
-        now = datetime.now()
+        now = datetime.now(IST)
         current_key = (now.year, now.month)
         months.pop(current_key, None)
 
@@ -59,7 +62,7 @@ def aggregate_to_weekly(daily_data, exclude_current=False):
 
     # Drop current week if requested (partial data distorts ST)
     if exclude_current:
-        now = datetime.now()
+        now = datetime.now(IST)
         current_key = now.isocalendar()[:2]
         weeks.pop(current_key, None)
 
@@ -130,7 +133,7 @@ def compute_supertrend(candles, period=10, multiplier=3):
             upper_band[i] = upper_band[i-1]  # don't let it increase in downtrend
 
         # Determine direction
-        if supertrend[i-1] == lower_band[i-1]:  # was bullish
+        if direction[i-1] == 1:  # was bullish
             if candles[i]['close'] < lower_band[i]:
                 direction[i] = -1
                 supertrend[i] = upper_band[i]

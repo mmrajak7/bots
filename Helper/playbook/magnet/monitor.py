@@ -484,8 +484,39 @@ def check_watching_signals(store, kite):
                                stock, option.get('symbol', '?'), retries, cfg.ENTRY_MAX_RETRIES)
             continue
 
+        # Validate option expiry is not in the past
+        opt_expiry = option.get('expiry', '')
+        if opt_expiry:
+            try:
+                exp_str = str(opt_expiry)[:10]
+                from datetime import datetime as _dt
+                exp_date = _dt.strptime(exp_str, '%Y-%m-%d')
+                today = _dt.now()
+                dte = (exp_date - today).days
+                if dte < 0:
+                    logger.warning("SKIP ENTRY %s: option %s expired (%s, %d days ago)",
+                                   stock, option.get('symbol', '?'), exp_str, abs(dte))
+                    store.cancel_signal(trade['id'], f"option expired: {exp_str}")
+                    continue
+                if dte < cfg.MIN_DTE:
+                    logger.warning("SKIP ENTRY %s: option %s DTE=%d < min %d",
+                                   stock, option.get('symbol', '?'), dte, cfg.MIN_DTE)
+                    continue
+            except (ValueError, TypeError):
+                pass  # can't parse — proceed with entry
+
         # Fixed lots per trade
         qty = lot_size * cfg.LOTS_PER_TRADE
+
+        # Max capital per trade check (prevents outsized exposure on expensive options)
+        capital_at_risk = premium * qty
+        max_capital = cfg.MAX_CAPITAL_PER_TRADE
+        if max_capital > 0 and capital_at_risk > max_capital:
+            logger.warning("SKIP ENTRY %s: capital Rs %,.0f > max Rs %,.0f (premium %.2f x %d qty)",
+                           stock, capital_at_risk, max_capital, premium, qty)
+            store.cancel_signal(trade['id'],
+                                f"capital Rs {capital_at_risk:,.0f} > max Rs {max_capital:,.0f}")
+            continue
 
         # Compute SL spot: price at 5% gap from ST on the same side
         side = trade['side']
@@ -700,6 +731,11 @@ def check_open_trades(store, kite):
 
     for trade in entered:
       try:
+        # Skip delegated trades — confidence tracker manages their exit timing.
+        # These are marked 'entered' for capacity counting but user hasn't actually entered.
+        if trade.get('delegated_to_confidence'):
+            continue
+
         stock = trade['stock']
         sd = spot_data.get(stock)
         if not sd:
@@ -841,6 +877,7 @@ def check_open_trades(store, kite):
 
         # === CHECK TRAILING PREMIUM SL: 50% of peak gain ===
         # Trail only activates after minimum gain threshold (avoids bid-ask noise exits)
+        # CRITICAL: trail must NEVER exit at a loss — minimum profit floor enforced
         peak = trade.get('peak_premium') or entry_prem
         min_gain = entry_prem * cfg.TRAIL_MIN_GAIN_PCT  # e.g., 15% of entry
         if peak >= entry_prem + min_gain and long_exit > 0:
@@ -848,7 +885,9 @@ def check_open_trades(store, kite):
             trail_level = entry_prem + gain * cfg.TRAIL_PCT
             # Trail must be above cost SL if active
             cost_sl = trade.get('cost_sl_level', 0) or 0
-            effective_trail = max(trail_level, cost_sl)
+            # Minimum profit floor: trail never below entry + 0.50 (prevents loss on trail exit)
+            min_profit_floor = entry_prem + max(0.50, _get_tick_size(trade.get('option_symbol', '')) * 2)
+            effective_trail = max(trail_level, cost_sl, min_profit_floor)
             if long_exit <= effective_trail:
                 store.exit_trade(trade_id, price, long_exit, 'tp_trail', hedge_exit)
                 # peak_premium persisted in trade dict — kept as historical record
@@ -1101,6 +1140,10 @@ def _find_hedge_strike(kite, trade: dict, current_spot: float) -> dict:
 
     # Check debit ratio
     net_debit = entry_prem - credit
+    if net_debit <= 0:
+        logger.warning("Hedge net_debit=%.2f (credit %.2f > entry %.2f) — net credit spread "
+                        "creates unlimited risk on short side, skipping", net_debit, credit, entry_prem)
+        return None
     debit_ratio = net_debit / spread_width if spread_width > 0 else 1.0
     if debit_ratio > cfg.HEDGE_MAX_DEBIT_RATIO:
         logger.info("Hedge debit ratio %.1f%% > max %.0f%%, skipping (fallback to premium SL)",
@@ -1438,12 +1481,13 @@ def run(dry_run: bool = False):
                 except Exception as e:
                     logger.error("Watching monitor error: %s", e, exc_info=True)
 
-                if not cfg.USE_CONFIDENCE_TRACKER:
-                    # Original exit monitoring (disabled when confidence tracker owns exits)
-                    try:
-                        check_open_trades(store, kite)
-                    except Exception as e:
-                        logger.error("Trade monitor error: %s", e, exc_info=True)
+                # 5-layer exit monitoring — ALWAYS runs for non-delegated trades.
+                # When confidence tracker is enabled, it handles delegated trades'
+                # entry timing, but the mechanical SL layers still protect all entered trades.
+                try:
+                    check_open_trades(store, kite)
+                except Exception as e:
+                    logger.error("Trade monitor error: %s", e, exc_info=True)
 
             # Confidence tracker: poll for entry timing + exhaustion
             if ct_tracker and not dry_run and (now - last_ct_time) >= cfg.CONFIDENCE_POLL_SEC:

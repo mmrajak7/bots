@@ -298,7 +298,10 @@ class MagnetStore:
 
         entry_prem = trade.get('option_premium', 0) or 0
         trade['cost_sl_active'] = True
-        trade['cost_sl_level'] = round(entry_prem + 0.10, 2)
+        # Buffer accounts for bid-ask spread: max(0.50, 2% of entry) ensures
+        # "breakeven" SL actually exits at breakeven, not at a loss
+        buffer = max(0.50, entry_prem * 0.02)
+        trade['cost_sl_level'] = round(entry_prem + buffer, 2)
         trade['cost_sl_activated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         trade['version'] += 1
 

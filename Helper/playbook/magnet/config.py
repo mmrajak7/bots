@@ -70,6 +70,7 @@ _DEFAULTS = {
     'min_dte': 3,                 # minimum days to expiry (current month liquidity is good)
     'lots_per_trade': 1,          # lots per trade (start small)
     'max_open_trades': 10,        # max concurrent magnet trades
+    'max_capital_per_trade': 50000,  # Rs 50K max capital at risk per trade (prevents outsized exposure)
     'scan_interval_sec': 300,     # 5 minutes between Chartink scans
     'monitor_interval_sec': 30,   # 30 seconds between LTP checks
     # ── Daily velocity filters (from backtest: 80% hit rate when all pass) ──
@@ -139,6 +140,7 @@ MARKET_CLOSE = (15, 30)      # 3:30 PM IST
 # ── Position sizing ──────────────────────────────────────────────────────
 LOTS_PER_TRADE = _runtime['lots_per_trade']
 MAX_OPEN_TRADES = _runtime['max_open_trades']
+MAX_CAPITAL_PER_TRADE = _runtime.get('max_capital_per_trade', 50000)
 
 # ── Option selection ──────────────────────────────────────────────────────
 # ── Supertrend parameters ───────────────────────────────────────────────

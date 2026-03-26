@@ -738,7 +738,7 @@ def score_signal(symbol, ltp, st_data, daily, hourly=None, m15=None,
         s1 = 13 if aligned else 4
         d1 = f"Monthly {m_dir} -- {'supports' if aligned else 'against'} {opt}"
     elif target_tf == 'monthly':
-        s1, d1 = 10, "Target is Monthly -- no higher TF"
+        s1, d1 = 7, "Target is Monthly -- no higher TF (neutral)"
     else:
         s1, d1 = 7, "No monthly data"
     sq['higher_tf'] = (s1, 13, d1)
@@ -825,9 +825,15 @@ def score_signal(symbol, ltp, st_data, daily, hourly=None, m15=None,
         else:            s6, rd = 1, 'oversold'
     sq['rsi'] = (s6, 5, f"RSI {rsi14:.0f} -- {rd}")
 
-    # SQ7. Market Outlook (0-7) -- NIFTY health
+    # SQ7. Market Outlook (0-7) -- NIFTY health, DIRECTION-AWARE
     mkt = _compute_market_outlook(kite)
-    sq['market'] = (mkt['score'], 7, mkt['detail'])
+    mkt_score = mkt['score']
+    # Invert score for PE trades: bullish NIFTY hurts puts, bearish helps
+    if not need_up:
+        # PE (need down): max=7 when bearish, min=1 when bullish
+        mkt_score = max(1, 8 - mkt_score)
+    sq['market'] = (mkt_score, 7,
+                    mkt['detail'] + (f" [inverted for {opt}]" if not need_up else ""))
 
     sq_total = sum(v[0] for v in sq.values())
 
@@ -853,10 +859,6 @@ def score_signal(symbol, ltp, st_data, daily, hourly=None, m15=None,
             d7 = f"-{pb_pct:.1f}% pullback zone, awaiting bounce"
         elif pb_pct < 1 and m15_pb['quality_score'] >= 4:
             # Daily near highs but 15min shows solid pullback = entry window
-            s7 = 7
-            d7 = f"Intraday dip ({m15_pb['depth_pct']:.1f}%) in daily uptrend"
-        elif pb_pct < 1 and m15_pb['quality_score'] >= 4:
-            # Daily near highs, solid 15min pullback = entry window
             s7 = 7
             d7 = f"Intraday dip ({m15_pb['depth_pct']:.1f}%) in daily uptrend"
         elif pb_pct < 1 and m15_pb['quality_score'] >= 3:

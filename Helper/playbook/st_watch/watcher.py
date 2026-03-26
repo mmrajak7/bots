@@ -361,15 +361,19 @@ def _format_alert(symbol: str, basket: str, timeframe: str,
     """Format Telegram alert message with direction awareness."""
     abs_gap = abs(gap_pct)
 
-    # Urgency based on proximity
-    if abs_gap <= 1:
-        urgency = "\U0001f534 SUPPORT LEVEL"
-    else:
-        urgency = "\U0001f7e1 NEAR SUPPORT LEVEL"
-
-    # Direction context
+    # Urgency based on proximity and direction
     if direction == 'DOWN':
-        urgency += " (from below)"
+        # ST DOWN = resistance/trend flip level, NOT support
+        if abs_gap <= 1:
+            urgency = "\U0001f7e1 TREND FLIP LEVEL"
+        else:
+            urgency = "\U0001f7e1 NEAR TREND FLIP"
+    else:
+        # ST UP = support level (buy signal)
+        if abs_gap <= 1:
+            urgency = "\U0001f534 SUPPORT LEVEL"
+        else:
+            urgency = "\U0001f7e1 NEAR SUPPORT LEVEL"
 
     basket_label = BASKET_LABELS.get(basket, basket.replace('_', ' ').title())
     tf_label = timeframe.capitalize()
@@ -382,10 +386,11 @@ def _format_alert(symbol: str, basket: str, timeframe: str,
         elif abs(prev_gap) < abs_gap:
             trend = f" (was {prev_gap:+.1f}%, widening)"
 
+    level_label = "Resistance" if direction == 'DOWN' else "Support"
     msg = (
         f"<b>{urgency} — {symbol}</b>\n"
         f"Basket: {basket_label} | {tf_label}\n"
-        f"LTP: Rs {ltp:,.2f} | Support: Rs {st_val:,.2f}\n"
+        f"LTP: Rs {ltp:,.2f} | {level_label}: Rs {st_val:,.2f}\n"
         f"Gap: {gap_pct:+.1f}%{trend}"
     )
 
@@ -399,7 +404,7 @@ def _format_alert(symbol: str, basket: str, timeframe: str,
             else:
                 msg += f"\n\n<i>TACTICAL: {tf_label} support level. Check for entry.</i>"
         else:
-            msg += "\n\n<i>Price approaching support from below. Potential trend flip. Watch closely.</i>"
+            msg += "\n\n<i>Price approaching resistance (ST DOWN). Potential trend flip. Watch closely — NOT a buy signal.</i>"
 
     return msg
 
