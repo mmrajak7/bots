@@ -489,12 +489,207 @@ STOCK_SECTOR = {
     "DGCONTENT": "nifty_media",
     "BAGFILMS": "nifty_media",
     "CINELINE": "nifty_media",
+
+    # =========================================================================
+    # F&O GAP FILL — stocks in NSE F&O but missing from sector indices above
+    # Detected via Chartink {33489} scan, Mar 2026
+    # =========================================================================
+
+    # Financial Services / NBFC / Insurance / Fintech
+    "360ONE": "nifty_bank",             # 360 ONE WAM (wealth mgmt)
+    "ABCAPITAL": "nifty_bank",          # Aditya Birla Capital
+    "BAJFINANCE": "nifty_bank",         # Bajaj Finance (NBFC)
+    "BAJAJFINSV": "nifty_bank",         # Bajaj Finserv (holding)
+    "BAJAJHLDNG": "nifty_bank",         # Bajaj Holdings (financial heavy)
+    "BSE": "nifty_bank",               # Bombay Stock Exchange
+    "CHOLAFIN": "nifty_bank",           # Cholamandalam Finance
+    "HDFCAMC": "nifty_bank",            # HDFC AMC
+    "HDFCLIFE": "nifty_bank",           # HDFC Life Insurance
+    "IREDA": "nifty_bank",              # Indian Renewable Energy Dev Agency
+    "IRFC": "nifty_bank",               # Indian Railway Finance Corp
+    "JIOFIN": "nifty_bank",             # Jio Financial Services
+    "LTF": "nifty_bank",               # L&T Finance
+    "MANAPPURAM": "nifty_bank",          # Manappuram Finance (gold loans)
+    "MFSL": "nifty_bank",              # Max Financial Services
+    "MUTHOOTFIN": "nifty_bank",          # Muthoot Finance (gold loans)
+    "NUVAMA": "nifty_bank",             # Nuvama Wealth Management
+    "PAYTM": "nifty_bank",              # One97 Communications (fintech)
+    "PFC": "nifty_bank",               # Power Finance Corporation
+    "PNBHOUSING": "nifty_bank",          # PNB Housing Finance
+    "POLICYBZR": "nifty_bank",           # PB Fintech (PolicyBazaar)
+    "SAMMAANCAP": "nifty_bank",          # Sammaan Capital (ex-Indiabulls Housing)
+    "SHRIRAMFIN": "nifty_bank",          # Shriram Finance
+
+    # Energy / Power / Oil & Gas
+    "ADANIENSOL": "nifty_energy",        # Adani Energy Solutions (alt symbol)
+    "HINDPETRO": "nifty_energy",         # Hindustan Petroleum
+    "INOXWIND": "nifty_energy",          # Inox Wind (renewables)
+    "JSWENERGY": "nifty_energy",         # JSW Energy
+    "NHPC": "nifty_energy",             # NHPC (hydro power)
+    "PETRONET": "nifty_energy",          # Petronet LNG
+    "PREMIERENE": "nifty_energy",        # Premier Energies (solar)
+    "WAAREEENER": "nifty_energy",        # Waaree Energies (solar)
+
+    # Pharma / Healthcare
+    "FORTIS": "nifty_pharma",           # Fortis Healthcare
+    "MAXHEALTH": "nifty_pharma",         # Max Healthcare
+
+    # IT / Tech
+    "LTM": "nifty_it",                 # LTIMindtree (renamed from LTIM)
+    "TATATECH": "nifty_it",             # Tata Technologies
+
+    # Auto
+    "UNOMINDA": "nifty_auto",           # Uno Minda (auto components)
+
+    # FMCG / Consumer
+    "ASIANPAINT": "nifty_fmcg",         # Asian Paints
+    "JUBLFOOD": "nifty_fmcg",           # Jubilant FoodWorks (Dominos)
+    "TITAN": "nifty_fmcg",             # Titan Company (watches/jewellery)
+    "PIDILITIND": "nifty_fmcg",         # Pidilite Industries (adhesives)
+
+    # Infra / Capital Goods / Defence / Construction / Logistics / Retail
+    "AMBER": "nifty_infra",             # Amber Enterprises (electronics mfg)
+    "BDL": "nifty_infra",              # Bharat Dynamics (defence)
+    "BEL": "nifty_infra",              # Bharat Electronics (defence)
+    "BLUESTARCO": "nifty_infra",         # Blue Star (cooling/AC)
+    "CGPOWER": "nifty_infra",           # CG Power & Industrial
+    "DALBHARAT": "nifty_infra",          # Dalmia Bharat (cement)
+    "DELHIVERY": "nifty_infra",          # Delhivery (logistics)
+    "ETERNAL": "nifty_infra",           # Eternal (Zomato, food delivery)
+    "GMRAIRPORT": "nifty_infra",         # GMR Airports
+    "IDEA": "nifty_infra",             # Vodafone Idea (telecom)
+    "INDHOTEL": "nifty_infra",          # Indian Hotels (Taj)
+    "INDUSTOWER": "nifty_infra",         # Indus Towers (telecom infra)
+    "KALYANKJIL": "nifty_infra",         # Kalyan Jewellers (retail)
+    "MAZDOCK": "nifty_infra",           # Mazagon Dock (defence shipbuilding)
+    "NBCC": "nifty_infra",             # NBCC India (construction)
+    "NYKAA": "nifty_infra",             # FSN E-Commerce (retail)
+    "POWERINDIA": "nifty_infra",         # Schneider Electric India
+    "SOLARINDS": "nifty_infra",          # Solar Industries (explosives)
+    "SRF": "nifty_infra",              # SRF Ltd (chemicals/packaging)
+    "SWIGGY": "nifty_infra",            # Swiggy (food delivery)
+    "TRENT": "nifty_infra",             # Trent Ltd (Westside/Zara retail)
+    "UPL": "nifty_infra",              # UPL (agrochemicals)
 }
 
 
+# =========================================================================
+# CHARTINK SECTOR BRIDGE — maps Chartink sector names to our sector keys
+# Chartink returns (symbol, mcap, sector) triplets in aggregatedStockList.
+# This bridge translates Chartink's sector names to our curated keys.
+# =========================================================================
+
+CHARTINK_SECTOR_MAP = {
+    # ── Exact names from Chartink backtest/process API (Mar 2026) ──
+    # 23 sectors returned in aggregatedStockList triplets.
+    # Case-sensitive — must match API response exactly.
+
+    # Banks — need PSU/PVT split via PSU_BANKS set
+    'Bank': '_bank_split',
+
+    # Financial services (NBFC, insurance, brokers, AMC, exchanges)
+    'Financials': 'nifty_bank',
+
+    # IT
+    'I.T': 'nifty_it',
+
+    # Healthcare (pharma + hospitals)
+    'Healthcare': 'nifty_pharma',
+
+    # Auto
+    'Auto': 'nifty_auto',
+
+    # Metals & Mining
+    'Metals & Mining': 'nifty_metal',
+
+    # Energy (oil, gas, renewables)
+    'Energy': 'nifty_energy',
+    'Power & Utilities': 'nifty_energy',
+
+    # FMCG + Consumer Discretionary (Titan, Asian Paints, DMART, etc.)
+    'FMCG': 'nifty_fmcg',
+    'Consumer Discretionary': 'nifty_fmcg',
+
+    # Realty
+    'Realty': 'nifty_realty',
+
+    # Infra / Capital Goods / Defence / Construction / Logistics
+    'Industrials': 'nifty_infra',
+    'Aerospace & Defence': 'nifty_infra',
+    'Building Materials': 'nifty_infra',
+    'Chemicals': 'nifty_infra',
+    'Plastic products': 'nifty_infra',
+    'Services': 'nifty_infra',
+    'Telecom': 'nifty_infra',
+    'Telecom-Service': 'nifty_infra',
+    'Transportation': 'nifty_infra',
+    'Textiles': 'nifty_infra',
+
+    # Media
+    'Media': 'nifty_media',
+
+    # Indices (NIFTY, BANKNIFTY) — skip in breadth
+    'Indices': '_skip',
+
+    # Miscellaneous / N/A — fall through to static mapping
+    'Miscellaneous': '_fallback',
+    'N/A': '_fallback',
+}
+
+# PSU banks — used to split Chartink "Bank" into PSU/PVT
+PSU_BANKS = {
+    'SBIN', 'BANKBARODA', 'PNB', 'CANBK', 'UNIONBANK',
+    'INDIANB', 'BANKINDIA', 'IOB', 'MAHABANK', 'UCOBANK',
+    'CENTRALBK', 'PSB', 'J&KBANK',
+}
+
+# Runtime cache: populated by breadth_tracker from Chartink scans.
+# Allows get_sector() to resolve symbols not in STOCK_SECTOR (e.g. newly
+# added F&O stocks) without needing manual static mapping updates.
+_dynamic_cache: dict = {}
+
+
+def update_dynamic_cache(stock_sector_map: dict):
+    """Update the runtime sector cache from Chartink data.
+
+    Called by breadth_tracker after each SCAN_ALL_FO parse.
+    """
+    _dynamic_cache.update(stock_sector_map)
+
+
+def get_sector_from_chartink(symbol: str, chartink_sector: str) -> str:
+    """Map a Chartink sector name to our sector key.
+
+    Handles the Bank → PSU/PVT split via PSU_BANKS.
+    Returns '_skip' for indices (NIFTY, BANKNIFTY) — caller should exclude.
+    Falls back to static STOCK_SECTOR if Chartink sector is unmapped.
+    """
+    sym = symbol.upper()
+    mapped = CHARTINK_SECTOR_MAP.get(chartink_sector)
+
+    if mapped == '_bank_split':
+        return 'nifty_psu_bank' if sym in PSU_BANKS else 'nifty_pvt_bank'
+
+    if mapped == '_skip':
+        return '_skip'
+
+    if mapped == '_fallback' or mapped is None:
+        # Chartink sector unknown — try static mapping
+        return STOCK_SECTOR.get(sym, 'other')
+
+    return mapped
+
+
 def get_sector(symbol: str) -> str:
-    """Return sector key for a stock. 'other' if not mapped."""
-    return STOCK_SECTOR.get(symbol.upper(), "other")
+    """Return sector key for a stock.
+
+    Checks dynamic cache (populated from Chartink) first, then static map.
+    Returns 'other' if not found in either.
+    """
+    sym = symbol.upper()
+    if sym in _dynamic_cache:
+        return _dynamic_cache[sym]
+    return STOCK_SECTOR.get(sym, "other")
 
 
 def get_all_sectors() -> list:
@@ -525,3 +720,5 @@ if __name__ == "__main__":
         total += count
     print(f"  {'TOTAL':20s}: {total:3d} stocks")
     print(f"\n  Unmapped stocks use 'other' (NIFTY 50 regime)")
+    print(f"\n  Chartink bridge: {len(CHARTINK_SECTOR_MAP)} sector names mapped")
+    print(f"  PSU banks: {len(PSU_BANKS)} symbols")

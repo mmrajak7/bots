@@ -45,20 +45,51 @@ _DATA_YEARS = {'monthly': 6, 'weekly': 3, 'daily': 1}
 def scan_chartink(scan_clause: str) -> List[str]:
     """Scrape Chartink screener API. Returns list of NSE symbols.
 
-    Same pattern as opportunity.py — POST with CSRF token.
+    Tries ``aggregatedStockList`` first (from backtest/process) for correct
+    F&O-filtered results.  Falls back to ``data`` key (screener/process
+    format) if aggregatedStockList is absent.
     """
     try:
         with requests.Session() as s:
             r = s.get('https://chartink.com/screener/', timeout=15)
             soup = BeautifulSoup(r.text, 'html.parser')
-            csrf = soup.select_one("[name='csrf-token']")['content']
-            s.headers['x-csrf-token'] = csrf
+            csrf_tag = soup.select_one("[name='csrf-token']")
+            if not csrf_tag:
+                logger.error("Chartink CSRF token not found")
+                return []
+            s.headers['x-csrf-token'] = csrf_tag['content']
 
             r = s.post(cfg.CHARTINK_URL, data={'scan_clause': scan_clause},
                        timeout=15)
-            data = r.json().get('data', [])
-            symbols = [item['nsecode'] for item in data if 'nsecode' in item]
-            return symbols
+            resp = r.json()
+
+            # Try aggregatedStockList first (backtest/process endpoint)
+            agg = resp.get('aggregatedStockList', [])
+            if agg and isinstance(agg, list):
+                if isinstance(agg[0], list):
+                    flat = agg[0]
+                elif isinstance(agg[0], str):
+                    flat = agg
+                else:
+                    flat = None
+
+                if flat and isinstance(flat[0], str):
+                    if len(flat) % 3 != 0:
+                        logger.warning("aggregatedStockList len %d not /3", len(flat))
+                    symbols = [flat[i] for i in range(0, len(flat) - 2, 3)
+                               if flat[i] and isinstance(flat[i], str)]
+                    if symbols:
+                        return symbols
+
+            # Fallback to data key (works with screener/process endpoint)
+            data = resp.get('data', [])
+            if data and isinstance(data[0], dict):
+                return [item['nsecode'] for item in data
+                        if isinstance(item, dict) and 'nsecode' in item]
+
+            logger.error("Chartink: no usable data in response (keys: %s)",
+                         list(resp.keys()))
+            return []
 
     except Exception as e:
         logger.error("Chartink scan failed: %s", e)

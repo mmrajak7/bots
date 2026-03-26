@@ -31,7 +31,7 @@ IST = pytz.timezone('Asia/Kolkata')
 # ── Chartink scanner config ──────────────────────────────────────────────
 
 CHARTINK_SCREENER_URL = 'https://chartink.com/screener/'
-CHARTINK_SCAN_URL = 'https://chartink.com/screener/process'
+CHARTINK_SCAN_URL = 'https://chartink.com/backtest/process'
 
 # F&O stocks where close > 50DMA (the "above" count)
 SCAN_ABOVE_50DMA = (
@@ -77,10 +77,14 @@ def _save_readings(readings: list):
 
 
 def _scan_chartink(scan_clause: str) -> list:
-    """Scrape Chartink and return list of matching stocks.
+    """Scrape Chartink and return list of matching F&O stocks.
 
-    Each item: {'nsecode': 'RELIANCE', 'name': '...', 'close': ..., 'per_chg': ...}
-    Returns empty list on failure.
+    Uses ``backtest/process`` endpoint which returns ``aggregatedStockList``
+    — a flat array of [symbol, mcap, sector, ...] triplets.  This is the
+    correctly-filtered F&O universe (~209 stocks).
+
+    Returns list of dicts: [{'nsecode': str, 'mcap': str, 'chartink_sector': str}, ...]
+    Empty list on failure.
     """
     try:
         import requests
@@ -89,13 +93,55 @@ def _scan_chartink(scan_clause: str) -> list:
         with requests.Session() as s:
             r = s.get(CHARTINK_SCREENER_URL, timeout=15)
             soup = BeautifulSoup(r.text, 'html.parser')
-            csrf = soup.select_one("[name='csrf-token']")['content']
-            s.headers['x-csrf-token'] = csrf
+            csrf_tag = soup.select_one("[name='csrf-token']")
+            if not csrf_tag:
+                logger.error("Chartink CSRF token not found on page")
+                return []
+            s.headers['x-csrf-token'] = csrf_tag['content']
 
             r = s.post(CHARTINK_SCAN_URL,
                        data={'scan_clause': scan_clause},
                        timeout=15)
-            return r.json().get('data', [])
+            resp = r.json()
+
+            # Parse aggregatedStockList (triplets: [sym, mcap, sector, ...])
+            agg = resp.get('aggregatedStockList', [])
+            if not agg or not isinstance(agg, list):
+                logger.error("Chartink: aggregatedStockList missing or empty")
+                return []
+
+            # backtest/process returns [[...], [...], ...] — one array per date.
+            # Use first array only (most recent / current scan).
+            if isinstance(agg[0], list):
+                flat = agg[0]
+            elif isinstance(agg[0], str):
+                flat = agg  # flat array of strings directly
+            else:
+                logger.error("Chartink: unexpected aggregatedStockList format: %s",
+                             type(agg[0]).__name__)
+                return []
+
+            if not flat or not isinstance(flat[0], str):
+                logger.error("Chartink: aggregatedStockList[0] is empty or not strings")
+                return []
+
+            if len(flat) % 3 != 0:
+                logger.warning("Chartink: aggregatedStockList length %d not divisible "
+                               "by 3, last %d elements dropped", len(flat), len(flat) % 3)
+
+            stocks = []
+            for i in range(0, len(flat) - 2, 3):
+                sym = flat[i]
+                if sym and isinstance(sym, str):
+                    stocks.append({
+                        'nsecode': sym,
+                        'mcap': flat[i + 1] or '',
+                        'chartink_sector': flat[i + 2] or '',
+                    })
+
+            if not stocks:
+                logger.error("Chartink: parsed 0 stocks from aggregatedStockList")
+            return stocks
 
     except Exception as e:
         logger.error("Chartink breadth scan failed: %s", e)
@@ -105,13 +151,18 @@ def _scan_chartink(scan_clause: str) -> list:
 def _compute_sector_breadth(above_stocks: list, total_stocks: list) -> tuple:
     """Compute per-sector breadth from Chartink results.
 
+    Uses Chartink's native sector data (from aggregatedStockList) mapped
+    through the CHARTINK_SECTOR_MAP bridge.  Falls back to static
+    sector_mapping for stocks with unknown Chartink sectors.
+
     Returns:
         (sectors, unmapped) where:
         - sectors: sorted list of dicts [{sector, above, total, breadth_pct}, ...]
           Only sectors with >= 3 total stocks included (filter noise).
-        - unmapped: sorted list of F&O stock symbols not in sector mapping.
+        - unmapped: sorted list of F&O stock symbols whose Chartink sector
+          could not be mapped to any of our curated sector keys.
     """
-    from playbook.sector_mapping import get_sector
+    from playbook.sector_mapping import get_sector_from_chartink
 
     # Count total per sector + collect unmapped
     sector_total = {}
@@ -120,7 +171,10 @@ def _compute_sector_breadth(above_stocks: list, total_stocks: list) -> tuple:
         sym = item.get('nsecode', '')
         if not sym:
             continue
-        sector = get_sector(sym)
+        chartink_sec = item.get('chartink_sector', '')
+        sector = get_sector_from_chartink(sym, chartink_sec)
+        if sector == '_skip':
+            continue  # indices (NIFTY, BANKNIFTY)
         if sector == 'other':
             unmapped.add(sym)
             continue
@@ -130,8 +184,11 @@ def _compute_sector_breadth(above_stocks: list, total_stocks: list) -> tuple:
     sector_above = {}
     for item in above_stocks:
         sym = item.get('nsecode', '')
-        sector = get_sector(sym)
-        if sector == 'other':
+        if not sym:
+            continue
+        chartink_sec = item.get('chartink_sector', '')
+        sector = get_sector_from_chartink(sym, chartink_sec)
+        if sector in ('_skip', 'other'):
             continue
         sector_above[sector] = sector_above.get(sector, 0) + 1
 
@@ -185,6 +242,39 @@ def fetch_breadth() -> dict:
     if total == 0:
         logger.error("Chartink breadth scan failed: total=0")
         return None
+
+    # Exclude indices (NIFTY, BANKNIFTY) from stock counts
+    from playbook.sector_mapping import get_sector_from_chartink, update_dynamic_cache
+    dyn_map = {}
+    skipped = 0
+    for item in total_stocks:
+        sym = item.get('nsecode', '')
+        if not sym:
+            continue
+        sec = get_sector_from_chartink(sym, item.get('chartink_sector', ''))
+        if sec == '_skip':
+            skipped += 1
+            continue
+        if sec != 'other':
+            dyn_map[sym] = sec
+    update_dynamic_cache(dyn_map)
+
+    # Adjust counts: exclude indices from denominator
+    total = total - skipped
+    # Recount above excluding indices
+    skip_syms = {item.get('nsecode', '') for item in total_stocks
+                 if get_sector_from_chartink(item.get('nsecode', ''),
+                                             item.get('chartink_sector', '')) == '_skip'}
+    above_index_count = sum(1 for item in above_stocks
+                            if item.get('nsecode', '') in skip_syms)
+    above = above - above_index_count
+
+    if total <= 0:
+        logger.error("Chartink breadth scan failed: total=%d after filtering", total)
+        return None
+
+    # Guard: above can never exceed total (race between two scans)
+    above = min(above, total)
 
     breadth_pct = round(above / total * 100, 1)
     now = datetime.now(IST)
@@ -285,6 +375,8 @@ def compute_daily_velocity(readings: list = None) -> dict:
 
     Groups readings by date, takes the last reading per day,
     computes multi-day velocity (5-day and 1-day).
+    Discards readings with a different denominator (total) than the latest
+    to avoid velocity distortion from denominator changes.
     """
     if readings is None:
         readings = _load_readings()
@@ -299,6 +391,17 @@ def compute_daily_velocity(readings: list = None) -> dict:
         by_date[d] = r  # last one wins
 
     daily = sorted(by_date.values(), key=lambda r: r.get('date', ''))
+
+    if len(daily) < 2:
+        return {'velocity_1d': 0, 'velocity_5d': 0}
+
+    # Filter: only keep readings with same denominator as latest (±20%)
+    # to avoid velocity distortion from denominator changes (e.g., 496→207)
+    latest_total = daily[-1].get('total', 0)
+    if latest_total:
+        daily = [d for d in daily
+                 if not d.get('total') or
+                 abs(d['total'] - latest_total) / latest_total <= 0.2]
 
     if len(daily) < 2:
         return {'velocity_1d': 0, 'velocity_5d': 0}
@@ -632,7 +735,21 @@ def check_breadth_alerts(reading: dict, dry_run: bool = False) -> str:
     # Reset state on new day
     if state.get('date') != today:
         state = {'date': today, 'alerts_sent': [], 'last_breadth': None,
+                 'last_total': None,
                  'velocity_sign_count': 0, 'last_velocity_sign': 0}
+
+    # Detect denominator change (e.g., 496→207 from Chartink fix).
+    # If total shifted by >20%, discard stale prev_breadth to avoid spurious alerts.
+    curr_total = reading.get('total', 0)
+    prev_total = state.get('last_total')
+    if prev_total and curr_total and abs(curr_total - prev_total) / prev_total > 0.2:
+        logger.warning("Breadth denominator changed %d→%d, resetting alert state",
+                        prev_total, curr_total)
+        state['last_breadth'] = None
+        state['velocity_sign_count'] = 0
+        state['last_velocity_sign'] = 0
+        state['had_flip'] = False
+        state['last_sectors'] = []
 
     alerts = []
     prev_breadth = state.get('last_breadth')
@@ -750,6 +867,7 @@ def check_breadth_alerts(reading: dict, dry_run: bool = False) -> str:
         sent_msg = msg  # return last alert
 
     state['last_breadth'] = breadth
+    state['last_total'] = curr_total
     state['last_sectors'] = curr_sectors
     _save_alert_state(state)
     return sent_msg
