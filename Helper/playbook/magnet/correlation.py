@@ -279,17 +279,62 @@ def compute_correlations(symbol: str, kite, get_token_fn,
     return result
 
 
-def format_correlation_block(corr_data: dict, market_score: int = None) -> str:
+def get_sector_breadth(symbol: str) -> dict:
+    """Look up a stock's sector and latest sector breadth.
+
+    Reads from breadth_readings.json (written by st_watch breadth tracker).
+    Zero API calls — pure local file read.
+
+    Returns: {'sector': 'Metal', 'breadth_pct': 18.0, 'above': 4, 'total': 32,
+              'sector_key': 'nifty_metal'} or None.
+    """
+    try:
+        from playbook.backtest_cache._sector_mapping import get_sector
+        from playbook.st_watch.breadth_tracker import get_latest, SECTOR_LABELS
+
+        sector_key = get_sector(symbol)
+        if sector_key == 'other':
+            return None
+
+        latest = get_latest()
+        if not latest:
+            return None
+
+        for s in latest.get('sectors', []):
+            if s['sector'] == sector_key:
+                return {
+                    'sector': SECTOR_LABELS.get(sector_key, sector_key),
+                    'sector_key': sector_key,
+                    'breadth_pct': s['breadth_pct'],
+                    'above': s['above'],
+                    'total': s['total'],
+                }
+        return None
+    except Exception as e:
+        logger.debug("Sector breadth lookup failed for %s: %s", symbol, e)
+        return None
+
+
+def format_correlation_block(corr_data: dict, market_score: int = None,
+                             sector_info: dict = None) -> str:
     """Format correlation data as Telegram HTML block.
 
     Args:
         corr_data:    Output of compute_correlations()
         market_score: Market outlook score (0-7) from confidence scorer.
                       Used to combine correlation + current market state in verdict.
+        sector_info:  Output of get_sector_breadth() — stock's sector + breadth.
 
     Returns: Multi-line HTML string, or '' if no data.
     """
     if not corr_data or not corr_data.get('nifty'):
+        # Still show sector info even without correlation data
+        if sector_info:
+            sb = sector_info
+            sec_icon = '\u26a0\ufe0f' if sb['breadth_pct'] < 30 else (
+                '\u2705' if sb['breadth_pct'] >= 50 else '~')
+            return (f"\U0001f4ca {sb['sector']}: {sb['breadth_pct']:.0f}% breadth "
+                    f"({sb['above']}/{sb['total']}) {sec_icon}")
         return ''
 
     n = corr_data['nifty']
@@ -308,6 +353,20 @@ def format_correlation_block(corr_data: dict, market_score: int = None) -> str:
         for sym, data in sorted_stocks[:3]:
             tag = ' (same trade!)' if abs(data['corr']) >= 0.75 else ''
             lines.append(f"  vs {sym}: {data['corr']:+.2f} {data['label']}{tag}")
+
+    # Sector breadth line
+    if sector_info:
+        sb = sector_info
+        if sb['breadth_pct'] < 30:
+            sec_tag = 'weak sector \u26a0\ufe0f'
+        elif sb['breadth_pct'] >= 60:
+            sec_tag = 'strong sector \u2705'
+        elif sb['breadth_pct'] >= 40:
+            sec_tag = 'neutral'
+        else:
+            sec_tag = 'soft sector'
+        lines.append(f"  {sb['sector']}: {sb['breadth_pct']:.0f}% breadth "
+                     f"({sb['above']}/{sb['total']}) {sec_tag}")
 
     # Verdict — combine correlation level with market state
     verdict = _build_verdict(nc, market_score)

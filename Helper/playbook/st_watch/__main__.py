@@ -268,6 +268,34 @@ def cmd_regime(args):
         print_regime_status()
 
 
+def cmd_unmapped(args):
+    """Show F&O stocks missing from sector mapping."""
+    from .breadth_tracker import get_latest
+
+    latest = get_latest()
+    if not latest:
+        print("  No breadth data. Run: python -m playbook.st_watch breadth --scan")
+        return
+
+    unmapped = latest.get('unmapped', [])
+    scan_date = latest.get('date', '?')
+    scan_time = latest.get('time', '?')
+
+    if not unmapped:
+        total = latest.get('total', '?')
+        print(f"\n  All F&O stocks mapped. (Last scan: {scan_date} {scan_time}, "
+              f"{total} stocks)")
+        return
+
+    print(f"\n  Unmapped F&O stocks: {len(unmapped)}  "
+          f"(scan: {scan_date} {scan_time})")
+    print(f"  {'─' * 40}")
+    for sym in unmapped:
+        print(f"  {sym}")
+    print(f"\n  Add to: playbook/backtest_cache/_sector_mapping.py")
+    print(f"  Then re-run breadth scan to verify.\n")
+
+
 def cmd_history(args):
     """Show alert history from persistent log."""
     from .alert_store import get_alert_store
@@ -321,6 +349,10 @@ def main():
     p_regime.add_argument('--dry-run', action='store_true',
                           help='Show alerts without sending Telegram')
     p_regime.set_defaults(func=cmd_regime)
+
+    # unmapped (F&O stocks not in sector mapping)
+    p_unmap = sub.add_parser('unmapped', help='Show F&O stocks missing from sector mapping')
+    p_unmap.set_defaults(func=cmd_unmapped)
 
     # run (single invocation, market hours check — for hourly cron)
     p_run = sub.add_parser('run', help='Single scan with market hours check (cron target)')

@@ -200,7 +200,8 @@ def cmd_ctrack(args):
         # Compute market correlation (3M: stock vs NIFTY + other watched stocks)
         corr_block = ''
         try:
-            from .correlation import compute_correlations, format_correlation_block
+            from .correlation import (compute_correlations, format_correlation_block,
+                                       get_sector_breadth)
 
             # Gather other symbols from tracker + magnet store
             other_syms = set()
@@ -223,7 +224,9 @@ def cmd_ctrack(args):
                 daily_data=daily,
             )
             market_sc = result.get('sq_dims', {}).get('market', (4, 7, ''))[0]
-            corr_block = format_correlation_block(corr_data, market_score=market_sc)
+            sector_info = get_sector_breadth(sym)
+            corr_block = format_correlation_block(corr_data, market_score=market_sc,
+                                                  sector_info=sector_info)
 
             # Print correlation to console
             if corr_data.get('nifty'):
@@ -236,9 +239,11 @@ def cmd_ctrack(args):
                 from .correlation import _build_verdict
                 verdict = _build_verdict(nc['corr'], market_sc)
                 if verdict:
-                    # Strip unicode for console safety
                     safe_verdict = verdict.encode('ascii', errors='replace').decode('ascii')
                     print(f"  Verdict: {safe_verdict}")
+            if sector_info:
+                print(f"  Sector: {sector_info['sector']} {sector_info['breadth_pct']:.0f}% "
+                      f"({sector_info['above']}/{sector_info['total']})")
         except Exception as e:
             print(f"  Correlation computation skipped: {e}")
 

@@ -102,20 +102,27 @@ def _scan_chartink(scan_clause: str) -> list:
         return []
 
 
-def _compute_sector_breadth(above_stocks: list, total_stocks: list) -> list:
+def _compute_sector_breadth(above_stocks: list, total_stocks: list) -> tuple:
     """Compute per-sector breadth from Chartink results.
 
-    Returns sorted list of dicts: [{sector, above, total, breadth_pct}, ...]
-    Only sectors with >= 3 total stocks included (filter noise).
+    Returns:
+        (sectors, unmapped) where:
+        - sectors: sorted list of dicts [{sector, above, total, breadth_pct}, ...]
+          Only sectors with >= 3 total stocks included (filter noise).
+        - unmapped: sorted list of F&O stock symbols not in sector mapping.
     """
     from playbook.backtest_cache._sector_mapping import get_sector
 
-    # Count total per sector
+    # Count total per sector + collect unmapped
     sector_total = {}
+    unmapped = set()
     for item in total_stocks:
         sym = item.get('nsecode', '')
+        if not sym:
+            continue
         sector = get_sector(sym)
         if sector == 'other':
+            unmapped.add(sym)
             continue
         sector_total[sector] = sector_total.get(sector, 0) + 1
 
@@ -142,7 +149,7 @@ def _compute_sector_breadth(above_stocks: list, total_stocks: list) -> list:
         })
 
     result.sort(key=lambda x: x['breadth_pct'], reverse=True)
-    return result
+    return result, sorted(unmapped)
 
 
 # Human-readable sector labels
@@ -182,8 +189,8 @@ def fetch_breadth() -> dict:
     breadth_pct = round(above / total * 100, 1)
     now = datetime.now(IST)
 
-    # Sector breakdown
-    sector_breadth = _compute_sector_breadth(above_stocks, total_stocks)
+    # Sector breakdown + unmapped detection
+    sector_breadth, unmapped = _compute_sector_breadth(above_stocks, total_stocks)
 
     reading = {
         'date': now.strftime('%Y-%m-%d'),
@@ -193,10 +200,16 @@ def fetch_breadth() -> dict:
         'total': total,
         'breadth_pct': breadth_pct,
         'sectors': sector_breadth,
+        'unmapped': unmapped,
     }
 
-    logger.info("Breadth: %d/%d = %.1f%% (%d sectors)", above, total, breadth_pct,
-                len(sector_breadth))
+    if unmapped:
+        logger.info("Breadth: %d/%d = %.1f%% (%d sectors, %d unmapped: %s)",
+                     above, total, breadth_pct, len(sector_breadth),
+                     len(unmapped), ', '.join(unmapped[:5]))
+    else:
+        logger.info("Breadth: %d/%d = %.1f%% (%d sectors)", above, total, breadth_pct,
+                    len(sector_breadth))
     return reading
 
 
@@ -580,6 +593,14 @@ def build_morning_briefing(dry_run: bool = False) -> str:
                 label = SECTOR_LABELS.get(s['sector'], s['sector'])
                 icon = '\U0001f4c8' if s['velocity'] > 0 else '\U0001f4c9'
                 msg += f"\n  {icon} {label}: {s['velocity']:+.0f} ppts intraday"
+
+    # Unmapped F&O stocks (not in sector mapping)
+    unmapped = y_last.get('unmapped', [])
+    if unmapped:
+        msg += f"\n\n\u26a0\ufe0f <b>Unmapped ({len(unmapped)}):</b> "
+        msg += ", ".join(unmapped[:10])
+        if len(unmapped) > 10:
+            msg += f" +{len(unmapped) - 10} more"
 
     if not dry_run:
         _send_telegram(msg)
