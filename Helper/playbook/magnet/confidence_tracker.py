@@ -133,58 +133,68 @@ def _dim_line(dims: dict, key: str, label: str) -> str:
 
 def format_watch_alert(result: dict, option: Optional[dict] = None,
                        corr_block: str = '') -> str:
-    """Format WATCHING alert for Telegram — comprehensive view.
+    """Format compact WATCHING alert for Telegram.
+
+    Designed for fast decision-making: score + strengths/risks + context.
+    ~8-10 lines instead of 22.
 
     Args:
         result:     Output of score_signal()
         option:     Option info dict (symbol, price, qty)
-        corr_block: Pre-formatted correlation HTML block (from correlation.py)
+        corr_block: Pre-formatted context line (from correlation.format_context_line)
     """
     s = result
     sym = s['symbol']
     opt = s['option_type']
     stars = _tg_stars(s['total_score'])
-    tgt_word = _target_word(s['need_up'])
     gap_abs = abs(s['gap_pct'])
-    sq = s.get('sq_dims', {})
-    et = s.get('et_dims', {})
 
+    # Header: score + SQ/ET split
     lines = [
         f"{stars} <b>WATCHING</b> <code>{sym}</code> {opt} | {s['total_score']}/100",
-        f"Spot {s['ltp']:,.0f} | {tgt_word} {s['target_st']:,.0f} ({gap_abs:.1f}%)",
-        "",
-        _dim_line(sq, 'higher_tf', 'Trend'),
-        _dim_line(sq, 'tf_align', 'TF'),
-        _dim_line(sq, 'velocity', 'Velocity'),
-        _dim_line(sq, 'market', 'Market'),
-        _dim_line(et, 'pullback', 'Pullback'),
-        _dim_line(et, 'intraday', 'Intraday'),
-        _dim_line(et, 'support', 'Support'),
+        (f"Spot {s['ltp']:,.0f} \u2192 {s['target_st']:,.0f} ({gap_abs:.1f}%)"
+         f" | SQ {s.get('sq_total', 0)} ET {s.get('et_total', 0)}"),
     ]
 
+    # Strengths (top reasons to enter) — 1 compact line
+    strengths = s.get('strengths', [])
+    if strengths:
+        lines.append("")
+        # Join top 3 strengths, truncate each to keep compact
+        short = [_shorten(st) for st in strengths[:3]]
+        lines.append(f"\u2713 {', '.join(short)}")
+
+    # Risks (top reasons to pause) — 1 compact line
+    risks = s.get('risks', [])
+    if risks:
+        short_r = [_shorten(r) for r in risks[:2]]
+        lines.append(f"\u2717 {' | '.join(short_r)}")
+
+    # Option info
     if option:
         opt_sym = option.get('symbol', '')
         opt_price = option.get('price', 0)
         opt_qty = option.get('qty', '')
         lines.append("")
-        lines.append(f"<code>{opt_sym}</code> @ {opt_price:.2f} | Qty {opt_qty}")
+        lines.append(f"<code>{opt_sym}</code> @ {opt_price:.2f} | {opt_qty} qty")
 
-    # Risks — only show weak/bad dimensions
-    risks = s.get('risks', [])
-    if risks:
-        lines.append("")
-        for r in risks[:2]:
-            lines.append(f"- {r}")
-
-    # Market correlation block (3-month stock vs NIFTY + other watched stocks)
+    # Market context (NIFTY correlation + sector breadth + verdict)
     if corr_block:
         lines.append("")
         lines.append(corr_block)
 
-    lines.append("")
-    lines.append("Waiting for pullback...")
-
     return "\n".join(lines)
+
+
+def _shorten(text: str, max_len: int = 45) -> str:
+    """Shorten a dimension detail string for compact display."""
+    # Strip common verbose prefixes
+    for prefix in ('Monthly ', 'Daily ', 'NIFTY '):
+        text = text.replace(prefix, '')
+    text = text.replace(' -- ', ': ')
+    if len(text) > max_len:
+        text = text[:max_len - 1] + '\u2026'  # …
+    return text
 
 
 def format_enter_alert(result: dict, option: Optional[dict] = None) -> str:

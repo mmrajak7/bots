@@ -1,19 +1,20 @@
-"""Market correlation analysis for magnet signals.
+"""Market correlation + sector context for magnet signals.
 
-Computes 3-month Pearson correlation between signal stock and:
-1. NIFTY 50 (market benchmark)
-2. Other currently watching/entered stocks (portfolio overlap)
+Computes 2-month Pearson correlation between signal stock and NIFTY 50.
+Looks up sector breadth (with intraday velocity) from st_watch data.
 
 Used to decide: "respect the market" vs "trust the stock setup."
 
 Usage:
-    from playbook.magnet.correlation import compute_correlations, format_correlation_block
+    from playbook.magnet.correlation import (
+        compute_nifty_correlation, get_sector_breadth, format_context_line,
+    )
 
-    corr = compute_correlations('SUNPHARMA', kite, get_token_fn,
-                                other_symbols=['CIPLA', 'TATAPOWER'],
-                                daily_data=daily_candles)
-    block = format_correlation_block(corr, market_score=3)
-    # -> Telegram HTML string
+    corr = compute_nifty_correlation('SUNPHARMA', kite, get_token_fn,
+                                      daily_data=daily_candles)
+    sector = get_sector_breadth('SUNPHARMA')
+    line = format_context_line(corr, market_score=3, sector_info=sector)
+    # -> "NIFTY +0.58 MOD | Pharma 55% ↑+8 (21/38)"
 """
 
 import logging
@@ -25,14 +26,13 @@ logger = logging.getLogger(__name__)
 # NIFTY 50 instrument token (NSE index, constant)
 _NIFTY_TOKEN = 256265
 
-# Number of trading days for correlation window (~3 months)
-CORR_DAYS = 60
+# Number of trading days for correlation window (~2 months)
+CORR_DAYS = 42
 
 # Minimum common dates needed for a meaningful correlation
-_MIN_COMMON = 20
+_MIN_COMMON = 15
 
 # Per-session cache: {key: {'date': 'YYYY-MM-DD', 'pairs': [(date_str, close)]}}
-# key = symbol or 'NIFTY50'
 _closes_cache: dict = {}
 
 
@@ -74,8 +74,6 @@ def _pearson(x: list, y: list):
     var_x = sum((xi - mean_x) ** 2 for xi in x)
     var_y = sum((yi - mean_y) ** 2 for yi in y)
 
-    # Epsilon check: variance < 1e-12 means series is effectively constant
-    # (e.g., stock price unchanged for 60 days — no meaningful correlation)
     if var_x < 1e-12 or var_y < 1e-12:
         return None
 
@@ -87,11 +85,10 @@ def _pearson(x: list, y: list):
 #  Data extraction & alignment
 # ---------------------------------------------------------------------------
 
-def _extract_date_closes(candles: list, max_days: int = 120) -> list:
+def _extract_date_closes(candles: list, max_days: int = 80) -> list:
     """Extract (date_str, close) pairs from daily candle data.
 
     Handles both datetime objects and ISO strings from Kite API.
-    Returns at most max_days most recent pairs.
     """
     pairs = []
     for c in candles[-max_days:]:
@@ -107,19 +104,11 @@ def _extract_date_closes(candles: list, max_days: int = 120) -> list:
 
 
 def _aligned_correlation(pairs_a: list, pairs_b: list):
-    """Compute Pearson correlation of daily returns aligned by common dates.
-
-    Args:
-        pairs_a: [(date_str, close), ...] for stock A
-        pairs_b: [(date_str, close), ...] for stock B
-
-    Returns: float correlation or None
-    """
+    """Compute Pearson correlation of daily returns aligned by common dates."""
     dict_a = {d: c for d, c in pairs_a}
     dict_b = {d: c for d, c in pairs_b}
     common = sorted(set(dict_a) & set(dict_b))
 
-    # Use last CORR_DAYS+1 common dates (+1 because returns need N+1 prices)
     common = common[-(CORR_DAYS + 1):]
 
     if len(common) < _MIN_COMMON + 1:
@@ -128,17 +117,14 @@ def _aligned_correlation(pairs_a: list, pairs_b: list):
     closes_a = [dict_a[d] for d in common]
     closes_b = [dict_b[d] for d in common]
 
-    returns_a = _daily_returns(closes_a)
-    returns_b = _daily_returns(closes_b)
-
-    return _pearson(returns_a, returns_b)
+    return _pearson(_daily_returns(closes_a), _daily_returns(closes_b))
 
 
 # ---------------------------------------------------------------------------
 #  Data fetching (with daily cache)
 # ---------------------------------------------------------------------------
 
-def _fetch_date_closes(kite, token: int, days: int = 100) -> list:
+def _fetch_date_closes(kite, token: int, days: int = 75) -> list:
     """Fetch daily OHLC from Kite, return [(date_str, close), ...]."""
     now = datetime.now()
     start = now - timedelta(days=days)
@@ -159,18 +145,17 @@ def _get_cached_pairs(kite, symbol: str, token: int) -> list:
     if cached and cached.get('date') == today:
         return cached['pairs']
 
-    pairs = _fetch_date_closes(kite, token, days=100)
+    pairs = _fetch_date_closes(kite, token)
     if pairs:
         _closes_cache[symbol] = {'date': today, 'pairs': pairs}
     return pairs
 
 
 # ---------------------------------------------------------------------------
-#  Labels & icons
+#  Labels
 # ---------------------------------------------------------------------------
 
 def _corr_label(r: float) -> str:
-    """Human-readable correlation label."""
     ar = abs(r)
     if ar >= 0.70:
         return 'HIGH'
@@ -180,53 +165,23 @@ def _corr_label(r: float) -> str:
         return 'LOW'
 
 
-def _corr_icon(r: float) -> str:
-    """Telegram icon for NIFTY correlation level.
-
-    Sign matters: positive HIGH = stock follows market (⚠️ if market weak).
-    Negative HIGH = stock moves against market (contrarian, less common).
-    """
-    ar = abs(r)
-    if ar < 0.40:
-        return '\u2705'         # ✅ independent
-    elif r < 0:
-        return '\U0001f504'     # 🔄 inverse
-    elif ar >= 0.70:
-        return '\u26a0\ufe0f'   # ⚠️ highly linked
-    else:
-        return '~'              # moderate
-
-
 # ---------------------------------------------------------------------------
 #  Main API
 # ---------------------------------------------------------------------------
 
-def compute_correlations(symbol: str, kite, get_token_fn,
-                         other_symbols: list = None,
-                         daily_data: list = None) -> dict:
-    """Compute 3-month correlations for a signal stock.
+def compute_nifty_correlation(symbol: str, kite, get_token_fn,
+                              daily_data: list = None) -> dict:
+    """Compute 2-month correlation between signal stock and NIFTY 50.
 
     Args:
         symbol:        Stock symbol (e.g., 'SUNPHARMA')
         kite:          KiteConnect instance
         get_token_fn:  fn(kite, symbol) -> instrument_token
-        other_symbols: Other watching/entered symbols to check overlap
         daily_data:    Pre-fetched daily candles for signal stock (avoids re-fetch)
 
-    Returns:
-        {
-            'nifty': {'corr': 0.72, 'label': 'HIGH', 'icon': '⚠️'} or None,
-            'stocks': {'CIPLA': {'corr': 0.81, ...}, ...},
-            'nifty_corr': 0.72 or None,
-        }
+    Returns: {'corr': 0.58, 'label': 'MOD'} or None.
     """
-    result = {
-        'nifty': None,
-        'stocks': {},
-        'nifty_corr': None,
-    }
-
-    # 1. Signal stock's (date, close) pairs
+    # Signal stock's (date, close) pairs
     if daily_data:
         stock_pairs = _extract_date_closes(daily_data, max_days=CORR_DAYS + 10)
     else:
@@ -235,62 +190,40 @@ def compute_correlations(symbol: str, kite, get_token_fn,
             stock_pairs = _get_cached_pairs(kite, symbol, tok)
         except Exception as e:
             logger.warning("Correlation: can't get data for %s: %s", symbol, e)
-            return result
+            return None
 
     if len(stock_pairs) < _MIN_COMMON + 1:
-        logger.warning("Correlation: insufficient data for %s (%d days)",
-                        symbol, len(stock_pairs))
-        return result
+        return None
 
-    # 2. NIFTY 50 correlation
+    # NIFTY 50 correlation
     try:
         nifty_pairs = _get_cached_pairs(kite, 'NIFTY50', _NIFTY_TOKEN)
-        if nifty_pairs and len(nifty_pairs) >= _MIN_COMMON + 1:
-            n_corr = _aligned_correlation(stock_pairs, nifty_pairs)
-            if n_corr is not None:
-                result['nifty'] = {
-                    'corr': round(n_corr, 2),
-                    'label': _corr_label(n_corr),
-                    'icon': _corr_icon(n_corr),
-                }
-                result['nifty_corr'] = round(n_corr, 2)
+        if not nifty_pairs or len(nifty_pairs) < _MIN_COMMON + 1:
+            return None
+        n_corr = _aligned_correlation(stock_pairs, nifty_pairs)
+        if n_corr is not None:
+            return {'corr': round(n_corr, 2), 'label': _corr_label(n_corr)}
     except Exception as e:
         logger.warning("Correlation: NIFTY fetch failed: %s", e)
 
-    # 3. Other watched/entered stocks (cap at 5 to limit API calls)
-    if other_symbols:
-        for other_sym in other_symbols[:5]:
-            if other_sym == symbol:
-                continue
-            try:
-                other_tok = get_token_fn(kite, other_sym)
-                other_pairs = _get_cached_pairs(kite, other_sym, other_tok)
-                if other_pairs and len(other_pairs) >= _MIN_COMMON + 1:
-                    r = _aligned_correlation(stock_pairs, other_pairs)
-                    if r is not None:
-                        result['stocks'][other_sym] = {
-                            'corr': round(r, 2),
-                            'label': _corr_label(r),
-                            'icon': _corr_icon(r),
-                        }
-            except Exception as e:
-                logger.debug("Correlation: skip %s: %s", other_sym, e)
-
-    return result
+    return None
 
 
 def get_sector_breadth(symbol: str) -> dict:
-    """Look up a stock's sector and latest sector breadth.
+    """Look up a stock's sector, latest breadth, and 5-day velocity.
 
     Reads from breadth_readings.json (written by st_watch breadth tracker).
     Zero API calls — pure local file read.
 
     Returns: {'sector': 'Metal', 'breadth_pct': 18.0, 'above': 4, 'total': 32,
-              'sector_key': 'nifty_metal'} or None.
+              'vel_5d': +12.0} or None.
+    vel_5d = 5-day sector breadth change (momentum direction). None if insufficient data.
     """
     try:
         from playbook.backtest_cache._sector_mapping import get_sector
-        from playbook.st_watch.breadth_tracker import get_latest, SECTOR_LABELS
+        from playbook.st_watch.breadth_tracker import (
+            get_latest, SECTOR_LABELS, _load_readings,
+        )
 
         sector_key = get_sector(symbol)
         if sector_key == 'other':
@@ -300,88 +233,98 @@ def get_sector_breadth(symbol: str) -> dict:
         if not latest:
             return None
 
+        # Find sector in latest reading
+        sector_data = None
         for s in latest.get('sectors', []):
             if s['sector'] == sector_key:
-                return {
-                    'sector': SECTOR_LABELS.get(sector_key, sector_key),
-                    'sector_key': sector_key,
-                    'breadth_pct': s['breadth_pct'],
-                    'above': s['above'],
-                    'total': s['total'],
-                }
-        return None
+                sector_data = s
+                break
+        if not sector_data:
+            return None
+
+        label = SECTOR_LABELS.get(sector_key, sector_key)
+
+        # Compute 5-day velocity: last reading from ~5 days ago vs latest
+        vel_5d = None
+        try:
+            readings = _load_readings()
+            if readings:
+                latest_date = latest.get('date', '')
+                # Find last reading from 4-6 days ago (allow weekends)
+                cutoff = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+                older = [r for r in readings
+                         if cutoff <= r.get('date', '') < latest_date
+                         and r.get('sectors')]
+                if older:
+                    # Use last reading of the oldest qualifying day
+                    ref = older[0]
+                    for rs in ref.get('sectors', []):
+                        if rs['sector'] == sector_key:
+                            vel_5d = round(sector_data['breadth_pct'] - rs['breadth_pct'], 1)
+                            break
+        except Exception:
+            pass  # velocity is optional
+
+        return {
+            'sector': label,
+            'sector_key': sector_key,
+            'breadth_pct': sector_data['breadth_pct'],
+            'above': sector_data['above'],
+            'total': sector_data['total'],
+            'vel_5d': vel_5d,
+        }
     except Exception as e:
         logger.debug("Sector breadth lookup failed for %s: %s", symbol, e)
         return None
 
 
-def format_correlation_block(corr_data: dict, market_score: int = None,
-                             sector_info: dict = None) -> str:
-    """Format correlation data as Telegram HTML block.
+def format_context_line(nifty_corr: dict, market_score: int = None,
+                        sector_info: dict = None) -> str:
+    """Format compact context line for Telegram alert.
 
-    Args:
-        corr_data:    Output of compute_correlations()
-        market_score: Market outlook score (0-7) from confidence scorer.
-                      Used to combine correlation + current market state in verdict.
-        sector_info:  Output of get_sector_breadth() — stock's sector + breadth.
+    Output: "NIFTY +0.58 MOD | Pharma 55% ↑+8 (21/38)"
+    Plus verdict line: "→ Setup OK — moderate link, market supports"
 
-    Returns: Multi-line HTML string, or '' if no data.
+    Returns multi-line string, or '' if no data.
     """
-    if not corr_data or not corr_data.get('nifty'):
-        # Still show sector info even without correlation data
-        if sector_info:
-            sb = sector_info
-            sec_icon = '\u26a0\ufe0f' if sb['breadth_pct'] < 30 else (
-                '\u2705' if sb['breadth_pct'] >= 50 else '~')
-            return (f"\U0001f4ca {sb['sector']}: {sb['breadth_pct']:.0f}% breadth "
-                    f"({sb['above']}/{sb['total']}) {sec_icon}")
-        return ''
+    parts = []
 
-    n = corr_data['nifty']
-    nc = n['corr']
+    # NIFTY correlation
+    if nifty_corr:
+        nc = nifty_corr['corr']
+        parts.append(f"NIFTY {nc:+.2f} {nifty_corr['label']}")
 
-    lines = ['\U0001f4ca <b>Correlation</b> (3M):']   # 📊
-
-    # NIFTY line
-    lines.append(f"  vs NIFTY: {nc:+.2f} {n['label']} {n['icon']}")
-
-    # Other stocks (top 3 by absolute correlation, descending)
-    stocks = corr_data.get('stocks', {})
-    if stocks:
-        sorted_stocks = sorted(stocks.items(),
-                               key=lambda x: abs(x[1]['corr']), reverse=True)
-        for sym, data in sorted_stocks[:3]:
-            tag = ' (same trade!)' if abs(data['corr']) >= 0.75 else ''
-            lines.append(f"  vs {sym}: {data['corr']:+.2f} {data['label']}{tag}")
-
-    # Sector breadth line
+    # Sector breadth + 5-day velocity
     if sector_info:
         sb = sector_info
-        if sb['breadth_pct'] < 30:
-            sec_tag = 'weak sector \u26a0\ufe0f'
-        elif sb['breadth_pct'] >= 60:
-            sec_tag = 'strong sector \u2705'
-        elif sb['breadth_pct'] >= 40:
-            sec_tag = 'neutral'
-        else:
-            sec_tag = 'soft sector'
-        lines.append(f"  {sb['sector']}: {sb['breadth_pct']:.0f}% breadth "
-                     f"({sb['above']}/{sb['total']}) {sec_tag}")
+        vel_str = ''
+        if sb.get('vel_5d') is not None:
+            arrow = '\u2191' if sb['vel_5d'] >= 0 else '\u2193'  # ↑ or ↓
+            vel_str = f" {arrow}{sb['vel_5d']:+.0f}/5d"
+        parts.append(f"{sb['sector']} {sb['breadth_pct']:.0f}%{vel_str} "
+                     f"({sb['above']}/{sb['total']})")
 
-    # Verdict — combine correlation level with market state
-    verdict = _build_verdict(nc, market_score)
-    if verdict:
-        lines.append(f"  \u2192 {verdict}")   # →
+    if not parts:
+        return ''
+
+    lines = [' | '.join(parts)]
+
+    # Verdict
+    if nifty_corr:
+        verdict = _build_verdict(nifty_corr['corr'], market_score, sector_info)
+        if verdict:
+            lines.append(f"\u2192 {verdict}")   # →
 
     return '\n'.join(lines)
 
 
-def _build_verdict(nifty_corr: float, market_score: int = None) -> str:
-    """Actionable verdict combining NIFTY correlation + market health.
+def _build_verdict(nifty_corr: float, market_score: int = None,
+                   sector_info: dict = None) -> str:
+    """Actionable verdict combining NIFTY correlation + market + sector.
 
     Sign-aware: positive corr = moves WITH market, negative = AGAINST.
     market_score: 0-7 from confidence scorer's market outlook dimension.
-        7 = bullish, 5 = mixed, 3 = weak, 1 = bearish.
+    sector_info: from get_sector_breadth() — adds sector strength to verdict.
     """
     if nifty_corr is None:
         return ''
@@ -389,7 +332,7 @@ def _build_verdict(nifty_corr: float, market_score: int = None) -> str:
     ac = abs(nifty_corr)
     is_positive = nifty_corr >= 0
 
-    # Determine market state from score
+    # Determine market state
     if market_score is not None:
         mkt_strong = market_score >= 5
         mkt_weak = market_score <= 2
@@ -397,34 +340,40 @@ def _build_verdict(nifty_corr: float, market_score: int = None) -> str:
         mkt_strong = None
         mkt_weak = None
 
-    # LOW correlation — independent regardless of sign
-    if ac < 0.40:
-        return 'Independent mover \u2705 trust stock setup'
+    # Sector suffix
+    sec_suffix = ''
+    if sector_info:
+        bp = sector_info['breadth_pct']
+        if bp < 30:
+            sec_suffix = ', weak sector'
+        elif bp >= 60:
+            sec_suffix = ', strong sector'
 
-    # NEGATIVE correlation — stock moves AGAINST market (rare for F&O stocks)
+    # LOW correlation — independent
+    if ac < 0.40:
+        return f'Independent \u2705 trust setup{sec_suffix}'
+
+    # NEGATIVE — contrarian
     if not is_positive:
         if ac >= 0.70:
             if mkt_weak:
-                return 'Inverse to market + NIFTY weak \u2705 contrarian edge'
+                return f'Inverse + NIFTY weak \u2705 contrarian edge{sec_suffix}'
             elif mkt_strong:
-                return 'Inverse to market + NIFTY strong \u26a0\ufe0f headwind'
-            else:
-                return 'Inverse to market \u2014 contrarian stock'
-        else:
-            return 'Weakly inverse \u2014 mild contrarian, weigh setup'
+                return f'Inverse + NIFTY strong \u26a0\ufe0f headwind{sec_suffix}'
+            return f'Inverse \u2014 contrarian{sec_suffix}'
+        return f'Weakly inverse{sec_suffix}'
 
-    # POSITIVE correlation — stock moves WITH market
+    # POSITIVE HIGH — market-linked
     if ac >= 0.70:
         if mkt_weak:
-            return 'Market-linked + NIFTY weak \u26a0\ufe0f setup riskier'
+            return f'Market-linked + weak \u26a0\ufe0f riskier{sec_suffix}'
         elif mkt_strong:
-            return 'Market-linked + NIFTY strong \u2705 tailwind'
-        else:
-            return 'Market-linked \u2014 respect NIFTY direction'
-    else:
-        if mkt_weak:
-            return 'Moderate link + weak market \u2014 weigh carefully'
-        elif mkt_strong:
-            return 'Moderate link + strong market \u2014 setup OK'
-        else:
-            return 'Moderate link \u2014 weigh market + stock setup'
+            return f'Market-linked + strong \u2705 tailwind{sec_suffix}'
+        return f'Market-linked \u2014 respect NIFTY{sec_suffix}'
+
+    # POSITIVE MODERATE
+    if mkt_weak:
+        return f'Moderate link + weak mkt \u2014 caution{sec_suffix}'
+    elif mkt_strong:
+        return f'Moderate link \u2705 setup OK{sec_suffix}'
+    return f'Moderate link{sec_suffix}'

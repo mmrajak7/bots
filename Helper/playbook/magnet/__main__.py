@@ -197,55 +197,32 @@ def cmd_ctrack(args):
         from .confidence import print_detail
         print_detail(result)
 
-        # Compute market correlation (3M: stock vs NIFTY + other watched stocks)
+        # Compute market context (NIFTY correlation + sector breadth)
         corr_block = ''
         try:
-            from .correlation import (compute_correlations, format_correlation_block,
-                                       get_sector_breadth)
+            from .correlation import (compute_nifty_correlation, get_sector_breadth,
+                                       format_context_line)
 
-            # Gather other symbols from tracker + magnet store
-            other_syms = set()
-            for s_sig in tracker.get_watching() + tracker.get_entered():
-                other_syms.add(s_sig['symbol'])
-            try:
-                from . import get_store as _get_magnet_store
-                for t in _get_magnet_store().load_trades():
-                    if t.get('status') in ('watching', 'entered'):
-                        other_syms.add(t['stock'])
-            except Exception:
-                pass  # magnet store unavailable, proceed with tracker only
-            other_syms.discard(sym)
-
-            corr_data = compute_correlations(
-                symbol=sym,
-                kite=kite,
+            nifty_corr = compute_nifty_correlation(
+                symbol=sym, kite=kite,
                 get_token_fn=_get_instrument_token,
-                other_symbols=list(other_syms),
                 daily_data=daily,
             )
             market_sc = result.get('sq_dims', {}).get('market', (4, 7, ''))[0]
             sector_info = get_sector_breadth(sym)
-            corr_block = format_correlation_block(corr_data, market_score=market_sc,
-                                                  sector_info=sector_info)
+            corr_block = format_context_line(nifty_corr, market_score=market_sc,
+                                             sector_info=sector_info)
 
-            # Print correlation to console
-            if corr_data.get('nifty'):
-                nc = corr_data['nifty']
-                print(f"\n  Correlation (3M): vs NIFTY {nc['corr']:+.2f} ({nc['label']})")
-                for cs, cd in sorted(corr_data.get('stocks', {}).items(),
-                                     key=lambda x: abs(x[1]['corr']), reverse=True):
-                    tag = ' <-- same trade!' if abs(cd['corr']) >= 0.75 else ''
-                    print(f"    vs {cs}: {cd['corr']:+.2f} ({cd['label']}){tag}")
-                from .correlation import _build_verdict
-                verdict = _build_verdict(nc['corr'], market_sc)
-                if verdict:
-                    safe_verdict = verdict.encode('ascii', errors='replace').decode('ascii')
-                    print(f"  Verdict: {safe_verdict}")
+            # Print context to console
+            if nifty_corr:
+                print(f"\n  NIFTY corr: {nifty_corr['corr']:+.2f} ({nifty_corr['label']})")
             if sector_info:
-                print(f"  Sector: {sector_info['sector']} {sector_info['breadth_pct']:.0f}% "
-                      f"({sector_info['above']}/{sector_info['total']})")
+                vel = sector_info.get('vel_5d')
+                vel_str = f" vel={vel:+.0f}/5d" if vel is not None else ''
+                print(f"  Sector: {sector_info['sector']} {sector_info['breadth_pct']:.0f}%"
+                      f"{vel_str} ({sector_info['above']}/{sector_info['total']})")
         except Exception as e:
-            print(f"  Correlation computation skipped: {e}")
+            print(f"  Context computation skipped: {e}")
 
         # Send WATCHING Telegram alert
         opt_info = {
