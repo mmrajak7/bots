@@ -80,6 +80,10 @@ def compute_breadth(cache_dir: Path, target_date: date = None,
     if target_date is None:
         target_date = date.today()
 
+    if not cache_dir.exists():
+        logger.debug("Breadth cache dir not found: %s (server mode — use Chartink)", cache_dir)
+        return -1.0
+
     stock_files = [f for f in os.listdir(cache_dir)
                    if f.endswith('.json') and not f.startswith('_')]
 
