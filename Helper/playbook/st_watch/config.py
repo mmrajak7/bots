@@ -47,7 +47,7 @@ TIMEFRAMES = ['monthly', 'weekly']
 # ── Defaults ──────────────────────────────────────────────────────────────
 _DEFAULTS = {
     'alert_thresholds': [3, 1],           # gap % levels that trigger alerts
-    'alert_cooldown_hours': 6,           # don't re-alert same threshold within N hours
+    'alert_cooldown': 'daily',           # re-alert same threshold only on new day (midnight IST)
 }
 
 

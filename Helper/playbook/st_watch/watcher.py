@@ -260,14 +260,13 @@ def _save_state(state: dict):
 
 
 def _find_alert_threshold(gap_pct: float, thresholds: list,
-                          state_key: str, state: dict,
-                          cooldown_hours: int):
+                          state_key: str, state: dict):
     """Return the threshold to alert at, or None if no alert needed.
 
     Logic:
     1. Find the tightest threshold the gap has crossed
     2. Alert if it's tighter than the last alerted threshold
-    3. Or same threshold but cooldown has elapsed
+    3. Or same threshold but last alert was on a previous day (IST midnight reset)
     """
     sym_state = state.get(state_key, {})
     last_threshold = sym_state.get('last_threshold')
@@ -287,18 +286,17 @@ def _find_alert_threshold(gap_pct: float, thresholds: list,
     if last_threshold is None or matched < last_threshold:
         return matched
 
-    # Same threshold — check cooldown
+    # Same threshold — only re-alert on a NEW day (midnight IST reset)
     if matched == last_threshold and last_alert_time:
         try:
             last_dt = datetime.fromisoformat(last_alert_time)
-            # Ensure timezone-aware comparison
             if last_dt.tzinfo is None:
                 last_dt = last_dt.replace(tzinfo=IST)
             else:
                 last_dt = last_dt.astimezone(IST)
-            hours_since = (datetime.now(IST) - last_dt).total_seconds() / 3600
-            if hours_since >= cooldown_hours:
-                return matched
+            today_ist = datetime.now(IST).date()
+            if last_dt.date() < today_ist:
+                return matched  # new day, allow re-alert
         except (ValueError, TypeError):
             return matched
 
@@ -435,7 +433,6 @@ def scan(dry_run: bool = False, symbol_filter: str = None) -> list:
     config = cfg.load_config()
     thresholds = sorted(config.get('alert_thresholds', cfg._DEFAULTS['alert_thresholds']),
                          reverse=True)
-    cooldown = config.get('alert_cooldown_hours', 6)
     symbols = cfg.get_all_symbols(config)
 
     # Optional single-symbol filter
@@ -517,7 +514,7 @@ def scan(dry_run: bool = False, symbol_filter: str = None) -> list:
 
             # Find the tightest threshold to alert at
             alert_at = _find_alert_threshold(
-                abs_gap, thresholds, cache_key, state, cooldown
+                abs_gap, thresholds, cache_key, state
             )
 
             if alert_at is not None:
