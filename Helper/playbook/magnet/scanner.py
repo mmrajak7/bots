@@ -96,6 +96,21 @@ def scan_chartink(scan_clause: str) -> List[str]:
         return []
 
 
+# Known Chartink → NSE symbol mismatches.
+# Add entries here when the warning log reports unrecognized symbols.
+_CHARTINK_TO_NSE = {
+    'M_M': 'M&M',
+    'M_MFIN': 'M&MFIN',
+    'L_TFH': 'L&TFH',
+    'NAM_INDIA': 'NAM-INDIA',
+}
+
+
+def _normalize_symbol(sym: str) -> str:
+    """Fix Chartink symbol mismatches with NSE/Kite naming."""
+    return _CHARTINK_TO_NSE.get(sym, sym)
+
+
 def run_all_scanners() -> List[dict]:
     """Run all configured Chartink scanners. Returns list of raw signals.
 
@@ -107,7 +122,7 @@ def run_all_scanners() -> List[dict]:
         logger.info("Chartink [%s]: %d symbols", scanner['name'], len(symbols))
         for sym in symbols:
             all_signals.append({
-                'stock': sym,
+                'stock': _normalize_symbol(sym),
                 'timeframe': scanner['timeframe'],
             })
         time.sleep(0.5)  # rate limit between scanners
@@ -132,21 +147,42 @@ def _get_kite():
 
 
 def get_ltp(kite, symbols: List[str]) -> Dict[str, float]:
-    """Get LTP for multiple symbols. Returns {symbol: price}."""
+    """Get LTP for multiple symbols. Returns {symbol: price}.
+
+    Validates symbols against Kite instrument cache first to avoid
+    silent failures from Chartink symbols that don't match NSE exactly.
+    Symbols not in NSE get price=0.0 so caller can distinguish from
+    "valid but suspended" (which just won't appear in the result).
+    """
     if not symbols:
         return {}
+    # Ensure instrument cache is loaded so we can validate
+    _load_instrument_cache(kite)
+
+    # Split into valid/invalid NSE symbols
+    valid = []
+    result = {}
+    for s in symbols:
+        if s in _instrument_cache:
+            valid.append(s)
+        else:
+            logger.warning("SKIP %s: not in NSE instrument list (Chartink mismatch — add to _CHARTINK_TO_NSE?)", s)
+            result[s] = 0.0  # sentinel: distinguishes "bad symbol" from "no LTP"
+
+    if not valid:
+        return result
+
     # Kite LTP accepts "NSE:SYMBOL" format
-    instruments = [f"NSE:{s}" for s in symbols]
+    instruments = [f"NSE:{s}" for s in valid]
     try:
         data = kite.ltp(instruments)
-        result = {}
         for key, val in data.items():
             sym = key.replace('NSE:', '')
             result[sym] = val['last_price']
         return result
     except Exception as e:
         logger.error("LTP fetch failed: %s", e)
-        return {}
+        return result
 
 
 def _load_instrument_cache(kite):
@@ -653,9 +689,11 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
             skipped_reasons['already_active'] += 1
             continue
 
-        # Have LTP?
+        # Have LTP?  0.0 = bad symbol (already logged in get_ltp), None = Kite didn't return
         price = ltps.get(stock)
         if not price:
+            if price is None:
+                logger.warning("SKIP %s (%s): valid NSE symbol but Kite returned no LTP (suspended?)", stock, timeframe)
             skipped_reasons['no_ltp'] += 1
             continue
 
@@ -682,6 +720,8 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
 
         # Verify gap is in valid range
         if gap > max_gap:
+            logger.info("SKIP %s (%s): gap %.1f%% > max %.1f%%, too far from ST",
+                        stock, timeframe, gap, max_gap)
             skipped_reasons['gap_too_wide'] += 1
             continue
 
