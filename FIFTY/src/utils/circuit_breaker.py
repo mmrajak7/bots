@@ -203,7 +203,7 @@ class CircuitBreakerOpenError(Exception):
 
 # Pre-configured breakers for common use cases
 def get_kite_breaker() -> CircuitBreaker:
-    """Get or create the Kite API circuit breaker"""
+    """Get or create the Kite API circuit breaker for critical operations (LTP, orders, GTT)"""
     breaker = CircuitBreaker.get_breaker('kite_api')
     if breaker is None:
         breaker = CircuitBreaker(
@@ -213,6 +213,28 @@ def get_kite_breaker() -> CircuitBreaker:
             ),
             reset_timeout=config.get(
                 'api_resilience.circuit_breaker.auto_reset.cooldown_minutes', 30
+            ) * 60
+        )
+    return breaker
+
+
+def get_kite_historical_breaker() -> CircuitBreaker:
+    """Get or create a separate circuit breaker for historical data fetches.
+
+    Isolated from the main kite_api breaker so that historical data failures
+    (e.g. one broken instrument) don't cascade to block LTP, orders, or GTT.
+    Higher threshold (5) and shorter cooldown (10 min) since historical data
+    is less critical than position monitoring.
+    """
+    breaker = CircuitBreaker.get_breaker('kite_historical')
+    if breaker is None:
+        breaker = CircuitBreaker(
+            'kite_historical',
+            failure_threshold=config.get(
+                'api_resilience.circuit_breaker.consecutive_failures.standard_operations', 5
+            ),
+            reset_timeout=config.get(
+                'api_resilience.circuit_breaker.historical_reset_minutes', 10
             ) * 60
         )
     return breaker

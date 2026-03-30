@@ -18,7 +18,7 @@ from loguru import logger
 from src.api.broker_adapter import BrokerAdapter
 from src.utils.config_manager import config
 from src.utils.timezone_helper import now_ist, today_ist, IST
-from src.utils.circuit_breaker import get_kite_breaker, CircuitBreakerOpenError
+from src.utils.circuit_breaker import get_kite_breaker, get_kite_historical_breaker, CircuitBreakerOpenError
 
 # FIX RC-004: Thread-safe singleton initialization lock
 _singleton_lock = threading.Lock()
@@ -69,8 +69,12 @@ class DualKiteClient(BrokerAdapter):
         # Data cache
         self._data_cache: Dict[str, Any] = {}
 
-        # Circuit breaker for API resilience
+        # Circuit breakers for API resilience
+        # Main breaker: LTP, orders, GTT, positions (critical path)
         self._circuit_breaker = get_kite_breaker()
+        # Historical breaker: historical data fetches (signal processing, SuperTrend)
+        # Isolated so one broken instrument doesn't block position monitoring
+        self._historical_breaker = get_kite_historical_breaker()
 
         logger.info("DualKiteClient initialized")
 
@@ -220,9 +224,9 @@ class DualKiteClient(BrokerAdapter):
             if now_ist() - cache_time < timedelta(minutes=cache_expiry):
                 return cached_data
 
-        # FIX SYS-H1: Check circuit breaker before API call
-        if not self._circuit_breaker.can_execute():
-            logger.warning(f"Circuit breaker OPEN - returning empty dataframe for {instrument_token}")
+        # Check historical circuit breaker (separate from main breaker)
+        if not self._historical_breaker.can_execute():
+            logger.warning(f"Historical circuit breaker OPEN - returning empty dataframe for {instrument_token}")
             return pd.DataFrame()
 
         self._rate_limit()
@@ -238,7 +242,7 @@ class DualKiteClient(BrokerAdapter):
                 oi=True
             )
 
-            self._circuit_breaker.record_success()
+            self._historical_breaker.record_success()
 
             if not data:
                 return pd.DataFrame()
@@ -260,7 +264,7 @@ class DualKiteClient(BrokerAdapter):
             return df
 
         except Exception as e:
-            self._circuit_breaker.record_failure()
+            self._historical_breaker.record_failure()
             logger.error(f"Historical data fetch failed for {instrument_token}: {e}")
             raise
 
@@ -276,6 +280,7 @@ class DualKiteClient(BrokerAdapter):
 
         # Collect daily data year by year
         daily_data_list = []
+        consecutive_fails = 0
         for year in range(start_date.year, end_date.year + 1):
             year_start = datetime(year, 1, 1).date()
             year_end = datetime(year, 12, 31).date()
@@ -294,8 +299,16 @@ class DualKiteClient(BrokerAdapter):
                 )
                 if not year_df.empty:
                     daily_data_list.append(year_df)
+                    consecutive_fails = 0
             except Exception as e:
+                consecutive_fails += 1
                 logger.warning(f"Failed to fetch data for year {year}: {e}")
+                if consecutive_fails >= 2:
+                    logger.warning(
+                        f"Skipping remaining years for {instrument_token} "
+                        f"after {consecutive_fails} consecutive failures"
+                    )
+                    break
 
             # FIX API-002: Use proper rate limiting between year fetches
             self._rate_limit_historical()
@@ -355,7 +368,11 @@ class DualKiteClient(BrokerAdapter):
                     self._circuit_breaker.record_failure()
                     logger.debug(f"LTP query failed for {tradingsymbol}: {e}")
 
-            # Fallback: Get from historical data (already circuit breaker protected)
+            # Fallback: Get from historical data (uses separate historical breaker)
+            # Skip fallback entirely if historical breaker is open — avoids redundant empty calls
+            if not self._historical_breaker.can_execute():
+                raise Exception(f"No LTP data available for {instrument_token} (historical breaker open)")
+
             # FIX API-001: Add staleness check to prevent using old data as LTP
             max_staleness_hours = config.get('risk.ltp_max_staleness_hours', 2)
 
