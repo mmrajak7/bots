@@ -776,7 +776,8 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
             if ready and sig['status'] == 'watching':
                 # Only send ENTER alert on watching -> ready transition
                 tracker.mark_ready(sig['id'])
-                # Fetch fresh option price + validate option is still tradeable
+
+                # Validate option is still tradeable (always, even on re-entry)
                 opt_price = sig['option_price']
                 opt_valid = True
                 try:
@@ -785,10 +786,8 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                     if fresh is not None and fresh > 0:
                         opt_price = fresh
                     else:
-                        # Option expired or delisted (no LTP)
                         opt_valid = False
                 except Exception:
-                    # API error fetching option -- option may be expired
                     opt_valid = False
 
                 if not opt_valid:
@@ -803,6 +802,13 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                     print(f"  #{sig['id']} {sym}: option expired, cancelled")
                     continue
 
+                # Guard: suppress duplicate ENTER alerts (oscillation fix)
+                if sig.get('enter_alert_sent'):
+                    log.info("CT #%s %s: re-entered ready (alert already sent, suppressing)",
+                             sig['id'], sym)
+                    print(f"  #{sig['id']} {sym}: re-entered ready (alert suppressed)")
+                    continue
+
                 opt_info = {
                     'symbol': sig['option_symbol'],
                     'price': opt_price,
@@ -811,6 +817,8 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                 }
                 msg = format_enter_alert(result, option=opt_info)
                 _send_telegram(msg, dry_run=dry_run, channel='trade')
+                sig['enter_alert_sent'] = True
+                tracker._save()
                 log.info("CT #%s %s: ENTER alert sent (score=%d, opt=%s @ %.2f)",
                          sig['id'], sym, total, sig['option_symbol'], opt_price)
                 print(f"  -> ENTER alert sent for #{sig['id']} {sym}")
