@@ -343,6 +343,10 @@ class SNAILKiteClient:
             if order_type == "LIMIT" and price is not None:
                 params['price'] = price
 
+            # Apr 2026: market_protection mandatory for MARKET/SL-M orders
+            if order_type in ("MARKET", "SL-M"):
+                params['market_protection'] = -1
+
             order_id = self.kite.place_order(**params)
             logger.info(f"Order placed: {order_id} - {transaction_type} "
                        f"{quantity} {tradingsymbol} @ {price or 'MARKET'}")
@@ -383,6 +387,9 @@ class SNAILKiteClient:
                 params['price'] = price
             if order_type is not None:
                 params['order_type'] = order_type
+                # Apr 2026: market_protection mandatory when modifying to MARKET/SL-M
+                if order_type in ("MARKET", "SL-M"):
+                    params['market_protection'] = -1
 
             return self.kite.modify_order(**params)
         except Exception as e:

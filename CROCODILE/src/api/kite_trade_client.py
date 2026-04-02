@@ -858,6 +858,10 @@ class KiteTradeClient:
         if order_type == "LIMIT" and price:
             payload["price"] = price
 
+        # Apr 2026: market_protection mandatory for MARKET/SL-M orders
+        if order_type in ("MARKET", "SL-M"):
+            payload["market_protection"] = -1
+
         # Make POST request to correct endpoint
         url = f"{self.base_url}/oms/orders/regular"
         headers = self._get_headers()

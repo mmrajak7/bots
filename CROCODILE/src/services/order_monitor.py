@@ -640,7 +640,8 @@ class OrderMonitor:
                         kite.modify_order(
                             variety='regular',
                             order_id=order_id,
-                            order_type='MARKET'
+                            order_type='MARKET',
+                            market_protection=-1
                         )
 
                         stats['orders_converted'] += 1

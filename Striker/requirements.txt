@@ -2,7 +2,7 @@
 # Most dependencies shared with Scalper
 
 # Kite Connect API
-kiteconnect>=5.0.0
+kiteconnect>=5.1.0
 
 # NEO API (via Scalper)
 # neo-api-client>=1.0.0

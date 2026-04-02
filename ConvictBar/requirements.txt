@@ -7,7 +7,7 @@ numpy>=1.23.0
 pyyaml>=6.0
 
 # Kite Connect (for data and trading)
-kiteconnect>=4.0.0
+kiteconnect>=5.1.0
 
 # Optional - for development
 python-dotenv>=1.0.0

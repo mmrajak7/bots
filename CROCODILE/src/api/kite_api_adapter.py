@@ -407,6 +407,10 @@ class KiteAPIAdapter(BrokerAdapter):
         elif self._order_tag:
             order_params['tag'] = self._order_tag
 
+        # Apr 2026: market_protection mandatory for MARKET/SL-M orders
+        if order_type in ("MARKET", "SL-M"):
+            order_params['market_protection'] = -1
+
         order_id = kite.place_order(variety='regular', **order_params)
 
         logger.info(

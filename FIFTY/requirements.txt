@@ -1,7 +1,7 @@
 # FIFTY Bot Dependencies
 
 # Kite Connect API
-kiteconnect>=5.0.0
+kiteconnect>=5.1.0
 
 # Data Processing
 pandas>=2.0.0

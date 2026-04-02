@@ -24,7 +24,7 @@ python-dotenv>=1.0.0  # Environment variables for secure credential management
 
 # Kite Connect (for kite_api trade method - optional)
 # Install only when switching to kite_api mode
-kiteconnect>=5.0.0  # Official Zerodha Kite Connect library
+kiteconnect>=5.1.0  # Official Zerodha Kite Connect library (5.1.0+ required for market_protection)
 
 # Testing
 pytest>=7.4.0

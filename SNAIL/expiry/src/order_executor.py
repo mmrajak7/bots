@@ -197,7 +197,7 @@ class OrderExecutor:
                 )
 
             # Live trading
-            order_id = self.kite.place_order(
+            order_params = dict(
                 variety=self.kite.VARIETY_REGULAR,
                 exchange=self.EXCHANGE,
                 tradingsymbol=request.symbol,
@@ -207,6 +207,12 @@ class OrderExecutor:
                 order_type=request.order_type,
                 product=self.PRODUCT
             )
+
+            # Apr 2026: market_protection mandatory for MARKET/SL-M orders
+            if request.order_type in ("MARKET", "SL-M"):
+                order_params['market_protection'] = -1
+
+            order_id = self.kite.place_order(**order_params)
 
             logger.info(
                 f"Order placed: {order_id} - {request.transaction_type.value} "

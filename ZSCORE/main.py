@@ -1136,7 +1136,8 @@ class OrderManager:
                 transaction_type=self.kite.TRANSACTION_TYPE_BUY,
                 quantity=qty,
                 product=self.kite.PRODUCT_MIS,
-                order_type=self.kite.ORDER_TYPE_MARKET
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                market_protection=-1
             )
 
             order.order_id = str(order_id)
@@ -1211,7 +1212,8 @@ class OrderManager:
                 transaction_type=self.kite.TRANSACTION_TYPE_SELL,
                 quantity=qty,
                 product=self.kite.PRODUCT_MIS,
-                order_type=self.kite.ORDER_TYPE_MARKET
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                market_protection=-1
             )
 
             order.order_id = str(order_id)
@@ -1349,7 +1351,8 @@ class OrderManager:
                 transaction_type=self.kite.TRANSACTION_TYPE_SELL,
                 quantity=qty,
                 product=self.kite.PRODUCT_MIS,
-                order_type=self.kite.ORDER_TYPE_MARKET
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                market_protection=-1
             )
             logging.info(f"Placed MARKET sell {qty} {symbol}, order_id={order_id}")
             return str(order_id)
@@ -1363,7 +1366,8 @@ class OrderManager:
             self.kite.modify_order(
                 variety=self.kite.VARIETY_REGULAR,
                 order_id=order_id,
-                order_type=self.kite.ORDER_TYPE_MARKET
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                market_protection=-1
             )
             logging.info(f"Modified order {order_id} to MARKET")
             return True

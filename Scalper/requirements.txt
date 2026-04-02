@@ -6,7 +6,7 @@
 neo-api-client>=1.0.0
 
 # Kite Connect for spot prices and ATM calculation
-kiteconnect>=5.0.0
+kiteconnect>=5.1.0
 
 # GUI Framework
 PyQt6>=6.5.0
