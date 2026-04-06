@@ -79,7 +79,24 @@ def cmd_check(args):
 
 
 def cmd_breach(args):
-    """Daily SL breach check — compare today's intraday low vs SL."""
+    """Daily SL breach check — compare today's intraday low vs SL.
+
+    Quick-checks local file first to avoid Drive/Kite init when idle.
+    Auto-resumes full monitoring when active positions appear.
+    """
+    # Fast path: read local file directly (no Drive, no Kite)
+    local_file = Path(__file__).resolve().parent.parent.parent / 'logs' / 'pyramid_positions.json'
+    if local_file.exists():
+        try:
+            with open(local_file) as f:
+                positions = json.load(f)
+            if not any(p.get('status') == 'active' for p in positions):
+                print(f"[{datetime.now():%H:%M:%S}] No active positions.")
+                return
+        except (json.JSONDecodeError, ValueError):
+            pass  # Corrupt file — fall through to full init
+
+    # Active positions found (or local file missing) — full init
     from .pyramid_checker import check_sl_breaches
 
     store = get_pyramid_store()

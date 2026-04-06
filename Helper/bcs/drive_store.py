@@ -4,6 +4,9 @@ Google Drive API wrapper for BCS trade store sync.
 Low-level functions only — no business logic.
 All functions raise on failure; caller decides fallback strategy.
 
+ServiceRef wraps the Drive service and auto-reconnects on stale TLS
+connections (SSL EOF errors from idle connection reuse).
+
 Requires:
   pip install google-auth google-api-python-client
 """
@@ -23,14 +26,60 @@ logger = logging.getLogger(__name__)
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
 
+# ---------------------------------------------------------------------------
+#  ServiceRef — auto-reconnecting Drive service wrapper
+# ---------------------------------------------------------------------------
+
+class ServiceRef:
+    """Mutable wrapper around a Drive v3 service.
+
+    Stores credentials path so the service can be recreated when the
+    underlying TLS connection goes stale (SSL EOF after idle period).
+    """
+
+    def __init__(self, service, creds_path: Path):
+        self.service = service
+        self.creds_path = creds_path
+
+    def reconnect(self):
+        """Create a fresh Drive service (new TLS connection)."""
+        creds = service_account.Credentials.from_service_account_file(
+            str(self.creds_path), scopes=SCOPES
+        )
+        self.service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+        logger.info("Drive service reconnected via %s", self.creds_path.name)
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    """Check if an exception is a transient connection/SSL error."""
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        'eof occurred', 'ssl', 'broken pipe', 'connection reset',
+        'connection aborted', 'timed out', 'read timeout',
+        'remotedisconnected',
+    ))
+
+
+def _extract_service(svc):
+    """Get raw Google API service from ServiceRef or pass through."""
+    return svc.service if isinstance(svc, ServiceRef) else svc
+
+
+# ---------------------------------------------------------------------------
+#  Public API
+# ---------------------------------------------------------------------------
+
 def get_drive_service(credentials_path: Path):
     """Build Drive v3 service from service account JSON.
+
+    Returns a ServiceRef that supports automatic reconnection when
+    the TLS connection goes stale.
 
     Args:
         credentials_path: Path to service account JSON key file.
 
     Returns:
-        googleapiclient Resource for Drive v3.
+        ServiceRef wrapping the Drive v3 resource.
 
     Raises:
         FileNotFoundError: If credentials file doesn't exist.
@@ -44,14 +93,14 @@ def get_drive_service(credentials_path: Path):
     )
     service = build('drive', 'v3', credentials=creds, cache_discovery=False)
     logger.info("Drive service authenticated via %s", credentials_path.name)
-    return service
+    return ServiceRef(service, credentials_path)
 
 
 def find_file(service, folder_id: str, file_name: str) -> Optional[str]:
     """Find file by name in a specific folder.
 
     Args:
-        service: Drive v3 service resource.
+        service: ServiceRef or raw Drive v3 resource.
         folder_id: Google Drive folder ID to search in.
         file_name: Exact file name to find.
 
@@ -61,33 +110,47 @@ def find_file(service, folder_id: str, file_name: str) -> Optional[str]:
     Raises:
         googleapiclient.errors.HttpError: On API failure.
     """
-    query = (
-        f"name = '{file_name}' and "
-        f"'{folder_id}' in parents and "
-        f"trashed = false"
-    )
-    result = service.files().list(
-        q=query, spaces='drive', fields='files(id, name)',
-        pageSize=5,
-    ).execute()
+    def _do_find(svc):
+        query = (
+            f"name = '{file_name}' and "
+            f"'{folder_id}' in parents and "
+            f"trashed = false"
+        )
+        result = svc.files().list(
+            q=query, spaces='drive', fields='files(id, name)',
+            pageSize=5,
+        ).execute()
 
-    files = result.get('files', [])
-    if not files:
-        logger.info("File '%s' not found in folder %s", file_name, folder_id)
-        return None
+        files = result.get('files', [])
+        if not files:
+            logger.info("File '%s' not found in folder %s", file_name, folder_id)
+            return None
 
-    if len(files) > 1:
-        logger.warning("Multiple files named '%s' in folder — using first", file_name)
+        if len(files) > 1:
+            logger.warning("Multiple files named '%s' in folder — using first", file_name)
 
-    logger.debug("Found file '%s' -> %s", file_name, files[0]['id'])
-    return files[0]['id']
+        logger.debug("Found file '%s' -> %s", file_name, files[0]['id'])
+        return files[0]['id']
+
+    svc = _extract_service(service)
+    try:
+        return _do_find(svc)
+    except Exception as e:
+        if isinstance(service, ServiceRef) and _is_connection_error(e):
+            logger.info("Reconnecting Drive after find_file error: %s", e)
+            service.reconnect()
+            return _do_find(service.service)
+        raise
 
 
 def download_json(service, file_id: str) -> list:
     """Download and parse a JSON file from Drive.
 
+    Auto-retries once on transient connection errors (SSL EOF, timeout)
+    by reconnecting the Drive service.
+
     Args:
-        service: Drive v3 service resource.
+        service: ServiceRef or raw Drive v3 resource.
         file_id: Google Drive file ID.
 
     Returns:
@@ -97,18 +160,30 @@ def download_json(service, file_id: str) -> list:
         googleapiclient.errors.HttpError: On API failure.
         json.JSONDecodeError: If file content is not valid JSON.
     """
-    request = service.files().get_media(fileId=file_id)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
+    def _do_download(svc):
+        request = svc.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        buf.seek(0)
+        data = json.loads(buf.read().decode('utf-8'))
+        if not isinstance(data, list):
+            raise ValueError(f"Expected list from Drive, got {type(data).__name__}")
+        return data
 
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
+    svc = _extract_service(service)
+    try:
+        data = _do_download(svc)
+    except Exception as e:
+        if isinstance(service, ServiceRef) and _is_connection_error(e):
+            logger.info("Reconnecting Drive after download error: %s", e)
+            service.reconnect()
+            data = _do_download(service.service)
+        else:
+            raise
 
-    buf.seek(0)
-    data = json.loads(buf.read().decode('utf-8'))
-    if not isinstance(data, list):
-        raise ValueError(f"Expected list from Drive, got {type(data).__name__}")
     logger.info("Downloaded %d trades from Drive (file %s)", len(data), file_id)
     return data
 
@@ -117,8 +192,11 @@ def upload_json(service, folder_id: str, file_name: str,
                 data: list, file_id: Optional[str] = None) -> str:
     """Upload JSON data to Drive. Creates new file or updates existing.
 
+    Auto-retries once on transient connection errors (SSL EOF, timeout)
+    by reconnecting the Drive service.
+
     Args:
-        service: Drive v3 service resource.
+        service: ServiceRef or raw Drive v3 resource.
         folder_id: Google Drive folder ID (used for new file creation).
         file_name: File name on Drive.
         data: List of trade dicts to serialize as JSON.
@@ -130,25 +208,36 @@ def upload_json(service, folder_id: str, file_name: str,
     Raises:
         googleapiclient.errors.HttpError: On API failure.
     """
-    content = json.dumps(data, indent=2, default=str).encode('utf-8')
-    media = MediaIoBaseUpload(
-        io.BytesIO(content), mimetype='application/json', resumable=False
-    )
+    def _do_upload(svc):
+        content = json.dumps(data, indent=2, default=str).encode('utf-8')
+        media = MediaIoBaseUpload(
+            io.BytesIO(content), mimetype='application/json', resumable=False
+        )
 
-    if file_id:
-        result = service.files().update(
-            fileId=file_id, media_body=media
-        ).execute()
-        logger.info("Updated %d trades on Drive (file %s)", len(data), result['id'])
-        return result['id']
-    else:
-        metadata = {
-            'name': file_name,
-            'parents': [folder_id],
-            'mimeType': 'application/json',
-        }
-        result = service.files().create(
-            body=metadata, media_body=media, fields='id'
-        ).execute()
-        logger.info("Created new file on Drive: %s -> %s", file_name, result['id'])
-        return result['id']
+        if file_id:
+            result = svc.files().update(
+                fileId=file_id, media_body=media
+            ).execute()
+            logger.info("Updated %d trades on Drive (file %s)", len(data), result['id'])
+            return result['id']
+        else:
+            metadata = {
+                'name': file_name,
+                'parents': [folder_id],
+                'mimeType': 'application/json',
+            }
+            result = svc.files().create(
+                body=metadata, media_body=media, fields='id'
+            ).execute()
+            logger.info("Created new file on Drive: %s -> %s", file_name, result['id'])
+            return result['id']
+
+    svc = _extract_service(service)
+    try:
+        return _do_upload(svc)
+    except Exception as e:
+        if isinstance(service, ServiceRef) and _is_connection_error(e):
+            logger.info("Reconnecting Drive after upload error: %s", e)
+            service.reconnect()
+            return _do_upload(service.service)
+        raise

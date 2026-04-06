@@ -10,6 +10,7 @@ Flow:
 Storage: logs/confidence_tracker.json (local only, no Drive sync).
 """
 
+import html
 import json
 import time
 import logging
@@ -129,7 +130,7 @@ def _dim_line(dims: dict, key: str, label: str) -> str:
     sc, mx, detail = d[0], d[1], d[2]
     pct = int(sc / mx * 100) if mx > 0 else 0
     icon = '+' if pct >= 70 else '~' if pct >= 40 else '-'
-    return f"  {icon} {label}: {detail}"
+    return f"  {icon} {label}: {html.escape(str(detail))}"
 
 
 def format_watch_alert(result: dict, option: Optional[dict] = None,
@@ -195,7 +196,7 @@ def _shorten(text: str, max_len: int = 45) -> str:
     text = text.replace(' -- ', ': ')
     if len(text) > max_len:
         text = text[:max_len - 1] + '\u2026'  # …
-    return text
+    return html.escape(text)
 
 
 def format_enter_alert(result: dict, option: Optional[dict] = None) -> str:
@@ -234,7 +235,7 @@ def format_enter_alert(result: dict, option: Optional[dict] = None) -> str:
     if risks:
         lines.append("")
         for r in risks[:2]:
-            lines.append(f"- {r}")
+            lines.append(f"- {html.escape(str(r))}")
 
     return "\n".join(lines)
 

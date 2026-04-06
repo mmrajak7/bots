@@ -791,7 +791,7 @@ def score_signal(symbol, ltp, st_data, daily, hourly=None, m15=None,
     elif atr_ratio <= 2.0: s4 = 3
     elif atr_ratio <= 3.0: s4 = 2
     else:                  s4 = 1
-    if atr_ratio <= 1:     reach = "<1 day"
+    if atr_ratio <= 1:     reach = "≤1 day"
     elif atr_ratio <= 3:   reach = f"~{atr_ratio:.0f} days"
     else:                  reach = f"{atr_ratio:.0f}+ days"
     sq['atr_reach'] = (s4, 7, f"Gap = {atr_ratio:.1f}x ATR({atr14:.0f}) -- {reach}")
