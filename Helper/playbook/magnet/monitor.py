@@ -636,6 +636,7 @@ def _delegate_to_confidence_tracker(store, kite, trade, stock, price, st_val,
             sq=sq,
             et=et,
             target_label=target_label,
+            option_expiry=option.get('expiry', ''),
         )
     except Exception as e:
         # Tracker add failed — revert magnet trade to watching so it can retry
@@ -646,25 +647,37 @@ def _delegate_to_confidence_tracker(store, kite, trade, stock, price, st_val,
             logger.error("Revert also failed for #%d %s: %s", trade['id'], stock, re)
         return
 
-    # Send WATCHING alert (confidence tracker will send ENTER when timing is right)
+    # Send WATCHING alert with 15M ST info on option
     icon = _dir_icon(direction)
     tf = _tf_tag(timeframe)
+
+    # Compute 15M ST on option chart
+    st15m = None
+    try:
+        from .confidence_tracker import _fetch_option_15m, compute_option_15m_st
+        opt_candles = _fetch_option_15m(kite, option['symbol'])
+        st15m = compute_option_15m_st(opt_candles)
+    except Exception as e:
+        logger.warning("15M ST computation failed for %s: %s", option['symbol'], e)
 
     if result and 'error' not in result:
         msg = format_watch_alert(result, option={
             'symbol': option['symbol'],
             'price': premium,
             'qty': qty,
-        })
+        }, st15m=st15m)
         ct_send(msg)
     else:
         # Fallback alert if scoring failed
+        st_line = ""
+        if st15m:
+            st_line = (f"\n15M ST: {st15m['st_value']:.2f} {st15m['direction']}"
+                       f" | Option: {st15m['close']:.2f}")
         msg = (
             f"{icon} <b>WATCHING</b> {tf} <code>{stock}</code>\n"
             f"Spot {price:,.1f} | ST {st_val:,.1f} | Gap {gap:.1%}\n"
-            f"<code>{option['symbol']}</code> @ {premium:.2f}\n"
-            f"Qty {qty} | SL {sl_spot:,.1f}\n"
-            f"Waiting for pullback entry..."
+            f"<code>{option['symbol']}</code> @ {premium:.2f} | {qty} qty"
+            f"{st_line}"
         )
         send_telegram(msg)
 
@@ -1425,7 +1438,7 @@ def run(dry_run: bool = False):
     # Startup summary
     watching = len(store.get_watching())
     entered = len(store.get_entered())
-    ct_watching = len(ct_tracker.get_watching()) + len(ct_tracker.get_ready()) if ct_tracker else 0
+    ct_watching = len(ct_tracker.get_watching()) if ct_tracker else 0
     ct_entered = len(ct_tracker.get_entered()) if ct_tracker else 0
     logger.info("Magnet monitor started: %d watching, %d entered, "
                 "ct_watching=%d, ct_entered=%d, dry_run=%s",
@@ -1491,7 +1504,7 @@ def run(dry_run: bool = False):
 
             # Confidence tracker: poll for entry timing + exhaustion
             if ct_tracker and not dry_run and (now - last_ct_time) >= cfg.CONFIDENCE_POLL_SEC:
-                ct_w = len(ct_tracker.get_watching()) + len(ct_tracker.get_ready())
+                ct_w = len(ct_tracker.get_watching())
                 ct_e = len(ct_tracker.get_entered())
                 logger.info("CT poll: %d watching, %d entered", ct_w, ct_e)
                 try:

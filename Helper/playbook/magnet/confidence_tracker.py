@@ -1,13 +1,18 @@
-"""Confidence Tracker -- watches magnet signals, alerts on entry/exit timing.
+"""Confidence Tracker v2 -- 15M SuperTrend on option chart for entry/exit.
 
 Flow:
-  1. User adds a signal (ctrack add NAUKRI ...) after magnet fires.
-  2. Tracker polls every 5 min, runs score_signal, waits for ET >= 28/40.
-  3. When entry threshold met -> sends ENTER NOW Telegram alert.
-  4. After user enters manually (ctrack enter ID), tracker watches for
-     exhaustion signals and sends TAKE PROFIT / EXIT alerts.
+  1. Magnet scanner detects stock near higher-TF ST → WATCHING signal.
+  2. Monitor delegates to tracker → picks option → computes 15M ST on option.
+  3. When option price pulls back to within 1% above 15M ST → ENTER alert.
+  4. After entry: if 15M candle CLOSES below ST → EXIT (15M ST broken).
+  5. Existing exits preserved: TP (spot touches higher-TF ST), Time SL (5d),
+     EOD daily, spot SL.
 
-Storage: logs/confidence_tracker.json (local only, no Drive sync).
+Key insight: 15M ST on the OPTION chart gives clean pullback entries
+with minimum risk. Multiple touches without a candle close below = hold.
+Only UP ST matters (we always buy options).
+
+Storage: logs/confidence_tracker.json (local + Drive sync).
 """
 
 import html
@@ -28,24 +33,15 @@ _TRACKER_PATH = _HELPER / 'logs' / 'confidence_tracker.json'
 
 log = logging.getLogger(__name__)
 
-# Lazy module-level imports from confidence.py (avoid circular at import time)
-_detect_reversal_candle = None
-_compute_hourly_st = None
-
-
-def _ensure_confidence_imports():
-    """Import confidence helpers on first use."""
-    global _detect_reversal_candle, _compute_hourly_st
-    if _detect_reversal_candle is None:
-        from .confidence import _detect_reversal_candle as _drc, _compute_hourly_st as _chs
-        _detect_reversal_candle = _drc
-        _compute_hourly_st = _chs
-
-
-# Entry timing thresholds
-_ET_ENTER_MIN = 28        # ET >= 28/40 to trigger ENTER alert
-_PULLBACK_ENTER_MIN = 6   # pullback dimension >= 6/8 to trigger ENTER alert
-_MIN_TOTAL_SCORE = 50     # minimum total score (SQ+ET) to allow entry — prevents LOW-grade entries
+# Entry/exit thresholds
+_ENTRY_GAP_PCT = 0.01     # alert when option price within 1% above 15M ST
+_ST_PERIOD = 10
+_ST_MULTIPLIER = 3
+_MIN_15M_CANDLES = 15     # minimum candles for ST computation
+_15M_FETCH_DAYS = 10      # fetch 10 days of 15M data (covers ~7 trading days)
+_GAP_DOWN_PCT = -0.03     # cancel if option drops >3% below 15M support
+_THETA_DECAY_PCT = 0.40   # cancel if option loses >40% from initial price while watching
+_MIN_DTE_AT_ENTRY = 3     # minimum DTE to allow auto-entry
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +54,8 @@ _MAGNET_TG_CONFIG = _BOTS / 'data' / 'telegram_config.json'  # trade alerts
 def _load_tg_config(channel='watching'):
     """Load Telegram bot config.
 
-    channel='watching' -> telegram_watching from magnet_config.json (WATCHING, CANCELLED)
-    channel='trade'    -> data/telegram_config.json (ENTER, EXIT, TP, CAUTION)
+    channel='watching' -> telegram_watching from magnet_config.json
+    channel='trade'    -> data/telegram_config.json
     """
     try:
         if channel == 'trade':
@@ -77,11 +73,7 @@ def _load_tg_config(channel='watching'):
 
 def _send_telegram(msg: str, dry_run: bool = False,
                    channel: str = 'watching') -> bool:
-    """Send Telegram message to specified channel.
-
-    channel='watching' -> scanner/watching alerts (WATCHING, CANCELLED)
-    channel='trade'    -> trade alerts (ENTER, EXIT, TP, CAUTION)
-    """
+    """Send Telegram message to specified channel."""
     if dry_run:
         safe = msg.encode('ascii', errors='replace').decode('ascii')
         tag = '[TRADE]' if channel == 'trade' else '[WATCH]'
@@ -109,134 +101,203 @@ def _send_telegram(msg: str, dry_run: bool = False,
 
 
 def _tg_stars(score: int) -> str:
-    """Return Unicode star rating for Telegram. Example: star*4 (4/5)."""
+    """Unicode star rating. Example: star*4 (4/5)."""
     star = '\u2b50'
     n = (5 if score >= 80 else 4 if score >= 65 else
          3 if score >= 50 else 2 if score >= 35 else 1)
     return star * n + f" ({n}/5)"
 
 
-def _target_word(need_up: bool) -> str:
-    return 'resistance' if need_up else 'support'
+# ---------------------------------------------------------------------------
+#  15M ST computation for options
+# ---------------------------------------------------------------------------
+
+_nfo_token_cache: dict = {}  # {option_symbol: instrument_token}
+
+
+def _get_option_token(kite, option_symbol: str) -> int:
+    """Get NFO instrument token for an option symbol. Cached per session."""
+    if option_symbol in _nfo_token_cache:
+        return _nfo_token_cache[option_symbol]
+
+    instruments = kite.instruments('NFO')
+    for inst in instruments:
+        _nfo_token_cache[inst['tradingsymbol']] = inst['instrument_token']
+
+    tok = _nfo_token_cache.get(option_symbol)
+    if tok is None:
+        raise ValueError(f"NFO instrument token not found: {option_symbol}")
+    return tok
+
+
+def _fetch_option_15m(kite, option_symbol: str, days: int = _15M_FETCH_DAYS) -> list:
+    """Fetch 15-minute candles for an option from Kite."""
+    tok = _get_option_token(kite, option_symbol)
+    now = datetime.now()
+    start = now - timedelta(days=days + 3)  # pad for weekends/holidays
+    candles = kite.historical_data(
+        tok, start.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'), '15minute')
+    return candles
+
+
+def compute_option_15m_st(candles: list) -> Optional[dict]:
+    """Compute 15M ST(10,3) on option candles.
+
+    Returns last ST point: {supertrend, direction, close, ...} or None.
+    Only care about UP direction (support line for bought options).
+    """
+    if not candles or len(candles) < _MIN_15M_CANDLES:
+        return None
+
+    from playbook.compute_st import compute_supertrend
+    st_data = compute_supertrend(candles, _ST_PERIOD, _ST_MULTIPLIER)
+    if not st_data:
+        return None
+
+    last = st_data[-1]
+    return {
+        'st_value': last['supertrend'],
+        'direction': last['direction'],
+        'close': last['close'],
+        'atr': last['atr'],
+        'candles_used': len(candles),
+    }
+
+
+def _check_15m_st_break(candles: list) -> Optional[dict]:
+    """Check if the 15M ST direction has flipped from UP to DOWN.
+
+    A break means the option's uptrend support is gone — time to exit.
+    Uses the last 3 ST points to detect the flip:
+      - st[-3] was UP (support was intact)
+      - st[-2] flipped to DOWN (the completed candle that broke it)
+      - st[-1] current (may be incomplete)
+
+    Returns break info dict if broken, None if intact.
+    """
+    if not candles or len(candles) < _MIN_15M_CANDLES + 2:
+        return None
+
+    from playbook.compute_st import compute_supertrend
+    st_data = compute_supertrend(candles, _ST_PERIOD, _ST_MULTIPLIER)
+    if not st_data or len(st_data) < 3:
+        return None
+
+    prev_prev = st_data[-3]  # candle before the break
+    prev = st_data[-2]       # last completed candle (potential breaker)
+    curr = st_data[-1]       # current running candle
+
+    # Primary check: direction flipped UP → DOWN on the last completed candle
+    if prev_prev['direction'] == 'UP' and prev['direction'] == 'DOWN':
+        return {
+            'broken': True,
+            'candle_close': prev['close'],
+            'st_value': prev_prev['supertrend'],  # ST value before break
+            'new_direction': prev['direction'],
+        }
+
+    # Secondary: current candle flipped (less reliable since candle is running,
+    # but catches fast breaks)
+    if prev['direction'] == 'UP' and curr['direction'] == 'DOWN':
+        return {
+            'broken': True,
+            'candle_close': curr['close'],
+            'st_value': prev['supertrend'],
+            'new_direction': 'DOWN',
+        }
+
+    return None
 
 
 # ---------------------------------------------------------------------------
-#  Alert formatters
+#  Alert formatters (compact, technical)
 # ---------------------------------------------------------------------------
-
-def _dim_line(dims: dict, key: str, label: str) -> str:
-    """Format a single dimension as 'Label: detail (score/max)'."""
-    d = dims.get(key, (0, 1, ''))
-    sc, mx, detail = d[0], d[1], d[2]
-    pct = int(sc / mx * 100) if mx > 0 else 0
-    icon = '+' if pct >= 70 else '~' if pct >= 40 else '-'
-    return f"  {icon} {label}: {html.escape(str(detail))}"
-
 
 def format_watch_alert(result: dict, option: Optional[dict] = None,
+                       st15m: Optional[dict] = None,
                        corr_block: str = '') -> str:
-    """Format compact WATCHING alert for Telegram.
+    """Format compact WATCHING alert (5 lines max).
 
-    Designed for fast decision-making: score + strengths/risks + context.
-    ~8-10 lines instead of 22.
-
-    Args:
-        result:     Output of score_signal()
-        option:     Option info dict (symbol, price, qty)
-        corr_block: Pre-formatted context line (from correlation.format_context_line)
+    Line 1: Stars + score + stock + direction + TF
+    Line 2: Spot + Potential (how far stock is from target)
+    Line 3: Strengths (why interesting)
+    Line 4: Risks (what to watch)
+    Line 5: Option symbol + price + qty + 15M support level
     """
     s = result
     sym = s['symbol']
     opt = s['option_type']
     stars = _tg_stars(s['total_score'])
     gap_abs = abs(s['gap_pct'])
+    tf_short = {'monthly': 'M', 'weekly': 'W', 'daily': 'D'}.get(
+        s.get('target_tf', ''), '')
 
-    # Header: score + SQ/ET split
     lines = [
-        f"{stars} <b>WATCHING</b> <code>{sym}</code> {opt} | {s['total_score']}/100",
-        (f"Spot {s['ltp']:,.0f} \u2192 {s['target_st']:,.0f} ({gap_abs:.1f}%)"
-         f" | SQ {s.get('sq_total', 0)} ET {s.get('et_total', 0)}"),
+        f"{stars} <b>WATCHING</b> <code>{sym}</code> {opt} [{tf_short}] | {s['total_score']}/100",
+        f"Spot {s['ltp']:,.0f} | Potential {s['target_st']:,.0f} ({gap_abs:.1f}%)",
     ]
 
-    # Strengths (top reasons to enter) — 1 compact line
+    # Strengths (compact, 1 line)
     strengths = s.get('strengths', [])
     if strengths:
-        lines.append("")
-        # Join top 3 strengths, truncate each to keep compact
         short = [_shorten(st) for st in strengths[:3]]
         lines.append(f"\u2713 {', '.join(short)}")
 
-    # Risks (top reasons to pause) — 1 compact line
+    # Risks (compact, 1 line)
     risks = s.get('risks', [])
     if risks:
         short_r = [_shorten(r) for r in risks[:2]]
         lines.append(f"\u2717 {' | '.join(short_r)}")
 
-    # Option info
+    # Option info + 15M support merged into one line
     if option:
         opt_sym = option.get('symbol', '')
         opt_price = option.get('price', 0)
         opt_qty = option.get('qty', '')
-        lines.append("")
-        lines.append(f"<code>{opt_sym}</code> @ {opt_price:.2f} | {opt_qty} qty")
+        sup_str = ''
+        if st15m:
+            dir_icon = '\u2191' if st15m['direction'] == 'UP' else '\u2193'
+            sup_str = f" | Sup {st15m['st_value']:.2f}{dir_icon}"
+        lines.append(f"<code>{opt_sym}</code> @ {opt_price:.2f} | {opt_qty} qty{sup_str}")
 
-    # Market context (NIFTY correlation + sector breadth + verdict)
+    # Market context
     if corr_block:
-        lines.append("")
         lines.append(corr_block)
 
     return "\n".join(lines)
 
 
-def _shorten(text: str, max_len: int = 45) -> str:
-    """Shorten a dimension detail string for compact display."""
-    # Strip common verbose prefixes
-    for prefix in ('Monthly ', 'Daily ', 'NIFTY '):
-        text = text.replace(prefix, '')
-    text = text.replace(' -- ', ': ')
-    if len(text) > max_len:
-        text = text[:max_len - 1] + '\u2026'  # …
-    return html.escape(text)
-
-
-def format_enter_alert(result: dict, option: Optional[dict] = None) -> str:
-    """Format ENTER NOW alert for Telegram — comprehensive view."""
-    s = result
-    sym = s['symbol']
-    opt = s['option_type']
-    stars = _tg_stars(s['total_score'])
-    tgt_word = _target_word(s['need_up'])
-    gap_abs = abs(s['gap_pct'])
-    sq = s.get('sq_dims', {})
-    et = s.get('et_dims', {})
+def format_enter_alert(sym: str, direction: str, tf: str,
+                       option_symbol: str, opt_ltp: float,
+                       st_value: float, qty: int,
+                       sl_spot: float, score: int = 0) -> str:
+    """Format compact ENTER alert — option near 15M support."""
+    tf_short = {'monthly': 'M', 'weekly': 'W', 'daily': 'D'}.get(tf, tf)
+    gap = (opt_ltp - st_value) / st_value * 100 if st_value > 0 else 0
 
     lines = [
-        f"{stars} <b>ENTER</b> <code>{sym}</code> {opt} | {s['total_score']}/100",
-        f"Spot {s['ltp']:,.0f} -> {tgt_word} {s['target_st']:,.0f} ({gap_abs:.1f}%)",
-        "",
-        _dim_line(et, 'pullback', 'Pullback'),
-        _dim_line(et, 'intraday', 'Intraday'),
-        _dim_line(et, 'support', 'Support'),
-        _dim_line(sq, 'higher_tf', 'Trend'),
-        _dim_line(sq, 'velocity', 'Velocity'),
-        _dim_line(sq, 'market', 'Market'),
+        f"\U0001f7e2 <b>ENTER</b> <code>{sym}</code> {direction} [{tf_short}]",
+        f"Option @ {opt_ltp:.2f} | 15M Support {st_value:.2f} ({gap:+.1f}%)",
+        f"<code>{option_symbol}</code> | {qty} qty | SL {sl_spot:,.0f}",
     ]
+    return "\n".join(lines)
 
-    if option:
-        opt_sym = option.get('symbol', '')
-        opt_price = option.get('price', 0)
-        opt_qty = option.get('qty', '')
-        sl_spot = option.get('sl_spot', 0)
-        sl_str = f" | SL {sl_spot:,.0f}" if sl_spot else ""
-        lines.append("")
-        lines.append(f"<code>{opt_sym}</code> @ {opt_price:.2f} | Qty {opt_qty}{sl_str}")
 
-    risks = s.get('risks', [])
-    if risks:
-        lines.append("")
-        for r in risks[:2]:
-            lines.append(f"- {html.escape(str(r))}")
+def format_exit_15m_st(sym: str, direction: str,
+                       entry_opt: float, exit_opt: float,
+                       st_value: float, candle_close: float,
+                       qty: int, days_held: int = 0) -> str:
+    """Format EXIT alert — 15M support broken."""
+    pnl = (exit_opt - entry_opt) * qty
+    pnl_pct = (exit_opt - entry_opt) / entry_opt * 100 if entry_opt > 0 else 0
+    pnl_icon = '\u2705' if pnl >= 0 else '\u274c'
 
+    lines = [
+        f"{pnl_icon} <b>15M BREAK</b> <code>{sym}</code> {direction}",
+        f"Close {candle_close:.2f} &lt; Support {st_value:.2f}",
+        f"{entry_opt:.2f}\u2192{exit_opt:.2f} | "
+        f"<b>Rs {pnl:+,.0f}</b> ({pnl_pct:+.1f}%) {days_held}d",
+    ]
     return "\n".join(lines)
 
 
@@ -245,10 +306,8 @@ def format_exit_alert(symbol: str, direction: str, entry_price: float,
                       pnl_pct: Optional[float] = None,
                       option_ltp: Optional[float] = None,
                       entry_option_price: Optional[float] = None) -> str:
-    """Format EXIT or TAKE PROFIT alert for Telegram."""
+    """Format EXIT/TP alert (for spot TP, time SL, EOD)."""
     need_up = direction == 'CE'
-
-    # Direction-aware spot move: positive = in our favour
     if not entry_price:
         spot_move = 0.0
     elif need_up:
@@ -257,28 +316,31 @@ def format_exit_alert(symbol: str, direction: str, entry_price: float,
         spot_move = (entry_price - ltp) / entry_price * 100
 
     is_profit = spot_move > 0
-
     if is_profit:
-        header = f"!! <b>TAKE PROFIT</b> <code>{symbol}</code> {direction}"
+        header = f"\u2705 <b>TP</b> <code>{symbol}</code> {direction}"
     else:
-        header = f"XX <b>EXIT</b> <code>{symbol}</code> {direction}"
+        header = f"\u274c <b>EXIT</b> <code>{symbol}</code> {direction}"
 
-    lines = [
-        header,
-        "",
-        f"Spot: {entry_price:,.0f} -> {ltp:,.0f} ({spot_move:+.1f}%)",
-    ]
+    lines = [header, f"Spot: {entry_price:,.0f} \u2192 {ltp:,.0f} ({spot_move:+.1f}%)"]
 
-    # Option P&L line (if available)
     if option_ltp and entry_option_price:
         opt_pnl = (option_ltp - entry_option_price) / entry_option_price * 100
-        lines.append(f"Option: {entry_option_price:.2f} -> {option_ltp:.2f} ({opt_pnl:+.0f}%)")
+        lines.append(f"Option: {entry_option_price:.2f} \u2192 {option_ltp:.2f} ({opt_pnl:+.0f}%)")
     elif pnl_pct is not None:
         lines.append(f"Option P&L: {pnl_pct:+.1f}%")
 
-    lines.append("")
     lines.append(reason)
     return "\n".join(lines)
+
+
+def _shorten(text: str, max_len: int = 45) -> str:
+    """Shorten a dimension detail string for compact display."""
+    for prefix in ('Monthly ', 'Daily ', 'NIFTY '):
+        text = text.replace(prefix, '')
+    text = text.replace(' -- ', ': ')
+    if len(text) > max_len:
+        text = text[:max_len - 1] + '\u2026'
+    return html.escape(text)
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +371,6 @@ class ConfidenceTracker:
                 self._signals = data.get('signals', [])
                 self._next_id = data.get('next_id', 1)
             except (json.JSONDecodeError, ValueError) as e:
-                # Back up corrupt file before resetting
                 backup = self.path.with_suffix(
                     f'.corrupt.{int(time.time())}.json')
                 try:
@@ -394,8 +455,17 @@ class ConfidenceTracker:
             direction: str, option_symbol: str, option_price: float,
             quantity: int, sl_spot: float, signal_price: float,
             score: int = 0, grade: str = '', sq: int = 0, et: int = 0,
-            target_label: str = '') -> dict:
-        """Add a new signal to track."""
+            target_label: str = '', option_expiry: str = '') -> dict:
+        """Add a new signal to track. Deduplicates by symbol+direction."""
+        # Dedup: skip if watching/entered signal already exists for same stock
+        existing = [s for s in self._signals
+                    if s['symbol'] == symbol and s['direction'] == direction
+                    and s['status'] in ('watching', 'ready', 'entered')]
+        if existing:
+            log.warning("CT add: %s %s already tracked (#%d), skipping",
+                        symbol, direction, existing[0]['id'])
+            return existing[0]
+
         sig = {
             'id': self._next_id,
             'symbol': symbol,
@@ -405,6 +475,7 @@ class ConfidenceTracker:
             'direction': direction,
             'option_symbol': option_symbol,
             'option_price': option_price,
+            'option_expiry': option_expiry,  # YYYY-MM-DD for expiry check
             'quantity': quantity,
             'sl_spot': sl_spot,
             'signal_price': signal_price,
@@ -419,7 +490,8 @@ class ConfidenceTracker:
             'entry_at': None,
             'exit_reason': None,
             'exit_at': None,
-            'scores': [],
+            'last_15m_st': None,
+            'last_15m_dir': None,
         }
         self._signals.append(sig)
         self._next_id += 1
@@ -433,40 +505,20 @@ class ConfidenceTracker:
         return None
 
     def get_watching(self) -> list:
-        return [s for s in self._signals if s['status'] == 'watching']
-
-    def get_ready(self) -> list:
-        return [s for s in self._signals if s['status'] == 'ready']
+        return [s for s in self._signals if s['status'] in ('watching', 'ready')]
 
     def get_entered(self) -> list:
         return [s for s in self._signals if s['status'] == 'entered']
 
-    def update_score(self, sig_id: int, total: int, sq: int, et: int):
-        """Record a score snapshot."""
+    def mark_entered(self, sig_id: int, entry_price: float,
+                     entry_option_price: float):
+        """Mark signal as entered. Guards: must be watching/ready status."""
         sig = self._find(sig_id)
         if not sig:
             return
-        sig['score'] = total
-        sig['sq'] = sq
-        sig['et'] = et
-        sig['scores'].append({
-            'at': datetime.now().isoformat(timespec='seconds'),
-            'total': total, 'sq': sq, 'et': et,
-        })
-        self._save()
-
-    def mark_ready(self, sig_id: int):
-        """Transition watching -> ready (entry threshold met)."""
-        sig = self._find(sig_id)
-        if sig and sig['status'] == 'watching':
-            sig['status'] = 'ready'
-            self._save()
-
-    def mark_entered(self, sig_id: int, entry_price: float,
-                     entry_option_price: float):
-        """Mark signal as entered by user."""
-        sig = self._find(sig_id)
-        if not sig:
+        if sig['status'] not in ('watching', 'ready'):
+            log.error("mark_entered #%s: status '%s' not watching — BLOCKED",
+                      sig_id, sig['status'])
             return
         if not entry_price or entry_price <= 0:
             log.error("mark_entered #%s: invalid spot price %s — BLOCKED", sig_id, entry_price)
@@ -479,16 +531,19 @@ class ConfidenceTracker:
 
     def mark_exited(self, sig_id: int, reason: str,
                     exit_spot: float = 0, exit_option_price: float = 0):
-        """Mark signal as exited with P&L."""
+        """Mark signal as exited with P&L. Guards: must be entered status."""
         sig = self._find(sig_id)
         if not sig:
+            return
+        if sig['status'] != 'entered':
+            log.error("mark_exited #%s: status '%s' not entered — BLOCKED",
+                      sig_id, sig['status'])
             return
         sig['status'] = 'exited'
         sig['exit_reason'] = reason
         sig['exit_at'] = datetime.now().isoformat(timespec='seconds')
         sig['exit_spot'] = exit_spot
         sig['exit_option_price'] = exit_option_price
-        # Compute P&L if we have entry + exit option prices
         entry_opt = sig.get('entry_option_price') or 0
         qty = sig.get('quantity') or 0
         if entry_opt > 0 and exit_option_price > 0 and qty > 0:
@@ -525,91 +580,36 @@ def get_tracker() -> ConfidenceTracker:
     return _tracker_instance
 
 
-# ---------------------------------------------------------------------------
-#  Exhaustion detection
-# ---------------------------------------------------------------------------
+def cleanup_old_signals(tracker: ConfidenceTracker, before_date: str = '2026-04-11'):
+    """One-time cleanup: cancel watching/ready signals from before the v2 rewrite.
 
-def check_exhaustion(ltp: float, entry_price: float, target_st: float,
-                     need_up: bool,
-                     daily: Optional[list] = None,
-                     hourly: Optional[list] = None) -> Optional[dict]:
-    """Check if position is showing exhaustion near target.
+    Exited/cancelled signals are kept (trading journal).
+    Only removes stale watching/ready signals that will never fire
+    under the new 15M ST logic.
 
-    Returns None (no action) or dict with action + reason.
-    Actions: 'TARGET HIT', 'TAKE PROFIT', 'CAUTION', 'EXIT'
+    Args:
+        before_date: Cancel watching signals created before this date (YYYY-MM-DD).
     """
-    if not entry_price:
-        return None
-    tgt_word = _target_word(need_up)
-    in_profit = (ltp > entry_price) if need_up else (ltp < entry_price)
-    move_pct = abs((ltp - entry_price) / entry_price * 100)
-
-    # 1. Target reached
-    if need_up and ltp >= target_st:
-        return {'action': 'TARGET HIT',
-                'reason': f'Reached {tgt_word} at {target_st:,.0f}'}
-    if not need_up and ltp <= target_st:
-        return {'action': 'TARGET HIT',
-                'reason': f'Reached {tgt_word} at {target_st:,.0f}'}
-
-    # Distance from target
-    dist_pct = abs(ltp - target_st) / target_st * 100
-
-    # 2. Very close to target + stalling
-    if dist_pct <= 0.3:
-        return {'action': 'TAKE PROFIT',
-                'reason': f'Near {tgt_word}, stalling ({dist_pct:.1f}% away)'}
-
-    # 3. Within 1% of target -- check reversal candle
-    if dist_pct <= 1.0 and daily and len(daily) >= 2:
-        _ensure_confidence_imports()
-        # Skip daily candle reversal before 14:00 -- today's candle (daily[-1])
-        # is incomplete and cached from first morning fetch, giving false signals.
-        # Hourly candles (below) update every hour and are more reliable intraday.
-        now_hour = datetime.now().hour
-        if now_hour >= 14:
-            # For CE near resistance: look for bearish candle (reversal from UP)
-            rc_name, rc_str = _detect_reversal_candle(daily[-3:], not need_up)
-            if rc_str >= 5:
-                return {'action': 'TAKE PROFIT',
-                        'reason': (f'Reversal candle ({rc_name.replace("_", " ")}) '
-                                   f'near {tgt_word}')}
-
-        # Also check hourly (preferred intraday -- completes every hour)
-        if hourly and len(hourly) >= 2:
-            hrc_name, hrc_str = _detect_reversal_candle(hourly[-3:], not need_up)
-            if hrc_str >= 5:
-                return {'action': 'TAKE PROFIT',
-                        'reason': (f'1hr reversal candle ({hrc_name.replace("_", " ")}) '
-                                   f'near {tgt_word}')}
-
-    # 4. Hourly ST flipped against position AND in profit
-    if in_profit and move_pct >= 1.0 and hourly and len(hourly) >= 15:
-        _ensure_confidence_imports()
-        h_st = _compute_hourly_st(hourly)
-        if h_st:
-            h_dir = h_st['direction']
-            flipped_against = (need_up and h_dir == 'DOWN') or (not need_up and h_dir == 'UP')
-            if flipped_against:
-                return {'action': 'CAUTION',
-                        'reason': f'1hr ST flipped against position, in +{move_pct:.1f}% profit'}
-
-    # 5. Thesis broken: spot moved against entry
-    # 2% for early exit (naked options lose premium fast), 3% for hard exit
-    loss_pct = ((entry_price - ltp) / entry_price * 100 if need_up
-                else (ltp - entry_price) / entry_price * 100)
-    if loss_pct >= 3.0:
-        return {'action': 'EXIT',
-                'reason': f'{tgt_word.title()} broken, moved {loss_pct:.1f}% against'}
-    if loss_pct >= 2.0:
-        return {'action': 'CAUTION',
-                'reason': f'Moved {loss_pct:.1f}% against entry, watch closely'}
-
-    return None
+    cleaned = 0
+    for sig in list(tracker._signals):
+        if sig['status'] not in ('watching', 'ready'):
+            continue
+        signal_at = sig.get('signal_at', '')
+        if signal_at and signal_at[:10] < before_date:
+            sig['status'] = 'cancelled'
+            sig['exit_reason'] = f'cleanup: pre-v2 signal (created {signal_at[:10]})'
+            sig['exit_at'] = datetime.now().isoformat(timespec='seconds')
+            cleaned += 1
+            log.info("Cleanup: cancelled #%s %s (created %s)",
+                     sig['id'], sig['symbol'], signal_at[:10])
+    if cleaned > 0:
+        tracker._save()
+        print(f"  Cleanup: cancelled {cleaned} stale pre-v2 signals")
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
-#  Monitor functions
+#  Option LTP helper
 # ---------------------------------------------------------------------------
 
 def _fetch_option_ltp(kite, option_symbol):
@@ -623,38 +623,91 @@ def _fetch_option_ltp(kite, option_symbol):
         return 0
 
 
-# Per-session data cache: heavy fetches (daily 6Y, hourly 30d) only once per day
-_data_cache = {}  # {symbol: {'date': 'YYYY-MM-DD', 'daily': [...], 'hourly': [...]}}
+# ---------------------------------------------------------------------------
+#  15M data cache — aligned to 15M candle boundaries
+# ---------------------------------------------------------------------------
+
+_15m_cache: dict = {}  # {option_symbol: {'boundary': str, 'candles': [...]}}
+_BOUNDARY_WAIT_SEC = 5  # wait 5s past boundary for candle to finalize
 
 
-def _get_cached_data(kite, symbol, fetch_daily, fetch_hourly, fetch_15min,
-                     get_token):
-    """Fetch daily+hourly once per day, 15min fresh each call."""
-    today = datetime.now().strftime('%Y-%m-%d')
-    tok = get_token(kite, symbol)
+def _current_15m_boundary() -> str:
+    """Return the last 15M candle boundary as 'HH:MM' string.
 
-    cached = _data_cache.get(symbol)
-    if cached and cached.get('date') == today:
-        daily = cached['daily']
-        hourly = cached['hourly']
+    Boundaries: :00, :15, :30, :45. Only valid after +5 seconds
+    (candle needs time to finalize on exchange side).
+    """
+    now = datetime.now()
+    # If we're in the first 5 seconds past a boundary, the candle just closed
+    # but may not be finalized — use the PREVIOUS boundary
+    minute = now.minute
+    second = now.second
+    boundary_min = (minute // 15) * 15
+    if minute % 15 == 0 and second < _BOUNDARY_WAIT_SEC:
+        # Too early — candle hasn't finalized, use previous boundary
+        if boundary_min == 0:
+            return f"{(now.hour - 1) % 24:02d}:45"
+        return f"{now.hour:02d}:{boundary_min - 15:02d}"
+    return f"{now.hour:02d}:{boundary_min:02d}"
+
+
+def _seconds_to_next_15m_boundary() -> float:
+    """Seconds until 5s past the next 15M candle close."""
+    now = datetime.now()
+    next_min = ((now.minute // 15) + 1) * 15
+    if next_min >= 60:
+        target = now.replace(hour=(now.hour + 1) % 24, minute=0,
+                             second=_BOUNDARY_WAIT_SEC, microsecond=0)
+        if now.hour == 23:
+            target = target + timedelta(days=1)
+            target = target.replace(hour=0)
     else:
-        daily = fetch_daily(kite, tok)
-        hourly = fetch_hourly(kite, tok)
-        _data_cache[symbol] = {'date': today, 'daily': daily, 'hourly': hourly}
+        target = now.replace(minute=next_min, second=_BOUNDARY_WAIT_SEC,
+                             microsecond=0)
+    delta = (target - now).total_seconds()
+    return max(delta, 0)
 
-    # 15min always fresh (entry timing)
-    m15 = fetch_15min(kite, tok)
-    return tok, daily, hourly, m15
+
+def _get_option_15m_cached(kite, option_symbol: str) -> list:
+    """Fetch 15M candles, cached until next 15M boundary.
+
+    Cache invalidates when a new 15M candle completes (boundary changes).
+    Empty/failed responses are NOT cached (prevents cache poisoning).
+    """
+    boundary = _current_15m_boundary()
+    cached = _15m_cache.get(option_symbol)
+    if cached and cached.get('boundary') == boundary:
+        return cached['candles']
+
+    candles = _fetch_option_15m(kite, option_symbol)
+    # Only cache valid responses (prevents poisoning from API failures)
+    if candles and len(candles) >= _MIN_15M_CANDLES:
+        _15m_cache[option_symbol] = {'boundary': boundary, 'candles': candles}
+    return candles
+
+
+# ---------------------------------------------------------------------------
+#  Monitor functions
+# ---------------------------------------------------------------------------
+
+_cleanup_done = False
 
 
 def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
-    """Single monitoring pass: check all watching + entered signals."""
-    from .confidence import (
-        score_signal, _get_instrument_token, _fetch_daily,
-        _fetch_hourly, _fetch_15min, _compute_all_st,
-    )
+    """Single monitoring pass using 15M ST on option chart.
 
-    watching = tracker.get_watching() + tracker.get_ready()
+    Watching signals: check if option price near 15M support → auto-enter.
+    Entered signals: check if 15M support broken → EXIT alert.
+
+    First call runs one-time cleanup of pre-v2 stale signals.
+    Also checks: spot SL, stale signals, time SL, EOD daily, spot TP.
+    """
+    global _cleanup_done
+    if not _cleanup_done:
+        cleanup_old_signals(tracker)
+        _cleanup_done = True
+
+    watching = tracker.get_watching()
     entered = tracker.get_entered()
 
     if not watching and not entered:
@@ -667,207 +720,240 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
           f"{len(watching)} watching, {len(entered)} entered")
 
     # --- Check watching signals ---
+    dirty = False
     for sig in watching:
         sym = sig['symbol']
+        opt_sym = sig.get('option_symbol', '')
         try:
-            tok, daily, hourly, m15 = _get_cached_data(
-                kite, sym, _fetch_daily, _fetch_hourly, _fetch_15min,
-                _get_instrument_token)
-
+            # 1. Fetch spot LTP
             ltp_data = kite.ltp([f'NSE:{sym}'])
             ltp = ltp_data.get(f'NSE:{sym}', {}).get('last_price')
             if ltp is None:
-                log.warning("CT #%s %s: no LTP", sig['id'], sym)
-                print(f"  #{sig['id']} {sym}: SKIP -- no LTP from Kite")
+                print(f"  #{sig['id']} {sym}: SKIP -- no spot LTP")
                 continue
 
-            st_data = _compute_all_st(daily)
-            result = score_signal(sym, ltp, st_data, daily, hourly, m15,
-                                  target_tf=sig['timeframe'], kite=kite)
-
-            if 'error' in result:
-                log.warning("CT #%s %s: score error: %s", sig['id'], sym, result['error'])
-                print(f"  #{sig['id']} {sym}: score error -- {result['error']}")
-                continue
-
-            total = result['total_score']
-            sq_v = result['sq_total']
-            et_v = result['et_total']
-            tracker.update_score(sig['id'], total, sq_v, et_v)
-
-            # Get pullback score from dims
-            pb_score = result.get('et_dims', {}).get('pullback', (0, 8, ''))[0]
-            ready = (total >= _MIN_TOTAL_SCORE
-                     and et_v >= _ET_ENTER_MIN
-                     and pb_score >= _PULLBACK_ENTER_MIN)
-
-            # --- Gap 1: SL invalidation while watching ---
-            ltp_val = result.get('ltp', ltp)
+            # 2. Check spot SL (invalidation before entry)
             need_up = sig['direction'] == 'CE'
             sl = sig.get('sl_spot')
             if sl:
-                sl_hit = (need_up and ltp_val <= sl) or (not need_up and ltp_val >= sl)
+                sl_hit = (need_up and ltp <= sl) or (not need_up and ltp >= sl)
                 if sl_hit:
-                    tracker.cancel(sig['id'], f'SL breached while watching (spot {ltp_val:,.0f})')
-                    msg = format_exit_alert(sym, sig['direction'], sig['signal_price'],
-                                            ltp_val, f'SL hit at {sl:,.0f} before entry')
+                    tracker.cancel(sig['id'],
+                                   f'SL breached while watching (spot {ltp:,.0f})')
+                    msg = format_exit_alert(sym, sig['direction'],
+                                            sig['signal_price'], ltp,
+                                            f'SL hit at {sl:,.0f} before entry')
                     _send_telegram(msg, dry_run=dry_run)
-                    log.warning("CT #%s %s: SL hit while watching (spot %.1f, SL %.1f)",
-                                sig['id'], sym, ltp_val, sl)
                     print(f"  #{sig['id']} {sym}: SL HIT while watching -> cancelled")
                     continue
 
-            # --- Gap 2: Momentum entry override ---
-            # If gap closes to <0.5% and signal quality high, don't miss the trade
-            gap_abs = abs(result.get('gap_pct', 99))
-            if not ready and gap_abs < 0.5 and sq_v >= 45:
-                ready = True  # override -- about to touch, can't wait
-                log.info("CT #%s %s: momentum override (gap %.1f%%, SQ=%d)",
-                         sig['id'], sym, gap_abs, sq_v)
-
-            # --- Gap 3: Stale signal auto-cancel + theta Telegram alert ---
+            # 3. Check stale signal auto-cancel
             signal_at = sig.get('signal_at', '')
             if signal_at:
                 try:
                     sig_dt = datetime.fromisoformat(signal_at)
                     days_waiting = (datetime.now() - sig_dt).total_seconds() / 86400
                     tf = sig.get('timeframe', 'weekly')
-                    # Auto-cancel limits: daily=1d, weekly=5d, monthly=20d
                     max_days = {'daily': 1, 'weekly': 5, 'monthly': 20}.get(tf, 5)
                     if days_waiting > max_days:
                         tracker.cancel(sig['id'],
-                                       f'stale: watching {days_waiting:.0f}d (max {max_days}d for {tf})')
+                                       f'stale: watching {days_waiting:.0f}d (max {max_days}d)')
                         _send_telegram(
-                            f"[X] <code>{sym}</code> {sig['direction']} CANCELLED\n"
-                            f"Watching for {days_waiting:.0f} days (max {max_days} for {tf})",
+                            f"\u274c <code>{sym}</code> {sig['direction']} CANCELLED"
+                            f" | stale ({days_waiting:.0f}d)",
                             dry_run=dry_run)
-                        log.info("CT #%s %s: auto-cancelled (stale %.0fd)",
-                                 sig['id'], sym, days_waiting)
                         print(f"  #{sig['id']} {sym}: AUTO-CANCELLED (stale {days_waiting:.0f}d)")
                         continue
-                    elif days_waiting > 3 and not sig.get('theta_warned'):
-                        sig['theta_warned'] = True
-                        tracker._save()
-                        _send_telegram(
-                            f"[!] <code>{sym}</code> {sig['direction']} watching for {days_waiting:.1f} days\n"
-                            f"Option theta decaying. Consider cancelling.",
-                            dry_run=dry_run)
-                        log.info("CT #%s %s: theta warning (%.1fd)",
-                                 sig['id'], sym, days_waiting)
-                        print(f"  #{sig['id']} {sym}: THETA WARNING sent ({days_waiting:.1f}d)")
                 except Exception:
                     pass
 
-            log.info("CT #%s %s: SQ=%d ET=%d Total=%d pb=%d gap=%.1f%% %s",
-                     sig['id'], sym, sq_v, et_v, total, pb_score, gap_abs,
-                     'ENTER' if ready else 'watching')
-            print(f"  #{sig['id']} {sym} {sig['direction']:<3} "
-                  f"SQ={sq_v}/60 ET={et_v}/40 Total={total}/100 "
-                  f"pb={pb_score}/8 gap={gap_abs:.1f}% "
-                  f"{'-> ENTER' if ready else '(watching)'}")
+            # 4. Fetch 15M candles for option + compute ST
+            if not opt_sym:
+                print(f"  #{sig['id']} {sym}: SKIP -- no option symbol")
+                continue
 
-            # --- Gap 7: Ready -> watching revert if timing degrades ---
-            if not ready and sig['status'] == 'ready':
-                sig['status'] = 'watching'
-                tracker._save()
-                log.info("CT #%s %s: timing degraded, reverted to watching",
-                         sig['id'], sym)
-                print(f"  #{sig['id']} {sym}: timing degraded, reverted to watching")
+            candles = _get_option_15m_cached(kite, opt_sym)
+            st_info = compute_option_15m_st(candles)
 
-            if ready and sig['status'] == 'watching':
-                # Only send ENTER alert on watching -> ready transition
-                tracker.mark_ready(sig['id'])
+            if not st_info:
+                print(f"  #{sig['id']} {sym}: SKIP -- insufficient 15M data "
+                      f"({len(candles)} candles)")
+                continue
 
-                # Validate option is still tradeable (always, even on re-entry)
-                opt_price = sig['option_price']
-                opt_valid = True
-                try:
-                    ltp_opt = kite.ltp([f"NFO:{sig['option_symbol']}"])
-                    fresh = ltp_opt.get(f"NFO:{sig['option_symbol']}", {}).get('last_price')
-                    if fresh is not None and fresh > 0:
-                        opt_price = fresh
-                    else:
-                        opt_valid = False
-                except Exception:
-                    opt_valid = False
+            st_val = st_info['st_value']
+            st_dir = st_info['direction']
 
-                if not opt_valid:
+            # Update signal with latest 15M ST (batched save at end)
+            sig['last_15m_st'] = st_val
+            sig['last_15m_dir'] = st_dir
+            dirty = True
+
+            # 5. Check option validity (LTP > 0)
+            opt_ltp = _fetch_option_ltp(kite, opt_sym)
+            if opt_ltp <= 0:
+                tracker.cancel(sig['id'],
+                               f'option {opt_sym} expired/no LTP')
+                _send_telegram(
+                    f"\u274c <code>{sym}</code> {sig['direction']} CANCELLED"
+                    f" | option expired",
+                    dry_run=dry_run)
+                print(f"  #{sig['id']} {sym}: option expired, cancelled")
+                continue
+
+            # 6. THETA DECAY guard: cancel if option lost >40% from initial price
+            initial_price = sig.get('option_price', 0)
+            if initial_price > 0 and opt_ltp < initial_price * (1 - _THETA_DECAY_PCT):
+                decay_pct = (initial_price - opt_ltp) / initial_price * 100
+                tracker.cancel(sig['id'],
+                               f'theta decay: option lost {decay_pct:.0f}% '
+                               f'({initial_price:.2f}->{opt_ltp:.2f})')
+                _send_telegram(
+                    f"\u274c <code>{sym}</code> {sig['direction']} CANCELLED"
+                    f" | theta decay -{decay_pct:.0f}%"
+                    f" ({initial_price:.2f}\u2192{opt_ltp:.2f})",
+                    dry_run=dry_run)
+                print(f"  #{sig['id']} {sym}: THETA DECAY ({decay_pct:.0f}%) -> cancelled")
+                continue
+
+            # 7. GAP-DOWN guard: cancel if option fell >3% below 15M support
+            gap_to_st = (opt_ltp - st_val) / st_val if st_val > 0 else 999
+            if st_dir == 'UP' and gap_to_st < _GAP_DOWN_PCT:
+                tracker.cancel(sig['id'],
+                               f'option gapped below 15M support ({gap_to_st*100:.1f}%)')
+                _send_telegram(
+                    f"\u274c <code>{sym}</code> {sig['direction']} CANCELLED"
+                    f" | option {gap_to_st*100:.1f}% below support",
+                    dry_run=dry_run)
+                print(f"  #{sig['id']} {sym}: GAP DOWN below support -> cancelled")
+                continue
+
+            # 8. 15M DOWN guard: cancel if trend flipped bearish
+            if st_dir == 'DOWN':
+                log.info("CT #%s %s: 15M trend DOWN, skipping entry", sig['id'], sym)
+                # Track consecutive DOWN polls — cancel after 2
+                down_count = sig.get('_down_count', 0) + 1
+                sig['_down_count'] = down_count
+                dirty = True
+                if down_count >= 2:
                     tracker.cancel(sig['id'],
-                                   f'option {sig["option_symbol"]} expired/delisted')
+                                   f'15M trend DOWN for {down_count} polls, support gone')
                     _send_telegram(
-                        f"[X] <code>{sym}</code> {sig['direction']} CANCELLED\n"
-                        f"Option <code>{sig['option_symbol']}</code> no longer tradeable",
+                        f"\u274c <code>{sym}</code> {sig['direction']} CANCELLED"
+                        f" | 15M trend \u2193 (support lost)",
                         dry_run=dry_run)
-                    log.warning("CT #%s %s: option expired/delisted, cancelled",
-                                sig['id'], sym)
-                    print(f"  #{sig['id']} {sym}: option expired, cancelled")
-                    continue
+                    print(f"  #{sig['id']} {sym}: 15M DOWN x{down_count} -> cancelled")
+                else:
+                    print(f"  #{sig['id']} {sym} {sig['direction']:<3} "
+                          f"opt={opt_ltp:.2f} 15M DOWN (watching, {down_count}/2)")
+                continue
+            else:
+                sig['_down_count'] = 0  # reset on UP
 
-                # Guard: suppress duplicate ENTER alerts (oscillation fix)
-                if sig.get('enter_alert_sent'):
-                    log.info("CT #%s %s: re-entered ready (alert already sent, suppressing)",
-                             sig['id'], sym)
-                    print(f"  #{sig['id']} {sym}: re-entered ready (alert suppressed)")
-                    continue
+            # 9. Entry logic: option price within 1% above 15M support (UP only)
+            near_st = (0 <= gap_to_st <= _ENTRY_GAP_PCT)
 
-                opt_info = {
-                    'symbol': sig['option_symbol'],
-                    'price': opt_price,
-                    'qty': sig['quantity'],
-                    'sl_spot': sig['sl_spot'],
-                }
-                msg = format_enter_alert(result, option=opt_info)
+            log.info("CT #%s %s: opt=%s LTP=%.2f 15M_Sup=%.2f dir=%s gap=%.1f%% %s",
+                     sig['id'], sym, opt_sym, opt_ltp, st_val, st_dir,
+                     gap_to_st * 100,
+                     'ENTER' if near_st else 'waiting')
+            print(f"  #{sig['id']} {sym} {sig['direction']:<3} "
+                  f"opt={opt_ltp:.2f} 15M_Sup={st_val:.2f} {st_dir} "
+                  f"gap={gap_to_st*100:+.1f}% "
+                  f"{'-> ENTER' if near_st else '(watching)'}")
+
+            if near_st:
+                # 10. DTE check before auto-entry
+                opt_expiry = sig.get('option_expiry', '')
+                if opt_expiry:
+                    try:
+                        exp_date = datetime.strptime(str(opt_expiry)[:10], '%Y-%m-%d')
+                        dte = (exp_date - datetime.now()).days
+                        if dte < _MIN_DTE_AT_ENTRY:
+                            tracker.cancel(sig['id'],
+                                           f'DTE too low ({dte}d, min {_MIN_DTE_AT_ENTRY}d)')
+                            _send_telegram(
+                                f"\u274c <code>{sym}</code> {sig['direction']} CANCELLED"
+                                f" | DTE {dte}d (min {_MIN_DTE_AT_ENTRY}d)",
+                                dry_run=dry_run)
+                            print(f"  #{sig['id']} {sym}: DTE {dte}d too low -> cancelled")
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
+                # Auto-enter: watching → entered directly
+                tracker.mark_entered(sig['id'], ltp, opt_ltp)
+
+                msg = format_enter_alert(
+                    sym, sig['direction'], sig.get('timeframe', ''),
+                    opt_sym, opt_ltp, st_val,
+                    sig['quantity'], sig.get('sl_spot', 0),
+                    score=sig.get('score', 0))
                 _send_telegram(msg, dry_run=dry_run, channel='trade')
-                sig['enter_alert_sent'] = True
-                tracker._save()
-                log.info("CT #%s %s: ENTER alert sent (score=%d, opt=%s @ %.2f)",
-                         sig['id'], sym, total, sig['option_symbol'], opt_price)
-                print(f"  -> ENTER alert sent for #{sig['id']} {sym}")
+                log.info("CT #%s %s: AUTO-ENTERED spot=%.0f opt=%.2f",
+                         sig['id'], sym, ltp, opt_ltp)
+                print(f"  -> AUTO-ENTERED #{sig['id']} {sym} "
+                      f"(spot={ltp:,.0f}, opt={opt_ltp:.2f})")
 
         except Exception as e:
             print(f"  #{sig['id']} {sym}: ERROR -- {e}")
             log.exception("Error checking watching signal #%s %s", sig['id'], sym)
 
+    # Batch save 15M ST updates (avoids N saves per cycle)
+    if dirty:
+        tracker._save()
+
     # --- Check entered signals ---
     now_dt = datetime.now()
+    today_str = now_dt.strftime('%Y-%m-%d')
     for sig in entered:
         sym = sig['symbol']
+        opt_sym = sig.get('option_symbol', '')
         try:
-            tok, daily, hourly, _ = _get_cached_data(
-                kite, sym, _fetch_daily, _fetch_hourly, _fetch_15min,
-                _get_instrument_token)
+            # Option expiry check (CRITICAL — prevents stuck entered signals)
+            opt_expiry = sig.get('option_expiry', '')
+            if opt_expiry and str(opt_expiry)[:10] < today_str:
+                entry_opt = sig.get('entry_option_price') or 0
+                qty = sig.get('quantity') or 0
+                pnl = -entry_opt * qty if entry_opt > 0 else 0
+                tracker.mark_exited(sig['id'], 'option_expired',
+                                    exit_option_price=0)
+                _send_telegram(
+                    f"\u23f0 <b>EXPIRED</b> <code>{sym}</code> {sig['direction']}\n"
+                    f"Option <code>{opt_sym}</code> expired {opt_expiry}\n"
+                    f"<b>Rs {pnl:+,.0f}</b> (total loss)",
+                    dry_run=dry_run, channel='trade')
+                print(f"  #{sig['id']} {sym}: OPTION EXPIRED {opt_expiry}")
+                continue
 
+            # Fetch spot LTP
             ltp_data = kite.ltp([f'NSE:{sym}'])
             ltp = ltp_data.get(f'NSE:{sym}', {}).get('last_price')
             if ltp is None:
-                log.warning("CT #%s %s: no LTP (entered)", sig['id'], sym)
-                print(f"  #{sig['id']} {sym}: SKIP -- no LTP from Kite")
+                print(f"  #{sig['id']} {sym}: SKIP -- no spot LTP")
                 continue
 
             entry_price = sig.get('entry_price') or sig['signal_price']
             need_up = sig['direction'] == 'CE'
 
             if not entry_price:
-                log.warning("CT #%s %s: no entry price", sig['id'], sym)
                 print(f"  #{sig['id']} {sym}: SKIP -- no entry price")
                 continue
 
-            # --- FIX: EOD exit for daily timeframe trades (15:15) ---
+            # --- EOD exit for daily timeframe trades (15:15) ---
             if sig.get('timeframe') == 'daily' and now_dt.hour >= 15 and now_dt.minute >= 15:
-                opt_ltp = _fetch_option_ltp(kite, sig.get('option_symbol'))
+                opt_ltp = _fetch_option_ltp(kite, opt_sym)
                 entry_opt = sig.get('entry_option_price') or 0
                 msg = format_exit_alert(
                     sym, sig['direction'], entry_price, ltp,
-                    'EOD exit -- daily trade closing at 15:15',
+                    'EOD exit -- daily trade',
                     option_ltp=opt_ltp, entry_option_price=entry_opt or None)
                 _send_telegram(msg, dry_run=dry_run, channel='trade')
                 tracker.mark_exited(sig['id'], 'eod_daily',
                                     exit_spot=ltp, exit_option_price=opt_ltp)
-                log.info("CT #%s %s: EOD daily exit", sig['id'], sym)
                 print(f"  #{sig['id']} {sym}: EOD daily exit")
                 continue
 
-            # --- FIX: Time SL (5 trading days max hold) ---
+            # --- Time SL (5 trading days max hold) ---
             entry_at = sig.get('entry_at', '')
             if entry_at:
                 try:
@@ -879,81 +965,89 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                             biz_days += 1
                         d += timedelta(days=1)
                     if biz_days >= 5:
-                        opt_ltp = _fetch_option_ltp(kite, sig.get('option_symbol'))
+                        opt_ltp = _fetch_option_ltp(kite, opt_sym)
                         entry_opt = sig.get('entry_option_price') or 0
                         msg = format_exit_alert(
                             sym, sig['direction'], entry_price, ltp,
-                            f'Time SL -- held {biz_days} trading days',
+                            f'Time SL -- {biz_days} trading days',
                             option_ltp=opt_ltp, entry_option_price=entry_opt or None)
                         _send_telegram(msg, dry_run=dry_run, channel='trade')
                         tracker.mark_exited(sig['id'], f'time_sl_{biz_days}d',
                                             exit_spot=ltp, exit_option_price=opt_ltp)
-                        log.info("CT #%s %s: time SL (%dd)", sig['id'], sym, biz_days)
                         print(f"  #{sig['id']} {sym}: TIME SL ({biz_days}d)")
                         continue
                 except Exception:
                     pass
 
-            # --- Exhaustion check ---
-            result = check_exhaustion(
-                ltp, entry_price, sig['target_st'], need_up,
-                daily=daily, hourly=hourly,
-            )
+            # --- TP: spot touches higher-TF ST target ---
+            target_st = sig.get('target_st', 0)
+            if target_st:
+                tp_hit = False
+                if need_up and ltp >= target_st:
+                    tp_hit = True
+                elif not need_up and ltp <= target_st:
+                    tp_hit = True
 
-            move_pct = ((ltp - entry_price) / entry_price * 100
-                        if need_up
-                        else (entry_price - ltp) / entry_price * 100)
-
-            log.info("CT #%s %s: entry=%.0f ltp=%.0f move=%.1f%% -> %s",
-                     sig['id'], sym, entry_price, ltp, move_pct,
-                     result['action'] if result else 'holding')
-            print(f"  #{sig['id']} {sym} {sig['direction']:<3} "
-                  f"entry={entry_price:,.0f} ltp={ltp:,.0f} "
-                  f"move={move_pct:+.1f}% "
-                  f"-> {result['action'] if result else 'holding'}")
-
-            if result:
-                action = result['action']
-                reason = result['reason']
-                entry_opt_price = sig.get('entry_option_price') or 0
-                opt_ltp = _fetch_option_ltp(kite, sig.get('option_symbol'))
-                pnl_pct = None
-                if entry_opt_price and opt_ltp:
-                    pnl_pct = (opt_ltp - entry_opt_price) / entry_opt_price * 100
-
-                if action in ('TARGET HIT', 'TAKE PROFIT', 'EXIT'):
+                if tp_hit:
+                    opt_ltp = _fetch_option_ltp(kite, opt_sym)
+                    entry_opt = sig.get('entry_option_price') or 0
                     msg = format_exit_alert(
-                        sym, sig['direction'], entry_price, ltp, reason,
-                        pnl_pct=pnl_pct,
-                        option_ltp=opt_ltp if opt_ltp else None,
-                        entry_option_price=entry_opt_price if entry_opt_price else None,
-                    )
+                        sym, sig['direction'], entry_price, ltp,
+                        f'TP -- spot reached potential {target_st:,.0f}',
+                        option_ltp=opt_ltp, entry_option_price=entry_opt or None)
                     _send_telegram(msg, dry_run=dry_run, channel='trade')
-                    # FIX: Auto-mark as exited (prevents duplicate alerts)
-                    tracker.mark_exited(sig['id'], f'{action}: {reason}',
+                    tracker.mark_exited(sig['id'], f'tp_spot_touched_st',
                                         exit_spot=ltp, exit_option_price=opt_ltp)
-                    log.info("CT #%s %s: %s alert sent", sig['id'], sym, action)
-                    print(f"  -> {action} #{sig['id']} {sym} -- auto-closed")
-                elif action == 'CAUTION':
-                    # FIX: Dedup CAUTION alerts (30 min cooldown)
-                    last_caution = sig.get('last_caution_at', '')
-                    cooldown_ok = True
-                    if last_caution:
+                    print(f"  #{sig['id']} {sym}: TP -- spot touched ST {target_st:,.0f}")
+                    continue
+
+            # --- 15M ST break check on option ---
+            if opt_sym:
+                candles = _get_option_15m_cached(kite, opt_sym)
+                break_info = _check_15m_st_break(candles)
+
+                if break_info and break_info.get('broken'):
+                    opt_ltp = _fetch_option_ltp(kite, opt_sym)
+                    entry_opt = sig.get('entry_option_price') or 0
+
+                    # Compute days held
+                    days_held = 0
+                    if entry_at:
                         try:
-                            lc_dt = datetime.fromisoformat(last_caution)
-                            cooldown_ok = (now_dt - lc_dt).total_seconds() > 1800
+                            entry_dt = datetime.fromisoformat(entry_at)
+                            days_held = (now_dt - entry_dt).days
                         except Exception:
                             pass
-                    if cooldown_ok:
-                        caution_msg = (
-                            f"[!] <b>CAUTION</b> <code>{sym}</code> {sig['direction']}\n"
-                            f"\n{reason}\nLTP: {ltp:,.0f} | Move: {move_pct:+.1f}%"
-                        )
-                        _send_telegram(caution_msg, dry_run=dry_run, channel='trade')
-                        sig['last_caution_at'] = now_dt.isoformat(timespec='seconds')
-                        tracker._save()
-                        log.info("CT #%s %s: CAUTION alert sent", sig['id'], sym)
-                        print(f"  -> CAUTION #{sig['id']} {sym}")
+
+                    msg = format_exit_15m_st(
+                        sym, sig['direction'],
+                        entry_opt, opt_ltp,
+                        break_info['st_value'], break_info['candle_close'],
+                        sig.get('quantity', 0), days_held)
+                    _send_telegram(msg, dry_run=dry_run, channel='trade')
+                    tracker.mark_exited(sig['id'], '15m_st_break',
+                                        exit_spot=ltp, exit_option_price=opt_ltp)
+                    print(f"  #{sig['id']} {sym}: 15M ST BROKEN -- exit")
+                    continue
+
+                # Compute current ST for status display
+                st_info = compute_option_15m_st(candles)
+                if st_info:
+                    st_val = st_info['st_value']
+                    st_dir = st_info['direction']
+                    opt_ltp = _fetch_option_ltp(kite, opt_sym)
+                    gap = (opt_ltp - st_val) / st_val * 100 if st_val > 0 else 0
+
+                    move_pct = ((ltp - entry_price) / entry_price * 100
+                                if need_up
+                                else (entry_price - ltp) / entry_price * 100)
+
+                    print(f"  #{sig['id']} {sym} {sig['direction']:<3} "
+                          f"spot={ltp:,.0f}({move_pct:+.1f}%) "
+                          f"opt={opt_ltp:.2f} 15M_Sup={st_val:.2f} {st_dir} "
+                          f"gap={gap:+.1f}% -> holding")
+                else:
+                    print(f"  #{sig['id']} {sym}: holding (no 15M ST data)")
 
         except Exception as e:
             print(f"  #{sig['id']} {sym}: ERROR -- {e}")
@@ -961,18 +1055,23 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
 
 
 def monitor_loop(kite, tracker: ConfidenceTracker, dry_run: bool = False):
-    """Long-running poll loop. Runs every 5 min during market hours."""
-    POLL_INTERVAL = 300  # 5 minutes
-    WAIT_SLEEP = 30      # sleep interval while waiting for market
-    WAIT_LOG_INTERVAL = 300  # print "waiting" message every 5 minutes
+    """Long-running poll loop aligned to 15M candle boundaries.
 
-    print("  Confidence tracker monitor started. Ctrl+C to stop.")
+    Polls at :00:05, :15:05, :30:05, :45:05 of each hour — right after
+    each 15M candle closes. This ensures we always work with complete
+    candle data for accurate ST computation.
 
-    last_wait_msg = 0  # timestamp of last "waiting for market" print
+    During market hours (9:15-15:30), polls every 15M boundary.
+    """
+    WAIT_SLEEP = 30
+    WAIT_LOG_INTERVAL = 300
+
+    print("  Confidence tracker started (15M boundary-aligned). Ctrl+C to stop.")
+
+    last_wait_msg = 0
 
     while True:
         now = datetime.now()
-        # Market hours: Mon-Fri 9:15-15:30
         is_weekday = now.weekday() < 5
         market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
         market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -984,7 +1083,6 @@ def monitor_loop(kite, tracker: ConfidenceTracker, dry_run: bool = False):
             if not is_weekday:
                 print(f"  Weekend ({now.strftime('%A')}). Exiting.")
                 break
-            # Before market open -- wait with periodic status messages
             wait_secs = (market_open - now).total_seconds()
             now_ts = time.time()
             if now_ts - last_wait_msg >= WAIT_LOG_INTERVAL:
@@ -1006,12 +1104,13 @@ def monitor_loop(kite, tracker: ConfidenceTracker, dry_run: bool = False):
             log.error("monitor_loop error: %s", e)
             print(f"  Loop error: {e}")
 
-        # Wait for next poll
-        next_run = datetime.now() + timedelta(seconds=POLL_INTERVAL)
-        print(f"  Next check at {next_run.strftime('%H:%M:%S')} "
-              f"(in {POLL_INTERVAL//60} min)")
+        # Sleep until next 15M boundary + 5 seconds
+        sleep_secs = _seconds_to_next_15m_boundary()
+        next_boundary = datetime.now() + timedelta(seconds=sleep_secs)
+        print(f"  Next poll at {next_boundary.strftime('%H:%M:%S')} "
+              f"(in {sleep_secs/60:.1f} min, after 15M candle close)")
         try:
-            time.sleep(POLL_INTERVAL)
+            time.sleep(sleep_secs)
         except KeyboardInterrupt:
             print("\n  Stopped by user.")
             break
@@ -1028,8 +1127,8 @@ def print_tracker_list(signals: list):
         return
 
     print(f"\n  {'ID':<4} {'Symbol':<10} {'Dir':<4} {'TF':<8} "
-          f"{'Target':<10} {'Status':<10} {'Score':<6} {'Entry':<8} {'P&L':>10}")
-    print(f"  {'-' * 78}")
+          f"{'Target':<10} {'Status':<10} {'15M ST':<10} {'Entry':<8} {'P&L':>10}")
+    print(f"  {'-' * 82}")
     total_pnl = 0
     wins = losses = 0
     for s in signals:
@@ -1043,20 +1142,17 @@ def print_tracker_list(signals: list):
                 wins += 1
             else:
                 losses += 1
-        sig_id = s.get('id', '?')
-        sym = s.get('symbol', '?')
-        direction = s.get('direction', '?')
-        timeframe = s.get('timeframe', '?')
-        target_st = s.get('target_st', 0)
-        status = s.get('status', '?')
-        score = s.get('score', 0)
-        print(f"  {sig_id:<4} {sym:<10} {direction:<4} "
-              f"{timeframe:<8} {target_st:<10,.0f} "
-              f"{status:<10} {score:<6} {entry_str:<8} {pnl_str:>10}")
+        st_15m = s.get('last_15m_st')
+        st_dir = s.get('last_15m_dir', '')
+        st_str = f"{st_15m:.2f} {st_dir}" if st_15m else '--'
+        print(f"  {s.get('id', '?'):<4} {s.get('symbol', '?'):<10} "
+              f"{s.get('direction', '?'):<4} {s.get('timeframe', '?'):<8} "
+              f"{s.get('target_st', 0):<10,.0f} {s.get('status', '?'):<10} "
+              f"{st_str:<10} {entry_str:<8} {pnl_str:>10}")
         if s.get('exit_reason'):
             print(f"  {'':4} Exit: {s['exit_reason']}")
     if wins + losses > 0:
-        print(f"  {'-' * 78}")
+        print(f"  {'-' * 82}")
         print(f"  {'':4} Total P&L: Rs {total_pnl:+,.0f} | "
               f"{wins}W / {losses}L | "
               f"Win rate: {wins/(wins+losses)*100:.0f}%")

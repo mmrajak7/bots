@@ -224,15 +224,31 @@ def cmd_ctrack(args):
         except Exception as e:
             print(f"  Context computation skipped: {e}")
 
+        # Compute 15M ST on option for WATCHING alert
+        st15m = None
+        try:
+            from .confidence_tracker import (
+                _send_telegram, _fetch_option_15m, compute_option_15m_st,
+            )
+            opt_candles = _fetch_option_15m(kite, args.ctrack_option)
+            st15m = compute_option_15m_st(opt_candles)
+            if st15m:
+                print(f"\n  15M ST on {args.ctrack_option}: "
+                      f"{st15m['st_value']:.2f} {st15m['direction']} "
+                      f"(close: {st15m['close']:.2f})")
+        except Exception as e:
+            print(f"  15M ST computation skipped: {e}")
+            from .confidence_tracker import _send_telegram
+
         # Send WATCHING Telegram alert
         opt_info = {
             'symbol': args.ctrack_option,
             'price': args.ctrack_price,
             'qty': args.ctrack_qty,
         }
-        msg = format_watch_alert(result, option=opt_info, corr_block=corr_block)
+        msg = format_watch_alert(result, option=opt_info,
+                                 st15m=st15m, corr_block=corr_block)
         dry = getattr(args, 'dry_run', False)
-        from .confidence_tracker import _send_telegram
         _send_telegram(msg, dry_run=dry)
 
         print(f"\n  Signal #{sig['id']} added: {sym} {direction} | "
