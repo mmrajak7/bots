@@ -204,6 +204,15 @@ class KiteAuthenticator:
             )
 
         logger.debug("Login page loaded successfully")
+
+        # Set headers required by Zerodha's CAPTCHA/bot detection (Apr 2026)
+        login_url = f"{self.KITE_BASE_URL}/connect/login?v=3&api_key={self.api_key}"
+        self.session.headers.update({
+            'X-Requested-With': 'XMLHttpRequest',
+            'Origin': self.KITE_BASE_URL,
+            'Referer': login_url,
+        })
+
         return None
 
     def _step2_submit_credentials(self) -> str:

@@ -157,6 +157,13 @@ def generate_access_token(creds: Dict[str, str]) -> Tuple[bool, str, Optional[st
         if response.status_code != 200:
             return False, f"Failed to load login page: HTTP {response.status_code}", None
 
+        # Set headers required by Zerodha's CAPTCHA/bot detection (Apr 2026)
+        session.headers.update({
+            'X-Requested-With': 'XMLHttpRequest',
+            'Origin': KITE_BASE_URL,
+            'Referer': login_url,
+        })
+
         # Step 2: Submit credentials
         logger.debug("Step 2: Submitting credentials...")
         login_endpoint = f"{KITE_BASE_URL}/api/login"
