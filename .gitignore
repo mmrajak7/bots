@@ -33,6 +33,7 @@ Scalper/config/credentials.yaml
 
 # CROCODILE config (has credentials)
 CROCODILE/config/config.yaml
+!CROCODILE/config/cred.env.template
 
 # Python
 __pycache__/
