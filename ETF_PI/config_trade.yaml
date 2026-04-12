@@ -1,0 +1,51 @@
+# Option Magnet - Trade Execution Config
+# ==============================================
+# Controls the Neo trader for live order execution
+# ==============================================
+
+# Master switch: set false for signal-only mode (no orders placed)
+trade_enabled: false
+
+# Log-only mode: logs order params but doesn't place real orders
+# Set true for day-1 validation before going live
+log_only: true
+
+# Position sizing
+num_lots: 1                    # Number of lots per signal (lot_size from instruments)
+max_concurrent_positions: 3    # Max open Neo positions at once
+
+# Product type for orders
+product: "MIS"                 # MIS for intraday, NRML for positional
+
+# Order execution
+entry_tick_buffer: 0.15        # Add to ask for entry LIMIT BUY (3 ticks, was 0.05)
+exit_tick_buffer: 0.10         # Subtract from bid for exit LIMIT SELL (2 ticks)
+tp_order_enabled: true         # Place TP LIMIT SELL at ST value on exchange
+
+# Time-based SL (in minutes)
+# Hard cap: TP or cut. Apr 2026 backtest:
+#   45m cap flips strategy from -72.6% to +90.3%
+#   Sacrifices 11 slow TPs (+46%) but saves 29 losers (-209%)
+#   1H gets 60m since all 1H TPs are 60-120m
+time_sl:
+  15minute: 45                 # hard cap 45m
+  30minute: 45                 # hard cap 45m
+  60minute: 60                 # 1 candle grace (2/3 TPs at 60m)
+  default: 45                  # hard cap
+
+# Risk management (H4 circuit breaker)
+max_loss_per_day: 10000        # INR — block new entries if daily loss exceeds this
+max_lots_per_order: 5          # Fat finger protection
+
+# SEBI April 2026 compliance
+# market_protection: max % deviation from LTP (for MARKET/SL-M orders)
+# For LIMIT orders (our only order type), the limit price IS the protection.
+# Set to "0" for LIMIT orders — broker applies its own price band checks.
+# If you ever switch to MARKET orders, set this to 3-5%.
+market_protection: "0"
+
+# Neo credentials (secrets — separate file, git-ignored)
+neo_credentials_file: "neo_credentials.yaml"
+
+# Audit logging
+log_dir: "logs"
