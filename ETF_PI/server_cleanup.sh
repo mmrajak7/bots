@@ -13,7 +13,7 @@
 # Safe to run multiple times. Does NOT touch /home/trustit/Desktop/BOTS/
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
 
 REPO_DIR="/home/trustit/Desktop/Scripts/bots"
 ETF_DIR="$REPO_DIR/ETF_PI"
@@ -81,7 +81,7 @@ for f in "${LOCAL_FILES[@]}"; do
     if [ -f "$ETF_DIR/$f" ]; then
         cp "$ETF_DIR/$f" "$BACKUP_DIR/"
         ok "backed up $f"
-        ((backed_up++))
+        backed_up=$((backed_up + 1))
     fi
 done
 
@@ -97,7 +97,7 @@ for f in "$ETF_DIR"/st_opt_*.json "$ETF_DIR"/*_state.json "$ETF_DIR"/*_positions
     if [ -f "$f" ]; then
         cp "$f" "$BACKUP_DIR/"
         ok "backed up $(basename $f)"
-        ((backed_up++))
+        backed_up=$((backed_up + 1))
     fi
 done
 
@@ -162,7 +162,7 @@ for f in "${LOCAL_FILES[@]}"; do
     if [ -f "$BACKUP_DIR/$f" ]; then
         cp "$BACKUP_DIR/$f" "$ETF_DIR/"
         ok "restored $f"
-        ((restored++))
+        restored=$((restored + 1))
     fi
 done
 
@@ -178,7 +178,7 @@ for f in "$BACKUP_DIR"/st_opt_*.json "$BACKUP_DIR"/*_state.json "$BACKUP_DIR"/*_
     if [ -f "$f" ]; then
         cp "$f" "$ETF_DIR/"
         ok "restored $(basename $f)"
-        ((restored++))
+        restored=$((restored + 1))
     fi
 done
 
