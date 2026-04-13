@@ -679,12 +679,13 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
         stock = sig['stock']
         timeframe = sig['timeframe']
 
-        # Already watching/entered/cancelled-today for this stock?
+        # Already watching/entered/exited-today/cancelled-today for this stock?
         today_str = datetime.now().strftime('%Y-%m-%d')
         existing = [t for t in store._trades
                     if t['stock'] == stock
                     and (t['status'] in ('watching', 'entered')
-                         or (t['status'] == 'cancelled' and t.get('exit_date') == today_str))]
+                         or (t['status'] in ('cancelled', 'exited')
+                             and t.get('exit_date') == today_str))]
         if existing:
             skipped_reasons['already_active'] += 1
             continue
