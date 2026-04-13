@@ -82,6 +82,8 @@ _DEFAULTS = {
     'daily_premium_sl_pct': 0.25,      # 25% — tighter for intraday (backtest: +80L vs +63L at 40%)
     'use_confidence_tracker': False,   # True = delegate entry/exit to confidence tracker (pullback timing)
     'confidence_poll_sec': 300,        # 5 min — how often confidence tracker checks entry timing
+    'st_period': 10,                   # Supertrend period
+    'st_multiplier': 3,               # Supertrend multiplier
 }
 
 import json as _json
@@ -142,10 +144,9 @@ LOTS_PER_TRADE = _runtime['lots_per_trade']
 MAX_OPEN_TRADES = _runtime['max_open_trades']
 MAX_CAPITAL_PER_TRADE = _runtime.get('max_capital_per_trade', 50000)
 
-# ── Option selection ──────────────────────────────────────────────────────
 # ── Supertrend parameters ───────────────────────────────────────────────
-ST_PERIOD = 10
-ST_MULTIPLIER = 3
+ST_PERIOD = _runtime.get('st_period', 10)
+ST_MULTIPLIER = _runtime.get('st_multiplier', 3)
 
 # ── Daily velocity thresholds ───────────────────────────────────────────
 DAILY_VELOCITY_3D_MAX = _runtime.get('daily_velocity_3d_max', -0.5)
