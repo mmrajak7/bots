@@ -13,6 +13,7 @@ apscheduler>=3.10.0
 
 # API & Network
 requests>=2.31.0
+curl_cffi>=0.5.9
 pyotp>=2.9.0
 python-dotenv>=1.0.0  # Environment variables for secure credential management
 

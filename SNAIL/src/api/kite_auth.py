@@ -15,8 +15,8 @@ No browser needed - perfect for headless Raspberry Pi deployment.
 import os
 import json
 import hashlib
-import requests
 import pyotp
+from curl_cffi import requests as curl_requests
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -76,14 +76,8 @@ class KiteAuthenticator:
         token_file = config.get('token_file', '../data/kite_access_token.json')
         self.token_file = Path(token_file)
 
-        # HTTP session with browser-like headers
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-        })
+        # HTTP session with Chrome TLS fingerprint (bypasses JA3-based bot detection)
+        self.session = curl_requests.Session(impersonate="chrome120")
 
         self._validate_config()
 
@@ -359,7 +353,7 @@ class KiteAuthenticator:
         }
 
         logger.debug("[5/5] Generating access token...")
-        response = requests.post(token_endpoint, data=payload, timeout=30)
+        response = self.session.post(token_endpoint, data=payload, timeout=30)
 
         if response.status_code != 200:
             raise KiteAuthenticationError(

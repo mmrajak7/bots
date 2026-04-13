@@ -8,8 +8,8 @@ Called by orchestrator during morning startup.
 import os
 import json
 import hashlib
-import requests
 import pyotp
+from curl_cffi import requests as curl_requests
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -140,13 +140,7 @@ def generate_access_token(creds: Dict[str, str]) -> Tuple[bool, str, Optional[st
     """
     logger.info(f"Generating access token for user {creds['user_id']}")
 
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-    })
+    session = curl_requests.Session(impersonate="chrome120")
 
     try:
         # Step 1: Get login page
@@ -272,11 +266,12 @@ def generate_access_token(creds: Dict[str, str]) -> Tuple[bool, str, Optional[st
         logger.info(f"Access token generated successfully for {creds['user_id']}")
         return True, "Token generated successfully", access_token
 
-    except requests.Timeout:
-        return False, "Request timed out", None
-    except requests.RequestException as e:
-        return False, f"Network error: {e}", None
     except Exception as e:
+        error_str = str(e).lower()
+        if 'timeout' in error_str:
+            return False, "Request timed out", None
+        elif 'connect' in error_str or 'network' in error_str or 'resolve' in error_str:
+            return False, f"Network error: {e}", None
         return False, f"Unexpected error: {e}", None
 
 
