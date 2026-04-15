@@ -145,6 +145,8 @@ class SpotTracker:
     # -- Query --
 
     def is_tracking(self, magnet_trade_id: int) -> bool:
+        if magnet_trade_id == 0:
+            return False  # Chartink-direct signals dedup by symbol, not ID
         return any(s['magnet_trade_id'] == magnet_trade_id
                    and s['status'] in _ENTRY_ACTIVE
                    for s in self._data['signals'])
@@ -486,55 +488,111 @@ def _check_age_limit(sig: dict, now: datetime) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-#  Core: pickup WATCHING + ENTERED signals
+#  Core: pickup from Chartink directly + ENTERED signals
 # ---------------------------------------------------------------------------
 
-def pickup_new_signals(kite, tracker: SpotTracker, dry_run: bool = False):
-    """Pick up new WATCHING signals for entry timing."""
-    watching = _read_magnet_by_status('watching')
-    if not watching:
-        return
+def pickup_from_chartink(kite, tracker: SpotTracker, dry_run: bool = False):
+    """Scan Chartink directly and start tracking immediately.
 
+    Does NOT wait for magnet system validation (freshness, velocity, etc.).
+    Any stock within 3% of ST gets tracked for pullback->flip entry timing.
+    """
     if tracker.active_count() >= _MAX_ACTIVE_SIGNALS:
         return
 
+    from .scanner import run_all_scanners, get_ltp, compute_st_for_stock
+    from . import config as mcfg
+
+    # Step 1: Chartink scan
+    raw = run_all_scanners()
+    if not raw:
+        return
+
+    # Dedup by stock (keep first timeframe)
+    seen = set()
+    unique = []
+    for sig in raw:
+        if sig['stock'] not in seen:
+            seen.add(sig['stock'])
+            unique.append(sig)
+
+    # Already tracking these symbols? (ANY type — entry OR exit)
+    active_syms = {s['symbol'] for s in tracker.get_active()}
+    # Also include terminal exit_alert (already got heads-up for these)
+    alerted_syms = {s['symbol'] for s in tracker.list_all()
+                    if s['status'] == 'exit_alert'}
+    skip_syms = active_syms | alerted_syms
+
+    candidates = [s for s in unique if s['stock'] not in skip_syms]
+    if not candidates:
+        return
+
+    # Step 2: LTP
+    stocks = [s['stock'] for s in candidates]
+    ltps = get_ltp(kite, stocks)
+
     picked = 0
-    for mt in watching:
+    for sig in candidates:
         if tracker.active_count() >= _MAX_ACTIVE_SIGNALS:
             break
-        if tracker.is_tracking(mt['id']):
+
+        stock = sig['stock']
+        timeframe = sig['timeframe']
+        price = ltps.get(stock)
+        if not price:
             continue
 
-        active_syms = {s['symbol'] for s in tracker.get_active()
-                       if s.get('tracking_type') == 'entry'}
-        if mt['stock'] in active_syms:
-            continue
-
-        st_info = fetch_spot_15m_st(kite, mt['stock'])
+        # Step 3: Compute higher-TF ST (for direction + target)
+        st_info = compute_st_for_stock(kite, stock, timeframe)
         if not st_info:
             continue
 
-        try:
-            ltp = kite.ltp([f"NSE:{mt['stock']}"])[f"NSE:{mt['stock']}"]['last_price']
-        except Exception:
-            ltp = st_info['close']
+        st_val = st_info['st']
+        gap = abs(price - st_val) / st_val
 
-        sig = tracker.add(mt, st_info['direction'], st_info['st_value'], ltp)
+        # Basic sanity: within 5% (Chartink already filters ~3%, but be safe)
+        if gap > 0.05:
+            continue
+
+        # Direction: above ST = PE (expect fall), below ST = CE (expect rally)
+        side = 'above' if price > st_val else 'below'
+        direction = 'PE' if side == 'above' else 'CE'
+
+        # Build a synthetic magnet-trade-like dict for add()
+        pseudo_trade = {
+            'id': 0,  # no magnet trade ID (independent signal)
+            'stock': stock,
+            'timeframe': timeframe,
+            'direction': direction,
+            'st_value': st_val,
+            'signal_price': price,
+            'signal_gap_pct': round(gap * 100, 2),
+            'option_expiry': '',
+        }
+
+        # Fetch spot 15M ST
+        spot_st = fetch_spot_15m_st(kite, stock)
+        if not spot_st:
+            continue
+
+        sig_obj = tracker.add(pseudo_trade, spot_st['direction'],
+                              spot_st['st_value'], price)
         picked += 1
-        print(f"  [strack] Picked up #{sig['id']} {sig['symbol']} "
-              f"{sig['direction']} [{sig['timeframe']}] "
-              f"15M={st_info['direction']} -> {sig['status'].upper()}")
+        print(f"  [strack] Chartink #{sig_obj['id']} {stock} "
+              f"{direction} [{timeframe}] gap={gap*100:.1f}% "
+              f"15M={spot_st['direction']} -> {sig_obj['status'].upper()}")
 
-        if sig['status'] == 'pullback':
+        if sig_obj['status'] == 'pullback':
             _send_telegram(
-                f"<b>PULLBACK</b> <code>{sig['symbol']}</code> "
-                f"{sig['direction']} [{sig['timeframe'][:1].upper()}]\n"
-                f"Spot 15M already {st_info['direction']} (against {sig['direction']})\n"
-                f"Watching for flip to {sig['need_reentry_dir']}...",
+                f"<b>PULLBACK</b> <code>{stock}</code> "
+                f"{direction} [{timeframe[:1].upper()}]\n"
+                f"Spot 15M already {spot_st['direction']} (against {direction})\n"
+                f"Watching for flip to {sig_obj['need_reentry_dir']}...\n"
+                f"Spot {price:,.2f} | ST {st_val:,.2f} | Gap {gap*100:.1f}%",
                 dry_run=dry_run)
 
     if picked:
-        print(f"  [strack] Picked up {picked} new entry signal(s)")
+        print(f"  [strack] Picked up {picked} from Chartink")
 
 
 def pickup_entered_trades(kite, tracker: SpotTracker, dry_run: bool = False):
@@ -603,26 +661,26 @@ def poll_once(kite, tracker: SpotTracker, dry_run: bool = False):
 
         # -- Guards (shared for entry + exit) --
 
-        # Magnet trade status check
-        mt = _get_magnet_trade(sig['magnet_trade_id'])
-        mt_status = mt.get('status', 'unknown') if mt else 'not_found'
+        # Magnet trade status check (skip for Chartink-direct signals with id=0)
+        mt_id = sig.get('magnet_trade_id', 0)
+        if mt_id and mt_id > 0:
+            mt = _get_magnet_trade(mt_id)
+            mt_status = mt.get('status', 'unknown') if mt else 'not_found'
 
-        if ttype == 'entry':
-            if mt_status not in ('watching', 'entered', 'unknown'):
-                tracker.cancel(sig['id'], f'magnet trade {mt_status}')
-                print(f"  [strack] #{sig['id']} {sym}: cancelled (magnet {mt_status})")
-                continue
-            # Auto-transition: magnet entered while we're still tracking entry
-            if mt_status == 'entered' and sig['status'] in _ENTRY_ACTIVE:
-                tracker.cancel(sig['id'], 'magnet entered, will track exit separately')
-                print(f"  [strack] #{sig['id']} {sym}: entry cancelled (magnet entered)")
-                continue
-        elif ttype == 'exit':
-            # Exit tracking: cancel if magnet trade exited/cancelled
-            if mt_status in ('exited', 'cancelled', 'not_found'):
-                tracker.cancel(sig['id'], f'magnet trade {mt_status}')
-                print(f"  [strack] #{sig['id']} {sym}: exit tracking ended ({mt_status})")
-                continue
+            if ttype == 'entry':
+                if mt_status not in ('watching', 'entered', 'unknown'):
+                    tracker.cancel(sig['id'], f'magnet trade {mt_status}')
+                    print(f"  [strack] #{sig['id']} {sym}: cancelled (magnet {mt_status})")
+                    continue
+                if mt_status == 'entered' and sig['status'] in _ENTRY_ACTIVE:
+                    tracker.cancel(sig['id'], 'magnet entered, will track exit separately')
+                    print(f"  [strack] #{sig['id']} {sym}: entry cancelled (magnet entered)")
+                    continue
+            elif ttype == 'exit':
+                if mt_status in ('exited', 'cancelled', 'not_found'):
+                    tracker.cancel(sig['id'], f'magnet trade {mt_status}')
+                    print(f"  [strack] #{sig['id']} {sym}: exit tracking ended ({mt_status})")
+                    continue
 
         # Age / DTE check (entry only; exit signals need alerts until expiry)
         if ttype == 'entry':
@@ -768,10 +826,10 @@ def _seconds_to_next_15m() -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_scan(kite, tracker: SpotTracker, dry_run: bool = False):
-    """One-shot: pick up new signals + poll once."""
+    """One-shot: Chartink scan + pick up entered trades + poll."""
     print(f"\n  [strack] {datetime.now().strftime('%H:%M:%S')} Scan + poll")
     pickup_entered_trades(kite, tracker, dry_run=dry_run)   # exit first (protect capital)
-    pickup_new_signals(kite, tracker, dry_run=dry_run)      # entry second
+    pickup_from_chartink(kite, tracker, dry_run=dry_run)    # direct from Chartink
     poll_once(kite, tracker, dry_run=dry_run)
 
 
@@ -846,7 +904,7 @@ def cmd_monitor(kite, tracker: SpotTracker, dry_run: bool = False):
         while True:
             if _is_market_hours():
                 pickup_entered_trades(kite, tracker, dry_run=dry_run)
-                pickup_new_signals(kite, tracker, dry_run=dry_run)
+                pickup_from_chartink(kite, tracker, dry_run=dry_run)
                 poll_once(kite, tracker, dry_run=dry_run)
 
                 sleep_sec = min(_seconds_to_next_15m(), _POLL_INTERVAL_SEC)
