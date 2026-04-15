@@ -153,6 +153,8 @@ class SpotTracker:
 
     def is_tracking_exit(self, magnet_trade_id: int) -> bool:
         """Check if already tracking exit (active OR already alerted)."""
+        if magnet_trade_id == 0:
+            return False  # Chartink-direct signals dedup by symbol, not ID
         return any(s['magnet_trade_id'] == magnet_trade_id
                    and s['status'] in ('exit_tracking', 'exit_alert')
                    for s in self._data['signals'])
@@ -516,12 +518,11 @@ def pickup_from_chartink(kite, tracker: SpotTracker, dry_run: bool = False):
             seen.add(sig['stock'])
             unique.append(sig)
 
-    # Already tracking these symbols? (ANY type — entry OR exit)
+    # Already tracking OR already alerted — skip all of these
     active_syms = {s['symbol'] for s in tracker.get_active()}
-    # Also include terminal exit_alert (already got heads-up for these)
-    alerted_syms = {s['symbol'] for s in tracker.list_all()
-                    if s['status'] == 'exit_alert'}
-    skip_syms = active_syms | alerted_syms
+    done_syms = {s['symbol'] for s in tracker.list_all()
+                 if s['status'] in ('exit_alert', 'alerted')}
+    skip_syms = active_syms | done_syms
 
     candidates = [s for s in unique if s['stock'] not in skip_syms]
     if not candidates:
@@ -550,8 +551,8 @@ def pickup_from_chartink(kite, tracker: SpotTracker, dry_run: bool = False):
         st_val = st_info['st']
         gap = abs(price - st_val) / st_val
 
-        # Basic sanity: within 5% (Chartink already filters ~3%, but be safe)
-        if gap > 0.05:
+        # Chartink pre-filters at 3.1%. Allow 3.5% for minor ST divergence.
+        if gap > 0.035:
             continue
 
         # Direction: above ST = PE (expect fall), below ST = CE (expect rally)
@@ -661,9 +662,10 @@ def poll_once(kite, tracker: SpotTracker, dry_run: bool = False):
 
         # -- Guards (shared for entry + exit) --
 
-        # Magnet trade status check (skip for Chartink-direct signals with id=0)
+        # Magnet trade status check
         mt_id = sig.get('magnet_trade_id', 0)
         if mt_id and mt_id > 0:
+            # Magnet-linked signal: check magnet trade lifecycle
             mt = _get_magnet_trade(mt_id)
             mt_status = mt.get('status', 'unknown') if mt else 'not_found'
 
@@ -681,6 +683,14 @@ def poll_once(kite, tracker: SpotTracker, dry_run: bool = False):
                     tracker.cancel(sig['id'], f'magnet trade {mt_status}')
                     print(f"  [strack] #{sig['id']} {sym}: exit tracking ended ({mt_status})")
                     continue
+        elif ttype == 'entry' and sig['status'] in _ENTRY_ACTIVE:
+            # Chartink-direct signal (mt_id=0): check if magnet entered this stock
+            entered_stocks = {t['stock'] for t in _load_magnet_snapshot()
+                              if t.get('status') == 'entered'}
+            if sym in entered_stocks:
+                tracker.cancel(sig['id'], 'stock entered via magnet')
+                print(f"  [strack] #{sig['id']} {sym}: cancelled (magnet entered same stock)")
+                continue
 
         # Age / DTE check (entry only; exit signals need alerts until expiry)
         if ttype == 'entry':
