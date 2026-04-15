@@ -3,7 +3,9 @@
 Flow:
   1. Magnet scanner detects stock near higher-TF ST → WATCHING signal.
   2. Monitor delegates to tracker → picks option → computes 15M ST on option.
-  3. When option price pulls back to within 1% above 15M ST → ENTER alert.
+  3. When option price pulls back to within 3% above 15M ST → ENTER alert.
+     Also detects 15M candle wick touches (low within threshold, close above ST).
+     Sends APPROACHING alert at 5% gap for early heads-up.
   4. After entry: if 15M candle CLOSES below ST → EXIT (15M ST broken).
   5. Existing exits preserved: TP (spot touches higher-TF ST), Time SL (5d),
      EOD daily, spot SL.
@@ -34,7 +36,8 @@ _TRACKER_PATH = _HELPER / 'logs' / 'confidence_tracker.json'
 log = logging.getLogger(__name__)
 
 # Entry/exit thresholds
-_ENTRY_GAP_PCT = 0.01     # alert when option price within 1% above 15M ST
+_ENTRY_GAP_PCT = 0.03     # alert when option price within 3% above 15M ST
+_ENTRY_GAP_ABS = 0.30     # absolute floor for cheap options (Rs 0.30 minimum gap tolerance)
 _ST_PERIOD = 10
 _ST_MULTIPLIER = 3
 _MIN_15M_CANDLES = 15     # minimum candles for ST computation
@@ -42,6 +45,10 @@ _15M_FETCH_DAYS = 10      # fetch 10 days of 15M data (covers ~7 trading days)
 _GAP_DOWN_PCT = -0.03     # cancel if option drops >3% below 15M support
 _THETA_DECAY_PCT = 0.40   # cancel if option loses >40% from initial price while watching
 _MIN_DTE_AT_ENTRY = 3     # minimum DTE to allow auto-entry
+_WICK_LTP_MAX_PCT = 0.05  # wick entry only if current LTP within 5% of ST
+_APPROACH_GAP_PCT = 0.05  # send approaching alert when gap <= 5%
+_APPROACH_RESET_PCT = 0.10  # reset approaching flag when gap widens above 10%
+_MIN_OPTION_PRICE = 5.0   # skip entry for options priced below Rs 5 (unreliable 15M data)
 
 
 # ---------------------------------------------------------------------------
@@ -270,13 +277,15 @@ def format_watch_alert(result: dict, option: Optional[dict] = None,
 def format_enter_alert(sym: str, direction: str, tf: str,
                        option_symbol: str, opt_ltp: float,
                        st_value: float, qty: int,
-                       sl_spot: float, score: int = 0) -> str:
+                       sl_spot: float, score: int = 0,
+                       via_wick: bool = False) -> str:
     """Format compact ENTER alert — option near 15M support."""
     tf_short = {'monthly': 'M', 'weekly': 'W', 'daily': 'D'}.get(tf, tf)
     gap = (opt_ltp - st_value) / st_value * 100 if st_value > 0 else 0
+    method = 'WICK ENTER' if via_wick else 'ENTER'
 
     lines = [
-        f"\U0001f7e2 <b>ENTER</b> <code>{sym}</code> {direction} [{tf_short}]",
+        f"\U0001f7e2 <b>{method}</b> <code>{sym}</code> {direction} [{tf_short}]",
         f"Option @ {opt_ltp:.2f} | 15M Support {st_value:.2f} ({gap:+.1f}%)",
         f"<code>{option_symbol}</code> | {qty} qty | SL {sl_spot:,.0f}",
     ]
@@ -800,6 +809,14 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                 print(f"  #{sig['id']} {sym}: option expired, cancelled")
                 continue
 
+            # 5a. Min option price guard: skip sub-Rs 5 options (unreliable 15M data)
+            if opt_ltp < _MIN_OPTION_PRICE:
+                log.info("CT #%s %s: option at Rs %.2f < Rs %.0f min, skipping",
+                         sig['id'], sym, opt_ltp, _MIN_OPTION_PRICE)
+                print(f"  #{sig['id']} {sym}: option Rs {opt_ltp:.2f} "
+                      f"< Rs {_MIN_OPTION_PRICE:.0f} min, skipping")
+                continue
+
             # 6. THETA DECAY guard: cancel if option lost >40% from initial price
             initial_price = sig.get('option_price', 0)
             if initial_price > 0 and opt_ltp < initial_price * (1 - _THETA_DECAY_PCT):
@@ -849,17 +866,74 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
             else:
                 sig['_down_count'] = 0  # reset on UP
 
-            # 9. Entry logic: option price within 1% above 15M support (UP only)
-            near_st = (0 <= gap_to_st <= _ENTRY_GAP_PCT)
+            # 8a. Approaching alert: heads-up when gap <= 5% (one-shot, reset at 10%)
+            if gap_to_st <= _APPROACH_GAP_PCT and not sig.get('_approaching_alerted'):
+                sig['_approaching_alerted'] = True
+                dirty = True
+                gap_pct_display = gap_to_st * 100
+                _send_telegram(
+                    f"\U0001f7e1 <b>APPROACHING</b> <code>{sym}</code> "
+                    f"{sig['direction']}\n"
+                    f"Option {opt_ltp:.2f} | 15M Support {st_val:.2f} "
+                    f"({gap_pct_display:+.1f}%)\n"
+                    f"<code>{opt_sym}</code> | Entry zone at "
+                    f"{_ENTRY_GAP_PCT*100:.0f}%",
+                    dry_run=dry_run, channel='watching')
+                log.info("CT #%s %s: APPROACHING alert sent (gap=%.1f%%)",
+                         sig['id'], sym, gap_pct_display)
+                print(f"  #{sig['id']} {sym}: APPROACHING 15M support "
+                      f"(gap={gap_pct_display:+.1f}%) -> alert sent")
 
+            # Reset approaching flag if gap widens back above 10%
+            if gap_to_st > _APPROACH_RESET_PCT and sig.get('_approaching_alerted'):
+                sig['_approaching_alerted'] = False
+                dirty = True
+                log.info("CT #%s %s: approaching flag RESET (gap=%.1f%%)",
+                         sig['id'], sym, gap_to_st * 100)
+
+            # 9. Entry logic: option price near 15M support (UP only)
+            #    Use max(absolute floor, percentage) so cheap options get enough room
+            abs_gap = opt_ltp - st_val
+            entry_threshold = max(_ENTRY_GAP_ABS, st_val * _ENTRY_GAP_PCT)
+            near_st = (0 <= abs_gap <= entry_threshold)
+
+            # 9a. Wick touch: last COMPLETED 15M candle's LOW entered threshold
+            #     zone, candle CLOSED above ST (bounce confirmed), LTP within 5%.
+            #     candles[-1] is the running candle; candles[-2] is last completed.
+            entry_via_wick = False
+            if not near_st and candles and len(candles) >= 2:
+                completed = candles[-2]
+                # Guard: skip wick check on stale candles (not from today)
+                candle_dt = completed.get('date')
+                is_today = (not candle_dt
+                            or not hasattr(candle_dt, 'date')
+                            or candle_dt.date() >= datetime.now().date())
+                if is_today:
+                    wick_low = completed['low']
+                    wick_close = completed['close']
+                    wick_gap = wick_low - st_val
+                    ltp_gap_pct = ((opt_ltp - st_val) / st_val
+                                   if st_val > 0 else 999)
+                    if (0 <= wick_gap <= entry_threshold
+                            and wick_close > st_val
+                            and 0 < ltp_gap_pct <= _WICK_LTP_MAX_PCT):
+                        near_st = True
+                        entry_via_wick = True
+                        log.info("CT #%s %s: WICK TOUCH on completed 15M "
+                                 "candle (low=%.2f close=%.2f ST=%.2f "
+                                 "LTP=%.2f)",
+                                 sig['id'], sym, wick_low, wick_close,
+                                 st_val, opt_ltp)
+
+            entry_method = ('WICK_ENTER' if entry_via_wick
+                            else ('ENTER' if near_st else 'waiting'))
             log.info("CT #%s %s: opt=%s LTP=%.2f 15M_Sup=%.2f dir=%s gap=%.1f%% %s",
                      sig['id'], sym, opt_sym, opt_ltp, st_val, st_dir,
-                     gap_to_st * 100,
-                     'ENTER' if near_st else 'waiting')
+                     gap_to_st * 100, entry_method)
             print(f"  #{sig['id']} {sym} {sig['direction']:<3} "
                   f"opt={opt_ltp:.2f} 15M_Sup={st_val:.2f} {st_dir} "
                   f"gap={gap_to_st*100:+.1f}% "
-                  f"{'-> ENTER' if near_st else '(watching)'}")
+                  f"{'-> ' + entry_method if near_st else '(watching)'}")
 
             if near_st:
                 # 10. DTE check before auto-entry
@@ -883,16 +957,18 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                 # Auto-enter: watching → entered directly
                 tracker.mark_entered(sig['id'], ltp, opt_ltp)
 
+                wick_tag = ' (wick confirmed)' if entry_via_wick else ''
                 msg = format_enter_alert(
                     sym, sig['direction'], sig.get('timeframe', ''),
                     opt_sym, opt_ltp, st_val,
                     sig['quantity'], sig.get('sl_spot', 0),
-                    score=sig.get('score', 0))
+                    score=sig.get('score', 0),
+                    via_wick=entry_via_wick)
                 _send_telegram(msg, dry_run=dry_run, channel='trade')
-                log.info("CT #%s %s: AUTO-ENTERED spot=%.0f opt=%.2f",
-                         sig['id'], sym, ltp, opt_ltp)
+                log.info("CT #%s %s: AUTO-ENTERED%s spot=%.0f opt=%.2f",
+                         sig['id'], sym, wick_tag, ltp, opt_ltp)
                 print(f"  -> AUTO-ENTERED #{sig['id']} {sym} "
-                      f"(spot={ltp:,.0f}, opt={opt_ltp:.2f})")
+                      f"(spot={ltp:,.0f}, opt={opt_ltp:.2f}){wick_tag}")
 
         except Exception as e:
             print(f"  #{sig['id']} {sym}: ERROR -- {e}")
