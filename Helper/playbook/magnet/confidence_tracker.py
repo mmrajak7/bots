@@ -48,7 +48,7 @@ _MIN_DTE_AT_ENTRY = 3     # minimum DTE to allow auto-entry
 _WICK_LTP_MAX_PCT = 0.05  # wick entry only if current LTP within 5% of ST
 _APPROACH_GAP_PCT = 0.05  # send approaching alert when gap <= 5%
 _APPROACH_RESET_PCT = 0.10  # reset approaching flag when gap widens above 10%
-_MIN_OPTION_PRICE = 5.0   # skip entry for options priced below Rs 5 (unreliable 15M data)
+_MIN_OPTION_PRICE = 0.50  # skip only near-worthless options (< Rs 0.50, no meaningful price action)
 
 
 # ---------------------------------------------------------------------------
