@@ -1,17 +1,16 @@
-"""Spot 15M ST Tracker -- parallel entry timing using spot pullback->flip.
+"""Spot 15M ST Tracker -- parallel entry timing + exit signals.
 
-Supplementary signal (not a hard gate). Backtest showed the flip filter helps
-avoid big losers during directional market events, but can delay fast winners.
-Use alongside existing magnet alerts -- user decides which to follow.
+Two modes:
+  ENTRY TIMING (WATCHING signals):
+    watching -> pullback (15M flips against) -> alerted (15M flips back = ENTER)
 
-Flow:
-  1. Reads WATCHING signals from magnet_trades.json (read-only).
-  2. Records spot 15M ST(10,3) direction at signal time.
-  3. Waits for spot 15M to flip AGAINST our direction (pullback).
-  4. When spot 15M flips BACK to our direction (fresh momentum) -> ALERT.
-  5. User decides manually whether to enter.
+  EXIT + RE-ENTRY (ENTERED trades):
+    exit_tracking -> exit_alert (15M flips against = EXIT)
+                  -> reentry_watch (waiting for flip back)
+                  -> re_alerted (15M flips back = RE-ENTER)
 
-Storage: logs/spot_tracker.json (independent, never touches magnet_trades.json).
+Reads magnet_trades.json (read-only). Own state in logs/spot_tracker.json.
+Supplementary signal -- user decides manually whether to follow.
 """
 
 import json
@@ -42,25 +41,29 @@ _MIN_DTE_DAYS = 3              # cancel if option DTE < this
 _POLL_INTERVAL_SEC = 300       # 5 minutes between polls
 _MAX_ACTIVE_SIGNALS = 20       # cap to avoid API rate limit issues
 _STALE_CHECK_MINUTES = 30      # skip transitions if last check was > N min ago
-_MAX_WATCHING_DAYS = {         # auto-cancel if no pullback within N days
+_MAX_WATCHING_DAYS = {         # auto-cancel if no flip within N days
     'daily': 3,
     'weekly': 10,
     'monthly': 20,
 }
-# Default DTE by timeframe (when option_expiry is null)
-_DEFAULT_MAX_DAYS = {
+_DEFAULT_MAX_DAYS = {          # fallback when option_expiry is null
     'daily': 5,
     'weekly': 12,
     'monthly': 30,
 }
 
+# All "active" states (signals that need polling)
+_ENTRY_ACTIVE = ('watching', 'pullback')
+_EXIT_ACTIVE = ('exit_tracking', 'exit_alert', 'reentry_watch')
+_ALL_ACTIVE = _ENTRY_ACTIVE + _EXIT_ACTIVE
+
 
 # ---------------------------------------------------------------------------
-#  Telegram (reuse confidence_tracker's helper to avoid duplication)
+#  Telegram
 # ---------------------------------------------------------------------------
 
 def _send_telegram(msg: str, dry_run: bool = False) -> bool:
-    """Send Telegram to watching channel. Delegates to CT's implementation."""
+    """Send Telegram to watching channel."""
     if dry_run:
         safe = msg.encode('ascii', errors='replace').decode('ascii')
         print(f"[DRY RUN] [SPOT] Telegram:\n{safe}\n")
@@ -68,19 +71,16 @@ def _send_telegram(msg: str, dry_run: bool = False) -> bool:
     try:
         from .confidence_tracker import _send_telegram as _ct_send
         return _ct_send(msg, dry_run=False, channel='watching')
-    except ImportError:
-        log.warning("Could not import CT telegram helper, using fallback")
+    except Exception:
         return _send_telegram_fallback(msg)
 
 
 def _send_telegram_fallback(msg: str) -> bool:
-    """Standalone fallback if CT import fails."""
     try:
         with open(_CONFIG_PATH) as f:
             mcfg = json.load(f)
         tg = mcfg.get('telegram_watching', {})
-        bot_token = tg.get('bot_token')
-        chat_id = tg.get('chat_id')
+        bot_token, chat_id = tg.get('bot_token'), tg.get('chat_id')
         if not bot_token or not chat_id:
             return False
         import requests
@@ -128,48 +128,176 @@ class SpotTracker:
                 return s
         return None
 
+    def _new_id(self) -> int:
+        sid = self._data['next_id']
+        self._data['next_id'] = sid + 1
+        return sid
+
+    # -- Direction helpers (shared by entry + exit) --
+
+    @staticmethod
+    def _dirs(direction: str):
+        """Return (against_dir, with_dir) for a trade direction."""
+        if direction == 'CE':
+            return 'DOWN', 'UP'     # CE wants UP; against=DOWN
+        return 'UP', 'DOWN'         # PE wants DOWN; against=UP
+
+    # -- Query --
+
     def is_tracking(self, magnet_trade_id: int) -> bool:
-        """Check if a magnet trade is already being tracked."""
         return any(s['magnet_trade_id'] == magnet_trade_id
-                   and s['status'] in ('watching', 'pullback')
+                   and s['status'] in _ENTRY_ACTIVE
+                   for s in self._data['signals'])
+
+    def is_tracking_exit(self, magnet_trade_id: int) -> bool:
+        return any(s['magnet_trade_id'] == magnet_trade_id
+                   and s['status'] in _EXIT_ACTIVE
                    for s in self._data['signals'])
 
     def active_count(self) -> int:
         return len(self.get_active())
 
+    def get_active(self) -> list:
+        return [s for s in self._data['signals'] if s['status'] in _ALL_ACTIVE]
+
+    def list_all(self, status_filter=None) -> list:
+        if status_filter:
+            return [s for s in self._data['signals']
+                    if s['status'] == status_filter]
+        return list(self._data['signals'])
+
+    def save_batch(self):
+        self._save()
+
+    # -- Entry-timing signals (WATCHING magnet trades) --
+
     def add(self, magnet_trade: dict, spot_15m_dir: str,
             spot_15m_st: float, spot_ltp: float) -> dict:
-        """Add a new signal from a magnet WATCHING trade."""
-        direction = magnet_trade['direction']  # CE or PE
-        # CE = buy call = want spot UP. Pullback = spot goes DOWN first.
-        # PE = buy put = want spot DOWN. Pullback = spot goes UP first.
-        if direction == 'CE':
-            need_pullback_dir = 'DOWN'  # spot falls = pullback
-            need_reentry_dir = 'UP'     # spot rises = fresh entry
-        else:
-            need_pullback_dir = 'UP'    # spot bounces = pullback
-            need_reentry_dir = 'DOWN'   # spot falls = fresh entry
+        against_dir, with_dir = self._dirs(magnet_trade['direction'])
 
-        sig = {
-            'id': self._data['next_id'],
+        sig = self._make_base_signal(magnet_trade, spot_15m_dir,
+                                     spot_15m_st, spot_ltp)
+        sig['tracking_type'] = 'entry'
+        sig['need_pullback_dir'] = against_dir
+        sig['need_reentry_dir'] = with_dir
+        sig['status'] = 'watching'
+
+        # Already in pullback direction? skip to pullback
+        if spot_15m_dir == against_dir:
+            sig['status'] = 'pullback'
+            sig['pullback_at'] = datetime.now().isoformat()
+            sig['pullback_st'] = spot_15m_st
+            sig['pullback_spot'] = spot_ltp
+            log.info("ST #%d %s: already in pullback (%s)",
+                     sig['id'], sig['symbol'], spot_15m_dir)
+
+        self._data['signals'].append(sig)
+        self._save()
+        return sig
+
+    def mark_pullback(self, sig_id: int, st_val: float, ltp: float):
+        sig = self._find(sig_id)
+        if sig and sig['status'] == 'watching':
+            sig['status'] = 'pullback'
+            sig['pullback_at'] = datetime.now().isoformat()
+            sig['pullback_st'] = st_val
+            sig['pullback_spot'] = ltp
+            self._save()
+
+    def mark_alerted(self, sig_id: int, st_val: float, ltp: float):
+        """Transition to terminal alerted state (entry or re-entry)."""
+        sig = self._find(sig_id)
+        if sig and sig['status'] in ('pullback', 'reentry_watch'):
+            sig['status'] = 'alerted' if sig['status'] == 'pullback' else 're_alerted'
+            sig['reentry_at'] = datetime.now().isoformat()
+            sig['reentry_st'] = st_val
+            sig['reentry_spot'] = ltp
+            sig['alerted_at'] = datetime.now().isoformat()
+            self._save()
+
+    # -- Exit-tracking signals (ENTERED magnet trades) --
+
+    def add_exit_tracking(self, magnet_trade: dict, spot_15m_dir: str,
+                          spot_15m_st: float, spot_ltp: float) -> dict:
+        against_dir, with_dir = self._dirs(magnet_trade['direction'])
+
+        sig = self._make_base_signal(magnet_trade, spot_15m_dir,
+                                     spot_15m_st, spot_ltp)
+        sig['tracking_type'] = 'exit'
+        sig['need_pullback_dir'] = against_dir   # reused: flip against = EXIT
+        sig['need_reentry_dir'] = with_dir       # reused: flip back = RE-ENTER
+        sig['status'] = 'exit_tracking'
+        sig['exit_alert_at'] = None
+        sig['exit_alert_spot'] = None
+
+        # Capture entry details from magnet trade
+        sig['entry_spot'] = magnet_trade.get('entry_spot')
+        sig['option_symbol'] = magnet_trade.get('option_symbol', '')
+        sig['option_premium'] = magnet_trade.get('option_premium')
+
+        self._data['signals'].append(sig)
+        self._save()
+        return sig
+
+    def mark_exit_alert(self, sig_id: int, st_val: float, ltp: float):
+        """exit_tracking -> exit_alert (EXIT signal fired)."""
+        sig = self._find(sig_id)
+        if sig and sig['status'] == 'exit_tracking':
+            sig['status'] = 'exit_alert'
+            sig['exit_alert_at'] = datetime.now().isoformat()
+            sig['exit_alert_spot'] = ltp
+            self._save()
+
+    def mark_reentry_watch(self, sig_id: int):
+        """exit_alert -> reentry_watch (user acknowledged exit, now watch for re-entry)."""
+        sig = self._find(sig_id)
+        if sig and sig['status'] == 'exit_alert':
+            sig['status'] = 'reentry_watch'
+            sig['pullback_at'] = datetime.now().isoformat()
+            sig['pullback_spot'] = sig.get('last_spot_ltp')
+            sig['pullback_st'] = sig.get('last_spot_15m_st')
+            self._save()
+
+    # -- Shared --
+
+    def cancel(self, sig_id: int, reason: str):
+        sig = self._find(sig_id)
+        if sig and sig['status'] in _ALL_ACTIVE:
+            sig['status'] = 'cancelled'
+            sig['cancel_reason'] = reason
+            self._save()
+
+    def update_15m(self, sig_id: int, st_val: float, st_dir: str, ltp: float):
+        sig = self._find(sig_id)
+        if sig:
+            sig['last_spot_15m_st'] = st_val
+            sig['last_spot_15m_dir'] = st_dir
+            sig['last_spot_ltp'] = ltp
+            sig['last_checked_at'] = datetime.now().isoformat()
+
+    def _make_base_signal(self, magnet_trade: dict, spot_15m_dir: str,
+                          spot_15m_st: float, spot_ltp: float) -> dict:
+        return {
+            'id': self._new_id(),
             'magnet_trade_id': magnet_trade['id'],
             'symbol': magnet_trade['stock'],
             'timeframe': magnet_trade['timeframe'],
-            'direction': direction,
+            'direction': magnet_trade['direction'],
             'st_value': magnet_trade['st_value'],
             'signal_price': magnet_trade.get('signal_price', 0),
             'signal_gap_pct': magnet_trade.get('signal_gap_pct', 0),
             'option_expiry': magnet_trade.get('option_expiry', ''),
             'initial_spot_15m_dir': spot_15m_dir,
-            'need_pullback_dir': need_pullback_dir,
-            'need_reentry_dir': need_reentry_dir,
+            'need_pullback_dir': None,   # set by caller
+            'need_reentry_dir': None,    # set by caller
             'pullback_at': None,
             'pullback_st': None,
             'pullback_spot': None,
             'reentry_at': None,
             'reentry_st': None,
             'reentry_spot': None,
-            'status': 'watching',
+            'status': None,              # set by caller
+            'tracking_type': None,       # set by caller
             'picked_up_at': datetime.now().isoformat(),
             'alerted_at': None,
             'cancel_reason': None,
@@ -179,82 +307,15 @@ class SpotTracker:
             'last_checked_at': datetime.now().isoformat(),
         }
 
-        # If spot is ALREADY in pullback direction, skip to pullback state
-        if spot_15m_dir == need_pullback_dir:
-            sig['status'] = 'pullback'
-            sig['pullback_at'] = datetime.now().isoformat()
-            sig['pullback_st'] = spot_15m_st
-            sig['pullback_spot'] = spot_ltp
-            log.info("ST #%d %s: already in pullback (%s), skipping to pullback state",
-                     sig['id'], sig['symbol'], spot_15m_dir)
-
-        self._data['next_id'] += 1
-        self._data['signals'].append(sig)
-        self._save()
-        return sig
-
-    def update_15m(self, sig_id: int, st_val: float, st_dir: str,
-                   ltp: float):
-        """Update the latest 15M ST data for a signal (no save, call save_batch)."""
-        sig = self._find(sig_id)
-        if sig:
-            sig['last_spot_15m_st'] = st_val
-            sig['last_spot_15m_dir'] = st_dir
-            sig['last_spot_ltp'] = ltp
-            sig['last_checked_at'] = datetime.now().isoformat()
-
-    def mark_pullback(self, sig_id: int, st_val: float, ltp: float):
-        """Transition: watching -> pullback."""
-        sig = self._find(sig_id)
-        if sig and sig['status'] == 'watching':
-            sig['status'] = 'pullback'
-            sig['pullback_at'] = datetime.now().isoformat()
-            sig['pullback_st'] = st_val
-            sig['pullback_spot'] = ltp
-            self._save()
-
-    def mark_ready(self, sig_id: int, st_val: float, ltp: float):
-        """Transition: pullback -> alerted."""
-        sig = self._find(sig_id)
-        if sig and sig['status'] == 'pullback':
-            sig['status'] = 'alerted'
-            sig['reentry_at'] = datetime.now().isoformat()
-            sig['reentry_st'] = st_val
-            sig['reentry_spot'] = ltp
-            sig['alerted_at'] = datetime.now().isoformat()
-            self._save()
-
-    def cancel(self, sig_id: int, reason: str):
-        sig = self._find(sig_id)
-        if sig and sig['status'] in ('watching', 'pullback'):
-            sig['status'] = 'cancelled'
-            sig['cancel_reason'] = reason
-            self._save()
-
-    def get_active(self) -> list:
-        return [s for s in self._data['signals']
-                if s['status'] in ('watching', 'pullback')]
-
-    def list_all(self, status_filter=None) -> list:
-        if status_filter:
-            return [s for s in self._data['signals']
-                    if s['status'] == status_filter]
-        return list(self._data['signals'])
-
-    def save_batch(self):
-        """Explicit batch save after multiple update_15m calls."""
-        self._save()
-
 
 # ---------------------------------------------------------------------------
 #  Read magnet_trades.json (READ-ONLY, single read per cycle)
 # ---------------------------------------------------------------------------
 
-_magnet_snapshot = None  # cached per poll cycle
+_magnet_snapshot = None
 
 
 def _load_magnet_snapshot() -> list:
-    """Read magnet_trades.json once per poll cycle. Never writes."""
     global _magnet_snapshot
     if _magnet_snapshot is not None:
         return _magnet_snapshot
@@ -272,34 +333,30 @@ def _load_magnet_snapshot() -> list:
 
 
 def _clear_magnet_snapshot():
-    """Invalidate per-cycle cache. Call at start of each poll."""
     global _magnet_snapshot
     _magnet_snapshot = None
 
 
-def _read_magnet_watching() -> list:
-    """Filter WATCHING signals from the snapshot."""
-    return [t for t in _load_magnet_snapshot() if t.get('status') == 'watching']
+def _read_magnet_by_status(status: str) -> list:
+    return [t for t in _load_magnet_snapshot() if t.get('status') == status]
 
 
-def _check_magnet_status(magnet_trade_id: int) -> str:
-    """Check status from the same snapshot (no extra file read)."""
+def _get_magnet_trade(magnet_trade_id: int) -> Optional[dict]:
     for t in _load_magnet_snapshot():
         if t.get('id') == magnet_trade_id:
-            return t.get('status', 'unknown')
-    return 'not_found'
+            return t
+    return None
 
 
 # ---------------------------------------------------------------------------
 #  Spot 15M data + ST computation
 # ---------------------------------------------------------------------------
 
-_spot_token_cache = {}  # {symbol: instrument_token}
-_15m_cache = {}         # {symbol: (st_summary, boundary_str)}
+_spot_token_cache = {}
+_15m_cache = {}
 
 
 def _get_spot_token(kite, symbol: str) -> int:
-    """Get NSE instrument token for a spot symbol. Cached per session."""
     if symbol in _spot_token_cache:
         return _spot_token_cache[symbol]
     ltp_data = kite.ltp([f'NSE:{symbol}'])
@@ -309,20 +366,15 @@ def _get_spot_token(kite, symbol: str) -> int:
 
 
 def _current_15m_boundary_str() -> str:
-    """Current 15-minute boundary as string 'HH:MM' for cache key.
-    If within 5 seconds of a boundary, use the PREVIOUS boundary
-    (candle may not be finalized yet)."""
     now = datetime.now()
     minute = now.minute - (now.minute % 15)
     if now.second < 5 and minute == now.minute:
-        # We're in the first 5 seconds, use previous boundary
         prev = now.replace(minute=minute, second=0) - timedelta(minutes=15)
         return prev.strftime('%H:%M')
     return f"{now.hour:02d}:{minute:02d}"
 
 
 def _evict_stale_cache(active_symbols: set):
-    """Remove cache entries for symbols no longer tracked."""
     stale = [sym for sym in _15m_cache if sym not in active_symbols]
     for sym in stale:
         del _15m_cache[sym]
@@ -332,12 +384,7 @@ def _evict_stale_cache(active_symbols: set):
 
 
 def fetch_spot_15m_st(kite, symbol: str) -> Optional[dict]:
-    """Fetch spot 15M candles and compute ST(10,3).
-
-    Returns {st_value, direction, close, atr} or None.
-    Uses per-symbol cache invalidated at each 15M boundary.
-    Only uses the SECOND-TO-LAST ST point (last completed candle).
-    """
+    """Fetch spot 15M candles, compute ST(10,3), return last completed candle."""
     boundary = _current_15m_boundary_str()
     cached = _15m_cache.get(symbol)
     if cached:
@@ -345,7 +392,6 @@ def fetch_spot_15m_st(kite, symbol: str) -> Optional[dict]:
         if cached_boundary == boundary:
             return cached_result
 
-    # Fetch fresh data
     try:
         tok = _get_spot_token(kite, symbol)
         now = datetime.now()
@@ -368,7 +414,6 @@ def fetch_spot_15m_st(kite, symbol: str) -> Optional[dict]:
         _15m_cache[symbol] = (None, boundary)
         return None
 
-    # Use second-to-last: last COMPLETED candle (avoid partial candle flicker)
     completed = st_data[-2]
     result = {
         'st_value': completed['supertrend'],
@@ -381,54 +426,112 @@ def fetch_spot_15m_st(kite, symbol: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-#  Core logic: pickup + poll
+#  Helpers
+# ---------------------------------------------------------------------------
+
+def _gap_pct(ltp: float, st_val: float) -> float:
+    if st_val and st_val > 0:
+        return (ltp - st_val) / st_val * 100
+    return 0.0
+
+
+def _is_fresh(sig: dict, now: datetime) -> bool:
+    """Check if prev_dir is fresh enough for state transitions."""
+    last_checked = sig.get('last_checked_at', '')
+    if not last_checked:
+        return False
+    try:
+        last_dt = datetime.fromisoformat(last_checked)
+        return (now - last_dt).total_seconds() / 60 <= _STALE_CHECK_MINUTES
+    except Exception:
+        return False
+
+
+def _check_stale(sig: dict, now: datetime) -> Optional[str]:
+    """Return cancel reason if signal is stale, else None."""
+    # For pullback/reentry_watch: measure from phase start, not pickup
+    if sig['status'] in ('pullback', 'reentry_watch') and sig.get('pullback_at'):
+        stale_ref = sig['pullback_at']
+    else:
+        stale_ref = sig.get('picked_up_at', '')
+
+    if not stale_ref:
+        return None
+    try:
+        ref_dt = datetime.fromisoformat(stale_ref)
+        days = (now - ref_dt).total_seconds() / 86400
+        max_days = _MAX_WATCHING_DAYS.get(sig['timeframe'], 10)
+        if days > max_days:
+            return f'stale {sig["status"]} ({days:.0f}d, max {max_days}d)'
+    except Exception:
+        pass
+    return None
+
+
+def _check_age_limit(sig: dict, now: datetime) -> Optional[str]:
+    """Return cancel reason if signal exceeded age limit (no expiry), else None."""
+    if sig.get('option_expiry'):
+        try:
+            exp = datetime.strptime(str(sig['option_expiry'])[:10], '%Y-%m-%d')
+            if (exp - now).days < _MIN_DTE_DAYS:
+                return f'DTE too low ({(exp - now).days}d)'
+        except (ValueError, TypeError):
+            pass
+        return None
+    # No expiry: age-based backstop
+    picked_at = sig.get('picked_up_at', '')
+    if not picked_at:
+        return None
+    try:
+        picked_dt = datetime.fromisoformat(picked_at)
+        days_age = (now - picked_dt).total_seconds() / 86400
+        max_age = _DEFAULT_MAX_DAYS.get(sig['timeframe'], 12)
+        if days_age > max_age:
+            return f'age {days_age:.0f}d > {max_age}d limit'
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+#  Core: pickup WATCHING + ENTERED signals
 # ---------------------------------------------------------------------------
 
 def pickup_new_signals(kite, tracker: SpotTracker, dry_run: bool = False):
-    """Scan magnet_trades.json for new WATCHING signals and start tracking."""
-    watching = _read_magnet_watching()
+    """Pick up new WATCHING signals for entry timing."""
+    watching = _read_magnet_by_status('watching')
     if not watching:
         return
 
-    # Capacity check
     if tracker.active_count() >= _MAX_ACTIVE_SIGNALS:
-        log.info("At capacity (%d signals), skipping pickup", _MAX_ACTIVE_SIGNALS)
         return
 
     picked = 0
     for mt in watching:
         if tracker.active_count() >= _MAX_ACTIVE_SIGNALS:
             break
-
         if tracker.is_tracking(mt['id']):
             continue
 
-        # Dedup by symbol (don't track same stock twice)
-        active_syms = {s['symbol'] for s in tracker.get_active()}
+        active_syms = {s['symbol'] for s in tracker.get_active()
+                       if s.get('tracking_type') == 'entry'}
         if mt['stock'] in active_syms:
-            log.info("Already tracking %s, skipping magnet #%d", mt['stock'], mt['id'])
             continue
 
-        # Fetch spot 15M ST
         st_info = fetch_spot_15m_st(kite, mt['stock'])
         if not st_info:
-            log.info("No 15M data for %s, skipping", mt['stock'])
             continue
 
-        # Get LTP
         try:
-            ltp_data = kite.ltp([f"NSE:{mt['stock']}"])
-            ltp = ltp_data[f"NSE:{mt['stock']}"]['last_price']
+            ltp = kite.ltp([f"NSE:{mt['stock']}"])[f"NSE:{mt['stock']}"]['last_price']
         except Exception:
             ltp = st_info['close']
 
         sig = tracker.add(mt, st_info['direction'], st_info['st_value'], ltp)
         picked += 1
-
-        state_label = sig['status'].upper()
         print(f"  [strack] Picked up #{sig['id']} {sig['symbol']} "
               f"{sig['direction']} [{sig['timeframe']}] "
-              f"15M={st_info['direction']} -> {state_label}")
+              f"15M={st_info['direction']} -> {sig['status'].upper()}")
 
         if sig['status'] == 'pullback':
             _send_telegram(
@@ -439,19 +542,63 @@ def pickup_new_signals(kite, tracker: SpotTracker, dry_run: bool = False):
                 dry_run=dry_run)
 
     if picked:
-        print(f"  [strack] Picked up {picked} new signal(s)")
+        print(f"  [strack] Picked up {picked} new entry signal(s)")
 
+
+def pickup_entered_trades(kite, tracker: SpotTracker, dry_run: bool = False):
+    """Pick up ENTERED magnet trades for exit monitoring."""
+    entered = _read_magnet_by_status('entered')
+    if not entered:
+        return
+
+    picked = 0
+    for mt in entered:
+        if tracker.active_count() >= _MAX_ACTIVE_SIGNALS:
+            break
+        if tracker.is_tracking_exit(mt['id']):
+            continue
+
+        # If we had an entry-type signal for this trade, cancel it
+        # (the trade entered via existing system, entry timing no longer relevant)
+        for existing in tracker.get_active():
+            if (existing['magnet_trade_id'] == mt['id']
+                    and existing.get('tracking_type') == 'entry'):
+                tracker.cancel(existing['id'], 'magnet entered, switching to exit tracking')
+                print(f"  [strack] #{existing['id']} {existing['symbol']}: "
+                      f"entry signal cancelled (trade entered)")
+
+        st_info = fetch_spot_15m_st(kite, mt['stock'])
+        if not st_info:
+            continue
+
+        try:
+            ltp = kite.ltp([f"NSE:{mt['stock']}"])[f"NSE:{mt['stock']}"]['last_price']
+        except Exception:
+            ltp = st_info['close']
+
+        sig = tracker.add_exit_tracking(mt, st_info['direction'],
+                                        st_info['st_value'], ltp)
+        picked += 1
+        print(f"  [strack] Exit tracking #{sig['id']} {sig['symbol']} "
+              f"{sig['direction']} [{sig['timeframe']}] "
+              f"15M={st_info['direction']} opt={sig.get('option_symbol', '?')}")
+
+    if picked:
+        print(f"  [strack] Picked up {picked} exit tracking signal(s)")
+
+
+# ---------------------------------------------------------------------------
+#  Core: poll all active signals
+# ---------------------------------------------------------------------------
 
 def poll_once(kite, tracker: SpotTracker, dry_run: bool = False):
-    """Single monitoring pass: check all active signals for state transitions."""
-    # Invalidate per-cycle magnet snapshot
+    """Single monitoring pass for all active signals."""
     _clear_magnet_snapshot()
 
     active = tracker.get_active()
     if not active:
         return
 
-    # Evict stale cache entries
     active_syms = {s['symbol'] for s in active}
     _evict_stale_cache(active_syms)
 
@@ -460,149 +607,108 @@ def poll_once(kite, tracker: SpotTracker, dry_run: bool = False):
 
     for sig in active:
         sym = sig['symbol']
+        ttype = sig.get('tracking_type', 'entry')
 
-        # 1. Check if magnet trade is still watching/entered
-        mt_status = _check_magnet_status(sig['magnet_trade_id'])
-        if mt_status not in ('watching', 'entered', 'unknown'):
-            tracker.cancel(sig['id'], f'magnet trade {mt_status}')
-            print(f"  [strack] #{sig['id']} {sym}: cancelled (magnet {mt_status})")
+        # -- Guards (shared for entry + exit) --
+
+        # Magnet trade status check
+        mt = _get_magnet_trade(sig['magnet_trade_id'])
+        mt_status = mt.get('status', 'unknown') if mt else 'not_found'
+
+        if ttype == 'entry':
+            if mt_status not in ('watching', 'entered', 'unknown'):
+                tracker.cancel(sig['id'], f'magnet trade {mt_status}')
+                print(f"  [strack] #{sig['id']} {sym}: cancelled (magnet {mt_status})")
+                continue
+            # Auto-transition: magnet entered while we're still tracking entry
+            if mt_status == 'entered' and sig['status'] in _ENTRY_ACTIVE:
+                tracker.cancel(sig['id'], 'magnet entered, will track exit separately')
+                print(f"  [strack] #{sig['id']} {sym}: entry cancelled (magnet entered)")
+                continue
+        elif ttype == 'exit':
+            # Exit tracking: cancel if magnet trade exited/cancelled
+            if mt_status in ('exited', 'cancelled', 'not_found'):
+                tracker.cancel(sig['id'], f'magnet trade {mt_status}')
+                print(f"  [strack] #{sig['id']} {sym}: exit tracking ended ({mt_status})")
+                continue
+
+        # Age / DTE check
+        age_reason = _check_age_limit(sig, now)
+        if age_reason:
+            tracker.cancel(sig['id'], age_reason)
+            print(f"  [strack] #{sig['id']} {sym}: cancelled ({age_reason})")
             continue
 
-        # 2. DTE / max age check
-        opt_expiry = sig.get('option_expiry', '')
-        if opt_expiry:
-            try:
-                exp_date = datetime.strptime(str(opt_expiry)[:10], '%Y-%m-%d')
-                dte = (exp_date - now).days
-                if dte < _MIN_DTE_DAYS:
-                    tracker.cancel(sig['id'], f'DTE too low ({dte}d)')
-                    print(f"  [strack] #{sig['id']} {sym}: cancelled (DTE {dte}d)")
-                    continue
-            except (ValueError, TypeError):
-                pass
-        else:
-            # No option_expiry: use default max days as backstop
-            max_age = _DEFAULT_MAX_DAYS.get(sig['timeframe'], 12)
-            picked_at = sig.get('picked_up_at', '')
-            if picked_at:
-                try:
-                    picked_dt = datetime.fromisoformat(picked_at)
-                    days_age = (now - picked_dt).total_seconds() / 86400
-                    if days_age > max_age:
-                        tracker.cancel(sig['id'],
-                                       f'no expiry + age {days_age:.0f}d > {max_age}d')
-                        print(f"  [strack] #{sig['id']} {sym}: cancelled (age {days_age:.0f}d)")
-                        continue
-                except Exception:
-                    pass
+        # Stale check (entry-type only; exit signals persist as long as trade is open)
+        if ttype == 'entry':
+            stale_reason = _check_stale(sig, now)
+            if stale_reason:
+                tracker.cancel(sig['id'], stale_reason)
+                print(f"  [strack] #{sig['id']} {sym}: cancelled ({stale_reason})")
+                continue
 
-        # 3. Stale check (separate from DTE -- catches stale signals WITH expiry too)
-        #    For pullback state: measure from pullback_at (not picked_up_at) so
-        #    signals that progressed aren't killed prematurely.
-        if sig['status'] == 'pullback' and sig.get('pullback_at'):
-            stale_ref = sig['pullback_at']
-            # Pullback gets extra time (already past phase 1)
-            max_days = _MAX_WATCHING_DAYS.get(sig['timeframe'], 10)
-        else:
-            stale_ref = sig.get('picked_up_at', '')
-            max_days = _MAX_WATCHING_DAYS.get(sig['timeframe'], 10)
-
-        if stale_ref:
-            try:
-                ref_dt = datetime.fromisoformat(stale_ref)
-                days_waiting = (now - ref_dt).total_seconds() / 86400
-                if days_waiting > max_days:
-                    phase = sig['status']
-                    tracker.cancel(sig['id'],
-                                   f'stale {phase} ({days_waiting:.0f}d, max {max_days}d)')
-                    print(f"  [strack] #{sig['id']} {sym}: cancelled (stale {phase})")
-                    continue
-            except Exception:
-                pass
-
-        # 4. Fetch spot 15M ST (uses completed candle only)
+        # -- Fetch 15M ST --
         st_info = fetch_spot_15m_st(kite, sym)
         if not st_info:
             print(f"  [strack] #{sig['id']} {sym}: no 15M data, skipping")
             continue
 
         try:
-            ltp_data = kite.ltp([f'NSE:{sym}'])
-            ltp = ltp_data[f'NSE:{sym}']['last_price']
+            ltp = kite.ltp([f'NSE:{sym}'])[f'NSE:{sym}']['last_price']
         except Exception:
             ltp = st_info['close']
 
         cur_dir = st_info['direction']
         prev_dir = sig['last_spot_15m_dir']
+        gap = _gap_pct(ltp, sig['st_value'])
 
-        # FIX C2: Freshness guard -- skip transitions if last check was too long ago
-        # (prevents false flips from overnight gaps or after market close)
-        last_checked = sig.get('last_checked_at', '')
-        is_fresh = True
-        if last_checked:
-            try:
-                last_dt = datetime.fromisoformat(last_checked)
-                minutes_since = (now - last_dt).total_seconds() / 60
-                if minutes_since > _STALE_CHECK_MINUTES:
-                    is_fresh = False
-                    log.info("ST #%d %s: stale prev_dir (%d min), resync only",
-                             sig['id'], sym, int(minutes_since))
-            except Exception:
-                is_fresh = False
-
-        # Update latest data (always, even on stale resync)
+        # Update state
         tracker.update_15m(sig['id'], st_info['st_value'], cur_dir, ltp)
         dirty = True
 
-        # 5. State machine transitions (ONLY if prev_dir is fresh)
-        if not is_fresh:
-            gap = (ltp - sig['st_value']) / sig['st_value'] * 100
+        # Freshness guard
+        fresh = _is_fresh(sig, now)
+        if not fresh:
+            log.info("ST #%d %s: stale prev_dir, resync only", sig['id'], sym)
             print(f"  [strack] #{sig['id']} {sym} {sig['direction']:<3} "
-                  f"15M={cur_dir:5s} (resync, skip transition) gap={gap:+.1f}%")
+                  f"15M={cur_dir:5s} (resync) gap={gap:+.1f}%")
             continue
 
+        flipped = (cur_dir != prev_dir)
+        tf_tag = sig['timeframe'][:1].upper()
+
+        # -- State machine: ENTRY timing --
         if sig['status'] == 'watching':
-            # Waiting for pullback: spot flips AGAINST our direction
-            if cur_dir == sig['need_pullback_dir'] and prev_dir != cur_dir:
+            if flipped and cur_dir == sig['need_pullback_dir']:
                 tracker.mark_pullback(sig['id'], st_info['st_value'], ltp)
                 print(f"  [strack] #{sig['id']} {sym} {sig['direction']}: "
-                      f"PULLBACK detected (15M -> {cur_dir})")
-
+                      f"PULLBACK (15M -> {cur_dir})")
                 _send_telegram(
                     f"<b>PULLBACK</b> <code>{sym}</code> "
-                    f"{sig['direction']} [{sig['timeframe'][:1].upper()}]\n"
+                    f"{sig['direction']} [{tf_tag}]\n"
                     f"Spot 15M flipped {cur_dir} (against {sig['direction']})\n"
                     f"Watching for flip to {sig['need_reentry_dir']}...\n"
                     f"Spot {ltp:,.2f} | 15M ST {st_info['st_value']:,.2f}",
                     dry_run=dry_run)
             else:
-                st_v = sig['st_value'] or 1  # guard div/0
-                gap = (ltp - st_v) / st_v * 100
                 print(f"  [strack] #{sig['id']} {sym} {sig['direction']:<3} "
                       f"15M={cur_dir:5s} need={sig['need_pullback_dir']} "
                       f"gap={gap:+.1f}% (watching)")
 
         elif sig['status'] == 'pullback':
-            # Waiting for re-entry: spot flips BACK to our direction
-            if cur_dir == sig['need_reentry_dir'] and prev_dir != cur_dir:
-                tracker.mark_ready(sig['id'], st_info['st_value'], ltp)
-
-                st_v = sig['st_value'] or 1
-                gap = (ltp - st_v) / st_v * 100
-                pullback_at = sig.get('pullback_at', '')
+            if flipped and cur_dir == sig['need_reentry_dir']:
+                tracker.mark_alerted(sig['id'], st_info['st_value'], ltp)
+                pb_at = sig.get('pullback_at', '')
                 try:
-                    pb_dt = datetime.fromisoformat(pullback_at)
-                    wait_hrs = (now - pb_dt).total_seconds() / 3600
+                    wait_hrs = (now - datetime.fromisoformat(pb_at)).total_seconds() / 3600
                     wait_str = f"{wait_hrs:.0f}h"
                 except Exception:
                     wait_str = "?"
-
                 print(f"  [strack] #{sig['id']} {sym} {sig['direction']}: "
                       f"FLIP! 15M -> {cur_dir} | ENTER {sig['direction']} NOW")
-
                 _send_telegram(
                     f"<b>SPOT FLIP</b> <code>{sym}</code> "
-                    f"{sig['direction']} [{sig['timeframe'][:1].upper()}]\n"
+                    f"{sig['direction']} [{tf_tag}]\n"
                     f"Spot 15M ST flipped {cur_dir} -- "
                     f"enter {sig['direction']} now\n"
                     f"Spot {ltp:,.2f} | Higher-TF ST "
@@ -610,11 +716,60 @@ def poll_once(kite, tracker: SpotTracker, dry_run: bool = False):
                     f"Pullback: {wait_str} ago | Fresh momentum confirmed",
                     dry_run=dry_run)
             else:
-                st_v = sig['st_value'] or 1
-                gap = (ltp - st_v) / st_v * 100
                 print(f"  [strack] #{sig['id']} {sym} {sig['direction']:<3} "
                       f"15M={cur_dir:5s} need={sig['need_reentry_dir']} "
-                      f"gap={gap:+.1f}% (pullback, waiting for flip)")
+                      f"gap={gap:+.1f}% (pullback)")
+
+        # -- State machine: EXIT tracking --
+        elif sig['status'] == 'exit_tracking':
+            if flipped and cur_dir == sig['need_pullback_dir']:
+                tracker.mark_exit_alert(sig['id'], st_info['st_value'], ltp)
+                opt_sym = sig.get('option_symbol', '')
+                print(f"  [strack] #{sig['id']} {sym} {sig['direction']}: "
+                      f"EXIT! 15M -> {cur_dir} (against {sig['direction']})")
+                _send_telegram(
+                    f"<b>SPOT EXIT</b> <code>{sym}</code> "
+                    f"{sig['direction']} [{tf_tag}]\n"
+                    f"Spot 15M ST flipped {cur_dir} -- "
+                    f"EXIT {sig['direction']} now\n"
+                    f"Spot {ltp:,.2f} | 15M ST {st_info['st_value']:,.2f}\n"
+                    f"Option: <code>{opt_sym}</code>\n"
+                    f"Watching for re-entry flip to {sig['need_reentry_dir']}...",
+                    dry_run=dry_run)
+                # Auto-transition to reentry_watch
+                tracker.mark_reentry_watch(sig['id'])
+            else:
+                print(f"  [strack] #{sig['id']} {sym} {sig['direction']:<3} "
+                      f"15M={cur_dir:5s} (exit tracking, holding) gap={gap:+.1f}%")
+
+        elif sig['status'] == 'exit_alert':
+            # Shouldn't stay here (auto-transitions to reentry_watch), but handle
+            tracker.mark_reentry_watch(sig['id'])
+
+        elif sig['status'] == 'reentry_watch':
+            if flipped and cur_dir == sig['need_reentry_dir']:
+                tracker.mark_alerted(sig['id'], st_info['st_value'], ltp)
+                ea_at = sig.get('exit_alert_at', '')
+                try:
+                    wait_hrs = (now - datetime.fromisoformat(ea_at)).total_seconds() / 3600
+                    wait_str = f"{wait_hrs:.0f}h"
+                except Exception:
+                    wait_str = "?"
+                print(f"  [strack] #{sig['id']} {sym} {sig['direction']}: "
+                      f"RE-ENTER! 15M -> {cur_dir}")
+                _send_telegram(
+                    f"<b>RE-ENTER</b> <code>{sym}</code> "
+                    f"{sig['direction']} [{tf_tag}]\n"
+                    f"Spot 15M ST flipped {cur_dir} -- "
+                    f"re-enter {sig['direction']} now\n"
+                    f"Spot {ltp:,.2f} | Higher-TF ST "
+                    f"{sig['st_value']:,.2f} | Gap {gap:+.1f}%\n"
+                    f"Since exit: {wait_str} | Fresh momentum confirmed",
+                    dry_run=dry_run)
+            else:
+                print(f"  [strack] #{sig['id']} {sym} {sig['direction']:<3} "
+                      f"15M={cur_dir:5s} need={sig['need_reentry_dir']} "
+                      f"gap={gap:+.1f}% (re-entry watch)")
 
     if dirty:
         tracker.save_batch()
@@ -633,9 +788,7 @@ def _is_market_hours() -> bool:
 
 
 def _seconds_to_next_15m() -> int:
-    """Seconds until next 15M boundary + 5s buffer. Safe at all hours."""
     now = datetime.now()
-    # Use timedelta to safely compute next boundary (no hour overflow)
     minutes_past = now.minute % 15
     delta = timedelta(minutes=(15 - minutes_past), seconds=(5 - now.second))
     if delta.total_seconds() <= 0:
@@ -651,6 +804,7 @@ def cmd_scan(kite, tracker: SpotTracker, dry_run: bool = False):
     """One-shot: pick up new signals + poll once."""
     print(f"\n  [strack] {datetime.now().strftime('%H:%M:%S')} Scan + poll")
     pickup_new_signals(kite, tracker, dry_run=dry_run)
+    pickup_entered_trades(kite, tracker, dry_run=dry_run)
     poll_once(kite, tracker, dry_run=dry_run)
 
 
@@ -661,62 +815,81 @@ def cmd_status(tracker: SpotTracker):
         print("\n  [strack] No signals tracked yet.")
         return
 
-    watching = [s for s in signals if s['status'] == 'watching']
-    pullback = [s for s in signals if s['status'] == 'pullback']
-    alerted = [s for s in signals if s['status'] == 'alerted']
-    cancelled = [s for s in signals if s['status'] == 'cancelled']
+    by_status = {}
+    for s in signals:
+        by_status.setdefault(s['status'], []).append(s)
+
+    # Count by type
+    entry_active = [s for s in signals if s['status'] in _ENTRY_ACTIVE]
+    exit_active = [s for s in signals if s['status'] in _EXIT_ACTIVE]
 
     print(f"\n  === SPOT TRACKER ===")
-    print(f"  Watching:   {len(watching)}  (waiting for pullback)")
-    print(f"  Pullback:   {len(pullback)}  (waiting for re-flip)")
-    print(f"  Alerted:    {len(alerted)}  (ENTER signal sent)")
-    print(f"  Cancelled:  {len(cancelled)}")
+    print(f"  Entry signals:  {len(entry_active)} active")
+    print(f"  Exit tracking:  {len(exit_active)} active")
 
-    for label, group in [('WATCHING', watching), ('PULLBACK', pullback),
-                         ('ALERTED', alerted)]:
+    labels = [
+        ('WATCHING (entry)', 'watching'),
+        ('PULLBACK (entry)', 'pullback'),
+        ('EXIT TRACKING', 'exit_tracking'),
+        ('EXIT ALERT', 'exit_alert'),
+        ('RE-ENTRY WATCH', 'reentry_watch'),
+        ('ALERTED (enter)', 'alerted'),
+        ('RE-ALERTED (re-enter)', 're_alerted'),
+    ]
+
+    for label, status in labels:
+        group = by_status.get(status, [])
         if not group:
             continue
         print(f"\n  --- {label} ---")
         for s in group:
-            gap = 0
-            st_v = s.get('st_value') or 0
-            if s.get('last_spot_ltp') and st_v > 0:
-                gap = (s['last_spot_ltp'] - st_v) / st_v * 100
+            gap = _gap_pct(s.get('last_spot_ltp', 0), s.get('st_value', 0))
             last_dir = s.get('last_spot_15m_dir', '?')
-            need = (s['need_pullback_dir'] if s['status'] == 'watching'
-                    else s['need_reentry_dir'])
+            ttype = s.get('tracking_type', '?')
+
+            if status in ('watching',):
+                need = s['need_pullback_dir']
+            elif status in ('exit_tracking',):
+                need = s['need_pullback_dir']  # flip against = exit
+            else:
+                need = s.get('need_reentry_dir', '?')
+
             checked = s.get('last_checked_at', '')[:16]
+            opt = s.get('option_symbol', '')
+            opt_tag = f" opt={opt}" if opt else ""
+
             print(f"  #{s['id']:3d} {s['symbol']:15s} {s['direction']:<3} "
                   f"[{s['timeframe'][:1].upper()}] "
                   f"15M={last_dir:5s} need={need:5s} "
-                  f"gap={gap:+.1f}% @ {checked}")
+                  f"gap={gap:+.1f}% [{ttype}]{opt_tag}")
 
+    cancelled = by_status.get('cancelled', [])
     if cancelled:
         print(f"\n  --- CANCELLED (last 5) ---")
         for s in cancelled[-5:]:
             print(f"  #{s['id']:3d} {s['symbol']:15s} "
-                  f"{s.get('cancel_reason', '?')}")
+                  f"[{s.get('tracking_type', '?')}] {s.get('cancel_reason', '?')}")
     print()
 
 
 def cmd_monitor(kite, tracker: SpotTracker, dry_run: bool = False):
     """Long-running monitor loop aligned to 15M candle boundaries."""
     print(f"\n  [strack] Monitor loop started (Ctrl+C to stop)")
-    print(f"  [strack] Polling every 15M boundary + {_POLL_INTERVAL_SEC}s fallback\n")
+    print(f"  [strack] Polling every 15M boundary\n")
 
     try:
         while True:
             if _is_market_hours():
                 pickup_new_signals(kite, tracker, dry_run=dry_run)
+                pickup_entered_trades(kite, tracker, dry_run=dry_run)
                 poll_once(kite, tracker, dry_run=dry_run)
 
-                # Sleep until next 15M boundary
                 sleep_sec = min(_seconds_to_next_15m(), _POLL_INTERVAL_SEC)
                 print(f"  [strack] next poll in {sleep_sec}s "
                       f"({datetime.now().strftime('%H:%M:%S')})")
                 time.sleep(sleep_sec)
             else:
-                print(f"  [strack] Market closed. Waiting... "
+                print(f"  [strack] Market closed. "
                       f"({datetime.now().strftime('%H:%M:%S')})")
                 time.sleep(60)
     except KeyboardInterrupt:
