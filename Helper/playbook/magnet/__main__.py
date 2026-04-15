@@ -308,6 +308,45 @@ def cmd_ctrack(args):
     print(f"Unknown ctrack action: {action}")
 
 
+def cmd_strack(args):
+    """Spot 15M ST tracker sub-commands."""
+    from .spot_tracker import (
+        get_tracker, get_kite, cmd_scan, cmd_status, cmd_monitor, cmd_run,
+    )
+
+    action = args.strack_action
+
+    if action == 'status':
+        tracker = get_tracker()
+        cmd_status(tracker)
+        return
+
+    if action == 'cancel':
+        tracker = get_tracker()
+        tracker.cancel(args.strack_id, args.strack_reason or 'manual cancel')
+        print(f"  Signal #{args.strack_id} cancelled")
+        return
+
+    # Actions that need Kite
+    try:
+        kite = get_kite()
+    except Exception as e:
+        print(f"Kite auth failed: {e}")
+        return
+
+    tracker = get_tracker()
+    dry = getattr(args, 'dry_run', False)
+
+    if action == 'scan':
+        cmd_scan(kite, tracker, dry_run=dry)
+    elif action == 'monitor':
+        cmd_monitor(kite, tracker, dry_run=dry)
+    elif action == 'run':
+        cmd_run(kite, tracker, dry_run=dry)
+    else:
+        print(f"Unknown strack action: {action}")
+
+
 def cmd_close(args):
     """Manually close a trade."""
     store = get_store()
@@ -490,6 +529,36 @@ def main():
 
     p_ct.set_defaults(func=cmd_ctrack)
 
+    # strack -- spot 15M ST tracker (parallel entry timing)
+    p_st = sub.add_parser('strack', help='Spot 15M ST tracker (pullback->flip entry)')
+    st_sub = p_st.add_subparsers(dest='strack_action')
+
+    st_scan = st_sub.add_parser('scan', help='Pick up new WATCHING signals + poll once')
+    st_scan.add_argument('--dry-run', action='store_true',
+                         help='No Telegram alerts')
+    st_scan.set_defaults(func=cmd_strack)
+
+    st_status = st_sub.add_parser('status', help='Status table of tracked signals')
+    st_status.set_defaults(func=cmd_strack)
+
+    st_monitor = st_sub.add_parser('monitor', help='Long-running monitor loop')
+    st_monitor.add_argument('--dry-run', action='store_true',
+                            help='No Telegram alerts')
+    st_monitor.set_defaults(func=cmd_strack)
+
+    st_run = st_sub.add_parser('run', help='Single scan+poll (cron target)')
+    st_run.add_argument('--dry-run', action='store_true',
+                        help='No Telegram alerts')
+    st_run.set_defaults(func=cmd_strack)
+
+    st_cancel = st_sub.add_parser('cancel', help='Cancel a tracked signal')
+    st_cancel.add_argument('strack_id', metavar='ID', type=int, help='Signal ID')
+    st_cancel.add_argument('--reason', dest='strack_reason',
+                           default=None, help='Cancel reason')
+    st_cancel.set_defaults(func=cmd_strack)
+
+    p_st.set_defaults(func=cmd_strack)
+
     args = parser.parse_args()
     setup_logging(args.verbose)
 
@@ -500,6 +569,11 @@ def main():
     # For ctrack with no sub-action, show ctrack help
     if args.command == 'ctrack' and not args.ctrack_action:
         p_ct.print_help()
+        sys.exit(1)
+
+    # For strack with no sub-action, show strack help
+    if args.command == 'strack' and not getattr(args, 'strack_action', None):
+        p_st.print_help()
         sys.exit(1)
 
     args.func(args)
