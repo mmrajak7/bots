@@ -168,18 +168,11 @@ def check_proximity_alerts(kite, store, watchlist: Dict[str, Set[str]],
             lots = max(1, int(cfg.CAPITAL_PER_TRADE / cost_per_lot)) if cost_per_lot > 0 else 0
             total_cost = lots * cost_per_lot
 
-            # Check liquidity
-            skip_reason = ''
+            # Only skip on wide spread — capital is user's decision
             if quote['spread_pct'] > cfg.MAX_SPREAD_PCT:
-                skip_reason = (f"Spread {quote['spread_pct']*100:.1f}% > "
-                               f"{cfg.MAX_SPREAD_PCT*100:.0f}% limit")
-            elif lots == 0 or total_cost > cfg.CAPITAL_PER_TRADE * 1.5:
-                skip_reason = (f"Capital insufficient: 1 lot = "
-                               f"Rs {cost_per_lot:,.0f} > Rs {cfg.CAPITAL_PER_TRADE:,.0f}")
-
-            if skip_reason:
-                # Log only, no Telegram for skips
-                logger.info("SKIP: %s — %s", stock, skip_reason)
+                logger.info("SKIP: %s — Spread %.1f%% > %.0f%% limit",
+                            stock, quote['spread_pct'] * 100,
+                            cfg.MAX_SPREAD_PCT * 100)
                 alerted_today.add(stock)
                 continue
 
