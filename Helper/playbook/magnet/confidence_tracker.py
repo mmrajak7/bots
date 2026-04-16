@@ -49,6 +49,7 @@ _WICK_LTP_MAX_PCT = 0.05  # wick entry only if current LTP within 5% of ST
 _APPROACH_GAP_PCT = 0.05  # send approaching alert when gap <= 5%
 _APPROACH_RESET_PCT = 0.10  # reset approaching flag when gap widens above 10%
 _MIN_OPTION_PRICE = 0.50  # skip only near-worthless options (< Rs 0.50, no meaningful price action)
+_SPOT_DIVERGE_PCT = 0.10  # cancel if spot moved >10% away from target ST (thesis dead)
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +755,25 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                                             f'SL hit at {sl:,.0f} before entry')
                     _send_telegram(msg, dry_run=dry_run)
                     print(f"  #{sig['id']} {sym}: SL HIT while watching -> cancelled")
+                    continue
+
+            # 2b. Spot divergence guard: cancel if spot moved far from target ST
+            # E.g. ANGELONE CE with target_spot=208 but spot=295 (42% above) — thesis dead
+            target = sig.get('target_spot', 0)
+            if target > 0:
+                spot_gap = (ltp - target) / target
+                diverged = ((need_up and spot_gap > _SPOT_DIVERGE_PCT) or
+                            (not need_up and spot_gap < -_SPOT_DIVERGE_PCT))
+                if diverged:
+                    tracker.cancel(sig['id'],
+                                   f'spot diverged: {ltp:,.0f} is '
+                                   f'{spot_gap*100:+.1f}% from ST {target:,.0f}')
+                    _send_telegram(
+                        f"\u274c <code>{sym}</code> {sig['direction']} CANCELLED"
+                        f" | spot {spot_gap*100:+.1f}% past target ST",
+                        dry_run=dry_run)
+                    print(f"  #{sig['id']} {sym}: SPOT DIVERGED "
+                          f"({spot_gap*100:+.1f}% from ST {target:,.0f}) -> cancelled")
                     continue
 
             # 3. Check stale signal auto-cancel
