@@ -250,22 +250,36 @@ def find_atm_option(stock: str, direction: str,
             logger.warning("No options found for %s %s in CSV", stock, direction)
             return None
 
-        # Filter by min DTE
+        # Filter by min DTE — skip expiries < MIN_DTE, roll to next
         now_dt = datetime.now()
+        today = now_dt.strftime('%Y-%m-%d')
         min_expiry = (now_dt + timedelta(days=cfg.MIN_DTE)).strftime('%Y-%m-%d')
-        valid = [c for c in candidates if c['expiry'] >= min_expiry]
-        if not valid:
-            # Fallback: any future expiry
-            today = now_dt.strftime('%Y-%m-%d')
-            valid = [c for c in candidates if c['expiry'] >= today]
-        if not valid:
+
+        # Get all unique expiries sorted
+        future = [c for c in candidates if c['expiry'] >= today]
+        if not future:
+            logger.warning("No future expiry for %s %s", stock, direction)
+            return None
+
+        expiries = sorted(set(c['expiry'] for c in future))
+
+        # Pick first expiry with >= MIN_DTE days
+        valid_expiry = None
+        for exp in expiries:
+            if exp >= min_expiry:
+                valid_expiry = exp
+                break
+
+        # If nothing has >= MIN_DTE, use the next available (last resort)
+        if not valid_expiry:
+            valid_expiry = expiries[-1] if expiries else None
+
+        if not valid_expiry:
             logger.warning("No valid expiry for %s %s (min DTE=%d)",
                            stock, direction, cfg.MIN_DTE)
             return None
 
-        # Pick nearest valid expiry
-        nearest_expiry = min(c['expiry'] for c in valid)
-        same_expiry = [c for c in valid if c['expiry'] == nearest_expiry]
+        same_expiry = [c for c in future if c['expiry'] == valid_expiry]
 
         # Find ATM strike (nearest to spot)
         atm = min(same_expiry, key=lambda c: abs(c['strike'] - spot))
@@ -324,21 +338,14 @@ def build_entry_alert(stock: str, side: str, gap_pct: float,
 
     msg = (
         f"{icon} FLOW ENTRY \u2014 <code>{stock}</code> ({side}) {gap_pct*100:.2f}%\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"Spot: \u20b9{spot:,.2f} | Level: \u20b9{st_value:,.2f}\n"
         f"\n"
         f"<code>{option['symbol']}</code>\n"
         f"Ask: \u20b9{quote['ask']:.2f} | Bid: \u20b9{quote['bid']:.2f} | "
         f"Spread: {spread_str}\n"
         f"Lots: {lots} ({lots * option['lot_size']} qty) | "
-        f"Cost: \u20b9{cost:,.0f}\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+        f"Cost: \u20b9{cost:,.0f}"
     )
-
-    if skip_reason:
-        msg += f"\n\u26a0\ufe0f SKIP: {skip_reason}"
 
     return msg
 
@@ -354,8 +361,6 @@ def build_exit_alert(trade: dict, reason: str, current_spot: float,
     msg = (
         f"{icon} FLOW EXIT \u2014 <code>{trade['stock']}</code> "
         f"({trade['side']})\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"Reason: {reason}\n"
         f"Spot: \u20b9{current_spot:,.2f}\n"
     )
@@ -363,20 +368,14 @@ def build_exit_alert(trade: dict, reason: str, current_spot: float,
         msg += f"Premium: \u20b9{current_premium:.2f}\n"
     msg += (
         f"{pnl_icon} P&L: \u20b9{pnl:,.0f} ({pnl_pct:+.1f}%)\n"
-        f"Days held: {trade.get('days_held', 0)}\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+        f"Days held: {trade.get('days_held', 0)}"
     )
     return msg
 
 
 def build_pre_close_alert(trades: list, ltp_map: Dict[str, float]) -> str:
     """Build 2:45 PM pre-close alert for all open trades."""
-    msg = (
-        "\U0001f553 FLOW PRE-CLOSE (2:45 PM)\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-    )
+    msg = "\U0001f553 FLOW PRE-CLOSE (2:45 PM)\n"
     for t in trades:
         spot = ltp_map.get(t['stock'], 0)
         entry = t.get('entry_spot', 0) or 0
@@ -394,11 +393,7 @@ def build_pre_close_alert(trades: list, ltp_map: Dict[str, float]) -> str:
             f"({spot_pnl_pct:+.1f}%)\n"
         )
 
-    msg += (
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        "Reply to hold overnight or exit manually."
-    )
+    msg += "Reply to hold overnight or exit manually."
     return msg
 
 

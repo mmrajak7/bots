@@ -42,14 +42,14 @@ CHARTINK_DOWN = (
 
 # ── Defaults (overridden by flow_config.json) ─────────────────────────────
 _DEFAULTS = {
-    # Alert zone: LTP within ±0.5% of 15M ST
-    'alert_zone_pct': 0.005,
+    # Alert zone: LTP within ±0.1% of 15M ST (almost touch)
+    'alert_zone_pct': 0.001,
     # Take profit: 5% spot move from entry
     'tp_pct': 0.05,
     # Capital per trade (buy as many lots as fit)
     'capital_per_trade': 50000,
-    # Minimum DTE for option selection
-    'min_dte': 15,
+    # Minimum DTE for option selection (rolls to next expiry below this)
+    'min_dte': 7,
     # Max bid-ask spread as % of mid-price
     'max_spread_pct': 0.10,
     # ST parameters (same across all TFs)

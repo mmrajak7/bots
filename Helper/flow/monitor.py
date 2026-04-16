@@ -178,11 +178,8 @@ def check_proximity_alerts(kite, store, watchlist: Dict[str, Set[str]],
                                f"Rs {cost_per_lot:,.0f} > Rs {cfg.CAPITAL_PER_TRADE:,.0f}")
 
             if skip_reason:
-                msg = build_skip_alert(stock, side, abs_gap, ltp, st_val,
-                                       option, skip_reason)
+                # Log only, no Telegram for skips
                 logger.info("SKIP: %s — %s", stock, skip_reason)
-                if not dry_run:
-                    send_telegram(msg)
                 alerted_today.add(stock)
                 continue
 
