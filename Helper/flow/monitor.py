@@ -102,7 +102,7 @@ def check_proximity_alerts(kite, store, watchlist: Dict[str, Set[str]],
                            alerted_today: Set[str],
                            ltp_map: Dict[str, float] = None,
                            dry_run: bool = False) -> Dict[str, float]:
-    """Check LTP vs 15M ST for all watchlist stocks. Alert if within +/-0.5%.
+    """Check LTP vs 15M ST for all watchlist stocks. Alert if within alert zone.
 
     Returns the ltp_map used (fetched if not provided), so caller can reuse it.
     """
@@ -135,7 +135,7 @@ def check_proximity_alerts(kite, store, watchlist: Dict[str, Set[str]],
             gap = (ltp - st_val) / st_val
             abs_gap = abs(gap)
 
-            # Check: LTP within +/-0.5% of ST
+            # Check: LTP within alert zone of ST
             if abs_gap > cfg.ALERT_ZONE_PCT:
                 continue
 
@@ -161,11 +161,11 @@ def check_proximity_alerts(kite, store, watchlist: Dict[str, Set[str]],
                 logger.warning("No quote for %s, skipping", option['symbol'])
                 continue
 
-            # Calculate lots and cost
+            # Calculate lots and cost (always at least 1 lot — user decides capital)
             ask_price = quote['ask']
             lot_size = option['lot_size']
             cost_per_lot = ask_price * lot_size
-            lots = max(1, int(cfg.CAPITAL_PER_TRADE / cost_per_lot)) if cost_per_lot > 0 else 0
+            lots = max(1, int(cfg.CAPITAL_PER_TRADE / cost_per_lot)) if cost_per_lot > 0 else 1
             total_cost = lots * cost_per_lot
 
             # Only skip on wide spread — capital is user's decision
