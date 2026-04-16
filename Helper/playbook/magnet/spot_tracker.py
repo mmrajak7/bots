@@ -40,6 +40,7 @@ _15M_FETCH_DAYS = 12           # enough for ST warmup
 _MIN_DTE_DAYS = 3              # cancel if option DTE < this
 _POLL_INTERVAL_SEC = 300       # 5 minutes between polls
 _MAX_ACTIVE_SIGNALS = 20       # cap to avoid API rate limit issues
+_SPOT_DIVERGE_PCT = 10.0       # cancel if spot moved >10% from higher-TF ST
 _STALE_CHECK_MINUTES = 30      # skip transitions if last check was > N min ago
 _MAX_WATCHING_DAYS = {         # auto-cancel if no flip within N days
     'daily': 3,
@@ -716,6 +717,18 @@ def poll_once(kite, tracker: SpotTracker, dry_run: bool = False):
         cur_dir = st_info['direction']
         prev_dir = sig['last_spot_15m_dir']
         gap = _gap_pct(ltp, sig['st_value'])
+
+        # Spot divergence guard: cancel if spot moved >10% from higher-TF ST
+        need_up = sig['direction'] == 'CE'
+        diverged = ((need_up and gap > _SPOT_DIVERGE_PCT) or
+                    (not need_up and gap < -_SPOT_DIVERGE_PCT))
+        if diverged and ttype == 'entry':
+            tracker.cancel(sig['id'],
+                           f'spot diverged: {ltp:,.0f} is {gap:+.1f}% '
+                           f'from ST {sig["st_value"]:,.0f}')
+            print(f"  [strack] #{sig['id']} {sym}: SPOT DIVERGED "
+                  f"({gap:+.1f}% from ST) -> cancelled")
+            continue
 
         # Update state
         tracker.update_15m(sig['id'], st_info['st_value'], cur_dir, ltp)
