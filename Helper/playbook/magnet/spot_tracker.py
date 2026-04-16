@@ -584,13 +584,7 @@ def pickup_from_chartink(kite, tracker: SpotTracker, dry_run: bool = False):
               f"15M={spot_st['direction']} -> {sig_obj['status'].upper()}")
 
         if sig_obj['status'] == 'pullback':
-            _send_telegram(
-                f"<b>PULLBACK</b> <code>{stock}</code> "
-                f"{direction} [{timeframe[:1].upper()}]\n"
-                f"Spot 15M already {spot_st['direction']} (against {direction})\n"
-                f"Watching for flip to {sig_obj['need_reentry_dir']}...\n"
-                f"Spot {price:,.2f} | ST {st_val:,.2f} | Gap {gap*100:.1f}%",
-                dry_run=dry_run)
+            pass  # Suppressed: only alert on FLIP / EXIT / RE-ENTRY
 
     if picked:
         print(f"  [strack] Picked up {picked} from Chartink")
@@ -744,13 +738,7 @@ def poll_once(kite, tracker: SpotTracker, dry_run: bool = False):
                 tracker.mark_pullback(sig['id'], st_info['st_value'], ltp)
                 print(f"  [strack] #{sig['id']} {sym} {sig['direction']}: "
                       f"PULLBACK (15M -> {cur_dir})")
-                _send_telegram(
-                    f"<b>PULLBACK</b> <code>{sym}</code> "
-                    f"{sig['direction']} [{tf_tag}]\n"
-                    f"Spot 15M flipped {cur_dir} (against {sig['direction']})\n"
-                    f"Watching for flip to {sig['need_reentry_dir']}...\n"
-                    f"Spot {ltp:,.2f} | 15M ST {st_info['st_value']:,.2f}",
-                    dry_run=dry_run)
+                pass  # Suppressed: only alert on FLIP / EXIT / RE-ENTRY
             else:
                 print(f"  [strack] #{sig['id']} {sym} {sig['direction']:<3} "
                       f"15M={cur_dir:5s} need={sig['need_pullback_dir']} "
