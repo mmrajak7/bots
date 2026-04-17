@@ -55,7 +55,7 @@ _ALL_SCANNERS = [
 _DEFAULTS = {
     'signal_gap_max': 0.05,       # 5% — WATCH band 4-5%, enter earlier (2026-04-18)
     'entry_gap': 0.04,            # 4% — buy option when gap shrinks to this (was 2%, earlier entry)
-    'entry_gap_min': 0.005,       # 0.5% — too close, already past entry zone
+    'entry_gap_min': 0.03,        # 3% — narrow entry band 3-4% to capture full 3-5% move
     'cost_sl_gap': 0.02,           # 2% — move SL to cost+0.10 at halfway (scales with entry_gap)
     'hedge_gap': 0.055,           # 5.5% — add short leg when gap widens past watch band (reversal)
     'hedge_max_debit_ratio': 0.35,# max net debit / spread width to enter hedge
