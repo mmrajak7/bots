@@ -269,8 +269,12 @@ def get_spot_with_recent_range(kite, symbols, instrument_tokens=None):
 
 # ── Option Selection ──────────────────────────────────────────────────────
 
-def select_option(kite, stock: str, direction: str, spot: float) -> dict:
-    """Select ATM option for the trade.
+def select_option(kite, stock: str, direction: str, target: float) -> dict:
+    """Select option strike NEAREST TO TARGET (not ATM).
+
+    target = ST line (where price is heading). Picks strike closest to target so
+    the option becomes ATM when the move completes — better leverage than ATM-at-entry.
+    Example: spot=1350, target=1380 -> picks 1380 CE (slightly OTM at entry).
 
     Returns: {strike, symbol, lot_size, premium} or empty dict on failure.
 
@@ -316,9 +320,9 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
                     target_exp = valid_expiry[0]['expiry']
                     same_exp = [c for c in valid_expiry if c['expiry'] == target_exp]
 
-                    # ATM: nearest strike to spot within same expiry
-                    # Try ATM first, then nearby strikes if illiquid
-                    same_exp.sort(key=lambda x: abs(x['strike'] - spot))
+                    # Nearest strike to TARGET (ST line) within same expiry
+                    # Strike becomes ATM at target — better leverage than ATM-at-entry
+                    same_exp.sort(key=lambda x: abs(x['strike'] - target))
 
                     for candidate in same_exp[:5]:  # check up to 5 nearest strikes
                         quote = get_option_quote(kite, candidate['symbol'])
@@ -377,8 +381,8 @@ def select_option(kite, stock: str, direction: str, spot: float) -> dict:
         target_expiry = near_expiry[0]['expiry']
         same_expiry = [c for c in near_expiry if c['expiry'] == target_expiry]
 
-        # ATM strike — try nearest strikes, skip illiquid
-        same_expiry.sort(key=lambda x: abs(x['strike'] - spot))
+        # Nearest strike to TARGET (ST line) — try nearest strikes, skip illiquid
+        same_expiry.sort(key=lambda x: abs(x['strike'] - target))
 
         for candidate in same_expiry[:5]:
             sym = candidate['tradingsymbol']
@@ -454,8 +458,10 @@ def check_watching_signals(store, kite):
         # === ENTRY ZONE: gap is between 0.5% and 2% ===
         logger.info("ENTRY TRIGGER: %s gap=%.1f%% (≤2%%)", stock, gap * 100)
 
-        # Select option
-        option = select_option(kite, stock, trade['direction'], price)
+        # Select option at TARGET strike (ST line), not ATM
+        # Strike becomes ATM at target — better leverage than ATM-at-entry
+        target = trade.get('target_spot') or trade['st_value']
+        option = select_option(kite, stock, trade['direction'], target)
 
         if not option or not option.get('symbol'):
             retries = (trade.get('entry_retries') or 0) + 1
