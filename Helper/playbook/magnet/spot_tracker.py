@@ -552,8 +552,8 @@ def pickup_from_chartink(kite, tracker: SpotTracker, dry_run: bool = False):
         st_val = st_info['st']
         gap = abs(price - st_val) / st_val
 
-        # Chartink pre-filters at 3.1%. Allow 3.5% for minor ST divergence.
-        if gap > 0.035:
+        # Tracked candidates must be within Chartink's watch band (slight buffer for ST divergence)
+        if gap > cfg.SIGNAL_GAP_MAX + 0.005:
             continue
 
         # Direction: above ST = PE (expect fall), below ST = CE (expect rally)

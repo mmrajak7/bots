@@ -19,28 +19,28 @@ CHARTINK_SCAN_URL = 'https://chartink.com/screener/process'
 CHARTINK_BACKTEST_URL = 'https://chartink.com/backtest/process'
 CHARTINK_URL = CHARTINK_SCAN_URL  # both endpoints work; screener is proven
 
-# Monthly: F&O stocks within +/-3.1% of Monthly ST(10,3)
+# Monthly: F&O stocks within +/-5.1% of Monthly ST(10,3)
 CHARTINK_MONTHLY = (
     '( {33489} ( '
-    ' monthly close <=  monthly supertrend( 10 , 3 ) *  1.031'
-    ' and  monthly close >=  monthly supertrend( 10 , 3 ) *  0.969'
+    ' monthly close <=  monthly supertrend( 10 , 3 ) *  1.051'
+    ' and  monthly close >=  monthly supertrend( 10 , 3 ) *  0.949'
     ' ) )'
 )
 
-# Weekly: F&O stocks within +/-3.1% of Weekly ST(10,3)
+# Weekly: F&O stocks within +/-5.1% of Weekly ST(10,3)
 CHARTINK_WEEKLY = (
     '( {33489} ( '
-    ' weekly close <=  weekly supertrend( 10 , 3 ) *  1.031'
-    ' and  weekly close >=  weekly supertrend( 10 , 3 ) *  0.969'
+    ' weekly close <=  weekly supertrend( 10 , 3 ) *  1.051'
+    ' and  weekly close >=  weekly supertrend( 10 , 3 ) *  0.949'
     ' ) )'
 )
 
-# Daily: F&O stocks within +/-3.1% of Daily ST(10,3)
+# Daily: F&O stocks within +/-5.1% of Daily ST(10,3)
 # Default timeframe on Chartink is daily — no prefix needed
 CHARTINK_DAILY = (
     '( {33489} ( '
-    ' close <=  supertrend( 10 , 3 ) *  1.031'
-    ' and  close >=  supertrend( 10 , 3 ) *  0.969'
+    ' close <=  supertrend( 10 , 3 ) *  1.051'
+    ' and  close >=  supertrend( 10 , 3 ) *  0.949'
     ' ) )'
 )
 
@@ -53,14 +53,14 @@ _ALL_SCANNERS = [
 # ── Defaults (overridden by magnet_config.json if present) ────────────────
 # These are compile-time defaults. Runtime values come from _load_runtime().
 _DEFAULTS = {
-    'signal_gap_max': 0.03,       # 3% — tighter range, stronger magnet pull (backtest: 5% too wide)
-    'entry_gap': 0.02,            # 2% — buy option when gap shrinks to this
+    'signal_gap_max': 0.05,       # 5% — WATCH band 4-5%, enter earlier (2026-04-18)
+    'entry_gap': 0.04,            # 4% — buy option when gap shrinks to this (was 2%, earlier entry)
     'entry_gap_min': 0.005,       # 0.5% — too close, already past entry zone
-    'cost_sl_gap': 0.01,           # 1% — move SL to cost+0.10 when stock reaches this gap
-    'hedge_gap': 0.03,            # 3% — add short leg when gap widens back to 3% (reversal)
+    'cost_sl_gap': 0.02,           # 2% — move SL to cost+0.10 at halfway (scales with entry_gap)
+    'hedge_gap': 0.055,           # 5.5% — add short leg when gap widens past watch band (reversal)
     'hedge_max_debit_ratio': 0.35,# max net debit / spread width to enter hedge
     'premium_sl_pct': 0.25,       # 25% — tighter SL, cut losers faster (was 40%)
-    'sl_gap': 0.05,               # 5% — if gap widens to this, thesis dead
+    'sl_gap': 0.07,               # 7% — if gap widens past this, thesis dead (widened with entry)
     'sl_time_days': 5,            # exit if no touch within 5 trading days
     'freshness_days': 5,          # signal invalid if price was <2% within last N days
     'slippage_pct': 0.0,          # deprecated: now using tick-size rounding (±1 tick)
@@ -124,6 +124,20 @@ PREMIUM_SL_PCT = _runtime.get('premium_sl_pct', 0.25)
 SL_GAP = _runtime.get('sl_gap', 0.05)
 SL_TIME_DAYS = _runtime['sl_time_days']
 FRESHNESS_DAYS = _runtime['freshness_days']
+
+# ── Invariant checks: catch mis-configured thresholds at startup ─────────
+assert SL_GAP > SIGNAL_GAP_MAX, (
+    f"SL_GAP ({SL_GAP}) must be > SIGNAL_GAP_MAX ({SIGNAL_GAP_MAX}) — "
+    "else SL triggers inside watch band")
+assert ENTRY_GAP < SIGNAL_GAP_MAX, (
+    f"ENTRY_GAP ({ENTRY_GAP}) must be < SIGNAL_GAP_MAX ({SIGNAL_GAP_MAX}) — "
+    "else no watch band")
+assert ENTRY_GAP_MIN < ENTRY_GAP, (
+    f"ENTRY_GAP_MIN ({ENTRY_GAP_MIN}) must be < ENTRY_GAP ({ENTRY_GAP}) — "
+    "else no entry zone")
+assert COST_SL_GAP < ENTRY_GAP, (
+    f"COST_SL_GAP ({COST_SL_GAP}) must be < ENTRY_GAP ({ENTRY_GAP}) — "
+    "breakeven SL must trigger after entry, not before")
 
 # ── Trail ────────────────────────────────────────────────────────────────
 TRAIL_PCT = _runtime.get('trail_pct', 0.50)

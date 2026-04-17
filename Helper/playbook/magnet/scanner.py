@@ -419,14 +419,15 @@ def check_freshness(symbol: str, st_value: float,
             return False, f"already at ST line (gap {current_gap:.1%}), too late"
 
         if current_gap < cfg.ENTRY_GAP:
-            return False, f"already in entry zone (gap {current_gap:.1%} < 2%), missed approach"
+            return False, (f"already in entry zone "
+                           f"(gap {current_gap:.1%} < {cfg.ENTRY_GAP:.1%}), missed approach")
 
-        # Check last N trading days — was price below 2% gap recently?
+        # Check last N trading days — was price below entry-gap zone recently?
         recent_days = daily[-cfg.FRESHNESS_DAYS:]
         for candle in recent_days:
             day_close = candle['close']
             day_low = candle['low']
-            # Check if the low or close was within 2% of ST
+            # Check if the low or close was within entry-gap of ST
             close_gap = abs(day_close - st_value) / st_value
             low_gap = abs(day_low - st_value) / st_value
             if close_gap < cfg.ENTRY_GAP or low_gap < cfg.ENTRY_GAP:
@@ -435,7 +436,7 @@ def check_freshness(symbol: str, st_value: float,
                     dt = dt.strftime('%Y-%m-%d')
                 else:
                     dt = dt[:10]
-                return False, (f"was in <2% zone on {dt} "
+                return False, (f"was in <{cfg.ENTRY_GAP:.1%} zone on {dt} "
                                f"(close gap {close_gap:.1%}, low gap {low_gap:.1%}). "
                                f"Bounce, not fresh approach")
 
@@ -714,9 +715,8 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
         st_val = st_info['st']
         gap = abs(price - st_val) / st_val
 
-        # Signal acceptance range: gap must be between ENTRY_GAP (2%) and max_gap (3%)
-        # For daily: same 3% range — velocity filter is the daily-specific quality gate
-        # Lifecycle: signal at 2-3% (watching) → gap shrinks to <2% → monitor enters
+        # Signal acceptance range: gap must be between ENTRY_GAP and max_gap (watch band)
+        # Lifecycle: signal inside watch band → gap shrinks below ENTRY_GAP → monitor enters
         max_gap = cfg.DAILY_GAP_MAX if timeframe == 'daily' else cfg.SIGNAL_GAP_MAX
 
         # Verify gap is in valid range
@@ -728,8 +728,8 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
 
         if gap < cfg.ENTRY_GAP:
             skipped_reasons['already_past_entry'] += 1
-            logger.info("SKIP %s (%s): already at %.1f%% gap, past 2%% entry zone",
-                        stock, timeframe, gap * 100)
+            logger.info("SKIP %s (%s): already at %.1f%% gap, past %.1f%% entry zone",
+                        stock, timeframe, gap * 100, cfg.ENTRY_GAP * 100)
             continue
 
         # Freshness check

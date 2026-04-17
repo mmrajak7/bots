@@ -455,8 +455,9 @@ def check_watching_signals(store, kite):
             store.cancel_signal(trade['id'], f"gap narrowed to {gap:.1%}, past entry zone")
             continue
 
-        # === ENTRY ZONE: gap is between 0.5% and 2% ===
-        logger.info("ENTRY TRIGGER: %s gap=%.1f%% (≤2%%)", stock, gap * 100)
+        # === ENTRY ZONE: gap is between ENTRY_GAP_MIN and ENTRY_GAP ===
+        logger.info("ENTRY TRIGGER: %s gap=%.1f%% (≤%.1f%%)",
+                     stock, gap * 100, cfg.ENTRY_GAP * 100)
 
         # Select option at TARGET strike (ST line), not ATM
         # Strike becomes ATM at target — better leverage than ATM-at-entry
