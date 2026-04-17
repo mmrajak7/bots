@@ -394,13 +394,17 @@ def compute_st_for_stock(kite, symbol: str, timeframe: str) -> dict:
 
 def check_freshness(symbol: str, st_value: float,
                     timeframe: str) -> Tuple[bool, str]:
-    """Check if the signal is a fresh approach, not a bounce from <2% zone.
+    """Check if the signal is a fresh approach, not a bounce from an ST touch.
 
     Returns: (is_fresh, reason)
 
     Rules:
-    - If price is already below 2% gap → NOT fresh (too late)
-    - If price was below 2% gap in the last 5 trading days → NOT fresh (bounce)
+    - If price is already in entry zone → too late
+    - If price TOUCHED ST (gap < TOUCHED_THRESHOLD) in last N days → NOT fresh
+      (we already played this move; pullback is not a new setup)
+
+    Natural approaches that dip through 3-4% are NOT rejected — only actual
+    near-ST touches (gap < 1%).
 
     Reuses _raw_daily_cache (populated by compute_st_for_stock) — zero API calls.
     """
@@ -422,23 +426,27 @@ def check_freshness(symbol: str, st_value: float,
             return False, (f"already in entry zone "
                            f"(gap {current_gap:.1%} < {cfg.ENTRY_GAP:.1%}), missed approach")
 
-        # Check last N trading days — was price below entry-gap zone recently?
+        # Check last N trading days — did price TOUCH ST (gap < 1%)?
+        # Only blocks genuine touches, not normal 3-4% dips in an approach.
         recent_days = daily[-cfg.FRESHNESS_DAYS:]
         for candle in recent_days:
             day_close = candle['close']
             day_low = candle['low']
-            # Check if the low or close was within entry-gap of ST
+            day_high = candle['high']
+            # Check if any intraday point came within TOUCHED_THRESHOLD of ST
             close_gap = abs(day_close - st_value) / st_value
             low_gap = abs(day_low - st_value) / st_value
-            if close_gap < cfg.ENTRY_GAP or low_gap < cfg.ENTRY_GAP:
+            high_gap = abs(day_high - st_value) / st_value
+            min_gap = min(close_gap, low_gap, high_gap)
+            if min_gap < cfg.TOUCHED_THRESHOLD:
                 dt = candle['date']
                 if not isinstance(dt, str):
                     dt = dt.strftime('%Y-%m-%d')
                 else:
                     dt = dt[:10]
-                return False, (f"was in <{cfg.ENTRY_GAP:.1%} zone on {dt} "
-                               f"(close gap {close_gap:.1%}, low gap {low_gap:.1%}). "
-                               f"Bounce, not fresh approach")
+                return False, (f"touched ST on {dt} "
+                               f"(min gap {min_gap:.2%} < {cfg.TOUCHED_THRESHOLD:.1%}). "
+                               f"Pullback from touch, not fresh approach")
 
         return True, f"fresh approach, current gap {current_gap:.1%}"
 
@@ -680,15 +688,37 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
         stock = sig['stock']
         timeframe = sig['timeframe']
 
-        # Already watching/entered/exited-today/cancelled-today for this stock?
-        today_str = datetime.now().strftime('%Y-%m-%d')
+        # Dedup:
+        # - currently watching/entered for this stock (any TF)
+        # - exited or cancelled TODAY for this stock (any TF)
+        # - EXITED within last FRESHNESS_DAYS for same stock+TF (post-TP pullback guard)
+        today = datetime.now()
+        today_str = today.strftime('%Y-%m-%d')
+        cooldown_cutoff = (today - timedelta(days=cfg.FRESHNESS_DAYS)).strftime('%Y-%m-%d')
         existing = [t for t in store._trades
                     if t['stock'] == stock
-                    and (t['status'] in ('watching', 'entered')
-                         or (t['status'] in ('cancelled', 'exited')
-                             and t.get('exit_date') == today_str))]
+                    and (
+                        t['status'] in ('watching', 'entered')
+                        or (t['status'] in ('cancelled', 'exited')
+                            and t.get('exit_date') == today_str)
+                        or (t['status'] == 'exited'
+                            and t.get('timeframe') == timeframe
+                            and t.get('exit_date', '') >= cooldown_cutoff)
+                    )]
         if existing:
-            skipped_reasons['already_active'] += 1
+            # Log the cooldown reason distinctly so we can count post-TP blocks
+            recent_tf_exit = [t for t in existing
+                              if t['status'] == 'exited'
+                              and t.get('timeframe') == timeframe
+                              and t.get('exit_date', '') >= cooldown_cutoff
+                              and t.get('exit_date') != today_str]
+            if recent_tf_exit:
+                skipped_reasons['post_exit_cooldown'] += 1
+                logger.info("SKIP %s (%s): recent %s exit on %s (cooldown %dd)",
+                            stock, timeframe, recent_tf_exit[0].get('exit_reason', 'exit'),
+                            recent_tf_exit[0].get('exit_date', '?'), cfg.FRESHNESS_DAYS)
+            else:
+                skipped_reasons['already_active'] += 1
             continue
 
         # Have LTP?  0.0 = bad symbol (already logged in get_ltp), None = Kite didn't return

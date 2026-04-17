@@ -124,6 +124,7 @@ PREMIUM_SL_PCT = _runtime.get('premium_sl_pct', 0.25)
 SL_GAP = _runtime.get('sl_gap', 0.05)
 SL_TIME_DAYS = _runtime['sl_time_days']
 FRESHNESS_DAYS = _runtime['freshness_days']
+TOUCHED_THRESHOLD = _runtime.get('touched_threshold', 0.01)  # 1% = ST touch (for freshness + cooldown)
 
 # ── Invariant checks: catch mis-configured thresholds at startup ─────────
 assert SL_GAP > SIGNAL_GAP_MAX, (
