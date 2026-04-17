@@ -221,34 +221,27 @@ def _compute_market_outlook(kite):
         if nifty_st_dir == 'UP':
             signals_on += 1
 
-        # Build description — no RSI, add 3d trend
-        dma_str = f"{'above' if above_50dma else 'below'} 50DMA ({dma_gap:+.1f}%)"
-        trend_str = f"3d: {n3d_chg:+.1f}%"
-        st_str = f"ST {nifty_st_dir or '?'}"
-
+        # Plain-English classification — no numbers in user-facing text
         if signals_on == 3:
-            sc = 7
-            desc = f"NIFTY bullish -- {dma_str}, {st_str}, {trend_str}"
+            sc, desc, cls = 7, "NIFTY bullish", 'bullish'
         elif signals_on == 2:
-            sc = 5
-            desc = f"NIFTY mixed -- {dma_str}, {st_str}, {trend_str}"
+            sc, desc, cls = 5, "NIFTY mixed", 'mixed'
         elif signals_on == 1:
-            sc = 3
-            desc = f"NIFTY weak -- {dma_str}, {st_str}, {trend_str}"
+            sc, desc, cls = 3, "NIFTY weak", 'weak'
         else:
-            sc = 1
-            desc = f"NIFTY bearish -- {dma_str}, {st_str}, {trend_str}"
+            sc, desc, cls = 1, "NIFTY bearish", 'bearish'
 
         _nifty_cache_ts = _time.time()
         _nifty_cache = {
-            'score': sc, 'detail': desc,
+            'score': sc, 'detail': desc, 'classification': cls,
             'nifty_rsi': nifty_rsi, 'above_50dma': above_50dma,
             'nifty_st_dir': nifty_st_dir, 'nifty_3d_chg': n3d_chg,
         }
         return _nifty_cache
     except Exception as e:
         # Do NOT cache errors -- next symbol should retry NIFTY fetch
-        return {'score': 4, 'detail': f'NIFTY data error: {e}',
+        return {'score': 4, 'detail': 'NIFTY data unavailable',
+                'classification': 'unknown',
                 'nifty_rsi': 50, 'above_50dma': None,
                 'nifty_st_dir': None}
 
@@ -835,6 +828,21 @@ def score_signal(symbol, ltp, st_data, daily, hourly=None, m15=None,
     sq['market'] = (mkt_score, 7,
                     mkt['detail'] + (f" [inverted for {opt}]" if not need_up else ""))
 
+    # Plain-English NIFTY context for alert (no numbers, direction-aware)
+    cls = mkt.get('classification', 'unknown')
+    if cls == 'unknown':
+        market_context = 'NIFTY context unavailable'
+    elif need_up:  # CE — wants UP market
+        if cls == 'bullish':    market_context = f'NIFTY tailwind ({cls})'
+        elif cls == 'mixed':    market_context = f'NIFTY neutral ({cls})'
+        elif cls == 'weak':     market_context = f'NIFTY headwind ({cls})'
+        else:                   market_context = f'NIFTY headwind ({cls})'
+    else:  # PE — wants DOWN market
+        if cls == 'bearish':    market_context = f'NIFTY tailwind ({cls})'
+        elif cls == 'weak':     market_context = f'NIFTY tailwind ({cls})'
+        elif cls == 'mixed':    market_context = f'NIFTY neutral ({cls})'
+        else:                   market_context = f'NIFTY headwind ({cls})'
+
     sq_total = sum(v[0] for v in sq.values())
 
     # ==========================================================================
@@ -991,6 +999,7 @@ def score_signal(symbol, ltp, st_data, daily, hourly=None, m15=None,
         'et_dims': et,
         'strengths': strengths,
         'risks': risks,
+        'market_context': market_context,
         'timing': timing,
         'vol_ratio': 0,
         'gap_velocity': gap_vel,

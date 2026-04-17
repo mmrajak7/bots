@@ -268,7 +268,17 @@ def format_watch_alert(result: dict, option: Optional[dict] = None,
             sup_str = f" | Sup {st15m['st_value']:.2f}{dir_icon}"
         lines.append(f"<code>{opt_sym}</code> @ {opt_price:.2f} | {opt_qty} qty{sup_str}")
 
-    # Market context
+    # NIFTY context — plain-English tailwind/headwind for informed decision
+    mkt_ctx = s.get('market_context', '')
+    if mkt_ctx:
+        if 'tailwind' in mkt_ctx:
+            lines.append(f"\U0001f7e2 {mkt_ctx}")
+        elif 'headwind' in mkt_ctx:
+            lines.append(f"\U0001f534 {mkt_ctx}")
+        else:
+            lines.append(f"\u26aa {mkt_ctx}")
+
+    # Correlation block (if provided)
     if corr_block:
         lines.append(corr_block)
 
