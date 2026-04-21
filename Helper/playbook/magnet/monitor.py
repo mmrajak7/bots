@@ -129,6 +129,68 @@ def get_option_quote(kite, symbol: str) -> dict:
                 'bid_qty': 0, 'ask_qty': 0, 'oi': 0, 'volume': 0}
 
 
+def check_synthetic_viable(kite, option_symbol: str, direction: str,
+                           long_ask: float = 0, strike: float = 0,
+                           lot_size: int = 0, spot: float = 0) -> dict:
+    """Check if a synthetic future (CE + -PE) at the same strike is viable,
+    and compute execution-ready numbers so the trader can optionally run the
+    synth alongside the naked.
+
+    For CE direction: synthetic LONG = buy CE + sell PE at same strike.
+    For PE direction: synthetic SHORT = buy PE + sell CE at same strike.
+
+    Thresholds: opposite-leg OI >= 50K, spread < 2% of premium.
+    """
+    try:
+        if direction == 'CE' and option_symbol.endswith('CE'):
+            opp_symbol = option_symbol[:-2] + 'PE'
+            opp_type = 'PE'
+        elif direction == 'PE' and option_symbol.endswith('PE'):
+            opp_symbol = option_symbol[:-2] + 'CE'
+            opp_type = 'CE'
+        else:
+            return {'viable': False, 'reason': 'symbol suffix mismatch'}
+
+        q = get_option_quote(kite, opp_symbol)
+        bid, ask, oi = q.get('bid', 0), q.get('ask', 0), q.get('oi', 0)
+        if ask <= 0 or bid <= 0:
+            return {'viable': False, 'reason': f'{opp_type} no bid/ask',
+                    'opp_symbol': opp_symbol, 'opp_oi': oi}
+        spread_pct = (ask - bid) / ask if ask > 0 else 1.0
+        viable = oi >= 50_000 and spread_pct < 0.02
+
+        # Execution-ready calcs (only when long_ask + lot_size provided)
+        # Synth long: pay long-leg ask, receive opposite-leg bid.
+        # net_debit per share = long_ask - opp_bid (negative = net credit)
+        net_debit = round(long_ask - bid, 2) if long_ask else None
+        notional = round(strike * lot_size, 0) if (strike and lot_size) else None
+        # SPAN margin rule-of-thumb: 18-24% of notional for large-cap F&O,
+        # up to 40% for volatile mid-caps. Use 22% as a reasonable point estimate.
+        est_margin = round(notional * 0.22, 0) if notional else None
+        # Upfront cash: long premium out minus short premium in.
+        # For synth long CE: pay long CE premium, collect PE bid. Cash = long - opp_bid = net_debit.
+        cash_per_share = net_debit
+        cash_per_lot = round(cash_per_share * lot_size, 0) if (cash_per_share is not None and lot_size) else None
+
+        return {
+            'viable': viable,
+            'opp_symbol': opp_symbol,
+            'opp_type': opp_type,
+            'opp_bid': bid,
+            'opp_ask': ask,
+            'opp_oi': oi,
+            'opp_spread_pct': round(spread_pct * 100, 2),
+            'net_debit': net_debit,
+            'notional': notional,
+            'est_margin': est_margin,
+            'cash_per_lot': cash_per_lot,
+            'reason': ('OK' if viable
+                       else f'OI={oi:,} sprd={spread_pct*100:.1f}%'),
+        }
+    except Exception as e:
+        return {'viable': False, 'reason': f'error: {e}'}
+
+
 def check_option_liquidity(quote: dict, premium: float) -> tuple:
     """Check if option is liquid enough for entry.
 
@@ -548,9 +610,26 @@ def check_watching_signals(store, kite):
         if side == 'above':
             # Price is above ST, we expect decline. SL = ST * 1.05 (price goes further up)
             sl_spot = round(st_val * (1 + cfg.SL_GAP), 2)
+            # Tight SL: 2.5% ABOVE entry (adverse = further up for PE)
+            tight_sl_spot = round(price * (1 + cfg.TIGHT_SL_PCT), 2)
         else:
             # Price is below ST, we expect rally. SL = ST * 0.95 (price goes further down)
             sl_spot = round(st_val * (1 - cfg.SL_GAP), 2)
+            # Tight SL: 2.5% BELOW entry (adverse = further down for CE)
+            tight_sl_spot = round(price * (1 - cfg.TIGHT_SL_PCT), 2)
+
+        # Synthetic-viability check: can we build CE + -PE at same strike?
+        # Informational only — doesn't gate entry. Surfaces in Telegram + trade store.
+        synth = check_synthetic_viable(
+            kite, option['symbol'], trade['direction'],
+            long_ask=premium, strike=option['strike'],
+            lot_size=lot_size, spot=price,
+        )
+        if synth.get('viable'):
+            logger.info("SYNTH-OK %s: %s OI=%d spread=%.1f%% net_debit=%.2f est_margin=%.0f",
+                        stock, synth.get('opp_symbol'),
+                        synth.get('opp_oi', 0), synth.get('opp_spread_pct', 0),
+                        synth.get('net_debit') or 0, synth.get('est_margin') or 0)
 
         # === ENTRY PATH: direct or via confidence tracker ===
         if cfg.USE_CONFIDENCE_TRACKER:
@@ -558,7 +637,7 @@ def check_watching_signals(store, kite):
             # score the signal, and alert when entry timing is right.
             _delegate_to_confidence_tracker(
                 store, kite, trade, stock, price, st_val, gap,
-                option, qty, sl_spot)
+                option, qty, sl_spot, tight_sl_spot, synth)
         else:
             # Direct entry (original behavior)
             store.enter_trade(trade['id'], {
@@ -570,24 +649,53 @@ def check_watching_signals(store, kite):
                 'lot_size': lot_size,
                 'quantity': qty,
                 'sl_spot': sl_spot,
+                'tight_sl_spot': tight_sl_spot,
+                'synthetic_viable': synth.get('viable', False),
+                'synthetic_info': synth,
             })
             if trade.get('entry_retries', 0) > 0:
                 store.update_entry_retries(trade['id'], 0)
 
             icon = _dir_icon(trade['direction'])
             tf = _tf_tag(trade['timeframe'])
+            synth_block = ""
+            if synth.get('viable'):
+                opp = synth.get('opp_symbol', '?')
+                opp_bid = synth.get('opp_bid', 0)
+                opp_ask = synth.get('opp_ask', 0)
+                opp_oi = synth.get('opp_oi', 0)
+                net_debit = synth.get('net_debit')
+                notional = synth.get('notional')
+                est_margin = synth.get('est_margin')
+                cash_per_lot = synth.get('cash_per_lot')
+
+                synth_block = "\n\n⚡ <b>SYNTHETIC ALT</b> (you decide)\n"
+                synth_block += (f"Long {trade['direction']} @ {premium:.2f} + "
+                                f"Short {synth.get('opp_type', '?')} @ {opp_bid:.2f} (bid)\n")
+                synth_block += f"<code>{opp}</code> bid/ask {opp_bid:.2f}/{opp_ask:.2f} | OI {opp_oi:,}"
+                if net_debit is not None and cash_per_lot is not None:
+                    credit_tag = "debit" if net_debit >= 0 else "credit"
+                    synth_block += (f"\nNet {credit_tag} = Rs {abs(net_debit):.2f}/sh "
+                                    f"(Rs {abs(cash_per_lot):,.0f} "
+                                    f"{'out' if net_debit>=0 else 'in'} per lot)")
+                if notional and est_margin:
+                    synth_block += (f"\nNotional Rs {notional/100000:.2f}L | "
+                                    f"Est SPAN ~Rs {est_margin/100000:.2f}L (22%)")
+
             msg = (
                 f"{icon} <b>ENTRY</b> {tf} <code>{stock}</code>\n"
                 f"Spot {price:,.1f} | ST {st_val:,.1f} | Gap {gap:.1%}\n"
                 f"<code>{option['symbol']}</code> @ {premium:.2f}\n"
-                f"Qty {qty} | SL {sl_spot:,.1f}"
+                f"Qty {qty} | SL {sl_spot:,.1f} | Tight {tight_sl_spot:,.1f}"
+                f"{synth_block}"
             )
             send_telegram(msg)
             logger.info(msg.replace('\n', ' | '))
 
 
 def _delegate_to_confidence_tracker(store, kite, trade, stock, price, st_val,
-                                     gap, option, qty, sl_spot):
+                                     gap, option, qty, sl_spot,
+                                     tight_sl_spot=None, synth=None):
     """Hand off entry to confidence tracker for pullback-timed entry.
 
     Instead of entering immediately, creates a confidence tracker signal.
@@ -608,6 +716,7 @@ def _delegate_to_confidence_tracker(store, kite, trade, stock, price, st_val,
 
     # Mark the magnet signal as entered (so magnet doesn't re-process it)
     # We use a special status to indicate it's delegated
+    synth = synth or {}
     store.enter_trade(trade['id'], {
         'entry_spot': price,
         'option_strike': option['strike'],
@@ -617,6 +726,9 @@ def _delegate_to_confidence_tracker(store, kite, trade, stock, price, st_val,
         'lot_size': option['lot_size'],
         'quantity': qty,
         'sl_spot': sl_spot,
+        'tight_sl_spot': tight_sl_spot,
+        'synthetic_viable': synth.get('viable', False),
+        'synthetic_info': synth,
         'delegated_to_confidence': True,
     })
     if trade.get('entry_retries', 0) > 0:
@@ -662,6 +774,8 @@ def _delegate_to_confidence_tracker(store, kite, trade, stock, price, st_val,
             et=et,
             target_label=target_label,
             option_expiry=option.get('expiry', ''),
+            tight_sl_spot=tight_sl_spot,
+            synthetic_info=synth,
         )
     except Exception as e:
         # Tracker add failed — revert magnet trade to watching so it can retry
@@ -979,6 +1093,34 @@ def check_open_trades(store, kite):
                 logger.info("PREM SL: %s", msg.replace('\n', ' | '))
                 continue
 
+        # === TIGHT SPOT SL: entry-anchored adverse move (fires FIRST) ===
+        # Tighter than sl_spot (which is 7% from ST). Required for sizing up —
+        # synthetic futures have symmetric 1:1 P&L; can't tolerate 10% drift.
+        tight_sl_spot = trade.get('tight_sl_spot')
+        if tight_sl_spot:
+            tight_hit = False
+            if side == 'above' and price >= tight_sl_spot:
+                tight_hit = True
+            elif side == 'below' and price <= tight_sl_spot:
+                tight_hit = True
+            if tight_hit:
+                entry_spot_ref = trade.get('entry_spot') or price
+                adverse_pct = abs(price - entry_spot_ref) / entry_spot_ref * 100
+                store.exit_trade(trade_id, price, long_exit, 'sl_spot_tight', hedge_exit)
+                pnl = trade.get('pnl', 0)
+                tf = _tf_tag(trade.get('timeframe', ''))
+                msg = (
+                    f"❌ <b>TIGHT SL</b> {tf} <code>{stock}</code>\n"
+                    f"Spot {price:,.1f} vs entry {entry_spot_ref:,.1f} "
+                    f"({adverse_pct:.1f}% adverse)\n"
+                    f"{entry_prem:.2f}→{long_exit:.2f} | "
+                    f"<b>Rs {pnl:+,.0f}</b> ({trade.get('pnl_pct', 0):+.1f}%) "
+                    f"{trade.get('days_held', 0)}d"
+                )
+                send_telegram(msg)
+                logger.info("TIGHT SL: %s", msg.replace('\n', ' | '))
+                continue
+
         # === CHECK SPOT SL: gap widened to 5% (hard backstop) ===
         sl_hit = False
         if side == 'above' and sl_spot:
@@ -1279,7 +1421,8 @@ def _short_reason(reason: str) -> str:
     return {
         'tp': 'TP', 'tp_trail': 'TRL', 'sl_cost': 'CSL',
         'sl_premium': 'PSL', 'sl_premium_gap': 'PSL',
-        'sl_spot': 'SSL', 'sl_spot_gap': 'SSL', 'sl_time': 'TSL',
+        'sl_spot': 'SSL', 'sl_spot_gap': 'SSL', 'sl_spot_tight': 'TSL-S',
+        'sl_time': 'TSL',
         'eod_daily': 'EOD', 'eod_stale': 'EOD',
         'option_expired': 'EXP', 'manual': 'MAN',
         'weekly signal stale': 'STL', 'monthly signal stale': 'STL',
@@ -1466,10 +1609,11 @@ def run(dry_run: bool = False):
     # Config banner — makes stale deployment obvious
     logger.info(
         "Active thresholds: CHARTINK<=%.1f%% | WATCH<=%.1f%% | ENTRY %.1f-%.1f%% | "
-        "COST_SL=%.1f%% | HEDGE=%.1f%% | SL=%.1f%%",
+        "COST_SL=%.1f%% | HEDGE=%.1f%% | TIGHT_SL=%.1f%% | SL=%.1f%%",
         cfg.CHARTINK_GAP_MAX * 100, cfg.SIGNAL_GAP_MAX * 100,
         cfg.ENTRY_GAP_MIN * 100, cfg.ENTRY_GAP * 100,
-        cfg.COST_SL_GAP * 100, cfg.HEDGE_GAP * 100, cfg.SL_GAP * 100,
+        cfg.COST_SL_GAP * 100, cfg.HEDGE_GAP * 100,
+        cfg.TIGHT_SL_PCT * 100, cfg.SL_GAP * 100,
     )
 
     # Config-drift warning: flag runtime thresholds that are LOOSER than

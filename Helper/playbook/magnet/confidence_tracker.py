@@ -316,7 +316,9 @@ def format_enter_alert(sym: str, direction: str, tf: str,
                        signal_price: Optional[float] = None,
                        signal_at: Optional[str] = None,
                        target_spot: Optional[float] = None,
-                       spot_now: Optional[float] = None) -> str:
+                       spot_now: Optional[float] = None,
+                       tight_sl_spot: Optional[float] = None,
+                       synth: Optional[dict] = None) -> str:
     """Format compact ENTER alert — option near 15M support.
 
     Additional spot context (signal date/price, spot move, target) appended
@@ -326,10 +328,13 @@ def format_enter_alert(sym: str, direction: str, tf: str,
     gap = (opt_ltp - st_value) / st_value * 100 if st_value > 0 else 0
     method = 'WICK ENTER' if via_wick else 'ENTER'
 
+    sl_line = f"<code>{option_symbol}</code> | {qty} qty | SL {sl_spot:,.0f}"
+    if tight_sl_spot:
+        sl_line += f" | Tight {tight_sl_spot:,.0f}"
     lines = [
         f"\U0001f7e2 <b>{method}</b> <code>{sym}</code> {direction} [{tf_short}]",
         f"Option @ {opt_ltp:.2f} | 15M Support {st_value:.2f} ({gap:+.1f}%)",
-        f"<code>{option_symbol}</code> | {qty} qty | SL {sl_spot:,.0f}",
+        sl_line,
     ]
 
     # Spot context block (signal date, signal price, spot move, target)
@@ -358,6 +363,37 @@ def format_enter_alert(sym: str, direction: str, tf: str,
                 remaining = -remaining
             lines.append(
                 f"Target {target_spot:,.1f} ({remaining:+.2f}% to go)"
+            )
+
+    # Synthetic alternative (execution-ready, you decide)
+    if synth and synth.get('viable'):
+        opp = synth.get('opp_symbol', '?')
+        opp_bid = synth.get('opp_bid', 0)
+        opp_ask = synth.get('opp_ask', 0)
+        opp_oi = synth.get('opp_oi', 0)
+        net_debit = synth.get('net_debit')
+        notional = synth.get('notional')
+        est_margin = synth.get('est_margin')
+        cash_per_lot = synth.get('cash_per_lot')
+
+        lines.append("")  # blank separator
+        lines.append("⚡ <b>SYNTHETIC ALT</b> (you decide, not auto-executed)")
+        # Long leg is the CE/PE we already picked (opt_ltp = ask)
+        lines.append(
+            f"Long {direction} @ {opt_ltp:.2f} + Short {synth.get('opp_type', '?')} "
+            f"@ {opp_bid:.2f} (bid)"
+        )
+        lines.append(f"<code>{opp}</code> bid/ask {opp_bid:.2f}/{opp_ask:.2f} | OI {opp_oi:,}")
+        if net_debit is not None and cash_per_lot is not None:
+            credit_tag = "debit" if net_debit >= 0 else "credit"
+            lines.append(
+                f"Net {credit_tag} = Rs {abs(net_debit):.2f}/sh "
+                f"(Rs {abs(cash_per_lot):,.0f} {'out' if net_debit>=0 else 'in'} per lot)"
+            )
+        if notional and est_margin:
+            lines.append(
+                f"Notional Rs {notional/100000:.2f}L | "
+                f"Est SPAN ~Rs {est_margin/100000:.2f}L (22% est)"
             )
 
     return "\n".join(lines)
@@ -535,7 +571,9 @@ class ConfidenceTracker:
             direction: str, option_symbol: str, option_price: float,
             quantity: int, sl_spot: float, signal_price: float,
             score: int = 0, grade: str = '', sq: int = 0, et: int = 0,
-            target_label: str = '', option_expiry: str = '') -> dict:
+            target_label: str = '', option_expiry: str = '',
+            tight_sl_spot: Optional[float] = None,
+            synthetic_info: Optional[dict] = None) -> dict:
         """Add a new signal to track. Deduplicates by symbol+direction."""
         # Dedup: skip if watching/entered signal already exists for same stock
         existing = [s for s in self._signals
@@ -558,6 +596,8 @@ class ConfidenceTracker:
             'option_expiry': option_expiry,  # YYYY-MM-DD for expiry check
             'quantity': quantity,
             'sl_spot': sl_spot,
+            'tight_sl_spot': tight_sl_spot,
+            'synthetic_info': synthetic_info or {},
             'signal_price': signal_price,
             'signal_at': datetime.now().isoformat(timespec='seconds'),
             'status': 'watching',
@@ -1057,7 +1097,9 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                     signal_price=sig.get('signal_price'),
                     signal_at=sig.get('signal_at'),
                     target_spot=sig.get('target_st'),
-                    spot_now=ltp)
+                    spot_now=ltp,
+                    tight_sl_spot=sig.get('tight_sl_spot'),
+                    synth=sig.get('synthetic_info'))
                 _send_telegram(msg, dry_run=dry_run, channel='trade')
                 log.info("CT #%s %s: AUTO-ENTERED%s spot=%.0f opt=%.2f",
                          sig['id'], sym, wick_tag, ltp, opt_ltp)

@@ -69,6 +69,7 @@ _DEFAULTS = {
     'hedge_max_debit_ratio': 0.35,# max net debit / spread width to enter hedge
     'premium_sl_pct': 0.25,       # 25% — tighter SL, cut losers faster (was 40%)
     'sl_gap': 0.07,               # 7% — if gap widens past this, thesis dead (widened with entry)
+    'tight_sl_pct': 0.025,         # 2.5% — ENTRY-anchored adverse move SL (fires BEFORE sl_gap). Synthetic futures need this tight.
     'sl_time_days': 5,            # exit if no touch within 5 trading days
     'freshness_days': 5,          # signal invalid if price was <2% within last N days
     'slippage_pct': 0.0,          # deprecated: now using tick-size rounding (±1 tick)
@@ -132,6 +133,7 @@ HEDGE_GAP = _runtime.get('hedge_gap', 0.03)
 HEDGE_MAX_DEBIT_RATIO = _runtime.get('hedge_max_debit_ratio', 0.35)
 PREMIUM_SL_PCT = _runtime.get('premium_sl_pct', 0.25)
 SL_GAP = _runtime.get('sl_gap', 0.05)
+TIGHT_SL_PCT = _runtime.get('tight_sl_pct', 0.025)  # entry-anchored adverse-move SL
 SL_TIME_DAYS = _runtime['sl_time_days']
 FRESHNESS_DAYS = _runtime['freshness_days']
 TOUCHED_THRESHOLD = _runtime.get('touched_threshold', 0.01)  # 1% = ST touch (for freshness + cooldown)
