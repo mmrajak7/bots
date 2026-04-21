@@ -130,62 +130,87 @@ def get_option_quote(kite, symbol: str) -> dict:
 
 
 def check_synthetic_viable(kite, option_symbol: str, direction: str,
-                           long_ask: float = 0, strike: float = 0,
-                           lot_size: int = 0, spot: float = 0) -> dict:
-    """Check if a synthetic future (CE + -PE) at the same strike is viable,
-    and compute execution-ready numbers so the trader can optionally run the
-    synth alongside the naked.
+                           long_ask: float = 0,
+                           strike: float = 0, lot_size: int = 0,
+                           spot: float = 0) -> dict:
+    """Check if a synthetic future at the same strike is viable, and compute
+    execution-ready numbers so the trader can optionally run synth alongside
+    the naked option.
 
-    For CE direction: synthetic LONG = buy CE + sell PE at same strike.
-    For PE direction: synthetic SHORT = buy PE + sell CE at same strike.
+    CE magnet (expecting rally):  synthetic LONG  = buy CE + sell PE
+    PE magnet (expecting decline): synthetic SHORT = buy PE + sell CE
 
-    Thresholds: opposite-leg OI >= 50K, spread < 2% of premium.
+    Liquidity filter (opposite leg): OI >= 50K, spread < 2% of ask.
     """
     try:
         if direction == 'CE' and option_symbol.endswith('CE'):
             opp_symbol = option_symbol[:-2] + 'PE'
             opp_type = 'PE'
+            synth_type = 'LONG'
         elif direction == 'PE' and option_symbol.endswith('PE'):
             opp_symbol = option_symbol[:-2] + 'CE'
             opp_type = 'CE'
+            synth_type = 'SHORT'
         else:
             return {'viable': False, 'reason': 'symbol suffix mismatch'}
 
-        q = get_option_quote(kite, opp_symbol)
-        bid, ask, oi = q.get('bid', 0), q.get('ask', 0), q.get('oi', 0)
+        # Single batched quote for both legs (round-trip cost view)
+        both = kite.quote([f"NFO:{option_symbol}", f"NFO:{opp_symbol}"])
+        long_q = both.get(f"NFO:{option_symbol}", {}) or {}
+        opp_q = both.get(f"NFO:{opp_symbol}", {}) or {}
+
+        def _bid_ask(q):
+            depth = q.get('depth', {}) or {}
+            buy = depth.get('buy') or [{}]
+            sell = depth.get('sell') or [{}]
+            b = buy[0].get('price', 0) if buy else 0
+            a = sell[0].get('price', 0) if sell else 0
+            return b, a
+
+        long_bid, _ = _bid_ask(long_q)
+        bid, ask = _bid_ask(opp_q)
+        oi = opp_q.get('oi', 0)
+
         if ask <= 0 or bid <= 0:
             return {'viable': False, 'reason': f'{opp_type} no bid/ask',
                     'opp_symbol': opp_symbol, 'opp_oi': oi}
-        spread_pct = (ask - bid) / ask if ask > 0 else 1.0
-        viable = oi >= 50_000 and spread_pct < 0.02
+        opp_spread_pct = (ask - bid) / ask if ask > 0 else 1.0
+        viable = oi >= 50_000 and opp_spread_pct < 0.02
 
-        # Execution-ready calcs (only when long_ask + lot_size provided)
-        # Synth long: pay long-leg ask, receive opposite-leg bid.
-        # net_debit per share = long_ask - opp_bid (negative = net credit)
+        # Long-leg spread (round-trip view — select_option confirmed liquid
+        # at entry, but worth showing alongside the short leg).
+        long_spread_pct = ((long_ask - long_bid) / long_ask
+                           if long_ask and long_bid else 0)
+
+        # Execution-ready calcs. Net "debit" = cash out if positive, credit if negative.
+        # Synth: pay long-leg ask, receive opposite-leg bid.
         net_debit = round(long_ask - bid, 2) if long_ask else None
         notional = round(strike * lot_size, 0) if (strike and lot_size) else None
-        # SPAN margin rule-of-thumb: 18-24% of notional for large-cap F&O,
-        # up to 40% for volatile mid-caps. Use 22% as a reasonable point estimate.
-        est_margin = round(notional * 0.22, 0) if notional else None
-        # Upfront cash: long premium out minus short premium in.
-        # For synth long CE: pay long CE premium, collect PE bid. Cash = long - opp_bid = net_debit.
-        cash_per_share = net_debit
-        cash_per_lot = round(cash_per_share * lot_size, 0) if (cash_per_share is not None and lot_size) else None
+        # SPAN + exposure for stock F&O: typically 18-24% (large-cap), up to
+        # 40%+ for volatile mid-caps. Show as range, not point estimate, to
+        # avoid giving the trader false precision.
+        margin_low = round(notional * 0.18, 0) if notional else None
+        margin_high = round(notional * 0.40, 0) if notional else None
+        cash_per_lot = (round(net_debit * lot_size, 0)
+                        if (net_debit is not None and lot_size) else None)
 
         return {
             'viable': viable,
+            'synth_type': synth_type,          # 'LONG' or 'SHORT'
             'opp_symbol': opp_symbol,
             'opp_type': opp_type,
             'opp_bid': bid,
             'opp_ask': ask,
             'opp_oi': oi,
-            'opp_spread_pct': round(spread_pct * 100, 2),
+            'opp_spread_pct': round(opp_spread_pct * 100, 2),
+            'long_spread_pct': round(long_spread_pct * 100, 2),
             'net_debit': net_debit,
             'notional': notional,
-            'est_margin': est_margin,
+            'margin_low': margin_low,
+            'margin_high': margin_high,
             'cash_per_lot': cash_per_lot,
             'reason': ('OK' if viable
-                       else f'OI={oi:,} sprd={spread_pct*100:.1f}%'),
+                       else f'OI={oi:,} sprd={opp_spread_pct*100:.1f}%'),
         }
     except Exception as e:
         return {'viable': False, 'reason': f'error: {e}'}
@@ -664,23 +689,31 @@ def check_watching_signals(store, kite):
                 opp_bid = synth.get('opp_bid', 0)
                 opp_ask = synth.get('opp_ask', 0)
                 opp_oi = synth.get('opp_oi', 0)
+                opp_sprd = synth.get('opp_spread_pct', 0)
+                long_sprd = synth.get('long_spread_pct', 0)
                 net_debit = synth.get('net_debit')
                 notional = synth.get('notional')
-                est_margin = synth.get('est_margin')
+                margin_low = synth.get('margin_low')
+                margin_high = synth.get('margin_high')
                 cash_per_lot = synth.get('cash_per_lot')
+                synth_type = synth.get('synth_type', 'LONG')
 
-                synth_block = "\n\n⚡ <b>SYNTHETIC ALT</b> (you decide)\n"
-                synth_block += (f"Long {trade['direction']} @ {premium:.2f} + "
-                                f"Short {synth.get('opp_type', '?')} @ {opp_bid:.2f} (bid)\n")
-                synth_block += f"<code>{opp}</code> bid/ask {opp_bid:.2f}/{opp_ask:.2f} | OI {opp_oi:,}"
+                synth_block = f"\n\n⚡ <b>SYNTHETIC {synth_type}</b> (you decide)\n"
+                synth_block += (f"Buy {trade['direction']} @ {premium:.2f} + "
+                                f"Sell {synth.get('opp_type', '?')} @ {opp_bid:.2f} (bid)\n")
+                synth_block += (f"<code>{opp}</code> bid/ask {opp_bid:.2f}/{opp_ask:.2f} "
+                                f"(sprd {opp_sprd:.1f}%) | OI {opp_oi:,}")
+                if long_sprd > 0:
+                    synth_block += f"\nLong-leg sprd {long_sprd:.1f}%"
                 if net_debit is not None and cash_per_lot is not None:
                     credit_tag = "debit" if net_debit >= 0 else "credit"
                     synth_block += (f"\nNet {credit_tag} = Rs {abs(net_debit):.2f}/sh "
                                     f"(Rs {abs(cash_per_lot):,.0f} "
                                     f"{'out' if net_debit>=0 else 'in'} per lot)")
-                if notional and est_margin:
+                if notional and margin_low and margin_high:
                     synth_block += (f"\nNotional Rs {notional/100000:.2f}L | "
-                                    f"Est SPAN ~Rs {est_margin/100000:.2f}L (22%)")
+                                    f"SPAN typical Rs {margin_low/100000:.2f}-"
+                                    f"{margin_high/100000:.2f}L (18-40%)")
 
             msg = (
                 f"{icon} <b>ENTRY</b> {tf} <code>{stock}</code>\n"
@@ -1619,12 +1652,20 @@ def run(dry_run: bool = False):
     # Config-drift warning: flag runtime thresholds that are LOOSER than
     # compile-time defaults. Common cause: server running old magnet_config.json
     # after a tightening commit (root cause of AUBANK 1.9% entry bug).
+    # Special case for tight_sl_pct: smaller = tighter, so "looser" means > default.
     drifted = []
     for key in ('entry_gap_min', 'entry_gap', 'signal_gap_max', 'chartink_gap_max'):
         default = cfg._DEFAULTS[key]
         runtime = cfg._runtime.get(key, default)
-        if runtime < default:  # runtime looser than intended
+        if runtime < default:
             drifted.append(f"{key}={runtime*100:.1f}% (default {default*100:.1f}%)")
+    # tight_sl_pct: direction inverted — larger runtime = looser SL
+    tight_default = cfg._DEFAULTS.get('tight_sl_pct', 0.025)
+    tight_runtime = cfg._runtime.get('tight_sl_pct', tight_default)
+    if tight_runtime > tight_default:
+        drifted.append(
+            f"tight_sl_pct={tight_runtime*100:.1f}% (default {tight_default*100:.1f}%)"
+        )
     if drifted:
         logger.warning(
             "CONFIG DRIFT — runtime thresholds LOOSER than defaults: %s. "

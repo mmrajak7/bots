@@ -371,29 +371,38 @@ def format_enter_alert(sym: str, direction: str, tf: str,
         opp_bid = synth.get('opp_bid', 0)
         opp_ask = synth.get('opp_ask', 0)
         opp_oi = synth.get('opp_oi', 0)
+        opp_sprd = synth.get('opp_spread_pct', 0)
+        long_sprd = synth.get('long_spread_pct', 0)
         net_debit = synth.get('net_debit')
         notional = synth.get('notional')
-        est_margin = synth.get('est_margin')
+        margin_low = synth.get('margin_low')
+        margin_high = synth.get('margin_high')
         cash_per_lot = synth.get('cash_per_lot')
+        synth_type = synth.get('synth_type', 'LONG')  # LONG (CE) or SHORT (PE)
 
         lines.append("")  # blank separator
-        lines.append("⚡ <b>SYNTHETIC ALT</b> (you decide, not auto-executed)")
-        # Long leg is the CE/PE we already picked (opt_ltp = ask)
+        lines.append(f"⚡ <b>SYNTHETIC {synth_type}</b> (you decide, not auto-executed)")
         lines.append(
-            f"Long {direction} @ {opt_ltp:.2f} + Short {synth.get('opp_type', '?')} "
+            f"Buy {direction} @ {opt_ltp:.2f} + Sell {synth.get('opp_type', '?')} "
             f"@ {opp_bid:.2f} (bid)"
         )
-        lines.append(f"<code>{opp}</code> bid/ask {opp_bid:.2f}/{opp_ask:.2f} | OI {opp_oi:,}")
+        lines.append(
+            f"<code>{opp}</code> bid/ask {opp_bid:.2f}/{opp_ask:.2f} "
+            f"(sprd {opp_sprd:.1f}%) | OI {opp_oi:,}"
+        )
+        if long_sprd > 0:
+            lines.append(f"Long-leg sprd {long_sprd:.1f}% (round-trip cost view)")
         if net_debit is not None and cash_per_lot is not None:
             credit_tag = "debit" if net_debit >= 0 else "credit"
             lines.append(
                 f"Net {credit_tag} = Rs {abs(net_debit):.2f}/sh "
                 f"(Rs {abs(cash_per_lot):,.0f} {'out' if net_debit>=0 else 'in'} per lot)"
             )
-        if notional and est_margin:
+        if notional and margin_low and margin_high:
             lines.append(
                 f"Notional Rs {notional/100000:.2f}L | "
-                f"Est SPAN ~Rs {est_margin/100000:.2f}L (22% est)"
+                f"SPAN typical Rs {margin_low/100000:.2f}-{margin_high/100000:.2f}L "
+                f"(18-40%)"
             )
 
     return "\n".join(lines)
