@@ -347,6 +347,15 @@ def cmd_strack(args):
         print(f"Unknown strack action: {action}")
 
 
+def cmd_dashboard(args):
+    """Live dashboard across scanner, confidence tracker, and spot tracker."""
+    from .dashboard import run
+    run(watch_sec=args.watch,
+        write_html=not args.no_html,
+        open_browser=not args.no_open,
+        filter_status=args.filter)
+
+
 def cmd_close(args):
     """Manually close a trade."""
     store = get_store()
@@ -441,6 +450,21 @@ def main():
     p_conf.add_argument('--conf-summary', action='store_true',
                         help='Summary table only')
     p_conf.set_defaults(func=cmd_confidence)
+
+    # dashboard (alias: md)
+    p_dash = sub.add_parser('dashboard', aliases=['md'],
+                            help='Live dashboard: regime + all active signals '
+                                 '(HTML + console)')
+    p_dash.add_argument('--watch', type=int, default=None, metavar='SEC',
+                        help='Refresh every N seconds (default: one-shot)')
+    p_dash.add_argument('--no-html', action='store_true',
+                        help='Skip writing the HTML file')
+    p_dash.add_argument('--no-open', action='store_true',
+                        help='Write HTML but do not open browser')
+    p_dash.add_argument('--filter', choices=['open', 'closed', 'all'],
+                        default='open',
+                        help='Console filter (HTML has its own UI toggle)')
+    p_dash.set_defaults(func=cmd_dashboard)
 
     # close
     p_close = sub.add_parser('close', help='Manual close/cancel')

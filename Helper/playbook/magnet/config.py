@@ -19,28 +19,31 @@ CHARTINK_SCAN_URL = 'https://chartink.com/screener/process'
 CHARTINK_BACKTEST_URL = 'https://chartink.com/backtest/process'
 CHARTINK_URL = CHARTINK_SCAN_URL  # both endpoints work; screener is proven
 
-# Monthly: F&O stocks within +/-5.1% of Monthly ST(10,3)
+# Monthly: F&O stocks within +/-8.1% of Monthly ST(10,3)
+# Wider net (was +/-5.1%) to catch candidates BEFORE Chartink's 5-10 min
+# delivery delay pushes them past our entry window. Our own Kite-LTP monitor
+# enforces the actual entry gate (3-4% band).
 CHARTINK_MONTHLY = (
     '( {33489} ( '
-    ' monthly close <=  monthly supertrend( 10 , 3 ) *  1.051'
-    ' and  monthly close >=  monthly supertrend( 10 , 3 ) *  0.949'
+    ' monthly close <=  monthly supertrend( 10 , 3 ) *  1.081'
+    ' and  monthly close >=  monthly supertrend( 10 , 3 ) *  0.919'
     ' ) )'
 )
 
-# Weekly: F&O stocks within +/-5.1% of Weekly ST(10,3)
+# Weekly: F&O stocks within +/-8.1% of Weekly ST(10,3)
 CHARTINK_WEEKLY = (
     '( {33489} ( '
-    ' weekly close <=  weekly supertrend( 10 , 3 ) *  1.051'
-    ' and  weekly close >=  weekly supertrend( 10 , 3 ) *  0.949'
+    ' weekly close <=  weekly supertrend( 10 , 3 ) *  1.081'
+    ' and  weekly close >=  weekly supertrend( 10 , 3 ) *  0.919'
     ' ) )'
 )
 
-# Daily: F&O stocks within +/-5.1% of Daily ST(10,3)
+# Daily: F&O stocks within +/-8.1% of Daily ST(10,3)
 # Default timeframe on Chartink is daily — no prefix needed
 CHARTINK_DAILY = (
     '( {33489} ( '
-    ' close <=  supertrend( 10 , 3 ) *  1.051'
-    ' and  close >=  supertrend( 10 , 3 ) *  0.949'
+    ' close <=  supertrend( 10 , 3 ) *  1.081'
+    ' and  close >=  supertrend( 10 , 3 ) *  0.919'
     ' ) )'
 )
 
@@ -53,9 +56,14 @@ _ALL_SCANNERS = [
 # ── Defaults (overridden by magnet_config.json if present) ────────────────
 # These are compile-time defaults. Runtime values come from _load_runtime().
 _DEFAULTS = {
-    'signal_gap_max': 0.05,       # 5% — WATCH band 4-5%, enter earlier (2026-04-18)
-    'entry_gap': 0.04,            # 4% — buy option when gap shrinks to this (was 2%, earlier entry)
-    'entry_gap_min': 0.03,        # 3% — narrow entry band 3-4% to capture full 3-5% move
+    # Gap cascade (surface → watch → enter → cost_sl → target → sl):
+    #   Chartink scan (±8.1%) → chartink_gap_max (8%) → signal_gap_max (5%, WATCH)
+    #   → entry_gap (4%) → entry_gap_min (3%) → cost_sl_gap (2%) → ST (target 0%)
+    #   → hedge_gap (5.5%, reversal) → sl_gap (7%, thesis dead)
+    'chartink_gap_max': 0.08,     # 8% — outer Kite-validated gate (Chartink's late-delivery buffer)
+    'signal_gap_max': 0.05,       # 5% — WATCH band ceiling (create 'watching' signal)
+    'entry_gap': 0.04,            # 4% — enter when Kite-LTP gap shrinks to this
+    'entry_gap_min': 0.03,        # 3% — floor: cancel if gap falls below (too late, past entry zone)
     'cost_sl_gap': 0.02,           # 2% — move SL to cost+0.10 at halfway (scales with entry_gap)
     'hedge_gap': 0.055,           # 5.5% — add short leg when gap widens past watch band (reversal)
     'hedge_max_debit_ratio': 0.35,# max net debit / spread width to enter hedge
@@ -82,6 +90,7 @@ _DEFAULTS = {
     'daily_premium_sl_pct': 0.25,      # 25% — tighter for intraday (backtest: +80L vs +63L at 40%)
     'use_confidence_tracker': False,   # True = delegate entry/exit to confidence tracker (pullback timing)
     'confidence_poll_sec': 300,        # 5 min — how often confidence tracker checks entry timing
+    'spot_tracker_enabled': False,     # True = run spot 15M ST tracker (pullback→flip alerts). Default OFF (resource waste vs value ratio was poor).
     'st_period': 10,                   # Supertrend period
     'st_multiplier': 3,               # Supertrend multiplier
 }
@@ -114,6 +123,7 @@ def _load_runtime() -> dict:
 _runtime = _load_runtime()
 
 # ── Gap thresholds (as fraction, not percent) ─────────────────────────────
+CHARTINK_GAP_MAX = _runtime.get('chartink_gap_max', 0.08)  # outer surface gate
 SIGNAL_GAP_MAX = _runtime['signal_gap_max']
 ENTRY_GAP = _runtime['entry_gap']
 ENTRY_GAP_MIN = _runtime['entry_gap_min']
@@ -127,6 +137,9 @@ FRESHNESS_DAYS = _runtime['freshness_days']
 TOUCHED_THRESHOLD = _runtime.get('touched_threshold', 0.01)  # 1% = ST touch (for freshness + cooldown)
 
 # ── Invariant checks: catch mis-configured thresholds at startup ─────────
+assert CHARTINK_GAP_MAX >= SIGNAL_GAP_MAX, (
+    f"CHARTINK_GAP_MAX ({CHARTINK_GAP_MAX}) must be >= SIGNAL_GAP_MAX ({SIGNAL_GAP_MAX}) — "
+    "else Chartink gate is tighter than WATCH band (no buffer for late-delivery)")
 assert SL_GAP > SIGNAL_GAP_MAX, (
     f"SL_GAP ({SL_GAP}) must be > SIGNAL_GAP_MAX ({SIGNAL_GAP_MAX}) — "
     "else SL triggers inside watch band")
@@ -174,6 +187,7 @@ DAILY_EOD_EXIT_HOUR = _eod[0]
 DAILY_EOD_EXIT_MIN = _eod[1]
 USE_CONFIDENCE_TRACKER = _runtime.get('use_confidence_tracker', False)
 CONFIDENCE_POLL_SEC = _runtime.get('confidence_poll_sec', 300)
+SPOT_TRACKER_ENABLED = _runtime.get('spot_tracker_enabled', False)
 
 # Filter scanners to only enabled timeframes
 SCANNERS = [s for s in _ALL_SCANNERS if s['timeframe'] in ENABLED_TIMEFRAMES]

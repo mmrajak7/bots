@@ -79,9 +79,32 @@ def _load_tg_config(channel='watching'):
         return None, None
 
 
+def _watch_channel_enabled() -> bool:
+    """Is the 'watching' Telegram channel enabled?
+
+    Kill-switch for WATCHING / APPROACHING / CANCEL / FLIP / CAUTION alerts.
+    Set `telegram_watching.enabled: false` in magnet_config.json to silence.
+
+    On config error: returns False (safer default — alerts stay silent rather
+    than spam unexpectedly if the user has explicitly disabled them).
+    Missing key: returns True (back-compat for installations without the flag).
+    """
+    try:
+        with open(_CONFIG_PATH) as f:
+            cfg = json.load(f)
+        return cfg.get('telegram_watching', {}).get('enabled', True) is not False
+    except Exception as e:
+        log.warning("Could not read telegram_watching.enabled (%s) — "
+                    "defaulting to SILENT for safety", e)
+        return False
+
+
 def _send_telegram(msg: str, dry_run: bool = False,
                    channel: str = 'watching') -> bool:
     """Send Telegram message to specified channel."""
+    # Kill-switch: watching-channel alerts are silenced when disabled
+    if channel != 'trade' and not _watch_channel_enabled():
+        return True  # silent success
     if dry_run:
         safe = msg.encode('ascii', errors='replace').decode('ascii')
         tag = '[TRADE]' if channel == 'trade' else '[WATCH]'
@@ -289,8 +312,16 @@ def format_enter_alert(sym: str, direction: str, tf: str,
                        option_symbol: str, opt_ltp: float,
                        st_value: float, qty: int,
                        sl_spot: float, score: int = 0,
-                       via_wick: bool = False) -> str:
-    """Format compact ENTER alert — option near 15M support."""
+                       via_wick: bool = False,
+                       signal_price: Optional[float] = None,
+                       signal_at: Optional[str] = None,
+                       target_spot: Optional[float] = None,
+                       spot_now: Optional[float] = None) -> str:
+    """Format compact ENTER alert — option near 15M support.
+
+    Additional spot context (signal date/price, spot move, target) appended
+    when the caller passes it. Gracefully degrades if any field is missing.
+    """
     tf_short = {'monthly': 'M', 'weekly': 'W', 'daily': 'D'}.get(tf, tf)
     gap = (opt_ltp - st_value) / st_value * 100 if st_value > 0 else 0
     method = 'WICK ENTER' if via_wick else 'ENTER'
@@ -300,6 +331,35 @@ def format_enter_alert(sym: str, direction: str, tf: str,
         f"Option @ {opt_ltp:.2f} | 15M Support {st_value:.2f} ({gap:+.1f}%)",
         f"<code>{option_symbol}</code> | {qty} qty | SL {sl_spot:,.0f}",
     ]
+
+    # Spot context block (signal date, signal price, spot move, target)
+    if signal_price and spot_now:
+        sig_date = ''
+        if signal_at:
+            try:
+                sig_date = datetime.fromisoformat(signal_at).strftime('%d-%b %H:%M')
+            except Exception:
+                sig_date = str(signal_at)[:16]
+
+        spot_mov = (spot_now - signal_price) / signal_price * 100
+        # Invert for PE (down move is favorable)
+        if direction == 'PE':
+            spot_mov = -spot_mov
+
+        pieces = [f"Spot {spot_now:,.1f} ({spot_mov:+.2f}% since signal"]
+        if sig_date:
+            pieces.append(f"@ {sig_date}")
+        pieces.append(f"{signal_price:,.1f})")
+        lines.append(" ".join(pieces[:1] + [p for p in pieces[1:]]))
+
+        if target_spot:
+            remaining = (target_spot - spot_now) / spot_now * 100
+            if direction == 'PE':
+                remaining = -remaining
+            lines.append(
+                f"Target {target_spot:,.1f} ({remaining:+.2f}% to go)"
+            )
+
     return "\n".join(lines)
 
 
@@ -993,7 +1053,11 @@ def monitor_once(kite, tracker: ConfidenceTracker, dry_run: bool = False):
                     opt_sym, opt_ltp, st_val,
                     sig['quantity'], sig.get('sl_spot', 0),
                     score=sig.get('score', 0),
-                    via_wick=entry_via_wick)
+                    via_wick=entry_via_wick,
+                    signal_price=sig.get('signal_price'),
+                    signal_at=sig.get('signal_at'),
+                    target_spot=sig.get('target_st'),
+                    spot_now=ltp)
                 _send_telegram(msg, dry_run=dry_run, channel='trade')
                 log.info("CT #%s %s: AUTO-ENTERED%s spot=%.0f opt=%.2f",
                          sig['id'], sym, wick_tag, ltp, opt_ltp)

@@ -448,6 +448,24 @@ def check_watching_signals(store, kite):
         if gap > cfg.ENTRY_GAP:
             continue
 
+        # Config-skew sanity floor: cancel entries below 2.5% regardless of
+        # runtime config. Backstop against stale magnet_config.json (AUBANK
+        # entered at 1.9% because server had entry_gap_min=0.005). This floor
+        # is source-code-level — loosen only by editing, not JSON.
+        _MIN_ENTRY_GAP_SANITY = 0.025
+        if gap < _MIN_ENTRY_GAP_SANITY:
+            logger.warning(
+                "CANCEL #%d %s: gap %.2f%% below sanity floor %.1f%% "
+                "(runtime ENTRY_GAP_MIN=%.1f%%). Check config drift.",
+                trade['id'], stock, gap * 100,
+                _MIN_ENTRY_GAP_SANITY * 100, cfg.ENTRY_GAP_MIN * 100,
+            )
+            store.cancel_signal(
+                trade['id'],
+                f"gap {gap:.2%} below sanity floor {_MIN_ENTRY_GAP_SANITY:.1%}"
+            )
+            continue
+
         # Too close — already past entry (shouldn't happen if scanner was right)
         if gap < cfg.ENTRY_GAP_MIN:
             logger.info("Signal #%d %s: gap %.1f%% too narrow, cancelling",
@@ -673,20 +691,14 @@ def _delegate_to_confidence_tracker(store, kite, trade, stock, price, st_val,
             'price': premium,
             'qty': qty,
         }, st15m=st15m)
-        ct_send(msg)
+        ct_send(msg)  # honors telegram_watching.enabled kill-switch
     else:
-        # Fallback alert if scoring failed
-        st_line = ""
-        if st15m:
-            st_line = (f"\n15M ST: {st15m['st_value']:.2f} {st15m['direction']}"
-                       f" | Option: {st15m['close']:.2f}")
-        msg = (
-            f"{icon} <b>WATCHING</b> {tf} <code>{stock}</code>\n"
-            f"Spot {price:,.1f} | ST {st_val:,.1f} | Gap {gap:.1%}\n"
-            f"<code>{option['symbol']}</code> @ {premium:.2f} | {qty} qty"
-            f"{st_line}"
+        # Scoring failed — log only, no Telegram (watching-channel silenced)
+        logger.info(
+            "WATCHING fallback %s %s %s spot=%.1f ST=%.1f gap=%.2f%% opt=%s @ %.2f",
+            timeframe, stock, direction, price, st_val, gap * 100,
+            option['symbol'], premium,
         )
-        send_telegram(msg)
 
     logger.info("Delegated %s %s to confidence tracker (signal #%d, score %d)",
                 stock, direction, sig['id'], score)
@@ -1450,6 +1462,31 @@ def run(dry_run: bool = False):
     logger.info("Magnet monitor started: %d watching, %d entered, "
                 "ct_watching=%d, ct_entered=%d, dry_run=%s",
                 watching, entered, ct_watching, ct_entered, dry_run)
+
+    # Config banner — makes stale deployment obvious
+    logger.info(
+        "Active thresholds: CHARTINK<=%.1f%% | WATCH<=%.1f%% | ENTRY %.1f-%.1f%% | "
+        "COST_SL=%.1f%% | HEDGE=%.1f%% | SL=%.1f%%",
+        cfg.CHARTINK_GAP_MAX * 100, cfg.SIGNAL_GAP_MAX * 100,
+        cfg.ENTRY_GAP_MIN * 100, cfg.ENTRY_GAP * 100,
+        cfg.COST_SL_GAP * 100, cfg.HEDGE_GAP * 100, cfg.SL_GAP * 100,
+    )
+
+    # Config-drift warning: flag runtime thresholds that are LOOSER than
+    # compile-time defaults. Common cause: server running old magnet_config.json
+    # after a tightening commit (root cause of AUBANK 1.9% entry bug).
+    drifted = []
+    for key in ('entry_gap_min', 'entry_gap', 'signal_gap_max', 'chartink_gap_max'):
+        default = cfg._DEFAULTS[key]
+        runtime = cfg._runtime.get(key, default)
+        if runtime < default:  # runtime looser than intended
+            drifted.append(f"{key}={runtime*100:.1f}% (default {default*100:.1f}%)")
+    if drifted:
+        logger.warning(
+            "CONFIG DRIFT — runtime thresholds LOOSER than defaults: %s. "
+            "Server may be running stale magnet_config.json. Re-deploy to match code.",
+            ", ".join(drifted)
+        )
 
     if not is_market_hours():
         logger.info("Market closed. Exiting.")

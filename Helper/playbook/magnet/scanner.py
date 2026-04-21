@@ -620,13 +620,15 @@ def _send_watching_alert(msg: str):
                 with open(cfg.CONFIG_FILE) as f:
                     file_cfg = _json.load(f)
                 tg = file_cfg.get('telegram_watching', {})
-                if tg.get('bot_token') and tg.get('chat_id'):
+                # Kill-switch: silence WATCHING alerts entirely
+                if tg.get('enabled') is False:
+                    _watching_tg_cfg = None
+                elif tg.get('bot_token') and tg.get('chat_id'):
                     _watching_tg_cfg = tg
             _watching_tg_loaded = True
 
         if not _watching_tg_cfg:
-            logger.info("Watching Telegram not configured, skipping")
-            return
+            return  # silenced or not configured
 
         resp = requests.post(
             f"https://api.telegram.org/bot{_watching_tg_cfg['bot_token']}/sendMessage",
@@ -745,15 +747,31 @@ def validate_and_add_signals(store, kite=None, dry_run: bool = False) -> List[di
         st_val = st_info['st']
         gap = abs(price - st_val) / st_val
 
-        # Signal acceptance range: gap must be between ENTRY_GAP and max_gap (watch band)
-        # Lifecycle: signal inside watch band → gap shrinks below ENTRY_GAP → monitor enters
+        # Two-stage acceptance (addresses Chartink 5-10 min delivery lag):
+        #   1. CHARTINK_GAP_MAX (8%): drop candidates that are already too far
+        #      even in Chartink's wide net (e.g. daily spikes / stale screener hits)
+        #   2. SIGNAL_GAP_MAX  (5%): only SAVE signals once Kite-LTP confirms
+        #      they're inside the WATCH band. Surfaced 5-8% are logged and re-checked
+        #      on the next scan (5 min later) as they approach.
+        #   3. ENTRY_GAP      (4%): if already inside entry zone, too late
+        #      (scanner doesn't create signals here — only the monitor enters)
         max_gap = cfg.DAILY_GAP_MAX if timeframe == 'daily' else cfg.SIGNAL_GAP_MAX
+        chartink_ceiling = cfg.CHARTINK_GAP_MAX  # 8% outer gate
 
-        # Verify gap is in valid range
+        if gap > chartink_ceiling:
+            logger.info("SKIP %s (%s): gap %.1f%% > Chartink gate %.1f%%, stale/noisy",
+                        stock, timeframe, gap * 100, chartink_ceiling * 100)
+            skipped_reasons['gap_beyond_chartink'] += 1
+            continue
+
+        # Approach band (watch_max to chartink_max): surface, don't save yet.
+        # DEBUG-level log because these fire in bulk (30-50 per scan).
+        # Count is still surfaced in the scan summary.
         if gap > max_gap:
-            logger.info("SKIP %s (%s): gap %.1f%% > max %.1f%%, too far from ST",
-                        stock, timeframe, gap, max_gap)
-            skipped_reasons['gap_too_wide'] += 1
+            logger.debug("APPROACHING %s (%s): gap %.1f%% in surface band %.1f-%.1f%%",
+                         stock, timeframe, gap * 100,
+                         max_gap * 100, chartink_ceiling * 100)
+            skipped_reasons['approaching_watch_band'] += 1
             continue
 
         if gap < cfg.ENTRY_GAP:

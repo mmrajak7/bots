@@ -63,6 +63,26 @@ _ALL_ACTIVE = _ENTRY_ACTIVE + _EXIT_ACTIVE
 #  Telegram
 # ---------------------------------------------------------------------------
 
+def _spot_tracker_enabled() -> bool:
+    """Kill-switch for the whole spot tracker scan/poll loop.
+
+    False (default) -> cmd_scan / cmd_run / cmd_monitor exit immediately
+    without polling Chartink or Kite. cmd_status still reads historical data.
+
+    Toggle via `spot_tracker_enabled: true` in magnet_config.json.
+    Re-reads JSON each call so a live monitor can be flipped on/off without
+    restart.
+    """
+    try:
+        with open(_CONFIG_PATH) as f:
+            cfg_data = json.load(f)
+        return bool(cfg_data.get('spot_tracker_enabled', cfg.SPOT_TRACKER_ENABLED))
+    except Exception as e:
+        log.warning("Could not read spot_tracker_enabled (%s) -- using startup value %s",
+                    e, cfg.SPOT_TRACKER_ENABLED)
+        return cfg.SPOT_TRACKER_ENABLED
+
+
 def _send_telegram(msg: str, dry_run: bool = False) -> bool:
     """Send Telegram to watching channel."""
     if dry_run:
@@ -81,6 +101,9 @@ def _send_telegram_fallback(msg: str) -> bool:
         with open(_CONFIG_PATH) as f:
             mcfg = json.load(f)
         tg = mcfg.get('telegram_watching', {})
+        # Kill-switch: honor `enabled: false`
+        if tg.get('enabled') is False:
+            return True  # silent success
         bot_token, chat_id = tg.get('bot_token'), tg.get('chat_id')
         if not bot_token or not chat_id:
             return False
@@ -838,6 +861,10 @@ def _seconds_to_next_15m() -> int:
 
 def cmd_scan(kite, tracker: SpotTracker, dry_run: bool = False):
     """One-shot: Chartink scan + pick up entered trades + poll."""
+    if not _spot_tracker_enabled():
+        print("  [strack] DISABLED via magnet_config.json "
+              "(spot_tracker_enabled=false). Skip scan.")
+        return
     print(f"\n  [strack] {datetime.now().strftime('%H:%M:%S')} Scan + poll")
     pickup_entered_trades(kite, tracker, dry_run=dry_run)   # exit first (protect capital)
     pickup_from_chartink(kite, tracker, dry_run=dry_run)    # direct from Chartink
@@ -908,6 +935,10 @@ def cmd_status(tracker: SpotTracker):
 
 def cmd_monitor(kite, tracker: SpotTracker, dry_run: bool = False):
     """Long-running monitor loop aligned to 15M candle boundaries."""
+    if not _spot_tracker_enabled():
+        print("  [strack] DISABLED via magnet_config.json "
+              "(spot_tracker_enabled=false). Monitor will not start.")
+        return
     print(f"\n  [strack] Monitor loop started (Ctrl+C to stop)")
     print(f"  [strack] Polling every 15M boundary\n")
 
@@ -932,6 +963,10 @@ def cmd_monitor(kite, tracker: SpotTracker, dry_run: bool = False):
 
 def cmd_run(kite, tracker: SpotTracker, dry_run: bool = False):
     """Single scan+poll with market hours check (cron target)."""
+    if not _spot_tracker_enabled():
+        print("  [strack] DISABLED via magnet_config.json "
+              "(spot_tracker_enabled=false). Skip run.")
+        return
     if not _is_market_hours():
         print(f"  [strack] Outside market hours, skipping.")
         return
