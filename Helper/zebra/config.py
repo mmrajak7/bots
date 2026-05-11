@@ -45,6 +45,7 @@ _ALL_SCANNERS = [
 
 # ── Defaults ──────────────────────────────────────────────────────────────
 _DEFAULTS = {
+    'paper_mode': True,          # PAPER: auto-enter on trigger + auto-close on exit signal
     'watch_gap_max': 0.05,       # WATCH band ceiling (signal added to watchlist)
     'trigger_gap_max': 0.04,     # TRIGGER zone: run Zebra analyzer + alert
     'stale_gap_min': 0.03,       # Floor: skip if gap < this at trigger (too late)
@@ -89,6 +90,7 @@ def _load_runtime() -> dict:
 _runtime = _load_runtime()
 
 # ── Exports ───────────────────────────────────────────────────────────────
+PAPER_MODE = _runtime['paper_mode']
 WATCH_GAP_MAX = _runtime['watch_gap_max']
 TRIGGER_GAP_MAX = _runtime['trigger_gap_max']
 STALE_GAP_MIN = _runtime['stale_gap_min']

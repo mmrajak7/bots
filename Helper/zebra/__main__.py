@@ -328,6 +328,15 @@ def cmd_status(args):
     print()
 
 
+def cmd_report(args):
+    from .report import run as run_report
+    run_report(
+        report_type=args.report_type,
+        send_telegram=args.telegram,
+        no_kite=args.no_kite,
+    )
+
+
 def main():
     p = argparse.ArgumentParser(prog='python -m zebra',
                                 description='Zebra — synthetic long/short option strategy')
@@ -394,6 +403,17 @@ def main():
 
     p_sts = sub.add_parser('status', help='Dashboard')
     p_sts.set_defaults(func=cmd_status)
+
+    p_rep = sub.add_parser('report',
+                           help='EOD daily or Friday weekly performance report')
+    p_rep.add_argument('--type', dest='report_type',
+                       choices=['daily', 'weekly', 'auto'], default='auto',
+                       help='auto = weekly on Fri, daily on Mon-Thu (default)')
+    p_rep.add_argument('--telegram', action='store_true',
+                       help='Also send to Telegram')
+    p_rep.add_argument('--no-kite', action='store_true',
+                       help='Skip live mid fetch for open positions (faster, no unrealized P&L)')
+    p_rep.set_defaults(func=cmd_report)
 
     args = p.parse_args()
     setup_logging(args.verbose)

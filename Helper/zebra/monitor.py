@@ -144,43 +144,58 @@ def _format_enter_alert(trade: dict, analysis: dict) -> str:
     return msg
 
 
-def _format_tp_alert(trade: dict, spot: float) -> str:
+def _paper_close_line(trade: dict, mid: Optional[float]) -> str:
+    """Inline P&L estimate for paper-mode auto-close alerts."""
+    if not cfg.PAPER_MODE:
+        return ""
+    if mid is None:
+        return "\n[PAPER auto-close pending — no quote, will retry]"
+    debit = trade.get('debit', 0)
+    qty = trade.get('quantity', 0)
+    pnl_per_share = mid - debit
+    pnl = pnl_per_share * qty
+    pct = (pnl_per_share / debit * 100) if debit > 0 else 0
+    return (f"\n[PAPER auto-closed] exit_mid {mid:.2f}  "
+            f"P&L Rs {pnl:+,.0f} ({pct:+.1f}%)")
+
+
+def _format_tp_alert(trade: dict, spot: float, mid: Optional[float] = None) -> str:
+    paper = _paper_close_line(trade, mid)
     return (
         f"\U0001F3AF <b>ZEBRA TP</b>  {trade['stock']} ({trade['direction']})\n"
         f"spot {spot:,.2f} hit TP {trade['tp_spot']:,.2f}\n"
         f"Long: <code>{trade['long_symbol']}</code>\n"
-        f"Short: <code>{trade['short_symbol']}</code>\n"
-        f"Consider closing. Use <code>zebra close {trade['id']} "
-        f"--exit-debit X --reason tp</code>"
+        f"Short: <code>{trade['short_symbol']}</code>{paper}"
     )
 
 
-def _format_spot_sl_alert(trade: dict, spot: float) -> str:
+def _format_spot_sl_alert(trade: dict, spot: float, mid: Optional[float] = None) -> str:
+    paper = _paper_close_line(trade, mid)
     return (
         f"\U0001F6D1 <b>ZEBRA SPOT SL</b>  {trade['stock']} ({trade['direction']})\n"
         f"spot {spot:,.2f} hit SL {trade['sl_spot']:,.2f}\n"
-        f"Adverse move from entry {trade['entry_spot']:,.2f}\n"
-        f"Close to save remaining premium: <code>zebra close {trade['id']} "
-        f"--exit-debit X --reason spot_sl</code>"
+        f"Adverse move from entry {trade['entry_spot']:,.2f}{paper}"
     )
 
 
 def _format_debit_sl_alert(trade: dict, mid: float) -> str:
+    paper = _paper_close_line(trade, mid)
+    pct_lost = (1 - mid / trade['debit']) * 100 if trade.get('debit') else 0
     return (
         f"\U0001F4C9 <b>ZEBRA DEBIT SL</b>  {trade['stock']} ({trade['direction']})\n"
         f"Mid {mid:.2f} ≤ debit-SL {trade['debit_sl_value']:.2f} "
         f"(entry debit {trade['debit']:.2f})\n"
-        f"Lost ~{(1 - mid/trade['debit'])*100:.0f}% of debit. Exit.\n"
-        f"<code>zebra close {trade['id']} --exit-debit {mid:.2f} --reason debit_sl</code>"
+        f"Lost ~{pct_lost:.0f}% of debit.{paper}"
     )
 
 
-def _format_time_alert(trade: dict, days_left: int) -> str:
+def _format_time_alert(trade: dict, days_left: int,
+                       mid: Optional[float] = None) -> str:
+    paper = _paper_close_line(trade, mid)
     return (
         f"⏰ <b>ZEBRA T-{days_left}</b>  {trade['stock']} ({trade['direction']})\n"
         f"Expiry {trade['expiry']}, {days_left} days left\n"
-        f"Pin risk on short {trade['short_symbol']}. Close now.\n"
-        f"<code>zebra close {trade['id']} --exit-debit X --reason time</code>"
+        f"Pin risk on short {trade['short_symbol']}.{paper}"
     )
 
 
@@ -280,6 +295,31 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         else:
             logger.warning("ENTER alert FAILED for #%d %s", trade['id'], stock)
 
+        # PAPER mode: auto-record the trade as entered using picker's mid prices.
+        # Real fills (live mode) would require the user to run `zebra enter`.
+        if cfg.PAPER_MODE:
+            best = analysis.get('best')
+            if not best:
+                continue
+            try:
+                store.mark_entered(trade['id'], {
+                    'long_strike': best['k_l'],
+                    'short_strike': best['k_s'],
+                    'long_symbol': best['long_symbol'],
+                    'short_symbol': best['short_symbol'],
+                    'debit': best['debit'],
+                    'lot_size': best['lot_size'],
+                    'lots': 1,
+                    'expiry': analysis['expiry'],
+                    'entry_spot': price,
+                })
+                logger.info("PAPER auto-entered #%d %s %d/%d debit=%.2f",
+                            trade['id'], stock,
+                            int(best['k_l']), int(best['k_s']), best['debit'])
+            except ValueError as e:
+                logger.error("PAPER auto-enter failed for #%d %s: %s",
+                             trade['id'], stock, e)
+
 
 # ── Entered → TP/SL/Time ─────────────────────────────────────────────────
 
@@ -298,10 +338,43 @@ def _quote_zebra_value(kite, trade: dict) -> Optional[float]:
         return None
 
 
+def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
+                       reason: str) -> Optional[dict]:
+    """Auto-close a paper trade at current structure mid. Returns the updated
+    trade dict (with pnl/pnl_pct) or None if close failed."""
+    if not cfg.PAPER_MODE:
+        return None
+    if trade.get('status') != 'entered':
+        return None  # already closed by an earlier trigger this cycle
+    if mid is None:
+        # No quote — book max loss (debit fully gone) only if reason explicitly
+        # forces it (time-based). Otherwise skip and retry next cycle.
+        if reason != 'time':
+            return None
+    try:
+        updated = store.mark_exited(
+            trade['id'],
+            trade.get('entry_spot', 0),  # spot not strictly needed for P&L
+            mid,
+            f'paper:{reason}'
+        )
+        logger.info("PAPER auto-closed #%d %s reason=%s mid=%s P&L=Rs%.0f (%.1f%%)",
+                    trade['id'], trade['stock'], reason,
+                    f'{mid:.2f}' if mid is not None else 'NA',
+                    updated.get('pnl', 0), updated.get('pnl_pct', 0))
+        # Mutate the in-loop dict so subsequent checks in this cycle skip it
+        trade['status'] = 'exited'
+        return updated
+    except ValueError as e:
+        logger.error("PAPER auto-close failed for #%d: %s", trade['id'], e)
+        return None
+
+
 def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     """Monitor entered trades for TP/SL/time exits.
 
-    NOTE: We don't auto-close. We alert and let the user run `zebra close`.
+    PAPER mode (default): auto-close at structure mid after each exit alert.
+    LIVE mode: alert only, user runs `zebra close` manually.
     Dedup via persistent <kind>_alerted_at flags on each trade (survives
     cron restarts).
     """
@@ -314,6 +387,10 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     today = datetime.now(IST).date()
 
     for trade in entered:
+        # An earlier exit-check this cycle may have already auto-closed.
+        if trade.get('status') != 'entered':
+            continue
+
         stock = trade['stock']
         spot = ltps.get(stock, 0)
         if spot <= 0:
@@ -328,15 +405,23 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         tp_hit = (direction == 'CE' and spot >= tp_spot) or \
                  (direction == 'PE' and spot <= tp_spot)
         if tp_hit and store.set_alert_flag(tid, 'tp'):
-            _send_telegram(_format_tp_alert(trade, spot), dry_run=dry_run)
+            mid = _quote_zebra_value(kite, trade)
+            _send_telegram(_format_tp_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
+            _paper_auto_close(store, trade, mid, 'tp')
+            if trade.get('status') == 'exited':
+                continue
 
         # ── SPOT SL ─────────────────────────────────────────────────────
         sl_hit = (direction == 'CE' and spot <= sl_spot) or \
                  (direction == 'PE' and spot >= sl_spot)
         if sl_hit and store.set_alert_flag(tid, 'spot_sl'):
-            _send_telegram(_format_spot_sl_alert(trade, spot), dry_run=dry_run)
+            mid = _quote_zebra_value(kite, trade)
+            _send_telegram(_format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
+            _paper_auto_close(store, trade, mid, 'spot_sl')
+            if trade.get('status') == 'exited':
+                continue
 
         # ── DEBIT SL ────────────────────────────────────────────────────
         mid = _quote_zebra_value(kite, trade)
@@ -345,6 +430,9 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 _send_telegram(_format_debit_sl_alert(trade, mid), dry_run=dry_run)
                 logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f",
                             tid, stock, mid, trade['debit_sl_value'])
+                _paper_auto_close(store, trade, mid, 'debit_sl')
+                if trade.get('status') == 'exited':
+                    continue
 
         # ── TIME SL ─────────────────────────────────────────────────────
         try:
@@ -353,8 +441,10 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         except Exception:
             days_left = 999
         if days_left <= cfg.TIME_SL_DAYS and store.set_alert_flag(tid, 'time'):
-            _send_telegram(_format_time_alert(trade, days_left), dry_run=dry_run)
+            mid = _quote_zebra_value(kite, trade)
+            _send_telegram(_format_time_alert(trade, days_left, mid), dry_run=dry_run)
             logger.info("TIME alert #%d %s days_left=%d", tid, stock, days_left)
+            _paper_auto_close(store, trade, mid, 'time')
 
 
 # ── Cycle ─────────────────────────────────────────────────────────────────
