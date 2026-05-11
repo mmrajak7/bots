@@ -161,8 +161,8 @@ Helper/config/
 Helper/data/
 Helper/output/
 
-# Server-deployment scripts (hardcode server paths — kept local only)
-Helper/zebra/deploy_server.sh
+# (Server-deployment scripts are tracked. To be removed later when paper-mode
+#  is established and the deploy bash becomes a one-time artifact.)
 
 # Claude Code specific (IDE instructions)
 .claude/
