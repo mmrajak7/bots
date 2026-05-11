@@ -607,11 +607,16 @@ _watching_tg_cfg = None
 _watching_tg_loaded = False
 
 
+_SILENCED = True  # 2026-05-11: magnet deprecated, replaced by zebra package.
+
+
 def _send_watching_alert(msg: str):
     """Send to the dedicated Watching channel. Best-effort.
 
     Bot token loaded from magnet_config.json 'telegram_watching' section.
     """
+    if _SILENCED:
+        return
     global _watching_tg_cfg, _watching_tg_loaded
     try:
         if not _watching_tg_loaded:

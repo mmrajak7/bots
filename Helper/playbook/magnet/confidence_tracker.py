@@ -99,9 +99,14 @@ def _watch_channel_enabled() -> bool:
         return False
 
 
+_SILENCED = True  # 2026-05-11: confidence_tracker deprecated, replaced by zebra package.
+
+
 def _send_telegram(msg: str, dry_run: bool = False,
                    channel: str = 'watching') -> bool:
     """Send Telegram message to specified channel."""
+    if _SILENCED:
+        return True  # silent success
     # Kill-switch: watching-channel alerts are silenced when disabled
     if channel != 'trade' and not _watch_channel_enabled():
         return True  # silent success

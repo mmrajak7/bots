@@ -83,8 +83,13 @@ def _spot_tracker_enabled() -> bool:
         return cfg.SPOT_TRACKER_ENABLED
 
 
+_SILENCED = True  # 2026-05-11: spot_tracker deprecated, replaced by zebra package.
+
+
 def _send_telegram(msg: str, dry_run: bool = False) -> bool:
     """Send Telegram to watching channel."""
+    if _SILENCED:
+        return True  # silent success
     if dry_run:
         safe = msg.encode('ascii', errors='replace').decode('ascii')
         print(f"[DRY RUN] [SPOT] Telegram:\n{safe}\n")

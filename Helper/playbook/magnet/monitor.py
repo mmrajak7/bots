@@ -51,8 +51,12 @@ _telegram_cfg = None
 _telegram_cfg_loaded = False
 
 
+_SILENCED = True  # 2026-05-11: magnet deprecated, replaced by zebra package.
+
 def send_telegram(msg: str):
     """Send Telegram alert with HTML parse mode. Best-effort: never blocks or crashes."""
+    if _SILENCED:
+        return
     global _telegram_cfg, _telegram_cfg_loaded
 
     try:

@@ -1,0 +1,390 @@
+"""CLI: python -m zebra [command]
+
+Commands:
+  scan        One-shot Chartink scan + watchlist add (no analyzer, no alert)
+  run         One cycle: scan + check watching + check entered (cron target)
+  loop        Long-running market-hours loop
+  list        List trades (optionally filter by status)
+  analyze     Run strike analyzer on a stock without scanning (for manual use)
+  trigger     Manually trigger analyzer + ENTER alert on a watching signal
+  enter       Mark a triggered signal as entered (after manual order placement)
+  close       Mark an entered trade as exited
+  cancel      Cancel a watching/triggered signal
+  status      Dashboard summary
+"""
+
+import argparse
+import logging
+import sys
+
+
+def setup_logging(verbose: bool = False):
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%H:%M:%S',
+    )
+
+
+def cmd_scan(args):
+    from .scanner import validate_and_add
+    from .monitor import _get_kite
+    from .trade_store import get_store
+    kite = _get_kite()
+    store = get_store()
+    added = validate_and_add(store, kite=kite, dry_run=args.dry_run)
+    print(f"\nScanner: {len(added)} signal(s) {'previewed' if args.dry_run else 'added'}")
+
+
+def cmd_run(args):
+    from .monitor import run_once
+    run_once(dry_run=args.dry_run)
+
+
+def cmd_loop(args):
+    from .monitor import run_loop
+    run_loop(dry_run=args.dry_run)
+
+
+def cmd_list(args):
+    from .trade_store import get_store
+    store = get_store()
+    store.list_trades(status_filter=args.status)
+
+
+def cmd_analyze(args):
+    """Run the strike analyzer on a stock outside the scanner. Manual review."""
+    from .scanner import _get_kite, get_ltp, compute_st_for_stock
+    from . import strikes as strikes_mod
+    from . import config as cfg
+
+    kite = _get_kite()
+    stock = args.symbol.upper()
+    ltps = get_ltp(kite, [stock])
+    spot = ltps.get(stock, 0)
+    if spot <= 0:
+        print(f"No LTP for {stock}")
+        sys.exit(1)
+
+    timeframe = args.timeframe
+    direction = args.direction.upper() if args.direction else None
+    if direction is None:
+        st = compute_st_for_stock(kite, stock, timeframe)
+        if not st:
+            print(f"ST compute failed for {stock} {timeframe}")
+            sys.exit(1)
+        if spot < st['st'] and st['direction'] == 'UP':
+            direction = 'CE'
+        elif spot > st['st'] and st['direction'] == 'DOWN':
+            direction = 'PE'
+        else:
+            print(f"Trend not aligned: spot={spot:.2f} vs ST={st['st']:.2f} "
+                  f"dir={st['direction']}. Specify --direction to override.")
+            sys.exit(1)
+
+    print(f"\nAnalyzing {stock} ({direction}) at spot {spot:.2f}...")
+    result = strikes_mod.analyze(kite, stock, direction, spot,
+                                 max_candidates=args.max_candidates)
+    if result.get('error'):
+        print(f"  ERROR: {result['error']}")
+        sys.exit(1)
+
+    print(f"  expiry {result['expiry']} ({result['dte']} DTE), lot={result['lot_size']}")
+    print(f"  K_S (ATM): {result['k_s_used']}\n")
+    for i, c in enumerate(result['candidates'], 1):
+        warn = ' [' + ','.join(c['gate_fails']) + ']' if c['gate_fails'] else ''
+        print(f"  [{i}] K_L={c['k_l']}, K_S={c['k_s']}, width={c['width']:.0f}{warn}")
+        print(f"      long  {c['long_symbol']}  mid={c['long_mid']:.2f} "
+              f"(b={c['long_bid']:.2f}/a={c['long_ask']:.2f}, "
+              f"sprd={c['long_spread_pct']:.1f}%) OI={c['long_oi']:,}")
+        print(f"      short {c['short_symbol']}  mid={c['short_mid']:.2f} "
+              f"(b={c['short_bid']:.2f}/a={c['short_ask']:.2f}, "
+              f"sprd={c['short_spread_pct']:.1f}%) OI={c['short_oi']:,}")
+        print(f"      debit={c['debit']:.2f}  BE={c['be']:.2f} ({c['be_pct_from_spot']:+.2f}%)  "
+              f"NetExt={c['net_ext']:+.2f}  regime={c['regime']}")
+        print(f"      cap/lot=Rs {c['capital_per_lot']:,.0f} -> lots={c['lots']} "
+              f"(total Rs {c['capital_per_lot']*c['lots']:,.0f})\n")
+
+
+def cmd_trigger(args):
+    """Force-run analyzer + alert on a specific watching signal."""
+    from .monitor import _send_telegram, _format_enter_alert
+    from .scanner import _get_kite, get_ltp
+    from . import strikes as strikes_mod
+    from .trade_store import get_store
+
+    store = get_store()
+    trade = store.find(args.id)
+    if not trade:
+        print(f"Trade #{args.id} not found")
+        sys.exit(1)
+    if trade['status'] not in ('watching', 'triggered'):
+        print(f"#{args.id} status={trade['status']}, can't re-trigger")
+        sys.exit(1)
+
+    kite = _get_kite()
+    spot = get_ltp(kite, [trade['stock']]).get(trade['stock'], 0)
+    if spot <= 0:
+        print(f"No LTP for {trade['stock']}")
+        sys.exit(1)
+
+    analysis = strikes_mod.analyze(kite, trade['stock'], trade['direction'],
+                                   spot, max_candidates=args.max_candidates)
+    if analysis.get('error'):
+        print(f"Analyzer error: {analysis['error']}")
+        sys.exit(1)
+
+    gap = abs(spot - trade['st_value']) / trade['st_value'] * 100
+    analysis['current_gap_pct'] = gap
+
+    if trade['status'] == 'watching':
+        store.mark_triggered(trade['id'], spot, gap, analysis['candidates'])
+
+    msg = _format_enter_alert(trade, analysis)
+    if args.dry_run:
+        print(msg)
+    else:
+        ok = _send_telegram(msg, dry_run=False)
+        print(f"Alert {'sent' if ok else 'FAILED'}")
+
+
+def cmd_enter(args):
+    from .trade_store import get_store
+    store = get_store()
+    try:
+        k_l_str, k_s_str = args.pair.split('/')
+        long_strike = float(k_l_str)
+        short_strike = float(k_s_str)
+    except Exception:
+        print(f"--pair must be K_L/K_S e.g. 700/750, got {args.pair}")
+        sys.exit(1)
+
+    # Look up the actual symbols + lot_size from the triggered alert if present,
+    # else from the options CSV directly.
+    trade = store.find(args.id)
+    if not trade:
+        print(f"#{args.id} not found")
+        sys.exit(1)
+
+    long_symbol = args.long_symbol
+    short_symbol = args.short_symbol
+    lot_size = args.lot_size
+
+    if (not long_symbol or not short_symbol or not lot_size) and \
+       trade.get('alert_strikes'):
+        for c in trade['alert_strikes']:
+            if abs(c['k_l'] - long_strike) < 1e-6 and abs(c['k_s'] - short_strike) < 1e-6:
+                long_symbol = long_symbol or c['long_symbol']
+                short_symbol = short_symbol or c['short_symbol']
+                lot_size = lot_size or c['lot_size']
+                break
+
+    if not (long_symbol and short_symbol and lot_size):
+        print("Could not resolve symbols/lot_size. Pass --long-symbol, --short-symbol, --lot-size.")
+        sys.exit(1)
+
+    entry_data = {
+        'long_strike': long_strike,
+        'short_strike': short_strike,
+        'long_symbol': long_symbol,
+        'short_symbol': short_symbol,
+        'debit': args.debit,
+        'lot_size': int(lot_size),
+        'lots': args.lots,
+        'expiry': args.expiry,
+    }
+    if args.entry_spot is not None:
+        entry_data['entry_spot'] = args.entry_spot
+    if args.spot_sl_pct is not None:
+        entry_data['spot_sl_pct'] = args.spot_sl_pct
+
+    try:
+        t = store.mark_entered(args.id, entry_data)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    print(f"Entered #{t['id']} {t['stock']} {int(t['long_strike'])}/{int(t['short_strike'])} "
+          f"debit={t['debit']:.2f} qty={t['quantity']} cap=Rs{t['capital']:,.0f}")
+    print(f"  TP at {t['tp_spot']:.2f}, SPOT SL at {t['sl_spot']:.2f}, "
+          f"DEBIT SL at {t['debit_sl_value']:.2f}")
+
+
+def cmd_close(args):
+    from .trade_store import get_store
+    store = get_store()
+    trade = store.find(args.id)
+    if not trade:
+        print(f"#{args.id} not found")
+        sys.exit(1)
+    if trade['status'] == 'entered':
+        exit_debit = args.exit_debit
+        exit_spot = args.exit_spot
+
+        # If user didn't pass --exit-debit, try to fetch live structure mid
+        # from Kite. Falls back to None (max loss) if Kite is unreachable.
+        if exit_debit is None:
+            try:
+                from .scanner import _get_kite, get_ltp
+                from .monitor import _quote_zebra_value
+                kite = _get_kite()
+                exit_debit = _quote_zebra_value(kite, trade)
+                if exit_debit is not None:
+                    print(f"  Fetched live structure mid: {exit_debit:.2f}")
+                if exit_spot is None:
+                    exit_spot = get_ltp(kite, [trade['stock']]).get(trade['stock'])
+            except Exception as e:
+                print(f"  (could not fetch live quote: {e})")
+
+        if exit_spot is None:
+            exit_spot = trade.get('entry_spot', 0)
+        if exit_debit is None:
+            print("  WARNING: no --exit-debit and Kite quote failed; "
+                  "P&L will be booked as MAX LOSS. Re-run with --exit-debit "
+                  "to record the actual fill.")
+
+        try:
+            t = store.mark_exited(args.id, exit_spot, exit_debit,
+                                  args.reason or 'manual')
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        print(f"Closed #{t['id']} P&L=Rs{t['pnl']:,.0f} ({t['pnl_pct']:.1f}%)")
+    elif trade['status'] in ('watching', 'triggered'):
+        store.cancel(args.id, args.reason or 'manual cancel')
+        print(f"Cancelled #{args.id}")
+    else:
+        print(f"#{args.id} status={trade['status']}, nothing to do")
+
+
+def cmd_cancel(args):
+    from .trade_store import get_store
+    store = get_store()
+    try:
+        store.cancel(args.id, args.reason or 'manual cancel')
+        print(f"Cancelled #{args.id}")
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+
+def cmd_status(args):
+    from .trade_store import get_store
+    store = get_store()
+    trades = store.load_trades()
+    by_status = {}
+    for t in trades:
+        by_status.setdefault(t.get('status', '?'), []).append(t)
+
+    print("\n=== ZEBRA DASHBOARD ===")
+    for st in ('watching', 'triggered', 'entered', 'exited', 'cancelled'):
+        lst = by_status.get(st, [])
+        print(f"  {st:<10} {len(lst)}")
+
+    entered = by_status.get('entered', [])
+    if entered:
+        print(f"\n  --- Open Trades ---")
+        for t in entered:
+            print(f"  #{t['id']} {t['stock']:<12} {t['direction']:<3} "
+                  f"{int(t['long_strike'])}/{int(t['short_strike'])} "
+                  f"debit={t['debit']:.2f} TP={t['tp_spot']:.2f} "
+                  f"SL={t['sl_spot']:.2f} exp={t['expiry']}")
+
+    watching = by_status.get('watching', [])
+    if watching:
+        print(f"\n  --- Watching ---")
+        for t in watching:
+            last = t.get('last_gap_pct', t['signal_gap_pct'])
+            print(f"  #{t['id']} {t['stock']:<12} {t['direction']:<3} "
+                  f"{t['timeframe']:<8} signal_gap={t['signal_gap_pct']:.2f}% "
+                  f"last={last:.2f}%")
+
+    exited = by_status.get('exited', [])
+    if exited:
+        wins = sum(1 for t in exited if t.get('pnl', 0) > 0)
+        total_pnl = sum(t.get('pnl', 0) or 0 for t in exited)
+        win_rate = wins / len(exited) * 100 if exited else 0
+        print(f"\n  --- Performance ---")
+        print(f"  Total P&L: Rs {total_pnl:,.0f}")
+        print(f"  Win rate:  {win_rate:.0f}% ({wins}W / {len(exited)-wins}L)")
+    print()
+
+
+def main():
+    p = argparse.ArgumentParser(prog='python -m zebra',
+                                description='Zebra — synthetic long/short option strategy')
+    p.add_argument('-v', '--verbose', action='store_true', help='Debug logging')
+    sub = p.add_subparsers(dest='command')
+
+    p_scan = sub.add_parser('scan', help='Chartink scan + watchlist add')
+    p_scan.add_argument('--dry-run', action='store_true')
+    p_scan.set_defaults(func=cmd_scan)
+
+    p_run = sub.add_parser('run', help='One full cycle (cron target)')
+    p_run.add_argument('--dry-run', action='store_true')
+    p_run.set_defaults(func=cmd_run)
+
+    p_loop = sub.add_parser('loop', help='Long-running market-hours loop')
+    p_loop.add_argument('--dry-run', action='store_true')
+    p_loop.set_defaults(func=cmd_loop)
+
+    p_list = sub.add_parser('list', help='List trades')
+    p_list.add_argument('--status', choices=['watching', 'triggered',
+                                              'entered', 'exited', 'cancelled'])
+    p_list.set_defaults(func=cmd_list)
+
+    p_anly = sub.add_parser('analyze', help='Strike analyzer for a stock (no save)')
+    p_anly.add_argument('symbol')
+    p_anly.add_argument('--timeframe', choices=['monthly', 'weekly'],
+                        default='monthly')
+    p_anly.add_argument('--direction', choices=['CE', 'PE'], default=None)
+    p_anly.add_argument('--max-candidates', type=int, default=3)
+    p_anly.set_defaults(func=cmd_analyze)
+
+    p_trg = sub.add_parser('trigger', help='Force analyzer + alert on watching ID')
+    p_trg.add_argument('id', type=int)
+    p_trg.add_argument('--max-candidates', type=int, default=3)
+    p_trg.add_argument('--dry-run', action='store_true')
+    p_trg.set_defaults(func=cmd_trigger)
+
+    p_ent = sub.add_parser('enter', help='Mark triggered signal as entered')
+    p_ent.add_argument('id', type=int)
+    p_ent.add_argument('--pair', required=True, help='K_L/K_S e.g. 700/750')
+    p_ent.add_argument('--debit', type=float, required=True)
+    p_ent.add_argument('--lots', type=int, required=True)
+    p_ent.add_argument('--expiry', required=True, help='YYYY-MM-DD')
+    p_ent.add_argument('--long-symbol', default=None)
+    p_ent.add_argument('--short-symbol', default=None)
+    p_ent.add_argument('--lot-size', type=int, default=None)
+    p_ent.add_argument('--entry-spot', type=float, default=None)
+    p_ent.add_argument('--spot-sl-pct', type=float, default=None,
+                       help='Override default spot SL percentage (e.g. 0.03)')
+    p_ent.set_defaults(func=cmd_enter)
+
+    p_cls = sub.add_parser('close', help='Close entered trade (or cancel watching)')
+    p_cls.add_argument('id', type=int)
+    p_cls.add_argument('--exit-debit', type=float, default=None,
+                       help='Closing net debit per share (struct value)')
+    p_cls.add_argument('--exit-spot', type=float, default=None)
+    p_cls.add_argument('--reason', default=None)
+    p_cls.set_defaults(func=cmd_close)
+
+    p_cnc = sub.add_parser('cancel', help='Cancel watching/triggered signal')
+    p_cnc.add_argument('id', type=int)
+    p_cnc.add_argument('--reason', default=None)
+    p_cnc.set_defaults(func=cmd_cancel)
+
+    p_sts = sub.add_parser('status', help='Dashboard')
+    p_sts.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    setup_logging(args.verbose)
+
+    if not args.command:
+        p.print_help()
+        sys.exit(1)
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()
