@@ -43,7 +43,7 @@ git pull --rebase
 step "3. Pull config + docs from Drive"
 cd "$HELPER_DIR"
 "$VENV" - <<'PYEOF'
-from bcs.drive_store import get_drive_service, find_file, download_json, _extract_service
+from bcs.drive_store import get_drive_service, find_file, _extract_service
 from googleapiclient.http import MediaIoBaseDownload
 from pathlib import Path
 import json, io
@@ -53,23 +53,29 @@ creds = Path('/home/trustit/Desktop/BOTS/data/secret.json')
 svc_ref = get_drive_service(creds)
 service = _extract_service(svc_ref)
 
-# Required: zebra_config.json
+
+def download_bytes(file_id):
+    """Raw download — works for any JSON shape (dict or list) or binary."""
+    req = service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    dl = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    return buf.getvalue()
+
+
+# Required: zebra_config.json (a dict — can't use bcs.download_json which is list-only)
 fid = find_file(svc_ref, FOLDER_ID, 'config_zebra_config.json')
 if not fid:
     raise SystemExit('  FAIL: config_zebra_config.json not on Drive — push from local first')
-data = download_json(svc_ref, fid)
+cfg = json.loads(download_bytes(fid).decode('utf-8'))
+# Force the linux credentials path (in case the source had a Windows-only path)
+cfg.setdefault('google_drive', {})['credentials_path_linux'] = '/home/trustit/Desktop/BOTS/data/secret.json'
 Path('config').mkdir(exist_ok=True)
 with open('config/zebra_config.json', 'w') as f:
-    json.dump(data, f, indent=2)
-print('  config/zebra_config.json pulled')
-
-# Patch credentials_path_linux to the server's secret.json (in case the local
-# config had a Windows-only path; safe no-op if already correct).
-with open('config/zebra_config.json') as f:
-    cfg = json.load(f)
-cfg.setdefault('google_drive', {})['credentials_path_linux'] = '/home/trustit/Desktop/BOTS/data/secret.json'
-with open('config/zebra_config.json', 'w') as f:
     json.dump(cfg, f, indent=2)
+print('  config/zebra_config.json pulled')
 
 # Optional: .md docs
 for drive_name, local_path in [
@@ -82,15 +88,10 @@ for drive_name, local_path in [
     if not fid:
         print(f'  {local_path}: skip (not on Drive)')
         continue
-    req = service.files().get_media(fileId=fid)
-    buf = io.BytesIO()
-    dl = MediaIoBaseDownload(buf, req)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
+    body = download_bytes(fid)
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
     with open(local_path, 'wb') as f:
-        f.write(buf.getvalue())
+        f.write(body)
     print(f'  {local_path} pulled')
 PYEOF
 
