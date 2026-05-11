@@ -136,8 +136,49 @@ fi
 rm -f /tmp/magnet_monitor.lock /tmp/strack.lock /tmp/flow_monitor.lock 2>/dev/null || true
 echo "  cleared lock files"
 
-# ── 7. Summary ───────────────────────────────────────────────────────────
-step "7. Summary"
+# ── 7. Archive old logs + stores ─────────────────────────────────────────
+step "7. Archive deprecated logs + stores"
+ARCHIVE_DIR="$HELPER_DIR/logs/archive/2026-05-11"
+mkdir -p "$ARCHIVE_DIR"
+moved=0
+
+# Specific files (stores + cron logs from deprecated systems)
+for f in \
+    magnet_trades.json \
+    confidence_tracker.json \
+    spot_tracker.json \
+    flow_trades.json \
+    cron_magnet.log \
+    cron_flow.log \
+    strack.log \
+    magnet_dashboard.html \
+    magnet_alert_analysis.csv \
+    magnet_alert_analysis_v2.csv \
+    magnet_entry_levels_sim.csv \
+    magnet_wider_entry_sim.csv \
+; do
+    src="$HELPER_DIR/logs/$f"
+    if [ -e "$src" ]; then
+        mv "$src" "$ARCHIVE_DIR/$f"
+        moved=$((moved + 1))
+    fi
+done
+
+# Pattern-matched dailies (magnet_YYYYMMDD.log etc.)
+shopt -s nullglob
+for f in "$HELPER_DIR/logs/magnet_"*.log; do
+    mv "$f" "$ARCHIVE_DIR/" && moved=$((moved + 1))
+done
+shopt -u nullglob
+
+echo "  moved $moved file(s) to $ARCHIVE_DIR"
+if [ "$moved" -gt 0 ]; then
+    echo "  archive contents (head):"
+    ls -la "$ARCHIVE_DIR" | head -15 | sed 's/^/    /'
+fi
+
+# ── 8. Summary ───────────────────────────────────────────────────────────
+step "8. Summary"
 echo "  crontab — zebra/magnet/flow lines:"
 crontab -l | grep -E "zebra|magnet|flow" | sed 's/^/    /' || echo "    (none)"
 echo
