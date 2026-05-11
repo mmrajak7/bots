@@ -41,31 +41,23 @@ from playbook.magnet.scanner import (
 
 
 def _direction_for(price: float, st_val: float, st_direction: str) -> str:
-    """Map (price vs ST, ST direction) → Zebra direction or 'SKIP'.
+    """Map (price vs ST) → Zebra direction.
 
-    Design choice (stricter than magnet's pure side-of-ST logic):
-    We only fire on FRESH CROSSES — where current intraday LTP is on the
-    opposite side of ST from the last COMPLETED period's close. These are
-    the highest-quality mean-reversion setups.
+    MAGNET logic: ST acts as an attractor. Whichever side of ST price sits
+    on, it tends to pull toward ST.
 
-      CE-Zebra:  price < st_val  AND  st_direction == 'UP'
-        Last close was above ST (bullish state), current LTP just broke
-        below. Bet on bounce back UP to ST.
+      price < ST  → CE-Zebra (expect rally UP to ST)
+      price > ST  → PE-Zebra (expect drop  DOWN to ST)
 
-      PE-Zebra:  price > st_val  AND  st_direction == 'DOWN'
-        Last close was below ST (bearish state), current LTP just popped
-        above. Bet on rejection back DOWN to ST.
-
-    Other combos (trend-aligned, price already past ST in same direction)
-    are skipped — magnet would take them, but they're weaker mean-reversion
-    candidates and we deliberately trade fewer/better signals here.
-    To match magnet exactly, drop the st_direction checks below.
+    ST direction is NOT used as a filter — magnet works regardless of trend.
+    Quality is enforced by the gap band (3-5%) and the freshness check
+    (no ST touch in last N days), not by trend confirmation.
     """
-    if price < st_val and st_direction == 'UP':
+    if price < st_val:
         return 'CE'
-    if price > st_val and st_direction == 'DOWN':
+    if price > st_val:
         return 'PE'
-    return 'SKIP'
+    return 'SKIP'  # exactly on ST (rare)
 
 
 def run_all_scanners() -> List[dict]:

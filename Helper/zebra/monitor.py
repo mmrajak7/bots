@@ -90,50 +90,58 @@ def _is_market_open() -> bool:
 # ── Alert formatters ──────────────────────────────────────────────────────
 
 def _format_enter_alert(trade: dict, analysis: dict) -> str:
-    """Build the ENTER alert with up to 3 strike pairs (click-copy ready)."""
+    """Build the ENTER alert. Single recommended Zebra pair (click-copy ready).
+
+    Picker chose this pair as the best balance of: passes liquidity gates,
+    NetExt ≤ 0 (theta-OK), BE near spot, lowest capital_per_lot.
+    """
     stock = trade['stock']
     direction = trade['direction']
     spot = analysis['spot']
     st_val = trade['st_value']
-    gap = analysis.get('current_gap_pct',
-                       (spot - st_val) / st_val * 100 if direction == 'PE'
-                       else (st_val - spot) / st_val * 100)
+    # Magnet gap: how far the price is from the ST attractor.
+    gap = analysis.get('current_gap_pct', abs(spot - st_val) / st_val * 100)
     expiry = analysis['expiry']
     dte = analysis['dte']
     lot_size = analysis['lot_size']
-    cands = analysis['candidates']
+    pull_dir = 'up to' if direction == 'CE' else 'down to'
 
-    head = (
-        f"\U0001F993 <b>ZEBRA ENTER</b>  {stock} ({direction})\n"
-        f"spot {spot:,.2f} | ST {st_val:,.2f} ({trade.get('st_direction', '?')})"
-        f" | gap {gap:+.2f}%\n"
-        f"expiry {expiry} ({dte} DTE) | lot {lot_size}\n"
-    )
-
-    blocks = []
-    for i, c in enumerate(cands, start=1):
-        k_l = int(c['k_l']) if c['k_l'].is_integer() else c['k_l']
-        k_s = int(c['k_s']) if c['k_s'].is_integer() else c['k_s']
-        warn = ' ⚠' + ','.join(c['gate_fails']) if c['gate_fails'] else ''
-        net_ext_tag = '+' if c['net_ext'] > 0 else ''
-        block = (
-            f"\n[{i}] {k_l}/{k_s}  debit {c['debit']:.2f}  "
-            f"BE {c['be']:.2f} ({c['be_pct_from_spot']:+.2f}%)  "
-            f"NetExt {net_ext_tag}{c['net_ext']:.2f}  "
-            f"OI {c['long_oi']:,}/{c['short_oi']:,}{warn}\n"
-            f"   BUY 2x <code>{c['long_symbol']}</code>\n"
-            f"   SELL 1x <code>{c['short_symbol']}</code>\n"
-            f"   Cap/lot Rs {c['capital_per_lot']:,.0f} → {c['lots']} lot(s) = "
-            f"Rs {c['capital_per_lot']*c['lots']:,.0f}"
+    best = analysis.get('best')
+    if not best:
+        # No tradeable pair (all candidates failed gates). Surface this clearly.
+        return (
+            f"⚠ <b>ZEBRA NO-PAIR</b>  {stock} ({direction})\n"
+            f"spot {spot:,.2f} | ST {st_val:,.2f} | gap {gap:.2f}%\n"
+            f"Strike analyzer found no viable (K_L,K_S) at expiry {expiry} "
+            f"— OI/spread/regime gates all failed."
         )
-        blocks.append(block)
 
-    tail = (
-        f"\n\nAfter placing:\n"
-        f"<code>python -m zebra enter {trade['id']} --pair K_L/K_S "
-        f"--debit X --lots N --expiry {expiry}</code>"
+    k_l = int(best['k_l']) if best['k_l'].is_integer() else best['k_l']
+    k_s = int(best['k_s']) if best['k_s'].is_integer() else best['k_s']
+    warn = ' ⚠ ' + ','.join(best['gate_fails']) if best['gate_fails'] else ''
+    net_ext_sign = '+' if best['net_ext'] > 0 else ''
+
+    msg = (
+        f"\U0001F993 <b>ZEBRA ENTER</b>  {stock} ({direction})\n"
+        f"spot {spot:,.2f} | ST {st_val:,.2f} | gap {gap:.2f}% "
+        f"({pull_dir} ST)\n"
+        f"expiry {expiry} ({dte} DTE) | lot {lot_size}{warn}\n"
+        f"\n"
+        f"<b>{k_l}/{k_s}</b>  debit {best['debit']:.2f}  "
+        f"BE {best['be']:.2f} ({best['be_pct_from_spot']:+.2f}%)  "
+        f"NetExt {net_ext_sign}{best['net_ext']:.2f}\n"
+        f"OI {best['long_oi']:,}/{best['short_oi']:,}  "
+        f"sprd {best['long_spread_pct']:.1f}%/{best['short_spread_pct']:.1f}%\n"
+        f"\n"
+        f"  BUY 2x <code>{best['long_symbol']}</code>\n"
+        f"  SELL 1x <code>{best['short_symbol']}</code>\n"
+        f"\n"
+        f"1 lot = Rs {best['capital_per_lot']:,.0f}\n"
+        f"\nAfter placing:\n"
+        f"<code>python -m zebra enter {trade['id']} --pair {k_l}/{k_s} "
+        f"--debit X --lots 1 --expiry {expiry}</code>"
     )
-    return head + ''.join(blocks) + tail
+    return msg
 
 
 def _format_tp_alert(trade: dict, spot: float) -> str:
@@ -249,14 +257,18 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         if analysis.get('error'):
             logger.warning("Strike analysis %s skipped: %s", stock, analysis['error'])
             continue
-        if not analysis.get('candidates'):
-            logger.info("No tradeable candidates for %s, leaving in watching", stock)
+        if not analysis.get('best'):
+            logger.info("No tradeable best pick for %s, leaving in watching", stock)
             continue
 
         analysis['current_gap_pct'] = gap_pct
+        # Store just the best pick + ranked list for traceability.
+        alert_strikes = [analysis['best']] + [
+            c for c in analysis.get('candidates', [])
+            if (c['k_l'], c['k_s']) != (analysis['best']['k_l'], analysis['best']['k_s'])
+        ]
         try:
-            store.mark_triggered(trade['id'], price, gap_pct,
-                                 analysis['candidates'])
+            store.mark_triggered(trade['id'], price, gap_pct, alert_strikes)
         except ValueError as e:
             logger.warning("mark_triggered failed for #%d: %s", trade['id'], e)
             continue

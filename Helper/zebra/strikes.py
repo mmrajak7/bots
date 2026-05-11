@@ -253,7 +253,8 @@ def analyze(kite, stock: str, direction: str, spot: float,
         be = be_info['be']
         be_pct_from_spot = round((be - spot) / spot * 100, 2)
         capital_per_lot = round(debit * lot_size, 2)
-        lots = max(1, int(target_capital // capital_per_lot)) if capital_per_lot > 0 else 1
+        # Suggest 1 lot by default. User can scale via --lots N at zebra enter.
+        lots = 1
 
         # Gates
         gate_fails = []
@@ -304,16 +305,15 @@ def analyze(kite, stock: str, direction: str, spot: float,
             'k_s_used': k_s, 'candidates': [],
         }
 
-    # Rank: first by gate_fails count (fewer is better),
-    # then by NetExt (lower / more theta-positive is better),
-    # then by |BE - spot| (closer is better)
-    candidates.sort(key=lambda c: (
+    best = _pick_best(candidates, spot)
+
+    # Full ranked list (best first) — kept for inspection / debugging via
+    # the analyze CLI, but the Telegram ENTER alert uses only `best`.
+    ranked = sorted(candidates, key=lambda c: (
         len(c['gate_fails']),
         c['net_ext'],
         abs(c['be'] - spot),
     ))
-
-    top = candidates[:max_candidates]
 
     return {
         'stock': stock,
@@ -324,6 +324,55 @@ def analyze(kite, stock: str, direction: str, spot: float,
         'lot_size': lot_size,
         'atm_strike': k_s,
         'k_s_used': k_s,
-        'candidates': top,
+        'best': best,                         # the recommended pair (or None)
+        'candidates': ranked[:max_candidates], # for `zebra analyze` inspection
         'all_evaluated': len(candidates),
     }
+
+
+def _pick_best(candidates: list, spot: float) -> Optional[dict]:
+    """Pick the single best Zebra pair.
+
+    Order of preference:
+      1. ALL gates pass (OI ≥ 5k both legs, spread ≤ 1% both legs, BE inside body).
+      2. NetExt ≤ 0 (theta-neutral or positive).
+      3. BE within ±0.5% of spot (closest to ideal).
+      4. Among the above, prefer LOWEST capital_per_lot (most capital-efficient).
+
+    Each gate is relaxed in turn if no candidate passes; we never return None
+    when at least one viable structure exists — fallback is the deepest one
+    with smallest gate-fail count.
+
+    The picker balances the user's three asks: least slippage (gate 1 covers
+    bid-ask), better OI (gate 1), capital efficient (tiebreaker).
+    """
+    if not candidates:
+        return None
+
+    # Tier 1: clean (no gate fails) + theta-OK + BE near spot
+    tier1 = [c for c in candidates
+             if not c['gate_fails']
+             and c['net_ext'] <= 0
+             and abs(c['be_pct_from_spot']) <= 0.5]
+    if tier1:
+        return min(tier1, key=lambda c: c['capital_per_lot'])
+
+    # Tier 2: clean + theta-OK (BE constraint relaxed)
+    tier2 = [c for c in candidates
+             if not c['gate_fails']
+             and c['net_ext'] <= 0]
+    if tier2:
+        return min(tier2, key=lambda c: c['capital_per_lot'])
+
+    # Tier 3: clean (theta constraint relaxed)
+    tier3 = [c for c in candidates if not c['gate_fails']]
+    if tier3:
+        return min(tier3, key=lambda c: (c['net_ext'], c['capital_per_lot']))
+
+    # Tier 4: ranked best-effort (gate fails allowed)
+    ranked = sorted(candidates, key=lambda c: (
+        len(c['gate_fails']),
+        c['net_ext'],
+        c['capital_per_lot'],
+    ))
+    return ranked[0]

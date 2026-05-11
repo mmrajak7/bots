@@ -91,20 +91,38 @@ def cmd_analyze(args):
         sys.exit(1)
 
     print(f"  expiry {result['expiry']} ({result['dte']} DTE), lot={result['lot_size']}")
-    print(f"  K_S (ATM): {result['k_s_used']}\n")
-    for i, c in enumerate(result['candidates'], 1):
+    print(f"  K_S (ATM): {result['k_s_used']}")
+    print(f"  evaluated {result['all_evaluated']} K_L candidates\n")
+
+    best = result.get('best')
+
+    def _print_row(c, label):
         warn = ' [' + ','.join(c['gate_fails']) + ']' if c['gate_fails'] else ''
-        print(f"  [{i}] K_L={c['k_l']}, K_S={c['k_s']}, width={c['width']:.0f}{warn}")
-        print(f"      long  {c['long_symbol']}  mid={c['long_mid']:.2f} "
+        print(f"  {label}  K_L={c['k_l']}, K_S={c['k_s']}, width={c['width']:.0f}{warn}")
+        print(f"        long  {c['long_symbol']}  mid={c['long_mid']:.2f} "
               f"(b={c['long_bid']:.2f}/a={c['long_ask']:.2f}, "
               f"sprd={c['long_spread_pct']:.1f}%) OI={c['long_oi']:,}")
-        print(f"      short {c['short_symbol']}  mid={c['short_mid']:.2f} "
+        print(f"        short {c['short_symbol']}  mid={c['short_mid']:.2f} "
               f"(b={c['short_bid']:.2f}/a={c['short_ask']:.2f}, "
               f"sprd={c['short_spread_pct']:.1f}%) OI={c['short_oi']:,}")
-        print(f"      debit={c['debit']:.2f}  BE={c['be']:.2f} ({c['be_pct_from_spot']:+.2f}%)  "
+        print(f"        debit={c['debit']:.2f}  BE={c['be']:.2f} ({c['be_pct_from_spot']:+.2f}%)  "
               f"NetExt={c['net_ext']:+.2f}  regime={c['regime']}")
-        print(f"      cap/lot=Rs {c['capital_per_lot']:,.0f} -> lots={c['lots']} "
-              f"(total Rs {c['capital_per_lot']*c['lots']:,.0f})\n")
+        print(f"        cap/lot=Rs {c['capital_per_lot']:,.0f}\n")
+
+    if best:
+        print("  >>> BEST PICK <<<")
+        _print_row(best, '       ')
+        print(f"  Place this trade then run:")
+        print(f"    python -m zebra enter ID --pair {int(best['k_l'])}/{int(best['k_s'])} "
+              f"--debit X --lots 1 --expiry {result['expiry']}\n")
+
+    best_key = (best['k_l'], best['k_s']) if best else (None, None)
+    alternatives = [c for c in result['candidates']
+                    if (c['k_l'], c['k_s']) != best_key]
+    if alternatives:
+        print("  Alternatives (top by theta-positivity):")
+        for i, c in enumerate(alternatives, 1):
+            _print_row(c, f'  [{i}]')
 
 
 def cmd_trigger(args):
