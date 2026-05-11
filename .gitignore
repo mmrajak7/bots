@@ -161,6 +161,9 @@ Helper/config/
 Helper/data/
 Helper/output/
 
+# Server-deployment scripts (hardcode server paths — kept local only)
+Helper/zebra/deploy_server.sh
+
 # Claude Code specific (IDE instructions)
 .claude/
 **/.claude/
