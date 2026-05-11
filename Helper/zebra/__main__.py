@@ -328,6 +328,65 @@ def cmd_status(args):
     print()
 
 
+def cmd_reset(args):
+    """Wipe in-flight signals (watching/triggered/entered) — for one-time cleanup
+    before going to paper mode, or to reset after a regime change. Already-exited
+    or cancelled trades are kept for history.
+    """
+    import json
+    import shutil
+    from datetime import datetime
+    from pathlib import Path
+    from .trade_store import get_store
+    from . import config as cfg
+
+    store = get_store()
+    all_trades = store.load_trades()
+    open_states = ('watching', 'triggered', 'entered')
+    in_flight = [t for t in all_trades if t.get('status') in open_states]
+
+    if not in_flight:
+        print("No in-flight signals to reset (0 watching/triggered/entered).")
+        return
+
+    print(f"In-flight signals to be cancelled:")
+    for t in in_flight:
+        print(f"  #{t['id']} {t['stock']:<12} {t['direction']:<3} "
+              f"{t['status']:<10} {t['timeframe']:<8}")
+
+    if not args.confirm:
+        print(f"\n{len(in_flight)} signal(s) would be cancelled. "
+              f"Re-run with --confirm to apply.")
+        return
+
+    # Archive the current file before mutating
+    cfg.LOG_DIR.mkdir(exist_ok=True)
+    archive_dir = cfg.LOG_DIR / 'archive' / datetime.now().strftime('%Y-%m-%d')
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    archive_path = archive_dir / f'zebra_trades_pre_reset_{stamp}.json'
+    if cfg.LOCAL_FILE.exists():
+        shutil.copy(cfg.LOCAL_FILE, archive_path)
+        print(f"\nArchived current store -> {archive_path}")
+
+    # Cancel each in-flight via the store API (so version + Drive sync are correct)
+    cancelled = 0
+    for t in in_flight:
+        try:
+            if t['status'] == 'entered':
+                # Force-close at debit (max loss assumption — paper trade, not real money)
+                store.mark_exited(t['id'], t.get('entry_spot', 0), None,
+                                  'reset_force_close')
+            else:
+                store.cancel(t['id'], 'reset')
+            cancelled += 1
+        except ValueError as e:
+            print(f"  WARN: #{t['id']} skip — {e}")
+
+    print(f"Reset complete: {cancelled} signal(s) closed/cancelled. "
+          f"Local + Drive synced.")
+
+
 def cmd_report(args):
     from .report import run as run_report
     run_report(
@@ -403,6 +462,12 @@ def main():
 
     p_sts = sub.add_parser('status', help='Dashboard')
     p_sts.set_defaults(func=cmd_status)
+
+    p_rst = sub.add_parser('reset',
+                           help='Cancel all in-flight signals (watching/triggered/entered)')
+    p_rst.add_argument('--confirm', action='store_true',
+                       help='Actually apply; without this, prints what would happen')
+    p_rst.set_defaults(func=cmd_reset)
 
     p_rep = sub.add_parser('report',
                            help='EOD daily or Friday weekly performance report')
