@@ -339,6 +339,30 @@ class ZebraStore:
             self._upload_to_drive()
         return True
 
+    def set_alert_flag_daily(self, trade_id: int, kind: str,
+                             persist: bool = True) -> bool:
+        """Like set_alert_flag, but fires at most once per calendar day.
+
+        Used for recurring reminders (e.g. expiry T-3..T-1 daily nag) so the
+        user keeps getting nudged each day until they close the position.
+        Returns True if the flag was set/refreshed today (fire the alert);
+        False if it already fired today.
+        """
+        t = self.find(trade_id)
+        if not t:
+            return False
+        key = f"{kind}_alerted_at"
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        last = t.get(key, '')
+        if last.startswith(today_str):
+            return False
+        t[key] = datetime.now().isoformat()
+        t['version'] = t.get('version', 0) + 1
+        if persist:
+            self._save_local()
+            self._upload_to_drive()
+        return True
+
     # ── Listing ───────────────────────────────────────────────────────────
     def list_trades(self, status_filter: Optional[str] = None):
         trades = self._trades

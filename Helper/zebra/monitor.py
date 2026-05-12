@@ -110,8 +110,8 @@ def _format_enter_alert(trade: dict, analysis: dict) -> str:
     if not best:
         # No tradeable pair (all candidates failed gates). Surface this clearly.
         return (
-            f"⚠ <b>ZEBRA NO-PAIR</b>  {stock} ({direction})\n"
-            f"spot {spot:,.2f} | ST {st_val:,.2f} | gap {gap:.2f}%\n"
+            f"⚠ <b>ZEBRA NO-PAIR</b>  <code>{stock}</code> ({direction})\n"
+            f"spot {spot:,.2f} | Level {st_val:,.2f} | gap {gap:.2f}%\n"
             f"Strike analyzer found no viable (K_L,K_S) at expiry {expiry} "
             f"— OI/spread/regime gates all failed."
         )
@@ -119,27 +119,19 @@ def _format_enter_alert(trade: dict, analysis: dict) -> str:
     k_l = int(best['k_l']) if best['k_l'].is_integer() else best['k_l']
     k_s = int(best['k_s']) if best['k_s'].is_integer() else best['k_s']
     warn = ' ⚠ ' + ','.join(best['gate_fails']) if best['gate_fails'] else ''
-    net_ext_sign = '+' if best['net_ext'] > 0 else ''
 
     msg = (
-        f"\U0001F993 <b>ZEBRA ENTER</b>  {stock} ({direction})\n"
-        f"spot {spot:,.2f} | ST {st_val:,.2f} | gap {gap:.2f}% "
-        f"({pull_dir} ST)\n"
-        f"expiry {expiry} ({dte} DTE) | lot {lot_size}{warn}\n"
+        f"\U0001F993 <b>ENTER</b>  <code>{stock}</code>  ({direction})\n"
+        f"Level {st_val:,.2f} | spot {spot:,.2f} | gap {gap:.2f}% "
+        f"({pull_dir} Level)\n"
+        f"expiry {expiry} ({dte} DTE) | lot {lot_size} | "
+        f"Capital (1 lot) = {best['capital_per_lot']:,.0f}{warn}\n"
         f"\n"
-        f"<b>{k_l}/{k_s}</b>  debit {best['debit']:.2f}  "
-        f"BE {best['be']:.2f} ({best['be_pct_from_spot']:+.2f}%)  "
-        f"NetExt {net_ext_sign}{best['net_ext']:.2f}\n"
-        f"OI {best['long_oi']:,}/{best['short_oi']:,}  "
-        f"sprd {best['long_spread_pct']:.1f}%/{best['short_spread_pct']:.1f}%\n"
+        f"Strikes <b>{k_l} / {k_s}</b>   debit {best['debit']:g} | "
+        f"BE {best['be']:,.2f} ({best['be_pct_from_spot']:+.2f}%)\n"
         f"\n"
-        f"  BUY 2x <code>{best['long_symbol']}</code>\n"
-        f"  SELL 1x <code>{best['short_symbol']}</code>\n"
-        f"\n"
-        f"1 lot = Rs {best['capital_per_lot']:,.0f}\n"
-        f"\nAfter placing:\n"
-        f"<code>python -m zebra enter {trade['id']} --pair {k_l}/{k_s} "
-        f"--debit X --lots 1 --expiry {expiry}</code>"
+        f"🟢 BUY 2× <code>{best['long_symbol']}</code>  {best['long_ask']:g}\n"
+        f"🔴 SELL 1× <code>{best['short_symbol']}</code>  {best['short_bid']:g}"
     )
     return msg
 
@@ -193,9 +185,13 @@ def _format_time_alert(trade: dict, days_left: int,
                        mid: Optional[float] = None) -> str:
     paper = _paper_close_line(trade, mid)
     return (
-        f"⏰ <b>ZEBRA T-{days_left}</b>  {trade['stock']} ({trade['direction']})\n"
-        f"Expiry {trade['expiry']}, {days_left} days left\n"
-        f"Pin risk on short {trade['short_symbol']}.{paper}"
+        f"⏰ <b>EXIT REMINDER</b>  <code>{trade['stock']}</code>  "
+        f"({trade['direction']})\n"
+        f"T-{days_left} | expiry {trade['expiry']}\n"
+        f"Close before physical-settlement margin spike (2× long ITM).\n"
+        f"\n"
+        f"🔴 BUY back 1× <code>{trade['short_symbol']}</code>\n"
+        f"🟢 SELL 2× <code>{trade['long_symbol']}</code>{paper}"
     )
 
 
@@ -440,7 +436,10 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             days_left = (exp - today).days
         except Exception:
             days_left = 999
-        if days_left <= cfg.TIME_SL_DAYS and store.set_alert_flag(tid, 'time'):
+        # Daily reminder during the last TIME_SL_DAYS — fires once per day so
+        # the user keeps getting nudged until they exit. Paper mode auto-closes
+        # on the first fire (subsequent days no-op since status='exited').
+        if days_left <= cfg.TIME_SL_DAYS and store.set_alert_flag_daily(tid, 'time'):
             mid = _quote_zebra_value(kite, trade)
             _send_telegram(_format_time_alert(trade, days_left, mid), dry_run=dry_run)
             logger.info("TIME alert #%d %s days_left=%d", tid, stock, days_left)
