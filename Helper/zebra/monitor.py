@@ -409,8 +409,13 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 continue
 
         # ── SPOT SL ─────────────────────────────────────────────────────
-        sl_hit = (direction == 'CE' and spot <= sl_spot) or \
-                 (direction == 'PE' and spot >= sl_spot)
+        # Disabled by default: the debit floor already caps max loss, and the
+        # 3% adverse spot SL was force-exiting capped-risk trades near the
+        # local bottom (biggest realized-loss bucket in paper). Flip
+        # spot_sl_enabled=True in zebra_config.json to restore.
+        sl_hit = cfg.SPOT_SL_ENABLED and (
+                 (direction == 'CE' and spot <= sl_spot) or
+                 (direction == 'PE' and spot >= sl_spot))
         if sl_hit and store.set_alert_flag(tid, 'spot_sl'):
             mid = _quote_zebra_value(kite, trade)
             _send_telegram(_format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)

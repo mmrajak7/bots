@@ -174,9 +174,10 @@ def _fmt_open_line(t: dict, unreal: Optional[dict]) -> str:
     """One-line summary for an open trade with unrealized P&L."""
     kl = int(t['long_strike']) if t.get('long_strike') else '?'
     ks = int(t['short_strike']) if t.get('short_strike') else '?'
+    sl_txt = f"  SL {t.get('sl_spot',0):.0f}" if cfg.SPOT_SL_ENABLED else ""
     base = (f"  #{t['id']} {t['stock']:<10} {t['direction']:<3} {kl}/{ks}  "
             f"entry {t.get('entry_date','?')[5:]} @ {t.get('entry_spot',0):.2f}  "
-            f"TP {t.get('tp_spot',0):.0f}  SL {t.get('sl_spot',0):.0f}")
+            f"TP {t.get('tp_spot',0):.0f}{sl_txt}")
     if unreal:
         base += f"  | mid {unreal['mid']:.2f}  unrealized Rs {unreal['pnl']:+,.0f} ({unreal['pnl_pct']:+.1f}%)"
     else:

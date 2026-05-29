@@ -222,9 +222,11 @@ def cmd_enter(args):
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
+    from . import config as cfg
     print(f"Entered #{t['id']} {t['stock']} {int(t['long_strike'])}/{int(t['short_strike'])} "
           f"debit={t['debit']:.2f} qty={t['quantity']} cap=Rs{t['capital']:,.0f}")
-    print(f"  TP at {t['tp_spot']:.2f}, SPOT SL at {t['sl_spot']:.2f}, "
+    sl_txt = f"SPOT SL at {t['sl_spot']:.2f}, " if cfg.SPOT_SL_ENABLED else "SPOT SL off, "
+    print(f"  TP at {t['tp_spot']:.2f}, {sl_txt}"
           f"DEBIT SL at {t['debit_sl_value']:.2f}")
 
 
@@ -301,12 +303,14 @@ def cmd_status(args):
 
     entered = by_status.get('entered', [])
     if entered:
+        from . import config as cfg
         print(f"\n  --- Open Trades ---")
         for t in entered:
+            sl_txt = f"SL={t['sl_spot']:.2f} " if cfg.SPOT_SL_ENABLED else ""
             print(f"  #{t['id']} {t['stock']:<12} {t['direction']:<3} "
                   f"{int(t['long_strike'])}/{int(t['short_strike'])} "
                   f"debit={t['debit']:.2f} TP={t['tp_spot']:.2f} "
-                  f"SL={t['sl_spot']:.2f} exp={t['expiry']}")
+                  f"{sl_txt}exp={t['expiry']}")
 
     watching = by_status.get('watching', [])
     if watching:

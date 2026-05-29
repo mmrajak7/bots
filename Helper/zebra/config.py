@@ -55,7 +55,8 @@ _DEFAULTS = {
     'min_leg_oi': 5000,
     'max_leg_spread_pct': 0.01,  # bid-ask spread cap per leg (1% of mid)
     'tp_target': 'st_line',       # 'st_line' or 'short_strike'
-    'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL
+    'spot_sl_enabled': False,     # master switch for the adverse-spot SL (off: debit floor only)
+    'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
     'time_sl_days_before_expiry': 3,
     'max_open_trades': 8,
@@ -100,6 +101,7 @@ MAX_DTE = _runtime['max_dte']
 MIN_LEG_OI = _runtime['min_leg_oi']
 MAX_LEG_SPREAD_PCT = _runtime['max_leg_spread_pct']
 TP_TARGET = _runtime['tp_target']
+SPOT_SL_ENABLED = _runtime['spot_sl_enabled']
 SPOT_SL_PCT = _runtime['spot_sl_pct']
 DEBIT_SL_PCT = _runtime['debit_sl_pct']
 TIME_SL_DAYS = _runtime['time_sl_days_before_expiry']
