@@ -133,6 +133,9 @@ class ZebraStore:
             'direction': direction,            # CE or PE
             'st_value': data['st_value'],
             'st_direction': data['st_direction'],
+            # trend_aligned is NOT stored — it is derived on demand from
+            # direction + st_direction via cfg.is_trend_aligned (single source
+            # of truth), so it can never drift from or be dropped by the schema.
             'signal_price': data['signal_price'],
             'signal_gap_pct': data['signal_gap_pct'],
             'signal_date': now.strftime('%Y-%m-%d'),

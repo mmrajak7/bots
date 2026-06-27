@@ -120,8 +120,11 @@ def _format_enter_alert(trade: dict, analysis: dict) -> str:
     k_s = int(best['k_s']) if best['k_s'].is_integer() else best['k_s']
     warn = ' ⚠ ' + ','.join(best['gate_fails']) if best['gate_fails'] else ''
 
+    conviction = ' ⭐ALIGNED' if cfg.is_trend_aligned(
+        trade.get('direction'), trade.get('st_direction')) else ''
+
     msg = (
-        f"\U0001F993 <b>ENTER</b>  <code>{stock}</code>  ({direction})\n"
+        f"\U0001F993 <b>ENTER</b>  <code>{stock}</code>  ({direction}){conviction}\n"
         f"Level {st_val:,.2f} | spot {spot:,.2f} | gap {gap:.2f}% "
         f"({pull_dir} Level)\n"
         f"expiry {expiry} ({dte} DTE) | lot {lot_size} | "
@@ -284,15 +287,12 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             logger.warning("mark_triggered failed for #%d: %s", trade['id'], e)
             continue
 
-        msg = _format_enter_alert(trade, analysis)
-        sent = _send_telegram(msg, dry_run=dry_run)
-        if sent:
-            logger.info("ENTER alert sent for #%d %s", trade['id'], stock)
-        else:
-            logger.warning("ENTER alert FAILED for #%d %s", trade['id'], stock)
-
-        # PAPER mode: auto-record the trade as entered using picker's mid prices.
-        # Real fills (live mode) would require the user to run `zebra enter`.
+        # PAPER mode: auto-record the entry FIRST, then alert — so the ENTER
+        # alert only goes out for a position that actually opened. If the fill
+        # is rejected we leave the signal in 'triggered' (it self-heals via the
+        # drift/stale-cancel checks next cycle); we deliberately do NOT cancel
+        # here, because a 'cancelled' record isn't deduped by the scanner and
+        # would be re-added + re-alerted every scan (alert churn).
         if cfg.PAPER_MODE:
             best = analysis.get('best')
             if not best:
@@ -312,9 +312,18 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 logger.info("PAPER auto-entered #%d %s %d/%d debit=%.2f",
                             trade['id'], stock,
                             int(best['k_l']), int(best['k_s']), best['debit'])
-            except ValueError as e:
-                logger.error("PAPER auto-enter failed for #%d %s: %s",
+            except Exception as e:  # broad: bad data OR persist/IO failure
+                logger.error("PAPER auto-enter failed for #%d %s: %s — left "
+                             "triggered (will drift-cancel), no alert sent",
                              trade['id'], stock, e)
+                continue
+
+        msg = _format_enter_alert(trade, analysis)
+        sent = _send_telegram(msg, dry_run=dry_run)
+        if sent:
+            logger.info("ENTER alert sent for #%d %s", trade['id'], stock)
+        else:
+            logger.warning("ENTER alert FAILED for #%d %s", trade['id'], stock)
 
 
 # ── Entered → TP/SL/Time ─────────────────────────────────────────────────
@@ -335,22 +344,26 @@ def _quote_zebra_value(kite, trade: dict) -> Optional[float]:
 
 
 def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
-                       reason: str) -> Optional[dict]:
+                       reason: str, spot: Optional[float] = None) -> Optional[dict]:
     """Auto-close a paper trade at current structure mid. Returns the updated
-    trade dict (with pnl/pnl_pct) or None if close failed."""
+    trade dict (with pnl/pnl_pct) or None if close failed.
+
+    `spot` is the live underlying LTP at exit — recorded for post-trade
+    spot-movement analysis. P&L itself is driven by `mid`, not spot.
+    """
     if not cfg.PAPER_MODE:
         return None
     if trade.get('status') != 'entered':
         return None  # already closed by an earlier trigger this cycle
     if mid is None:
-        # No quote — book max loss (debit fully gone) only if reason explicitly
-        # forces it (time-based). Otherwise skip and retry next cycle.
-        if reason != 'time':
-            return None
+        # No quote — never fabricate a price (booking -debit max-loss on a
+        # transient outage corrupts the paper P&L). Defer; the caller retries
+        # next poll. Callers already skip paper trades with no mid.
+        return None
     try:
         updated = store.mark_exited(
             trade['id'],
-            trade.get('entry_spot', 0),  # spot not strictly needed for P&L
+            spot if spot is not None else trade.get('entry_spot', 0),
             mid,
             f'paper:{reason}'
         )
@@ -397,14 +410,23 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         tp_spot = trade['tp_spot']
         sl_spot = trade['sl_spot']
 
+        # One structure quote per trade per cycle. Every paper exit books at
+        # this mid, so if the quote is momentarily unavailable we DEFER the
+        # whole trade to the next poll — rather than burning a one-shot dedup
+        # flag on a close we can't execute (which would strand the exit
+        # forever) or booking a fabricated max-loss. LIVE mode still alerts
+        # (mid rendered as NA) since there it's an alert, not an auto-close.
+        mid = _quote_zebra_value(kite, trade)
+        if cfg.PAPER_MODE and mid is None:
+            continue
+
         # ── TP ──────────────────────────────────────────────────────────
         tp_hit = (direction == 'CE' and spot >= tp_spot) or \
                  (direction == 'PE' and spot <= tp_spot)
         if tp_hit and store.set_alert_flag(tid, 'tp'):
-            mid = _quote_zebra_value(kite, trade)
             _send_telegram(_format_tp_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
-            _paper_auto_close(store, trade, mid, 'tp')
+            _paper_auto_close(store, trade, mid, 'tp', spot)
             if trade.get('status') == 'exited':
                 continue
 
@@ -417,21 +439,19 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                  (direction == 'CE' and spot <= sl_spot) or
                  (direction == 'PE' and spot >= sl_spot))
         if sl_hit and store.set_alert_flag(tid, 'spot_sl'):
-            mid = _quote_zebra_value(kite, trade)
             _send_telegram(_format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
-            _paper_auto_close(store, trade, mid, 'spot_sl')
+            _paper_auto_close(store, trade, mid, 'spot_sl', spot)
             if trade.get('status') == 'exited':
                 continue
 
         # ── DEBIT SL ────────────────────────────────────────────────────
-        mid = _quote_zebra_value(kite, trade)
         if mid is not None and mid <= trade['debit_sl_value']:
             if store.set_alert_flag(tid, 'debit_sl'):
                 _send_telegram(_format_debit_sl_alert(trade, mid), dry_run=dry_run)
                 logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f",
                             tid, stock, mid, trade['debit_sl_value'])
-                _paper_auto_close(store, trade, mid, 'debit_sl')
+                _paper_auto_close(store, trade, mid, 'debit_sl', spot)
                 if trade.get('status') == 'exited':
                     continue
 
@@ -445,10 +465,9 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # the user keeps getting nudged until they exit. Paper mode auto-closes
         # on the first fire (subsequent days no-op since status='exited').
         if days_left <= cfg.TIME_SL_DAYS and store.set_alert_flag_daily(tid, 'time'):
-            mid = _quote_zebra_value(kite, trade)
             _send_telegram(_format_time_alert(trade, days_left, mid), dry_run=dry_run)
             logger.info("TIME alert #%d %s days_left=%d", tid, stock, days_left)
-            _paper_auto_close(store, trade, mid, 'time')
+            _paper_auto_close(store, trade, mid, 'time', spot)
 
 
 # ── Cycle ─────────────────────────────────────────────────────────────────

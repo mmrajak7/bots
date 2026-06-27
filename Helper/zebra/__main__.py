@@ -74,14 +74,23 @@ def cmd_analyze(args):
         if not st:
             print(f"ST compute failed for {stock} {timeframe}")
             sys.exit(1)
-        if spot < st['st'] and st['direction'] == 'UP':
+        # Magnet routing — same as the scanner's _direction_for: direction is
+        # set by which side of the ST line price sits on, and spot exactly on
+        # the line is SKIP (no edge). Trend alignment is reported as conviction
+        # (not a hard skip), matching how the bot actually trades.
+        if spot < st['st']:
             direction = 'CE'
-        elif spot > st['st'] and st['direction'] == 'DOWN':
+        elif spot > st['st']:
             direction = 'PE'
         else:
-            print(f"Trend not aligned: spot={spot:.2f} vs ST={st['st']:.2f} "
-                  f"dir={st['direction']}. Specify --direction to override.")
+            print(f"  spot {spot:.2f} is exactly on ST {st['st']:.2f} — no "
+                  f"direction. Specify --direction to override.")
             sys.exit(1)
+        aligned = cfg.is_trend_aligned(direction, st['direction'])
+        tag = 'ALIGNED (with-trend, premium)' if aligned \
+            else 'COUNTER-TREND (lower conviction)'
+        print(f"  spot {spot:.2f} vs ST {st['st']:.2f} ({st['direction']}) "
+              f"-> {direction}  [{tag}]")
 
     print(f"\nAnalyzing {stock} ({direction}) at spot {spot:.2f}...")
     result = strikes_mod.analyze(kite, stock, direction, spot,

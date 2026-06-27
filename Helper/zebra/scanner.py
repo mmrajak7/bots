@@ -177,7 +177,11 @@ def validate_and_add(store: ZebraStore, kite=None,
                          stock, direction, opposite['id'], opposite['direction'])
             continue
 
-        # Passed all gates — add as watching
+        # Passed all gates — add as watching. Trend alignment (the validated
+        # with-trend premium tier) is NOT stored or baked into notes — it is
+        # derived on demand via cfg.is_trend_aligned wherever it's shown (alert
+        # badge, reports, analyze), so there is a single source of truth that
+        # can't drift.
         signal_data = {
             'stock': stock,
             'timeframe': timeframe,

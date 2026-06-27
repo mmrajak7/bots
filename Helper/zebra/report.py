@@ -87,7 +87,40 @@ def _summarize_exits(exits: list) -> dict:
         'best': max(exits, key=lambda t: t.get('pnl') or 0),
         'worst': min(exits, key=lambda t: t.get('pnl') or 0),
         'by_reason': by_reason,
+        'by_alignment': _alignment_split(exits),
     }
+
+
+def _alignment_split(exits: list) -> dict:
+    """Split exits into with-trend (aligned) vs counter-trend and stat each.
+
+    Alignment is derived from direction + st_direction (cfg.is_trend_aligned),
+    so this works for every trade, including those logged before the flag
+    existed. Lets us watch the validated alignment edge materialise forward.
+    """
+    def _stat(group: list) -> dict:
+        if not group:
+            return {'count': 0, 'net_pnl': 0.0, 'win_rate': 0.0}
+        wins = 0
+        net = 0.0
+        for t in group:
+            pnl = t.get('pnl') or 0
+            net += pnl
+            if pnl > 0:
+                wins += 1
+        return {
+            'count': len(group),
+            'net_pnl': round(net, 0),
+            'win_rate': round(wins / len(group) * 100, 1),
+        }
+    aligned, counter = [], []
+    for t in exits:
+        sd = t.get('st_direction')
+        if sd not in ('UP', 'DOWN'):
+            continue  # unclassifiable — exclude so it skews neither bucket
+        bucket = aligned if cfg.is_trend_aligned(t.get('direction'), sd) else counter
+        bucket.append(t)
+    return {'aligned': _stat(aligned), 'counter': _stat(counter)}
 
 
 def _unrealized_for_open(open_trades: list, kite) -> dict:
@@ -215,6 +248,13 @@ def format_text(report: dict) -> str:
             for r, st in sorted(s['by_reason'].items()):
                 lines.append(f"    {r:<12} {st['count']:>2} trades  "
                              f"Rs {st['pnl']:+,.0f}")
+        a = s.get('by_alignment')
+        if a and (a['aligned']['count'] or a['counter']['count']):
+            lines.append("")
+            lines.append("  By alignment (with-trend edge):")
+            for label, st in (('aligned ⭐', a['aligned']), ('counter ', a['counter'])):
+                lines.append(f"    {label:<12} {st['count']:>2} trades  "
+                             f"Rs {st['net_pnl']:+,.0f}  WR {st['win_rate']:.0f}%")
 
     # Open section
     lines.append("")
@@ -269,6 +309,14 @@ def format_telegram(report: dict) -> str:
             parts.append(
                 f"{tag} <code>{t['stock']}</code> {t['direction']} "
                 f"{kl}/{ks}  Rs {pnl:+,.0f} [{reason}]"
+            )
+        a = s.get('by_alignment')
+        if a and (a['aligned']['count'] or a['counter']['count']):
+            al, co = a['aligned'], a['counter']
+            parts.append(
+                f"<i>⭐aligned {al['count']}: Rs {al['net_pnl']:+,.0f} "
+                f"(WR {al['win_rate']:.0f}%) | counter {co['count']}: "
+                f"Rs {co['net_pnl']:+,.0f} (WR {co['win_rate']:.0f}%)</i>"
             )
 
     if report['open']:

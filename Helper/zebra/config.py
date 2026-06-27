@@ -59,7 +59,10 @@ _DEFAULTS = {
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
     'time_sl_days_before_expiry': 3,
-    'max_open_trades': 8,
+    'max_open_trades': 8,        # LIVE guidance only. PAPER intentionally does
+                                 # NOT cap entries — capturing every signal keeps
+                                 # the validation P&L unbiased (a cap would skew
+                                 # which trades the track record contains).
     'max_watching_signals': 25,
     'scan_interval_sec': 300,    # 5 min between Chartink scans
     'monitor_interval_sec': 300, # 5 min between LTP/monitor checks
@@ -115,6 +118,18 @@ ST_PERIOD = _runtime['st_period']
 ST_MULTIPLIER = _runtime['st_multiplier']
 
 SCANNERS = [s for s in _ALL_SCANNERS if s['timeframe'] in ENABLED_TIMEFRAMES]
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+def is_trend_aligned(direction: str, st_direction: str) -> bool:
+    """True if a Zebra signal is a WITH-TREND pullback (the validated premium
+    setup): CE into a rising ST, PE into a falling ST. Counter-trend signals
+    still trade (the capped-loss structure keeps them net-positive) — this flag
+    is a conviction tag, not a hard filter. Single source of truth so the
+    scanner tag and any consumer never diverge.
+    """
+    return (direction == 'CE' and st_direction == 'UP') or \
+           (direction == 'PE' and st_direction == 'DOWN')
+
 
 # ── Market hours ──────────────────────────────────────────────────────────
 MARKET_OPEN = (9, 15)
