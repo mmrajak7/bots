@@ -232,6 +232,9 @@ class Orchestrator:
 
     def _send_startup_message(self, kite) -> None:
         """Send professional startup message like CROCODILE"""
+        if not config.get('telegram.daemon_lifecycle_alerts', False):
+            logger.info("Startup message suppressed (telegram.daemon_lifecycle_alerts=false)")
+            return
         try:
             session = get_session()
             try:

@@ -419,7 +419,8 @@ class TelegramBot:
         position_value: float,
         available_capital: float,
         is_fno: bool = False,
-        company_snapshot: Optional[str] = None
+        company_snapshot: Optional[str] = None,
+        conviction: Optional[str] = None
     ) -> Optional[int]:
         """
         Send signal notification with approval buttons
@@ -432,10 +433,12 @@ class TelegramBot:
 
         fno_tag = " [NFO]" if is_fno else ""
 
+        conviction_line = f"\n{conviction}" if conviction else ""
+
         text = (
             f"<b>{script}</b>{fno_tag} @ {signal_level:,.2f}\n"
             f"LTP: {ltp:,.2f} ({distance_sign}{distance_pct:.1f}%)\n"
-            f"Qty: {quantity} / Value: {position_value:,.0f}\n\n"
+            f"Qty: {quantity} / Value: {position_value:,.0f}{conviction_line}\n\n"
             f"Capital: {available_capital:,.0f}"
         )
 

@@ -482,7 +482,11 @@ def run_daemon():
         # Wait for telegram thread to finish (it checks _daemon_running)
         if _telegram_thread is not None and _telegram_thread.is_alive():
             _telegram_thread.join(timeout=35)  # Slightly longer than poll timeout
-        telegram.send_alert("FIFTY Bot Daemon Stopped")
+        from src.utils.config_manager import config as _cfg
+        if _cfg.get('telegram.daemon_lifecycle_alerts', False):
+            telegram.send_alert("FIFTY Bot Daemon Stopped")
+        else:
+            logger.info("Daemon stop message suppressed (telegram.daemon_lifecycle_alerts=false)")
 
 
 def _handle_signal_approved_daemon(action: dict, orchestrator) -> None:

@@ -203,8 +203,8 @@ class OrderManager:
         """
         FIX TR-002: Re-check NIFTY weekly filter before placing entry order.
 
-        Signal may have been approved during bullish but market could turn bearish
-        before the entry is actually placed.
+        Signal may have been approved while the NIFTY filter allowed entries, but the
+        filter could flip to block (e.g. over-extended) before the entry is placed.
 
         Returns:
             (is_ok, message)
@@ -214,12 +214,12 @@ class OrderManager:
 
         try:
             from src.core.signal_processor import signal_processor
-            is_bullish = signal_processor.check_nifty_weekly_filter()
+            allow = signal_processor.check_nifty_weekly_filter()
 
-            if not is_bullish:
-                return False, "NIFTY weekly turned bearish since approval"
+            if not allow:
+                return False, "NIFTY weekly filter blocks entry (over-extended) since approval"
 
-            return True, "NIFTY weekly still bullish"
+            return True, "NIFTY weekly filter OK"
 
         except Exception as e:
             # FIX TR-M2: Block on error (conservative)
@@ -268,7 +268,7 @@ class OrderManager:
                 f"<b>Entry Blocked - Market Condition</b>\n\n"
                 f"{script} @ {entry_price:,.2f}\n"
                 f"{nifty_msg}\n"
-                f"Signal will need re-approval if market turns bullish."
+                f"Signal will need re-approval when the NIFTY filter allows again."
             )
             # Mark signal as HOLD so it can be re-notified
             session = get_session()

@@ -26,6 +26,7 @@ telegram:
   enabled: true
   retry_attempts: 3
   retry_delay: 5
+  daemon_lifecycle_alerts: false  # suppress "Service Started"/"Daemon Stopped" telegram messages (daily restart noise)
 
 # Signal Source Configuration
 signals:
@@ -38,8 +39,8 @@ signals:
 trading:
   test_mode: 'X'  # 'X' for test mode (1 qty), '' for production
   initial_capital: 100000
-  per_trade_amount: 20000
-  max_positions: 5
+  per_trade_amount: 10000  # capital-neutral: initial_capital / max_positions (100K / 10)
+  max_positions: 10        # 10 slots beats 5 (same total return, ~half the worst-year drawdown, more monster capture)
   max_pending_orders: 3
   initial_sl_percent: 20
 
@@ -53,6 +54,9 @@ risk:
 nifty_filter:
   enabled: true
   instrument_token: "256265"
+  mode: stretch          # 'stretch' (gate: weekly (close-ST)/ATR <= stretch_high) | 'binary' (legacy ST trend up)
+  stretch_high: 2.0      # block new entries when NIFTY weekly stretch exceeds this (over-extended). No lower bound.
+  conviction_enabled: true  # show NIFTY monthly stretch conviction stars (★) in signal alerts (context only, not a gate)
 
 # SuperTrend Configuration
 supertrend:

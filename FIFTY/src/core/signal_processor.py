@@ -42,6 +42,15 @@ class SignalProcessor:
         self._nifty_filter_cache_time: Optional[datetime] = None
         self._nifty_filter_cache_ttl = 300  # 5 minutes
 
+        # NIFTY monthly conviction cache. TTL is long: it's derived from COMPLETED weekly/monthly
+        # candles that don't change intraday, so no need to refetch every 5-min cycle.
+        self._nifty_conviction_cache: Optional[str] = None
+        self._nifty_conviction_cache_time: Optional[datetime] = None
+        self._nifty_conviction_cache_ttl = 3600  # 1 hour
+
+        # NIFTY weekly ATR percentile (vs last 52 weeks) - set during weekly filter, used as alert context
+        self._nifty_weekly_atr_rank: Optional[float] = None
+
         # SuperTrend parameters
         self.st_period = config.get('supertrend.period', 10)
         self.st_multiplier = config.get('supertrend.multiplier', 3)
@@ -481,6 +490,7 @@ class SignalProcessor:
         df['final_ub'] = final_ub
         df['supertrend'] = supertrend
         df['trend'] = trend
+        df['atr'] = atr  # surfaced for stretch = (close - ST) / ATR
 
         return df
 
@@ -576,8 +586,9 @@ class SignalProcessor:
         Conservative approach - don't take entries when uncertain.
 
         Returns:
-            True if NIFTY weekly trend is bullish (allow entries)
-            False if bearish OR on error (block entries)
+            True to allow entries (stretch mode: NIFTY weekly stretch <= stretch_high,
+                i.e. not over-extended; binary mode: weekly ST trend up)
+            False to block (over-extended / bearish / on error)
         """
         if not config.get('nifty_filter.enabled', True):
             return True
@@ -608,11 +619,52 @@ class SignalProcessor:
             # Calculate SuperTrend
             df_with_st = self._calculate_supertrend(df)
 
-            # Check trend: trend == 1 means UPTREND (bullish), trend == -1 means DOWNTREND (bearish)
+            if len(df_with_st) < 2:
+                logger.warning("Insufficient NIFTY weekly data for filter - BLOCKING entries (safety)")
+                return False
+
+            mode = config.get('nifty_filter.mode', 'stretch')
+
+            if mode == 'stretch':
+                # STRETCH GATE: allow entries unless NIFTY is over-extended above its weekly ST.
+                # Use the COMPLETED weekly candle (iloc[-2]); iloc[-1] is the running/partial week
+                # (consistent with _calculate_signal_level, and avoids mid-week gate flips).
+                # stretch = (close - ST) / ATR ; block when stretch > stretch_high.
+                stretch_high = config.get('nifty_filter.stretch_high', 2.0)
+                close = float(df_with_st['Close'].iloc[-2])
+                st = float(df_with_st['supertrend'].iloc[-2])
+                atr = float(df_with_st['atr'].iloc[-2])
+                if atr <= 0:
+                    logger.warning("NIFTY weekly ATR <= 0 - BLOCKING entries (safety)")
+                    return False
+                stretch = (close - st) / atr
+                is_ok = stretch <= stretch_high
+
+                # Weekly ATR percentile vs last 52 completed weeks (context for alerts).
+                # Low percentile + high stretch = complacent top; high percentile = volatile/recovery.
+                try:
+                    atr_pct = (df_with_st['atr'] / df_with_st['Close'] * 100)
+                    window = atr_pct.iloc[-53:-1]  # 52 completed weeks ending at iloc[-2]
+                    if len(window) >= 20:
+                        self._nifty_weekly_atr_rank = float((window < atr_pct.iloc[-2]).sum() / len(window) * 100)
+                    else:
+                        self._nifty_weekly_atr_rank = None
+                except Exception:
+                    self._nifty_weekly_atr_rank = None
+
+                logger.info(
+                    f"NIFTY weekly filter (stretch): {stretch:.2f} ATR "
+                    f"(<= {stretch_high} ? {'ALLOW' if is_ok else 'BLOCK (over-extended)'})"
+                )
+                self._nifty_filter_cache = is_ok
+                self._nifty_filter_cache_time = datetime.now()
+                return is_ok
+
+            # Legacy BINARY mode: trend == 1 means UPTREND (bullish), -1 means DOWNTREND (bearish)
             current_trend = int(df_with_st['trend'].iloc[-1])
             is_bullish = current_trend == 1
 
-            logger.info(f"NIFTY weekly filter: trend={current_trend}, {'BULLISH (allow)' if is_bullish else 'BEARISH (block)'}")
+            logger.info(f"NIFTY weekly filter (binary): trend={current_trend}, {'BULLISH (allow)' if is_bullish else 'BEARISH (block)'}")
             self._nifty_filter_cache = is_bullish
             self._nifty_filter_cache_time = datetime.now()
             return is_bullish
@@ -625,6 +677,75 @@ class SignalProcessor:
             self._nifty_filter_cache_time = datetime.now()
             return False
 
+    def get_nifty_monthly_conviction(self) -> Optional[str]:
+        """
+        Grade conviction from NIFTY MONTHLY stretch = (close - ST) / ATR on the
+        completed monthly candle. The lower the monthly stretch, the better the
+        historical dip-buy outcome (monotonic). This is a CONVICTION label only
+        (shown in the signal alert) - it is NOT a gate (the weekly filter gates).
+
+        Returns a short star string like "★★★☆☆ NORMAL (NIFTY +1.2)", or None.
+        """
+        if not config.get('nifty_filter.conviction_enabled', True):
+            return None
+
+        # Cache: completed-candle value doesn't change intraday (own 1-hour TTL)
+        now = datetime.now()
+        if (self._nifty_conviction_cache is not None and
+                self._nifty_conviction_cache_time is not None and
+                (now - self._nifty_conviction_cache_time).total_seconds() < self._nifty_conviction_cache_ttl):
+            return self._nifty_conviction_cache
+
+        try:
+            nifty_token = config.get('nifty_filter.instrument_token', '256265')
+            df = self.kite.get_historical_data_sampled(
+                instrument_token=nifty_token,
+                timeframe='monthly',
+                years_back=config.get('historical_data.monthly_lookback_years', 5.0)
+            )
+            if df is None or df.empty:
+                return None
+
+            df_with_st = self._calculate_supertrend(df)
+            if len(df_with_st) < 2:
+                return None
+
+            # Completed monthly candle (iloc[-2]); iloc[-1] is the running month
+            close = float(df_with_st['Close'].iloc[-2])
+            st = float(df_with_st['supertrend'].iloc[-2])
+            atr = float(df_with_st['atr'].iloc[-2])
+            if atr <= 0:
+                return None
+            stretch = (close - st) / atr
+
+            # Conviction tiers (backtest 2019-2026: lower stretch -> higher win/return)
+            if stretch <= 0:
+                stars, label = "★★★★★", "DEEP VALUE"
+            elif stretch <= 1:
+                stars, label = "★★★★☆", "STRONG"
+            elif stretch <= 2:
+                stars, label = "★★★☆☆", "NORMAL"
+            else:
+                stars, label = "★★☆☆☆", "EXTENDED"
+
+            sign = "+" if stretch >= 0 else ""
+            result = f"{stars} {label} (NIFTY {sign}{stretch:.1f})"
+
+            # Append weekly volatility context (ATR percentile set during the weekly filter check)
+            ar = self._nifty_weekly_atr_rank
+            if ar is not None:
+                vol = "calm" if ar < 30 else ("elevated" if ar > 70 else "normal")
+                result += f" · vol {vol}"
+
+            self._nifty_conviction_cache = result
+            self._nifty_conviction_cache_time = now
+            logger.info(f"NIFTY monthly conviction: {result}")
+            return result
+
+        except Exception as e:
+            logger.warning(f"Could not compute NIFTY monthly conviction: {e}")
+            return None
+
     def can_send_notification(self) -> Tuple[bool, str]:
         """
         Check if we can send new signal notifications.
@@ -636,7 +757,7 @@ class SignalProcessor:
         """
         session = get_session()
         try:
-            max_positions = config.get('trading.max_positions', 5)
+            max_positions = config.get('trading.max_positions', 10)
 
             # Single query for open positions
             open_positions = session.query(OpenPosition).filter(
@@ -659,7 +780,7 @@ class SignalProcessor:
 
             # Check NIFTY filter
             if not self.check_nifty_weekly_filter():
-                return False, "NIFTY weekly filter bearish"
+                return False, "NIFTY weekly filter blocked (over-extended)"
 
             return True, ""
 
@@ -785,6 +906,9 @@ class SignalProcessor:
             # Record that NIFTY filter was passed (for audit trail)
             signal.nifty_filter_passed = True
 
+            # NIFTY monthly conviction label (context only - never blocks)
+            conviction = self.get_nifty_monthly_conviction()
+
             # Send notification
             msg_id = telegram.send_signal_notification(
                 signal_id=signal.id,
@@ -795,7 +919,8 @@ class SignalProcessor:
                 position_value=position_value,
                 available_capital=available,
                 is_fno=is_fno,
-                company_snapshot=company_snapshot
+                company_snapshot=company_snapshot,
+                conviction=conviction
             )
 
             if msg_id:

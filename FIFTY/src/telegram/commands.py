@@ -319,7 +319,7 @@ class CommandHandler:
             # Get config values
             initial_capital = config.get('trading.initial_capital', 100000)
             per_trade = config.get('trading.per_trade_amount', 20000)
-            max_positions = config.get('trading.max_positions', 5)
+            max_positions = config.get('trading.max_positions', 10)
 
             # Get positions
             positions = session.query(OpenPosition).filter(
