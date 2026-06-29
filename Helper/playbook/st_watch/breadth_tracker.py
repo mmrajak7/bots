@@ -548,6 +548,12 @@ BREADTH_LEVELS = [20, 30, 40, 50]
 # Minimum ppts change in a single reading to trigger velocity spike alert
 VELOCITY_SPIKE_THRESHOLD = 3.0
 
+# Master switch for intraday breadth alerts (BREADTH SPIKE / SECTOR SHIFT /
+# BREADTH TURNING / 40% level cross). Disabled 2026-06-29 — too noisy and not
+# actionable; the morning briefing + regime monitor (PAUSE/UNPAUSE) already
+# cover breadth. Flip to True to re-arm intraday breadth alerting.
+_INTRADAY_BREADTH_ALERTS_ENABLED = False
+
 
 def _load_alert_state() -> dict:
     if not ALERT_STATE_FILE.exists():
@@ -884,5 +890,9 @@ def scan_and_record(dry_run: bool = False) -> dict:
     reading = fetch_breadth()
     if reading:
         record_reading(reading)
-        check_breadth_alerts(reading, dry_run=dry_run)
+        # Intraday breadth alerts silenced by default — see
+        # _INTRADAY_BREADTH_ALERTS_ENABLED. Breadth data is still recorded
+        # (above) for the morning briefing and regime monitor.
+        if _INTRADAY_BREADTH_ALERTS_ENABLED:
+            check_breadth_alerts(reading, dry_run=dry_run)
     return reading

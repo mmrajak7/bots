@@ -309,17 +309,22 @@ _telegram_cfg = None
 _telegram_cfg_loaded = False
 
 
-def _send_telegram(msg: str):
-    """Send Telegram alert. Best-effort: never blocks or crashes.
+def _send_telegram(msg: str, retries: int = 3) -> bool:
+    """Send Telegram alert with retries. Returns True only on confirmed HTTP 200.
 
-    Uses st_watch_config.json 'telegram' section (dedicated bot for Watch alerts).
-    Falls back to shared BOTS/data/telegram_config.json if not configured.
+    Best-effort: never raises. Transient network failures (connect timeouts at
+    market open) are retried with backoff so a brief blip doesn't silently drop
+    an alert. The caller uses the return value to decide whether to mark the
+    alert as delivered — a failed send is retried on the next scan cycle.
+
+    Uses st_watch_config.json 'telegram' section (falls back to shared
+    BOTS/data/telegram_config.json if not configured).
     """
     global _telegram_cfg, _telegram_cfg_loaded
 
     try:
         if not _telegram_cfg_loaded:
-            # Priority 1: dedicated telegram config in st_watch_config.json
+            # Priority 1: telegram config in st_watch_config.json
             watch_cfg = cfg.load_config()
             tg = watch_cfg.get('telegram')
             if tg and tg.get('bot_token') and tg.get('chat_id'):
@@ -331,26 +336,43 @@ def _send_telegram(msg: str):
             _telegram_cfg_loaded = True
 
         if not _telegram_cfg:
-            logger.info("Telegram not configured, skipping alert")
-            return
+            logger.warning("Telegram not configured, alert NOT sent")
+            return False
 
         import requests
-        resp = requests.post(
-            f"https://api.telegram.org/bot{_telegram_cfg['bot_token']}/sendMessage",
-            json={'chat_id': _telegram_cfg['chat_id'], 'text': msg,
-                  'parse_mode': 'HTML'},
-            timeout=10,
-        )
         bot_id = _telegram_cfg['bot_token'].split(':')[0]
-        if resp.ok:
-            logger.info("Telegram sent (bot=%s): %s", bot_id, msg[:120])
-        else:
-            logger.warning("Telegram FAILED (bot=%s) %d: %s\nMsg: %s",
-                           bot_id, resp.status_code, resp.text, msg[:200])
+        for attempt in range(1, retries + 1):
+            try:
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{_telegram_cfg['bot_token']}/sendMessage",
+                    json={'chat_id': _telegram_cfg['chat_id'], 'text': msg,
+                          'parse_mode': 'HTML'},
+                    timeout=15,
+                )
+                if resp.ok:
+                    logger.info("Telegram sent (bot=%s): %s", bot_id, msg[:120])
+                    return True
+                # Client errors (bad token/chat) won't fix on retry — stop early
+                logger.warning("Telegram HTTP %d (bot=%s, attempt %d/%d): %s",
+                               resp.status_code, bot_id, attempt, retries,
+                               resp.text[:200])
+                if 400 <= resp.status_code < 500:
+                    return False
+            except Exception as e:
+                logger.warning("Telegram attempt %d/%d failed (bot=%s): %s",
+                               attempt, retries, bot_id, e)
+            if attempt < retries:
+                time.sleep(2 * attempt)  # backoff: 2s, then 4s
+
+        logger.error("Telegram FAILED after %d attempts (bot=%s)\nMsg: %s",
+                     retries, bot_id, msg[:200])
+        return False
     except ImportError:
-        logger.info("Telegram skipped: 'requests' not installed")
+        logger.warning("Telegram skipped: 'requests' not installed")
+        return False
     except Exception as e:
-        logger.warning("Telegram alert failed: %s\nMsg: %s", e, msg[:200])
+        logger.warning("Telegram alert failed (config error): %s", e)
+        return False
 
 
 def _format_alert(symbol: str, basket: str, timeframe: str,
@@ -524,22 +546,34 @@ def scan(dry_run: bool = False, symbol_filter: str = None) -> list:
                 )
                 if dry_run:
                     logger.info("DRY RUN alert:\n%s", msg)
+                    sent = True
                 else:
-                    _send_telegram(msg)
-                    logger.info("Alert: %s %s gap=%.1f%% (threshold=%d%%)",
-                                symbol, tf, gap_pct, alert_at)
+                    sent = _send_telegram(msg)
 
-                # Log to alert history (both dry-run and live)
-                _log_alert(symbol, sym_info['basket'], tf,
-                           ltp, st_val, gap_pct, direction, alert_at, prev_gap)
-
-                state[cache_key] = {
-                    'last_threshold': alert_at,
-                    'last_alert_time': datetime.now(IST).isoformat(),
-                    'prev_gap': round(gap_pct, 2),
-                }
-                result['alerted'] = True
-                _save_state(state)  # persist after each alert
+                if sent:
+                    if not dry_run:
+                        logger.info("Alert: %s %s gap=%.1f%% (threshold=%d%%)",
+                                    symbol, tf, gap_pct, alert_at)
+                    # Log to history + advance dedup state only on confirmed send,
+                    # so a failed send is retried on the next scan cycle.
+                    _log_alert(symbol, sym_info['basket'], tf,
+                               ltp, st_val, gap_pct, direction, alert_at, prev_gap)
+                    state[cache_key] = {
+                        'last_threshold': alert_at,
+                        'last_alert_time': datetime.now(IST).isoformat(),
+                        'prev_gap': round(gap_pct, 2),
+                    }
+                    result['alerted'] = True
+                    _save_state(state)  # persist after each alert
+                else:
+                    logger.warning("Alert NOT delivered (Telegram failed), will "
+                                   "retry next cycle: %s %s gap=%.1f%%",
+                                   symbol, tf, gap_pct)
+                    # Update prev_gap only; leave dedup state untouched so the
+                    # alert re-fires next cycle instead of being lost for the day.
+                    if cache_key not in state:
+                        state[cache_key] = {}
+                    state[cache_key]['prev_gap'] = round(gap_pct, 2)
             else:
                 # Update prev_gap even if not alerting
                 if cache_key not in state:
