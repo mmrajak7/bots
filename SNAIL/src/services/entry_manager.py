@@ -1184,12 +1184,22 @@ class EntryManager:
                 raise ValueError(f"Invalid margin value: {margin_deployed}")
             logger.info(f"Margin deployed after entry: ₹{margin_deployed:,.2f}")
         except Exception as e:
-            # No fallback - margin accuracy is critical for exit thresholds
-            # Use max_loss as conservative upper bound (margin is always <= max_loss for Iron Fly)
-            margin_deployed = metrics.max_loss
+            # Fallback when the live broker margin is unavailable or <= 0. This is
+            # ALWAYS the case in paper mode (broker reports zero utilised margin).
+            #
+            # Do NOT fall back to max_loss: real SPAN+exposure margin for a NIFTY Iron
+            # Fly is ~₹1.2L/lot, an order of magnitude larger than max_loss (~₹10k).
+            # Since every exit threshold is % of this base (ROM), a max_loss base makes
+            # the stop loss ~10x too tight and fires it on routine intraday noise.
+            # Use a realistic per-lot estimate scaled by the number of lots instead.
+            capital_config = self.trading_config.get('capital', {})
+            margin_per_lot = capital_config.get('margin_per_lot_estimate', 120000)
+            num_lots = max(1, quantity // NIFTY_LOT_SIZE)
+            margin_deployed = float(margin_per_lot * num_lots)
             logger.warning(
                 f"Could not fetch margin utilised: {e}. "
-                f"Using max_loss (₹{margin_deployed:,.2f}) as conservative margin estimate"
+                f"Using estimate ₹{margin_deployed:,.2f} "
+                f"({num_lots} lot(s) × ₹{margin_per_lot:,.0f}/lot) as ROM base"
             )
 
         # Note: conditions.expiry and atm_strike validated at function start

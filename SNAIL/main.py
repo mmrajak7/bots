@@ -41,7 +41,19 @@ from src.utils.db import init_database
 # FILE LOCKING (ISSUE-013: Prevent concurrent cron job execution)
 # =============================================================================
 
+# Shared lock for monitor + exit: these are mutually exclusive (they both act on an
+# OPEN position, and must never double-exit it).
 LOCK_FILE = PROJECT_ROOT / "data" / ".snail.lock"
+
+# Entry uses a SEPARATE lock. Entry blocks on a human Telegram confirmation for up to
+# 300s while holding its lock; if it shared the lock above it would starve the
+# safety-critical monitor/exit for minutes (observed: 74 "could not acquire lock"
+# warnings in a single session). Entry self-blocks whenever a position is open
+# (get_blocking_position_summary at both condition-check and execute time, plus the
+# entry_in_progress DB flag), so it can never create a 2nd position alongside the
+# monitor — making a distinct lock safe. This lock still serializes overlapping
+# entry crons against each other.
+ENTRY_LOCK_FILE = PROJECT_ROOT / "data" / ".snail_entry.lock"
 
 
 @contextmanager
@@ -84,21 +96,32 @@ def file_lock(lock_path: Path = LOCK_FILE, timeout: float = 0):
         lock_file.close()
 
 
-def with_file_lock(func):
+def with_file_lock(lock_path: Path = LOCK_FILE):
     """
-    Decorator to ensure function runs with exclusive file lock.
-    Prevents concurrent execution of entry/exit/monitor commands.
+    Decorator to ensure a command runs while holding an exclusive file lock.
+
+    Defaults to the shared LOCK_FILE (monitor + exit). Pass a distinct lock_path
+    (e.g. ENTRY_LOCK_FILE) for commands that must not contend on the shared lock.
+
+    Usage: ``@with_file_lock()`` or ``@with_file_lock(ENTRY_LOCK_FILE)``.
     """
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        try:
-            with file_lock():
-                return func(*args, **kwargs)
-        except BlockingIOError:
-            logger.warning(f"Could not acquire lock - another SNAIL process is running")
-            print("⚠️ Another SNAIL process is running. Skipping to prevent conflicts.")
-            return 0
-    return wrapper
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                with file_lock(lock_path):
+                    return func(*args, **kwargs)
+            except (BlockingIOError, PermissionError):
+                # Linux fcntl.flock(LOCK_NB) raises BlockingIOError when the lock is
+                # held; Windows msvcrt.locking raises PermissionError for the same
+                # condition. Catch both so "already running" is handled on either OS.
+                logger.warning(
+                    f"Could not acquire lock {lock_path.name} - another SNAIL process is running"
+                )
+                print("⚠️ Another SNAIL process is running. Skipping to prevent conflicts.")
+                return 0
+        return wrapper
+    return decorator
 
 
 # =============================================================================
@@ -206,9 +229,14 @@ def cmd_entry(args):
     return _cmd_entry_with_lock(args, config)
 
 
-@with_file_lock
+@with_file_lock(ENTRY_LOCK_FILE)
 def _cmd_entry_with_lock(args, config):
-    """Entry logic that requires exclusive lock."""
+    """Entry logic that requires exclusive lock.
+
+    Uses a dedicated ENTRY_LOCK_FILE (not the shared monitor/exit lock) because this
+    function blocks for up to 300s waiting for the user's Telegram confirmation and
+    must not starve the safety-critical monitor/exit during that wait.
+    """
     from src.services.entry_manager import get_entry_manager
     from src.services.claude_advisor import get_claude_advisor
     from src.utils.market_events_scraper import scrape_and_save_all
@@ -294,7 +322,7 @@ def _cmd_entry_with_lock(args, config):
     return 0
 
 
-@with_file_lock
+@with_file_lock()
 def cmd_exit(args):
     """Execute position exit."""
     from src.services.exit_manager import get_exit_manager, ExitReason
@@ -410,7 +438,7 @@ def cmd_summary(args):
     return 0
 
 
-@with_file_lock
+@with_file_lock()
 def cmd_monitor(args):
     """Run a single monitoring iteration (for cron)."""
     from src.workflows.monitor_workflow import MonitorWorkflow
