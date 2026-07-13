@@ -117,8 +117,8 @@ def find_file(service, folder_id: str, file_name: str) -> Optional[str]:
             f"trashed = false"
         )
         result = svc.files().list(
-            q=query, spaces='drive', fields='files(id, name)',
-            pageSize=5,
+            q=query, spaces='drive', fields='files(id, name, modifiedTime)',
+            pageSize=25,
         ).execute()
 
         files = result.get('files', [])
@@ -126,8 +126,18 @@ def find_file(service, folder_id: str, file_name: str) -> Optional[str]:
             logger.info("File '%s' not found in folder %s", file_name, folder_id)
             return None
 
+        # Drive does not guarantee list ordering, so an unsorted files[0] can
+        # resolve to a different duplicate on each machine — split-brain writes.
+        # Sort newest-first so every caller converges on the file actually in use.
+        files.sort(key=lambda f: f.get('modifiedTime', ''), reverse=True)
+
         if len(files) > 1:
-            logger.warning("Multiple files named '%s' in folder — using first", file_name)
+            logger.error(
+                "DUPLICATE Drive files named '%s' in folder %s — using most recently "
+                "modified (%s). Retire the others; all ids: %s",
+                file_name, folder_id, files[0]['id'],
+                [f"{f['id']} (mod {f.get('modifiedTime')})" for f in files],
+            )
 
         logger.debug("Found file '%s' -> %s", file_name, files[0]['id'])
         return files[0]['id']
@@ -214,9 +224,22 @@ def upload_json(service, folder_id: str, file_name: str,
             io.BytesIO(content), mimetype='application/json', resumable=False
         )
 
-        if file_id:
+        target_id = file_id
+        if not target_id:
+            # Last-chance lookup before creating. A caller reaches here whenever its
+            # startup find_file() came back None — which also happens on a transient
+            # API miss, not just a genuinely absent file. Creating blind in that case
+            # forks the store into two same-named files that then diverge silently.
+            target_id = find_file(svc, folder_id, file_name)
+            if target_id:
+                logger.warning(
+                    "upload_json called with no file_id but '%s' exists on Drive (%s) — "
+                    "updating it instead of creating a duplicate", file_name, target_id
+                )
+
+        if target_id:
             result = svc.files().update(
-                fileId=file_id, media_body=media
+                fileId=target_id, media_body=media
             ).execute()
             logger.info("Updated %d trades on Drive (file %s)", len(data), result['id'])
             return result['id']
