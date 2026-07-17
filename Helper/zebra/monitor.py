@@ -101,7 +101,13 @@ def _alerts_enabled(trade: dict) -> bool:
     background (still auto-trades + shows in EOD reports). Config-driven via
     alert_structures — auto-close/dedup logic is NEVER gated by this, only
     the Telegram sends.
+
+    LIVE-MODE OVERRIDE: when paper_mode is off, alerts are the ONLY exit
+    mechanism (no auto-close), so every structure always talks regardless
+    of alert_structures. Silencing is a paper-mode luxury.
     """
+    if not cfg.PAPER_MODE:
+        return True
     struct = 'bcs' if trade.get('structure') == 'bcs' else 'zebra'
     return struct in cfg.ALERT_STRUCTURES
 
@@ -416,7 +422,9 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         #   bcs only                   -> BCS-led alert; if the shadow failed,
         #                                 a short notice so a fired signal is
         #                                 never a silent miss.
-        send_zebra = 'zebra' in cfg.ALERT_STRUCTURES
+        # LIVE-mode override: the zebra ENTER alert is the user's order
+        # ticket — with no paper auto-entry it must never be suppressed.
+        send_zebra = 'zebra' in cfg.ALERT_STRUCTURES or not cfg.PAPER_MODE
         send_bcs = 'bcs' in cfg.ALERT_STRUCTURES
         if send_zebra:
             msg = _format_enter_alert(trade, analysis,
@@ -475,8 +483,8 @@ def _intrinsic_floor(trade: dict, spot: float) -> Optional[float]:
         allowance = trade.get('short_extrinsic_entry')
         if allowance is None:
             for p in trade.get('alert_strikes') or []:
-                if (p.get('k_l') == trade['long_strike']
-                        and p.get('k_s') == trade['short_strike']):
+                if (abs(float(p.get('k_l', -1)) - k_l) < 1e-6
+                        and abs(float(p.get('k_s', -1)) - k_s) < 1e-6):
                     allowance = p.get('short_extrinsic')
                     break
         if allowance is None:

@@ -106,11 +106,21 @@ _runtime = _load_runtime()
 # ── Exports ───────────────────────────────────────────────────────────────
 PAPER_MODE = _runtime['paper_mode']
 BCS_PAPER_ENABLED = _runtime['bcs_paper_enabled']
-ALERT_STRUCTURES = [s for s in _runtime['alert_structures']
-                    if s in ('zebra', 'bcs')]
-if list(_runtime['alert_structures']) != ALERT_STRUCTURES:
+_raw_alerts = _runtime['alert_structures']
+if isinstance(_raw_alerts, str):     # common JSON typo: "bcs" not ["bcs"]
+    _raw_alerts = [_raw_alerts]
+ALERT_STRUCTURES = [s for s in _raw_alerts if s in ('zebra', 'bcs')]
+if list(_raw_alerts) != ALERT_STRUCTURES:
     logger.warning("alert_structures: unknown entries ignored in %s",
-                   _runtime['alert_structures'])
+                   _raw_alerts)
+if not ALERT_STRUCTURES and PAPER_MODE:
+    logger.warning("alert_structures is empty — NO per-trade Telegram alerts "
+                   "will fire in paper mode (EOD reports unaffected)")
+if 'bcs' in ALERT_STRUCTURES \
+        and 'zebra' not in ALERT_STRUCTURES and not BCS_PAPER_ENABLED:
+    logger.warning("alert_structures=['bcs'] but bcs_paper_enabled=false — "
+                   "no BCS trades exist to alert on; paper mode will be "
+                   "silent. Enable bcs_paper_enabled or add 'zebra'.")
 WATCH_GAP_MAX = _runtime['watch_gap_max']
 TRIGGER_GAP_MAX = _runtime['trigger_gap_max']
 STALE_GAP_MIN = _runtime['stale_gap_min']
