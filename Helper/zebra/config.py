@@ -50,6 +50,12 @@ _DEFAULTS = {
                                  # paper-traded alongside every zebra entry for A/B
                                  # comparison (July 2026 slippage analysis). Only
                                  # active when paper_mode is also true.
+    'alert_structures': ['bcs'], # Which structures' Telegram alerts fire
+                                 # (ENTER + TP/SL/TIME). 2026-07-17: BCS is the
+                                 # voice, zebra trades silently in the background.
+                                 # Both keep auto-trading + appear in EOD reports
+                                 # regardless. Set ['zebra','bcs'] or ['zebra'] to
+                                 # change who talks.
     'watch_gap_max': 0.05,       # WATCH band ceiling (signal added to watchlist)
     'trigger_gap_max': 0.04,     # TRIGGER zone: run Zebra analyzer + alert
     'stale_gap_min': 0.03,       # Floor: skip if gap < this at trigger (too late)
@@ -100,6 +106,11 @@ _runtime = _load_runtime()
 # ── Exports ───────────────────────────────────────────────────────────────
 PAPER_MODE = _runtime['paper_mode']
 BCS_PAPER_ENABLED = _runtime['bcs_paper_enabled']
+ALERT_STRUCTURES = [s for s in _runtime['alert_structures']
+                    if s in ('zebra', 'bcs')]
+if list(_runtime['alert_structures']) != ALERT_STRUCTURES:
+    logger.warning("alert_structures: unknown entries ignored in %s",
+                   _runtime['alert_structures'])
 WATCH_GAP_MAX = _runtime['watch_gap_max']
 TRIGGER_GAP_MAX = _runtime['trigger_gap_max']
 STALE_GAP_MIN = _runtime['stale_gap_min']

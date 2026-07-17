@@ -90,8 +90,20 @@ def _is_market_open() -> bool:
 # ── Alert formatters ──────────────────────────────────────────────────────
 
 def _struct_label(trade: dict) -> str:
-    """Alert title tag: ZEBRA for real structures, BCS-PAPER for shadows."""
-    return 'BCS-PAPER' if trade.get('structure') == 'bcs' else 'ZEBRA'
+    """Alert title tag by structure."""
+    return 'BCS' if trade.get('structure') == 'bcs' else 'ZEBRA'
+
+
+def _alerts_enabled(trade: dict) -> bool:
+    """Telegram gate: does this trade's structure get to talk?
+
+    2026-07-17: BCS is the alerting structure; zebra runs silently in the
+    background (still auto-trades + shows in EOD reports). Config-driven via
+    alert_structures — auto-close/dedup logic is NEVER gated by this, only
+    the Telegram sends.
+    """
+    struct = 'bcs' if trade.get('structure') == 'bcs' else 'zebra'
+    return struct in cfg.ALERT_STRUCTURES
 
 
 def _format_enter_alert(trade: dict, analysis: dict,
@@ -153,6 +165,38 @@ def _format_enter_alert(trade: dict, analysis: dict,
             f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_mid']:g}"
         )
     return msg
+
+
+def _format_bcs_enter_alert(trade: dict, analysis: dict, bcs: dict) -> str:
+    """BCS-led ENTER alert (zebra silenced): the shadow spread is the story."""
+    stock = trade['stock']
+    direction = trade['direction']
+    spot = analysis['spot']
+    st_val = trade['st_value']
+    gap = analysis.get('current_gap_pct', abs(spot - st_val) / st_val * 100)
+    pull_dir = 'up to' if direction == 'CE' else 'down to'
+    conviction = ' ⭐ALIGNED' if cfg.is_trend_aligned(
+        direction, trade.get('st_direction')) else ''
+    warn = ' ⚠ ' + ','.join(bcs['warnings']) if bcs.get('warnings') else ''
+    k_atm = f"{bcs['long_strike']:g}"
+    k_tgt = f"{bcs['short_strike']:g}"
+    capital = bcs['debit'] * bcs['lot_size']
+    max_p = bcs['max_profit_per_share']
+    rr = (max_p / bcs['debit']) if bcs['debit'] > 0 else 0
+    return (
+        f"📐 <b>ENTER BCS</b>  <code>{stock}</code>  ({direction}){conviction}\n"
+        f"Level {st_val:,.2f} | spot {spot:,.2f} | gap {gap:.2f}% "
+        f"({pull_dir} Level)\n"
+        f"expiry {analysis['expiry']} ({analysis['dte']} DTE) | "
+        f"lot {bcs['lot_size']} | Capital (1 lot) = {capital:,.0f}{warn}\n"
+        f"\n"
+        f"Strikes <b>{k_atm} / {k_tgt}</b>   debit {bcs['debit']:g} "
+        f"({bcs['debit_to_width_pct']:.0f}% of width) | "
+        f"maxP {max_p:g} | R:R 1:{rr:.1f}\n"
+        f"\n"
+        f"🟢 BUY 1× <code>{bcs['long_symbol']}</code>  {bcs['long_mid']:g}\n"
+        f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_mid']:g}"
+    )
 
 
 def _paper_close_line(trade: dict, mid: Optional[float]) -> str:
@@ -367,7 +411,30 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                                  trade['id'], stock, e)
                     bcs = None
 
-        msg = _format_enter_alert(trade, analysis, bcs=bcs)
+        # Who talks on Telegram (both structures auto-trade regardless):
+        #   zebra in alert_structures  -> classic zebra alert (+BCS block if on)
+        #   bcs only                   -> BCS-led alert; if the shadow failed,
+        #                                 a short notice so a fired signal is
+        #                                 never a silent miss.
+        send_zebra = 'zebra' in cfg.ALERT_STRUCTURES
+        send_bcs = 'bcs' in cfg.ALERT_STRUCTURES
+        if send_zebra:
+            msg = _format_enter_alert(trade, analysis,
+                                      bcs=bcs if send_bcs else None)
+        elif send_bcs and bcs:
+            msg = _format_bcs_enter_alert(trade, analysis, bcs)
+        elif send_bcs and cfg.PAPER_MODE and cfg.BCS_PAPER_ENABLED:
+            msg = (f"⚠ <b>BCS SKIP</b>  <code>{stock}</code> "
+                   f"({trade['direction']}) — signal fired but no viable "
+                   f"BCS pair (see logs). Zebra #{trade['id']} entered "
+                   f"silently.")
+        else:
+            msg = None
+        if msg is None:
+            logger.info("ENTER alert suppressed for #%d %s "
+                        "(alert_structures=%s)", trade['id'], stock,
+                        cfg.ALERT_STRUCTURES)
+            continue
         sent = _send_telegram(msg, dry_run=dry_run)
         if sent:
             logger.info("ENTER alert sent for #%d %s", trade['id'], stock)
@@ -537,7 +604,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         tp_hit = (direction == 'CE' and spot >= tp_spot) or \
                  (direction == 'PE' and spot <= tp_spot)
         if tp_hit and store.set_alert_flag(tid, 'tp'):
-            _send_telegram(_format_tp_alert(trade, spot, mid), dry_run=dry_run)
+            if _alerts_enabled(trade):
+                _send_telegram(_format_tp_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
             _paper_auto_close(store, trade, mid, 'tp', spot)
             if trade.get('status') == 'exited':
@@ -552,7 +620,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                  (direction == 'CE' and spot <= sl_spot) or
                  (direction == 'PE' and spot >= sl_spot))
         if sl_hit and store.set_alert_flag(tid, 'spot_sl'):
-            _send_telegram(_format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
+            if _alerts_enabled(trade):
+                _send_telegram(_format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
             _paper_auto_close(store, trade, mid, 'spot_sl', spot)
             if trade.get('status') == 'exited':
@@ -561,7 +630,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # ── DEBIT SL ────────────────────────────────────────────────────
         if mid is not None and mid <= trade['debit_sl_value']:
             if store.set_alert_flag(tid, 'debit_sl'):
-                _send_telegram(_format_debit_sl_alert(trade, mid), dry_run=dry_run)
+                if _alerts_enabled(trade):
+                    _send_telegram(_format_debit_sl_alert(trade, mid), dry_run=dry_run)
                 logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f",
                             tid, stock, mid, trade['debit_sl_value'])
                 _paper_auto_close(store, trade, mid, 'debit_sl', spot)
@@ -578,7 +648,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # the user keeps getting nudged until they exit. Paper mode auto-closes
         # on the first fire (subsequent days no-op since status='exited').
         if days_left <= cfg.TIME_SL_DAYS and store.set_alert_flag_daily(tid, 'time'):
-            _send_telegram(_format_time_alert(trade, days_left, mid), dry_run=dry_run)
+            if _alerts_enabled(trade):
+                _send_telegram(_format_time_alert(trade, days_left, mid), dry_run=dry_run)
             logger.info("TIME alert #%d %s days_left=%d", tid, stock, days_left)
             _paper_auto_close(store, trade, mid, 'time', spot)
 
