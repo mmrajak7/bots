@@ -114,10 +114,13 @@ class ZebraStore:
         direction = data['direction']
 
         # Dedup: no two open signals for same (stock, timeframe, direction).
+        # BCS shadows are excluded — they are passive A/B mirrors and must
+        # never block a fresh zebra signal.
         for t in self._trades:
             if (t.get('stock') == stock
                     and t.get('timeframe') == timeframe
                     and t.get('direction') == direction
+                    and t.get('structure', 'zebra') != 'bcs'
                     and t.get('status') in ('watching', 'triggered', 'entered')):
                 raise ValueError(
                     f"{stock} {timeframe} {direction} already open as #{t['id']}"
@@ -244,6 +247,10 @@ class ZebraStore:
         t['spot_sl_pct'] = spot_sl_pct
         t['debit_sl_value'] = debit_sl_value
         t['debit_sl_pct'] = cfg.DEBIT_SL_PCT
+        # Entry-time extrinsic of the short leg — feeds the intrinsic-floor
+        # quote-sanity guard in the monitor (bad-quote false-SL protection).
+        if 'short_extrinsic_entry' in entry_data:
+            t['short_extrinsic_entry'] = float(entry_data['short_extrinsic_entry'])
         t['version'] = t.get('version', 0) + 1
         self._save_local()
         self._upload_to_drive()
@@ -253,6 +260,87 @@ class ZebraStore:
             debit, quantity, capital, tp_spot, sl_spot
         )
         return t
+
+    def add_bcs_shadow(self, zebra_trade: dict, bcs: dict) -> dict:
+        """Create a paper BCS trade shadowing a just-entered zebra trade.
+
+        Born directly as 'entered' (it has no watching/triggered life of its
+        own — the zebra signal already did that). `bcs` is the dict returned
+        by strikes.analyze_bcs plus 'expiry' and 'entry_spot' set by caller.
+        Tagged structure='bcs' + shadow_of=<zebra id> so reports can pair the
+        A/B legs; excluded from all scanner dedup.
+        """
+        lot_size = int(bcs['lot_size'])
+        lots = 1
+        quantity = lot_size * lots
+        debit = float(bcs['debit'])
+        entry_spot = float(bcs['entry_spot'])
+        direction = zebra_trade['direction']
+
+        if direction == 'CE':
+            sl_spot = round(entry_spot * (1 - cfg.SPOT_SL_PCT), 2)
+        else:
+            sl_spot = round(entry_spot * (1 + cfg.SPOT_SL_PCT), 2)
+
+        try:
+            exp_date = datetime.strptime(bcs['expiry'], '%Y-%m-%d')
+            dte = (exp_date.date() - datetime.now().date()).days
+        except Exception:
+            dte = None
+
+        now = datetime.now()
+        trade = {
+            'id': self._next_id(),
+            'version': 1,
+            'status': 'entered',
+            'structure': 'bcs',
+            'shadow_of': zebra_trade['id'],
+            'stock': zebra_trade['stock'],
+            'timeframe': zebra_trade['timeframe'],
+            'direction': direction,
+            'st_value': zebra_trade['st_value'],
+            'st_direction': zebra_trade['st_direction'],
+            'signal_price': zebra_trade['signal_price'],
+            'signal_gap_pct': zebra_trade['signal_gap_pct'],
+            'signal_date': zebra_trade.get('signal_date'),
+            'signal_time': zebra_trade.get('signal_time'),
+            'paper': True,
+            'notes': f"BCS shadow of zebra #{zebra_trade['id']}",
+            'entry_date': now.strftime('%Y-%m-%d'),
+            'entry_time': now.strftime('%H:%M:%S'),
+            'entry_spot': entry_spot,
+            'long_strike': float(bcs['long_strike']),
+            'short_strike': float(bcs['short_strike']),
+            'long_symbol': bcs['long_symbol'],
+            'short_symbol': bcs['short_symbol'],
+            'debit': debit,
+            'lot_size': lot_size,
+            'lots': lots,
+            'quantity': quantity,
+            'capital': round(debit * quantity, 2),
+            'expiry': bcs['expiry'],
+            'dte_at_entry': dte,
+            'tp_spot': float(zebra_trade.get('tp_spot', zebra_trade['st_value'])),
+            'sl_spot': sl_spot,
+            'spot_sl_pct': cfg.SPOT_SL_PCT,
+            'debit_sl_value': round(debit * cfg.DEBIT_SL_PCT, 2),
+            'debit_sl_pct': cfg.DEBIT_SL_PCT,
+            'width': float(bcs['width']),
+            'debit_to_width_pct': bcs.get('debit_to_width_pct'),
+            'short_extrinsic_entry': float(bcs.get('short_extrinsic', 0)
+                                           or bcs.get('short_extrinsic_entry', 0)),
+            'entry_warnings': bcs.get('warnings', []),
+        }
+        self._trades.append(trade)
+        self._save_local()
+        self._upload_to_drive()
+        logger.info(
+            "BCS SHADOW #%d (of #%d) %s %s %g/%g debit=%.2f qty=%d d/w=%s%%",
+            trade['id'], zebra_trade['id'], trade['stock'], direction,
+            trade['long_strike'], trade['short_strike'], debit, quantity,
+            trade.get('debit_to_width_pct')
+        )
+        return trade
 
     def mark_exited(self, trade_id: int, exit_spot: float,
                     exit_debit: Optional[float],
@@ -385,6 +473,8 @@ class ZebraStore:
             tp = f"{t.get('tp_spot', 0):.2f}" if t.get('tp_spot') else '-'
             sl = f"{t.get('sl_spot', 0):.2f}" if t.get('sl_spot') else '-'
             notes = (t.get('notes') or t.get('exit_reason') or '')[:30]
+            if t.get('structure') == 'bcs':
+                notes = f"[BCS] {notes}"[:36]
             print(f"{t['id']:>3} {t.get('status', '?'):<10} {t.get('stock', '?'):<12} "
                   f"{t.get('direction', '?'):<4} {t.get('timeframe', '?'):<8} "
                   f"{strikes:<14} {debit:>7} {tp:>9} {sl:>9}  {notes}")

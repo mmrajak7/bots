@@ -88,7 +88,25 @@ def _summarize_exits(exits: list) -> dict:
         'worst': min(exits, key=lambda t: t.get('pnl') or 0),
         'by_reason': by_reason,
         'by_alignment': _alignment_split(exits),
+        'by_structure': _structure_split(exits),
     }
+
+
+def _structure_split(exits: list) -> dict:
+    """Zebra vs shadow-BCS A/B stats (BCS paper comparison, July 2026)."""
+    def _stat(group: list) -> dict:
+        if not group:
+            return {'count': 0, 'net_pnl': 0.0, 'win_rate': 0.0, 'capital': 0.0}
+        wins = sum(1 for t in group if (t.get('pnl') or 0) > 0)
+        return {
+            'count': len(group),
+            'net_pnl': round(sum(t.get('pnl') or 0 for t in group), 0),
+            'win_rate': round(wins / len(group) * 100, 1),
+            'capital': round(sum(t.get('capital') or 0 for t in group), 0),
+        }
+    zebra = [t for t in exits if t.get('structure') != 'bcs']
+    bcs = [t for t in exits if t.get('structure') == 'bcs']
+    return {'zebra': _stat(zebra), 'bcs': _stat(bcs)}
 
 
 def _alignment_split(exits: list) -> dict:
@@ -198,9 +216,10 @@ def _fmt_trade_line(t: dict) -> str:
     kl = int(t['long_strike']) if t.get('long_strike') else '?'
     ks = int(t['short_strike']) if t.get('short_strike') else '?'
     reason = (t.get('exit_reason') or '').replace('paper:', '')
+    tag = ' [BCS]' if t.get('structure') == 'bcs' else ''
     return (f"  #{t['id']} {t['stock']:<10} {t['direction']:<3} {kl}/{ks}  "
             f"{t.get('entry_date','?')[5:]}->{t.get('exit_date','?')[5:]}  "
-            f"P&L Rs {pnl:+,.0f} ({pct:+.1f}%)  [{reason}]")
+            f"P&L Rs {pnl:+,.0f} ({pct:+.1f}%)  [{reason}]{tag}")
 
 
 def _fmt_open_line(t: dict, unreal: Optional[dict]) -> str:
@@ -208,7 +227,8 @@ def _fmt_open_line(t: dict, unreal: Optional[dict]) -> str:
     kl = int(t['long_strike']) if t.get('long_strike') else '?'
     ks = int(t['short_strike']) if t.get('short_strike') else '?'
     sl_txt = f"  SL {t.get('sl_spot',0):.0f}" if cfg.SPOT_SL_ENABLED else ""
-    base = (f"  #{t['id']} {t['stock']:<10} {t['direction']:<3} {kl}/{ks}  "
+    st_tag = '[BCS] ' if t.get('structure') == 'bcs' else ''
+    base = (f"  #{t['id']} {st_tag}{t['stock']:<10} {t['direction']:<3} {kl}/{ks}  "
             f"entry {t.get('entry_date','?')[5:]} @ {t.get('entry_spot',0):.2f}  "
             f"TP {t.get('tp_spot',0):.0f}{sl_txt}")
     if unreal:
@@ -255,6 +275,15 @@ def format_text(report: dict) -> str:
             for label, st in (('aligned ⭐', a['aligned']), ('counter ', a['counter'])):
                 lines.append(f"    {label:<12} {st['count']:>2} trades  "
                              f"Rs {st['net_pnl']:+,.0f}  WR {st['win_rate']:.0f}%")
+        b = s.get('by_structure')
+        if b and b['bcs']['count']:
+            lines.append("")
+            lines.append("  Zebra vs BCS shadow (A/B):")
+            for label, st in (('zebra', b['zebra']), ('bcs  ', b['bcs'])):
+                roc = (st['net_pnl'] / st['capital'] * 100) if st['capital'] else 0
+                lines.append(f"    {label:<6} {st['count']:>2} trades  "
+                             f"Rs {st['net_pnl']:+,.0f}  WR {st['win_rate']:.0f}%  "
+                             f"RoC {roc:+.1f}%")
 
     # Open section
     lines.append("")
@@ -306,8 +335,9 @@ def format_telegram(report: dict) -> str:
             kl = int(t['long_strike']) if t.get('long_strike') else '?'
             ks = int(t['short_strike']) if t.get('short_strike') else '?'
             reason = (t.get('exit_reason') or '').replace('paper:', '')
+            st_tag = '📐' if t.get('structure') == 'bcs' else ''
             parts.append(
-                f"{tag} <code>{t['stock']}</code> {t['direction']} "
+                f"{tag}{st_tag} <code>{t['stock']}</code> {t['direction']} "
                 f"{kl}/{ks}  Rs {pnl:+,.0f} [{reason}]"
             )
         a = s.get('by_alignment')
@@ -317,6 +347,14 @@ def format_telegram(report: dict) -> str:
                 f"<i>⭐aligned {al['count']}: Rs {al['net_pnl']:+,.0f} "
                 f"(WR {al['win_rate']:.0f}%) | counter {co['count']}: "
                 f"Rs {co['net_pnl']:+,.0f} (WR {co['win_rate']:.0f}%)</i>"
+            )
+        b = s.get('by_structure')
+        if b and b['bcs']['count']:
+            zb, bc = b['zebra'], b['bcs']
+            parts.append(
+                f"<i>📐 A/B — zebra {zb['count']}: Rs {zb['net_pnl']:+,.0f} "
+                f"(WR {zb['win_rate']:.0f}%) | BCS {bc['count']}: "
+                f"Rs {bc['net_pnl']:+,.0f} (WR {bc['win_rate']:.0f}%)</i>"
             )
 
     if report['open']:
@@ -332,16 +370,17 @@ def format_telegram(report: dict) -> str:
             u = report['unrealized'].get(t['id'])
             kl = int(t['long_strike']) if t.get('long_strike') else '?'
             ks = int(t['short_strike']) if t.get('short_strike') else '?'
+            st_tag = '📐' if t.get('structure') == 'bcs' else ''
             if u:
                 pnl = u['pnl']
                 tag = '↑' if pnl > 0 else '↓'
                 parts.append(
-                    f"{tag} <code>{t['stock']}</code> {t['direction']} "
+                    f"{tag}{st_tag} <code>{t['stock']}</code> {t['direction']} "
                     f"{kl}/{ks}  Rs {pnl:+,.0f} ({u['pnl_pct']:+.0f}%)"
                 )
             else:
                 parts.append(
-                    f"• <code>{t['stock']}</code> {t['direction']} {kl}/{ks}  "
+                    f"•{st_tag} <code>{t['stock']}</code> {t['direction']} {kl}/{ks}  "
                     f"(quote n/a)"
                 )
     else:

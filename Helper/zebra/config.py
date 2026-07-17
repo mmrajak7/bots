@@ -46,6 +46,10 @@ _ALL_SCANNERS = [
 # ── Defaults ──────────────────────────────────────────────────────────────
 _DEFAULTS = {
     'paper_mode': True,          # PAPER: auto-enter on trigger + auto-close on exit signal
+    'bcs_paper_enabled': True,   # Shadow BCS (buy ATM, sell strike nearest ST target)
+                                 # paper-traded alongside every zebra entry for A/B
+                                 # comparison (July 2026 slippage analysis). Only
+                                 # active when paper_mode is also true.
     'watch_gap_max': 0.05,       # WATCH band ceiling (signal added to watchlist)
     'trigger_gap_max': 0.04,     # TRIGGER zone: run Zebra analyzer + alert
     'stale_gap_min': 0.03,       # Floor: skip if gap < this at trigger (too late)
@@ -95,6 +99,7 @@ _runtime = _load_runtime()
 
 # ── Exports ───────────────────────────────────────────────────────────────
 PAPER_MODE = _runtime['paper_mode']
+BCS_PAPER_ENABLED = _runtime['bcs_paper_enabled']
 WATCH_GAP_MAX = _runtime['watch_gap_max']
 TRIGGER_GAP_MAX = _runtime['trigger_gap_max']
 STALE_GAP_MIN = _runtime['stale_gap_min']

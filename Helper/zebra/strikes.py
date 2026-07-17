@@ -330,6 +330,80 @@ def analyze(kite, stock: str, direction: str, spot: float,
     }
 
 
+def analyze_bcs(kite, stock: str, direction: str, spot: float,
+                target_spot: float, expiry: str,
+                atm_strike: float, atm_quote: dict,
+                lot_size: int) -> dict:
+    """Build the shadow BCS pair for a triggered zebra signal.
+
+    BUY 1× ATM (the same strike/quote as the zebra short leg — passed in so
+    both structures share one snapshot) + SELL 1× the strike nearest the ST
+    target, forced at least one strike beyond ATM in the trade direction.
+
+    `atm_quote` needs bid/ask/mid/oi keys (the zebra analyzer's short-leg
+    quote). Returns {'error': ...} when no viable target leg exists — the
+    caller skips the shadow, never blocks the zebra flow.
+    """
+    _load_options_csv()
+    strikes = _list_strikes(stock, expiry, direction)
+    if direction == 'CE':
+        beyond = sorted(k for k in strikes if k > atm_strike)
+    else:
+        beyond = sorted((k for k in strikes if k < atm_strike), reverse=True)
+    if not beyond:
+        return {'error': f"no strike beyond ATM {atm_strike} for BCS target"}
+
+    # Nearest strike to the ST target, but at least one step beyond ATM
+    # (beyond[0]) so the spread always has width.
+    k_tgt = min(beyond, key=lambda k: abs(k - target_spot))
+
+    tgt_meta = _OPTIONS_CACHE.get(stock, {}).get(expiry, {}) \
+        .get(k_tgt, {}).get(direction)
+    if not tgt_meta:
+        return {'error': f"no chain entry for target strike {k_tgt}"}
+    tgt_q = _quote_option(kite, tgt_meta['tradingsymbol'])
+    if tgt_q.get('error') or tgt_q['mid'] <= 0:
+        return {'error': f"bad quote for target leg "
+                         f"{tgt_meta['tradingsymbol']}: {tgt_q.get('error')}"}
+
+    debit = round(atm_quote['mid'] - tgt_q['mid'], 2)
+    if debit <= 0:
+        return {'error': f"non-positive BCS debit {debit} "
+                         f"(ATM {atm_quote['mid']} vs target {tgt_q['mid']})"}
+
+    width = abs(k_tgt - atm_strike)
+    long_ext = _extrinsic(direction, spot, atm_strike, atm_quote['mid'])
+    short_ext = _extrinsic(direction, spot, k_tgt, tgt_q['mid'])
+    tgt_spread_pct = ((tgt_q['ask'] - tgt_q['bid']) / tgt_q['mid']) \
+        if tgt_q['mid'] > 0 else 1.0
+
+    warnings = []
+    if tgt_q['oi'] < cfg.MIN_LEG_OI:
+        warnings.append(f'target_OI<{cfg.MIN_LEG_OI}')
+    if tgt_spread_pct > cfg.MAX_LEG_SPREAD_PCT:
+        warnings.append(f'target_spread>{cfg.MAX_LEG_SPREAD_PCT*100:.0f}%')
+
+    return {
+        'long_strike': atm_strike,
+        'short_strike': k_tgt,
+        'long_symbol': _OPTIONS_CACHE[stock][expiry][atm_strike][direction]['tradingsymbol'],
+        'short_symbol': tgt_meta['tradingsymbol'],
+        'long_mid': atm_quote['mid'], 'long_bid': atm_quote['bid'],
+        'long_ask': atm_quote['ask'], 'long_oi': atm_quote['oi'],
+        'short_mid': tgt_q['mid'], 'short_bid': tgt_q['bid'],
+        'short_ask': tgt_q['ask'], 'short_oi': tgt_q['oi'],
+        'short_spread_pct': round(tgt_spread_pct * 100, 2),
+        'long_extrinsic': round(long_ext, 2),
+        'short_extrinsic': round(short_ext, 2),
+        'debit': debit,
+        'width': width,
+        'max_profit_per_share': round(width - debit, 2),
+        'debit_to_width_pct': round(debit / width * 100, 1) if width else 0,
+        'lot_size': lot_size,
+        'warnings': warnings,
+    }
+
+
 def _pick_best(candidates: list, spot: float) -> Optional[dict]:
     """Pick the single best Zebra pair.
 

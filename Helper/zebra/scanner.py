@@ -149,12 +149,14 @@ def validate_and_add(store: ZebraStore, kite=None,
             logger.debug("SKIP %s %s: %s", stock, timeframe, freshness_reason)
             continue
 
-        # Dedup against existing open signals
+        # Dedup against existing open signals (BCS shadows excluded — they
+        # mirror zebra trades passively and must not block fresh signals)
         existing = next(
             (t for t in store.load_trades()
              if t.get('stock') == stock
              and t.get('timeframe') == timeframe
              and t.get('direction') == direction
+             and t.get('structure', 'zebra') != 'bcs'
              and t.get('status') in ('watching', 'triggered', 'entered')),
             None
         )
@@ -169,6 +171,7 @@ def validate_and_add(store: ZebraStore, kite=None,
             (t for t in store.load_trades()
              if t.get('stock') == stock
              and t.get('direction') != direction
+             and t.get('structure', 'zebra') != 'bcs'
              and t.get('status') in ('watching', 'triggered', 'entered')),
             None
         )

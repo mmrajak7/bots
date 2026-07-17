@@ -316,10 +316,11 @@ def cmd_status(args):
         print(f"\n  --- Open Trades ---")
         for t in entered:
             sl_txt = f"SL={t['sl_spot']:.2f} " if cfg.SPOT_SL_ENABLED else ""
+            st_tag = ' [BCS]' if t.get('structure') == 'bcs' else ''
             print(f"  #{t['id']} {t['stock']:<12} {t['direction']:<3} "
                   f"{int(t['long_strike'])}/{int(t['short_strike'])} "
                   f"debit={t['debit']:.2f} TP={t['tp_spot']:.2f} "
-                  f"{sl_txt}exp={t['expiry']}")
+                  f"{sl_txt}exp={t['expiry']}{st_tag}")
 
     watching = by_status.get('watching', [])
     if watching:
@@ -332,12 +333,17 @@ def cmd_status(args):
 
     exited = by_status.get('exited', [])
     if exited:
-        wins = sum(1 for t in exited if t.get('pnl', 0) > 0)
-        total_pnl = sum(t.get('pnl', 0) or 0 for t in exited)
-        win_rate = wins / len(exited) * 100 if exited else 0
         print(f"\n  --- Performance ---")
-        print(f"  Total P&L: Rs {total_pnl:,.0f}")
-        print(f"  Win rate:  {win_rate:.0f}% ({wins}W / {len(exited)-wins}L)")
+        for label, group in (
+                ('Zebra', [t for t in exited if t.get('structure') != 'bcs']),
+                ('BCS  ', [t for t in exited if t.get('structure') == 'bcs'])):
+            if not group:
+                continue
+            wins = sum(1 for t in group if t.get('pnl', 0) > 0)
+            total_pnl = sum(t.get('pnl', 0) or 0 for t in group)
+            win_rate = wins / len(group) * 100
+            print(f"  {label}  P&L: Rs {total_pnl:,.0f}  "
+                  f"WR {win_rate:.0f}% ({wins}W / {len(group)-wins}L)")
     print()
 
 

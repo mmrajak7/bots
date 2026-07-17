@@ -89,7 +89,13 @@ def _is_market_open() -> bool:
 
 # ── Alert formatters ──────────────────────────────────────────────────────
 
-def _format_enter_alert(trade: dict, analysis: dict) -> str:
+def _struct_label(trade: dict) -> str:
+    """Alert title tag: ZEBRA for real structures, BCS-PAPER for shadows."""
+    return 'BCS-PAPER' if trade.get('structure') == 'bcs' else 'ZEBRA'
+
+
+def _format_enter_alert(trade: dict, analysis: dict,
+                        bcs: Optional[dict] = None) -> str:
     """Build the ENTER alert. Single recommended Zebra pair (click-copy ready).
 
     Picker chose this pair as the best balance of: passes liquidity gates,
@@ -136,6 +142,16 @@ def _format_enter_alert(trade: dict, analysis: dict) -> str:
         f"🟢 BUY 2× <code>{best['long_symbol']}</code>  {best['long_ask']:g}\n"
         f"🔴 SELL 1× <code>{best['short_symbol']}</code>  {best['short_bid']:g}"
     )
+    if bcs:
+        warn = ' ⚠ ' + ','.join(bcs['warnings']) if bcs.get('warnings') else ''
+        msg += (
+            f"\n\n📐 <b>BCS shadow</b> (paper A/B): "
+            f"{bcs['long_strike']:g}/{bcs['short_strike']:g}  "
+            f"debit {bcs['debit']:g} ({bcs['debit_to_width_pct']:.0f}% of width) | "
+            f"maxP {bcs['max_profit_per_share']:g}{warn}\n"
+            f"🟢 BUY 1× <code>{bcs['long_symbol']}</code>  {bcs['long_mid']:g}\n"
+            f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_mid']:g}"
+        )
     return msg
 
 
@@ -157,7 +173,7 @@ def _paper_close_line(trade: dict, mid: Optional[float]) -> str:
 def _format_tp_alert(trade: dict, spot: float, mid: Optional[float] = None) -> str:
     paper = _paper_close_line(trade, mid)
     return (
-        f"\U0001F3AF <b>ZEBRA TP</b>  {trade['stock']} ({trade['direction']})\n"
+        f"\U0001F3AF <b>{_struct_label(trade)} TP</b>  {trade['stock']} ({trade['direction']})\n"
         f"spot {spot:,.2f} hit TP {trade['tp_spot']:,.2f}\n"
         f"Long: <code>{trade['long_symbol']}</code>\n"
         f"Short: <code>{trade['short_symbol']}</code>{paper}"
@@ -167,7 +183,7 @@ def _format_tp_alert(trade: dict, spot: float, mid: Optional[float] = None) -> s
 def _format_spot_sl_alert(trade: dict, spot: float, mid: Optional[float] = None) -> str:
     paper = _paper_close_line(trade, mid)
     return (
-        f"\U0001F6D1 <b>ZEBRA SPOT SL</b>  {trade['stock']} ({trade['direction']})\n"
+        f"\U0001F6D1 <b>{_struct_label(trade)} SPOT SL</b>  {trade['stock']} ({trade['direction']})\n"
         f"spot {spot:,.2f} hit SL {trade['sl_spot']:,.2f}\n"
         f"Adverse move from entry {trade['entry_spot']:,.2f}{paper}"
     )
@@ -177,7 +193,7 @@ def _format_debit_sl_alert(trade: dict, mid: float) -> str:
     paper = _paper_close_line(trade, mid)
     pct_lost = (1 - mid / trade['debit']) * 100 if trade.get('debit') else 0
     return (
-        f"\U0001F4C9 <b>ZEBRA DEBIT SL</b>  {trade['stock']} ({trade['direction']})\n"
+        f"\U0001F4C9 <b>{_struct_label(trade)} DEBIT SL</b>  {trade['stock']} ({trade['direction']})\n"
         f"Mid {mid:.2f} ≤ debit-SL {trade['debit_sl_value']:.2f} "
         f"(entry debit {trade['debit']:.2f})\n"
         f"Lost ~{pct_lost:.0f}% of debit.{paper}"
@@ -187,14 +203,15 @@ def _format_debit_sl_alert(trade: dict, mid: float) -> str:
 def _format_time_alert(trade: dict, days_left: int,
                        mid: Optional[float] = None) -> str:
     paper = _paper_close_line(trade, mid)
+    n_long = 1 if trade.get('structure') == 'bcs' else 2
     return (
-        f"⏰ <b>EXIT REMINDER</b>  <code>{trade['stock']}</code>  "
-        f"({trade['direction']})\n"
+        f"⏰ <b>EXIT REMINDER</b> [{_struct_label(trade)}]  "
+        f"<code>{trade['stock']}</code>  ({trade['direction']})\n"
         f"T-{days_left} | expiry {trade['expiry']}\n"
-        f"Close before physical-settlement margin spike (2× long ITM).\n"
+        f"Close before physical-settlement margin spike ({n_long}× long ITM).\n"
         f"\n"
         f"🔴 BUY back 1× <code>{trade['short_symbol']}</code>\n"
-        f"🟢 SELL 2× <code>{trade['long_symbol']}</code>{paper}"
+        f"🟢 SELL {n_long}× <code>{trade['long_symbol']}</code>{paper}"
     )
 
 
@@ -293,6 +310,7 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # drift/stale-cancel checks next cycle); we deliberately do NOT cancel
         # here, because a 'cancelled' record isn't deduped by the scanner and
         # would be re-added + re-alerted every scan (alert churn).
+        bcs = None
         if cfg.PAPER_MODE:
             best = analysis.get('best')
             if not best:
@@ -308,6 +326,8 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     'lots': 1,
                     'expiry': analysis['expiry'],
                     'entry_spot': price,
+                    # Feeds the intrinsic-floor quote-sanity guard
+                    'short_extrinsic_entry': best['short_extrinsic'],
                 })
                 logger.info("PAPER auto-entered #%d %s %d/%d debit=%.2f",
                             trade['id'], stock,
@@ -318,7 +338,36 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                              trade['id'], stock, e)
                 continue
 
-        msg = _format_enter_alert(trade, analysis)
+            # Shadow BCS (paper A/B): buy the same ATM strike zebra shorts,
+            # sell the strike nearest the ST target. Best-effort — a failure
+            # here never blocks the zebra flow or its alert.
+            if cfg.BCS_PAPER_ENABLED:
+                try:
+                    bcs = strikes_mod.analyze_bcs(
+                        kite, stock, trade['direction'], price,
+                        target_spot=trade['st_value'],
+                        expiry=analysis['expiry'],
+                        atm_strike=best['k_s'],
+                        atm_quote={'mid': best['short_mid'],
+                                   'bid': best['short_bid'],
+                                   'ask': best['short_ask'],
+                                   'oi': best['short_oi']},
+                        lot_size=best['lot_size'],
+                    )
+                    if bcs.get('error'):
+                        logger.warning("BCS shadow skipped for #%d %s: %s",
+                                       trade['id'], stock, bcs['error'])
+                        bcs = None
+                    else:
+                        bcs['expiry'] = analysis['expiry']
+                        bcs['entry_spot'] = price
+                        store.add_bcs_shadow(store.find(trade['id']), bcs)
+                except Exception as e:
+                    logger.error("BCS shadow failed for #%d %s: %s",
+                                 trade['id'], stock, e)
+                    bcs = None
+
+        msg = _format_enter_alert(trade, analysis, bcs=bcs)
         sent = _send_telegram(msg, dry_run=dry_run)
         if sent:
             logger.info("ENTER alert sent for #%d %s", trade['id'], stock)
@@ -328,19 +377,82 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
 
 # ── Entered → TP/SL/Time ─────────────────────────────────────────────────
 
-def _quote_zebra_value(kite, trade: dict) -> Optional[float]:
-    """Compute current Zebra structure value per share (2*long_mid - 1*short_mid).
-    Returns None if any leg has bad quote.
+def _long_multiplier(trade: dict) -> int:
+    """2 long legs for zebra, 1 for a BCS shadow."""
+    return 1 if trade.get('structure') == 'bcs' else 2
+
+
+def _intrinsic_floor(trade: dict, spot: float) -> Optional[float]:
+    """Arbitrage-floor for the structure value at the given spot, minus a
+    generous extrinsic allowance for the short leg.
+
+    A quoted structure mid below this is a bad quote (stale/one-sided book on
+    the illiquid ITM leg), not a real price — July 2026: ABB #242 booked a
+    -50% debit-SL exit at mid 335 when pure intrinsic at the recorded spot
+    was 1,020. Returns None if the floor can't be computed.
+    """
+    try:
+        k_l = float(trade['long_strike'])
+        k_s = float(trade['short_strike'])
+        mult = _long_multiplier(trade)
+        if trade['direction'] == 'CE':
+            intr = mult * max(spot - k_l, 0.0) - max(spot - k_s, 0.0)
+        else:
+            intr = mult * max(k_l - spot, 0.0) - max(k_s - spot, 0.0)
+
+        # Short-leg extrinsic allowance: the structure can legitimately trade
+        # below pure intrinsic by up to the short leg's time value. Use the
+        # entry-time value (extrinsic peaks ATM ≈ entry) with 1.5× headroom
+        # for IV spikes; fall back to the triggered alert pair, then to 30%
+        # of the entry debit for pre-guard trades.
+        allowance = trade.get('short_extrinsic_entry')
+        if allowance is None:
+            for p in trade.get('alert_strikes') or []:
+                if (p.get('k_l') == trade['long_strike']
+                        and p.get('k_s') == trade['short_strike']):
+                    allowance = p.get('short_extrinsic')
+                    break
+        if allowance is None:
+            allowance = 0.3 * trade.get('debit', 0)
+        return round(intr - 1.5 * float(allowance), 2)
+    except Exception:
+        return None
+
+
+def _structure_value(kite, trade: dict, spot: Optional[float] = None
+                     ) -> Optional[float]:
+    """Current structure value per share: mult*long_mid - short_mid
+    (mult = 2 zebra / 1 BCS). Returns None if any leg has a bad quote.
+
+    When `spot` is given, the value is clamped to the intrinsic floor: a mid
+    below the floor means the quote violates no-arbitrage (junk book on the
+    ITM leg) and the floor is the conservative real closeable value. This is
+    the false-debit-SL guard — without it a garbage quote can book a -50%
+    exit on a winning trade (ABB #242, July 2026).
     """
     try:
         long_q = strikes_mod._quote_option(kite, trade['long_symbol'])
         short_q = strikes_mod._quote_option(kite, trade['short_symbol'])
         if long_q['mid'] <= 0 or short_q['mid'] <= 0:
             return None
-        return round(2 * long_q['mid'] - 1 * short_q['mid'], 2)
+        mid = round(_long_multiplier(trade) * long_q['mid'] - short_q['mid'], 2)
+        if spot is not None and spot > 0:
+            floor = _intrinsic_floor(trade, spot)
+            if floor is not None and mid < floor:
+                logger.warning(
+                    "QUOTE GUARD #%d %s: structure mid %.2f < intrinsic floor "
+                    "%.2f at spot %.2f — clamping to floor (bad ITM quote)",
+                    trade['id'], trade['stock'], mid, floor, spot)
+                return floor
+        return mid
     except Exception as e:
         logger.debug("Quote fail for #%d: %s", trade['id'], e)
         return None
+
+
+# Backward-compat alias (report.py / manual close path import this name).
+def _quote_zebra_value(kite, trade: dict) -> Optional[float]:
+    return _structure_value(kite, trade)
 
 
 def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
@@ -416,7 +528,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # flag on a close we can't execute (which would strand the exit
         # forever) or booking a fabricated max-loss. LIVE mode still alerts
         # (mid rendered as NA) since there it's an alert, not an auto-close.
-        mid = _quote_zebra_value(kite, trade)
+        # Passing spot arms the intrinsic-floor clamp (false-debit-SL guard).
+        mid = _structure_value(kite, trade, spot)
         if cfg.PAPER_MODE and mid is None:
             continue
 
