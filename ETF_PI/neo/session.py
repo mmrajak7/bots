@@ -13,6 +13,21 @@ import logging
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 
+# Force IPv4 (same fix as Kite bots, 2026-07-23): home machines are dual-stack
+# with rotating IPv6; if the broker ever enforces a static-IP whitelist it will
+# hold the shared home IPv4, and IPv6 requests would be rejected at the order
+# moment. Neo has no known IP gate today — this is defensive consistency.
+import socket as _socket
+
+_orig_getaddrinfo = _socket.getaddrinfo
+
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
+
+
+_socket.getaddrinfo = _ipv4_only_getaddrinfo
+
 import pyotp
 import pytz
 

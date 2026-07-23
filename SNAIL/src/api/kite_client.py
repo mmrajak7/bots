@@ -18,6 +18,21 @@ from datetime import datetime, date, timedelta
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
 
+# Kite's IP whitelist holds only the shared home IPv4; dual-stack machines
+# otherwise connect over a rotating IPv6 and order placement is rejected
+# with PermissionException (quotes still work, so the failure only surfaces
+# at the order moment). Force all connections over IPv4.
+import socket as _socket
+
+_orig_getaddrinfo = _socket.getaddrinfo
+
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
+
+
+_socket.getaddrinfo = _ipv4_only_getaddrinfo
+
 from kiteconnect import KiteConnect
 from loguru import logger
 

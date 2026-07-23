@@ -5,6 +5,20 @@ import json
 import time
 from pathlib import Path
 from datetime import datetime
+
+# Force IPv4: Kite's IP whitelist holds only the shared home IPv4;
+# over IPv6 order placement is rejected with PermissionException.
+import socket as _socket
+
+_orig_getaddrinfo = _socket.getaddrinfo
+
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
+
+
+_socket.getaddrinfo = _ipv4_only_getaddrinfo
+
 from kiteconnect import KiteConnect
 
 TOKEN_FILE = Path('.').resolve().parent / 'data' / 'kite_access_token.json'

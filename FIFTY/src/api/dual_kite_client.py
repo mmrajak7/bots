@@ -23,6 +23,21 @@ from src.utils.circuit_breaker import get_kite_breaker, get_kite_historical_brea
 # FIX RC-004: Thread-safe singleton initialization lock
 _singleton_lock = threading.Lock()
 
+# Kite's IP whitelist holds only the shared home IPv4; dual-stack machines
+# otherwise connect over a rotating IPv6 and order placement is rejected
+# with PermissionException (quotes still work, so the failure only surfaces
+# at the order moment). Force all connections over IPv4.
+import socket as _socket
+
+_orig_getaddrinfo = _socket.getaddrinfo
+
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
+
+
+_socket.getaddrinfo = _ipv4_only_getaddrinfo
+
 try:
     from kiteconnect import KiteConnect
     KITECONNECT_AVAILABLE = True
