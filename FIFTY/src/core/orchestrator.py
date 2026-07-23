@@ -122,6 +122,11 @@ class Orchestrator:
             if in_time_window(current, "09:00", "09:05"):
                 self._morning_startup()
 
+            # 3b. Regime upkeep: intraday capture of prev session's official
+            # closes (breadth), downtime backfill, state evaluation +
+            # transition alerts. Internally throttled; never raises.
+            self._update_regime()
+
             # 4. Process Telegram callbacks (always during market hours)
             if in_time_window(current, "09:00", "16:30"):
                 self._process_telegram_callbacks()
@@ -383,6 +388,20 @@ class Orchestrator:
     # =========================================================================
     # SIGNAL PROCESSING
     # =========================================================================
+
+    def _update_regime(self) -> None:
+        """Regime gate upkeep (entries-only gate; exits untouched).
+
+        - maintenance(): post-close breadth capture / downtime backfill
+        - evaluate(): state machine update; sends Telegram ONLY on
+          PAUSED<->UNPAUSED transitions (user requirement)
+        """
+        try:
+            regime = self.signal_processor.regime
+            regime.maintenance()
+            regime.evaluate()
+        except Exception as e:
+            logger.error(f"Regime update failed (non-fatal): {e}")
 
     def _process_signals(self) -> None:
         """Process new CSP signals from CSV and check watching signals"""

@@ -42,6 +42,7 @@ trading:
   per_trade_amount: 10000  # capital-neutral: initial_capital / max_positions (100K / 10)
   max_positions: 10        # 10 slots beats 5 (same total return, ~half the worst-year drawdown, more monster capture)
   max_pending_orders: 3
+  min_price: 100  # skip signals below Rs 100 (circuit micro-caps: backtest fills are fiction)
   initial_sl_percent: 20
 
 # Risk Management
@@ -57,6 +58,18 @@ nifty_filter:
   mode: stretch          # 'stretch' (gate: weekly (close-ST)/ATR <= stretch_high) | 'binary' (legacy ST trend up)
   stretch_high: 2.0      # block new entries when NIFTY weekly stretch exceeds this (over-extended). No lower bound.
   conviction_enabled: true  # show NIFTY monthly stretch conviction stars (★) in signal alerts (context only, not a gate)
+
+# Market Regime Gate (validated 2020-2026, Helper/20/06_hybrid_validation.md)
+# Pauses NEW entries when market internals die; deep capitulation overrides.
+# ENTRIES ONLY - exits (20% SL + monthly-low trail) are never touched.
+regime:
+  enabled: true
+  rsi_threshold: 50            # NIFTY daily RSI(14) > 50 = signal ON
+  breadth_threshold: 40        # % of universe above own 50DMA > 40 = signal ON
+  sma_period: 50               # NIFTY close > 50DMA = signal ON
+  unpause_days: 7              # 2-of-3 ON for 7 straight sessions to resume
+  deep_override_stretch: -2.0  # allow entries while paused if weekly stretch <= this
+  breadth_min_coverage: 300    # min symbols with data to trust the breadth reading
 
 # SuperTrend Configuration
 supertrend:

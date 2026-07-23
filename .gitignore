@@ -194,3 +194,9 @@ Sniper/archive/
 
 # HTML reports
 *.html
+
+# FIFTY regime/breadth working files (bot-maintained on server; seed is committed)
+FIFTY/data/breadth/history.json
+FIFTY/data/breadth/breadth_daily.json
+FIFTY/data/regime_state.json
+FIFTY/data/breadth/*.tmp

@@ -51,6 +51,14 @@ class SignalProcessor:
         # NIFTY weekly ATR percentile (vs last 52 weeks) - set during weekly filter, used as alert context
         self._nifty_weekly_atr_rank: Optional[float] = None
 
+        # NIFTY weekly stretch VALUE (set during weekly filter check, same TTL).
+        # Consumed by the regime gate's deep-capitulation override.
+        self._nifty_weekly_stretch: Optional[float] = None
+
+        # Regime manager (pause/unpause entry gate; validated 2020-2026)
+        from src.core.regime import RegimeManager
+        self.regime = RegimeManager(self.kite)
+
         # SuperTrend parameters
         self.st_period = config.get('supertrend.period', 10)
         self.st_multiplier = config.get('supertrend.multiplier', 3)
@@ -506,6 +514,25 @@ class SignalProcessor:
             today = today_ist()
             current_month = today.strftime('%Y-%m')
 
+            # PRICE FLOOR (validated 2020-2026): below min_price the backtest
+            # "edge" is circuit micro-caps whose fills are fiction. Reject.
+            min_price = float(config.get('trading.min_price', 100))
+            if signal_level < min_price:
+                signal = SignalQueue(
+                    script=script,
+                    signal_date=today,
+                    signal_level=signal_level,
+                    status=SignalStatus.REJECTED,
+                    rejection_reason=f"Price floor: level {signal_level:.2f} < Rs {min_price:.0f}",
+                    first_seen_at=ist_now_naive(),
+                    signal_month=current_month
+                )
+                session.add(signal)
+                session.commit()
+                logger.info(f"{script}: rejected - signal level {signal_level:.2f} "
+                            f"below price floor Rs {min_price:.0f}")
+                return None
+
             # Check LTP proximity to decide initial status
             status = SignalStatus.PENDING
             proximity_threshold = config.get('signals.ltp_proximity_threshold', 0.015)
@@ -638,6 +665,7 @@ class SignalProcessor:
                     logger.warning("NIFTY weekly ATR <= 0 - BLOCKING entries (safety)")
                     return False
                 stretch = (close - st) / atr
+                self._nifty_weekly_stretch = stretch
                 is_ok = stretch <= stretch_high
 
                 # Weekly ATR percentile vs last 52 completed weeks (context for alerts).
@@ -778,9 +806,16 @@ class SignalProcessor:
             if total_deployed >= max_positions:
                 return False, f"Max deployment reached ({open_count} open + {pending_count} pending = {total_deployed}/{max_positions})"
 
-            # Check NIFTY filter
+            # Check NIFTY filter (also refreshes self._nifty_weekly_stretch)
             if not self.check_nifty_weekly_filter():
                 return False, "NIFTY weekly filter blocked (over-extended)"
+
+            # Regime gate: pause new entries when market internals are dead,
+            # UNLESS deep capitulation (weekly stretch <= -2) - validated 2020-2026.
+            # Entries only; exits are never touched by this gate.
+            allowed, reason = self.regime.entry_allowed(self._nifty_weekly_stretch)
+            if not allowed:
+                return False, reason
 
             return True, ""
 
@@ -863,6 +898,16 @@ class SignalProcessor:
                 session.commit()
                 return False
 
+            # PRICE FLOOR (defense-in-depth for signals queued before the
+            # floor was introduced; new signals are rejected at queue-add)
+            min_price = float(config.get('trading.min_price', 100))
+            if signal_level < min_price:
+                logger.info(f"{script}: Skipping notification - below price floor")
+                signal.status = SignalStatus.REJECTED
+                signal.rejection_reason = f"Price floor: level {signal_level:.2f} < Rs {min_price:.0f}"
+                session.commit()
+                return False
+
             # Get current LTP
             try:
                 instrument_token = self.kite.get_instrument_token(script)
@@ -908,6 +953,16 @@ class SignalProcessor:
 
             # NIFTY monthly conviction label (context only - never blocks)
             conviction = self.get_nifty_monthly_conviction()
+
+            # Tag deep-capitulation override entries so the trader knows why a
+            # signal arrived while the regime is paused (no separate alert)
+            try:
+                allowed, why = self.regime.entry_allowed(self._nifty_weekly_stretch)
+                if allowed and why == 'override':
+                    conviction = ((conviction + "\n") if conviction else "") + \
+                        "⚡ deep-capitulation override (regime paused)"
+            except Exception:
+                pass
 
             # Send notification
             msg_id = telegram.send_signal_notification(
