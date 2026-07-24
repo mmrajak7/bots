@@ -87,10 +87,73 @@ TRAIL_PERCENT = 0.60             # trail at 60% of peak spread
 # At 09:15, order books are thin/empty → spread values are garbage.
 MARKET_OPEN_BUFFER_SEC = 180     # 3 minutes = wait until 09:18
 
+# ── Quote-Reliability Guards (post 2026-07-24 NHPC false SL_SPREAD) ─────────
+# Incident: 86CE opening book bid 0.28 / ask 1.40 (width 133% of mid, fair
+# ~0.65) computed spread 0.42 <= SL 0.71 on a single poll at 09:18:24 and the
+# close paid the garbage 1.40 ask. Rs 4,900 of the Rs 7,297 loss was phantom.
+# A leg's quote is UNRELIABLE if (ask-bid) > max(ABS, PCT*mid), if the book is
+# crossed, or if today's traded LTP contradicts the book. Unreliable leg =>
+# spread value is None => no value-based trigger can fire or trail can update.
+QUOTE_MAX_WIDTH_ABS = 0.30       # 6 ticks: cheap options near tick size stay reliable
+QUOTE_MAX_WIDTH_PCT = 0.25       # normal formed books run 2-10% of mid; incident was 133%
+# LTP on illiquid options is itself a lone print and cannot be fully trusted:
+# it may only VETO a book (never validate one), and only when fresh. The width
+# test above is the primary detector — it needs no trade history at all.
+LTP_DIVERGENCE_MULT = 2.0        # ask > ltp*2 + ABS (or bid < ltp/2 - ABS) = unreliable
+LTP_DIVERGENCE_ABS = 0.10        # exempts tick-sized options from the LTP check
+LTP_FRESH_SEC = 30 * 60          # LTP may veto only if last trade < 30 min old
+
+# Value-based triggers (SL_SPREAD / SL_TRAIL) must hold on N reliable polls
+# before closing. SL_SPOT and expiry stay single-poll (spot LTP comes from
+# real trades; delaying a thesis-dead exit costs more than any spread
+# artifact can). Unreliable polls FREEZE the counter (a flickering book must
+# not indefinitely block a genuine exit); a reliable non-trigger poll resets
+# it; a streak older than CONFIRM_STALE_SEC restarts from zero.
+SL_CONFIRM_POLLS = 3
+CONFIRM_STALE_SEC = 180
+
+# After a close ABORTs (unreliable book / re-verify artifact), don't re-attempt
+# valuation/TP closes for this long — prevents an abort->re-trigger->abort loop
+# from spamming orders/Telegram and starving the poll loop. SL_SPOT is exempt.
+ABORT_COOLDOWN_SEC = 300
+
+# Spread-based triggers wait longer after open than spot-based ones: the
+# incident proved illiquid stock-option books are still unformed at 09:18.
+SPREAD_TRIGGER_OPEN_BUFFER_SEC = 900   # SL_SPREAD/SL_TRAIL live from 09:30
+
+# Trail-peak jump gate: a vertical spread can't rise >50% above its running
+# peak within one poll without a huge spot move. Bigger jumps need
+# SL_CONFIRM_POLLS consecutive reliable polls; the window MINIMUM is persisted.
+# Blocks one garbage-high bid from poisoning trail state in the store/Drive.
+TRAIL_PEAK_JUMP_MULT = 1.5
+
+# Execution anchors: never validate an ask against itself. Anchor = today's
+# LTP if the option traded today, else prev close. Caps are deliberately loose
+# (an option CAN double intraday) — they are the last resort behind the
+# reliability + debounce + re-verify layers.
+BUY_CAP_ANCHOR_MULT = 2.5        # buy limit capped at anchor*2.5 (except final urgent attempt)
+SELL_FLOOR_ANCHOR_DIV = 2.5      # sell limit floored at anchor/2.5 (except final urgent attempt)
+URGENT_BOOK_WAITS = 2            # urgent closes wait at most 2x3s for a reliable book
+
+# Blind-mode observability: if spread quotes stay unreliable/absent while the
+# market is settled, the user MUST know SL_SPREAD/SL_TRAIL are suspended.
+# The blind clock clears only after BLIND_CLEAR_OK_POLLS consecutive reliable
+# polls — a single good quote in a flickering book must not silence the alert.
+SPREAD_BLIND_ALERT_SEC = 15 * 60      # first Telegram after 15 min blind
+SPREAD_BLIND_REPEAT_SEC = 60 * 60     # repeat at most hourly
+BLIND_CLEAR_OK_POLLS = 3
+SPOT_PROXIMITY_ALERT_PCT = 0.01       # escalate while blind AND spot within 1% of sl_spot
+PROXIMITY_REPEAT_SEC = 10 * 60        # proximity alert every 10 min
+
+# Re-verify: after debounce passes, fetch one fresh quote before placing any
+# order — kills artifacts that healed between the confirming polls and order time.
+REVERIFY_DELAY_SEC = 2
+
 # ── Market Hours (IST) ──────────────────────────────────────────────────────
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
-LAST_ORDER_TIME = dtime(15, 20)   # Don't place new orders after this time
+LAST_ORDER_TIME = dtime(15, 20)   # No NEW normal-close orders after this time
+HARD_ORDER_CUTOFF_TIME = dtime(15, 25)  # urgent reduce-only exits allowed until here
 
 # ── Error Budget ──────────────────────────────────────────────────────────
 MAX_CONSECUTIVE_ERRORS = 20       # Exit after this many consecutive API errors
@@ -164,39 +227,119 @@ def get_option_depth(kite: KiteConnect, exchange: str, symbol: str) -> dict:
     depth = q.get('depth', {})
     best_bid = depth['buy'][0] if depth.get('buy') else {'price': 0, 'quantity': 0}
     best_ask = depth['sell'][0] if depth.get('sell') else {'price': 0, 'quantity': 0}
+
+    # LTP trust tiers. On illiquid options the LTP is itself a lone print:
+    # a stale (yesterday's) LTP must not judge a legitimately repriced book,
+    # and even today's print goes stale within minutes. ltp_fresh gates the
+    # divergence VETO; traded_today gates the (looser) execution anchor.
+    traded_today = False
+    ltp_fresh = False
+    ltt = q.get('last_trade_time')
+    try:
+        if ltt is not None:
+            if hasattr(ltt, 'date'):
+                ltt_dt = ltt
+            else:
+                ltt_dt = datetime.strptime(str(ltt)[:19], '%Y-%m-%d %H:%M:%S')
+            traded_today = (ltt_dt.date() == date.today())
+            if traded_today:
+                ltp_fresh = (datetime.now() - ltt_dt).total_seconds() <= LTP_FRESH_SEC
+    except Exception:
+        traded_today = False
+        ltp_fresh = False
+
     return {
-        'bid': best_bid['price'],
-        'bid_qty': best_bid['quantity'],
-        'ask': best_ask['price'],
-        'ask_qty': best_ask['quantity'],
-        'ltp': q['last_price'],
+        'bid': best_bid.get('price', 0),
+        'bid_qty': best_bid.get('quantity', 0),
+        'ask': best_ask.get('price', 0),
+        'ask_qty': best_ask.get('quantity', 0),
+        'ltp': q.get('last_price', 0),
+        'prev_close': (q.get('ohlc') or {}).get('close', 0),
+        'traded_today': traded_today,
+        'ltp_fresh': ltp_fresh,
     }
+
+
+def leg_quote_reliable(depth: dict) -> tuple:
+    """Judge whether a leg's top-of-book is trustworthy for VALUATION.
+
+    Post 2026-07-24 NHPC incident: an unformed book (bid 0.28 / ask 1.40,
+    width 133% of mid) produced a phantom SL_SPREAD trigger AND a garbage
+    fill. Returns (reliable: bool, reason: str).
+
+    Unreliable if:
+      - either side missing/zero (no two-way market)
+      - crossed book (bid > ask)
+      - width > max(QUOTE_MAX_WIDTH_ABS, QUOTE_MAX_WIDTH_PCT * mid)
+      - a FRESH traded LTP (< LTP_FRESH_SEC old) contradicts the book
+
+    LTP is itself untrustworthy on illiquid strikes (a lone stale print), so
+    it may only veto — a book is never validated BY its LTP, and a stale LTP
+    cannot blind the monitor against a legitimately repriced book.
+    """
+    bid, ask = depth['bid'], depth['ask']
+    if bid <= 0 or ask <= 0 or depth['bid_qty'] <= 0 or depth['ask_qty'] <= 0:
+        return False, 'no_two_way_book'
+    if bid > ask:
+        return False, f'crossed_book bid {bid} > ask {ask}'
+    width = ask - bid
+    mid = (bid + ask) / 2.0
+    if width > max(QUOTE_MAX_WIDTH_ABS, QUOTE_MAX_WIDTH_PCT * mid) + 1e-9:
+        return False, f'wide_book width {width:.2f} vs mid {mid:.2f}'
+    ltp = depth.get('ltp') or 0
+    if ltp > 0 and depth.get('ltp_fresh'):
+        if ask > ltp * LTP_DIVERGENCE_MULT + LTP_DIVERGENCE_ABS:
+            return False, f'ask {ask} diverges from fresh ltp {ltp}'
+        if bid < ltp / LTP_DIVERGENCE_MULT - LTP_DIVERGENCE_ABS:
+            return False, f'bid {bid} diverges from fresh ltp {ltp}'
+    return True, ''
+
+
+def price_anchor(depth: dict) -> float:
+    """External fair-price anchor for execution caps.
+
+    max(today's LTP, prev close) — deliberately the LOOSER reference, because
+    LTP on illiquid options can be a lone garbage/stale print and the anchor's
+    only job is a last-resort bound on urgent fills; a too-tight anchor could
+    block a real exit. 0 if no reference exists (brand-new strike).
+    """
+    ltp = depth['ltp'] if (depth.get('traded_today') and (depth.get('ltp') or 0) > 0) else 0
+    return max(ltp, depth.get('prev_close') or 0)
 
 
 def get_spread_value(kite: KiteConnect, trade: dict) -> dict:
     """Fetch both legs and compute spread value (long bid - short ask).
 
-    Returns dict with long depth, short depth, and computed spread.
-    Spread is None if depth is invalid (e.g. no bids/asks at market open).
+    Returns dict with long depth, short depth, computed spread, and
+    'unreliable' (reason string, or None if both books are trustworthy).
+    Spread is None whenever EITHER leg's book fails leg_quote_reliable() —
+    a garbage book must never produce a tradeable valuation (2026-07-24).
     """
     long_d = get_option_depth(kite, trade['exchange'], trade['long_symbol'])
     short_d = get_option_depth(kite, trade['exchange'], trade['short_symbol'])
 
-    # Spread is only meaningful when both sides have real depth.
-    # At market open, bid/ask can be 0 → spread = 0 - ask = negative garbage.
-    if long_d['bid'] > 0 and long_d['bid_qty'] > 0 and short_d['ask'] > 0 and short_d['ask_qty'] > 0:
+    long_ok, long_why = leg_quote_reliable(long_d)
+    short_ok, short_why = leg_quote_reliable(short_d)
+
+    spread_val = None
+    unreliable = None
+    if not long_ok:
+        unreliable = f'long {long_why}'
+    elif not short_ok:
+        unreliable = f'short {short_why}'
+    else:
         spread_val = long_d['bid'] - short_d['ask']
         # Negative spread = bid-ask inversion or market dislocation.
         # Not a real loss signal, treat as unreliable data.
         if spread_val < 0:
             spread_val = None
-    else:
-        spread_val = None
+            unreliable = f"negative_spread {long_d['bid']} - {short_d['ask']}"
 
     return {
         'long': long_d,
         'short': short_d,
         'spread': spread_val,
+        'unreliable': unreliable,
     }
 
 
@@ -268,6 +411,17 @@ def is_market_settled() -> bool:
     """
     from datetime import timedelta
     settle_time = datetime.combine(date.today(), MARKET_OPEN) + timedelta(seconds=MARKET_OPEN_BUFFER_SEC)
+    return datetime.now() >= settle_time
+
+
+def is_spread_settled() -> bool:
+    """Longer buffer for SPREAD-VALUE triggers (SL_SPREAD / SL_TRAIL / trail
+    updates). The 2026-07-24 incident proved illiquid option books are still
+    unformed at 09:18; they reliably form by 09:30. SL_SPOT and TP are
+    spot-based and keep their existing (shorter/no) buffers.
+    """
+    from datetime import timedelta
+    settle_time = datetime.combine(date.today(), MARKET_OPEN) + timedelta(seconds=SPREAD_TRIGGER_OPEN_BUFFER_SEC)
     return datetime.now() >= settle_time
 
 
@@ -454,30 +608,52 @@ def cancel_order_safe(kite: KiteConnect, order_id: str, dry_run: bool):
 
 
 def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
-              qty: int, is_buy: bool, dry_run: bool) -> Optional[dict]:
+              qty: int, is_buy: bool, dry_run: bool,
+              urgent: bool = False) -> Optional[dict]:
     """
     Close one leg with retry + escalating slippage.
 
     is_buy=True  -> buying back short, price = ASK + slippage
     is_buy=False -> selling long,       price = BID - slippage
 
-    Design principles (post 2026-02-18 incident):
+    urgent=False (SL_SPREAD/SL_TRAIL/TP): the depth wait also demands a
+      RELIABLE book (leg_quote_reliable). If the book never becomes reliable
+      the leg is NOT closed (returns None) — the caller aborts pre-fill and
+      the trigger re-arms. Never lift a garbage ask for a valuation trigger.
+    urgent=True (SL_SPOT/EXPIRY/second-leg escalation): waits at most
+      URGENT_BOOK_WAITS cycles for reliability, then proceeds — attempts
+      before the last are price-capped vs an external anchor (max of today's
+      LTP / prev close), the FINAL attempt pays through uncapped with a loud
+      Telegram. Must-exit beats overpay, but overpay is bounded first.
+
+    Design principles (post 2026-02-18 + 2026-07-24 incidents):
       1. Track REMAINING qty — never retry with the original full qty
       2. Check for pending orders from this script before placing new ones
       3. Handle partial fills — reduce remaining, continue with rest
-      4. Price guards — sell never below TICK_SIZE, buy never above sanity limit
+      4. Price guards anchored EXTERNALLY (LTP/prev_close), never to the
+         quote being sanity-checked (the old 5x-ask check was self-referential
+         and mathematically could not fire)
       5. Don't retry REJECTED orders (margin, price band — won't resolve)
       6. After cancel, always re-check for race-condition fills
+      7. Re-check order-time cutoff EVERY attempt (a close that starts 15:19
+         must not still be placing orders at 15:24 unless urgent)
     """
     NO_DEPTH_MAX_WAITS = 10     # Wait up to 10 × 3s = 30s for depth to appear
     NO_DEPTH_WAIT_SEC = 3
-    BUY_PRICE_SANITY_MULT = 5.0  # Reject buy price > 5x spread_width (illiquid)
 
     remaining_qty = qty
     cumulative_fill_value = 0.0   # sum of (fill_price × filled_qty) across attempts
     cumulative_fill_qty = 0       # sum of filled qty across attempts
 
     for attempt in range(1, MAX_RETRIES + 1):
+        # ── Order-time cutoff, re-checked EVERY attempt ───────────────
+        cutoff = HARD_ORDER_CUTOFF_TIME if urgent else LAST_ORDER_TIME
+        if datetime.now().time() > cutoff:
+            log(f"    ORDER CUTOFF: {datetime.now().strftime('%H:%M:%S')} > {cutoff.strftime('%H:%M')} "
+                f"({'urgent' if urgent else 'normal'}). No more orders for {symbol}.")
+            send_telegram(f"Order cutoff reached closing {symbol} — "
+                          f"{remaining_qty} qty NOT closed. Manual intervention needed!")
+            break
         # ── Safety: Re-check position to compute actual remaining ─────
         if not dry_run:
             current_qty = get_net_position(kite, symbol)
@@ -525,46 +701,86 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
                             return {'status': 'COMPLETE', 'average_price': avg,
                                     'order_id': 'cumulative', 'filled_quantity': cumulative_fill_qty}
 
-        # ── Wait for depth (don't burn order-retry slots on empty books) ──
+        # ── Wait for depth AND a reliable book ────────────────────────
+        # Normal closes (valuation-triggered) NEVER trade an unreliable
+        # book — they keep waiting and ultimately give up (caller re-arms).
+        # Urgent closes wait at most URGENT_BOOK_WAITS cycles, then proceed
+        # with anchor-capped pricing (must exit, but bounded overpay).
         depth = None
+        book_reliable = False
         for wait_i in range(NO_DEPTH_MAX_WAITS):
             depth = get_option_depth(kite, exchange, symbol)
-            if is_buy and depth['ask'] > 0 and depth['ask_qty'] > 0:
+            has_side = (depth['ask'] > 0 and depth['ask_qty'] > 0) if is_buy \
+                       else (depth['bid'] > 0 and depth['bid_qty'] > 0)
+            book_reliable, why = leg_quote_reliable(depth)
+            if has_side and book_reliable:
                 break
-            if not is_buy and depth['bid'] > 0 and depth['bid_qty'] > 0:
+            if has_side and urgent and wait_i >= URGENT_BOOK_WAITS:
+                log(f"    URGENT: proceeding on unreliable book ({why}) after {wait_i} waits.")
                 break
             side = "ask" if is_buy else "bid"
-            log(f"    No {side} depth for {symbol} (wait {wait_i+1}/{NO_DEPTH_MAX_WAITS})...")
+            reason = why if has_side else f"no {side} depth"
+            log(f"    Book not tradeable for {symbol}: {reason} (wait {wait_i+1}/{NO_DEPTH_MAX_WAITS})...")
             time.sleep(NO_DEPTH_WAIT_SEC)
         else:
-            side = "ask" if is_buy else "bid"
-            log(f"    No {side} depth after {NO_DEPTH_MAX_WAITS * NO_DEPTH_WAIT_SEC}s. Skipping attempt {attempt}.")
+            log(f"    No tradeable book after {NO_DEPTH_MAX_WAITS * NO_DEPTH_WAIT_SEC}s "
+                f"({'urgent' if urgent else 'normal'}). Skipping attempt {attempt}.")
+            # Normal close with nothing filled: further attempts would just
+            # repeat the same 30s wait — bail out now so the caller can abort
+            # and re-arm instead of grinding ~90s of the poll loop.
+            if not urgent and cumulative_fill_qty == 0:
+                log(f"    Normal close: aborting leg early (nothing filled, book unreliable).")
+                return None
             continue
 
         slippage = (SLIPPAGE_TICKS_BASE + SLIPPAGE_TICKS_INCREMENT * (attempt - 1)) * TICK_SIZE
+        anchor = price_anchor(depth)
+        final_urgent_attempt = urgent and attempt == MAX_RETRIES
 
         if is_buy:
             price = depth['ask'] + slippage
-            # ── Buy price sanity: don't overpay into illiquid books ──
-            if price > depth['ask'] * BUY_PRICE_SANITY_MULT and depth['ask'] > 1.0:
-                log(f"    BUY PRICE SANITY: {round_to_tick(price)} > {BUY_PRICE_SANITY_MULT}x ask ({depth['ask']}). Capping.")
-                price = depth['ask'] * 2  # Cap at 2x ask as reasonable ceiling
+            # ── Anchored buy cap: never validate the ask against itself ──
+            # (2026-07-24: a lone 1.40 ask vs fair 0.65 passed the old
+            # ask-relative check and was paid in full.) Applies ONLY to
+            # UNRELIABLE books — a tight book's ask is market consensus and
+            # capping it would strand an urgent gap exit off-market. A capped
+            # limit below a garbage ask simply rests and works the order for
+            # ORDER_WAIT_SEC — it often fills as the book forms.
+            if anchor > 0 and not book_reliable and not final_urgent_attempt:
+                cap = round_to_tick(anchor * BUY_CAP_ANCHOR_MULT + slippage)
+                if price > cap:
+                    log(f"    BUY CAP: ask+slip {round_to_tick(price)} > anchor {anchor} x {BUY_CAP_ANCHOR_MULT}. "
+                        f"Working limit {cap} instead.")
+                    price = cap
+            elif final_urgent_attempt and not book_reliable and anchor > 0 and price > anchor * BUY_CAP_ANCHOR_MULT:
+                log(f"    URGENT FINAL ATTEMPT: paying through ask {depth['ask']} (anchor {anchor}).")
+                send_telegram(f"URGENT close paying through: BUY {symbol} at ask {depth['ask']} "
+                              f"vs anchor {anchor} — exiting anyway.")
             log(f"  Attempt {attempt}/{MAX_RETRIES}: BUY {symbol} x {remaining_qty}")
-            log(f"    Depth -> Ask: {depth['ask']} x {depth['ask_qty']} | Bid: {depth['bid']} x {depth['bid_qty']}")
-            log(f"    Limit price: {depth['ask']} + {slippage:.2f} slippage = {round_to_tick(price)}")
+            log(f"    Depth -> Ask: {depth['ask']} x {depth['ask_qty']} | Bid: {depth['bid']} x {depth['bid_qty']} "
+                f"| LTP: {depth['ltp']} | PrevCl: {depth['prev_close']} | Reliable: {book_reliable}")
+            log(f"    Limit price: {round_to_tick(price)}")
         else:
             price = depth['bid'] - slippage
             # ── Sell price floor: never sell for nothing ──
             if price < TICK_SIZE:
                 log(f"    SELL PRICE FLOOR: {price:.2f} < {TICK_SIZE}. Setting to {TICK_SIZE}.")
                 price = TICK_SIZE
-            # ── Sell price sanity: don't sell at < 50% of bid ──
-            if price < depth['bid'] * 0.5 and depth['bid'] > TICK_SIZE:
-                log(f"    SELL PRICE SANITY: {round_to_tick(price)} < 50% of bid ({depth['bid']}). Using bid directly.")
-                price = depth['bid']
+            # ── Anchored sell floor: don't dump the leg into a garbage-low
+            # lone bid (mirror of the buy-side incident mode). Unreliable
+            # books only — a tight bid is market consensus. ──
+            if anchor > 0 and not book_reliable and not final_urgent_attempt:
+                floor_p = round_to_tick(max(TICK_SIZE, anchor / SELL_FLOOR_ANCHOR_DIV - slippage))
+                if price < floor_p:
+                    log(f"    SELL FLOOR: bid-slip {round_to_tick(price)} < anchor {anchor} / {SELL_FLOOR_ANCHOR_DIV}. "
+                        f"Working limit {floor_p} instead.")
+                    price = floor_p
+            elif final_urgent_attempt and not book_reliable:
+                log(f"    URGENT FINAL ATTEMPT: selling at bid {depth['bid']} (anchor {anchor}).")
             log(f"  Attempt {attempt}/{MAX_RETRIES}: SELL {symbol} x {remaining_qty}")
-            log(f"    Depth -> Bid: {depth['bid']} x {depth['bid_qty']} | Ask: {depth['ask']} x {depth['ask_qty']}")
-            log(f"    Limit price: {depth['bid']} - {slippage:.2f} slippage = {round_to_tick(price)}")
+            log(f"    Depth -> Bid: {depth['bid']} x {depth['bid_qty']} | Ask: {depth['ask']} x {depth['ask_qty']} "
+                f"| LTP: {depth['ltp']} | PrevCl: {depth['prev_close']} | Reliable: {book_reliable}")
+            log(f"    Limit price: {round_to_tick(price)}")
 
         order_id = place_limit_order(kite, exchange, symbol, txn_type, remaining_qty, price, dry_run)
         result = wait_for_fill(kite, order_id, dry_run)
@@ -580,11 +796,21 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
                     'order_id': order_id, 'filled_quantity': cumulative_fill_qty}
 
         # ── REJECTED: don't retry (margin, price band, frozen qty) ──
+        # Return a typed status, NOT None: None means "nothing tradeable,
+        # safe to abort and re-arm", but a rejection will repeat on every
+        # re-attempt — the caller must LOCK the trade (partial_close), not
+        # re-open it into an infinite order-placement loop.
         if result and result['status'] == 'REJECTED':
             msg = result.get('status_message', 'unknown')
             log(f"    ORDER REJECTED: {msg}. Will not retry (same error likely).")
             send_telegram(f"Order REJECTED: {txn_type} {symbol} x {remaining_qty} — {msg}")
-            return None
+            if cumulative_fill_qty > 0:
+                avg = cumulative_fill_value / cumulative_fill_qty
+                log(f"    PARTIAL before rejection: {cumulative_fill_qty}/{qty} @ avg {avg:.2f}")
+                return {'status': 'PARTIAL', 'average_price': avg,
+                        'order_id': 'cumulative', 'filled_quantity': cumulative_fill_qty}
+            return {'status': 'REJECTED', 'average_price': 0.0,
+                    'order_id': order_id, 'filled_quantity': 0}
 
         # ── Not filled / CANCELLED — check for partial fill then retry ──
         partial_qty = 0
@@ -649,18 +875,40 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
     return None
 
 
+URGENT_CLOSE_REASONS = ('SL_SPOT', 'EXPIRY_FORCE_CLOSE')
+
+
 def close_spread(kite: KiteConnect, trade: dict, spot: float,
                  reason: str, dry_run: bool, store=None,
-                 strategy_label: str = 'BCS') -> bool:
+                 strategy_label: str = 'BCS',
+                 reverify_sl: Optional[float] = None):
     """
     Close the full spread. Short FIRST, then long (margin rules).
     Works for both BCS and BPS (same 2-leg structure).
     Updates the provided TradeStore on success (local + Drive).
-    Returns True if fully closed, False if any leg failed.
+
+    Returns:
+      True     — fully closed
+      False    — a leg failed after orders were placed (partial_close state,
+                 manual intervention alerted)
+      'ABORT'  — nothing was placed/filled and the trade is still OPEN:
+                 re-verify found the trigger was a quote artifact, or a
+                 normal-urgency close could not get a reliable book. The
+                 caller must clear its closing state and re-arm the trigger.
+
+    reverify_sl: for SL_SPREAD/SL_TRAIL — the trigger threshold. Before any
+    order, one FRESH quote is taken after REVERIFY_DELAY_SEC; if the fresh
+    spread is reliable and back ABOVE the threshold (or is unreliable), the
+    close aborts. Kills single-poll artifacts that healed. (2026-07-24)
+
+    Urgency: SL_SPOT / EXPIRY_FORCE_CLOSE closes are URGENT — they may pay
+    through unreliable books (bounded by anchor caps until the final
+    attempt). Valuation closes are NORMAL — they never trade a garbage book.
 
     Safety checks:
       - Acquires close-lock (status='closing') before any orders
-      - Late-day guard: refuses to place orders after LAST_ORDER_TIME
+      - Late-day guard: NORMAL closes refuse after LAST_ORDER_TIME; URGENT
+        (reduce-only) closes get until HARD_ORDER_CUTOFF_TIME
       - Verifies actual position state before placing any orders
       - If short is already flat/long, skips to closing the long
       - On both-legs-flat: marks trade closed with recovered fill prices
@@ -671,24 +919,50 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
         store = get_store()  # Default to BCS store for backward compat
     label = strategy_label
     stock = trade['stock']
+    urgent = reason in URGENT_CLOSE_REASONS
 
     log("")
     log("=" * 70)
     log(f"  {reason} TRIGGERED! {stock} spot = {spot}")
-    log(f"  Initiating spread close sequence...")
+    log(f"  Initiating spread close sequence... ({'URGENT' if urgent else 'normal'})")
     log("=" * 70)
 
-    # ── Late-day guard ────────────────────────────────────────────────────
+    # ── Late-day guard (urgent closes are reduce-only and get 5 more min) ──
     now_t = datetime.now().time()
-    if now_t > LAST_ORDER_TIME:
-        log(f"  LATE-DAY GUARD: {now_t.strftime('%H:%M')} > {LAST_ORDER_TIME.strftime('%H:%M')}.")
+    cutoff = HARD_ORDER_CUTOFF_TIME if urgent else LAST_ORDER_TIME
+    if now_t > cutoff:
+        log(f"  LATE-DAY GUARD: {now_t.strftime('%H:%M')} > {cutoff.strftime('%H:%M')}.")
         log(f"  Too close to market close. Not placing orders — manual intervention needed.")
         send_telegram(
             f"{label} {reason} TRIGGERED {stock} @ {spot}\n"
-            f"BUT past {LAST_ORDER_TIME.strftime('%H:%M')} — NOT auto-closing.\n"
+            f"BUT past {cutoff.strftime('%H:%M')} — NOT auto-closing.\n"
             f"Close manually in Kite!"
         )
         return False
+
+    # ── Re-verify valuation triggers on a FRESH quote before any order ────
+    if reverify_sl is not None:
+        time.sleep(REVERIFY_DELAY_SEC)
+        try:
+            fresh = get_spread_value(kite, trade)
+        except Exception as e:
+            log(f"  RE-VERIFY: quote fetch failed ({e}). Aborting close — trigger will re-arm.")
+            return 'ABORT'
+        if fresh['spread'] is None:
+            log(f"  RE-VERIFY ABORT: fresh quote unreliable ({fresh['unreliable']}). "
+                f"Not closing on a garbage book — trigger re-arms.")
+            send_telegram(f"{label} {stock}: {reason} suppressed — fresh quote unreliable "
+                          f"({fresh['unreliable']}). Trade still open, monitoring continues.")
+            return 'ABORT'
+        if fresh['spread'] > reverify_sl:
+            log(f"  RE-VERIFY ABORT: fresh spread {fresh['spread']:.2f} > {reverify_sl:.2f} — "
+                f"trigger was a quote artifact. "
+                f"(L bid {fresh['long']['bid']}/ask {fresh['long']['ask']} | "
+                f"S bid {fresh['short']['bid']}/ask {fresh['short']['ask']})")
+            send_telegram(f"{label} {stock}: {reason} near-miss — fresh spread "
+                          f"{fresh['spread']:.2f} > SL {reverify_sl:.2f}. NOT closed (quote artifact).")
+            return 'ABORT'
+        log(f"  RE-VERIFY CONFIRMED: fresh spread {fresh['spread']:.2f} <= {reverify_sl:.2f}. Proceeding.")
 
     # ── Acquire close-lock (prevents concurrent close from another machine) ──
     close_lock_acquired = False
@@ -699,7 +973,8 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
         close_lock_acquired = True
 
     try:
-        return _close_spread_inner(kite, store, trade, spot, reason, dry_run, label)
+        return _close_spread_inner(kite, store, trade, spot, reason, dry_run, label,
+                                   urgent=urgent)
     except Exception as e:
         log(f"  EXCEPTION during close_spread: {e}")
         send_telegram(f"{label} {stock}: EXCEPTION during {reason} close! {e}\nManual intervention needed!")
@@ -713,7 +988,8 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
         return False
 
 
-def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS'):
+def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
+                        urgent=False):
     """Inner close logic, separated so close_spread() can wrap with try/except."""
     stock = trade['stock']
     short_sym = trade['short_symbol']
@@ -773,10 +1049,23 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS'):
         log(f"STEP 1: Close SHORT leg -> BUY {short_sym} x {close_qty}")
         log("-" * 55)
         short_result = close_leg(
-            kite, exchange, short_sym, "BUY", close_qty, is_buy=True, dry_run=dry_run
+            kite, exchange, short_sym, "BUY", close_qty, is_buy=True, dry_run=dry_run,
+            urgent=urgent
         )
 
         if not short_result or short_result['status'] not in ('COMPLETE', 'PARTIAL'):
+            # close_leg returns None only when ZERO qty filled — for a NORMAL
+            # (valuation-triggered) close the position is untouched, so abort
+            # back to 'open' and let the trigger re-arm instead of freezing
+            # the trade in partial_close. (2026-07-24 guard design.)
+            if not urgent and short_result is None:
+                log(f"\n  NORMAL close abort: short leg not tradeable/fillable, nothing filled.")
+                log(f"  Trade stays OPEN — trigger re-arms on the next reliable poll.")
+                send_telegram(f"{label} {stock}: {reason} close aborted — short-leg book not "
+                              f"tradeable. Trade still open, monitoring continues.")
+                if not dry_run:
+                    store.recover_closing_trade(trade['id'])
+                return 'ABORT'
             msg = f"CRITICAL: {stock} SHORT LEG CLOSE FAILED! Manual intervention needed."
             log("")
             log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -805,11 +1094,28 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS'):
         log("")
         log(f"STEP 2: Close LONG leg -> SELL {long_sym} x {close_qty}")
         log("-" * 55)
+        # Escalation invariant: once the short leg has FILLED this close, the
+        # long leg MUST exit too (a lingering naked long is unhedged risk +
+        # the close can never abort half-done) — run it urgent regardless of
+        # the original trigger's urgency.
+        long_urgent = urgent or short_closed_now
         long_result = close_leg(
-            kite, exchange, long_sym, "SELL", close_qty, is_buy=False, dry_run=dry_run
+            kite, exchange, long_sym, "SELL", close_qty, is_buy=False, dry_run=dry_run,
+            urgent=long_urgent
         )
 
         if not long_result or long_result['status'] not in ('COMPLETE', 'PARTIAL'):
+            # Same pre-fill abort as the short leg: if this close hasn't
+            # touched the position at all (short was already flat, long fill
+            # zero) a NORMAL close aborts back to open instead of freezing.
+            if not long_urgent and long_result is None and not short_closed_now:
+                log(f"\n  NORMAL close abort: long leg not tradeable/fillable, nothing filled.")
+                log(f"  Trade stays OPEN — trigger re-arms on the next reliable poll.")
+                send_telegram(f"{label} {stock}: {reason} close aborted — long-leg book not "
+                              f"tradeable. Trade still open, monitoring continues.")
+                if not dry_run:
+                    store.recover_closing_trade(trade['id'])
+                return 'ABORT'
             actual_close_qty = min(long_qty, qty)
             msg = (f"WARNING: {stock} LONG LEG CLOSE FAILED!\n"
                    f"Short is closed. Naked long {long_sym} remains.\n"
@@ -914,14 +1220,14 @@ def close_fh_position(kite: KiteConnect, trade: dict, spot: float,
     log(f"  Initiating FH close sequence...")
     log("=" * 70)
 
-    # ── Late-day guard ────────────────────────────────────────────────────
+    # ── Late-day guard (FH closes are always urgent: SL_SPOT/expiry only) ──
     now_t = datetime.now().time()
-    if now_t > LAST_ORDER_TIME:
-        log(f"  LATE-DAY GUARD: {now_t.strftime('%H:%M')} > {LAST_ORDER_TIME.strftime('%H:%M')}.")
+    if now_t > HARD_ORDER_CUTOFF_TIME:
+        log(f"  LATE-DAY GUARD: {now_t.strftime('%H:%M')} > {HARD_ORDER_CUTOFF_TIME.strftime('%H:%M')}.")
         log(f"  Too close to market close. Not placing orders — manual intervention needed.")
         send_telegram(
             f"FH {reason} TRIGGERED {stock} @ {spot}\n"
-            f"BUT past {LAST_ORDER_TIME.strftime('%H:%M')} — NOT auto-closing.\n"
+            f"BUT past {HARD_ORDER_CUTOFF_TIME.strftime('%H:%M')} — NOT auto-closing.\n"
             f"Close manually in Kite!"
         )
         return False
@@ -1011,7 +1317,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         close_qty = min(abs(sc_qty), qty)
         log(f"\nSTEP 1: BUY back SHORT CALL {sc_sym} x {close_qty}")
         log("-" * 55)
-        result = close_leg(kite, exchange, sc_sym, "BUY", close_qty, is_buy=True, dry_run=dry_run)
+        result = close_leg(kite, exchange, sc_sym, "BUY", close_qty, is_buy=True, dry_run=dry_run,
+                           urgent=True)
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log("!!! CRITICAL: SHORT CALL CLOSE FAILED — naked risk remains !!!")
             send_telegram(f"FH {stock}: SHORT CALL CLOSE FAILED! Naked risk! Manual intervention needed!")
@@ -1028,7 +1335,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         close_qty = min(lc_qty, qty)
         log(f"\nSTEP 2: SELL LONG CALL {lc_sym} x {close_qty}")
         log("-" * 55)
-        result = close_leg(kite, exchange, lc_sym, "SELL", close_qty, is_buy=False, dry_run=dry_run)
+        result = close_leg(kite, exchange, lc_sym, "SELL", close_qty, is_buy=False, dry_run=dry_run,
+                           urgent=True)
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log(f"  WARNING: Long call close failed. Naked long remains — not critical.")
             send_telegram(f"FH {stock}: Long call sell failed. Manual sell {lc_sym}.")
@@ -1043,7 +1351,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         close_qty = min(abs(sp_qty), qty)
         log(f"\nSTEP 3: BUY back SHORT PUT {sp_sym} x {close_qty}")
         log("-" * 55)
-        result = close_leg(kite, exchange, sp_sym, "BUY", close_qty, is_buy=True, dry_run=dry_run)
+        result = close_leg(kite, exchange, sp_sym, "BUY", close_qty, is_buy=True, dry_run=dry_run,
+                           urgent=True)
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log("!!! WARNING: SHORT PUT CLOSE FAILED !!!")
             send_telegram(f"FH {stock}: SHORT PUT CLOSE FAILED! Manual intervention needed!")
@@ -1060,7 +1369,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         close_qty = min(lp_qty, qty)
         log(f"\nSTEP 4: SELL LONG PUT {lp_sym} x {close_qty}")
         log("-" * 55)
-        result = close_leg(kite, exchange, lp_sym, "SELL", close_qty, is_buy=False, dry_run=dry_run)
+        result = close_leg(kite, exchange, lp_sym, "SELL", close_qty, is_buy=False, dry_run=dry_run,
+                           urgent=True)
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log(f"  WARNING: Long put sell failed. Manual sell {lp_sym}.")
             send_telegram(f"FH {stock}: Long put sell failed. Manual sell {lp_sym}.")
@@ -1162,6 +1472,127 @@ def verify_positions(kite: KiteConnect, trade: dict, fatal: bool = True):
     return long_pos, short_pos
 
 
+# ── Trigger-Confirmation / Trail / Blind-Mode Helpers (2026-07-24) ──────────
+
+def new_trail_state(trade: dict) -> dict:
+    """Trail state dict, restored from persisted trade fields."""
+    return {
+        'peak': trade.get('trail_peak', 0.0),
+        'trail': trade.get('trail_sl', 0.0),
+        'active': trade.get('trail_active', False),
+        'engage_level': trade['net_debit'] * TRAIL_ENGAGE_MULTIPLIER,
+        'cand_count': 0,     # jump-gate candidate confirmation counter
+        'cand_min': 0.0,     # minimum spread seen across the candidate window
+    }
+
+
+def update_trail(ts: dict, spread_val: float) -> bool:
+    """Apply trail engage/peak logic with the jump-plausibility gate.
+
+    Mutates ts. Returns True when peak/trail changed and should be persisted.
+
+    A proposed peak more than TRAIL_PEAK_JUMP_MULT above the baseline
+    (max(current peak, engage level)) is implausible for a vertical spread
+    within one poll — it must be seen on SL_CONFIRM_POLLS consecutive
+    reliable polls, and the window MINIMUM is what gets persisted. One
+    garbage-high bid can no longer poison trail state in the store/Drive
+    and fire a delayed false SL_TRAIL. (2026-07-24 guard design.)
+    """
+    if not ts['active'] and spread_val < ts['engage_level']:
+        ts['cand_count'] = 0
+        return False
+    if ts['active'] and spread_val <= ts['peak']:
+        ts['cand_count'] = 0
+        return False
+
+    baseline = max(ts['peak'], ts['engage_level'])
+    if spread_val <= baseline * TRAIL_PEAK_JUMP_MULT:
+        accepted = spread_val
+        ts['cand_count'] = 0
+    else:
+        # Stale candidate window restarts (same rule as bump_confirm):
+        # confirming polls must be reasonably contiguous.
+        now = time.time()
+        if now - ts.get('cand_t', 0.0) > CONFIRM_STALE_SEC:
+            ts['cand_count'] = 0
+        ts['cand_t'] = now
+        if ts['cand_count'] == 0:
+            ts['cand_min'] = spread_val
+        ts['cand_count'] += 1
+        ts['cand_min'] = min(ts['cand_min'], spread_val)
+        if ts['cand_count'] < SL_CONFIRM_POLLS:
+            return False
+        accepted = ts['cand_min']
+        ts['cand_count'] = 0
+
+    if accepted <= ts['peak']:
+        return False
+    ts['active'] = True
+    ts['peak'] = accepted
+    ts['trail'] = accepted * TRAIL_PERCENT
+    return True
+
+
+def new_blind_state() -> dict:
+    return {'since': None, 'reason': '', 'last_alert': 0.0, 'last_prox': 0.0,
+            'ok_streak': 0}
+
+
+def bump_confirm(confirm: dict, key: str) -> int:
+    """Increment a trigger-confirmation counter, restarting a stale streak.
+
+    A streak whose last hit is older than CONFIRM_STALE_SEC restarts from
+    zero — hits must be reasonably contiguous, but unreliable polls in
+    between (which simply don't call this) may not indefinitely block a
+    genuine exit in a flickering book.
+    """
+    now = time.time()
+    if now - confirm.get(key + '_t', 0.0) > CONFIRM_STALE_SEC:
+        confirm[key] = 0
+    confirm[key] += 1
+    confirm[key + '_t'] = now
+    return confirm[key]
+
+
+def track_spread_blindness(bs: dict, spread_ok: bool, reason: str,
+                           spot: float, sl_spot: float, adverse_below: bool,
+                           label: str):
+    """Tell the user when spread valuation has been blind long enough to
+    matter. Pure observability — no trading action; SL_SPOT stays armed.
+
+    The blind clock clears only after BLIND_CLEAR_OK_POLLS consecutive ok
+    polls — one good quote inside a flickering book must not silence the
+    alert. adverse_below: True when the SL direction is DOWN (BCS:
+    spot <= sl_spot), False when UP (BPS).
+    """
+    now = time.time()
+    if spread_ok:
+        bs['ok_streak'] += 1
+        if bs['ok_streak'] >= BLIND_CLEAR_OK_POLLS:
+            bs['since'] = None
+        return
+    bs['ok_streak'] = 0
+    bs['reason'] = reason or 'no_data'
+    if bs['since'] is None:
+        bs['since'] = now
+        return
+    dur = now - bs['since']
+    if dur < SPREAD_BLIND_ALERT_SEC:
+        return
+    if now - bs['last_alert'] >= SPREAD_BLIND_REPEAT_SEC:
+        send_telegram(f"{label}: spread quotes unreliable for {int(dur / 60)} min "
+                      f"({bs['reason']}). SL_SPREAD/SL_TRAIL suspended. "
+                      f"SL_SPOT still armed at {sl_spot}.")
+        bs['last_alert'] = now
+    near = (spot <= sl_spot * (1 + SPOT_PROXIMITY_ALERT_PCT)) if adverse_below \
+        else (spot >= sl_spot * (1 - SPOT_PROXIMITY_ALERT_PCT))
+    if near and now - bs['last_prox'] >= PROXIMITY_REPEAT_SEC:
+        send_telegram(f"{label}: BLIND NEAR SL! spot {spot} vs SL {sl_spot}, quotes "
+                      f"unreliable ({bs['reason']}). Spread SLs cannot fire — "
+                      f"consider manual action.")
+        bs['last_prox'] = now
+
+
 # ── Main Monitor Loop ────────────────────────────────────────────────────────
 
 def monitor(kite: KiteConnect, trade: dict, target: float,
@@ -1190,11 +1621,15 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
     trail_engage_level = entry_net * TRAIL_ENGAGE_MULTIPLIER
 
     # Restore trailing SL state from trade store (survives process restarts)
-    peak_spread = trade.get('trail_peak', 0.0)
-    trailing_sl = trade.get('trail_sl', 0.0)
-    trail_active = trade.get('trail_active', False)
-    if trail_active:
-        log(f"  Restored trail state: peak={peak_spread:.2f}, trail={trailing_sl:.2f}")
+    ts = new_trail_state(trade)
+    if ts['active']:
+        log(f"  Restored trail state: peak={ts['peak']:.2f}, trail={ts['trail']:.2f}")
+
+    # Trigger-confirmation + blind-mode state (in-memory; reset on restart —
+    # a restart can only DELAY a value trigger, never accelerate one)
+    confirm = {'sl_spread': 0, 'sl_trail': 0}
+    abort_until = 0.0    # no valuation/TP close attempts before this time
+    blind = new_blind_state()
 
     log("")
     log("=" * 70)
@@ -1223,13 +1658,13 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
     if is_market_settled():
         if spot <= sl_spot:
             log(f"Spot already at/below SL!")
-            close_spread(kite, trade, spot, "SL_SPOT", dry_run)
-            return
+            if close_spread(kite, trade, spot, "SL_SPOT", dry_run) != 'ABORT':
+                return
 
-        if spot >= target:
+        elif spot >= target:
             log(f"Spot already at/above target!")
-            close_spread(kite, trade, spot, "TP", dry_run)
-            return
+            if close_spread(kite, trade, spot, "TP", dry_run) != 'ABORT':
+                return
     else:
         log(f"\n  Skipping immediate checks — market-open buffer active")
 
@@ -1252,8 +1687,8 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
                 now_t = datetime.now().time()
                 if now_t > MARKET_CLOSE:
                     log("Market closed for the day. Exiting monitor.")
-                    if trail_active:
-                        log(f"  Trailing SL state: peak={peak_spread:.2f}, trail={trailing_sl:.2f}")
+                    if ts['active']:
+                        log(f"  Trailing SL state: peak={ts['peak']:.2f}, trail={ts['trail']:.2f}")
                     return
                 # Before market open - wait
                 log(f"Market not open yet ({now_t.strftime('%H:%M')}). Waiting...")
@@ -1284,42 +1719,55 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
             # Fetch spread for SL checks and status
             spread_data = None
             spread_val = None
+            spread_fail = None
             try:
                 spread_data = get_spread_value(kite, trade)
                 spread_val = spread_data['spread']
-            except Exception:
-                pass  # spread fetch can fail; spot-based checks still work
+            except Exception as e:
+                spread_fail = str(e)  # spot-based checks still work
 
-            # ── Update trailing SL state ─────────────────────────────────
-            # Only when market is settled. During cooldown, spread values can
-            # be aberrant (wide bid-ask) → fake peak → immediate SL_TRAIL
-            # after cooldown ends.
             settled = is_market_settled()
-            if settled and spread_val is not None:
-                if not trail_active and spread_val >= trail_engage_level:
-                    trail_active = True
-                    peak_spread = spread_val
-                    trailing_sl = peak_spread * TRAIL_PERCENT
-                    log(f"  ** TRAILING SL ENGAGED ** spread={spread_val:.2f} >= {trail_engage_level:.2f}")
-                    log(f"     Peak: {peak_spread:.2f} | Trail level: {trailing_sl:.2f}")
-                    store.update_trade_fields(trade['id'],
-                                              trail_active=True, trail_peak=peak_spread, trail_sl=trailing_sl)
+            spread_settled = is_spread_settled()
 
-                if trail_active and spread_val > peak_spread:
-                    peak_spread = spread_val
-                    trailing_sl = peak_spread * TRAIL_PERCENT
-                    log(f"  ** TRAIL UPDATED ** Peak: {peak_spread:.2f} | Trail: {trailing_sl:.2f}")
-                    store.update_trade_fields(trade['id'],
-                                              trail_peak=peak_spread, trail_sl=trailing_sl)
+            # ── Blind-mode tracking: user must know when spread SLs are
+            # suspended (unreliable books, quote failures) ────────────────
+            blind_reason = spread_fail or (spread_data['unreliable'] if spread_data else 'no_data')
+            track_spread_blindness(
+                blind, spread_ok=(spread_val is not None or not spread_settled),
+                reason=blind_reason, spot=spot, sl_spot=sl_spot,
+                adverse_below=True, label=f"BCS {stock}")
+
+            # ── Update trailing SL state (jump-gated, reliable quotes only,
+            # spread-settled market only) ─────────────────────────────────
+            if spread_settled and spread_val is not None:
+                was_active = ts['active']
+                if update_trail(ts, spread_val):
+                    if not was_active:
+                        log(f"  ** TRAILING SL ENGAGED ** spread={spread_val:.2f} >= {trail_engage_level:.2f}")
+                        log(f"     Peak: {ts['peak']:.2f} | Trail level: {ts['trail']:.2f}")
+                    else:
+                        log(f"  ** TRAIL UPDATED ** Peak: {ts['peak']:.2f} | Trail: {ts['trail']:.2f}")
+                    store.update_trade_fields(trade['id'], trail_active=True,
+                                              trail_peak=ts['peak'], trail_sl=ts['trail'])
+                elif ts['cand_count'] > 0:
+                    log(f"  Trail peak candidate {spread_val:.2f} held "
+                        f"(confirm {ts['cand_count']}/{SL_CONFIRM_POLLS})")
 
             # ── Periodic status line ─────────────────────────────────────
             if now - last_status_time >= STATUS_PRINT_INTERVAL_SEC:
                 settle_tag = "" if settled else " [COOLDOWN]"
+                if settled and not spread_settled:
+                    settle_tag = " [SPREAD-COOLDOWN]"
                 expiry_tag = " [EXPIRY]" if expiry_today else ""
+                suspect_tag = ""
+                if spread_data and spread_data.get('unreliable'):
+                    suspect_tag = f" [SUSPECT {spread_data['unreliable']}]"
+                elif spread_fail:
+                    suspect_tag = f" [QUOTE-FAIL {spread_fail[:40]}]"
                 try:
                     if spread_data and spread_val is not None:
                         unrealized = (spread_val - entry_net) * trade['quantity']
-                        trail_str = f" | Trail: {trailing_sl:.2f}" if trail_active else ""
+                        trail_str = f" | Trail: {ts['trail']:.2f}" if ts['active'] else ""
                         log(
                             f"Spot: {spot:>8.2f} | "
                             f"TP: {target} (gap: {target - spot:>+.2f}) | "
@@ -1329,7 +1777,7 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
                             f"P&L: Rs {unrealized:>+,.0f}{trail_str}{settle_tag}{expiry_tag}"
                         )
                     else:
-                        log(f"Spot: {spot:>8.2f} | TP: {target} (gap: {target - spot:>+.2f}) | SL: {sl_spot} (buf: {spot - sl_spot:>+.2f}){settle_tag}{expiry_tag}")
+                        log(f"Spot: {spot:>8.2f} | TP: {target} (gap: {target - spot:>+.2f}) | SL: {sl_spot} (buf: {spot - sl_spot:>+.2f}){settle_tag}{expiry_tag}{suspect_tag}")
                 except Exception:
                     log(f"Spot: {spot:>8.2f} | TP: {target} | SL: {sl_spot}{settle_tag}{expiry_tag}")
                 last_status_time = now
@@ -1348,40 +1796,89 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
             if spot <= sl_spot:
                 log(f"\n  *** SL_SPOT HIT: {spot:.2f} <= {sl_spot} ***")
                 success = close_spread(kite, trade, spot, "SL_SPOT", dry_run)
+                if success == 'ABORT':
+                    log("  SL_SPOT close aborted — still monitoring.")
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
                 if success:
                     log("\nMonitor complete. Position closed on SL_SPOT.")
                 else:
                     log("\nMonitor stopped. CHECK POSITION MANUALLY!")
                 return
 
-            # ── Cooldown gate: SL_SPREAD, SL_TRAIL, TP need settled market ──
+            # ── Cooldown gate: TP needs settled market ───────────────────
             if not settled:
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # ── CHECK 2: SL_SPREAD ───────────────────────────────────────
-            if spread_val is not None and spread_val <= sl_spread:
-                log(f"\n  *** SL_SPREAD HIT: {spread_val:.2f} <= {sl_spread:.2f} ***")
-                success = close_spread(kite, trade, spot, "SL_SPREAD", dry_run)
-                if success:
-                    log("\nMonitor complete. Position closed on SL_SPREAD.")
-                else:
-                    log("\nMonitor stopped. CHECK POSITION MANUALLY!")
-                return
+            # ── Abort cooldown: after an aborted close, hold off further
+            # valuation/TP attempts (SL_SPOT above stays exempt) ──────────
+            in_abort_cooldown = time.time() < abort_until
 
-            # ── CHECK 3: SL_TRAIL ────────────────────────────────────────
-            if trail_active and spread_val is not None and spread_val <= trailing_sl:
-                log(f"\n  *** SL_TRAIL HIT: {spread_val:.2f} <= {trailing_sl:.2f} (peak was {peak_spread:.2f}) ***")
-                success = close_spread(kite, trade, spot, "SL_TRAIL", dry_run)
-                if success:
-                    log("\nMonitor complete. Position closed on SL_TRAIL.")
+            # ── Spread-trigger gate: SL_SPREAD/SL_TRAIL wait for the longer
+            # spread buffer AND need SL_CONFIRM_POLLS reliable polls in
+            # trigger state (2026-07-24: single garbage poll fired a false
+            # SL_SPREAD and cost Rs 7,297). Unreliable polls freeze the
+            # counters; bump_confirm restarts stale streaks. ──────────────
+            if spread_settled and spread_val is not None and not in_abort_cooldown:
+
+                # ── CHECK 2: SL_SPREAD (debounced + re-verified) ─────────
+                if spread_val <= sl_spread:
+                    n = bump_confirm(confirm, 'sl_spread')
+                    if n < SL_CONFIRM_POLLS:
+                        log(f"  SL_SPREAD condition {spread_val:.2f} <= {sl_spread:.2f} "
+                            f"(confirm {n}/{SL_CONFIRM_POLLS})")
+                    else:
+                        log(f"\n  *** SL_SPREAD HIT: {spread_val:.2f} <= {sl_spread:.2f} "
+                            f"(confirmed {n}x) ***")
+                        success = close_spread(kite, trade, spot, "SL_SPREAD", dry_run,
+                                               reverify_sl=sl_spread)
+                        if success == 'ABORT':
+                            confirm['sl_spread'] = 0
+                            abort_until = time.time() + ABORT_COOLDOWN_SEC
+                            time.sleep(POLL_INTERVAL_SEC)
+                            continue
+                        if success:
+                            log("\nMonitor complete. Position closed on SL_SPREAD.")
+                        else:
+                            log("\nMonitor stopped. CHECK POSITION MANUALLY!")
+                        return
                 else:
-                    log("\nMonitor stopped. CHECK POSITION MANUALLY!")
-                return
+                    confirm['sl_spread'] = 0
+
+                # ── CHECK 3: SL_TRAIL (debounced + re-verified) ──────────
+                if ts['active'] and spread_val <= ts['trail']:
+                    n = bump_confirm(confirm, 'sl_trail')
+                    if n < SL_CONFIRM_POLLS:
+                        log(f"  SL_TRAIL condition {spread_val:.2f} <= {ts['trail']:.2f} "
+                            f"(confirm {n}/{SL_CONFIRM_POLLS})")
+                    else:
+                        log(f"\n  *** SL_TRAIL HIT: {spread_val:.2f} <= {ts['trail']:.2f} "
+                            f"(peak was {ts['peak']:.2f}, confirmed {n}x) ***")
+                        success = close_spread(kite, trade, spot, "SL_TRAIL", dry_run,
+                                               reverify_sl=ts['trail'])
+                        if success == 'ABORT':
+                            confirm['sl_trail'] = 0
+                            abort_until = time.time() + ABORT_COOLDOWN_SEC
+                            time.sleep(POLL_INTERVAL_SEC)
+                            continue
+                        if success:
+                            log("\nMonitor complete. Position closed on SL_TRAIL.")
+                        else:
+                            log("\nMonitor stopped. CHECK POSITION MANUALLY!")
+                        return
+                else:
+                    confirm['sl_trail'] = 0
 
             # ── CHECK 4: TP ──────────────────────────────────────────────
-            if spot >= target:
+            if spot >= target and not in_abort_cooldown:
                 success = close_spread(kite, trade, spot, "TP", dry_run)
+                if success == 'ABORT':
+                    log(f"  TP close aborted — retrying after {ABORT_COOLDOWN_SEC}s cooldown "
+                        f"(spot trigger persists).")
+                    abort_until = time.time() + ABORT_COOLDOWN_SEC
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
                 if success:
                     log("\nMonitor complete. Position closed on TP.")
                 else:
@@ -1393,8 +1890,8 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
         except KeyboardInterrupt:
             log("\nMonitor stopped by user (Ctrl+C)")
             log("Position is still OPEN.")
-            if trail_active:
-                log(f"  Trailing SL state: peak={peak_spread:.2f}, trail={trailing_sl:.2f}")
+            if ts['active']:
+                log(f"  Trailing SL state: peak={ts['peak']:.2f}, trail={ts['trail']:.2f}")
             return
         except Exception as e:
             consecutive_errors += 1
@@ -1497,33 +1994,26 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     log(f"  Poll:   Every {POLL_INTERVAL_SEC}s | Status every {STATUS_PRINT_INTERVAL_SEC}s")
     log("=" * 70)
 
-    # Per-trade trailing SL state (BCS only): {(strategy, trade_id): {peak, trail, active}}
+    # Per-trade trailing SL state (BCS/BPS): {(strategy, trade_id): trail dict}
     trail_state = {}
+    # Per-trade trigger confirmation counters + blind-mode state (in-memory;
+    # reset on restart — a restart can only DELAY a value trigger)
+    confirm_state = {}   # {(strategy, id): {'sl_spread': n, 'sl_trail': n}}
+    blind_state = {}     # {(strategy, id): blind dict}
+    abort_until = {}     # {(strategy, id): time.time() before which no valuation/TP closes}
     for t in all_trades:
         strat = t['_strategy']
         lots_str = f"{t.get('lots', '?')}x{t.get('lot_size', '?')}"
 
         if strat == 'BCS':
-            entry_net = t['net_debit']
-            trail_state[('BCS', t['id'])] = {
-                'peak': t.get('trail_peak', 0.0),
-                'trail': t.get('trail_sl', 0.0),
-                'active': t.get('trail_active', False),
-                'engage_level': entry_net * TRAIL_ENGAGE_MULTIPLIER,
-            }
+            trail_state[('BCS', t['id'])] = new_trail_state(t)
             if trail_state[('BCS', t['id'])]['active']:
                 log(f"  BCS #{t['id']} {t['stock']}: Restored trail: peak={t.get('trail_peak', 0):.2f}, trail={t.get('trail_sl', 0):.2f}")
             log(f"  BCS #{t['id']} {t['stock']} {t['long_symbol']}/{t['short_symbol']} "
                 f"| Lots: {lots_str} "
                 f"| TP: {t['target_spot']} | SL: {t['sl_spot']} | SL Spread: {t['sl_spread']:.2f}")
         elif strat == 'BPS':
-            entry_net = t['net_debit']
-            trail_state[('BPS', t['id'])] = {
-                'peak': t.get('trail_peak', 0.0),
-                'trail': t.get('trail_sl', 0.0),
-                'active': t.get('trail_active', False),
-                'engage_level': entry_net * TRAIL_ENGAGE_MULTIPLIER,
-            }
+            trail_state[('BPS', t['id'])] = new_trail_state(t)
             if trail_state[('BPS', t['id'])]['active']:
                 log(f"  BPS #{t['id']} {t['stock']}: Restored trail: peak={t.get('trail_peak', 0):.2f}, trail={t.get('trail_sl', 0):.2f}")
             log(f"  BPS #{t['id']} {t['stock']} {t['long_symbol']}/{t['short_symbol']} "
@@ -1621,6 +2111,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 return
 
             settled = is_market_settled()
+            spread_settled = is_spread_settled()
             consecutive_errors = 0  # Reset on successful iteration
             now = time.time()
             print_status = (now - last_status_time >= STATUS_PRINT_INTERVAL_SEC)
@@ -1641,36 +2132,22 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     continue
 
                 # ── BCS/BPS-specific fields ────────────────────────────────
-                if strat == 'BCS':
+                if strat in ('BCS', 'BPS'):
                     target = trade['target_spot']
                     sl_spread_val = trade['sl_spread']
                     entry_net = trade['net_debit']
 
-                    # Initialize trail state for new BCS trades added mid-session
+                    # Initialize state for new trades added mid-session
                     if close_key not in trail_state:
-                        trail_state[close_key] = {
-                            'peak': 0.0, 'trail': 0.0, 'active': False,
-                            'engage_level': entry_net * TRAIL_ENGAGE_MULTIPLIER,
-                        }
+                        trail_state[close_key] = new_trail_state(trade)
                         if is_expiry_day(trade):
                             expiry_trades[close_key] = True
-                            log(f"  BCS #{tid} {stock}: EXPIRY DAY (added mid-session)")
-                            send_telegram(f"BCS #{tid} {stock}: EXPIRY DAY (added mid-session). Force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
-                elif strat == 'BPS':
-                    target = trade['target_spot']
-                    sl_spread_val = trade['sl_spread']
-                    entry_net = trade['net_debit']
-
-                    # Initialize trail state for new BPS trades added mid-session
-                    if close_key not in trail_state:
-                        trail_state[close_key] = {
-                            'peak': 0.0, 'trail': 0.0, 'active': False,
-                            'engage_level': entry_net * TRAIL_ENGAGE_MULTIPLIER,
-                        }
-                        if is_expiry_day(trade):
-                            expiry_trades[close_key] = True
-                            log(f"  BPS #{tid} {stock}: EXPIRY DAY (added mid-session)")
-                            send_telegram(f"BPS #{tid} {stock}: EXPIRY DAY (added mid-session). Force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
+                            log(f"  {strat} #{tid} {stock}: EXPIRY DAY (added mid-session)")
+                            send_telegram(f"{strat} #{tid} {stock}: EXPIRY DAY (added mid-session). Force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
+                    if close_key not in confirm_state:
+                        confirm_state[close_key] = {'sl_spread': 0, 'sl_trail': 0}
+                    if close_key not in blind_state:
+                        blind_state[close_key] = new_blind_state()
                 else:
                     # FH: check for new expiry-day trades added mid-session
                     if close_key not in expiry_trades and is_expiry_day(trade):
@@ -1687,63 +2164,55 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 # ── BCS/BPS: Fetch spread + update trailing SL ────────────
                 spread_val = None
                 spread_data = None
+                spread_fail = None
                 fh_val = None
-                if strat == 'BCS':
+                if strat in ('BCS', 'BPS'):
                     try:
                         spread_data = get_spread_value(kite, trade)
                         spread_val = spread_data['spread']
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        spread_fail = str(e)
 
+                    # Blind-mode tracking: alert when spread SLs are suspended
+                    blind_reason = spread_fail or (spread_data['unreliable'] if spread_data else 'no_data')
+                    track_spread_blindness(
+                        blind_state[close_key],
+                        spread_ok=(spread_val is not None or not spread_settled),
+                        reason=blind_reason, spot=spot, sl_spot=sl_spot_val,
+                        adverse_below=(strat == 'BCS'),
+                        label=f"{strat} #{tid} {stock}")
+
+                    # Trail update: jump-gated, reliable quotes only, longer
+                    # spread buffer (2026-07-24 guard design)
                     ts = trail_state[close_key]
-                    if settled and spread_val is not None:
-                        if not ts['active'] and spread_val >= ts['engage_level']:
-                            ts['active'] = True
-                            ts['peak'] = spread_val
-                            ts['trail'] = ts['peak'] * TRAIL_PERCENT
-                            log(f"  BCS #{tid} {stock} ** TRAIL ENGAGED ** spread={spread_val:.2f} | trail={ts['trail']:.2f}")
-                            trade_store.update_trade_fields(tid,
-                                                            trail_active=True, trail_peak=ts['peak'], trail_sl=ts['trail'])
-
-                        if ts['active'] and spread_val > ts['peak']:
-                            ts['peak'] = spread_val
-                            ts['trail'] = ts['peak'] * TRAIL_PERCENT
-                            log(f"  BCS #{tid} {stock} ** TRAIL UPDATED ** peak={ts['peak']:.2f} | trail={ts['trail']:.2f}")
-                            trade_store.update_trade_fields(tid,
+                    if spread_settled and spread_val is not None:
+                        was_active = ts['active']
+                        if update_trail(ts, spread_val):
+                            verb = "TRAIL UPDATED" if was_active else "TRAIL ENGAGED"
+                            log(f"  {strat} #{tid} {stock} ** {verb} ** peak={ts['peak']:.2f} | trail={ts['trail']:.2f}")
+                            trade_store.update_trade_fields(tid, trail_active=True,
                                                             trail_peak=ts['peak'], trail_sl=ts['trail'])
-                elif strat == 'BPS':
-                    try:
-                        spread_data = get_spread_value(kite, trade)
-                        spread_val = spread_data['spread']
-                    except Exception:
-                        pass
-
-                    ts = trail_state[close_key]
-                    if settled and spread_val is not None:
-                        if not ts['active'] and spread_val >= ts['engage_level']:
-                            ts['active'] = True
-                            ts['peak'] = spread_val
-                            ts['trail'] = ts['peak'] * TRAIL_PERCENT
-                            log(f"  BPS #{tid} {stock} ** TRAIL ENGAGED ** spread={spread_val:.2f} | trail={ts['trail']:.2f}")
-                            trade_store.update_trade_fields(tid,
-                                                            trail_active=True, trail_peak=ts['peak'], trail_sl=ts['trail'])
-
-                        if ts['active'] and spread_val > ts['peak']:
-                            ts['peak'] = spread_val
-                            ts['trail'] = ts['peak'] * TRAIL_PERCENT
-                            log(f"  BPS #{tid} {stock} ** TRAIL UPDATED ** peak={ts['peak']:.2f} | trail={ts['trail']:.2f}")
-                            trade_store.update_trade_fields(tid,
-                                                            trail_peak=ts['peak'], trail_sl=ts['trail'])
+                        elif ts['cand_count'] > 0:
+                            log(f"  {strat} #{tid} {stock}: trail peak candidate {spread_val:.2f} "
+                                f"held (confirm {ts['cand_count']}/{SL_CONFIRM_POLLS})")
                 else:
                     # FH: Fetch position value for status display only
                     try:
                         fh_val = get_fh_position_value(kite, trade)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if print_status:
+                            log(f"  FH #{tid} {stock}: value fetch failed: {e}")
 
                 # ── Status line ───────────────────────────────────────────
                 if print_status:
                     settle_tag = "" if settled else " [COOLDOWN]"
+                    if settled and not spread_settled and strat in ('BCS', 'BPS'):
+                        settle_tag = " [SPREAD-COOLDOWN]"
+                    if strat in ('BCS', 'BPS'):
+                        if spread_data and spread_data.get('unreliable'):
+                            settle_tag += f" [SUSPECT {spread_data['unreliable']}]"
+                        elif spread_fail:
+                            settle_tag += f" [QUOTE-FAIL {spread_fail[:40]}]"
                     expiry_tag = " [EXPIRY]" if close_key in expiry_trades else ""
                     try:
                         if strat == 'BCS':
@@ -1817,105 +2286,110 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 # ── SL/TP checks ─────────────────────────────────────────
                 closed = False
 
-                if strat == 'BCS':
-                    # ── BCS SL_SPOT: spot <= sl_spot (bearish risk) ──────
-                    if spot <= sl_spot_val:
-                        log(f"\n  BCS #{tid} {stock} *** SL_SPOT HIT: {spot:.2f} <= {sl_spot_val} ***")
+                if strat in ('BCS', 'BPS'):
+                    # ── SL_SPOT: direction-aware, always active, single poll.
+                    # Spot LTP comes from real underlying trades (garbage-
+                    # immune) and a thesis-dead exit must not be delayed.
+                    # BCS risk is DOWN (spot <= sl), BPS risk is UP (spot >= sl).
+                    sl_spot_hit = (spot <= sl_spot_val) if strat == 'BCS' else (spot >= sl_spot_val)
+                    if sl_spot_hit:
+                        op = '<=' if strat == 'BCS' else '>='
+                        log(f"\n  {strat} #{tid} {stock} *** SL_SPOT HIT: {spot:.2f} {op} {sl_spot_val} ***")
                         closing_in_progress[close_key] = "SL_SPOT"
                         success = close_spread(kite, trade, spot, "SL_SPOT", dry_run,
-                                               store=trade_store, strategy_label='BCS')
-                        closed = True
-                        if not success:
-                            log(f"  BCS #{tid} {stock}: Close failed. Trade locked — manual intervention needed.")
-                            send_telegram(f"BCS #{tid} {stock}: SL_SPOT close FAILED. Manual intervention needed!")
+                                               store=trade_store, strategy_label=strat)
+                        if success == 'ABORT':
+                            closing_in_progress.pop(close_key, None)
+                        else:
+                            closed = True
+                            if not success:
+                                log(f"  {strat} #{tid} {stock}: Close failed. Trade locked — manual intervention needed.")
+                                send_telegram(f"{strat} #{tid} {stock}: SL_SPOT close FAILED. Manual intervention needed!")
 
-                    # Cooldown gate: SL_SPREAD, SL_TRAIL, TP need settled market
+                    # Cooldown gate: TP needs settled market
                     if not closed and not settled:
                         continue
 
-                    # CHECK 2: SL_SPREAD
-                    if not closed and spread_val is not None and spread_val <= sl_spread_val:
-                        log(f"\n  BCS #{tid} {stock} *** SL_SPREAD HIT: {spread_val:.2f} <= {sl_spread_val:.2f} ***")
-                        closing_in_progress[close_key] = "SL_SPREAD"
-                        success = close_spread(kite, trade, spot, "SL_SPREAD", dry_run,
-                                               store=trade_store, strategy_label='BCS')
-                        closed = True
-                        if not success:
-                            log(f"  BCS #{tid} {stock}: Close failed — manual intervention needed.")
-                            send_telegram(f"BCS #{tid} {stock}: SL_SPREAD close FAILED. Manual intervention needed!")
-
-                    # CHECK 3: SL_TRAIL
+                    confirm = confirm_state[close_key]
                     ts = trail_state[close_key]
-                    if not closed and ts['active'] and spread_val is not None and spread_val <= ts['trail']:
-                        log(f"\n  BCS #{tid} {stock} *** SL_TRAIL HIT: {spread_val:.2f} <= {ts['trail']:.2f} ***")
-                        closing_in_progress[close_key] = "SL_TRAIL"
-                        success = close_spread(kite, trade, spot, "SL_TRAIL", dry_run,
-                                               store=trade_store, strategy_label='BCS')
-                        closed = True
-                        if not success:
-                            log(f"  BCS #{tid} {stock}: Close failed — manual intervention needed.")
-                            send_telegram(f"BCS #{tid} {stock}: SL_TRAIL close FAILED. Manual intervention needed!")
+                    # Abort cooldown: after an aborted close, hold off further
+                    # valuation/TP attempts for this trade (SL_SPOT exempt)
+                    in_abort_cooldown = time.time() < abort_until.get(close_key, 0)
 
-                    # CHECK 4: TP
-                    if not closed and spot >= target:
-                        log(f"\n  BCS #{tid} {stock} *** TP HIT: {spot:.2f} >= {target} ***")
+                    # CHECK 2: SL_SPREAD — spread-settled market + debounce +
+                    # re-verify (2026-07-24: one garbage poll = Rs 7,297 lost).
+                    # Counter semantics: reliable trigger poll increments
+                    # (stale-aware), reliable non-trigger poll resets,
+                    # UNRELIABLE poll freezes — a flickering book must not
+                    # indefinitely block a genuine exit.
+                    if not closed and not in_abort_cooldown and spread_settled and spread_val is not None and spread_val <= sl_spread_val:
+                        n = bump_confirm(confirm, 'sl_spread')
+                        if n < SL_CONFIRM_POLLS:
+                            log(f"  {strat} #{tid} {stock}: SL_SPREAD condition {spread_val:.2f} <= "
+                                f"{sl_spread_val:.2f} (confirm {n}/{SL_CONFIRM_POLLS})")
+                        else:
+                            log(f"\n  {strat} #{tid} {stock} *** SL_SPREAD HIT: {spread_val:.2f} <= "
+                                f"{sl_spread_val:.2f} (confirmed {n}x) ***")
+                            closing_in_progress[close_key] = "SL_SPREAD"
+                            success = close_spread(kite, trade, spot, "SL_SPREAD", dry_run,
+                                                   store=trade_store, strategy_label=strat,
+                                                   reverify_sl=sl_spread_val)
+                            if success == 'ABORT':
+                                closing_in_progress.pop(close_key, None)
+                                confirm['sl_spread'] = 0
+                                abort_until[close_key] = time.time() + ABORT_COOLDOWN_SEC
+                            else:
+                                closed = True
+                                if not success:
+                                    log(f"  {strat} #{tid} {stock}: Close failed — manual intervention needed.")
+                                    send_telegram(f"{strat} #{tid} {stock}: SL_SPREAD close FAILED. Manual intervention needed!")
+                    elif not closed and spread_val is not None and spread_val > sl_spread_val:
+                        confirm['sl_spread'] = 0
+
+                    # CHECK 3: SL_TRAIL — same guards as SL_SPREAD
+                    if not closed and not in_abort_cooldown and spread_settled and ts['active'] and spread_val is not None and spread_val <= ts['trail']:
+                        n = bump_confirm(confirm, 'sl_trail')
+                        if n < SL_CONFIRM_POLLS:
+                            log(f"  {strat} #{tid} {stock}: SL_TRAIL condition {spread_val:.2f} <= "
+                                f"{ts['trail']:.2f} (confirm {n}/{SL_CONFIRM_POLLS})")
+                        else:
+                            log(f"\n  {strat} #{tid} {stock} *** SL_TRAIL HIT: {spread_val:.2f} <= "
+                                f"{ts['trail']:.2f} (confirmed {n}x) ***")
+                            closing_in_progress[close_key] = "SL_TRAIL"
+                            success = close_spread(kite, trade, spot, "SL_TRAIL", dry_run,
+                                                   store=trade_store, strategy_label=strat,
+                                                   reverify_sl=ts['trail'])
+                            if success == 'ABORT':
+                                closing_in_progress.pop(close_key, None)
+                                confirm['sl_trail'] = 0
+                                abort_until[close_key] = time.time() + ABORT_COOLDOWN_SEC
+                            else:
+                                closed = True
+                                if not success:
+                                    log(f"  {strat} #{tid} {stock}: Close failed — manual intervention needed.")
+                                    send_telegram(f"{strat} #{tid} {stock}: SL_TRAIL close FAILED. Manual intervention needed!")
+                    elif not closed and spread_val is not None and (not ts['active'] or spread_val > ts['trail']):
+                        confirm['sl_trail'] = 0
+
+                    # CHECK 4: TP — spot-based (BCS: spot >= target rising;
+                    # BPS: spot <= target dropping). ABORT re-fires after the
+                    # cooldown since the spot condition persists.
+                    tp_hit = (spot >= target) if strat == 'BCS' else (spot <= target)
+                    if not closed and tp_hit and not in_abort_cooldown:
+                        op = '>=' if strat == 'BCS' else '<='
+                        log(f"\n  {strat} #{tid} {stock} *** TP HIT: {spot:.2f} {op} {target} ***")
                         closing_in_progress[close_key] = "TP"
                         success = close_spread(kite, trade, spot, "TP", dry_run,
-                                               store=trade_store, strategy_label='BCS')
-                        closed = True
-                        if not success:
-                            log(f"  BCS #{tid} {stock}: Close failed — manual intervention needed.")
-                            send_telegram(f"BCS #{tid} {stock}: TP close FAILED. Manual intervention needed!")
-
-                elif strat == 'BPS':
-                    # ── BPS SL_SPOT: spot >= sl_spot (bullish risk — stock rising is BAD) ──
-                    if spot >= sl_spot_val:
-                        log(f"\n  BPS #{tid} {stock} *** SL_SPOT HIT: {spot:.2f} >= {sl_spot_val} ***")
-                        closing_in_progress[close_key] = "SL_SPOT"
-                        success = close_spread(kite, trade, spot, "SL_SPOT", dry_run,
-                                               store=trade_store, strategy_label='BPS')
-                        closed = True
-                        if not success:
-                            log(f"  BPS #{tid} {stock}: Close failed — manual intervention needed.")
-                            send_telegram(f"BPS #{tid} {stock}: SL_SPOT close FAILED. Manual intervention needed!")
-
-                    # Cooldown gate
-                    if not closed and not settled:
-                        continue
-
-                    # CHECK 2: SL_SPREAD (spread shrinking = bad, same as BCS)
-                    if not closed and spread_val is not None and spread_val <= sl_spread_val:
-                        log(f"\n  BPS #{tid} {stock} *** SL_SPREAD HIT: {spread_val:.2f} <= {sl_spread_val:.2f} ***")
-                        closing_in_progress[close_key] = "SL_SPREAD"
-                        success = close_spread(kite, trade, spot, "SL_SPREAD", dry_run,
-                                               store=trade_store, strategy_label='BPS')
-                        closed = True
-                        if not success:
-                            log(f"  BPS #{tid} {stock}: Close failed — manual intervention needed.")
-                            send_telegram(f"BPS #{tid} {stock}: SL_SPREAD close FAILED. Manual intervention needed!")
-
-                    # CHECK 3: SL_TRAIL (spread shrinking = bad, same as BCS)
-                    ts = trail_state[close_key]
-                    if not closed and ts['active'] and spread_val is not None and spread_val <= ts['trail']:
-                        log(f"\n  BPS #{tid} {stock} *** SL_TRAIL HIT: {spread_val:.2f} <= {ts['trail']:.2f} ***")
-                        closing_in_progress[close_key] = "SL_TRAIL"
-                        success = close_spread(kite, trade, spot, "SL_TRAIL", dry_run,
-                                               store=trade_store, strategy_label='BPS')
-                        closed = True
-                        if not success:
-                            log(f"  BPS #{tid} {stock}: Close failed — manual intervention needed.")
-                            send_telegram(f"BPS #{tid} {stock}: SL_TRAIL close FAILED. Manual intervention needed!")
-
-                    # CHECK 4: TP — spot <= target (stock DROPPING to target is good for BPS)
-                    if not closed and spot <= target:
-                        log(f"\n  BPS #{tid} {stock} *** TP HIT: {spot:.2f} <= {target} ***")
-                        closing_in_progress[close_key] = "TP"
-                        success = close_spread(kite, trade, spot, "TP", dry_run,
-                                               store=trade_store, strategy_label='BPS')
-                        closed = True
-                        if not success:
-                            log(f"  BPS #{tid} {stock}: Close failed — manual intervention needed.")
-                            send_telegram(f"BPS #{tid} {stock}: TP close FAILED. Manual intervention needed!")
+                                               store=trade_store, strategy_label=strat)
+                        if success == 'ABORT':
+                            closing_in_progress.pop(close_key, None)
+                            abort_until[close_key] = time.time() + ABORT_COOLDOWN_SEC
+                            log(f"  {strat} #{tid} {stock}: TP close aborted — cooldown {ABORT_COOLDOWN_SEC}s.")
+                        else:
+                            closed = True
+                            if not success:
+                                log(f"  {strat} #{tid} {stock}: Close failed — manual intervention needed.")
+                                send_telegram(f"{strat} #{tid} {stock}: TP close FAILED. Manual intervention needed!")
 
                 else:
                     # ── FH SL_SPOT: spot >= sl_spot (upside/bullish risk) ──
@@ -1930,6 +2404,9 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
 
                 if closed:
                     trail_state.pop(close_key, None)
+                    confirm_state.pop(close_key, None)
+                    blind_state.pop(close_key, None)
+                    abort_until.pop(close_key, None)
 
             # ── Watchlist price alerts (after trade checks) ──────────
             if wl_active:
