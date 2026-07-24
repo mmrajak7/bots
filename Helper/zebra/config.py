@@ -161,6 +161,19 @@ def is_trend_aligned(direction: str, st_direction: str) -> bool:
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
 
+# ── Quote-reliability guards (2026-07-24 NHPC false DEBIT-SL incident) ──────
+# The DEBIT-SL is a VALUE trigger (structure mid <= 50% of entry debit); a
+# single garbage opening book once booked a phantom -50% exit. Zebra polls
+# every MONITOR_INTERVAL_SEC (~5 min), so require N consecutive RELIABLE
+# triggering reads before the alert fires. An unreliable read FREEZES the
+# counter (a flickering book must not indefinitely block a genuine exit); a
+# reliable non-trigger read resets it; a streak with a poll gap wider than
+# CONFIRM_STALE_SEC restarts from zero. Spot-based TP/SPOT-SL stay single-poll
+# (spot LTP is real trades). Layered ON TOP of the existing intrinsic-floor guard.
+DEBIT_SL_CONFIRM_POLLS = 2       # reliable triggering polls before DEBIT SL alert
+CONFIRM_STALE_SEC = 15 * 60      # confirm streak restarts if the poll gap exceeds this
+DEBIT_BLIND_CYCLES = 3           # consecutive unusable-quote cycles (~15 min) => one blind alert
+
 # ── Invariant checks ──────────────────────────────────────────────────────
 assert WATCH_GAP_MAX > TRIGGER_GAP_MAX, (
     f"WATCH_GAP_MAX ({WATCH_GAP_MAX}) must be > TRIGGER_GAP_MAX ({TRIGGER_GAP_MAX})")

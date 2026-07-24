@@ -119,6 +119,17 @@ def check_position(kite, position: Dict) -> Dict:
         bid = q['depth']['buy'][0]['price'] if q.get('depth', {}).get('buy') else 0
         ask = q['depth']['sell'][0]['price'] if q.get('depth', {}).get('sell') else 0
 
+        # Quote reliability check (display-only warning, no behavior change).
+        # Mirrors bcs/spread_monitor.py's leg_quote_reliable(): unreliable if
+        # one-sided, crossed, or width > max(Rs 0.30, 25% of mid). A garbage
+        # top-of-book here silently corrupts leg_pnl/close_value below —
+        # 2026-07-24 NHPC incident (Rs 7,297 loss) was exactly this pattern.
+        quote_mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0
+        quote_suspect = (
+            bid <= 0 or ask <= 0 or bid > ask
+            or (quote_mid > 0 and (ask - bid) > max(0.30, 0.25 * quote_mid))
+        )
+
         # Calculate leg P&L
         if order['transaction_type'] == 'BUY':
             leg_pnl = (bid - order['fill_price']) * order['quantity']
@@ -135,7 +146,8 @@ def check_position(kite, position: Dict) -> Dict:
             'entry': order['fill_price'],
             'bid': bid,
             'ask': ask,
-            'pnl': leg_pnl
+            'pnl': leg_pnl,
+            'quote_suspect': quote_suspect,
         })
 
     # Overall P&L
@@ -260,6 +272,8 @@ def print_position(result: Dict):
     for leg in result['legs']:
         side = 'L' if leg['side'] == 'BUY' else 'S'
         print(f"| {leg['leg']:<3}({side}) {leg['symbol']:<25} {leg['entry']:>8.2f} {leg['bid']:>8.2f} {leg['ask']:>8.2f} {leg['pnl']:>+10,.0f} |")
+        if leg.get('quote_suspect'):
+            print(f"|      WARNING: WIDE/SUSPECT QUOTE (one-sided/crossed/wide book) — P&L for this leg may be unreliable |")
     print(f"+{'-'*73}+")
 
     # P&L Summary

@@ -581,6 +581,21 @@ def check_filters(analysis: ButterflyAnalysis) -> FilterResult:
         elif leg and leg.spread > FILTERS['bid_ask_spread_max'] * 0.8:
             warnings.append(f"{leg_name} spread Rs{leg.spread:.2f} approaching limit")
 
+        # WIDE/SUSPECT QUOTE flag: the absolute Rs1.50 spread check above can
+        # pass a one-sided/crossed/thin book on a cheap option (e.g. Rs1.40
+        # width on a Rs2 mid = 70%). Mirrors bcs/spread_monitor.py's
+        # leg_quote_reliable() relative gate (post 2026-07-24 NHPC incident,
+        # Rs 7,297 loss from acting on an unformed book). Warning only —
+        # does not change pass/fail, just surfaces the risk before --execute.
+        if leg:
+            leg_mid = leg.mid_price if (leg.bid > 0 and leg.ask > 0) else 0
+            if (leg.bid <= 0 or leg.ask <= 0 or leg.bid > leg.ask
+                    or (leg_mid > 0 and leg.spread > max(0.30, 0.25 * leg_mid))):
+                warnings.append(
+                    f"{leg_name} WIDE/SUSPECT QUOTE (bid={leg.bid:.2f}, ask={leg.ask:.2f}) "
+                    f"— one-sided/crossed/wide book, pricing may be unreliable"
+                )
+
     # OI check for ATM
     if analysis.atm_leg and analysis.atm_leg.oi < FILTERS['oi_atm_min']:
         if analysis.atm_leg.oi < FILTERS['oi_atm_min'] * 0.5:

@@ -122,6 +122,12 @@ class MonitorSnapshot:
     straddle_value: float
     wing_value: float
     quotes: Dict[str, Quote] = field(default_factory=dict)
+    # reliable=False means at least one option leg's top-of-book failed the
+    # garbage-book test (unformed / one-sided / crossed / abnormally wide), so
+    # current_pnl is NOT trustworthy for value-based auto-exit triggers.
+    # Spot/VIX/expiry guards are unaffected. See utils/quote_reliability.py.
+    reliable: bool = True
+    unreliable_reason: str = ""
 
 
 # =============================================================================
@@ -356,6 +362,29 @@ class PositionMonitor:
                 position.margin_deployed
             )
 
+            # ---- Garbage-book reliability gate (2026-07-24 incident) ----
+            # current_pnl is a sum of short-leg ASKs and long-leg BIDs; if ANY
+            # leg's top-of-book is unreliable (unformed/one-sided/crossed/wide),
+            # the P&L is untrustworthy and value-based auto-exits must FREEZE.
+            # The snapshot is still returned so /status + P&L history keep
+            # working; the flag only gates money triggers in monitor_workflow.
+            from src.utils.quote_reliability import quote_reliable
+            reliable = True
+            unreliable_reason = ""
+            for leg in legs:
+                q = quotes.get(leg.leg_type)
+                ok, why = quote_reliable(q) if q else (False, "missing_quote")
+                if not ok:
+                    reliable = False
+                    unreliable_reason = "{0}: {1}".format(leg.leg_type, why)
+                    break
+            if not reliable:
+                logger.warning(
+                    "Quotes UNRELIABLE ({0}) - P&L ₹{1:,.0f} flagged; value-based "
+                    "auto-exits will FREEZE this poll (spot/VIX/expiry unaffected)".format(
+                        unreliable_reason, current_pnl)
+                )
+
             # Update state
             self.state.last_pnl = current_pnl
             self.state.last_pnl_pct = pnl_pct
@@ -369,7 +398,9 @@ class PositionMonitor:
                 pnl_percentage=pnl_pct,
                 straddle_value=current_straddle,
                 wing_value=current_wing,
-                quotes=quotes
+                quotes=quotes,
+                reliable=reliable,
+                unreliable_reason=unreliable_reason
             )
 
         except Exception as e:
@@ -466,9 +497,13 @@ class PositionMonitor:
             logger.error("Position missing required attributes (atm_strike, wing_distance, max_profit, max_loss)")
             return None
 
+        # Freeze value-based auto-exit if the option books are unreliable
+        # (garbage-book guard). Spot/VIX checks below stay armed.
+        pnl_reliable = getattr(snapshot, 'reliable', True)
+
         # Check profit target (50%)
         profit_target_pct = self.trading_config.get('exit', {}).get('profit_target_pct', 50)
-        if snapshot.pnl_percentage >= profit_target_pct:
+        if pnl_reliable and snapshot.pnl_percentage >= profit_target_pct:
             logger.info(f"Profit target reached: {snapshot.pnl_percentage:.1f}%")
             return ExitReason.PROFIT_TARGET
 
@@ -486,7 +521,7 @@ class PositionMonitor:
 
         # Check stop loss (50% of max loss)
         stop_loss_pct = self.trading_config.get('exit', {}).get('stop_loss_pct', 50)
-        loss_pct = abs(snapshot.pnl_percentage) if snapshot.pnl_percentage < 0 else 0
+        loss_pct = abs(snapshot.pnl_percentage) if (pnl_reliable and snapshot.pnl_percentage < 0) else 0
 
         if loss_pct >= stop_loss_pct:
             # At stop loss level - need Claude advisory

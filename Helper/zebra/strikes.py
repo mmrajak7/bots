@@ -29,6 +29,63 @@ from . import config as cfg
 
 logger = logging.getLogger(__name__)
 
+# ── Quote-reliability guard (2026-07-24 NHPC false-SL incident) ────────────
+# Reuse the BCS monitor's leg reliability rule so both systems judge a garbage
+# opening book identically. The import pulls in the bcs package (IPv4 socket
+# monkeypatch is idempotent; nothing else runs at its module top-level), and
+# nothing in bcs imports zebra, so there is no circular-import risk. A defensive
+# fallback keeps zebra usable even if the import ever breaks — the fallback
+# replicates the width / crossed / one-sided core with the same thresholds.
+try:
+    from bcs.spread_monitor import (
+        leg_quote_reliable as _bcs_leg_reliable,
+        LTP_FRESH_SEC as _LTP_FRESH_SEC,
+    )
+except Exception as _e:  # pragma: no cover - import safety fallback
+    logger.warning("Could not import bcs reliability helpers (%s); using local "
+                   "fallback", _e)
+    _bcs_leg_reliable = None
+    _LTP_FRESH_SEC = 30 * 60
+
+
+def _ltp_fresh(ltt) -> bool:
+    """True if the option printed a trade within _LTP_FRESH_SEC (today only).
+
+    Mirrors bcs.get_option_depth: a stale LTP must never veto a legitimately
+    repriced book, so freshness gates the LTP-divergence check inside
+    leg_quote_reliable.
+    """
+    if ltt is None:
+        return False
+    try:
+        ltt_dt = ltt if hasattr(ltt, 'date') else \
+            datetime.strptime(str(ltt)[:19], '%Y-%m-%d %H:%M:%S')
+        if ltt_dt.date() != datetime.now().date():
+            return False
+        return (datetime.now() - ltt_dt).total_seconds() <= _LTP_FRESH_SEC
+    except Exception:
+        return False
+
+
+def _leg_reliable(q: dict) -> tuple:
+    """Judge a leg's top-of-book for VALUATION. Returns (reliable, reason).
+
+    Delegates to bcs.leg_quote_reliable (same width/crossed/one-sided/LTP-veto
+    rule as the BCS monitor). Fallback covers the width/crossed/one-sided core.
+    """
+    if _bcs_leg_reliable is not None:
+        return _bcs_leg_reliable(q)
+    bid, ask = q.get('bid', 0), q.get('ask', 0)
+    if bid <= 0 or ask <= 0 or q.get('bid_qty', 0) <= 0 or q.get('ask_qty', 0) <= 0:
+        return False, 'no_two_way_book'
+    if bid > ask:
+        return False, f'crossed_book bid {bid} > ask {ask}'
+    width = ask - bid
+    mid = (bid + ask) / 2.0
+    if width > max(0.30, 0.25 * mid) + 1e-9:
+        return False, f'wide_book width {width:.2f} vs mid {mid:.2f}'
+    return True, ''
+
 
 # ── Options CSV loader ────────────────────────────────────────────────────
 
@@ -100,7 +157,14 @@ def _list_strikes(stock: str, expiry: str, opt_type: str) -> list:
 
 
 def _quote_option(kite, tradingsymbol: str) -> dict:
-    """Get bid/ask/OI for an NFO option. Returns {bid, ask, mid, oi, error}."""
+    """Get bid/ask/OI for an NFO option.
+
+    Returns {bid, ask, mid, oi, last, bid_qty, ask_qty, ltp, ltp_fresh,
+    reliable, unreliable_reason, error?}. `reliable` is False when the
+    top-of-book is unusable for valuation (one-sided, crossed, or wider than
+    max(0.30, 25% of mid)) — a garbage opening book must never feed a DEBIT-SL
+    trigger or an ENTER click-copy price (2026-07-24 NHPC incident).
+    """
     key = f"NFO:{tradingsymbol}"
     try:
         q = kite.quote([key])[key]
@@ -109,12 +173,25 @@ def _quote_option(kite, tradingsymbol: str) -> dict:
         sell = depth.get('sell', [])
         bid = buy[0]['price'] if buy else 0.0
         ask = sell[0]['price'] if sell else 0.0
+        bid_qty = buy[0].get('quantity', 0) if buy else 0
+        ask_qty = sell[0].get('quantity', 0) if sell else 0
         oi = q.get('oi', 0)
-        mid = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else q.get('last_price', 0)
-        return {'bid': bid, 'ask': ask, 'mid': mid, 'oi': oi,
-                'last': q.get('last_price', 0)}
+        last = q.get('last_price', 0)
+        mid = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else last
+        out = {
+            'bid': bid, 'ask': ask, 'mid': mid, 'oi': oi, 'last': last,
+            'bid_qty': bid_qty, 'ask_qty': ask_qty,
+            'ltp': last, 'ltp_fresh': _ltp_fresh(q.get('last_trade_time')),
+        }
+        ok, why = _leg_reliable(out)
+        out['reliable'] = ok
+        out['unreliable_reason'] = why
+        return out
     except Exception as e:
-        return {'bid': 0, 'ask': 0, 'mid': 0, 'oi': 0, 'error': str(e)}
+        return {'bid': 0, 'ask': 0, 'mid': 0, 'oi': 0, 'last': 0,
+                'bid_qty': 0, 'ask_qty': 0, 'ltp': 0, 'ltp_fresh': False,
+                'reliable': False, 'unreliable_reason': f'quote_error: {e}',
+                'error': str(e)}
 
 
 # ── Zebra metrics ─────────────────────────────────────────────────────────
@@ -220,6 +297,12 @@ def analyze(kite, stock: str, direction: str, spot: float,
     k_s_q = _quote_option(kite, k_s_meta['tradingsymbol'])
     if k_s_q.get('error') or k_s_q['mid'] <= 0:
         return {'error': f"Bad quote for short leg {k_s_meta['tradingsymbol']}: {k_s_q.get('error')}"}
+    # ATM book is shared by every candidate — if it's garbage there is no
+    # tradeable pair. Skip (no alert) and let the next 5-min cycle retry once
+    # the book forms, rather than alert click-copy prices off an unformed book.
+    if not k_s_q.get('reliable', True):
+        return {'error': f"Unreliable short-leg book {k_s_meta['tradingsymbol']}: "
+                         f"{k_s_q.get('unreliable_reason')}"}
 
     short_int = _intrinsic(direction, spot, k_s)
     short_ext = _extrinsic(direction, spot, k_s, k_s_q['mid'])
@@ -235,6 +318,11 @@ def analyze(kite, stock: str, direction: str, spot: float,
             continue
         long_q = _quote_option(kite, leg_meta['tradingsymbol'])
         if long_q.get('error') or long_q['mid'] <= 0:
+            continue
+        # Never price a candidate off a garbage ITM book (the false-SL leg).
+        if not long_q.get('reliable', True):
+            logger.info("Skip K_L=%s for %s: unreliable book (%s)",
+                        k_l, stock, long_q.get('unreliable_reason'))
             continue
 
         long_int = _intrinsic(direction, spot, k_l)
@@ -365,6 +453,9 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     if tgt_q.get('error') or tgt_q['mid'] <= 0:
         return {'error': f"bad quote for target leg "
                          f"{tgt_meta['tradingsymbol']}: {tgt_q.get('error')}"}
+    if not tgt_q.get('reliable', True):
+        return {'error': f"unreliable target-leg book "
+                         f"{tgt_meta['tradingsymbol']}: {tgt_q.get('unreliable_reason')}"}
 
     debit = round(atm_quote['mid'] - tgt_q['mid'], 2)
     if debit <= 0:

@@ -61,10 +61,26 @@ short_quote = quotes[SHORT_SYMBOL]
 long_ask = long_quote['depth']['sell'][0]['price'] if long_quote['depth']['sell'] else 0
 short_bid = short_quote['depth']['buy'][0]['price'] if short_quote['depth']['buy'] else 0
 
+# Other side of each book, needed only for the width/reliability warning below.
+long_bid = long_quote['depth']['buy'][0]['price'] if long_quote['depth']['buy'] else 0
+short_ask = short_quote['depth']['sell'][0]['price'] if short_quote['depth']['sell'] else 0
+
 print(f'{LONG_SYMBOL}:')
 print(f'  Ask: {long_ask:.2f}')
 print(f'{SHORT_SYMBOL}:')
 print(f'  Bid: {short_bid:.2f}')
+print()
+
+# WIDE/SUSPECT QUOTE check (display-only, no behavior change). Mirrors
+# bcs/spread_monitor.py's leg_quote_reliable(): unreliable if one-sided,
+# crossed, or width > max(Rs 0.30, 25% of mid). Post 2026-07-24 NHPC
+# incident (Rs 7,297 loss) — a single garbage top-of-book quote must never
+# be trusted silently.
+for _name, _bid, _ask in [(LONG_SYMBOL, long_bid, long_ask), (SHORT_SYMBOL, short_bid, short_ask)]:
+    _mid = (_bid + _ask) / 2 if (_bid > 0 and _ask > 0) else 0
+    if _bid <= 0 or _ask <= 0 or _bid > _ask or (_mid > 0 and (_ask - _bid) > max(0.30, 0.25 * _mid)):
+        print(f'  WARNING: WIDE/SUSPECT QUOTE on {_name} (bid={_bid:.2f}, ask={_ask:.2f}) '
+              f'— one-sided/crossed/wide book, pricing below may be unreliable')
 print()
 
 net_debit = long_ask - short_bid

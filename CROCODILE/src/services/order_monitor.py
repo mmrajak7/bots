@@ -612,8 +612,12 @@ class OrderMonitor:
                 # Get current LTP
                 try:
                     ltp = self._get_ltp(symbol)
-                    if ltp is None:
-                        logger.warning(f"Could not get LTP for {symbol}")
+                    # A bad/zero tick must not silently look like a 100% price
+                    # drift and trigger an unwarranted LIMIT->MARKET conversion
+                    # below (ltp<=0 would otherwise make price_drift compute
+                    # as ~1.0, i.e. maximum drift, on garbage data).
+                    if ltp is None or ltp <= 0:
+                        logger.warning(f"Could not get valid LTP for {symbol} (got {ltp})")
                         continue
                 except Exception as e:
                     logger.error(f"Error getting LTP for {symbol}: {e}")

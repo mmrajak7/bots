@@ -454,6 +454,76 @@ class ZebraStore:
             self._upload_to_drive()
         return True
 
+    # ── Quote-reliability confirm / blind counters ─────────────────────────
+    # Advisory per-trade state for the DEBIT-SL value trigger. Persisted to the
+    # LOCAL file only (no Drive upload, no version bump) so it survives cron
+    # restarts on the server without churning Drive every 5-min poll. On a
+    # version-tie merge the local copy wins, so these fields are never lost.
+    def bump_confirm(self, trade_id: int, kind: str, persist: bool = True) -> int:
+        """Increment a trigger-confirmation counter, restarting a stale streak.
+
+        A streak whose last hit is older than cfg.CONFIRM_STALE_SEC restarts
+        from zero — confirming polls must be reasonably contiguous, but
+        unreliable polls in between (which simply don't call this) may not
+        indefinitely block a genuine exit. Mirrors bcs.bump_confirm.
+        """
+        t = self.find(trade_id)
+        if not t:
+            return 0
+        key = f"{kind}_confirm"
+        tkey = f"{kind}_confirm_t"
+        now = time.time()
+        if now - float(t.get(tkey, 0.0)) > cfg.CONFIRM_STALE_SEC:
+            t[key] = 0
+        t[key] = int(t.get(key, 0)) + 1
+        t[tkey] = now
+        if persist:
+            self._save_local()
+        return t[key]
+
+    def reset_confirm(self, trade_id: int, kind: str, persist: bool = True) -> None:
+        """Clear a confirmation counter (a reliable non-trigger poll)."""
+        t = self.find(trade_id)
+        if not t:
+            return
+        key = f"{kind}_confirm"
+        if t.get(key):
+            t[key] = 0
+            t[f"{kind}_confirm_t"] = time.time()
+            if persist:
+                self._save_local()
+
+    def bump_blind(self, trade_id: int, persist: bool = True) -> int:
+        """Increment the consecutive unusable-quote cycle counter."""
+        t = self.find(trade_id)
+        if not t:
+            return 0
+        t['debit_blind_cycles'] = int(t.get('debit_blind_cycles', 0)) + 1
+        if persist:
+            self._save_local()
+        return t['debit_blind_cycles']
+
+    def clear_blind(self, trade_id: int, persist: bool = True) -> None:
+        """Reset blindness state on the first usable quote (re-arms the alert)."""
+        t = self.find(trade_id)
+        if not t:
+            return
+        if t.get('debit_blind_cycles') or t.get('debit_blind_alerted'):
+            t['debit_blind_cycles'] = 0
+            t['debit_blind_alerted'] = False
+            if persist:
+                self._save_local()
+
+    def mark_blind_alerted(self, trade_id: int, persist: bool = True) -> bool:
+        """Set the blind-alert flag once per blind spell. True if newly set."""
+        t = self.find(trade_id)
+        if not t or t.get('debit_blind_alerted'):
+            return False
+        t['debit_blind_alerted'] = True
+        if persist:
+            self._save_local()
+        return True
+
     # ── Listing ───────────────────────────────────────────────────────────
     def list_trades(self, status_filter: Optional[str] = None):
         trades = self._trades

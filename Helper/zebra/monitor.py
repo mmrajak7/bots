@@ -250,6 +250,20 @@ def _format_debit_sl_alert(trade: dict, mid: float) -> str:
     )
 
 
+def _format_blind_alert(trade: dict, reason: Optional[str]) -> str:
+    """One-shot warning that DEBIT-SL valuation has been blind (unreliable /
+    missing book) long enough to matter. Spot TP/SL stay armed — this is pure
+    observability, not a trading action."""
+    mins = cfg.DEBIT_BLIND_CYCLES * cfg.MONITOR_INTERVAL_SEC // 60
+    return (
+        f"⚠ <b>{_struct_label(trade)} DEBIT-BLIND</b>  "
+        f"<code>{trade['stock']}</code> ({trade['direction']})\n"
+        f"Debit-SL valuation blind ~{mins} min: option book unreliable "
+        f"({reason or 'no quote'}).\n"
+        f"Spot TP/SL still armed. Check the book manually before acting."
+    )
+
+
 def _format_time_alert(trade: dict, days_left: int,
                        mid: Optional[float] = None) -> str:
     paper = _paper_close_line(trade, mid)
@@ -494,35 +508,57 @@ def _intrinsic_floor(trade: dict, spot: float) -> Optional[float]:
         return None
 
 
-def _structure_value(kite, trade: dict, spot: Optional[float] = None
-                     ) -> Optional[float]:
-    """Current structure value per share: mult*long_mid - short_mid
-    (mult = 2 zebra / 1 BCS). Returns None if any leg has a bad quote.
+def _structure_quote(kite, trade: dict, spot: Optional[float] = None) -> dict:
+    """Fetch both legs and compute the structure value + per-leg reliability.
 
-    When `spot` is given, the value is clamped to the intrinsic floor: a mid
-    below the floor means the quote violates no-arbitrage (junk book on the
-    ITM leg) and the floor is the conservative real closeable value. This is
-    the false-debit-SL guard — without it a garbage quote can book a -50%
-    exit on a winning trade (ABB #242, July 2026).
+    Returns {'mid': float|None, 'reliable': bool, 'reason': str|None}.
+
+    `mid` is the per-share structure value (mult*long_mid - short_mid,
+    mult = 2 zebra / 1 BCS), clamped to the intrinsic floor when `spot` is
+    given — the ABB #242 no-arbitrage guard against a junk ITM quote booking a
+    phantom -50% exit. `mid` is None only when a leg has no usable quote at all.
+
+    `reliable` is False when EITHER leg's top-of-book fails the width / crossed
+    / one-sided test (2026-07-24 NHPC incident) — the caller must FREEZE any
+    value-based DEBIT-SL confirmation on an unreliable read, never fire on it.
+    Reliability is orthogonal to the floor clamp: the floor bounds the mid,
+    reliability governs whether the mid may drive an exit decision this cycle.
     """
     try:
         long_q = strikes_mod._quote_option(kite, trade['long_symbol'])
         short_q = strikes_mod._quote_option(kite, trade['short_symbol'])
-        if long_q['mid'] <= 0 or short_q['mid'] <= 0:
-            return None
-        mid = round(_long_multiplier(trade) * long_q['mid'] - short_q['mid'], 2)
-        if spot is not None and spot > 0:
-            floor = _intrinsic_floor(trade, spot)
-            if floor is not None and mid < floor:
-                logger.warning(
-                    "QUOTE GUARD #%d %s: structure mid %.2f < intrinsic floor "
-                    "%.2f at spot %.2f — clamping to floor (bad ITM quote)",
-                    trade['id'], trade['stock'], mid, floor, spot)
-                return floor
-        return mid
     except Exception as e:
         logger.debug("Quote fail for #%d: %s", trade['id'], e)
-        return None
+        return {'mid': None, 'reliable': False, 'reason': 'quote_error'}
+
+    if long_q['mid'] <= 0 or short_q['mid'] <= 0:
+        return {'mid': None, 'reliable': False, 'reason': 'no_quote'}
+
+    reason = None
+    if not long_q.get('reliable', True):
+        reason = f"long {long_q.get('unreliable_reason')}"
+    elif not short_q.get('reliable', True):
+        reason = f"short {short_q.get('unreliable_reason')}"
+    reliable = reason is None
+
+    mid = round(_long_multiplier(trade) * long_q['mid'] - short_q['mid'], 2)
+    if spot is not None and spot > 0:
+        floor = _intrinsic_floor(trade, spot)
+        if floor is not None and mid < floor:
+            logger.warning(
+                "QUOTE GUARD #%d %s: structure mid %.2f < intrinsic floor "
+                "%.2f at spot %.2f — clamping to floor (bad ITM quote)",
+                trade['id'], trade['stock'], mid, floor, spot)
+            mid = floor
+    return {'mid': mid, 'reliable': reliable, 'reason': reason}
+
+
+def _structure_value(kite, trade: dict, spot: Optional[float] = None
+                     ) -> Optional[float]:
+    """Structure value per share (floor-clamped). Thin wrapper over
+    _structure_quote for callers that only need the scalar mid (report.py,
+    manual close). Returns None if any leg has no usable quote."""
+    return _structure_quote(kite, trade, spot)['mid']
 
 
 # Backward-compat alias (report.py / manual close path import this name).
@@ -566,6 +602,24 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
         return None
 
 
+def _track_debit_blindness(store: ZebraStore, trade: dict, usable: bool,
+                           reason: Optional[str], dry_run: bool = False) -> None:
+    """Fire ONE rate-limited Telegram when the DEBIT-SL valuation has been blind
+    (unreliable / missing book) for DEBIT_BLIND_CYCLES consecutive cycles while
+    a trade is entered. Re-arms once a usable quote returns. SL_SPOT/TP are
+    unaffected — they run off real spot trades."""
+    tid = trade['id']
+    if usable:
+        store.clear_blind(tid)
+        return
+    n = store.bump_blind(tid)
+    if n >= cfg.DEBIT_BLIND_CYCLES and store.mark_blind_alerted(tid):
+        if _alerts_enabled(trade):
+            _send_telegram(_format_blind_alert(trade, reason), dry_run=dry_run)
+        logger.warning("DEBIT-BLIND alert #%d %s: %d cycles unreliable (%s)",
+                       tid, trade['stock'], n, reason)
+
+
 def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     """Monitor entered trades for TP/SL/time exits.
 
@@ -604,7 +658,13 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # forever) or booking a fabricated max-loss. LIVE mode still alerts
         # (mid rendered as NA) since there it's an alert, not an auto-close.
         # Passing spot arms the intrinsic-floor clamp (false-debit-SL guard).
-        mid = _structure_value(kite, trade, spot)
+        sq = _structure_quote(kite, trade, spot)
+        mid = sq['mid']
+        # DEBIT-SL valuation is usable only with a mid AND a reliable book —
+        # a wide/crossed/one-sided book (2026-07-24) freezes the value trigger.
+        debit_usable = mid is not None and sq['reliable']
+        _track_debit_blindness(store, trade, debit_usable, sq['reason'],
+                               dry_run=dry_run)
         if cfg.PAPER_MODE and mid is None:
             continue
 
@@ -636,15 +696,30 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 continue
 
         # ── DEBIT SL ────────────────────────────────────────────────────
-        if mid is not None and mid <= trade['debit_sl_value']:
-            if store.set_alert_flag(tid, 'debit_sl'):
-                if _alerts_enabled(trade):
-                    _send_telegram(_format_debit_sl_alert(trade, mid), dry_run=dry_run)
-                logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f",
-                            tid, stock, mid, trade['debit_sl_value'])
-                _paper_auto_close(store, trade, mid, 'debit_sl', spot)
-                if trade.get('status') == 'exited':
-                    continue
+        # Value trigger: needs DEBIT_SL_CONFIRM_POLLS consecutive RELIABLE
+        # triggering reads. An unreliable / no-quote read FREEZES the counter
+        # (never resets it — a flickering book must not block a genuine exit);
+        # a reliable non-trigger read resets it. This is the direct fix for the
+        # 2026-07-24 single-poll phantom SL.
+        if not debit_usable:
+            pass  # freeze confirm counter; blindness handled above
+        elif mid <= trade['debit_sl_value']:
+            n = store.bump_confirm(tid, 'debit_sl')
+            if n >= cfg.DEBIT_SL_CONFIRM_POLLS:
+                if store.set_alert_flag(tid, 'debit_sl'):
+                    if _alerts_enabled(trade):
+                        _send_telegram(_format_debit_sl_alert(trade, mid), dry_run=dry_run)
+                    logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f (confirmed x%d)",
+                                tid, stock, mid, trade['debit_sl_value'], n)
+                    _paper_auto_close(store, trade, mid, 'debit_sl', spot)
+                    if trade.get('status') == 'exited':
+                        continue
+            else:
+                logger.info("DEBIT SL pending #%d %s mid=%.2f<=sl=%.2f confirm %d/%d",
+                            tid, stock, mid, trade['debit_sl_value'],
+                            n, cfg.DEBIT_SL_CONFIRM_POLLS)
+        else:
+            store.reset_confirm(tid, 'debit_sl')
 
         # ── TIME SL ─────────────────────────────────────────────────────
         try:

@@ -20,6 +20,12 @@ from loguru import logger
 
 from src.api.kite_client import SNAILKiteClient, Quote, OrderExecutionError
 from src.utils.calculations import NIFTY_LOT_SIZE
+from src.utils.quote_reliability import (
+    quote_reliable,
+    price_anchor,
+    cap_buy_price,
+    floor_sell_price,
+)
 
 
 class SlippageTierConfig(TypedDict):
@@ -1180,12 +1186,30 @@ def execute_iron_fly_exit_safe(
         else:
             base_price = quotes[leg_name].bid
 
+        # Garbage-book guard (2026-07-24): this is a MUST-EXIT, so we never
+        # BLOCK — but if the leg's top-of-book is unreliable we BOUND the LIMIT
+        # price against an EXTERNAL anchor (fresh LTP / prev close) so we cannot
+        # lift a phantom ask / hit a phantom bid. The MARKET fallback below
+        # remains the uncapped last resort.
+        leg_ok, leg_why = quote_reliable(quotes[leg_name])
+        leg_anchor = 0.0 if leg_ok else price_anchor(quotes[leg_name])
+        if not leg_ok:
+            logger.warning(
+                "  {0}: UNRELIABLE book ({1}) - bounding exit LIMIT vs anchor "
+                "{2:.2f} (MARKET fallback stays uncapped)".format(leg_name, leg_why, leg_anchor)
+            )
+
         # Try with increasing slippage
         for retry_idx, current_slippage in enumerate(slippage_progression[:max_retries]):
             try:
                 logger.info(f"Closing {leg_name} ({txn_type}), attempt {retry_idx + 1}, slippage={current_slippage}...")
 
                 price = apply_slippage(base_price, txn_type, current_slippage)
+                if not leg_ok and leg_anchor > 0:
+                    # Anchor never validates a price against itself; it caps buys
+                    # and floors sells at a loose multiple of the external anchor.
+                    capped = cap_buy_price(price, leg_anchor) if txn_type == 'BUY' else floor_sell_price(price, leg_anchor)
+                    price = round_to_tick(max(capped, TICK_SIZE))
 
                 order = execute_order(
                     kite,

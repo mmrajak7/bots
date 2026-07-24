@@ -713,6 +713,14 @@ class ExitManager:
             # even if the caller forgets to call reset_trailing_state()
             reset_trailing_state(position.id)
 
+            # Clear garbage-book confirmation counters for this position so a
+            # stale streak can't influence any future position reusing the id.
+            try:
+                from src.utils.quote_reliability import confirm_reset_position
+                confirm_reset_position(position.id)
+            except Exception as e:
+                logger.debug(f"Confirm-counter cleanup skipped (non-fatal): {e}")
+
             # Cooldown already set early (before exit orders placed)
             # No need to set again here - early set prevents re-entry race
 

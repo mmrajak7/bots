@@ -45,12 +45,21 @@ from src.api.kite_auth import KiteAuthenticator
 
 @dataclass
 class Quote:
-    """Standardized quote structure with bid-ask data."""
+    """Standardized quote structure with bid-ask data.
+
+    bid_qty/ask_qty/last_trade_time/prev_close feed the quote-reliability guards
+    (src/utils/quote_reliability.py) added after the 2026-07-24 garbage-book
+    incident. They default to 0/None so existing callers are unaffected.
+    """
     bid: float
     ask: float
     ltp: float
     oi: int = 0
     volume: int = 0
+    bid_qty: int = 0
+    ask_qty: int = 0
+    last_trade_time: Optional[Any] = None
+    prev_close: float = 0.0
 
     @property
     def spread(self) -> float:
@@ -232,13 +241,21 @@ class SNAILKiteClient:
             depth = data.get('depth', {})
             buy_depth = depth.get('buy', [{}])
             sell_depth = depth.get('sell', [{}])
+            best_buy = buy_depth[0] if buy_depth else {}
+            best_sell = sell_depth[0] if sell_depth else {}
 
             result[inst] = Quote(
-                bid=buy_depth[0].get('price', 0) if buy_depth else 0,
-                ask=sell_depth[0].get('price', 0) if sell_depth else 0,
+                bid=best_buy.get('price', 0),
+                ask=best_sell.get('price', 0),
                 ltp=data.get('last_price', 0),
                 oi=data.get('oi', 0),
-                volume=data.get('volume', 0)
+                volume=data.get('volume', 0),
+                # Depth quantities + trade recency + prev close feed the
+                # quote-reliability guards (garbage-book protection).
+                bid_qty=best_buy.get('quantity', 0),
+                ask_qty=best_sell.get('quantity', 0),
+                last_trade_time=data.get('last_trade_time'),
+                prev_close=(data.get('ohlc') or {}).get('close', 0)
             )
 
         return result

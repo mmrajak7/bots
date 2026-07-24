@@ -1058,6 +1058,46 @@ _Fetching P&L data..._"""
     # MAIN LOOP
     # =========================================================================
 
+    def _confirm_trigger(
+        self,
+        position_id: int,
+        key: str,
+        condition_met: bool,
+        reliable: bool
+    ) -> bool:
+        """Consecutive-poll confirmation gate for a value-based auto-exit.
+
+        Garbage-book guard (2026-07-24). Returns True only after the trigger
+        condition has held on N consecutive RELIABLE polls (N from
+        exit.reliability_confirm_polls, default 2 for the ~10-min cron cadence).
+
+        Semantics:
+        - unreliable poll  -> FREEZE (counter untouched, never fires)
+        - reliable + met    -> bump; fire (and clear) once count >= N
+        - reliable + unmet  -> reset counter
+        """
+        from src.utils.quote_reliability import (
+            confirm_bump, confirm_reset, DEFAULT_CONFIRM_POLLS
+        )
+        polls = self.trading_config.get('exit', {}).get(
+            'reliability_confirm_polls', DEFAULT_CONFIRM_POLLS
+        )
+        ck = "{0}:{1}".format(position_id, key)
+        if not reliable:
+            return False  # freeze
+        if not condition_met:
+            confirm_reset(ck)
+            return False
+        n = confirm_bump(ck)
+        if n >= polls:
+            confirm_reset(ck)
+            return True
+        logger.warning(
+            "{0} condition met on reliable poll {1}/{2} - awaiting confirmation "
+            "before auto-exit (garbage-book guard)".format(key, n, polls)
+        )
+        return False
+
     def _single_iteration(self) -> None:
         """Execute single monitoring iteration."""
         self._stats.iterations += 1
@@ -1158,6 +1198,19 @@ _Fetching P&L data..._"""
 
                 logger.info(f"Monitor: P&L snapshot saved: ₹{snapshot.current_pnl:,.0f} ({current_pnl_pct:+.2f}% ROM)")
 
+                # Garbage-book gate (2026-07-24): when any option leg's book is
+                # unreliable, current_pnl is untrustworthy. VALUE-based triggers
+                # (hard-cap TP, trailing, fixed TP, stop loss) FREEZE this poll;
+                # spot/VIX/wing/friday/expiry guards below stay armed because
+                # they do not depend on the option book.
+                pnl_reliable = getattr(snapshot, 'reliable', True)
+                if not pnl_reliable:
+                    logger.warning(
+                        "Monitor: quotes UNRELIABLE ({0}) - freezing value-based "
+                        "TP/SL/trailing triggers this poll".format(
+                            getattr(snapshot, 'unreliable_reason', ''))
+                    )
+
                 # =============================================================
                 # EXIT CHECKS — Each block is independently protected.
                 # A failure in one check must NEVER skip safety-critical
@@ -1175,7 +1228,8 @@ _Fetching P&L data..._"""
                         logger.debug(f"Hard cap target: ₹{profit_target_per_lot:,.0f}/lot × {num_lots} lots = ₹{profit_target_amount:,.0f}")
                     else:
                         profit_target_amount = 0
-                    if profit_target_amount > 0 and snapshot.current_pnl >= profit_target_amount:
+                    _hardcap_hit = profit_target_amount > 0 and snapshot.current_pnl >= profit_target_amount
+                    if self._confirm_trigger(position.id, 'tp_hardcap', _hardcap_hit, pnl_reliable):
                         logger.info(
                             f"HARD CAP TP HIT! P&L: ₹{snapshot.current_pnl:,.0f} >= ₹{profit_target_amount:,.0f} ({num_lots} lots × ₹{profit_target_per_lot:,.0f})"
                         )
@@ -1252,7 +1306,10 @@ _Fetching P&L data..._"""
                                 logger.warning(f"Trailing active but peak is None - initializing to {current_pnl_pct:.2f}%")
                                 current_peak_pct = current_pnl_pct
 
-                            if current_pnl_pct > 0 and current_pnl_pct > current_peak_pct:
+                            # Freeze peak update on unreliable books: a garbage
+                            # high P&L would ratchet the floor up and cause a
+                            # false trailing stop when P&L returns to reality.
+                            if pnl_reliable and current_pnl_pct > 0 and current_pnl_pct > current_peak_pct:
                                 new_floor_pct, new_breakeven_locked = update_trailing_peak(
                                     position_id=position.id,
                                     new_peak_pct=current_pnl_pct,
@@ -1284,7 +1341,13 @@ _Fetching P&L data..._"""
                             if current_floor_pct is None:
                                 logger.warning("Trailing active but floor is None - skipping exit check")
                             elif round(current_pnl_pct, 2) <= round(current_floor_pct, 2):
-                                if is_exit_in_progress(position.id):
+                                if not pnl_reliable:
+                                    # Garbage-book guard: a bad low P&L must not
+                                    # trip the trailing stop. Freeze this poll.
+                                    logger.warning(
+                                        "Trailing stop condition met but quotes UNRELIABLE - freezing (no exit)"
+                                    )
+                                elif is_exit_in_progress(position.id):
                                     logger.debug(
                                         "Trailing stop condition met but exit already in progress - skipping"
                                     )
@@ -1316,8 +1379,9 @@ _Fetching P&L data..._"""
 
                         elif position_age_minutes >= min_holding_minutes:
                             # ---- ACTIVATION CHECK (age-gated) ----
-                            # Only activate trailing for mature positions
-                            if current_pnl_pct > 0 and current_pnl_pct >= activation_pct:
+                            # Only activate trailing for mature positions, and
+                            # never off an unreliable book (garbage-book guard).
+                            if pnl_reliable and current_pnl_pct > 0 and current_pnl_pct >= activation_pct:
                                 floor_pct = activate_trailing(
                                     position_id=position.id,
                                     current_pnl_pct=current_pnl_pct,
@@ -1360,9 +1424,12 @@ _Fetching P&L data..._"""
 
                     use_fixed_tp = not trailing_enabled or not (trailing_state_cached or {}).get('trailing_active', False)
 
-                    if use_fixed_tp and current_pnl_pct >= profit_target_pct:
-                        logger.info(f"PROFIT TARGET HIT! P&L: {current_pnl_pct:.2f}% >= {profit_target_pct}% target")
-                        if auto_exit_on_tp:
+                    _fixed_tp_hit = use_fixed_tp and current_pnl_pct >= profit_target_pct
+                    if _fixed_tp_hit and auto_exit_on_tp:
+                        # AUTO-EXIT path: needs consecutive-poll confirmation on
+                        # reliable books (garbage-book guard); freezes otherwise.
+                        if self._confirm_trigger(position.id, 'tp_fixed', True, pnl_reliable):
+                            logger.info(f"PROFIT TARGET HIT! P&L: {current_pnl_pct:.2f}% >= {profit_target_pct}% target")
                             logger.info("Auto-exit on TP enabled - executing exit...")
                             result = self.exit_manager.execute_exit(
                                 reason=ExitReason.PROFIT_TARGET,
@@ -1373,14 +1440,16 @@ _Fetching P&L data..._"""
                                 return
                             else:
                                 logger.error(f"Profit target exit failed: {result.error}")
-                        else:
-                            logger.info("Auto-exit on TP disabled - sending advisory alert")
-                            self.telegram.send(
-                                f"🎯 *Profit Target Reached!*\n\n"
-                                f"P&L: ₹{snapshot.current_pnl:,.0f} ({current_pnl_pct:+.1f}%)\n"
-                                f"Target: {profit_target_pct}%\n\n"
-                                f"_Use /exit to close position_"
-                            )
+                    elif _fixed_tp_hit and pnl_reliable and not auto_exit_on_tp:
+                        # Advisory-only path (no order): fine on any reliable poll.
+                        logger.info(f"PROFIT TARGET HIT! P&L: {current_pnl_pct:.2f}% >= {profit_target_pct}% target")
+                        logger.info("Auto-exit on TP disabled - sending advisory alert")
+                        self.telegram.send(
+                            f"🎯 *Profit Target Reached!*\n\n"
+                            f"P&L: ₹{snapshot.current_pnl:,.0f} ({current_pnl_pct:+.1f}%)\n"
+                            f"Target: {profit_target_pct}%\n\n"
+                            f"_Use /exit to close position_"
+                        )
                 except Exception as e:
                     logger.error(f"Fixed TP check error (continuing to next check): {e}")
 
@@ -1389,10 +1458,21 @@ _Fetching P&L data..._"""
                     stop_loss_pct = self.trading_config.get('exit', {}).get('stop_loss_pct', 5)
                     auto_exit_on_sl = self.trading_config.get('exit', {}).get('auto_exit_on_sl', True)
 
-                    if current_pnl_pct < 0 and abs(current_pnl_pct) >= stop_loss_pct:
-                        loss_pct = abs(current_pnl_pct)
-                        logger.warning(f"STOP LOSS HIT! Loss: {loss_pct:.2f}% >= {stop_loss_pct}% threshold")
-                        if auto_exit_on_sl:
+                    # Garbage-book guard: the 2026-07-24 incident was a FALSE
+                    # stop loss off an unformed book. On an unreliable poll,
+                    # freeze (no exit, no alert). On reliable polls the auto-exit
+                    # path additionally needs consecutive-poll confirmation.
+                    _sl_hit = current_pnl_pct < 0 and abs(current_pnl_pct) >= stop_loss_pct
+                    if _sl_hit and not pnl_reliable:
+                        logger.warning(
+                            "STOP LOSS condition met but quotes UNRELIABLE - freezing this poll (no exit/alert)"
+                        )
+                    elif auto_exit_on_sl:
+                        # _confirm_trigger also RESETS the streak when _sl_hit is
+                        # False on a reliable poll (freezes when unreliable).
+                        if self._confirm_trigger(position.id, 'stop_loss', _sl_hit, pnl_reliable):
+                            loss_pct = abs(current_pnl_pct)
+                            logger.warning(f"STOP LOSS HIT! Loss: {loss_pct:.2f}% >= {stop_loss_pct}% threshold")
                             logger.info("Auto-exit on SL enabled - executing exit...")
                             result = self.exit_manager.execute_exit(
                                 reason=ExitReason.STOP_LOSS,
@@ -1403,10 +1483,13 @@ _Fetching P&L data..._"""
                                 return
                             else:
                                 logger.error(f"Stop loss exit failed: {result.error}")
-                        else:
-                            if self._handle_stop_loss(snapshot):
-                                self._stats.exits_triggered += 1
-                                return
+                    elif _sl_hit and pnl_reliable:
+                        # Advisory path (decision buttons, no auto-order).
+                        loss_pct = abs(current_pnl_pct)
+                        logger.warning(f"STOP LOSS HIT! Loss: {loss_pct:.2f}% >= {stop_loss_pct}% threshold")
+                        if self._handle_stop_loss(snapshot):
+                            self._stats.exits_triggered += 1
+                            return
                 except Exception as e:
                     logger.error(f"Stop loss check error (continuing to next check): {e}")
 

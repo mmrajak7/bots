@@ -492,6 +492,22 @@ class ExitManager:
                 logger.warning(f"{script}: Could not get Friday close price for ATR trailing")
                 return None
 
+            # Sanity gate: a single garbled/bad price tick must not silently
+            # become a real GTT SL price. Mirrors the LTP-vs-reference ratio
+            # check already used in entry_manager (10x/0.1x band) — here the
+            # trade's own entry_price is the independent reference. On a
+            # failure, fall back to current_sl (same safe "no_change" path
+            # used by the activation gate below) instead of trailing on a
+            # phantom value.
+            price_ratio = friday_close / entry_price if entry_price > 0 else 0
+            if price_ratio > 10 or price_ratio < 0.1:
+                logger.warning(
+                    f"{script}: Suspicious Friday close Rs.{friday_close:.2f} vs entry "
+                    f"Rs.{entry_price:.2f} (ratio {price_ratio:.2f}x) - skipping ATR "
+                    f"trailing SL update this cycle, keeping current SL"
+                )
+                return position.current_sl
+
             # Activation gate: has the position moved enough to start trailing?
             activation_threshold = entry_price + (self.trailing_activation_multiplier * entry_atr)
 

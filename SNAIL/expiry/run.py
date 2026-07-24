@@ -495,10 +495,37 @@ class ExpiryTradingSystem:
             self._chart_data, mtm_pnl, snapshot.spot
         )
 
+        # Garbage-book guard (2026-07-24 incident). mtm_pnl is a mid-price of
+        # each leg's top-of-book; an unformed/one-sided/crossed/abnormally-wide
+        # book makes it garbage. If ANY option leg is unreliable, FREEZE the
+        # value-based exits (TARGET_HIT / STOP_LOSS) and let only the
+        # time-based TIME_EXIT (must-exit) through. Thresholds mirror
+        # src/utils/quote_reliability.py (SNAIL is a separate import root here).
+        def _leg_book_reliable(qw: QuoteWrapper) -> bool:
+            bid, ask = qw.bid, qw.ask
+            if bid <= 0 or ask <= 0 or bid > ask:
+                return False
+            width = ask - bid
+            mid = (bid + ask) / 2.0
+            return width <= max(0.30, 0.25 * mid) + 1e-9
+
+        books_reliable = all(
+            _leg_book_reliable(quotes[f"NFO:{leg.symbol}"])
+            for leg in position.legs
+            if quotes.get(f"NFO:{leg.symbol}") is not None
+        )
+
         # Check exit conditions
         exit_signal = self.position_manager.check_exit_conditions(position, mtm_pnl)
 
-        if exit_signal.should_exit and exit_signal.reason is not None:
+        _value_exits = (self._ExitReason.TARGET_HIT, self._ExitReason.STOP_LOSS)
+        if (exit_signal.should_exit and exit_signal.reason in _value_exits
+                and not books_reliable):
+            logger.warning(
+                f"{exit_signal.reason.value} suppressed - option books UNRELIABLE; "
+                f"freezing value-based exit this poll (TIME_EXIT still armed)"
+            )
+        elif exit_signal.should_exit and exit_signal.reason is not None:
             logger.info(f"Exit signal: {exit_signal.reason.value} - {exit_signal.message}")
             self._execute_exit(exit_signal.reason, quotes)
             return
