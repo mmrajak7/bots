@@ -232,6 +232,76 @@ check('T6 SL GTT succeeds once the tick is propagated to the limit',
 check('T6 old behaviour provably burned all retries (no SL placed)',
       not buggy_ok, f'attempts={buggy_attempts}')
 
+# --- T7: an unresolvable symbol must not re-download the instrument list ----
+# get_instrument_token() refetches all ~10k NSE instruments whenever a symbol
+# misses. The breadth universe carries 73 delisted names, so a single backfill
+# sweep triggered 73 full downloads and effectively never finished. A delisted
+# name in the signal CSV (GSPL) did the same thing on every 5-minute cycle.
+import src.api.dual_kite_client as dkc
+
+fetches = []
+client3 = DualKiteClient.__new__(DualKiteClient)
+client3._instruments_cache = {'REALSYM': '111'}
+client3._token_to_symbol_cache = {}
+client3._tick_size_cache = {}
+client3._missing_symbols = set()
+client3._last_instruments_fetch = 0.0
+client3._instruments_file = str(csv)
+
+
+def _fake_fetch():
+    fetches.append(1)
+    return True
+
+
+client3._fetch_instruments = _fake_fetch
+
+# cached lookup: never fetches, never raises
+check('T7 cached lookup resolves a known symbol',
+      client3.get_instrument_token_cached('REALSYM') == '111', 'REALSYM')
+check('T7 cached lookup returns None for a delisted name',
+      client3.get_instrument_token_cached('DELISTED1') is None
+      and client3.get_instrument_token_cached('DELISTED2') is None,
+      f'fetches so far: {len(fetches)}')
+check('T7 cached lookup NEVER triggers a download', len(fetches) == 0,
+      f'{len(fetches)} fetches')
+
+# uncached lookup: at most ONE download, then the negative cache takes over
+for _ in range(5):
+    try:
+        client3.get_instrument_token('DELISTED1')
+    except ValueError:
+        pass
+check('T7 repeated misses trigger exactly ONE download', len(fetches) == 1,
+      f'{len(fetches)} fetches for 5 lookups')
+
+# a DIFFERENT missing symbol must not re-download either, inside the cooldown
+for _ in range(3):
+    try:
+        client3.get_instrument_token('DELISTED2')
+    except ValueError:
+        pass
+check('T7 cooldown blocks downloads for other misses too', len(fetches) == 1,
+      f'{len(fetches)} fetches')
+
+# still raises ValueError, so callers behave exactly as before
+raised = False
+try:
+    client3.get_instrument_token('DELISTED1')
+except ValueError:
+    raised = True
+check('T7 still raises ValueError for callers', raised, 'contract unchanged')
+
+# once the cooldown lapses, one more genuine attempt is allowed
+client3._last_instruments_fetch -= (dkc.INSTRUMENTS_REFETCH_COOLDOWN + 1)
+client3._missing_symbols.clear()
+try:
+    client3.get_instrument_token('DELISTED1')
+except ValueError:
+    pass
+check('T7 a lapsed cooldown permits one fresh attempt', len(fetches) == 2,
+      f'{len(fetches)} fetches')
+
 print('=' * 50)
 print(f'{len(PASS)} passed, {len(FAIL)} failed')
 if FAIL:

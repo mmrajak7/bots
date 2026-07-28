@@ -395,20 +395,27 @@ if MODE == "inspect":
 if not missing:
     print("    nothing to do - repository is current")
 else:
-    # One-shot: a large per-cycle budget finishes the sweep in this run instead
-    # of over ~9 daemon cycles. The daemon keeps its own 60s budget.
-    config._config.setdefault("regime", {})["backfill_seconds_per_cycle"] = 1800
+    # Bounded chunk, NOT the whole sweep. At ~1.1s/symbol the full 905 takes
+    # ~16 min, which is far too long to hold the service down mid-session.
+    # The backfill is resumable and its cursor persists, so we do a capped
+    # slice here and the daemon finishes the remainder on its own 60s budget
+    # with the bot back up.
+    budget = int(os.environ.get("BF_ONESHOT_SECONDS", "300"))
+    config._config.setdefault("regime", {})["backfill_seconds_per_cycle"] = budget
+    print(f"    one-shot budget: {budget}s (~{budget // 1}s of downtime max); "
+          f"the daemon completes any remainder")
     t0 = time.time()
-    for i in range(25):
-        rm.maintenance()
-        bf = (rm._load_state().get("backfill") or {})
-        if not bf:
-            print("    no backfill was needed (single-session gap -> daily capture)")
-            break
-        print(f"    pass {i+1}: cursor={bf.get('cursor')} filled={bf.get('filled')} "
-              f"done={bf.get('done')} complete={bf.get('complete')}")
-        if bf.get("done"):
-            break
+    rm.maintenance()
+    bf = (rm._load_state().get("backfill") or {})
+    if not bf:
+        print("    no backfill was needed (single-session gap -> daily capture)")
+    else:
+        print(f"    cursor={bf.get('cursor')} filled={bf.get('filled')} "
+              f"complete={bf.get('complete')}")
+        if not bf.get("complete"):
+            left = 905 - int(bf.get("cursor", 0))
+            print(f"    ~{left} symbols remain -> the daemon will finish them "
+                  f"(~{max(1, left * 11 // 600)} cycles, bot stays UP)")
     print(f"    elapsed: {time.time()-t0:.0f}s")
 
 after = rm._last_session_in_history()

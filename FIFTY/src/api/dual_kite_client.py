@@ -20,6 +20,11 @@ from src.utils.config_manager import config
 from src.utils.timezone_helper import now_ist, today_ist, IST
 from src.utils.circuit_breaker import get_kite_breaker, get_kite_historical_breaker, CircuitBreakerOpenError
 
+# Minimum gap between full NSE instrument-list downloads triggered by a symbol
+# lookup miss. Without a floor here, every unresolvable symbol re-downloads all
+# ~10k instruments on every cycle.
+INSTRUMENTS_REFETCH_COOLDOWN = 3600  # seconds
+
 # FIX RC-004: Thread-safe singleton initialization lock
 _singleton_lock = threading.Lock()
 
@@ -76,6 +81,8 @@ class DualKiteClient(BrokerAdapter):
         self._instruments_cache: Dict[str, str] = {}  # tradingsymbol -> token
         self._token_to_symbol_cache: Dict[str, str] = {}  # token -> tradingsymbol
         self._tick_size_cache: Dict[str, float] = {}  # tradingsymbol -> tick_size
+        self._missing_symbols: set = set()      # proven-absent, don't re-download for these
+        self._last_instruments_fetch: float = 0.0
         self._instruments_file = config.get('instruments.cache_file', 'data/instruments.csv')
 
         # F&O symbols cache (scripts that have NFO contracts)
@@ -685,6 +692,21 @@ class DualKiteClient(BrokerAdapter):
     # INSTRUMENTS
     # =========================================================================
 
+    def get_instrument_token_cached(self, script: str) -> Optional[str]:
+        """Token from the in-memory cache ONLY - never triggers a refetch.
+
+        BULK CALLERS MUST USE THIS. get_instrument_token() re-downloads the
+        entire NSE instrument list whenever a symbol cannot be resolved, so a
+        sweep over a universe containing delisted names costs one full download
+        per dead symbol (the breadth universe has 73 of them).
+        """
+        if not self._instruments_cache:
+            self._load_instruments_cache()
+        for variation in self._generate_symbol_variations(script.upper()):
+            if variation in self._instruments_cache:
+                return self._instruments_cache[variation]
+        return None
+
     def get_instrument_token(self, script: str) -> str:
         """Get instrument token for script symbol"""
         if not self._instruments_cache:
@@ -697,12 +719,22 @@ class DualKiteClient(BrokerAdapter):
             if variation in self._instruments_cache:
                 return self._instruments_cache[variation]
 
-        # Refresh cache and try again
-        self._fetch_instruments()
-        for variation in variations:
-            if variation in self._instruments_cache:
-                return self._instruments_cache[variation]
+        # A symbol already proven absent must NOT trigger another full download.
+        # Without this a permanently delisted name (GSPL) re-downloads all ~10k
+        # instruments on every 5-minute cycle, forever.
+        if script_upper in self._missing_symbols:
+            raise ValueError(f"Instrument token not found for: {script}")
 
+        # Refresh at most once per cooldown, however many symbols miss.
+        now = time.time()
+        if now - self._last_instruments_fetch >= INSTRUMENTS_REFETCH_COOLDOWN:
+            self._last_instruments_fetch = now
+            self._fetch_instruments()
+            for variation in variations:
+                if variation in self._instruments_cache:
+                    return self._instruments_cache[variation]
+
+        self._missing_symbols.add(script_upper)
         raise ValueError(f"Instrument token not found for: {script}")
 
     def get_tradingsymbol(self, instrument_token: str) -> Optional[str]:
@@ -829,6 +861,11 @@ class DualKiteClient(BrokerAdapter):
                 row['tradingsymbol']: row['tick_size']
                 for row in eq_instruments
             }
+            # Fresh list: give previously-absent symbols one more chance (a
+            # newly listed scrip should resolve). The refetch cooldown, not this
+            # set, is what prevents a download storm.
+            self._missing_symbols.clear()
+            self._last_instruments_fetch = time.time()
 
             logger.info(f"Fetched {len(eq_instruments)} instruments")
             return True

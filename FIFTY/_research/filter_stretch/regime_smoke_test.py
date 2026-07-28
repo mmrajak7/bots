@@ -201,7 +201,7 @@ hits = []
 class OkKite:
     """Returns real rows, so the cursor is allowed to advance.
     (A broker that fetches NOTHING must instead rewind - see T9f.)"""
-    def get_instrument_token(self, s): hits.append(s); return '1'
+    def get_instrument_token_cached(self, s): hits.append(s); return '1'
     def get_historical_data(self, *a):
         return pd.DataFrame([{'Date': '2026-07-21', 'Close': 10.0},
                              {'Date': '2026-07-22', 'Close': 11.0}])
@@ -233,7 +233,7 @@ check('T9c done short-circuits', len(hits) == n_before, f'hits grew to {len(hits
 # universe instantly and latch a COMPLETE holding no data.
 class DeadKite:
     """Breaker-open behaviour: returns empty frames, never raises."""
-    def get_instrument_token(self, s): return '1'
+    def get_instrument_token_cached(self, s): return '1'
     def get_historical_data(self, *a): return pd.DataFrame()
 
 rm8 = RegimeManager(kite=DeadKite())
@@ -247,7 +247,7 @@ check('T9f empty frames do not fake a COMPLETE',
 
 # and once the API recovers, the sweep proceeds normally from the same cursor
 class LiveKite:
-    def get_instrument_token(self, s): return '1'
+    def get_instrument_token_cached(self, s): return '1'
     def get_historical_data(self, *a):
         return pd.DataFrame([{'Date': '2026-07-21', 'Close': 10.0},
                              {'Date': '2026-07-22', 'Close': 11.0}])

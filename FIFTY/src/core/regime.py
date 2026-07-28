@@ -275,23 +275,41 @@ class RegimeManager:
         # Budget is checked AFTER each symbol so at least one is always
         # processed - a misconfigured (or zero) budget must never leave the
         # cursor parked forever.
+        unresolved = 0
+        attempted = 0     # symbols we actually issued an API call for
         while cursor < len(symbols):
             sym = symbols[cursor]
             cursor += 1
+            # CACHED lookup only. get_instrument_token() re-downloads the whole
+            # NSE instrument list on a miss, and 73 of the 905 seeded symbols
+            # are delisted - that turned one sweep into 73 full downloads and
+            # made the backfill effectively never finish.
+            token = None
+            lookup_failed = False
             try:
-                token = self.kite.get_instrument_token(sym)
-                df = self.kite.get_historical_data(token, frm, to, 'day')
-                # An EMPTY frame is NOT success: get_historical_data returns one
-                # (no exception) when the historical circuit breaker is open, so
-                # counting it would let a dead API sweep the remaining symbols
-                # instantly and latch a COMPLETE that holds no data.
-                if df is not None and not df.empty:
-                    for _, r in df.iterrows():
-                        ds = pd.Timestamp(r['Date']).date().isoformat()
-                        hist[sym][ds] = float(r['Close'])
-                    filled += 1
+                token = self.kite.get_instrument_token_cached(sym)
             except Exception:
-                pass  # per-symbol failure must not abort the sweep
+                lookup_failed = True
+
+            if token is None and not lookup_failed:
+                # Genuinely delisted: nothing to fetch, and NOT evidence that
+                # the API is unhealthy.
+                unresolved += 1
+            else:
+                attempted += 1
+                try:
+                    df = self.kite.get_historical_data(token, frm, to, 'day')
+                    # An EMPTY frame is NOT success: get_historical_data returns
+                    # one (no exception) when the historical circuit breaker is
+                    # open, so counting it would let a dead API sweep the rest
+                    # instantly and latch a COMPLETE that holds no data.
+                    if df is not None and not df.empty:
+                        for _, r in df.iterrows():
+                            ds = pd.Timestamp(r['Date']).date().isoformat()
+                            hist[sym][ds] = float(r['Close'])
+                        filled += 1
+                except Exception:
+                    pass  # per-symbol failure must not abort the sweep
             if (time.monotonic() - started) >= budget:
                 break
 
@@ -299,9 +317,12 @@ class RegimeManager:
         # open, token dead), not that those symbols have no history. Rewind so
         # the sweep resumes at the same place next cycle instead of burning
         # through the universe and declaring the range COMPLETE.
-        if filled == 0 and cursor > start_cursor:
+        # Keyed on ATTEMPTED, not filled: a cycle that happened to cover only
+        # delisted symbols legitimately fills nothing, and rewinding there would
+        # loop on that block forever.
+        if attempted > 0 and filled == 0:
             logger.warning(
-                f"Breadth: backfill fetched 0 of {cursor - start_cursor} symbols "
+                f"Breadth: backfill fetched 0 of {attempted} attempted symbols "
                 f"this cycle (API down?) - rewinding cursor to {start_cursor}")
             cursor = start_cursor
 
@@ -317,8 +338,9 @@ class RegimeManager:
         self._save_state(state)
 
         logger.info(f"Breadth: backfill progress {cursor}/{len(symbols)} symbols "
-                    f"(+{filled} this cycle, {bf['filled']} filled total)"
-                    + (" - COMPLETE" if complete else ""))
+                    f"(+{filled} this cycle, {bf['filled']} filled total"
+                    + (f", {unresolved} delisted/unknown" if unresolved else "")
+                    + ")" + (" - COMPLETE" if complete else ""))
 
         if complete:
             # Fill rate is the health signal: a COMPLETE carrying few actual
