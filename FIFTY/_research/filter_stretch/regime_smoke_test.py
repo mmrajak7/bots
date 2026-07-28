@@ -158,7 +158,7 @@ rm4 = RegimeManager(kite=None)
 rm4._load_history = lambda: {'X': {'2026-07-20': 100.0}}
 rm4._last_session_in_history = lambda: '2026-07-20'
 rm4._capture_prev_session_closes = lambda s: calls9.append(('capture', s))
-rm4._backfill_sessions = lambda m: calls9.append(('backfill', tuple(m)))
+rm4._run_backfill = lambda f, t, s: calls9.append(('backfill', tuple(s)))
 def mk_sessions(*days):
     return {'session': days[-1], 'rsi': 55, 'close': 100, 'sma50': 99,
             'sessions': list(days)}
@@ -176,28 +176,155 @@ rm4._nifty_daily_signals = lambda: mk_sessions('2026-07-20', '2026-07-21', '2026
 rm4.maintenance()
 check('T9b multi-missing -> backfill',
       calls9 == [('backfill', ('2026-07-21', '2026-07-22', '2026-07-23'))], str(calls9))
-# outside market hours -> nothing
+# outside the capture window: batch-OHLC capture must NOT run (its close
+# semantics are intraday-only) but the historical backfill MUST still run -
+# that is what lets a multi-session gap heal the same day it is noticed.
 calls9.clear()
 regime_mod.now_ist = lambda: _dt(2026, 7, 23, 16, 0)
+rm4._nifty_daily_signals = lambda: mk_sessions('2026-07-20', '2026-07-22')
 rm4.maintenance()
-check('T9b time-gated', calls9 == [], str(calls9))
+check('T9b capture is intraday-gated', calls9 == [], str(calls9))
+calls9.clear()
+rm4._nifty_daily_signals = lambda: mk_sessions('2026-07-20', '2026-07-21', '2026-07-22', '2026-07-23')
+rm4.maintenance()
+check('T9b backfill runs outside window',
+      calls9 == [('backfill', ('2026-07-21', '2026-07-22', '2026-07-23'))], str(calls9))
 
-# --- T9c: backfill throttle (once per day, persisted) ---
+# --- T9c: backfill is resumable + time-budgeted (never blocks the daemon) ---
 regime_mod.today_ist = lambda: _dt(2026, 7, 23).date()
-rm5 = RegimeManager(kite=None)
-rm5._load_history = lambda: {'Y': {'2026-07-18': 50.0}}
+regime_mod.now_ist = lambda: _dt(2026, 7, 23, 16, 0)
+UNIVERSE = {f'S{i:03d}': {'2026-07-18': 50.0} for i in range(5)}
 hits = []
-orig_backfill = RegimeManager._backfill_sessions
-st = rm5._load_state(); st.pop('backfill_attempted_on', None); rm5._save_state(st)
-class NoKite:
-    def get_instrument_token(self, s): hits.append(s); raise RuntimeError('no net')
-    def get_historical_data(self, *a): raise RuntimeError('no net')
-rm5.kite = NoKite()
-rm5._history = {'Y': {'2026-07-18': 50.0}}
-rm5._backfill_sessions(['2026-07-21', '2026-07-22'])   # attempt 1: runs (hits symbol)
-n1 = len(hits)
-rm5._backfill_sessions(['2026-07-21', '2026-07-22'])   # attempt 2 same day: throttled
-check('T9c backfill throttled to 1/day', n1 == 1 and len(hits) == n1, f'hits={hits}')
+class OkKite:
+    """Returns real rows, so the cursor is allowed to advance.
+    (A broker that fetches NOTHING must instead rewind - see T9f.)"""
+    def get_instrument_token(self, s): hits.append(s); return '1'
+    def get_historical_data(self, *a):
+        return pd.DataFrame([{'Date': '2026-07-21', 'Close': 10.0},
+                             {'Date': '2026-07-22', 'Close': 11.0}])
+rm5 = RegimeManager(kite=OkKite())
+rm5._history = dict(UNIVERSE)
+st = rm5._load_state(); st.pop('backfill', None); rm5._save_state(st)
+# budget 0 -> exactly one symbol per cycle, but ALWAYS at least one (forward
+# progress must not depend on the budget being generous)
+regime_mod.config._config.setdefault('regime', {})['backfill_seconds_per_cycle'] = 0
+rm5._run_backfill('2026-07-21', '2026-07-22', ['2026-07-21', '2026-07-22'])
+c1 = rm5._load_state()['backfill']['cursor']
+rm5._run_backfill('2026-07-21', '2026-07-22', ['2026-07-21', '2026-07-22'])
+c2 = rm5._load_state()['backfill']['cursor']
+check('T9c backfill resumes from cursor', c1 == 1 and c2 == 2, f'{c1}->{c2} hits={hits}')
+
+# runs to completion across cycles, then stops
+for _ in range(5):
+    rm5._run_backfill('2026-07-21', '2026-07-22', ['2026-07-21', '2026-07-22'])
+bf = rm5._load_state()['backfill']
+check('T9c completes and latches done',
+      bf['cursor'] == 5 and bf['done'] and bf['complete'], str(bf))
+n_before = len(hits)
+rm5._run_backfill('2026-07-21', '2026-07-22', ['2026-07-21', '2026-07-22'])
+check('T9c done short-circuits', len(hits) == n_before, f'hits grew to {len(hits)}')
+
+# --- T9f: an empty df is NOT success (circuit breaker open) ---------------
+# get_historical_data returns an EMPTY frame (no exception) when the historical
+# breaker trips. Counting that as filled would let a dead API sweep the whole
+# universe instantly and latch a COMPLETE holding no data.
+class DeadKite:
+    """Breaker-open behaviour: returns empty frames, never raises."""
+    def get_instrument_token(self, s): return '1'
+    def get_historical_data(self, *a): return pd.DataFrame()
+
+rm8 = RegimeManager(kite=DeadKite())
+rm8._history = {f'S{i:03d}': {'2026-07-18': 50.0} for i in range(5)}
+st = rm8._load_state(); st.pop('backfill', None); rm8._save_state(st)
+regime_mod.config._config.setdefault('regime', {})['backfill_seconds_per_cycle'] = 999
+rm8._run_backfill('2026-07-21', '2026-07-22', ['2026-07-21', '2026-07-22'])
+bf8 = rm8._load_state()['backfill']
+check('T9f empty frames do not fake a COMPLETE',
+      bf8['cursor'] == 0 and not bf8['complete'] and bf8['filled'] == 0, str(bf8))
+
+# and once the API recovers, the sweep proceeds normally from the same cursor
+class LiveKite:
+    def get_instrument_token(self, s): return '1'
+    def get_historical_data(self, *a):
+        return pd.DataFrame([{'Date': '2026-07-21', 'Close': 10.0},
+                             {'Date': '2026-07-22', 'Close': 11.0}])
+
+rm8.kite = LiveKite()
+rm8._run_backfill('2026-07-21', '2026-07-22', ['2026-07-21', '2026-07-22'])
+bf8b = rm8._load_state()['backfill']
+check('T9f recovers and completes once the API returns data',
+      bf8b['cursor'] == 5 and bf8b['complete'] and bf8b['filled'] == 5, str(bf8b))
+
+# --- T9g: day rollover must not strand symbols past the cursor -------------
+# A sweep abandoned at cursor N leaves symbols N.. without that range. The next
+# day `missing` is computed off the GLOBAL max session, which the swept symbols
+# already advanced - so the older gap looks filled. The range must widen back.
+rm9 = RegimeManager(kite=LiveKite())
+rm9._history = {f'S{i:03d}': {'2026-07-18': 50.0} for i in range(5)}
+rm9._save_state({'state': 'UNPAUSED', 'streak': 0, 'since': None,
+                 'last_session': None, 'transitions': [],
+                 'backfill': {'from': '2026-07-21', 'to': '2026-07-22',
+                              'day': '2026-07-22', 'sessions': ['2026-07-21', '2026-07-22'],
+                              'cursor': 2, 'cycles': 3, 'filled': 2,
+                              'done': True, 'complete': False}})
+# next day, only the newest session looks missing
+rm9._run_backfill('2026-07-23', '2026-07-23', ['2026-07-23'])
+bf9 = rm9._load_state()['backfill']
+check('T9g incomplete prior sweep widens the range (no stranded gap)',
+      bf9['from'] == '2026-07-21' and bf9['to'] == '2026-07-23'
+      and bf9['sessions'] == ['2026-07-21', '2026-07-22', '2026-07-23']
+      and bf9['cursor'] == 5,
+      f"range={bf9['from']}..{bf9['to']} sessions={bf9['sessions']}")
+
+# a COMPLETED prior sweep must NOT widen - that would re-fetch the universe daily
+rm10 = RegimeManager(kite=LiveKite())
+rm10._history = {f'S{i:03d}': {'2026-07-18': 50.0} for i in range(5)}
+rm10._save_state({'state': 'UNPAUSED', 'streak': 0, 'since': None,
+                  'last_session': None, 'transitions': [],
+                  'backfill': {'from': '2026-07-21', 'to': '2026-07-22',
+                               'day': '2026-07-22', 'sessions': ['2026-07-21'],
+                               'cursor': 5, 'cycles': 1, 'filled': 5,
+                               'done': True, 'complete': True}})
+rm10._run_backfill('2026-07-23', '2026-07-23', ['2026-07-23'])
+bf10 = rm10._load_state()['backfill']
+check('T9g completed prior sweep does NOT widen',
+      bf10['from'] == '2026-07-23', f"range={bf10['from']}..{bf10['to']}")
+
+# --- T9d: state machine HOLDS while a backfill is mid-flight ---
+rm6 = RegimeManager(kite=None)
+rm6._history = dict(UNIVERSE)
+rm6._save_state({'state': 'UNPAUSED', 'streak': 0, 'since': None,
+                 'last_session': '2026-07-20', 'transitions': [],
+                 'backfill': {'from': '2026-07-21', 'to': '2026-07-22',
+                              'day': '2026-07-23', 'cursor': 2,
+                              'done': False, 'complete': False}})
+def _boom(self):
+    raise AssertionError('must not hit the API while backfilling')
+rm6._nifty_daily_signals = lambda: _boom(rm6)
+r6 = rm6.evaluate()
+check('T9d evaluate holds during backfill',
+      r6.get('backfill') is True and r6['state'] == 'UNPAUSED', str(r6))
+allowed, why = rm6.entry_allowed(-0.5)
+check('T9d gate fails open while holding', allowed is True, f'{allowed},{why}')
+
+# --- T9e: per-session breadth ignores later closes (backfill scoring) ---
+rm7 = RegimeManager(kite=None)
+# 51 sessions; the last close is a huge spike that must NOT leak into the
+# reading for the session before it
+days = [f'2026-05-{d:02d}' for d in range(1, 29)] + \
+       [f'2026-06-{d:02d}' for d in range(1, 24)]
+def _spiked():
+    closes = {d: 100.0 for d in days[:-1]}
+    closes[days[-1]] = 900.0
+    return closes
+rm7._history = {f'S{i}': _spiked() for i in range(400)}
+regime_mod.config._config.setdefault('regime', {})['breadth_min_coverage'] = 300
+r_last = rm7._compute_breadth()
+r_prev = rm7._compute_breadth(days[-2])
+check('T9e breadth scored at target session',
+      r_last[0] == days[-1] and r_last[1] == 100.0
+      and r_prev[0] == days[-2] and r_prev[1] == 0.0,
+      f'last={r_last} prev={r_prev}')
 
 # --- T10: price floor in _add_to_queue (fake session, no DB writes) ---
 from src.core import signal_processor as sp_mod

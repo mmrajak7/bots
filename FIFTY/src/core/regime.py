@@ -32,6 +32,7 @@ Telegram: alerts ONLY on state transitions (OFF -> paused, back ON -> unpaused).
 
 import gzip
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -62,6 +63,7 @@ class RegimeManager:
         self._eval_cache_session: Optional[str] = None
         self._eval_cache_result: Optional[dict] = None
         self._history: Optional[Dict[str, Dict[str, float]]] = None
+        self._bf_hold_logged: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Config
@@ -133,10 +135,17 @@ class RegimeManager:
             hist = self._load_history()
             if not hist:
                 return
-            now = now_ist()
-            hhmm = now.strftime('%H:%M')
-            if not ('09:20' <= hhmm <= '15:25'):
-                return  # ohlc.close semantics are only unambiguous intraday
+
+            # Resume an in-flight backfill BEFORE computing what's missing.
+            # Partial progress already advances the history's max session, so
+            # `missing` would come back empty and strand the remaining symbols
+            # half-filled.
+            state = self._load_state()
+            bf = state.get('backfill') or {}
+            if bf and not bf.get('done') and bf.get('day') == today_ist().isoformat():
+                self._run_backfill(bf['from'], bf['to'], bf.get('sessions') or [])
+                return
+
             nifty = self._nifty_daily_signals()
             if nifty is None or not nifty.get('sessions'):
                 return
@@ -146,10 +155,19 @@ class RegimeManager:
             missing = [s for s in nifty['sessions'] if s > last]
             if not missing:
                 return
+
             if len(missing) == 1:
-                self._capture_prev_session_closes(missing[0])
-            else:
-                self._backfill_sessions(missing)
+                # Batch OHLC only: ohlc.close is the previous session's OFFICIAL
+                # close *only while a newer session is trading*, so this path is
+                # strictly intraday.
+                if '09:20' <= now_ist().strftime('%H:%M') <= '15:25':
+                    self._capture_prev_session_closes(missing[0])
+                return
+
+            # More than one session missing: only the historical API can fix it,
+            # and that reads COMPLETED sessions - valid at any hour. Running it
+            # outside the capture window is what lets a gap heal the same day.
+            self._run_backfill(missing[0], missing[-1], missing)
         except Exception as e:
             logger.error(f"Regime maintenance error (non-fatal): {e}")
 
@@ -187,42 +205,134 @@ class RegimeManager:
         self._append_breadth_reading(session_s)
         logger.info(f"Breadth: captured {captured} closes for {session_s}")
 
-    def _backfill_sessions(self, missing: List[str]) -> None:
+    def _run_backfill(self, frm: str, to: str, sessions: List[str]) -> None:
         """Backfill missed sessions via historical API (downtime recovery).
 
-        Expensive (~1 call/symbol) - throttled to ONE attempt per calendar day,
-        persisted in regime_state.json so cron restarts don't retry-storm.
+        ~1 API call per symbol, so a full 905-symbol universe is ~9 minutes -
+        far too long to run inline in the daemon's 5-minute task loop. Instead
+        this is RESUMABLE and TIME-BUDGETED: each cycle spends at most
+        regime.backfill_seconds_per_cycle, persists a cursor to
+        regime_state.json, and picks up where it left off on the next cycle.
+        A full universe therefore heals over ~10 cycles (~50 min) while never
+        blocking the daemon for more than the budget.
         """
         state = self._load_state()
         today_s = today_ist().isoformat()
-        if state.get('backfill_attempted_on') == today_s:
+        bf = state.get('backfill') or {}
+
+        # A different range (or a new day) means new work - start over.
+        if (bf.get('from') != frm or bf.get('to') != to
+                or bf.get('day') != today_s):
+            # If the previous sweep never COMPLETED, every symbol past its
+            # cursor is still missing that range's sessions. Recomputing
+            # `missing` hides this: the symbols already swept advanced the
+            # repository's global max session, so the older gap looks filled.
+            # Widen the range back over the abandoned one and restart, else
+            # those symbols keep a permanent hole and their 50DMA silently
+            # spans the wrong calendar window for ~50 sessions.
+            prev = bf
+            if prev.get('from') and not prev.get('complete') and prev['from'] < frm:
+                logger.warning(
+                    f"Breadth: previous backfill {prev['from']}..{prev.get('to')} "
+                    f"stopped at symbol {prev.get('cursor')} - widening range to "
+                    f"{prev['from']}..{to} and restarting to avoid stranded gaps")
+                frm = prev['from']
+                sessions = sorted(set(list(sessions)
+                                      + list(prev.get('sessions') or [])))
+            bf = {'from': frm, 'to': to, 'day': today_s, 'sessions': sessions,
+                  'cursor': 0, 'cycles': 0, 'filled': 0,
+                  'done': False, 'complete': False}
+        if bf.get('done'):
             return
-        state['backfill_attempted_on'] = today_s
-        self._save_state(state)
+
+        max_cycles = int(config.get('regime.backfill_max_cycles', 30))
+        if bf['cycles'] >= max_cycles:
+            # Give up on THIS RANGE rather than burning the budget every cycle.
+            # (A genuinely new range later the same day re-arms a fresh budget,
+            # which is intended - that is new work, not a retry of this one.)
+            # done=True also releases the state machine's hold (see evaluate).
+            bf['done'] = True
+            state['backfill'] = bf
+            self._save_state(state)
+            logger.warning(
+                f"Breadth: backfill {frm}..{to} hit {max_cycles} cycles at "
+                f"{bf['cursor']} symbols - giving up for today")
+            return
+        bf['cycles'] += 1
 
         hist = self._load_history()
-        frm, to = missing[0], missing[-1]
-        logger.info(f"Breadth: backfilling {len(missing)} sessions "
-                    f"{frm}..{to} for {len(hist)} symbols")
-        filled_sessions = set()
-        done = 0
-        for sym in sorted(hist.keys()):
+        symbols = sorted(hist.keys())
+        cursor = int(bf.get('cursor', 0))
+        budget = float(config.get('regime.backfill_seconds_per_cycle', 60))
+
+        if cursor == 0:
+            logger.info(f"Breadth: backfilling sessions {frm}..{to} "
+                        f"for {len(symbols)} symbols (resumable)")
+
+        started = time.monotonic()
+        start_cursor = cursor
+        filled = 0
+        # Budget is checked AFTER each symbol so at least one is always
+        # processed - a misconfigured (or zero) budget must never leave the
+        # cursor parked forever.
+        while cursor < len(symbols):
+            sym = symbols[cursor]
+            cursor += 1
             try:
                 token = self.kite.get_instrument_token(sym)
                 df = self.kite.get_historical_data(token, frm, to, 'day')
-                for _, r in df.iterrows():
-                    ds = pd.Timestamp(r['Date']).date().isoformat()
-                    hist[sym][ds] = float(r['Close'])
-                    filled_sessions.add(ds)
-                done += 1
+                # An EMPTY frame is NOT success: get_historical_data returns one
+                # (no exception) when the historical circuit breaker is open, so
+                # counting it would let a dead API sweep the remaining symbols
+                # instantly and latch a COMPLETE that holds no data.
+                if df is not None and not df.empty:
+                    for _, r in df.iterrows():
+                        ds = pd.Timestamp(r['Date']).date().isoformat()
+                        hist[sym][ds] = float(r['Close'])
+                    filled += 1
             except Exception:
-                continue
+                pass  # per-symbol failure must not abort the sweep
+            if (time.monotonic() - started) >= budget:
+                break
+
+        # A cycle that fetched nothing at all means the API is down (breaker
+        # open, token dead), not that those symbols have no history. Rewind so
+        # the sweep resumes at the same place next cycle instead of burning
+        # through the universe and declaring the range COMPLETE.
+        if filled == 0 and cursor > start_cursor:
+            logger.warning(
+                f"Breadth: backfill fetched 0 of {cursor - start_cursor} symbols "
+                f"this cycle (API down?) - rewinding cursor to {start_cursor}")
+            cursor = start_cursor
+
+        bf['filled'] = int(bf.get('filled', 0)) + filled
+        complete = cursor >= len(symbols)
+        bf['cursor'] = cursor
+        bf['done'] = complete
+        bf['complete'] = complete
+        state['backfill'] = bf
+
         self._trim_history()
         self._save_history()
-        for ds in sorted(filled_sessions):
-            self._append_breadth_reading(ds)
-        logger.info(f"Breadth: backfilled {done}/{len(hist)} symbols, "
-                    f"sessions: {sorted(filled_sessions)}")
+        self._save_state(state)
+
+        logger.info(f"Breadth: backfill progress {cursor}/{len(symbols)} symbols "
+                    f"(+{filled} this cycle, {bf['filled']} filled total)"
+                    + (" - COMPLETE" if complete else ""))
+
+        if complete:
+            # Fill rate is the health signal: a COMPLETE carrying few actual
+            # fills means the sweep ran against a dead API, not that the data
+            # is genuinely absent.
+            if bf['filled'] < len(symbols) * 0.5:
+                logger.warning(
+                    f"Breadth: backfill COMPLETE but only {bf['filled']}/"
+                    f"{len(symbols)} symbols returned data - breadth readings "
+                    f"may be unreliable for {frm}..{to}")
+            # Record a breadth reading for every session we just filled, not
+            # just the newest one.
+            for ds in sorted(set(sessions)):
+                self._append_breadth_reading(ds)
 
     def _trim_history(self) -> None:
         hist = self._load_history()
@@ -231,23 +341,29 @@ class RegimeManager:
                 keep = sorted(closes)[-MAX_SESSIONS_KEPT:]
                 hist[sym] = {d: closes[d] for d in keep}
 
-    def _compute_breadth_for_last_session(self) -> Optional[Tuple[str, float, int]]:
-        """(session_date, breadth_pct, coverage) using each symbol's last 50 closes."""
+    def _compute_breadth(self, session_s: Optional[str] = None
+                         ) -> Optional[Tuple[str, float, int]]:
+        """(session_date, breadth_pct, coverage) = % of universe above own 50DMA.
+
+        `session_s` defaults to the newest session in the repository. Passing an
+        explicit session lets backfilled history be scored for the session it
+        actually belongs to (each symbol's 50-close window is taken as of that
+        date, never using later closes).
+        """
         hist = self._load_history()
-        last = self._last_session_in_history()
-        if not last:
+        target = session_s or self._last_session_in_history()
+        if not target:
             return None
         above = 0
         total = 0
         for closes in hist.values():
-            if last not in closes:
+            if target not in closes:
                 continue
-            ds = sorted(closes)
+            # Closes up to and including the target session only - no lookahead.
+            ds = sorted(d for d in closes if d <= target)
             if len(ds) < 50:
                 continue
-            window = ds[-50:]
-            if window[-1] != last:
-                continue
+            window = ds[-50:]  # window[-1] == target by construction
             vals = [closes[d] for d in window]
             sma = sum(vals) / 50
             total += 1
@@ -255,12 +371,17 @@ class RegimeManager:
                 above += 1
         min_cov = int(config.get('regime.breadth_min_coverage', 300))
         if total < min_cov:
-            logger.warning(f"Breadth coverage too low ({total} < {min_cov})")
+            logger.warning(
+                f"Breadth coverage too low for {target} ({total} < {min_cov})")
             return None
-        return last, above / total * 100.0, total
+        return target, above / total * 100.0, total
+
+    def _compute_breadth_for_last_session(self) -> Optional[Tuple[str, float, int]]:
+        """Back-compat alias for the newest-session breadth reading."""
+        return self._compute_breadth()
 
     def _append_breadth_reading(self, session_s: str) -> None:
-        res = self._compute_breadth_for_last_session()
+        res = self._compute_breadth(session_s)
         if not res or res[0] != session_s:
             return
         readings = {}
@@ -361,6 +482,23 @@ class RegimeManager:
             return {'state': 'UNPAUSED', 'n_on': None, 'session': None,
                     'disabled': True}
         state = self._load_state()
+
+        # While a backfill is mid-flight the repository is only partially
+        # updated - just the symbols swept so far carry the newest session - so
+        # any breadth reading would be computed off a biased subset. Hold the
+        # machine until the sweep finishes; the gate meanwhile answers from the
+        # persisted state, which fails open.
+        bf = state.get('backfill') or {}
+        if bf and not bf.get('done') and bf.get('day') == today_ist().isoformat():
+            marker = f"{bf.get('day')}:{bf.get('cursor')}"
+            if self._bf_hold_logged != marker:
+                logger.info("Regime: breadth backfill in progress "
+                            f"({bf.get('cursor')} symbols done) - holding state machine")
+                self._bf_hold_logged = marker
+            return {'state': state['state'], 'n_on': None,
+                    'session': state.get('last_session'),
+                    'streak': state.get('streak', 0), 'backfill': True}
+
         try:
             nifty = self._nifty_daily_signals()
             if nifty is None:
@@ -386,7 +524,11 @@ class RegimeManager:
                 recent = nifty['sessions'][-3:]
                 if recent and breadth_date >= recent[0]:
                     if state.get('last_session') != session:
-                        logger.debug(
+                        # INFO, not DEBUG: this is the one state in which the
+                        # machine deliberately stops advancing. At DEBUG it hid
+                        # a 3-session freeze (breadth capture was never wired
+                        # into the daemon) with zero operator-visible signal.
+                        logger.info(
                             f"Regime: waiting for {session} breadth "
                             f"(latest {breadth_date}) before advancing")
                         return {'state': state['state'], 'n_on': None,

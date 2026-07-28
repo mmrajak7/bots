@@ -24,7 +24,7 @@ from src.models.database import (
 from src.telegram.bot import telegram
 from src.utils.config_manager import config
 from src.utils.timezone_helper import today_ist, now_ist
-from src.utils.price_rounder import round_price_down, PriceRounder
+from src.utils.price_rounder import PriceRounder, parse_required_tick
 from src.utils.cost_calculator import cost_calculator
 
 
@@ -81,7 +81,27 @@ class ExitManager:
             # In a gap-down scenario, LIMIT at trigger price won't fill if stock opens lower
             # Use 2% buffer below trigger to increase fill probability
             sl_limit_buffer = config.get('risk.sl_gtt_limit_buffer_percent', 2.0) / 100
-            sl_limit_price = round_price_down(sl_price * (1 - sl_limit_buffer))
+
+            # Round on the scrip's REAL exchange tick, not the 0.05/0.10 price-band
+            # heuristic: coarse-tick scrips (SHREECEM = 5.00) get the GTT rejected,
+            # which would leave the position with no stop loss at all.
+            try:
+                sl_tick = self.kite.get_tick_size(script)
+            except Exception as e:
+                logger.warning(f"Tick size lookup failed for {script}: {e}")
+                sl_tick = None
+
+            # Boxed so the tick-size retry below can REBIND it. The limit price
+            # is recomputed from this closure on every attempt: if the retry
+            # corrected only the trigger, the limit would keep being rounded on
+            # the stale (heuristic) grid, every attempt would be rejected, and
+            # the position would end up with no stop loss at all.
+            sl_tick_box = [sl_tick]
+
+            def _sl_round_down(price: float) -> float:
+                return PriceRounder.round_down_to_tick(price, tick_size=sl_tick_box[0])
+
+            sl_limit_price = _sl_round_down(sl_price * (1 - sl_limit_buffer))
 
             # Prepare GTT payload - Use LIMIT order (battle-tested in CROCODILE)
             # Trigger at sl_price, but limit order at sl_limit_price (2% lower)
@@ -117,7 +137,7 @@ class ExitManager:
                 try:
                     # Update payload with current SL price (may have been adjusted)
                     # FIX TR-C3: Maintain gap-down buffer - limit price must be BELOW trigger
-                    current_limit_price = round_price_down(current_sl_price * (1 - sl_limit_buffer))
+                    current_limit_price = _sl_round_down(current_sl_price * (1 - sl_limit_buffer))
                     payload['condition']['trigger_values'] = [current_sl_price]
                     payload['orders'][0]['price'] = current_limit_price
 
@@ -138,7 +158,7 @@ class ExitManager:
 
                     if price_too_close and attempt < max_attempts - 1:
                         # Apply 0.3% buffer (0.25% requirement + 0.05% margin)
-                        current_sl_price = round_price_down(current_sl_price * 0.997)
+                        current_sl_price = _sl_round_down(current_sl_price * 0.997)
                         logger.warning(
                             f"GTT rejected - trigger too close to LTP, retrying with buffer: "
                             f"SL={current_sl_price} (attempt {attempt + 1}/{max_attempts})"
@@ -148,17 +168,22 @@ class ExitManager:
 
                     # Check if error is tick size related (from CROCODILE)
                     if "tick size" in error_str and attempt < max_attempts - 1:
-                        # Extract tick size from error message
-                        tick_match = re.search(r'tick size.*?is\s+(0\.\d+)', str(e), re.IGNORECASE)
+                        # Must handle BOTH Zerodha phrasings - the old pattern
+                        # required the literal "is" and so missed the common
+                        # "... a multiple of tick size 0.50." form. On this path
+                        # a missed retry leaves the position with NO stop loss.
+                        required_tick = parse_required_tick(str(e))
 
-                        if tick_match:
-                            required_tick = float(tick_match.group(1))
+                        if required_tick:
                             logger.warning(
                                 f"SL GTT tick size error for {script}. "
                                 f"Zerodha requires {required_tick}, retrying..."
                             )
 
-                            # Re-round price with correct tick size
+                            # Adopt the exchange's tick for BOTH the trigger and
+                            # the limit - the limit is re-derived from the
+                            # closure at the top of the next attempt.
+                            sl_tick_box[0] = required_tick
                             current_sl_price = PriceRounder.round_down_to_tick(
                                 current_sl_price, tick_size=required_tick
                             )
@@ -504,7 +529,12 @@ class ExitManager:
             monthly_low = float(monthly_df['Low'].iloc[-1])
             candle_date = monthly_df['Date'].iloc[-1] if 'Date' in monthly_df.columns else 'unknown'
             logger.debug(f"{script}: Current month LOW {monthly_low:.2f} from {candle_date}")
-            new_sl = round_price_down(monthly_low)
+            try:
+                trail_tick = self.kite.get_tick_size(script)
+            except Exception as e:
+                logger.warning(f"Tick size lookup failed for {script}: {e}")
+                trail_tick = None
+            new_sl = PriceRounder.round_down_to_tick(monthly_low, tick_size=trail_tick)
 
             # Only trail upward (SL can only tighten)
             if new_sl <= current_sl:

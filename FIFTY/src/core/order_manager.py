@@ -21,7 +21,7 @@ from src.models.database import (
 from src.telegram.bot import telegram
 from src.utils.config_manager import config
 from src.utils.timezone_helper import today_ist, now_ist, in_time_window
-from src.utils.price_rounder import round_price, round_price_down, PriceRounder
+from src.utils.price_rounder import PriceRounder, parse_required_tick
 
 # Order cutoff time - no orders after 3:29 PM (safety feature from CROCODILE)
 ORDER_CUTOFF_TIME = "15:29"
@@ -422,22 +422,41 @@ class OrderManager:
                 logger.info(f"{script}: LTP {ltp:.2f} < signal level {entry_price:.2f}, using LTP for cheaper entry")
                 effective_price = ltp
 
-            # Round price to tick size
-            trigger_price = round_price(effective_price)
-            limit_price = round_price(effective_price)
+            # Round price to tick size.
+            # Use the EXCHANGE-published tick for this scrip when known; the
+            # price-band heuristic in round_price() only ever yields 0.05/0.10
+            # and silently produces exchange-rejected prices on scrips that
+            # trade at a coarser tick (ICRA = 0.50, rejected 2026-07-23).
+            try:
+                instrument_tick = self.kite.get_tick_size(script)
+            except Exception as e:
+                logger.warning(f"Tick size lookup failed for {script}: {e}")
+                instrument_tick = None
+
+            def _tick_round(price: float) -> float:
+                return PriceRounder.round_to_tick(price, tick_size=instrument_tick)
+
+            def _tick_round_down(price: float) -> float:
+                return PriceRounder.round_down_to_tick(price, tick_size=instrument_tick)
+
+            if instrument_tick:
+                logger.debug(f"{script}: using exchange tick size {instrument_tick}")
+
+            trigger_price = _tick_round(effective_price)
+            limit_price = _tick_round(effective_price)
 
             # GTT trigger cannot equal LTP - Zerodha rejects "trigger price equal to last price"
             # If trigger is too close to LTP, adjust down slightly (0.3%) so GTT can be placed
             # The GTT will trigger almost immediately when price touches the trigger
             if ltp and abs(trigger_price - ltp) / ltp < 0.003:  # Within 0.3% of LTP
-                adjusted_trigger = round_price(ltp * 0.997)  # Set trigger 0.3% below LTP
+                adjusted_trigger = _tick_round(ltp * 0.997)  # Set trigger 0.3% below LTP
                 logger.info(
                     f"{script}: Trigger {trigger_price:.2f} too close to LTP {ltp:.2f}, "
                     f"adjusting to {adjusted_trigger:.2f} (-0.3%)"
                 )
                 trigger_price = adjusted_trigger
                 # Keep limit_price at or slightly above trigger for fill
-                limit_price = round_price(adjusted_trigger * 1.002)  # 0.2% buffer for execution
+                limit_price = _tick_round(adjusted_trigger * 1.002)  # 0.2% buffer for execution
 
             # === COMPREHENSIVE PRE-ORDER VALIDATION (from CROCODILE) ===
             is_valid, validation_msg, corrected_price = self._validate_order_params(
@@ -538,7 +557,7 @@ class OrderManager:
                         # This ensures we're well below the 0.25% threshold
                         adjustment_pct = 0.005  # 0.5%
                         old_trigger = trigger_price
-                        trigger_price = round_price_down(trigger_price * (1 - adjustment_pct))
+                        trigger_price = _tick_round_down(trigger_price * (1 - adjustment_pct))
                         limit_price = trigger_price
 
                         logger.warning(
@@ -559,11 +578,16 @@ class OrderManager:
 
                     # Check if it's a tick size error (can retry)
                     if attempt < max_retries - 1 and "tick size" in error_msg:
-                        # Extract tick size from error message
-                        tick_match = re.search(r'tick size.*?is\s+(0\.\d+)', str(gtt_error), re.IGNORECASE)
+                        # Extract the tick Zerodha demands. The old pattern
+                        # required the literal "is", so the real-world message
+                        # "Trigger price should be a multiple of tick size 0.50."
+                        # never matched -> ICRA 2026-07-23 was rejected outright.
+                        # parse_required_tick() handles both phrasings AND
+                        # refuses to mistake a digit-leading symbol (20MICRONS)
+                        # for the tick. None => fall through, never guess.
+                        required_tick = parse_required_tick(str(gtt_error))
 
-                        if tick_match:
-                            required_tick = float(tick_match.group(1))
+                        if required_tick:
                             logger.warning(
                                 f"GTT tick size error for {script}. "
                                 f"Zerodha requires {required_tick}, retrying..."
@@ -1041,9 +1065,18 @@ class OrderManager:
             OpenPosition if successful, None otherwise
         """
         try:
-            # Calculate 20% initial SL
+            # Calculate 20% initial SL.
+            # Round DOWN on the scrip's real exchange tick: a price rounded to
+            # the 0.05/0.10 heuristic is rejected outright on coarse-tick scrips
+            # (SHREECEM = 5.00), and a rejected SL leaves the position naked.
             sl_percent = config.get('trading.initial_sl_percent', 20)
-            initial_sl = round_price_down(fill_price * (1 - sl_percent / 100))
+            try:
+                sl_tick = self.kite.get_tick_size(order.script)
+            except Exception as e:
+                logger.warning(f"Tick size lookup failed for {order.script}: {e}")
+                sl_tick = None
+            initial_sl = PriceRounder.round_down_to_tick(
+                fill_price * (1 - sl_percent / 100), tick_size=sl_tick)
 
             # Use ACTUAL filled quantity for capital calculation
             capital_deployed = fill_price * fill_qty

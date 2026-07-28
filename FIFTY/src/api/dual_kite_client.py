@@ -75,6 +75,7 @@ class DualKiteClient(BrokerAdapter):
         # Instruments cache
         self._instruments_cache: Dict[str, str] = {}  # tradingsymbol -> token
         self._token_to_symbol_cache: Dict[str, str] = {}  # token -> tradingsymbol
+        self._tick_size_cache: Dict[str, float] = {}  # tradingsymbol -> tick_size
         self._instruments_file = config.get('instruments.cache_file', 'data/instruments.csv')
 
         # F&O symbols cache (scripts that have NFO contracts)
@@ -710,6 +711,20 @@ class DualKiteClient(BrokerAdapter):
             self._load_instruments_cache()
         return self._token_to_symbol_cache.get(str(instrument_token))
 
+    def get_tick_size(self, script: str) -> Optional[float]:
+        """Exchange-published tick size for a symbol, or None if unknown.
+
+        Callers MUST treat None as "unknown" and fall back to the price-band
+        heuristic - never assume 0.05.
+        """
+        if not self._tick_size_cache:
+            self._load_instruments_cache()
+        for variation in self._generate_symbol_variations(script.upper()):
+            tick = self._tick_size_cache.get(variation)
+            if tick:
+                return float(tick)
+        return None
+
     def _generate_symbol_variations(self, script: str) -> List[str]:
         """Generate possible symbol variations"""
         variations = [script]
@@ -739,6 +754,13 @@ class DualKiteClient(BrokerAdapter):
             if df.empty:
                 return self._fetch_instruments()
 
+            # Caches written before tick_size was tracked lack the column.
+            # Refetch rather than silently fall back to the price-band guess:
+            # a wrong tick gets orders rejected by the exchange (ICRA, 0.50).
+            if 'tick_size' not in df.columns:
+                logger.info("Instruments cache has no tick_size column - refetching")
+                return self._fetch_instruments()
+
             self._instruments_cache = {
                 str(row['tradingsymbol']): str(row['instrument_token'])
                 for _, row in df.iterrows()
@@ -748,6 +770,12 @@ class DualKiteClient(BrokerAdapter):
                 str(row['instrument_token']): str(row['tradingsymbol'])
                 for _, row in df.iterrows()
                 if pd.notna(row['tradingsymbol']) and pd.notna(row['instrument_token'])
+            }
+            self._tick_size_cache = {
+                str(row['tradingsymbol']): float(row['tick_size'])
+                for _, row in df.iterrows()
+                if pd.notna(row['tradingsymbol']) and pd.notna(row['tick_size'])
+                and float(row['tick_size']) > 0
             }
 
             logger.info(f"Loaded {len(self._instruments_cache)} instruments from cache")
@@ -771,7 +799,10 @@ class DualKiteClient(BrokerAdapter):
                     'tradingsymbol': i['tradingsymbol'],
                     'name': i.get('name', ''),
                     'exchange': i['exchange'],
-                    'instrument_type': i.get('instrument_type', '')
+                    'instrument_type': i.get('instrument_type', ''),
+                    # Exchange-published tick, NOT a price-band guess: some
+                    # scrips (e.g. ICRA) use 0.50 and reject anything else.
+                    'tick_size': float(i.get('tick_size') or 0) or 0.05
                 }
                 for i in instruments
                 if i.get('instrument_type') == 'EQ'
@@ -792,6 +823,10 @@ class DualKiteClient(BrokerAdapter):
             }
             self._token_to_symbol_cache = {
                 row['instrument_token']: row['tradingsymbol']
+                for row in eq_instruments
+            }
+            self._tick_size_cache = {
+                row['tradingsymbol']: row['tick_size']
                 for row in eq_instruments
             }
 

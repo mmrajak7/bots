@@ -70,6 +70,8 @@ regime:
   unpause_days: 7              # 2-of-3 ON for 7 straight sessions to resume
   deep_override_stretch: -2.0  # allow entries while paused if weekly stretch <= this
   breadth_min_coverage: 300    # min symbols with data to trust the breadth reading
+  backfill_seconds_per_cycle: 60  # max seconds/cycle spent healing a breadth gap (resumable)
+  backfill_max_cycles: 30      # give up for the day after this many backfill cycles
 
 # SuperTrend Configuration
 supertrend:

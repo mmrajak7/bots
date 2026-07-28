@@ -571,6 +571,20 @@ def _run_scheduled_tasks(orchestrator, current) -> None:
     if is_market and in_time_window(current, "09:00", "09:05"):
         _safe_run("morning_startup", orchestrator._morning_startup)
 
+    # Regime upkeep: breadth capture / downtime backfill / state machine.
+    # Internally throttled and time-budgeted; runs on every cycle from market
+    # open onward. (Was previously only wired into orchestrator.run(), the
+    # cron-mode path, which the daemon's process lock makes unreachable - so
+    # breadth never ran at all.)
+    #
+    # Starts at 09:15, NOT at 00:00: is_market is only a DATE check, and the
+    # shared read token expires 06:00 with regen at ~08:50. Running before then
+    # would fail every call for ~30 cycles and could leave the SHARED historical
+    # circuit breaker open right when morning startup needs it. The window still
+    # covers post-close hours, which is when a multi-session backfill heals.
+    if is_market and in_time_window(current, "09:15", "23:59"):
+        _safe_run("regime", orchestrator._update_regime)
+
     # Signal processing during market hours
     if is_market and is_market_hours(current):
         _safe_run("process_signals", orchestrator._process_signals)
