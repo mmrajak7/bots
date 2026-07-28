@@ -16,8 +16,11 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, r'C:/Users/mail2/Documents/Projects/BOTS/FIFTY')
-os.chdir(r'C:/Users/mail2/Documents/Projects/BOTS/FIFTY')
+# Derive the FIFTY root from this file - these tests run on the Pi too, so a
+# hardcoded Windows path breaks the deployment script.
+FIFTY_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, FIFTY_DIR)
+os.chdir(FIFTY_DIR)
 
 from src.utils.price_rounder import PriceRounder
 

@@ -47,6 +47,8 @@ for arg in "$@"; do
 done
 
 WATCHDOG_SUSPENDED=0
+SERVICE_STOPPED=0
+DEPLOY_OK=0
 CRON_BACKUP="/tmp/fifty_crontab_$TS.bak"
 
 step()  { echo; echo "=============================================================="; \
@@ -63,18 +65,32 @@ confirm() {
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
-# --- watchdog restore runs on ANY exit, including failure/Ctrl-C -------------
-restore_watchdog() {
+# --- cleanup runs on ANY exit, including failure/Ctrl-C ---------------------
+# Leaving the bot DOWN is worse than anything this script was trying to prevent,
+# so an abnormal exit after STEP 3 brings the service back before returning.
+cleanup() {
+  if [ "$SERVICE_STOPPED" = "1" ] && [ "$DEPLOY_OK" != "1" ]; then
+    echo
+    warn "script aborted with the service stopped - restarting it"
+    if sudo systemctl start "$SERVICE" 2>/dev/null; then
+      sleep 5
+      systemctl is-active --quiet "$SERVICE" \
+        && ok "service restarted (VERIFY which commit it is running: git log --oneline -1)" \
+        || warn "RESTART FAILED - start it yourself: sudo systemctl start $SERVICE"
+    else
+      warn "RESTART FAILED - start it yourself: sudo systemctl start $SERVICE"
+    fi
+  fi
   if [ "$WATCHDOG_SUSPENDED" = "1" ]; then
     if crontab "$CRON_BACKUP" 2>/dev/null; then
-      echo; ok "watchdog cron restored"
+      ok "watchdog cron restored"
     else
-      echo; warn "COULD NOT restore watchdog cron automatically!"
+      warn "COULD NOT restore watchdog cron automatically!"
       warn "run this yourself:  crontab $CRON_BACKUP"
     fi
   fi
 }
-trap restore_watchdog EXIT
+trap cleanup EXIT
 
 # =====================================================================
 step "STEP 0  Preflight"
@@ -158,6 +174,7 @@ else
     sleep 1
   done
   systemctl is-active --quiet "$SERVICE" && die "service still active after 30s"
+  SERVICE_STOPPED=1   # from here on, any abnormal exit must restart it
   ok "service stopped"
 
   # The daemon holds a process lock; a hard kill can leave it behind and the
@@ -423,6 +440,7 @@ else
 fi
 
 # =====================================================================
+DEPLOY_OK=1   # reached the end cleanly; the trap must not second-guess us
 step "DONE"
 # =====================================================================
 cat <<EOF
