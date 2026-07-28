@@ -2,14 +2,14 @@
 #
 # FIFTY - Raspberry Pi deployment script
 # =====================================================================
-# Deploys the breadth/regime + tick-size fixes (commit 4fafcae) and heals
-# the breadth gap left by the regime pipeline never having run.
+# Deploys the breadth/regime + tick-size fixes and heals the breadth gap left
+# by the regime pipeline never having run.
 #
 # Run manually on the Pi:
 #     cd /home/trustit/Desktop/BOTS/FIFTY
-#     bash scripts/deploy_pi.sh            # interactive, asks before writes
+#     git pull origin main                 # get THIS script first
 #     bash scripts/deploy_pi.sh --dry-run  # show everything, change nothing
-#     bash scripts/deploy_pi.sh --yes      # no prompts
+#     bash scripts/deploy_pi.sh            # do it
 #
 # Options:
 #   --dry-run        inspect + report only; no pull, no DB write, no restart
@@ -17,13 +17,21 @@
 #   --skip-backfill  don't run the one-shot breadth backfill
 #   --force          allow running during market hours (09:15-15:30 IST)
 #
-# SAFE TO RE-RUN. Every step is idempotent or explicitly guarded.
+# SAFE TO RE-RUN. Every step is idempotent or explicitly guarded, and re-running
+# after a partial deploy is the intended recovery path.
 #
-# WHY THE ORDER MATTERS:
-#   the watchdog cron restarts the service within 5 min of it stopping, so it
-#   is suspended FIRST and restored by an EXIT trap even if this script dies;
-#   the backfill runs while the service is DOWN so nothing else is writing
-#   history.json / regime_state.json at the same time.
+# ORDERING IS DELIBERATE - everything that can FAIL happens while the service is
+# still UP:
+#   pull + compile + tests run first; a failure there rolls the code back and
+#   exits with ZERO downtime. Only once the code is proven do we suspend the
+#   watchdog, stop the service, clean the DB and backfill. Downtime is confined
+#   to steps 5-8. (v1 verified AFTER stopping, so a broken test harness left the
+#   bot down during market hours - that is what this ordering prevents.)
+#
+# The watchdog cron restarts the service within 5 min of it stopping and
+# Telegram-alerts each time, so it is suspended for the duration and restored by
+# an EXIT trap. That same trap restarts the service if we abort while it is
+# down - a stopped bot is worse than whatever the abort was protecting against.
 # =====================================================================
 
 set -euo pipefail
@@ -49,6 +57,8 @@ done
 WATCHDOG_SUSPENDED=0
 SERVICE_STOPPED=0
 DEPLOY_OK=0
+PULLED=0
+BEFORE=""
 CRON_BACKUP="/tmp/fifty_crontab_$TS.bak"
 
 step()  { echo; echo "=============================================================="; \
@@ -65,28 +75,24 @@ confirm() {
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
-# --- cleanup runs on ANY exit, including failure/Ctrl-C ---------------------
-# Leaving the bot DOWN is worse than anything this script was trying to prevent,
-# so an abnormal exit after STEP 3 brings the service back before returning.
 cleanup() {
   if [ "$SERVICE_STOPPED" = "1" ] && [ "$DEPLOY_OK" != "1" ]; then
     echo
-    warn "script aborted with the service stopped - restarting it"
+    warn "aborted with the service stopped - restarting it"
     if sudo systemctl start "$SERVICE" 2>/dev/null; then
       sleep 5
       systemctl is-active --quiet "$SERVICE" \
-        && ok "service restarted (VERIFY which commit it is running: git log --oneline -1)" \
-        || warn "RESTART FAILED - start it yourself: sudo systemctl start $SERVICE"
+        && ok "service restarted - VERIFY the commit: git log --oneline -1" \
+        || warn "RESTART FAILED - run: sudo systemctl start $SERVICE"
     else
-      warn "RESTART FAILED - start it yourself: sudo systemctl start $SERVICE"
+      warn "RESTART FAILED - run: sudo systemctl start $SERVICE"
     fi
   fi
   if [ "$WATCHDOG_SUSPENDED" = "1" ]; then
     if crontab "$CRON_BACKUP" 2>/dev/null; then
       ok "watchdog cron restored"
     else
-      warn "COULD NOT restore watchdog cron automatically!"
-      warn "run this yourself:  crontab $CRON_BACKUP"
+      warn "COULD NOT restore watchdog cron!  run:  crontab $CRON_BACKUP"
     fi
   fi
 }
@@ -100,17 +106,19 @@ step "STEP 0  Preflight"
 cd "$BOT_DIR"
 git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repo: $BOT_DIR"
 
+SVC_STATE="$(systemctl is-active $SERVICE 2>/dev/null || echo inactive)"
 info "dir      : $BOT_DIR"
 info "python   : $($VENV_PY --version 2>&1)"
 info "commit   : $(git log --oneline -1)"
-info "service  : $(systemctl is-active $SERVICE 2>/dev/null || echo inactive)"
+info "service  : $SVC_STATE"
 [ "$DRY_RUN" = "1" ] && warn "DRY RUN - nothing will be changed"
+[ "$SVC_STATE" != "active" ] && warn "service is not running - it will be started at the end"
 
-# Deploying mid-session stops signal processing and order monitoring.
-# 10# forces base 10: "0915" would otherwise be read as octal and blow up.
+# Downtime here is confined to steps 5-8, but that still pauses signal
+# processing and order monitoring.
 DOW=$(date +%u); NOW=$((10#$(date +%H%M)))
 if [ "$DOW" -le 5 ] && [ "$NOW" -ge 915 ] && [ "$NOW" -le 1530 ]; then
-  warn "MARKET HOURS - the bot will be down for several minutes"
+  warn "MARKET HOURS - the bot will be down briefly (steps 5-8 only)"
   if [ "$FORCE" != "1" ] && [ "$DRY_RUN" != "1" ]; then
     confirm "deploy anyway?" || die "aborted (re-run after 15:30, or pass --force)"
   fi
@@ -133,7 +141,7 @@ fi
 step "STEP 1  Backup"
 # =====================================================================
 if [ "$DRY_RUN" = "1" ]; then
-  info "would back up trading.db, regime_state.json, breadth/ -> $BACKUP_DIR"
+  info "would back up trading.db, regime_state.json, breadth/, config.yaml"
 else
   mkdir -p "$BACKUP_DIR"
   for f in data/trading.db data/regime_state.json data/breadth/history.json \
@@ -144,14 +152,80 @@ else
 fi
 
 # =====================================================================
-step "STEP 2  Suspend watchdog"
+step "STEP 2  Pull the new code   (service still running)"
 # =====================================================================
-# watchdog.sh runs every 5 min and will restart the service the moment we stop
-# it - which would run OLD code and, worse, hold the process lock while the
-# backfill writes history.json. It also Telegram-alerts on every restart.
+BEFORE="$(git rev-parse --short HEAD)"
+info "before: $BEFORE"
+if [ "$DRY_RUN" = "1" ]; then
+  git fetch origin main >/dev/null 2>&1 || warn "fetch failed"
+  info "would fast-forward to: $(git rev-parse --short origin/main)"
+else
+  # config.yaml.template is tracked and has conflicted on the Pi before.
+  # (config.yaml itself is gitignored and is never touched by this script.)
+  if ! git diff --quiet -- config/config.yaml.template 2>/dev/null; then
+    warn "local edits to config.yaml.template - discarding (it is a template)"
+    git checkout -- config/config.yaml.template
+  fi
+  git pull origin main || die "git pull FAILED - resolve manually, then re-run"
+  AFTER="$(git rev-parse --short HEAD)"
+  [ "$BEFORE" != "$AFTER" ] && PULLED=1
+  ok "now at: $AFTER"
+  [ "$PULLED" = "0" ] && info "(already up to date)"
+  git merge-base --is-ancestor "$EXPECTED_COMMIT" HEAD 2>/dev/null \
+    && ok "expected commit $EXPECTED_COMMIT present" \
+    || die "expected commit $EXPECTED_COMMIT NOT in history - wrong branch?"
+fi
+
+# =====================================================================
+step "STEP 3  Verify   (service STILL running - failure costs no downtime)"
+# =====================================================================
+# On failure we roll the code back, so a crash-restart can't pick up bad code.
+verify_failed() {
+  warn "verification FAILED: $1"
+  if [ "$PULLED" = "1" ] && [ "$DRY_RUN" != "1" ]; then
+    warn "rolling code back to $BEFORE so a restart cannot load it"
+    git reset --hard "$BEFORE" >/dev/null 2>&1 \
+      && ok "rolled back to $BEFORE" \
+      || warn "ROLLBACK FAILED - run: git reset --hard $BEFORE"
+  fi
+  die "aborted before touching the service (it is still running)"
+}
+
+$VENV_PY -m py_compile main.py src/core/regime.py src/core/order_manager.py \
+    src/core/exit_manager.py src/api/dual_kite_client.py src/utils/price_rounder.py \
+  && ok "all modified modules compile" \
+  || verify_failed "modules do not compile"
+
+# The whole point of this release: the regime task must be in the DAEMON's
+# scheduler, not only in the dead cron path.
+grep -q '_safe_run("regime"' main.py \
+  && ok "regime task is wired into the daemon scheduler" \
+  || verify_failed "regime task NOT wired into main.py"
+
+for t in regime_smoke_test tick_size_smoke_test; do
+  if [ -f "_research/filter_stretch/$t.py" ]; then
+    if PYTHONIOENCODING=utf-8 $VENV_PY "_research/filter_stretch/$t.py" \
+         >"/tmp/${t}_$TS.log" 2>&1; then
+      ok "$t: $(grep -oE '[0-9]+ passed, [0-9]+ failed' "/tmp/${t}_$TS.log" | tail -1)"
+    else
+      echo "  --- last 20 lines ---"; tail -20 "/tmp/${t}_$TS.log"
+      verify_failed "$t failed (full log: /tmp/${t}_$TS.log)"
+    fi
+  else
+    warn "$t not found (skipped)"
+  fi
+done
+ok "code verified - safe to restart the service on it"
+
+# =====================================================================
+step "STEP 4  Suspend watchdog"
+# =====================================================================
+# watchdog.sh runs every 5 min and restarts the service the moment we stop it,
+# which would hold the process lock while the backfill writes history.json -
+# and it Telegram-alerts on every restart.
 if crontab -l 2>/dev/null | grep -q "watchdog.sh"; then
   if [ "$DRY_RUN" = "1" ]; then
-    info "would suspend the watchdog cron line for the duration of this run"
+    info "would suspend the watchdog cron line for this run"
   else
     crontab -l > "$CRON_BACKUP"
     crontab -l | sed '/watchdog\.sh/s/^/#DEPLOY /' | crontab -
@@ -163,7 +237,7 @@ else
 fi
 
 # =====================================================================
-step "STEP 3  Stop the service"
+step "STEP 5  Stop the service   <-- downtime starts"
 # =====================================================================
 if [ "$DRY_RUN" = "1" ]; then
   info "would: sudo systemctl stop $SERVICE"
@@ -174,11 +248,11 @@ else
     sleep 1
   done
   systemctl is-active --quiet "$SERVICE" && die "service still active after 30s"
-  SERVICE_STOPPED=1   # from here on, any abnormal exit must restart it
+  SERVICE_STOPPED=1   # from here, any abnormal exit must restart it
   ok "service stopped"
 
-  # The daemon holds a process lock; a hard kill can leave it behind and the
-  # next start would exit(2) with "Another instance is running".
+  # A hard kill can leave the process lock behind; the next start would then
+  # exit(2) with "Another instance is running".
   if pgrep -f "main.py --daemon" >/dev/null 2>&1; then
     warn "a main.py --daemon process is still alive - killing it"
     pkill -f "main.py --daemon" || true
@@ -186,65 +260,14 @@ else
     pgrep -f "main.py --daemon" >/dev/null 2>&1 && die "could not kill daemon process"
   fi
   ok "no daemon process remains"
-  if [ -f data/.fifty_lock ]; then
-    rm -f data/.fifty_lock && ok "removed stale lock file"
-  fi
+  [ -f data/.fifty_lock ] && rm -f data/.fifty_lock && ok "removed stale lock file"
 fi
-
-# =====================================================================
-step "STEP 4  Pull the new code"
-# =====================================================================
-BEFORE="$(git rev-parse --short HEAD)"
-info "before: $BEFORE"
-if [ "$DRY_RUN" = "1" ]; then
-  git fetch origin main >/dev/null 2>&1 || warn "fetch failed"
-  info "would fast-forward to: $(git rev-parse --short origin/main)"
-else
-  # config.yaml.template is tracked and has previously conflicted on the Pi.
-  if ! git diff --quiet -- config/config.yaml.template 2>/dev/null; then
-    warn "local edits to config.yaml.template - discarding (it is a template)"
-    git checkout -- config/config.yaml.template
-  fi
-  git pull origin main || die "git pull FAILED - resolve manually, then re-run"
-  AFTER="$(git rev-parse --short HEAD)"
-  ok "now at: $AFTER"
-  [ "$BEFORE" = "$AFTER" ] && info "(already up to date)"
-  git merge-base --is-ancestor "$EXPECTED_COMMIT" HEAD 2>/dev/null \
-    && ok "expected commit $EXPECTED_COMMIT present" \
-    || die "expected commit $EXPECTED_COMMIT NOT in history - wrong branch?"
-fi
-
-# =====================================================================
-step "STEP 5  Verify the code before starting anything"
-# =====================================================================
-$VENV_PY -m py_compile main.py src/core/regime.py src/core/order_manager.py \
-    src/core/exit_manager.py src/api/dual_kite_client.py src/utils/price_rounder.py \
-  && ok "all modified modules compile" || die "compile FAILED - do not start the service"
-
-# The whole point of this release: the regime task must be in the DAEMON's
-# scheduler, not only in the dead cron path.
-grep -q '_safe_run("regime"' main.py \
-  && ok "regime task is wired into the daemon scheduler" \
-  || die "regime task NOT wired into main.py - wrong code deployed"
-
-for t in regime_smoke_test tick_size_smoke_test; do
-  if [ -f "_research/filter_stretch/$t.py" ]; then
-    if PYTHONIOENCODING=utf-8 $VENV_PY "_research/filter_stretch/$t.py" >/tmp/${t}_$TS.log 2>&1; then
-      ok "$t: $(grep -oE '[0-9]+ passed, [0-9]+ failed' /tmp/${t}_$TS.log | tail -1)"
-    else
-      tail -20 /tmp/${t}_$TS.log
-      die "$t FAILED - see /tmp/${t}_$TS.log"
-    fi
-  else
-    warn "$t not found (skipped)"
-  fi
-done
 
 # =====================================================================
 step "STEP 6  Inspect + clean the trading DB"
 # =====================================================================
-# Finds rows the bot can no longer resolve on its own and verifies each against
-# the BROKER before touching it. Nothing is retired that holds real exposure.
+# Data-driven, not hardcoded: finds rows the bot can no longer resolve and
+# verifies each against the BROKER. Nothing holding real exposure is touched.
 CLEAN_MODE="report"
 if [ "$DRY_RUN" != "1" ]; then
   if confirm "retire stale rows if the broker confirms they hold no position?"; then
@@ -254,11 +277,8 @@ if [ "$DRY_RUN" != "1" ]; then
   fi
 fi
 
-# `if !` wrapper: a DB-inspection failure must not abort the run and leave the
-# service stopped. We still need to reach STEP 8.
 if ! CLEAN_MODE="$CLEAN_MODE" $VENV_PY - <<'PYEOF'
-import os, sqlite3, sys, json
-from datetime import datetime, timedelta
+import os, sqlite3, sys
 
 MODE = os.environ.get("CLEAN_MODE", "report")
 db = sqlite3.connect("data/trading.db")
@@ -270,7 +290,7 @@ for tbl in ("signal_queue", "open_orders", "open_positions"):
                        db.execute(f"select status,count(*) from {tbl} group by status"))
     print(f"    {tbl:<16} {counts}")
 
-# Broker truth. If this fails we must NOT guess - abort the cleanup.
+# Broker truth. If this fails we must NOT guess - skip the cleanup entirely.
 try:
     sys.path.insert(0, ".")
     from src.api.dual_kite_client import get_kite_client
@@ -285,7 +305,7 @@ except Exception as e:
 actions = []
 
 # (a) entry orders still PENDING whose GTT no longer exists at the broker
-for r in db.execute("select id,script,gtt_id,placed_at,last_error from open_orders "
+for r in db.execute("select id,script,gtt_id,placed_at from open_orders "
                     "where status='PENDING' and position_created=0"):
     gid = str(r["gtt_id"])
     if gid in gtt_ids:
@@ -299,7 +319,7 @@ for r in db.execute("select id,script,gtt_id,placed_at,last_error from open_orde
                     f"no holding (placed {r['placed_at']})"))
 
 # (b) signals stuck APPROVED with no live order and no position
-for r in db.execute("select id,script,signal_date,signal_month from signal_queue "
+for r in db.execute("select id,script,signal_date from signal_queue "
                     "where status='APPROVED'"):
     live = db.execute(
         "select count(*) from open_orders where signal_id=? and status in "
@@ -317,12 +337,11 @@ for r in db.execute("select id,script,signal_date,signal_month from signal_queue
 print("  --- stale rows ---")
 if not actions:
     print("    none - nothing to clean")
-else:
-    for _, _, _, desc in actions:
-        print(f"    - {desc}")
+for _, _, _, desc in actions:
+    print(f"    - {desc}")
 
 if actions and MODE == "apply":
-    for table, rid, new_status, desc in actions:
+    for table, rid, new_status, _ in actions:
         db.execute(f"update {table} set status=? where id=?", (new_status, rid))
     db.commit()
     print(f"  [OK]   retired {len(actions)} row(s) -> EXPIRED")
@@ -341,58 +360,59 @@ fi
 step "STEP 7  Heal the breadth gap (one-shot backfill)"
 # =====================================================================
 # Runs with the service DOWN so nothing else writes history.json concurrently.
-# If skipped, the daemon heals it itself over ~9 cycles once it is running -
-# this step only makes it immediate.
+# If skipped, the running daemon heals it itself over ~9 cycles - this only
+# makes it immediate.
 if [ "$SKIP_BACKFILL" = "1" ]; then
   info "skipped (--skip-backfill)"
 elif [ "$TOKEN_OK" != "1" ]; then
   warn "skipped - kite token stale/missing."
   warn "the daemon will heal the gap itself after its 08:50 token refresh."
-elif [ "$DRY_RUN" = "1" ]; then
-  $VENV_PY - <<'PYEOF'
-import sys; sys.path.insert(0, ".")
-from src.core.regime import RegimeManager
-from src.api.dual_kite_client import get_kite_client
-rm = RegimeManager(get_kite_client())
-hist_last = rm._last_session_in_history()
-n = rm._nifty_daily_signals()
-missing = [s for s in (n or {}).get("sessions", []) if s > (hist_last or "")]
-print(f"    history last session : {hist_last}")
-print(f"    NIFTY last session   : {(n or {}).get('session')}")
-print(f"    MISSING              : {missing}")
-print(f"    would backfill       : {'yes' if len(missing) > 1 else 'no (<=1 missing -> daily capture handles it)'}")
-PYEOF
 else
-  # non-fatal for the same reason as STEP 6: the daemon can heal the gap itself.
-  if ! $VENV_PY - <<'PYEOF'
-import sys, json, time; sys.path.insert(0, ".")
+  BF_MODE=$([ "$DRY_RUN" = "1" ] && echo inspect || echo run)
+  if ! BF_MODE="$BF_MODE" $VENV_PY - <<'PYEOF'
+import os, sys, json, time
+sys.path.insert(0, ".")
 from pathlib import Path
 from src.core.regime import RegimeManager
 from src.api.dual_kite_client import get_kite_client
 from src.utils.config_manager import config
 
+MODE = os.environ.get("BF_MODE", "inspect")
 rm = RegimeManager(get_kite_client())
+
 before = rm._last_session_in_history()
-print(f"    history last session BEFORE: {before}")
+n = rm._nifty_daily_signals()
+missing = [s for s in (n or {}).get("sessions", []) if s > (before or "")]
+print(f"    history last session : {before}")
+print(f"    NIFTY last session   : {(n or {}).get('session')}")
+print(f"    MISSING              : {missing or 'none - already up to date'}")
 
-# One-shot: give it a large per-cycle budget so the sweep finishes in this run
-# instead of over ~9 daemon cycles. The daemon keeps its own 60s budget.
-config._config.setdefault("regime", {})["backfill_seconds_per_cycle"] = 1800
+if MODE == "inspect":
+    print(f"    would backfill       : "
+          f"{'yes' if len(missing) > 1 else 'no (<=1 missing -> daily capture handles it)'}")
+    raise SystemExit(0)
 
-t0 = time.time()
-for i in range(25):
-    rm.maintenance()
-    bf = (rm._load_state().get("backfill") or {})
-    if not bf:
-        print("    no backfill was needed")
-        break
-    print(f"    pass {i+1}: cursor={bf.get('cursor')} filled={bf.get('filled')} "
-          f"done={bf.get('done')} complete={bf.get('complete')}")
-    if bf.get("done"):
-        break
+if not missing:
+    print("    nothing to do - repository is current")
+else:
+    # One-shot: a large per-cycle budget finishes the sweep in this run instead
+    # of over ~9 daemon cycles. The daemon keeps its own 60s budget.
+    config._config.setdefault("regime", {})["backfill_seconds_per_cycle"] = 1800
+    t0 = time.time()
+    for i in range(25):
+        rm.maintenance()
+        bf = (rm._load_state().get("backfill") or {})
+        if not bf:
+            print("    no backfill was needed (single-session gap -> daily capture)")
+            break
+        print(f"    pass {i+1}: cursor={bf.get('cursor')} filled={bf.get('filled')} "
+              f"done={bf.get('done')} complete={bf.get('complete')}")
+        if bf.get("done"):
+            break
+    print(f"    elapsed: {time.time()-t0:.0f}s")
 
 after = rm._last_session_in_history()
-print(f"    history last session AFTER : {after}  ({time.time()-t0:.0f}s)")
+print(f"    history last session AFTER : {after}")
 
 daily = Path("data/breadth/breadth_daily.json")
 if daily.exists():
@@ -402,8 +422,7 @@ if daily.exists():
 else:
     print("    [WARN] breadth_daily.json still absent")
 
-res = rm.evaluate()
-print(f"    regime now: {res}")
+print(f"    regime now: {rm.evaluate()}")
 PYEOF
   then
     warn "backfill did not finish cleanly - the daemon will retry it on its own"
@@ -411,7 +430,7 @@ PYEOF
 fi
 
 # =====================================================================
-step "STEP 8  Start the service"
+step "STEP 8  Start the service   <-- downtime ends"
 # =====================================================================
 if [ "$DRY_RUN" = "1" ]; then
   info "would: sudo systemctl start $SERVICE"
@@ -423,7 +442,6 @@ else
     die "service failed to start - see journal above"
   }
   ok "service active"
-  info "$(systemctl status $SERVICE --no-pager | sed -n '3p')"
 
   # Heartbeat proves the main loop is turning, not just that the unit started.
   sleep 20
@@ -445,30 +463,28 @@ step "DONE"
 # =====================================================================
 cat <<EOF
 
-  Backup            : $BACKUP_DIR
-  Commit            : $(git rev-parse --short HEAD)
-  Service           : $(systemctl is-active $SERVICE 2>/dev/null || echo inactive)
+  Backup   : $BACKUP_DIR
+  Commit   : $(git rev-parse --short HEAD)
+  Service  : $(systemctl is-active $SERVICE 2>/dev/null || echo inactive)
 
-  WHAT TO CHECK ON THE NEXT MARKET DAY
-  ------------------------------------
-  Breadth must now produce log lines. Watch for:
-
+  WHAT TO CHECK
+  -------------
     grep -iE "breadth|regime" logs/fifty_\$(date +%F).log
 
-  Expected, in order:
-    * if a gap remains  -> "Breadth: backfilling sessions ... (resumable)"
+  Expected:
+    * if a gap remained -> "Breadth: backfilling sessions ... (resumable)"
                            then "backfill progress N/905 ... COMPLETE"
     * every morning     -> "Breadth: capturing <date> official closes for 905 symbols"
                            then "Breadth: captured ~900 closes for <date>"
 
   RED FLAGS
-    * an INSTANT "COMPLETE" with a low filled count -> API was down, data is
-      not real. The script now warns on this explicitly.
-    * "Breadth coverage too low"  -> repository did not fill properly
-    * NO breadth lines at all     -> the regime task is still not running
+    * INSTANT "COMPLETE" with a low filled count -> API was down, data is not
+      real (the code warns on this explicitly)
+    * "Breadth coverage too low" -> repository did not fill properly
+    * NO breadth lines at all    -> the regime task is still not running
 
-  Regime state:  cat data/regime_state.json
-  Roll back   :  git checkout $BEFORE && sudo systemctl restart $SERVICE
-                 (and restore the DB from $BACKUP_DIR if the cleanup ran)
+  Regime state : cat data/regime_state.json
+  Roll back    : git reset --hard $BEFORE && sudo systemctl restart $SERVICE
+                 (restore the DB from $BACKUP_DIR if the cleanup ran)
 
 EOF
