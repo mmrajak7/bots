@@ -196,13 +196,17 @@ $VENV_PY -m py_compile main.py src/core/regime.py src/core/order_manager.py \
   && ok "all modified modules compile" \
   || verify_failed "modules do not compile"
 
-# The whole point of this release: the regime task must be in the DAEMON's
-# scheduler, not only in the dead cron path.
-grep -q '_safe_run("regime"' main.py \
-  && ok "regime task is wired into the daemon scheduler" \
-  || verify_failed "regime task NOT wired into main.py"
+# The whole point of these releases: these tasks must be in the DAEMON's
+# scheduler, not only in orchestrator.run() - the cron path the process lock
+# makes unreachable. Kept as a hard grep (not just the wiring test) because the
+# test loop below only WARNS when a test file is missing.
+for task in regime monitor_sl_hits; do
+  grep -q "_safe_run(\"$task\"" main.py \
+    && ok "$task task is wired into the daemon scheduler" \
+    || verify_failed "$task task NOT wired into main.py"
+done
 
-for t in regime_smoke_test tick_size_smoke_test; do
+for t in wiring_smoke_test regime_smoke_test tick_size_smoke_test; do
   if [ -f "_research/filter_stretch/$t.py" ]; then
     if PYTHONIOENCODING=utf-8 $VENV_PY "_research/filter_stretch/$t.py" \
          >"/tmp/${t}_$TS.log" 2>&1; then

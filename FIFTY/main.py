@@ -590,6 +590,13 @@ def _run_scheduled_tasks(orchestrator, current) -> None:
         _safe_run("process_signals", orchestrator._process_signals)
         _safe_run("send_notifications", orchestrator._send_pending_notifications)
         _safe_run("monitor_orders", orchestrator._monitor_orders)
+        # Same dead-cron-path bug as the regime block above: _monitor_sl_hits was
+        # only ever called from orchestrator.run(), which the daemon's process
+        # lock makes unreachable - so intraday SL-hit detection never ran. The
+        # position still exited (the GTT fires broker-side regardless); what was
+        # missing was the bot NOTICING, so the slot stayed marked OPEN and the
+        # exit alert waited until _reconcile_positions() at 16:00.
+        _safe_run("monitor_sl_hits", orchestrator._monitor_sl_hits)
         _safe_run("monitor_drops", orchestrator._monitor_positions_for_drops)
 
     # Hold signal re-notification (9:30-9:35)
