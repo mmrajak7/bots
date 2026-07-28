@@ -383,16 +383,33 @@ rm = RegimeManager(get_kite_client())
 before = rm._last_session_in_history()
 n = rm._nifty_daily_signals()
 missing = [s for s in (n or {}).get("sessions", []) if s > (before or "")]
+
+# An in-flight sweep must be resumed even when `missing` looks empty: the
+# symbols already swept have advanced the repository's GLOBAL max session, so
+# recomputing `missing` hides the fact that the rest of the universe still has
+# a hole. maintenance() knows this - never gate the call on our own recompute.
+bf_state = (rm._load_state().get("backfill") or {})
+in_flight = bool(bf_state) and not bf_state.get("done")
+
 print(f"    history last session : {before}")
 print(f"    NIFTY last session   : {(n or {}).get('session')}")
-print(f"    MISSING              : {missing or 'none - already up to date'}")
+print(f"    MISSING              : {missing or 'none by global max session'}")
+if in_flight:
+    print(f"    IN-FLIGHT SWEEP      : cursor={bf_state.get('cursor')} "
+          f"filled={bf_state.get('filled')} range={bf_state.get('from')}..{bf_state.get('to')}"
+          f"  <- resuming (this is why 'MISSING' can read empty)")
 
 if MODE == "inspect":
-    print(f"    would backfill       : "
-          f"{'yes' if len(missing) > 1 else 'no (<=1 missing -> daily capture handles it)'}")
+    if in_flight:
+        verdict = "yes - resuming the in-flight sweep"
+    elif len(missing) > 1:
+        verdict = "yes"
+    else:
+        verdict = "no (<=1 missing -> daily capture handles it)"
+    print(f"    would backfill       : {verdict}")
     raise SystemExit(0)
 
-if not missing:
+if not missing and not in_flight:
     print("    nothing to do - repository is current")
 else:
     # Bounded chunk, NOT the whole sweep. At ~1.1s/symbol the full 905 takes
