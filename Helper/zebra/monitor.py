@@ -179,6 +179,40 @@ def _format_enter_alert(trade: dict, analysis: dict,
     return msg
 
 
+def _vet_line(trade: dict) -> str:
+    """One line describing the vetting verdict, appended to an ENTER alert.
+
+    Allows deliberately do NOT get their own Telegram message — one signal, one
+    alert. The verdict rides on the ticket that was already going to be sent.
+    An UNVETTED entry says so explicitly: silence there would read as "Claude
+    approved this", which is exactly the wrong impression.
+    """
+    state = vet_mod.vet_state(trade)
+    if not state:
+        return ""
+    v = trade.get('vet') or {}
+    if state == vet_mod.UNAVAILABLE:
+        return "\n\n⚠ <i>Entered UNVETTED — Claude did not answer in time.</i>"
+    if state == vet_mod.ALLOWED:
+        rid = v.get('decision_id')
+        return f"\n\n✅ <i>Vetted by Claude (decision #{rid}).</i>" if rid \
+            else "\n\n✅ <i>Vetted by Claude.</i>"
+    return ""
+
+
+def format_vetoed_alert(trade: dict, reasons: list, red_flags: list) -> str:
+    """A veto DOES get its own message — nothing else will be sent for this
+    signal, and silence would be indistinguishable from 'nothing fired'."""
+    lines = [f"🛑 <b>VETOED</b>  <code>{trade.get('stock')}</code> "
+             f"({trade.get('direction')})"]
+    for r in (red_flags or [])[:4]:
+        lines.append(f"⚠ {html.escape(str(r))}")
+    for r in (reasons or [])[:4]:
+        lines.append(f"• {html.escape(str(r))}")
+    lines.append("<i>No entry — neither zebra nor the BCS shadow.</i>")
+    return "\n".join(lines)
+
+
 def _vet_context(trade: dict, analysis: dict, gap_pct: float) -> dict:
     """The evidence bundle handed to the vetting agent.
 
@@ -568,6 +602,11 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             msg = _format_bcs_enter_alert(trade, analysis, bcs)
         else:
             msg = None
+        # One signal, one alert: an ALLOW rides on the ticket already being
+        # sent rather than firing a second notification. Read from the FRESH
+        # record — `trade` predates the verdict that let us reach this line.
+        if msg is not None and cfg.VET_ENABLED:
+            msg += _vet_line(store.find(trade['id']) or trade)
         if msg is None:
             # Two distinct reasons land here; say which, or a gated signal
             # looks like a config problem when reading the log later.

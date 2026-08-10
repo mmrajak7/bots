@@ -123,6 +123,21 @@ def cmd_vet_decide(args):
     outcome = vet_mod.record_verdict(store, args.id, verdict,
                                      decision_id=d['id'])
     print(f"decision #{d['id']} recorded; verdict {outcome}")
+
+    # A VETO is the end of the story for this signal — nothing else will be
+    # sent, so silence would be indistinguishable from "nothing fired". An
+    # ALLOW deliberately stays quiet here: it rides on the ENTER alert that is
+    # already going out (one signal, one alert).
+    if verdict == vet_mod.VETOED and outcome == 'applied':
+        from .monitor import _send_telegram, format_vetoed_alert
+        try:
+            _send_telegram(format_vetoed_alert(t, args.reason or [],
+                                               args.red_flag or []))
+        except Exception as e:
+            # The decision is already recorded and applied; a Telegram failure
+            # must not make the agent think its verdict did not land.
+            logging.getLogger(__name__).warning(
+                "veto alert failed for #%d: %s", args.id, e)
     # A discarded verdict is NOT an error the agent should retry — the signal
     # already settled. Exit 0 so a retry loop does not hammer a closed case.
     return 0

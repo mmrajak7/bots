@@ -159,3 +159,78 @@ def test_bad_confidence_is_rejected_before_anything_lands(wired):
         cli.cmd_vet_decide(_decide(confidence=42.0))
     assert journal.all() == []
     assert vet_mod.is_pending(store.find(1))     # signal untouched, still vettable
+
+
+# ── notifications: one signal, one alert ─────────────────────────────────
+def test_veto_sends_a_telegram(wired, monkeypatch):
+    """A veto is the end of the story for this signal — nothing else will be
+    sent, so silence would read as 'nothing fired'."""
+    from zebra import monitor
+    sent = []
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: sent.append(m))
+    store, _ = wired
+    vet_mod.request_entry_vet(store, 1, CONTEXT, spawn=False)
+    cli.cmd_vet_decide(_decide(verdict='veto', red_flag=['Q1 results Aug 14']))
+    assert len(sent) == 1
+    assert 'VETOED' in sent[0] and 'TESTCO' in sent[0]
+    assert 'Q1 results Aug 14' in sent[0]
+
+
+def test_allow_sends_no_separate_telegram(wired, monkeypatch):
+    """One signal, one alert: an allow rides on the ENTER ticket already going
+    out, rather than firing a second notification."""
+    from zebra import monitor
+    sent = []
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: sent.append(m))
+    store, _ = wired
+    vet_mod.request_entry_vet(store, 1, CONTEXT, spawn=False)
+    cli.cmd_vet_decide(_decide(verdict='allow'))
+    assert sent == []
+
+
+def test_discarded_veto_sends_nothing(wired, monkeypatch):
+    """The signal already entered unvetted; a 'VETOED' alert for a live
+    position would be actively misleading."""
+    from zebra import monitor
+    sent = []
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: sent.append(m))
+    store, _ = wired
+    vet_mod.request_entry_vet(store, 1, CONTEXT, spawn=False)
+    vet_mod.expire_stale(store, now=datetime.now() + timedelta(hours=2))
+    cli.cmd_vet_decide(_decide(verdict='veto'))
+    assert sent == []
+
+
+def test_telegram_failure_does_not_break_a_landed_verdict(wired, monkeypatch):
+    """The decision is already applied; a Telegram outage must not make the
+    agent think its verdict failed and retry."""
+    from zebra import monitor
+    monkeypatch.setattr(monitor, '_send_telegram',
+                        lambda m, **k: (_ for _ in ()).throw(RuntimeError('down')))
+    store, _ = wired
+    vet_mod.request_entry_vet(store, 1, CONTEXT, spawn=False)
+    assert cli.cmd_vet_decide(_decide(verdict='veto')) == 0
+    assert store.find(1)['vet']['state'] == vet_mod.VETOED
+
+
+def test_veto_alert_escapes_html(wired, monkeypatch):
+    """Reasons are free text from an LLM; a bare '<' would 400 the whole
+    message and the veto would vanish silently."""
+    from zebra import monitor
+    sent = []
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: sent.append(m))
+    store, _ = wired
+    vet_mod.request_entry_vet(store, 1, CONTEXT, spawn=False)
+    cli.cmd_vet_decide(_decide(verdict='veto', reason=['depth < 500 lots']))
+    assert '&lt;' in sent[0] and ' < ' not in sent[0]
+
+
+def test_prompt_template_renders_with_every_placeholder(wired):
+    """A missing placeholder would raise KeyError inside _spawn_cli and the
+    signal would silently never be vetted."""
+    from zebra import config as _cfg
+    import sys as _sys
+    p = _cfg.VET_PROMPT_TEMPLATE.format(trade_id=1, python=_sys.executable,
+                                        vetting_doc=_cfg.VETTING_DOC)
+    assert 'vet show 1' in p and 'vet decide 1' in p
+    assert _cfg.VETTING_DOC.exists(), "VETTING.md must ship with the package"

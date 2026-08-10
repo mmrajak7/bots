@@ -178,7 +178,10 @@ def test_live_mode_sends_the_order_ticket_exactly_once(wired, monkeypatch):
     assert sent == []
     vet.record_verdict(store, 1, vet.ALLOWED)
     cycle(store)                                         # verdict tick: alert
-    assert sent == ['TICKET']
+    assert len(sent) == 1 and sent[0].startswith('TICKET')
+    # One signal, one alert: the ALLOW rides on this ticket rather than firing
+    # a second notification, so the verdict must be visible ON it.
+    assert 'Vetted by Claude' in sent[0]
     for _ in range(3):
         cycle(store)                                     # later ticks: silent
-    assert sent == ['TICKET'], "the order ticket repeated"
+    assert len(sent) == 1, "the order ticket repeated"

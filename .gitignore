@@ -12,6 +12,10 @@
 *.md
 !README.md
 !**/README.md
+# VETTING.md is a RUNTIME dependency, not documentation: the spawned Claude CLI
+# reads it as its operating instructions. If it is not pulled onto the Pi, every
+# vet silently does nothing (fails open, never vets). It must ship with the code.
+!Helper/zebra/VETTING.md
 
 # Credential files (API keys, tokens, secrets)
 **/credentials.yaml

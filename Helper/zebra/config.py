@@ -45,14 +45,17 @@ VET_TIMEOUT_SEC = 600
 # {python} is filled with sys.executable at spawn time: the Pi runs the bot
 # under a venv and has no guaranteed bare `python` on PATH, and the CLI verbs
 # must import the exact zebra package the bot runs.
+# The spawn prompt stays SHORT because it is argv. The real instructions live in
+# zebra/VETTING.md, which the agent reads — editable without touching code, and
+# reviewable as prose rather than as an escaped string literal.
 VET_PROMPT_TEMPLATE = (
-    "You are vetting a triggered options signal for the zebra/BCS paper book. "
-    "Run `{python} -m zebra vet show {trade_id}` for the full context, follow the "
-    "pre-entry checklist in Helper/CLAUDE.md, then record your call with "
-    "`{python} -m zebra vet decide {trade_id} --verdict allow|veto ...`. "
-    "Veto if event risk, liquidity or structure make this a bad entry. "
-    "You must finish by calling `vet decide` exactly once."
+    "Read {vetting_doc} and follow it exactly to vet signal {trade_id}. "
+    "Start with `{python} -m zebra vet show {trade_id}`. "
+    "Use `{python}` for every zebra command. "
+    "You MUST finish by calling `{python} -m zebra vet decide {trade_id} "
+    "--verdict allow|veto ...` exactly once."
 )
+VETTING_DOC = SCRIPT_DIR / 'VETTING.md'
 KITE_TOKEN_FILE = BOTS_ROOT / 'data' / 'kite_access_token.json'
 TELEGRAM_CONFIG = BOTS_ROOT / 'data' / 'telegram_config.json'
 OPTIONS_CSV = PROJECT_ROOT / 'nse_stocks_options.csv'

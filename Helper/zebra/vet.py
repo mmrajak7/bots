@@ -176,7 +176,8 @@ def _spawn_cli(trade_id: int) -> Optional[int]:
     # bot under a venv and has no guaranteed bare `python` on PATH, and the CLI
     # verbs must import the same zebra package the bot runs.
     prompt = cfg.VET_PROMPT_TEMPLATE.format(trade_id=trade_id,
-                                            python=sys.executable)
+                                            python=sys.executable,
+                                            vetting_doc=cfg.VETTING_DOC)
     argv = [cfg.VET_CLI, '-p', prompt, '--model', cfg.VET_MODEL]
     try:
         _reap_children()
