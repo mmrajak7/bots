@@ -3,6 +3,7 @@
 import json
 import logging
 import math
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,33 @@ LOCK_FILE = LOG_DIR / 'zebra_trades.lock'
 # Callers must never nest the two.
 DECISIONS_FILE = LOG_DIR / 'zebra_decisions.json'
 DECISIONS_LOCK = LOG_DIR / 'zebra_decisions.lock'
+
+# ── Claude vetting layer ──────────────────────────────────────────────────
+# Master switch. OFF by default: the layer ships dark and is enabled explicitly
+# once the CLI is authenticated on the Pi and the prompt has been exercised.
+# With this False, zebra behaves exactly as it did before the layer existed.
+VET_ENABLED = os.environ.get('ZEBRA_VET_ENABLED', '').lower() in ('1', 'true', 'yes')
+# CLI ONLY — never the Anthropic API/SDK. The Pi is authenticated once
+# interactively and that is the sanctioned path for this fleet.
+VET_CLI = os.environ.get('ZEBRA_VET_CLI', 'claude')
+VET_MODEL = os.environ.get('ZEBRA_VET_MODEL', 'fable')   # decision-maker tier
+# Fail-open deadline. Generous because the CLI does live web research (results
+# dates, ex-div, overhangs) and the structure is hedged and non-HFT, so a few
+# minutes of entry drift costs far less than trading an unvetted signal. Past
+# this the signal enters UNVETTED rather than stalling — a vetting outage must
+# never become a silent trading halt.
+VET_TIMEOUT_SEC = 600
+# {python} is filled with sys.executable at spawn time: the Pi runs the bot
+# under a venv and has no guaranteed bare `python` on PATH, and the CLI verbs
+# must import the exact zebra package the bot runs.
+VET_PROMPT_TEMPLATE = (
+    "You are vetting a triggered options signal for the zebra/BCS paper book. "
+    "Run `{python} -m zebra vet show {trade_id}` for the full context, follow the "
+    "pre-entry checklist in Helper/CLAUDE.md, then record your call with "
+    "`{python} -m zebra vet decide {trade_id} --verdict allow|veto ...`. "
+    "Veto if event risk, liquidity or structure make this a bad entry. "
+    "You must finish by calling `vet decide` exactly once."
+)
 KITE_TOKEN_FILE = BOTS_ROOT / 'data' / 'kite_access_token.json'
 TELEGRAM_CONFIG = BOTS_ROOT / 'data' / 'telegram_config.json'
 OPTIONS_CSV = PROJECT_ROOT / 'nse_stocks_options.csv'

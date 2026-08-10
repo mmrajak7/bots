@@ -53,6 +53,81 @@ def cmd_list(args):
     store.list_trades(status_filter=args.status)
 
 
+def cmd_vet_show(args):
+    """Dump the vetting context as JSON — the Claude CLI's only input.
+
+    Deliberately reads the context CAPTURED AT TRIGGER rather than re-quoting:
+    the vetter must judge the same book the bot saw, or its verdict describes a
+    trade that no longer exists. Live re-quoting belongs in the checklist the
+    agent runs, not in the handoff.
+    """
+    import json as _json
+    from . import config as cfg
+    from .trade_store import get_store
+    from . import vet as vet_mod
+    t = get_store().find(args.id)
+    if not t:
+        print(_json.dumps({'error': f'trade #{args.id} not found'}))
+        return 1
+    v = t.get('vet') or {}
+    print(_json.dumps({
+        'trade_id': t['id'],
+        'stock': t.get('stock'),
+        'direction': t.get('direction'),
+        'timeframe': t.get('timeframe'),
+        'st_value': t.get('st_value'),
+        'st_direction': t.get('st_direction'),
+        'signal_gap_pct': t.get('signal_gap_pct'),
+        'trend_aligned': cfg.is_trend_aligned(t.get('direction'),
+                                              t.get('st_direction')),
+        'vet_state': v.get('state'),
+        'deadline': v.get('deadline'),
+        'expired': vet_mod.is_expired(t),
+        'context': v.get('context', {}),
+        'checklist': 'Helper/CLAUDE.md — BCS pre-entry checklist (A-E)',
+    }, indent=2, default=str))
+    return 0
+
+
+def cmd_vet_decide(args):
+    """Record Claude's verdict: journal it, then land it on the signal.
+
+    Order matters. The journal is written FIRST so a crash between the two
+    leaves an auditable decision with no action taken — the safe direction.
+    The reverse would act on a verdict with no record of why.
+    """
+    from . import config as cfg
+    from .trade_store import get_store
+    from .decisions import get_store as get_decisions
+    from . import vet as vet_mod
+
+    store = get_store()
+    t = store.find(args.id)
+    if not t:
+        print(f"trade #{args.id} not found")
+        return 1
+
+    verdict = vet_mod.ALLOWED if args.verdict == 'allow' else vet_mod.VETOED
+    # One decision, both A/B arms — keeps the structure comparison clean.
+    trade_ids = [t['id']] + [s['id'] for s in store.load_trades()
+                             if s.get('shadow_of') == t['id']]
+    d = get_decisions().record(
+        kind='entry',
+        verdict='allow' if verdict == vet_mod.ALLOWED else 'veto',
+        trade_ids=trade_ids,
+        stock=t.get('stock'), direction=t.get('direction'),
+        reasons=args.reason or [], red_flags=args.red_flag or [],
+        confidence=args.confidence, model=cfg.VET_MODEL,
+        notes=args.notes or '',
+    )
+    outcome = vet_mod.record_verdict(store, args.id, verdict,
+                                     decision_id=d['id'])
+    print(f"decision #{d['id']} recorded; verdict {outcome}")
+    # A discarded verdict is NOT an error the agent should retry — the signal
+    # already settled. Exit 0 so a retry loop does not hammer a closed case.
+    return 0
+
+
 def cmd_analyze(args):
     """Run the strike analyzer on a stock outside the scanner. Manual review."""
     from .scanner import _get_kite, get_ltp, compute_st_for_stock
@@ -438,6 +513,25 @@ def main():
                                               'entered', 'exited', 'cancelled'])
     p_list.set_defaults(func=cmd_list)
 
+    # ── Claude vetting layer (called BY the spawned CLI, not by the user) ──
+    p_vet = sub.add_parser('vet', help='Claude vetting layer')
+    vet_sub = p_vet.add_subparsers(dest='vet_command')
+
+    p_vshow = vet_sub.add_parser('show', help='Dump vetting context as JSON')
+    p_vshow.add_argument('id', type=int)
+    p_vshow.set_defaults(func=cmd_vet_show)
+
+    p_vdec = vet_sub.add_parser('decide', help='Record a verdict')
+    p_vdec.add_argument('id', type=int)
+    p_vdec.add_argument('--verdict', required=True, choices=['allow', 'veto'])
+    p_vdec.add_argument('--reason', action='append',
+                        help='Repeatable: one checklist finding per flag')
+    p_vdec.add_argument('--red-flag', action='append',
+                        help='Repeatable: a concrete risk found')
+    p_vdec.add_argument('--confidence', type=float, default=None)
+    p_vdec.add_argument('--notes', default='')
+    p_vdec.set_defaults(func=cmd_vet_decide)
+
     p_anly = sub.add_parser('analyze', help='Strike analyzer for a stock (no save)')
     p_anly.add_argument('symbol')
     p_anly.add_argument('--timeframe', choices=['monthly', 'weekly'],
@@ -505,7 +599,13 @@ def main():
     if not args.command:
         p.print_help()
         sys.exit(1)
-    args.func(args)
+    # A parent command used without its subcommand (e.g. `zebra vet`) parses
+    # fine but carries no func — print that group's help instead of an
+    # AttributeError traceback.
+    if not hasattr(args, 'func'):
+        p.parse_args([args.command, '--help'])
+        sys.exit(1)
+    sys.exit(args.func(args) or 0)
 
 
 if __name__ == '__main__':

@@ -23,6 +23,7 @@ import requests
 
 from . import config as cfg
 from . import strikes as strikes_mod
+from . import vet as vet_mod
 from .scanner import _get_kite, get_ltp, compute_st_for_stock, validate_and_add
 from .trade_store import ZebraStore, get_store
 
@@ -176,6 +177,32 @@ def _format_enter_alert(trade: dict, analysis: dict,
             f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_mid']:g}"
         )
     return msg
+
+
+def _vet_context(trade: dict, analysis: dict, gap_pct: float) -> dict:
+    """The evidence bundle handed to the vetting agent.
+
+    Snapshotted here rather than re-quoted by the agent so its verdict judges
+    exactly the book the bot acted on. Live re-quoting is a step INSIDE the
+    agent's checklist, not part of the handoff.
+    """
+    best = analysis.get('best') or {}
+    return {
+        'stock': trade['stock'],
+        'direction': trade['direction'],
+        'timeframe': trade.get('timeframe'),
+        'spot': analysis.get('spot'),
+        'st_value': trade.get('st_value'),
+        'st_direction': trade.get('st_direction'),
+        'gap_pct': round(gap_pct, 2),
+        'expiry': analysis.get('expiry'),
+        'dte': analysis.get('dte'),
+        'lot_size': analysis.get('lot_size'),
+        'zebra': {k: best.get(k) for k in
+                  ('k_l', 'k_s', 'debit', 'be', 'be_pct_from_spot',
+                   'long_symbol', 'short_symbol', 'long_oi', 'short_oi',
+                   'capital_per_lot', 'gate_fails')},
+    }
 
 
 def _log_bcs_suppressed(trade: dict, reason: Optional[str]) -> None:
@@ -359,10 +386,29 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 pass
             continue
 
-        # Already triggered + still in zone → already alerted, no action.
-        # (Saves Kite quote calls in the analyzer.)
+        # Already triggered + still in zone.
+        # Vet OFF: the alert (and paper entry) happened in the trigger cycle —
+        #   nothing to do. (Saves Kite quote calls in the analyzer.)
+        # Vet ON: 'triggered' is the WAITING state. The entry was deliberately
+        #   deferred past the verdict and it happens HERE, on the first cycle
+        #   whose verdict permits it. Without this fall-through an allowed
+        #   signal would wait forever: this early `continue` runs long before
+        #   the gate below, so the gate alone can never re-admit it.
         if trade['status'] == 'triggered':
-            continue
+            if not cfg.VET_ENABLED:
+                continue
+            state = vet_mod.vet_state(store.find(trade['id']) or trade)
+            if state in (vet_mod.PENDING, vet_mod.VETOED):
+                continue    # still deciding (expire_stale bounds it) / blocked
+            # ALLOWED / UNAVAILABLE → enter now (re-running the analyzer for a
+            # fresh book; entry drift ≤ one tick is the accepted cost of
+            # vetting). None → the vet request never landed (crash after
+            # mark_triggered): fall through so the gate below re-requests it —
+            # recoverable instead of parked until drift-cancel.
+            if state in (vet_mod.ALLOWED, vet_mod.UNAVAILABLE) \
+                    and not cfg.PAPER_MODE \
+                    and (store.find(trade['id']) or {}).get('vet_enter_alerted_at'):
+                continue    # LIVE: the order-ticket alert already went out
 
         # In trigger zone — run analyzer + alert
         try:
@@ -385,11 +431,51 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             c for c in analysis.get('candidates', [])
             if (c['k_l'], c['k_s']) != (analysis['best']['k_l'], analysis['best']['k_s'])
         ]
-        try:
-            store.mark_triggered(trade['id'], price, gap_pct, alert_strikes)
-        except ValueError as e:
-            logger.warning("mark_triggered failed for #%d: %s", trade['id'], e)
-            continue
+        if trade['status'] == 'watching':
+            try:
+                store.mark_triggered(trade['id'], price, gap_pct, alert_strikes)
+            except ValueError as e:
+                logger.warning("mark_triggered failed for #%d: %s", trade['id'], e)
+                continue
+
+        # ── Claude vetting gate ──────────────────────────────────────────
+        # A triggered signal waits for a verdict before it enters. The vet is
+        # requested once; the spawned CLI is never waited on, so this cycle
+        # returns immediately and the entry happens on a later tick.
+        #
+        # EVERY branch that is not an explicit ALLOW must still let the trade
+        # through eventually — `unavailable` (the fail-open timeout) reads as
+        # "enter unvetted", because a vetting outage must never become a
+        # silent trading halt. Only an explicit VETO stops the entry.
+        if cfg.VET_ENABLED:
+            state = vet_mod.vet_state(store.find(trade['id']))
+            if state is None:
+                try:
+                    vet_mod.request_entry_vet(
+                        store, trade['id'],
+                        context=_vet_context(trade, analysis, gap_pct))
+                except ValueError as e:
+                    # The locked re-check saw a state this cache missed —
+                    # already requested or already SETTLED (possibly a veto).
+                    # Never enter on a guess; the next cycle reads the real
+                    # state (request_entry_vet's refresh updated the cache).
+                    logger.warning("VET request refused for #%d: %s — "
+                                   "re-reading next cycle", trade['id'], e)
+                    continue
+                except Exception as e:
+                    # Infra failure (lock timeout, IO). Requesting the vet must
+                    # never block trading: fail open and enter unvetted THIS
+                    # cycle, exactly as the bot behaved before this layer.
+                    logger.error("VET request failed for #%d: %s — proceeding "
+                                 "unvetted", trade['id'], e)
+                else:
+                    continue          # wait for the verdict
+            elif state == vet_mod.PENDING:
+                continue              # still deciding; expire_stale bounds it
+            elif state == vet_mod.VETOED:
+                logger.info("VETOED #%d %s — no entry", trade['id'], stock)
+                continue
+            # ALLOWED or UNAVAILABLE fall through and enter below.
 
         # PAPER mode: auto-record the entry FIRST, then alert — so the ENTER
         # alert only goes out for a position that actually opened. If the fill
@@ -493,6 +579,17 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 logger.info("ENTER alert suppressed for #%d %s "
                             "(alert_structures=%s)", trade['id'], stock,
                             cfg.ALERT_STRUCTURES)
+            continue
+        # LIVE + vet: the ENTER alert is the user's order ticket and fires on
+        # the verdict tick, not the trigger tick — and the signal stays
+        # 'triggered' afterwards (the user enters manually), so status alone
+        # cannot dedupe it. Atomic test-and-set: overlapping crons cannot send
+        # the ticket twice, and the flag is only consumed here, on the path
+        # that actually reaches the alert (never before a step that can fail).
+        if cfg.VET_ENABLED and not cfg.PAPER_MODE \
+                and not store.set_alert_flag(trade['id'], 'vet_enter'):
+            logger.info("Deferred ENTER alert already sent for #%d %s",
+                        trade['id'], stock)
             continue
         sent = _send_telegram(msg, dry_run=dry_run)
         if sent:
@@ -779,6 +876,20 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
 def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
               do_scan: bool = True) -> None:
     """One full cycle: scan + check watching + check entered."""
+    # FIRST, before anything can read a vet state: fail open any vet that blew
+    # its deadline. This is the guard that stops a Claude outage (crash, hung
+    # CLI, expired auth, Pi reboot) from quietly parking signals in `pending`
+    # forever — i.e. from becoming a silent trading halt. It must run on the
+    # entrypoint that ACTUALLY executes, which is this one; check_watching
+    # relies on it having already run.
+    if cfg.VET_ENABLED:
+        try:
+            expired = vet_mod.expire_stale(store)
+            if expired:
+                logger.warning("VET fail-open: %d signal(s) timed out and will "
+                               "enter UNVETTED: %s", len(expired), expired)
+        except Exception as e:
+            logger.error("Vet expiry sweep failed: %s", e, exc_info=True)
     if do_scan:
         try:
             validate_and_add(store, kite=kite, dry_run=dry_run)
