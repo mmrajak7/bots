@@ -7,17 +7,20 @@ Mirrors pyramid/bcs store pattern: local-first JSON, Drive-secondary,
 atomic writes, version-based merge, singleton access.
 """
 
+import copy
 import json
 import logging
 import os
 import platform
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from . import config as cfg
+from .filelock import LockTimeout, exclusive
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +99,49 @@ class ZebraStore:
                 return t
         return None
 
+    # ── Cross-process mutation guard ──────────────────────────────────────
+    @contextmanager
+    def _mutate(self, drive: bool = True, persist: bool = True):
+        """Lock → refresh from disk → caller mutates → save → unlock → Drive.
+
+        Every write path MUST go through this. As of 2026-08-10 there are two
+        writer processes (zebra cron and the Claude vetting/review cron), and
+        an unprotected read-modify-write silently loses trades: both read the
+        same state, both write, and the second erases the first's change with
+        no error and no corrupt file.
+
+        The refresh matters as much as the lock. `self._trades` is a cache that
+        goes stale the moment the OTHER process writes, so mutating it and
+        saving would push stale data back over fresh. Inside the lock we
+        re-read the disk and version-merge, making disk the truth before the
+        caller touches anything. That is also why callers must call `find()`
+        INSIDE the block — a dict fetched before the refresh is a detached
+        object whose mutations would be silently dropped.
+
+        Ordering is deliberate: the Drive upload is a NETWORK call and happens
+        after the lock is released. Holding a mutex across an HTTP round-trip
+        would stall the other cron's entire cycle (see feedback: drive-first —
+        sync down before, upload after, never inside).
+        """
+        with exclusive(cfg.LOCK_FILE):
+            self._trades = self._merge(self._read_local(), self._trades)
+            # Rollback point. If the caller raises mid-mutation (e.g.
+            # _apply_entry sets status='entered' and then a float() cast on a
+            # later field blows up), the half-mutated trade must not linger in
+            # self._trades — get_entered() would report a position that was
+            # never persisted. Snapshot post-refresh state and restore it on
+            # any exception; disk is untouched either way (save is skipped).
+            snapshot = copy.deepcopy(self._trades)
+            try:
+                yield
+            except BaseException:
+                self._trades = snapshot
+                raise
+            if persist:
+                self._save_local()
+        if persist and drive:
+            self._upload_to_drive()
+
     # ── Writes ────────────────────────────────────────────────────────────
     def add_signal(self, data: dict) -> dict:
         """Add a fresh signal at WATCH band entry (gap <= watch_gap_max).
@@ -113,43 +159,41 @@ class ZebraStore:
         timeframe = data['timeframe']
         direction = data['direction']
 
-        # Dedup: no two open signals for same (stock, timeframe, direction).
-        # BCS shadows are excluded — they are passive A/B mirrors and must
-        # never block a fresh zebra signal.
-        for t in self._trades:
-            if (t.get('stock') == stock
-                    and t.get('timeframe') == timeframe
-                    and t.get('direction') == direction
-                    and t.get('structure', 'zebra') != 'bcs'
-                    and t.get('status') in ('watching', 'triggered', 'entered')):
-                raise ValueError(
-                    f"{stock} {timeframe} {direction} already open as #{t['id']}"
-                )
+        # Dedup + id allocation must both happen INSIDE the lock: they are a
+        # read-check-write, and two processes racing here would either double-add
+        # the same signal or hand out the same id to two different trades.
+        with self._mutate():
+            for t in self._trades:
+                if (t.get('stock') == stock
+                        and t.get('timeframe') == timeframe
+                        and t.get('direction') == direction
+                        and t.get('structure', 'zebra') != 'bcs'
+                        and t.get('status') in ('watching', 'triggered', 'entered')):
+                    raise ValueError(
+                        f"{stock} {timeframe} {direction} already open as #{t['id']}"
+                    )
 
-        now = datetime.now()
-        trade = {
-            'id': self._next_id(),
-            'version': 1,
-            'status': 'watching',
-            'stock': stock,
-            'timeframe': timeframe,
-            'direction': direction,            # CE or PE
-            'st_value': data['st_value'],
-            'st_direction': data['st_direction'],
-            # trend_aligned is NOT stored — it is derived on demand from
-            # direction + st_direction via cfg.is_trend_aligned (single source
-            # of truth), so it can never drift from or be dropped by the schema.
-            'signal_price': data['signal_price'],
-            'signal_gap_pct': data['signal_gap_pct'],
-            'signal_date': now.strftime('%Y-%m-%d'),
-            'signal_time': now.strftime('%H:%M:%S'),
-            'paper': data.get('paper', True),
-            'notes': data.get('notes', ''),
-        }
-
-        self._trades.append(trade)
-        self._save_local()
-        self._upload_to_drive()
+            now = datetime.now()
+            trade = {
+                'id': self._next_id(),
+                'version': 1,
+                'status': 'watching',
+                'stock': stock,
+                'timeframe': timeframe,
+                'direction': direction,            # CE or PE
+                'st_value': data['st_value'],
+                'st_direction': data['st_direction'],
+                # trend_aligned is NOT stored — it is derived on demand from
+                # direction + st_direction via cfg.is_trend_aligned (single source
+                # of truth), so it can never drift from or be dropped by the schema.
+                'signal_price': data['signal_price'],
+                'signal_gap_pct': data['signal_gap_pct'],
+                'signal_date': now.strftime('%Y-%m-%d'),
+                'signal_time': now.strftime('%H:%M:%S'),
+                'paper': data.get('paper', True),
+                'notes': data.get('notes', ''),
+            }
+            self._trades.append(trade)
         logger.info(
             "WATCHING #%d %s %s %s spot=%.2f ST=%.2f gap=%.2f%%",
             trade['id'], stock, timeframe, direction,
@@ -161,18 +205,19 @@ class ZebraStore:
                        trigger_gap_pct: float,
                        alert_strikes: list) -> dict:
         """Promote watching → triggered. alert_strikes = candidate pairs from analyzer."""
-        t = self._must_find(trade_id)
-        if t['status'] != 'watching':
-            raise ValueError(f"#{trade_id} status={t['status']}, can't trigger")
-        now = datetime.now()
-        t['status'] = 'triggered'
-        t['triggered_at'] = now.isoformat()
-        t['trigger_spot'] = trigger_spot
-        t['trigger_gap_pct'] = trigger_gap_pct
-        t['alert_strikes'] = alert_strikes
-        t['version'] = t.get('version', 0) + 1
-        self._save_local()
-        self._upload_to_drive()
+        with self._mutate():
+            # find() inside the lock: a dict fetched before the refresh is a
+            # detached object and its mutations would be silently discarded.
+            t = self._must_find(trade_id)
+            if t['status'] != 'watching':
+                raise ValueError(f"#{trade_id} status={t['status']}, can't trigger")
+            now = datetime.now()
+            t['status'] = 'triggered'
+            t['triggered_at'] = now.isoformat()
+            t['trigger_spot'] = trigger_spot
+            t['trigger_gap_pct'] = trigger_gap_pct
+            t['alert_strikes'] = alert_strikes
+            t['version'] = t.get('version', 0) + 1
         logger.info("TRIGGERED #%d %s gap=%.2f%% (%d candidate pairs)",
                     trade_id, t['stock'], trigger_gap_pct, len(alert_strikes))
         return t
@@ -184,16 +229,28 @@ class ZebraStore:
         short_symbol, debit, lot_size, lots, expiry.
         Computed: quantity, capital, tp_spot, sl_spot, debit_sl_value, dte.
         """
-        t = self._must_find(trade_id)
-        if t['status'] not in ('watching', 'triggered'):
-            raise ValueError(f"#{trade_id} status={t['status']}, can't enter")
-
         required = ['long_strike', 'short_strike', 'long_symbol',
                     'short_symbol', 'debit', 'lot_size', 'lots', 'expiry']
         missing = [f for f in required if f not in entry_data]
         if missing:
             raise ValueError(f"mark_entered missing: {missing}")
 
+        with self._mutate():
+            t = self._must_find(trade_id)
+            if t['status'] not in ('watching', 'triggered'):
+                raise ValueError(f"#{trade_id} status={t['status']}, can't enter")
+            self._apply_entry(t, entry_data)
+        logger.info(
+            "ENTERED #%d %s %s/%s debit=%.2f qty=%d cap=Rs%.0f TP=%.2f SL=%.2f",
+            trade_id, t['stock'], int(t['long_strike']), int(t['short_strike']),
+            t['debit'], t['quantity'], t['capital'], t['tp_spot'], t['sl_spot']
+        )
+        return t
+
+    def _apply_entry(self, t: dict, entry_data: dict) -> None:
+        """Field-level entry mutation. Split out of mark_entered so the whole
+        computation runs INSIDE the lock without a 60-line critical section
+        being visually lost in the middle of the method."""
         lot_size = int(entry_data['lot_size'])
         lots = int(entry_data['lots'])
         quantity = lot_size * lots
@@ -252,14 +309,6 @@ class ZebraStore:
         if 'short_extrinsic_entry' in entry_data:
             t['short_extrinsic_entry'] = float(entry_data['short_extrinsic_entry'])
         t['version'] = t.get('version', 0) + 1
-        self._save_local()
-        self._upload_to_drive()
-        logger.info(
-            "ENTERED #%d %s %s/%s debit=%.2f qty=%d cap=Rs%.0f TP=%.2f SL=%.2f",
-            trade_id, t['stock'], int(t['long_strike']), int(t['short_strike']),
-            debit, quantity, capital, tp_spot, sl_spot
-        )
-        return t
 
     def add_bcs_shadow(self, zebra_trade: dict, bcs: dict) -> dict:
         """Create a paper BCS trade shadowing a just-entered zebra trade.
@@ -289,7 +338,26 @@ class ZebraStore:
             dte = None
 
         now = datetime.now()
-        trade = {
+        # _next_id() + append must be inside the lock, or two processes racing
+        # a shadow creation would hand the same id to two different trades.
+        with self._mutate():
+            trade = self._build_bcs_shadow(zebra_trade, bcs, now, lot_size, lots,
+                                           quantity, debit, entry_spot,
+                                           direction, sl_spot, dte)
+            self._trades.append(trade)
+        logger.info(
+            "BCS SHADOW #%d (of #%d) %s %s %g/%g debit=%.2f qty=%d d/w=%s%%",
+            trade['id'], zebra_trade['id'], trade['stock'], direction,
+            trade['long_strike'], trade['short_strike'], debit, quantity,
+            trade.get('debit_to_width_pct')
+        )
+        return trade
+
+    def _build_bcs_shadow(self, zebra_trade, bcs, now, lot_size, lots, quantity,
+                          debit, entry_spot, direction, sl_spot, dte) -> dict:
+        """Assemble the shadow record. Called INSIDE the store lock so that
+        _next_id() sees every trade another process may have just added."""
+        return {
             'id': self._next_id(),
             'version': 1,
             'status': 'entered',
@@ -331,26 +399,26 @@ class ZebraStore:
                                            or bcs.get('short_extrinsic_entry', 0)),
             'entry_warnings': bcs.get('warnings', []),
         }
-        self._trades.append(trade)
-        self._save_local()
-        self._upload_to_drive()
-        logger.info(
-            "BCS SHADOW #%d (of #%d) %s %s %g/%g debit=%.2f qty=%d d/w=%s%%",
-            trade['id'], zebra_trade['id'], trade['stock'], direction,
-            trade['long_strike'], trade['short_strike'], debit, quantity,
-            trade.get('debit_to_width_pct')
-        )
-        return trade
 
     def mark_exited(self, trade_id: int, exit_spot: float,
                     exit_debit: Optional[float],
                     reason: str) -> dict:
         """Close an entered trade. exit_debit = closing net debit per share
         (positive if still costs money to close, negative if closes for credit)."""
-        t = self._must_find(trade_id)
-        if t['status'] != 'entered':
-            raise ValueError(f"#{trade_id} status={t['status']}, can't exit")
+        with self._mutate():
+            t = self._must_find(trade_id)
+            # Status check inside the lock is what makes the exit idempotent
+            # across processes: if the other cron already closed this trade,
+            # we see 'exited' here and refuse, instead of double-booking a
+            # close on stale in-memory state.
+            if t['status'] != 'entered':
+                raise ValueError(f"#{trade_id} status={t['status']}, can't exit")
+            self._apply_exit(t, exit_spot, exit_debit, reason)
+        return t
 
+    def _apply_exit(self, t: dict, exit_spot: float,
+                    exit_debit: Optional[float], reason: str) -> None:
+        """Field-level exit mutation — runs inside the store lock."""
         debit = float(t['debit'])
         qty = int(t['quantity'])
         if exit_debit is not None:
@@ -378,34 +446,34 @@ class ZebraStore:
         t['pnl_pct'] = pnl_pct
         t['exit_reason'] = reason
         t['version'] = t.get('version', 0) + 1
-        self._save_local()
-        self._upload_to_drive()
         logger.info(
             "EXITED #%d %s reason=%s spot=%.2f P&L=Rs%.0f (%.1f%%)",
-            trade_id, t['stock'], reason, exit_spot, pnl, pnl_pct
+            t['id'], t['stock'], reason, exit_spot, pnl, pnl_pct
         )
-        return t
 
     def cancel(self, trade_id: int, reason: str) -> dict:
         """Cancel a watching/triggered signal."""
-        t = self._must_find(trade_id)
-        if t['status'] not in ('watching', 'triggered'):
-            raise ValueError(f"#{trade_id} status={t['status']}, can't cancel")
-        t['status'] = 'cancelled'
-        t['cancelled_at'] = datetime.now().isoformat()
-        t['cancel_reason'] = reason
-        t['version'] = t.get('version', 0) + 1
-        self._save_local()
-        self._upload_to_drive()
+        with self._mutate():
+            t = self._must_find(trade_id)
+            if t['status'] not in ('watching', 'triggered'):
+                raise ValueError(f"#{trade_id} status={t['status']}, can't cancel")
+            t['status'] = 'cancelled'
+            t['cancelled_at'] = datetime.now().isoformat()
+            t['cancel_reason'] = reason
+            t['version'] = t.get('version', 0) + 1
         logger.info("CANCELLED #%d %s: %s", trade_id, t['stock'], reason)
         return t
 
     def update_gap(self, trade_id: int, current_gap_pct: float) -> dict:
-        """Cheap update of last seen gap on a watching signal — no Drive write."""
+        """Cheap update of last seen gap on a watching signal.
+
+        In-memory only — no save, no Drive, no version bump, so it needs no
+        lock. Purely advisory display state; if the other process overwrites
+        it nothing is lost that matters.
+        """
         t = self._must_find(trade_id)
         t['last_gap_pct'] = current_gap_pct
         t['last_gap_at'] = datetime.now().isoformat()
-        # No version bump — purely advisory
         return t
 
     def set_alert_flag(self, trade_id: int, kind: str,
@@ -416,19 +484,23 @@ class ZebraStore:
         False if it was already set (alert already fired in a previous cycle).
         This is the persistent replacement for in-memory dedup that survives
         cron restarts.
+
+        THE read-check-write that most needs the lock. Two processes racing it
+        can both observe the flag unset and both return True — meaning two
+        exits, two alerts, or in a live context two orders. That is exactly the
+        shape of the Feb ICICI bug that put 4x BUY orders on the short leg.
+        Test-and-set is only atomic while the lock is held.
         """
-        t = self.find(trade_id)
-        if not t:
-            return False
-        key = f"{kind}_alerted_at"
-        if t.get(key):
-            return False
-        t[key] = datetime.now().isoformat()
-        t['version'] = t.get('version', 0) + 1
-        if persist:
-            self._save_local()
-            self._upload_to_drive()
-        return True
+        newly_set = False
+        with self._mutate(drive=persist, persist=persist):
+            t = self.find(trade_id)
+            if t:
+                key = f"{kind}_alerted_at"
+                if not t.get(key):
+                    t[key] = datetime.now().isoformat()
+                    t['version'] = t.get('version', 0) + 1
+                    newly_set = True
+        return newly_set
 
     def set_alert_flag_daily(self, trade_id: int, kind: str,
                              persist: bool = True) -> bool:
@@ -439,20 +511,17 @@ class ZebraStore:
         Returns True if the flag was set/refreshed today (fire the alert);
         False if it already fired today.
         """
-        t = self.find(trade_id)
-        if not t:
-            return False
-        key = f"{kind}_alerted_at"
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        last = t.get(key, '')
-        if last.startswith(today_str):
-            return False
-        t[key] = datetime.now().isoformat()
-        t['version'] = t.get('version', 0) + 1
-        if persist:
-            self._save_local()
-            self._upload_to_drive()
-        return True
+        newly_set = False
+        with self._mutate(drive=persist, persist=persist):
+            t = self.find(trade_id)
+            if t:
+                key = f"{kind}_alerted_at"
+                today_str = datetime.now().strftime('%Y-%m-%d')
+                if not str(t.get(key, '')).startswith(today_str):
+                    t[key] = datetime.now().isoformat()
+                    t['version'] = t.get('version', 0) + 1
+                    newly_set = True
+        return newly_set
 
     # ── Quote-reliability confirm / blind counters ─────────────────────────
     # Advisory per-trade state for the DEBIT-SL value trigger. Persisted to the
@@ -467,62 +536,55 @@ class ZebraStore:
         unreliable polls in between (which simply don't call this) may not
         indefinitely block a genuine exit. Mirrors bcs.bump_confirm.
         """
-        t = self.find(trade_id)
-        if not t:
-            return 0
-        key = f"{kind}_confirm"
-        tkey = f"{kind}_confirm_t"
-        now = time.time()
-        if now - float(t.get(tkey, 0.0)) > cfg.CONFIRM_STALE_SEC:
-            t[key] = 0
-        t[key] = int(t.get(key, 0)) + 1
-        t[tkey] = now
-        if persist:
-            self._save_local()
-        return t[key]
+        count = 0
+        with self._mutate(drive=False, persist=persist):
+            t = self.find(trade_id)
+            if t:
+                key = f"{kind}_confirm"
+                tkey = f"{kind}_confirm_t"
+                now = time.time()
+                if now - float(t.get(tkey, 0.0)) > cfg.CONFIRM_STALE_SEC:
+                    t[key] = 0
+                t[key] = int(t.get(key, 0)) + 1
+                t[tkey] = now
+                count = t[key]
+        return count
 
     def reset_confirm(self, trade_id: int, kind: str, persist: bool = True) -> None:
         """Clear a confirmation counter (a reliable non-trigger poll)."""
-        t = self.find(trade_id)
-        if not t:
-            return
-        key = f"{kind}_confirm"
-        if t.get(key):
-            t[key] = 0
-            t[f"{kind}_confirm_t"] = time.time()
-            if persist:
-                self._save_local()
+        with self._mutate(drive=False, persist=persist):
+            t = self.find(trade_id)
+            if t and t.get(f"{kind}_confirm"):
+                t[f"{kind}_confirm"] = 0
+                t[f"{kind}_confirm_t"] = time.time()
 
     def bump_blind(self, trade_id: int, persist: bool = True) -> int:
         """Increment the consecutive unusable-quote cycle counter."""
-        t = self.find(trade_id)
-        if not t:
-            return 0
-        t['debit_blind_cycles'] = int(t.get('debit_blind_cycles', 0)) + 1
-        if persist:
-            self._save_local()
-        return t['debit_blind_cycles']
+        count = 0
+        with self._mutate(drive=False, persist=persist):
+            t = self.find(trade_id)
+            if t:
+                t['debit_blind_cycles'] = int(t.get('debit_blind_cycles', 0)) + 1
+                count = t['debit_blind_cycles']
+        return count
 
     def clear_blind(self, trade_id: int, persist: bool = True) -> None:
         """Reset blindness state on the first usable quote (re-arms the alert)."""
-        t = self.find(trade_id)
-        if not t:
-            return
-        if t.get('debit_blind_cycles') or t.get('debit_blind_alerted'):
-            t['debit_blind_cycles'] = 0
-            t['debit_blind_alerted'] = False
-            if persist:
-                self._save_local()
+        with self._mutate(drive=False, persist=persist):
+            t = self.find(trade_id)
+            if t and (t.get('debit_blind_cycles') or t.get('debit_blind_alerted')):
+                t['debit_blind_cycles'] = 0
+                t['debit_blind_alerted'] = False
 
     def mark_blind_alerted(self, trade_id: int, persist: bool = True) -> bool:
         """Set the blind-alert flag once per blind spell. True if newly set."""
-        t = self.find(trade_id)
-        if not t or t.get('debit_blind_alerted'):
-            return False
-        t['debit_blind_alerted'] = True
-        if persist:
-            self._save_local()
-        return True
+        newly_set = False
+        with self._mutate(drive=False, persist=persist):
+            t = self.find(trade_id)
+            if t and not t.get('debit_blind_alerted'):
+                t['debit_blind_alerted'] = True
+                newly_set = True
+        return newly_set
 
     # ── Listing ───────────────────────────────────────────────────────────
     def list_trades(self, status_filter: Optional[str] = None):
@@ -590,11 +652,20 @@ class ZebraStore:
         try:
             from bcs.drive_store import download_json
             if self._drive_file_id:
+                # Network call OUTSIDE the lock (same rule as _mutate's upload).
                 drive_data = download_json(self._drive_service, self._drive_file_id)
-                base = self._trades if self._trades else self._read_local()
-                merged = self._merge(base, drive_data)
-                self._trades = merged
-                self._save_local()
+                # The merge+save is a read-modify-write on the shared file and
+                # MUST hold the store lock: unlocked, a trade the other cron
+                # writes between our read and our _save_local is clobbered —
+                # the exact silent lost-write this lock exists to prevent.
+                # Base is disk-merged-with-memory (disk is truth), never bare
+                # self._trades, which goes stale the moment the other process
+                # writes.
+                with exclusive(cfg.LOCK_FILE):
+                    base = self._merge(self._read_local(), self._trades)
+                    merged = self._merge(base, drive_data)
+                    self._trades = merged
+                    self._save_local()
                 self._last_sync_time = time.time()
                 drive_vers = {t['id']: t.get('version', 0) for t in drive_data}
                 merged_vers = {t['id']: t.get('version', 0) for t in merged}
@@ -604,7 +675,14 @@ class ZebraStore:
             else:
                 logger.info("No zebra file on Drive yet, loading local")
                 self._load_local()
+        except LockTimeout:
+            # Lock busy for 30s+ — do NOT fall through to _load_local, which
+            # would immediately re-attempt the same busy lock for another 30s.
+            # In-memory state is untouched and still sane; next sync retries.
+            logger.warning("Drive sync skipped: store lock busy")
         except Exception as e:
+            # The `with exclusive` above has already released on unwind, so the
+            # _load_local fallback (which takes the lock itself) cannot deadlock.
             logger.warning("Drive sync failed: %s. Using local.", e)
             self._load_local()
 
@@ -645,7 +723,13 @@ class ZebraStore:
             return []
 
     def _load_local(self):
-        self._trades = self._read_local()
+        # Under the lock: an unlocked startup read can land mid-save from the
+        # other cron. On Linux that silently returns a stale snapshot; on
+        # Windows the open handle makes the writer's os.replace fail outright.
+        # Only safe here because _load_local is never called from inside
+        # _mutate — flock on a second fd in the same process would deadlock.
+        with exclusive(cfg.LOCK_FILE):
+            self._trades = self._read_local()
         if self._trades:
             logger.info("Loaded %d trades from local", len(self._trades))
         else:
@@ -675,7 +759,18 @@ class ZebraStore:
                 json.dump(self._trades, f, indent=2, default=str)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, str(cfg.LOCAL_FILE))
+            # POSIX rename is indifferent to open handles, but on Windows a
+            # reader holding the destination open makes this fail outright.
+            # Callers are all under the store lock, so a collision here means a
+            # stray unlocked reader — retry briefly rather than lose the write.
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_path, str(cfg.LOCAL_FILE))
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05)
             tmp_path = None
         except Exception:
             if fd is not None:

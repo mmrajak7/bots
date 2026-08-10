@@ -14,6 +14,17 @@ BOTS_ROOT = PROJECT_ROOT.parent                     # BOTS/
 LOG_DIR = PROJECT_ROOT / 'logs'
 CONFIG_FILE = PROJECT_ROOT / 'config' / 'zebra_config.json'
 LOCAL_FILE = LOG_DIR / 'zebra_trades.json'
+# Cross-process mutex for the trade store. Two writers exist as of 2026-08-10
+# (zebra cron + the Claude vetting/review cron), and an unprotected
+# read-modify-write loses trades SILENTLY. A sidecar token file, never read —
+# see zebra/filelock.py for why an OS advisory lock beats a PID lockfile here.
+LOCK_FILE = LOG_DIR / 'zebra_trades.lock'
+# Claude vetting journal. SEPARATE lock from the trade store on purpose: sharing
+# one would deadlock any caller that journalled while holding the trade lock
+# (POSIX flock is per-fd, so a second acquire in the same process blocks).
+# Callers must never nest the two.
+DECISIONS_FILE = LOG_DIR / 'zebra_decisions.json'
+DECISIONS_LOCK = LOG_DIR / 'zebra_decisions.lock'
 KITE_TOKEN_FILE = BOTS_ROOT / 'data' / 'kite_access_token.json'
 TELEGRAM_CONFIG = BOTS_ROOT / 'data' / 'telegram_config.json'
 OPTIONS_CSV = PROJECT_ROOT / 'nse_stocks_options.csv'
