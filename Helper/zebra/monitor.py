@@ -12,6 +12,7 @@ User executes manually and uses `zebra enter ID ...` / `zebra close ID ...`.
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import time
@@ -142,7 +143,10 @@ def _format_enter_alert(trade: dict, analysis: dict,
 
     k_l = int(best['k_l']) if best['k_l'].is_integer() else best['k_l']
     k_s = int(best['k_s']) if best['k_s'].is_integer() else best['k_s']
-    warn = ' ⚠ ' + ','.join(best['gate_fails']) if best['gate_fails'] else ''
+    # escape: gate tags contain '<' (long_OI<5000) — a bare '<' makes
+    # Telegram's HTML parser reject the whole message.
+    warn = ' ⚠ ' + html.escape(','.join(best['gate_fails'])) \
+        if best['gate_fails'] else ''
 
     conviction = ' ⭐ALIGNED' if cfg.is_trend_aligned(
         trade.get('direction'), trade.get('st_direction')) else ''
@@ -161,7 +165,8 @@ def _format_enter_alert(trade: dict, analysis: dict,
         f"🔴 SELL 1× <code>{best['short_symbol']}</code>  {best['short_bid']:g}"
     )
     if bcs:
-        warn = ' ⚠ ' + ','.join(bcs['warnings']) if bcs.get('warnings') else ''
+        warn = ' ⚠ ' + html.escape(','.join(bcs['warnings'])) \
+            if bcs.get('warnings') else ''
         msg += (
             f"\n\n📐 <b>BCS shadow</b> (paper A/B): "
             f"{bcs['long_strike']:g}/{bcs['short_strike']:g}  "
@@ -171,6 +176,23 @@ def _format_enter_alert(trade: dict, analysis: dict,
             f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_mid']:g}"
         )
     return msg
+
+
+def _format_bcs_suppressed_alert(trade: dict, reason: Optional[str]) -> str:
+    """Suppression notice for a gated shadow BCS (BCS-led alert mode).
+
+    A suppressed signal must still be visible — silence would look identical
+    to "nothing fired", and a gate that starts rejecting everything must be
+    obvious from the phone. The reason is html-escaped because gate reasons
+    legitimately contain '<' (e.g. "OI 4,999 < 5,000") and a single bare '<'
+    makes Telegram's HTML parser reject the WHOLE message with a 400 — the
+    alert would be lost exactly when the gate fires.
+    """
+    reason = html.escape(reason or "no viable BCS pair (see logs)")
+    return (f"⚠ <b>BCS SUPPRESSED</b>  <code>{trade['stock']}</code> "
+            f"({trade['direction']})\n{reason}\n"
+            f"<i>No trade. Zebra #{trade['id']} entered silently for "
+            f"the A/B record.</i>")
 
 
 def _format_bcs_enter_alert(trade: dict, analysis: dict, bcs: dict) -> str:
@@ -183,7 +205,8 @@ def _format_bcs_enter_alert(trade: dict, analysis: dict, bcs: dict) -> str:
     pull_dir = 'up to' if direction == 'CE' else 'down to'
     conviction = ' ⭐ALIGNED' if cfg.is_trend_aligned(
         direction, trade.get('st_direction')) else ''
-    warn = ' ⚠ ' + ','.join(bcs['warnings']) if bcs.get('warnings') else ''
+    warn = ' ⚠ ' + html.escape(','.join(bcs['warnings'])) \
+        if bcs.get('warnings') else ''
     k_atm = f"{bcs['long_strike']:g}"
     k_tgt = f"{bcs['short_strike']:g}"
     capital = bcs['debit'] * bcs['lot_size']
@@ -375,6 +398,7 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # here, because a 'cancelled' record isn't deduped by the scanner and
         # would be re-added + re-alerted every scan (alert churn).
         bcs = None
+        bcs_skip_reason = None      # why a gate suppressed the shadow, if it did
         if cfg.PAPER_MODE:
             best = analysis.get('best')
             if not best:
@@ -421,6 +445,7 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     if bcs.get('error'):
                         logger.warning("BCS shadow skipped for #%d %s: %s",
                                        trade['id'], stock, bcs['error'])
+                        bcs_skip_reason = bcs['error']
                         bcs = None
                     else:
                         bcs['expiry'] = analysis['expiry']
@@ -429,6 +454,10 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 except Exception as e:
                     logger.error("BCS shadow failed for #%d %s: %s",
                                  trade['id'], stock, e)
+                    # Attribute honestly: this is a crash (or a persist
+                    # failure AFTER a clean analysis), not a gate rejection —
+                    # the alert must not imply the pair was unviable.
+                    bcs_skip_reason = f"shadow build failed: {e}"
                     bcs = None
 
         # Who talks on Telegram (both structures auto-trade regardless):
@@ -443,13 +472,16 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         if send_zebra:
             msg = _format_enter_alert(trade, analysis,
                                       bcs=bcs if send_bcs else None)
+            if send_bcs and bcs is None and bcs_skip_reason:
+                # Both structures alert but the shadow was gated: the zebra
+                # ticket must carry the reason, or the BCS just vanishes from
+                # the combined alert with no trace of why.
+                msg += (f"\n\n📐 BCS shadow suppressed: "
+                        f"{html.escape(bcs_skip_reason)}")
         elif send_bcs and bcs:
             msg = _format_bcs_enter_alert(trade, analysis, bcs)
         elif send_bcs and cfg.PAPER_MODE and cfg.BCS_PAPER_ENABLED:
-            msg = (f"⚠ <b>BCS SKIP</b>  <code>{stock}</code> "
-                   f"({trade['direction']}) — signal fired but no viable "
-                   f"BCS pair (see logs). Zebra #{trade['id']} entered "
-                   f"silently.")
+            msg = _format_bcs_suppressed_alert(trade, bcs_skip_reason)
         else:
             msg = None
         if msg is None:

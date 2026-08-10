@@ -431,6 +431,14 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     `atm_quote` needs bid/ask/mid/oi keys (the zebra analyzer's short-leg
     quote). Returns {'error': ...} when no viable target leg exists — the
     caller skips the shadow, never blocks the zebra flow.
+
+    Two HARD gates (2026-08-10, from the 25-trade shadow study). Both return
+    an error rather than a warning, so an unclean signal is SUPPRESSED
+    instead of being alerted with a ⚠ nobody reads:
+      1. OI >= cfg.MIN_LEG_OI on BOTH legs  — the COCHINSHIP/NHPC failure
+      2. debit <= cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT of width  — payoff floor
+    Together they rejected 32% of the closed sample, and that rejected third
+    ran 37.5% WR / -22.9% ROC / PF 0.27 — it lost money outright.
     """
     _load_options_csv()
     strikes = _list_strikes(stock, expiry, direction)
@@ -457,6 +465,24 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
         return {'error': f"unreliable target-leg book "
                          f"{tgt_meta['tradingsymbol']}: {tgt_q.get('unreliable_reason')}"}
 
+    # ── HARD GATE 1: liquidity on BOTH legs ──────────────────────────────
+    # Was a soft warning until 2026-08-10. It is now a block because the
+    # damage is mechanical, not statistical: on an illiquid book the debit
+    # stop does not fill where it is set. Across the closed shadows, OI-
+    # flagged trades overshot the -50% trigger by -22.0 pts (realised
+    # -72.0%) against -2.7 pts on clean books. COCHINSHIP collapsed
+    # 2.18 -> 0.18 in one session while spot moved the RIGHT way; NHPC cost
+    # real money the same way. A missed signal is cheap, this tail is not.
+    for leg, oi in (('ATM', atm_quote.get('oi')), ('target', tgt_q.get('oi'))):
+        # Kite can ship "oi": null and a caller-built atm_quote may omit the
+        # key entirely. Unknown liquidity must fail CLOSED (treat as 0) —
+        # never raise, which would misreport the block as 'shadow build
+        # failed' instead of the gate reason.
+        oi = oi or 0
+        if oi < cfg.MIN_LEG_OI:
+            return {'error': f"{leg} leg OI {oi:,} < {cfg.MIN_LEG_OI:,} "
+                             f"— illiquid book, signal suppressed"}
+
     debit = round(atm_quote['mid'] - tgt_q['mid'], 2)
     if debit <= 0:
         return {'error': f"non-positive BCS debit {debit} "
@@ -467,12 +493,27 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     short_ext = _extrinsic(direction, spot, k_tgt, tgt_q['mid'])
     tgt_spread_pct = ((tgt_q['ask'] - tgt_q['bid']) / tgt_q['mid']) \
         if tgt_q['mid'] > 0 else 1.0
+    debit_to_width_pct = round(debit / width * 100, 1) if width else 0
 
-    warnings = []
-    if tgt_q['oi'] < cfg.MIN_LEG_OI:
-        warnings.append(f'target_OI<{cfg.MIN_LEG_OI}')
-    if tgt_spread_pct > cfg.MAX_LEG_SPREAD_PCT:
-        warnings.append(f'target_spread>{cfg.MAX_LEG_SPREAD_PCT*100:.0f}%')
+    # ── HARD GATE 2: debit as a share of width ───────────────────────────
+    # See cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT for the full rationale. Short
+    # version: width is pinned at ~3.8% of spot by the ST-magnet distance,
+    # so d/w is the market's own probability quote. Past ~45% the payoff is
+    # priced out — that band ran PF 0.24 while still winning 50% of the
+    # time, i.e. it is a payoff problem, not a hit-rate problem.
+    if debit_to_width_pct > cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT:
+        return {'error': f"debit {debit:g} is {debit_to_width_pct:.1f}% of "
+                         f"width {width:g} (cap {cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT:g}%) "
+                         f"— no payoff left, signal suppressed"}
+
+    # `target_spread>2%` was dropped here on 2026-08-10. It fired on 17 of 25
+    # closed shadows (68%) and carried no signal whatsoever — 58.8% WR flagged
+    # vs 62.5% clean. Its only real effect was to train the reader to ignore
+    # the ⚠ marker, which is how the OI flag on COCHINSHIP got waved through.
+    # The measured value still ships below as `short_spread_pct` for the record.
+    # The list stays (empty) so the stored schema is stable and there is a home
+    # for genuinely informational, non-blocking flags later.
+    warnings: list = []
 
     return {
         'long_strike': atm_strike,
@@ -489,7 +530,7 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
         'debit': debit,
         'width': width,
         'max_profit_per_share': round(width - debit, 2),
-        'debit_to_width_pct': round(debit / width * 100, 1) if width else 0,
+        'debit_to_width_pct': debit_to_width_pct,
         'lot_size': lot_size,
         'warnings': warnings,
     }

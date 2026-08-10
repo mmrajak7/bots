@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,25 @@ _DEFAULTS = {
     'max_dte': 45,
     'min_leg_oi': 5000,
     'max_leg_spread_pct': 0.01,  # bid-ask spread cap per leg (1% of mid)
+    'bcs_max_debit_to_width_pct': 45.0,
+                                 # HARD gate on the shadow BCS: reject when the
+                                 # debit exceeds this share of the spread width.
+                                 # From the 2026-08-10 study of 25 closed shadows:
+                                 # d/w is the market's probability quote, so it
+                                 # barely predicts WINNING (r=+0.20) but almost
+                                 # perfectly predicts PAYOFF (r=-0.92 on winners).
+                                 # Above ~45% there is no payoff left — that band
+                                 # ran 40% WR / -16% ROC / PF 0.24. Gating at 45
+                                 # kept 80% of trades and lifted ROC 16.6%->28.9%.
+                                 # NOT the BCS playbook's 30-35%: that rule assumes
+                                 # a freely-chosen width, but here the ST-magnet
+                                 # distance pins width at ~3.8% of spot, and 35%
+                                 # would keep only 24% of signals at 33% WR.
+                                 # Jackknife puts the true optimum in 39-47, so
+                                 # treat 45 as a region, not a magic number.
+                                 # There is deliberately NO floor: cheap spreads
+                                 # are the high-payoff tail (avg win +127%) and
+                                 # capping that would violate the power-law rule.
     'tp_target': 'st_line',       # 'st_line' or 'short_strike'
     'spot_sl_enabled': False,     # master switch for the adverse-spot SL (off: debit floor only)
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
@@ -103,6 +123,41 @@ def _load_runtime() -> dict:
 
 _runtime = _load_runtime()
 
+
+def _positive_finite(key: str, val, default: float) -> float:
+    """Coerce a gate threshold to a positive finite number, else the default.
+
+    A threshold that arrives from JSON as a string/null raises TypeError on
+    every comparison — which would suppress EVERY shadow with a misleading
+    'shadow build failed' reason. Worse, json.load happily parses the NaN
+    literal, and NaN compares False against everything, which silently turns
+    a hard gate into a no-op. Fail LOUD and fall back to the tested default
+    instead; never let a config typo disarm a gate. (bool is excluded
+    explicitly because it is an int subclass: true would gate at 1%.)
+    """
+    if isinstance(val, bool) or not isinstance(val, (int, float)) \
+            or not math.isfinite(val) or val <= 0:
+        logger.warning("zebra_config.json: %s=%r is not a positive finite "
+                       "number — using default %g", key, val, default)
+        return float(default)
+    return float(val)
+
+
+def _positive_int(key: str, val, default: int) -> int:
+    """Same guard for the count-valued keys, preserving int type.
+
+    These feed range()/timedelta()/sleep() and integer comparisons, so they
+    must not silently become floats. A non-integral value (st_period=10.5) is
+    rejected rather than rounded — quietly changing a lookback window is the
+    kind of drift nobody notices until a backtest stops reconciling.
+    """
+    checked = _positive_finite(key, val, float(default))
+    if checked != int(checked):
+        logger.warning("zebra_config.json: %s=%r must be a whole number — "
+                       "using default %d", key, val, default)
+        return int(default)
+    return int(checked)
+
 # ── Exports ───────────────────────────────────────────────────────────────
 PAPER_MODE = _runtime['paper_mode']
 BCS_PAPER_ENABLED = _runtime['bcs_paper_enabled']
@@ -121,27 +176,42 @@ if 'bcs' in ALERT_STRUCTURES \
     logger.warning("alert_structures=['bcs'] but bcs_paper_enabled=false — "
                    "no BCS trades exist to alert on; paper mode will be "
                    "silent. Enable bcs_paper_enabled or add 'zebra'.")
-WATCH_GAP_MAX = _runtime['watch_gap_max']
-TRIGGER_GAP_MAX = _runtime['trigger_gap_max']
-STALE_GAP_MIN = _runtime['stale_gap_min']
-FRESHNESS_DAYS = _runtime['freshness_days']
-MIN_DTE = _runtime['min_dte']
-MAX_DTE = _runtime['max_dte']
-MIN_LEG_OI = _runtime['min_leg_oi']
-MAX_LEG_SPREAD_PCT = _runtime['max_leg_spread_pct']
+# Every numeric threshold goes through a validator. `zebra_config.json` is
+# hand-edited and Drive-synced, so a typo is a live risk, and an unvalidated
+# threshold fails in the worst possible way: json.load accepts the bare NaN
+# literal, NaN compares False against everything, and the gate silently becomes
+# a no-op that still LOOKS configured. Fail loud, fall back to the tested
+# default. (2026-08-10, found by review before it ever ran.)
+def _num(key: str) -> float:
+    return _positive_finite(key, _runtime[key], _DEFAULTS[key])
+
+
+def _int(key: str) -> int:
+    return _positive_int(key, _runtime[key], _DEFAULTS[key])
+
+
+WATCH_GAP_MAX = _num('watch_gap_max')
+TRIGGER_GAP_MAX = _num('trigger_gap_max')
+STALE_GAP_MIN = _num('stale_gap_min')
+FRESHNESS_DAYS = _int('freshness_days')
+MIN_DTE = _int('min_dte')
+MAX_DTE = _int('max_dte')
+MIN_LEG_OI = _int('min_leg_oi')
+MAX_LEG_SPREAD_PCT = _num('max_leg_spread_pct')
+BCS_MAX_DEBIT_TO_WIDTH_PCT = _num('bcs_max_debit_to_width_pct')
 TP_TARGET = _runtime['tp_target']
 SPOT_SL_ENABLED = _runtime['spot_sl_enabled']
-SPOT_SL_PCT = _runtime['spot_sl_pct']
-DEBIT_SL_PCT = _runtime['debit_sl_pct']
-TIME_SL_DAYS = _runtime['time_sl_days_before_expiry']
-MAX_OPEN_TRADES = _runtime['max_open_trades']
-MAX_WATCHING_SIGNALS = _runtime['max_watching_signals']
-SCAN_INTERVAL_SEC = _runtime['scan_interval_sec']
-MONITOR_INTERVAL_SEC = _runtime['monitor_interval_sec']
+SPOT_SL_PCT = _num('spot_sl_pct')
+DEBIT_SL_PCT = _num('debit_sl_pct')
+TIME_SL_DAYS = _int('time_sl_days_before_expiry')
+MAX_OPEN_TRADES = _int('max_open_trades')
+MAX_WATCHING_SIGNALS = _int('max_watching_signals')
+SCAN_INTERVAL_SEC = _int('scan_interval_sec')
+MONITOR_INTERVAL_SEC = _int('monitor_interval_sec')
 ENABLED_DIRECTIONS = _runtime['enabled_directions']
 ENABLED_TIMEFRAMES = _runtime['enabled_timeframes']
-ST_PERIOD = _runtime['st_period']
-ST_MULTIPLIER = _runtime['st_multiplier']
+ST_PERIOD = _int('st_period')
+ST_MULTIPLIER = _num('st_multiplier')
 
 SCANNERS = [s for s in _ALL_SCANNERS if s['timeframe'] in ENABLED_TIMEFRAMES]
 
