@@ -178,21 +178,21 @@ def _format_enter_alert(trade: dict, analysis: dict,
     return msg
 
 
-def _format_bcs_suppressed_alert(trade: dict, reason: Optional[str]) -> str:
-    """Suppression notice for a gated shadow BCS (BCS-led alert mode).
+def _log_bcs_suppressed(trade: dict, reason: Optional[str]) -> None:
+    """Record a gated shadow BCS — LOG ONLY, deliberately never Telegram.
 
-    A suppressed signal must still be visible — silence would look identical
-    to "nothing fired", and a gate that starts rejecting everything must be
-    obvious from the phone. The reason is html-escaped because gate reasons
-    legitimately contain '<' (e.g. "OI 4,999 < 5,000") and a single bare '<'
-    makes Telegram's HTML parser reject the WHOLE message with a 400 — the
-    alert would be lost exactly when the gate fires.
+    User's call (2026-08-10): a suppression is a non-event, and pushing one
+    notification per rejected signal would be exactly the alert fatigue the
+    gates exist to cure. The whole point is fewer, better tickets.
+
+    It is still recorded at WARNING with a fixed 'BCS SUPPRESSED' prefix so a
+    gate that starts rejecting everything is one grep away:
+        grep 'BCS SUPPRESSED' logs/cron_zebra.log
+    No html-escaping here — a log line is not parsed as markup.
     """
-    reason = html.escape(reason or "no viable BCS pair (see logs)")
-    return (f"⚠ <b>BCS SUPPRESSED</b>  <code>{trade['stock']}</code> "
-            f"({trade['direction']})\n{reason}\n"
-            f"<i>No trade. Zebra #{trade['id']} entered silently for "
-            f"the A/B record.</i>")
+    logger.warning("BCS SUPPRESSED #%d %s (%s): %s — no trade; zebra entered "
+                   "silently for the A/B record", trade['id'], trade['stock'],
+                   trade['direction'], reason or "no viable BCS pair")
 
 
 def _format_bcs_enter_alert(trade: dict, analysis: dict, bcs: dict) -> str:
@@ -462,32 +462,37 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
 
         # Who talks on Telegram (both structures auto-trade regardless):
         #   zebra in alert_structures  -> classic zebra alert (+BCS block if on)
-        #   bcs only                   -> BCS-led alert; if the shadow failed,
-        #                                 a short notice so a fired signal is
-        #                                 never a silent miss.
+        #   bcs only                   -> BCS-led alert, ONLY when there is a
+        #                                 tradeable pair. A gated shadow is a
+        #                                 non-event: it goes to the log, never
+        #                                 to Telegram (user's call 2026-08-10 —
+        #                                 one notification per rejected signal
+        #                                 is the alert fatigue the gates exist
+        #                                 to cure).
         # LIVE-mode override: the zebra ENTER alert is the user's order
         # ticket — with no paper auto-entry it must never be suppressed.
         send_zebra = 'zebra' in cfg.ALERT_STRUCTURES or not cfg.PAPER_MODE
         send_bcs = 'bcs' in cfg.ALERT_STRUCTURES
+        if bcs is None and bcs_skip_reason:
+            _log_bcs_suppressed(trade, bcs_skip_reason)
         if send_zebra:
             msg = _format_enter_alert(trade, analysis,
                                       bcs=bcs if send_bcs else None)
-            if send_bcs and bcs is None and bcs_skip_reason:
-                # Both structures alert but the shadow was gated: the zebra
-                # ticket must carry the reason, or the BCS just vanishes from
-                # the combined alert with no trace of why.
-                msg += (f"\n\n📐 BCS shadow suppressed: "
-                        f"{html.escape(bcs_skip_reason)}")
         elif send_bcs and bcs:
             msg = _format_bcs_enter_alert(trade, analysis, bcs)
-        elif send_bcs and cfg.PAPER_MODE and cfg.BCS_PAPER_ENABLED:
-            msg = _format_bcs_suppressed_alert(trade, bcs_skip_reason)
         else:
             msg = None
         if msg is None:
-            logger.info("ENTER alert suppressed for #%d %s "
-                        "(alert_structures=%s)", trade['id'], stock,
-                        cfg.ALERT_STRUCTURES)
+            # Two distinct reasons land here; say which, or a gated signal
+            # looks like a config problem when reading the log later.
+            if bcs is None and bcs_skip_reason:
+                logger.info("No ENTER alert for #%d %s — shadow gated "
+                            "(logged above), zebra silenced",
+                            trade['id'], stock)
+            else:
+                logger.info("ENTER alert suppressed for #%d %s "
+                            "(alert_structures=%s)", trade['id'], stock,
+                            cfg.ALERT_STRUCTURES)
             continue
         sent = _send_telegram(msg, dry_run=dry_run)
         if sent:

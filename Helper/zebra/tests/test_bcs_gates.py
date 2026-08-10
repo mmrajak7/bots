@@ -249,23 +249,42 @@ def test_validation_did_not_change_the_live_values():
             assert float(getattr(cfg, const)) == float(live[key]), key
 
 
-# ── the suppression alert must survive Telegram's HTML parser ────────────
-# Gate 1's reason contains a bare '<' ("OI 4,999 < 5,000"); parse_mode=HTML
-# rejects the whole message on a stray '<' → the alert would be silently
-# lost exactly when the gate fires. The formatter must escape the reason.
+# ── a suppression is LOG-ONLY, never Telegram ────────────────────────────
+# User's call 2026-08-10: one notification per rejected signal is the alert
+# fatigue the gates exist to cure. The record still has to be greppable.
 
-def test_suppressed_alert_escapes_gate_reason(monkeypatch):
+def test_suppression_is_logged_with_a_greppable_prefix(monkeypatch, caplog):
     from zebra import monitor
     r = _run(monkeypatch, tgt_mid=16.0, tgt_oi=cfg.MIN_LEG_OI - 1)
     trade = {'id': 7, 'stock': STOCK, 'direction': DIRECTION}
-    msg = monitor._format_bcs_suppressed_alert(trade, r['error'])
-    assert '&lt;' in msg                      # the reason's '<' is escaped
-    assert ' < ' not in msg                   # no bare '<' left in the body
-    assert STOCK in msg and '#7' in msg
+    with caplog.at_level('WARNING', logger='zebra.monitor'):
+        monitor._log_bcs_suppressed(trade, r['error'])
+    text = caplog.text
+    assert 'BCS SUPPRESSED' in text        # the documented grep handle
+    assert STOCK in text and '#7' in text
+    assert 'target leg OI' in text         # the real reason, not a summary
 
 
-def test_suppressed_alert_has_fallback_reason():
+def test_suppression_log_has_a_fallback_reason(monkeypatch, caplog):
     from zebra import monitor
     trade = {'id': 3, 'stock': STOCK, 'direction': DIRECTION}
-    msg = monitor._format_bcs_suppressed_alert(trade, None)
-    assert 'no viable BCS pair' in msg
+    with caplog.at_level('WARNING', logger='zebra.monitor'):
+        monitor._log_bcs_suppressed(trade, None)
+    assert 'no viable BCS pair' in caplog.text
+
+
+def test_no_telegram_formatter_for_suppression_remains():
+    """Guard against the notification creeping back in: there must be no
+    suppression *alert* builder, only the logger."""
+    from zebra import monitor
+    assert not hasattr(monitor, '_format_bcs_suppressed_alert')
+
+
+# The alerts that DO still fire must keep their escaping — gate_fails tags
+# ("long_OI<5000") carry a bare '<' and would 400 the whole message.
+
+def test_live_alerts_still_escape_interpolated_tags():
+    from zebra import monitor
+    import inspect
+    for fn in (monitor._format_enter_alert, monitor._format_bcs_enter_alert):
+        assert 'html.escape' in inspect.getsource(fn), fn.__name__
