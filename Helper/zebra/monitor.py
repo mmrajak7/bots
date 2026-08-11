@@ -22,6 +22,10 @@ from typing import Optional
 import requests
 
 from . import config as cfg
+from . import events as events_mod
+from . import health as health_mod
+from . import outcomes as outcomes_mod
+from . import review as review_mod
 from . import strikes as strikes_mod
 from . import vet as vet_mod
 from .scanner import _get_kite, get_ltp, compute_st_for_stock, validate_and_add
@@ -568,6 +572,14 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 continue              # still deciding; expire_stale bounds it
             elif state == vet_mod.VETOED:
                 logger.info("VETOED #%d %s — no entry", trade['id'], stock)
+                # A veto blocks a trade that never happens, so without this the
+                # layer's most consequential decisions are the only ones with
+                # no evidence. Track what the signal went on to do.
+                try:
+                    outcomes_mod.open_shadow(store, trade['id'])
+                except Exception as e:
+                    logger.error("Veto shadow failed for #%d: %s",
+                                 trade['id'], e)
                 continue
             # ALLOWED or UNAVAILABLE fall through and enter below.
 
@@ -1015,6 +1027,56 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
         check_entered(store, kite, dry_run=dry_run)
     except Exception as e:
         logger.error("Entered cycle failed: %s", e, exc_info=True)
+    # Everything below is OBSERVATION, never trading. It runs last and each
+    # piece is independently caught, so a failure in the learning/monitoring
+    # half can never stop the half that trades.
+    if cfg.VET_ENABLED:
+        _run_vet_side_channels(store, kite, dry_run=dry_run)
+
+
+def _run_vet_side_channels(store, kite, dry_run: bool = False) -> None:
+    """Scoring, position review, event calendar and auth watch.
+
+    Split out so the trading path above reads as one page, and so tests can
+    drive these without a full cycle. None of it can open or close a position.
+    """
+    # LTPs for every symbol we are still tracking: open positions AND vetoed
+    # signals whose shadow is still running. One batched call, as elsewhere.
+    try:
+        symbols = {t['stock'] for t in store.get_entered()}
+        symbols |= {t['stock'] for t in store.load_trades()
+                    if isinstance(t.get('veto_shadow'), dict)
+                    and t['veto_shadow'].get('status') == 'open'}
+        ltps = get_ltp(kite, sorted(symbols)) if symbols else {}
+    except Exception as e:
+        logger.error("Vet side-channel LTP fetch failed: %s", e)
+        ltps = {}
+
+    for label, fn in (
+        ('veto shadows', lambda: outcomes_mod.track_shadows(store, ltps)),
+        ('outcome join', lambda: outcomes_mod.join(store)),
+        ('position review', lambda: review_mod.run(
+            store, ltps, send=_send_telegram, dry_run=dry_run)),
+        ('event calendar', lambda: _refresh_events_if_stale(store)),
+        ('auth watch', lambda: health_mod.check(send=_send_telegram,
+                                                dry_run=dry_run)),
+    ):
+        try:
+            fn()
+        except Exception as e:
+            logger.error("Vet side-channel '%s' failed: %s", label, e,
+                         exc_info=True)
+
+
+def _refresh_events_if_stale(store) -> bool:
+    """Kick the calendar agent when the file has aged out."""
+    if not events_mod.is_stale():
+        return False
+    symbols = sorted({t['stock'] for t in store.get_entered()}
+                     | {t['stock'] for t in store.load_trades()
+                        if t.get('status') == 'triggered'})
+    logger.info("Event calendar stale — refreshing (%d symbols)", len(symbols))
+    return events_mod.refresh(symbols)
 
 
 def run_once(dry_run: bool = False) -> None:

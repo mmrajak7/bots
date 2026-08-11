@@ -201,6 +201,163 @@ def cmd_vet_exit_decide(args):
     return 0
 
 
+def cmd_vet_score(args):
+    """Is the vetting layer earning its keep?
+
+    The report that decides whether this layer ever gets live authority. Two
+    scores, never blended: realised P&L (which can only judge ALLOWS, because a
+    vetoed structure was never priced) and the signal-quality label (which
+    judges both arms on the same hit/miss basis). Blending a spot proxy into a
+    rupee figure would be the easiest possible way to lie to ourselves.
+    """
+    from .decisions import get_store as get_decisions
+    from .trade_store import get_store
+    from . import outcomes as outcomes_mod
+
+    store = get_store()
+    decisions = get_decisions()
+    if not getattr(args, 'no_join', False):
+        joined = outcomes_mod.join(store, decisions)
+        if joined:
+            print(f"joined {joined} new outcome(s)\n")
+    decisions.refresh()
+
+    s = decisions.score('entry')
+    q = s.get('signal_quality') or {}
+    print("ENTRY VETTING")
+    print("-" * 62)
+    print(f"decisions scored on realised P&L : {s['scored']}")
+    for verdict in ('veto', 'allow'):
+        b = s.get(verdict) or {}
+        if not b.get('n'):
+            print(f"  {verdict:<6} n=0")
+            continue
+        money = b.get('pnl_avoided', b.get('pnl_captured'))
+        print(f"  {verdict:<6} n={b['n']:<3} correct={b['correct']:<3} "
+              f"precision={b['precision']:<6} Rs{money:,.0f}")
+    print(f"\nsignal quality (hit/miss, comparable across both) : "
+          f"{q.get('labelled', 0)} labelled")
+    for verdict in ('veto', 'allow'):
+        b = q.get(verdict) or {}
+        prec = b.get('precision')
+        print(f"  {verdict:<6} n={b.get('n', 0):<3} decisive={b.get('decisive', 0):<3} "
+              f"flat={b.get('flat', 0):<3} correct={b.get('correct', 0):<3} "
+              f"precision={prec if prec is not None else 'n/a'}")
+    pending = [d for d in decisions.pending_outcome() if d.get('kind') == 'entry']
+    if pending:
+        print(f"\n{len(pending)} decision(s) still awaiting an outcome "
+              f"(open positions / unresolved veto shadows)")
+
+    if getattr(args, 'list', False):
+        print("\nRECENT DECISIONS")
+        print("-" * 62)
+        for d in decisions.all()[-args.list:]:
+            o = d.get('outcome') or {}
+            print(f"#{d['id']:<4} {d['created_at'][:16]} {d['kind']:<6} "
+                  f"{d['verdict']:<12} {(d.get('signal_ref') or {}).get('stock', ''):<12} "
+                  f"{o.get('label') or ('pending' if not o else ''):<8} "
+                  f"{('Rs%.0f' % o['pnl']) if o.get('pnl') is not None else ''}")
+    return 0
+
+
+def cmd_events_show(args):
+    """Print the event calendar (optionally filtered to one symbol)."""
+    import json as _json
+    from . import events as events_mod
+    data = events_mod.load()
+    if args.symbol:
+        rows = events_mod.upcoming(args.symbol, within_days=args.days, data=data)
+    else:
+        rows = events_mod.upcoming(None, within_days=args.days, data=data)
+    print(_json.dumps({'refreshed_at': data.get('refreshed_at'),
+                       'stale': events_mod.is_stale(data),
+                       'events': rows}, indent=2, default=str))
+    return 0
+
+
+def cmd_events_replace(args):
+    """Install a validated event calendar from a JSON file.
+
+    The agent never writes the calendar directly: it hands a candidate here and
+    this verb owns the schema, so a malformed refresh is rejected as a batch
+    rather than silently emptying the file.
+    """
+    import json as _json
+    from . import events as events_mod
+    try:
+        with open(args.file) as f:
+            payload = _json.load(f)
+    except Exception as e:
+        print(f"cannot read {args.file}: {e}")
+        return 1
+    rows = payload.get('events') if isinstance(payload, dict) else payload
+    try:
+        doc = events_mod.replace(rows)
+    except ValueError as e:
+        print(f"rejected: {e}")
+        return 1
+    print(f"event calendar replaced: {len(doc['events'])} event(s)")
+    return 0
+
+
+def cmd_review_show(args):
+    """Dump a position-review context as JSON — the review agent's input."""
+    import json as _json
+    from . import config as cfg
+    from . import events as events_mod
+    from .trade_store import get_store
+    t = get_store().find(args.id)
+    if not t:
+        print(_json.dumps({'error': f'trade #{args.id} not found'}))
+        return 1
+    m = t.get('review') if isinstance(t.get('review'), dict) else {}
+    print(_json.dumps({
+        'trade_id': t['id'],
+        'stock': t.get('stock'),
+        'direction': t.get('direction'),
+        'status': t.get('status'),
+        'entry_spot': t.get('entry_spot'),
+        'entry_date': t.get('entry_date'),
+        'debit': t.get('debit'),
+        'max_loss': t.get('capital'),
+        'tp_spot': t.get('tp_spot'),
+        'expiry': t.get('expiry'),
+        'long_symbol': t.get('long_symbol'),
+        'short_symbol': t.get('short_symbol'),
+        'quantity': t.get('quantity'),
+        'flagged_because': m.get('why'),
+        'context': m.get('context', {}),
+        'events': events_mod.upcoming(t.get('stock')),
+        'checklist': str(cfg.VETTING_DOC) + ' — POSITION REVIEW section',
+    }, indent=2, default=str))
+    return 0
+
+
+def cmd_review_record(args):
+    """Record a review recommendation. Cannot close anything — by design."""
+    from . import config as cfg
+    from .trade_store import get_store
+    from .decisions import get_store as get_decisions
+    from . import review as review_mod
+
+    store = get_store()
+    t = store.find(args.id)
+    if not t:
+        print(f"trade #{args.id} not found")
+        return 1
+    d = get_decisions().record(
+        kind='review', verdict=args.action, trade_ids=[t['id']],
+        stock=t.get('stock'), direction=t.get('direction'),
+        reasons=args.reason or [], red_flags=args.red_flag or [],
+        confidence=args.confidence, model=cfg.VET_MODEL,
+        notes=args.notes or '',
+    )
+    outcome = review_mod.record(store, args.id, args.action,
+                               reasons=args.reason or [], decision_id=d['id'])
+    print(f"decision #{d['id']} recorded; review {outcome}")
+    return 0
+
+
 def cmd_analyze(args):
     """Run the strike analyzer on a stock outside the scanner. Manual review."""
     from .scanner import _get_kite, get_ltp, compute_st_for_stock
@@ -617,6 +774,45 @@ def main():
     p_vdec.add_argument('--confidence', type=float, default=None)
     p_vdec.add_argument('--notes', default='')
     p_vdec.set_defaults(func=cmd_vet_decide)
+
+    p_vscore = vet_sub.add_parser('score', help='Was the vetting layer right?')
+    p_vscore.add_argument('--list', type=int, nargs='?', const=20, default=0,
+                          metavar='N', help='Also print the last N decisions')
+    p_vscore.add_argument('--no-join', action='store_true',
+                          help='Report only; do not join new outcomes first')
+    p_vscore.set_defaults(func=cmd_vet_score)
+
+    # ── Event calendar (refreshed BY a Sonnet agent, read by the gates) ────
+    p_ev = sub.add_parser('events', help='Event calendar')
+    ev_sub = p_ev.add_subparsers(dest='events_command')
+
+    p_evshow = ev_sub.add_parser('show', help='Print upcoming events')
+    p_evshow.add_argument('--symbol', default=None)
+    p_evshow.add_argument('--days', type=int, default=None)
+    p_evshow.set_defaults(func=cmd_events_show)
+
+    p_evrep = ev_sub.add_parser('replace', help='Install a validated calendar')
+    p_evrep.add_argument('--file', required=True,
+                         help='JSON: {"events":[...]} or a bare [...] list')
+    p_evrep.set_defaults(func=cmd_events_replace)
+
+    # ── Position review (called BY the spawned CLI) ────────────────────────
+    p_rev = sub.add_parser('review', help='Periodic position review')
+    rev_sub = p_rev.add_subparsers(dest='review_command')
+
+    p_rvshow = rev_sub.add_parser('show', help='Dump review context as JSON')
+    p_rvshow.add_argument('id', type=int)
+    p_rvshow.set_defaults(func=cmd_review_show)
+
+    p_rvrec = rev_sub.add_parser('record', help='Record a recommendation')
+    p_rvrec.add_argument('id', type=int)
+    p_rvrec.add_argument('--action', required=True,
+                         choices=['hold', 'adjust', 'exit'])
+    p_rvrec.add_argument('--reason', action='append')
+    p_rvrec.add_argument('--red-flag', action='append')
+    p_rvrec.add_argument('--confidence', type=float, default=None)
+    p_rvrec.add_argument('--notes', default='')
+    p_rvrec.set_defaults(func=cmd_review_record)
 
     p_anly = sub.add_parser('analyze', help='Strike analyzer for a stock (no save)')
     p_anly.add_argument('symbol')

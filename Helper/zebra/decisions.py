@@ -47,8 +47,12 @@ logger = logging.getLogger(__name__)
 # Valid verdicts. `unavailable` is not a judgement — it records that Claude
 # could not be reached, so those rows are EXCLUDED from scoring rather than
 # counted as allows (which would silently flatter the layer's precision).
-VERDICTS = ('allow', 'veto', 'exit', 'defer', 'unavailable')
-KINDS = ('entry', 'exit')
+VERDICTS = ('allow', 'veto', 'exit', 'defer', 'unavailable',
+            # Position-review recommendations. `exit` is shared with the exit
+            # kind, and means the same thing in both: get out. It is still only
+            # ever a RECOMMENDATION here — review.py cannot close a position.
+            'hold', 'adjust')
+KINDS = ('entry', 'exit', 'review')
 
 
 class DecisionStore:
@@ -200,6 +204,44 @@ class DecisionStore:
                 'pnl_avoided' if verdict == 'veto' else 'pnl_captured':
                     round(sum(-float(d['outcome']['pnl']) if verdict == 'veto'
                               else float(d['outcome']['pnl']) for d in sub), 2),
+            }
+        out['signal_quality'] = self.score_signal_quality(kind)
+        return out
+
+    def score_signal_quality(self, kind: str = 'entry') -> dict:
+        """The comparable view: did price go where the strategy said?
+
+        The money score above can only judge ALLOWS — a vetoed structure was
+        never priced, so it has no P&L and is invisible there. That leaves the
+        layer's most important decisions unscored. This scores both arms on the
+        one basis they share: a `hit`/`miss`/`flat` label (see outcomes.py).
+
+        Explicitly NOT a P&L claim. A veto that blocked a `miss` was right about
+        DIRECTION; how much money it saved is unknown and deliberately not
+        guessed at. `flat` rows are excluded from precision — an unresolved
+        signal is not evidence either way — but reported, because a layer that
+        mostly blocks signals that go nowhere is telling you something too.
+        """
+        rows = [d for d in self._rows
+                if d.get('kind') == kind
+                and d.get('verdict') in ('allow', 'veto')
+                and isinstance(d.get('outcome'), dict)
+                and d['outcome'].get('label') in ('hit', 'miss', 'flat')]
+        out = {'labelled': len(rows)}
+        for verdict in ('veto', 'allow'):
+            sub = [d for d in rows if d['verdict'] == verdict]
+            decisive = [d for d in sub if d['outcome']['label'] != 'flat']
+            # A veto is right when the signal it blocked went on to MISS; an
+            # allow is right when the signal it let through HIT.
+            want = 'miss' if verdict == 'veto' else 'hit'
+            hits = [d for d in decisive if d['outcome']['label'] == want]
+            out[verdict] = {
+                'n': len(sub),
+                'decisive': len(decisive),
+                'flat': len(sub) - len(decisive),
+                'correct': len(hits),
+                'precision': (round(len(hits) / len(decisive), 3)
+                              if decisive else None),
             }
         return out
 

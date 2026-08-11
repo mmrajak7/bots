@@ -1,0 +1,199 @@
+"""Event calendar — the facts the mechanical rules cannot see.
+
+Results dates, ex-dividends, budget day, election results, RBI policy. None of
+these are in a price series, and all of them can invalidate a structure that
+every numeric gate just passed. A Sonnet agent refreshes this file every couple
+of hours; the entry checklist and the position-review pre-filter read it.
+
+Design notes
+------------
+- **Read-mostly and never load-bearing.** A missing, stale or corrupt calendar
+  degrades to "no known events" and the bot behaves exactly as it did before
+  this file existed. An event feed that can halt trading is a liability, not a
+  safety feature.
+- **The agent cannot write this file directly.** It builds a candidate JSON and
+  installs it through `zebra events replace`, which validates every row and
+  rejects the batch atomically. Same discipline as the trade store: agents call
+  verbs, verbs own the schema.
+- **Whole-file replace, not append.** Events get cancelled and rescheduled, so a
+  refresh must be able to REMOVE rows. Append-only would accumulate phantom
+  events that quietly veto entries forever.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import tempfile
+import time
+from datetime import date, datetime
+from typing import Optional
+
+from . import config as cfg
+from .filelock import exclusive
+
+logger = logging.getLogger(__name__)
+
+# Only these matter enough to act on. An open vocabulary would let the agent
+# invent categories nobody downstream handles.
+EVENT_TYPES = ('results', 'ex_dividend', 'budget', 'election', 'rbi_policy',
+               'expiry', 'other')
+# Events that move the whole market rather than one symbol.
+MARKET_TYPES = ('budget', 'election', 'rbi_policy')
+
+
+def _today() -> date:
+    return datetime.now(cfg.IST).date()
+
+
+def _parse_date(v) -> Optional[date]:
+    try:
+        return datetime.strptime(str(v), '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        return None
+
+
+def load() -> dict:
+    """Read the calendar. Never raises; a broken file reads as empty."""
+    if not cfg.EVENT_FILE.exists():
+        return {'refreshed_at': None, 'events': []}
+    try:
+        with open(cfg.EVENT_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get('events'), list):
+            raise ValueError('expected {refreshed_at, events[]}')
+        return data
+    except Exception as e:
+        logger.error('Event calendar unreadable (%s) — treating as empty', e)
+        return {'refreshed_at': None, 'events': []}
+
+
+def is_stale(data: Optional[dict] = None, now: Optional[datetime] = None) -> bool:
+    data = load() if data is None else data
+    ts = data.get('refreshed_at')
+    if not ts:
+        return True
+    try:
+        age = (now or datetime.now()) - datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return True
+    return age.total_seconds() > cfg.EVENT_REFRESH_SEC
+
+
+def validate(events) -> list:
+    """Return only well-formed rows, logging what was dropped and why.
+
+    Dropping silently would let a malformed refresh empty the calendar while
+    reporting success — the failure mode where everything looks fine and no
+    event is ever seen again.
+    """
+    if not isinstance(events, list):
+        raise ValueError('events must be a list')
+    clean, dropped = [], []
+    for i, e in enumerate(events):
+        if not isinstance(e, dict):
+            dropped.append((i, 'not an object'))
+            continue
+        d = _parse_date(e.get('date'))
+        etype = e.get('type')
+        title = str(e.get('title') or '').strip()
+        symbol = (e.get('symbol') or '').strip().upper() or None
+        if d is None:
+            dropped.append((i, 'bad date %r' % e.get('date')))
+        elif etype not in EVENT_TYPES:
+            dropped.append((i, 'unknown type %r' % etype))
+        elif not title:
+            dropped.append((i, 'empty title'))
+        elif etype not in MARKET_TYPES and not symbol:
+            dropped.append((i, 'per-stock event with no symbol'))
+        else:
+            clean.append({
+                'date': d.isoformat(),
+                'type': etype,
+                'symbol': symbol,
+                'title': title[:200],
+                'confidence': e.get('confidence'),
+                'source': str(e.get('source') or '')[:200],
+            })
+    for i, why in dropped:
+        logger.warning('Event row %d dropped: %s', i, why)
+    if dropped and not clean:
+        raise ValueError('every event row was invalid (%d dropped)' % len(dropped))
+    return clean
+
+
+def replace(events, refreshed_at: Optional[str] = None) -> dict:
+    """Atomically install a validated calendar. Returns the stored document."""
+    clean = validate(events)
+    doc = {'refreshed_at': refreshed_at or datetime.now().isoformat(),
+           'events': sorted(clean, key=lambda e: (e['date'], e['type']))}
+    with exclusive(cfg.EVENT_LOCK):
+        cfg.EVENT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(cfg.EVENT_FILE.parent),
+                                   suffix='.tmp', prefix='zev_')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                fd = None
+                json.dump(doc, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, str(cfg.EVENT_FILE))
+                    break
+                except PermissionError:          # Windows: another reader open
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05)
+            tmp = None
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    logger.info('Event calendar replaced: %d events', len(clean))
+    return doc
+
+
+# ── queries ──────────────────────────────────────────────────────────────
+def upcoming(symbol: Optional[str] = None, within_days: Optional[int] = None,
+             data: Optional[dict] = None, today: Optional[date] = None) -> list:
+    """Events from today forward that bear on `symbol` (market-wide included)."""
+    data = load() if data is None else data
+    today = today or _today()
+    horizon = cfg.EVENT_HORIZON_DAYS if within_days is None else within_days
+    sym = (symbol or '').upper() or None
+    out = []
+    for e in data.get('events') or []:
+        d = _parse_date(e.get('date'))
+        if d is None or d < today or (d - today).days > horizon:
+            continue
+        if e.get('type') in MARKET_TYPES or sym is None or e.get('symbol') == sym:
+            out.append(dict(e, days_away=(d - today).days))
+    return sorted(out, key=lambda e: e['days_away'])
+
+
+def refresh(symbols, spawn: bool = True) -> bool:
+    """Spawn the calendar agent. Returns True if a process was started.
+
+    Detached and fire-and-forget, like every other agent here: a hung research
+    call must never hold up a trading cycle.
+    """
+    from .vet import _spawn_generic
+    prompt = cfg.EVENT_PROMPT_TEMPLATE.format(
+        vetting_doc=cfg.VETTING_DOC,
+        python=_interpreter(),
+        symbols=', '.join(sorted(set(symbols))[:40]) or 'none',
+    )
+    if not spawn:
+        return False
+    return _spawn_generic(prompt, cfg.EVENT_MODEL, 'events') is not None
+
+
+def _interpreter() -> str:
+    import sys
+    return sys.executable

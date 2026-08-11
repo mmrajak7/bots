@@ -168,6 +168,18 @@ _DEFAULTS = {
                                  # vetted process is deliberately holding.
                                  # ZEBRA_VET_ENABLED still overrides, for a
                                  # one-off test without editing config.
+    'veto_shadow_days': 30,      # Horizon for scoring a VETOED signal. A veto
+                                 # blocks a trade that never happens, so without
+                                 # a shadow the layer's most important decisions
+                                 # are the only ones with no evidence. ~30d is
+                                 # one option cycle: long enough for the thesis
+                                 # to play out, short enough to score this month.
+    'event_refresh_sec': 7200,   # Event calendar staleness bound (2h).
+    'event_horizon_days': 10,    # How far ahead an event counts as relevant.
+    'review_adverse_pct': 0.04,  # Position-review pre-filter: |move| from entry
+                                 # spot that makes a position worth a fresh look.
+    'auth_warn_days': 3,         # Telegram this many days before the Claude CLI
+                                 # credential expires (user re-logs in manually).
     'exit_vet_ttl_sec': 900,     # How long a terminal EXIT verdict stays valid.
                                  # A verdict is a judgement about the book AT
                                  # THAT MOMENT, so it must not authorise an exit
@@ -298,6 +310,30 @@ _vet_env = os.environ.get('ZEBRA_VET_ENABLED', '').strip()
 VET_ENABLED = (_vet_env.lower() in ('1', 'true', 'yes') if _vet_env
                else bool(_runtime['vet_enabled']))
 EXIT_VET_TTL_SEC = _int('exit_vet_ttl_sec')
+VETO_SHADOW_DAYS = _int('veto_shadow_days')
+EVENT_REFRESH_SEC = _int('event_refresh_sec')
+EVENT_HORIZON_DAYS = _int('event_horizon_days')
+REVIEW_ADVERSE_PCT = _num('review_adverse_pct')
+AUTH_WARN_DAYS = _int('auth_warn_days')
+EVENT_FILE = LOG_DIR / 'event_calendar.json'
+EVENT_LOCK = LOG_DIR / 'event_calendar.lock'
+# Sonnet, not Fable: this is routine fact-collection, not a judgement call.
+EVENT_MODEL = os.environ.get('ZEBRA_EVENT_MODEL', 'sonnet')
+EVENT_PROMPT_TEMPLATE = (
+    "Refresh the trading event calendar. Read {vetting_doc} (the EVENT CALENDAR "
+    "section) and follow it exactly. Research upcoming India-market events and "
+    "the per-stock events for these symbols: {symbols}. "
+    "Write your findings to a JSON file, then install it with "
+    "`{python} -m zebra events replace --file <path>` exactly once."
+)
+REVIEW_PROMPT_TEMPLATE = (
+    "Review open position {trade_id} for event/macro risk the mechanical rules "
+    "cannot see. Read {vetting_doc} (the POSITION REVIEW section) and follow it "
+    "exactly. Start with `{python} -m zebra review show {trade_id}`. "
+    "Use `{python}` for every zebra command. You MUST finish by calling "
+    "`{python} -m zebra review record {trade_id} --action hold|adjust|exit "
+    "--reason ...` exactly once."
+)
 if EXIT_VET_TTL_SEC <= MONITOR_INTERVAL_SEC:
     # A TTL shorter than one cycle expires every verdict before the cycle that
     # would act on it — the gate would re-request forever and no exit could

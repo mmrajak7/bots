@@ -197,7 +197,19 @@ def _spawn_cli(trade_id: int, exit_kind: Optional[str] = None) -> Optional[int]:
                              python=sys.executable,
                              exit_kind=exit_kind or '',
                              vetting_doc=cfg.VETTING_DOC)
-    argv = [cfg.VET_CLI, '-p', prompt, '--model', cfg.VET_MODEL]
+    return _spawn_generic(prompt, cfg.VET_MODEL,
+                          'vet #%d%s' % (trade_id,
+                                         ' ' + exit_kind if exit_kind else ''))
+
+
+def _spawn_generic(prompt: str, model: str, tag: str) -> Optional[int]:
+    """Fire a detached Claude CLI run. Returns the pid, or None on failure.
+
+    Shared by every agent this package spawns (entry vet, exit vet, position
+    review, event calendar) so they cannot drift apart on the details that
+    actually matter: detachment, output redirection, cwd, and never raising.
+    """
+    argv = [cfg.VET_CLI, '-p', prompt, '--model', model]
     try:
         _reap_children()
         # Detach so the child survives the cron process exiting. stdout/stderr
@@ -217,14 +229,25 @@ def _spawn_cli(trade_id: int, exit_kind: Optional[str] = None) -> Optional[int]:
         finally:
             out.close()             # child holds its own duplicate of the fd
         _children.append(p)
-        logger.info("VET CLI spawned pid=%d for #%d (model=%s)",
-                    p.pid, trade_id, cfg.VET_MODEL)
+        logger.info("CLI spawned pid=%d for %s (model=%s)", p.pid, tag, model)
+        _note_spawn(True)
         return p.pid
     except Exception as e:
         # Never propagate: a missing/broken CLI must not stop the bot trading.
-        logger.error("VET CLI spawn FAILED for #%d: %s — will fail open at "
-                     "the deadline", trade_id, e)
+        logger.error("CLI spawn FAILED for %s: %s — the caller's deadline "
+                     "governs from here", tag, e)
+        _note_spawn(False)
         return None
+
+
+def _note_spawn(ok: bool) -> None:
+    """Feed the auth watchdog. Best-effort: health tracking must never be able
+    to break the thing it is watching."""
+    try:
+        from .health import record_spawn_result
+        record_spawn_result(ok)
+    except Exception:                            # pragma: no cover - paranoia
+        pass
 
 
 # ── verdict ──────────────────────────────────────────────────────────────
