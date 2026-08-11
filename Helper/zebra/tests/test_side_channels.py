@@ -251,10 +251,38 @@ def test_repeated_spawn_failures_raise_the_alarm_without_a_credential_file(paths
     assert len(sent) == 1 and 'NOT STARTING' in sent[0]
 
 
-def test_a_successful_spawn_clears_the_streak(paths):
+def test_only_a_landed_agent_clears_the_alarm(paths):
+    """A successful Popen proves the BINARY EXISTS, nothing more. An expired
+    login spawns perfectly and exits instantly with an auth error — the exact
+    failure this watchdog is for. Only a verb landing counts as proof of life."""
     for _ in range(3):
         health.record_spawn_result(False)
-    health.record_spawn_result(True)
+    health.record_spawn_result(True)                  # spawned fine...
+    sent = []
+    health.check(send=lambda m, **k: sent.append(m) or True,
+                 paths=[paths / 'nope.json'])
+    assert len(sent) == 1, "a mere spawn silenced the alarm"
+
+    health.record_agent_landed()
+    assert health.status()['spawn_failures'] == 0
+    assert health.status()['spawns_since_landing'] == 0
+
+
+def test_spawning_without_ever_landing_raises_the_alarm(paths):
+    """What an expired login actually looks like from the outside: processes
+    start all day and not one of them ever reports back."""
+    for _ in range(health.SILENT_SPAWN_LIMIT):
+        health.record_spawn_result(True)
+    sent = []
+    health.check(send=lambda m, **k: sent.append(m) or True,
+                 paths=[paths / 'nope.json'])
+    assert len(sent) == 1 and 'NOT REPORTING BACK' in sent[0]
+
+
+def test_a_landed_agent_keeps_the_watchdog_quiet(paths):
+    for _ in range(health.SILENT_SPAWN_LIMIT):
+        health.record_spawn_result(True)
+        health.record_agent_landed()
     sent = []
     health.check(send=lambda m, **k: sent.append(m) or True,
                  paths=[paths / 'nope.json'])
@@ -268,3 +296,154 @@ def test_auth_watch_is_silent_when_the_layer_is_off(paths, monkeypatch):
     health.check(send=lambda m, **k: sent.append(m) or True,
                  paths=_creds(paths, refreshTokenExpiresAt=soon))
     assert sent == []
+
+
+# ── WIRING: drive the monitor, not the module ────────────────────────────
+# The veto shadow shipped dead: it was wired into a branch the control flow
+# could never reach, because an early `continue` for VETOED sat above it — the
+# third "wired but never executes" bug in this fleet. Every test below drives
+# check_watching so a future regression that unwires it FAILS here.
+@pytest.fixture
+def vetoed(paths, monkeypatch):
+    """A signal that has been triggered and then vetoed, as the CLI leaves it."""
+    from zebra import monitor
+    from zebra import vet as vet_mod
+    s = ZebraStore(config={})
+    s._load_local()
+    s.add_signal({'stock': 'VETOCO', 'timeframe': 'weekly', 'direction': 'CE',
+                  'st_value': 100.0, 'st_direction': 'UP',
+                  'signal_price': 90.0, 'signal_gap_pct': 10.0})
+    s.mark_triggered(1, 96.5, 3.5, [])
+    vet_mod.request_entry_vet(s, 1, {'stock': 'VETOCO'}, spawn=False)
+    vet_mod.record_verdict(s, 1, vet_mod.VETOED, decision_id=1)
+    monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {'VETOCO': 96.5})
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: True)
+    return s, monitor
+
+
+def test_a_veto_opens_its_shadow_through_the_real_monitor(vetoed):
+    """THE regression test for the Critical. If open_shadow ever moves back
+    below the early `continue`, this fails."""
+    store, monitor = vetoed
+    monitor.check_watching(store, kite=None, dry_run=True)
+    shadow = store.find(1).get('veto_shadow')
+    assert shadow, "veto shadow never opened in the live path"
+    assert shadow['status'] == 'open'
+
+
+def test_the_shadow_anchors_on_veto_time_spot_not_the_watch_price(vetoed):
+    """signal_price (90.0) is where the signal joined the watchlist, possibly
+    days earlier and 10% away. Anchoring there measures a move that started
+    before the decision was made."""
+    store, monitor = vetoed
+    monitor.check_watching(store, kite=None, dry_run=True)
+    s = store.find(1)['veto_shadow']
+    assert s['entry_spot'] == 96.5
+    assert s['adverse_spot'] == 93.0        # symmetric about 96.5 vs target 100
+
+
+def test_repeated_cycles_do_not_reopen_the_shadow(vetoed):
+    store, monitor = vetoed
+    for _ in range(3):
+        monitor.check_watching(store, kite=None, dry_run=True)
+    assert store.find(1)['veto_shadow']['status'] == 'open'
+    assert store.find(1)['status'] == 'triggered'      # still never entered
+
+
+def test_a_vetoed_signal_still_never_enters(vetoed):
+    store, monitor = vetoed
+    monitor.check_watching(store, kite=None, dry_run=True)
+    assert store.find(1)['status'] == 'triggered'
+    assert store.find(1).get('entry_date') is None
+
+
+# ── spawn discipline: a failure must not become a spawn cannon ───────────
+def test_refresh_spawns_once_while_one_is_in_flight(paths, spawns):
+    """Staleness clears only when an agent lands `events replace`, which takes
+    minutes. Without an in-flight marker a stale calendar spawns a fresh Claude
+    process EVERY cycle — ~75/day, forever, if the agent can never succeed."""
+    for _ in range(4):
+        if events.is_stale():
+            events.refresh(['TESTCO'])
+    assert len(spawns) == 1, "event refresh spawned %d agents" % len(spawns)
+
+
+def test_refresh_can_spawn_again_once_the_marker_expires(paths, spawns,
+                                                         monkeypatch):
+    events.refresh(['TESTCO'])
+    assert len(spawns) == 1
+    monkeypatch.setattr(events, 'refresh_pending', lambda *a, **k: False)
+    events.refresh(['TESTCO'])
+    assert len(spawns) == 2
+
+
+def test_a_landed_refresh_clears_the_in_flight_marker(paths, spawns):
+    events.refresh(['TESTCO'])
+    assert events.refresh_pending() is True
+    events.replace([{'date': '2026-08-14', 'type': 'budget', 'title': 'B'}])
+    assert events.refresh_pending() is False
+
+
+def test_an_empty_calendar_install_is_refused(paths):
+    """An empty install wipes the calendar AND refreshes the timestamp, so it
+    reads healthy for 2h while every gate sees no events — indistinguishable
+    from a failed research run."""
+    events.replace([{'date': '2026-08-14', 'type': 'budget', 'title': 'B'}])
+    with pytest.raises(ValueError, match='empty'):
+        events.replace([])
+    assert len(events.load()['events']) == 1
+    events.replace([], allow_empty=True)              # explicit is fine
+    assert events.load()['events'] == []
+
+
+def test_a_dead_review_agent_does_not_respawn_all_day(store, monkeypatch,
+                                                      spawns):
+    """A review agent that never reports (expired auth, crash) leaves a pending
+    marker that expires. If the daily cap keyed only on COMPLETION, the sweep
+    would respawn it every 10 minutes — ~35/day/position, each with a trade
+    store write and a Drive upload."""
+    monkeypatch.setattr(events, 'upcoming', lambda *a, **k: [
+        {'type': 'results', 'days_away': 3, 'title': 'Q1'}])
+    review.run(store, {'TESTCO': 96.0})
+    assert len(spawns) == 1
+    # The agent dies. Its deadline lapses; the flagging condition still stands.
+    with store._mutate():
+        store.find(1)['review']['deadline'] = (
+            datetime.now() - timedelta(hours=1)).isoformat()
+    for _ in range(3):
+        review.run(store, {'TESTCO': 96.0})
+    assert len(spawns) == 1, "dead review agent respawned %d times" % len(spawns)
+
+
+def test_a_review_that_completes_still_caps_at_one_a_day(store, monkeypatch,
+                                                         spawns):
+    monkeypatch.setattr(events, 'upcoming', lambda *a, **k: [
+        {'type': 'results', 'days_away': 3, 'title': 'Q1'}])
+    review.run(store, {'TESTCO': 96.0})
+    review.record(store, 1, 'hold')
+    review.run(store, {'TESTCO': 96.0})
+    assert len(spawns) == 1
+
+
+def test_a_review_alert_is_sent_once_across_repeated_sweeps(store, monkeypatch):
+    """The flag is claimed BEFORE sending: an overlapping cron and `zebra loop`
+    both see it un-alerted otherwise (flock covers the store, not the cycle)."""
+    monkeypatch.setattr(events, 'upcoming', lambda *a, **k: [])
+    sent = []
+    review.request(store, 1, 'why', {}, spawn=False)
+    review.record(store, 1, 'adjust', reasons=['roll the short leg'])
+    for _ in range(3):
+        review.run(store, {'TESTCO': 96.0},
+                   send=lambda m, **k: sent.append(m) or True, spawn=False)
+    assert len(sent) == 1, "review alert sent %d times" % len(sent)
+
+
+def test_a_failed_review_alert_is_retried_not_lost(store, monkeypatch):
+    monkeypatch.setattr(events, 'upcoming', lambda *a, **k: [])
+    review.request(store, 1, 'why', {}, spawn=False)
+    review.record(store, 1, 'adjust', reasons=['roll the short leg'])
+    review.run(store, {'TESTCO': 96.0}, send=lambda m, **k: False, spawn=False)
+    sent = []
+    review.run(store, {'TESTCO': 96.0},
+               send=lambda m, **k: sent.append(m) or True, spawn=False)
+    assert len(sent) == 1, "recommendation lost after a send failure"

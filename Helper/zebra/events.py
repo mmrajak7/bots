@@ -27,7 +27,7 @@ import logging
 import os
 import tempfile
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from . import config as cfg
@@ -123,9 +123,17 @@ def validate(events) -> list:
     return clean
 
 
-def replace(events, refreshed_at: Optional[str] = None) -> dict:
+def replace(events, refreshed_at: Optional[str] = None,
+            allow_empty: bool = False) -> dict:
     """Atomically install a validated calendar. Returns the stored document."""
     clean = validate(events)
+    if not clean and not allow_empty:
+        # An empty install wipes the calendar AND refreshes the timestamp, so
+        # it reads healthy for two hours while every gate sees no events. That
+        # is indistinguishable from a failed research run, so make the caller
+        # say it meant it.
+        raise ValueError('refusing to install an empty calendar — pass '
+                         'allow_empty if the market really has no events')
     doc = {'refreshed_at': refreshed_at or datetime.now().isoformat(),
            'events': sorted(clean, key=lambda e: (e['date'], e['type']))}
     with exclusive(cfg.EVENT_LOCK):
@@ -155,6 +163,7 @@ def replace(events, refreshed_at: Optional[str] = None) -> dict:
                     os.unlink(tmp)
                 except OSError:
                     pass
+    _clear_refresh_pending()        # the agent landed; the next staleness may spawn
     logger.info('Event calendar replaced: %d events', len(clean))
     return doc
 
@@ -177,20 +186,71 @@ def upcoming(symbol: Optional[str] = None, within_days: Optional[int] = None,
     return sorted(out, key=lambda e: e['days_away'])
 
 
+def refresh_pending(now: Optional[datetime] = None) -> bool:
+    """Is a calendar agent already in flight?
+
+    Staleness alone is NOT a spawn condition. The file only stops being stale
+    when an agent successfully lands `events replace`, which takes minutes — so
+    a stale-triggered spawn on a 5-minute cycle launches a fresh agent every
+    cycle until one succeeds. If the agent can never succeed (expired auth,
+    research failure, a batch that keeps getting rejected) that is one Claude
+    process every 5 minutes, ~75/day, forever, with nothing on Telegram.
+
+    Same fix as the exit vet: an in-flight marker with a deadline, so a hung
+    agent bounds the damage at one process per deadline instead of one per
+    cycle.
+    """
+    try:
+        with open(_pending_path()) as f:
+            until = datetime.fromisoformat(json.load(f)['until'])
+    except Exception:
+        return False
+    return (now or datetime.now()) < until
+
+
+def _pending_path():
+    return cfg.EVENT_FILE.with_suffix('.pending.json')
+
+
+def _mark_refresh_pending() -> None:
+    deadline = datetime.now() + timedelta(seconds=cfg.VET_TIMEOUT_SEC)
+    try:
+        cfg.EVENT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_pending_path(), 'w') as f:
+            json.dump({'until': deadline.isoformat()}, f)
+    except Exception as e:
+        # Failing to write the marker means we might spawn again next cycle.
+        # Log it loudly rather than pretending: a silent failure here is the
+        # spawn storm coming back.
+        logger.error('Could not mark event refresh in-flight (%s) — a repeat '
+                     'spawn is possible next cycle', e)
+
+
+def _clear_refresh_pending() -> None:
+    try:
+        os.unlink(str(_pending_path()))
+    except OSError:
+        pass
+
+
 def refresh(symbols, spawn: bool = True) -> bool:
     """Spawn the calendar agent. Returns True if a process was started.
 
     Detached and fire-and-forget, like every other agent here: a hung research
     call must never hold up a trading cycle.
     """
+    if refresh_pending():
+        logger.debug('Event refresh already in flight — not re-spawning')
+        return False
+    if not spawn:
+        return False
     from .vet import _spawn_generic
     prompt = cfg.EVENT_PROMPT_TEMPLATE.format(
         vetting_doc=cfg.VETTING_DOC,
         python=_interpreter(),
         symbols=', '.join(sorted(set(symbols))[:40]) or 'none',
     )
-    if not spawn:
-        return False
+    _mark_refresh_pending()
     return _spawn_generic(prompt, cfg.EVENT_MODEL, 'events') is not None
 
 

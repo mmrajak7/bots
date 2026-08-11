@@ -81,11 +81,18 @@ def needs_review(trade: dict, spot: float, evts: Optional[list] = None,
     if not reasons:
         return False, ''
 
-    # At most one review per position per day, unless it is still pending.
+    # At most one review per position per day. `attempted_at` is stamped when
+    # the agent is SPAWNED, not when it reports — an agent that dies (expired
+    # auth, crash, hung research) never calls record(), so capping on
+    # completion would respawn it every time the deadline lapsed. The review
+    # reasons here are standing conditions (an event stays inside the horizon
+    # for days; an adverse move persists), so that is ~35 spawns/day/position
+    # against a broken CLI, each with a trade-store write and a Drive upload.
     m = _marker(trade)
-    last = vet_mod._parse(m.get('reviewed_at'))
-    if last and (now - last) < timedelta(days=1):
-        return False, ''
+    for key in ('reviewed_at', 'attempted_at'):
+        last = vet_mod._parse(m.get(key))
+        if last and (now - last) < timedelta(days=1):
+            return False, ''
     if m.get('state') == 'pending':
         deadline = vet_mod._parse(m.get('deadline'))
         if deadline and now < deadline:
@@ -112,7 +119,10 @@ def request(store, trade_id: int, why: str, context: dict,
                 'why': why,
                 'context': context,
                 'action': None,
+                # Both survive the wholesale overwrite on purpose: they are the
+                # daily caps, and dropping them would re-arm the sweep instantly.
                 'reviewed_at': m.get('reviewed_at'),
+                'attempted_at': _now().isoformat(),
             }
             t['version'] = t.get('version', 0) + 1
     if not fresh:
@@ -200,16 +210,40 @@ def run(store, ltps: dict, send=None, dry_run: bool = False,
             logger.error('Review sweep failed for #%s: %s', trade.get('id'), e)
     # Deliver any recommendation that landed since the last sweep.
     for trade in list(store.get_entered()):
-        m = _marker(trade)
-        if m.get('state') != 'done' or m.get('alerted'):
-            continue
-        action = m.get('action')
-        if action and action != 'hold' and send:
-            if send(format_alert(trade, action, m.get('reasons') or []),
-                    dry_run=dry_run):
-                with store._mutate():
-                    t = store.find(trade['id'])
-                    if t and isinstance(t.get('review'), dict):
-                        t['review']['alerted'] = True
-                        t['version'] = t.get('version', 0) + 1
+        try:
+            m = _marker(trade)
+            if m.get('state') != 'done' or m.get('alerted'):
+                continue
+            action = m.get('action')
+            if not action or action == 'hold' or not send:
+                continue
+            # CLAIM the flag before sending, atomically. Sending first lets an
+            # overlapping cron and `zebra loop` both see it un-alerted and both
+            # send (flock covers the store, not the cycle). Same discipline as
+            # the exit escalation; released below if the send fails, so a
+            # Telegram outage retries rather than losing the message.
+            if not _claim_alert(store, trade['id']):
+                continue
+            if not send(format_alert(trade, action, m.get('reasons') or []),
+                        dry_run=dry_run):
+                _claim_alert(store, trade['id'], value=False)
+                logger.error('REVIEW alert FAILED to send for #%d — flag '
+                             'released, retrying next sweep', trade['id'])
+        except Exception as e:
+            # One undeliverable recommendation must not stop the others.
+            logger.error('Review delivery failed for #%s: %s',
+                         trade.get('id'), e)
     return requested
+
+
+def _claim_alert(store, trade_id: int, value: bool = True) -> bool:
+    """Test-and-set the review `alerted` flag inside the store lock."""
+    claimed = False
+    with store._mutate():
+        t = store.find(trade_id)
+        m = t.get('review') if t and isinstance(t.get('review'), dict) else None
+        if m is not None and bool(m.get('alerted')) != value:
+            m['alerted'] = value
+            t['version'] = t.get('version', 0) + 1
+            claimed = True
+    return claimed

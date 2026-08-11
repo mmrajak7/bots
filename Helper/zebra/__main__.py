@@ -148,6 +148,8 @@ def cmd_vet_decide(args):
     )
     outcome = vet_mod.record_verdict(store, args.id, verdict,
                                      decision_id=d['id'])
+    from .health import record_agent_landed
+    record_agent_landed()      # proof of life: an agent got all the way here
     print(f"decision #{d['id']} recorded; verdict {outcome}")
 
     # A VETO is the end of the story for this signal — nothing else will be
@@ -197,6 +199,8 @@ def cmd_vet_exit_decide(args):
     )
     outcome = vet_mod.record_exit_verdict(store, args.id, args.kind,
                                           args.verdict, decision_id=d['id'])
+    from .health import record_agent_landed
+    record_agent_landed()      # proof of life: an agent got all the way here
     print(f"decision #{d['id']} recorded; exit verdict {outcome}")
     return 0
 
@@ -296,6 +300,8 @@ def cmd_events_replace(args):
     except ValueError as e:
         print(f"rejected: {e}")
         return 1
+    from .health import record_agent_landed
+    record_agent_landed()      # proof of life: an agent got all the way here
     print(f"event calendar replaced: {len(doc['events'])} event(s)")
     return 0
 
@@ -354,6 +360,8 @@ def cmd_review_record(args):
     )
     outcome = review_mod.record(store, args.id, args.action,
                                reasons=args.reason or [], decision_id=d['id'])
+    from .health import record_agent_landed
+    record_agent_landed()      # proof of life: an agent got all the way here
     print(f"decision #{d['id']} recorded; review {outcome}")
     return 0
 

@@ -45,6 +45,10 @@ _EXPIRY_KEYS = ('refreshTokenExpiresAt', 'refresh_token_expires_at',
                 'sessionExpiresAt')
 
 STATE_FILE = 'auth_health.json'
+# How many agents may be spawned without a single one reporting back before we
+# call the layer broken. Entry + exit + review + calendar agents all land verbs,
+# so on a working Pi this counter rarely passes 1.
+SILENT_SPAWN_LIMIT = 5
 
 
 def _state_path():
@@ -108,17 +112,39 @@ def credential_expiry(paths=None) -> Optional[datetime]:
 
 
 def record_spawn_result(ok: bool) -> int:
-    """Track consecutive CLI spawn failures. Returns the current streak.
+    """Track CLI health from the spawn side. Returns spawns-since-landing.
 
-    The behavioural fallback: if the CLI cannot start, the layer is down
-    regardless of what any credential file claims.
+    A successful `Popen` proves only that the BINARY EXISTS. An expired login
+    spawns perfectly and then exits immediately with an auth error — which is
+    precisely the failure this watchdog is for, and precisely what a
+    spawn-success counter cannot see. So a successful spawn does NOT clear the
+    alarm; only a landed verb does (see `record_agent_landed`). What we count
+    here is "agents launched that never came back", which catches an expired
+    login, a broken prompt, and a crashing agent alike.
     """
     state = _read_state()
-    streak = 0 if ok else int(state.get('spawn_failures') or 0) + 1
-    state['spawn_failures'] = streak
+    if ok:
+        state['spawns_since_landing'] = int(
+            state.get('spawns_since_landing') or 0) + 1
+    else:
+        state['spawn_failures'] = int(state.get('spawn_failures') or 0) + 1
     state['last_spawn_at'] = datetime.now().isoformat()
     _write_state(state)
-    return streak
+    return int(state.get('spawns_since_landing') or 0)
+
+
+def record_agent_landed() -> None:
+    """A spawned agent completed its job by calling a zebra verb.
+
+    THE proof of life for this layer: the CLI started, authenticated, did the
+    work, and wrote back. Called from every verb an agent finishes with, and
+    the only thing that clears the alarm.
+    """
+    state = _read_state()
+    state['spawns_since_landing'] = 0
+    state['spawn_failures'] = 0
+    state['last_landed_at'] = datetime.now().isoformat()
+    _write_state(state)
 
 
 def check(send=None, now: Optional[datetime] = None, dry_run: bool = False,
@@ -150,10 +176,21 @@ def check(send=None, now: Optional[datetime] = None, dry_run: bool = False,
                    f"deterministic rules — trading continues unvetted.</i>")
     elif int(state.get('spawn_failures') or 0) >= 3:
         msg = (f"🔑 <b>CLAUDE CLI NOT STARTING</b>\n"
-               f"{state['spawn_failures']} consecutive spawn failures — the "
-               f"vetting layer is effectively OFF.\n"
-               f"<i>Check auth on the Pi: <code>claude</code> then /login. "
+               f"{state['spawn_failures']} spawn failures — the vetting layer "
+               f"is effectively OFF.\n"
+               f"<i>Check the CLI on the Pi: <code>claude</code> then /login. "
                f"Trading continues on the deterministic rules.</i>")
+    elif int(state.get('spawns_since_landing') or 0) >= SILENT_SPAWN_LIMIT:
+        # Spawning fine, never reporting back. This is what an expired login
+        # actually looks like from the outside, and what a spawn-success
+        # counter would call healthy.
+        msg = (f"🔑 <b>CLAUDE AGENTS NOT REPORTING BACK</b>\n"
+               f"{state['spawns_since_landing']} agents spawned since the last "
+               f"one completed. The CLI starts but never finishes — usually an "
+               f"expired login.\n"
+               f"<i>Log in on the Pi: <code>claude</code> then /login. "
+               f"Vetting is effectively OFF; trading continues on the "
+               f"deterministic rules.</i>")
 
     if not msg:
         return None
@@ -177,5 +214,7 @@ def status(now: Optional[datetime] = None) -> dict:
         'credential_expiry': expiry.isoformat() if expiry else None,
         'days_left': (expiry - now).days if expiry else None,
         'spawn_failures': int(state.get('spawn_failures') or 0),
+        'spawns_since_landing': int(state.get('spawns_since_landing') or 0),
+        'last_landed_at': state.get('last_landed_at'),
         'last_warned_on': state.get('last_warned_on'),
     }

@@ -496,8 +496,23 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             if not cfg.VET_ENABLED:
                 continue
             state = vet_mod.vet_state(store.find(trade['id']) or trade)
-            if state in (vet_mod.PENDING, vet_mod.VETOED):
-                continue    # still deciding (expire_stale bounds it) / blocked
+            if state == vet_mod.VETOED:
+                # THE ONLY place a veto is ever observed. The verdict lands
+                # between cycles (the CLI is a separate process), so every
+                # post-veto cycle stops right here — anything downstream of
+                # this `continue` is unreachable for a vetoed signal. Opening
+                # the shadow anywhere below would look wired and never run,
+                # which is exactly the mistake the comment above describes and
+                # exactly how the veto scoring was dead on arrival.
+                try:
+                    outcomes_mod.open_shadow(store, trade['id'],
+                                             entry_spot=price)
+                except Exception as e:
+                    logger.error("Veto shadow failed for #%d: %s",
+                                 trade['id'], e)
+                continue
+            if state == vet_mod.PENDING:
+                continue    # still deciding; expire_stale bounds it
             # ALLOWED / UNAVAILABLE → enter now (re-running the analyzer for a
             # fresh book; entry drift ≤ one tick is the accepted cost of
             # vetting). None → the vet request never landed (crash after
@@ -571,12 +586,13 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             elif state == vet_mod.PENDING:
                 continue              # still deciding; expire_stale bounds it
             elif state == vet_mod.VETOED:
+                # Reachable only when the verdict lands DURING this cycle (the
+                # `triggered` fast-path above catches every later cycle, and
+                # opens the shadow there).
                 logger.info("VETOED #%d %s — no entry", trade['id'], stock)
-                # A veto blocks a trade that never happens, so without this the
-                # layer's most consequential decisions are the only ones with
-                # no evidence. Track what the signal went on to do.
                 try:
-                    outcomes_mod.open_shadow(store, trade['id'])
+                    outcomes_mod.open_shadow(store, trade['id'],
+                                             entry_spot=price)
                 except Exception as e:
                     logger.error("Veto shadow failed for #%d: %s",
                                  trade['id'], e)

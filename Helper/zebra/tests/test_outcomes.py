@@ -218,3 +218,62 @@ def test_money_score_ignores_veto_rows_entirely(store, decisions):
     outcomes.join(store, decisions)
     s = decisions.score('entry')
     assert s['veto'] == {'n': 0} and s['scored'] == 0
+
+
+def test_a_paper_exit_is_labelled_correctly(store, decisions):
+    """PAPER mode stamps every auto-booked exit `paper:tp` / `paper:debit_sl`.
+    Without stripping that prefix EVERY allow in the only mode running today
+    labels FLAT, allow-precision is None forever, and the veto-vs-allow
+    comparison this score exists for can never produce a number."""
+    store.add_signal(dict(SIGNAL))
+    store.mark_entered(1, dict(ENTRY))
+    d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+                         stock='TESTCO', direction='CE')
+    store.mark_exited(1, 101.0, 16.0, 'paper:tp')      # what production writes
+    outcomes.join(store, decisions)
+    assert decisions.find(d['id'])['outcome']['label'] == outcomes.HIT
+    q = decisions.score('entry')['signal_quality']
+    assert q['allow']['precision'] == 1.0, "allow precision unusable"
+
+
+def test_paper_stop_is_a_miss_not_flat(store, decisions):
+    store.add_signal(dict(SIGNAL))
+    store.mark_entered(1, dict(ENTRY))
+    d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+                         stock='TESTCO', direction='CE')
+    store.mark_exited(1, 92.0, 5.0, 'paper:debit_sl')
+    outcomes.join(store, decisions)
+    assert decisions.find(d['id'])['outcome']['label'] == outcomes.MISS
+
+
+def test_the_bcs_arm_is_scored_even_though_it_is_not_in_trade_ids(store, decisions):
+    """Under vetting the shadow is built at ENTRY, one tick AFTER the verdict is
+    journalled, so it can never be in trade_ids. Trusting that list would score
+    the zebra arm alone while claiming to cover both."""
+    store.add_signal(dict(SIGNAL))
+    store.mark_entered(1, dict(ENTRY))
+    d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+                         stock='TESTCO', direction='CE')
+    with store._mutate():
+        store._trades.append({
+            'id': 99, 'version': 1, 'status': 'exited', 'stock': 'TESTCO',
+            'direction': 'CE', 'structure': 'bcs', 'shadow_of': 1,
+            'pnl': 250.0, 'pnl_pct': 25.0, 'exit_reason': 'paper:tp',
+        })
+    store.mark_exited(1, 101.0, 16.0, 'paper:tp')
+    outcomes.join(store, decisions)
+    o = decisions.find(d['id'])['outcome']
+    assert set(o['arms']) == {'zebra', 'bcs'}
+    assert o['pnl'] == 850.0                           # 600 zebra + 250 bcs
+
+
+def test_a_cancelled_signal_settles_instead_of_pending_forever(store, decisions):
+    """An allow whose signal drift-cancels before the entry tick can never
+    settle, so it would be re-scanned every 5 minutes for eternity."""
+    store.add_signal(dict(SIGNAL))
+    d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+                         stock='TESTCO', direction='CE')
+    store.cancel(1, 'drifted out of zone')
+    assert outcomes.join(store, decisions) == 1
+    assert decisions.find(d['id'])['outcome']['basis'] == 'not_taken'
+    assert decisions.pending_outcome(kind='entry') == []

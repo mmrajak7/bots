@@ -56,23 +56,43 @@ FLAT = 'flat'        # neither, before the position ran out of time
 _REASON_LABEL = {'tp': HIT, 'spot_sl': MISS, 'debit_sl': MISS, 'time': FLAT}
 
 
+def label_for_reason(reason) -> str:
+    """Map an exit reason to a signal-quality label.
+
+    Strips the `paper:` prefix that `_paper_auto_close` stamps on every
+    auto-booked exit. Without this, PAPER mode — the only mode running today —
+    labels every single allow FLAT, allow-precision is None forever, and the
+    veto-vs-allow comparison this whole score exists for can never produce a
+    number. report.py strips the same prefix in three places.
+    """
+    return _REASON_LABEL.get(str(reason or '').replace('paper:', ''), FLAT)
+
+
 def _now() -> datetime:
     return datetime.now()
 
 
 # ── vetoed signals: the shadow ───────────────────────────────────────────
-def open_shadow(store, trade_id: int) -> Optional[dict]:
+def open_shadow(store, trade_id: int,
+                entry_spot: Optional[float] = None) -> Optional[dict]:
     """Start tracking a vetoed signal. Idempotent.
 
     Called the first time the monitor observes a VETOED signal. The barriers
     are frozen here, at veto time, so a later drift in spot or in the ST line
     cannot move the goalposts and flatter the verdict after the fact.
+
+    `entry_spot` is the LIVE spot at the moment the veto was observed, and is
+    the right anchor: `signal_price` is the price when the signal was added to
+    the watchlist, up to 5% from the ST line and possibly days earlier, so
+    anchoring there would measure a move that started before the decision. It
+    falls back to `trigger_spot` (set at trigger time) and only then to
+    `signal_price`.
     """
     with store._mutate():
         t = store._must_find(trade_id)
         if isinstance(t.get('veto_shadow'), dict):
             return t['veto_shadow']
-        entry = t.get('signal_price') or t.get('trigger_price')
+        entry = entry_spot or t.get('trigger_spot') or t.get('signal_price')
         target = t.get('st_value')
         if not entry or not target:
             logger.warning('Veto shadow for #%d skipped — no entry/target spot',
@@ -185,11 +205,30 @@ def _entry_outcome(store, decision: dict) -> Optional[dict]:
 
     # Allowed / unavailable: score the real thing. Both arms share one verdict,
     # so the outcome is the sum across whichever arms actually traded.
+    #
+    # Arms are resolved by `shadow_of` rather than trusting `trade_ids`: under
+    # vetting the BCS shadow is built at ENTRY, which happens on the tick AFTER
+    # the verdict, so it cannot exist when the decision is journalled and is
+    # never in trade_ids. Trusting that list would silently score the zebra arm
+    # alone while claiming to cover both.
+    ids = {t['id'] for t in trades}
+    trades = trades + [t for t in store.load_trades()
+                       if t.get('shadow_of') in ids and t['id'] not in ids]
+
+    live = [t for t in trades if t.get('status') == 'entered']
     closed = [t for t in trades if t.get('status') == 'exited']
-    if not closed or len(closed) != len([t for t in trades
-                                         if t.get('status') in ('entered',
-                                                                'exited')]):
-        return None                      # still at least one leg open
+    if live:
+        return None                      # at least one arm still open
+    if not closed:
+        # No arm ever opened. If the signal is terminal (drift/stale-cancelled
+        # between the verdict and the entry tick) this decision can NEVER
+        # settle, and leaving it pending means re-scanning it every 5 minutes
+        # forever. Settle it as "not taken" — a real outcome, excluded from
+        # both scores because no judgement of ours produced it.
+        if all(t.get('status') == 'cancelled' for t in trades):
+            return {'basis': 'not_taken',
+                    'note': 'signal cancelled before entry; verdict never acted on'}
+        return None                      # still watching/triggered
     pnl = round(sum(float(t.get('pnl') or 0) for t in closed), 2)
     reasons = [t.get('exit_reason') for t in closed]
     return {
@@ -198,7 +237,7 @@ def _entry_outcome(store, decision: dict) -> Optional[dict]:
         'pnl_pct': round(sum(float(t.get('pnl_pct') or 0)
                              for t in closed) / len(closed), 2),
         'exit_reason': reasons[0],
-        'label': _REASON_LABEL.get(reasons[0], FLAT),
+        'label': label_for_reason(reasons[0]),
         'arms': {t.get('structure') or 'zebra': float(t.get('pnl') or 0)
                  for t in closed},
     }
@@ -214,19 +253,16 @@ def join(store, decisions=None) -> int:
     decisions = decisions or get_decisions()
     decisions.refresh()
     joined = 0
-    for d in list(decisions.pending_outcome()):
-        if d.get('kind') != 'entry':
-            continue                     # exit/review decisions score elsewhere
+    for d in list(decisions.pending_outcome(kind='entry')):
         try:
             outcome = _entry_outcome(store, d)
+            if outcome is None:
+                continue
+            decisions.set_outcome(d['id'], outcome)
+            joined += 1
+            logger.info('DECISION #%s outcome: %s %s', d.get('id'),
+                        outcome['basis'], outcome.get('label'))
         except Exception as e:            # one bad row must not stall the rest
             logger.error('Outcome join failed for decision #%s: %s',
                          d.get('id'), e)
-            continue
-        if outcome is None:
-            continue
-        decisions.set_outcome(d['id'], outcome)
-        joined += 1
-        logger.info('DECISION #%d outcome: %s %s', d['id'], outcome['basis'],
-                    outcome.get('label'))
     return joined

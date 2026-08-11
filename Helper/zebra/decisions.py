@@ -86,10 +86,20 @@ class DecisionStore:
                if trade_id in (d.get('signal_ref') or {}).get('trade_ids', [])]
         return [d for d in out if d.get('kind') == kind] if kind else out
 
-    def pending_outcome(self) -> list:
-        """Decisions still waiting to be scored."""
+    def pending_outcome(self, kind: Optional[str] = None) -> list:
+        """Decisions still waiting to be scored.
+
+        `kind` matters for cost: only ENTRY decisions are ever joined to an
+        outcome, so an unfiltered call hands the joiner every exit and review
+        row ever written, forever, on a five-minute cycle. Rows missing an `id`
+        are dropped here rather than downstream, so one hand-mangled row cannot
+        stall the whole channel.
+        """
         return [d for d in self._rows
-                if d.get('outcome') is None and d.get('verdict') != 'unavailable']
+                if d.get('id') is not None
+                and d.get('outcome') is None
+                and d.get('verdict') != 'unavailable'
+                and (kind is None or d.get('kind') == kind)]
 
     # ── writes ────────────────────────────────────────────────────────────
     @contextmanager
