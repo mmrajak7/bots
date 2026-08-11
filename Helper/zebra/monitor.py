@@ -29,7 +29,7 @@ from .trade_store import ZebraStore, get_store
 
 logger = logging.getLogger(__name__)
 
-IST = timezone(timedelta(hours=5, minutes=30))
+IST = cfg.IST          # single definition lives in config; alias kept for callers
 
 # ── Telegram ──────────────────────────────────────────────────────────────
 
@@ -200,11 +200,23 @@ def _exit_cleared(store, trade: dict, kind: str, quote: dict, spot: float,
     # 'hold' — deferred to the cap. This is the one case that needs a human:
     # the structure's loss is capped and known, but firing on a book we could
     # not verify is the unbounded-damage direction.
-    if store.set_alert_flag_daily(trade['id'], f'exit_escalate_{kind}'):
-        _send_telegram(_format_exit_escalation(trade, kind, quote, spot),
-                       dry_run=dry_run)
-        logger.warning("EXIT %s #%d ESCALATED to user after %d defers",
-                       kind, trade['id'], vet_mod.exit_defers(trade, kind))
+    flag = f'exit_escalate_{kind}'
+    if store.set_alert_flag_daily(trade['id'], flag):
+        # Re-read: _mutate has detached the caller's dict from the store, so the
+        # defer count on `trade` can lag the write that just pushed us to hold.
+        fresh = store.find(trade['id']) or trade
+        if _send_telegram(_format_exit_escalation(fresh, kind, quote, spot),
+                          dry_run=dry_run):
+            logger.warning("EXIT %s #%d ESCALATED to user after %d defers",
+                           kind, trade['id'], vet_mod.exit_defers(fresh, kind))
+        else:
+            # Give the day's flag back. This is the ONE message with a human in
+            # the loop, on a position we are holding precisely because nothing
+            # automated can verify it — losing it silently for a day is worse
+            # than a duplicate nag.
+            store.clear_alert_flag(trade['id'], flag)
+            logger.error("EXIT %s #%d escalation FAILED to send — flag "
+                         "released, retrying next cycle", kind, trade['id'])
     return False
 
 
@@ -892,10 +904,13 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # ── TP ──────────────────────────────────────────────────────────
         tp_hit = (direction == 'CE' and spot >= tp_spot) or \
                  (direction == 'PE' and spot <= tp_spot)
-        if tp_hit and not _exit_cleared(store, trade, 'tp', sq, spot,
-                                        dry_run=dry_run):
-            continue
-        if tp_hit and store.set_alert_flag(tid, 'tp'):
+        # A blocked trigger skips ONLY ITS OWN branch. It must not `continue`:
+        # that would also skip the DEBIT-SL and TIME checks below, so a TP held
+        # on an untradeable book would suppress the T-3 expiry nag entirely and
+        # ride the position into settlement week unnoticed.
+        if tp_hit and _exit_cleared(store, trade, 'tp', sq, spot,
+                                    dry_run=dry_run) \
+                and store.set_alert_flag(tid, 'tp'):
             if _alerts_enabled(trade):
                 _send_telegram(_format_tp_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
@@ -911,10 +926,9 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         sl_hit = cfg.SPOT_SL_ENABLED and (
                  (direction == 'CE' and spot <= sl_spot) or
                  (direction == 'PE' and spot >= sl_spot))
-        if sl_hit and not _exit_cleared(store, trade, 'spot_sl', sq, spot,
-                                        dry_run=dry_run):
-            continue
-        if sl_hit and store.set_alert_flag(tid, 'spot_sl'):
+        if sl_hit and _exit_cleared(store, trade, 'spot_sl', sq, spot,
+                                    dry_run=dry_run) \
+                and store.set_alert_flag(tid, 'spot_sl'):
             if _alerts_enabled(trade):
                 _send_telegram(_format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
@@ -936,10 +950,9 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 # THE NHPC case. The debounce above proves the reading is
                 # repeatable; it cannot prove the book was real. Vet before
                 # claiming the consume-once flag.
-                if not _exit_cleared(store, trade, 'debit_sl', sq, spot,
-                                     dry_run=dry_run):
-                    continue
-                if store.set_alert_flag(tid, 'debit_sl'):
+                if _exit_cleared(store, trade, 'debit_sl', sq, spot,
+                                 dry_run=dry_run) \
+                        and store.set_alert_flag(tid, 'debit_sl'):
                     if _alerts_enabled(trade):
                         _send_telegram(_format_debit_sl_alert(trade, mid), dry_run=dry_run)
                     logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f (confirmed x%d)",

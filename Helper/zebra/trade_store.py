@@ -523,6 +523,22 @@ class ZebraStore:
                     newly_set = True
         return newly_set
 
+    def clear_alert_flag(self, trade_id: int, kind: str,
+                         persist: bool = True) -> None:
+        """Un-set an alert flag so the next cycle may fire it again.
+
+        Exists for one narrow case: an alert whose flag was claimed but whose
+        SEND then failed. Claiming before sending is deliberate (two processes
+        must not both send), but without this the failed message is simply lost
+        — which for the exit escalation means the human is never asked about a
+        position the bot has decided to hold indefinitely.
+        """
+        with self._mutate(drive=persist, persist=persist):
+            t = self.find(trade_id)
+            if t and t.get(f"{kind}_alerted_at"):
+                t[f"{kind}_alerted_at"] = None
+                t['version'] = t.get('version', 0) + 1
+
     # ── Quote-reliability confirm / blind counters ─────────────────────────
     # Advisory per-trade state for the DEBIT-SL value trigger. Persisted to the
     # LOCAL file only (no Drive upload, no version bump) so it survives cron

@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+from datetime import timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,8 @@ DECISIONS_LOCK = LOG_DIR / 'zebra_decisions.lock'
 # Master switch. OFF by default: the layer ships dark and is enabled explicitly
 # once the CLI is authenticated on the Pi and the prompt has been exercised.
 # With this False, zebra behaves exactly as it did before the layer existed.
-VET_ENABLED = os.environ.get('ZEBRA_VET_ENABLED', '').lower() in ('1', 'true', 'yes')
+# (VET_ENABLED is exported further down — it reads zebra_config.json, which is
+# not loaded yet at this point in the module.)
 # CLI ONLY — never the Anthropic API/SDK. The Pi is authenticated once
 # interactively and that is the sanctioned path for this fleet.
 VET_CLI = os.environ.get('ZEBRA_VET_CLI', 'claude')
@@ -157,6 +159,24 @@ _DEFAULTS = {
     'enabled_timeframes': ['monthly', 'weekly'],
     'st_period': 10,
     'st_multiplier': 3,
+    'vet_enabled': False,        # Claude vetting layer master switch. Lives HERE
+                                 # rather than env-only so it cannot be ON in the
+                                 # cron and OFF in a manual `python -m zebra run`
+                                 # — a half-enabled fleet is worse than a dark
+                                 # one: the unvetted process would fire, and burn
+                                 # the consume-once flag on, the very exit the
+                                 # vetted process is deliberately holding.
+                                 # ZEBRA_VET_ENABLED still overrides, for a
+                                 # one-off test without editing config.
+    'exit_vet_ttl_sec': 900,     # How long a terminal EXIT verdict stays valid.
+                                 # A verdict is a judgement about the book AT
+                                 # THAT MOMENT, so it must not authorise an exit
+                                 # days later on a book that has since rotted —
+                                 # precisely the NHPC shape this layer exists to
+                                 # catch. Must comfortably exceed one
+                                 # monitor_interval_sec (the verdict has to
+                                 # survive until the next cycle fires the exit)
+                                 # and stay far below a session.
 }
 
 
@@ -270,6 +290,23 @@ ENABLED_TIMEFRAMES = _runtime['enabled_timeframes']
 ST_PERIOD = _int('st_period')
 ST_MULTIPLIER = _num('st_multiplier')
 
+# ── Claude vetting switches (need _runtime, hence exported here) ───────────
+# Env wins when set, so a one-off `ZEBRA_VET_ENABLED=1 python -m zebra run`
+# works without editing config; otherwise every process in the fleet reads the
+# SAME file and cannot disagree about whether the layer is on.
+_vet_env = os.environ.get('ZEBRA_VET_ENABLED', '').strip()
+VET_ENABLED = (_vet_env.lower() in ('1', 'true', 'yes') if _vet_env
+               else bool(_runtime['vet_enabled']))
+EXIT_VET_TTL_SEC = _int('exit_vet_ttl_sec')
+if EXIT_VET_TTL_SEC <= MONITOR_INTERVAL_SEC:
+    # A TTL shorter than one cycle expires every verdict before the cycle that
+    # would act on it — the gate would re-request forever and no exit could
+    # ever fire through it. Refuse to run in that shape.
+    logger.warning("exit_vet_ttl_sec=%d must exceed monitor_interval_sec=%d — "
+                   "using %d", EXIT_VET_TTL_SEC, MONITOR_INTERVAL_SEC,
+                   MONITOR_INTERVAL_SEC * 3)
+    EXIT_VET_TTL_SEC = MONITOR_INTERVAL_SEC * 3
+
 SCANNERS = [s for s in _ALL_SCANNERS if s['timeframe'] in ENABLED_TIMEFRAMES]
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -285,6 +322,11 @@ def is_trend_aligned(direction: str, st_direction: str) -> bool:
 
 
 # ── Market hours ──────────────────────────────────────────────────────────
+# Single source of truth for the exchange clock. Anything that reasons about
+# "where are we in the session" must use this, never the host's local time —
+# a UTC-clocked server would otherwise read 09:15 IST as 03:45 and mis-apply
+# every session-relative rule.
+IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
 

@@ -56,7 +56,24 @@ TERMINAL = (ALLOWED, VETOED, UNAVAILABLE)
 
 
 def _now() -> datetime:
+    """Naive local clock — used only for durations (deadlines, TTLs).
+
+    Deliberately naive and self-consistent: every timestamp this module stores
+    and re-parses uses it, so arithmetic between them is correct regardless of
+    host timezone. Never use it to ask WHERE IN THE SESSION we are.
+    """
     return datetime.now()
+
+
+def _now_ist() -> datetime:
+    """Exchange wall clock — used only for session-relative questions.
+
+    Separate from _now() because these are different questions: "has 10 minutes
+    passed" is timezone-free, "are we in the opening 15 minutes" is not. On a
+    UTC-clocked Pi, answering the second with the first silently moves the
+    whole session window.
+    """
+    return datetime.now(cfg.IST)
 
 
 def _parse(ts: Optional[str]) -> Optional[datetime]:
@@ -306,6 +323,26 @@ def _exit_marker(trade: dict, kind: str) -> dict:
     return m if isinstance(m, dict) else {}
 
 
+def _marker_fresh(marker: dict, now: Optional[datetime] = None) -> bool:
+    """Is a TERMINAL exit verdict still about the book in front of us?
+
+    A verdict is a judgement about a specific quote at a specific moment, not a
+    standing permission. Without this, an `allow` granted on a clean book on
+    Monday sits on the marker forever and waves through a Friday exit priced off
+    a garbage book — the exact NHPC shape the layer exists to catch. Same for
+    `unavailable`: one ten-minute Claude outage would otherwise disarm vetting
+    for that (trade, kind) permanently while the switch still reads ON.
+
+    A stale marker is treated as "never vetted", so the next trigger re-requests
+    from scratch — including the defer count, since accumulated distrust belongs
+    to the episode that produced it.
+    """
+    decided = _parse(marker.get('decided_at'))
+    if decided is None:
+        return False
+    return (now or _now()) - decided < timedelta(seconds=cfg.EXIT_VET_TTL_SEC)
+
+
 def needs_exit_vet(trade: dict, kind: str, quote: dict,
                    now: Optional[datetime] = None) -> tuple:
     """Cheap deterministic pre-filter: is this exit worth an LLM call?
@@ -319,13 +356,18 @@ def needs_exit_vet(trade: dict, kind: str, quote: dict,
     far above it, on a book nobody could actually have traded.
     """
     reasons = []
-    if not quote.get('reliable', True):
+    # Default FALSE, not True: a malformed/empty quote dict is exactly the case
+    # that most deserves a second look, and defaulting to "reliable" would let
+    # it through unvetted.
+    if not quote.get('reliable', False):
         reasons.append('unreliable book (%s)' % (quote.get('reason') or 'n/a'))
     if int(trade.get('debit_blind_cycles') or 0) > 0:
         reasons.append('recent debit-blind cycles')
     # Both real-money incidents happened in the opening minutes, when books are
-    # thin and prints are unrepresentative.
-    n = now or _now()
+    # thin and prints are unrepresentative. EXCHANGE clock, never the host's:
+    # on a UTC-clocked Pi local time would put the whole session outside this
+    # window (or all of it inside), silently changing what gets vetted.
+    n = now or _now_ist()
     if (n.hour, n.minute) < (9, 30):
         reasons.append('first 15 minutes of the session')
     # A value trigger acts on a PRICE; a spot trigger is corroborated by real
@@ -355,6 +397,14 @@ def exit_gate(store, trade: dict, kind: str, quote: dict, spot: float,
     m = _exit_marker(trade, kind)
     state = m.get('state')
 
+    # A terminal verdict authorises THIS episode, not this trade forever. Once
+    # it goes stale we forget it entirely — state, defer count and all — so the
+    # next trigger is judged on the book actually in front of us.
+    if state in (ALLOWED, UNAVAILABLE, DEFER) and not _marker_fresh(m):
+        logger.info('EXIT VET marker for #%d %s is stale (%s) — re-evaluating '
+                    'this trigger from scratch', trade['id'], kind, state)
+        m, state = {}, None
+
     if state == ALLOWED:
         return 'proceed'
     if state == UNAVAILABLE:
@@ -367,7 +417,23 @@ def exit_gate(store, trade: dict, kind: str, quote: dict, spot: float,
     if state == PENDING:
         if not _exit_expired(m):
             return 'wait'
-        _set_exit_state(store, trade['id'], kind, UNAVAILABLE)
+        prior = int(m.get('defers') or 0)
+        if prior:
+            # Claude LOOKED at this exit and said it could not verify the
+            # quote; then the re-check timed out. A timeout is "we don't know",
+            # and "we don't know" after an explicit refusal is not consent —
+            # fail-open is the contract for *never examined*, not for this.
+            # Count the timeout as another failure to verify so the escalation
+            # cap arrives on schedule.
+            _set_exit_state(store, trade['id'], kind, DEFER,
+                            bump_defer=True, expect_state=PENDING)
+            new = prior + 1
+            logger.warning('EXIT VET TIMED OUT #%d %s after %d prior defer(s) '
+                           '— NOT proceeding; distrust carries over',
+                           trade['id'], kind, prior)
+            return 'hold' if new >= cfg.EXIT_MAX_DEFERS else 'wait'
+        _set_exit_state(store, trade['id'], kind, UNAVAILABLE,
+                        expect_state=PENDING)
         logger.warning('EXIT VET TIMED OUT #%d %s — proceeding on the '
                        'deterministic guards alone', trade['id'], kind)
         return 'proceed'
@@ -407,45 +473,77 @@ def _exit_expired(marker: dict, now: Optional[datetime] = None) -> bool:
 
 
 def _request_exit_vet(store, trade_id: int, kind: str, context: dict,
-                      defers: int = 0, spawn: bool = True) -> None:
+                      defers: int = 0, spawn: bool = True) -> bool:
+    """Mark this (trade, kind) PENDING and spawn the CLI. True if we spawned.
+
+    Carries the same overlap guard as request_entry_vet: `zebra loop` and a
+    manual `python -m zebra run` are not serialised against each other (flock
+    covers the STORE, not the cycle), so without this both would overwrite the
+    marker and spawn a CLI. Two agents answering one request is not redundancy
+    — their verdicts race, and two `defer`s from a single re-check drive the
+    counter to the escalation cap in one step.
+    """
+    fresh = True
     with store._mutate():
         t = store._must_find(trade_id)
         ev = t.get('exit_vet')
         if not isinstance(ev, dict):
             ev = {}
-        ev[kind] = {
-            'state': PENDING,
-            'requested_at': _now().isoformat(),
-            'deadline': (_now() + timedelta(
-                seconds=cfg.VET_TIMEOUT_SEC)).isoformat(),
-            'defers': defers,
-            'context': context,
-            'decision_id': None,
-        }
-        t['exit_vet'] = ev
-        t['version'] = t.get('version', 0) + 1
+        existing = ev.get(kind) if isinstance(ev.get(kind), dict) else {}
+        if existing.get('state') == PENDING and not _exit_expired(existing):
+            fresh = False          # someone else already asked; keep their marker
+        else:
+            ev[kind] = {
+                'state': PENDING,
+                'requested_at': _now().isoformat(),
+                'deadline': (_now() + timedelta(
+                    seconds=cfg.VET_TIMEOUT_SEC)).isoformat(),
+                'defers': defers,
+                'context': context,
+                'decision_id': None,
+            }
+            t['exit_vet'] = ev
+            t['version'] = t.get('version', 0) + 1
+    if not fresh:
+        logger.info('EXIT VET already pending for #%d %s — not re-requesting',
+                    trade_id, kind)
+        return False
     logger.info('EXIT VET REQUESTED #%d %s — %s', trade_id, kind,
                 context.get('reason_flagged'))
     if spawn:
         _spawn_cli(trade_id, exit_kind=kind)
+    return True
 
 
 def _set_exit_state(store, trade_id: int, kind: str, state: str,
                     decision_id: Optional[int] = None,
-                    bump_defer: bool = False) -> None:
+                    bump_defer: bool = False,
+                    expect_state: Optional[str] = None) -> bool:
+    """Compare-and-set the exit marker. True if the write landed.
+
+    `expect_state` makes this a CAS rather than a blind write, and the check
+    happens INSIDE the lock. Checking outside it (as this originally did, via
+    the caller) is a TOCTOU: two CLIs that both read PENDING both write, so a
+    `defer` and an `allow` become last-writer-wins — and the losing writer is
+    silently the one that said "I cannot verify this quote".
+    """
+    applied = False
     with store._mutate():
         t = store._must_find(trade_id)
         ev = t.get('exit_vet') if isinstance(t.get('exit_vet'), dict) else {}
         m = ev.get(kind) if isinstance(ev.get(kind), dict) else {}
-        m['state'] = state
-        m['decided_at'] = _now().isoformat()
-        if decision_id is not None:
-            m['decision_id'] = decision_id
-        if bump_defer:
-            m['defers'] = int(m.get('defers') or 0) + 1
-        ev[kind] = m
-        t['exit_vet'] = ev
-        t['version'] = t.get('version', 0) + 1
+        if expect_state is None or m.get('state') == expect_state:
+            m['state'] = state
+            m['decided_at'] = _now().isoformat()
+            if decision_id is not None:
+                m['decision_id'] = decision_id
+            if bump_defer:
+                m['defers'] = int(m.get('defers') or 0) + 1
+            ev[kind] = m
+            t['exit_vet'] = ev
+            t['version'] = t.get('version', 0) + 1
+            applied = True
+    return applied
 
 
 def record_exit_verdict(store, trade_id: int, kind: str, verdict: str,
@@ -462,20 +560,28 @@ def record_exit_verdict(store, trade_id: int, kind: str, verdict: str,
     t = store.find(trade_id)
     if not t:
         raise ValueError('#%d not found' % trade_id)
-    m = _exit_marker(t, kind)
-    if m.get('state') != PENDING:
-        logger.warning('EXIT verdict for #%d %s discarded — state is %s',
-                       trade_id, kind, m.get('state'))
-        return 'discarded (state %s)' % m.get('state')
-    if verdict == 'allow':
-        _set_exit_state(store, trade_id, kind, ALLOWED, decision_id)
-        logger.info('EXIT ALLOWED #%d %s (decision #%s)', trade_id, kind,
-                    decision_id)
-    else:
-        _set_exit_state(store, trade_id, kind, DEFER, decision_id,
-                        bump_defer=True)
-        logger.info('EXIT DEFERRED #%d %s (decision #%s)', trade_id, kind,
-                    decision_id)
+    if t.get('status') != 'entered':
+        # The position closed while the agent was thinking. Landing a verdict
+        # on a settled trade cannot help and would leave a marker that outlives
+        # the position it describes.
+        logger.warning('EXIT verdict for #%d %s discarded — trade is %s',
+                       trade_id, kind, t.get('status'))
+        return 'discarded (trade %s)' % t.get('status')
+    # The state check that MATTERS happens inside _set_exit_state's lock; this
+    # one only buys a precise log line for the common non-racing case.
+    applied = _set_exit_state(
+        store, trade_id, kind,
+        ALLOWED if verdict == 'allow' else DEFER,
+        decision_id, bump_defer=(verdict == DEFER), expect_state=PENDING)
+    if not applied:
+        state = _exit_marker(store.find(trade_id) or {}, kind).get('state')
+        logger.warning('EXIT verdict for #%d %s discarded — state is %s '
+                       '(late, duplicate, or another agent answered first)',
+                       trade_id, kind, state)
+        return 'discarded (state %s)' % state
+    logger.info('EXIT %s #%d %s (decision #%s)',
+                'ALLOWED' if verdict == 'allow' else 'DEFERRED',
+                trade_id, kind, decision_id)
     return 'applied'
 
 

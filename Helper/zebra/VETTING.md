@@ -173,6 +173,12 @@ corroborated loss should be taken. Deferring a genuine stop is how a capped loss
 becomes a maximum loss. You are checking the QUOTE, not second-guessing the
 strategy.
 
+**Your verdict covers this episode, not this trade.** It expires after
+`exit_vet_ttl_sec` (15 min by default). If the same trigger fires again
+tomorrow, a fresh agent judges the book as it is then — so decide about the
+quote in front of you and nothing further out. An `allow` is never a standing
+permission to exit this position later.
+
 ```
 <python> -m zebra vet exit-decide 42 --kind debit_sl --verdict defer     --red-flag "structure mid 0.36 below intrinsic 1.10 — impossible"     --reason "spot moved -0.4%, cannot explain a -74% structure move"     --reason "ask side one-sided, no depth at touch"     --confidence 0.9
 ```
