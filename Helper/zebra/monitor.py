@@ -179,6 +179,54 @@ def _format_enter_alert(trade: dict, analysis: dict,
     return msg
 
 
+def _exit_cleared(store, trade: dict, kind: str, quote: dict, spot: float,
+                  dry_run: bool = False) -> bool:
+    """True if this exit may fire now. False = wait or hold.
+
+    Called BEFORE `set_alert_flag` on every price-driven exit, because that
+    flag is consume-once and burning it on an exit that does not execute
+    strands the exit permanently.
+
+    TIME exits are deliberately NOT gated: they are calendar-driven rather than
+    quote-driven, and their flag re-arms daily, so a bad mid there costs one
+    day of paper accounting instead of a stranded position.
+    """
+    gate = vet_mod.exit_gate(store, trade, kind, quote, spot)
+    if gate == 'proceed':
+        return True
+    if gate == 'wait':
+        logger.info("EXIT %s #%d held pending vet", kind, trade['id'])
+        return False
+    # 'hold' — deferred to the cap. This is the one case that needs a human:
+    # the structure's loss is capped and known, but firing on a book we could
+    # not verify is the unbounded-damage direction.
+    if store.set_alert_flag_daily(trade['id'], f'exit_escalate_{kind}'):
+        _send_telegram(_format_exit_escalation(trade, kind, quote, spot),
+                       dry_run=dry_run)
+        logger.warning("EXIT %s #%d ESCALATED to user after %d defers",
+                       kind, trade['id'], vet_mod.exit_defers(trade, kind))
+    return False
+
+
+def _format_exit_escalation(trade: dict, kind: str, quote: dict,
+                            spot: float) -> str:
+    """Ask the human. Nothing else will act on this signal until they do."""
+    mid = quote.get('mid')
+    return (
+        f"🟡 <b>EXIT NEEDS YOU</b>  <code>{trade.get('stock')}</code> "
+        f"({trade.get('direction')})\n"
+        f"{html.escape(kind.upper())} triggered but Claude could not verify the "
+        f"quote after {vet_mod.exit_defers(trade, kind)} re-checks.\n"
+        f"spot {spot:,.2f} | structure mid "
+        f"{('%.2f' % mid) if mid is not None else 'NA'} | entry debit "
+        f"{trade.get('debit')}\n"
+        f"reason: {html.escape(str(quote.get('reason') or 'unreliable book'))}\n"
+        f"<i>HOLDING — max loss is the debit and already capped. "
+        f"Close manually with <code>zebra close {trade.get('id')}</code> "
+        f"if you disagree.</i>"
+    )
+
+
 def _vet_line(trade: dict) -> str:
     """One line describing the vetting verdict, appended to an ENTER alert.
 
@@ -844,6 +892,9 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # ── TP ──────────────────────────────────────────────────────────
         tp_hit = (direction == 'CE' and spot >= tp_spot) or \
                  (direction == 'PE' and spot <= tp_spot)
+        if tp_hit and not _exit_cleared(store, trade, 'tp', sq, spot,
+                                        dry_run=dry_run):
+            continue
         if tp_hit and store.set_alert_flag(tid, 'tp'):
             if _alerts_enabled(trade):
                 _send_telegram(_format_tp_alert(trade, spot, mid), dry_run=dry_run)
@@ -860,6 +911,9 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         sl_hit = cfg.SPOT_SL_ENABLED and (
                  (direction == 'CE' and spot <= sl_spot) or
                  (direction == 'PE' and spot >= sl_spot))
+        if sl_hit and not _exit_cleared(store, trade, 'spot_sl', sq, spot,
+                                        dry_run=dry_run):
+            continue
         if sl_hit and store.set_alert_flag(tid, 'spot_sl'):
             if _alerts_enabled(trade):
                 _send_telegram(_format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
@@ -879,6 +933,12 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         elif mid <= trade['debit_sl_value']:
             n = store.bump_confirm(tid, 'debit_sl')
             if n >= cfg.DEBIT_SL_CONFIRM_POLLS:
+                # THE NHPC case. The debounce above proves the reading is
+                # repeatable; it cannot prove the book was real. Vet before
+                # claiming the consume-once flag.
+                if not _exit_cleared(store, trade, 'debit_sl', sq, spot,
+                                     dry_run=dry_run):
+                    continue
                 if store.set_alert_flag(tid, 'debit_sl'):
                     if _alerts_enabled(trade):
                         _send_telegram(_format_debit_sl_alert(trade, mid), dry_run=dry_run)

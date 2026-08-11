@@ -56,6 +56,21 @@ VET_PROMPT_TEMPLATE = (
     "--verdict allow|veto ...` exactly once."
 )
 VETTING_DOC = SCRIPT_DIR / 'VETTING.md'
+# How many times Claude may defer one exit before the human is asked. Two
+# deferrals is ~10 min of re-checks with fresh quotes. Past that we do NOT fall
+# through to the deterministic trigger: every structure here is hedged with max
+# loss = debit known at entry, so HOLDING is bounded while exiting on a bad
+# print is not (NHPC). The conservative direction is to hold and escalate.
+EXIT_MAX_DEFERS = 2
+EXIT_PROMPT_TEMPLATE = (
+    "An EXIT trigger fired on open position {trade_id} ({exit_kind}) and the "
+    "quote behind it looks questionable. Read {vetting_doc} (the EXIT section) "
+    "and follow it exactly. Start with "
+    "`{python} -m zebra vet show {trade_id} --exit {exit_kind}`. "
+    "Use `{python}` for every zebra command. You MUST finish by calling "
+    "`{python} -m zebra vet exit-decide {trade_id} --kind {exit_kind} "
+    "--verdict allow|defer ...` exactly once."
+)
 KITE_TOKEN_FILE = BOTS_ROOT / 'data' / 'kite_access_token.json'
 TELEGRAM_CONFIG = BOTS_ROOT / 'data' / 'telegram_config.json'
 OPTIONS_CSV = PROJECT_ROOT / 'nse_stocks_options.csv'

@@ -69,6 +69,32 @@ def cmd_vet_show(args):
     if not t:
         print(_json.dumps({'error': f'trade #{args.id} not found'}))
         return 1
+    if getattr(args, 'exit', None):
+        # Exit context: what the trigger saw, plus the entry reference points a
+        # verdict needs (intrinsic floor, entry debit, SL level).
+        m = ((t.get('exit_vet') or {}).get(args.exit) or {})
+        print(_json.dumps({
+            'trade_id': t['id'],
+            'stock': t.get('stock'),
+            'direction': t.get('direction'),
+            'exit_kind': args.exit,
+            'vet_state': m.get('state'),
+            'defers_so_far': m.get('defers', 0),
+            'max_defers': cfg.EXIT_MAX_DEFERS,
+            'deadline': m.get('deadline'),
+            'expired': vet_mod._exit_expired(m) if m else True,
+            'entry_debit': t.get('debit'),
+            'debit_sl_value': t.get('debit_sl_value'),
+            'entry_spot': t.get('entry_spot'),
+            'tp_spot': t.get('tp_spot'),
+            'expiry': t.get('expiry'),
+            'long_symbol': t.get('long_symbol'),
+            'short_symbol': t.get('short_symbol'),
+            'quantity': t.get('quantity'),
+            'context': m.get('context', {}),
+            'checklist': str(cfg.VETTING_DOC) + ' — EXIT section',
+        }, indent=2, default=str))
+        return 0
     v = t.get('vet') or {}
     print(_json.dumps({
         'trade_id': t['id'],
@@ -140,6 +166,38 @@ def cmd_vet_decide(args):
                 "veto alert failed for #%d: %s", args.id, e)
     # A discarded verdict is NOT an error the agent should retry — the signal
     # already settled. Exit 0 so a retry loop does not hammer a closed case.
+    return 0
+
+
+def cmd_vet_exit_decide(args):
+    """Record an exit verdict: allow the exit, or defer for a re-check.
+
+    No hard veto exists here by design — see vet.record_exit_verdict. Deferring
+    is the same protective power in a shape that cannot silently disarm a stop.
+    """
+    from . import config as cfg
+    from .trade_store import get_store
+    from .decisions import get_store as get_decisions
+    from . import vet as vet_mod
+
+    store = get_store()
+    t = store.find(args.id)
+    if not t:
+        print(f"trade #{args.id} not found")
+        return 1
+
+    d = get_decisions().record(
+        kind='exit',
+        verdict='allow' if args.verdict == 'allow' else 'defer',
+        trade_ids=[t['id']],
+        stock=t.get('stock'), direction=t.get('direction'),
+        reasons=args.reason or [], red_flags=args.red_flag or [],
+        confidence=args.confidence, model=cfg.VET_MODEL,
+        notes=args.notes or '', evidence={'exit_kind': args.kind},
+    )
+    outcome = vet_mod.record_exit_verdict(store, args.id, args.kind,
+                                          args.verdict, decision_id=d['id'])
+    print(f"decision #{d['id']} recorded; exit verdict {outcome}")
     return 0
 
 
@@ -534,7 +592,20 @@ def main():
 
     p_vshow = vet_sub.add_parser('show', help='Dump vetting context as JSON')
     p_vshow.add_argument('id', type=int)
+    p_vshow.add_argument('--exit', choices=['tp', 'spot_sl', 'debit_sl'],
+                         default=None, help='Show EXIT context for this trigger')
     p_vshow.set_defaults(func=cmd_vet_show)
+
+    p_vexit = vet_sub.add_parser('exit-decide', help='Record an exit verdict')
+    p_vexit.add_argument('id', type=int)
+    p_vexit.add_argument('--kind', required=True,
+                         choices=['tp', 'spot_sl', 'debit_sl'])
+    p_vexit.add_argument('--verdict', required=True, choices=['allow', 'defer'])
+    p_vexit.add_argument('--reason', action='append')
+    p_vexit.add_argument('--red-flag', action='append')
+    p_vexit.add_argument('--confidence', type=float, default=None)
+    p_vexit.add_argument('--notes', default='')
+    p_vexit.set_defaults(func=cmd_vet_exit_decide)
 
     p_vdec = vet_sub.add_parser('decide', help='Record a verdict')
     p_vdec.add_argument('id', type=int)

@@ -162,7 +162,7 @@ def _reap_children() -> None:
             _children.remove(p)
 
 
-def _spawn_cli(trade_id: int) -> Optional[int]:
+def _spawn_cli(trade_id: int, exit_kind: Optional[str] = None) -> Optional[int]:
     """Fire the Claude Code CLI detached. Returns the pid, or None on failure.
 
     Detached and never waited on: the trading loop must not block on an LLM.
@@ -175,9 +175,11 @@ def _spawn_cli(trade_id: int) -> Optional[int]:
     # The prompt tells the agent the EXACT interpreter to use: the Pi runs the
     # bot under a venv and has no guaranteed bare `python` on PATH, and the CLI
     # verbs must import the same zebra package the bot runs.
-    prompt = cfg.VET_PROMPT_TEMPLATE.format(trade_id=trade_id,
-                                            python=sys.executable,
-                                            vetting_doc=cfg.VETTING_DOC)
+    template = cfg.EXIT_PROMPT_TEMPLATE if exit_kind else cfg.VET_PROMPT_TEMPLATE
+    prompt = template.format(trade_id=trade_id,
+                             python=sys.executable,
+                             exit_kind=exit_kind or '',
+                             vetting_doc=cfg.VETTING_DOC)
     argv = [cfg.VET_CLI, '-p', prompt, '--model', cfg.VET_MODEL]
     try:
         _reap_children()
@@ -270,3 +272,216 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
         logger.warning("VET TIMED OUT #%d — failing OPEN (enters unvetted, "
                        "excluded from scoring)", tid)
     return expired
+
+
+# ══ EXIT VETTING ═════════════════════════════════════════════════════════
+# Exits are the dangerous direction. Both real-money losses in this fleet were
+# automated EXITS firing on bad data at market open (ICICI Feb, NHPC Jul), and
+# every structure here is hedged with max loss = debit, KNOWN AT ENTRY.
+#
+# That asymmetry drives the design: HOLDING is bounded risk, EXITING BADLY is
+# not. So an exit whose quote cannot be trusted is HELD and escalated to the
+# human rather than fired on the hope the print was real.
+#
+# This sits ON TOP of the deterministic guards (quote reliability, the DEBIT_SL
+# confirm debounce, the intrinsic-floor clamp). It never overrides them, and it
+# can never TRIGGER an exit they did not already call for — it only delays one.
+
+DEFER = 'defer'
+
+
+def _exit_marker(trade: dict, kind: str) -> dict:
+    """Read the per-kind exit marker, tolerating corruption.
+
+    Same hardening as vet_state(): this is read on the exit path, and an
+    AttributeError from a hand-edited record would take down the monitor loop
+    for every position, not just this one.
+    """
+    if not isinstance(trade, dict):
+        return {}
+    ev = trade.get('exit_vet')
+    if not isinstance(ev, dict):
+        return {}
+    m = ev.get(kind)
+    return m if isinstance(m, dict) else {}
+
+
+def needs_exit_vet(trade: dict, kind: str, quote: dict,
+                   now: Optional[datetime] = None) -> tuple:
+    """Cheap deterministic pre-filter: is this exit worth an LLM call?
+
+    Returns (needed, why). Market hours are ~75 cycles/day; a full agent run
+    on each would burn ~1M tokens/day to conclude "nothing changed". Python
+    decides what is interesting; Claude judges only those.
+
+    An exit is interesting when the QUOTE BEHIND IT might be lying — the NHPC
+    signature exactly: a structure that read 0.18 against an intrinsic floor
+    far above it, on a book nobody could actually have traded.
+    """
+    reasons = []
+    if not quote.get('reliable', True):
+        reasons.append('unreliable book (%s)' % (quote.get('reason') or 'n/a'))
+    if int(trade.get('debit_blind_cycles') or 0) > 0:
+        reasons.append('recent debit-blind cycles')
+    # Both real-money incidents happened in the opening minutes, when books are
+    # thin and prints are unrepresentative.
+    n = now or _now()
+    if (n.hour, n.minute) < (9, 30):
+        reasons.append('first 15 minutes of the session')
+    # A value trigger acts on a PRICE; a spot trigger is corroborated by real
+    # trades in the underlying. The value one is the one that can be faked.
+    if kind == 'debit_sl':
+        reasons.append('value-based trigger (priced off the option book)')
+    return (bool(reasons), '; '.join(reasons))
+
+
+def exit_gate(store, trade: dict, kind: str, quote: dict, spot: float,
+              spawn: bool = True) -> str:
+    """May this exit fire THIS cycle?
+
+    Returns:
+      'proceed' — fire it (vetted, not worth vetting, or Claude is down and the
+                  deterministic guards stand on their own)
+      'wait'    — a verdict is pending; re-evaluate next cycle
+      'hold'    — deferred to the cap and escalated; the human decides
+
+    MUST be called BEFORE `set_alert_flag`. That flag is consume-once, and
+    burning it on an exit that does not execute strands the exit permanently —
+    the monitor's own comments warn about exactly this.
+    """
+    if not cfg.VET_ENABLED:
+        return 'proceed'
+
+    m = _exit_marker(trade, kind)
+    state = m.get('state')
+
+    if state == ALLOWED:
+        return 'proceed'
+    if state == UNAVAILABLE:
+        # Claude never answered. The deterministic guards are unchanged and
+        # still hold, so this is the same fail-open contract as entry: the
+        # layer is additive, never load-bearing.
+        return 'proceed'
+    if state == DEFER and int(m.get('defers') or 0) >= cfg.EXIT_MAX_DEFERS:
+        return 'hold'
+    if state == PENDING:
+        if not _exit_expired(m):
+            return 'wait'
+        _set_exit_state(store, trade['id'], kind, UNAVAILABLE)
+        logger.warning('EXIT VET TIMED OUT #%d %s — proceeding on the '
+                       'deterministic guards alone', trade['id'], kind)
+        return 'proceed'
+
+    needed, why = needs_exit_vet(trade, kind, quote)
+    if not needed:
+        return 'proceed'
+
+    defers = int(m.get('defers') or 0) if state == DEFER else 0
+    try:
+        _request_exit_vet(store, trade['id'], kind, {
+            'reason_flagged': why,
+            'kind': kind,
+            'spot': spot,
+            'mid': quote.get('mid'),
+            'reliable': quote.get('reliable'),
+            'quote_reason': quote.get('reason'),
+            'entry_debit': trade.get('debit'),
+            'debit_sl_value': trade.get('debit_sl_value'),
+            'short_extrinsic_entry': trade.get('short_extrinsic_entry'),
+            'long_symbol': trade.get('long_symbol'),
+            'short_symbol': trade.get('short_symbol'),
+            'expiry': trade.get('expiry'),
+        }, defers=defers, spawn=spawn)
+    except Exception as e:
+        logger.error('EXIT VET request failed #%d %s: %s — proceeding on the '
+                     'deterministic guards', trade['id'], kind, e)
+        return 'proceed'
+    return 'wait'
+
+
+def _exit_expired(marker: dict, now: Optional[datetime] = None) -> bool:
+    d = _parse(marker.get('deadline'))
+    if d is None:
+        return True                      # malformed: fail to the guards
+    return (now or _now()) >= d
+
+
+def _request_exit_vet(store, trade_id: int, kind: str, context: dict,
+                      defers: int = 0, spawn: bool = True) -> None:
+    with store._mutate():
+        t = store._must_find(trade_id)
+        ev = t.get('exit_vet')
+        if not isinstance(ev, dict):
+            ev = {}
+        ev[kind] = {
+            'state': PENDING,
+            'requested_at': _now().isoformat(),
+            'deadline': (_now() + timedelta(
+                seconds=cfg.VET_TIMEOUT_SEC)).isoformat(),
+            'defers': defers,
+            'context': context,
+            'decision_id': None,
+        }
+        t['exit_vet'] = ev
+        t['version'] = t.get('version', 0) + 1
+    logger.info('EXIT VET REQUESTED #%d %s — %s', trade_id, kind,
+                context.get('reason_flagged'))
+    if spawn:
+        _spawn_cli(trade_id, exit_kind=kind)
+
+
+def _set_exit_state(store, trade_id: int, kind: str, state: str,
+                    decision_id: Optional[int] = None,
+                    bump_defer: bool = False) -> None:
+    with store._mutate():
+        t = store._must_find(trade_id)
+        ev = t.get('exit_vet') if isinstance(t.get('exit_vet'), dict) else {}
+        m = ev.get(kind) if isinstance(ev.get(kind), dict) else {}
+        m['state'] = state
+        m['decided_at'] = _now().isoformat()
+        if decision_id is not None:
+            m['decision_id'] = decision_id
+        if bump_defer:
+            m['defers'] = int(m.get('defers') or 0) + 1
+        ev[kind] = m
+        t['exit_vet'] = ev
+        t['version'] = t.get('version', 0) + 1
+
+
+def record_exit_verdict(store, trade_id: int, kind: str, verdict: str,
+                        decision_id: Optional[int] = None) -> str:
+    """Land an exit verdict. `verdict` is 'allow' or 'defer'.
+
+    There is deliberately NO hard veto for exits. A veto would let the model
+    cancel a stop-loss outright; `defer` re-checks with a fresh quote next
+    cycle and escalates to the human at cfg.EXIT_MAX_DEFERS. That is the same
+    protective power in a shape that cannot silently disarm a stop.
+    """
+    if verdict not in ('allow', DEFER):
+        raise ValueError("exit verdict must be 'allow' or 'defer'")
+    t = store.find(trade_id)
+    if not t:
+        raise ValueError('#%d not found' % trade_id)
+    m = _exit_marker(t, kind)
+    if m.get('state') != PENDING:
+        logger.warning('EXIT verdict for #%d %s discarded — state is %s',
+                       trade_id, kind, m.get('state'))
+        return 'discarded (state %s)' % m.get('state')
+    if verdict == 'allow':
+        _set_exit_state(store, trade_id, kind, ALLOWED, decision_id)
+        logger.info('EXIT ALLOWED #%d %s (decision #%s)', trade_id, kind,
+                    decision_id)
+    else:
+        _set_exit_state(store, trade_id, kind, DEFER, decision_id,
+                        bump_defer=True)
+        logger.info('EXIT DEFERRED #%d %s (decision #%s)', trade_id, kind,
+                    decision_id)
+    return 'applied'
+
+
+def exit_defers(trade: dict, kind: str) -> int:
+    return int(_exit_marker(trade, kind).get('defers') or 0)
+
+
+def exit_state(trade: dict, kind: str) -> Optional[str]:
+    return _exit_marker(trade, kind).get('state')

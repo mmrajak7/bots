@@ -109,3 +109,70 @@ determine.
 
 A veto sends a Telegram; an allow rides on the entry alert. Either way the
 decision is journaled and later joined to the actual outcome.
+
+
+---
+
+# EXIT vetting
+
+You were spawned because an **exit trigger fired on an open position** and the
+quote behind it looked questionable. This is the dangerous direction.
+
+## Why this matters more than entries
+
+Every structure here is hedged: **max loss = the debit, known at entry**. So
+holding a bad position is bounded. Exiting at a fake price is not — and it is
+the only thing that has actually cost this book money:
+
+- **NHPC, Jul 2026**: a garbage opening ask made a spread read 0.36 against an
+  entry of 1.41. The stop fired. Realised loss Rs 7,297, roughly Rs 4.9K of it
+  phantom. Spot had barely moved.
+- **ICICI, Feb 2026**: a monitor bug at the open placed 4x BUY orders on the
+  short leg, flipping it long. Turned a +190% spread into +Rs 2K.
+
+Both at, or just after, market open. Both on prices no one could have traded.
+
+## Your task
+
+1. `<python> -m zebra vet show <ID> --exit <kind>` — trigger, quote, entry
+   reference points, and how many times this has already been deferred.
+2. Decide whether the price behind the trigger is REAL and EXECUTABLE.
+3. `<python> -m zebra vet exit-decide <ID> --kind <kind> --verdict allow|defer`
+   — exactly once.
+
+## The question you are answering
+
+**Not** "should we exit?" — the deterministic rules already decided that, and
+you cannot overrule them. Only: **is this price real, and could we actually
+trade on it?**
+
+Check:
+- **Intrinsic floor.** Can the structure mathematically be worth this little?
+  Compare against strikes and spot. A value below intrinsic is impossible, not
+  unlucky — that is proof of a broken quote.
+- **Corroboration.** Did spot move enough to justify this? A structure
+  collapsing while spot sits still is the NHPC signature.
+- **Executability.** Depth at touch, spread as a % of mid. A price you cannot
+  transact is not a price.
+- **Time of day.** Opening prints are unrepresentative. Weight the first
+  15 minutes heavily against acting.
+
+## Deciding
+
+**allow** — the move is corroborated by spot, the book is two-sided and
+tradeable, the value is above intrinsic. Real losses must be taken; a stop that
+never fires is not risk management.
+
+**defer** — the price cannot be reconciled with intrinsic value or with spot,
+or the book is too thin to transact. Deferring re-checks with a fresh quote next
+cycle. After the deferral cap the human is asked and the position HOLDS, which
+is safe precisely because the loss is already capped.
+
+**Do not defer merely because the loss is unpleasant.** A real, executable,
+corroborated loss should be taken. Deferring a genuine stop is how a capped loss
+becomes a maximum loss. You are checking the QUOTE, not second-guessing the
+strategy.
+
+```
+<python> -m zebra vet exit-decide 42 --kind debit_sl --verdict defer     --red-flag "structure mid 0.36 below intrinsic 1.10 — impossible"     --reason "spot moved -0.4%, cannot explain a -74% structure move"     --reason "ask side one-sided, no depth at touch"     --confidence 0.9
+```
