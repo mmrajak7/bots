@@ -228,6 +228,19 @@ def _spawn_cli(trade_id: int, exit_kind: Optional[str] = None) -> Optional[int]:
                           channel='exit' if exit_kind else 'entry')
 
 
+def _allowed_tools(channel: str) -> list:
+    """Tool grants for this channel, with the real interpreter path baked in.
+
+    `{python}` must be sys.executable, the same interpreter the prompt tells
+    the agent to use: on the Pi that is the CROCODILE venv, and a pattern
+    naming a different python would match nothing the agent actually types.
+    """
+    tools = [t.format(python=sys.executable) for t in cfg.VET_ALLOWED_TOOLS]
+    if channel == 'events':
+        tools += list(cfg.EVENT_EXTRA_TOOLS)
+    return tools
+
+
 _cli_path: list = []            # one-element memo; [] = not yet resolved
 
 
@@ -278,7 +291,9 @@ def _spawn_generic(prompt: str, model: str, tag: str,
                      cfg.VET_CLI, tag)
         _note_spawn(False, channel)
         return None
-    argv = [cli, '-p', prompt, '--model', model]
+    argv = [cli, '-p', prompt, '--model', model,
+            '--allowedTools'] + _allowed_tools(channel) + \
+           ['--disallowedTools'] + list(cfg.VET_DENIED_TOOLS)
     # Hard wall-clock bound on the CHILD, not just on our bookkeeping. In cron
     # mode — the production path — our process exits within seconds and init
     # adopts the child, so _reap_children can never reach it: without this a

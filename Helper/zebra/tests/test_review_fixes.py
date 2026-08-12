@@ -409,6 +409,48 @@ def test_a_side_channel_failure_cannot_stop_the_others(paths, monkeypatch):
     assert ran == ['review', 'health']
 
 
+# ── the spawn must carry its own permissions ─────────────────────────────
+def test_the_spawn_grants_tools_on_argv_not_via_settings(monkeypatch,
+                                                         real_spawn):
+    """`claude -p` IGNORES a project settings.json allow rule (measured), so a
+    spawn without `--allowedTools` produces an agent that asks for approval
+    nobody can give and **exits 0 in ~12s with the work undone** — a clean exit
+    code and no verdict. Grants must be on argv.
+
+    Popen is stubbed before the call, so nothing is ever started; the point is
+    to read the argv the real code assembles."""
+    import subprocess as sp
+    seen = {}
+
+    class _P:
+        pid = 1234
+
+        def poll(self):
+            return None
+    monkeypatch.setattr(vet_mod, 'resolve_cli', lambda refresh=False: '/bin/claude')
+    monkeypatch.setattr(vet_mod.shutil, 'which', lambda n: None)
+    monkeypatch.setattr(sp, 'Popen', lambda argv, **k: seen.update(argv=argv) or _P())
+    real_spawn('prompt', 'fable', 'test', channel='entry')
+
+    argv = seen['argv']
+    assert '--allowedTools' in argv, "agent spawned with no tool grants"
+    assert '--disallowedTools' in argv, "agent spawned with no deny list"
+    joined = ' '.join(argv)
+    assert 'WebSearch' in joined and '-m zebra' in joined
+    # The invariant, on the command line where it cannot be forgotten.
+    for verb in ('close', 'enter', 'cancel', 'reset', 'trigger'):
+        assert 'Bash(*zebra %s*)' % verb in argv
+
+
+def test_the_calendar_agent_alone_may_write_files(monkeypatch):
+    """It builds a candidate JSON before installing it; nothing else needs to
+    write anything, and a decision agent with Write is a decision agent that
+    can edit the code that judges it."""
+    assert 'Write' not in vet_mod._allowed_tools('entry')
+    assert 'Write' not in vet_mod._allowed_tools('exit')
+    assert 'Write' in vet_mod._allowed_tools('events')
+
+
 # ── the CLI must be findable where cron actually runs ────────────────────
 def test_the_cli_is_resolved_to_an_absolute_path(monkeypatch):
     """`claude` was invoked by bare name. Debian cron's PATH is /usr/bin:/bin

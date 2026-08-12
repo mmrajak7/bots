@@ -40,6 +40,34 @@ DECISIONS_LOCK = LOG_DIR / 'zebra_decisions.lock'
 # absolute path, because cron's PATH (/usr/bin:/bin) does not contain the CLI's
 # install directory and every spawn would fail.
 VET_CLI = os.environ.get('ZEBRA_VET_CLI', 'claude')
+# Tool permissions for the spawned agents, passed as CLI FLAGS.
+#
+# Measured 2026-08-12, because the obvious approach silently does not work:
+# a project `.claude/settings.json` **allow** rule is IGNORED by `claude -p`
+# (Claude Code will not grant itself permissions from a file in the working
+# directory — otherwise any cloned repo could). Its **deny** rules ARE honoured.
+# So grants must ride on argv; the settings file is only a deny-side backstop.
+#
+# The failure mode without this is nasty precisely because it is quiet: the
+# agent starts, decides it needs approval, writes "please approve this command"
+# to a log nobody reads, and **exits 0 after ~12 seconds**. Not a hang, not an
+# error — a clean exit with the work undone. Every signal then fails open and
+# enters unvetted while the switch still reads ON.
+#
+# Deliberately coarse on the allow side and precise on the deny side. Matching
+# one exact verb per rule looked tighter but breaks the moment the agent
+# prefixes a `cd`, and a denied tool is indistinguishable from a broken layer.
+# The invariant that actually matters — the model can never open or close a
+# position — is carried by the deny list, whose patterns match anywhere in the
+# command string (verified).
+VET_ALLOWED_TOOLS = ['WebSearch', 'WebFetch', 'Read', 'Glob', 'Grep',
+                     'Bash({python} -m zebra:*)']
+# The calendar agent builds a candidate JSON file before installing it.
+EVENT_EXTRA_TOOLS = ['Write']
+VET_DENIED_TOOLS = ['Bash(*zebra close*)', 'Bash(*zebra enter*)',
+                    'Bash(*zebra cancel*)', 'Bash(*zebra reset*)',
+                    'Bash(*zebra trigger*)']
+
 # VET_MODEL, VET_TIMEOUT_SEC and CHILD_KILL_SEC are exported further down —
 # they read zebra_config.json, which is not loaded yet at this point.
 # The fail-open deadline is generous because the CLI does live web research
