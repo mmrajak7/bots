@@ -36,6 +36,7 @@ Usage:
 
 import json
 import logging
+import re
 import sys
 import time
 import argparse
@@ -111,6 +112,29 @@ LTP_FRESH_SEC = 30 * 60          # LTP may veto only if last trade < 30 min old
 # it; a streak older than CONFIRM_STALE_SEC restarts from zero.
 SL_CONFIRM_POLLS = 3
 CONFIRM_STALE_SEC = 180
+
+# SL_SPOT was deliberately single-poll (spot LTP comes from real trades, and
+# delaying a thesis-dead exit is itself a cost). Kept single-poll in spirit —
+# two polls is 10 seconds — because the residual risk is not a FAKE spot but an
+# outlier/stale OPENING print, and SL_SPOT is the one trigger that is exempt
+# from every cooldown AND runs at URGENT urgency, whose final attempt pays
+# through uncapped. 10s of confirmation cannot meaningfully delay a genuine
+# gap-down while removing the last single-print path to a live order.
+# Set to 1 to restore the old behaviour.
+SL_SPOT_CONFIRM_POLLS = 2
+
+# ── Spot corroboration (the NHPC signature) ───────────────────────────────
+# NHPC's book passed nothing, but the shape it exposed generalises: a vertical
+# spread's value is monotonic in spot, so a large collapse in the structure
+# WITHOUT a corresponding move in the underlying is not a price — it is a
+# broken book. Reliability/debounce/re-verify all interrogate the SAME order
+# book, so identical stale reads can confirm each other; spot is an
+# INDEPENDENT source and is the only cross-check available.
+#
+# Like the LTP test, this may only VETO a valuation, never validate one.
+SPREAD_COLLAPSE_PCT = 0.35       # value drop vs the last reliable reading...
+SPOT_MOVE_MIN_PCT = 0.004        # ...unexplained by a spot move this small
+CORROBORATION_STALE_SEC = 900    # ignore a reference older than this (gaps)
 
 # After a close ABORTs (unreliable book / re-verify artifact), don't re-attempt
 # valuation/TP closes for this long — prevents an abort->re-trigger->abort loop
@@ -295,6 +319,85 @@ def leg_quote_reliable(depth: dict) -> tuple:
     return True, ''
 
 
+def strike_from_symbol(symbol: str):
+    """Strike embedded in an NFO tradingsymbol, or None.
+
+    The BCS trade schema stores `spread_width` but NOT the individual strikes
+    (verified against logs/bcs_trades.json), so the arbitrage floor below has
+    to recover them from the symbols. Returns None on anything unexpected —
+    the floor then simply does not apply, which is the fail-open direction.
+    """
+    m = re.search(r'(\d+(?:\.\d+)?)(CE|PE)$', str(symbol or '').upper())
+    return float(m.group(1)) if m else None
+
+
+def spread_intrinsic_floor(trade: dict, spot: float):
+    """No-arbitrage floor for a bull call spread at `spot`, or None.
+
+    Ported from the zebra monitor's ABB #242 guard: in July 2026 a junk quote
+    on an illiquid ITM leg booked a -50% stop at a value of 335 when pure
+    intrinsic at the recorded spot was 1,020. A structure cannot be worth less
+    than it could be unwound for; a quote below this is proof of a broken book,
+    not an unlucky price.
+
+    Deliberately generous — it subtracts 1.5x the short leg's entry-time
+    extrinsic, so it only ever fires on the impossible, never the merely
+    unfavourable. A too-tight floor would block a real stop, which is the
+    error that costs money.
+    """
+    try:
+        k_l = strike_from_symbol(trade.get('long_symbol'))
+        k_s = strike_from_symbol(trade.get('short_symbol'))
+        if k_l is None or k_s is None:
+            return None
+        intrinsic = max(spot - k_l, 0.0) - max(spot - k_s, 0.0)
+
+        # Short-leg extrinsic AT ENTRY. The short leg is sold OTM/NTM, so its
+        # entire premium is extrinsic unless spot was already past the strike.
+        short_px = trade.get('entry_short_price')
+        entry_spot = trade.get('entry_spot')
+        if short_px is not None and entry_spot is not None:
+            allowance = float(short_px) - max(float(entry_spot) - k_s, 0.0)
+        else:
+            allowance = 0.3 * float(trade.get('net_debit') or 0)
+        allowance = max(allowance, 0.0)
+        return round(intrinsic - 1.5 * allowance, 2)
+    except Exception:
+        return None
+
+
+def spot_corroborates(state: dict, spot: float, spread_val,
+                      now: float = None) -> tuple:
+    """Does the underlying explain this structure move? (ok, reason).
+
+    Returns ok=True whenever it cannot prove otherwise — no reference yet, a
+    stale reference, a rise rather than a collapse. It VETOES one specific
+    shape: the structure falling off a cliff while spot barely moves, which is
+    the NHPC signature and is not reachable by any real repricing of a vertical
+    spread.
+
+    `state` is per-run in-memory (like the confirm counters); the reference
+    updates only on readings that were themselves reliable, so a garbage read
+    can never become the baseline that a later real move is judged against.
+    """
+    now = time.time() if now is None else now
+    ref_spot, ref_spread = state.get('spot'), state.get('spread')
+    ref_t = state.get('t', 0.0)
+    ok, reason = True, ''
+    if (ref_spread is not None and ref_spot and spread_val is not None
+            and now - ref_t <= CORROBORATION_STALE_SEC and ref_spread > 0):
+        drop = (ref_spread - spread_val) / ref_spread
+        spot_move = abs(spot - ref_spot) / ref_spot if ref_spot else 1.0
+        if drop >= SPREAD_COLLAPSE_PCT and spot_move < SPOT_MOVE_MIN_PCT:
+            ok = False
+            reason = ('uncorroborated collapse: spread %.2f -> %.2f (-%.0f%%) '
+                      'on a %.2f%% spot move' % (ref_spread, spread_val,
+                                                 drop * 100, spot_move * 100))
+    if ok and spread_val is not None:
+        state.update({'spot': spot, 'spread': spread_val, 't': now})
+    return ok, reason
+
+
 def price_anchor(depth: dict) -> float:
     """External fair-price anchor for execution caps.
 
@@ -307,13 +410,18 @@ def price_anchor(depth: dict) -> float:
     return max(ltp, depth.get('prev_close') or 0)
 
 
-def get_spread_value(kite: KiteConnect, trade: dict) -> dict:
+def get_spread_value(kite: KiteConnect, trade: dict, spot: float = None) -> dict:
     """Fetch both legs and compute spread value (long bid - short ask).
 
     Returns dict with long depth, short depth, computed spread, and
     'unreliable' (reason string, or None if both books are trustworthy).
     Spread is None whenever EITHER leg's book fails leg_quote_reliable() —
     a garbage book must never produce a tradeable valuation (2026-07-24).
+
+    When `spot` is supplied, a value below the no-arbitrage floor is also
+    rejected. Note this catches a DIFFERENT failure from the width/LTP tests:
+    those judge the book's SHAPE, this judges whether the number is possible at
+    all. A well-formed book can still quote an impossible price.
     """
     long_d = get_option_depth(kite, trade['exchange'], trade['long_symbol'])
     short_d = get_option_depth(kite, trade['exchange'], trade['short_symbol'])
@@ -334,6 +442,16 @@ def get_spread_value(kite: KiteConnect, trade: dict) -> dict:
         if spread_val < 0:
             spread_val = None
             unreliable = f"negative_spread {long_d['bid']} - {short_d['ask']}"
+        elif spot is not None and spot > 0:
+            floor = spread_intrinsic_floor(trade, spot)
+            if floor is not None and spread_val < floor:
+                # Below what the structure could be unwound for. Impossible,
+                # not unlucky — refuse the valuation entirely rather than
+                # clamping it: in a LIVE order path a clamped number would
+                # still be a number we might trade on.
+                unreliable = (f'below_intrinsic {spread_val:.2f} < floor '
+                              f'{floor:.2f} at spot {spot:.2f}')
+                spread_val = None
 
     return {
         'long': long_d,
@@ -944,7 +1062,10 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
     if reverify_sl is not None:
         time.sleep(REVERIFY_DELAY_SEC)
         try:
-            fresh = get_spread_value(kite, trade)
+            # Spot passed so the re-verify applies the arbitrage floor too —
+            # otherwise the freshest, most decision-relevant quote in the whole
+            # flow would be the one quote nobody floor-checks.
+            fresh = get_spread_value(kite, trade, spot=spot)
         except Exception as e:
             log(f"  RE-VERIFY: quote fetch failed ({e}). Aborting close — trigger will re-arm.")
             return 'ABORT'
@@ -1190,10 +1311,53 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
     if not dry_run:
         store.update_trade_exit(trade['id'], exit_data)
         log(f"  Trade #{trade['id']} marked closed (local + Drive)")
+        reconcile_after_close(kite, trade, label)
     else:
         log(f"  [DRY RUN] Would mark trade #{trade['id']} closed")
 
     return True
+
+
+def reconcile_after_close(kite: KiteConnect, trade: dict, label: str = 'BCS'
+                          ) -> bool:
+    """After a close reports success, PROVE both legs are actually flat.
+
+    This is the ICICI-class guard, and it is the one thing the vetting layer
+    cannot supply: in Feb 2026 a monitor bug placed 4x BUY on the short leg and
+    flipped the position long, turning a +190% spread into +Rs 2K. The bug was
+    in the code that placed the orders — so the code that placed them was never
+    going to catch it. This check reads the BROKER's view instead, and it is
+    deliberately independent of every fill/quantity variable the close path
+    computed.
+
+    Read-only and never raises: it cannot make an exit worse, only visible.
+    Returns True when flat.
+    """
+    try:
+        residues = []
+        for leg in ('short_symbol', 'long_symbol'):
+            sym = trade.get(leg)
+            if not sym:
+                continue
+            qty = get_net_position(kite, sym)
+            if qty != 0:
+                residues.append(f'{sym} net {qty:+d}')
+        if not residues:
+            log("  RECONCILE: both legs flat at the broker ✓")
+            return True
+        detail = '; '.join(residues)
+        log(f"  *** RECONCILE FAILED: {detail} ***")
+        send_telegram(
+            f"🚨 <b>{label} {trade.get('stock')}: POSITION NOT FLAT AFTER CLOSE</b>\n"
+            f"The trade is marked closed but the broker still shows: {detail}\n"
+            f"<i>Check Kite NOW — this is the shape of the Feb 2026 bug that "
+            f"flipped a short leg long.</i>"
+        )
+        return False
+    except Exception as e:
+        # Never let the audit break the close it is auditing.
+        log(f"  RECONCILE: could not verify positions ({e})")
+        return False
 
 
 # ── FH Close ────────────────────────────────────────────────────────────────
@@ -1627,9 +1791,13 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
 
     # Trigger-confirmation + blind-mode state (in-memory; reset on restart —
     # a restart can only DELAY a value trigger, never accelerate one)
-    confirm = {'sl_spread': 0, 'sl_trail': 0}
+    confirm = {'sl_spread': 0, 'sl_trail': 0, 'sl_spot': 0}
     abort_until = 0.0    # no valuation/TP close attempts before this time
     blind = new_blind_state()
+    # Spot-corroboration reference. In-memory and reset on restart for the
+    # same reason as `confirm`: a restart may only DELAY a trigger (the first
+    # poll after it has no reference and therefore cannot veto), never fire one.
+    corrob = {}
 
     log("")
     log("=" * 70)
@@ -1721,8 +1889,17 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
             spread_val = None
             spread_fail = None
             try:
-                spread_data = get_spread_value(kite, trade)
+                spread_data = get_spread_value(kite, trade, spot=spot)
                 spread_val = spread_data['spread']
+                # Independent cross-check. Every guard above reads the same
+                # order book, so identical stale prints confirm one another;
+                # spot is the only source that cannot be wrong in the same way.
+                if spread_val is not None:
+                    ok, why = spot_corroborates(corrob, spot, spread_val)
+                    if not ok:
+                        log(f"  QUOTE GUARD: {why} — valuation rejected")
+                        spread_data['unreliable'] = why
+                        spread_val = None
             except Exception as e:
                 spread_fail = str(e)  # spot-based checks still work
 
@@ -1793,8 +1970,20 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
                 return
 
             # ── CHECK 1: SL_SPOT — always active, even during cooldown ────
+            # Still exempt from every cooldown (a thesis-dead exit must not
+            # wait for a book to form), but no longer single-poll: this is the
+            # one trigger that runs at URGENT urgency, whose final attempt pays
+            # through uncapped, and both real-money losses happened at the open.
+            # SL_SPOT_CONFIRM_POLLS=2 is ~10 seconds.
             if spot <= sl_spot:
-                log(f"\n  *** SL_SPOT HIT: {spot:.2f} <= {sl_spot} ***")
+                n = bump_confirm(confirm, 'sl_spot')
+                if n < SL_SPOT_CONFIRM_POLLS:
+                    log(f"  SL_SPOT condition {spot:.2f} <= {sl_spot} "
+                        f"(confirm {n}/{SL_SPOT_CONFIRM_POLLS})")
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
+                log(f"\n  *** SL_SPOT HIT: {spot:.2f} <= {sl_spot} "
+                    f"(confirmed {n}/{SL_SPOT_CONFIRM_POLLS}) ***")
                 success = close_spread(kite, trade, spot, "SL_SPOT", dry_run)
                 if success == 'ABORT':
                     log("  SL_SPOT close aborted — still monitoring.")
@@ -1805,6 +1994,10 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
                 else:
                     log("\nMonitor stopped. CHECK POSITION MANUALLY!")
                 return
+            else:
+                # Spot recovered above the stop: the streak is broken. Same
+                # discipline as sl_spread/sl_trail — only contiguous hits count.
+                confirm['sl_spot'] = 0
 
             # ── Cooldown gate: TP needs settled market ───────────────────
             if not settled:
