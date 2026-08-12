@@ -43,14 +43,15 @@ def _no_real_agents(monkeypatch, request):
     """
     calls = []
 
-    def fake_generic(prompt, model, tag):
+    def fake_generic(prompt, model, tag, channel='entry'):
         calls.append((tag, model))
         return 4242                       # a plausible pid; nothing was started
 
     def fake_cli(trade_id, exit_kind=None):
         return fake_generic('', vet_mod.cfg.VET_MODEL,
                             'vet #%s%s' % (trade_id,
-                                           ' ' + exit_kind if exit_kind else ''))
+                                           ' ' + exit_kind if exit_kind else ''),
+                            channel='exit' if exit_kind else 'entry')
 
     monkeypatch.setattr(vet_mod, '_spawn_generic', fake_generic)
     monkeypatch.setattr(vet_mod, '_spawn_cli', fake_cli)
@@ -62,3 +63,23 @@ def _no_real_agents(monkeypatch, request):
 def spawns(_no_real_agents):
     """Opt-in view of the spawn recorder for tests that assert on spawning."""
     return _no_real_agents
+
+
+# The pre-patch function object, captured once at import. A test that needs to
+# exercise the REAL spawn logic (argv assembly, CLI resolution, failure
+# bookkeeping) cannot reach it through the module attribute — the autouse rail
+# above has already replaced it, which is the point.
+_REAL_SPAWN_GENERIC = vet_mod._spawn_generic
+
+
+@pytest.fixture
+def real_spawn(monkeypatch):
+    """The unpatched `_spawn_generic`, for failure-path tests ONLY.
+
+    Returns it only after forcing `resolve_cli` to None, so the function is
+    guaranteed to take the not-found branch and return before it can reach
+    Popen. There is deliberately no way to get a version of this that could
+    start a process: the rail stays absolute.
+    """
+    monkeypatch.setattr(vet_mod, 'resolve_cli', lambda refresh=False: None)
+    return _REAL_SPAWN_GENERIC

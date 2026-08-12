@@ -12,9 +12,10 @@ authority.
 ## Your task, in order
 
 1. `<python> -m zebra vet show <ID>` — the context, exactly as the bot saw it.
-   If `expired: true`, the signal has already been failed open and entered
-   unvetted. **Stop.** Do not call `vet decide` — a late verdict is discarded
-   anyway, and the run wastes tokens.
+   **If `stop` is true, STOP immediately** and do not call `vet decide`:
+   `stop_reason` says why (already settled, deadline blown, never requested).
+   A verdict in any of those states is discarded, so the whole run is wasted
+   tokens. Check this field first, before any research.
 2. Work the checklist below.
 3. `<python> -m zebra vet decide <ID> --verdict allow|veto ...` — **exactly
    once.** This is the only way to finish.
@@ -26,17 +27,33 @@ a fast good-enough answer beats a slow perfect one.
 
 ## What the mechanical gates already enforce
 
-Do NOT re-litigate these. They passed, by construction:
+These are already measured, so do not re-derive them from scratch — but do not
+assume they PASSED either. Read `gates_all_passed` and `gate_fails` in the
+context:
 
-- OI ≥ 5,000 on both legs
-- debit/width ≤ 45% (BCS shadow)
-- DTE within 15–45
-- gap to the ST line within the trigger band
-- trend alignment recorded (`trend_aligned` in the context)
+- **`gates_all_passed: true`** — OI ≥ 5,000 on both legs, per-leg spread within
+  1% of mid, and breakeven below the short strike all hold. Don't re-litigate.
+- **`gates_all_passed: false`** — the strike picker found NO clean pair and fell
+  back to the least-bad one. `gate_fails` names exactly what failed. This is a
+  signal worth a hard look, not a rubber stamp: a `long_OI<5000` here is the
+  thin book that item 2 below calls the failure mode that has cost real money.
+
+Always true by construction: DTE within 15–45, gap to the ST line inside the
+trigger band, and `trend_aligned` recorded.
+
+The BCS shadow's debit/width ≤ 45% gate is **not** yet applied when you are
+called — the shadow is built at entry, one tick after your verdict. Judge the
+zebra structure in front of you.
 
 ## What only you can catch
 
 ### 1. Event risk inside the expiry window — the big one
+**Start with `known_events` in the context** — the shared calendar a Sonnet
+agent refreshes every couple of hours. Anything already listed there is a fact
+you do not need to re-research; spend your budget on what is missing from it.
+An empty list means the calendar had nothing for this symbol, NOT that nothing
+is scheduled — it may be stale or the symbol may never have been researched.
+
 - **Quarterly results.** Usually unannounced until ~a week prior; estimate from
   the last two years' pattern plus the SEBI 45-day ceiling. A print inside the
   window makes this a conscious earnings bet — say so explicitly, never as a
@@ -50,8 +67,10 @@ Do NOT re-litigate these. They passed, by construction:
 - **Macro dates**: budget, election results, RBI policy, major index rebalance.
 
 ### 2. Liquidity beyond the OI gate
-OI ≥ 5,000 says contracts exist, not that you could get out. Look at the actual
-depth at touch and the spread as a % of mid. **A position you cannot exit at a
+OI ≥ 5,000 says contracts exist, not that you could get out. The context
+carries `long_bid`/`long_ask`, `short_bid`/`short_ask` and
+`long_spread_pct`/`short_spread_pct` as the bot saw them at trigger — start
+there, then re-quote live if the numbers look marginal. **A position you cannot exit at a
 fair price is the failure mode that has cost this book real money** — a thin
 book once collapsed a spread from 2.18 to 0.18 in a single session while spot
 moved the *right* way.
@@ -115,8 +134,14 @@ decision is journaled and later joined to the actual outcome.
 
 # EXIT vetting
 
-You were spawned because an **exit trigger fired on an open position** and the
-quote behind it looked questionable. This is the dangerous direction.
+You were spawned because an **exit trigger fired on an open position** and a
+cheap pre-filter flagged it as worth a look. That filter is deliberately
+generous: an unreliable book, a recent debit-blind cycle, the first 15 minutes
+of the session, **or any `debit_sl` trigger at all** — because a value trigger
+prices off the option book itself, which is the thing that can lie. So being
+called does not mean the quote IS bad; it means nobody has checked. This is the
+dangerous direction, and a routine-looking `allow` here is a perfectly good
+outcome.
 
 ## Why this matters more than entries
 
@@ -136,6 +161,8 @@ Both at, or just after, market open. Both on prices no one could have traded.
 
 1. `<python> -m zebra vet show <ID> --exit <kind>` — trigger, quote, entry
    reference points, and how many times this has already been deferred.
+   **If `stop` is true, STOP** — the episode already settled or the position
+   closed while you were being spawned. `stop_reason` says which.
 2. Decide whether the price behind the trigger is REAL and EXECUTABLE.
 3. `<python> -m zebra vet exit-decide <ID> --kind <kind> --verdict allow|defer`
    — exactly once.
@@ -178,6 +205,11 @@ strategy.
 tomorrow, a fresh agent judges the book as it is then — so decide about the
 quote in front of you and nothing further out. An `allow` is never a standing
 permission to exit this position later.
+
+One exception, and it runs the safe way: once deferrals reach the cap and the
+human has been asked, that HOLD persists for the day rather than expiring in 15
+minutes. It authorises nothing, and re-running the whole episode every quarter
+hour to re-reach an escalation the user already has is pure cost.
 
 ```
 <python> -m zebra vet exit-decide 42 --kind debit_sl --verdict defer     --red-flag "structure mid 0.36 below intrinsic 1.10 — impossible"     --reason "spot moved -0.4%, cannot explain a -74% structure move"     --reason "ask side one-sided, no depth at touch"     --confidence 0.9

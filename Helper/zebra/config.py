@@ -36,14 +36,17 @@ DECISIONS_LOCK = LOG_DIR / 'zebra_decisions.lock'
 # not loaded yet at this point in the module.)
 # CLI ONLY — never the Anthropic API/SDK. The Pi is authenticated once
 # interactively and that is the sanctioned path for this fleet.
+# Bare `claude` is only a starting point — vet.resolve_cli() turns it into an
+# absolute path, because cron's PATH (/usr/bin:/bin) does not contain the CLI's
+# install directory and every spawn would fail.
 VET_CLI = os.environ.get('ZEBRA_VET_CLI', 'claude')
-VET_MODEL = os.environ.get('ZEBRA_VET_MODEL', 'fable')   # decision-maker tier
-# Fail-open deadline. Generous because the CLI does live web research (results
-# dates, ex-div, overhangs) and the structure is hedged and non-HFT, so a few
-# minutes of entry drift costs far less than trading an unvetted signal. Past
-# this the signal enters UNVETTED rather than stalling — a vetting outage must
-# never become a silent trading halt.
-VET_TIMEOUT_SEC = 600
+# VET_MODEL, VET_TIMEOUT_SEC and CHILD_KILL_SEC are exported further down —
+# they read zebra_config.json, which is not loaded yet at this point.
+# The fail-open deadline is generous because the CLI does live web research
+# (results dates, ex-div, overhangs) and the structure is hedged and non-HFT,
+# so a few minutes of entry drift costs far less than trading an unvetted
+# signal. Past it the signal enters UNVETTED rather than stalling — a vetting
+# outage must never become a silent trading halt.
 # {python} is filled with sys.executable at spawn time: the Pi runs the bot
 # under a venv and has no guaranteed bare `python` on PATH, and the CLI verbs
 # must import the exact zebra package the bot runs.
@@ -189,6 +192,25 @@ _DEFAULTS = {
                                  # monitor_interval_sec (the verdict has to
                                  # survive until the next cycle fires the exit)
                                  # and stay far below a session.
+    'exit_hold_ttl_sec': 86400,  # How long an ESCALATED exit (deferred to the
+                                 # cap, human asked) keeps holding without
+                                 # re-vetting. Deliberately far longer than
+                                 # exit_vet_ttl_sec: on a persistently
+                                 # untradeable book the short TTL made the
+                                 # episode restart — agent and all — every 15
+                                 # minutes, ~30 Fable runs/day for one position
+                                 # to reach the same escalation it already
+                                 # reached. The human has been told and the
+                                 # loss is capped, so holding quietly until
+                                 # tomorrow is both cheaper and safer.
+    'vet_timeout_sec': 600,      # Fail-open deadline for one agent run.
+    'child_kill_sec': 900,       # Hard wall-clock bound on a spawned CLI. Past
+                                 # this the process is killed: the deadline
+                                 # fails the MARKER open, but a hung child
+                                 # would otherwise live until reboot and this
+                                 # Pi also runs live-money bots.
+    'vet_model': 'fable',        # Decisions.
+    'event_model': 'sonnet',     # Routine calendar refresh.
 }
 
 
@@ -310,15 +332,25 @@ _vet_env = os.environ.get('ZEBRA_VET_ENABLED', '').strip()
 VET_ENABLED = (_vet_env.lower() in ('1', 'true', 'yes') if _vet_env
                else bool(_runtime['vet_enabled']))
 EXIT_VET_TTL_SEC = _int('exit_vet_ttl_sec')
+EXIT_HOLD_TTL_SEC = _int('exit_hold_ttl_sec')
 VETO_SHADOW_DAYS = _int('veto_shadow_days')
 EVENT_REFRESH_SEC = _int('event_refresh_sec')
 EVENT_HORIZON_DAYS = _int('event_horizon_days')
 REVIEW_ADVERSE_PCT = _num('review_adverse_pct')
 AUTH_WARN_DAYS = _int('auth_warn_days')
+# Timeout and model live in the config FILE like every other threshold, with an
+# env override for one-off runs. They were env-only-or-hardcoded, so editing
+# zebra_config.json — the documented surface — logged "unknown keys ignored"
+# and silently changed nothing.
+VET_TIMEOUT_SEC = int(os.environ.get('ZEBRA_VET_TIMEOUT_SEC')
+                      or _int('vet_timeout_sec'))
+CHILD_KILL_SEC = int(os.environ.get('ZEBRA_CHILD_KILL_SEC')
+                     or _int('child_kill_sec'))
+VET_MODEL = os.environ.get('ZEBRA_VET_MODEL') or _runtime['vet_model']
 EVENT_FILE = LOG_DIR / 'event_calendar.json'
 EVENT_LOCK = LOG_DIR / 'event_calendar.lock'
 # Sonnet, not Fable: this is routine fact-collection, not a judgement call.
-EVENT_MODEL = os.environ.get('ZEBRA_EVENT_MODEL', 'sonnet')
+EVENT_MODEL = os.environ.get('ZEBRA_EVENT_MODEL') or _runtime['event_model']
 EVENT_PROMPT_TEMPLATE = (
     "Refresh the trading event calendar. Read {vetting_doc} (the EVENT CALENDAR "
     "section) and follow it exactly. Research upcoming India-market events and "

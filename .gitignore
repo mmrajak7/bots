@@ -171,6 +171,17 @@ Helper/output/
 # Claude Code specific (IDE instructions)
 .claude/
 **/.claude/
+# EXCEPTION: the zebra vetting layer spawns Claude CLI agents on the Pi, and
+# `claude -p` is non-interactive — a tool it has no permission for is DENIED,
+# not prompted. So the agents cannot run a single `zebra` verb without this
+# allowlist. It is tracked (not Drive-synced) deliberately: it authorises the
+# exact commands the prompts in config.py tell agents to type, so the two must
+# travel together in one `git pull` and can never drift apart.
+!Helper/.claude/
+Helper/.claude/*
+!Helper/.claude/settings.json
+# settings.local.json stays ignored: it is per-machine dev state (Windows
+# paths, ad-hoc allows) and must never reach the Pi.
 
 # Lock files
 *.lock

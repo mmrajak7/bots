@@ -55,25 +55,64 @@ VERDICTS = ('allow', 'veto', 'exit', 'defer', 'unavailable',
 KINDS = ('entry', 'exit', 'review')
 
 
+def _load_config() -> dict:
+    """Same zebra_config.json the trade store reads, for the Drive block."""
+    try:
+        with open(cfg.CONFIG_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 class DecisionStore:
     """Append-mostly journal of Claude's vetting decisions."""
 
-    def __init__(self, path=None, lock_path=None):
+    def __init__(self, path=None, lock_path=None, config=None,
+                 drive: bool = True):
         self._path = path or cfg.DECISIONS_FILE
         self._lock = lock_path or cfg.DECISIONS_LOCK
         self._rows: list = []
+        # Drive is OFF for any store pointed at a non-default path — that is
+        # what every test constructs, and a test must never touch the real
+        # Drive file. Production goes through get_store(), which passes none of
+        # these and gets the default path plus sync.
+        self._drive_wanted = drive and path is None
+        self._config = config or _load_config()
+        self._drive_service = None
+        self._drive_file_id = None
+        self._drive_enabled = False
+        self._last_sync_time = 0.0
 
     def initialize(self):
-        with exclusive(self._lock):
-            self._rows = self._read()
-        logger.info("DecisionStore: %d decisions", len(self._rows))
+        drive_cfg = self._config.get('google_drive', {})
+        if self._drive_wanted and drive_cfg.get('enabled', False):
+            self._init_drive(drive_cfg)
+        if self._drive_enabled:
+            self._sync_from_drive()
+        else:
+            with exclusive(self._lock):
+                self._rows = self._read()
+        logger.info("DecisionStore: %d decisions, drive=%s", len(self._rows),
+                    'enabled' if self._drive_enabled else 'disabled')
         return self
 
     # ── reads (in-memory; refresh() for a fresh snapshot) ─────────────────
     def all(self) -> list:
         return self._rows
 
-    def refresh(self) -> list:
+    def refresh(self, force_drive: bool = False) -> list:
+        """Re-read the journal. Pulls from Drive on the sync interval.
+
+        The journal is written by TWO processes on the Pi (the monitor and each
+        spawned CLI agent) and read from a third machine, so a local-only read
+        can be stale in exactly the window where the join runs.
+        """
+        interval = self._config.get('google_drive', {}).get(
+            'sync_interval_sec', 300)
+        if self._drive_enabled and (
+                force_drive or time.time() - self._last_sync_time >= interval):
+            self._sync_from_drive()
+            return self._rows
         with exclusive(self._lock):
             self._rows = self._read()
         return self._rows
@@ -94,9 +133,18 @@ class DecisionStore:
         row ever written, forever, on a five-minute cycle. Rows missing an `id`
         are dropped here rather than downstream, so one hand-mangled row cannot
         stall the whole channel.
+
+        **Only ACTED decisions are joinable.** A journalled verdict that the
+        trade store discarded (arrived after the deadline, duplicate from a
+        retried CLI, signal already settled) never influenced anything, so
+        joining it would attribute a trade's P&L to a judgement that did not
+        cause it. Worse, a discarded VETO has no shadow and no position, so it
+        can never settle — leaving it here means re-scanning it every five
+        minutes for the life of the journal.
         """
         return [d for d in self._rows
                 if d.get('id') is not None
+                and d.get('acted') is True
                 and d.get('outcome') is None
                 and d.get('verdict') != 'unavailable'
                 and (kind is None or d.get('kind') == kind)]
@@ -108,6 +156,10 @@ class DecisionStore:
 
         Rolls back in-memory state on a caller exception so a half-written
         decision never lingers and get-by-id never returns a phantom row.
+
+        The Drive upload happens AFTER the lock is released — it is a network
+        call, and holding a cross-process lock across it would stall the other
+        process's whole cycle behind a Drive timeout.
         """
         with exclusive(self._lock):
             self._rows = self._merge(self._read(), self._rows)
@@ -118,6 +170,7 @@ class DecisionStore:
                 self._rows = snapshot
                 raise
             self._save()
+        self._upload_to_drive()
 
     def record(self, kind: str, verdict: str, trade_ids: list,
                stock: str, direction: str, reasons=None, red_flags=None,
@@ -130,6 +183,14 @@ class DecisionStore:
             raise ValueError(f"verdict must be one of {VERDICTS}, got {verdict!r}")
         if confidence is not None and not 0.0 <= float(confidence) <= 1.0:
             raise ValueError(f"confidence must be 0..1, got {confidence!r}")
+
+        # Drive-first before allocating an id. Ids come from max(id)+1, so two
+        # machines writing against stale copies would both mint the same id and
+        # the union-merge — which keys on id — would silently drop one agent's
+        # reasoning. A decision is written a handful of times a day; one
+        # download to make the id safe is free at that rate.
+        if self._drive_enabled:
+            self._sync_from_drive()
 
         with self._mutate():
             row = {
@@ -166,11 +227,29 @@ class DecisionStore:
         return row
 
     def mark_acted(self, decision_id: int) -> dict:
-        """Record that the bot actually applied this verdict."""
+        """Record that the bot actually applied this verdict.
+
+        The gate on every score. A decision is only evidence about the layer if
+        the layer's verdict is what happened — see `pending_outcome`.
+        """
         with self._mutate():
             d = self._must_find(decision_id)
             d['acted'] = True
             d['acted_at'] = datetime.now().isoformat()
+            d['version'] = d.get('version', 0) + 1
+            return d
+
+    def mark_discarded(self, decision_id: int, reason: str) -> dict:
+        """Record that the trade store REFUSED this verdict, and why.
+
+        The row stays in the journal — an agent's reasoning is worth keeping
+        even when it arrived too late to matter, and deleting it would hide how
+        often the deadline is missed. It is simply never scored.
+        """
+        with self._mutate():
+            d = self._must_find(decision_id)
+            d['acted'] = False
+            d['discarded_reason'] = str(reason)
             d['version'] = d.get('version', 0) + 1
             return d
 
@@ -191,10 +270,13 @@ class DecisionStore:
         A veto is CORRECT when the trade it blocked went on to lose, and WRONG
         when it would have won. An allow is the mirror. `unavailable` rows are
         excluded — they are outages, not judgements, and counting them as
-        allows would flatter the layer.
+        allows would flatter the layer. So are un-ACTED rows: a verdict the
+        store discarded did not cause the outcome, and crediting the layer for
+        a trade that entered unvetted is the same flattery by another route.
         """
         rows = [d for d in self._rows
                 if d.get('kind') == kind
+                and d.get('acted') is True
                 and d.get('verdict') in ('allow', 'veto')
                 and isinstance(d.get('outcome'), dict)
                 and d['outcome'].get('pnl') is not None]
@@ -234,6 +316,7 @@ class DecisionStore:
         """
         rows = [d for d in self._rows
                 if d.get('kind') == kind
+                and d.get('acted') is True
                 and d.get('verdict') in ('allow', 'veto')
                 and isinstance(d.get('outcome'), dict)
                 and d['outcome'].get('label') in ('hit', 'miss', 'flat')]
@@ -254,6 +337,100 @@ class DecisionStore:
                               if decisive else None),
             }
         return out
+
+    # ── Drive ─────────────────────────────────────────────────────────────
+    # The journal is the layer's ONLY evidence base — the record that decides
+    # whether Claude vetting ever earns live authority. It lived on the Pi's SD
+    # card alone, which is the one component in this fleet with a documented
+    # habit of dying, and it was invisible from the machine the user actually
+    # reads reports on. Same local-first, Drive-secondary pattern as every
+    # other store here: Drive never gates a write, and a Drive outage degrades
+    # to exactly the local-only behaviour this had before.
+    def _drive_name(self) -> str:
+        return self._config.get('google_drive', {}).get(
+            'decisions_file_name', 'zebra_decisions.json')
+
+    def _init_drive(self, drive_cfg: dict):
+        from .trade_store import _resolve_credentials_path
+        creds = _resolve_credentials_path(self._config)
+        if not creds or not creds.exists():
+            logger.warning("Drive credentials not found at %s — decision "
+                           "journal is local-only", creds)
+            return
+        try:
+            from bcs.drive_store import get_drive_service, find_file
+            self._drive_service = get_drive_service(creds)
+            self._drive_file_id = find_file(self._drive_service,
+                                            drive_cfg['folder_id'],
+                                            self._drive_name())
+            self._drive_enabled = True
+        except Exception as e:
+            logger.warning("Decision-journal Drive init failed: %s. "
+                           "Local-only.", e)
+
+    def _resolve_remote_id(self):
+        """Look the remote file up again if we do not have its id yet.
+
+        Not a formality: the journal does not exist on Drive until the first
+        write, so every process that starts before that holds file_id=None. If
+        that were sticky, such a process would keep taking the 'nothing on
+        Drive' branch forever — never seeing another machine's rows, and
+        re-minting ids that already exist. Caught by a negative control.
+        """
+        if self._drive_file_id:
+            return self._drive_file_id
+        try:
+            from bcs.drive_store import find_file
+            self._drive_file_id = find_file(
+                self._drive_service,
+                self._config['google_drive']['folder_id'], self._drive_name())
+        except Exception as e:
+            logger.debug('decision journal lookup failed: %s', e)
+        return self._drive_file_id
+
+    def _sync_from_drive(self):
+        """Pull, union-merge, persist. Network call outside the lock."""
+        try:
+            from bcs.drive_store import download_json
+            if not self._resolve_remote_id():
+                logger.info("No decision journal on Drive yet — will create on "
+                            "the first write")
+                with exclusive(self._lock):
+                    self._rows = self._read()
+                return
+            remote = download_json(self._drive_service, self._drive_file_id)
+            # The merge+save is a read-modify-write on the shared file, so it
+            # holds the lock; the download above deliberately does not.
+            with exclusive(self._lock):
+                base = self._merge(self._read(), self._rows)
+                self._rows = self._merge(base, remote or [])
+                self._save()
+            self._last_sync_time = time.time()
+        except Exception as e:
+            logger.warning("Decision-journal Drive sync failed: %s. Using "
+                           "local.", e)
+            try:
+                with exclusive(self._lock):
+                    self._rows = self._read()
+            except Exception:                    # pragma: no cover - paranoia
+                pass
+
+    def _upload_to_drive(self):
+        if not self._drive_enabled:
+            return
+        try:
+            from bcs.drive_store import upload_json
+            self._drive_file_id = upload_json(
+                self._drive_service,
+                self._config['google_drive']['folder_id'],
+                self._drive_name(), self._rows, self._drive_file_id)
+            self._last_sync_time = time.time()
+        except Exception as e:
+            # Local is already written and is the operational truth; Drive is
+            # durability. Never raise — an agent must not think its verdict
+            # failed to land because a network call did.
+            logger.error("Decision-journal Drive upload failed: %s. Local is "
+                         "safe.", e)
 
     # ── internals ─────────────────────────────────────────────────────────
     def _next_id(self) -> int:

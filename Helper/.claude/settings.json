@@ -1,0 +1,61 @@
+{
+  "_comment": [
+    "Permissions for the zebra vetting agents. Tracked in git on purpose: it",
+    "authorises exactly the commands the prompt templates in zebra/config.py",
+    "tell agents to type, so the two can never drift apart.",
+    "",
+    "WHY THIS FILE IS LOAD-BEARING: agents are spawned with `claude -p`, which",
+    "is non-interactive. A tool with no matching allow rule is DENIED outright,",
+    "not prompted. Without this the agents start, get refused on their first",
+    "`zebra vet show`, and die without landing a verdict — every signal enters",
+    "unvetted while the switch still reads ON. (The health watchdog now catches",
+    "that shape via `spawns_since_landing`, but do not rely on the alarm to",
+    "discover a permissions problem you can prevent here.)",
+    "",
+    "SCOPE IS DELIBERATELY NARROW. The agents may run the READ and DECIDE verbs",
+    "and nothing else. A broad `Bash(python:*)` would also authorise `zebra",
+    "close`, `zebra enter` and `zebra reset --confirm` — i.e. it would hand the",
+    "model the power to open and close positions, which is precisely the",
+    "invariant the whole layer is built to preserve. Keep it narrow: an agent",
+    "that needs a new verb should get a new line here, reviewed.",
+    "",
+    "PATHS: the Pi runs the bot under CROCODILE/venv. If that interpreter path",
+    "ever changes, these rules stop matching and the agents go silent — update",
+    "both here and in the deploy notes."
+  ],
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.nseindia.com)",
+      "WebFetch(domain:nseindia.com)",
+      "WebFetch(domain:www.bseindia.com)",
+      "WebFetch(domain:trendlyne.com)",
+      "WebFetch(domain:www.screener.in)",
+      "WebFetch(domain:web.sensibull.com)",
+      "WebFetch(domain:zerodha.com)",
+      "WebFetch(domain:groww.in)",
+      "WebFetch(domain:www.moneycontrol.com)",
+      "WebFetch(domain:economictimes.indiatimes.com)",
+      "WebFetch(domain:www.business-standard.com)",
+      "WebFetch(domain:www.rbi.org.in)",
+
+      "Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python -m zebra vet show:*)",
+      "Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python -m zebra vet decide:*)",
+      "Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python -m zebra vet exit-decide:*)",
+      "Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python -m zebra vet score:*)",
+      "Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python -m zebra review show:*)",
+      "Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python -m zebra review record:*)",
+      "Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python -m zebra events show:*)",
+      "Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python -m zebra events replace:*)",
+      "Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python -m zebra list:*)",
+      "Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python -m zebra status:*)"
+    ],
+    "deny": [
+      "Bash(*zebra close*)",
+      "Bash(*zebra enter*)",
+      "Bash(*zebra cancel*)",
+      "Bash(*zebra reset*)",
+      "Bash(*zebra trigger*)"
+    ]
+  }
+}

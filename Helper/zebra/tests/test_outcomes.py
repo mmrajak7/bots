@@ -111,9 +111,21 @@ def test_missing_ltp_leaves_the_shadow_open(store):
     assert store.find(1)['veto_shadow']['status'] == 'open'
 
 
+def _rec(store, **kw):
+    """Journal a decision the way production does: record, then mark ACTED.
+
+    `cmd_vet_decide` settles every row it writes — applied or discarded — and
+    only ACTED rows are joinable. Recording without settling would test a state
+    the bot never leaves behind.
+    """
+    d = store.record(**kw)
+    store.mark_acted(d['id'])
+    return store.find(d['id'])
+
+
 # ── the join ─────────────────────────────────────────────────────────────
 def test_veto_outcome_carries_a_label_and_deliberately_no_pnl(store, decisions):
-    d = decisions.record(kind='entry', verdict='veto', trade_ids=[1],
+    d = _rec(decisions, kind='entry', verdict='veto', trade_ids=[1],
                          stock='TESTCO', direction='CE')
     _vetoed(store, decision_id=d['id'])
     outcomes.track_shadows(store, {'TESTCO': 91.0})
@@ -126,7 +138,7 @@ def test_veto_outcome_carries_a_label_and_deliberately_no_pnl(store, decisions):
 
 
 def test_unresolved_veto_is_not_joined_yet(store, decisions):
-    d = decisions.record(kind='entry', verdict='veto', trade_ids=[1],
+    d = _rec(decisions, kind='entry', verdict='veto', trade_ids=[1],
                          stock='TESTCO', direction='CE')
     _vetoed(store, decision_id=d['id'])
     assert outcomes.join(store, decisions) == 0
@@ -136,7 +148,7 @@ def test_unresolved_veto_is_not_joined_yet(store, decisions):
 def test_allowed_outcome_is_realised_pnl(store, decisions):
     store.add_signal(dict(SIGNAL))
     store.mark_entered(1, dict(ENTRY))
-    d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+    d = _rec(decisions, kind='entry', verdict='allow', trade_ids=[1],
                          stock='TESTCO', direction='CE')
     store.mark_exited(1, 101.0, 16.0, 'tp')
     assert outcomes.join(store, decisions) == 1
@@ -148,7 +160,7 @@ def test_allowed_outcome_is_realised_pnl(store, decisions):
 def test_open_position_is_not_joined(store, decisions):
     store.add_signal(dict(SIGNAL))
     store.mark_entered(1, dict(ENTRY))
-    d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+    d = _rec(decisions, kind='entry', verdict='allow', trade_ids=[1],
                          stock='TESTCO', direction='CE')
     assert outcomes.join(store, decisions) == 0
     assert decisions.find(d['id'])['outcome'] is None
@@ -157,7 +169,7 @@ def test_open_position_is_not_joined(store, decisions):
 def test_join_is_idempotent(store, decisions):
     store.add_signal(dict(SIGNAL))
     store.mark_entered(1, dict(ENTRY))
-    decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+    _rec(decisions, kind='entry', verdict='allow', trade_ids=[1],
                      stock='TESTCO', direction='CE')
     store.mark_exited(1, 101.0, 16.0, 'tp')
     assert outcomes.join(store, decisions) == 1
@@ -169,7 +181,7 @@ def test_time_exit_is_flat_not_a_loss(store, decisions):
     loss would make every veto of a slow signal look brilliant."""
     store.add_signal(dict(SIGNAL))
     store.mark_entered(1, dict(ENTRY))
-    d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+    d = _rec(decisions, kind='entry', verdict='allow', trade_ids=[1],
                          stock='TESTCO', direction='CE')
     store.mark_exited(1, 97.0, 9.0, 'time')
     outcomes.join(store, decisions)
@@ -180,14 +192,14 @@ def test_time_exit_is_flat_not_a_loss(store, decisions):
 def test_signal_quality_scores_both_arms_on_one_basis(store, decisions):
     """The money score can only see allows. This is the comparable view."""
     # A veto that was RIGHT: the blocked signal went the wrong way.
-    dv = decisions.record(kind='entry', verdict='veto', trade_ids=[1],
+    dv = _rec(decisions, kind='entry', verdict='veto', trade_ids=[1],
                           stock='TESTCO', direction='CE')
     _vetoed(store, decision_id=dv['id'])
     outcomes.track_shadows(store, {'TESTCO': 91.0})
     # An allow that was RIGHT: it hit target.
     store.add_signal(dict(SIGNAL, stock='OTHERCO'))
     store.mark_entered(2, dict(ENTRY))
-    decisions.record(kind='entry', verdict='allow', trade_ids=[2],
+    _rec(decisions, kind='entry', verdict='allow', trade_ids=[2],
                      stock='OTHERCO', direction='CE')
     store.mark_exited(2, 101.0, 16.0, 'tp')
 
@@ -198,7 +210,7 @@ def test_signal_quality_scores_both_arms_on_one_basis(store, decisions):
 
 
 def test_flat_rows_are_excluded_from_precision_but_reported(store, decisions):
-    d = decisions.record(kind='entry', verdict='veto', trade_ids=[1],
+    d = _rec(decisions, kind='entry', verdict='veto', trade_ids=[1],
                          stock='TESTCO', direction='CE')
     _vetoed(store, decision_id=d['id'])
     later = datetime.now() + timedelta(days=cfg.VETO_SHADOW_DAYS + 1)
@@ -211,7 +223,7 @@ def test_flat_rows_are_excluded_from_precision_but_reported(store, decisions):
 
 def test_money_score_ignores_veto_rows_entirely(store, decisions):
     """A spot label must never be counted as cash."""
-    d = decisions.record(kind='entry', verdict='veto', trade_ids=[1],
+    d = _rec(decisions, kind='entry', verdict='veto', trade_ids=[1],
                          stock='TESTCO', direction='CE')
     _vetoed(store, decision_id=d['id'])
     outcomes.track_shadows(store, {'TESTCO': 91.0})
@@ -227,7 +239,7 @@ def test_a_paper_exit_is_labelled_correctly(store, decisions):
     comparison this score exists for can never produce a number."""
     store.add_signal(dict(SIGNAL))
     store.mark_entered(1, dict(ENTRY))
-    d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+    d = _rec(decisions, kind='entry', verdict='allow', trade_ids=[1],
                          stock='TESTCO', direction='CE')
     store.mark_exited(1, 101.0, 16.0, 'paper:tp')      # what production writes
     outcomes.join(store, decisions)
@@ -239,7 +251,7 @@ def test_a_paper_exit_is_labelled_correctly(store, decisions):
 def test_paper_stop_is_a_miss_not_flat(store, decisions):
     store.add_signal(dict(SIGNAL))
     store.mark_entered(1, dict(ENTRY))
-    d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+    d = _rec(decisions, kind='entry', verdict='allow', trade_ids=[1],
                          stock='TESTCO', direction='CE')
     store.mark_exited(1, 92.0, 5.0, 'paper:debit_sl')
     outcomes.join(store, decisions)
@@ -252,7 +264,7 @@ def test_the_bcs_arm_is_scored_even_though_it_is_not_in_trade_ids(store, decisio
     the zebra arm alone while claiming to cover both."""
     store.add_signal(dict(SIGNAL))
     store.mark_entered(1, dict(ENTRY))
-    d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+    d = _rec(decisions, kind='entry', verdict='allow', trade_ids=[1],
                          stock='TESTCO', direction='CE')
     with store._mutate():
         store._trades.append({
@@ -271,7 +283,7 @@ def test_a_cancelled_signal_settles_instead_of_pending_forever(store, decisions)
     """An allow whose signal drift-cancels before the entry tick can never
     settle, so it would be re-scanned every 5 minutes for eternity."""
     store.add_signal(dict(SIGNAL))
-    d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
+    d = _rec(decisions, kind='entry', verdict='allow', trade_ids=[1],
                          stock='TESTCO', direction='CE')
     store.cancel(1, 'drifted out of zone')
     assert outcomes.join(store, decisions) == 1

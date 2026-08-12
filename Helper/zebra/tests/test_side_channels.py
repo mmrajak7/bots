@@ -265,7 +265,7 @@ def test_only_a_landed_agent_clears_the_alarm(paths):
 
     health.record_agent_landed()
     assert health.status()['spawn_failures'] == 0
-    assert health.status()['spawns_since_landing'] == 0
+    assert health.status()['spawns_since_landing']['entry'] == 0
 
 
 def test_spawning_without_ever_landing_raises_the_alarm(paths):

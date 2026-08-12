@@ -185,3 +185,32 @@ def test_live_mode_sends_the_order_ticket_exactly_once(wired, monkeypatch):
     for _ in range(3):
         cycle(store)                                     # later ticks: silent
     assert len(sent) == 1, "the order ticket repeated"
+
+
+def test_live_order_ticket_survives_one_telegram_failure(wired, monkeypatch):
+    """The mirror of the test above, and the more dangerous half.
+
+    The consume-once flag is claimed BEFORE the send, and the `triggered`
+    fast-path skips the signal once it is set — so a single Telegram hiccup on
+    the verdict tick used to lose the ticket permanently. The user would never
+    be told to enter a signal Claude had ALLOWED, and it would ride silently to
+    drift-cancel. Same claim-then-release discipline as the exit escalation.
+    """
+    store, _ = wired
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    monkeypatch.setattr(monitor, '_format_enter_alert', lambda *a, **k: 'TICKET')
+    sent, working = [], [False]
+    monkeypatch.setattr(
+        monitor, '_send_telegram',
+        lambda msg, dry_run=False: (sent.append(msg) or True) if working[0]
+        else False)
+    cycle(store)
+    vet.record_verdict(store, 1, vet.ALLOWED)
+    cycle(store)                                   # verdict tick: send FAILS
+    assert sent == []
+    working[0] = True
+    cycle(store)                                   # Telegram is back
+    assert len(sent) == 1, "an allowed entry was lost to one Telegram failure"
+    for _ in range(2):
+        cycle(store)
+    assert len(sent) == 1, "the released flag let the ticket repeat"

@@ -38,9 +38,11 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 from . import config as cfg
@@ -162,21 +164,44 @@ def request_entry_vet(store, trade_id: int, context: dict,
     return store.find(trade_id)
 
 
-# Detached children we have spawned and not yet reaped. On the cron (the
-# production path) the parent exits within seconds and init adopts the child,
-# so zombies cannot exist. In `zebra loop` the parent lives all day and an
-# un-waited child sits as a zombie until the loop exits — poll() in
-# _reap_children collects them without ever blocking.
+# Detached children we have spawned and not yet reaped, as (proc, kill_after).
+# On the cron (the production path) the parent exits within seconds and init
+# adopts the child, so zombies cannot exist. In `zebra loop` the parent lives
+# all day and an un-waited child sits as a zombie until the loop exits — poll()
+# in _reap_children collects them without ever blocking.
 _children: list = []
 
 
-def _reap_children() -> None:
-    for p in _children[:]:
+def _reap_children(now: Optional[datetime] = None) -> int:
+    """Collect finished children and KILL overdue ones. Returns kills.
+
+    The deadline machinery fails the MARKER open; nothing used to touch the
+    PROCESS. A `claude` run that hangs (API outage, network stall) therefore
+    lived forever, and the calendar channel re-spawns on its own deadline — so
+    a bad afternoon could leave dozens of node processes, a few hundred MB
+    each, on a Pi that also runs SNAIL and FIFTY. A paper vetting layer must
+    not be able to OOM a box with live-money processes on it, so anything still
+    running well past its own deadline is killed.
+    """
+    now = now or _now()
+    killed = 0
+    for entry in _children[:]:
+        p, kill_after = entry
         try:
             if p.poll() is not None:
-                _children.remove(p)
+                _children.remove(entry)
+                continue
+            if now < kill_after:
+                continue
+            p.kill()
+            killed += 1
+            logger.error('CLI pid=%d overdue past %s — KILLED (a hung agent '
+                         'must not accumulate on the Pi)',
+                         p.pid, kill_after.strftime('%H:%M:%S'))
+            _children.remove(entry)
         except Exception:                       # pragma: no cover - paranoia
-            _children.remove(p)
+            _children.remove(entry)
+    return killed
 
 
 def _spawn_cli(trade_id: int, exit_kind: Optional[str] = None) -> Optional[int]:
@@ -199,17 +224,74 @@ def _spawn_cli(trade_id: int, exit_kind: Optional[str] = None) -> Optional[int]:
                              vetting_doc=cfg.VETTING_DOC)
     return _spawn_generic(prompt, cfg.VET_MODEL,
                           'vet #%d%s' % (trade_id,
-                                         ' ' + exit_kind if exit_kind else ''))
+                                         ' ' + exit_kind if exit_kind else ''),
+                          channel='exit' if exit_kind else 'entry')
 
 
-def _spawn_generic(prompt: str, model: str, tag: str) -> Optional[int]:
+_cli_path: list = []            # one-element memo; [] = not yet resolved
+
+
+def resolve_cli(refresh: bool = False) -> Optional[str]:
+    """Absolute path to the Claude CLI, or None if it cannot be found.
+
+    `claude` was invoked by bare name, which works in an interactive shell and
+    fails under cron: Debian's cron PATH is `/usr/bin:/bin`, while the CLI
+    installs into `~/.local/bin` or an npm prefix. Every spawn would have
+    raised FileNotFoundError on the Pi — the layer inert from the first cycle,
+    and (before the watchdog fix above) invisibly so.
+    """
+    if _cli_path and not refresh:
+        return _cli_path[0]
+    candidates = [cfg.VET_CLI]
+    if os.sep not in str(cfg.VET_CLI):
+        found = shutil.which(cfg.VET_CLI)
+        if found:
+            candidates.append(found)
+        home = Path.home()
+        candidates += [str(home / '.local' / 'bin' / 'claude'),
+                       str(home / '.npm-global' / 'bin' / 'claude'),
+                       str(home / 'node_modules' / '.bin' / 'claude'),
+                       '/usr/local/bin/claude', '/usr/bin/claude']
+    for c in candidates:
+        try:
+            if os.sep in str(c) and os.path.isfile(c) and os.access(c, os.X_OK):
+                _cli_path[:] = [c]
+                return c
+        except OSError:                          # pragma: no cover - paranoia
+            continue
+    return None
+
+
+def _spawn_generic(prompt: str, model: str, tag: str,
+                   channel: str = 'entry') -> Optional[int]:
     """Fire a detached Claude CLI run. Returns the pid, or None on failure.
 
     Shared by every agent this package spawns (entry vet, exit vet, position
     review, event calendar) so they cannot drift apart on the details that
     actually matter: detachment, output redirection, cwd, and never raising.
     """
-    argv = [cfg.VET_CLI, '-p', prompt, '--model', model]
+    cli = resolve_cli()
+    if cli is None:
+        logger.error("CLI %r not found on PATH or in any known install "
+                     "location — cannot spawn %s. Vetting is OFF until this is "
+                     "fixed; set ZEBRA_VET_CLI to the absolute path.",
+                     cfg.VET_CLI, tag)
+        _note_spawn(False, channel)
+        return None
+    argv = [cli, '-p', prompt, '--model', model]
+    # Hard wall-clock bound on the CHILD, not just on our bookkeeping. In cron
+    # mode — the production path — our process exits within seconds and init
+    # adopts the child, so _reap_children can never reach it: without this a
+    # hung agent runs until the Pi reboots. `timeout` is coreutils and present
+    # on Raspbian; if it is missing we still spawn (fail-open) and rely on the
+    # in-process kill, which covers `zebra loop` only.
+    if os.name == 'posix':
+        timeout_bin = shutil.which('timeout')
+        if timeout_bin:
+            argv = [timeout_bin, '-k', '30', str(cfg.CHILD_KILL_SEC)] + argv
+        else:
+            logger.warning('coreutils `timeout` not found — a hung %s agent '
+                           'can only be killed in loop mode', tag)
     try:
         _reap_children()
         # Detach so the child survives the cron process exiting. stdout/stderr
@@ -228,24 +310,24 @@ def _spawn_generic(prompt: str, model: str, tag: str) -> Optional[int]:
             p = subprocess.Popen(argv, **kwargs)
         finally:
             out.close()             # child holds its own duplicate of the fd
-        _children.append(p)
+        _children.append((p, _now() + timedelta(seconds=cfg.CHILD_KILL_SEC)))
         logger.info("CLI spawned pid=%d for %s (model=%s)", p.pid, tag, model)
-        _note_spawn(True)
+        _note_spawn(True, channel)
         return p.pid
     except Exception as e:
         # Never propagate: a missing/broken CLI must not stop the bot trading.
         logger.error("CLI spawn FAILED for %s: %s — the caller's deadline "
                      "governs from here", tag, e)
-        _note_spawn(False)
+        _note_spawn(False, channel)
         return None
 
 
-def _note_spawn(ok: bool) -> None:
+def _note_spawn(ok: bool, channel: str = 'entry') -> None:
     """Feed the auth watchdog. Best-effort: health tracking must never be able
     to break the thing it is watching."""
     try:
         from .health import record_spawn_result
-        record_spawn_result(ok)
+        record_spawn_result(ok, channel)
     except Exception:                            # pragma: no cover - paranoia
         pass
 
@@ -271,6 +353,14 @@ def record_verdict(store, trade_id: int, verdict: str,
             outcome = f'discarded (already {state})'
         elif state != PENDING:
             outcome = 'discarded (no pending vet)'
+        elif is_expired(t):
+            # Past the deadline but the sweep has not run yet (it fires at the
+            # top of each cycle, so there is up to one monitor_interval_sec of
+            # window). VETTING.md promises the agent that a late verdict is
+            # void; honour that here rather than leaving it true only by the
+            # accident of sweep timing. The signal stays PENDING and the next
+            # sweep fails it open exactly as designed.
+            outcome = 'discarded (deadline passed)'
         else:
             t['vet']['state'] = verdict
             t['vet']['decided_at'] = _now().isoformat()
@@ -359,11 +449,35 @@ def _marker_fresh(marker: dict, now: Optional[datetime] = None) -> bool:
     A stale marker is treated as "never vetted", so the next trigger re-requests
     from scratch — including the defer count, since accumulated distrust belongs
     to the episode that produced it.
+
+    An ESCALATED hold is the exception, and gets a much longer life — see
+    `_marker_ttl`.
     """
     decided = _parse(marker.get('decided_at'))
     if decided is None:
         return False
-    return (now or _now()) - decided < timedelta(seconds=cfg.EXIT_VET_TTL_SEC)
+    return (now or _now()) - decided < timedelta(seconds=_marker_ttl(marker))
+
+
+def _marker_ttl(marker: dict) -> int:
+    """Seconds a terminal exit verdict stays authoritative.
+
+    Short (EXIT_VET_TTL_SEC) for ALLOW/UNAVAILABLE: those authorise an exit, and
+    an authorisation must not outlive the book it judged.
+
+    Long (EXIT_HOLD_TTL_SEC) once the defer cap is reached and the human has
+    been asked. That state authorises nothing — it HOLDS — so it is safe to keep,
+    and keeping it is what stops a pathological loop: on a persistently
+    untradeable book the short TTL wiped the episode every 15 minutes, and the
+    next trigger re-ran the whole agent sequence to arrive at the same
+    escalation. ~30 Fable runs a day, per position, to re-learn one fact the
+    user was already told. The escalation flag re-arms daily; a genuinely new
+    session gets a genuinely fresh look.
+    """
+    if marker.get('state') == DEFER and \
+            int(marker.get('defers') or 0) >= cfg.EXIT_MAX_DEFERS:
+        return cfg.EXIT_HOLD_TTL_SEC
+    return cfg.EXIT_VET_TTL_SEC
 
 
 def needs_exit_vet(trade: dict, kind: str, quote: dict,
@@ -448,15 +562,25 @@ def exit_gate(store, trade: dict, kind: str, quote: dict, spot: float,
             # fail-open is the contract for *never examined*, not for this.
             # Count the timeout as another failure to verify so the escalation
             # cap arrives on schedule.
-            _set_exit_state(store, trade['id'], kind, DEFER,
-                            bump_defer=True, expect_state=PENDING)
+            if not _set_exit_state(store, trade['id'], kind, DEFER,
+                                   bump_defer=True, expect_state=PENDING):
+                return _cas_lost(trade, kind)
             new = prior + 1
             logger.warning('EXIT VET TIMED OUT #%d %s after %d prior defer(s) '
                            '— NOT proceeding; distrust carries over',
                            trade['id'], kind, prior)
             return 'hold' if new >= cfg.EXIT_MAX_DEFERS else 'wait'
-        _set_exit_state(store, trade['id'], kind, UNAVAILABLE,
-                        expect_state=PENDING)
+        if not _set_exit_state(store, trade['id'], kind, UNAVAILABLE,
+                               expect_state=PENDING):
+            # The CAS lost, so the marker is NOT pending on disk — a verdict
+            # landed between our cached read and this write. Returning
+            # 'proceed' here (as this did) fires the exit on the strength of a
+            # timeout that did not happen, and if that verdict was `defer` it
+            # fires the exit on the very book Claude just said it could not
+            # verify. In `zebra loop` the cached read can be a full cycle old,
+            # so this is not a microsecond race — it is most of the deadline
+            # window, and it is the NHPC direction exactly.
+            return _cas_lost(trade, kind)
         logger.warning('EXIT VET TIMED OUT #%d %s — proceeding on the '
                        'deterministic guards alone', trade['id'], kind)
         return 'proceed'
@@ -485,6 +609,20 @@ def exit_gate(store, trade: dict, kind: str, quote: dict, spot: float,
         logger.error('EXIT VET request failed #%d %s: %s — proceeding on the '
                      'deterministic guards', trade['id'], kind, e)
         return 'proceed'
+    return 'wait'
+
+
+def _cas_lost(trade: dict, kind: str) -> str:
+    """A timeout write lost its compare-and-set. Wait, never proceed.
+
+    Something else moved the marker off PENDING while we were deciding it had
+    timed out — in practice a verdict that landed in the gap. `wait` costs one
+    cycle and then acts on the REAL state; `proceed` would act on a state we
+    already know is wrong, in the direction that has cost this book money.
+    """
+    logger.warning('EXIT VET #%d %s: a verdict landed while we were timing it '
+                   'out — waiting one cycle to act on the real state',
+                   trade['id'], kind)
     return 'wait'
 
 

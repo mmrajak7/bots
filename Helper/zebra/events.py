@@ -81,6 +81,14 @@ def is_stale(data: Optional[dict] = None, now: Optional[datetime] = None) -> boo
     return age.total_seconds() > cfg.EVENT_REFRESH_SEC
 
 
+def _confidence(v) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(f, 2) if 0.0 <= f <= 1.0 else None
+
+
 def validate(events) -> list:
     """Return only well-formed rows, logging what was dropped and why.
 
@@ -113,7 +121,12 @@ def validate(events) -> list:
                 'type': etype,
                 'symbol': symbol,
                 'title': title[:200],
-                'confidence': e.get('confidence'),
+                # Coerced, not passed through. The doc asks the agent for a
+                # 0..1 estimate and the row is meant to be judged on it, so a
+                # string or a 7 arriving here would be silently unusable to any
+                # future consumer. Unparseable becomes None — "no stated
+                # confidence" — rather than a number nobody can trust.
+                'confidence': _confidence(e.get('confidence')),
                 'source': str(e.get('source') or '')[:200],
             })
     for i, why in dropped:
@@ -251,7 +264,8 @@ def refresh(symbols, spawn: bool = True) -> bool:
         symbols=', '.join(sorted(set(symbols))[:40]) or 'none',
     )
     _mark_refresh_pending()
-    return _spawn_generic(prompt, cfg.EVENT_MODEL, 'events') is not None
+    return _spawn_generic(prompt, cfg.EVENT_MODEL, 'events',
+                          channel='events') is not None
 
 
 def _interpreter() -> str:

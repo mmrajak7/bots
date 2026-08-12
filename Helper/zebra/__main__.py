@@ -73,7 +73,12 @@ def cmd_vet_show(args):
         # Exit context: what the trigger saw, plus the entry reference points a
         # verdict needs (intrinsic floor, entry debit, SL level).
         m = ((t.get('exit_vet') or {}).get(args.exit) or {})
+        stop, why = _stop_reason(t, m.get('state'),
+                                 vet_mod._exit_expired(m) if m else True,
+                                 exit_kind=args.exit)
         print(_json.dumps({
+            'stop': stop,
+            'stop_reason': why,
             'trade_id': t['id'],
             'stock': t.get('stock'),
             'direction': t.get('direction'),
@@ -95,8 +100,12 @@ def cmd_vet_show(args):
             'checklist': str(cfg.VETTING_DOC) + ' — EXIT section',
         }, indent=2, default=str))
         return 0
+    from . import events as events_mod
     v = t.get('vet') or {}
+    stop, why = _stop_reason(t, v.get('state'), vet_mod.is_expired(t))
     print(_json.dumps({
+        'stop': stop,
+        'stop_reason': why,
         'trade_id': t['id'],
         'stock': t.get('stock'),
         'direction': t.get('direction'),
@@ -109,10 +118,67 @@ def cmd_vet_show(args):
         'vet_state': v.get('state'),
         'deadline': v.get('deadline'),
         'expired': vet_mod.is_expired(t),
+        # The shared calendar the Sonnet agent maintains. The entry checklist
+        # calls event risk "the big one", and this path used to omit it
+        # entirely — so every entry agent re-researched results and ex-div
+        # dates from scratch, which is the exact cost the calendar exists to
+        # remove, and could miss an event already known to the fleet.
+        'known_events': events_mod.upcoming(t.get('stock')),
         'context': v.get('context', {}),
         'checklist': 'Helper/CLAUDE.md — BCS pre-entry checklist (A-E)',
     }, indent=2, default=str))
     return 0
+
+
+def _stop_reason(trade: dict, state, expired: bool, exit_kind=None) -> tuple:
+    """Should the agent stop without deciding? (stop, reason).
+
+    VETTING.md used to tell the agent to stop when `expired: true`, describing
+    it as "already failed open and entered unvetted". Both halves were wrong:
+    `expired` goes true while the signal is still PENDING and nothing has
+    entered, and once it really HAS failed open the state is `unavailable` and
+    `expired` reads FALSE — so the documented stop condition never fired for
+    the case it named. An agent following the doc therefore burned a full
+    research run and a `decide` call on every already-settled signal.
+
+    This computes the question the agent actually needs answered, so the doc
+    can point at one boolean instead of describing an inference.
+    """
+    from . import vet as vet_mod
+    if state is None:
+        return True, 'no vet was requested for this signal — nothing to decide'
+    if exit_kind is None and state in vet_mod.TERMINAL:
+        return True, ('already settled as %s — a verdict now would be '
+                      'discarded' % state)
+    if exit_kind is not None and state in (vet_mod.ALLOWED, vet_mod.UNAVAILABLE):
+        return True, 'this exit episode already settled as %s' % state
+    if exit_kind is not None and trade.get('status') != 'entered':
+        return True, ('position is %s, not open — a verdict cannot apply'
+                      % trade.get('status'))
+    if expired:
+        return True, ('the deadline passed; this signal fails open and enters '
+                      'unvetted, and a verdict now is void')
+    return False, ''
+
+
+def _settle_decision(decision_id: int, outcome: str) -> None:
+    """Stamp a journal row with whether its verdict was actually applied.
+
+    `outcome` is whatever the store returned: 'applied', or a
+    'discarded (...)' string. Best-effort — the verdict has already landed on
+    the trade, and failing to annotate the journal must never make an agent
+    believe its decision did not take effect. A miss here costs one unscored
+    row, which is the safe direction: unscored beats wrongly scored.
+    """
+    from .decisions import get_store as get_decisions
+    try:
+        if outcome == 'applied':
+            get_decisions().mark_acted(decision_id)
+        else:
+            get_decisions().mark_discarded(decision_id, outcome)
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "could not settle decision #%s (%s): %s", decision_id, outcome, e)
 
 
 def cmd_vet_decide(args):
@@ -148,8 +214,13 @@ def cmd_vet_decide(args):
     )
     outcome = vet_mod.record_verdict(store, args.id, verdict,
                                      decision_id=d['id'])
+    # Close the loop on the journal row: did this verdict actually govern the
+    # signal, or did the store refuse it (late, duplicate, already settled)?
+    # Without this the row looks identical to one that WAS applied, and the
+    # scoring pipeline credits the layer for a trade it never authorised.
+    _settle_decision(d['id'], outcome)
     from .health import record_agent_landed
-    record_agent_landed()      # proof of life: an agent got all the way here
+    record_agent_landed('entry')   # proof of life for THIS channel
     print(f"decision #{d['id']} recorded; verdict {outcome}")
 
     # A VETO is the end of the story for this signal — nothing else will be
@@ -200,7 +271,7 @@ def cmd_vet_exit_decide(args):
     outcome = vet_mod.record_exit_verdict(store, args.id, args.kind,
                                           args.verdict, decision_id=d['id'])
     from .health import record_agent_landed
-    record_agent_landed()      # proof of life: an agent got all the way here
+    record_agent_landed('exit')   # proof of life for THIS channel
     print(f"decision #{d['id']} recorded; exit verdict {outcome}")
     return 0
 
@@ -296,12 +367,17 @@ def cmd_events_replace(args):
         return 1
     rows = payload.get('events') if isinstance(payload, dict) else payload
     try:
-        doc = events_mod.replace(rows)
+        # `replace()` refuses an empty install by default and tells the caller
+        # to pass allow_empty — which the CLI did not expose, so the escape
+        # hatch the error message advertised was unreachable by the only caller
+        # that ever sees it.
+        doc = events_mod.replace(rows, allow_empty=getattr(args, 'allow_empty',
+                                                           False))
     except ValueError as e:
         print(f"rejected: {e}")
         return 1
     from .health import record_agent_landed
-    record_agent_landed()      # proof of life: an agent got all the way here
+    record_agent_landed('events')   # proof of life for THIS channel
     print(f"event calendar replaced: {len(doc['events'])} event(s)")
     return 0
 
@@ -361,7 +437,7 @@ def cmd_review_record(args):
     outcome = review_mod.record(store, args.id, args.action,
                                reasons=args.reason or [], decision_id=d['id'])
     from .health import record_agent_landed
-    record_agent_landed()      # proof of life: an agent got all the way here
+    record_agent_landed('review')   # proof of life for THIS channel
     print(f"decision #{d['id']} recorded; review {outcome}")
     return 0
 
@@ -657,7 +733,60 @@ def cmd_status(args):
             win_rate = wins / len(group) * 100
             print(f"  {label}  P&L: Rs {total_pnl:,.0f}  "
                   f"WR {win_rate:.0f}% ({wins}W / {len(group)-wins}L)")
+    _print_vet_status(trades)
     print()
+
+
+def _print_vet_status(trades: list) -> None:
+    """The vetting layer, in the ONE dashboard — not a second status command.
+
+    Without this an operator cannot tell "dark" from "on and working" from "on
+    and silently dead" without grepping logs, and the two failure modes this
+    layer is most likely to hit on the Pi (CLI not found, agents never
+    reporting back) are exactly the invisible kind.
+    """
+    from . import config as cfg
+    from . import events as events_mod
+    from . import health as health_mod
+    from . import vet as vet_mod
+
+    if not cfg.VET_ENABLED:
+        print("\n  --- Claude vetting: OFF (dark) ---")
+        print(f"  enable in {cfg.CONFIG_FILE.name} -> \"vet_enabled\": true "
+              f"(NOT via env: one process ON and another OFF is worse than "
+              f"dark)")
+        return
+
+    h = health_mod.status()
+    cli = vet_mod.resolve_cli() or 'NOT FOUND'
+    print("\n  --- Claude vetting: ON ---")
+    print(f"  cli       {cli}")
+    days = h.get('days_left')
+    print(f"  login     expires in {days}d" if days is not None
+          else "  login     expiry unknown (behavioural probes only)")
+    silent = h.get('silent_channels') or []
+    fails = h.get('spawn_failures') or 0
+    verdict = ('HEALTHY' if not silent and not fails
+               else 'DEGRADED — agents are not completing')
+    print(f"  agents    {verdict}"
+          + (f"  silent={silent}" if silent else "")
+          + (f"  spawn_failures={fails}" if fails else ""))
+
+    pend = [t for t in trades if vet_mod.is_pending(t)]
+    if pend:
+        print(f"  pending   {len(pend)} signal(s) awaiting a verdict: "
+              f"{[t['id'] for t in pend]}")
+    held = [(t['id'], k, vet_mod.exit_defers(t, k))
+            for t in trades if isinstance(t.get('exit_vet'), dict)
+            for k in t['exit_vet']
+            if vet_mod.exit_state(t, k) == vet_mod.DEFER]
+    if held:
+        print(f"  exits     HELD, awaiting you: "
+              + ', '.join('#%s %s (%d defers)' % x for x in held))
+    stale = events_mod.is_stale()
+    n_events = len(events_mod.load().get('events') or [])
+    print(f"  calendar  {n_events} event(s)"
+          + ("  STALE — refresh in flight or failing" if stale else "  fresh"))
 
 
 def cmd_reset(args):
@@ -802,6 +931,11 @@ def main():
     p_evrep = ev_sub.add_parser('replace', help='Install a validated calendar')
     p_evrep.add_argument('--file', required=True,
                          help='JSON: {"events":[...]} or a bare [...] list')
+    p_evrep.add_argument('--allow-empty', action='store_true',
+                         help='Install a calendar with NO events. Only when '
+                              'the window genuinely has none — an empty '
+                              'install also refreshes the timestamp, so it '
+                              'reads healthy while every gate sees nothing.')
     p_evrep.set_defaults(func=cmd_events_replace)
 
     # ── Position review (called BY the spawned CLI) ────────────────────────

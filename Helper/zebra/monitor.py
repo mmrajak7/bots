@@ -296,10 +296,24 @@ def _vet_context(trade: dict, analysis: dict, gap_pct: float) -> dict:
         'expiry': analysis.get('expiry'),
         'dte': analysis.get('dte'),
         'lot_size': analysis.get('lot_size'),
+        # Liquidity evidence travels WITH the handoff. VETTING.md tells the
+        # agent to judge "depth at touch and the spread as a % of mid" — the
+        # analyzer measures exactly that, and this bundle used to drop it, so
+        # the agent was asked to judge the one thing it could not see. That is
+        # the failure mode (a book you cannot exit) the same doc calls the one
+        # that has actually cost this book money.
         'zebra': {k: best.get(k) for k in
                   ('k_l', 'k_s', 'debit', 'be', 'be_pct_from_spot',
                    'long_symbol', 'short_symbol', 'long_oi', 'short_oi',
-                   'capital_per_lot', 'gate_fails')},
+                   'long_bid', 'long_ask', 'short_bid', 'short_ask',
+                   'long_spread_pct', 'short_spread_pct',
+                   'long_extrinsic', 'short_extrinsic', 'net_ext',
+                   'liquidity_ok', 'capital_per_lot', 'gate_fails')},
+        # Explicit, because the agent's instructions used to say these gates
+        # "passed by construction" — true for most picks, but `_pick_best` has
+        # a last-resort tier that returns a candidate WITH failed gates when no
+        # clean one exists. Those are precisely the entries worth a hard look.
+        'gates_all_passed': not (best.get('gate_fails') or []),
     }
 
 
@@ -586,9 +600,15 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             elif state == vet_mod.PENDING:
                 continue              # still deciding; expire_stale bounds it
             elif state == vet_mod.VETOED:
-                # Reachable only when the verdict lands DURING this cycle (the
-                # `triggered` fast-path above catches every later cycle, and
-                # opens the shadow there).
+                # DEFENCE IN DEPTH, and believed UNREACHABLE today: nothing
+                # between the fast-path read above and this one refreshes the
+                # store cache, and a verdict that settles mid-request comes
+                # back as request_entry_vet's ValueError instead. Kept because
+                # it is the safe duplicate of the fast-path (same action, same
+                # shadow) and any future cache refresh in between would make it
+                # live. Stated as a belief, not a fact: an over-confident
+                # reachability comment is what made the veto shadow dead code
+                # in the first place.
                 logger.info("VETOED #%d %s — no entry", trade['id'], stock)
                 try:
                     outcomes_mod.open_shadow(store, trade['id'],
@@ -723,6 +743,17 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             logger.info("ENTER alert sent for #%d %s", trade['id'], stock)
         else:
             logger.warning("ENTER alert FAILED for #%d %s", trade['id'], stock)
+            # LIVE: that ticket was the ONLY notification this allowed signal
+            # will ever produce, and the fast-path above skips the trade once
+            # the flag is set — so a single Telegram hiccup would silently lose
+            # a vetted entry until it drift-cancelled. Give the claim back and
+            # retry next cycle, the same discipline as the exit escalation and
+            # the review alert. (PAPER never claims the flag; the position is
+            # already open and the alert is a notification, not a ticket.)
+            if cfg.VET_ENABLED and not cfg.PAPER_MODE:
+                store.clear_alert_flag(trade['id'], 'vet_enter')
+                logger.error("Deferred ENTER ticket for #%d %s released — "
+                             "retrying next cycle", trade['id'], stock)
 
 
 # ── Entered → TP/SL/Time ─────────────────────────────────────────────────

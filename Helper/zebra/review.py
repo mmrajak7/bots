@@ -133,7 +133,8 @@ def request(store, trade_id: int, why: str, context: dict,
         prompt = cfg.REVIEW_PROMPT_TEMPLATE.format(
             trade_id=trade_id, python=sys.executable,
             vetting_doc=cfg.VETTING_DOC)
-        vet_mod._spawn_generic(prompt, cfg.VET_MODEL, 'review #%d' % trade_id)
+        vet_mod._spawn_generic(prompt, cfg.VET_MODEL, 'review #%d' % trade_id,
+                               channel='review')
     return True
 
 

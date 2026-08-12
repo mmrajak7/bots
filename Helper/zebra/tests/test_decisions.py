@@ -27,11 +27,21 @@ def store(tmp_path):
                          lock_path=tmp_path / 'd.lock').initialize()
 
 
-def _rec(store, **kw):
+def _rec(store, acted=True, **kw):
+    """Record a decision the way PRODUCTION does — journal, then settle.
+
+    `cmd_vet_decide` always follows `record()` with `mark_acted()` (applied) or
+    `mark_discarded()` (refused), and only ACTED rows are scored. A test that
+    records without settling is testing a state the bot never leaves behind,
+    and would have hidden the scoring bug this gate exists to close.
+    """
     base = dict(kind='entry', verdict='allow', trade_ids=[1, 2],
                 stock='TESTCO', direction='CE')
     base.update(kw)
-    return store.record(**base)
+    d = store.record(**base)
+    if acted:
+        store.mark_acted(d['id'])
+    return store.find(d['id'])
 
 
 # ── basics ───────────────────────────────────────────────────────────────
