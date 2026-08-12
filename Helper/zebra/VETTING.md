@@ -335,3 +335,60 @@ Rules the installer enforces, so get them right or the row is dropped:
 include everything still upcoming — omitting a real event silently deletes it.
 **Never invent a date.** An estimated date with `confidence: 0.5` is useful; a
 confident guess is worse than no row at all, because the gates will act on it.
+
+---
+
+# POST-MORTEM
+
+You were spawned by the end-of-day batch. One or more positions have settled
+and each needs a tagged post-mortem. This is the feedback loop: your tags
+become PRECEDENTS, and precedents are injected into the context of the agent
+vetting the next signal. Without them that agent starts every decision from
+zero, and the book's own history is the one input it never gets.
+
+## Your task, per id
+
+1. `<python> -m zebra postmortem show <ID>` — what was known at entry, what
+   happened, how far it got, and the allowed tag list.
+2. Decide what actually explains the outcome.
+3. `<python> -m zebra postmortem record <ID> --tag <t> [--tag <t2>] --lesson '...'`
+   — exactly once per id.
+
+## Tags are a CLOSED list
+
+The context prints them. A tag outside it is rejected and the post-mortem is
+lost — the command fails, it does not "mostly work".
+
+This is not bureaucracy. Free-text tags read better in one post-mortem and are
+worthless in aggregate: "illiquid book", "bad book", "couldn't exit" and "wide
+spreads" become four precedents with support 1 instead of one with support 4,
+and support is precisely the number that decides whether a precedent is ever
+shown to anybody.
+
+Use as few tags as honestly fit. Two is common; four means you have not decided
+what actually happened.
+
+## Basis: realised vs proxy
+
+`basis` in the context tells you which kind of evidence this is:
+
+- **realised** — the position traded. `pnl` is real money.
+- **proxy** — the signal was VETOED, so nothing traded. The "outcome" is a spot
+  triple-barrier: where the underlying went afterwards. It is evidence, but it
+  is not a P&L, and the structure was never priced.
+
+Say which one you are reasoning from when it matters. A proxy outcome that says
+"the stock went up 6%" does NOT establish that the trade would have made money —
+the debit, the spreads and the clock are all unknown on that path.
+
+## The lesson line
+
+One sentence, written for the agent vetting the NEXT signal, not for a reader
+of this trade. "Entered at 42% d/w and the payoff was never there" is useful.
+"Should have been more careful" is not.
+
+## What you are NOT doing
+
+You are not grading the vetting layer, re-litigating the entry rules, or
+recommending changes to thresholds. You are recording what happened, in a form
+that aggregates. The scoring report and the human do the rest.

@@ -264,6 +264,10 @@ _DEFAULTS = {
                                  # Pi also runs live-money bots.
     'vet_model': 'fable',        # Decisions.
     'event_model': 'sonnet',     # Routine calendar refresh.
+    'postmortem_model': 'sonnet',  # Classifying settled trades
+                                 # against a CLOSED tag list is
+                                 # fact-collection, not a call
+                                 # about money.
     'mfe_confirm_polls': 2,      # Max-favourable-excursion peak tracking. A
                                  # peak is a MAX, so one garbage-high print
                                  # poisons it PERMANENTLY — unlike a low print,
@@ -454,6 +458,18 @@ EVENT_PROMPT_TEMPLATE = (
     "the per-stock events for these symbols: {symbols}. "
     "Write your findings to a JSON file, then install it with "
     "`{python} -m zebra events replace --file <path>` exactly once."
+)
+# Sonnet, like the calendar: classifying settled trades against a CLOSED tag
+# list is fact-collection, not a judgement about money.
+POSTMORTEM_MODEL = os.environ.get('ZEBRA_POSTMORTEM_MODEL') \
+    or _runtime['postmortem_model']
+POSTMORTEM_PROMPT_TEMPLATE = (
+    "Write post-mortems for the settled positions {ids}. Read {vetting_doc} "
+    "(the POST-MORTEM section) and follow it exactly. For EACH id: run "
+    "`{python} -m zebra postmortem show <id>`, then finish it with "
+    "`{python} -m zebra postmortem record <id> --tag ... --lesson '...'` "
+    "exactly once. Tags MUST come from the list the context prints; a tag "
+    "outside it is rejected and the post-mortem is lost."
 )
 REVIEW_PROMPT_TEMPLATE = (
     "Review open position {trade_id} for event/macro risk the mechanical rules "

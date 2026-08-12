@@ -111,6 +111,7 @@ def cmd_vet_show(args):
         }, indent=2, default=str))
         return 0
     from . import events as events_mod
+    from . import postmortem as pm_mod
     v = t.get('vet') or {}
     stop, why = _stop_reason(t, v.get('state'), vet_mod.is_expired(t))
     print(_json.dumps({
@@ -134,10 +135,33 @@ def cmd_vet_show(args):
         # dates from scratch, which is the exact cost the calendar exists to
         # remove, and could miss an event already known to the fleet.
         'known_events': events_mod.upcoming(t.get('stock')),
+        # What happened the last times this pattern appeared. Without it the
+        # layer starts every decision from zero and the book's own history is
+        # the one input it never gets. `withheld` is included rather than
+        # dropped: a precedent suppressed by the realised-support guard is
+        # itself information ("we believe this pattern is bad but have only
+        # ever vetoed it"), and a guard nobody can see is one nobody trusts.
+        'precedents': _precedents_for(t),
         'context': v.get('context', {}),
         'checklist': 'Helper/CLAUDE.md — BCS pre-entry checklist (A-E)',
     }, indent=2, default=str))
     return 0
+
+
+def _precedents_for(trade: dict) -> dict:
+    """Precedent block for the entry context — never load-bearing.
+
+    A broken or empty precedent store must leave vetting exactly as it was
+    before this existed, so every failure here degrades to "no precedents"
+    rather than to a missing verdict.
+    """
+    from . import postmortem as pm_mod
+    from .trade_store import get_store
+    try:
+        return pm_mod.for_signal(get_store(), trade.get('stock'))
+    except Exception as e:
+        logging.getLogger(__name__).warning("precedent lookup failed: %s", e)
+        return {'shown': [], 'withheld': [], 'error': str(e)}
 
 
 def _stop_reason(trade: dict, state, expired: bool, exit_kind=None) -> tuple:
@@ -867,6 +891,85 @@ def cmd_report(args):
     )
 
 
+def cmd_pm_show(args):
+    """Evidence bundle for one post-mortem — the agent's only input."""
+    import json as _json
+    from . import postmortem as pm_mod
+    from .trade_store import get_store
+    print(_json.dumps(pm_mod.context(get_store(), args.id), indent=2,
+                      default=str))
+    return 0
+
+
+def cmd_pm_record(args):
+    from . import postmortem as pm_mod
+    from .health import record_agent_landed
+    from .trade_store import get_store
+    record_agent_landed('postmortem')   # proof of life for THIS channel
+    try:
+        pm = pm_mod.record(get_store(), args.id, args.tag, args.lesson)
+    except ValueError as e:
+        print(f"REJECTED: {e}")
+        return 1
+    print(f"post-mortem #{args.id} recorded ({pm['basis']}): "
+          f"{', '.join(pm['tags'])}")
+    return 0
+
+
+def cmd_pm_pending(args):
+    from . import postmortem as pm_mod
+    from .trade_store import get_store
+    rows = pm_mod.pending(get_store())
+    if not rows:
+        print("Nothing settled is waiting for a post-mortem.")
+        return 0
+    print(f"{len(rows)} awaiting a post-mortem:")
+    for r in rows:
+        print(f"  #{r['trade_id']:>4}  {r['basis']:<8}  settled {r['settled']}")
+    return 0
+
+
+def cmd_pm_precedents(args):
+    from . import postmortem as pm_mod
+    from .trade_store import get_store
+    store = get_store()
+    view = pm_mod.for_signal(store, args.stock)
+    allr = pm_mod.precedents(store)
+    if not allr:
+        print("\nNo post-mortems recorded yet — precedents fill in as "
+              "positions settle and the EOD batch classifies them.\n")
+        return 0
+    print(f"\nPRECEDENTS  (shown to the vetting agent: {len(view['shown'])}, "
+          f"withheld: {len(view['withheld'])})")
+    print(f"  {'TAG':<24} {'SUP':>4} {'REAL':>5} {'WIN%':>6} {'LEANS':>6}  "
+          f"{'REALISED P&L':>13}")
+    for r in allr:
+        print(f"  {r['tag']:<24} {r['support']:>4} {r['realised_support']:>5} "
+              f"{(r['win_rate'] if r['win_rate'] is not None else 0):>6.1f} "
+              f"{r['leans']:>6}  {r['realised_pnl']:>13,.0f}")
+    for w in view['withheld']:
+        # Printed loudly: a suppressed precedent is itself information, and a
+        # guard nobody can see is a guard nobody will trust.
+        print(f"\n  WITHHELD  {w['tag']}: {w['withheld_because']}")
+    print()
+    return 0
+
+
+def cmd_pm_run(args):
+    """The EOD batch. Spawns at most one agent a day, only if something settled."""
+    from . import postmortem as pm_mod
+    from .trade_store import get_store
+    store = get_store()
+    if not pm_mod.due(store) and not args.force:
+        print("Not due: nothing settled since the last run (or already ran "
+              "today). --force overrides.")
+        return 0
+    spawned = pm_mod.spawn_batch(store, spawn=not args.dry_run)
+    print("post-mortem batch spawned" if spawned else
+          "post-mortem batch NOT spawned (dry-run or CLI unavailable)")
+    return 0
+
+
 def cmd_giveback(args):
     """Peak-vs-exit table for closed trades that carry a measured peak."""
     from . import mfe as mfe_mod
@@ -1066,6 +1169,27 @@ def main():
     p_rep.add_argument('--no-kite', action='store_true',
                        help='Skip live mid fetch for open positions (faster, no unrealized P&L)')
     p_rep.set_defaults(func=cmd_report)
+
+    p_pm = sub.add_parser('postmortem', help='Post-mortems and precedents')
+    pm_sub = p_pm.add_subparsers(dest='pm_command')
+    p_pmshow = pm_sub.add_parser('show', help='Dump post-mortem context as JSON')
+    p_pmshow.add_argument('id', type=int)
+    p_pmshow.set_defaults(func=cmd_pm_show)
+    p_pmrec = pm_sub.add_parser('record', help='Attach a post-mortem')
+    p_pmrec.add_argument('id', type=int)
+    p_pmrec.add_argument('--tag', action='append', required=True,
+                         help='Repeatable; must come from the fixed taxonomy')
+    p_pmrec.add_argument('--lesson', required=True)
+    p_pmrec.set_defaults(func=cmd_pm_record)
+    p_pmpend = pm_sub.add_parser('pending', help='What is awaiting a post-mortem')
+    p_pmpend.set_defaults(func=cmd_pm_pending)
+    p_pmprec = pm_sub.add_parser('precedents', help='Aggregated tag evidence')
+    p_pmprec.add_argument('--stock', default=None)
+    p_pmprec.set_defaults(func=cmd_pm_precedents)
+    p_pmrun = pm_sub.add_parser('run', help='EOD batch (max 1/day)')
+    p_pmrun.add_argument('--force', action='store_true')
+    p_pmrun.add_argument('--dry-run', action='store_true')
+    p_pmrun.set_defaults(func=cmd_pm_run)
 
     p_mfe = sub.add_parser('giveback',
                            help='Peak-vs-exit: what winners handed back')

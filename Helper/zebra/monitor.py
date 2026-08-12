@@ -26,6 +26,7 @@ from . import events as events_mod
 from . import health as health_mod
 from . import mfe as mfe_mod
 from . import outcomes as outcomes_mod
+from . import postmortem as postmortem_mod
 from . import review as review_mod
 from . import strikes as strikes_mod
 from . import vet as vet_mod
@@ -1434,6 +1435,11 @@ def _run_vet_side_channels(store, kite, dry_run: bool = False) -> None:
         ('position review', lambda: review_mod.run(
             store, ltps, send=_send_telegram, dry_run=dry_run)),
         ('event calendar', lambda: _refresh_events_if_stale(store)),
+        # Runs AFTER the outcome join: a veto shadow that resolved this very
+        # cycle should be post-mortemed today, not tomorrow. `due` caps it at
+        # one spawn a day and returns False when nothing has settled, so on a
+        # quiet day this costs a list comprehension.
+        ('post-mortem batch', lambda: _run_postmortem_batch(store, dry_run)),
         ('auth watch', lambda: health_mod.check(send=_send_telegram,
                                                 dry_run=dry_run)),
     ):
@@ -1442,6 +1448,15 @@ def _run_vet_side_channels(store, kite, dry_run: bool = False) -> None:
         except Exception as e:
             logger.error("Vet side-channel '%s' failed: %s", label, e,
                          exc_info=True)
+
+
+def _run_postmortem_batch(store, dry_run: bool = False) -> bool:
+    """Spawn the EOD post-mortem agent if anything settled and it is due."""
+    if not postmortem_mod.due(store):
+        return False
+    n = len(postmortem_mod.pending(store))
+    logger.info("POST-MORTEM batch due: %d settled decision(s)", n)
+    return postmortem_mod.spawn_batch(store, spawn=not dry_run)
 
 
 def _refresh_events_if_stale(store) -> bool:
