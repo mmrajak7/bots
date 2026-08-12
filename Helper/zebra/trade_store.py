@@ -24,6 +24,15 @@ from .filelock import LockTimeout, exclusive
 
 logger = logging.getLogger(__name__)
 
+# Non-mfe_* fields the batched per-poll write is allowed to carry. Kept as an
+# explicit allowlist rather than loosening the prefix check: that check exists
+# because callers pass whole-state patches, so one typo'd key would silently
+# overwrite `status` or `debit` on a live position. The spot-corroboration
+# reference rides this write for the same reason the peaks do — it updates once
+# per open position per poll, and a write per trade per cycle is precisely what
+# the batching removed.
+_BATCHED_POLL_FIELDS = frozenset({'corrob_spot', 'corrob_value', 'corrob_t'})
+
 
 def _load_config() -> dict:
     if not cfg.CONFIG_FILE.exists():
@@ -777,6 +786,26 @@ class ZebraStore:
                 t['debit_blind_cycles'] = 0
                 t['debit_blind_alerted'] = False
 
+    def corroboration_ref(self, trade_id: int) -> dict:
+        """The last spot/value pair a RELIABLE poll observed for this trade.
+
+        Persisted (local only, like the confirm counters) because zebra's cron
+        process exits between cycles: the live monitor keeps this reference in
+        memory only, which it can afford as a long-lived process, but here an
+        in-memory reference would reset every 5 minutes and the veto would
+        never have anything to compare against.
+        """
+        t = self.find(trade_id) or {}
+        return {'spot': t.get('corrob_spot'), 'value': t.get('corrob_value'),
+                't': float(t.get('corrob_t') or 0.0)}
+
+    # The reference is ADVANCED through the batched `apply_mfe` write, not by a
+    # setter here: it updates once per open position per poll, and a write per
+    # trade per cycle is exactly what the batching exists to prevent. Only
+    # RELIABLE readings may advance it — a garbage read that became the
+    # baseline would make the next genuine move look uncorroborated, i.e. veto
+    # the exit that should happen.
+
     def mark_blind_alerted(self, trade_id: int, persist: bool = True) -> bool:
         """Set the blind-alert flag once per blind spell. True if newly set."""
         newly_set = False
@@ -808,9 +837,12 @@ class ZebraStore:
         `debit` on a live position.
         """
         bad = sorted({k for f in patches.values() for k in f
-                      if not str(k).startswith('mfe_')})
+                      if not str(k).startswith('mfe_')
+                      and k not in _BATCHED_POLL_FIELDS})
         if bad:
-            raise ValueError(f"apply_mfe only writes mfe_* fields, got: {bad}")
+            raise ValueError(
+                f"apply_mfe only writes mfe_* fields or {sorted(_BATCHED_POLL_FIELDS)}, "
+                f"got: {bad}")
         if not patches:
             return
         with self._mutate(drive=False, persist=persist):

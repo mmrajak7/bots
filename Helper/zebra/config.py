@@ -612,6 +612,42 @@ DEBIT_SL_CONFIRM_POLLS = 2       # reliable triggering polls before DEBIT SL ale
 CONFIRM_STALE_SEC = 15 * 60      # confirm streak restarts if the poll gap exceeds this
 DEBIT_BLIND_CYCLES = 3           # consecutive unusable-quote cycles (~15 min) => one blind alert
 
+# ── The SECOND source (2026-08-12) ─────────────────────────────────────────
+# Everything above is four CHECKS on ONE SOURCE. The reliability gate, the
+# intrinsic floor, the debounce and the blind alert all read the same NFO
+# option book, so a book that is wrong in a way they all accept produces a
+# wrong exit with four green lights. Spot is the independent source: it is the
+# most liquid instrument in the chain and it is quoted continuously.
+#
+# It is a VETO, never a trigger. Measured on 147 records with candle coverage,
+# a 3% adverse SPOT TRIGGER cuts 31 of 78 eventual winners (Rs 8.9L given up)
+# because the strategy enters on a pullback TOWARD the ST line — adverse
+# movement is the thesis, not its failure. Winners' median MAE is 2.74%, so a
+# 3% stop sits ON the median, and the book's biggest winner (IDFCFIRSTB
+# +155.4%) has an MAE of 4.43% and dies at 3% or 4%. Reaping winners is the
+# rule inverted. As a veto, spot costs nothing: it can only ever REFUSE an
+# exit the option book asked for.
+#
+# Ported from bcs/spread_monitor.py:369 (`spot_corroborates`), which has run on
+# the live money system since the NHPC post-mortem. One change: the reference
+# is persisted to the store. The live monitor keeps it in memory, which a
+# long-lived process can afford; zebra's cron process EXITS between cycles, so
+# an in-memory reference would reset every 5 minutes and never veto anything.
+SPOT_VETO_ENABLED = True         # veto a collapse the underlying cannot explain
+SPREAD_COLLAPSE_PCT = 0.35       # value drop that demands an explanation
+SPOT_MOVE_MIN_PCT = 0.004        # spot move that would count as one
+CORROBORATION_STALE_SEC = 15 * 60  # reference older than this proves nothing
+
+# Value triggers (DEBIT-SL, TRAIL) stay dark until this many seconds after the
+# open. Both incidents that cost real money — ICICI 2026-02-18, NHPC
+# 2026-07-24 — happened at the open, on the first prints of the day, and the
+# hardened live monitor already refuses to act before 09:30
+# (SPREAD_TRIGGER_OPEN_BUFFER_SEC). Zebra's first cycle is 09:15 with no
+# buffer at all, so BOTH of its debounce polls land inside the window the live
+# system will not trade in. Spot-driven TP and the TIME nag are unaffected:
+# spot at the open is real trades, and the calendar does not care.
+VALUE_TRIGGER_OPEN_BUFFER_SEC = 15 * 60
+
 # ── Invariant checks ──────────────────────────────────────────────────────
 assert WATCH_GAP_MAX > TRIGGER_GAP_MAX, (
     f"WATCH_GAP_MAX ({WATCH_GAP_MAX}) must be > TRIGGER_GAP_MAX ({TRIGGER_GAP_MAX})")

@@ -674,16 +674,34 @@ def _format_corp_action_alert(trade: dict, evt: dict) -> str:
     )
 
 
-def _format_blind_alert(trade: dict, reason: Optional[str]) -> str:
+def _format_blind_alert(trade: dict, reason: Optional[str],
+                        spot: Optional[float] = None) -> str:
     """One-shot warning that DEBIT-SL valuation has been blind (unreliable /
     missing book) long enough to matter. Spot TP/SL stay armed — this is pure
     observability, not a trading action."""
     mins = cfg.DEBIT_BLIND_CYCLES * cfg.MONITOR_INTERVAL_SEC // 60
+    # Where the UNDERLYING is, while the book cannot be seen. This is the one
+    # moment `sl_spot` earns its keep: the spot stop is deliberately not a
+    # trigger (it cuts 40% of winners at 3%), but when the option book has gone
+    # dark, how far spot has travelled against the position is the only
+    # independent read available to the human deciding whether to look.
+    spot_line = ''
+    if spot and trade.get('sl_spot') and trade.get('entry_spot'):
+        try:
+            entry = float(trade['entry_spot'])
+            adverse = ((entry - spot) / entry if trade['direction'] == 'CE'
+                       else (spot - entry) / entry) * 100
+            spot_line = (f"Spot {spot:.2f} vs entry {entry:.2f} "
+                         f"({adverse:+.1f}% adverse), 3% mark "
+                         f"{float(trade['sl_spot']):.2f}.\n")
+        except (TypeError, ValueError, ZeroDivisionError):
+            spot_line = ''
     return (
         f"⚠ <b>{_struct_label(trade)} DEBIT-BLIND</b>  "
         f"<code>{trade['stock']}</code> ({trade['direction']})\n"
         f"Debit-SL valuation blind ~{mins} min: option book unreliable "
         f"({reason or 'no quote'}).\n"
+        f"{spot_line}"
         f"Spot TP/SL still armed. Check the book manually before acting."
     )
 
@@ -1332,6 +1350,79 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
         return None
 
 
+def _value_triggers_live(now: Optional[datetime] = None) -> bool:
+    """Are the BOOK-driven triggers (DEBIT-SL, TRAIL) allowed to fire yet?
+
+    False for the first VALUE_TRIGGER_OPEN_BUFFER_SEC of the session. Both
+    incidents that cost real money happened at the open on the first prints of
+    the day, and the live monitor has refused to act before 09:30 ever since.
+    Spot-driven TP and the TIME nag are deliberately NOT gated: spot at the
+    open is real trades, and the calendar does not care what the book is doing.
+    """
+    now = now or datetime.now(IST)
+    open_h, open_m = cfg.MARKET_OPEN
+    open_dt = now.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+    return (now - open_dt).total_seconds() >= cfg.VALUE_TRIGGER_OPEN_BUFFER_SEC
+
+
+def _spot_corroborates(store: ZebraStore, trade: dict, spot: float,
+                       value: Optional[float], reliable: bool,
+                       now: Optional[float] = None) -> tuple:
+    """Does the underlying explain this collapse in structure value?
+
+    Returns (ok, reason). ok=True whenever it cannot prove otherwise — no
+    reference yet, a stale one, or a RISE rather than a collapse. It vetoes one
+    specific shape: value falling off a cliff while spot barely moves. That is
+    the NHPC signature, and no real repricing of a vertical spread can produce
+    it — the structure's value is a function of the underlying.
+
+    VETO-ONLY. It can refuse an exit the book asked for; it can never ask for
+    one. That polarity is the whole reason a second source is safe to add: the
+    measured cost of a spot TRIGGER is 31 of 78 winners, the cost of a spot
+    VETO is nothing.
+
+    The reference only advances on RELIABLE readings, so a garbage read can
+    never become the baseline that a later genuine move is judged against.
+
+    Returns (ok, reason, patch). The advanced reference comes back as a PATCH
+    rather than being written here: this runs once per open position per poll,
+    and writing it inline would put a store write per trade per cycle back
+    into a loop that was deliberately reduced to one batched write.
+    """
+    if not cfg.SPOT_VETO_ENABLED or value is None or not spot or spot <= 0:
+        return True, '', None
+    now = time.time() if now is None else now
+    ref = store.corroboration_ref(trade['id'])
+    ok, reason = True, ''
+    if (ref['value'] is not None and ref['spot']
+            and now - ref['t'] <= cfg.CORROBORATION_STALE_SEC
+            and ref['value'] > 0):
+        drop = (ref['value'] - value) / ref['value']
+        spot_move = abs(spot - ref['spot']) / ref['spot']
+        if drop >= cfg.SPREAD_COLLAPSE_PCT and spot_move < cfg.SPOT_MOVE_MIN_PCT:
+            ok = False
+            reason = (f"uncorroborated collapse: value {ref['value']:.2f} -> "
+                      f"{value:.2f} (-{drop*100:.0f}%) on a "
+                      f"{spot_move*100:.2f}% spot move")
+    # Advance the reference only when it would actually differ: a reading
+    # identical to the stored one carries no new information, and rewriting it
+    # would put a store write back into every cycle — the batched-write
+    # optimisation exists because 24 open positions were rewriting ~1 MB
+    # forty-eight times a cycle on a Pi that also runs the live-money monitor.
+    # It is refreshed before it can go stale, so the baseline is never older
+    # than half the staleness window. In a moving market spot changes most
+    # polls, so this WILL usually write — one small batched write per cycle is
+    # the accepted price of having a second source at all.
+    patch = None
+    if ok and reliable:
+        moved = (ref['spot'] != spot or ref['value'] != value)
+        ageing = (now - ref['t']) >= cfg.CORROBORATION_STALE_SEC / 2
+        if ref['value'] is None or moved or ageing:
+            patch = {'corrob_spot': float(spot), 'corrob_value': float(value),
+                     'corrob_t': now}
+    return ok, reason, patch
+
+
 def _settlement_value(trade: dict, spot: float) -> Optional[float]:
     """What the structure is worth at expiry, from spot alone.
 
@@ -1400,7 +1491,8 @@ def _settle_if_expired(store: ZebraStore, trade: dict, spot: float, today,
 
 
 def _track_debit_blindness(store: ZebraStore, trade: dict, usable: bool,
-                           reason: Optional[str], dry_run: bool = False) -> None:
+                           reason: Optional[str], dry_run: bool = False,
+                           spot: Optional[float] = None) -> None:
     """Fire ONE rate-limited Telegram when the DEBIT-SL valuation has been blind
     (unreliable / missing book) for DEBIT_BLIND_CYCLES consecutive cycles while
     a trade is entered. Re-arms once a usable quote returns. SL_SPOT/TP are
@@ -1412,7 +1504,8 @@ def _track_debit_blindness(store: ZebraStore, trade: dict, usable: bool,
     n = store.bump_blind(tid)
     if n >= cfg.DEBIT_BLIND_CYCLES and store.mark_blind_alerted(tid):
         if _alerts_enabled(trade):
-            _send_telegram(_format_blind_alert(trade, reason), dry_run=dry_run)
+            _send_telegram(_format_blind_alert(trade, reason, spot),
+                           dry_run=dry_run)
         logger.warning("DEBIT-BLIND alert #%d %s: %d cycles unreliable (%s)",
                        tid, trade['stock'], n, reason)
 
@@ -1489,7 +1582,30 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # a wide/crossed/one-sided book (2026-07-24) freezes the value trigger.
         debit_usable = mid is not None and sq['reliable']
         _track_debit_blindness(store, trade, debit_usable, sq['reason'],
-                               dry_run=dry_run)
+                               dry_run=dry_run, spot=spot)
+
+        # ── The second source, and the open ──────────────────────────────
+        # Everything above this line is checks on ONE source: the option book.
+        # These two are the other kind. Both gate ONLY the value triggers
+        # (DEBIT-SL, TRAIL) by folding into `debit_usable`; spot-driven TP and
+        # the TIME nag are untouched, because spot at the open is real trades
+        # and the calendar does not care about the book.
+        if debit_usable:
+            corrob_ok, corrob_why, corrob_patch = _spot_corroborates(
+                store, trade, spot, mid, sq['reliable'])
+            if corrob_patch:
+                pending_mfe.setdefault(tid, {}).update(corrob_patch)
+            if not corrob_ok:
+                logger.warning(
+                    "SPOT VETO #%d %s: %s — value triggers held this cycle",
+                    tid, stock, corrob_why)
+                debit_usable = False
+        if debit_usable and not _value_triggers_live():
+            logger.info(
+                "OPEN BUFFER #%d %s: value triggers dark until %ds after the "
+                "open (spot TP and the expiry nag still live)",
+                tid, stock, cfg.VALUE_TRIGGER_OPEN_BUFFER_SEC)
+            debit_usable = False
 
         # BEFORE the exit branches and BEFORE the no-quote skip below: the poll
         # that exits a trade is usually the poll that set its peak, and the
@@ -1497,7 +1613,12 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # is dark. Never gates or blocks anything — pure measurement.
         patch = mfe_mod.compute(trade, spot, mid, sq['reliable'])
         if patch:
-            pending_mfe[tid] = patch
+            # MERGE, never assign. This dict may already hold the spot
+            # corroboration reference for the same trade, and `pending_mfe[tid]
+            # = patch` silently dropped it on every cycle where a peak
+            # advanced — leaving the veto with a baseline that only updated on
+            # quiet cycles, which is precisely backwards.
+            pending_mfe.setdefault(tid, {}).update(patch)
 
         if cfg.PAPER_MODE and mid is None:
             # Terminal net first: without it a position whose book has gone
