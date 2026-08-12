@@ -313,7 +313,26 @@ def _spawn_generic(prompt: str, model: str, tag: str,
         # to a log rather than a pipe: nobody is draining a pipe here, and a
         # full pipe buffer would hang the child mid-decision.
         cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
-        out = open(cfg.LOG_DIR / 'vet_cli.log', 'a')
+        # ONE FILE PER DAY, and a banner naming the spawn.
+        #
+        # This file holds the ONLY copy of an agent's reasoning — the verdict
+        # reaches the store, but the working-out that produced it exists
+        # nowhere else, and it is the whole point of reviewing whether the
+        # layer is any good. It used to be a single unbounded `vet_cli.log`
+        # that every spawn appended to, so an entry vet, a position review and
+        # a post-mortem firing in one cycle interleaved their output line by
+        # line with nothing saying which was which. Unreadable is the same as
+        # unrecorded.
+        #
+        # Dated like the cron log so `find -mtime` can trim it, and so a bad
+        # day's reasoning stays findable.
+        log_path = cfg.LOG_DIR / f"vet_cli_{_now().strftime('%Y%m%d')}.log"
+        out = open(log_path, 'a')
+        out.write(f"\n{'=' * 78}\n"
+                  f"=== {_now().strftime('%Y-%m-%d %H:%M:%S')}  {tag}  "
+                  f"model={model}  channel={channel}\n"
+                  f"{'=' * 78}\n")
+        out.flush()
         try:
             kwargs = {'stdout': out, 'stderr': subprocess.STDOUT,
                       'stdin': subprocess.DEVNULL,

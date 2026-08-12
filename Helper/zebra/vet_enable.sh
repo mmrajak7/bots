@@ -264,7 +264,7 @@ cat <<'TXT'
 
   Watch tomorrow:
     python -m zebra status                       # vet state per signal
-    tail -f logs/vet_cli.log                     # the agent's own output
+    tail -f logs/vet_cli_$(date +%Y%m%d).log      # the agent's own reasoning
     grep -E 'VET|VETO|ALLOW|fail-open' logs/cron_zebra_$(date +%Y%m%d).log
     python -m zebra vet score                    # was the layer RIGHT? (needs a few days)
 
