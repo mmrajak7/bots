@@ -327,6 +327,21 @@ class ZebraStore:
         t['spot_sl_pct'] = spot_sl_pct
         t['debit_sl_value'] = debit_sl_value
         t['debit_sl_pct'] = cfg.DEBIT_SL_PCT
+        # WHICH STRUCTURE, and therefore which valuation formula, for the rest
+        # of the position's life. Absent, `_long_multiplier` falls back to 2
+        # (zebra) and a hand-entered BCS is marked at `2*long - short`: the
+        # debit SL never fires because the value reads roughly double, the
+        # trail never arms because it needs a width, and the P&L is twice the
+        # truth. `width` is derived here rather than passed so the two can
+        # never disagree.
+        # Only 'bcs' is stamped. A zebra stays unmarked, which is the existing
+        # convention every reader already keys on (`structure != 'bcs'`), and
+        # leaving it alone keeps this fix to the one case that was broken.
+        structure = entry_data.get('structure') or 'zebra'
+        if structure == 'bcs':
+            t['structure'] = 'bcs'
+            t['width'] = round(abs(float(entry_data['short_strike'])
+                                   - float(entry_data['long_strike'])), 2)
         # Entry-time extrinsic of the short leg — feeds the intrinsic-floor
         # quote-sanity guard in the monitor (bad-quote false-SL protection).
         if 'short_extrinsic_entry' in entry_data:
@@ -541,11 +556,56 @@ class ZebraStore:
             self._apply_exit(t, exit_spot, exit_debit, reason)
         return t
 
+    @staticmethod
+    def _bound_exit_value(t: dict, exit_debit: Optional[float]) -> Optional[float]:
+        """Hold the booked value inside what the structure can be worth.
+
+        The monitor already rejects impossible quotes, so in the automated path
+        this should never bind. It exists because this is the LAST place every
+        exit passes through, including `zebra close` where a human types the
+        number, and because the invariant is worth enforcing where the record
+        is written rather than trusting six callers to have checked.
+
+        Bounds: a debit structure is never worth less than zero (you can always
+        let it expire), and a vertical is never worth more than its width.
+        PIIND #50 booked exit_debit -30.04 on a debit of 242.11 — -112.4% on a
+        structure whose arithmetic floor is -100% — because nothing enforced
+        the lower bound anywhere.
+        """
+        if exit_debit is None:
+            return None
+        try:
+            v = float(exit_debit)
+        except (TypeError, ValueError):
+            return exit_debit
+        lo = 0.0
+        hi = None
+        if t.get('structure') == 'bcs':
+            try:
+                w = float(t.get('width') or 0)
+            except (TypeError, ValueError):
+                w = 0.0
+            if w > 0:
+                hi = w
+        bounded = v
+        if bounded < lo:
+            bounded = lo
+        if hi is not None and bounded > hi:
+            bounded = hi
+        if bounded != v:
+            logger.error(
+                "EXIT VALUE OUT OF RANGE #%s %s: %.2f -> %.2f "
+                "(structure=%s width=%s) — booking the bound, not the quote",
+                t.get('id'), t.get('stock'), v, bounded,
+                t.get('structure') or 'zebra', t.get('width'))
+        return bounded
+
     def _apply_exit(self, t: dict, exit_spot: float,
                     exit_debit: Optional[float], reason: str) -> None:
         """Field-level exit mutation — runs inside the store lock."""
         debit = float(t['debit'])
         qty = int(t['quantity'])
+        exit_debit = self._bound_exit_value(t, exit_debit)
         if exit_debit is not None:
             # P&L per share = current value of structure - entry debit
             # If user closed at exit_debit (i.e., paid that much to unwind),

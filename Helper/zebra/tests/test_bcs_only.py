@@ -356,9 +356,13 @@ def test_the_structure_quote_carries_both_books(wired, monkeypatch):
     assert q['floored'] is False
 
 
-def test_a_clamped_mid_is_declared_as_clamped(wired, monkeypatch):
-    """A floored mid is a number the market never quoted. A verdict about
-    whether a price is REAL has to know it is looking at a floor, not a bid."""
+def test_a_quote_below_the_intrinsic_floor_is_refused_not_clamped(wired,
+                                                                  monkeypatch):
+    """The floor is an ESTIMATE of fair value, not a price anyone offered.
+    Pulling a quote up to it invents a fill exactly the way the garbage book
+    did — and on the fill basis it was lifting honest valuations UP (1.8
+    booked as 2.5), re-introducing the optimism fill pricing removed. Refuse
+    the quote instead and let the next poll try again."""
     monkeypatch.setattr(
         monitor.strikes_mod, '_quote_option',
         lambda kite, sym: {'bid': 0.1, 'ask': 0.2, 'mid': 0.15, 'oi': 7000,
@@ -366,7 +370,34 @@ def test_a_clamped_mid_is_declared_as_clamped(wired, monkeypatch):
     t = cycle(wired)[0]
     monkeypatch.setattr(monitor, '_intrinsic_floor', lambda tr, sp: 5.0)
     q = monitor._structure_quote(None, t, spot=SPOT)
-    assert q['floored'] is True and q['mid'] == 5.0
+    assert q['mid'] is None, "a fair-value estimate was booked as a price"
+    assert q['reliable'] is False
+    assert q['reason'] == 'below_intrinsic_floor'
+    assert q['floored'] is False
+
+
+def test_a_value_below_zero_is_bounded_to_zero_not_refused(wired, monkeypatch):
+    """Distinct from the floor case, and deliberately so. Long bid 0.55 /
+    short ask 0.60 is an ORDINARY book once a spread is worthless, and zero is
+    a bound the holder can always realise by letting it expire. So it is a
+    real value, and booking the loss beats stranding the position until
+    expiry. PIIND #50 booked -112.4% on a -100%-capped structure for want of
+    this."""
+    t = cycle(wired)[0]
+    _two_books(monkeypatch, t, 0.50, 0.60, 0.55, 0.65)   # fill = 0.50-0.65
+    q = monitor._structure_quote(None, t, spot=None)
+    assert q['mid'] == 0.0, "a structure was valued below zero"
+    assert q['reliable'] is True, "a bounded value is still a usable quote"
+
+
+def test_a_value_above_the_width_is_bounded_to_the_width(wired, monkeypatch):
+    """The other mathematical bound: a vertical is never worth more than the
+    distance between its strikes, whatever a garbage short leg claims."""
+    t = cycle(wired)[0]
+    assert t['width'] == 40.0
+    _two_books(monkeypatch, t, 60.0, 62.0, 1.0, 2.0)     # fill = 60-2 = 58
+    q = monitor._structure_quote(None, t, spot=None)
+    assert q['mid'] == 40.0, "a vertical was valued above its width"
 
 
 # ── exit valuation: the basis is a property of the TRADE ─────────────────
@@ -381,16 +412,31 @@ def _books(monkeypatch, bid, ask):
                            'oi': 7000, 'last': (bid + ask) / 2, 'reliable': True})
 
 
+def _two_books(monkeypatch, trade, l_bid, l_ask, s_bid, s_ask):
+    """Per-leg books. Giving both legs the SAME book (what `_books` does) is
+    fine for arithmetic but impossible for a vertical — the lower strike is
+    always worth more — and an impossible book cannot exercise the bounds."""
+    def q(kite, sym):
+        bid, ask = ((l_bid, l_ask) if sym == trade['long_symbol']
+                    else (s_bid, s_ask))
+        return {'bid': bid, 'ask': ask, 'mid': (bid + ask) / 2, 'oi': 7000,
+                'last': (bid + ask) / 2, 'reliable': True}
+    monkeypatch.setattr(monitor.strikes_mod, '_quote_option', q)
+
+
 def test_a_fill_basis_position_is_valued_at_bid_minus_ask(wired, monkeypatch):
     """Closing a BCS SELLS the long (at the bid) and BUYS BACK the short (at
-    the ask) — strictly worse than mid-mid, which is the honest number."""
+    the ask) — strictly worse than mid-mid, which is the honest number.
+
+    One book, both bases, so the gap between them is the assertion: fill
+    9 - 6 = 3 against mid 10 - 5 = 5. The 2.00/sh difference IS the round trip
+    the old mid-mid valuation recorded as free."""
     t = cycle(wired)[0]
     assert t['pricing_basis'] == 'fill'
-    _books(monkeypatch, 9.0, 11.0)                 # mid 10 on both legs
-    # spot=None: the intrinsic floor would clamp this synthetic value and we
-    # are testing the BASIS here, not the no-arbitrage guard.
+    _two_books(monkeypatch, t, 9.0, 11.0, 4.0, 6.0)
+    # spot=None: the intrinsic floor is a separate guard with its own tests.
     q = monitor._structure_quote(None, t, spot=None)
-    assert q['mid'] == pytest.approx(9.0 - 11.0)   # bid(long) - ask(short)
+    assert q['mid'] == pytest.approx(9.0 - 6.0)   # bid(long) - ask(short)
 
 
 def test_a_legacy_mid_basis_position_keeps_its_old_valuation(wired, monkeypatch):
@@ -402,9 +448,9 @@ def test_a_legacy_mid_basis_position_keeps_its_old_valuation(wired, monkeypatch)
     with wired._mutate():
         wired.find(t['id'])['pricing_basis'] = 'mid'
     t = wired.find(t['id'])
-    _books(monkeypatch, 9.0, 11.0)
+    _two_books(monkeypatch, t, 9.0, 11.0, 4.0, 6.0)   # same book as the fill test
     q = monitor._structure_quote(None, t, spot=None)
-    assert q['mid'] == pytest.approx(0.0)          # mid(long) - mid(short)
+    assert q['mid'] == pytest.approx(10.0 - 5.0)      # mid(long) - mid(short)
 
 
 def test_a_one_sided_book_has_no_fill_value(wired, monkeypatch):

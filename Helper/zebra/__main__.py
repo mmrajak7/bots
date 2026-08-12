@@ -634,6 +634,15 @@ def cmd_enter(args):
         print("Could not resolve symbols/lot_size. Pass --long-symbol, --short-symbol, --lot-size.")
         sys.exit(1)
 
+    from . import config as cfg
+    # Which structure was actually placed decides how the position is VALUED
+    # for the rest of its life (`_long_multiplier`: a zebra is 2*long - short,
+    # a BCS is long - short). Left unset, every hand-entered BCS was valued as
+    # a zebra — debit SL effectively disarmed, trail dead for want of a width,
+    # P&L doubled. The automated path has stamped this since the BCS entry
+    # fields landed; this CLI never did.
+    structure = args.structure or cfg.ENTRY_STRUCTURE
+
     entry_data = {
         'long_strike': long_strike,
         'short_strike': short_strike,
@@ -643,6 +652,7 @@ def cmd_enter(args):
         'lot_size': int(lot_size),
         'lots': args.lots,
         'expiry': args.expiry,
+        'structure': structure,
     }
     if args.entry_spot is not None:
         entry_data['entry_spot'] = args.entry_spot
@@ -654,8 +664,8 @@ def cmd_enter(args):
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
-    from . import config as cfg
-    print(f"Entered #{t['id']} {t['stock']} {int(t['long_strike'])}/{int(t['short_strike'])} "
+    print(f"Entered #{t['id']} {t['stock']} [{t.get('structure', 'zebra').upper()}] "
+          f"{int(t['long_strike'])}/{int(t['short_strike'])} "
           f"debit={t['debit']:.2f} qty={t['quantity']} cap=Rs{t['capital']:,.0f}")
     sl_txt = f"SPOT SL at {t['sl_spot']:.2f}, " if cfg.SPOT_SL_ENABLED else "SPOT SL off, "
     print(f"  TP at {t['tp_spot']:.2f}, {sl_txt}"
@@ -1135,6 +1145,12 @@ def main():
     p_ent.add_argument('--entry-spot', type=float, default=None)
     p_ent.add_argument('--spot-sl-pct', type=float, default=None,
                        help='Override default spot SL percentage (e.g. 0.03)')
+    p_ent.add_argument('--structure', choices=['bcs', 'zebra'], default=None,
+                       help='What was actually placed. Defaults to the '
+                            'configured entry_structure. This is NOT cosmetic: '
+                            'it selects the valuation formula, so recording a '
+                            'BCS as a zebra disarms its debit SL and doubles '
+                            'its P&L.')
     p_ent.set_defaults(func=cmd_enter)
 
     p_cls = sub.add_parser('close', help='Close entered trade (or cancel watching)')

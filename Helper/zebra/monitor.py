@@ -1073,7 +1073,13 @@ def _intrinsic_floor(trade: dict, spot: float) -> Optional[float]:
                     break
         if allowance is None:
             allowance = 0.3 * trade.get('debit', 0)
-        return round(intr - 1.5 * float(allowance), 2)
+        # Never below zero. `intr - 1.5*allowance` goes negative the moment the
+        # spread is OTM (intr = 0), which made this guard inert in exactly the
+        # region it exists for: on a losing position it returned -0.83 against
+        # a stop of 0.705, so no collapsed book could ever fall below it. Zero
+        # is a real floor — a debit structure is never worth less, because you
+        # can always let it expire.
+        return max(0.0, round(intr - 1.5 * float(allowance), 2))
     except Exception:
         return None
 
@@ -1132,29 +1138,74 @@ def _structure_quote(kite, trade: dict, spot: Optional[float] = None) -> dict:
     else:
         long_px, short_px = long_q['mid'], short_q['mid']
     mid = round(_long_multiplier(trade) * long_px - short_px, 2)
-    floored = False
+    legs = {'long': _leg_book(trade.get('long_symbol'), long_q),
+            'short': _leg_book(trade.get('short_symbol'), short_q)}
+
+    # ── Bounds vs heuristics: clamp the first, reject the second ─────────
+    #
+    # (1) MATHEMATICAL BOUNDS — clamp. A debit structure is never worth less
+    # than zero, because letting it expire is always available and costs
+    # nothing; so a book quoting -0.05 (long bid 0.55, short ask 0.60 — an
+    # ordinary shape once a spread is worthless) means "worth about nothing",
+    # not "unpriceable". Zero is achievable, so booking it is honest, and
+    # booking the loss beats stranding the position until expiry. A vertical
+    # is likewise never worth more than its width. PIIND #50 booked
+    # exit_debit -30.04 against a debit of 242.11 — -112.4% on a -100%-capped
+    # structure — because neither bound existed anywhere.
+    bounded = mid
+    if bounded < 0:
+        bounded = 0.0
+    if trade.get('structure') == 'bcs':
+        try:
+            w = float(trade.get('width') or 0)
+        except (TypeError, ValueError):
+            w = 0.0
+        if w > 0 and bounded > w:
+            bounded = w
+    if bounded != mid:
+        logger.warning(
+            "VALUE BOUND #%d %s: %.2f -> %.2f (structure cannot be worth "
+            "that) — long %s/%s short %s/%s",
+            trade['id'], trade['stock'], mid, bounded,
+            long_q.get('bid'), long_q.get('ask'),
+            short_q.get('bid'), short_q.get('ask'))
+        mid = round(bounded, 2)
+
+    # (2) FAIR-VALUE HEURISTIC — reject, never clamp. The intrinsic floor is
+    # an ESTIMATE of what the structure ought to be worth, not a price anyone
+    # offered, so pulling a quote up to it invents a fill exactly the way the
+    # garbage book did. The old code clamped, and on the fill basis that was
+    # lifting honest valuations UP (1.8 booked as 2.5), re-introducing the
+    # optimism fill pricing was shipped to remove. A rejected quote defers the
+    # trade to the next poll — the same answer every other unusable book gets.
     if spot is not None and spot > 0:
         floor = _intrinsic_floor(trade, spot)
         if floor is not None and mid < floor:
+            bad = (f'value {mid:.2f} below intrinsic floor {floor:.2f} '
+                   f'at spot {spot:.2f}')
             logger.warning(
-                "QUOTE GUARD #%d %s: structure mid %.2f < intrinsic floor "
-                "%.2f at spot %.2f — clamping to floor (bad ITM quote)",
-                trade['id'], trade['stock'], mid, floor, spot)
-            mid = floor
-            floored = True
+                "QUOTE REJECT #%d %s: %s — long %s/%s short %s/%s (an "
+                "estimate is not a price; deferring, nothing booked)",
+                trade['id'], trade['stock'], bad,
+                long_q.get('bid'), long_q.get('ask'),
+                short_q.get('bid'), short_q.get('ask'))
+            return {'mid': None, 'reliable': False,
+                    'reason': 'below_intrinsic_floor',
+                    'legs': legs, 'floored': False, 'rejected': bad}
+
     return {'mid': mid, 'reliable': reliable, 'reason': reason,
             # PER-LEG BOOK. VETTING.md tells the exit agent to judge "depth at
             # touch and the spread as a % of mid", and this dict used to carry
             # only mid/reliable/reason — so the agent was asked to judge the one
             # thing it could not see, exactly the defect the ENTRY context had
-            # already been fixed for. `floored` matters too: a clamped mid is a
-            # number the market never quoted, and a verdict about "is this price
-            # real" must know it is looking at a floor, not a bid.
-            'legs': {
-                'long': _leg_book(trade.get('long_symbol'), long_q),
-                'short': _leg_book(trade.get('short_symbol'), short_q),
-            },
-            'floored': floored}
+            # already been fixed for.
+            'legs': legs,
+            # Kept for schema stability with every consumer of this dict.
+            # Always False now: a quote that would once have been CLAMPED to
+            # the intrinsic floor is rejected outright above, because booking a
+            # clamped number invents a fill just as surely as booking the
+            # garbage did.
+            'floored': False}
 
 
 def _leg_book(symbol, q: dict) -> dict:
@@ -1222,7 +1273,9 @@ def _flush_mfe(store: ZebraStore, pending: dict) -> None:
 
 def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
                        reason: str, spot: Optional[float] = None,
-                       pending_mfe: Optional[dict] = None) -> Optional[dict]:
+                       pending_mfe: Optional[dict] = None,
+                       reliable: bool = True,
+                       release_flag: bool = True) -> Optional[dict]:
     """Auto-close a paper trade at current structure mid. Returns the updated
     trade dict (with pnl/pnl_pct) or None if close failed.
 
@@ -1233,10 +1286,30 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
         return None
     if trade.get('status') != 'entered':
         return None  # already closed by an earlier trigger this cycle
-    if mid is None:
-        # No quote — never fabricate a price (booking -debit max-loss on a
-        # transient outage corrupts the paper P&L). Defer; the caller retries
-        # next poll. Callers already skip paper trades with no mid.
+    if mid is None or not reliable:
+        # Never book a price we could not have transacted at. `mid is None` is
+        # the obvious case; `not reliable` is the one that was missing — the
+        # reliability freeze covered DEBIT-SL and TRAIL only, so TP, SPOT-SL
+        # and TIME still booked whatever a crossed or one-sided book said, and
+        # in PAPER the booked number IS the result.
+        #
+        # The alert has already claimed its consume-once flag by now (claiming
+        # before sending is deliberate — two processes must not both send), so
+        # release it: otherwise the exit is announced, never booked, and never
+        # allowed to fire again, leaving the position open with its own trigger
+        # permanently disarmed.
+        #
+        # TIME opts out (`release_flag=False`). Its alert is a NAG about the
+        # calendar, not a claim about a price, so it stands whatever the book
+        # is doing — and it already re-arms daily. Releasing it would re-nag
+        # every 5 minutes.
+        if release_flag:
+            store.clear_alert_flag(trade['id'], reason)
+        logger.warning(
+            "PAPER close DEFERRED #%d %s reason=%s: %s — flag released, will "
+            "re-fire when the book is usable",
+            trade['id'], trade['stock'], reason,
+            'no quote' if mid is None else 'book not reliable')
         return None
     if pending_mfe is not None:
         _flush_mfe(store, pending_mfe)
@@ -1257,6 +1330,73 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
     except ValueError as e:
         logger.error("PAPER auto-close failed for #%d: %s", trade['id'], e)
         return None
+
+
+def _settlement_value(trade: dict, spot: float) -> Optional[float]:
+    """What the structure is worth at expiry, from spot alone.
+
+    At expiry extrinsic is zero by definition, so no option book is needed —
+    which is the point: this is the one valuation that still works when the
+    book has gone dark. Bounded the same way every booked value is.
+    """
+    try:
+        k_l = float(trade['long_strike'])
+        k_s = float(trade['short_strike'])
+        mult = _long_multiplier(trade)
+        if trade['direction'] == 'CE':
+            v = mult * max(spot - k_l, 0.0) - max(spot - k_s, 0.0)
+        else:
+            v = mult * max(k_l - spot, 0.0) - max(k_s - spot, 0.0)
+        v = max(0.0, v)
+        if trade.get('structure') == 'bcs':
+            w = float(trade.get('width') or 0)
+            if w > 0:
+                v = min(v, w)
+        return round(v, 2)
+    except Exception as e:
+        logger.warning("Settlement value failed for #%s: %s",
+                       trade.get('id'), e)
+        return None
+
+
+def _settle_if_expired(store: ZebraStore, trade: dict, spot: float, today,
+                       pending_mfe: Optional[dict] = None,
+                       dry_run: bool = False) -> bool:
+    """Terminal safety net: close a position whose expiry has PASSED.
+
+    Every other exit needs a quote, so a trade whose book dies never reaches
+    one — it rides past expiry and stays `entered` forever. That is not just an
+    accounting leak: scanner dedup keys on open positions, so one orphan bans
+    its stock from the pipeline permanently. Expiry is the one moment we can
+    price without a book, so it is the one place the net can hang.
+
+    Strictly PAST expiry (`today > exp`) — expiry day itself still trades.
+    """
+    try:
+        exp = datetime.strptime(trade['expiry'], '%Y-%m-%d').date()
+    except Exception:
+        return False
+    if today <= exp:
+        return False
+    val = _settlement_value(trade, spot)
+    if val is None:
+        return False
+    logger.warning(
+        "EXPIRY SETTLE #%d %s: expiry %s has passed and there is no usable "
+        "book — settling at intrinsic %.2f from spot %.2f",
+        trade['id'], trade['stock'], trade['expiry'], val, spot)
+    if store.set_alert_flag(trade['id'], 'expiry_settled') \
+            and _alerts_enabled(trade):
+        _send_exit_alert(
+            store, trade, 'expiry_settled',
+            f"⏹️ <b>{html.escape(str(trade['stock']))} EXPIRED</b>\n"
+            f"#{trade['id']} {_struct_label(trade)} — no usable option book, "
+            f"settled at intrinsic <b>{val:.2f}</b>/sh (spot {spot:.2f}).\n"
+            f"Entry debit was {float(trade.get('debit', 0)):.2f}/sh.",
+            dry_run=dry_run)
+    _paper_auto_close(store, trade, val, 'expiry', spot,
+                      pending_mfe=pending_mfe)
+    return True
 
 
 def _track_debit_blindness(store: ZebraStore, trade: dict, usable: bool,
@@ -1360,6 +1500,16 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             pending_mfe[tid] = patch
 
         if cfg.PAPER_MODE and mid is None:
+            # Terminal net first: without it a position whose book has gone
+            # dark never reaches ANY exit and stays `entered` past expiry
+            # forever, which also bans its stock from the scanner for good.
+            # Expiry is the one valuation that needs no book.
+            if not _settle_if_expired(store, trade, spot, today,
+                                      pending_mfe, dry_run):
+                logger.info(
+                    "DEFER #%d %s: no usable book (%s) — spot=%.2f, nothing "
+                    "booked this cycle", tid, stock,
+                    sq.get('rejected') or sq['reason'] or 'no_quote', spot)
             continue
 
         # ── TP ──────────────────────────────────────────────────────────
@@ -1376,7 +1526,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                              _format_tp_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
             _paper_auto_close(store, trade, mid, 'tp', spot,
-                              pending_mfe=pending_mfe)
+                              pending_mfe=pending_mfe, reliable=sq['reliable'])
             if trade.get('status') == 'exited':
                 continue
 
@@ -1437,7 +1587,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                              _format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
             _paper_auto_close(store, trade, mid, 'spot_sl', spot,
-                              pending_mfe=pending_mfe)
+                              pending_mfe=pending_mfe, reliable=sq['reliable'])
             if trade.get('status') == 'exited':
                 continue
 
@@ -1494,7 +1644,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 _send_telegram(_format_time_alert(trade, days_left, mid), dry_run=dry_run)
             logger.info("TIME alert #%d %s days_left=%d", tid, stock, days_left)
             _paper_auto_close(store, trade, mid, 'time', spot,
-                              pending_mfe=pending_mfe)
+                              pending_mfe=pending_mfe, reliable=sq['reliable'],
+                              release_flag=False)
 
     # Anything not already flushed by an exit. On a normal cycle this is the
     # ONLY store write the peak tracking does, however many positions moved.

@@ -520,6 +520,19 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     if debit <= 0:
         return {'error': f"non-positive BCS debit {debit} "
                          f"(long ask {long_ask} vs short bid {short_bid})"}
+    # The mid basis needs the same check, and for a sharper reason than
+    # symmetry: BOTH gates below divide by a quantity derived from debit_mid,
+    # so a broken mid book does not merely mis-measure, it makes the gates
+    # MORE PERMISSIVE. At debit_mid = -0.2 the entry-cost denominator
+    # (width - debit_mid) inflates and an identical true cost reads 14.3%
+    # PASS where a healthy book reads 16.7% BLOCK; the d/w gate passes
+    # trivially at -5%. A gate that relaxes as its input degrades is worse
+    # than no gate, so an unusable mid fails CLOSED like every other one.
+    if debit_mid <= 0:
+        return {'error': f"non-positive BCS mid debit {debit_mid} "
+                         f"(long mid {atm_quote['mid']} vs short mid "
+                         f"{tgt_q['mid']}) — both entry gates are denominated "
+                         f"in it, so a broken mid book would relax them"}
 
     width = abs(k_tgt - atm_strike)
     long_ext = _extrinsic(direction, spot, atm_strike, atm_quote['mid'])
