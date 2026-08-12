@@ -62,8 +62,16 @@ VET_CLI = os.environ.get('ZEBRA_VET_CLI', 'claude')
 # command string (verified).
 VET_ALLOWED_TOOLS = ['WebSearch', 'WebFetch', 'Read', 'Glob', 'Grep',
                      'Bash({python} -m zebra:*)']
-# The calendar agent builds a candidate JSON file before installing it.
-EVENT_EXTRA_TOOLS = ['Write']
+# The calendar agent builds a candidate JSON file before installing it — and
+# that is ALL it may write. An unscoped `Write` made vet.py's stated invariant
+# ("Claude NEVER writes the store directly ... the vetting layer physically
+# cannot corrupt the trade record") false for this one channel: the agent could
+# write zebra_trades.json, zebra_config.json (which carries vet_enabled),
+# VETTING.md, or any .py in the package. The deny list has no Write rule to
+# catch it, and the test asserting the OTHER channels lack Write did not bound
+# this one. Scoped to the single file it legitimately produces.
+EVENT_CANDIDATE_FILE = LOG_DIR / 'event_calendar.candidate.json'
+EVENT_EXTRA_TOOLS = ['Write({})'.format(EVENT_CANDIDATE_FILE)]
 # The five position VERBS, plus the four verbs that CALL them. Denying only
 # the explicit verbs left the invariant above false: `zebra run` was granted by
 # the coarse allow rule and denied by nothing, and it runs the whole cycle —
@@ -176,6 +184,10 @@ _DEFAULTS = {
     'trigger_gap_max': 0.04,     # TRIGGER zone: run Zebra analyzer + alert
     'stale_gap_min': 0.03,       # Floor: skip if gap < this at trigger (too late)
     'freshness_days': 5,         # Skip if price touched ST in last N days (bounce)
+    # The REAL watch-band floor — see FRESH_ENTRY_GAP below. 0.04, not
+    # stale_gap_min's 0.03, because that is the value magnet's check_freshness
+    # has been silently enforcing all along.
+    'fresh_entry_gap': 0.04,
     'min_dte': 15,
     'max_dte': 45,
     'min_leg_oi': 5000,
@@ -488,6 +500,20 @@ WATCH_GAP_MAX = _num('watch_gap_max')
 TRIGGER_GAP_MAX = _num('trigger_gap_max')
 STALE_GAP_MIN = _num('stale_gap_min')
 FRESHNESS_DAYS = _int('freshness_days')
+# The freshness floor zebra passes into magnet's `check_freshness`.
+#
+# DEFAULTS TO THE VALUE THAT WAS ALREADY IN FORCE (magnet's ENTRY_GAP = 0.04),
+# so this changes nothing today — it only makes the number local, visible and
+# owned. It was inherited silently: zebra advertises a [3%, 5%] band via
+# `stale_gap_min`, and its own gate honours that, but `check_freshness` then
+# rejected everything under magnet's 4% as "missed approach". The effective
+# band was [4%, 5%], the 3-4% band was discarded, and the skip was counted as
+# `not_fresh` — indistinguishable from ordinary freshness filtering.
+#
+# THE OWNER'S CALL, not a silent fix: setting this to STALE_GAP_MIN (0.03)
+# restores the advertised band and will admit meaningfully more signals. That
+# is a strategy change and wants measuring, so it is left at the status quo.
+FRESH_ENTRY_GAP = _num('fresh_entry_gap')
 MIN_DTE = _int('min_dte')
 MAX_DTE = _int('max_dte')
 MIN_LEG_OI = _int('min_leg_oi')
@@ -556,6 +582,15 @@ VET_TIMEOUT_SEC = int(os.environ.get('ZEBRA_VET_TIMEOUT_SEC')
                       or _int('vet_timeout_sec'))
 CHILD_KILL_SEC = int(os.environ.get('ZEBRA_CHILD_KILL_SEC')
                      or _int('child_kill_sec'))
+# How many agents may be ALIVE at once, across every channel, on this box.
+# The other caps are per-position-per-day, which bound how often one trade is
+# looked at and say nothing about how many processes start together: one
+# market-wide event row makes `needs_review` true for every open position in
+# the same cycle, which was 24 detached node processes on a Pi that also runs
+# the live-money monitor. Refusing a spawn is not refusing to trade — the
+# caller's deadline lapses and the signal fails open as in any other outage.
+MAX_CONCURRENT_AGENTS = int(os.environ.get('ZEBRA_MAX_CONCURRENT_AGENTS')
+                            or _runtime.get('max_concurrent_agents') or 3)
 VET_MODEL = os.environ.get('ZEBRA_VET_MODEL') or _runtime['vet_model']
 EVENT_FILE = LOG_DIR / 'event_calendar.json'
 EVENT_LOCK = LOG_DIR / 'event_calendar.lock'
@@ -565,8 +600,9 @@ EVENT_PROMPT_TEMPLATE = (
     "Refresh the trading event calendar. Read {vetting_doc} (the EVENT CALENDAR "
     "section) and follow it exactly. Research upcoming India-market events and "
     "the per-stock events for these symbols: {symbols}. "
-    "Write your findings to a JSON file, then install it with "
-    "`{python} -m zebra events replace --file <path>` exactly once."
+    "Write your findings to EXACTLY this path: {candidate} — it is the only "
+    "path you are permitted to write. Then install it with "
+    "`{python} -m zebra events replace --file {candidate}` exactly once."
 )
 # Sonnet, like the calendar: classifying settled trades against a CLOSED tag
 # list is fact-collection, not a judgement about money.

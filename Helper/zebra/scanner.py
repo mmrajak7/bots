@@ -151,10 +151,22 @@ def validate_and_add(store: ZebraStore, kite=None,
                          stock, timeframe, gap * 100, cfg.STALE_GAP_MIN * 100)
             continue
 
-        # Freshness check (reuse magnet's logic)
-        is_fresh, freshness_reason = check_freshness(stock, st_val, timeframe)
+        # Freshness check (reuse magnet's logic, but with OUR thresholds —
+        # they used to be magnet's, so zebra's live entry band was set by the
+        # config file of a bot retired in May).
+        is_fresh, freshness_reason = check_freshness(
+            stock, st_val, timeframe,
+            entry_gap=cfg.FRESH_ENTRY_GAP,
+            entry_gap_min=cfg.STALE_GAP_MIN,
+            freshness_days=cfg.FRESHNESS_DAYS)
         if not is_fresh:
-            skips['not_fresh'] += 1
+            # Counted separately: a band clip and a genuine ST touch are
+            # different facts, and lumping them made the 3-4% clip invisible —
+            # it read as ordinary freshness filtering in the skip histogram.
+            if 'missed approach' in freshness_reason or 'too late' in freshness_reason:
+                skips['gap_below_entry_band'] += 1
+            else:
+                skips['not_fresh'] += 1
             logger.debug("SKIP %s %s: %s", stock, timeframe, freshness_reason)
             continue
 

@@ -290,7 +290,26 @@ if [ -f "$OLD" ]; then
 fi
 COUNT=$(ls -1 "$HELPER"/logs/cron_zebra_*.log 2>/dev/null | wc -l)
 note "$COUNT dated zebra log(s) present"
-note "to trim later:  find $HELPER/logs -name 'cron_zebra_*.log' -mtime +90 -delete"
+# ACTUALLY TRIM, rather than printing advice nobody runs. The unconditional
+# POLL line is ~24 positions x 78 cycles ~ 0.5 MB/day, plus a daily
+# vet_cli_*.log holding full agent transcripts -- unbounded, on the SD card
+# that also carries the live-money monitor. cron owns the log fd so Python
+# cannot rotate these; a dated filename plus a find is the whole mechanism, and
+# the find half was missing.
+LOGTRIM='0 6 * * * find HELPERDIR/logs \( -name "cron_zebra_*.log" -o -name "vet_cli_*.log" \) -mtime +90 -delete'
+LOGTRIM=${LOGTRIM/HELPERDIR/$HELPER}
+if crontab -l 2>/dev/null | grep -qF 'name "cron_zebra_*.log"'; then
+  ok "log-trim cron already installed"
+elif [ "$APPLY" = "1" ]; then
+  ( crontab -l 2>/dev/null; echo "$LOGTRIM" ) | crontab -
+  if crontab -l 2>/dev/null | grep -qF 'name "cron_zebra_*.log"'; then
+    ok "log-trim cron installed (daily 06:00, keeps 90 days)"
+  else
+    fail "log-trim cron did NOT install"
+  fi
+else
+  warn "no log-trim cron installed -- logs grow without bound (--apply installs it)"
+fi
 
 # ── 10. CRON ──────────────────────────────────────────────────────────────
 head_ "10. Cron"

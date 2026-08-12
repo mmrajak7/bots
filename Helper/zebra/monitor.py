@@ -698,18 +698,34 @@ def _format_debit_sl_alert(trade: dict, mid: float) -> str:
 
 
 def _format_trail_alert(trade: dict, mid: float, tl: dict) -> str:
-    """Trail-stop exit. Always a PROFIT — the level sits above the entry debit
-    by construction — so the alert leads with what was kept, not with a stop."""
+    """Trail-stop exit. The LEVEL sits above the entry debit by construction;
+    the FILL does not.
+
+    The docstring used to claim "Always a PROFIT", which mfe.py explicitly
+    refutes two files away: the trigger is `mid <= level` and the booking price
+    is `mid`, so a gap straight through the level books wherever it landed —
+    possibly below the debit. `feedback_trigger_is_not_the_fill` is the lesson,
+    and the alert is the layer the human actually reads, so a breached trail
+    that lost money must not render as "Locking in ~Rs -12,000".
+    """
     paper = _paper_close_line(trade, mid)
-    kept = (mid - trade['debit']) * int(trade.get('quantity') or 0)
+    qty = int(trade.get('quantity') or 0)
+    kept = (mid - trade['debit']) * qty
+    if kept >= 0:
+        outcome = (f"Locking in ~Rs {kept:,.0f} of a peak Rs "
+                   f"{tl['peak_gain'] * qty:,.0f}.")
+    else:
+        outcome = (f"⚠ BREACHED ON A GAP — booked BELOW entry: ~Rs "
+                   f"{kept:,.0f} against a peak Rs "
+                   f"{tl['peak_gain'] * qty:,.0f}. The trail triggered, it did "
+                   f"not fill where it triggered.")
     return (
         f"\U0001F512 <b>{_struct_label(trade)} TRAIL</b>  "
         f"<code>{trade['stock']}</code> ({trade['direction']})\n"
         f"Mid {mid:.2f} ≤ trail {tl['level']:.2f} "
         f"(peak {trade['debit'] + tl['peak_gain']:.2f}, "
         f"{tl['peak_pct_of_max']:.0f}% of max)\n"
-        f"Locking in ~Rs {kept:,.0f} of a peak Rs "
-        f"{tl['peak_gain'] * int(trade.get('quantity') or 0):,.0f}.{paper}"
+        f"{outcome}{paper}"
     )
 
 
@@ -993,6 +1009,22 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     # cycle, exactly as the bot behaved before this layer.
                     logger.error("VET request failed for #%d: %s — proceeding "
                                  "unvetted", trade['id'], e)
+                    # ...but SAY SO on the record. This was the only fail-open
+                    # that wrote nothing at all: the exception fired before or
+                    # inside `_mutate`, so no `vet` key exists, and a trade
+                    # entered this way is byte-identical to one entered with
+                    # vetting switched off. `_vet_line` then returns "" for a
+                    # missing state, so the ENTER alert carries nothing about
+                    # vetting — and its own docstring says why that is wrong:
+                    # silence reads as "Claude approved this". The UNAVAILABLE
+                    # path is honest about the same outage; this one was not.
+                    # Best-effort by design — we are already in an IO failure.
+                    try:
+                        vet_mod.mark_unavailable(store, trade['id'], str(e))
+                    except Exception as e2:
+                        logger.warning(
+                            "could not stamp the failed-open marker on #%d: "
+                            "%s", trade['id'], e2)
                 else:
                     continue          # wait for the verdict
             elif state == vet_mod.PENDING:
@@ -1428,7 +1460,19 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
         # is doing — and it already re-arms daily. Releasing it would re-nag
         # every 5 minutes.
         if release_flag:
-            store.clear_alert_flag(trade['id'], reason)
+            # Guarded like the failure path below, and for the same reason. A
+            # bare call here could raise LockTimeout out of the exit branch with
+            # the consume-once flag ALREADY claimed: the exit is announced on
+            # Telegram, never booked, and that exit kind is disarmed for the
+            # position permanently — a capped loss quietly becoming a maximum
+            # one. The careful handling existed one path over and not on this
+            # one.
+            try:
+                store.clear_alert_flag(trade['id'], reason)
+            except Exception as e2:
+                logger.error("Could not release the %s flag on #%d after a "
+                             "deferred close: %s — that exit is disarmed until "
+                             "the flag is cleared", reason, trade['id'], e2)
         logger.warning(
             "PAPER close DEFERRED #%d %s reason=%s: %s — flag released, will "
             "re-fire when the book is usable",
@@ -1716,10 +1760,17 @@ def _settle_if_expired(store: ZebraStore, trade: dict, spot: float, today,
         "EXPIRY SETTLE #%d %s: expiry %s has passed and there is no usable "
         "book — settling at intrinsic %.2f from spot %.2f",
         trade['id'], trade['stock'], trade['expiry'], val, spot)
-    if store.set_alert_flag(trade['id'], 'expiry_settled') \
+    # ONE name for the flag, the alert and the close reason. They disagreed:
+    # the flag was claimed as `expiry_settled` and the close ran as `expiry`, so
+    # on a failed close `_paper_auto_close` released `expiry_alerted_at` — a key
+    # nothing had ever set — and logged "flag released, will retry" about a flag
+    # it never touched. Benign only by accident, since this close is retried
+    # every cycle regardless of the flag; a broken invariant waiting for the
+    # next person who relies on the release actually releasing something.
+    if store.set_alert_flag(trade['id'], 'expiry') \
             and _alerts_enabled(trade):
         _send_exit_alert(
-            store, trade, 'expiry_settled',
+            store, trade, 'expiry',
             f"⏹️ <b>{html.escape(str(trade['stock']))} EXPIRED</b>\n"
             f"#{trade['id']} {_struct_label(trade)} — no usable option book, "
             f"settled at intrinsic <b>{val:.2f}</b>/sh (spot {spot:.2f}).\n"

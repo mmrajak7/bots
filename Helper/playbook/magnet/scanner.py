@@ -15,7 +15,7 @@ import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -418,7 +418,10 @@ def compute_st_for_stock(kite, symbol: str, timeframe: str) -> dict:
 # ── Freshness Check ───────────────────────────────────────────────────────
 
 def check_freshness(symbol: str, st_value: float,
-                    timeframe: str) -> Tuple[bool, str]:
+                    timeframe: str,
+                    entry_gap: Optional[float] = None,
+                    entry_gap_min: Optional[float] = None,
+                    freshness_days: Optional[int] = None) -> Tuple[bool, str]:
     """Check if the signal is a fresh approach, not a bounce from an ST touch.
 
     Returns: (is_fresh, reason)
@@ -444,16 +447,29 @@ def check_freshness(symbol: str, st_value: float,
         current_price = daily[-1]['close']
         current_gap = abs(current_price - st_value) / st_value
 
-        if current_gap < cfg.ENTRY_GAP_MIN:
+        # Thresholds are ARGUMENTS with magnet's config as the default, so a
+        # caller can own its own band. zebra reuses this function and therefore
+        # silently inherited magnet's numbers: it advertises a [3%, 5%] watch
+        # band in zebra_config.json, but `cfg.ENTRY_GAP` here is 4%, so the
+        # whole 3-4% band was rejected — and labelled `not_fresh`, which reads
+        # as ordinary freshness filtering rather than a band clip. Editing
+        # magnet_config.json, for a bot retired in May, moved zebra's LIVE
+        # entry band. zebra now passes its own values explicitly.
+        gap_min = cfg.ENTRY_GAP_MIN if entry_gap_min is None else entry_gap_min
+        gap_floor = cfg.ENTRY_GAP if entry_gap is None else entry_gap
+        days = cfg.FRESHNESS_DAYS if freshness_days is None else freshness_days
+
+        if current_gap < gap_min:
             return False, f"already at ST line (gap {current_gap:.1%}), too late"
 
-        if current_gap < cfg.ENTRY_GAP:
+        if current_gap < gap_floor:
             return False, (f"already in entry zone "
-                           f"(gap {current_gap:.1%} < {cfg.ENTRY_GAP:.1%}), missed approach")
+                           f"(gap {current_gap:.1%} < {gap_floor:.1%}), "
+                           f"missed approach")
 
         # Check last N trading days — did price TOUCH ST (gap < 1%)?
         # Only blocks genuine touches, not normal 3-4% dips in an approach.
-        recent_days = daily[-cfg.FRESHNESS_DAYS:]
+        recent_days = daily[-days:]
         for candle in recent_days:
             day_close = candle['close']
             day_low = candle['low']

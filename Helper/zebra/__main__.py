@@ -220,6 +220,50 @@ def _settle_decision(decision_id: int, outcome: str) -> None:
             "could not settle decision #%s (%s): %s", decision_id, outcome, e)
 
 
+def _journal(**kw) -> dict:
+    """Write the audit row, but never let it decide whether the verdict lands.
+
+    The journal is deliberately written before the verdict (see below), and it
+    was the ONE call in this flow allowed to raise. Everything else treats the
+    journal as non-load-bearing — `_settle_decision` is best-effort, the Drive
+    upload swallows, precedents degrade to empty — but `record()` raises on a
+    `confidence` outside 0..1, `_mutate` raises LockTimeout, and `_save`
+    re-raises PermissionError. `main()` has no handler, so any of those killed
+    the process BEFORE `record_verdict` ran.
+
+    The failure that matters: an agent researches for four minutes, finds an
+    earnings print inside the expiry window, and calls `--verdict veto
+    --confidence 85` instead of 0.85. Traceback, exit 1, marker still PENDING —
+    six minutes later `expire_stale` fails it open and the signal ENTERS, with
+    the alert telling the owner Claude did not answer in time. The veto is gone
+    and the record says outage. A contended decisions lock does the same thing
+    with no operator error at all.
+
+    An audit store must never be able to disarm a veto. On an INFRASTRUCTURE
+    failure we return a null id, log CRITICAL, and let the verdict proceed
+    unaudited: an unaudited action beats an unexecuted decision that reports
+    itself as an outage.
+
+    VALIDATION errors are deliberately NOT swallowed. A `confidence` outside
+    0..1 is the agent's own mistake, it is fully retryable, and nothing has
+    landed yet — so raising leaves the marker pending and the signal genuinely
+    re-vettable, which is the better outcome than recording a malformed verdict
+    unaudited. The two failure classes look identical from the call site and are
+    opposite in what they demand; only the infra one is a fail-open.
+    """
+    from .decisions import get_store as get_decisions
+    try:
+        return get_decisions().record(**kw)
+    except ValueError:
+        raise                      # the agent's error: let it retry cleanly
+    except Exception as e:
+        logging.getLogger(__name__).critical(
+            "JOURNAL FAILED for a %s verdict (%s) — the verdict will still be "
+            "applied, UNAUDITED: %s", kw.get('kind'), kw.get('verdict'), e,
+            exc_info=True)
+        return {'id': None}
+
+
 def cmd_vet_decide(args):
     """Record Claude's verdict: journal it, then land it on the signal.
 
@@ -242,7 +286,7 @@ def cmd_vet_decide(args):
     # One decision, both A/B arms — keeps the structure comparison clean.
     trade_ids = [t['id']] + [s['id'] for s in store.load_trades()
                              if s.get('shadow_of') == t['id']]
-    d = get_decisions().record(
+    d = _journal(
         kind='entry',
         verdict='allow' if verdict == vet_mod.ALLOWED else 'veto',
         trade_ids=trade_ids,
@@ -298,7 +342,7 @@ def cmd_vet_exit_decide(args):
         print(f"trade #{args.id} not found")
         return 1
 
-    d = get_decisions().record(
+    d = _journal(
         kind='exit',
         verdict='allow' if args.verdict == 'allow' else 'defer',
         trade_ids=[t['id']],
@@ -309,7 +353,22 @@ def cmd_vet_exit_decide(args):
     )
     outcome = vet_mod.record_exit_verdict(store, args.id, args.kind,
                                           args.verdict, decision_id=d['id'])
+    # The entry channel has settled its row since the refusal-journalling fix;
+    # this one computed `outcome` and threw it away, so a REFUSED verdict —
+    # trade no longer entered, CAS lost, marker not pending — left a row
+    # byte-identical to an applied one. That is not hypothetical: all 36 rows in
+    # zebra_decisions.stray-backup.json are refusals and none is marked as one,
+    # so the file reads as "the exit vetter deferred 36 exits" when it deferred
+    # nothing. An unmarked refusal silently becomes evidence.
+    _settle_decision(d['id'], outcome)
+    if outcome != 'applied':
+        logging.getLogger(__name__).warning(
+            "exit verdict for #%s %s was NOT applied: %s",
+            args.id, args.kind, outcome)
     from .health import record_agent_landed
+    # Stays unconditional: this measures "did the agent come back", and an
+    # agent that reached this verb came back whether or not the store took its
+    # verdict. The refusal is now visible in the journal instead.
     record_agent_landed('exit')   # proof of life for THIS channel
     print(f"decision #{d['id']} recorded; exit verdict {outcome}")
     return 0
@@ -466,7 +525,7 @@ def cmd_review_record(args):
     if not t:
         print(f"trade #{args.id} not found")
         return 1
-    d = get_decisions().record(
+    d = _journal(
         kind='review', verdict=args.action, trade_ids=[t['id']],
         stock=t.get('stock'), direction=t.get('direction'),
         reasons=args.reason or [], red_flags=args.red_flag or [],
@@ -475,6 +534,13 @@ def cmd_review_record(args):
     )
     outcome = review_mod.record(store, args.id, args.action,
                                reasons=args.reason or [], decision_id=d['id'])
+    # Third channel, same contract as entry and exit: an unmarked refusal is
+    # indistinguishable from an applied verdict and corrupts anything scored
+    # off it.
+    _settle_decision(d['id'], outcome)
+    if outcome != 'applied':
+        logging.getLogger(__name__).warning(
+            "review verdict for #%s was NOT applied: %s", args.id, outcome)
     from .health import record_agent_landed
     record_agent_landed('review')   # proof of life for THIS channel
     print(f"decision #{d['id']} recorded; review {outcome}")

@@ -445,10 +445,21 @@ def test_the_spawn_grants_tools_on_argv_not_via_settings(monkeypatch,
 def test_the_calendar_agent_alone_may_write_files(monkeypatch):
     """It builds a candidate JSON before installing it; nothing else needs to
     write anything, and a decision agent with Write is a decision agent that
-    can edit the code that judges it."""
-    assert 'Write' not in vet_mod._allowed_tools('entry')
-    assert 'Write' not in vet_mod._allowed_tools('exit')
-    assert 'Write' in vet_mod._allowed_tools('events')
+    can edit the code that judges it.
+
+    And the calendar agent's own grant must be SCOPED. A bare `Write` made
+    vet.py's stated invariant false for this channel — it could have written
+    the trade store, zebra_config.json (which carries vet_enabled), or any .py
+    in the package, with no Write rule in the deny list to stop it. Asserting
+    the literal string 'Write' could not tell those two apart.
+    """
+    assert not any(t.startswith('Write') for t in vet_mod._allowed_tools('entry'))
+    assert not any(t.startswith('Write') for t in vet_mod._allowed_tools('exit'))
+    writes = [t for t in vet_mod._allowed_tools('events') if t.startswith('Write')]
+    assert len(writes) == 1, writes
+    assert writes[0] != 'Write', 'the calendar grant must be path-scoped'
+    assert writes[0].startswith('Write(') and writes[0].endswith(')')
+    assert 'event_calendar.candidate.json' in writes[0]
 
 
 # ── the CLI must be findable where cron actually runs ────────────────────

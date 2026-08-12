@@ -302,6 +302,7 @@ def refresh(symbols, spawn: bool = True) -> bool:
         vetting_doc=cfg.VETTING_DOC,
         python=_interpreter(),
         symbols=', '.join(sorted(set(symbols))[:40]) or 'none',
+        candidate=cfg.EVENT_CANDIDATE_FILE,
     )
     _mark_refresh_pending()
     return _spawn_generic(prompt, cfg.EVENT_MODEL, 'events',

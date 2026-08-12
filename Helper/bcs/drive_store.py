@@ -24,6 +24,11 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 logger = logging.getLogger(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
+# Wall-clock ceiling on any single Drive call. Comfortably above a normal
+# round trip for a ~1 MB store on a home line, and far below the 5-minute cron
+# interval it must not eat — a Drive hang must degrade to "local only", which
+# every caller already handles, rather than to a stalled cycle.
+DRIVE_TIMEOUT_SEC = 20
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +96,27 @@ def get_drive_service(credentials_path: Path):
     creds = service_account.Credentials.from_service_account_file(
         str(credentials_path), scopes=SCOPES
     )
+    # A BOUNDED socket, because an unbounded one stops trading.
+    #
+    # httplib2 (underneath the Drive client) defaults to NO timeout, and no
+    # timeout was set anywhere in this repo. The store uploads AFTER releasing
+    # its file lock — right for the other process, but it still blocks THIS
+    # cycle, and the zebra cron runs under `flock -n`, so every subsequent
+    # 5-minute tick is skipped silently while one TCP connection hangs. Exit
+    # monitoring stops on every open position with no alert at all. The same
+    # client backs the live-money BCS store on the same Pi.
+    #
+    # Set on the authorized http object rather than via socket.setdefaulttimeout
+    # so it cannot leak into Kite's HTTP calls or anything else in-process.
     service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+    try:
+        # google-api-python-client builds its own http; reach in and bound it.
+        http = getattr(service, '_http', None)
+        if http is not None and hasattr(http, 'timeout') and not http.timeout:
+            http.timeout = DRIVE_TIMEOUT_SEC
+            logger.debug("Drive socket timeout set to %ss", DRIVE_TIMEOUT_SEC)
+    except Exception as e:                       # never block auth on this
+        logger.warning("Could not set the Drive socket timeout: %s", e)
     logger.info("Drive service authenticated via %s", credentials_path.name)
     return ServiceRef(service, credentials_path)
 

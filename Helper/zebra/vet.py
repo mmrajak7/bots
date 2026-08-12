@@ -36,16 +36,19 @@ Safety invariants
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from . import config as cfg
+from .filelock import exclusive
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +278,56 @@ def resolve_cli(refresh: bool = False) -> Optional[str]:
     return None
 
 
+def _spawn_budget_ok(tag: str) -> bool:
+    """Is there room on this box to start another agent right now?
+
+    There was no bound of any kind. The caps that exist are PER POSITION and
+    PER DAY, which limit how often one trade is looked at — not how many agents
+    start at once. `review.run` loops over every entered position, and
+    `needs_review` keys on market-wide event types, so a single `rbi_policy` row
+    inside the horizon makes it true for ALL of them in the SAME cycle: 24 open
+    positions today, 24 detached node processes, each alive up to CHILD_KILL_SEC
+    (three cron cycles). Entry and exit channels add more, and one trade can
+    hold two exit agents at once.
+
+    `_children` cannot bound this — it is a module global in a process that
+    exits in seconds, so in cron it is always empty. The only existing bound is
+    coreutils `timeout`, which caps DURATION, not COUNT. So the budget lives on
+    the filesystem, where it survives the process.
+
+    This is the rule vet.py already states and did not enforce: a PAPER vetting
+    layer must not be able to OOM a box that is running live money.
+    """
+    path = cfg.LOG_DIR / 'zebra_spawn_budget.json'
+    now = time.time()
+    window = float(cfg.CHILD_KILL_SEC)
+    try:
+        cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with exclusive(cfg.LOG_DIR / 'zebra_spawn_budget.lock'):
+            try:
+                recent = json.loads(path.read_text())
+            except Exception:
+                recent = []
+            # Anything older than the child's own kill deadline is gone.
+            recent = [t for t in recent
+                      if isinstance(t, (int, float)) and now - t < window]
+            if len(recent) >= cfg.MAX_CONCURRENT_AGENTS:
+                logger.warning(
+                    "SPAWN BUDGET: %d agent(s) started in the last %ds, cap is "
+                    "%d — refusing to spawn %s. It will fail open on its "
+                    "deadline.", len(recent), int(window),
+                    cfg.MAX_CONCURRENT_AGENTS, tag)
+                return False
+            recent.append(now)
+            path.write_text(json.dumps(recent))
+        return True
+    except Exception as e:
+        # Fail OPEN on a bookkeeping failure: a broken budget file must not
+        # become a silent vetting halt.
+        logger.error("Spawn-budget check failed (%s) — allowing %s", e, tag)
+        return True
+
+
 def _spawn_generic(prompt: str, model: str, tag: str,
                    channel: str = 'entry') -> Optional[int]:
     """Fire a detached Claude CLI run. Returns the pid, or None on failure.
@@ -290,6 +343,12 @@ def _spawn_generic(prompt: str, model: str, tag: str,
                      "fixed; set ZEBRA_VET_CLI to the absolute path.",
                      cfg.VET_CLI, tag)
         _note_spawn(False, channel)
+        return None
+    if not _spawn_budget_ok(tag):
+        # Refusing to spawn is NOT refusing to trade: the caller's deadline
+        # lapses and the signal fails open exactly as it does during any other
+        # outage. Losing one verdict is survivable; browning out the box that
+        # runs the live-money monitor is not.
         return None
     argv = [cli, '-p', prompt, '--model', model,
             '--allowedTools'] + _allowed_tools(channel) + \
@@ -407,6 +466,34 @@ def record_verdict(store, trade_id: int, verdict: str,
         logger.warning("VET verdict for #%d %s — late or duplicate call",
                        trade_id, outcome)
     return outcome
+
+
+def mark_unavailable(store, trade_id: int, why: str,
+                     now: Optional[datetime] = None) -> bool:
+    """Stamp a signal as failed-open when the REQUEST itself could not be made.
+
+    `expire_stale` covers the request that was made and never answered. This
+    covers the one that never got out of the door — a lock timeout or IO error
+    inside `request_entry_vet`, which left no `vet` key at all and so produced a
+    record indistinguishable from vetting being switched off, and an ENTER alert
+    that said nothing about vetting because `_vet_line` returns "" for a missing
+    state. Three different "no vetting happened" outcomes with one appearance is
+    how a broken layer passes for a working one.
+
+    `failed_open_because` is kept so the forensic record says WHICH kind of
+    outage this was.
+    """
+    now = now or _now()
+    with store._mutate():
+        t = store.find(trade_id)
+        if not t or vet_state(t) in TERMINAL:
+            return False
+        t['vet'] = dict(t.get('vet') or {},
+                        state=UNAVAILABLE,
+                        decided_at=now.isoformat(),
+                        failed_open_because=str(why)[:300])
+        t['version'] = t.get('version', 0) + 1
+    return True
 
 
 def expire_stale(store, now: Optional[datetime] = None) -> list:
