@@ -500,3 +500,36 @@ def test_no_peak_recorded_means_no_give_back_signal(store, monkeypatch):
     monkeypatch.setattr(events, 'upcoming', lambda *a, **k: [])
     needed, _ = review.needs_review(store.find(1), 96.8, now=TODAY)
     assert needed is False
+
+
+# ── strike-adjusting corporate actions (2026-08-12) ──────────────────────
+# The calendar had been collecting these and nothing consumed them.
+def test_a_bonus_today_is_an_adjustment(paths):
+    events.replace([{'date': TODAY.strftime('%Y-%m-%d'), 'type': 'bonus',
+                     'symbol': 'TESTCO', 'title': '1:1 bonus'}])
+    assert events.adjustment_today('TESTCO', today=TODAY.date())
+
+
+def test_an_ordinary_dividend_is_NOT_an_adjustment(paths):
+    """The strikes are not adjusted, so the drop is real and a stop firing on
+    it is a genuine stop. Suppressing it is how a capped loss becomes a
+    maximum loss."""
+    events.replace([{'date': TODAY.strftime('%Y-%m-%d'), 'type': 'ex_dividend',
+                     'symbol': 'TESTCO', 'title': 'Rs 4 dividend'}])
+    assert events.adjustment_today('TESTCO', today=TODAY.date()) is None
+
+
+def test_an_adjustment_on_another_symbol_or_day_is_ignored(paths):
+    events.replace([
+        {'date': TODAY.strftime('%Y-%m-%d'), 'type': 'split',
+         'symbol': 'OTHER', 'title': '1:5 split'},
+        {'date': (TODAY + timedelta(days=1)).strftime('%Y-%m-%d'),
+         'type': 'split', 'symbol': 'TESTCO', 'title': 'tomorrow'},
+    ])
+    assert events.adjustment_today('TESTCO', today=TODAY.date()) is None
+
+
+def test_a_market_wide_event_never_counts_as_an_adjustment(paths):
+    events.replace([{'date': TODAY.strftime('%Y-%m-%d'), 'type': 'budget',
+                     'title': 'Union Budget'}])
+    assert events.adjustment_today('TESTCO', today=TODAY.date()) is None

@@ -550,6 +550,26 @@ def _format_trail_alert(trade: dict, mid: float, tl: dict) -> str:
     )
 
 
+def _format_corp_action_alert(trade: dict, evt: dict) -> str:
+    """Tell the human the bot has stood down on this position for the day.
+
+    Deliberately explicit that NOTHING will fire: this is the one alert where
+    silence afterwards means the guards are off, not that all is well.
+    """
+    return (
+        f"⚠ <b>CORPORATE ACTION</b>  <code>{trade['stock']}</code> "
+        f"({trade['direction']})\n"
+        f"{html.escape(str(evt.get('type', '?')).upper())} ex-date today — "
+        f"{html.escape(str(evt.get('title', ''))[:80])}\n"
+        f"Strikes and lot size are adjusted, so every stored level "
+        f"(entry {trade.get('entry_spot')}, TP {trade.get('tp_spot')}, "
+        f"SL {trade.get('sl_spot')}, debit {trade.get('debit')}) refers to a "
+        f"share that no longer exists.\n"
+        f"<b>All automated exits are SUSPENDED for this position today.</b> "
+        f"Close or re-enter it manually."
+    )
+
+
 def _format_blind_alert(trade: dict, reason: Optional[str]) -> str:
     """One-shot warning that DEBIT-SL valuation has been blind (unreliable /
     missing book) long enough to matter. Spot TP/SL stay armed — this is pure
@@ -988,6 +1008,7 @@ def _structure_quote(kite, trade: dict, spot: Optional[float] = None) -> dict:
     reliable = reason is None
 
     mid = round(_long_multiplier(trade) * long_q['mid'] - short_q['mid'], 2)
+    floored = False
     if spot is not None and spot > 0:
         floor = _intrinsic_floor(trade, spot)
         if floor is not None and mid < floor:
@@ -996,7 +1017,33 @@ def _structure_quote(kite, trade: dict, spot: Optional[float] = None) -> dict:
                 "%.2f at spot %.2f — clamping to floor (bad ITM quote)",
                 trade['id'], trade['stock'], mid, floor, spot)
             mid = floor
-    return {'mid': mid, 'reliable': reliable, 'reason': reason}
+            floored = True
+    return {'mid': mid, 'reliable': reliable, 'reason': reason,
+            # PER-LEG BOOK. VETTING.md tells the exit agent to judge "depth at
+            # touch and the spread as a % of mid", and this dict used to carry
+            # only mid/reliable/reason — so the agent was asked to judge the one
+            # thing it could not see, exactly the defect the ENTRY context had
+            # already been fixed for. `floored` matters too: a clamped mid is a
+            # number the market never quoted, and a verdict about "is this price
+            # real" must know it is looking at a floor, not a bid.
+            'legs': {
+                'long': _leg_book(trade.get('long_symbol'), long_q),
+                'short': _leg_book(trade.get('short_symbol'), short_q),
+            },
+            'floored': floored}
+
+
+def _leg_book(symbol, q: dict) -> dict:
+    """One leg's top-of-book, in the shape the vetting agent is asked to judge."""
+    bid, ask, mid_ = q.get('bid'), q.get('ask'), q.get('mid')
+    spread_pct = None
+    if bid is not None and ask is not None and mid_:
+        spread_pct = round((ask - bid) / mid_ * 100, 1)
+    return {'symbol': symbol, 'bid': bid, 'ask': ask, 'mid': mid_,
+            'oi': q.get('oi'), 'last': q.get('last'),
+            'spread_pct': spread_pct,
+            'reliable': q.get('reliable', True),
+            'unreliable_reason': q.get('unreliable_reason')}
 
 
 def _structure_value(kite, trade: dict, spot: Optional[float] = None
@@ -1146,6 +1193,32 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # forever) or booking a fabricated max-loss. LIVE mode still alerts
         # (mid rendered as NA) since there it's an alert, not an auto-close.
         # Passing spot arms the intrinsic-floor clamp (false-debit-SL guard).
+        # ── Strike-adjusting corporate action ───────────────────────────
+        # Before the quote, before MFE, before every exit. On a bonus/split/
+        # rights ex-date the exchange re-prices the underlying and adjusts the
+        # strikes with it: a 1:1 bonus halves the quoted spot, so yesterday's
+        # sl_spot is breached instantly by an event in which nothing went
+        # wrong, and the per-share debit refers to a lot size that changed. The
+        # recorded PEAK would be corrupted too, which is why this sits above
+        # the capture and not merely above the triggers. Nothing automated can
+        # repair those levels, so the position is suspended for the day and the
+        # human is told. (Ordinary ex-dividends are NOT included — see
+        # events.ADJUSTMENT_TYPES.)
+        adj = None
+        try:
+            adj = events_mod.adjustment_today(stock)
+        except Exception as e:
+            logger.debug("Adjustment lookup failed for %s: %s", stock, e)
+        if adj:
+            if store.set_alert_flag_daily(tid, 'corp_action') \
+                    and _alerts_enabled(trade):
+                _send_telegram(_format_corp_action_alert(trade, adj),
+                               dry_run=dry_run)
+            logger.warning("CORP ACTION #%d %s: %s today — automated exits "
+                           "SUSPENDED (stored spot levels are stale)",
+                           tid, stock, adj.get('type'))
+            continue
+
         sq = _structure_quote(kite, trade, spot)
         mid = sq['mid']
         # DEBIT-SL valuation is usable only with a mid AND a reliable book —

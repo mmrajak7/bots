@@ -258,3 +258,107 @@ def test_an_unknown_entry_structure_falls_back_loudly():
     from zebra import config
     assert config.ENTRY_STRUCTURE in ('bcs', 'zebra')
     assert config._DEFAULTS['entry_structure'] == 'bcs'
+
+
+# ── corporate actions suspend the position (F-2) ─────────────────────────
+def _entered(store, monkeypatch, mid=13.0, spot=SPOT):
+    monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {'TESTCO': spot})
+    monkeypatch.setattr(monitor, '_structure_quote',
+                        lambda kite, t, spot=None: {
+                            'mid': mid, 'reliable': True, 'reason': None,
+                            'legs': {}, 'floored': False})
+    monkeypatch.setattr(monitor, '_exit_cleared', lambda *a, **k: True)
+
+
+def test_a_bonus_ex_date_suspends_every_automated_exit(wired, monkeypatch):
+    """A 1:1 bonus halves the quoted spot while the exchange doubles the lot
+    size and halves the strikes. Yesterday's sl_spot is breached instantly by
+    an event in which nothing went wrong."""
+    cycle(wired)                                   # open the position
+    _entered(wired, monkeypatch, mid=0.5, spot=48.0)   # "halved" spot, junk mid
+    monkeypatch.setattr(monitor.events_mod, 'adjustment_today',
+                        lambda stock: {'type': 'bonus', 'title': '1:1'})
+    sent = []
+    monkeypatch.setattr(monitor, '_send_telegram',
+                        lambda msg, dry_run=False: sent.append(msg) or True)
+    monitor.check_entered(wired, kite=None, dry_run=True)
+
+    t = wired.find(1)
+    assert t['status'] == 'entered', "an automated exit fired on a bonus ex-date"
+    assert len(sent) == 1 and 'CORPORATE ACTION' in sent[0]
+    assert 'SUSPENDED' in sent[0]
+
+
+def test_the_corrupted_spot_never_reaches_the_recorded_peak(wired, monkeypatch):
+    """The suspension sits ABOVE the MFE capture, not merely above the exits.
+    A post-adjustment spot recorded as a peak would poison the give-back watch
+    and the trail for the rest of the position's life."""
+    cycle(wired)
+    _entered(wired, monkeypatch, mid=13.0, spot=SPOT)
+    monitor.check_entered(wired, kite=None, dry_run=True)
+    good_peak = wired.find(1)['mfe_spot']
+
+    monkeypatch.setattr(monitor.events_mod, 'adjustment_today',
+                        lambda stock: {'type': 'split', 'title': '1:5'})
+    _entered(wired, monkeypatch, mid=2.6, spot=SPOT * 5)   # "un-split" price
+    monkeypatch.setattr(monitor, '_send_telegram', lambda *a, **k: True)
+    monitor.check_entered(wired, kite=None, dry_run=True)
+    assert wired.find(1)['mfe_spot'] == good_peak, "a split price became the peak"
+
+
+def test_the_suspension_alert_fires_once_a_day(wired, monkeypatch):
+    cycle(wired)
+    _entered(wired, monkeypatch)
+    monkeypatch.setattr(monitor.events_mod, 'adjustment_today',
+                        lambda stock: {'type': 'rights', 'title': 'R'})
+    sent = []
+    monkeypatch.setattr(monitor, '_send_telegram',
+                        lambda msg, dry_run=False: sent.append(msg) or True)
+    for _ in range(4):
+        monitor.check_entered(wired, kite=None, dry_run=True)
+    assert len(sent) == 1
+
+
+def test_a_broken_calendar_never_blocks_the_monitor(wired, monkeypatch):
+    """Every side channel in this fleet must degrade to 'as if it did not
+    exist'. A calendar that raises must not freeze the exit path."""
+    cycle(wired)
+    _entered(wired, monkeypatch, mid=1.0)          # deep below the debit SL
+    monkeypatch.setattr(
+        monitor.events_mod, 'adjustment_today',
+        lambda stock: (_ for _ in ()).throw(RuntimeError('calendar corrupt')))
+    for _ in range(3):
+        monitor.check_entered(wired, kite=None, dry_run=True)
+    assert wired.find(1)['status'] == 'exited', \
+        "a broken calendar suppressed a real exit"
+
+
+# ── per-leg depth reaches the exit agent (F-3) ───────────────────────────
+def test_the_structure_quote_carries_both_books(wired, monkeypatch):
+    """VETTING.md asks the exit agent to judge depth at touch and spread as a
+    % of mid. The quote dict used to carry only mid/reliable/reason, so the
+    agent was asked to judge the one thing it could not see."""
+    monkeypatch.setattr(
+        monitor.strikes_mod, '_quote_option',
+        lambda kite, sym: {'bid': 9.8, 'ask': 10.2, 'mid': 10.0, 'oi': 7000,
+                           'last': 10.0, 'reliable': True})
+    t = cycle(wired)[0]
+    q = monitor._structure_quote(None, t, spot=SPOT)
+    assert set(q['legs']) == {'long', 'short'}
+    assert q['legs']['long']['bid'] == 9.8
+    assert q['legs']['long']['spread_pct'] == 4.0
+    assert q['legs']['short']['oi'] == 7000
+    assert q['floored'] is False
+
+
+def test_a_clamped_mid_is_declared_as_clamped(wired, monkeypatch):
+    """A floored mid is a number the market never quoted. A verdict about
+    whether a price is REAL has to know it is looking at a floor, not a bid."""
+    monkeypatch.setattr(
+        monitor.strikes_mod, '_quote_option',
+        lambda kite, sym: {'bid': 0.1, 'ask': 0.2, 'mid': 0.15, 'oi': 7000,
+                           'last': 0.15, 'reliable': True})
+    t = cycle(wired)[0]
+    monkeypatch.setattr(monitor, '_intrinsic_floor', lambda tr, sp: 5.0)
+    q = monitor._structure_quote(None, t, spot=SPOT)
+    assert q['floored'] is True and q['mid'] == 5.0

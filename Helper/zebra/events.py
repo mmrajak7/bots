@@ -37,10 +37,24 @@ logger = logging.getLogger(__name__)
 
 # Only these matter enough to act on. An open vocabulary would let the agent
 # invent categories nobody downstream handles.
-EVENT_TYPES = ('results', 'ex_dividend', 'budget', 'election', 'rbi_policy',
-               'expiry', 'other')
+EVENT_TYPES = ('results', 'ex_dividend', 'bonus', 'split', 'rights',
+               'budget', 'election', 'rbi_policy', 'expiry', 'other')
 # Events that move the whole market rather than one symbol.
 MARKET_TYPES = ('budget', 'election', 'rbi_policy')
+
+# Corporate actions that RE-PRICE the underlying and get the option strikes
+# adjusted with it. On the ex-date every spot level this bot has stored —
+# entry_spot, tp_spot, sl_spot, the recorded peak — refers to a share that no
+# longer exists, and the per-share debit refers to a lot size that has changed
+# too. Nothing automated can repair that, so the position is suspended and the
+# human is told.
+#
+# `ex_dividend` is deliberately NOT in this list. An ordinary dividend drops
+# the stock for real and the strikes are not adjusted, so a stop firing there
+# is a genuine stop on a genuine loss. Suppressing it would be precisely the
+# "deferring a real, corroborated exit" error the vetting doc warns about — the
+# way a capped loss becomes a maximum loss.
+ADJUSTMENT_TYPES = ('bonus', 'split', 'rights')
 
 
 def _today() -> date:
@@ -197,6 +211,32 @@ def upcoming(symbol: Optional[str] = None, within_days: Optional[int] = None,
         if e.get('type') in MARKET_TYPES or sym is None or e.get('symbol') == sym:
             out.append(dict(e, days_away=(d - today).days))
     return sorted(out, key=lambda e: e['days_away'])
+
+
+def adjustment_today(symbol: str, data: Optional[dict] = None,
+                     today: Optional[date] = None) -> Optional[dict]:
+    """A strike-adjusting corporate action dated TODAY for this symbol.
+
+    The calendar has been collecting these and nothing consumed them. On such a
+    day a 1:1 bonus halves the quoted spot while the exchange doubles the lot
+    size and halves the strikes — so a stored `sl_spot` from yesterday is
+    instantly and catastrophically breached by an event in which nothing
+    actually went wrong. Market-wide events are excluded by construction: a
+    budget does not re-price one company's shares.
+    """
+    data = load() if data is None else data
+    today = today or _today()
+    sym = (symbol or '').upper()
+    if not sym:
+        return None
+    for e in data.get('events') or []:
+        if e.get('type') not in ADJUSTMENT_TYPES:
+            continue
+        if e.get('symbol') != sym:
+            continue
+        if _parse_date(e.get('date')) == today:
+            return dict(e)
+    return None
 
 
 def refresh_pending(now: Optional[datetime] = None) -> bool:

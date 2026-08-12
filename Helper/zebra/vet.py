@@ -634,6 +634,13 @@ def exit_gate(store, trade: dict, kind: str, quote: dict, spot: float,
             'mid': quote.get('mid'),
             'reliable': quote.get('reliable'),
             'quote_reason': quote.get('reason'),
+            # The actual books. The doc asks the agent to judge depth at touch
+            # and spread as a % of mid; without these it was being asked to
+            # judge what it could not see. `floored` says the mid is the
+            # no-arbitrage floor rather than anything the market quoted — a
+            # verdict about whether a price is REAL has to know that.
+            'legs': quote.get('legs'),
+            'floored': quote.get('floored'),
             'entry_debit': trade.get('debit'),
             'debit_sl_value': trade.get('debit_sl_value'),
             'short_extrinsic_entry': trade.get('short_extrinsic_entry'),

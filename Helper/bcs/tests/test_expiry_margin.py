@@ -173,3 +173,118 @@ def test_warning_is_wired_into_the_cron_startup():
     src = (HELPER / 'bcs' / 'spread_monitor.py').read_text(encoding='utf-8')
     assert src.count('maybe_warn_expiry_proximity(') >= 3, \
         "warning defined but not called from both monitor paths"
+
+
+# ── resumption after an interruption (2026-08-12) ────────────────────────
+# Both settle buffers are computed from a FIXED clock time, so they arm once at
+# 09:18 / 09:30 and stay armed all session. That assumes the session runs
+# uninterrupted. An exchange halt, a broker outage, or this process crashing
+# and being restarted by the 5-minute cron all end with the monitor looking at
+# a book as unformed as at 09:15, while is_spread_settled() reports True.
+@pytest.fixture(autouse=True)
+def _clean_poll_state():
+    sm.reset_poll_state()
+    yield
+    sm.reset_poll_state()
+
+
+def test_a_blackout_rearms_the_spread_buffer(monkeypatch):
+    monkeypatch.setattr(sm, 'is_market_settled', lambda: True)
+    assert sm.note_poll(True, now=1000.0) is False       # first ever poll
+    assert sm.is_spread_settled(now=1005.0) is True
+
+    assert sm.note_poll(True, now=1005.0) is False       # steady polling
+    assert sm.note_poll(True, now=2000.0) is True        # ~16 min gap
+    assert sm.is_spread_settled(now=2010.0) is False, \
+        "value triggers armed on a book that has not re-formed"
+    assert sm.is_spread_settled(now=2181.0) is True      # buffer served
+
+
+def test_normal_polling_never_rearms(monkeypatch):
+    monkeypatch.setattr(sm, 'is_market_settled', lambda: True)
+    t = 1000.0
+    for _ in range(50):                                  # 5s cadence
+        assert sm.note_poll(True, now=t) is False
+        t += 5
+    assert sm.is_spread_settled(now=t) is True
+
+
+def test_a_failed_poll_does_not_count_as_activity(monkeypatch):
+    """The blackout is measured between GOOD polls. Counting a failed one as a
+    heartbeat is how an outage looks like a healthy session."""
+    monkeypatch.setattr(sm, 'is_market_settled', lambda: True)
+    sm.note_poll(True, now=1000.0)
+    for t in range(1005, 2000, 5):
+        sm.note_poll(False, now=float(t))
+    assert sm.note_poll(True, now=2000.0) is True
+
+
+def test_spot_triggers_are_not_delayed_by_a_resume(monkeypatch):
+    """Only the value buffer re-arms. Spot triggers run off real trades and are
+    what catches a dead thesis — delaying them suppresses the exit that still
+    works."""
+    monkeypatch.setattr(sm, 'is_market_settled', lambda: True)
+    sm.note_poll(True, now=1000.0)
+    sm.note_poll(True, now=2000.0)                       # re-armed
+    assert sm.is_spread_settled(now=2010.0) is False
+    assert sm.is_market_settled() is True, "a resume delayed the spot triggers"
+
+
+def test_the_open_buffer_still_wins(monkeypatch):
+    """Re-arming must not accidentally UNBLOCK the 09:30 open buffer."""
+    monkeypatch.setattr(sm, 'is_market_settled', lambda: True)
+    import datetime as _dt
+
+    class _Early(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.combine(_dt.date.today(), sm.MARKET_OPEN)
+    monkeypatch.setattr(sm, 'datetime', _Early)
+    sm.note_poll(True, now=1000.0)
+    assert sm.is_spread_settled(now=1000.0) is False
+
+
+def test_note_poll_is_wired_into_both_loops():
+    src = (HELPER / 'bcs' / 'spread_monitor.py').read_text(encoding='utf-8')
+    assert src.count('note_poll(True, now)') == 2, \
+        "resumption tracking is defined but not called from both monitor loops"
+
+
+# ── the playbook's DTE<5 gamma rule (nothing enforced it before) ─────────
+def test_gamma_rule_fires_when_little_of_the_max_is_captured():
+    t = dict(BCS_TRADE, spread_width=40.0, net_debit=10.0)
+    note = sm.gamma_note(t, spread_val=20.0, sessions=3)     # 33% of max
+    assert '33% of max' in note and 'gamma' in note
+
+
+def test_gamma_rule_is_quiet_on_a_position_near_max():
+    t = dict(BCS_TRADE, spread_width=40.0, net_debit=10.0)
+    assert sm.gamma_note(t, spread_val=36.0, sessions=3) == ''   # 87%
+
+
+def test_gamma_rule_is_quiet_while_expiry_is_far():
+    t = dict(BCS_TRADE, spread_width=40.0, net_debit=10.0)
+    assert sm.gamma_note(t, spread_val=20.0, sessions=9) == ''
+
+
+def test_gamma_rule_says_nothing_without_a_quote():
+    """A warning built on a number nobody has is worse than silence."""
+    t = dict(BCS_TRADE, spread_width=40.0, net_debit=10.0)
+    assert sm.gamma_note(t, spread_val=None, sessions=3) == ''
+
+
+def test_gamma_rule_survives_a_degenerate_spread():
+    assert sm.gamma_note(dict(BCS_TRADE, spread_width=10.0, net_debit=10.0),
+                         spread_val=5.0, sessions=3) == ''
+    assert sm.gamma_note(dict(BCS_TRADE), spread_val=5.0, sessions=3) == ''
+
+
+def test_gamma_note_rides_on_the_expiry_warning(_no_telegram):
+    """One decision, one notification: it fires in the same window on the same
+    position, so a second alert would be pure fatigue."""
+    t = dict(BCS_TRADE, spread_width=40.0, net_debit=10.0)
+    sm.maybe_warn_expiry_proximity(FakeStore(), t, 150.0, 'BCS',
+                                   today=date(2026, 8, 25), spread_val=20.0)
+    assert len(_no_telegram) == 1
+    assert 'Delivery-margin ramp' in _no_telegram[0]
+    assert 'gamma' in _no_telegram[0]

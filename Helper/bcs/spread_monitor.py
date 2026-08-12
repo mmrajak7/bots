@@ -532,15 +532,67 @@ def is_market_settled() -> bool:
     return datetime.now() >= settle_time
 
 
-def is_spread_settled() -> bool:
+# ── Resumption after an interruption ───────────────────────────────────────
+# Both buffers above are computed from a FIXED clock time, so they arm once at
+# 09:18 / 09:30 and stay armed for the rest of the session. That assumes the
+# session runs uninterrupted. It does not: an exchange halt, a broker outage, a
+# network drop, or this process crashing and being restarted by the 5-minute
+# cron all end with the monitor looking at a book that is exactly as unformed
+# as it was at 09:15 — while `is_spread_settled()` cheerfully reports True.
+#
+# Only the SPREAD (value) buffer re-arms. Spot triggers run off real trades in
+# the underlying and are the ones that catch a dead thesis, so delaying them
+# would suppress the exit that should still work. This is the same split the
+# rest of this file makes: value triggers are the ones a broken book can fake.
+RESUME_SETTLE_SEC = 180
+
+_last_ok_poll: Optional[float] = None
+_resume_settle_at: Optional[float] = None
+
+
+def reset_poll_state() -> None:
+    """Clear resumption state (process start, and tests)."""
+    global _last_ok_poll, _resume_settle_at
+    _last_ok_poll = None
+    _resume_settle_at = None
+
+
+def note_poll(ok: bool, now: Optional[float] = None,
+              gap_sec: int = RESUME_SETTLE_SEC) -> bool:
+    """Record a poll outcome; re-arm the spread buffer after a long blackout.
+
+    Returns True when this call armed a fresh buffer. `gap_sec` is both the
+    blackout that counts as an interruption and the buffer served afterwards —
+    one knob, because they answer the same question: how long is long enough to
+    mean the book has to re-form.
+    """
+    global _last_ok_poll, _resume_settle_at
+    now = time.time() if now is None else now
+    if not ok:
+        return False
+    prev, _last_ok_poll = _last_ok_poll, now
+    if prev is not None and (now - prev) > gap_sec:
+        _resume_settle_at = now + gap_sec
+        log(f"  Resumed after a {int(now - prev)}s blackout — spread-value "
+            f"triggers re-armed for {gap_sec}s (book must re-form)")
+        return True
+    return False
+
+
+def is_spread_settled(now: Optional[float] = None) -> bool:
     """Longer buffer for SPREAD-VALUE triggers (SL_SPREAD / SL_TRAIL / trail
     updates). The 2026-07-24 incident proved illiquid option books are still
     unformed at 09:18; they reliably form by 09:30. SL_SPOT and TP are
     spot-based and keep their existing (shorter/no) buffers.
+
+    Also False during a post-interruption buffer — see note_poll.
     """
     from datetime import timedelta
     settle_time = datetime.combine(date.today(), MARKET_OPEN) + timedelta(seconds=SPREAD_TRIGGER_OPEN_BUFFER_SEC)
-    return datetime.now() >= settle_time
+    if datetime.now() < settle_time:
+        return False
+    now = time.time() if now is None else now
+    return _resume_settle_at is None or now >= _resume_settle_at
 
 
 def is_expiry_day(trade: dict) -> bool:
@@ -630,8 +682,41 @@ def delivery_exposure(trade: dict, spot: float) -> dict:
             'itm': None if not legs else [l['leg'] for l in legs if l['itm']]}
 
 
+GAMMA_RULE_SESSIONS = 5          # playbook: "DTE < 5"
+GAMMA_RULE_CAPTURE_PCT = 80.0    # "...and spread < 80% max -> close, gamma risk"
+
+
+def gamma_note(trade: dict, spread_val: Optional[float],
+               sessions: int) -> str:
+    """The playbook's DTE<5 gamma rule, which nothing has ever enforced.
+
+    Folded into the expiry warning rather than given its own alert: it fires in
+    the same window, on the same position, and two notifications about one
+    decision is the alert fatigue the gates exist to cure. Reported, never
+    acted on — whether the remaining upside is worth the gamma is a judgement,
+    and this file gains no new automated close.
+
+    Returns '' when it does not apply or cannot be computed. A missing quote
+    yields silence, not a warning built on a number nobody has.
+    """
+    try:
+        width = float(trade.get('spread_width') or 0)
+        debit = float(trade.get('net_debit') or 0)
+    except (TypeError, ValueError):
+        return ''
+    if spread_val is None or sessions > GAMMA_RULE_SESSIONS or width <= debit:
+        return ''
+    pct = (float(spread_val) - debit) / (width - debit) * 100
+    if pct >= GAMMA_RULE_CAPTURE_PCT:
+        return ''
+    return (f"\nPlaybook: {sessions} session(s) left with only {pct:.0f}% of "
+            f"max captured (<{GAMMA_RULE_CAPTURE_PCT:.0f}%) — gamma risk now "
+            f"outweighs what is left to win.")
+
+
 def maybe_warn_expiry_proximity(store, trade: dict, spot: float, label: str,
-                                today: Optional[date] = None) -> bool:
+                                today: Optional[date] = None,
+                                spread_val: Optional[float] = None) -> bool:
     """One Telegram per trade per day once expiry is close. Alert only.
 
     Returns True if a warning was sent this call.
@@ -643,6 +728,15 @@ def maybe_warn_expiry_proximity(store, trade: dict, spot: float, label: str,
     if trade.get('expiry_warn_date') == stamp:
         return False        # already nagged today; survives a monitor restart
 
+    # The playbook's DTE<5 gamma rule, which nothing has ever enforced: "DTE < 5
+    # and spread < 80% of max -> close, gamma risk". Folded into this warning
+    # rather than given its own alert — it fires in the same window, on the
+    # same position, and two notifications about one decision is the alert
+    # fatigue the gates exist to cure. Reported, never acted on: it is a
+    # judgement about whether the remaining upside is worth the gamma, and this
+    # file gains no new automated close.
+    gamma = gamma_note(trade, spread_val, sessions)
+
     exp = delivery_exposure(trade, spot)
     itm = exp['itm']
     itm_txt = ('could not read the leg symbols — CHECK MANUALLY' if itm is None
@@ -653,7 +747,7 @@ def maybe_warn_expiry_proximity(store, trade: dict, spot: float, label: str,
            f"{sessions} trading session(s) to expiry ({trade.get('expiry')}).\n"
            f"Delivery-margin ramp {ramp}. ITM legs: {itm_txt}.\n"
            f"Physical settlement — close before the margin builds, or confirm "
-           f"your broker nets the legs.")
+           f"your broker nets the legs.{gamma}")
     log(f"  *** {label} #{trade['id']} {trade['stock']}: {sessions} session(s) "
         f"to expiry, delivery ramp {ramp}, ITM: {itm_txt} ***")
     send_telegram(msg)
@@ -1955,7 +2049,9 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
         send_telegram(f"BCS {stock}: EXPIRY DAY. Monitor will force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
     else:
         try:
-            maybe_warn_expiry_proximity(store, trade, spot, 'BCS')
+            maybe_warn_expiry_proximity(store, trade, spot, 'BCS',
+                                        spread_val=get_spread_value(
+                                            kite, trade, spot=spot))
         except Exception as e:
             log(f"  WARNING: expiry-proximity check failed: {e}")
 
@@ -2000,6 +2096,10 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
             spot = get_spot(kite, trade['spot_symbol'])
             now = time.time()
             consecutive_errors = 0  # Reset on successful API call
+            # A long gap since the last GOOD poll means a halt, an outage or a
+            # crash-restart: the book has to re-form before value triggers
+            # arm again.
+            note_poll(True, now)
 
             # Fetch spread for SL checks and status
             spread_data = None
@@ -2391,9 +2491,12 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
         # ONLY automated close this file does on expiry proximity.
         try:
             _spot = get_spot(kite, t['spot_symbol'])
+            _sv = None
+            if t.get('_strategy') in ('BCS', 'BPS'):
+                _sv = get_spread_value(kite, t, spot=_spot)
             maybe_warn_expiry_proximity(
                 _get_store_for(t, bcs_store, fh_store, bps_store), t, _spot,
-                t.get('_strategy', '?'))
+                t.get('_strategy', '?'), spread_val=_sv)
         except Exception as e:
             log(f"  WARNING: expiry-proximity check failed for "
                 f"#{t['id']} {t.get('stock')}: {e}")
@@ -2433,10 +2536,14 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 log("All trades closed and no active watchlist alerts. Cron monitor exiting.")
                 return
 
-            settled = is_market_settled()
-            spread_settled = is_spread_settled()
-            consecutive_errors = 0  # Reset on successful iteration
             now = time.time()
+            # BEFORE reading is_spread_settled(), so a re-arm takes effect on
+            # this very iteration instead of one poll late — the poll right
+            # after a blackout is the one most likely to see a torn book.
+            note_poll(True, now)
+            settled = is_market_settled()
+            spread_settled = is_spread_settled(now)
+            consecutive_errors = 0  # Reset on successful iteration
             print_status = (now - last_status_time >= STATUS_PRINT_INTERVAL_SEC)
 
             for trade in all_trades:
