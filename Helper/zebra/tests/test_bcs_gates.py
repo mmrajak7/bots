@@ -37,14 +37,17 @@ def _chain(monkeypatch):
     monkeypatch.setattr(strikes, '_list_strikes', lambda *a, **k: [ATM, TGT])
 
 
-def _quote(mid, oi, spread_pct=0.005):
+def _quote(mid, oi, spread_pct=0.0):
+    """Zero-width by default so mid == bid == ask, and the FILL debit equals
+    the MID debit. That keeps the gate tests below testing gates rather than
+    the ask/bid arithmetic, which has its own section at the end of the file."""
     half = mid * spread_pct / 2
     return {'mid': mid, 'bid': round(mid - half, 2), 'ask': round(mid + half, 2),
             'oi': oi, 'reliable': True}
 
 
 def _run(monkeypatch, *, tgt_mid, tgt_oi, atm_mid=30.0, atm_oi=20000,
-         tgt_spread_pct=0.005, atm_quote=None):
+         tgt_spread_pct=0.0, atm_quote=None):
     _chain(monkeypatch)
     monkeypatch.setattr(strikes, '_quote_option',
                         lambda kite, sym: _quote(tgt_mid, tgt_oi, tgt_spread_pct))
@@ -288,3 +291,93 @@ def test_live_alerts_still_escape_interpolated_tags():
     import inspect
     for fn in (monitor._format_enter_alert, monitor._format_bcs_enter_alert):
         assert 'html.escape' in inspect.getsource(fn), fn.__name__
+
+
+# ── FILL basis: ask to buy, bid to sell (2026-08-12) ─────────────────────
+# The local BCS rule has always said "For BUYING use ASK. For SELLING use BID
+# (never LTP)". The zebra ticket obeyed it; this builder priced both legs at
+# mid, and BCS is now the only structure that trades and the only Telegram
+# voice — so the ticket quoted a debit nobody could fill at, and that number
+# anchors max_gain, the debit-SL and both trail levels.
+
+def test_the_debit_is_priced_at_ask_minus_bid(monkeypatch):
+    """atm 30 ±5% -> ask 30.75; tgt 16 ±5% -> bid 15.60. Fill debit 15.15,
+    against 14.00 at mid: 8% more expensive before anything moves."""
+    r = _run(monkeypatch, tgt_mid=16.0, tgt_oi=20000,
+             tgt_spread_pct=0.05, atm_quote=_quote(30.0, 20000, 0.05))
+    assert 'error' not in r, r
+    assert r['debit'] == pytest.approx(30.75 - 15.60, abs=0.02)
+    assert r['debit_mid'] == 14.0
+    assert r['pricing_basis'] == 'fill'
+
+
+def test_the_entry_cost_is_reported_against_max_gain(monkeypatch):
+    r = _run(monkeypatch, tgt_mid=16.0, tgt_oi=20000,
+             tgt_spread_pct=0.05, atm_quote=_quote(30.0, 20000, 0.05))
+    assert r['entry_cost'] == pytest.approx(r['debit'] - r['debit_mid'], abs=0.01)
+    assert r['entry_cost_pct'] == pytest.approx(
+        r['entry_cost'] / (r['width'] - r['debit_mid']) * 100, abs=0.1)
+
+
+def test_max_profit_is_computed_off_the_fill_not_the_quote(monkeypatch):
+    """The whole point: what you can actually win, after paying to get in."""
+    r = _run(monkeypatch, tgt_mid=16.0, tgt_oi=20000,
+             tgt_spread_pct=0.05, atm_quote=_quote(30.0, 20000, 0.05))
+    assert r['max_profit_per_share'] == pytest.approx(r['width'] - r['debit'],
+                                                      abs=0.01)
+    assert r['max_profit_per_share'] < r['width'] - r['debit_mid']
+
+
+def test_a_one_sided_book_cannot_be_priced(monkeypatch):
+    """No bid on the leg being sold = no fill price = no trade, rather than a
+    debit computed off a mid that nothing backs."""
+    atm = _quote(30.0, 20000)
+    tgt = _quote(16.0, 20000)
+    tgt['bid'] = 0
+    monkeypatch.setattr(strikes, '_quote_option', lambda kite, sym: tgt)
+    _chain(monkeypatch)
+    r = strikes.analyze_bcs(kite=None, stock=STOCK, direction=DIRECTION,
+                            spot=1000.0, target_spot=1040.0, expiry=EXPIRY,
+                            atm_strike=ATM, atm_quote=atm, lot_size=LOT)
+    assert 'error' in r and 'two-way book' in r['error']
+
+
+# ── gate 3: what the book charges to open ────────────────────────────────
+def test_a_book_that_eats_the_payoff_is_blocked(monkeypatch):
+    """_leg_reliable admits legs up to 25% of mid — a garbage-print detector,
+    never a tradeability gate. At that width the entry cost alone takes a
+    quarter of the max gain, which is the same 'payoff priced out' problem the
+    d/w cap exists for."""
+    r = _run(monkeypatch, tgt_mid=16.0, tgt_oi=20000,
+             tgt_spread_pct=0.25, atm_quote=_quote(30.0, 20000, 0.25))
+    assert 'error' in r
+    assert 'entry cost' in r['error'] and 'suppressed' in r['error']
+
+
+def test_the_entry_cost_gate_is_judged_after_the_debit_cap(monkeypatch):
+    """A spread that is both overpriced AND badly quoted should report the
+    payoff problem — it is the one that survives a better book."""
+    r = _run(monkeypatch, tgt_mid=10.0, tgt_oi=20000,
+             tgt_spread_pct=0.25, atm_quote=_quote(30.0, 20000, 0.25))
+    assert 'error' in r and 'of width' in r['error']
+
+
+def test_a_tight_book_passes_the_entry_cost_gate(monkeypatch):
+    r = _run(monkeypatch, tgt_mid=16.0, tgt_oi=20000,
+             tgt_spread_pct=0.01, atm_quote=_quote(30.0, 20000, 0.01))
+    assert 'error' not in r, r
+    assert r['entry_cost_pct'] < cfg.BCS_MAX_ENTRY_COST_PCT
+
+
+def test_the_d_w_gate_still_reads_the_mid_basis(monkeypatch):
+    """It was calibrated on mid-basis d/w across 42 records and cannot be
+    re-derived — none of them persisted an entry book. Moving it onto the fill
+    basis would change selectivity by an unmeasurable amount."""
+    cap = cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT
+    # mid debit lands exactly on the cap; the fill debit is well past it.
+    r = _run(monkeypatch, tgt_mid=round(30.0 - 40.0 * cap / 100, 2),
+             tgt_oi=20000, tgt_spread_pct=0.02,
+             atm_quote=_quote(30.0, 20000, 0.02))
+    assert 'error' not in r, r
+    assert r['debit_to_width_pct_mid'] == pytest.approx(cap)
+    assert r['debit_to_width_pct'] > cap

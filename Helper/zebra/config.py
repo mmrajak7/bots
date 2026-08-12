@@ -168,6 +168,26 @@ _DEFAULTS = {
     'max_dte': 45,
     'min_leg_oi': 5000,
     'max_leg_spread_pct': 0.01,  # bid-ask spread cap per leg (1% of mid)
+    'bcs_max_entry_cost_pct': 15.0,
+                                 # HARD gate: (ask(long) - bid(short)) minus
+                                 # the same spread at mid, as a share of the
+                                 # max gain at mid. What the book charges just
+                                 # to open the position.
+                                 # Replaces the raw per-leg rupee bid-ask cap
+                                 # dropped 2026-08-10 — that one fired on 68%
+                                 # of shadows with no signal (58.8% WR flagged
+                                 # vs 62.5% clean) because rupees per leg say
+                                 # nothing about whether the payoff survives.
+                                 # This is denominated in the payoff, the same
+                                 # logic bcs_max_debit_to_width_pct uses.
+                                 # UNCALIBRATED — reasoned, not fitted. No
+                                 # historical record persisted its entry books
+                                 # so the rejection rate on the existing 42 is
+                                 # unmeasurable. 15% ≈ legs ~15% wide, well
+                                 # inside the 25%-of-mid that _leg_reliable
+                                 # admits (a garbage-print detector, never a
+                                 # tradeability gate). Review once ~30
+                                 # fill-basis records exist.
     'bcs_max_debit_to_width_pct': 45.0,
                                  # HARD gate on the shadow BCS: reject when the
                                  # debit exceeds this share of the spread width.
@@ -405,6 +425,11 @@ MAX_DTE = _int('max_dte')
 MIN_LEG_OI = _int('min_leg_oi')
 MAX_LEG_SPREAD_PCT = _num('max_leg_spread_pct')
 BCS_MAX_DEBIT_TO_WIDTH_PCT = _num('bcs_max_debit_to_width_pct')
+BCS_MAX_ENTRY_COST_PCT = _num('bcs_max_entry_cost_pct')
+assert 0 < BCS_MAX_ENTRY_COST_PCT < 100, \
+    "BCS_MAX_ENTRY_COST_PCT is a percentage of max gain; 0 blocks every trade"
+assert 0 < BCS_MAX_DEBIT_TO_WIDTH_PCT < 100, \
+    "BCS_MAX_DEBIT_TO_WIDTH_PCT is a percentage of width"
 TP_TARGET = _runtime['tp_target']
 SPOT_SL_ENABLED = _runtime['spot_sl_enabled']
 SPOT_SL_PCT = _num('spot_sl_pct')

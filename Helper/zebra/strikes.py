@@ -495,10 +495,31 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
             return {'error': f"{leg} leg OI {oi:,} < {cfg.MIN_LEG_OI:,} "
                              f"— illiquid book, signal suppressed"}
 
-    debit = round(atm_quote['mid'] - tgt_q['mid'], 2)
+    # ── FILL basis, not mid (2026-08-12) ─────────────────────────────────
+    # You BUY the long at the ASK and SELL the short at the BID. Local BCS
+    # rule, CLAUDE.md: "For BUYING use ASK. For SELLING use BID (never LTP)."
+    # The zebra ticket always obeyed this; the BCS one quoted mid on both legs
+    # — and BCS is now the only structure that trades and the only Telegram
+    # voice, so the ticket quoted a debit nobody could fill at. The number
+    # anchors everything downstream: max_gain, the debit-SL, both trail levels.
+    # On the widest book `_leg_reliable` admits (25% of mid per leg) a spread
+    # reading 32% d/w fills at 48% — past its own cap, a quarter of the max
+    # gain gone before the position exists.
+    long_ask = atm_quote.get('ask') or 0
+    short_bid = tgt_q.get('bid') or 0
+    if long_ask <= 0 or short_bid <= 0:
+        return {'error': f"no two-way book to price the fill "
+                         f"(long ask {long_ask}, short bid {short_bid})"}
+    debit = round(long_ask - short_bid, 2)
+    # The same spread at fair value. Kept, and gated on, because the d/w cap
+    # below was CALIBRATED on this basis and cannot be re-derived: entry books
+    # were never persisted, so all 42 historical records carry mid-basis d/w
+    # only. Moving the cap onto the fill basis would silently change
+    # selectivity by an unmeasurable amount.
+    debit_mid = round(atm_quote['mid'] - tgt_q['mid'], 2)
     if debit <= 0:
         return {'error': f"non-positive BCS debit {debit} "
-                         f"(ATM {atm_quote['mid']} vs target {tgt_q['mid']})"}
+                         f"(long ask {long_ask} vs short bid {short_bid})"}
 
     width = abs(k_tgt - atm_strike)
     long_ext = _extrinsic(direction, spot, atm_strike, atm_quote['mid'])
@@ -506,6 +527,12 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     tgt_spread_pct = ((tgt_q['ask'] - tgt_q['bid']) / tgt_q['mid']) \
         if tgt_q['mid'] > 0 else 1.0
     debit_to_width_pct = round(debit / width * 100, 1) if width else 0
+    debit_to_width_pct_mid = round(debit_mid / width * 100, 1) if width else 0
+    # What the book charges just to open, denominated in the payoff it eats.
+    entry_cost = round(debit - debit_mid, 2)
+    max_gain_mid = width - debit_mid
+    entry_cost_pct = round(entry_cost / max_gain_mid * 100, 1) \
+        if max_gain_mid > 0 else 999.0
 
     # ── HARD GATE 2: debit as a share of width ───────────────────────────
     # See cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT for the full rationale. Short
@@ -513,10 +540,35 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     # so d/w is the market's own probability quote. Past ~45% the payoff is
     # priced out — that band ran PF 0.24 while still winning 50% of the
     # time, i.e. it is a payoff problem, not a hit-rate problem.
-    if debit_to_width_pct > cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT:
-        return {'error': f"debit {debit:g} is {debit_to_width_pct:.1f}% of "
-                         f"width {width:g} (cap {cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT:g}%) "
+    # Evaluated on the MID basis — the one it was fitted on. See debit_mid.
+    if debit_to_width_pct_mid > cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT:
+        return {'error': f"debit {debit_mid:g} (mid) is "
+                         f"{debit_to_width_pct_mid:.1f}% of width {width:g} "
+                         f"(cap {cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT:g}%) "
                          f"— no payoff left, signal suppressed"}
+
+    # ── HARD GATE 3: what the book charges to get in ─────────────────────
+    # The principled replacement for the raw bid-ask cap dropped on
+    # 2026-08-10. That rule was denominated in RUPEES per leg, fired on 68% of
+    # shadows and carried no signal (58.8% WR flagged vs 62.5% clean) — its
+    # only effect was to train the reader to ignore the ⚠. This one is
+    # denominated in the PAYOFF, which is the same logic gate 2 already uses:
+    # a spread whose entry cost eats a fifth of the max gain has the payoff
+    # priced out just as surely as a rich debit does, and until the fill-basis
+    # pricing above there was nothing measuring it at all — `_leg_reliable`
+    # (≤25% of mid per leg) is a garbage-print detector, not a tradeability
+    # gate.
+    #
+    # UNCALIBRATED. The threshold is reasoned, not fitted: no historical
+    # record persisted its entry books, so the rejection rate on the existing
+    # 42 is unmeasurable. Entry books are now stored on every BCS record
+    # (`pricing_basis: 'fill'`) precisely so this can be fitted later. Review
+    # once ~30 fill-basis records exist.
+    if entry_cost_pct > cfg.BCS_MAX_ENTRY_COST_PCT:
+        return {'error': f"entry cost {entry_cost:g}/sh is {entry_cost_pct:.1f}% "
+                         f"of the {max_gain_mid:g} max gain "
+                         f"(cap {cfg.BCS_MAX_ENTRY_COST_PCT:g}%) — the book "
+                         f"takes too much of the payoff, signal suppressed"}
 
     # `target_spread>2%` was dropped here on 2026-08-10. It fired on 17 of 25
     # closed shadows (68%) and carried no signal whatsoever — 58.8% WR flagged
@@ -539,10 +591,15 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
         'short_spread_pct': round(tgt_spread_pct * 100, 2),
         'long_extrinsic': round(long_ext, 2),
         'short_extrinsic': round(short_ext, 2),
-        'debit': debit,
+        'debit': debit,                      # FILL basis: ask(long) - bid(short)
+        'debit_mid': debit_mid,              # fair value, the gate's basis
+        'entry_cost': entry_cost,            # what the book takes to open
+        'entry_cost_pct': entry_cost_pct,    # ...as a share of max gain at mid
+        'pricing_basis': 'fill',
         'width': width,
         'max_profit_per_share': round(width - debit, 2),
-        'debit_to_width_pct': debit_to_width_pct,
+        'debit_to_width_pct': debit_to_width_pct,          # matches `debit`
+        'debit_to_width_pct_mid': debit_to_width_pct_mid,  # matches `debit_mid`
         'lot_size': lot_size,
         'warnings': warnings,
     }

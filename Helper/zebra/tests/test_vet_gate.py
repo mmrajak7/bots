@@ -48,7 +48,12 @@ BCS = {'long_strike': 100.0, 'short_strike': 140.0, 'width': 40.0,
        'long_symbol': 'TESTCO26SEP100CE', 'short_symbol': 'TESTCO26SEP140CE',
        'debit': 10.0, 'lot_size': 100, 'debit_to_width_pct': 25.0,
        'short_extrinsic': 1.0, 'max_profit_per_share': 30.0, 'warnings': [],
-       'long_mid': 12.0, 'short_mid': 2.0}
+       # Books, not just mids: the ticket quotes ASK to buy and BID to sell,
+       # and `debit` is the fill (12.1 - 1.9 = 10.2 here, mid-mid would be 10).
+       'long_mid': 12.0, 'long_bid': 11.9, 'long_ask': 12.1,
+       'short_mid': 2.0, 'short_bid': 1.9, 'short_ask': 2.1,
+       'debit_mid': 10.0, 'entry_cost': 0.2, 'entry_cost_pct': 0.7,
+       'debit_to_width_pct_mid': 25.0, 'pricing_basis': 'fill'}
 
 
 @pytest.fixture

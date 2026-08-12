@@ -37,7 +37,12 @@ BCS = {'long_strike': 100.0, 'short_strike': 140.0, 'width': 40.0,
        'long_symbol': 'TESTCO26SEP100CE', 'short_symbol': 'TESTCO26SEP140CE',
        'debit': 10.0, 'lot_size': 100, 'debit_to_width_pct': 25.0,
        'short_extrinsic': 1.0, 'max_profit_per_share': 30.0, 'warnings': [],
-       'long_mid': 12.0, 'short_mid': 2.0}
+       # Books, not just mids: the ticket quotes ASK to buy and BID to sell,
+       # and `debit` is the fill (12.1 - 1.9 = 10.2 here, mid-mid would be 10).
+       'long_mid': 12.0, 'long_bid': 11.9, 'long_ask': 12.1,
+       'short_mid': 2.0, 'short_bid': 1.9, 'short_ask': 2.1,
+       'debit_mid': 10.0, 'entry_cost': 0.2, 'entry_cost_pct': 0.7,
+       'debit_to_width_pct_mid': 25.0, 'pricing_basis': 'fill'}
 
 
 @pytest.fixture
@@ -362,3 +367,78 @@ def test_a_clamped_mid_is_declared_as_clamped(wired, monkeypatch):
     monkeypatch.setattr(monitor, '_intrinsic_floor', lambda tr, sp: 5.0)
     q = monitor._structure_quote(None, t, spot=SPOT)
     assert q['floored'] is True and q['mid'] == 5.0
+
+
+# ── exit valuation: the basis is a property of the TRADE ─────────────────
+# Entry pays the spread and exit pays it again. A mid-mid book records
+# neither, which is why the paper P&L read optimistic at BOTH ends and
+# modelled zero round-trip cost.
+
+def _books(monkeypatch, bid, ask):
+    monkeypatch.setattr(
+        monitor.strikes_mod, '_quote_option',
+        lambda kite, sym: {'bid': bid, 'ask': ask, 'mid': (bid + ask) / 2,
+                           'oi': 7000, 'last': (bid + ask) / 2, 'reliable': True})
+
+
+def test_a_fill_basis_position_is_valued_at_bid_minus_ask(wired, monkeypatch):
+    """Closing a BCS SELLS the long (at the bid) and BUYS BACK the short (at
+    the ask) — strictly worse than mid-mid, which is the honest number."""
+    t = cycle(wired)[0]
+    assert t['pricing_basis'] == 'fill'
+    _books(monkeypatch, 9.0, 11.0)                 # mid 10 on both legs
+    # spot=None: the intrinsic floor would clamp this synthetic value and we
+    # are testing the BASIS here, not the no-arbitrage guard.
+    q = monitor._structure_quote(None, t, spot=None)
+    assert q['mid'] == pytest.approx(9.0 - 11.0)   # bid(long) - ask(short)
+
+
+def test_a_legacy_mid_basis_position_keeps_its_old_valuation(wired, monkeypatch):
+    """Basis is stamped at ENTRY and never changes under an open position.
+    Flipping a live trade from mid to fill would move its debit-SL and trail
+    levels beneath it, and make its round-trip P&L a comparison between two
+    different price conventions."""
+    t = cycle(wired)[0]
+    with wired._mutate():
+        wired.find(t['id'])['pricing_basis'] = 'mid'
+    t = wired.find(t['id'])
+    _books(monkeypatch, 9.0, 11.0)
+    q = monitor._structure_quote(None, t, spot=None)
+    assert q['mid'] == pytest.approx(0.0)          # mid(long) - mid(short)
+
+
+def test_a_one_sided_book_has_no_fill_value(wired, monkeypatch):
+    """There is no price this position could be closed at, so there is no
+    honest value to report — the caller freezes its confirm counters instead
+    of acting on a number it cannot transact at."""
+    t = cycle(wired)[0]
+    monkeypatch.setattr(
+        monitor.strikes_mod, '_quote_option',
+        lambda kite, sym: {'bid': 0, 'ask': 11.0, 'mid': 10.0, 'oi': 7000,
+                           'last': 10.0, 'reliable': True})
+    q = monitor._structure_quote(None, t, spot=SPOT)
+    assert q['mid'] is None and q['reliable'] is False
+
+
+def test_the_entry_books_are_persisted(wired):
+    """42 BCS records existed with no book on any of them, so the gap between
+    quoted and fillable could never be measured after the fact — and the
+    entry-cost gate had nothing to calibrate against."""
+    t = cycle(wired)[0]
+    for f in ('long_ask_entry', 'short_bid_entry', 'long_mid_entry',
+              'short_mid_entry', 'debit_mid', 'entry_cost', 'entry_cost_pct'):
+        assert t.get(f) is not None, f
+
+
+def test_the_ticket_quotes_prices_you_can_transact_at(wired):
+    """In LIVE this alert IS the order ticket. Quoting mid on both legs asks
+    the owner to enter at a debit the book will not give him — and the local
+    BCS rule has always said ASK to buy, BID to sell, never LTP."""
+    t = cycle(wired)[0]
+    msg = monitor._format_bcs_enter_alert(t, ANALYSIS, BCS)
+    # Compare the trailing PRICE TOKEN, not a substring — "12" lives inside
+    # "12.1" and a substring assertion passes on the very bug it is guarding.
+    buy_px = next(l for l in msg.splitlines() if 'BUY' in l).split()[-1]
+    sell_px = next(l for l in msg.splitlines() if 'SELL' in l).split()[-1]
+    assert buy_px == f"{BCS['long_ask']:g}", "ticket does not quote the ask to buy"
+    assert sell_px == f"{BCS['short_bid']:g}", "ticket does not quote the bid to sell"

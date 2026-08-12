@@ -407,6 +407,25 @@ class ZebraStore:
             'debit_sl_pct': cfg.DEBIT_SL_PCT,
             'width': float(bcs['width']),
             'debit_to_width_pct': bcs.get('debit_to_width_pct'),
+            # ── the entry books, persisted (2026-08-12) ──────────────────
+            # Records used to keep only the derived `debit`, so the gap
+            # between quoted and fillable could never be measured after the
+            # fact — 42 BCS records, zero with a book on them. That made the
+            # entry-cost gate impossible to calibrate and left the
+            # `illiquid_book` post-mortem tag with no entry-side evidence.
+            'pricing_basis': bcs.get('pricing_basis', 'mid'),
+            'debit_mid': bcs.get('debit_mid'),
+            'entry_cost': bcs.get('entry_cost'),
+            'entry_cost_pct': bcs.get('entry_cost_pct'),
+            'debit_to_width_pct_mid': bcs.get('debit_to_width_pct_mid'),
+            'long_ask_entry': bcs.get('long_ask'),
+            'long_bid_entry': bcs.get('long_bid'),
+            'long_mid_entry': bcs.get('long_mid'),
+            'short_ask_entry': bcs.get('short_ask'),
+            'short_bid_entry': bcs.get('short_bid'),
+            'short_mid_entry': bcs.get('short_mid'),
+            'long_oi_entry': bcs.get('long_oi'),
+            'short_oi_entry': bcs.get('short_oi'),
             'short_extrinsic_entry': float(bcs.get('short_extrinsic', 0)
                                            or bcs.get('short_extrinsic_entry', 0)),
             'entry_warnings': bcs.get('warnings', []),

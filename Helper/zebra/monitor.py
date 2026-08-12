@@ -179,8 +179,8 @@ def _format_enter_alert(trade: dict, analysis: dict,
             f"{bcs['long_strike']:g}/{bcs['short_strike']:g}  "
             f"debit {bcs['debit']:g} ({bcs['debit_to_width_pct']:.0f}% of width) | "
             f"maxP {bcs['max_profit_per_share']:g}{warn}\n"
-            f"🟢 BUY 1× <code>{bcs['long_symbol']}</code>  {bcs['long_mid']:g}\n"
-            f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_mid']:g}"
+            f"🟢 BUY 1× <code>{bcs['long_symbol']}</code>  {bcs['long_ask']:g}\n"
+            f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_bid']:g}"
         )
     return msg
 
@@ -508,9 +508,14 @@ def _format_bcs_enter_alert(trade: dict, analysis: dict, bcs: dict) -> str:
         f"Strikes <b>{k_atm} / {k_tgt}</b>   debit {bcs['debit']:g} "
         f"({bcs['debit_to_width_pct']:.0f}% of width) | "
         f"maxP {max_p:g} | R:R 1:{rr:.1f}\n"
+        f"fair {bcs.get('debit_mid', bcs['debit']):g} — the book takes "
+        f"{bcs.get('entry_cost', 0):g}/sh to open "
+        f"({bcs.get('entry_cost_pct', 0):.0f}% of max gain)\n"
         f"\n"
-        f"🟢 BUY 1× <code>{bcs['long_symbol']}</code>  {bcs['long_mid']:g}\n"
-        f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_mid']:g}"
+        # ASK to buy, BID to sell — this is an order ticket, and the prices on
+        # it have to be ones the owner can actually transact at.
+        f"🟢 BUY 1× <code>{bcs['long_symbol']}</code>  {bcs['long_ask']:g}\n"
+        f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_bid']:g}"
     )
 
 
@@ -1032,7 +1037,27 @@ def _structure_quote(kite, trade: dict, spot: Optional[float] = None) -> dict:
         reason = f"short {short_q.get('unreliable_reason')}"
     reliable = reason is None
 
-    mid = round(_long_multiplier(trade) * long_q['mid'] - short_q['mid'], 2)
+    # Value it on the basis the position was ENTERED on, never on whatever the
+    # current default is. Basis is a property of the TRADE, stamped at entry:
+    # flipping a live position from mid to fill mid-flight would move its
+    # debit-SL and trail levels under it, and would make its round-trip P&L a
+    # comparison between two different price conventions.
+    #
+    # 'fill' = what closing would actually pay — sell the long at the BID, buy
+    # the short back at the ASK. Entry pays the spread and exit pays it again;
+    # a mid-mid book records neither, which is why the paper P&L read
+    # optimistic at BOTH ends and modelled zero round-trip cost.
+    if trade.get('pricing_basis') == 'fill':
+        long_px, short_px = long_q.get('bid') or 0, short_q.get('ask') or 0
+        if long_px <= 0 or short_px <= 0:
+            # One-sided book: there is no price this position could be closed
+            # at, so there is no honest value to report. Same answer as a dead
+            # quote — the caller freezes its confirm counters rather than
+            # acting on a number it cannot transact at.
+            return {'mid': None, 'reliable': False, 'reason': 'no_two_way_book'}
+    else:
+        long_px, short_px = long_q['mid'], short_q['mid']
+    mid = round(_long_multiplier(trade) * long_px - short_px, 2)
     floored = False
     if spot is not None and spot > 0:
         floor = _intrinsic_floor(trade, spot)
