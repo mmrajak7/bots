@@ -171,12 +171,21 @@ class ZebraStore:
         # Dedup + id allocation must both happen INSIDE the lock: they are a
         # read-check-write, and two processes racing here would either double-add
         # the same signal or hand out the same id to two different trades.
+        #
+        # The dedup predicate is `shadow_of is None`, NOT `structure != 'bcs'`.
+        # It used to be the latter, which was right only while every BCS was a
+        # second record shadowing a zebra: a shadow is an observation, so it
+        # must not block a new signal. Once a BCS became the position itself
+        # (2026-08-12) that same test would have excluded every real position
+        # from dedup and let duplicates open on one thesis. "Is this a shadow
+        # of something else" is the property that actually matters, and it does
+        # not change meaning when the structure does.
         with self._mutate():
             for t in self._trades:
                 if (t.get('stock') == stock
                         and t.get('timeframe') == timeframe
                         and t.get('direction') == direction
-                        and t.get('structure', 'zebra') != 'bcs'
+                        and t.get('shadow_of') is None
                         and t.get('status') in ('watching', 'triggered', 'entered')):
                     raise ValueError(
                         f"{stock} {timeframe} {direction} already open as #{t['id']}"
@@ -362,27 +371,21 @@ class ZebraStore:
         )
         return trade
 
-    def _build_bcs_shadow(self, zebra_trade, bcs, now, lot_size, lots, quantity,
-                          debit, entry_spot, direction, sl_spot, dte) -> dict:
-        """Assemble the shadow record. Called INSIDE the store lock so that
-        _next_id() sees every trade another process may have just added."""
+    @staticmethod
+    def _bcs_entry_fields(bcs, now, lot_size, lots, quantity, debit,
+                          entry_spot, sl_spot, dte, tp_spot) -> dict:
+        """Every field that makes a record a BCS position.
+
+        Shared by the shadow builder and by mark_entered_bcs so `structure`
+        (and `width`, which the trail and the intrinsic floor both read) is
+        stamped in ONE place. It used to live only in the shadow builder: a
+        BCS promoted through any other path would have carried no `structure`
+        key, been treated as a 2-long zebra by `_long_multiplier`, and had
+        every structure value — quote, floor, P&L — doubled.
+        """
         return {
-            'id': self._next_id(),
-            'version': 1,
             'status': 'entered',
             'structure': 'bcs',
-            'shadow_of': zebra_trade['id'],
-            'stock': zebra_trade['stock'],
-            'timeframe': zebra_trade['timeframe'],
-            'direction': direction,
-            'st_value': zebra_trade['st_value'],
-            'st_direction': zebra_trade['st_direction'],
-            'signal_price': zebra_trade['signal_price'],
-            'signal_gap_pct': zebra_trade['signal_gap_pct'],
-            'signal_date': zebra_trade.get('signal_date'),
-            'signal_time': zebra_trade.get('signal_time'),
-            'paper': True,
-            'notes': f"BCS shadow of zebra #{zebra_trade['id']}",
             'entry_date': now.strftime('%Y-%m-%d'),
             'entry_time': now.strftime('%H:%M:%S'),
             'entry_spot': entry_spot,
@@ -397,7 +400,7 @@ class ZebraStore:
             'capital': round(debit * quantity, 2),
             'expiry': bcs['expiry'],
             'dte_at_entry': dte,
-            'tp_spot': float(zebra_trade.get('tp_spot', zebra_trade['st_value'])),
+            'tp_spot': tp_spot,
             'sl_spot': sl_spot,
             'spot_sl_pct': cfg.SPOT_SL_PCT,
             'debit_sl_value': round(debit * cfg.DEBIT_SL_PCT, 2),
@@ -408,6 +411,71 @@ class ZebraStore:
                                            or bcs.get('short_extrinsic_entry', 0)),
             'entry_warnings': bcs.get('warnings', []),
         }
+
+    def _build_bcs_shadow(self, zebra_trade, bcs, now, lot_size, lots, quantity,
+                          debit, entry_spot, direction, sl_spot, dte) -> dict:
+        """Assemble the shadow record. Called INSIDE the store lock so that
+        _next_id() sees every trade another process may have just added."""
+        trade = {
+            'id': self._next_id(),
+            'version': 1,
+            'shadow_of': zebra_trade['id'],
+            'stock': zebra_trade['stock'],
+            'timeframe': zebra_trade['timeframe'],
+            'direction': direction,
+            'st_value': zebra_trade['st_value'],
+            'st_direction': zebra_trade['st_direction'],
+            'signal_price': zebra_trade['signal_price'],
+            'signal_gap_pct': zebra_trade['signal_gap_pct'],
+            'signal_date': zebra_trade.get('signal_date'),
+            'signal_time': zebra_trade.get('signal_time'),
+            'paper': True,
+            'notes': f"BCS shadow of zebra #{zebra_trade['id']}",
+        }
+        trade.update(self._bcs_entry_fields(
+            bcs, now, lot_size, lots, quantity, debit, entry_spot, sl_spot, dte,
+            float(zebra_trade.get('tp_spot', zebra_trade['st_value']))))
+        return trade
+
+    def mark_entered_bcs(self, trade_id: int, bcs: dict) -> dict:
+        """Promote a signal straight into a BCS position — ONE record.
+
+        The BCS-only pipeline (2026-08-12). Where `add_bcs_shadow` creates a
+        second record shadowing a zebra, this turns the signal itself into the
+        position: no `shadow_of`, so it dedups like any other open trade, and
+        the scanner will not hand out a duplicate on the same thesis.
+        """
+        lot_size = int(bcs['lot_size'])
+        lots = 1
+        quantity = lot_size * lots
+        debit = float(bcs['debit'])
+        entry_spot = float(bcs['entry_spot'])
+
+        with self._mutate():
+            t = self._must_find(trade_id)
+            if t['status'] not in ('watching', 'triggered'):
+                raise ValueError(f"#{trade_id} status={t['status']}, can't enter")
+            direction = t['direction']
+            sl_spot = round(entry_spot * (1 - cfg.SPOT_SL_PCT), 2) \
+                if direction == 'CE' else \
+                round(entry_spot * (1 + cfg.SPOT_SL_PCT), 2)
+            try:
+                exp_date = datetime.strptime(bcs['expiry'], '%Y-%m-%d')
+                dte = (exp_date.date() - datetime.now().date()).days
+            except Exception:
+                dte = None
+            t.update(self._bcs_entry_fields(
+                bcs, datetime.now(), lot_size, lots, quantity, debit,
+                entry_spot, sl_spot, dte,
+                float(t.get('tp_spot', t['st_value']))))
+            t['version'] = t.get('version', 0) + 1
+        logger.info(
+            "ENTERED BCS #%d %s %g/%g debit=%.2f qty=%d cap=Rs%.0f d/w=%s%% "
+            "TP=%.2f SL=%.2f",
+            trade_id, t['stock'], t['long_strike'], t['short_strike'],
+            debit, quantity, t['capital'], t.get('debit_to_width_pct'),
+            t['tp_spot'], t['sl_spot'])
+        return t
 
     def mark_exited(self, trade_id: int, exit_spot: float,
                     exit_debit: Optional[float],

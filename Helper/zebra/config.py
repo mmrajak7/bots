@@ -137,6 +137,19 @@ _ALL_SCANNERS = [
 # ── Defaults ──────────────────────────────────────────────────────────────
 _DEFAULTS = {
     'paper_mode': True,          # PAPER: auto-enter on trigger + auto-close on exit signal
+    'entry_structure': 'bcs',    # What a triggered signal actually opens.
+                                 # 'bcs'   — ONE record, structure='bcs', no
+                                 #           shadow. The pipeline as of
+                                 #           2026-08-12: zebra is retired
+                                 #           (28 matched pairs, 4.1% RoC vs
+                                 #           18.4%, identical win counts, ~9x
+                                 #           the capital, 3 legs, one of them
+                                 #           deep-ITM and illiquid).
+                                 # 'zebra' — the old path: a zebra entry plus
+                                 #           an optional BCS shadow. Set this
+                                 #           to roll the migration back; no
+                                 #           data migration either way, since
+                                 #           open positions are untouched.
     'bcs_paper_enabled': True,   # Shadow BCS (buy ATM, sell strike nearest ST target)
                                  # paper-traded alongside every zebra entry for A/B
                                  # comparison (July 2026 slippage analysis). Only
@@ -342,6 +355,13 @@ def _positive_int(key: str, val, default: int) -> int:
 
 # ── Exports ───────────────────────────────────────────────────────────────
 PAPER_MODE = _runtime['paper_mode']
+_raw_struct = str(_runtime['entry_structure']).strip().lower()
+if _raw_struct not in ('bcs', 'zebra'):
+    logger.warning("entry_structure=%r is not 'bcs' or 'zebra' — falling back "
+                   "to %r", _runtime['entry_structure'],
+                   _DEFAULTS['entry_structure'])
+    _raw_struct = _DEFAULTS['entry_structure']
+ENTRY_STRUCTURE = _raw_struct
 BCS_PAPER_ENABLED = _runtime['bcs_paper_enabled']
 _raw_alerts = _runtime['alert_structures']
 if isinstance(_raw_alerts, str):     # common JSON typo: "bcs" not ["bcs"]

@@ -286,7 +286,29 @@ def _vet_context(trade: dict, analysis: dict, gap_pct: float) -> dict:
     agent's checklist, not part of the handoff.
     """
     best = analysis.get('best') or {}
+    # Under the BCS-only pipeline the zebra pair is never traded, so a context
+    # describing only that pair would ask the agent to vet a position that
+    # will not exist — and `gates_all_passed` would read TRUE off an empty
+    # `best`, i.e. an all-clear derived from having nothing to check.
+    bcs_ctx = None
+    if cfg.ENTRY_STRUCTURE == 'bcs':
+        atm = analysis.get('atm_quote') or {}
+        bcs_ctx = {
+            'atm_strike': analysis.get('atm_strike'),
+            'atm_bid': atm.get('bid'), 'atm_ask': atm.get('ask'),
+            'atm_mid': atm.get('mid'), 'atm_oi': atm.get('oi'),
+            'target_spot': trade.get('st_value'),
+            'max_debit_to_width_pct': cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT,
+            'min_leg_oi': cfg.MIN_LEG_OI,
+            # The short leg is picked, quoted and gated INSIDE analyze_bcs,
+            # after this snapshot is taken. Say so rather than leave the agent
+            # to assume the omission means "nothing there".
+            'note': 'short leg is chosen and gated at entry; if this signal '
+                    'entered, both OI and debit/width gates passed',
+        }
     return {
+        'structure': cfg.ENTRY_STRUCTURE,
+        'bcs': bcs_ctx,
         'stock': trade['stock'],
         'direction': trade['direction'],
         'timeframe': trade.get('timeframe'),
@@ -311,11 +333,110 @@ def _vet_context(trade: dict, analysis: dict, gap_pct: float) -> dict:
                    'long_extrinsic', 'short_extrinsic', 'net_ext',
                    'liquidity_ok', 'capital_per_lot', 'gate_fails')},
         # Explicit, because the agent's instructions used to say these gates
-        # "passed by construction" — true for most picks, but `_pick_best` has
-        # a last-resort tier that returns a candidate WITH failed gates when no
-        # clean one exists. Those are precisely the entries worth a hard look.
-        'gates_all_passed': not (best.get('gate_fails') or []),
+        # "passed by construction". Under 'zebra' that is true for most picks
+        # but `_pick_best` has a last-resort tier that returns a candidate WITH
+        # failed gates. Under 'bcs' the zebra pair is not traded at all, so
+        # None ("not applicable") is the honest value — an empty `best` would
+        # otherwise compute to True and hand the agent an all-clear about a
+        # structure nobody is opening.
+        'gates_all_passed': (None if cfg.ENTRY_STRUCTURE == 'bcs'
+                             else not (best.get('gate_fails') or [])),
     }
+
+
+def _send_enter_alert(store: ZebraStore, trade: dict, msg: str, stock: str,
+                      dry_run: bool = False) -> None:
+    """Send the ENTER alert exactly once, whatever structure produced it.
+
+    LIVE + vet: the alert is the user's ORDER TICKET. It fires on the verdict
+    tick rather than the trigger tick, and the signal stays 'triggered'
+    afterwards (the user enters manually), so status alone cannot dedupe it.
+    Atomic test-and-set: overlapping crons cannot send the ticket twice, and
+    the flag is consumed only here, on the path that actually reaches the
+    alert — never before a step that can fail.
+
+    Shared rather than reimplemented per structure. The BCS-only path first
+    sent its own alert directly, which skipped this claim entirely: in LIVE
+    mode that is an order ticket re-sent every five minutes, forever, which is
+    how duplicate manual entries happen.
+    """
+    if cfg.VET_ENABLED and not cfg.PAPER_MODE \
+            and not store.set_alert_flag(trade['id'], 'vet_enter'):
+        logger.info("Deferred ENTER alert already sent for #%d %s",
+                    trade['id'], stock)
+        return
+    if _send_telegram(msg, dry_run=dry_run):
+        logger.info("ENTER alert sent for #%d %s", trade['id'], stock)
+        return
+    logger.warning("ENTER alert FAILED for #%d %s", trade['id'], stock)
+    # LIVE: that ticket was the ONLY notification this allowed signal will ever
+    # produce, and the fast-path skips the trade once the flag is set — so a
+    # single Telegram hiccup would silently lose a vetted entry until it
+    # drift-cancelled. Give the claim back and retry next cycle, the same
+    # discipline as the exit escalation and the review alert. (PAPER never
+    # claims the flag; the position is already open and the alert is a
+    # notification, not a ticket.)
+    if cfg.VET_ENABLED and not cfg.PAPER_MODE:
+        store.clear_alert_flag(trade['id'], 'vet_enter')
+        logger.error("Deferred ENTER ticket for #%d %s released — "
+                     "retrying next cycle", trade['id'], stock)
+
+
+def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
+                  price: float, dry_run: bool = False):
+    """Build and open a first-class BCS from a triggered signal.
+
+    Returns:
+      None            — skipped; the signal stays 'triggered' and the
+                        drift/stale checks clean it up, as the zebra path does
+      (bcs, trade)    — PAPER: entered, `trade` is the fresh record
+      (bcs, None)     — LIVE: nothing entered, the alert IS the order ticket
+
+    The three-way return is deliberate. An earlier version returned None for
+    both "skipped" and "live", and the caller's `continue` then suppressed
+    every entry alert in LIVE mode — where the alert is the only way a trade
+    ever gets placed. Auto-entry is a paper-mode behaviour; alerting is not.
+
+    Never raises into the cycle: one bad chain must not stop the other
+    positions being monitored.
+    """
+    atm_strike = analysis.get('atm_strike')
+    atm_quote = analysis.get('atm_quote')
+    if not atm_strike or not atm_quote or atm_quote.get('mid') in (None, 0):
+        _log_bcs_suppressed(trade, 'no usable ATM book from the analyzer')
+        return None
+
+    try:
+        bcs = strikes_mod.analyze_bcs(
+            kite, trade['stock'], trade['direction'], price,
+            target_spot=trade['st_value'],
+            expiry=analysis['expiry'],
+            atm_strike=atm_strike,
+            atm_quote=atm_quote,
+            lot_size=analysis['lot_size'],
+        )
+    except Exception as e:
+        logger.error("BCS build failed for #%d %s: %s",
+                     trade['id'], trade['stock'], e)
+        _log_bcs_suppressed(trade, f"build failed: {e}")
+        return None
+    if bcs.get('error'):
+        _log_bcs_suppressed(trade, bcs['error'])
+        return None
+
+    bcs['expiry'] = analysis['expiry']
+    bcs['entry_spot'] = price
+    if not cfg.PAPER_MODE:
+        return bcs, None       # alert-only; the alert is the order ticket
+
+    try:
+        fresh = store.mark_entered_bcs(trade['id'], bcs)
+    except Exception as e:      # broad: bad data OR persist/IO failure
+        logger.error("BCS auto-enter failed for #%d %s: %s — left triggered "
+                     "(will drift-cancel), no alert sent",
+                     trade['id'], trade['stock'], e)
+        return None
+    return bcs, fresh
 
 
 def _log_bcs_suppressed(trade: dict, reason: Optional[str]) -> None:
@@ -565,16 +686,29 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         if analysis.get('error'):
             logger.warning("Strike analysis %s skipped: %s", stock, analysis['error'])
             continue
-        if not analysis.get('best'):
+        # Require what the structure we ACTUALLY trade needs. Under BCS-only
+        # the zebra pair is never opened, so gating the whole signal on a
+        # tradeable zebra `best` would let the zebra's constraints
+        # (net-extrinsic, deep-ITM liquidity) veto a spread that shares none of
+        # them — a retired structure still deciding which trades happen.
+        if cfg.ENTRY_STRUCTURE == 'bcs':
+            atm_q = analysis.get('atm_quote') or {}
+            if not analysis.get('atm_strike') or not atm_q.get('mid'):
+                logger.info("No usable ATM book for %s, leaving in watching",
+                            stock)
+                continue
+        elif not analysis.get('best'):
             logger.info("No tradeable best pick for %s, leaving in watching", stock)
             continue
 
         analysis['current_gap_pct'] = gap_pct
-        # Store just the best pick + ranked list for traceability.
-        alert_strikes = [analysis['best']] + [
-            c for c in analysis.get('candidates', [])
-            if (c['k_l'], c['k_s']) != (analysis['best']['k_l'], analysis['best']['k_s'])
-        ]
+        # Store just the best pick + ranked list for traceability. Under
+        # BCS-only these are zebra pairs nobody will trade, so the record
+        # carries none rather than a list that reads like a shortlist.
+        best = analysis.get('best')
+        alert_strikes = [] if cfg.ENTRY_STRUCTURE == 'bcs' or not best else \
+            [best] + [c for c in analysis.get('candidates', [])
+                      if (c['k_l'], c['k_s']) != (best['k_l'], best['k_s'])]
         if trade['status'] == 'watching':
             try:
                 store.mark_triggered(trade['id'], price, gap_pct, alert_strikes)
@@ -644,6 +778,35 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # would be re-added + re-alerted every scan (alert churn).
         bcs = None
         bcs_skip_reason = None      # why a gate suppressed the shadow, if it did
+
+        # ── BCS-only pipeline (2026-08-12) ──────────────────────────────
+        # One record, no zebra leg, no shadow. The strike analyzer still runs
+        # because it owns expiry selection, lot size and the ATM book — but a
+        # BCS is built from `atm_quote` at the TOP level of that result, not
+        # from the zebra's recommended pair, so the zebra's own gates
+        # (net-extrinsic, deep-ITM liquidity) can no longer veto a spread that
+        # shares none of those constraints.
+        if cfg.ENTRY_STRUCTURE == 'bcs':
+            built = _enter_as_bcs(store, kite, trade, analysis, price,
+                                  dry_run=dry_run)
+            if built is None:
+                continue
+            bcs, fresh = built
+            # `fresh` is None in LIVE mode (nothing entered). The alert still
+            # goes out — it is the order ticket, and _alerts_enabled always
+            # returns True when paper mode is off for exactly that reason.
+            target = fresh or trade
+            if _alerts_enabled(target):
+                msg = _format_bcs_enter_alert(target, analysis, bcs)
+                if cfg.VET_ENABLED:
+                    msg += _vet_line(store.find(trade['id']) or target)
+                _send_enter_alert(store, trade, msg, stock, dry_run=dry_run)
+            else:
+                logger.info("ENTER alert suppressed for #%d %s "
+                            "(alert_structures=%s)", trade['id'], stock,
+                            cfg.ALERT_STRUCTURES)
+            continue
+
         if cfg.PAPER_MODE:
             best = analysis.get('best')
             if not best:
@@ -744,33 +907,7 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                             "(alert_structures=%s)", trade['id'], stock,
                             cfg.ALERT_STRUCTURES)
             continue
-        # LIVE + vet: the ENTER alert is the user's order ticket and fires on
-        # the verdict tick, not the trigger tick — and the signal stays
-        # 'triggered' afterwards (the user enters manually), so status alone
-        # cannot dedupe it. Atomic test-and-set: overlapping crons cannot send
-        # the ticket twice, and the flag is only consumed here, on the path
-        # that actually reaches the alert (never before a step that can fail).
-        if cfg.VET_ENABLED and not cfg.PAPER_MODE \
-                and not store.set_alert_flag(trade['id'], 'vet_enter'):
-            logger.info("Deferred ENTER alert already sent for #%d %s",
-                        trade['id'], stock)
-            continue
-        sent = _send_telegram(msg, dry_run=dry_run)
-        if sent:
-            logger.info("ENTER alert sent for #%d %s", trade['id'], stock)
-        else:
-            logger.warning("ENTER alert FAILED for #%d %s", trade['id'], stock)
-            # LIVE: that ticket was the ONLY notification this allowed signal
-            # will ever produce, and the fast-path above skips the trade once
-            # the flag is set — so a single Telegram hiccup would silently lose
-            # a vetted entry until it drift-cancelled. Give the claim back and
-            # retry next cycle, the same discipline as the exit escalation and
-            # the review alert. (PAPER never claims the flag; the position is
-            # already open and the alert is a notification, not a ticket.)
-            if cfg.VET_ENABLED and not cfg.PAPER_MODE:
-                store.clear_alert_flag(trade['id'], 'vet_enter')
-                logger.error("Deferred ENTER ticket for #%d %s released — "
-                             "retrying next cycle", trade['id'], stock)
+        _send_enter_alert(store, trade, msg, stock, dry_run=dry_run)
 
 
 # ── Entered → TP/SL/Time ─────────────────────────────────────────────────

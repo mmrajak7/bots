@@ -37,7 +37,18 @@ BEST = {'k_l': 90.0, 'k_s': 100.0, 'debit': 5.0, 'lot_size': 100,
         'be': 95.0, 'be_pct_from_spot': -1.5, 'capital_per_lot': 500,
         'gate_fails': []}
 ANALYSIS = {'spot': SPOT, 'expiry': '2026-09-30', 'dte': 30, 'lot_size': 100,
-            'best': BEST, 'candidates': []}
+            'best': BEST, 'candidates': [],
+            'atm_strike': 100.0,
+            'atm_quote': {'bid': 1.9, 'ask': 2.1, 'mid': 2.0, 'oi': 9000}}
+# The pipeline entered by default is BCS-only, so the gate is exercised
+# against the structure that actually opens. These tests are about the VET
+# GATE, not the structure — pinning them to the retired zebra path would leave
+# the live entry path ungated by any of them.
+BCS = {'long_strike': 100.0, 'short_strike': 140.0, 'width': 40.0,
+       'long_symbol': 'TESTCO26SEP100CE', 'short_symbol': 'TESTCO26SEP140CE',
+       'debit': 10.0, 'lot_size': 100, 'debit_to_width_pct': 25.0,
+       'short_extrinsic': 1.0, 'max_profit_per_share': 30.0, 'warnings': [],
+       'long_mid': 12.0, 'short_mid': 2.0}
 
 
 @pytest.fixture
@@ -52,6 +63,8 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {'TESTCO': SPOT})
     monkeypatch.setattr(monitor.strikes_mod, 'analyze',
                         lambda *a, **k: dict(ANALYSIS))
+    monkeypatch.setattr(monitor.strikes_mod, 'analyze_bcs',
+                        lambda *a, **k: dict(BCS))
     spawned = []
     monkeypatch.setattr(vet, '_spawn_cli', lambda tid: spawned.append(tid))
 
@@ -170,7 +183,11 @@ def test_live_mode_sends_the_order_ticket_exactly_once(wired, monkeypatch):
     store, _ = wired
     monkeypatch.setattr(cfg, 'PAPER_MODE', False)
     sent = []
+    # Stub BOTH formatters: which one runs depends on entry_structure, and a
+    # test that stubs only the retired one silently stops testing the live path.
     monkeypatch.setattr(monitor, '_format_enter_alert',
+                        lambda *a, **k: 'TICKET')
+    monkeypatch.setattr(monitor, '_format_bcs_enter_alert',
                         lambda *a, **k: 'TICKET')
     monkeypatch.setattr(monitor, '_send_telegram',
                         lambda msg, dry_run=False: sent.append(msg) or True)
@@ -199,6 +216,7 @@ def test_live_order_ticket_survives_one_telegram_failure(wired, monkeypatch):
     store, _ = wired
     monkeypatch.setattr(cfg, 'PAPER_MODE', False)
     monkeypatch.setattr(monitor, '_format_enter_alert', lambda *a, **k: 'TICKET')
+    monkeypatch.setattr(monitor, '_format_bcs_enter_alert', lambda *a, **k: 'TICKET')
     sent, working = [], [False]
     monkeypatch.setattr(
         monitor, '_send_telegram',

@@ -390,7 +390,8 @@ def analyze(kite, stock: str, direction: str, spot: float,
             'error': f"No tradeable K_L found for {stock} {direction} {expiry}",
             'stock': stock, 'direction': direction, 'spot': spot,
             'expiry': expiry, 'dte': dte, 'lot_size': lot_size,
-            'k_s_used': k_s, 'candidates': [],
+            'k_s_used': k_s, 'atm_strike': k_s, 'atm_quote': _atm_quote(k_s_q),
+            'candidates': [],
         }
 
     best = _pick_best(candidates, spot)
@@ -412,10 +413,21 @@ def analyze(kite, stock: str, direction: str, spot: float,
         'lot_size': lot_size,
         'atm_strike': k_s,
         'k_s_used': k_s,
+        # The ATM book, at the top level rather than only inside `best`. A BCS
+        # buys this exact strike, so tucking the quote inside the zebra's
+        # recommended PAIR meant the zebra's own gates (net-extrinsic, deep-ITM
+        # liquidity) could veto a perfectly tradeable spread that shares none
+        # of those constraints.
+        'atm_quote': _atm_quote(k_s_q),
         'best': best,                         # the recommended pair (or None)
         'candidates': ranked[:max_candidates], # for `zebra analyze` inspection
         'all_evaluated': len(candidates),
     }
+
+
+def _atm_quote(q: dict) -> dict:
+    """The ATM leg's book, in the shape analyze_bcs expects."""
+    return {k: q.get(k) for k in ('bid', 'ask', 'mid', 'oi')}
 
 
 def analyze_bcs(kite, stock: str, direction: str, spot: float,
