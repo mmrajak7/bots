@@ -447,3 +447,56 @@ def test_a_failed_review_alert_is_retried_not_lost(store, monkeypatch):
     review.run(store, {'TESTCO': 96.0},
                send=lambda m, **k: sent.append(m) or True, spawn=False)
     assert len(sent) == 1, "recommendation lost after a send failure"
+
+
+# ── give-back watch (2026-08-12) ─────────────────────────────────────────
+# The pre-filter fired only on ADVERSE conditions, so a position that ran most
+# of the way to target and handed it all back never tripped it — the single
+# most expensive pattern in the book (10 of 116 closed trades, -Rs 273,446,
+# about twice what the whole book made). Retracing a big gain is not an adverse
+# move from ENTRY; it can happen entirely in profit.
+def _peaked(store, peak_spot):
+    """Entry 96, target 100 (the ST line). Give the position a peak."""
+    store.apply_mfe({1: {'mfe_spot': peak_spot}})
+    return store.find(1)
+
+
+def test_giving_back_a_big_gain_flags_a_review(store, monkeypatch):
+    monkeypatch.setattr(events, 'upcoming', lambda *a, **k: [])
+    t = _peaked(store, 99.5)                    # 87% of the way to target
+    needed, why = review.needs_review(t, 96.8, now=TODAY)   # back to 20%
+    assert needed and 'gave back' in why
+
+
+def test_a_position_still_near_its_peak_is_not_flagged(store, monkeypatch):
+    monkeypatch.setattr(events, 'upcoming', lambda *a, **k: [])
+    t = _peaked(store, 99.5)
+    needed, _ = review.needs_review(t, 99.2, now=TODAY)
+    assert needed is False
+
+
+def test_a_small_gain_given_back_is_not_flagged(store, monkeypatch):
+    """Only moves that got MOST of the way to target count. A position that
+    reached 30% and slipped is ordinary noise, not the give-back pattern."""
+    monkeypatch.setattr(events, 'upcoming', lambda *a, **k: [])
+    t = _peaked(store, 97.2)                    # 30% of the way
+    needed, _ = review.needs_review(t, 96.5, now=TODAY)
+    assert needed is False
+
+
+def test_give_back_is_measured_from_the_peak_not_from_entry(store, monkeypatch):
+    """The whole point: this can trigger while the position is still IN PROFIT,
+    which is why no adverse-move check could ever have caught it."""
+    monkeypatch.setattr(events, 'upcoming', lambda *a, **k: [])
+    t = _peaked(store, 99.9)
+    needed, why = review.needs_review(t, 97.5, now=TODAY)   # +1.6% vs entry
+    assert needed, "a profitable position that gave back its gain was ignored"
+    assert 'adverse' not in why
+
+
+def test_no_peak_recorded_means_no_give_back_signal(store, monkeypatch):
+    """Positions opened before MFE capture existed carry no peak. Inferring one
+    from the current spot would manufacture a signal out of missing data."""
+    monkeypatch.setattr(events, 'upcoming', lambda *a, **k: [])
+    needed, _ = review.needs_review(store.find(1), 96.8, now=TODAY)
+    assert needed is False

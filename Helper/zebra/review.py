@@ -49,6 +49,13 @@ def _marker(trade: dict) -> dict:
     return m
 
 
+# Give-back watch: reached this far toward target, then handed back this share
+# of the peak progress. Both fractions of the SAME move, so the trigger means
+# the same thing on a 3% target and a 12% one.
+GIVEBACK_PROGRESS = 0.70
+GIVEBACK_RETRACE = 1.0 / 3.0
+
+
 def needs_review(trade: dict, spot: float, evts: Optional[list] = None,
                  now: Optional[datetime] = None) -> tuple:
     """(needed, why). Deterministic, free, and deliberately narrow."""
@@ -66,6 +73,36 @@ def needs_review(trade: dict, spot: float, evts: Optional[list] = None,
         adverse = -move if trade.get('direction') == 'CE' else move
         if adverse >= cfg.REVIEW_ADVERSE_PCT:
             reasons.append('%.1f%% adverse from entry' % (adverse * 100))
+
+        # ── Give-back watch ──────────────────────────────────────────────
+        # The pre-filter above only ever fired on ADVERSE conditions, so a
+        # position that ran most of the way to target and then handed it all
+        # back never tripped it — the single most expensive pattern in the
+        # book (10 of 116 closed trades, -Rs 273,446, about twice what the
+        # whole book made). Retracing a big gain is not an adverse move from
+        # ENTRY; it can happen entirely in profit, which is exactly why
+        # nothing was watching.
+        tp = float(trade.get('tp_spot') or 0)
+        peak = trade.get('mfe_spot')
+        if tp and peak is not None and tp != entry:
+            span = tp - entry
+            peak_prog = (float(peak) - entry) / span
+            now_prog = (spot - entry) / span
+            if peak_prog >= GIVEBACK_PROGRESS and \
+                    (peak_prog - now_prog) >= peak_prog * GIVEBACK_RETRACE:
+                reasons.append(
+                    'gave back %.0f%% of a move that reached %.0f%% to target'
+                    % ((peak_prog - now_prog) / peak_prog * 100,
+                       peak_prog * 100))
+
+        # NOTE — no separate "absurd adverse move" trigger. It was written and
+        # removed the same hour: any move large enough to qualify has already
+        # tripped the REVIEW_ADVERSE_PCT check three lines up, so it added a
+        # second reason string and zero new coverage while doubling nothing but
+        # the agent spawns. The version that WOULD add something is velocity —
+        # this much in ONE session, versus the same drift over three weeks —
+        # and that needs the previous close, which this loop does not carry.
+        # Left undone deliberately rather than shipped as a redundant threshold.
 
     try:
         dte = (datetime.strptime(trade['expiry'], '%Y-%m-%d').date()
