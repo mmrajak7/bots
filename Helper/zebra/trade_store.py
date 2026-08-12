@@ -896,9 +896,55 @@ class ZebraStore:
 
     # ── Private ───────────────────────────────────────────────────────────
     def _next_id(self) -> int:
-        if not self._trades:
-            return 1
-        return max(t.get('id', 0) for t in self._trades) + 1
+        """Allocate an id that has never been used, even after a quarantine.
+
+        `max(id) + 1` over the live list is an allocator only while the list is
+        COMPLETE. It is not, in the one case that matters: `_read_local`
+        quarantines a corrupt file and returns `[]`, and if Drive is also down
+        `initialize()` takes the local branch, so the store legitimately starts
+        empty — and this handed out 1, 2, 3 again.
+
+        That is silently destructive rather than merely confusing. `_merge` is
+        keyed on `id` with the higher `version` winning, so once Drive returns,
+        a recycled id whose version has outrun the original REPLACES a genuine
+        trade. The original is then gone from disk (quarantined) and from Drive
+        (overwritten) — the only surviving copy is the `.corrupt.*.json` backup
+        nobody knows to look in.
+
+        A monotonic high-water mark on disk makes the collision impossible. It
+        is advisory: if it is missing or unreadable we fall back to the live max
+        and are no worse off than before.
+        """
+        live = max((t.get('id', 0) for t in self._trades), default=0)
+        nid = max(live, self._read_high_water()) + 1
+        self._write_high_water(nid)
+        return nid
+
+    @staticmethod
+    def _high_water_path():
+        # Keyed to the STORE FILE, not to LOG_DIR: the sequence belongs to one
+        # book. A directory-wide sidecar would make two store files share an id
+        # space, so opening a second store would silently skip ids in the first.
+        return cfg.LOCAL_FILE.with_suffix('.nextid.json')
+
+    def _read_high_water(self) -> int:
+        try:
+            return int(json.loads(
+                self._high_water_path().read_text()).get('max_id_ever') or 0)
+        except Exception:
+            return 0
+
+    def _write_high_water(self, value: int) -> None:
+        """Best-effort and never fatal — a trade must not fail to save because
+        a bookkeeping sidecar could not be written."""
+        try:
+            if value <= self._read_high_water():
+                return
+            cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            self._high_water_path().write_text(
+                json.dumps({'max_id_ever': int(value)}))
+        except Exception as e:
+            logger.warning("Could not persist the id high-water mark: %s", e)
 
     def _must_find(self, trade_id: int) -> dict:
         t = self.find(trade_id)
@@ -994,7 +1040,33 @@ class ZebraStore:
             except OSError:
                 pass
             logger.critical("File CORRUPT (%s). Backed up to %s.", e, backup)
+            self._flag_corruption(str(e), backup)
             return []
+
+    def _flag_corruption(self, err: str, backup) -> None:
+        """Leave a marker the MONITOR turns into a Telegram.
+
+        Quarantine is the single highest-consequence event in this system and it
+        was log-only. The store goes empty; `check_entered` hits
+        `if not entered: return` and exits before `_alert_monitoring_blind` can
+        ever be reached — that alert requires a NON-empty book, so the total
+        failure is precisely the case it cannot report. Every open position
+        stops being monitored and the only witness is one CRITICAL line in a log
+        nobody is tailing. "Blind means Telegram" is the fleet rule.
+
+        A marker file rather than a direct send: this module deliberately has no
+        Telegram dependency, and the cron process exits between cycles so an
+        in-memory flag would not survive to the alerting layer.
+        """
+        try:
+            cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            (cfg.LOG_DIR / 'zebra_store_corrupt.json').write_text(json.dumps({
+                'at': datetime.now().isoformat(timespec='seconds'),
+                'error': err,
+                'backup': str(backup),
+            }))
+        except Exception as e:
+            logger.error("Could not write the corruption marker: %s", e)
 
     def _load_local(self):
         # Under the lock: an unlocked startup read can land mid-save from the

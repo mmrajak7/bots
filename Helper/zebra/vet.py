@@ -506,6 +506,26 @@ def _marker_fresh(marker: dict, now: Optional[datetime] = None) -> bool:
     return (now or _now()) - decided < timedelta(seconds=_marker_ttl(marker))
 
 
+def _pending_recent(marker: dict, now: Optional[datetime] = None) -> bool:
+    """Is an expired PENDING request still ABOUT the episode in front of us?
+
+    A PENDING marker carries no `decided_at`, so `_marker_fresh` cannot judge
+    it. This bounds it by its own DEADLINE plus one TTL — deliberately not by
+    `requested_at`, which would leave only the gap between the deadline and the
+    TTL (5 minutes on the defaults) for a genuine outage to cash out as
+    fail-open. Measuring from the deadline guarantees a full TTL — three cron
+    cycles — in which a real "Claude did not answer" still returns 'proceed',
+    while a fossil from days ago is still discarded.
+
+    Fail-open is the contract for an outage. It is NOT a contract for a request
+    that expired in a market that has since closed and reopened.
+    """
+    deadline = _parse(marker.get('deadline')) or _parse(marker.get('requested_at'))
+    if deadline is None:
+        return False
+    return (now or _now()) - deadline < timedelta(seconds=cfg.EXIT_VET_TTL_SEC)
+
+
 def _marker_ttl(marker: dict) -> int:
     """Seconds a terminal exit verdict stays authoritative.
 
@@ -595,6 +615,29 @@ def exit_gate(store, trade: dict, kind: str, quote: dict, spot: float,
     if state in (ALLOWED, UNAVAILABLE, DEFER) and not _marker_fresh(m):
         logger.info('EXIT VET marker for #%d %s is stale (%s) — re-evaluating '
                     'this trigger from scratch', trade['id'], kind, state)
+        m, state = {}, None
+
+    # PENDING had NO age bound: `_marker_fresh` covers only the three TERMINAL
+    # states, and nothing sweeps `exit_vet` at all (`expire_stale` walks the
+    # ENTRY marker only). `exit_gate` is reached solely when a trigger fires, so
+    # a request whose agent died — and whose trigger then stopped firing —
+    # simply sat on disk. Days later the book genuinely collapses, the trigger
+    # returns, and the timeout branch below flips that fossil to UNAVAILABLE and
+    # returns 'proceed': the exit fires on the strength of a timeout that
+    # happened last week, against a book no agent has ever looked at, while the
+    # log says "TIMED OUT — proceeding" exactly as it would for a real
+    # ten-minute outage. That is a one-shot silent bypass per (trade, kind), on
+    # the precise failure shape this channel exists to catch.
+    #
+    # Forget it entirely so control falls through to `needs_exit_vet` and raises
+    # a FRESH request against the quote actually in front of us. Accumulated
+    # defers go with it, for the same reason a stale DEFER above loses them:
+    # distrust belongs to the episode that earned it.
+    if state == PENDING and _exit_expired(m) and not _pending_recent(m):
+        logger.warning(
+            'EXIT VET request for #%d %s is ANCIENT (requested %s) — '
+            'discarding it and re-requesting against the current book',
+            trade['id'], kind, m.get('requested_at'))
         m, state = {}, None
 
     if state == ALLOWED:

@@ -64,9 +64,21 @@ VET_ALLOWED_TOOLS = ['WebSearch', 'WebFetch', 'Read', 'Glob', 'Grep',
                      'Bash({python} -m zebra:*)']
 # The calendar agent builds a candidate JSON file before installing it.
 EVENT_EXTRA_TOOLS = ['Write']
+# The five position VERBS, plus the four verbs that CALL them. Denying only
+# the explicit verbs left the invariant above false: `zebra run` was granted by
+# the coarse allow rule and denied by nothing, and it runs the whole cycle —
+# `run_once` -> `run_cycle` -> `_enter_as_bcs` (opens a paper position) and
+# `check_entered` -> `_paper_auto_close` (closes one), then `_run_vet_side_
+# channels` spawns FURTHER agents recursively. A model asked to judge one
+# signal could open and close positions across the whole book and fork the
+# fleet, while the preflight reported the deny list complete. `loop` is the
+# same cycle held open all session; `scan` mutates the watchlist; `report`
+# sends Telegram to the owner as if the engine had spoken.
 VET_DENIED_TOOLS = ['Bash(*zebra close*)', 'Bash(*zebra enter*)',
                     'Bash(*zebra cancel*)', 'Bash(*zebra reset*)',
-                    'Bash(*zebra trigger*)']
+                    'Bash(*zebra trigger*)',
+                    'Bash(*zebra run*)', 'Bash(*zebra loop*)',
+                    'Bash(*zebra scan*)', 'Bash(*zebra report*)']
 
 # VET_MODEL, VET_TIMEOUT_SEC and CHILD_KILL_SEC are exported further down —
 # they read zebra_config.json, which is not loaded yet at this point.

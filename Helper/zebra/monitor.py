@@ -765,6 +765,26 @@ def _format_blind_alert(trade: dict, reason: Optional[str],
     )
 
 
+def _format_no_spot_alert(trade: dict) -> str:
+    """The underlying itself stopped quoting on an OPEN position.
+
+    Deliberately not `_format_blind_alert`: that one ends "Spot TP/SL still
+    armed", which is the opposite of true here. When spot is the missing input,
+    nothing is armed — TP, the expiry nag's pricing and the spot veto all run
+    off it. This is the most complete blindness the engine has, and it used to
+    be the only one that said nothing at all.
+    """
+    return (
+        f"⚠ <b>{_struct_label(trade)} NO SPOT</b>  "
+        f"<code>{trade['stock']}</code> ({trade['direction']})\n"
+        f"The UNDERLYING is not quoting — suspended, renamed or delisted.\n"
+        f"Every exit trigger on this position is blind: TP, debit-SL, trail "
+        f"and the spot veto all read spot.\n"
+        f"Expiry {trade.get('expiry', '?')}. Check the symbol manually — an "
+        f"open position on a dead symbol will not close itself."
+    )
+
+
 def _format_time_alert(trade: dict, days_left: int,
                        mid: Optional[float] = None) -> str:
     paper = _paper_close_line(trade, mid)
@@ -1602,6 +1622,47 @@ def _alert_monitoring_blind(n_open: int, stocks: list,
         dry_run=dry_run)
 
 
+def _alert_store_corruption(dry_run: bool = False) -> bool:
+    """Telegram once per quarantine event, then disarm on the marker itself.
+
+    The store writes the marker (it has no Telegram dependency by design); this
+    reads it. Keyed on the marker's own timestamp rather than on today's date,
+    because two corruptions in one day are two events and the second matters as
+    much as the first.
+
+    The alert names the backup file: after a quarantine the `.corrupt.*.json`
+    is the ONLY surviving copy of anything the Drive merge has not seen, and it
+    is deleted by nothing. Telling the human where it is, at the moment it is
+    created, is the difference between a recoverable incident and a lost book.
+    """
+    marker = cfg.LOG_DIR / 'zebra_store_corrupt.json'
+    seen = cfg.LOG_DIR / 'zebra_store_corrupt.alerted'
+    try:
+        if not marker.exists():
+            return False
+        info = json.loads(marker.read_text())
+        stamp = str(info.get('at') or '')
+        if seen.exists() and seen.read_text().strip() == stamp:
+            return False
+        _send_telegram(
+            f"🛑 <b>ZEBRA STORE CORRUPT</b>\n"
+            f"The trade file failed to parse and was quarantined at "
+            f"{html.escape(stamp)}.\n"
+            f"Error: <code>{html.escape(str(info.get('error'))[:200])}</code>\n"
+            f"Backup: <code>{html.escape(str(info.get('backup')))}</code>\n"
+            f"The store may have restarted EMPTY — if so, exit monitoring is "
+            f"off on every open position and ids can be reissued. Restore from "
+            f"the backup or Drive before the next session.",
+            dry_run=dry_run)
+        seen.write_text(stamp)
+        logger.critical("STORE CORRUPTION alerted (quarantined at %s, "
+                        "backup %s)", stamp, info.get('backup'))
+        return True
+    except Exception as e:
+        logger.error("Could not process the store-corruption marker: %s", e)
+        return False
+
+
 def _settlement_value(trade: dict, spot: float) -> Optional[float]:
     """What the structure is worth at expiry, from spot alone.
 
@@ -1712,14 +1773,38 @@ def _time_nag(store: ZebraStore, trade: dict, today, mid, spot,
         days_left = _sessions_left(today, exp)
     except Exception:
         days_left = 999
-    # Fires once per DAY so the nudge repeats until the position is out. In
-    # PAPER the first fire also closes it; later days no-op on status.
-    if days_left > cfg.TIME_SL_DAYS or not store.set_alert_flag_daily(tid, 'time'):
+    if days_left > cfg.TIME_SL_DAYS:
         return
-    if _alerts_enabled(trade):
-        _send_telegram(_format_time_alert(trade, days_left, mid), dry_run=dry_run)
-    logger.info("TIME alert #%d %s days_left=%d mid=%s", tid, trade['stock'],
-                days_left, f'{mid:.2f}' if mid is not None else 'NA')
+
+    # THE NAG is a calendar fact and fires once per DAY, ungated: a position
+    # whose book has gone dark in its final week needs the delivery-margin
+    # warning more than one quoting fine, not less.
+    if store.set_alert_flag_daily(tid, 'time'):
+        if _alerts_enabled(trade):
+            _send_telegram(_format_time_alert(trade, days_left, mid),
+                           dry_run=dry_run)
+        logger.info("TIME alert #%d %s days_left=%d mid=%s", tid,
+                    trade['stock'], days_left,
+                    f'{mid:.2f}' if mid is not None else 'NA')
+
+    # THE CLOSE is a claim about a PRICE, and was the one exit still booking at
+    # the opening auction. The daily flag is claimed by the 09:15 cycle and the
+    # close ran straight off it, so all 34 `paper:time` exits in the book priced
+    # between 09:15:35 and 09:18:05 — not one later in the day, while every
+    # other exit reason spreads across the session. That is the exact window
+    # VALUE_TRIGGER_OPEN_BUFFER_SEC exists to sit out, and both incidents that
+    # cost real money were opening prints. The nag above still goes out on time;
+    # only the booking waits.
+    if not _value_triggers_live():
+        logger.info(
+            "TIME HOLD #%d %s: nagged, close held until %ds after the open "
+            "(days_left=%d)", tid, trade['stock'],
+            cfg.VALUE_TRIGGER_OPEN_BUFFER_SEC, days_left)
+        return
+    # Retried EVERY cycle past the buffer, not once per day. The close is no
+    # longer gated on the daily flag, so a defer on a momentarily unusable book
+    # costs one poll rather than stranding the position un-booked until
+    # tomorrow — the old coupling gave TIME exactly one attempt per session.
     _paper_auto_close(store, trade, mid, 'time', spot, pending_mfe=pending_mfe,
                       reliable=reliable, release_flag=False, legs=legs)
 
@@ -1765,258 +1850,306 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         if trade.get('status') != 'entered':
             continue
 
-        stock = trade['stock']
-        spot = ltps.get(stock, 0)
-        if spot <= 0:
-            continue
-
-        tid = trade['id']
-        direction = trade['direction']
-        tp_spot = trade['tp_spot']
-        sl_spot = trade['sl_spot']
-
-        # One structure quote per trade per cycle. Every paper exit books at
-        # this mid, so if the quote is momentarily unavailable we DEFER the
-        # whole trade to the next poll — rather than burning a one-shot dedup
-        # flag on a close we can't execute (which would strand the exit
-        # forever) or booking a fabricated max-loss. LIVE mode still alerts
-        # (mid rendered as NA) since there it's an alert, not an auto-close.
-        # Passing spot arms the intrinsic-floor clamp (false-debit-SL guard).
-        # ── Strike-adjusting corporate action ───────────────────────────
-        # Before the quote, before MFE, before every exit. On a bonus/split/
-        # rights ex-date the exchange re-prices the underlying and adjusts the
-        # strikes with it: a 1:1 bonus halves the quoted spot, so yesterday's
-        # sl_spot is breached instantly by an event in which nothing went
-        # wrong, and the per-share debit refers to a lot size that changed. The
-        # recorded PEAK would be corrupted too, which is why this sits above
-        # the capture and not merely above the triggers. Nothing automated can
-        # repair those levels, so the position is suspended for the day and the
-        # human is told. (Ordinary ex-dividends are NOT included — see
-        # events.ADJUSTMENT_TYPES.)
-        adj = None
+        # ── Per-position fault isolation ─────────────────────────────
+        # One bad record used to abort the whole phase. The body indexes
+        # directly (`trade['tp_spot']`, `trade['debit_sl_value']`) and calls a
+        # store that can raise LockTimeout, so a single hand-edited or
+        # half-merged row raised out of the loop and EVERY position sorted
+        # after it got no exit check at all — silently, since run_cycle catches
+        # at the phase level. The cycle's accumulated peak and corroboration
+        # patches went with it, because `_flush_mfe` below never ran. Same shape
+        # as the dead-token incident this file already documents: that fix
+        # guarded one CALL, this guards the CLASS.
         try:
-            adj = events_mod.adjustment_today(stock)
-        except Exception as e:
-            logger.debug("Adjustment lookup failed for %s: %s", stock, e)
-        if adj:
-            if store.set_alert_flag_daily(tid, 'corp_action') \
-                    and _alerts_enabled(trade):
-                _send_telegram(_format_corp_action_alert(trade, adj),
-                               dry_run=dry_run)
-            logger.warning("CORP ACTION #%d %s: %s today — automated exits "
-                           "SUSPENDED (stored spot levels are stale)",
-                           tid, stock, adj.get('type'))
-            continue
-
-        sq = _structure_quote(kite, trade, spot)
-        mid = sq['mid']
-        # DEBIT-SL valuation is usable only with a mid AND a reliable book —
-        # a wide/crossed/one-sided book (2026-07-24) freezes the value trigger.
-        debit_usable = mid is not None and sq['reliable']
-        _track_debit_blindness(store, trade, debit_usable, sq['reason'],
-                               dry_run=dry_run, spot=spot)
-
-        # ── The second source, and the open ──────────────────────────────
-        # Everything above this line is checks on ONE source: the option book.
-        # These two are the other kind. Both gate ONLY the value triggers
-        # (DEBIT-SL, TRAIL) by folding into `debit_usable`; spot-driven TP and
-        # the TIME nag are untouched, because spot at the open is real trades
-        # and the calendar does not care about the book.
-        if debit_usable:
-            corrob_ok, corrob_why, corrob_patch = _spot_corroborates(
-                store, trade, spot, mid, sq['reliable'])
-            if corrob_patch:
-                pending_mfe.setdefault(tid, {}).update(corrob_patch)
-            if not corrob_ok:
+            stock = trade['stock']
+            tid = trade['id']
+            spot = ltps.get(stock, 0)
+            if spot <= 0:
+                # A suspended, renamed or delisted underlying — `get_ltp`
+                # returns the 0.0 sentinel for a symbol missing from the
+                # instrument cache. This was a bare `continue`: no POLL line, no
+                # counter, no alert. The position produced ZERO log output while
+                # staying `entered` forever, and the scanner's dedup went on
+                # banning its stock from ever signalling again.
+                # `_alert_monitoring_blind` cannot cover it — that fires only
+                # when EVERY position is unpriceable, so one dead symbol among
+                # 24 healthy ones is invisible by construction. In paper mode
+                # the log is the entire forensic record, and this position was
+                # not in it.
                 logger.warning(
-                    "SPOT VETO #%d %s: %s — value triggers held this cycle",
-                    tid, stock, corrob_why)
-                debit_usable = False
-        # ONE line per open position per cycle, unconditionally. Without it a
-        # cycle carrying 33 positions logged nothing at all between the store
-        # banner and the scanner summary — `check_entered` spoke only when a
-        # trigger fired — so "what did the engine SEE at 14:35" and "why did TP
-        # not fire" were both unanswerable. In paper mode the log is the entire
-        # forensic record, and a record of exits only is a record of the
-        # cycles that were already interesting.
-        logger.info(
-            "POLL #%d %s %s spot=%.2f tp=%.2f sl=%.2f | value=%s "
-            "(%s) debit_sl=%.2f | long %s/%s short %s/%s",
-            tid, stock, direction, spot, tp_spot, sl_spot,
-            f'{mid:.2f}' if mid is not None else 'NA',
-            'ok' if debit_usable else (sq.get('rejected') or sq['reason']
-                                       or 'unusable'),
-            trade.get('debit_sl_value', 0),
-            ((sq.get('legs') or {}).get('long') or {}).get('bid'),
-            ((sq.get('legs') or {}).get('long') or {}).get('ask'),
-            ((sq.get('legs') or {}).get('short') or {}).get('bid'),
-            ((sq.get('legs') or {}).get('short') or {}).get('ask'))
+                    "NO SPOT #%d %s: underlying did not quote this cycle — "
+                    "every exit trigger on this position is blind", tid, stock)
+                # Expiry is the one valuation needing neither a book nor a live
+                # spot. `_expire_if_ancient` already rescues WATCHING rows from
+                # exactly this immortality; entered rows had no equivalent, so
+                # fall back to the last spot ever recorded and let the position
+                # terminate rather than outlive its own contract.
+                last = (trade.get('corrob_spot') or trade.get('entry_spot') or 0)
+                try:
+                    if float(last) > 0:
+                        _settle_if_expired(store, trade, float(last), today,
+                                           pending_mfe, dry_run)
+                except (TypeError, ValueError):
+                    pass
+                if store.set_alert_flag_daily(tid, 'no_spot') \
+                        and _alerts_enabled(trade):
+                    _send_telegram(_format_no_spot_alert(trade), dry_run=dry_run)
+                continue
 
-        if debit_usable and not _value_triggers_live():
+            direction = trade['direction']
+            tp_spot = trade['tp_spot']
+            sl_spot = trade['sl_spot']
+
+            # One structure quote per trade per cycle. Every paper exit books at
+            # this mid, so if the quote is momentarily unavailable we DEFER the
+            # whole trade to the next poll — rather than burning a one-shot dedup
+            # flag on a close we can't execute (which would strand the exit
+            # forever) or booking a fabricated max-loss. LIVE mode still alerts
+            # (mid rendered as NA) since there it's an alert, not an auto-close.
+            # Passing spot arms the intrinsic-floor clamp (false-debit-SL guard).
+            # ── Strike-adjusting corporate action ───────────────────────────
+            # Before the quote, before MFE, before every exit. On a bonus/split/
+            # rights ex-date the exchange re-prices the underlying and adjusts the
+            # strikes with it: a 1:1 bonus halves the quoted spot, so yesterday's
+            # sl_spot is breached instantly by an event in which nothing went
+            # wrong, and the per-share debit refers to a lot size that changed. The
+            # recorded PEAK would be corrupted too, which is why this sits above
+            # the capture and not merely above the triggers. Nothing automated can
+            # repair those levels, so the position is suspended for the day and the
+            # human is told. (Ordinary ex-dividends are NOT included — see
+            # events.ADJUSTMENT_TYPES.)
+            adj = None
+            try:
+                adj = events_mod.adjustment_today(stock)
+            except Exception as e:
+                logger.debug("Adjustment lookup failed for %s: %s", stock, e)
+            if adj:
+                if store.set_alert_flag_daily(tid, 'corp_action') \
+                        and _alerts_enabled(trade):
+                    _send_telegram(_format_corp_action_alert(trade, adj),
+                                   dry_run=dry_run)
+                logger.warning("CORP ACTION #%d %s: %s today — automated exits "
+                               "SUSPENDED (stored spot levels are stale)",
+                               tid, stock, adj.get('type'))
+                continue
+
+            sq = _structure_quote(kite, trade, spot)
+            mid = sq['mid']
+            # DEBIT-SL valuation is usable only with a mid AND a reliable book —
+            # a wide/crossed/one-sided book (2026-07-24) freezes the value trigger.
+            debit_usable = mid is not None and sq['reliable']
+            _track_debit_blindness(store, trade, debit_usable, sq['reason'],
+                                   dry_run=dry_run, spot=spot)
+
+            # ── The second source, and the open ──────────────────────────────
+            # Everything above this line is checks on ONE source: the option book.
+            # These two are the other kind. Both gate ONLY the value triggers
+            # (DEBIT-SL, TRAIL) by folding into `debit_usable`; spot-driven TP and
+            # the TIME nag are untouched, because spot at the open is real trades
+            # and the calendar does not care about the book.
+            if debit_usable:
+                corrob_ok, corrob_why, corrob_patch = _spot_corroborates(
+                    store, trade, spot, mid, sq['reliable'])
+                if corrob_patch:
+                    pending_mfe.setdefault(tid, {}).update(corrob_patch)
+                if not corrob_ok:
+                    logger.warning(
+                        "SPOT VETO #%d %s: %s — value triggers held this cycle",
+                        tid, stock, corrob_why)
+                    debit_usable = False
+            # ONE line per open position per cycle, unconditionally. Without it a
+            # cycle carrying 33 positions logged nothing at all between the store
+            # banner and the scanner summary — `check_entered` spoke only when a
+            # trigger fired — so "what did the engine SEE at 14:35" and "why did TP
+            # not fire" were both unanswerable. In paper mode the log is the entire
+            # forensic record, and a record of exits only is a record of the
+            # cycles that were already interesting.
             logger.info(
-                "OPEN BUFFER #%d %s: value triggers dark until %ds after the "
-                "open (spot TP and the expiry nag still live)",
-                tid, stock, cfg.VALUE_TRIGGER_OPEN_BUFFER_SEC)
-            debit_usable = False
+                "POLL #%d %s %s spot=%.2f tp=%.2f sl=%.2f | value=%s "
+                "(%s) debit_sl=%.2f | long %s/%s short %s/%s",
+                tid, stock, direction, spot, tp_spot, sl_spot,
+                f'{mid:.2f}' if mid is not None else 'NA',
+                'ok' if debit_usable else (sq.get('rejected') or sq['reason']
+                                           or 'unusable'),
+                trade.get('debit_sl_value', 0),
+                ((sq.get('legs') or {}).get('long') or {}).get('bid'),
+                ((sq.get('legs') or {}).get('long') or {}).get('ask'),
+                ((sq.get('legs') or {}).get('short') or {}).get('bid'),
+                ((sq.get('legs') or {}).get('short') or {}).get('ask'))
 
-        # BEFORE the exit branches and BEFORE the no-quote skip below: the poll
-        # that exits a trade is usually the poll that set its peak, and the
-        # underlying is still worth recording on a cycle when the option book
-        # is dark. Never gates or blocks anything — pure measurement.
-        patch = mfe_mod.compute(trade, spot, mid, sq['reliable'])
-        if patch:
-            # MERGE, never assign. This dict may already hold the spot
-            # corroboration reference for the same trade, and `pending_mfe[tid]
-            # = patch` silently dropped it on every cycle where a peak
-            # advanced — leaving the veto with a baseline that only updated on
-            # quiet cycles, which is precisely backwards.
-            pending_mfe.setdefault(tid, {}).update(patch)
-
-        if cfg.PAPER_MODE and mid is None:
-            # Terminal net first: without it a position whose book has gone
-            # dark never reaches ANY exit and stays `entered` past expiry
-            # forever, which also bans its stock from the scanner for good.
-            # Expiry is the one valuation that needs no book.
-            if not _settle_if_expired(store, trade, spot, today,
-                                      pending_mfe, dry_run):
-                # The expiry NAG is a calendar fact and must survive a dark
-                # book. It used to sit below this `continue`, so a position
-                # whose book went unquotable in its final week got no warning
-                # at all — and the delivery-margin ramp is exactly what the nag
-                # exists to stay ahead of. Alert only: with no price there is
-                # nothing to book, and the daily flag re-nags tomorrow.
-                _time_nag(store, trade, today, None, spot, None, dry_run)
+            if debit_usable and not _value_triggers_live():
                 logger.info(
-                    "DEFER #%d %s: no usable book (%s) — spot=%.2f, nothing "
-                    "booked this cycle", tid, stock,
-                    sq.get('rejected') or sq['reason'] or 'no_quote', spot)
+                    "OPEN BUFFER #%d %s: value triggers dark until %ds after the "
+                    "open (spot TP and the expiry nag still live)",
+                    tid, stock, cfg.VALUE_TRIGGER_OPEN_BUFFER_SEC)
+                debit_usable = False
+
+            # BEFORE the exit branches and BEFORE the no-quote skip below: the poll
+            # that exits a trade is usually the poll that set its peak, and the
+            # underlying is still worth recording on a cycle when the option book
+            # is dark. Never gates or blocks anything — pure measurement.
+            patch = mfe_mod.compute(trade, spot, mid, sq['reliable'])
+            if patch:
+                # MERGE, never assign. This dict may already hold the spot
+                # corroboration reference for the same trade, and `pending_mfe[tid]
+                # = patch` silently dropped it on every cycle where a peak
+                # advanced — leaving the veto with a baseline that only updated on
+                # quiet cycles, which is precisely backwards.
+                pending_mfe.setdefault(tid, {}).update(patch)
+
+            if cfg.PAPER_MODE and mid is None:
+                # Terminal net first: without it a position whose book has gone
+                # dark never reaches ANY exit and stays `entered` past expiry
+                # forever, which also bans its stock from the scanner for good.
+                # Expiry is the one valuation that needs no book.
+                if not _settle_if_expired(store, trade, spot, today,
+                                          pending_mfe, dry_run):
+                    # The expiry NAG is a calendar fact and must survive a dark
+                    # book. It used to sit below this `continue`, so a position
+                    # whose book went unquotable in its final week got no warning
+                    # at all — and the delivery-margin ramp is exactly what the nag
+                    # exists to stay ahead of. Alert only: with no price there is
+                    # nothing to book, and the daily flag re-nags tomorrow.
+                    _time_nag(store, trade, today, None, spot, None, dry_run)
+                    logger.info(
+                        "DEFER #%d %s: no usable book (%s) — spot=%.2f, nothing "
+                        "booked this cycle", tid, stock,
+                        sq.get('rejected') or sq['reason'] or 'no_quote', spot)
+                continue
+
+            # ── TP ──────────────────────────────────────────────────────────
+            tp_hit = (direction == 'CE' and spot >= tp_spot) or \
+                     (direction == 'PE' and spot <= tp_spot)
+            # A blocked trigger skips ONLY ITS OWN branch. It must not `continue`:
+            # that would also skip the DEBIT-SL and TIME checks below, so a TP held
+            # on an untradeable book would suppress the T-3 expiry nag entirely and
+            # ride the position into settlement week unnoticed.
+            if tp_hit and _exit_cleared(store, trade, 'tp', sq, spot,
+                                        dry_run=dry_run) \
+                    and store.set_alert_flag(tid, 'tp'):
+                _send_exit_alert(store, trade, 'tp',
+                                 _format_tp_alert(trade, spot, mid), dry_run=dry_run)
+                logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
+                _paper_auto_close(store, trade, mid, 'tp', spot,
+                                  pending_mfe=pending_mfe, reliable=sq['reliable'],
+                                  legs=sq.get('legs'))
+                if trade.get('status') == 'exited':
+                    continue
+
+            # ── TRAIL ───────────────────────────────────────────────────────
+            # Profit-protection, so it sits with TP rather than with the stops: the
+            # LEVEL is above the entry debit by construction. The FILL is not — the
+            # trigger is `mid <= level` and the booking price is `mid`, so a gap
+            # through the level books wherever it landed. That is intended (a
+            # breached trail means get out), but it means a `trail` exit can be a
+            # loss, and it can land below the DEBIT-SL level too — TRAIL is checked
+            # first, so it wins the tag. outcomes.label_for_reason takes the
+            # realised P&L for exactly this reason; do not score `trail` as a HIT
+            # off the reason string alone.
+            tl = mfe_mod.trail_levels(trade) if cfg.TRAIL_ENABLED else None
+            if tl and tl['armed'] and store.set_alert_flag(tid, 'trail_armed'):
+                logger.info("TRAIL armed #%d %s peak=%.1f%% of max gain, level=%.2f",
+                            tid, stock, tl['peak_pct_of_max'], tl['level'])
+            if not debit_usable or not tl or not tl['armed']:
+                # Unusable quote FREEZES the counter rather than resetting it —
+                # same rule as the DEBIT-SL, so a flickering book cannot
+                # indefinitely block a genuine exit.
+                pass
+            elif mid <= tl['level']:
+                n = store.bump_confirm(tid, 'trail')
+                if n >= cfg.DEBIT_SL_CONFIRM_POLLS:
+                    if _exit_cleared(store, trade, 'trail', sq, spot,
+                                     dry_run=dry_run) \
+                            and store.set_alert_flag(tid, 'trail'):
+                        _send_exit_alert(store, trade, 'trail',
+                                         _format_trail_alert(trade, mid, tl),
+                                         dry_run=dry_run)
+                        logger.info("TRAIL alert #%d %s mid=%.2f<=level=%.2f "
+                                    "peak_gain=%.2f (confirmed x%d)",
+                                    tid, stock, mid, tl['level'], tl['peak_gain'], n)
+                        _paper_auto_close(store, trade, mid, 'trail', spot,
+                                          pending_mfe=pending_mfe,
+                                          legs=sq.get('legs'))
+                        if trade.get('status') == 'exited':
+                            continue
+                else:
+                    logger.info("TRAIL pending #%d %s mid=%.2f<=level=%.2f "
+                                "confirm %d/%d", tid, stock, mid, tl['level'],
+                                n, cfg.DEBIT_SL_CONFIRM_POLLS)
+            else:
+                store.reset_confirm(tid, 'trail')
+
+            # ── SPOT SL ─────────────────────────────────────────────────────
+            # Disabled by default: the debit floor already caps max loss, and the
+            # 3% adverse spot SL was force-exiting capped-risk trades near the
+            # local bottom (biggest realized-loss bucket in paper). Flip
+            # spot_sl_enabled=True in zebra_config.json to restore.
+            sl_hit = cfg.SPOT_SL_ENABLED and (
+                     (direction == 'CE' and spot <= sl_spot) or
+                     (direction == 'PE' and spot >= sl_spot))
+            if sl_hit and _exit_cleared(store, trade, 'spot_sl', sq, spot,
+                                        dry_run=dry_run) \
+                    and store.set_alert_flag(tid, 'spot_sl'):
+                _send_exit_alert(store, trade, 'spot_sl',
+                                 _format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
+                logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
+                _paper_auto_close(store, trade, mid, 'spot_sl', spot,
+                                  pending_mfe=pending_mfe, reliable=sq['reliable'],
+                                  legs=sq.get('legs'))
+                if trade.get('status') == 'exited':
+                    continue
+
+            # ── DEBIT SL ────────────────────────────────────────────────────
+            # Value trigger: needs DEBIT_SL_CONFIRM_POLLS consecutive RELIABLE
+            # triggering reads. An unreliable / no-quote read FREEZES the counter
+            # (never resets it — a flickering book must not block a genuine exit);
+            # a reliable non-trigger read resets it. This is the direct fix for the
+            # 2026-07-24 single-poll phantom SL.
+            if not debit_usable:
+                pass  # freeze confirm counter; blindness handled above
+            elif mid <= trade['debit_sl_value']:
+                n = store.bump_confirm(tid, 'debit_sl')
+                if n >= cfg.DEBIT_SL_CONFIRM_POLLS:
+                    # THE NHPC case. The debounce above proves the reading is
+                    # repeatable; it cannot prove the book was real. Vet before
+                    # claiming the consume-once flag.
+                    if _exit_cleared(store, trade, 'debit_sl', sq, spot,
+                                     dry_run=dry_run) \
+                            and store.set_alert_flag(tid, 'debit_sl'):
+                        _send_exit_alert(store, trade, 'debit_sl',
+                                         _format_debit_sl_alert(trade, mid),
+                                         dry_run=dry_run)
+                        logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f (confirmed x%d)",
+                                    tid, stock, mid, trade['debit_sl_value'], n)
+                        _paper_auto_close(store, trade, mid, 'debit_sl', spot,
+                                          pending_mfe=pending_mfe,
+                                          legs=sq.get('legs'))
+                        if trade.get('status') == 'exited':
+                            continue
+                else:
+                    logger.info("DEBIT SL pending #%d %s mid=%.2f<=sl=%.2f confirm %d/%d",
+                                tid, stock, mid, trade['debit_sl_value'],
+                                n, cfg.DEBIT_SL_CONFIRM_POLLS)
+            else:
+                store.reset_confirm(tid, 'debit_sl')
+
+            # ── TIME SL ─────────────────────────────────────────────────────
+            # SESSIONS, not calendar days. Indian stock options are physically
+            # settled and the exchange ramps a delivery margin over the final
+            # trading sessions, so "3 days left" on a Friday — one session — is the
+            # exact moment the old calendar count was most wrong and the margin
+            # most urgent. No holiday calendar exists here, so this over-counts
+            # across a holiday; TIME_SL_DAYS is set with that slack in mind.
+            _time_nag(store, trade, today, mid, spot, pending_mfe, dry_run,
+                      reliable=sq['reliable'], legs=sq.get('legs'))
+        except Exception as e:
+            # Never fatal to the phase. A position that cannot be evaluated is
+            # a position that keeps its stop where it is until the next poll.
+            logger.error(
+                "POSITION CHECK FAILED #%s %s: %s — this position is skipped "
+                "this cycle; the rest of the book continues",
+                trade.get('id'), trade.get('stock'), e, exc_info=True)
             continue
-
-        # ── TP ──────────────────────────────────────────────────────────
-        tp_hit = (direction == 'CE' and spot >= tp_spot) or \
-                 (direction == 'PE' and spot <= tp_spot)
-        # A blocked trigger skips ONLY ITS OWN branch. It must not `continue`:
-        # that would also skip the DEBIT-SL and TIME checks below, so a TP held
-        # on an untradeable book would suppress the T-3 expiry nag entirely and
-        # ride the position into settlement week unnoticed.
-        if tp_hit and _exit_cleared(store, trade, 'tp', sq, spot,
-                                    dry_run=dry_run) \
-                and store.set_alert_flag(tid, 'tp'):
-            _send_exit_alert(store, trade, 'tp',
-                             _format_tp_alert(trade, spot, mid), dry_run=dry_run)
-            logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
-            _paper_auto_close(store, trade, mid, 'tp', spot,
-                              pending_mfe=pending_mfe, reliable=sq['reliable'],
-                              legs=sq.get('legs'))
-            if trade.get('status') == 'exited':
-                continue
-
-        # ── TRAIL ───────────────────────────────────────────────────────
-        # Profit-protection, so it sits with TP rather than with the stops: the
-        # LEVEL is above the entry debit by construction. The FILL is not — the
-        # trigger is `mid <= level` and the booking price is `mid`, so a gap
-        # through the level books wherever it landed. That is intended (a
-        # breached trail means get out), but it means a `trail` exit can be a
-        # loss, and it can land below the DEBIT-SL level too — TRAIL is checked
-        # first, so it wins the tag. outcomes.label_for_reason takes the
-        # realised P&L for exactly this reason; do not score `trail` as a HIT
-        # off the reason string alone.
-        tl = mfe_mod.trail_levels(trade) if cfg.TRAIL_ENABLED else None
-        if tl and tl['armed'] and store.set_alert_flag(tid, 'trail_armed'):
-            logger.info("TRAIL armed #%d %s peak=%.1f%% of max gain, level=%.2f",
-                        tid, stock, tl['peak_pct_of_max'], tl['level'])
-        if not debit_usable or not tl or not tl['armed']:
-            # Unusable quote FREEZES the counter rather than resetting it —
-            # same rule as the DEBIT-SL, so a flickering book cannot
-            # indefinitely block a genuine exit.
-            pass
-        elif mid <= tl['level']:
-            n = store.bump_confirm(tid, 'trail')
-            if n >= cfg.DEBIT_SL_CONFIRM_POLLS:
-                if _exit_cleared(store, trade, 'trail', sq, spot,
-                                 dry_run=dry_run) \
-                        and store.set_alert_flag(tid, 'trail'):
-                    _send_exit_alert(store, trade, 'trail',
-                                     _format_trail_alert(trade, mid, tl),
-                                     dry_run=dry_run)
-                    logger.info("TRAIL alert #%d %s mid=%.2f<=level=%.2f "
-                                "peak_gain=%.2f (confirmed x%d)",
-                                tid, stock, mid, tl['level'], tl['peak_gain'], n)
-                    _paper_auto_close(store, trade, mid, 'trail', spot,
-                                      pending_mfe=pending_mfe,
-                                      legs=sq.get('legs'))
-                    if trade.get('status') == 'exited':
-                        continue
-            else:
-                logger.info("TRAIL pending #%d %s mid=%.2f<=level=%.2f "
-                            "confirm %d/%d", tid, stock, mid, tl['level'],
-                            n, cfg.DEBIT_SL_CONFIRM_POLLS)
-        else:
-            store.reset_confirm(tid, 'trail')
-
-        # ── SPOT SL ─────────────────────────────────────────────────────
-        # Disabled by default: the debit floor already caps max loss, and the
-        # 3% adverse spot SL was force-exiting capped-risk trades near the
-        # local bottom (biggest realized-loss bucket in paper). Flip
-        # spot_sl_enabled=True in zebra_config.json to restore.
-        sl_hit = cfg.SPOT_SL_ENABLED and (
-                 (direction == 'CE' and spot <= sl_spot) or
-                 (direction == 'PE' and spot >= sl_spot))
-        if sl_hit and _exit_cleared(store, trade, 'spot_sl', sq, spot,
-                                    dry_run=dry_run) \
-                and store.set_alert_flag(tid, 'spot_sl'):
-            _send_exit_alert(store, trade, 'spot_sl',
-                             _format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
-            logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
-            _paper_auto_close(store, trade, mid, 'spot_sl', spot,
-                              pending_mfe=pending_mfe, reliable=sq['reliable'],
-                              legs=sq.get('legs'))
-            if trade.get('status') == 'exited':
-                continue
-
-        # ── DEBIT SL ────────────────────────────────────────────────────
-        # Value trigger: needs DEBIT_SL_CONFIRM_POLLS consecutive RELIABLE
-        # triggering reads. An unreliable / no-quote read FREEZES the counter
-        # (never resets it — a flickering book must not block a genuine exit);
-        # a reliable non-trigger read resets it. This is the direct fix for the
-        # 2026-07-24 single-poll phantom SL.
-        if not debit_usable:
-            pass  # freeze confirm counter; blindness handled above
-        elif mid <= trade['debit_sl_value']:
-            n = store.bump_confirm(tid, 'debit_sl')
-            if n >= cfg.DEBIT_SL_CONFIRM_POLLS:
-                # THE NHPC case. The debounce above proves the reading is
-                # repeatable; it cannot prove the book was real. Vet before
-                # claiming the consume-once flag.
-                if _exit_cleared(store, trade, 'debit_sl', sq, spot,
-                                 dry_run=dry_run) \
-                        and store.set_alert_flag(tid, 'debit_sl'):
-                    _send_exit_alert(store, trade, 'debit_sl',
-                                     _format_debit_sl_alert(trade, mid),
-                                     dry_run=dry_run)
-                    logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f (confirmed x%d)",
-                                tid, stock, mid, trade['debit_sl_value'], n)
-                    _paper_auto_close(store, trade, mid, 'debit_sl', spot,
-                                      pending_mfe=pending_mfe,
-                                      legs=sq.get('legs'))
-                    if trade.get('status') == 'exited':
-                        continue
-            else:
-                logger.info("DEBIT SL pending #%d %s mid=%.2f<=sl=%.2f confirm %d/%d",
-                            tid, stock, mid, trade['debit_sl_value'],
-                            n, cfg.DEBIT_SL_CONFIRM_POLLS)
-        else:
-            store.reset_confirm(tid, 'debit_sl')
-
-        # ── TIME SL ─────────────────────────────────────────────────────
-        # SESSIONS, not calendar days. Indian stock options are physically
-        # settled and the exchange ramps a delivery margin over the final
-        # trading sessions, so "3 days left" on a Friday — one session — is the
-        # exact moment the old calendar count was most wrong and the margin
-        # most urgent. No holiday calendar exists here, so this over-counts
-        # across a holiday; TIME_SL_DAYS is set with that slack in mind.
-        _time_nag(store, trade, today, mid, spot, pending_mfe, dry_run,
-                  reliable=sq['reliable'], legs=sq.get('legs'))
 
     # Anything not already flushed by an exit. On a normal cycle this is the
     # ONLY store write the peak tracking does, however many positions moved.
@@ -2028,6 +2161,11 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
 def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
               do_scan: bool = True) -> None:
     """One full cycle: scan + check watching + check entered."""
+    # Before anything else: did the store quarantine a corrupt file? That path
+    # empties the book, and an empty book makes `check_entered` return at its
+    # first line — so the ONE event that stops all exit monitoring is the one
+    # event `_alert_monitoring_blind` structurally cannot report.
+    _alert_store_corruption(dry_run=dry_run)
     # FIRST, before anything can read a vet state: fail open any vet that blew
     # its deadline. This is the guard that stops a Claude outage (crash, hung
     # CLI, expired auth, Pi reboot) from quietly parking signals in `pending`

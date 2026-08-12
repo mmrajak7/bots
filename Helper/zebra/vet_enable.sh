@@ -142,7 +142,8 @@ fi
 $PY - <<EOF
 import sys; sys.path.insert(0, '$HELPER')
 from zebra import config as c
-need = ['close', 'enter', 'cancel', 'reset', 'trigger']
+need = ['close', 'enter', 'cancel', 'reset', 'trigger',
+        'run', 'loop', 'scan', 'report']
 missing = [v for v in need if not any(v in d for d in c.VET_DENIED_TOOLS)]
 if missing:
     print(f'  \033[31m[FAIL]\033[0m VET_DENIED_TOOLS does not cover: {missing}')

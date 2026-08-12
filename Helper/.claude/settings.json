@@ -19,7 +19,14 @@
     "position. Verified 2026-08-12 by asking a real agent to run",
     "`zebra close --help` (harmless even if the deny failed) — it answered",
     "DENIED. Do not weaken these patterns; the wildcards are what make them",
-    "survive a `cd foo && python -m zebra close` phrasing."
+    "survive a `cd foo && python -m zebra close` phrasing.",
+    "",
+    "2026-08-13: the five position verbs were NOT the whole invariant. The",
+    "cycle verbs call them. `zebra run` opens positions (_enter_as_bcs),",
+    "closes them (_paper_auto_close) and recursively spawns more agents; it",
+    "was granted by the coarse allow rule and denied here by nothing. `loop`",
+    "is the same cycle held open, `scan` mutates the watchlist, `report`",
+    "Telegrams the owner. Deny the callers, not just the callees."
   ],
   "permissions": {
     "deny": [
@@ -27,7 +34,11 @@
       "Bash(*zebra enter*)",
       "Bash(*zebra cancel*)",
       "Bash(*zebra reset*)",
-      "Bash(*zebra trigger*)"
+      "Bash(*zebra trigger*)",
+      "Bash(*zebra run*)",
+      "Bash(*zebra loop*)",
+      "Bash(*zebra scan*)",
+      "Bash(*zebra report*)"
     ]
   }
 }

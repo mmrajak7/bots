@@ -140,11 +140,36 @@ def test_defer_reasks_then_escalates_at_the_cap(store):
 
 def test_timeout_proceeds_on_the_deterministic_guards(store, monkeypatch):
     """Claude down must NOT stop exits — the debounce, reliability check and
-    intrinsic floor are unchanged and still stand on their own."""
+    intrinsic floor are unchanged and still stand on their own.
+
+    Twelve minutes: past the 10-minute deadline, inside the window in which the
+    timeout still describes THIS episode. It used to jump two HOURS, which
+    quietly made this a test of the fossil path below instead of a test of an
+    outage — and asserted that the fossil should fire the exit.
+    """
     _gate(store)
-    _clock(monkeypatch, datetime.now() + timedelta(hours=2))
+    _clock(monkeypatch, datetime.now() + timedelta(minutes=12))
     assert _gate(store) == 'proceed'
     assert vet.exit_state(store.find(1), 'debit_sl') == vet.UNAVAILABLE
+
+
+def test_an_ancient_pending_is_rerequested_not_cashed_in_as_a_timeout(
+        store, monkeypatch):
+    """The V1 bypass: `exit_gate` runs ONLY when a trigger fires, and nothing
+    sweeps `exit_vet`. A request whose agent died, on a trigger that then
+    stopped firing, sat on disk — and days later the timeout branch flipped it
+    to UNAVAILABLE and returned 'proceed'. The exit fired on a timeout from last
+    week, against a book no agent had ever seen, logging the same line a real
+    ten-minute outage logs. One silent bypass per (trade, kind), on exactly the
+    shape this channel exists to catch.
+    """
+    _gate(store)
+    assert vet.exit_state(store.find(1), 'debit_sl') == vet.PENDING
+    _clock(monkeypatch, datetime.now() + timedelta(days=3))
+    # Discarded and re-requested against the CURRENT book, not cashed in.
+    assert _gate(store) == 'wait'
+    assert vet.exit_state(store.find(1), 'debit_sl') == vet.PENDING
+    assert vet.exit_defers(store.find(1), 'debit_sl') == 0
 
 
 def test_request_failure_proceeds(store, monkeypatch):
@@ -222,7 +247,7 @@ def test_rejects_a_veto_verdict(store):
 
 def test_late_verdict_is_discarded(store, monkeypatch):
     _gate(store)
-    _clock(monkeypatch, datetime.now() + timedelta(hours=2))
+    _clock(monkeypatch, datetime.now() + timedelta(minutes=12))
     _gate(store)                                     # flips to unavailable
     assert 'discarded' in vet.record_exit_verdict(store, 1, 'debit_sl', 'allow')
 

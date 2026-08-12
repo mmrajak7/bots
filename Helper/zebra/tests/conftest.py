@@ -46,8 +46,41 @@ import pytest
 HELPER = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HELPER))
 
+from zebra import config as cfg           # noqa: E402
 from zebra import monitor as monitor_mod  # noqa: E402
 from zebra import vet as vet_mod          # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_production_paths(tmp_path_factory, monkeypatch):
+    """No test may write the production logs, store, or watchdog state.
+
+    Third instance of the same class, after real Telegrams and real spawns.
+    `test_review_fixes.py::test_the_spawn_grants_tools_on_argv_not_via_settings`
+    does not take the `paths` fixture, and forces `resolve_cli` back to a real
+    path so it can inspect argv. Popen is stubbed, so nothing was launched — but
+    execution still reached `vet.py:315`, which mkdir'd the production
+    `Helper/logs/`, appended a banner to the real `vet_cli_YYYYMMDD.log`, and
+    called `_note_spawn(True, 'entry')` -> `health.record_spawn_result` -> the
+    real `auth_health.json`.
+
+    Measured: that counter read `spawns_since_landing: 73`, accumulated ~3 per
+    suite run over ~24 runs. `SILENT_SPAWN_LIMIT` is 5, so `health.check` would
+    have Telegrammed "CLAUDE AGENTS NOT REPORTING BACK" on the first live cycle
+    — the one detector built to catch "the layer is dead while the switch reads
+    ON", made to cry wolf by the test suite, and clearable only by a real
+    landing. The number was also useless as evidence: it measured pytest.
+
+    Railed at the SOURCE and autouse, not per test: `paths` fixes the files one
+    test knows about, and the next test nobody remembers to isolate walks
+    straight past it. Both modules read `cfg.LOG_DIR` at call time, so this one
+    redirect covers every writer. A test wanting real paths must say so.
+    """
+    tmp = tmp_path_factory.mktemp('zebra_prod_rail')
+    monkeypatch.setattr(cfg, 'LOG_DIR', tmp)
+    monkeypatch.setattr(cfg, 'LOCAL_FILE', tmp / 'zebra_trades.json')
+    monkeypatch.setattr(cfg, 'LOCK_FILE', tmp / 'zebra_trades.lock')
+    return tmp
 
 
 @pytest.fixture(autouse=True)
