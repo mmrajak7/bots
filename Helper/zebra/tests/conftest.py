@@ -1,5 +1,22 @@
 """Test-wide safety rails.
 
+## No test may send a real Telegram
+
+Reported by the owner 2026-08-12, mid-session: "i am getting too many test
+messages like this" — a VETOED alert for TESTCO, the fixture symbol. Every
+suite run had been messaging his phone, because `cmd_vet_decide` sends the veto
+alert with no dry_run and `test_vet_cli.py` drives that function directly.
+
+Exactly the same shape as the spawn incident below, in a different channel: a
+test reaching out and touching production. Nothing was lost but the owner's
+attention, and an alert channel that cries wolf is worse than no channel — the
+one message that matters is the one he will scroll past.
+
+Blocked here rather than in the offending file for the same reason as the
+spawn rail: patching it per-file leaves the NEXT test free to do it again.
+Sending is impossible by default; a test that wants to observe it passes its
+own `send=` or asserts on the recorder.
+
 ## No test may spawn a real Claude CLI
 
 Discovered the hard way on 2026-08-11: `monitor._exit_cleared` calls
@@ -29,7 +46,63 @@ import pytest
 HELPER = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HELPER))
 
+from zebra import monitor as monitor_mod  # noqa: E402
 from zebra import vet as vet_mod          # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_real_telegram(monkeypatch, request):
+    """Every Telegram send becomes a recording. Returns the list of messages."""
+    sent = []
+
+    def fake_send(msg, dry_run=False):
+        sent.append(msg)
+        return True
+
+    monkeypatch.setattr(monitor_mod, '_send_telegram', fake_send)
+    request.node._telegram = sent
+    return sent
+
+
+@pytest.fixture
+def telegrams(_no_real_telegram):
+    """Opt-in view for tests that assert on what was sent."""
+    return _no_real_telegram
+
+
+class RealTelegramAttempted(BaseException):
+    """Deliberately a BaseException, not an Exception.
+
+    The production senders are wrapped in `except Exception` — correctly, since
+    a Telegram failure must never make an agent think its verdict did not land.
+    That same handler swallows a plain-Exception rail and logs it as a warning,
+    so the suite passes, nobody sees it, and the messages keep arriving. A test
+    rail that production error handling can catch is not a rail.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _no_telegram_http(monkeypatch):
+    """Backstop at the NETWORK call, not just at our wrapper.
+
+    Patching `_send_telegram` covers the paths that go through it. This covers
+    the ones that do not: a future sender, a copy-pasted requests.post, a module
+    that imported the function by value. One SOURCE beats N call sites —
+    counting sources rather than checks is the lesson from the guard audit.
+
+    It raises rather than no-ops: a silent stub would let a real bug ('we never
+    send anything') pass as healthy.
+    """
+    import requests
+    real_post = requests.post
+
+    def guarded(url, *a, **k):
+        if 'api.telegram.org' in str(url):
+            raise RealTelegramAttempted(
+                'a test tried to send a REAL Telegram: %s' % str(url)[:60])
+        return real_post(url, *a, **k)
+
+    monkeypatch.setattr(requests, 'post', guarded)
 
 
 @pytest.fixture(autouse=True)
