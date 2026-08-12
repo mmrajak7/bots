@@ -752,6 +752,14 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         stock = trade['stock']
         price = ltps.get(stock, 0)
         if price <= 0:
+            # No LTP, so the gap is never updated, so the drift and stale
+            # cancels below can never fire — a suspended, renamed or delisted
+            # symbol becomes an IMMORTAL row, holding a slot against
+            # MAX_WATCHING_SIGNALS (25) and blocking its own stock through
+            # dedup forever. Age is the only bound that still works when the
+            # price feed does not.
+            if _expire_if_ancient(store, trade):
+                continue
             continue
         st_val = trade['st_value']
         gap = (price - st_val) / st_val if trade['direction'] == 'PE' \
@@ -1480,6 +1488,38 @@ def _spot_corroborates(store: ZebraStore, trade: dict, spot: float,
             patch = {'corrob_spot': float(spot), 'corrob_value': float(value),
                      'corrob_t': now}
     return ok, reason, patch
+
+
+def _expire_if_ancient(store: ZebraStore, trade: dict) -> bool:
+    """Cancel a watching/triggered signal that has outlived its usefulness.
+
+    Every other exit from the watchlist is driven by the GAP, which needs a
+    price. A symbol that stops quoting — suspended, renamed, delisted — never
+    updates its gap, so it can never drift-cancel or stale-cancel, and it sits
+    in the watchlist permanently: one of 25 slots, and a dedup entry that bans
+    its own stock from ever signalling again.
+    """
+    raw = trade.get('signal_date') or trade.get('entry_date')
+    if not raw:
+        return False
+    try:
+        age = (datetime.now(IST).date()
+               - datetime.strptime(str(raw)[:10], '%Y-%m-%d').date()).days
+    except Exception:
+        return False
+    if age < cfg.WATCH_MAX_AGE_DAYS:
+        return False
+    try:
+        store.cancel(trade['id'],
+                     f'expired: {age}d in {trade.get("status")} with no '
+                     f'tradeable price')
+        logger.warning(
+            "EXPIRED #%d %s: %d days in '%s' and still unpriceable — "
+            "releasing the watchlist slot and the dedup hold",
+            trade['id'], trade['stock'], age, trade.get('status'))
+        return True
+    except ValueError:
+        return False
 
 
 def _alert_monitoring_blind(n_open: int, stocks: list,

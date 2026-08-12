@@ -277,6 +277,14 @@ _DEFAULTS = {
                                  # the validation P&L unbiased (a cap would skew
                                  # which trades the track record contains).
     'max_watching_signals': 25,
+    'watch_max_age_days': 45,  # A watching/triggered row whose symbol has
+                               # stopped quoting can never drift- or
+                               # stale-cancel (both need a gap, which needs
+                               # a price), so it holds one of the 25 slots
+                               # and its stock's dedup entry forever. Age is
+                               # the only bound that survives a dead feed.
+                               # 45d comfortably outlives a real approach:
+                               # the whole watch band is a few % of spot.
     'scan_interval_sec': 300,    # 5 min between Chartink scans
     'monitor_interval_sec': 300, # 5 min between LTP/monitor checks
     'enabled_directions': ['CE', 'PE'],
@@ -500,6 +508,7 @@ DEBIT_SL_PCT = _num('debit_sl_pct')
 TIME_SL_DAYS = _int('time_sl_days_before_expiry')
 MAX_OPEN_TRADES = _int('max_open_trades')
 MAX_WATCHING_SIGNALS = _int('max_watching_signals')
+WATCH_MAX_AGE_DAYS = _int('watch_max_age_days')
 SCAN_INTERVAL_SEC = _int('scan_interval_sec')
 MONITOR_INTERVAL_SEC = _int('monitor_interval_sec')
 ENABLED_DIRECTIONS = _runtime['enabled_directions']

@@ -127,3 +127,46 @@ def test_the_cycle_is_delimited_and_timed():
     src = inspect.getsource(monitor.run_once)
     assert 'CYCLE START' in src and 'ABORTED' in src
     assert 'finally:' in src, "a crashed cycle must still close its marker"
+
+
+# ── an unpriceable watchlist row must not be immortal ────────────────────
+
+def test_a_symbol_that_stops_quoting_is_eventually_released(tmp_path,
+                                                            monkeypatch):
+    """Drift and stale cancels both need a GAP, which needs a price. A
+    suspended/renamed/delisted symbol never updates its gap, so it holds one of
+    the 25 watchlist slots and its stock's dedup entry forever."""
+    from datetime import datetime, timedelta
+    from zebra import monitor
+    from zebra.trade_store import ZebraStore
+    monkeypatch.setattr(cfg, 'LOG_DIR', tmp_path)
+    monkeypatch.setattr(cfg, 'LOCAL_FILE', tmp_path / 'z.json')
+    monkeypatch.setattr(cfg, 'LOCK_FILE', tmp_path / 'z.lock')
+    s = ZebraStore()
+    s.add_signal({'stock': 'GONECO', 'timeframe': 'weekly', 'direction': 'CE',
+                  'st_value': 100.0, 'st_direction': 'UP',
+                  'signal_price': 96.0, 'signal_gap_pct': 4.0})
+    old = (datetime.now() - timedelta(days=cfg.WATCH_MAX_AGE_DAYS + 5))
+    with s._mutate():
+        s.find(1)['signal_date'] = old.strftime('%Y-%m-%d')
+
+    monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {'GONECO': 0.0})
+    monitor.check_watching(s, kite=None, dry_run=True)
+    assert s.find(1)['status'] == 'cancelled', "the dead row kept its slot"
+
+
+def test_a_fresh_unpriceable_row_is_left_alone(tmp_path, monkeypatch):
+    """Companion: one bad quote is not a dead symbol. A feed hiccup must not
+    cancel a signal that was added this morning."""
+    from zebra import monitor
+    from zebra.trade_store import ZebraStore
+    monkeypatch.setattr(cfg, 'LOG_DIR', tmp_path)
+    monkeypatch.setattr(cfg, 'LOCAL_FILE', tmp_path / 'z2.json')
+    monkeypatch.setattr(cfg, 'LOCK_FILE', tmp_path / 'z2.lock')
+    s = ZebraStore()
+    s.add_signal({'stock': 'FINECO', 'timeframe': 'weekly', 'direction': 'CE',
+                  'st_value': 100.0, 'st_direction': 'UP',
+                  'signal_price': 96.0, 'signal_gap_pct': 4.0})
+    monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {'FINECO': 0.0})
+    monitor.check_watching(s, kite=None, dry_run=True)
+    assert s.find(1)['status'] == 'watching'
