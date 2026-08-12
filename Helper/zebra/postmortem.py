@@ -318,9 +318,11 @@ def spawn_batch(store, spawn: bool = True) -> bool:
     ids = ', '.join(str(r['trade_id']) for r in rows)
     prompt = cfg.POSTMORTEM_PROMPT_TEMPLATE.format(
         vetting_doc=cfg.VETTING_DOC, python=_interpreter(), ids=ids)
-    mark_run()
     if not spawn:
+        # A dry run must not consume the day's slot. Marking here would mean
+        # one `zebra run --dry-run` silently cancels that day's real batch.
         return False
+    mark_run()
     return _spawn_generic(prompt, cfg.POSTMORTEM_MODEL, 'postmortem',
                           channel='postmortem') is not None
 

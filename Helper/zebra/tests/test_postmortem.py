@@ -232,3 +232,32 @@ def test_the_batch_is_wired_into_the_cycle():
     reached."""
     src = (HELPER / 'zebra' / 'monitor.py').read_text(encoding='utf-8')
     assert 'post-mortem batch' in src and '_run_postmortem_batch' in src
+
+
+def test_a_dry_run_does_not_consume_the_days_slot(store):
+    """One `zebra run --dry-run` would otherwise silently cancel that day's
+    real batch."""
+    _closed(store, 'AAA', 500)
+    assert pm.spawn_batch(store, spawn=False) is False
+    assert pm.due(store) is True, "a dry run burned the day's post-mortem slot"
+
+
+def test_a_real_run_does_consume_it(store, monkeypatch):
+    _closed(store, 'AAA', 500)
+    monkeypatch.setattr('zebra.vet._spawn_generic', lambda *a, **k: 4242)
+    assert pm.spawn_batch(store) is True
+    assert pm.due(store) is False
+
+
+def test_one_batch_never_exceeds_its_size(store, monkeypatch):
+    """The book has a ~200-trade backlog predating this feature. Handing all of
+    it to one agent is a long session with many chances to die halfway, losing
+    the whole run — a post-mortem only lands when `record` is called."""
+    for i in range(pm.BATCH_SIZE + 6):
+        _closed(store, f'S{i}', 100)
+    seen = {}
+    monkeypatch.setattr('zebra.vet._spawn_generic',
+                        lambda prompt, *a, **k: seen.update(prompt=prompt) or 1)
+    pm.spawn_batch(store)
+    ids = seen['prompt'].split('positions ', 1)[1].split('.', 1)[0]
+    assert len(ids.split(',')) == pm.BATCH_SIZE
