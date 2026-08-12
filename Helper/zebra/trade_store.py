@@ -285,12 +285,17 @@ class ZebraStore:
         else:
             sl_spot = round(entry_spot * (1 + spot_sl_pct), 2)
 
-        # TP: ST line (default) or short strike
+        # TP: a swing level in the way (if the caller found one), else the ST
+        # line, else the short strike. The override is computed in the monitor
+        # because it needs candles and a kite handle; it arrives already
+        # validated as lying strictly between spot and ST, so it can only ever
+        # SHORTEN the target. See zebra/history.py:swing_tp.
         tp_target = cfg.TP_TARGET
-        if tp_target == 'short_strike':
-            tp_spot = float(entry_data['short_strike'])
-        else:
-            tp_spot = float(t['st_value'])
+        base = (float(entry_data['short_strike']) if tp_target == 'short_strike'
+                else float(t['st_value']))
+        tp_spot = self._resolve_tp(
+            t, entry_data.get('swing_tp'), base,
+            'short_strike' if tp_target == 'short_strike' else 'st_line')
 
         debit_sl_value = round(debit * cfg.DEBIT_SL_PCT, 2)
 
@@ -456,6 +461,28 @@ class ZebraStore:
             float(zebra_trade.get('tp_spot', zebra_trade['st_value']))))
         return trade
 
+    @staticmethod
+    def _resolve_tp(t: dict, swing, base: float, base_name: str) -> float:
+        """TP: a swing level standing in the way, else the usual target.
+
+        Shared by the zebra and BCS entry paths. They derived their TP
+        independently before this, which is exactly how the BCS path — the one
+        that actually trades — ends up quietly missing a feature.
+
+        `swing` arrives already validated as lying strictly between spot and
+        the ST line (zebra/history.py:swing_tp), so this can only ever SHORTEN
+        the target. The original is kept on the record: a trade whose TP was
+        moved has to be reviewable against the target it would otherwise have
+        had, or the shortening can never be scored.
+        """
+        if isinstance(swing, dict) and swing.get('tp_spot'):
+            t['tp_source'] = swing.get('kind', 'swing')
+            t['tp_swing'] = swing
+            t['tp_st_line'] = float(t['st_value'])
+            return float(swing['tp_spot'])
+        t['tp_source'] = base_name
+        return float(base)
+
     def mark_entered_bcs(self, trade_id: int, bcs: dict) -> dict:
         """Promote a signal straight into a BCS position — ONE record.
 
@@ -486,7 +513,9 @@ class ZebraStore:
             t.update(self._bcs_entry_fields(
                 bcs, datetime.now(), lot_size, lots, quantity, debit,
                 entry_spot, sl_spot, dte,
-                float(t.get('tp_spot', t['st_value']))))
+                self._resolve_tp(t, bcs.get('swing_tp'),
+                                 float(t.get('tp_spot', t['st_value'])),
+                                 'st_line')))
             t['version'] = t.get('version', 0) + 1
         logger.info(
             "ENTERED BCS #%d %s %g/%g debit=%.2f qty=%d cap=Rs%.0f d/w=%s%% "

@@ -208,6 +208,54 @@ _DEFAULTS = {
                                  # are the high-payoff tail (avg win +127%) and
                                  # capping that would violate the power-law rule.
     'tp_target': 'st_line',       # 'st_line' or 'short_strike'
+    'swing_tp_enabled': True,     # Shorten TP to a swing level standing between
+                                  # spot and the ST magnet. LUPIN 2026-08: a PE
+                                  # signal with a prior swing LOW well above the
+                                  # ST line — price stalls at its own support far
+                                  # more often than it runs the full distance to
+                                  # a magnet. Only ever SHORTENS; a level beyond
+                                  # ST is ignored. Off => TP stays the ST line.
+    'swing_pivot_bars': 2,        # Candles either side that must be higher/lower
+                                  # for a swing to count. BOTH sides required, so
+                                  # the last N candles cannot form one — an
+                                  # unconfirmed pivot at the right edge is the
+                                  # move still happening, not a level.
+    'swing_lookback_candles': 60, # How far back to look for pivots. ~14 months
+                                  # weekly, 5 years monthly. Older levels are
+                                  # archaeology, not support.
+    'swing_min_gap_pct': 1.0,     # A swing nearer than this to spot is not a
+                                  # target — booking there pays the round-trip
+                                  # spread for nothing.
+    'swing_min_retained_pct': 40.0,
+                                  # The shortened TP must keep at least this
+                                  # share of the original spot->ST run.
+                                  # Measured on 75 signal-like symbols: 57% had
+                                  # a swing in the way and the shortening ran
+                                  # as high as 82% of the journey. Keeping a
+                                  # fifth of the distance is not a shortened
+                                  # target, it is a much worse trade — under
+                                  # BCS the short strike is still chosen at the
+                                  # ST line, so max gain would need a move the
+                                  # TP is set never to wait for. Below the
+                                  # floor the TP is left ALONE (conservative)
+                                  # and the level is reported to the vetting
+                                  # agent instead: support that close to spot
+                                  # says the trade has little room.
+    'attraction_enabled': True,   # Measure whether this symbol actually gets
+                                  # pulled back to its ST line, and hand it to
+                                  # the vetting agent. The magnet IS the trade;
+                                  # some symbols trend away from ST for months
+                                  # and nothing was measuring which kind a
+                                  # symbol was.
+    'attraction_horizon_bars': 8, # Candles allowed for the return. ~2 months
+                                  # weekly, which is the DTE band these trades
+                                  # actually live in.
+    'attraction_gap_pct': 3.0,    # How far from ST a candle must close to open
+                                  # an episode. Matches the trigger band, so the
+                                  # statistic describes the setup being traded.
+    'attraction_min_episodes': 4, # Below this the rate is reported WITH its
+                                  # sample size and flagged thin. 2 of 3 is not
+                                  # a 67% hit rate.
     'spot_sl_enabled': False,     # master switch for the adverse-spot SL (off: debit floor only)
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
@@ -431,6 +479,21 @@ assert 0 < BCS_MAX_ENTRY_COST_PCT < 100, \
 assert 0 < BCS_MAX_DEBIT_TO_WIDTH_PCT < 100, \
     "BCS_MAX_DEBIT_TO_WIDTH_PCT is a percentage of width"
 TP_TARGET = _runtime['tp_target']
+SWING_TP_ENABLED = bool(_runtime['swing_tp_enabled'])
+SWING_PIVOT_BARS = _int('swing_pivot_bars')
+SWING_LOOKBACK_CANDLES = _int('swing_lookback_candles')
+SWING_MIN_GAP_PCT = _num('swing_min_gap_pct')
+SWING_MIN_RETAINED_PCT = _num('swing_min_retained_pct')
+assert 0 < SWING_MIN_RETAINED_PCT < 100, \
+    "SWING_MIN_RETAINED_PCT is a share of the spot->ST run"
+ATTRACTION_ENABLED = bool(_runtime['attraction_enabled'])
+ATTRACTION_HORIZON_BARS = _int('attraction_horizon_bars')
+ATTRACTION_GAP_PCT = _num('attraction_gap_pct')
+ATTRACTION_MIN_EPISODES = _int('attraction_min_episodes')
+assert SWING_PIVOT_BARS >= 1, "a swing needs at least one candle either side"
+assert SWING_LOOKBACK_CANDLES > SWING_PIVOT_BARS * 2, \
+    "the lookback window cannot be shorter than one pivot window"
+assert ATTRACTION_HORIZON_BARS >= 1, "the return horizon must be at least 1 candle"
 SPOT_SL_ENABLED = _runtime['spot_sl_enabled']
 SPOT_SL_PCT = _num('spot_sl_pct')
 DEBIT_SL_PCT = _num('debit_sl_pct')

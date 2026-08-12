@@ -80,7 +80,51 @@ Monthly ST direction, weekly structure, daily not stretched. A single intraday
 level cross can whipsaw the same day; alignment across timeframes outweighs
 pip-level trigger precision.
 
-### 4. Anything genuinely odd
+### 4. Does this symbol actually GET pulled to its ST line?
+`context.st_attraction` is that symbol's own record on its own timeframe. The
+magnet IS the thesis — the trade wins by price returning to ST — and until now
+every signal was vetted as though the pull were a property of the setup rather
+than of the symbol. It is not. Measured across the cached universe the touch
+rate ranges from **17% to 100%**, median 69%.
+
+Read it like this:
+
+| Field | Meaning |
+|-------|---------|
+| `overall.touch_rate_pct` | share of past departures that came back to ST inside the horizon |
+| `overall.episodes` | how many departures that rate is built on — ONE per move, not per candle |
+| `median_bars_to_touch` | typical time to return, in candles of `timeframe` |
+| `same_direction` | the same numbers restricted to departures on this signal's side |
+| `gap_band_pct` / `horizon_bars` | the band and window the rate was measured over |
+| `sample` | `'thin'` means too few episodes to lean on |
+
+**A low touch rate is a real reason to veto**, and the strongest one this
+section can give you: it says the magnet does not work on this symbol, which is
+the entire trade. Weigh `median_bars_to_touch` against DTE — a symbol that
+usually takes 10 weekly candles to return is a poor fit for a 20-DTE option
+however high its rate.
+
+Do NOT treat a high rate as a reason to allow. It removes an objection; it does
+not answer event risk or liquidity. And `sample: 'thin'` means say so in your
+reasoning rather than quoting the percentage — 2 of 3 is not 67%.
+
+`st_attraction: null` means the history was unavailable. That is a missing
+section, not an all-clear.
+
+### 5. Is there a level standing in the way?
+`context.swing_tp`, when present, is a prior swing point between spot and the
+ST line — support for a PE, resistance for a CE. Price meets its own levels on
+the way to a magnet.
+
+- `applied: true` — the TP has already been **shortened** to `tp_spot`. Judge
+  the trade against THAT target, not the ST line: `retained_pct` is how much of
+  the original run is left to win.
+- `applied: false` — a level was found but left the trade too little room
+  (`reason` says how much), so the TP is unchanged. This is a **caution**: the
+  chart says price is likely to stall early. It does not force a veto, but a
+  thin trade with support right underneath deserves saying so out loud.
+
+### 6. Anything genuinely odd
 A price that cannot be right, a symbol that does not match the company, a gap
 that implies news you should go find. Trust this instinct — it is why a model
 is in this loop rather than another `if` statement.

@@ -24,6 +24,7 @@ import requests
 from . import config as cfg
 from . import events as events_mod
 from . import health as health_mod
+from . import history
 from . import mfe as mfe_mod
 from . import outcomes as outcomes_mod
 from . import postmortem as postmortem_mod
@@ -279,7 +280,8 @@ def format_vetoed_alert(trade: dict, reasons: list, red_flags: list) -> str:
     return "\n".join(lines)
 
 
-def _vet_context(trade: dict, analysis: dict, gap_pct: float) -> dict:
+def _vet_context(trade: dict, analysis: dict, gap_pct: float,
+                 kite=None) -> dict:
     """The evidence bundle handed to the vetting agent.
 
     Snapshotted here rather than re-quoted by the agent so its verdict judges
@@ -287,6 +289,23 @@ def _vet_context(trade: dict, analysis: dict, gap_pct: float) -> dict:
     agent's checklist, not part of the handoff.
     """
     best = analysis.get('best') or {}
+    # Both of these read candles. They are wrapped because a statistics or
+    # chart failure must never stop a signal being vetted — a missing section
+    # is a gap in the evidence, an exception here is a halted pipeline.
+    try:
+        attraction = history.attraction(kite, trade['stock'],
+                                        trade.get('timeframe'),
+                                        trade.get('direction'))
+    except Exception as e:
+        logger.warning("attraction lookup failed for %s: %s", trade['stock'], e)
+        attraction = None
+    try:
+        swing = history.swing_tp(kite, trade['stock'], trade.get('timeframe'),
+                                 trade.get('direction'), analysis.get('spot'),
+                                 trade.get('st_value'))
+    except Exception as e:
+        logger.warning("swing lookup failed for %s: %s", trade['stock'], e)
+        swing = None
     # Under the BCS-only pipeline the zebra pair is never traded, so a context
     # describing only that pair would ask the agent to vet a position that
     # will not exist — and `gates_all_passed` would read TRUE off an empty
@@ -342,6 +361,19 @@ def _vet_context(trade: dict, analysis: dict, gap_pct: float) -> dict:
         # structure nobody is opening.
         'gates_all_passed': (None if cfg.ENTRY_STRUCTURE == 'bcs'
                              else not (best.get('gate_fails') or [])),
+        # ── does this symbol actually GET pulled to its ST line? ─────────
+        # The magnet IS the thesis, and every signal was vetted as though the
+        # pull were a property of the setup rather than of the symbol. Some
+        # symbols oscillate around ST; some trend away from it for months and
+        # never come back inside an option's life. This is that symbol's own
+        # record on its own timeframe. `sample: 'thin'` means the rate is real
+        # but built on too few episodes to lean on — say so, do not round it
+        # into a confident number.
+        'st_attraction': attraction,
+        # A swing level standing between spot and the magnet. When present the
+        # TP is booked HERE instead of at the ST line, so the agent is judging
+        # the target the trade will actually use.
+        'swing_tp': swing,
     }
 
 
@@ -451,6 +483,31 @@ def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
 
     bcs['expiry'] = analysis['expiry']
     bcs['entry_spot'] = price
+    # A swing level standing between spot and the magnet shortens the TP. Done
+    # HERE, before either branch, so the LIVE order ticket quotes the same
+    # target the paper position books against — the ticket is the only exit
+    # instruction the owner gets in LIVE.
+    try:
+        bcs['swing_tp'] = history.swing_tp(
+            kite, trade['stock'], trade.get('timeframe'), trade['direction'],
+            price, float(trade['st_value']))
+    except Exception as e:      # a missing chart must never block an entry
+        logger.warning("swing TP lookup failed for #%d %s: %s",
+                       trade['id'], trade['stock'], e)
+        bcs['swing_tp'] = None
+    s = bcs.get('swing_tp') or {}
+    if s.get('applied'):
+        logger.info("TP SHORTENED #%d %s: %s %.2f (%s, %d bars ago) instead of "
+                    "ST %.2f — %.0f%% less distance, %.0f%% left to win",
+                    trade['id'], trade['stock'], s['kind'], s['tp_spot'],
+                    s['timeframe'], s['bars_ago'], s['st_value'],
+                    s['shortened_by_pct'], s['retained_pct'])
+    elif s:
+        # Found but NOT applied — the level is too close to spot to be worth
+        # trading to. TP stays the ST line; the agent still gets told.
+        logger.info("TP UNCHANGED #%d %s: %s %.2f in the way but %s",
+                    trade['id'], trade['stock'], s['kind'], s['level'],
+                    s['reason'])
     if not cfg.PAPER_MODE:
         return bcs, None       # alert-only; the alert is the order ticket
 
@@ -479,6 +536,22 @@ def _log_bcs_suppressed(trade: dict, reason: Optional[str]) -> None:
     logger.warning("BCS SUPPRESSED #%d %s (%s): %s — no trade; zebra entered "
                    "silently for the A/B record", trade['id'], trade['stock'],
                    trade['direction'], reason or "no viable BCS pair")
+
+
+def _swing_tp_line(swing) -> str:
+    """One line explaining a moved target, or nothing at all.
+
+    A TP that silently differs from the ST line the signal was built on reads
+    as a bug to whoever is holding the position. Say which level it is and how
+    old, so the owner can look at the same candle the bot did.
+    """
+    if not isinstance(swing, dict) or not swing.get('tp_spot'):
+        return ''
+    kind = 'swing low' if swing['kind'].endswith('low') else 'swing high'
+    return (f"🎯 TP shortened to {swing['tp_spot']:g} — {kind} from "
+            f"{html.escape(str(swing['date']))} ({swing['bars_ago']} "
+            f"{html.escape(str(swing['timeframe']))} bars ago) stands between "
+            f"spot and ST {swing['st_value']:g}\n")
 
 
 def _format_bcs_enter_alert(trade: dict, analysis: dict, bcs: dict) -> str:
@@ -511,6 +584,7 @@ def _format_bcs_enter_alert(trade: dict, analysis: dict, bcs: dict) -> str:
         f"fair {bcs.get('debit_mid', bcs['debit']):g} — the book takes "
         f"{bcs.get('entry_cost', 0):g}/sh to open "
         f"({bcs.get('entry_cost_pct', 0):.0f}% of max gain)\n"
+        f"{_swing_tp_line(bcs.get('swing_tp'))}"
         f"\n"
         # ASK to buy, BID to sell — this is an order ticket, and the prices on
         # it have to be ones the owner can actually transact at.
@@ -781,7 +855,7 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 try:
                     vet_mod.request_entry_vet(
                         store, trade['id'],
-                        context=_vet_context(trade, analysis, gap_pct))
+                        context=_vet_context(trade, analysis, gap_pct, kite))
                 except ValueError as e:
                     # The locked re-check saw a state this cache missed —
                     # already requested or already SETTLED (possibly a veto).
