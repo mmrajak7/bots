@@ -146,6 +146,15 @@ def _get_kite():
     return kite
 
 
+# Chartink hands back the INDEX alongside its constituents. These are not
+# equities, will never appear in the NSE instrument list, and there is no
+# mapping to add — so they are noise, not warnings. Measured in the real log:
+# NIFTY 4,472 + CNXMIDCAP 3,386 + BANKNIFTY 1,921 = 9,779 of 9,928 WARNING
+# lines, which is how a warning channel becomes unreadable.
+_KNOWN_NON_EQUITY = frozenset({'NIFTY', 'BANKNIFTY', 'CNXMIDCAP', 'FINNIFTY',
+                               'MIDCPNIFTY', 'NIFTYNXT50', 'SENSEX'})
+
+
 def get_ltp(kite, symbols: List[str]) -> Dict[str, float]:
     """Get LTP for multiple symbols. Returns {symbol: price}.
 
@@ -162,12 +171,28 @@ def get_ltp(kite, symbols: List[str]) -> Dict[str, float]:
     # Split into valid/invalid NSE symbols
     valid = []
     result = {}
+    unmapped = []
     for s in symbols:
         if s in _instrument_cache:
             valid.append(s)
+        elif s in _KNOWN_NON_EQUITY:
+            # Chartink returns the INDEX alongside its constituents. These are
+            # not equities, will never be in the NSE instrument list, and there
+            # is nothing to fix — but warning about them twice a cycle produced
+            # 7,858 of the 9,928 WARNING lines in the real log, i.e. a warning
+            # channel that is 79% noise is a warning channel nobody reads.
+            logger.debug("SKIP %s: index symbol, not an equity", s)
         else:
-            logger.warning("SKIP %s: not in NSE instrument list (Chartink mismatch — add to _CHARTINK_TO_NSE?)", s)
+            unmapped.append(s)
+        if s not in _instrument_cache:
             result[s] = 0.0  # sentinel: distinguishes "bad symbol" from "no LTP"
+
+    if unmapped:
+        # ONE aggregated line for the symbols that genuinely need a mapping.
+        # This is the actionable half of what used to be 9,928 warnings.
+        logger.warning("SKIP %d symbol(s) not in the NSE instrument list "
+                       "(Chartink mismatch — add to _CHARTINK_TO_NSE?): %s",
+                       len(unmapped), ', '.join(sorted(unmapped)[:20]))
 
     if not valid:
         return result

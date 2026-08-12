@@ -357,8 +357,15 @@ def analyze(kite, stock: str, direction: str, spot: float,
         if be_info['regime'] == 'sub_optimal':
             gate_fails.append('BE>K_S')
 
-        liquidity_ok = not any(g.endswith('_OI<5000') or g.startswith('long_spread')
-                               or g.startswith('short_spread') for g in gate_fails)
+        # Match on the PREFIX, never on a baked-in threshold. This used to test
+        # `g.endswith('_OI<5000')` while the string it matches is built from
+        # cfg.MIN_LEG_OI — so raising the config to 6000 would emit
+        # 'long_OI<6000', match nothing, and silently mark an illiquid leg
+        # liquid. A liquidity check that switches itself off when you tighten
+        # the threshold is worse than none.
+        liquidity_ok = not any(g.startswith(('long_OI<', 'short_OI<',
+                                             'long_spread', 'short_spread'))
+                               for g in gate_fails)
 
         candidates.append({
             'k_l': k_l, 'k_s': k_s, 'width': abs(k_s - k_l),

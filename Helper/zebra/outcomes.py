@@ -81,7 +81,14 @@ def label_for_reason(reason, pnl=None) -> str:
     label = _REASON_LABEL.get(str(reason or '').replace('paper:', ''), FLAT)
     if label == HIT and pnl is not None:
         try:
-            if float(pnl) < 0:
+            v = float(pnl)
+            # NaN fails EVERY comparison, so `v < 0` was False and a corrupt or
+            # unknown P&L sailed through as a HIT — asserting a good signal from
+            # missing data, then feeding it to the vetting scorecard and the
+            # precedent system. Unknown is FLAT: it is not evidence either way.
+            if v != v or v in (float('inf'), float('-inf')):
+                return FLAT
+            if v < 0:
                 return MISS
         except (TypeError, ValueError):
             pass

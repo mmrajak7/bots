@@ -802,7 +802,25 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         #   the gate below, so the gate alone can never re-admit it.
         if trade['status'] == 'triggered':
             if not cfg.VET_ENABLED:
-                continue
+                # In PAPER a completed entry moves the row to `entered`, so a
+                # row still sitting in `triggered` means the entry did NOT
+                # complete — a suppressing gate, one bad quote, an IO blip.
+                # The old `continue` (justified as "saves Kite quote calls")
+                # therefore parked it forever: still inside its trigger band,
+                # never retried, and only ever released by a drift/stale
+                # cancel. Retry while it is still in the zone; the band is a
+                # window, and a book that was unquotable at 10:05 is routinely
+                # fine at 10:10.
+                #
+                # LIVE still stops here: there the alert IS the order ticket,
+                # the human acts on it, and re-alerting every 5 minutes would
+                # be noise rather than a retry.
+                if not cfg.PAPER_MODE:
+                    continue
+                logger.info(
+                    "RETRY #%d %s: still triggered and in the zone "
+                    "(gap %.2f%%) — entry did not complete, re-running the "
+                    "analyzer", trade['id'], stock, gap_pct)
             state = vet_mod.vet_state(store.find(trade['id']) or trade)
             if state == vet_mod.VETOED:
                 # THE ONLY place a veto is ever observed. The verdict lands
@@ -2008,9 +2026,23 @@ def run_once(dry_run: bool = False) -> None:
     if not _is_market_open():
         logger.info("Market closed, skipping cycle")
         return
-    kite = _get_kite()
-    store = get_store()
-    run_cycle(store, kite, dry_run=dry_run, do_scan=True)
+    # CYCLE BOUNDARIES. cron appends every run to one file and the process
+    # exits between them, so without a marker there is nothing separating one
+    # cycle's lines from the next — and a cycle that died halfway is
+    # indistinguishable from one that had nothing to say. The duration is the
+    # cheap early warning for the 5-minute cron overlapping itself.
+    t0 = time.time()
+    logger.info("=== CYCLE START %s ===",
+                datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S'))
+    ok = False
+    try:
+        kite = _get_kite()
+        store = get_store()
+        run_cycle(store, kite, dry_run=dry_run, do_scan=True)
+        ok = True
+    finally:
+        logger.info("=== CYCLE %s in %.1fs ===",
+                    'END' if ok else 'ABORTED', time.time() - t0)
 
 
 def run_loop(dry_run: bool = False) -> None:
