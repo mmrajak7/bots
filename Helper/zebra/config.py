@@ -253,6 +253,23 @@ _DEFAULTS = {
                                  # 15% single-poll move confirms on the next
                                  # poll and is recorded ~5 min late; a bad tick
                                  # never repeats and is dropped.
+    'trail_enabled': True,       # Gain-anchored trailing stop. BCS only — a
+                                 # zebra back-ratio has no capped payoff, so
+                                 # "fraction of max gain" is undefined there.
+                                 # PAPER auto-closes; in LIVE mode the same
+                                 # code alerts and closes nothing, because
+                                 # _paper_auto_close no-ops. No new automated
+                                 # close path in the real-order system.
+    'trail_engage_frac': 0.50,   # Arm once the PEAK gain reaches this share of
+                                 # max gain (width - debit). Deliberately NOT
+                                 # the live monitor's 2x-debit rule: that lands
+                                 # at 43% of max gain on a 30% d/w spread but
+                                 # 82% on a 45% one, tightening exactly as the
+                                 # payoff shrinks, and it would have engaged on
+                                 # only 2 of 32 closed shadows.
+    'trail_retain_frac': 0.50,   # Keep this share of the peak gain. Must stay
+                                 # below 1: a trail sitting AT the peak fires
+                                 # on the first tick down.
 }
 
 
@@ -383,6 +400,9 @@ AUTH_WARN_DAYS = _int('auth_warn_days')
 MFE_CONFIRM_POLLS = _int('mfe_confirm_polls')
 MFE_JUMP_MULT = _num('mfe_jump_mult')
 MFE_SPOT_JUMP_PCT = _num('mfe_spot_jump_pct')
+TRAIL_ENABLED = bool(_runtime['trail_enabled'])
+TRAIL_ENGAGE_FRAC = _num('trail_engage_frac')
+TRAIL_RETAIN_FRAC = _num('trail_retain_frac')
 # Timeout and model live in the config FILE like every other threshold, with an
 # env override for one-off runs. They were env-only-or-hardcoded, so editing
 # zebra_config.json — the documented surface — logged "unknown keys ignored"
@@ -468,3 +488,10 @@ assert MIN_DTE >= 1, f"MIN_DTE must be >= 1"
 # exits the trade) would never be recorded at all. _num() already rejects
 # non-positive values; this catches the merely useless ones.
 assert MFE_JUMP_MULT > 1.0, f"MFE_JUMP_MULT ({MFE_JUMP_MULT}) must be > 1.0"
+# A trail that keeps 100% of the peak sits ON the peak and fires on the first
+# tick down — it would convert every winner into an immediate exit at the high,
+# which is not a tighter stop but a different (and untested) strategy.
+assert 0 < TRAIL_RETAIN_FRAC < 1, (
+    f"TRAIL_RETAIN_FRAC ({TRAIL_RETAIN_FRAC}) must be strictly between 0 and 1")
+assert 0 < TRAIL_ENGAGE_FRAC <= 1, (
+    f"TRAIL_ENGAGE_FRAC ({TRAIL_ENGAGE_FRAC}) must be in (0, 1]")

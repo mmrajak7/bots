@@ -413,6 +413,22 @@ def _format_debit_sl_alert(trade: dict, mid: float) -> str:
     )
 
 
+def _format_trail_alert(trade: dict, mid: float, tl: dict) -> str:
+    """Trail-stop exit. Always a PROFIT — the level sits above the entry debit
+    by construction — so the alert leads with what was kept, not with a stop."""
+    paper = _paper_close_line(trade, mid)
+    kept = (mid - trade['debit']) * int(trade.get('quantity') or 0)
+    return (
+        f"\U0001F512 <b>{_struct_label(trade)} TRAIL</b>  "
+        f"<code>{trade['stock']}</code> ({trade['direction']})\n"
+        f"Mid {mid:.2f} ≤ trail {tl['level']:.2f} "
+        f"(peak {trade['debit'] + tl['peak_gain']:.2f}, "
+        f"{tl['peak_pct_of_max']:.0f}% of max)\n"
+        f"Locking in ~Rs {kept:,.0f} of a peak Rs "
+        f"{tl['peak_gain'] * int(trade.get('quantity') or 0):,.0f}.{paper}"
+    )
+
+
 def _format_blind_alert(trade: dict, reason: Optional[str]) -> str:
     """One-shot warning that DEBIT-SL valuation has been blind (unreliable /
     missing book) long enough to matter. Spot TP/SL stay armed — this is pure
@@ -1012,6 +1028,43 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                               pending_mfe=pending_mfe)
             if trade.get('status') == 'exited':
                 continue
+
+        # ── TRAIL ───────────────────────────────────────────────────────
+        # Profit-protection, so it sits with TP rather than with the stops: the
+        # level is above the entry debit by construction and a fired trail
+        # always books a gain. Cannot collide with the DEBIT-SL below — that
+        # fires at half the debit, the trail never below it.
+        tl = mfe_mod.trail_levels(trade) if cfg.TRAIL_ENABLED else None
+        if tl and tl['armed'] and store.set_alert_flag(tid, 'trail_armed'):
+            logger.info("TRAIL armed #%d %s peak=%.1f%% of max gain, level=%.2f",
+                        tid, stock, tl['peak_pct_of_max'], tl['level'])
+        if not debit_usable or not tl or not tl['armed']:
+            # Unusable quote FREEZES the counter rather than resetting it —
+            # same rule as the DEBIT-SL, so a flickering book cannot
+            # indefinitely block a genuine exit.
+            pass
+        elif mid <= tl['level']:
+            n = store.bump_confirm(tid, 'trail')
+            if n >= cfg.DEBIT_SL_CONFIRM_POLLS:
+                if _exit_cleared(store, trade, 'trail', sq, spot,
+                                 dry_run=dry_run) \
+                        and store.set_alert_flag(tid, 'trail'):
+                    if _alerts_enabled(trade):
+                        _send_telegram(_format_trail_alert(trade, mid, tl),
+                                       dry_run=dry_run)
+                    logger.info("TRAIL alert #%d %s mid=%.2f<=level=%.2f "
+                                "peak_gain=%.2f (confirmed x%d)",
+                                tid, stock, mid, tl['level'], tl['peak_gain'], n)
+                    _paper_auto_close(store, trade, mid, 'trail', spot,
+                                      pending_mfe=pending_mfe)
+                    if trade.get('status') == 'exited':
+                        continue
+            else:
+                logger.info("TRAIL pending #%d %s mid=%.2f<=level=%.2f "
+                            "confirm %d/%d", tid, stock, mid, tl['level'],
+                            n, cfg.DEBIT_SL_CONFIRM_POLLS)
+        else:
+            store.reset_confirm(tid, 'trail')
 
         # ── SPOT SL ─────────────────────────────────────────────────────
         # Disabled by default: the debit floor already caps max loss, and the

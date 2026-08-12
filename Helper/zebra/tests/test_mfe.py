@@ -12,6 +12,7 @@ the two ways this fleet has actually lost data:
 Run:  cd Helper && python -m pytest zebra/tests/test_mfe.py -v
 """
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -315,6 +316,197 @@ def test_exit_above_the_recorded_peak_never_reports_negative_giveback():
     assert r['peak_gain'] == 1500.0
     assert r['given_back'] == 0.0
     assert r['kept_pct'] == 100.0
+
+
+# ── gain-anchored trail ──────────────────────────────────────────────────
+SHADOW = {'long_strike': 100.0, 'short_strike': 140.0, 'width': 40.0,
+          'long_symbol': 'TESTCO26SEP100CE', 'short_symbol': 'TESTCO26SEP140CE',
+          'debit': 10.0, 'lot_size': 100, 'expiry': '2026-09-30',
+          'entry_spot': 100.0, 'debit_to_width_pct': 25.0,
+          'short_extrinsic': 1.0, 'warnings': []}
+
+
+@pytest.fixture
+def bcs(entered):
+    """A real BCS shadow via add_bcs_shadow — width 40, debit 10, max gain 30.
+
+    Built through the production path on purpose. An earlier version of this
+    fixture set `width` on the dict from find(): that mutation was silently
+    erased by the next store write, because `_merge` gives DISK the tie on
+    equal versions, and the trail tests then passed for the wrong reason.
+    """
+    shadow = entered.add_bcs_shadow(entered.find(1), dict(SHADOW))
+    entered._shadow_id = shadow['id']
+    return entered
+
+
+def bpoll(store, spot, mid=None, reliable=True):
+    """Capture + flush against the SHADOW, not the parent zebra."""
+    tid = store._shadow_id
+    patch = mfe.compute(store.find(tid), spot, mid, reliable)
+    if patch:
+        store.apply_mfe({tid: patch})
+    return store.find(tid)
+
+
+def test_zebra_has_no_trail(entered):
+    """A back-ratio has two longs and no capped payoff, so 'fraction of max
+    gain' is undefined. Zebra positions run to expiry untrailed by design."""
+    poll(entered, 108.0, 20.0)
+    assert mfe.trail_levels(entered.find(1)) is None
+
+
+def _climb(store, *mids):
+    """Walk the mid up in believable steps. The MFE jump gate refuses a peak
+    more than 50% above the running peak on sight, so a test that leaps from
+    10 to 20 in one poll measures the GATE, not the trail."""
+    for m in mids:
+        bpoll(store, 106.0, m)
+
+
+def test_trail_arms_at_half_of_max_gain(bcs):
+    _climb(bcs, 14.0, 20.0)                     # gain 10 of max 30 = 33%
+    assert mfe.trail_levels(bcs.find(bcs._shadow_id))['armed'] is False
+    _climb(bcs, 25.0)                           # gain 15 of 30 = 50%
+    tl = mfe.trail_levels(bcs.find(bcs._shadow_id))
+    assert tl['armed'] is True
+    assert tl['peak_pct_of_max'] == 50.0
+    assert tl['level'] == 17.5                 # debit 10 + half of peak gain 15
+
+
+def test_trail_stays_armed_after_the_gain_evaporates(bcs):
+    """The whole point. A position that WAS up half its max and has given it
+    back is the case this exists for — arming off the LIVE gain would disarm at
+    the moment it starts mattering."""
+    _climb(bcs, 14.0, 20.0, 25.0)
+    bpoll(bcs, 101.0, 11.0)                     # gain collapses to 1
+    tl = mfe.trail_levels(bcs.find(bcs._shadow_id))
+    assert tl['armed'] is True
+    assert tl['level'] == 17.5, "the level followed the price down"
+
+
+def test_trail_level_always_books_a_profit(bcs):
+    """It sits above the entry debit by construction, which is what makes the
+    trail compatible with the power-law rule: it can only ever cut a winner
+    short, never turn one into a loss."""
+    for mid in (14.0, 20.0, 25.0, 35.0):
+        bpoll(bcs, 106.0, mid)
+        tl = mfe.trail_levels(bcs.find(bcs._shadow_id))
+        if tl['armed']:
+            assert tl['level'] > bcs.find(bcs._shadow_id)['debit']
+
+
+def test_trail_is_not_the_live_monitors_2x_rule(bcs):
+    """A fixed 2x-debit engage would arm at mid 20 here — 33% of max gain — and
+    on a 45% d/w spread it would arm at 82%. Anchoring to max gain is what
+    keeps the trigger meaning the same thing across spreads."""
+    _climb(bcs, 14.0, 20.0)                     # exactly 2x the entry debit
+    assert mfe.trail_levels(bcs.find(bcs._shadow_id))['armed'] is False
+
+
+def test_degenerate_spread_has_no_trail():
+    """debit at or above width: there is no gain to protect, and the level
+    arithmetic would put the stop above the structure's maximum value."""
+    assert mfe.trail_levels({'width': 10.0, 'debit': 10.0,
+                             'mfe_mid': 12.0}) is None
+    assert mfe.trail_levels({'width': 10.0, 'debit': 12.0,
+                             'mfe_mid': 12.0}) is None
+
+
+# ── trail: the monitor path ──────────────────────────────────────────────
+def _wire(monkeypatch, spot, mid):
+    monkeypatch.setattr(cfg, 'PAPER_MODE', True)
+    monkeypatch.setattr(cfg, 'TRAIL_ENABLED', True)
+    monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {'TESTCO': spot})
+    monkeypatch.setattr(monitor, '_structure_quote',
+                        lambda kite, t, spot=None: {
+                            'mid': mid, 'reliable': True, 'reason': None})
+    monkeypatch.setattr(monitor, '_exit_cleared', lambda *a, **k: True)
+
+
+def test_trail_exit_fires_and_books_a_profit(bcs, monkeypatch):
+    for m in (14.0, 20.0, 25.0):                           # climb past 50%
+        _wire(monkeypatch, 106.0, m)
+        monitor.check_entered(bcs, kite=None, dry_run=True)
+    assert mfe.trail_levels(bcs.find(bcs._shadow_id))['armed'] is True
+
+    _wire(monkeypatch, 103.0, 17.0)                        # 17 <= level 17.5
+    monitor.check_entered(bcs, kite=None, dry_run=True)    # confirm 1/2
+    assert bcs.find(bcs._shadow_id)['status'] == 'entered', "trail fired on a single poll"
+    monitor.check_entered(bcs, kite=None, dry_run=True)    # confirm 2/2
+
+    t = bcs.find(bcs._shadow_id)
+    assert t['status'] == 'exited'
+    assert t['exit_reason'] == 'paper:trail'
+    assert t['pnl'] > 0, "a trail exit booked a LOSS"
+
+
+def test_trail_never_fires_before_it_arms(bcs, monkeypatch):
+    """Mid below what would be a trail level, but the peak never reached half
+    of max gain — there is nothing to protect yet."""
+    for m in (14.0, 20.0):
+        _wire(monkeypatch, 106.0, m)
+        monitor.check_entered(bcs, kite=None, dry_run=True)
+    _wire(monkeypatch, 102.0, 12.0)
+    for _ in range(3):
+        monitor.check_entered(bcs, kite=None, dry_run=True)
+    assert bcs.find(bcs._shadow_id)['status'] == 'entered'
+
+
+def test_an_unreliable_book_cannot_fire_the_trail(bcs, monkeypatch):
+    """Same rule as the DEBIT-SL. A garbage-low mid on a broken book would
+    otherwise end a position that was working."""
+    for m in (14.0, 20.0, 25.0):
+        _wire(monkeypatch, 106.0, m)
+        monitor.check_entered(bcs, kite=None, dry_run=True)
+    monkeypatch.setattr(monitor, '_structure_quote',
+                        lambda kite, t, spot=None: {
+                            'mid': 0.4, 'reliable': False, 'reason': 'one-sided'})
+    for _ in range(3):
+        monitor.check_entered(bcs, kite=None, dry_run=True)
+    assert bcs.find(bcs._shadow_id)['status'] == 'entered'
+
+
+def test_trail_is_vetted_like_a_value_trigger(bcs):
+    """It prices off the option book, so the pre-filter must flag it even when
+    the book looks fine — the ABB case looked fine."""
+    from zebra import vet
+    interesting, why = vet.needs_exit_vet(
+        bcs.find(bcs._shadow_id), 'trail', {'reliable': True},
+        now=datetime(2026, 8, 12, 14, 0, tzinfo=cfg.IST))
+    assert interesting, "a trail exit skipped vetting on a tidy-looking book"
+    assert 'value-based' in why
+
+
+def test_every_exit_kind_the_monitor_raises_can_record_a_verdict():
+    """An exit kind the CLI's argparse rejects produces a gate that spawns an
+    agent which cannot answer it: the agent exits having done nothing and the
+    exit defers to the cap and escalates. Wired-but-inert, the usual shape.
+
+    The kinds are read from the MONITOR's own `_exit_cleared` call sites, not
+    from `vet.EXIT_KINDS`. Asserting the CLI accepts everything in EXIT_KINDS
+    is circular — shrink that list and the test shrinks with it, which is
+    exactly the drift this guards against.
+    """
+    import re
+    import subprocess
+    src = (HELPER / 'zebra' / 'monitor.py').read_text(encoding='utf-8')
+    raised = set(re.findall(r"_exit_cleared\(store, trade, '(\w+)'", src))
+    assert raised, "found no exit kinds in monitor.py — the pattern moved"
+
+    out = subprocess.run([sys.executable, '-m', 'zebra', 'vet',
+                          'exit-decide', '--help'],
+                         cwd=str(HELPER), capture_output=True, text=True)
+    for kind in sorted(raised):
+        assert kind in out.stdout, \
+            f"monitor raises '{kind}' but the CLI cannot record a verdict for it"
+
+
+def test_trail_exit_scores_as_a_hit():
+    """It always books a profit, so labelling it a MISS would punish the allow
+    that worked and make the trail look like a source of losses."""
+    from zebra import outcomes
+    assert outcomes.label_for_reason('paper:trail') == outcomes.HIT
 
 
 # ── the analysis ─────────────────────────────────────────────────────────

@@ -65,6 +65,7 @@ def cmd_vet_show(args):
     from . import config as cfg
     from .trade_store import get_store
     from . import vet as vet_mod
+    from . import mfe as _mfe_mod
     t = get_store().find(args.id)
     if not t:
         print(_json.dumps({'error': f'trade #{args.id} not found'}))
@@ -90,6 +91,15 @@ def cmd_vet_show(args):
             'expired': vet_mod._exit_expired(m) if m else True,
             'entry_debit': t.get('debit'),
             'debit_sl_value': t.get('debit_sl_value'),
+            # The peak this position reached and the trail derived from it.
+            # A TRAIL trigger is unjudgeable without them — the agent would be
+            # asked whether a level is right while being shown neither the
+            # level nor the peak it came from, which is the same defect the
+            # ENTRY context already had to fix.
+            'peak_mid': t.get('mfe_mid'),
+            'peak_mid_at': t.get('mfe_mid_at'),
+            'peak_spot': t.get('mfe_spot'),
+            'trail': _mfe_mod.trail_levels(t),
             'entry_spot': t.get('entry_spot'),
             'tp_spot': t.get('tp_spot'),
             'expiry': t.get('expiry'),
@@ -897,6 +907,7 @@ def cmd_giveback(args):
 
 
 def main():
+    from . import vet as vet_mod          # exit-kind choices, single source
     p = argparse.ArgumentParser(prog='python -m zebra',
                                 description='Zebra — synthetic long/short option strategy')
     p.add_argument('-v', '--verbose', action='store_true', help='Debug logging')
@@ -925,14 +936,14 @@ def main():
 
     p_vshow = vet_sub.add_parser('show', help='Dump vetting context as JSON')
     p_vshow.add_argument('id', type=int)
-    p_vshow.add_argument('--exit', choices=['tp', 'spot_sl', 'debit_sl'],
+    p_vshow.add_argument('--exit', choices=list(vet_mod.EXIT_KINDS),
                          default=None, help='Show EXIT context for this trigger')
     p_vshow.set_defaults(func=cmd_vet_show)
 
     p_vexit = vet_sub.add_parser('exit-decide', help='Record an exit verdict')
     p_vexit.add_argument('id', type=int)
     p_vexit.add_argument('--kind', required=True,
-                         choices=['tp', 'spot_sl', 'debit_sl'])
+                         choices=list(vet_mod.EXIT_KINDS))
     p_vexit.add_argument('--verdict', required=True, choices=['allow', 'defer'])
     p_vexit.add_argument('--reason', action='append')
     p_vexit.add_argument('--red-flag', action='append')

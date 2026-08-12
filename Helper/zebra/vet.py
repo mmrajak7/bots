@@ -434,6 +434,19 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
 
 DEFER = 'defer'
 
+# Every exit kind the monitor can raise, in ONE place. The CLI's argparse
+# choices are built from this: they used to be typed out separately, so adding
+# the TRAIL exit would have produced a gate that spawns an agent which then
+# cannot record a verdict — `--kind trail` would be rejected by argparse, the
+# agent would exit having done nothing, and every trail exit would defer to the
+# cap and escalate to the human. Silently inert, in the familiar shape.
+EXIT_KINDS = ('tp', 'spot_sl', 'debit_sl', 'trail')
+
+# Exit kinds whose trigger is corroborated by REAL TRADES in the underlying, so
+# a lying option book cannot manufacture them. Everything else is priced off
+# the book and is vetted by default — see _exit_interesting.
+SPOT_CORROBORATED_EXITS = frozenset({'tp', 'spot_sl'})
+
 
 def _exit_marker(trade: dict, kind: str) -> dict:
     """Read the per-kind exit marker, tolerating corruption.
@@ -524,7 +537,15 @@ def needs_exit_vet(trade: dict, kind: str, quote: dict,
         reasons.append('first 15 minutes of the session')
     # A value trigger acts on a PRICE; a spot trigger is corroborated by real
     # trades in the underlying. The value one is the one that can be faked.
-    if kind == 'debit_sl':
+    #
+    # Stated as "which kinds are spot-corroborated" rather than "which are
+    # value-based" ON PURPOSE. The list used to name `debit_sl` directly, so
+    # when the TRAIL exit arrived — also priced entirely off the option book —
+    # it would have been silently exempt from vetting unless the book happened
+    # to look unreliable, which is precisely the ABB case that looked fine.
+    # Inverted, any exit kind added later is vetted by default and has to argue
+    # its way out.
+    if kind not in SPOT_CORROBORATED_EXITS:
         reasons.append('value-based trigger (priced off the option book)')
     return (bool(reasons), '; '.join(reasons))
 

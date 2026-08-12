@@ -165,6 +165,65 @@ def compute(trade: dict, spot: float,
     return patch
 
 
+# ── Gain-anchored trailing stop ────────────────────────────────────────────
+# The measured leak: 10 of 116 closed trades got most of the way to target and
+# still booked a loss, costing about twice what the whole book made. A trail is
+# the direct answer, and it does NOT collide with the power-law rule: that rule
+# forbids capping a tail, and a BCS caps its own upside at ENTRY
+# (max value = width), so there is no tail above the short strike to protect.
+# The rule still governs which spreads to ENTER — keep "no d/w floor" forever.
+#
+# Anchored to a FRACTION OF MAX GAIN, not to a multiple of debit. The live
+# monitor's fixed 2x-debit engage sounds equivalent and is not: it lands at 43%
+# of max gain on a 30% d/w spread but 82% on a 45% one, so it silently tightens
+# exactly as the payoff shrinks, and it would have engaged on only 2 of 32
+# closed shadows. Reusing that constant here would have shipped a trail that
+# almost never fires while looking like it works.
+
+def trail_levels(trade: dict) -> Optional[dict]:
+    """Trail state for a capped-payoff structure, or None if it has none.
+
+    Everything is DERIVED from `mfe_mid` plus config — deliberately not
+    persisted. The peak is already durable, and a second stored copy of a level
+    computed from it is a source that can drift out of step with the peak it
+    claims to describe.
+
+    Returns None for zebra: a back-ratio has two longs and no capped payoff, so
+    "fraction of max gain" has no meaning there. Zebra is retired and its open
+    positions run to expiry untrailed, which is the intended behaviour, not an
+    oversight.
+    """
+    width = trade.get('width')
+    debit = trade.get('debit')
+    if width is None or debit is None:
+        return None
+    width, debit = float(width), float(debit)
+    max_gain = width - debit
+    if max_gain <= 0:                      # degenerate: debit at or above width
+        return None
+
+    peak_mid = trade.get('mfe_mid')
+    if peak_mid is None:
+        return None
+    peak_gain = float(peak_mid) - debit
+    engage_gain = max_gain * cfg.TRAIL_ENGAGE_FRAC
+    # Armed off the PEAK, not the current gain. That is the entire point: a
+    # position that WAS up half its max and has since given it back is exactly
+    # the case this exists for, and arming off the live gain would disarm at
+    # the moment it starts mattering.
+    armed = peak_gain >= engage_gain
+    return {
+        'max_gain': round(max_gain, 2),
+        'engage_gain': round(engage_gain, 2),
+        'peak_gain': round(peak_gain, 2),
+        'peak_pct_of_max': round(peak_gain / max_gain * 100, 1),
+        'armed': armed,
+        # Always strictly above the entry debit while peak_gain > 0, so a fired
+        # trail always books a profit.
+        'level': round(debit + peak_gain * cfg.TRAIL_RETAIN_FRAC, 2),
+    }
+
+
 # ── Analysis ───────────────────────────────────────────────────────────────
 
 def excursion(trade: dict) -> Optional[dict]:

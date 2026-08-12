@@ -53,7 +53,12 @@ FLAT = 'flat'        # neither, before the position ran out of time
 # Exit reasons mapped onto the same labels. TIME is deliberately FLAT, not a
 # miss: expiring without resolution says the signal was slow, not wrong, and
 # scoring it as a loss would make every veto of a slow signal look brilliant.
-_REASON_LABEL = {'tp': HIT, 'spot_sl': MISS, 'debit_sl': MISS, 'time': FLAT}
+# TRAIL is a HIT, not a miss: the level sits above the entry debit by
+# construction, so a trailed exit always books a profit and the signal did what
+# it was supposed to. Scoring it MISS would punish the allow that worked and
+# make the trail itself look like a source of losses.
+_REASON_LABEL = {'tp': HIT, 'trail': HIT,
+                 'spot_sl': MISS, 'debit_sl': MISS, 'time': FLAT}
 
 
 def label_for_reason(reason) -> str:

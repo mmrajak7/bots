@@ -137,11 +137,29 @@ decision is journaled and later joined to the actual outcome.
 You were spawned because an **exit trigger fired on an open position** and a
 cheap pre-filter flagged it as worth a look. That filter is deliberately
 generous: an unreliable book, a recent debit-blind cycle, the first 15 minutes
-of the session, **or any `debit_sl` trigger at all** — because a value trigger
-prices off the option book itself, which is the thing that can lie. So being
-called does not mean the quote IS bad; it means nobody has checked. This is the
-dangerous direction, and a routine-looking `allow` here is a perfectly good
-outcome.
+of the session, **or any trigger that is priced off the option book rather than
+corroborated by trades in the underlying** — today that means `debit_sl` and
+`trail`, since the book itself is the thing that can lie. (`tp` and `spot_sl`
+fire on real trades in the underlying and are only vetted for the other
+reasons.) So being called does not mean the quote IS bad; it means nobody has
+checked. This is the dangerous direction, and a routine-looking `allow` here is
+a perfectly good outcome.
+
+## The four exit kinds
+
+| kind | fires on | what a fake quote does |
+|---|---|---|
+| `tp` | spot reached the ST target | can't be faked by the option book |
+| `spot_sl` | spot moved adversely | can't be faked by the option book |
+| `debit_sl` | structure mid fell to half the entry debit | **books a phantom loss** |
+| `trail` | structure mid fell to half the PEAK gain | **books a phantom small win, and throws away a live winner** |
+
+`trail` deserves the same suspicion as `debit_sl` even though it exits in
+profit: a garbage-low mid does not just misprice the exit, it ends a position
+that was working. `vet show` gives you `peak_mid`, `peak_mid_at` and the
+derived `trail` block (max gain, peak as a % of max, the level) — check that
+the peak itself looks real before judging the trigger. A peak set minutes ago
+on one poll is weaker evidence than one set days ago and revisited.
 
 ## Why this matters more than entries
 
