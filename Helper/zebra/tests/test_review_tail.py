@@ -170,3 +170,80 @@ def test_a_fresh_unpriceable_row_is_left_alone(tmp_path, monkeypatch):
     monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {'FINECO': 0.0})
     monitor.check_watching(s, kite=None, dry_run=True)
     assert s.find(1)['status'] == 'watching'
+
+
+# ── the simulation's two bugs ────────────────────────────────────────────
+
+def _bcs_trade():
+    return ({'id': 7, 'stock': 'TESTCO', 'direction': 'CE',
+             'st_value': 140.0, 'timeframe': 'weekly'},
+            {'long_strike': 100.0, 'short_strike': 140.0, 'debit': 10.0})
+
+
+def test_a_shortened_target_below_breakeven_is_refused():
+    """swing_tp reasons purely about the CHART — it never sees the strikes or
+    the debit, so its 40%-retained floor bounds SPOT distance, not payoff. With
+    the short strike still pinned at the ST line, a level keeping 40% of the
+    journey can sit below breakeven: measured, 2 of the 11 cases where the
+    override applies (MPHASIS -10.8%, BANDHANBNK -43.4% of max gain). Firing
+    'target reached' into a booked loss is not a target."""
+    from zebra import monitor
+    trade, bcs = _bcs_trade()
+    swing = {'applied': True, 'tp_spot': 105.0, 'kind': 'high',
+             'st_value': 140.0}                      # breakeven is 110
+    out = monitor._swing_clears_breakeven(trade, bcs, swing)
+    assert out['applied'] is False, "a losing target was accepted"
+    assert out['tp_spot'] is None
+    assert out['level'] == 105.0, "the level must still be REPORTED"
+    assert out['breakeven'] == 110.0
+
+
+def test_a_shortened_target_above_breakeven_is_kept():
+    """Companion — the guard must not swallow the feature it protects."""
+    from zebra import monitor
+    trade, bcs = _bcs_trade()
+    swing = {'applied': True, 'tp_spot': 125.0, 'kind': 'high',
+             'st_value': 140.0}
+    out = monitor._swing_clears_breakeven(trade, bcs, swing)
+    assert out['applied'] is True and out['tp_spot'] == 125.0
+
+
+def test_the_pe_side_mirrors_the_breakeven_test():
+    """PE is a bear vertical: breakeven is long_strike MINUS debit, and spot
+    has to travel DOWN through it."""
+    from zebra import monitor
+    trade = {'id': 8, 'stock': 'TESTCO', 'direction': 'PE',
+             'st_value': 60.0, 'timeframe': 'weekly'}
+    bcs = {'long_strike': 100.0, 'short_strike': 60.0, 'debit': 10.0}
+    near = {'applied': True, 'tp_spot': 95.0, 'kind': 'low', 'st_value': 60.0}
+    assert monitor._swing_clears_breakeven(trade, bcs, near)['applied'] is False
+    far = {'applied': True, 'tp_spot': 85.0, 'kind': 'low', 'st_value': 60.0}
+    assert monitor._swing_clears_breakeven(trade, bcs, far)['applied'] is True
+
+
+def test_the_expiry_nag_survives_a_dark_book():
+    """The nag is a CALENDAR fact. It sat below the no-quote `continue`, so a
+    position whose book went unquotable in its final week got no warning at
+    all — and the delivery-margin ramp is what the nag exists to stay ahead
+    of."""
+    import inspect
+    from zebra import monitor
+    body = inspect.getsource(monitor.check_entered)
+    defer = body.index('DEFER #%d')
+    window = body[max(0, defer - 900):defer]
+    assert '_time_nag(' in window, \
+        "a dark book still silences the expiry nag"
+
+
+def test_the_breakeven_guard_is_actually_wired_into_the_entry():
+    """The tests above call the guard directly, so they pass whether or not
+    anything calls it — the recurring failure in this fleet is code that is
+    written, tested and never reached. This one fails if the entry path stops
+    invoking it."""
+    import inspect
+    from zebra import monitor
+    src = inspect.getsource(monitor._enter_as_bcs)
+    assert '_swing_clears_breakeven(' in src, \
+        "the breakeven guard is not called from the BCS entry path"
+    assert src.index('history.swing_tp(') < src.index('_swing_clears_breakeven('), \
+        "the guard must run AFTER the lookup it filters"

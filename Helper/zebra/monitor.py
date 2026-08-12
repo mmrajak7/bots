@@ -509,6 +509,7 @@ def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
         logger.warning("swing TP lookup failed for #%d %s: %s",
                        trade['id'], trade['stock'], e)
         bcs['swing_tp'] = None
+    bcs['swing_tp'] = _swing_clears_breakeven(trade, bcs, bcs.get('swing_tp'))
     s = bcs.get('swing_tp') or {}
     if s.get('applied'):
         logger.info("TP SHORTENED #%d %s: %s %.2f (%s, %d bars ago) instead of "
@@ -550,6 +551,50 @@ def _log_bcs_suppressed(trade: dict, reason: Optional[str]) -> None:
     logger.warning("BCS SUPPRESSED #%d %s (%s): %s — no trade; zebra entered "
                    "silently for the A/B record", trade['id'], trade['stock'],
                    trade['direction'], reason or "no viable BCS pair")
+
+
+def _swing_clears_breakeven(trade: dict, bcs: dict, swing):
+    """Refuse a shortened target the spread cannot make money at.
+
+    `history.swing_tp` reasons purely about the CHART: it sees spot, the ST
+    line and the pivots between them, and it knows nothing about the strikes or
+    the debit. Its 40%-retained floor therefore bounds the SPOT distance kept,
+    not the PAYOFF — and the short strike is still pinned at the ST line, so a
+    level that keeps 40% of the journey can still sit below the spread's
+    breakeven. Measured over the 42 records: the override applies to 11, the
+    median collectable gain at the swing target is ~24% of max, and TWO land
+    BELOW breakeven at intrinsic (MPHASIS -10.8%, BANDHANBNK -43.4% of max
+    gain). Firing "target reached" into a booked loss is not a target.
+
+    Breakeven for a vertical is `long_strike ± debit`, in the direction the
+    trade needs spot to travel. Below it the override is dropped and the ST
+    line stays the target; the level is still REPORTED, because "there is
+    resistance in the way and it is not worth trading to" is exactly the
+    context the vetting agent should have.
+    """
+    if not isinstance(swing, dict) or not swing.get('applied'):
+        return swing
+    try:
+        k_l = float(bcs['long_strike'])
+        debit = float(bcs['debit'])
+        tp = float(swing['tp_spot'])
+    except (KeyError, TypeError, ValueError):
+        return swing
+    be = k_l + debit if trade['direction'] == 'CE' else k_l - debit
+    clears = tp >= be if trade['direction'] == 'CE' else tp <= be
+    if clears:
+        return swing
+    logger.warning(
+        "TP OVERRIDE DROPPED #%d %s: swing %s %.2f is short of breakeven "
+        "%.2f (long %.2f %s debit %.2f) — reaching it would book a LOSS, "
+        "keeping the ST line %.2f",
+        trade['id'], trade['stock'], swing.get('kind'), tp, be, k_l,
+        '+' if trade['direction'] == 'CE' else '-', debit, swing.get('st_value', 0))
+    dropped = dict(swing)
+    dropped.update({'applied': False, 'tp_spot': None,
+                    'reason': f'below breakeven {be:.2f}',
+                    'level': tp, 'breakeven': round(be, 2)})
+    return dropped
 
 
 def _swing_tp_line(swing) -> str:
@@ -1644,6 +1689,41 @@ def _track_debit_blindness(store: ZebraStore, trade: dict, usable: bool,
                        tid, trade['stock'], n, reason)
 
 
+def _time_nag(store: ZebraStore, trade: dict, today, mid, spot,
+              pending_mfe, dry_run: bool = False, reliable: bool = True,
+              legs=None) -> None:
+    """The expiry reminder, and in PAPER the close that goes with it.
+
+    Shared by the normal cascade and the dark-book deferral, because the nag is
+    a CALENDAR fact: Indian stock options are physically settled and the
+    exchange ramps a delivery margin over the final sessions, so a position
+    whose option book has gone unquotable in its last week needs the warning
+    MORE than one that is quoting fine, not less. It previously sat below the
+    no-quote `continue` and was silenced by exactly that case.
+
+    SESSIONS, not calendar days: "3 days left" on a Friday is one session, the
+    moment the old calendar count was most wrong and the margin most urgent. No
+    holiday calendar exists, so this over-counts across one; TIME_SL_DAYS is
+    set with that slack in mind.
+    """
+    tid = trade['id']
+    try:
+        exp = datetime.strptime(trade['expiry'], '%Y-%m-%d').date()
+        days_left = _sessions_left(today, exp)
+    except Exception:
+        days_left = 999
+    # Fires once per DAY so the nudge repeats until the position is out. In
+    # PAPER the first fire also closes it; later days no-op on status.
+    if days_left > cfg.TIME_SL_DAYS or not store.set_alert_flag_daily(tid, 'time'):
+        return
+    if _alerts_enabled(trade):
+        _send_telegram(_format_time_alert(trade, days_left, mid), dry_run=dry_run)
+    logger.info("TIME alert #%d %s days_left=%d mid=%s", tid, trade['stock'],
+                days_left, f'{mid:.2f}' if mid is not None else 'NA')
+    _paper_auto_close(store, trade, mid, 'time', spot, pending_mfe=pending_mfe,
+                      reliable=reliable, release_flag=False, legs=legs)
+
+
 def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     """Monitor entered trades for TP/SL/time exits.
 
@@ -1799,6 +1879,13 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # Expiry is the one valuation that needs no book.
             if not _settle_if_expired(store, trade, spot, today,
                                       pending_mfe, dry_run):
+                # The expiry NAG is a calendar fact and must survive a dark
+                # book. It used to sit below this `continue`, so a position
+                # whose book went unquotable in its final week got no warning
+                # at all — and the delivery-margin ramp is exactly what the nag
+                # exists to stay ahead of. Alert only: with no price there is
+                # nothing to book, and the daily flag re-nags tomorrow.
+                _time_nag(store, trade, today, None, spot, None, dry_run)
                 logger.info(
                     "DEFER #%d %s: no usable book (%s) — spot=%.2f, nothing "
                     "booked this cycle", tid, stock,
@@ -1928,21 +2015,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # exact moment the old calendar count was most wrong and the margin
         # most urgent. No holiday calendar exists here, so this over-counts
         # across a holiday; TIME_SL_DAYS is set with that slack in mind.
-        try:
-            exp = datetime.strptime(trade['expiry'], '%Y-%m-%d').date()
-            days_left = _sessions_left(today, exp)
-        except Exception:
-            days_left = 999
-        # Daily reminder during the last TIME_SL_DAYS — fires once per day so
-        # the user keeps getting nudged until they exit. Paper mode auto-closes
-        # on the first fire (subsequent days no-op since status='exited').
-        if days_left <= cfg.TIME_SL_DAYS and store.set_alert_flag_daily(tid, 'time'):
-            if _alerts_enabled(trade):
-                _send_telegram(_format_time_alert(trade, days_left, mid), dry_run=dry_run)
-            logger.info("TIME alert #%d %s days_left=%d", tid, stock, days_left)
-            _paper_auto_close(store, trade, mid, 'time', spot,
-                              pending_mfe=pending_mfe, reliable=sq['reliable'],
-                              release_flag=False, legs=sq.get('legs'))
+        _time_nag(store, trade, today, mid, spot, pending_mfe, dry_run,
+                  reliable=sq['reliable'], legs=sq.get('legs'))
 
     # Anything not already flushed by an exit. On a normal cycle this is the
     # ONLY store write the peak tracking does, however many positions moved.
