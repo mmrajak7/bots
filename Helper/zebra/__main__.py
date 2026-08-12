@@ -857,6 +857,45 @@ def cmd_report(args):
     )
 
 
+def cmd_giveback(args):
+    """Peak-vs-exit table for closed trades that carry a measured peak."""
+    from . import mfe as mfe_mod
+    from .trade_store import get_store
+    store = get_store()
+    trades = store.load_trades()
+    g = mfe_mod.giveback(trades, min_progress=args.min_progress)
+
+    print(f"\nGIVE-BACK  ({g['measured']} measured, "
+          f"{g['unmeasured']} closed before MFE capture existed)")
+    if not g['measured']:
+        # Say this plainly rather than printing an empty table that reads as
+        # "no leak found". Capture only starts on the next monitor poll of an
+        # OPEN trade, so this is the expected state right after deployment.
+        print("  Nothing measured yet — peaks are recorded from the first "
+              "monitor poll after deployment, so this fills in as open "
+              "trades close.\n")
+        return
+
+    print(f"  was ahead at some point : {g['was_ahead']}")
+    print(f"  total handed back       : Rs {g['given_back']:,.0f}")
+    if g['kept_pct_median'] is not None:
+        print(f"  median % of peak kept   : {g['kept_pct_median']:.1f}%")
+    print(f"  reached >={args.min_progress:.0%} to target then LOST: "
+          f"{g['reached_then_lost']} "
+          f"(Rs {g['reached_then_lost_pnl']:,.0f})")
+
+    print(f"\n  {'#':>4} {'STOCK':<12} {'STRUCT':<6} {'PEAK':>10} {'P&L':>10} "
+          f"{'BACK':>10} {'KEPT':>6} {'TP%':>6}  EXIT")
+    for r in g['rows']:
+        kept = f"{r['kept_pct']:.0f}%" if r['kept_pct'] is not None else '-'
+        back = f"{r['given_back']:,.0f}" if r['given_back'] is not None else '-'
+        prog = f"{r['tp_progress'] * 100:.0f}%" if r.get('tp_progress') is not None else '-'
+        print(f"  {r['id']:>4} {r['stock']:<12} {r['structure']:<6} "
+              f"{r['peak_gain']:>10,.0f} {r['pnl']:>10,.0f} {back:>10} "
+              f"{kept:>6} {prog:>6}  {r['reason'] or ''}")
+    print()
+
+
 def main():
     p = argparse.ArgumentParser(prog='python -m zebra',
                                 description='Zebra — synthetic long/short option strategy')
@@ -1016,6 +1055,13 @@ def main():
     p_rep.add_argument('--no-kite', action='store_true',
                        help='Skip live mid fetch for open positions (faster, no unrealized P&L)')
     p_rep.set_defaults(func=cmd_report)
+
+    p_mfe = sub.add_parser('giveback',
+                           help='Peak-vs-exit: what winners handed back')
+    p_mfe.add_argument('--min-progress', type=float, default=0.7,
+                       help='Fraction of the way to target that counts as '
+                            '"was winning" (default 0.7)')
+    p_mfe.set_defaults(func=cmd_giveback)
 
     args = p.parse_args()
     setup_logging(args.verbose)

@@ -137,9 +137,18 @@ class ZebraStore:
             except BaseException:
                 self._trades = snapshot
                 raise
-            if persist:
+            # A mutation that mutated nothing must not rewrite the store. The
+            # guarded advisory writers (reset_confirm, clear_blind) run for
+            # every open position on every poll and their guard skips only the
+            # FIELD assignment, not this save — so a quiet cycle with 24
+            # positions was rewriting ~1 MB forty-eight times and taking the
+            # cross-process lock for each, on a Pi that also runs the
+            # live-money monitor. The snapshot already exists for rollback;
+            # comparing against it is far cheaper than serialising to disk.
+            changed = self._trades != snapshot
+            if persist and changed:
                 self._save_local()
-        if persist and drive:
+        if persist and changed and drive:
             self._upload_to_drive()
 
     # ── Writes ────────────────────────────────────────────────────────────
@@ -601,6 +610,38 @@ class ZebraStore:
                 t['debit_blind_alerted'] = True
                 newly_set = True
         return newly_set
+
+    # ── Max favourable excursion ───────────────────────────────────────────
+    def apply_mfe(self, patches: dict, persist: bool = True) -> None:
+        """Persist peak-excursion state for many trades in ONE write.
+
+        `patches` is {trade_id: {field: value}}. Batched deliberately: this
+        fires for every open position on every poll, and a write per trade
+        would rewrite the whole ~1 MB store that many times per cycle while
+        holding the cross-process lock each time.
+
+        LOCAL only (drive=False, no version bump), like the confirm/blind
+        counters: pushing a peak to Drive every 5 minutes would churn the
+        network for data nobody reads until the trade closes. The values still
+        REACH Drive, because `mark_exited` does a full drive=True write and its
+        in-lock refresh picks them up — so the record lands exactly when it
+        becomes worth keeping.
+
+        Callers pass whole-state patches, so the key check is not decoration:
+        one typo'd key in a dict-update would silently overwrite `status` or
+        `debit` on a live position.
+        """
+        bad = sorted({k for f in patches.values() for k in f
+                      if not str(k).startswith('mfe_')})
+        if bad:
+            raise ValueError(f"apply_mfe only writes mfe_* fields, got: {bad}")
+        if not patches:
+            return
+        with self._mutate(drive=False, persist=persist):
+            for trade_id, fields in patches.items():
+                t = self.find(trade_id)
+                if t:
+                    t.update(fields)
 
     # ── Listing ───────────────────────────────────────────────────────────
     def list_trades(self, status_filter: Optional[str] = None):

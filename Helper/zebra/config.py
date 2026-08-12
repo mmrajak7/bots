@@ -239,6 +239,20 @@ _DEFAULTS = {
                                  # Pi also runs live-money bots.
     'vet_model': 'fable',        # Decisions.
     'event_model': 'sonnet',     # Routine calendar refresh.
+    'mfe_confirm_polls': 2,      # Max-favourable-excursion peak tracking. A
+                                 # peak is a MAX, so one garbage-high print
+                                 # poisons it PERMANENTLY — unlike a low print,
+                                 # which the DEBIT-SL debounce already handles.
+                                 # A proposed peak beyond the jump bound below
+                                 # must therefore repeat on this many polls,
+                                 # and the window MINIMUM is what gets stored.
+                                 # Same shape as bcs.update_trail's gate.
+    'mfe_jump_mult': 1.5,        # Structure mid: implausible to rise >50% above
+                                 # the running peak inside one ~5-min poll.
+    'mfe_spot_jump_pct': 0.15,   # Underlying: same idea in price terms. A real
+                                 # 15% single-poll move confirms on the next
+                                 # poll and is recorded ~5 min late; a bad tick
+                                 # never repeats and is dropped.
 }
 
 
@@ -366,6 +380,9 @@ EVENT_REFRESH_SEC = _int('event_refresh_sec')
 EVENT_HORIZON_DAYS = _int('event_horizon_days')
 REVIEW_ADVERSE_PCT = _num('review_adverse_pct')
 AUTH_WARN_DAYS = _int('auth_warn_days')
+MFE_CONFIRM_POLLS = _int('mfe_confirm_polls')
+MFE_JUMP_MULT = _num('mfe_jump_mult')
+MFE_SPOT_JUMP_PCT = _num('mfe_spot_jump_pct')
 # Timeout and model live in the config FILE like every other threshold, with an
 # env override for one-off runs. They were env-only-or-hardcoded, so editing
 # zebra_config.json — the documented surface — logged "unknown keys ignored"
@@ -446,3 +463,8 @@ assert TRIGGER_GAP_MAX > STALE_GAP_MIN, (
     f"TRIGGER_GAP_MAX ({TRIGGER_GAP_MAX}) must be > STALE_GAP_MIN ({STALE_GAP_MIN})")
 assert MIN_DTE < MAX_DTE, f"MIN_DTE must be < MAX_DTE"
 assert MIN_DTE >= 1, f"MIN_DTE must be >= 1"
+# A multiplier of 1.0 would send EVERY new peak through the confirmation
+# window, so a peak reached in the final poll of a session (or the poll that
+# exits the trade) would never be recorded at all. _num() already rejects
+# non-positive values; this catches the merely useless ones.
+assert MFE_JUMP_MULT > 1.0, f"MFE_JUMP_MULT ({MFE_JUMP_MULT}) must be > 1.0"

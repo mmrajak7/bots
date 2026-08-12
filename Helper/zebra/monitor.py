@@ -24,6 +24,7 @@ import requests
 from . import config as cfg
 from . import events as events_mod
 from . import health as health_mod
+from . import mfe as mfe_mod
 from . import outcomes as outcomes_mod
 from . import review as review_mod
 from . import strikes as strikes_mod
@@ -858,8 +859,29 @@ def _quote_zebra_value(kite, trade: dict) -> Optional[float]:
     return _structure_value(kite, trade)
 
 
+def _flush_mfe(store: ZebraStore, pending: dict) -> None:
+    """Write the cycle's accumulated peak state and clear the accumulator.
+
+    Called before any exit books and once at the end of the cycle. It must run
+    BEFORE mark_exited: `_merge` gives disk the tie on equal versions, so a
+    patch still sitting in this dict would be discarded by mark_exited's own
+    in-lock refresh — and mark_exited is the write that carries these fields to
+    Drive. Losing them there loses exactly the trades the give-back question is
+    about.
+    """
+    if not pending:
+        return
+    try:
+        store.apply_mfe(dict(pending))
+    except Exception as e:
+        # Measurement must never be able to block an exit.
+        logger.warning("MFE flush failed (%d trades): %s", len(pending), e)
+    pending.clear()
+
+
 def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
-                       reason: str, spot: Optional[float] = None) -> Optional[dict]:
+                       reason: str, spot: Optional[float] = None,
+                       pending_mfe: Optional[dict] = None) -> Optional[dict]:
     """Auto-close a paper trade at current structure mid. Returns the updated
     trade dict (with pnl/pnl_pct) or None if close failed.
 
@@ -875,6 +897,8 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
         # transient outage corrupts the paper P&L). Defer; the caller retries
         # next poll. Callers already skip paper trades with no mid.
         return None
+    if pending_mfe is not None:
+        _flush_mfe(store, pending_mfe)
     try:
         updated = store.mark_exited(
             trade['id'],
@@ -927,6 +951,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     stocks = list({t['stock'] for t in entered})
     ltps = get_ltp(kite, stocks)
     today = datetime.now(IST).date()
+    # One store write for the whole cycle's peak tracking — see _flush_mfe.
+    pending_mfe: dict = {}
 
     for trade in entered:
         # An earlier exit-check this cycle may have already auto-closed.
@@ -957,6 +983,15 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         debit_usable = mid is not None and sq['reliable']
         _track_debit_blindness(store, trade, debit_usable, sq['reason'],
                                dry_run=dry_run)
+
+        # BEFORE the exit branches and BEFORE the no-quote skip below: the poll
+        # that exits a trade is usually the poll that set its peak, and the
+        # underlying is still worth recording on a cycle when the option book
+        # is dark. Never gates or blocks anything — pure measurement.
+        patch = mfe_mod.compute(trade, spot, mid, sq['reliable'])
+        if patch:
+            pending_mfe[tid] = patch
+
         if cfg.PAPER_MODE and mid is None:
             continue
 
@@ -973,7 +1008,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             if _alerts_enabled(trade):
                 _send_telegram(_format_tp_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
-            _paper_auto_close(store, trade, mid, 'tp', spot)
+            _paper_auto_close(store, trade, mid, 'tp', spot,
+                              pending_mfe=pending_mfe)
             if trade.get('status') == 'exited':
                 continue
 
@@ -991,7 +1027,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             if _alerts_enabled(trade):
                 _send_telegram(_format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
-            _paper_auto_close(store, trade, mid, 'spot_sl', spot)
+            _paper_auto_close(store, trade, mid, 'spot_sl', spot,
+                              pending_mfe=pending_mfe)
             if trade.get('status') == 'exited':
                 continue
 
@@ -1016,7 +1053,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                         _send_telegram(_format_debit_sl_alert(trade, mid), dry_run=dry_run)
                     logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f (confirmed x%d)",
                                 tid, stock, mid, trade['debit_sl_value'], n)
-                    _paper_auto_close(store, trade, mid, 'debit_sl', spot)
+                    _paper_auto_close(store, trade, mid, 'debit_sl', spot,
+                                      pending_mfe=pending_mfe)
                     if trade.get('status') == 'exited':
                         continue
             else:
@@ -1039,7 +1077,12 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             if _alerts_enabled(trade):
                 _send_telegram(_format_time_alert(trade, days_left, mid), dry_run=dry_run)
             logger.info("TIME alert #%d %s days_left=%d", tid, stock, days_left)
-            _paper_auto_close(store, trade, mid, 'time', spot)
+            _paper_auto_close(store, trade, mid, 'time', spot,
+                              pending_mfe=pending_mfe)
+
+    # Anything not already flushed by an exit. On a normal cycle this is the
+    # ONLY store write the peak tracking does, however many positions moved.
+    _flush_mfe(store, pending_mfe)
 
 
 # ── Cycle ─────────────────────────────────────────────────────────────────
