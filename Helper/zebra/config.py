@@ -178,7 +178,19 @@ _DEFAULTS = {
     'spot_sl_enabled': False,     # master switch for the adverse-spot SL (off: debit floor only)
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
-    'time_sl_days_before_expiry': 3,
+    'time_sl_days_before_expiry': 4,
+                                 # TRADING SESSIONS, not calendar days (the
+                                 # count was calendar until 2026-08-12, so a
+                                 # Friday read "3 days left" when one session
+                                 # remained). Indian stock options are
+                                 # PHYSICALLY settled and the exchange ramps a
+                                 # delivery margin on ITM legs over the last
+                                 # ~4 sessions; 3 sessions sat INSIDE that
+                                 # ramp. Firing at the start of the E-4 session
+                                 # means acting before that day's end-of-day
+                                 # risk run, while keeping the time value that
+                                 # exiting a session earlier would give up.
+                                 # Raise to 5 if your broker levies intraday.
     'max_open_trades': 8,        # LIVE guidance only. PAPER intentionally does
                                  # NOT cap entries — capturing every signal keeps
                                  # the validation P&L unbiased (a cap would skew

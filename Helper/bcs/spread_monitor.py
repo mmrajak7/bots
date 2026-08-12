@@ -40,7 +40,7 @@ import re
 import sys
 import time
 import argparse
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -554,6 +554,118 @@ def is_expiry_day(trade: dict) -> bool:
 
 
 EXPIRY_FORCE_CLOSE_TIME = dtime(15, 15)   # Force close by 15:15 on expiry day
+
+# ── Physical-delivery margin proximity ─────────────────────────────────────
+# Indian single-stock options are PHYSICALLY settled, and the exchange levies a
+# delivery margin on ITM options that ramps up over the final trading sessions
+# before expiry. Until now the only expiry handling in this file was a
+# force-close ON EXPIRY DAY — i.e. after the entire ramp has been paid, and
+# late enough that a broker short of margin may square the position off first,
+# at a price nobody chose.
+#
+# Both legs of a BCS are calls on one underlying, so if both finish ITM the
+# delivery obligations largely offset. That is an exchange/broker policy
+# question, not one this code can answer, and brokers apply their own stricter
+# rules — so this WARNS with the facts (sessions left, which legs are ITM) and
+# closes nothing. Confirm the exact schedule and your broker's netting policy
+# before relying on the numbers.
+DELIVERY_MARGIN_SESSIONS = 4    # ramp is widely documented as starting at E-4
+EXPIRY_WARN_SESSIONS = 5        # warn one session BEFORE the ramp starts
+
+
+def sessions_to_expiry(trade: dict, today: Optional[date] = None) -> Optional[int]:
+    """Trading sessions remaining, expiry inclusive. 0 = expiry day.
+
+    Counts WEEKDAYS, not calendar days: over a weekend a calendar count reads
+    "3 days left" when only one session remains, which is precisely when this
+    warning matters most.
+
+    No holiday calendar exists in this repo, so a holiday inside the window
+    makes this an OVER-estimate — it will say more sessions remain than really
+    do. That is why the warning threshold sits one session before the ramp
+    starts: it absorbs a single holiday. It is not a substitute for a real
+    calendar, and a long holiday stretch will still surprise it.
+    """
+    try:
+        expiry = datetime.strptime(trade.get('expiry', ''), '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return None
+    d = today or date.today()
+    if expiry < d:
+        return 0
+    sessions = 0
+    cur = d
+    while cur < expiry:
+        cur += timedelta(days=1)
+        if cur.weekday() < 5:
+            sessions += 1
+    return sessions
+
+
+def delivery_exposure(trade: dict, spot: float) -> dict:
+    """Which legs are ITM — i.e. which carry a delivery obligation at expiry.
+
+    Reads every `*_symbol` leg on the record rather than the BCS pair, so this
+    is correct for the bear put spread and for Fallen Hero — whose SHORT CALL
+    is the largest delivery exposure in the fleet. A BCS-shaped implementation
+    would have found no legs on an FH record and reported "ITM legs: none",
+    which is not a missing feature but an actively false all-clear on the one
+    position where being wrong costs the most.
+
+    `itm` is None (unknown), never an empty list, when no leg could be parsed.
+    """
+    legs = []
+    for key, val in trade.items():
+        if not key.endswith('_symbol') or key == 'spot_symbol':
+            continue
+        sym = str(val or '').upper()
+        m = re.search(r'(\d+(?:\.\d+)?)(CE|PE)$', sym)
+        if not m:
+            continue
+        strike, kind = float(m.group(1)), m.group(2)
+        itm = spot > strike if kind == 'CE' else spot < strike
+        legs.append({'leg': key[:-len('_symbol')], 'strike': strike,
+                     'type': kind, 'itm': itm})
+    return {'legs': legs,
+            'itm': None if not legs else [l['leg'] for l in legs if l['itm']]}
+
+
+def maybe_warn_expiry_proximity(store, trade: dict, spot: float, label: str,
+                                today: Optional[date] = None) -> bool:
+    """One Telegram per trade per day once expiry is close. Alert only.
+
+    Returns True if a warning was sent this call.
+    """
+    sessions = sessions_to_expiry(trade, today)
+    if sessions is None or sessions > EXPIRY_WARN_SESSIONS or sessions <= 0:
+        return False        # expiry day has its own force-close path
+    stamp = (today or date.today()).isoformat()
+    if trade.get('expiry_warn_date') == stamp:
+        return False        # already nagged today; survives a monitor restart
+
+    exp = delivery_exposure(trade, spot)
+    itm = exp['itm']
+    itm_txt = ('could not read the leg symbols — CHECK MANUALLY' if itm is None
+               else (', '.join(itm) if itm else 'none'))
+    ramp = 'ACTIVE' if sessions <= DELIVERY_MARGIN_SESSIONS else \
+           f'starts in {sessions - DELIVERY_MARGIN_SESSIONS} session(s)'
+    msg = (f"⏳ {label} #{trade['id']} {trade['stock']}: "
+           f"{sessions} trading session(s) to expiry ({trade.get('expiry')}).\n"
+           f"Delivery-margin ramp {ramp}. ITM legs: {itm_txt}.\n"
+           f"Physical settlement — close before the margin builds, or confirm "
+           f"your broker nets the legs.")
+    log(f"  *** {label} #{trade['id']} {trade['stock']}: {sessions} session(s) "
+        f"to expiry, delivery ramp {ramp}, ITM: {itm_txt} ***")
+    send_telegram(msg)
+    try:
+        store.update_trade_fields(trade['id'], expiry_warn_date=stamp)
+        trade['expiry_warn_date'] = stamp
+    except Exception as e:
+        # A failed flag write means tomorrow's identical nag; losing the WARNING
+        # would be the worse failure, so this never blocks the alert.
+        log(f"  WARNING: could not persist expiry-warn flag for "
+            f"#{trade['id']}: {e}")
+    return True
 
 
 _telegram_cfg: Optional[dict] = None
@@ -1841,6 +1953,11 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
     if expiry_today:
         log(f"\n  *** EXPIRY DAY! Will force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
         send_telegram(f"BCS {stock}: EXPIRY DAY. Monitor will force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
+    else:
+        try:
+            maybe_warn_expiry_proximity(store, trade, spot, 'BCS')
+        except Exception as e:
+            log(f"  WARNING: expiry-proximity check failed: {e}")
 
     log(f"\nMonitoring started. Waiting for TP={target} | SL={sl_spot}...\n")
     if not is_market_settled():
@@ -2267,6 +2384,19 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             expiry_trades[(strat, t['id'])] = True
             log(f"  *** {strat} #{t['id']} {t['stock']}: EXPIRY DAY! Force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
             send_telegram(f"{strat} #{t['id']} {t['stock']}: EXPIRY DAY. Will force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
+            continue
+        # Not expiry day, but close enough that physical-delivery margin is
+        # about to build. Every strategy here is physically settled, so all of
+        # them get the warning. Alert only — the force-close above remains the
+        # ONLY automated close this file does on expiry proximity.
+        try:
+            _spot = get_spot(kite, t['spot_symbol'])
+            maybe_warn_expiry_proximity(
+                _get_store_for(t, bcs_store, fh_store, bps_store), t, _spot,
+                t.get('_strategy', '?'))
+        except Exception as e:
+            log(f"  WARNING: expiry-proximity check failed for "
+                f"#{t['id']} {t.get('stock')}: {e}")
 
     log(f"\nCron monitoring started at {datetime.now().strftime('%H:%M:%S')}...")
     if not is_market_settled():

@@ -450,7 +450,7 @@ def _format_time_alert(trade: dict, days_left: int,
     return (
         f"⏰ <b>EXIT REMINDER</b> [{_struct_label(trade)}]  "
         f"<code>{trade['stock']}</code>  ({trade['direction']})\n"
-        f"T-{days_left} | expiry {trade['expiry']}\n"
+        f"T-{days_left} session(s) | expiry {trade['expiry']}\n"
         f"Close before physical-settlement margin spike ({n_long}× long ITM).\n"
         f"\n"
         f"🔴 BUY back 1× <code>{trade['short_symbol']}</code>\n"
@@ -875,6 +875,23 @@ def _quote_zebra_value(kite, trade: dict) -> Optional[float]:
     return _structure_value(kite, trade)
 
 
+def _sessions_left(today, expiry) -> int:
+    """Trading sessions from `today` (exclusive) to `expiry` (inclusive).
+
+    Weekdays only. Returns 0 on or after expiry day. Holidays are not known to
+    this repo, so a holiday inside the window makes this an OVER-estimate —
+    it reports more sessions than really remain, never fewer.
+    """
+    if expiry <= today:
+        return 0
+    sessions, cur = 0, today
+    while cur < expiry:
+        cur += timedelta(days=1)
+        if cur.weekday() < 5:
+            sessions += 1
+    return sessions
+
+
 def _flush_mfe(store: ZebraStore, pending: dict) -> None:
     """Write the cycle's accumulated peak state and clear the accumulator.
 
@@ -1118,9 +1135,15 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             store.reset_confirm(tid, 'debit_sl')
 
         # ── TIME SL ─────────────────────────────────────────────────────
+        # SESSIONS, not calendar days. Indian stock options are physically
+        # settled and the exchange ramps a delivery margin over the final
+        # trading sessions, so "3 days left" on a Friday — one session — is the
+        # exact moment the old calendar count was most wrong and the margin
+        # most urgent. No holiday calendar exists here, so this over-counts
+        # across a holiday; TIME_SL_DAYS is set with that slack in mind.
         try:
             exp = datetime.strptime(trade['expiry'], '%Y-%m-%d').date()
-            days_left = (exp - today).days
+            days_left = _sessions_left(today, exp)
         except Exception:
             days_left = 999
         # Daily reminder during the last TIME_SL_DAYS — fires once per day so
