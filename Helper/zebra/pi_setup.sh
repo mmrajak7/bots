@@ -333,10 +333,47 @@ if [ "$APPLY" -eq 1 ]; then
     BACKUP="$HOME/crontab.backup.$(date +%Y%m%d-%H%M%S)"
     printf '%s\n' "$CURRENT" > "$BACKUP"
     ok "crontab backed up to $BACKUP"
-    NEW="$(printf '%s\n' "$CURRENT" | grep -vF "$CRON_TAG")"
-    NEW="$(printf '%s\n%s\n' "$NEW" "$CRON_LINE" | sed '/^$/d')"
+    # Replace IN PLACE, preserving position, comments and blank lines. The
+    # first version of this did `grep -v` + append + `sed '/^$/d'`, which
+    # stripped every blank line out of a 200-line hand-maintained crontab and
+    # moved the entry to the bottom. Cron did not care; the human reading it
+    # afterwards would.
+    #
+    # CRON_LINE goes through the ENVIRON array, NOT `awk -v`: -v processes
+    # backslash escapes, which would eat the `\%` that stops cron reading a
+    # bare % as a newline — silently truncating the very line being installed.
+    NEW="$(printf '%s\n' "$CURRENT" | CL="$CRON_LINE" CT="$CRON_TAG" awk '
+        BEGIN { new = ENVIRON["CL"]; tag = ENVIRON["CT"] }
+        index($0, tag) && $0 !~ /^[[:space:]]*#/ { print new; found=1; next }
+        { print }
+        END { if (!found) print new }')"
+    OLD_N=$(printf '%s\n' "$CURRENT" | wc -l)
+    NEW_N=$(printf '%s\n' "$NEW" | wc -l)
     if printf '%s\n' "$NEW" | crontab -; then
-      ok "zebra cron line installed"
+      # READ IT BACK. An install that reports success without re-reading is
+      # the same class of claim as a guard that is defined but never called.
+      BACK="$(crontab -l 2>/dev/null)"
+      BACK_N=$(printf '%s\n' "$BACK" | wc -l)
+      if printf '%s\n' "$BACK" | grep -qF "$CRON_LINE"; then
+        ok "zebra cron line installed and verified by read-back"
+      else
+        bad "line NOT present after install — restore: crontab $BACKUP"
+      fi
+      if [ "$OLD_N" -eq "$BACK_N" ] && [ "$NEW_N" -eq "$BACK_N" ]; then
+        ok "crontab still $BACK_N lines — nothing else added or lost"
+      else
+        warn "line count changed: was $OLD_N, wrote $NEW_N, now $BACK_N"
+      fi
+      # Everything that is not our line must be byte-identical to the backup.
+      if diff <(printf '%s\n' "$CURRENT" | grep -vF "$CRON_TAG") \
+              <(printf '%s\n' "$BACK"    | grep -vF "$CRON_TAG") >/dev/null; then
+        ok "every OTHER crontab line is byte-identical to the backup"
+      else
+        bad "OTHER crontab lines changed — restore: crontab $BACKUP"
+        diff <(printf '%s\n' "$CURRENT" | grep -vF "$CRON_TAG") \
+             <(printf '%s\n' "$BACK"    | grep -vF "$CRON_TAG") \
+          | head -20 | sed 's/^/           /'
+      fi
       note "restore with:  crontab $BACKUP"
     else
       bad "crontab install FAILED — restore with: crontab $BACKUP"
