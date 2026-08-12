@@ -212,3 +212,153 @@ def test_a_booked_value_cannot_go_below_zero(store):
 def test_a_booked_value_cannot_exceed_the_width(store):
     store.mark_exited(1, 150.0, 99.0, 'paper:tp')
     assert store.find(1)['exit_debit'] == 40.0
+
+
+# ── the feed going dark ──────────────────────────────────────────────────
+
+def test_no_price_for_any_position_alerts_instead_of_going_quiet(store,
+                                                                 monkeypatch):
+    """`get_ltp` guards kite.ltp() but NOT the instrument-cache load beneath
+    it, so a dead token raised straight out of check_entered. run_cycle logged
+    one line and exit monitoring stopped on every open position — no Telegram,
+    and the blind counter untouched because it lives in the per-trade loop
+    that never ran."""
+    sent = []
+    monkeypatch.setattr(monitor, '_send_telegram',
+                        lambda m, **k: sent.append(m) or True)
+
+    def dead_token(kite, stocks):
+        raise Exception('TokenException: Incorrect `api_key` or `access_token`')
+    monkeypatch.setattr(monitor, 'get_ltp', dead_token)
+    monitor.check_entered(store, kite=None, dry_run=True)
+
+    assert sent, "monitoring went blind without telling anyone"
+    assert 'BLIND' in sent[0]
+    assert 'kite_access_token' in sent[0], "the alert must name the likely cause"
+
+
+def test_the_blind_alert_fires_once_a_day_not_once_a_cycle(store, monkeypatch):
+    """The cron process EXITS between cycles, so an in-memory guard would
+    re-alert every five minutes. 78 identical messages a day is how a reader
+    learns to ignore the one that matters."""
+    sent = []
+    monkeypatch.setattr(monitor, '_send_telegram',
+                        lambda m, **k: sent.append(m) or True)
+    monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {})
+    for _ in range(3):
+        monitor.check_entered(store, kite=None, dry_run=True)
+    assert len(sent) == 1, f"blind alert fired {len(sent)} times in one day"
+
+
+def test_a_partial_feed_is_not_treated_as_blind(store, monkeypatch):
+    """Companion to the two above: 'blind' means NO position can be priced.
+    One missing symbol out of many is an ordinary skip, not a full stop."""
+    sent = []
+    monkeypatch.setattr(monitor, '_send_telegram',
+                        lambda m, **k: sent.append(m) or True)
+    monkeypatch.setattr(monitor, 'get_ltp',
+                        lambda kite, stocks: {'TESTCO': 105.0})
+    monkeypatch.setattr(monitor, '_structure_quote',
+                        lambda kite, t, spot=None: {'mid': 11.0,
+                                                    'reliable': True,
+                                                    'reason': None})
+    monitor.check_entered(store, kite=None, dry_run=True)
+    assert not any('BLIND' in m for m in sent)
+
+
+# ── the exit book ────────────────────────────────────────────────────────
+
+def test_the_exit_book_is_persisted_not_just_the_price(store, monkeypatch):
+    """Entry books have been stored since fill pricing landed; exits kept only
+    two scalars — so the one direction that has twice cost real money was the
+    one direction with no evidence. An option book cannot be reconstructed
+    after the fact."""
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: True)
+    book = {'long': {'symbol': 'L', 'bid': 12.0, 'ask': 12.4, 'oi': 9000},
+            'short': {'symbol': 'S', 'bid': 1.8, 'ask': 2.0, 'oi': 8000}}
+    monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {'TESTCO': 105.0})
+    monkeypatch.setattr(monitor, '_structure_quote',
+                        lambda kite, t, spot=None: {'mid': 10.4,
+                                                    'reliable': True,
+                                                    'reason': None,
+                                                    'legs': book,
+                                                    'floored': False})
+    monitor.check_entered(store, kite=None, dry_run=True)   # spot 105 >= tp 100
+    t = store.find(1)
+    assert t['status'] == 'exited'
+    assert t['exit_legs'] == book, "the book we exited on was thrown away"
+
+
+def test_a_failed_close_releases_the_flag_instead_of_disarming_the_exit(
+        store, monkeypatch):
+    """Only ValueError was caught, so a LockTimeout propagated with the
+    consume-once flag ALREADY claimed: the exit was announced on Telegram,
+    never booked, and that exit kind permanently disarmed for the position."""
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: True)
+
+    def boom(*a, **k):
+        raise OSError('disk went away mid-write')
+    monkeypatch.setattr(store, 'mark_exited', boom)
+    t = store.find(1)
+    store.set_alert_flag(1, 'tp')
+    monitor._paper_auto_close(store, t, 11.0, 'tp', 105.0)
+    assert store.find(1).get('tp_alerted_at') is None, \
+        "the exit kind was left permanently disarmed"
+    assert store.find(1)['status'] == 'entered'
+
+
+# ── the manual entry path ────────────────────────────────────────────────
+
+def test_a_hand_entered_bcs_is_recorded_as_a_bcs(store):
+    """`_apply_entry` stamped neither structure nor width, so every BCS
+    entered through the CLI was valued at 2*long - short: debit SL disarmed,
+    trail dead for want of a width, P&L doubled. LIVE-only, which is why paper
+    never caught it."""
+    t = store.find(1)
+    assert t['structure'] == 'bcs'
+    assert t['width'] == 40.0
+    assert monitor._long_multiplier(t) == 1, "a BCS was valued as a zebra"
+
+
+def test_the_zebra_path_stays_unstamped(store, tmp_path, monkeypatch):
+    """Companion. Only 'bcs' is stamped — every reader keys on
+    `structure != 'bcs'`, and the fix must not change what a zebra looks
+    like."""
+    monkeypatch.setattr(cfg, 'LOCAL_FILE', tmp_path / 'z2.json')
+    monkeypatch.setattr(cfg, 'LOCK_FILE', tmp_path / 'z2.lock')
+    s = ZebraStore()
+    s.add_signal({'stock': 'OTHERCO', 'timeframe': 'weekly', 'direction': 'CE',
+                  'st_value': 100.0, 'st_direction': 'UP',
+                  'signal_price': 96.0, 'signal_gap_pct': 4.0})
+    s.mark_entered(1, {'long_strike': 90.0, 'short_strike': 100.0,
+                       'long_symbol': 'L', 'short_symbol': 'S', 'debit': 5.0,
+                       'lot_size': 100, 'lots': 1, 'expiry': '2026-09-30',
+                       'structure': 'zebra'})
+    t = s.find(1)
+    assert t.get('structure') is None
+    assert t.get('width') is None
+    assert monitor._long_multiplier(t) == 2
+
+
+# ── paper must not book a price it could not have traded at ──────────────
+
+def test_paper_refuses_to_book_at_an_unreliable_mid(store, monkeypatch):
+    """The reliability freeze covered DEBIT-SL and TRAIL only, so TP, SPOT-SL
+    and TIME booked whatever a crossed book said — and in paper the booked
+    number IS the result."""
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: True)
+    store.set_alert_flag(1, 'tp')
+    out = monitor._paper_auto_close(store, store.find(1), 11.0, 'tp', 105.0,
+                                    reliable=False)
+    assert out is None, "a price off an unreliable book was booked"
+    assert store.find(1)['status'] == 'entered'
+    assert store.find(1).get('tp_alerted_at') is None, \
+        "the exit was announced, never booked, and left disarmed"
+
+
+def test_paper_books_normally_on_a_reliable_mid(store, monkeypatch):
+    """Companion, so the test above cannot pass by refusing everything."""
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: True)
+    out = monitor._paper_auto_close(store, store.find(1), 11.0, 'tp', 105.0,
+                                    reliable=True)
+    assert out is not None and store.find(1)['status'] == 'exited'

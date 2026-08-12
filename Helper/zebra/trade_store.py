@@ -551,7 +551,7 @@ class ZebraStore:
 
     def mark_exited(self, trade_id: int, exit_spot: float,
                     exit_debit: Optional[float],
-                    reason: str) -> dict:
+                    reason: str, exit_legs: Optional[dict] = None) -> dict:
         """Close an entered trade. exit_debit = closing net debit per share
         (positive if still costs money to close, negative if closes for credit)."""
         with self._mutate():
@@ -562,7 +562,7 @@ class ZebraStore:
             # close on stale in-memory state.
             if t['status'] != 'entered':
                 raise ValueError(f"#{trade_id} status={t['status']}, can't exit")
-            self._apply_exit(t, exit_spot, exit_debit, reason)
+            self._apply_exit(t, exit_spot, exit_debit, reason, exit_legs)
         return t
 
     @staticmethod
@@ -610,7 +610,8 @@ class ZebraStore:
         return bounded
 
     def _apply_exit(self, t: dict, exit_spot: float,
-                    exit_debit: Optional[float], reason: str) -> None:
+                    exit_debit: Optional[float], reason: str,
+                    exit_legs: Optional[dict] = None) -> None:
         """Field-level exit mutation — runs inside the store lock."""
         debit = float(t['debit'])
         qty = int(t['quantity'])
@@ -639,6 +640,14 @@ class ZebraStore:
         t['pnl'] = pnl
         t['pnl_pct'] = pnl_pct
         t['exit_reason'] = reason
+        # THE BOOK WE EXITED ON. Entry books have been persisted since fill
+        # pricing landed; exits kept only the two scalars, so the one direction
+        # that has twice cost real money (ICICI Feb, NHPC Jul) was also the one
+        # direction with no evidence. An option book cannot be reconstructed
+        # after the fact -- if it is not written down at the moment of the
+        # exit, the post-mortem is guesswork forever.
+        if exit_legs:
+            t['exit_legs'] = exit_legs
         t['version'] = t.get('version', 0) + 1
         logger.info(
             "EXITED #%d %s reason=%s spot=%.2f P&L=Rs%.0f (%.1f%%)",

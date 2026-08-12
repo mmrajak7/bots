@@ -18,6 +18,7 @@ playbook.magnet.scanner — that code is proven, just imported.
 
 from __future__ import annotations
 
+from collections import Counter
 import logging
 import time
 from datetime import datetime
@@ -104,17 +105,20 @@ def validate_and_add(store: ZebraStore, kite=None,
     ltps = get_ltp(kite, stocks)
 
     added = []
+    skips = Counter()
     for r in raw:
         stock = r['stock']
         timeframe = r['timeframe']
         price = ltps.get(stock, 0)
         if price <= 0:
+            skips['no_ltp'] += 1
             logger.debug("SKIP %s: no LTP", stock)
             continue
 
         # ST compute (cached if already done today for this stock+TF)
         st_info = compute_st_for_stock(kite, stock, timeframe)
         if not st_info:
+            skips['st_failed'] += 1
             logger.debug("SKIP %s %s: ST compute failed", stock, timeframe)
             continue
 
@@ -124,10 +128,12 @@ def validate_and_add(store: ZebraStore, kite=None,
         # Direction routing
         direction = _direction_for(price, st_val, st_dir)
         if direction == 'SKIP':
+            skips['trend_misaligned'] += 1
             logger.debug("SKIP %s %s: trend not aligned (price=%.2f vs ST=%.2f, dir=%s)",
                          stock, timeframe, price, st_val, st_dir)
             continue
         if direction not in cfg.ENABLED_DIRECTIONS:
+            skips['direction_disabled'] += 1
             logger.debug("SKIP %s %s: direction %s disabled",
                          stock, timeframe, direction)
             continue
@@ -135,10 +141,12 @@ def validate_and_add(store: ZebraStore, kite=None,
         # Gap check: must be within watch band
         gap = abs(price - st_val) / st_val
         if gap > cfg.WATCH_GAP_MAX:
+            skips['gap_too_wide'] += 1
             logger.debug("SKIP %s %s: gap %.2f%% > watch_max %.2f%%",
                          stock, timeframe, gap * 100, cfg.WATCH_GAP_MAX * 100)
             continue
         if gap < cfg.STALE_GAP_MIN:
+            skips['gap_too_late'] += 1
             logger.debug("SKIP %s %s: gap %.2f%% < stale_min %.2f%% (too late)",
                          stock, timeframe, gap * 100, cfg.STALE_GAP_MIN * 100)
             continue
@@ -146,6 +154,7 @@ def validate_and_add(store: ZebraStore, kite=None,
         # Freshness check (reuse magnet's logic)
         is_fresh, freshness_reason = check_freshness(stock, st_val, timeframe)
         if not is_fresh:
+            skips['not_fresh'] += 1
             logger.debug("SKIP %s %s: %s", stock, timeframe, freshness_reason)
             continue
 
@@ -161,6 +170,7 @@ def validate_and_add(store: ZebraStore, kite=None,
             None
         )
         if existing:
+            skips['already_open'] += 1
             logger.debug("SKIP %s %s %s: already open as #%d (%s)",
                          stock, timeframe, direction, existing['id'],
                          existing['status'])
@@ -176,6 +186,7 @@ def validate_and_add(store: ZebraStore, kite=None,
             None
         )
         if opposite:
+            skips['opposite_open'] += 1
             logger.debug("SKIP %s %s: opposite direction open (#%d %s)",
                          stock, direction, opposite['id'], opposite['direction'])
             continue
@@ -205,7 +216,16 @@ def validate_and_add(store: ZebraStore, kite=None,
                 trade = store.add_signal(signal_data)
                 added.append(trade)
             except ValueError as e:
+                skips['store_rejected'] += 1
                 logger.debug("add_signal skipped %s: %s", stock, e)
 
-    logger.info("Scanner: %d raw → %d added", len(raw), len(added))
+    # The REASONS, aggregated, on the summary line. Per-symbol skips stay at
+    # DEBUG (900 of them a cycle at INFO would bury everything else), but
+    # "0 added" with no explanation is unactionable — and 4,475 such lines in
+    # the real log carried no reason at all, so "why did DABUR never signal on
+    # Aug 7" had no answer anywhere.
+    detail = ', '.join(f'{k}={v}' for k, v in sorted(skips.items(),
+                                                     key=lambda kv: -kv[1]))
+    logger.info("Scanner: %d raw → %d added%s", len(raw), len(added),
+                f' | skipped: {detail}' if detail else '')
     return added

@@ -23,7 +23,12 @@ def setup_logging(verbose: bool = False):
     logging.basicConfig(
         level=level,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        datefmt='%H:%M:%S',
+        # No datefmt: the default includes the DATE. cron appends every run to
+        # one file, which already spans ~94 trading days, and with a
+        # time-of-day-only stamp locating "what happened on Aug 7" meant
+        # counting `Market closed` banners backwards from the end of a
+        # 54,000-line file. Paper mode is a forensic exercise; the log is the
+        # only evidence, and evidence needs a date.
     )
 
 

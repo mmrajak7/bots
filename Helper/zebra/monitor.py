@@ -76,9 +76,23 @@ def _send_telegram(msg: str, dry_run: bool = False) -> bool:
             json={'chat_id': _tg_cfg['chat_id'], 'text': msg, 'parse_mode': 'HTML'},
             timeout=10,
         )
-        return resp.status_code == 200
+        if resp.status_code != 200:
+            # A non-200 used to return False and log NOTHING, so a vanished
+            # alert left no trace whatsoever. That is exactly how a single
+            # unescaped '<' in an interpolated reason 400s the whole message
+            # and the alert simply never arrives. The body carries Telegram's
+            # own description of what it objected to, so it goes in the log —
+            # and the message with it, because "which alert died" is the first
+            # question anyone will ask.
+            logger.error("Telegram REJECTED (HTTP %s): %s | message was: %r",
+                         resp.status_code, resp.text[:300], msg[:400])
+            return False
+        return True
     except Exception as e:
-        logger.debug("Telegram send failed: %s", e)
+        # WARNING, not DEBUG. This is the notification channel for a trading
+        # system; when it breaks, the log is the only place that can say so.
+        logger.warning("Telegram send failed: %s | message was: %r",
+                       e, msg[:200], exc_info=True)
         return False
 
 
@@ -1293,7 +1307,8 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
                        reason: str, spot: Optional[float] = None,
                        pending_mfe: Optional[dict] = None,
                        reliable: bool = True,
-                       release_flag: bool = True) -> Optional[dict]:
+                       release_flag: bool = True,
+                       legs: Optional[dict] = None) -> Optional[dict]:
     """Auto-close a paper trade at current structure mid. Returns the updated
     trade dict (with pnl/pnl_pct) or None if close failed.
 
@@ -1336,17 +1351,43 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
             trade['id'],
             spot if spot is not None else trade.get('entry_spot', 0),
             mid,
-            f'paper:{reason}'
+            f'paper:{reason}',
+            exit_legs=legs,
         )
-        logger.info("PAPER auto-closed #%d %s reason=%s mid=%s P&L=Rs%.0f (%.1f%%)",
-                    trade['id'], trade['stock'], reason,
-                    f'{mid:.2f}' if mid is not None else 'NA',
-                    updated.get('pnl', 0), updated.get('pnl_pct', 0))
+        # The BOOK on the line, not just the derived value. An option book is
+        # unreconstructable after the fact, so a post-mortem holding only
+        # "exit_debit 11.29" can never answer the question that matters --
+        # was that a price, or was it garbage?
+        lg = legs or {}
+        lo, sh = lg.get('long') or {}, lg.get('short') or {}
+        logger.info(
+            "PAPER auto-closed #%d %s reason=%s mid=%s P&L=Rs%.0f (%.1f%%) "
+            "spot=%s | long %s %s/%s oi=%s | short %s %s/%s oi=%s",
+            trade['id'], trade['stock'], reason,
+            f'{mid:.2f}' if mid is not None else 'NA',
+            updated.get('pnl', 0), updated.get('pnl_pct', 0),
+            f'{spot:.2f}' if spot is not None else 'NA',
+            lo.get('symbol'), lo.get('bid'), lo.get('ask'), lo.get('oi'),
+            sh.get('symbol'), sh.get('bid'), sh.get('ask'), sh.get('oi'))
         # Mutate the in-loop dict so subsequent checks in this cycle skip it
         trade['status'] = 'exited'
         return updated
-    except ValueError as e:
-        logger.error("PAPER auto-close failed for #%d: %s", trade['id'], e)
+    except Exception as e:
+        # Broad on purpose. Only ValueError was caught, so a LockTimeout or an
+        # OSError from the store propagated out of the exit branch with the
+        # consume-once flag ALREADY claimed — announcing an exit on Telegram,
+        # never booking it, and permanently disarming that exit kind for the
+        # position. Releasing the flag is what makes the failure retryable
+        # instead of terminal.
+        if release_flag:
+            try:
+                store.clear_alert_flag(trade['id'], reason)
+            except Exception as e2:
+                logger.error("Could not release the %s flag on #%d after a "
+                             "failed close: %s", reason, trade['id'], e2)
+        logger.error("PAPER auto-close FAILED for #%d %s reason=%s: %s "
+                     "(flag released, will retry)",
+                     trade['id'], trade['stock'], reason, e, exc_info=True)
         return None
 
 
@@ -1421,6 +1462,41 @@ def _spot_corroborates(store: ZebraStore, trade: dict, spot: float,
             patch = {'corrob_spot': float(spot), 'corrob_value': float(value),
                      'corrob_t': now}
     return ok, reason, patch
+
+
+def _alert_monitoring_blind(n_open: int, stocks: list,
+                            dry_run: bool = False) -> None:
+    """One Telegram a day when NO open position can be priced at all.
+
+    Deliberately not a per-trade flag: the condition is about the data feed,
+    not about any one position, and 24 identical messages would train the
+    reader to ignore the one that matters. The marker is a file rather than a
+    module global because the cron process exits between cycles, so an
+    in-memory guard would re-alert every five minutes.
+    """
+    today = datetime.now(IST).strftime('%Y-%m-%d')
+    marker = cfg.LOG_DIR / 'zebra_blind_alert.json'
+    try:
+        seen = json.loads(marker.read_text()).get('date') if marker.exists() else None
+    except Exception:
+        seen = None
+    logger.error(
+        "MONITORING BLIND: no LTP for ANY of %d open position(s) (%s) — "
+        "TP, spot SL and the expiry nag are all dark this cycle. Check the "
+        "Kite access token.", n_open, ', '.join(sorted(stocks)[:12]))
+    if seen == today:
+        return
+    try:
+        marker.write_text(json.dumps({'date': today}))
+    except Exception as e:
+        logger.warning("Could not write the blind-alert marker: %s", e)
+    _send_telegram(
+        f"🚨 <b>ZEBRA MONITORING BLIND</b>\n"
+        f"No price for ANY of {n_open} open position(s).\n"
+        f"TP, spot SL and the expiry nag are all dark. Most likely the Kite "
+        f"access token has expired — check "
+        f"<code>data/kite_access_token.json</code>.",
+        dry_run=dry_run)
 
 
 def _settlement_value(trade: dict, spot: float) -> Optional[float]:
@@ -1523,7 +1599,25 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         return
 
     stocks = list({t['stock'] for t in entered})
-    ltps = get_ltp(kite, stocks)
+    # `get_ltp` guards its kite.ltp() call but NOT the instrument-cache load
+    # underneath it, so a dead access token raises straight out of here. That
+    # killed the whole function, run_cycle logged one line, and exit monitoring
+    # on every open position stopped — with no Telegram, and with the blind
+    # counter untouched because it lives inside the per-trade loop below that
+    # never ran. health.py watches the Claude CLI credential and nothing has
+    # ever watched Kite's.
+    try:
+        ltps = get_ltp(kite, stocks)
+    except Exception as e:
+        logger.error("LTP fetch RAISED for %d open position(s): %s",
+                     len(entered), e, exc_info=True)
+        ltps = {}
+    if not any((ltps.get(s) or 0) > 0 for s in stocks):
+        # Not one price for any open position. Blind on the SPOT source, which
+        # is the one TP and the expiry nag run off, so this is a full stop of
+        # exit monitoring rather than a degraded mode. Blind means Telegram.
+        _alert_monitoring_blind(len(entered), stocks, dry_run=dry_run)
+        return
     today = datetime.now(IST).date()
     # One store write for the whole cycle's peak tracking — see _flush_mfe.
     pending_mfe: dict = {}
@@ -1600,6 +1694,26 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     "SPOT VETO #%d %s: %s — value triggers held this cycle",
                     tid, stock, corrob_why)
                 debit_usable = False
+        # ONE line per open position per cycle, unconditionally. Without it a
+        # cycle carrying 33 positions logged nothing at all between the store
+        # banner and the scanner summary — `check_entered` spoke only when a
+        # trigger fired — so "what did the engine SEE at 14:35" and "why did TP
+        # not fire" were both unanswerable. In paper mode the log is the entire
+        # forensic record, and a record of exits only is a record of the
+        # cycles that were already interesting.
+        logger.info(
+            "POLL #%d %s %s spot=%.2f tp=%.2f sl=%.2f | value=%s "
+            "(%s) debit_sl=%.2f | long %s/%s short %s/%s",
+            tid, stock, direction, spot, tp_spot, sl_spot,
+            f'{mid:.2f}' if mid is not None else 'NA',
+            'ok' if debit_usable else (sq.get('rejected') or sq['reason']
+                                       or 'unusable'),
+            trade.get('debit_sl_value', 0),
+            ((sq.get('legs') or {}).get('long') or {}).get('bid'),
+            ((sq.get('legs') or {}).get('long') or {}).get('ask'),
+            ((sq.get('legs') or {}).get('short') or {}).get('bid'),
+            ((sq.get('legs') or {}).get('short') or {}).get('ask'))
+
         if debit_usable and not _value_triggers_live():
             logger.info(
                 "OPEN BUFFER #%d %s: value triggers dark until %ds after the "
@@ -1647,7 +1761,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                              _format_tp_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
             _paper_auto_close(store, trade, mid, 'tp', spot,
-                              pending_mfe=pending_mfe, reliable=sq['reliable'])
+                              pending_mfe=pending_mfe, reliable=sq['reliable'],
+                              legs=sq.get('legs'))
             if trade.get('status') == 'exited':
                 continue
 
@@ -1683,7 +1798,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                                 "peak_gain=%.2f (confirmed x%d)",
                                 tid, stock, mid, tl['level'], tl['peak_gain'], n)
                     _paper_auto_close(store, trade, mid, 'trail', spot,
-                                      pending_mfe=pending_mfe)
+                                      pending_mfe=pending_mfe,
+                                      legs=sq.get('legs'))
                     if trade.get('status') == 'exited':
                         continue
             else:
@@ -1708,7 +1824,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                              _format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
             _paper_auto_close(store, trade, mid, 'spot_sl', spot,
-                              pending_mfe=pending_mfe, reliable=sq['reliable'])
+                              pending_mfe=pending_mfe, reliable=sq['reliable'],
+                              legs=sq.get('legs'))
             if trade.get('status') == 'exited':
                 continue
 
@@ -1735,7 +1852,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f (confirmed x%d)",
                                 tid, stock, mid, trade['debit_sl_value'], n)
                     _paper_auto_close(store, trade, mid, 'debit_sl', spot,
-                                      pending_mfe=pending_mfe)
+                                      pending_mfe=pending_mfe,
+                                      legs=sq.get('legs'))
                     if trade.get('status') == 'exited':
                         continue
             else:
@@ -1766,7 +1884,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             logger.info("TIME alert #%d %s days_left=%d", tid, stock, days_left)
             _paper_auto_close(store, trade, mid, 'time', spot,
                               pending_mfe=pending_mfe, reliable=sq['reliable'],
-                              release_flag=False)
+                              release_flag=False, legs=sq.get('legs'))
 
     # Anything not already flushed by an exit. On a normal cycle this is the
     # ONLY store write the peak tracking does, however many positions moved.
@@ -1810,6 +1928,20 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
     # half can never stop the half that trades.
     if cfg.VET_ENABLED:
         _run_vet_side_channels(store, kite, dry_run=dry_run)
+    else:
+        # The corporate-action guard is a SAFETY interlock, not a vetting
+        # opinion: on a bonus/split ex-date the exchange re-prices the
+        # underlying and adjusts the strikes, so yesterday's sl_spot is
+        # breached by an event in which nothing went wrong. But the calendar it
+        # reads has exactly ONE writer, and that writer lived inside the vet
+        # side-channels — which ship disabled. So the guard was wired into
+        # check_entered, looked deployed, and could never fire, because the
+        # file it consults was never written. Safety interlocks do not get to
+        # depend on an optional subsystem being switched on.
+        try:
+            _refresh_events_if_stale(store)
+        except Exception as e:
+            logger.error("Event calendar refresh failed: %s", e, exc_info=True)
 
 
 def _run_vet_side_channels(store, kite, dry_run: bool = False) -> None:
