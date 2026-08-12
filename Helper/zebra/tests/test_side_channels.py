@@ -533,3 +533,51 @@ def test_a_market_wide_event_never_counts_as_an_adjustment(paths):
     events.replace([{'date': TODAY.strftime('%Y-%m-%d'), 'type': 'budget',
                      'title': 'Union Budget'}])
     assert events.adjustment_today('TESTCO', today=TODAY.date()) is None
+
+
+# ── exit alerts: the claim must come back if the send fails ──────────────
+# set_alert_flag is one-time-EVER for the four exit kinds (TIME uses the daily
+# variant and self-heals). A claim that is never released silences that exit
+# for the life of the position, and in LIVE the alert IS the exit mechanism —
+# there is no auto-close. Same discipline the entry path already had.
+@pytest.mark.parametrize('kind', ['tp', 'spot_sl', 'debit_sl', 'trail'])
+def test_a_failed_exit_alert_releases_its_claim(store, monkeypatch, kind):
+    from zebra import monitor
+    trade = store.find(1)
+    assert store.set_alert_flag(1, kind) is True, "fixture could not claim"
+    monkeypatch.setattr(monitor, '_alerts_enabled', lambda t: True)
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, dry_run=False: False)
+
+    monitor._send_exit_alert(store, trade, kind, 'msg')
+
+    assert store.set_alert_flag(1, kind) is True, \
+        f"{kind} stayed claimed after a failed send — that exit is now silent " \
+        f"for the life of the trade"
+
+
+@pytest.mark.parametrize('kind', ['tp', 'spot_sl', 'debit_sl', 'trail'])
+def test_a_delivered_exit_alert_keeps_its_claim(store, monkeypatch, kind):
+    """The release must be narrow. If it fired on success too, overlapping
+    crons would each re-send the same exit."""
+    from zebra import monitor
+    trade = store.find(1)
+    store.set_alert_flag(1, kind)
+    monkeypatch.setattr(monitor, '_alerts_enabled', lambda t: True)
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, dry_run=False: True)
+
+    monitor._send_exit_alert(store, trade, kind, 'msg')
+
+    assert store.set_alert_flag(1, kind) is False, "a delivered alert lost its claim"
+
+
+def test_every_exit_branch_routes_through_the_release_helper():
+    """A future exit kind that calls _send_telegram directly reintroduces the
+    orphaned-claim bug silently. Pin the call sites."""
+    src = (Path(__file__).resolve().parents[1] / 'monitor.py').read_text(encoding='utf-8')
+    for fmt in ('_format_tp_alert', '_format_spot_sl_alert',
+                '_format_debit_sl_alert', '_format_trail_alert'):
+        assert f"_send_telegram({fmt}" not in src, \
+            f"{fmt} is handed straight to _send_telegram — a failed send " \
+            f"orphans the consume-once claim and silences that exit forever"
+        assert f"_send_exit_alert(store, trade, " in src and fmt in src, \
+            f"{fmt} no longer routed through _send_exit_alert"

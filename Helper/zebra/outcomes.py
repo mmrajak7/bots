@@ -53,15 +53,14 @@ FLAT = 'flat'        # neither, before the position ran out of time
 # Exit reasons mapped onto the same labels. TIME is deliberately FLAT, not a
 # miss: expiring without resolution says the signal was slow, not wrong, and
 # scoring it as a loss would make every veto of a slow signal look brilliant.
-# TRAIL is a HIT, not a miss: the level sits above the entry debit by
-# construction, so a trailed exit always books a profit and the signal did what
-# it was supposed to. Scoring it MISS would punish the allow that worked and
-# make the trail itself look like a source of losses.
+# TRAIL is nominally a HIT — the level sits above the entry debit, so a trail
+# that fires ON its level books a profit and the signal did what it was
+# supposed to. But the reason string alone is NOT proof of that; see below.
 _REASON_LABEL = {'tp': HIT, 'trail': HIT,
                  'spot_sl': MISS, 'debit_sl': MISS, 'time': FLAT}
 
 
-def label_for_reason(reason) -> str:
+def label_for_reason(reason, pnl=None) -> str:
     """Map an exit reason to a signal-quality label.
 
     Strips the `paper:` prefix that `_paper_auto_close` stamps on every
@@ -69,8 +68,24 @@ def label_for_reason(reason) -> str:
     labels every single allow FLAT, allow-precision is None forever, and the
     veto-vs-allow comparison this whole score exists for can never produce a
     number. report.py strips the same prefix in three places.
+
+    `pnl`, when known, OVERRIDES a positive label. The trail fires on
+    `mid <= level`, and books at `mid` — the two are not the same number. A gap
+    straight through the level books far below it, and can book below the entry
+    debit outright: a loss, tagged `trail`, which this map would otherwise
+    score as a signal-quality HIT and feed to the vetting scorecard and the
+    precedent system. A booked loss is never a hit, whatever fired it. The
+    reverse is not symmetric — a MISS that somehow booked a profit stays a
+    MISS, because the stop firing is the fact being scored.
     """
-    return _REASON_LABEL.get(str(reason or '').replace('paper:', ''), FLAT)
+    label = _REASON_LABEL.get(str(reason or '').replace('paper:', ''), FLAT)
+    if label == HIT and pnl is not None:
+        try:
+            if float(pnl) < 0:
+                return MISS
+        except (TypeError, ValueError):
+            pass
+    return label
 
 
 def _now() -> datetime:
@@ -242,7 +257,7 @@ def _entry_outcome(store, decision: dict) -> Optional[dict]:
         'pnl_pct': round(sum(float(t.get('pnl_pct') or 0)
                              for t in closed) / len(closed), 2),
         'exit_reason': reasons[0],
-        'label': label_for_reason(reasons[0]),
+        'label': label_for_reason(reasons[0], pnl),
         'arms': {t.get('structure') or 'zebra': float(t.get('pnl') or 0)
                  for t in closed},
     }

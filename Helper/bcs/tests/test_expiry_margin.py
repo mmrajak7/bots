@@ -288,3 +288,32 @@ def test_gamma_note_rides_on_the_expiry_warning(_no_telegram):
     assert len(_no_telegram) == 1
     assert 'Delivery-margin ramp' in _no_telegram[0]
     assert 'gamma' in _no_telegram[0]
+
+
+# ── the call-site type bug that killed this warning outright ─────────────
+def test_gamma_note_survives_a_quote_dict():
+    """get_spread_value returns {'long','short','spread','unreliable'}. Both
+    call sites once passed that whole dict, gamma_note did float(dict), and the
+    caller's `except Exception` logged 'expiry-proximity check failed' to a file
+    nobody reads live — so the delivery-margin warning was dead every day it
+    had something to say."""
+    t = {'spread_width': 50.0, 'net_debit': 15.0}
+    assert sm.gamma_note(t, {'spread': 20.0, 'unreliable': None}, 3) \
+        == sm.gamma_note(t, 20.0, 3) != ''
+
+
+def test_gamma_note_is_silent_on_an_unreliable_book():
+    t = {'spread_width': 50.0, 'net_debit': 15.0}
+    assert sm.gamma_note(t, {'spread': None, 'unreliable': 'wide'}, 3) == ''
+
+
+def test_the_call_sites_pass_a_float_not_the_dict():
+    """The type guard inside gamma_note is defence in depth, not the fix. If a
+    call site regresses, this catches it where the bug actually was."""
+    src = (Path(__file__).resolve().parents[1] / 'spread_monitor.py').read_text(
+        encoding='utf-8')
+    flat = ''.join(src.split())          # whitespace/newline agnostic
+    for site in ("spread_val=get_spread_value(kite,trade,spot=spot).get('spread')",
+                 "_sv=get_spread_value(kite,t,spot=_spot).get('spread')"):
+        assert site in flat, \
+            f"expiry-warning call site regressed to passing the quote dict: {site}"

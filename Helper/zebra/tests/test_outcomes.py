@@ -289,3 +289,31 @@ def test_a_cancelled_signal_settles_instead_of_pending_forever(store, decisions)
     assert outcomes.join(store, decisions) == 1
     assert decisions.find(d['id'])['outcome']['basis'] == 'not_taken'
     assert decisions.pending_outcome(kind='entry') == []
+
+
+# ── a booked loss is never a hit, whatever fired it ──────────────────────
+def test_a_trail_exit_that_booked_a_loss_is_not_a_hit():
+    """The trail fires on `mid <= level` and books at `mid`. A gap through the
+    level books below the entry debit — a loss, tagged `trail`. Scoring that a
+    HIT off the reason string fed a fake win into allow-precision and into the
+    precedent system that the postmortem trap guard exists to keep clean."""
+    assert outcomes.label_for_reason('paper:trail', -800.0) == outcomes.MISS
+    assert outcomes.label_for_reason('paper:tp', -120.0) == outcomes.MISS
+
+
+def test_a_profitable_trail_is_still_a_hit():
+    assert outcomes.label_for_reason('paper:trail', 1500.0) == outcomes.HIT
+
+
+def test_an_unknown_pnl_falls_back_to_the_reason_map():
+    """Open trades and pre-capture history have no pnl. The map must still
+    answer, or every legacy row silently becomes FLAT."""
+    assert outcomes.label_for_reason('paper:trail') == outcomes.HIT
+    assert outcomes.label_for_reason('paper:trail', None) == outcomes.HIT
+    assert outcomes.label_for_reason('paper:trail', 'not-a-number') == outcomes.HIT
+
+
+def test_a_stop_that_booked_a_profit_stays_a_miss():
+    """Deliberately NOT symmetric: the stop firing is the fact being scored.
+    A debit-SL that happened to book green still means the signal went wrong."""
+    assert outcomes.label_for_reason('paper:debit_sl', 500.0) == outcomes.MISS

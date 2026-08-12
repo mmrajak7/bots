@@ -23,6 +23,7 @@ sys.path.insert(0, str(HELPER))
 from zebra import config as cfg            # noqa: E402
 from zebra import mfe                      # noqa: E402
 from zebra import monitor                  # noqa: E402
+from zebra import outcomes                 # noqa: E402
 from zebra.trade_store import ZebraStore    # noqa: E402
 
 SIGNAL = {
@@ -385,10 +386,10 @@ def test_trail_stays_armed_after_the_gain_evaporates(bcs):
     assert tl['level'] == 17.5, "the level followed the price down"
 
 
-def test_trail_level_always_books_a_profit(bcs):
-    """It sits above the entry debit by construction, which is what makes the
-    trail compatible with the power-law rule: it can only ever cut a winner
-    short, never turn one into a loss."""
+def test_trail_level_sits_above_the_entry_debit(bcs):
+    """Bounds the LEVEL. It does NOT bound the fill — see
+    test_a_gap_through_the_trail_books_a_loss, which is the same trail firing
+    below its own level because the monitor books at `mid`, not at `level`."""
     for mid in (14.0, 20.0, 25.0, 35.0):
         bpoll(bcs, 106.0, mid)
         tl = mfe.trail_levels(bcs.find(bcs._shadow_id))
@@ -439,6 +440,30 @@ def test_trail_exit_fires_and_books_a_profit(bcs, monkeypatch):
     assert t['status'] == 'exited'
     assert t['exit_reason'] == 'paper:trail'
     assert t['pnl'] > 0, "a trail exit booked a LOSS"
+
+
+def test_a_gap_through_the_trail_books_a_loss(bcs, monkeypatch):
+    """The trigger is `mid <= level`; the booking price is `mid`. Nothing keeps
+    the two together, so a gap straight through the level books wherever the
+    gap landed — here below the entry debit, i.e. a LOSS tagged `trail`.
+
+    This is intended behaviour (a breached trail means get out, and refusing to
+    exit would hold the exact give-back the trail exists to stop). What is NOT
+    acceptable is scoring it a win, which is what the old reason-string-only
+    map did — see the companion test in test_outcomes.py."""
+    for m in (14.0, 20.0, 25.0):                           # arm the trail
+        _wire(monkeypatch, 106.0, m)
+        monitor.check_entered(bcs, kite=None, dry_run=True)
+    assert mfe.trail_levels(bcs.find(bcs._shadow_id))['armed'] is True
+
+    _wire(monkeypatch, 95.0, 2.0)                          # gap FAR below 17.5
+    monitor.check_entered(bcs, kite=None, dry_run=True)    # confirm 1/2
+    monitor.check_entered(bcs, kite=None, dry_run=True)    # confirm 2/2
+
+    t = bcs.find(bcs._shadow_id)
+    assert t['status'] == 'exited' and t['exit_reason'] == 'paper:trail'
+    assert t['pnl'] < 0, "the gap case no longer books a loss — retune this test"
+    assert outcomes.label_for_reason(t['exit_reason'], t['pnl']) == outcomes.MISS
 
 
 def test_trail_never_fires_before_it_arms(bcs, monkeypatch):

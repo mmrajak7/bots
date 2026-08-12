@@ -345,6 +345,30 @@ def _vet_context(trade: dict, analysis: dict, gap_pct: float) -> dict:
     }
 
 
+def _send_exit_alert(store: ZebraStore, trade: dict, kind: str, msg: str,
+                     dry_run: bool = False) -> None:
+    """Send an exit alert, giving the consume-once claim back if the send fails.
+
+    The caller has ALREADY claimed `kind` via set_alert_flag, which is
+    one-time-EVER (not daily like TIME). So an unreleased claim silences that
+    exit for the life of the position: every later cycle's set_alert_flag
+    returns False and short-circuits the whole branch.
+
+    In LIVE the alert IS the exit mechanism — there is no auto-close — so one
+    transient Telegram failure would strand a position with its stop already
+    "fired" and nobody told. Same discipline as _send_enter_alert, the exit
+    escalation and the review alert; the exit branches were the one family that
+    never got it.
+    """
+    if not _alerts_enabled(trade):
+        return
+    if _send_telegram(msg, dry_run=dry_run):
+        return
+    logger.error("%s alert FAILED for #%d %s — releasing the claim to retry "
+                 "next cycle", kind.upper(), trade['id'], trade.get('stock'))
+    store.clear_alert_flag(trade['id'], kind)
+
+
 def _send_enter_alert(store: ZebraStore, trade: dict, msg: str, stock: str,
                       dry_run: bool = False) -> None:
     """Send the ENTER alert exactly once, whatever structure produced it.
@@ -1249,8 +1273,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         if tp_hit and _exit_cleared(store, trade, 'tp', sq, spot,
                                     dry_run=dry_run) \
                 and store.set_alert_flag(tid, 'tp'):
-            if _alerts_enabled(trade):
-                _send_telegram(_format_tp_alert(trade, spot, mid), dry_run=dry_run)
+            _send_exit_alert(store, trade, 'tp',
+                             _format_tp_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
             _paper_auto_close(store, trade, mid, 'tp', spot,
                               pending_mfe=pending_mfe)
@@ -1259,9 +1283,14 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
 
         # ── TRAIL ───────────────────────────────────────────────────────
         # Profit-protection, so it sits with TP rather than with the stops: the
-        # level is above the entry debit by construction and a fired trail
-        # always books a gain. Cannot collide with the DEBIT-SL below — that
-        # fires at half the debit, the trail never below it.
+        # LEVEL is above the entry debit by construction. The FILL is not — the
+        # trigger is `mid <= level` and the booking price is `mid`, so a gap
+        # through the level books wherever it landed. That is intended (a
+        # breached trail means get out), but it means a `trail` exit can be a
+        # loss, and it can land below the DEBIT-SL level too — TRAIL is checked
+        # first, so it wins the tag. outcomes.label_for_reason takes the
+        # realised P&L for exactly this reason; do not score `trail` as a HIT
+        # off the reason string alone.
         tl = mfe_mod.trail_levels(trade) if cfg.TRAIL_ENABLED else None
         if tl and tl['armed'] and store.set_alert_flag(tid, 'trail_armed'):
             logger.info("TRAIL armed #%d %s peak=%.1f%% of max gain, level=%.2f",
@@ -1277,9 +1306,9 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 if _exit_cleared(store, trade, 'trail', sq, spot,
                                  dry_run=dry_run) \
                         and store.set_alert_flag(tid, 'trail'):
-                    if _alerts_enabled(trade):
-                        _send_telegram(_format_trail_alert(trade, mid, tl),
-                                       dry_run=dry_run)
+                    _send_exit_alert(store, trade, 'trail',
+                                     _format_trail_alert(trade, mid, tl),
+                                     dry_run=dry_run)
                     logger.info("TRAIL alert #%d %s mid=%.2f<=level=%.2f "
                                 "peak_gain=%.2f (confirmed x%d)",
                                 tid, stock, mid, tl['level'], tl['peak_gain'], n)
@@ -1305,8 +1334,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         if sl_hit and _exit_cleared(store, trade, 'spot_sl', sq, spot,
                                     dry_run=dry_run) \
                 and store.set_alert_flag(tid, 'spot_sl'):
-            if _alerts_enabled(trade):
-                _send_telegram(_format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
+            _send_exit_alert(store, trade, 'spot_sl',
+                             _format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
             logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
             _paper_auto_close(store, trade, mid, 'spot_sl', spot,
                               pending_mfe=pending_mfe)
@@ -1330,8 +1359,9 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 if _exit_cleared(store, trade, 'debit_sl', sq, spot,
                                  dry_run=dry_run) \
                         and store.set_alert_flag(tid, 'debit_sl'):
-                    if _alerts_enabled(trade):
-                        _send_telegram(_format_debit_sl_alert(trade, mid), dry_run=dry_run)
+                    _send_exit_alert(store, trade, 'debit_sl',
+                                     _format_debit_sl_alert(trade, mid),
+                                     dry_run=dry_run)
                     logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f (confirmed x%d)",
                                 tid, stock, mid, trade['debit_sl_value'], n)
                     _paper_auto_close(store, trade, mid, 'debit_sl', spot,

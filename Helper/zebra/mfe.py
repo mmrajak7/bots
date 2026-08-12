@@ -218,8 +218,12 @@ def trail_levels(trade: dict) -> Optional[dict]:
         'peak_gain': round(peak_gain, 2),
         'peak_pct_of_max': round(peak_gain / max_gain * 100, 1),
         'armed': armed,
-        # Always strictly above the entry debit while peak_gain > 0, so a fired
-        # trail always books a profit.
+        # Strictly above the entry debit while peak_gain > 0. That bounds the
+        # LEVEL, not the FILL: the monitor fires on `mid <= level` and books at
+        # `mid`, so a gap straight through the level books wherever the gap
+        # landed — possibly below the debit, i.e. a loss tagged `trail`. Do not
+        # restate this as "a fired trail always books a profit"; it was written
+        # that way once and outcomes.py scored the losses as HITs.
         'level': round(debit + peak_gain * cfg.TRAIL_RETAIN_FRAC, 2),
     }
 

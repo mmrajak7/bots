@@ -699,6 +699,13 @@ def gamma_note(trade: dict, spread_val: Optional[float],
     Returns '' when it does not apply or cannot be computed. A missing quote
     yields silence, not a warning built on a number nobody has.
     """
+    # Defence in depth: both call sites once handed us get_spread_value's whole
+    # dict. float() raised, the caller's except swallowed it, and the warning
+    # was silently dead. Accept the dict rather than die on it, and say so.
+    if isinstance(spread_val, dict):
+        log("  WARNING: gamma_note got a quote dict, not a float — "
+            "caller should pass ['spread']")
+        spread_val = spread_val.get('spread')
     try:
         width = float(trade.get('spread_width') or 0)
         debit = float(trade.get('net_debit') or 0)
@@ -706,7 +713,11 @@ def gamma_note(trade: dict, spread_val: Optional[float],
         return ''
     if spread_val is None or sessions > GAMMA_RULE_SESSIONS or width <= debit:
         return ''
-    pct = (float(spread_val) - debit) / (width - debit) * 100
+    try:
+        spread_val = float(spread_val)
+    except (TypeError, ValueError):
+        return ''
+    pct = (spread_val - debit) / (width - debit) * 100
     if pct >= GAMMA_RULE_CAPTURE_PCT:
         return ''
     return (f"\nPlaybook: {sessions} session(s) left with only {pct:.0f}% of "
@@ -2049,9 +2060,14 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
         send_telegram(f"BCS {stock}: EXPIRY DAY. Monitor will force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
     else:
         try:
+            # ['spread'], not the whole dict — get_spread_value returns
+            # {'long','short','spread','unreliable'} and gamma_note does
+            # float(spread_val). Passing the dict raised TypeError before the
+            # message was ever built, and the caller's except swallowed it, so
+            # the warning was dead every day it had something to say.
             maybe_warn_expiry_proximity(store, trade, spot, 'BCS',
                                         spread_val=get_spread_value(
-                                            kite, trade, spot=spot))
+                                            kite, trade, spot=spot).get('spread'))
         except Exception as e:
             log(f"  WARNING: expiry-proximity check failed: {e}")
 
@@ -2493,7 +2509,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             _spot = get_spot(kite, t['spot_symbol'])
             _sv = None
             if t.get('_strategy') in ('BCS', 'BPS'):
-                _sv = get_spread_value(kite, t, spot=_spot)
+                _sv = get_spread_value(kite, t, spot=_spot).get('spread')
             maybe_warn_expiry_proximity(
                 _get_store_for(t, bcs_store, fh_store, bps_store), t, _spot,
                 t.get('_strategy', '?'), spread_val=_sv)
