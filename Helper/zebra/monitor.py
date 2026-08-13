@@ -32,7 +32,7 @@ from . import review as review_mod
 from . import strikes as strikes_mod
 from . import vet as vet_mod
 from .scanner import _get_kite, get_ltp, compute_st_for_stock, validate_and_add
-from .trade_store import ZebraStore, get_store
+from .trade_store import ZebraStore, get_store, in_cohort
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +128,28 @@ def _alerts_enabled(trade: dict) -> bool:
     LIVE-MODE OVERRIDE: when paper_mode is off, alerts are the ONLY exit
     mechanism (no auto-close), so every structure always talks regardless
     of alert_structures. Silencing is a paper-mode luxury.
+
+    COHORT GATE (`alerts_cohort_only`, 2026-08-13): trades this engine did not
+    open stop Telegramming. Three properties worth stating, because getting any
+    of them wrong turns a notification filter into a safety defect:
+
+    1. It gates the SEND only. `_paper_auto_close` runs whether or not the
+       alert went out, so a silenced legacy position still books its exits,
+       still records P&L, and still shows in `zebra status`. This function has
+       always been send-only and must stay that way.
+    2. It is deliberately INSIDE the paper-mode branch, below the live
+       override. A pre-cohort record cannot be proven to carry no real money
+       from the record alone, and in LIVE the alert IS the exit instruction —
+       so live keeps talking about everything. In practice this costs nothing:
+       every position opened from the cohort date onward is stamped, so by the
+       time live is on there is nothing legacy left to be noisy about.
+    3. Consume-once claims are unaffected. A silenced exit still claims and
+       still books; it does not sit there re-firing.
     """
     if not cfg.PAPER_MODE:
         return True
+    if cfg.ALERTS_COHORT_ONLY and not in_cohort(trade):
+        return False
     struct = 'bcs' if trade.get('structure') == 'bcs' else 'zebra'
     return struct in cfg.ALERT_STRUCTURES
 

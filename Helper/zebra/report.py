@@ -10,12 +10,13 @@ average hold days, exit-reason distribution.
 
 from __future__ import annotations
 
+import html
 import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from . import config as cfg
-from .trade_store import ZebraStore
+from .trade_store import ZebraStore, in_cohort
 
 logger = logging.getLogger(__name__)
 
@@ -166,11 +167,25 @@ def _unrealized_for_open(open_trades: list, kite) -> dict:
 
 # ── Report builders ──────────────────────────────────────────────────────
 
+def _reportable(trades: list) -> list:
+    """Trades this report is allowed to talk about.
+
+    With `alerts_cohort_only` on, that is the current engine's trades only.
+    The legacy book is not deleted or hidden from the store — `zebra status`
+    still shows it under the whole-book block — it just stops being reported
+    daily, because 25 legacy positions were most of the message and a report
+    nobody reads to the bottom is worse than a shorter one.
+    """
+    if not cfg.ALERTS_COHORT_ONLY:
+        return trades
+    return [t for t in trades if in_cohort(t)]
+
+
 def daily_report(store: ZebraStore, kite=None,
                  ref_date: Optional[date] = None) -> dict:
     """Daily EOD: closed today + open positions with unrealized."""
     ref = ref_date or _today()
-    all_trades = store.load_trades()
+    all_trades = _reportable(store.load_trades())
     closed_today = [t for t in all_trades
                     if t.get('status') == 'exited'
                     and _in_range(t.get('exit_date'), ref, ref)]
@@ -190,7 +205,7 @@ def weekly_report(store: ZebraStore, kite=None,
     """Weekly: closed in Mon-Fri of ref week + open positions."""
     ref = ref_date or _today()
     monday, friday = _week_range(ref)
-    all_trades = store.load_trades()
+    all_trades = _reportable(store.load_trades())
     closed_week = [t for t in all_trades
                    if t.get('status') == 'exited'
                    and _in_range(t.get('exit_date'), monday, friday)]
@@ -337,8 +352,12 @@ def format_telegram(report: dict) -> str:
             reason = (t.get('exit_reason') or '').replace('paper:', '')
             st_tag = '📐' if t.get('structure') == 'bcs' else ''
             parts.append(
-                f"{tag}{st_tag} <code>{t['stock']}</code> {t['direction']} "
-                f"{kl}/{ks}  Rs {pnl:+,.0f} [{reason}]"
+                # html.escape: the EOD report is parse_mode=HTML too, and `M&M`
+                # is a real NSE symbol sitting in this book right now. Same
+                # class as the exit-alert formatters.
+                f"{tag}{st_tag} <code>{html.escape(str(t['stock']))}</code> "
+                f"{t['direction']} {kl}/{ks}  Rs {pnl:+,.0f} "
+                f"[{html.escape(str(reason))}]"
             )
         a = s.get('by_alignment')
         if a and (a['aligned']['count'] or a['counter']['count']):
@@ -362,27 +381,33 @@ def format_telegram(report: dict) -> str:
             (u.get('pnl') or 0)
             for u in report['unrealized'].values() if u
         )
+        # The COUNT and the aggregate always go out — a book quietly emptying
+        # or filling up has to stay visible, and that is one line. What is
+        # switchable is the position-by-position listing below it, which with a
+        # full book was most of the message.
         parts.append(
             f"\n<b>Open:</b> {len(report['open'])} pos, "
             f"unrealized Rs {unreal_pnl:+,.0f}"
         )
-        for t in report['open']:
-            u = report['unrealized'].get(t['id'])
-            kl = int(t['long_strike']) if t.get('long_strike') else '?'
-            ks = int(t['short_strike']) if t.get('short_strike') else '?'
-            st_tag = '📐' if t.get('structure') == 'bcs' else ''
-            if u:
-                pnl = u['pnl']
-                tag = '↑' if pnl > 0 else '↓'
-                parts.append(
-                    f"{tag}{st_tag} <code>{t['stock']}</code> {t['direction']} "
-                    f"{kl}/{ks}  Rs {pnl:+,.0f} ({u['pnl_pct']:+.0f}%)"
-                )
-            else:
-                parts.append(
-                    f"•{st_tag} <code>{t['stock']}</code> {t['direction']} {kl}/{ks}  "
-                    f"(quote n/a)"
-                )
+        if cfg.EOD_OPEN_POSITIONS:
+            for t in report['open']:
+                u = report['unrealized'].get(t['id'])
+                kl = int(t['long_strike']) if t.get('long_strike') else '?'
+                ks = int(t['short_strike']) if t.get('short_strike') else '?'
+                st_tag = '📐' if t.get('structure') == 'bcs' else ''
+                if u:
+                    pnl = u['pnl']
+                    tag = '↑' if pnl > 0 else '↓'
+                    parts.append(
+                        f"{tag}{st_tag} <code>{html.escape(str(t['stock']))}</code> "
+                        f"{t['direction']} {kl}/{ks}  Rs {pnl:+,.0f} "
+                        f"({u['pnl_pct']:+.0f}%)"
+                    )
+                else:
+                    parts.append(
+                        f"•{st_tag} <code>{html.escape(str(t['stock']))}</code> "
+                        f"{t['direction']} {kl}/{ks}  (quote n/a)"
+                    )
     else:
         parts.append("\n<b>Open:</b> 0")
 

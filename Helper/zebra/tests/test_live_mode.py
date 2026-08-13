@@ -288,6 +288,129 @@ def test_the_cohort_stamp_is_frozen_not_recomputed(monkeypatch):
     assert in_cohort(t) is False
 
 
+# ── cohort-only alerting ─────────────────────────────────────────────────
+
+def _legacy(**o):
+    t = {'structure': 'bcs', 'status': 'entered'}
+    t.update(o)
+    return t
+
+
+def _current(**o):
+    t = {'structure': 'bcs', 'status': 'entered', 'cohort': cfg.COHORT_START}
+    t.update(o)
+    return t
+
+
+def test_cohort_only_silences_legacy_and_keeps_current(monkeypatch):
+    monkeypatch.setattr(cfg, 'PAPER_MODE', True)
+    monkeypatch.setattr(cfg, 'ALERTS_COHORT_ONLY', True)
+    monkeypatch.setattr(cfg, 'ALERT_STRUCTURES', ['bcs'])
+    assert mon._alerts_enabled(_current()) is True
+    assert mon._alerts_enabled(_legacy()) is False
+
+
+def test_cohort_gate_is_off_when_the_switch_is_off(monkeypatch):
+    monkeypatch.setattr(cfg, 'PAPER_MODE', True)
+    monkeypatch.setattr(cfg, 'ALERTS_COHORT_ONLY', False)
+    monkeypatch.setattr(cfg, 'ALERT_STRUCTURES', ['bcs'])
+    assert mon._alerts_enabled(_legacy()) is True
+
+
+def test_live_mode_never_silences_anything(monkeypatch):
+    """A pre-cohort record cannot be proven to carry no real money from the
+    record alone, and in LIVE the alert IS the exit instruction. So the live
+    override stays absolute — the cohort gate is a paper-mode luxury, exactly
+    like alert_structures."""
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    monkeypatch.setattr(cfg, 'ALERTS_COHORT_ONLY', True)
+    monkeypatch.setattr(cfg, 'ALERT_STRUCTURES', [])
+    assert mon._alerts_enabled(_legacy()) is True
+    assert mon._alerts_enabled(_current()) is True
+
+
+def test_silencing_an_alert_does_not_silence_the_EXIT(monkeypatch):
+    """THE property this whole feature stands on.
+
+    `_alerts_enabled` gates the SEND. `_paper_auto_close` runs regardless, so a
+    silenced legacy position still books its exits and still records P&L. If
+    this ever inverts, a notification preference has quietly become a trading
+    halt on 25 open positions.
+    """
+    monkeypatch.setattr(cfg, 'PAPER_MODE', True)
+    monkeypatch.setattr(cfg, 'ALERTS_COHORT_ONLY', True)
+    monkeypatch.setattr(cfg, 'ALERT_STRUCTURES', ['bcs'])
+    monkeypatch.setattr(mon, '_send_telegram',
+                        lambda *a, **k: pytest.fail("legacy trade Telegrammed"))
+
+    booked = []
+
+    class _S:
+        def clear_alert_flag(self, *a, **k):
+            pytest.fail("a silenced alert must not release its claim")
+
+    trade = _legacy(id=5, stock='M&M', direction='CE')
+    mon._send_exit_alert(_S(), trade, 'tp', 'msg')      # must not send, not raise
+
+    # And the close path is reached independently of the send.
+    import inspect
+    src = inspect.getsource(mon.check_entered)
+    for kind in ('tp', 'spot_sl', 'debit_sl'):
+        i_send = src.index(f"_send_exit_alert(store, trade, '{kind}'")
+        i_close = src.index(f"_paper_auto_close(store, trade, mid, '{kind}'")
+        assert i_close > i_send, f"{kind}: close must follow, not depend on, the send"
+    assert booked == []
+
+
+# ── EOD consolidated-position switch ─────────────────────────────────────
+
+def _report(open_n=2):
+    opens = [{'id': i, 'stock': 'M&M', 'direction': 'CE', 'long_strike': 3450,
+              'short_strike': 3550, 'structure': 'bcs'} for i in range(open_n)]
+    return {'type': 'daily', 'date': '2026-08-14', 'closed': [], 'open': opens,
+            'closed_summary': {'count': 0}, 'unrealized': {}}
+
+
+def test_eod_lists_positions_only_when_switched_on(monkeypatch):
+    from zebra import report as rep
+
+    monkeypatch.setattr(cfg, 'EOD_OPEN_POSITIONS', False)
+    off = rep.format_telegram(_report())
+    monkeypatch.setattr(cfg, 'EOD_OPEN_POSITIONS', True)
+    on = rep.format_telegram(_report())
+
+    assert 'Open:</b> 2 pos' in off, "the COUNT must always go out"
+    assert 'M&amp;M' not in off, "the per-position listing must be gone"
+    assert 'M&amp;M' in on, "and must come back when switched on"
+    assert len(off.splitlines()) < len(on.splitlines())
+
+
+def test_eod_escapes_the_symbol_in_both_blocks(monkeypatch):
+    """The EOD report is parse_mode=HTML too, and M&M is in this book."""
+    from zebra import report as rep
+
+    monkeypatch.setattr(cfg, 'EOD_OPEN_POSITIONS', True)
+    r = _report(1)
+    r['closed'] = [{'id': 9, 'stock': 'M&M', 'direction': 'CE', 'pnl': 500,
+                    'long_strike': 3450, 'short_strike': 3550,
+                    'exit_reason': 'paper:tp', 'structure': 'bcs'}]
+    r['closed_summary'] = {'count': 1, 'wins': 1, 'losses': 0, 'net_pnl': 500,
+                           'win_rate': 100.0, 'avg_hold_days': 3.0}
+    msg = rep.format_telegram(r)
+    assert 'M&amp;M' in msg
+    assert '>M&M<' not in msg
+
+
+def test_reports_are_scoped_to_the_cohort(monkeypatch):
+    from zebra import report as rep
+
+    trades = [_current(id=1), _legacy(id=2)]
+    monkeypatch.setattr(cfg, 'ALERTS_COHORT_ONLY', True)
+    assert [t['id'] for t in rep._reportable(trades)] == [1]
+    monkeypatch.setattr(cfg, 'ALERTS_COHORT_ONLY', False)
+    assert [t['id'] for t in rep._reportable(trades)] == [1, 2]
+
+
 @pytest.mark.parametrize('fmt,args', [
     ('_format_tp_alert', {'spot': 3500.0, 'mid': 12.0}),
     ('_format_spot_sl_alert', {'spot': 3200.0, 'mid': 4.0}),

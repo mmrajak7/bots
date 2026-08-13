@@ -283,6 +283,21 @@ _DEFAULTS = {
     # silently reclassify positions that are already open, for the same reason
     # `pricing_basis` is a property of the trade.
     'cohort_start': '2026-08-14',
+    # Report and alert ONLY on trades this engine opened. Owner's call
+    # 2026-08-13: "going forward i need to monitor and get alerts only for new
+    # trades ... both live and consolidated eod report."
+    #
+    # This silences TELEGRAM only. The legacy positions still poll, still book
+    # their exits, still appear in the store and in `zebra status` under the
+    # whole-book block — they just stop talking. That distinction is the whole
+    # design: an alert filter must never become an exit filter.
+    'alerts_cohort_only': True,
+    # Whether the EOD/weekly Telegram lists every open position with its
+    # unrealized P&L. Off per the same request — with 25 legacy positions the
+    # consolidated block was most of the message, and a report nobody reads to
+    # the bottom is worse than a shorter one. The COUNT still goes out, so a
+    # book quietly emptying or filling is still visible.
+    'eod_open_positions': False,
     'swing_tp_enabled': True,     # Shorten TP to a swing level standing between
                                   # spot and the ST magnet. LUPIN 2026-08: a PE
                                   # signal with a prior swing LOW well above the
@@ -660,6 +675,8 @@ def _cohort_start() -> str:
 
 
 COHORT_START = _cohort_start()
+ALERTS_COHORT_ONLY = _strict_bool('alerts_cohort_only')
+EOD_OPEN_POSITIONS = _strict_bool('eod_open_positions')
 SWING_TP_ENABLED = bool(_runtime['swing_tp_enabled'])
 SWING_PIVOT_BARS = _int('swing_pivot_bars')
 SWING_LOOKBACK_CANDLES = _int('swing_lookback_candles')
