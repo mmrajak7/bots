@@ -84,6 +84,62 @@ def _no_production_paths(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pinned_vet_flag(monkeypatch):
+    """The suite must not read the MACHINE's live vetting switch.
+
+    Found 2026-08-13 on the Pi: five tests failed there and passed here, on the
+    same commit. `cfg.VET_ENABLED` is read from the real `zebra_config.json` at
+    import, and the Pi has had vetting ON since 22:45 on the 12th while this
+    dev box has no vet key at all. Every price-driven exit goes through
+    `_exit_cleared` -> `vet.exit_gate`, which returns 'wait' when the flag is
+    set, so on the Pi the exits under test simply never fired.
+
+    Fourth instance of the same class as the rails above, and the subtlest:
+    the earlier three had tests reaching OUT to production, this one has
+    production reaching IN. A suite whose result depends on the config of the
+    box it runs on cannot certify a deploy — which is exactly what it was
+    being used for.
+
+    Reproduce either direction with `ZEBRA_VET_ENABLED=1 pytest` (env wins over
+    the file, see config.py:561).
+
+    Pinned FALSE because that is the property most tests actually want to
+    assert: what the deterministic engine does. The 14 sites that exercise the
+    gate set it True explicitly, and their own fixtures run after this one.
+    """
+    monkeypatch.setattr(cfg, 'VET_ENABLED', False)
+
+
+@pytest.fixture(autouse=True)
+def _value_triggers_awake(monkeypatch):
+    """The suite must not depend on WHAT TIME OF DAY it runs.
+
+    The other half of the 2026-08-13 Pi discrepancy, and the reason last
+    night's "456 passed" was not reproducible this morning: `_value_triggers_live`
+    compares `datetime.now(IST)` against the open, so DEBIT-SL and TRAIL are
+    dark before 09:15 + the buffer. Every run last night was after the close
+    (True); the 08:40 run today was before the open (False), and the three
+    book-driven exit tests silently changed answer. Nothing in the code moved.
+
+    A green suite that is only green after 09:30 cannot gate a deploy, and the
+    failure is worse than a plain flake — it looks exactly like a real
+    regression in the exit path, on the morning you are least able to afford
+    the doubt.
+
+    Delegating rather than blanket-True on purpose: `test_second_source`
+    asserts the real boundary by passing an explicit `now`, and that is the
+    test that actually pins the buffer's behaviour. Only the implicit
+    "whatever o'clock it happens to be" call is forced awake. Tests wanting
+    the dark path patch this attribute themselves; a test-body monkeypatch
+    runs after fixtures and wins.
+    """
+    real = monitor_mod._value_triggers_live
+    monkeypatch.setattr(
+        monitor_mod, '_value_triggers_live',
+        lambda now=None: real(now) if now is not None else True)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_telegram(monkeypatch, request):
     """Every Telegram send becomes a recording. Returns the list of messages."""
     sent = []
