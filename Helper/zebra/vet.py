@@ -43,6 +43,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -284,7 +285,83 @@ def resolve_cli(refresh: bool = False) -> Optional[str]:
     return None
 
 
-def _spawn_budget_ok(tag: str, channel: str = 'entry') -> bool:
+#: How long a reserved slot may sit with no pid before we call the spawn dead.
+#: The token is written BEFORE Popen (the pid does not exist yet), so a crash in
+#: between would otherwise leak a slot until CHILD_KILL_SEC.
+_UNCLAIMED_SLOT_SEC = 60.0
+
+
+def _load_budget(path) -> list:
+    """Read the budget file, tolerating the pre-2026-08-13 format.
+
+    The file used to be a bare list of floats. A Pi mid-upgrade will have one
+    on disk, and crashing on it would take the budget check — and therefore
+    every spawn — down with it.
+    """
+    raw = json.loads(path.read_text())
+    out = []
+    for e in raw:
+        if isinstance(e, (int, float)):
+            out.append({'t': float(e), 'pid': None, 'id': None})
+        elif isinstance(e, dict) and isinstance(e.get('t'), (int, float)):
+            out.append(e)
+    return out
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is this pid still running?
+
+    POSIX only, and the guard is not pedantry: on Windows `os.kill(pid, 0)`
+    does NOT probe, it calls TerminateProcess — it would KILL the pid. The dev
+    box runs the test suite, so an unguarded call would shoot arbitrary local
+    processes. Off-posix we report True (assume alive), which degrades this to
+    the old age-window behaviour rather than to an unbounded cap.
+    """
+    if not pid or os.name != 'posix':
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                     # exists; simply not ours to signal
+    except OSError:
+        return False
+    return True
+
+
+def _slot_occupied(entry: dict, now: float) -> bool:
+    """Does this budget entry still tie up an agent slot?"""
+    pid = entry.get('pid')
+    if pid:
+        return _pid_alive(pid)
+    # No pid yet: either a spawn in flight (keep the slot, briefly) or one that
+    # died before it could report (release it).
+    return now - entry['t'] < _UNCLAIMED_SLOT_SEC
+
+
+def claim_slot_pid(token: str, pid: int) -> None:
+    """Attach the real pid to the slot reserved by `_spawn_budget_ok`.
+
+    Matched by token, never by position: several processes append to this file
+    concurrently, so "the last entry" is not reliably ours.
+    """
+    if not token:
+        return
+    path = cfg.LOG_DIR / 'zebra_spawn_budget.json'
+    try:
+        with exclusive(cfg.LOG_DIR / 'zebra_spawn_budget.lock'):
+            entries = _load_budget(path)
+            for e in entries:
+                if e.get('id') == token:
+                    e['pid'] = pid
+                    break
+            path.write_text(json.dumps(entries))
+    except Exception as e:                       # pragma: no cover - paranoia
+        logger.warning('Could not record pid %s for slot %s: %s', pid, token, e)
+
+
+def _spawn_budget_ok(tag: str, channel: str = 'entry') -> str:
     """Is there room on this box to start another agent right now?
 
     There was no bound of any kind. The caps that exist are PER POSITION and
@@ -311,12 +388,18 @@ def _spawn_budget_ok(tag: str, channel: str = 'entry') -> bool:
         cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
         with exclusive(cfg.LOG_DIR / 'zebra_spawn_budget.lock'):
             try:
-                recent = json.loads(path.read_text())
+                recent = _load_budget(path)
             except Exception:
                 recent = []
-            # Anything older than the child's own kill deadline is gone.
-            recent = [t for t in recent
-                      if isinstance(t, (int, float)) and now - t < window]
+            # LIVE processes, not recent starts. The original filter dropped an
+            # entry only once it aged past CHILD_KILL_SEC, so an agent that
+            # finished in 90 seconds still held its slot for the full 15
+            # minutes: the cap was really "N starts per window" — about 12 an
+            # hour box-wide — which is why a cap of 3 could starve a channel
+            # that only wanted one agent. Age is now just the backstop for a
+            # pid we failed to record; liveness is the real test.
+            recent = [e for e in recent
+                      if now - e['t'] < window and _slot_occupied(e, now)]
             # One pool, but NOT one cap. The five channels are not equally
             # urgent and they are not equally numerous: `review` fans out over
             # every entered position and `events` runs on a timer, while
@@ -334,20 +417,21 @@ def _spawn_budget_ok(tag: str, channel: str = 'entry') -> bool:
                 cap = max(1, cap - cfg.AGENT_RESERVE)
             if len(recent) >= cap:
                 logger.warning(
-                    "SPAWN BUDGET: %d agent(s) started in the last %ds, cap is "
-                    "%d for channel %r (total %d, reserve %d) — refusing to "
-                    "spawn %s. It will fail open on its deadline.",
-                    len(recent), int(window), cap, channel,
+                    "SPAWN BUDGET: %d agent(s) LIVE, cap is %d for channel %r "
+                    "(total %d, reserve %d) — refusing to spawn %s.",
+                    len(recent), cap, channel,
                     cfg.MAX_CONCURRENT_AGENTS, cfg.AGENT_RESERVE, tag)
-                return False
-            recent.append(now)
+                return ''
+            token = uuid.uuid4().hex
+            recent.append({'t': now, 'pid': None, 'id': token})
             path.write_text(json.dumps(recent))
-        return True
+        return token
     except Exception as e:
         # Fail OPEN on a bookkeeping failure: a broken budget file must not
-        # become a silent vetting halt.
+        # become a silent vetting halt. No token, so no pid is recorded and the
+        # slot self-releases after _UNCLAIMED_SLOT_SEC.
         logger.error("Spawn-budget check failed (%s) — allowing %s", e, tag)
-        return True
+        return 'unbudgeted'
 
 
 def _spawn_generic(prompt: str, model: str, tag: str,
@@ -366,7 +450,13 @@ def _spawn_generic(prompt: str, model: str, tag: str,
                      cfg.VET_CLI, tag)
         _note_spawn(False, channel)
         return None
-    if not _spawn_budget_ok(tag, channel):
+    slot = _spawn_budget_ok(tag, channel)
+    if not slot:
+        # Feed the watchdog. A refusal used to return here without touching
+        # `_note_spawn`, so budget starvation was invisible to the one detector
+        # built to catch "the layer is dead while the switch reads ON" — and
+        # starvation is now the most likely way entries stop.
+        _note_spawn(False, channel)
         # Refusing to spawn is NOT refusing to trade: the caller's deadline
         # lapses and the signal fails open exactly as it does during any other
         # outage. Losing one verdict is survivable; browning out the box that
@@ -426,6 +516,9 @@ def _spawn_generic(prompt: str, model: str, tag: str,
         finally:
             out.close()             # child holds its own duplicate of the fd
         _children.append((p, _now() + timedelta(seconds=cfg.CHILD_KILL_SEC)))
+        # Bind the reserved slot to the real process, so the slot is released
+        # when the agent EXITS rather than when its start ages out.
+        claim_slot_pid(slot, p.pid)
         logger.info("CLI spawned pid=%d for %s (model=%s)", p.pid, tag, model)
         _note_spawn(True, channel)
         return p.pid

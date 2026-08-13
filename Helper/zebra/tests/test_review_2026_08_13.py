@@ -90,7 +90,8 @@ def test_the_spawn_budget_refuses_beyond_the_cap(store, monkeypatch, tmp_path):
     runs the live-money monitor. The per-position daily caps bound how often one
     trade is looked at and say nothing about how many start together."""
     monkeypatch.setattr(cfg, 'MAX_CONCURRENT_AGENTS', 3)
-    allowed = [vet_mod._spawn_budget_ok(f'agent-{i}') for i in range(6)]
+    # Grants return a slot TOKEN (str); a refusal returns ''.
+    allowed = [bool(vet_mod._spawn_budget_ok(f'agent-{i}')) for i in range(6)]
     assert allowed[:3] == [True, True, True]
     assert allowed[3:] == [False, False, False], \
         'the budget did not bound the fan-out'
@@ -111,7 +112,7 @@ def test_the_budget_forgets_agents_older_than_their_own_kill_deadline(
 def test_a_broken_budget_file_fails_open(store, monkeypatch, tmp_path):
     """A bookkeeping failure must not become a silent vetting halt."""
     (tmp_path / 'zebra_spawn_budget.json').write_text('{not json')
-    assert vet_mod._spawn_budget_ok('x') is True
+    assert vet_mod._spawn_budget_ok('x'), 'a broken budget file halted vetting'
 
 
 # ── ids are never reissued ───────────────────────────────────────────────
@@ -365,20 +366,20 @@ def test_a_batch_channel_cannot_consume_the_last_agent_slot(monkeypatch):
     monkeypatch.setattr(cfg, 'MAX_CONCURRENT_AGENTS', 3)
     monkeypatch.setattr(cfg, 'AGENT_RESERVE', 1)
     # Two batch agents already running: review may not take the third.
-    assert vet_mod._spawn_budget_ok('a', channel='review') is True
-    assert vet_mod._spawn_budget_ok('b', channel='review') is True
-    assert vet_mod._spawn_budget_ok('c', channel='review') is False, \
+    assert vet_mod._spawn_budget_ok('a', channel='review')
+    assert vet_mod._spawn_budget_ok('b', channel='review')
+    assert not vet_mod._spawn_budget_ok('c', channel='review'), \
         'a batch channel took the slot reserved for a trading decision'
     # ...but the entry vet still gets through.
-    assert vet_mod._spawn_budget_ok('entry', channel='entry') is True
+    assert vet_mod._spawn_budget_ok('entry', channel='entry')
 
 
 def test_the_decision_channels_still_share_the_total_cap(monkeypatch):
     """The reserve gives priority, not immunity — the box must stay bounded."""
     monkeypatch.setattr(cfg, 'MAX_CONCURRENT_AGENTS', 3)
     monkeypatch.setattr(cfg, 'AGENT_RESERVE', 1)
-    assert [vet_mod._spawn_budget_ok(str(i), channel='entry') for i in range(4)] \
-        == [True, True, True, False]
+    assert [bool(vet_mod._spawn_budget_ok(str(i), channel='entry'))
+            for i in range(4)] == [True, True, True, False]
 
 
 def test_a_refused_spawn_says_never_asked_not_did_not_answer(monkeypatch):
@@ -394,3 +395,140 @@ def test_a_refused_spawn_says_never_asked_not_did_not_answer(monkeypatch):
 
     trade['vet']['failed_open_because'] = None
     assert 'did not answer in time' in monitor._vet_line(trade)
+
+
+# ── Funds check: live mode only (2026-08-13) ──────────────────────────────
+# In live mode the ENTER alert IS the order ticket. A ticket the account
+# cannot fund invites a rejected order at the one moment attention is scarce.
+# In paper there is no account and no order, so it must cost nothing at all.
+
+class _Kite:
+    def __init__(self, avail, margin=None, boom=False):
+        self.avail, self.margin, self.boom = avail, margin, boom
+        self.calls = []
+
+    def margins(self, seg):
+        self.calls.append('margins')
+        if self.boom:
+            raise RuntimeError('kite down')
+        return {'available': {'live_balance': self.avail}}
+
+    def basket_order_margins(self, basket):
+        self.calls.append('basket')
+        if self.margin is None:
+            raise RuntimeError('no basket api')
+        return {'final': {'total': self.margin}}
+
+
+_BCS = {'long_symbol': 'L', 'short_symbol': 'S', 'debit': 2.0,
+        'long_ask': 5.5, 'short_bid': 3.5}
+
+
+def test_paper_mode_never_touches_the_broker_for_funds(monkeypatch):
+    monkeypatch.setattr(cfg, 'PAPER_MODE', True)
+    k = _Kite(avail=1_000_000, margin=10_000)
+    assert monitor._funds_line(k, _BCS, 5000) == ''
+    assert k.calls == [], 'paper mode called the margin API'
+
+
+def test_live_mode_shouts_when_the_account_is_short(monkeypatch):
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    k = _Kite(avail=4_000, margin=10_000)
+    line = monitor._funds_line(k, _BCS, 5000)
+    assert 'INSUFFICIENT FUNDS' in line
+    assert '6,000' in line, 'the shortfall itself must be on the ticket'
+
+
+def test_live_mode_confirms_when_funded(monkeypatch):
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    line = monitor._funds_line(_Kite(avail=50_000, margin=10_000), _BCS, 5000)
+    assert 'Funds OK' in line and 'INSUFFICIENT' not in line
+
+
+def test_it_prefers_the_exchange_margin_over_the_debit_estimate(monkeypatch):
+    """A BCS is hedged and the exchange prices the pair as one position, so a
+    leg-by-leg guess is meaningfully wrong."""
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    # debit fallback would be 2.0 * 5000 = 10,000; exchange says 30,000.
+    line = monitor._funds_line(_Kite(avail=20_000, margin=30_000), _BCS, 5000)
+    assert 'INSUFFICIENT' in line and 'exchange margin' in line
+
+
+def test_it_falls_back_to_the_net_debit_when_basket_margin_is_unavailable(
+        monkeypatch):
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    line = monitor._funds_line(_Kite(avail=5_000, margin=None), _BCS, 5000)
+    assert 'net debit' in line and 'INSUFFICIENT' in line   # need 10,000
+
+
+def test_an_unverifiable_balance_warns_but_does_not_shout(monkeypatch):
+    """A definite shortfall blocks; an inability to check only warns. Losing a
+    real signal to a margin-endpoint hiccup costs an opportunity to guard
+    against a maybe, and a human still places the order in live mode."""
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    line = monitor._funds_line(_Kite(avail=0, margin=10_000, boom=True),
+                               _BCS, 5000)
+    assert 'Could not verify funds' in line
+    assert 'INSUFFICIENT' not in line
+
+
+# ── the budget counts LIVE agents, not recent starts (2026-08-13) ─────────
+# Found by a Fable design review. The filter dropped an entry only once it aged
+# past CHILD_KILL_SEC, so an agent finishing in 90s still held its slot for the
+# full 15 minutes: the cap was really "N starts per window" (~12/hour box-wide),
+# which is how a cap of 3 starved a channel that wanted one agent.
+
+def test_a_finished_agent_releases_its_slot_immediately(store, monkeypatch,
+                                                        tmp_path):
+    monkeypatch.setattr(cfg, 'MAX_CONCURRENT_AGENTS', 2)
+    monkeypatch.setattr(cfg, 'AGENT_RESERVE', 0)
+    alive = {101: True, 102: True}
+    monkeypatch.setattr(vet_mod, '_pid_alive', lambda pid: alive.get(pid, False))
+
+    a = vet_mod._spawn_budget_ok('a'); vet_mod.claim_slot_pid(a, 101)
+    b = vet_mod._spawn_budget_ok('b'); vet_mod.claim_slot_pid(b, 102)
+    assert not vet_mod._spawn_budget_ok('c'), 'precondition: cap reached'
+
+    alive[101] = False                      # that agent exited seconds later
+    assert vet_mod._spawn_budget_ok('c'), \
+        'a finished agent still held its slot for the whole kill window'
+
+
+def test_a_spawn_that_never_reports_a_pid_frees_its_slot(store, monkeypatch,
+                                                         tmp_path):
+    """The slot is reserved BEFORE Popen (no pid exists yet), so a crash in
+    between would leak it until CHILD_KILL_SEC."""
+    monkeypatch.setattr(cfg, 'MAX_CONCURRENT_AGENTS', 1)
+    monkeypatch.setattr(cfg, 'AGENT_RESERVE', 0)
+    assert vet_mod._spawn_budget_ok('a')     # reserved, pid never claimed
+    assert not vet_mod._spawn_budget_ok('b'), 'an in-flight spawn must hold it'
+
+    import time as _t
+    path = tmp_path / 'zebra_spawn_budget.json'
+    entries = json.loads(path.read_text())
+    entries[0]['t'] = _t.time() - vet_mod._UNCLAIMED_SLOT_SEC - 1
+    path.write_text(json.dumps(entries))
+    assert vet_mod._spawn_budget_ok('b'), 'a dead spawn leaked its slot'
+
+
+def test_the_old_bare_timestamp_budget_file_does_not_break_the_layer(
+        store, monkeypatch, tmp_path):
+    """A Pi mid-upgrade has the pre-2026-08-13 format on disk. Crashing on it
+    would take every spawn down with it."""
+    monkeypatch.setattr(cfg, 'MAX_CONCURRENT_AGENTS', 2)
+    monkeypatch.setattr(cfg, 'AGENT_RESERVE', 0)
+    import time as _t
+    (tmp_path / 'zebra_spawn_budget.json').write_text(json.dumps([_t.time()]))
+    assert vet_mod._spawn_budget_ok('a'), 'the legacy format was not tolerated'
+
+
+def test_pid_liveness_never_probes_off_posix(monkeypatch):
+    """os.kill(pid, 0) on Windows TERMINATES the pid — it does not probe. The
+    dev box runs this suite, so an unguarded call would shoot local processes."""
+    import os as _os
+    monkeypatch.setattr(vet_mod.os, 'name', 'nt')
+    killed = []
+    monkeypatch.setattr(vet_mod.os, 'kill',
+                        lambda *a: killed.append(a))
+    assert vet_mod._pid_alive(4242) is True
+    assert killed == [], 'os.kill was reached on a non-posix host'

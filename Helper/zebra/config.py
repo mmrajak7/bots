@@ -356,12 +356,33 @@ _DEFAULTS = {
                                  # reached. The human has been told and the
                                  # loss is capped, so holding quietly until
                                  # tomorrow is both cheaper and safer.
-    'vet_timeout_sec': 600,      # Fail-open deadline for one agent run.
-    'child_kill_sec': 900,       # Hard wall-clock bound on a spawned CLI. Past
+    'vet_timeout_sec': 600,      # Fail-open deadline for one agent run. NOT
+                                 # shortened with child_kill_sec: VETTING.md
+                                 # itself budgets the agent ~5 min and promises
+                                 # 10, and the checklist is real work (several
+                                 # CLI calls plus live event research). A
+                                 # deadline under the work just converts every
+                                 # vet into a timeout.
+    'child_kill_sec': 720,       # Hard wall-clock bound on a spawned CLI. Past
                                  # this the process is killed: the deadline
                                  # fails the MARKER open, but a hung child
                                  # would otherwise live until reboot and this
                                  # Pi also runs live-money bots.
+                                 # 900 -> 720 on 2026-08-13: a verdict arriving
+                                 # after vet_timeout_sec is DISCARDED anyway, so
+                                 # seconds 600-900 bought nothing and burned RAM
+                                 # on a process whose answer was already void.
+                                 # 600 + 120s grace.
+    'max_concurrent_agents': 5,  # LIVE agents box-wide, not starts-per-window.
+                                 # Raised 3 -> 5 on 2026-08-13 at the owner's
+                                 # call. Each is a node process of a few hundred
+                                 # MB and this Pi also runs live-money bots —
+                                 # MEASURE RSS before raising further.
+    'agent_reserve': 2,          # Slots the DEFERRABLE_CHANNELS may never take,
+                                 # so an entry/exit decision always has room.
+                                 # Batch channels therefore cap at 5-2=3, which
+                                 # still drains a 24-position review sweep while
+                                 # leaving the trading decisions unblocked.
     'vet_model': 'fable',        # Decisions.
     'event_model': 'sonnet',     # Routine calendar refresh.
     'postmortem_model': 'sonnet',  # Classifying settled trades
@@ -590,7 +611,7 @@ CHILD_KILL_SEC = int(os.environ.get('ZEBRA_CHILD_KILL_SEC')
 # the live-money monitor. Refusing a spawn is not refusing to trade — the
 # caller's deadline lapses and the signal fails open as in any other outage.
 MAX_CONCURRENT_AGENTS = int(os.environ.get('ZEBRA_MAX_CONCURRENT_AGENTS')
-                            or _runtime.get('max_concurrent_agents') or 3)
+                            or _int('max_concurrent_agents'))
 
 # Channels whose work can wait for the next window without a decision going
 # unmade. `review` sweeps every open position and `events` runs on a timer, so
@@ -603,7 +624,7 @@ DEFERRABLE_CHANNELS = ('review', 'events', 'postmortem')
 # has room. Must stay < MAX_CONCURRENT_AGENTS or the batch channels can never
 # run at all (the cap floors at 1 regardless).
 AGENT_RESERVE = int(os.environ.get('ZEBRA_AGENT_RESERVE')
-                    or _runtime.get('agent_reserve') or 1)
+                    or _int('agent_reserve'))
 VET_MODEL = os.environ.get('ZEBRA_VET_MODEL') or _runtime['vet_model']
 EVENT_FILE = LOG_DIR / 'event_calendar.json'
 EVENT_LOCK = LOG_DIR / 'event_calendar.lock'

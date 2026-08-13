@@ -296,6 +296,80 @@ def _format_exit_escalation(trade: dict, kind: str, quote: dict,
     )
 
 
+def _required_capital(kite, bcs: dict, quantity: int) -> tuple:
+    """What the exchange will actually block for this spread, and how we know.
+
+    Prefers `basket_order_margins`: a BCS is HEDGED, and the exchange prices the
+    pair as one position, so a leg-by-leg estimate is meaningfully wrong. Falls
+    back to the net debit — the cash cost, and the true floor for a debit spread
+    — when the API is unavailable.
+
+    Returns (rupees, basis) where basis is 'exchange' or 'debit'.
+    """
+    basket = [
+        {'exchange': 'NFO', 'tradingsymbol': bcs['long_symbol'],
+         'transaction_type': 'BUY', 'variety': 'regular', 'product': 'NRML',
+         'order_type': 'LIMIT', 'quantity': quantity,
+         'price': bcs.get('long_ask') or 0},
+        {'exchange': 'NFO', 'tradingsymbol': bcs['short_symbol'],
+         'transaction_type': 'SELL', 'variety': 'regular', 'product': 'NRML',
+         'order_type': 'LIMIT', 'quantity': quantity,
+         'price': bcs.get('short_bid') or 0},
+    ]
+    try:
+        om = kite.basket_order_margins(basket)
+        final = (om or {}).get('final') or {}
+        total = final.get('total')
+        if total:
+            return float(total), 'exchange'
+    except Exception as e:
+        logger.warning('basket_order_margins failed (%s) — falling back to the '
+                       'net debit', e)
+    return float(bcs['debit']) * quantity, 'debit'
+
+
+def _funds_line(kite, bcs: dict, quantity: int) -> str:
+    """Funds check for the ENTER ticket. LIVE MODE ONLY.
+
+    In paper mode there is no account to check and no order to fund, so this
+    costs nothing and says nothing — not even an API call.
+
+    In live mode the ENTER alert IS the order ticket the owner acts on, so a
+    ticket the account cannot fund is worse than no ticket: it invites a
+    rejected order at the one moment attention is scarce.
+
+    Deliberate asymmetry on failure. A definite shortfall SHOUTS; an inability
+    to check merely warns. Blocking a real signal because a margin endpoint
+    hiccuped would cost an opportunity to protect against a maybe, and in live
+    mode a human places the order anyway — Kite will refuse it if the money is
+    genuinely not there.
+    """
+    if cfg.PAPER_MODE:
+        return ""
+    if not kite or not bcs:
+        return "\n\n⚠ <i>Funds not checked — no broker session.</i>"
+    try:
+        need, basis = _required_capital(kite, bcs, quantity)
+        avail = float(kite.margins('equity')['available']['live_balance'])
+    except Exception as e:
+        logger.error('FUNDS CHECK FAILED: %s', e)
+        return ("\n\n⚠ <i>Could not verify funds "
+                f"({html.escape(str(e)[:60])}) — check before placing.</i>")
+
+    tag = 'exchange margin' if basis == 'exchange' else 'net debit'
+    if avail >= need:
+        logger.info('FUNDS OK: need %.0f (%s), available %.0f', need, basis, avail)
+        return (f"\n\n💰 <i>Funds OK — need Rs {need:,.0f} ({tag}), "
+                f"have Rs {avail:,.0f}.</i>")
+
+    short = need - avail
+    logger.warning('INSUFFICIENT FUNDS: need %.0f (%s), available %.0f, '
+                   'short %.0f', need, basis, avail, short)
+    return (f"\n\n🛑 <b>INSUFFICIENT FUNDS — short Rs {short:,.0f}</b>\n"
+            f"<i>Need Rs {need:,.0f} ({tag}), have Rs {avail:,.0f}. "
+            f"Do not place this without adding funds.</i>")
+
+
 def _vet_line(trade: dict) -> str:
     """One line describing the vetting verdict, appended to an ENTER alert.
 
@@ -1223,6 +1297,11 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # record — `trade` predates the verdict that let us reach this line.
         if msg is not None and cfg.VET_ENABLED:
             msg += _vet_line(store.find(trade['id']) or trade)
+        # Funds last, so the money line sits closest to the click-copy symbols.
+        # No-ops entirely in paper mode.
+        if msg is not None:
+            msg += _funds_line(kite, bcs,
+                               (analysis.get('lot_size') or 0) * 1)
         if msg is None:
             # Two distinct reasons land here; say which, or a gated signal
             # looks like a config problem when reading the log later.
