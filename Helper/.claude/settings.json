@@ -26,7 +26,18 @@
     "closes them (_paper_auto_close) and recursively spawns more agents; it",
     "was granted by the coarse allow rule and denied here by nothing. `loop`",
     "is the same cycle held open, `scan` mutates the watchlist, `report`",
-    "Telegrams the owner. Deny the callers, not just the callees."
+    "Telegrams the owner. Deny the callers, not just the callees.",
+    "",
+    "2026-08-13 (later): the same test applied to the verbs added since found",
+    "two more. `postmortem run` calls spawn_batch -> _spawn_generic, so it is",
+    "a SPAWNER — the very class the paragraph above exists to catch — and it",
+    "was reachable by every channel. `events replace` REPLACES the shared",
+    "event calendar and --allow-empty can wipe it: the same calendar the",
+    "corporate-action interlock reads, so any agent could blank a safety",
+    "input and re-stamp it fresh. Both denied here. The events channel gets",
+    "`events replace` back via a per-channel carve-out in vet._denied_tools,",
+    "because Claude Code resolves deny BEFORE allow — a global deny cannot be",
+    "granted back on the command line, so scoping has to remove the rule."
   ],
   "permissions": {
     "deny": [
@@ -38,7 +49,9 @@
       "Bash(*zebra run*)",
       "Bash(*zebra loop*)",
       "Bash(*zebra scan*)",
-      "Bash(*zebra report*)"
+      "Bash(*zebra report*)",
+      "Bash(*postmortem run*)",
+      "Bash(*events replace*)"
     ]
   }
 }

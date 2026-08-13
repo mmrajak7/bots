@@ -511,6 +511,85 @@ def _vet_context(trade: dict, analysis: dict, gap_pct: float,
     }
 
 
+def _band_cancel(store: ZebraStore, trade: dict, reason: str,
+                 dry_run: bool = False) -> None:
+    """Retire a signal that has left its entry band — safely in LIVE.
+
+    In PAPER an unentered signal is worth nothing, so drift/crossed/stale just
+    cancel the row and the slot is reclaimed.
+
+    LIVE is different in one decisive way: the ENTER alert is an ORDER TICKET,
+    and once it has been delivered the owner may ALREADY hold the real
+    position. The band checks run on `triggered` rows too, so the plain cancel
+    fired on signals that had a ticket out — and `mark_entered` refuses a
+    cancelled row, so `zebra enter` could no longer record the fill. The result
+    was a real, funded position with NO record: no TP alert, no debit-SL alert,
+    no expiry nag, in the mode where those alerts are the only exit mechanism.
+
+    Worse, the likeliest trigger is `crossed` — gap going negative means price
+    reached the magnet, i.e. the trade WON. The failure preferentially struck
+    winners.
+
+    So in LIVE, a ticketed signal is never silently cancelled. It is announced
+    once and left `triggered` for the human to resolve with `zebra enter` (I
+    took it) or `zebra cancel` (I did not). `_expire_if_ancient` still bounds
+    the row, so nothing becomes immortal.
+    """
+    ticketed = bool((trade.get('vet_enter_alerted_at')))
+    if not cfg.PAPER_MODE and ticketed:
+        if store.set_alert_flag_daily(trade['id'], 'band_exit'):
+            msg = (f"⚠ <b>SIGNAL LEFT THE BAND</b>  "
+                   f"<code>{html.escape(str(trade.get('stock')))}</code> "
+                   f"({html.escape(str(trade.get('direction')))})\n"
+                   f"{html.escape(reason)}\n"
+                   f"<i>An order ticket was already sent for this signal. If "
+                   f"you took the trade, record it now with "
+                   f"<code>zebra enter {trade['id']} ...</code> — it is NOT "
+                   f"being monitored until you do. If you did not, close it "
+                   f"out with <code>zebra cancel {trade['id']}</code>.</i>")
+            if not _send_telegram(msg, dry_run=dry_run):
+                store.clear_alert_flag(trade['id'], 'band_exit')
+                logger.error("BAND EXIT alert FAILED for #%d %s — flag "
+                             "released, retrying next cycle",
+                             trade['id'], trade.get('stock'))
+        logger.warning("BAND EXIT #%d %s: %s — ticket already sent, NOT "
+                       "cancelling; awaiting `zebra enter` or `zebra cancel`",
+                       trade['id'], trade.get('stock'), reason)
+        return
+    try:
+        store.cancel(trade['id'], reason)
+    except ValueError:
+        pass
+
+
+def _claim_exit_alert(store: ZebraStore, trade_id: int, kind: str) -> bool:
+    """Claim the consume-once exit alert. Daily in LIVE, once-ever in PAPER.
+
+    In PAPER the position is booked in the SAME cycle the alert fires, so one
+    claim per position is exactly right — a second alert would describe a trade
+    that is already closed.
+
+    LIVE changed what the alert IS without changing how long the claim lives.
+    There `_paper_auto_close` returns at its first line, so nothing ever books
+    the exit and the position stays `entered`; the Telegram is not a
+    notification about an exit, it is the ONLY instruction that an exit should
+    happen. A one-time-EVER claim therefore means a breached stop is announced
+    once and then never mentioned again while the position stays open and keeps
+    losing — the owner has to be looking at the phone in the minute it fires or
+    the capped loss quietly becomes the maximum loss. That is the same shape as
+    both real-money incidents: protection that looks armed and is not.
+
+    So in LIVE the claim re-arms daily, reusing the machinery the expiry nag
+    has always used. Daily, not per-cycle: re-alerting every 5 minutes is the
+    alert fatigue the gates exist to cure (owner's call, 2026-08-10), and a
+    stop that keeps asking once a day until the position is actually closed is
+    the behaviour a human can act on.
+    """
+    if cfg.PAPER_MODE:
+        return store.set_alert_flag(trade_id, kind)
+    return store.set_alert_flag_daily(trade_id, kind)
+
+
 def _send_exit_alert(store: ZebraStore, trade: dict, kind: str, msg: str,
                      dry_run: bool = False) -> None:
     """Send an exit alert, giving the consume-once claim back if the send fails.
@@ -551,7 +630,14 @@ def _send_enter_alert(store: ZebraStore, trade: dict, msg: str, stock: str,
     mode that is an order ticket re-sent every five minutes, forever, which is
     how duplicate manual entries happen.
     """
-    if cfg.VET_ENABLED and not cfg.PAPER_MODE \
+    # The claim is a property of LIVE, not of vetting. With vetting off the
+    # dedup used to rest entirely on a `continue` in the caller, so the ticket
+    # was neither claimed nor releasable — and a single failed Telegram lost
+    # the only order instruction that signal would ever produce, with the
+    # caller's `continue` then blocking every retry. Claim in LIVE regardless;
+    # PAPER still never claims (the position is already open and the alert is
+    # a notification, not a ticket).
+    if not cfg.PAPER_MODE \
             and not store.set_alert_flag(trade['id'], 'vet_enter'):
         logger.info("Deferred ENTER alert already sent for #%d %s",
                     trade['id'], stock)
@@ -567,7 +653,7 @@ def _send_enter_alert(store: ZebraStore, trade: dict, msg: str, stock: str,
     # discipline as the exit escalation and the review alert. (PAPER never
     # claims the flag; the position is already open and the alert is a
     # notification, not a ticket.)
-    if cfg.VET_ENABLED and not cfg.PAPER_MODE:
+    if not cfg.PAPER_MODE:
         store.clear_alert_flag(trade['id'], 'vet_enter')
         logger.error("Deferred ENTER ticket for #%d %s released — "
                      "retrying next cycle", trade['id'], stock)
@@ -793,17 +879,19 @@ def _paper_close_line(trade: dict, mid: Optional[float]) -> str:
 def _format_tp_alert(trade: dict, spot: float, mid: Optional[float] = None) -> str:
     paper = _paper_close_line(trade, mid)
     return (
-        f"\U0001F3AF <b>{_struct_label(trade)} TP</b>  {trade['stock']} ({trade['direction']})\n"
+        f"\U0001F3AF <b>{_struct_label(trade)} TP</b>  "
+        f"{html.escape(str(trade['stock']))} ({trade['direction']})\n"
         f"spot {spot:,.2f} hit TP {trade['tp_spot']:,.2f}\n"
-        f"Long: <code>{trade['long_symbol']}</code>\n"
-        f"Short: <code>{trade['short_symbol']}</code>{paper}"
+        f"Long: <code>{html.escape(str(trade['long_symbol']))}</code>\n"
+        f"Short: <code>{html.escape(str(trade['short_symbol']))}</code>{paper}"
     )
 
 
 def _format_spot_sl_alert(trade: dict, spot: float, mid: Optional[float] = None) -> str:
     paper = _paper_close_line(trade, mid)
     return (
-        f"\U0001F6D1 <b>{_struct_label(trade)} SPOT SL</b>  {trade['stock']} ({trade['direction']})\n"
+        f"\U0001F6D1 <b>{_struct_label(trade)} SPOT SL</b>  "
+        f"{html.escape(str(trade['stock']))} ({trade['direction']})\n"
         f"spot {spot:,.2f} hit SL {trade['sl_spot']:,.2f}\n"
         f"Adverse move from entry {trade['entry_spot']:,.2f}{paper}"
     )
@@ -813,7 +901,8 @@ def _format_debit_sl_alert(trade: dict, mid: float) -> str:
     paper = _paper_close_line(trade, mid)
     pct_lost = (1 - mid / trade['debit']) * 100 if trade.get('debit') else 0
     return (
-        f"\U0001F4C9 <b>{_struct_label(trade)} DEBIT SL</b>  {trade['stock']} ({trade['direction']})\n"
+        f"\U0001F4C9 <b>{_struct_label(trade)} DEBIT SL</b>  "
+        f"{html.escape(str(trade['stock']))} ({trade['direction']})\n"
         f"Mid {mid:.2f} ≤ debit-SL {trade['debit_sl_value']:.2f} "
         f"(entry debit {trade['debit']:.2f})\n"
         f"Lost ~{pct_lost:.0f}% of debit.{paper}"
@@ -973,11 +1062,9 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
 
         # Drift cancel: if gap blew past watch band by 20%
         if gap > cfg.WATCH_GAP_MAX * 1.2:
-            try:
-                store.cancel(trade['id'],
-                             f'drift: gap {gap_pct:.2f}% > watch+20%')
-            except ValueError:
-                pass
+            _band_cancel(store, trade,
+                         f'drift: gap {gap_pct:.2f}% > watch+20%',
+                         dry_run=dry_run)
             continue
 
         # Stale (too close): gap fell below stale_min → past entry zone
@@ -985,11 +1072,9 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # Crossed the line. For CE-Zebra (price < ST, gap = (ST-price)/ST),
             # negative gap means price overshot above ST. Likely already moving
             # toward target. Cancel as we missed the entry window.
-            try:
-                store.cancel(trade['id'],
-                             f'crossed: gap {gap_pct:.2f}% (past ST)')
-            except ValueError:
-                pass
+            _band_cancel(store, trade,
+                         f'crossed: gap {gap_pct:.2f}% (past ST)',
+                         dry_run=dry_run)
             continue
 
         if gap > cfg.TRIGGER_GAP_MAX:
@@ -997,11 +1082,10 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             continue
         if gap < cfg.STALE_GAP_MIN:
             # In stale zone: too late
-            try:
-                store.cancel(trade['id'],
-                             f'stale: gap {gap_pct:.2f}% < {cfg.STALE_GAP_MIN*100:.1f}%')
-            except ValueError:
-                pass
+            _band_cancel(
+                store, trade,
+                f'stale: gap {gap_pct:.2f}% < {cfg.STALE_GAP_MIN*100:.1f}%',
+                dry_run=dry_run)
             continue
 
         # Already triggered + still in zone.
@@ -1024,11 +1108,19 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 # window, and a book that was unquotable at 10:05 is routinely
                 # fine at 10:10.
                 #
-                # LIVE still stops here: there the alert IS the order ticket,
-                # the human acts on it, and re-alerting every 5 minutes would
-                # be noise rather than a retry.
+                # LIVE stops here ONLY once the ticket has actually gone out.
+                # Re-alerting every 5 minutes would be noise rather than a
+                # retry — but a ticket whose Telegram FAILED released its
+                # claim, and an unconditional `continue` then parked the
+                # signal forever with the human never told. Gate on the claim,
+                # not on the mode.
                 if not cfg.PAPER_MODE:
-                    continue
+                    if (store.find(trade['id']) or {}).get('vet_enter_alerted_at'):
+                        continue
+                    logger.warning(
+                        "TICKET RETRY #%d %s: live entry ticket was never "
+                        "delivered (claim not held) — re-running the analyzer",
+                        trade['id'], stock)
                 logger.info(
                     "RETRY #%d %s: still triggered and in the zone "
                     "(gap %.2f%%) — entry did not complete, re-running the "
@@ -2252,7 +2344,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # ride the position into settlement week unnoticed.
             if tp_hit and _exit_cleared(store, trade, 'tp', sq, spot,
                                         dry_run=dry_run) \
-                    and store.set_alert_flag(tid, 'tp'):
+                    and _claim_exit_alert(store, tid, 'tp'):
                 _send_exit_alert(store, trade, 'tp',
                                  _format_tp_alert(trade, spot, mid), dry_run=dry_run)
                 logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
@@ -2286,7 +2378,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 if n >= cfg.DEBIT_SL_CONFIRM_POLLS:
                     if _exit_cleared(store, trade, 'trail', sq, spot,
                                      dry_run=dry_run) \
-                            and store.set_alert_flag(tid, 'trail'):
+                            and _claim_exit_alert(store, tid, 'trail'):
                         _send_exit_alert(store, trade, 'trail',
                                          _format_trail_alert(trade, mid, tl),
                                          dry_run=dry_run)
@@ -2315,7 +2407,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                      (direction == 'PE' and spot >= sl_spot))
             if sl_hit and _exit_cleared(store, trade, 'spot_sl', sq, spot,
                                         dry_run=dry_run) \
-                    and store.set_alert_flag(tid, 'spot_sl'):
+                    and _claim_exit_alert(store, tid, 'spot_sl'):
                 _send_exit_alert(store, trade, 'spot_sl',
                                  _format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
                 logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
@@ -2341,7 +2433,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     # claiming the consume-once flag.
                     if _exit_cleared(store, trade, 'debit_sl', sq, spot,
                                      dry_run=dry_run) \
-                            and store.set_alert_flag(tid, 'debit_sl'):
+                            and _claim_exit_alert(store, tid, 'debit_sl'):
                         _send_exit_alert(store, trade, 'debit_sl',
                                          _format_debit_sl_alert(trade, mid),
                                          dry_run=dry_run)

@@ -736,6 +736,32 @@ def cmd_enter(args):
         entry_data['entry_spot'] = args.entry_spot
     if args.spot_sl_pct is not None:
         entry_data['spot_sl_pct'] = args.spot_sl_pct
+    # A hand-entered trade is a REAL fill: --debit is what was actually paid,
+    # i.e. ASK(long) - BID(short). Default the basis to 'fill' so the monitor
+    # values it the way it will actually be closed. Left unset it fell through
+    # to mid-mid, which reads optimistic at both ends and fires the debit SL
+    # late. Overridable for the rare case of recording a mid-basis figure.
+    entry_data['pricing_basis'] = args.pricing_basis
+    if args.short_extrinsic is not None:
+        entry_data['short_extrinsic_entry'] = args.short_extrinsic
+    else:
+        # Recover it from the alert the ticket came from, so the intrinsic-
+        # floor guard starts armed with a real number rather than the
+        # 30%-of-debit fallback.
+        for c in trade.get('alert_strikes') or []:
+            if abs(c.get('k_l', -1) - long_strike) < 1e-6 \
+                    and abs(c.get('k_s', -1) - short_strike) < 1e-6 \
+                    and c.get('short_extrinsic') is not None:
+                entry_data['short_extrinsic_entry'] = c['short_extrinsic']
+                print(f"  short extrinsic {c['short_extrinsic']} recovered "
+                      f"from the alert (intrinsic-floor guard armed)")
+                break
+        else:
+            print("  WARNING: no short-leg extrinsic available — the "
+                  "intrinsic-floor quote guard will fall back to 30% of the "
+                  "debit. Pass --short-extrinsic to arm it properly.")
+    if args.tp is not None:
+        entry_data['tp_spot'] = args.tp
 
     try:
         t = store.mark_entered(args.id, entry_data)
@@ -808,6 +834,77 @@ def cmd_cancel(args):
         sys.exit(1)
 
 
+def _print_cohort_scoreboard(exited, entered):
+    """The only scoreboard that answers the question the paper run is asking.
+
+    Kept ABOVE the whole-book performance block on purpose. The legacy numbers
+    are larger, older and more flattering, and reading them as "how the strategy
+    is doing" is exactly the mistake this split exists to prevent: those trades
+    were priced mid-mid (so they model zero round-trip cost), ran unvetted, and
+    came out of an engine that no longer exists.
+
+    Gross is shown next to an estimated NET, because the measured baseline is
+    that the median trade is +0.90% gross and -0.79% after Zerodha's fees on
+    four option legs. A scoreboard that only ever prints gross would show this
+    strategy as profitable in exactly the regime where it is not.
+    """
+    from . import config as cfg
+    from .trade_store import cohort_split
+
+    done, _ = cohort_split(exited)
+    live, _ = cohort_split(entered)
+    print(f"\n  === CURRENT ENGINE (cohort {cfg.COHORT_START}) ===")
+    if not done and not live:
+        print(f"  No trades yet. Everything in the book above predates "
+              f"{cfg.COHORT_START} and is a different engine.")
+        return
+    print(f"  open {len(live)}   closed {len(done)}")
+    if not done:
+        print("  Nothing closed yet — no P&L to report.")
+        return
+    wins = sum(1 for t in done if (t.get('pnl') or 0) > 0)
+    gross = sum(float(t.get('pnl') or 0) for t in done)
+    fees = sum(_est_fees(t) for t in done)
+    pcts = sorted(float(t.get('pnl_pct') or 0) for t in done)
+    med = pcts[len(pcts) // 2]
+    print(f"  WR {wins}/{len(done)} ({wins / len(done) * 100:.0f}%)   "
+          f"median trade {med:+.2f}% gross")
+    print(f"  GROSS Rs {gross:,.0f}   est. fees Rs {fees:,.0f}   "
+          f"NET Rs {gross - fees:,.0f}")
+    n_fill = sum(1 for t in done if t.get('pricing_basis') == 'fill')
+    print(f"  fill-basis records: {n_fill}/{len(done)}"
+          f"{'' if n_fill >= 30 else '  (need ~30 to judge the cost question)'}")
+
+
+def _est_fees(trade: dict) -> float:
+    """Estimated Zerodha round-trip cost for one BCS, in rupees.
+
+    An ESTIMATE and labelled as one — the store holds no brokerage record, and
+    exit leg prices are not persisted, so exit premiums are approximated by
+    entry premiums. It is here because the alternative (printing gross only) is
+    what makes a strategy whose median trade is negative look positive.
+
+    Short leg is OTM so its premium is its extrinsic; long = debit + short.
+    Rs 20/order x 4 legs, STT 0.1% on the two SELL premiums, NSE txn 0.03503%
+    of turnover, GST 18% on brokerage+txn, stamp 0.003% on buys.
+    """
+    try:
+        q = float(trade['quantity'])
+        debit = float(trade['debit'])
+        short_p = float(trade.get('short_extrinsic_entry') or 0) or debit * 0.5
+        long_p = debit + short_p
+        buy_turn = q * (long_p + short_p)
+        sell_turn = q * (short_p + long_p)
+        turnover = buy_turn + sell_turn
+        brok = 80.0
+        txn = 0.0003503 * turnover
+        sebi = 0.000001 * turnover
+        return (brok + 0.001 * sell_turn + txn + sebi
+                + 0.18 * (brok + txn + sebi) + 0.00003 * buy_turn)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
 def cmd_status(args):
     from .trade_store import get_store
     store = get_store()
@@ -844,7 +941,8 @@ def cmd_status(args):
 
     exited = by_status.get('exited', [])
     if exited:
-        print(f"\n  --- Performance ---")
+        _print_cohort_scoreboard(exited, entered)
+        print(f"\n  --- Performance (WHOLE BOOK, all engines) ---")
         for label, group in (
                 ('Zebra', [t for t in exited if t.get('structure') != 'bcs']),
                 ('BCS  ', [t for t in exited if t.get('structure') == 'bcs'])):
@@ -1245,6 +1343,19 @@ def main():
     p_ent.add_argument('--short-symbol', default=None)
     p_ent.add_argument('--lot-size', type=int, default=None)
     p_ent.add_argument('--entry-spot', type=float, default=None)
+    p_ent.add_argument('--pricing-basis', choices=['fill', 'mid'],
+                       default='fill',
+                       help="How --debit was priced. 'fill' (default) = what "
+                            "you actually paid, ASK(long)-BID(short); the "
+                            "monitor then values the position at BID-ASK, "
+                            "which is what closing it would pay.")
+    p_ent.add_argument('--short-extrinsic', type=float, default=None,
+                       help='Short-leg time value at entry. Arms the '
+                            'intrinsic-floor guard against garbage quotes; '
+                            'recovered from the alert when omitted.')
+    p_ent.add_argument('--tp', type=float, default=None,
+                       help='Target spot, if the ticket quoted a shortened '
+                            '(swing) target rather than the ST line.')
     p_ent.add_argument('--spot-sl-pct', type=float, default=None,
                        help='Override default spot SL percentage (e.g. 0.03)')
     p_ent.add_argument('--structure', choices=['bcs', 'zebra'], default=None,

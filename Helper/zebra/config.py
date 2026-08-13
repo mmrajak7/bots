@@ -4,7 +4,7 @@ import json
 import logging
 import math
 import os
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -96,11 +96,25 @@ EVENT_EXTRA_TOOLS = [
 # fleet, while the preflight reported the deny list complete. `loop` is the
 # same cycle held open all session; `scan` mutates the watchlist; `report`
 # sends Telegram to the owner as if the engine had spoken.
+#
+# Two more, found 2026-08-13 by re-applying the same "deny the callers" test to
+# the verbs added AFTER that rule was written:
+#   `postmortem run` calls `spawn_batch` -> `_spawn_generic`. It is a SPAWNER,
+#   the exact class the paragraph above exists to catch, and it was reachable
+#   by every channel. Recursion is bounded by the budget cap and a daily
+#   marker, but a preflight asserting "the deny list is complete" would have
+#   passed again while the invariant was false.
+#   `events replace` REPLACES the shared event calendar, and `--allow-empty`
+#   can wipe it — the same calendar the corporate-action interlock reads. Any
+#   channel could blank a safety input and re-stamp it "fresh". Denied for
+#   everyone here and granted back to the events channel alone via
+#   EVENT_EXTRA_TOOLS, which is how per-channel scoping already works.
 VET_DENIED_TOOLS = ['Bash(*zebra close*)', 'Bash(*zebra enter*)',
                     'Bash(*zebra cancel*)', 'Bash(*zebra reset*)',
                     'Bash(*zebra trigger*)',
                     'Bash(*zebra run*)', 'Bash(*zebra loop*)',
-                    'Bash(*zebra scan*)', 'Bash(*zebra report*)']
+                    'Bash(*zebra scan*)', 'Bash(*zebra report*)',
+                    'Bash(*postmortem run*)', 'Bash(*events replace*)']
 
 # VET_MODEL, VET_TIMEOUT_SEC and CHILD_KILL_SEC are exported further down —
 # they read zebra_config.json, which is not loaded yet at this point.
@@ -247,6 +261,28 @@ _DEFAULTS = {
                                  # are the high-payoff tail (avg win +127%) and
                                  # capping that would violate the power-law rule.
     'tp_target': 'st_line',       # 'st_line' or 'short_strike'
+    # ── COHORT BOUNDARY ────────────────────────────────────────────────────
+    # The date the CURRENT engine started trading. Every entry from here on is
+    # stamped with it, and reports split on that stamp.
+    #
+    # Why this exists rather than "just read the whole book": the 383 records
+    # before this date were produced by an engine that no longer exists. They
+    # were priced MID on both ends (so they model zero round-trip cost), they
+    # ran without the Claude vetting layer, without the gain-anchored trail,
+    # at min_dte 10, and without the guards added on 2026-08-13. Their
+    # aggregate P&L answers a question nobody is asking any more.
+    #
+    # 2026-08-14 is day one of the two-month paper run whose whole purpose is
+    # to answer ONE question: does this strategy clear its own costs? The
+    # measured baseline says the median trade is +0.90% gross and -0.79% NET
+    # of Zerodha fees, carried entirely by 3 winners out of 33 — see
+    # Helper/ISSUES.md S1/S2. Mixing the old book into that measurement would
+    # bury the answer.
+    #
+    # Stamped per trade, never recomputed: moving this date later must not
+    # silently reclassify positions that are already open, for the same reason
+    # `pricing_basis` is a property of the trade.
+    'cohort_start': '2026-08-14',
     'swing_tp_enabled': True,     # Shorten TP to a swing level standing between
                                   # spot and the ST magnet. LUPIN 2026-08: a PE
                                   # signal with a prior swing LOW well above the
@@ -603,6 +639,27 @@ assert 0 < BCS_MAX_ENTRY_COST_PCT < 100, \
 assert 0 < BCS_MAX_DEBIT_TO_WIDTH_PCT < 100, \
     "BCS_MAX_DEBIT_TO_WIDTH_PCT is a percentage of width"
 TP_TARGET = _runtime['tp_target']
+
+
+def _cohort_start() -> str:
+    """The cohort boundary, validated as a real ISO date.
+
+    A typo here would silently mis-stamp every future entry and quietly corrupt
+    the only measurement the paper run exists to produce, so it is parsed
+    rather than trusted — same discipline as `_strict_bool` on `paper_mode`.
+    Unparseable falls back to the default instead of stamping garbage.
+    """
+    val = _runtime.get('cohort_start', _DEFAULTS['cohort_start'])
+    try:
+        datetime.strptime(str(val), '%Y-%m-%d')
+        return str(val)
+    except (TypeError, ValueError):
+        logger.warning("cohort_start %r is not a YYYY-MM-DD date — falling "
+                       "back to %s", val, _DEFAULTS['cohort_start'])
+        return _DEFAULTS['cohort_start']
+
+
+COHORT_START = _cohort_start()
 SWING_TP_ENABLED = bool(_runtime['swing_tp_enabled'])
 SWING_PIVOT_BARS = _int('swing_pivot_bars')
 SWING_LOOKBACK_CANDLES = _int('swing_lookback_candles')

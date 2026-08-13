@@ -407,6 +407,27 @@ def _allowed_tools(channel: str) -> list:
     return tools
 
 
+def _denied_tools(channel: str) -> list:
+    """Deny rules for this channel.
+
+    Almost everything is denied to everyone — that is the point of the list.
+    The one per-channel carve-out is `events replace`: installing the refreshed
+    calendar is the events channel's whole job, but it was reachable by EVERY
+    channel, so any agent could blank a safety input (the calendar the
+    corporate-action interlock reads) and re-stamp it "fresh".
+
+    A carve-out is needed because Claude Code resolves deny BEFORE allow: a
+    global deny cannot be granted back by `--allowedTools`, so denying it
+    everywhere would silently disable the calendar refresh instead of scoping
+    it. Removing the rule for one channel is the only way to express
+    "everybody except the agent whose job this is".
+    """
+    denied = list(cfg.VET_DENIED_TOOLS)
+    if channel == 'events':
+        denied = [d for d in denied if 'events replace' not in d]
+    return denied
+
+
 _cli_path: list = []            # one-element memo; [] = not yet resolved
 
 
@@ -692,7 +713,7 @@ def _spawn_generic(prompt: str, model: str, tag: str,
     try:
         argv = [cli, '-p', prompt, '--model', model,
                 '--allowedTools'] + _allowed_tools(channel) + \
-               ['--disallowedTools'] + list(cfg.VET_DENIED_TOOLS)
+               ['--disallowedTools'] + _denied_tools(channel)
     except Exception as e:
         logger.error("Could not build the CLI command for %s: %s", tag, e)
         _note_spawn(False, channel)

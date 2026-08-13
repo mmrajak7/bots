@@ -38,6 +38,7 @@ autouse and package-wide: the default is that spawning is impossible, and a
 test that genuinely wants to observe spawn behaviour must opt in via the
 `spawns` fixture and assert on the recorded calls.
 """
+import json
 import sys
 from pathlib import Path
 
@@ -73,14 +74,87 @@ def _no_production_paths(tmp_path_factory, monkeypatch):
 
     Railed at the SOURCE and autouse, not per test: `paths` fixes the files one
     test knows about, and the next test nobody remembers to isolate walks
-    straight past it. Both modules read `cfg.LOG_DIR` at call time, so this one
-    redirect covers every writer. A test wanting real paths must say so.
+    straight past it. A test wanting real paths must say so.
+
+    FOURTH instance, found 2026-08-13. The paragraph above used to end "Both
+    modules read `cfg.LOG_DIR` at call time, so this one redirect covers every
+    writer." That was FALSE, and the falsehood is the whole lesson: five paths
+    are module-level constants EVALUATED AT IMPORT from the original LOG_DIR
+    (`config.py:28,29,73,720,721`), so rebinding `cfg.LOG_DIR` afterwards moves
+    nothing. Measured damage: a suite run downloaded the real decision journal
+    from Drive with real service-account credentials and rewrote production
+    `zebra_decisions.json` and `event_calendar.pending.json`. `DecisionStore`
+    re-UPLOADS on divergence, so a junk row invented by a test can be pushed to
+    Drive and pulled down by the Pi into the very journal that scores whether
+    the vetting layer earns live authority.
+
+    Rule this encodes: patching a directory does not patch the paths already
+    derived from it. Redirect every leaf constant, and assert it — the list
+    below is checked by `test_prod_rail_covers_every_log_path`, which fails the
+    day someone adds a sixth.
     """
     tmp = tmp_path_factory.mktemp('zebra_prod_rail')
     monkeypatch.setattr(cfg, 'LOG_DIR', tmp)
     monkeypatch.setattr(cfg, 'LOCAL_FILE', tmp / 'zebra_trades.json')
     monkeypatch.setattr(cfg, 'LOCK_FILE', tmp / 'zebra_trades.lock')
+    monkeypatch.setattr(cfg, 'DECISIONS_FILE', tmp / 'zebra_decisions.json')
+    monkeypatch.setattr(cfg, 'DECISIONS_LOCK', tmp / 'zebra_decisions.lock')
+    monkeypatch.setattr(cfg, 'EVENT_FILE', tmp / 'event_calendar.json')
+    monkeypatch.setattr(cfg, 'EVENT_LOCK', tmp / 'event_calendar.lock')
+    monkeypatch.setattr(cfg, 'EVENT_CANDIDATE_FILE',
+                        tmp / 'event_calendar.candidate.json')
     return tmp
+
+
+class RealDriveAttempted(BaseException):
+    """Raised when a test reaches for Google Drive.
+
+    BaseException, not Exception, for the same reason the Telegram rail is:
+    every Drive caller in this package wraps its network in `except Exception`
+    and degrades to local-only, so an ordinary exception would be SWALLOWED and
+    the rail would silently pass while proving nothing.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _no_real_drive(tmp_path_factory, monkeypatch):
+    """No test may touch Google Drive with the real service account.
+
+    The production-path rail above stops tests WRITING production files. It
+    does not stop them READING production Drive — and the incident that
+    prompted both was a test that downloaded the live decision journal with
+    real service-account credentials and then wrote it locally.
+
+    Two layers, because one is not enough:
+
+    1. POSTURE. Both `_load_config()`s (`decisions.py:58`, `trade_store.py:37`)
+       read `cfg.CONFIG_FILE`, so pointing that at a config with
+       `google_drive.enabled: false` puts every store on the same local-only
+       path it already takes on a box with no credentials. This is the layer
+       that keeps legitimate tests working: they exercise the real code, it
+       just never leaves the machine.
+
+    2. HARD RAIL. `get_drive_service` still raises, as BaseException — because
+       `_init_drive` wraps its call in `except Exception` and degrades to
+       "local-only" with a warning, so an ordinary exception would be
+       SWALLOWED and the rail would prove nothing. With layer 1 in place this
+       should be unreachable; if it fires, a test has bypassed the config and
+       that is worth failing loudly over.
+    """
+    import bcs.drive_store as ds
+
+    cfg_dir = tmp_path_factory.mktemp('zebra_cfg_rail')
+    cfg_file = cfg_dir / 'zebra_config.json'
+    cfg_file.write_text(json.dumps({'google_drive': {'enabled': False}}))
+    monkeypatch.setattr(cfg, 'CONFIG_FILE', cfg_file)
+
+    def _refuse(*a, **k):
+        raise RealDriveAttempted(
+            "A test reached for Google Drive. Stub the store or pass "
+            "drive=False; never authenticate the real service account "
+            "from the suite.")
+
+    monkeypatch.setattr(ds, 'get_drive_service', _refuse)
 
 
 @pytest.fixture(autouse=True)

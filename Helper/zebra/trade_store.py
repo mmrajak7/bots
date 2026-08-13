@@ -34,6 +34,33 @@ logger = logging.getLogger(__name__)
 _BATCHED_POLL_FIELDS = frozenset({'corrob_spot', 'corrob_value', 'corrob_t'})
 
 
+def in_cohort(trade: dict, cohort: Optional[str] = None) -> bool:
+    """Was this position opened by the CURRENT engine?
+
+    ONE definition, imported by every reader, because the alternative is each
+    report inventing its own date test and them quietly disagreeing about what
+    the scoreboard means.
+
+    A record with no `cohort` stamp is LEGACY by construction — the 383 records
+    that predate the stamp were priced mid-mid, ran unvetted, and were made by
+    an engine that no longer exists. Absence is the answer, not a reason to
+    guess from `entry_date`.
+    """
+    stamped = trade.get('cohort')
+    if not stamped:
+        return False
+    return stamped == (cohort or cfg.COHORT_START)
+
+
+def cohort_split(trades: list, cohort: Optional[str] = None) -> tuple:
+    """(current-engine trades, legacy trades). Order matters — current first,
+    because it is the one anybody is actually asking about."""
+    want = cohort or cfg.COHORT_START
+    current = [t for t in trades if in_cohort(t, want)]
+    legacy = [t for t in trades if not in_cohort(t, want)]
+    return current, legacy
+
+
 def _load_config() -> dict:
     if not cfg.CONFIG_FILE.exists():
         logger.warning("Config %s not found, using defaults", cfg.CONFIG_FILE)
@@ -266,6 +293,7 @@ class ZebraStore:
             t = self._must_find(trade_id)
             if t['status'] not in ('watching', 'triggered'):
                 raise ValueError(f"#{trade_id} status={t['status']}, can't enter")
+            self._refuse_if_book_full(trade_id)
             self._apply_entry(t, entry_data)
         logger.info(
             "ENTERED #%d %s %s/%s debit=%.2f qty=%d cap=Rs%.0f TP=%.2f SL=%.2f",
@@ -302,9 +330,18 @@ class ZebraStore:
         tp_target = cfg.TP_TARGET
         base = (float(entry_data['short_strike']) if tp_target == 'short_strike'
                 else float(t['st_value']))
-        tp_spot = self._resolve_tp(
-            t, entry_data.get('swing_tp'), base,
-            'short_strike' if tp_target == 'short_strike' else 'st_line')
+        if entry_data.get('tp_spot') is not None:
+            # The LIVE ticket can quote a swing-shortened target, but this path
+            # had no way to receive it — so the monitor watched the ST line
+            # while the owner had been told a nearer level. The TP then fired
+            # late, or never, in exactly the case the feature exists for
+            # (price stalling at its own support short of the magnet).
+            tp_spot = float(entry_data['tp_spot'])
+            t['tp_source'] = 'manual'
+        else:
+            tp_spot = self._resolve_tp(
+                t, entry_data.get('swing_tp'), base,
+                'short_strike' if tp_target == 'short_strike' else 'st_line')
 
         debit_sl_value = round(debit * cfg.DEBIT_SL_PCT, 2)
 
@@ -353,8 +390,26 @@ class ZebraStore:
                                    - float(entry_data['long_strike'])), 2)
         # Entry-time extrinsic of the short leg — feeds the intrinsic-floor
         # quote-sanity guard in the monitor (bad-quote false-SL protection).
+        # Absent, the floor falls back to a flat 30%-of-debit guess, so the
+        # NHPC-class garbage-quote protection runs degraded for the life of the
+        # position. This is the LIVE path, where that guard matters most.
         if 'short_extrinsic_entry' in entry_data:
             t['short_extrinsic_entry'] = float(entry_data['short_extrinsic_entry'])
+        # WHICH PRICE CONVENTION this position is valued on, for the rest of
+        # its life. `_structure_quote` reads it and falls through to MID when
+        # absent — so a hand-entered LIVE trade, whose `debit` is what the
+        # owner actually PAID (ask - bid), was then marked mid-mid every poll.
+        # The debit SL is `mid <= 0.5 * debit`: measuring a fill-basis debit
+        # against a mid-basis value fires the stop LATE by roughly half the
+        # round-trip spread, and books exits at a price nobody could transact
+        # at. The automated path has stamped this since fill pricing shipped;
+        # this one never did. Stamped at entry and never changed afterwards —
+        # flipping it under an open position would move its stop and trail
+        # levels beneath it.
+        basis = entry_data.get('pricing_basis')
+        if basis:
+            t['pricing_basis'] = basis
+        self._stamp_cohort(t)
         t['version'] = t.get('version', 0) + 1
 
     def add_bcs_shadow(self, zebra_trade: dict, bcs: dict) -> dict:
@@ -507,6 +562,48 @@ class ZebraStore:
         t['tp_source'] = base_name
         return float(base)
 
+    def _stamp_cohort(self, t: dict) -> None:
+        """Mark which engine opened this position. Stamped once, at entry.
+
+        Derived from the config at ENTRY time and then frozen, rather than
+        recomputed from `entry_date` on every read. Two reasons, both learned
+        the hard way on `pricing_basis`:
+
+        - Moving `cohort_start` later must not silently reclassify positions
+          that are already open and already being measured.
+        - `entry_date` is a display string; a cohort test that re-parses it on
+          every read is one date-format change away from silently returning
+          False for the whole book.
+        """
+        t['cohort'] = cfg.COHORT_START
+
+    def _refuse_if_book_full(self, trade_id: int) -> None:
+        """Cap concurrent open positions. MUST be called inside the lock.
+
+        `MAX_OPEN_TRADES` was defined in config, asserted by a test, and read
+        by NOTHING — the only portfolio-level risk control in the system was
+        decorative, and the paper book duly reached 17 simultaneous positions
+        against a stated cap of 8. In paper that only skews the record; with
+        real money it is the difference between a bad day and an account.
+
+        PAPER is deliberately exempt: capping entries would bias which trades
+        the validation record contains, and an unentered paper signal costs
+        nothing. The cap binds where it means something — live.
+
+        Raises ValueError, which every caller already treats as "did not
+        enter" (the monitor logs and leaves the row triggered; the CLI prints
+        and exits non-zero). Refusing to open is always safe; the signal is
+        simply not taken.
+        """
+        if cfg.PAPER_MODE or not cfg.MAX_OPEN_TRADES:
+            return
+        open_n = sum(1 for x in self._trades if x.get('status') == 'entered')
+        if open_n >= cfg.MAX_OPEN_TRADES:
+            raise ValueError(
+                f"#{trade_id} refused: {open_n} positions already open, cap is "
+                f"{cfg.MAX_OPEN_TRADES} (max_open_trades). Close something or "
+                f"raise the cap deliberately.")
+
     def mark_entered_bcs(self, trade_id: int, bcs: dict) -> dict:
         """Promote a signal straight into a BCS position — ONE record.
 
@@ -525,6 +622,7 @@ class ZebraStore:
             t = self._must_find(trade_id)
             if t['status'] not in ('watching', 'triggered'):
                 raise ValueError(f"#{trade_id} status={t['status']}, can't enter")
+            self._refuse_if_book_full(trade_id)
             direction = t['direction']
             sl_spot = round(entry_spot * (1 - cfg.SPOT_SL_PCT), 2) \
                 if direction == 'CE' else \
@@ -540,6 +638,7 @@ class ZebraStore:
                 self._resolve_tp(t, bcs.get('swing_tp'),
                                  float(t.get('tp_spot', t['st_value'])),
                                  'st_line')))
+            self._stamp_cohort(t)
             t['version'] = t.get('version', 0) + 1
         logger.info(
             "ENTERED BCS #%d %s %g/%g debit=%.2f qty=%d cap=Rs%.0f d/w=%s%% "

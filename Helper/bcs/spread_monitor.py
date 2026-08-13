@@ -809,6 +809,11 @@ def send_telegram(msg: str):
 
 ORDER_TAG = "BCS_MON"   # Tag for all orders placed by this script
 
+# The only statuses from which an order can NEVER fill again. Anything else —
+# including a status this code has never seen — counts as live, so the
+# duplicate-order guard fails toward NOT placing a second order on a leg.
+_TERMINAL_ORDER_STATUS = frozenset({'COMPLETE', 'REJECTED', 'CANCELLED'})
+
 
 def _find_last_fill_price(kite: KiteConnect, symbol: str, txn_type: str) -> float:
     """Find the fill price of the most recent COMPLETE order for a symbol+side.
@@ -844,11 +849,18 @@ def _find_last_fill_price(kite: KiteConnect, symbol: str, txn_type: str) -> floa
     return 0.0
 
 
-def _find_pending_orders(kite: KiteConnect, symbol: str, txn_type: str) -> list:
-    """Find OPEN/PENDING orders for a symbol+side placed by this script.
+def _find_pending_orders(kite: KiteConnect, symbol: str, txn_type: str):
+    """Find live orders for a symbol+side placed by this script.
 
     Used to detect orders that were placed but whose response was lost
     (network drop after place_order succeeded). Prevents duplicate orders.
+
+    Returns a list, or **None meaning "could not tell"**. That distinction is
+    the whole point: this guard exists for the network-flake window, and an
+    `except` returning `[]` stood the guard down at exactly the moment it was
+    needed — an unreadable order book was reported as "no live orders", and the
+    caller placed on top of a possibly-live one. `None` makes the caller wait
+    instead of guess.
     """
     pending = []
     try:
@@ -856,10 +868,24 @@ def _find_pending_orders(kite: KiteConnect, symbol: str, txn_type: str) -> list:
             if (o.get('tradingsymbol') == symbol
                     and o.get('transaction_type') == txn_type
                     and o.get('tag') == ORDER_TAG
-                    and o.get('status') in ('OPEN', 'PENDING', 'TRIGGER PENDING')):
+                    # TERMINAL-list, not a live-list. The old check named three
+                    # statuses and missed every transient one Kite actually
+                    # emits under load at 09:15 — 'PUT ORDER REQ RECEIVED',
+                    # 'VALIDATION PENDING', 'OPEN PENDING', 'MODIFY PENDING',
+                    # 'CANCEL PENDING'. An order sitting in any of those was
+                    # invisible here, so the retry placed a SECOND order on the
+                    # same leg and both could fill: the short leg bought twice
+                    # and flipped long. That is the Feb-2026 ICICIBANK loss
+                    # exactly, and enumerating the live states is what let it
+                    # back in. Enumerate the DEAD states instead — a status
+                    # this code has never heard of is now treated as live,
+                    # which fails toward "do not place another order".
+                    and str(o.get('status', '')).upper() not in _TERMINAL_ORDER_STATUS):
                 pending.append(o)
     except Exception as e:
-        log(f"    Could not check pending orders: {e}")
+        log(f"    Could not check pending orders: {e} — treating as UNKNOWN, "
+            f"refusing to place until the order book is readable")
+        return None
     return pending
 
 
@@ -942,6 +968,25 @@ def cancel_order_safe(kite: KiteConnect, order_id: str, dry_run: bool):
         log(f"    Cancel failed for {order_id}: {e}")
 
 
+def _order_final_state(kite: KiteConnect, order_id: str):
+    """Read an order's state after a cancel, to catch a fill in the race.
+
+    A cancel request and a fill can cross: the order completes at the exchange
+    microseconds before the cancel lands, so treating "we cancelled it" as
+    "it did not fill" would lose a real fill and leave the code closing a leg
+    that is already closed. Returns the order dict, or None if it cannot be
+    read — callers must treat None as "unknown", never as "did not fill".
+    """
+    try:
+        time.sleep(1)
+        for o in kite.orders():
+            if str(o['order_id']) == str(order_id):
+                return o
+    except Exception as e:
+        log(f"    Post-cancel state check failed for {order_id}: {e}")
+    return None
+
+
 def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
               qty: int, is_buy: bool, dry_run: bool,
               urgent: bool = False) -> Optional[dict]:
@@ -1017,6 +1062,16 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
             # have left pending orders that recover_closing_trade didn't cancel.
             if not dry_run:
                 pending = _find_pending_orders(kite, symbol, txn_type)
+                if pending is None:
+                    # Could not read the order book. Placing now risks doubling
+                    # a live order on this leg, which is the ICICI failure.
+                    # Skip to the next attempt instead — the retry loop already
+                    # bounds how long this can go on, and the caller's ABORT /
+                    # partial_close paths handle running out of attempts.
+                    log(f"    Order book unreadable — skipping attempt {attempt} "
+                        f"rather than risk a duplicate order on {symbol}.")
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
                 if pending:
                     order_id = str(pending[0]['order_id'])
                     log(f"    Found pending order {order_id} from this script. Waiting for it...")
@@ -1024,7 +1079,25 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
                     if result and result['status'] == 'COMPLETE':
                         log(f"    Pending order FILLED at {result['average_price']}")
                         return result
-                    # If pending order timed out/cancelled, continue to retry logic
+                    # TIMEOUT MEANS THE ORDER IS STILL LIVE. `wait_for_fill`
+                    # returns None on timeout WITHOUT cancelling — its own
+                    # docstring says "caller should cancel and check" — and
+                    # this caller did not, then fell through and placed a
+                    # replacement. Two live orders on one leg, both fillable:
+                    # the short leg bought twice, flipped long. The code
+                    # already applies exactly this cancel-then-verify
+                    # discipline to its OWN timed-out orders further down; the
+                    # ADOPTED order was the one path that skipped it.
+                    if result is None:
+                        log(f"    Adopted order {order_id} timed out — cancelling "
+                            f"before any replacement is placed.")
+                        cancel_order_safe(kite, order_id, dry_run=False)
+                        # Re-read it: a fill can land in the cancel race.
+                        result = _order_final_state(kite, order_id)
+                        if result and result.get('status') == 'COMPLETE':
+                            log(f"    Adopted order filled during cancel at "
+                                f"{result.get('average_price')}")
+                            return result
                     filled = result.get('filled_quantity', 0) if result else 0
                     if filled > 0:
                         cumulative_fill_qty += filled
@@ -1919,6 +1992,43 @@ def new_blind_state() -> dict:
             'ok_streak': 0}
 
 
+def _malformed_reason(trade: dict):
+    """Name the field that makes this record unmonitorable, or None.
+
+    Checked BEFORE the monitor touches a record, because the alternative —
+    letting a KeyError escape the per-trade body — takes the whole book down
+    with it. Only fields the loop dereferences unconditionally are listed; an
+    optional field missing is a different problem and must not quarantine a
+    live position.
+    """
+    common = ('id', 'stock', '_strategy', 'sl_spot', 'spot_symbol', 'quantity')
+    missing = [f for f in common if trade.get(f) is None]
+    if trade.get('_strategy') in ('BCS', 'BPS'):
+        missing += [f for f in ('target_spot', 'sl_spread', 'net_debit',
+                                'long_symbol', 'short_symbol')
+                    if trade.get(f) is None]
+    return ('missing ' + ', '.join(missing)) if missing else None
+
+
+def _alert_malformed_record(trade: dict, reason: str, alerted: set) -> None:
+    """Skip a broken record loudly, once — never silently, never repeatedly.
+
+    A live position the monitor cannot read is the worst state in the system:
+    it has real risk and no stop. The owner has to be told, but at a 5s poll
+    an unconditional Telegram would be thousands of messages a day, so it is
+    once per (strategy, id) per process.
+    """
+    key = (trade.get('_strategy'), trade.get('id'))
+    log(f"  MALFORMED RECORD {key}: {reason} — NOT MONITORED, skipping.")
+    if key in alerted:
+        return
+    alerted.add(key)
+    send_telegram(
+        f"CRITICAL: {key[0]} #{key[1]} {trade.get('stock', '?')} record is "
+        f"malformed ({reason}). It is NOT being monitored — no SL, no TP. "
+        f"Fix the record or close the position manually.")
+
+
 def bump_confirm(confirm: dict, key: str) -> int:
     """Increment a trigger-confirmation counter, restarting a stale streak.
 
@@ -2524,6 +2634,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
 
     last_status_time = 0
     closing_in_progress = {}  # {(strategy, trade_id): reason}
+    malformed_alerted = set()  # (strategy, id) already shouted about
     consecutive_errors = 0
 
     while True:
@@ -2563,6 +2674,22 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             print_status = (now - last_status_time >= STATUS_PRINT_INTERVAL_SEC)
 
             for trade in all_trades:
+                # ── Per-record isolation ───────────────────────────────────
+                # One malformed record used to halt exit checks for the ENTIRE
+                # live book, silently and forever: a missing key raised out of
+                # this loop body, the outer handler slept 10s and retried, and
+                # `consecutive_errors = 0` above runs BEFORE the loop on every
+                # pass — so the counter went 0->1 forever and neither the
+                # warning nor the MAX_CONSECUTIVE_ERRORS fatal Telegram could
+                # ever be reached. Every trade sorted after the bad one got
+                # zero exit checks, witnessed only by a log line every 10s.
+                # zebra fixed this class months ago (one try per record); the
+                # live-money file never got the fix.
+                bad = _malformed_reason(trade)
+                if bad:
+                    _alert_malformed_record(trade, bad, malformed_alerted)
+                    continue
+
                 tid = trade['id']
                 stock = trade['stock']
                 strat = trade['_strategy']
@@ -2614,7 +2741,14 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 fh_val = None
                 if strat in ('BCS', 'BPS'):
                     try:
-                        spread_data = get_spread_value(kite, trade)
+                        # `spot=` is what arms the no-arbitrage floor inside
+                        # get_spread_value. Every other call site passes it;
+                        # this one — the loop that actually runs on the Pi —
+                        # did not, so the floor was inert in production while
+                        # its unit tests passed. Guard class 2 (possibility)
+                        # from the incident review: a tidy, two-sided, tight
+                        # book can still quote an impossible price.
+                        spread_data = get_spread_value(kite, trade, spot=spot)
                         spread_val = spread_data['spread']
                     except Exception as e:
                         spread_fail = str(e)
@@ -2733,14 +2867,32 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 closed = False
 
                 if strat in ('BCS', 'BPS'):
-                    # ── SL_SPOT: direction-aware, always active, single poll.
-                    # Spot LTP comes from real underlying trades (garbage-
-                    # immune) and a thesis-dead exit must not be delayed.
-                    # BCS risk is DOWN (spot <= sl), BPS risk is UP (spot >= sl).
+                    # ── SL_SPOT: direction-aware, exempt from every cooldown
+                    # (a thesis-dead exit must not wait for a book to form),
+                    # but NOT single-poll. SL_SPOT_CONFIRM_POLLS=2 (~10s) was
+                    # added after the two real-money losses because this is the
+                    # trigger that runs at URGENT urgency, whose final attempt
+                    # pays through uncapped — and both losses were opening
+                    # prints. The debounce was wired into `monitor()`, the
+                    # single-trade mode nobody runs, while `monitor_all()` —
+                    # the --cron entrypoint on the Pi — kept firing on ONE
+                    # print. The constant and its unit test both passed the
+                    # whole time. BCS risk is DOWN (spot <= sl), BPS risk is UP.
                     sl_spot_hit = (spot <= sl_spot_val) if strat == 'BCS' else (spot >= sl_spot_val)
                     if sl_spot_hit:
+                        # confirm_state[...] directly: the `confirm` local is
+                        # bound below, after the TP cooldown gate.
+                        n_sl = bump_confirm(confirm_state[close_key], 'sl_spot')
+                        if n_sl < SL_SPOT_CONFIRM_POLLS:
+                            op = '<=' if strat == 'BCS' else '>='
+                            log(f"  {strat} #{tid} {stock}: SL_SPOT condition "
+                                f"{spot:.2f} {op} {sl_spot_val} "
+                                f"(confirm {n_sl}/{SL_SPOT_CONFIRM_POLLS})")
+                            sl_spot_hit = False
+                    if sl_spot_hit:
                         op = '<=' if strat == 'BCS' else '>='
-                        log(f"\n  {strat} #{tid} {stock} *** SL_SPOT HIT: {spot:.2f} {op} {sl_spot_val} ***")
+                        log(f"\n  {strat} #{tid} {stock} *** SL_SPOT HIT: {spot:.2f} {op} {sl_spot_val} "
+                            f"(confirmed x{SL_SPOT_CONFIRM_POLLS}) ***")
                         closing_in_progress[close_key] = "SL_SPOT"
                         success = close_spread(kite, trade, spot, "SL_SPOT", dry_run,
                                                store=trade_store, strategy_label=strat)

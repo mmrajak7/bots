@@ -65,15 +65,21 @@ def _enter(s, tid, expiry_days=30):
 # recursively spawns more agents — was granted and denied by nothing.
 CYCLE_VERBS = ['run', 'loop', 'scan', 'report']
 POSITION_VERBS = ['close', 'enter', 'cancel', 'reset', 'trigger']
+# Added 2026-08-13 by re-applying the same test to the verbs written since.
+# `postmortem run` calls spawn_batch -> _spawn_generic (a SPAWNER, the exact
+# class this list exists to catch); `events replace` overwrites the shared
+# event calendar that the corporate-action interlock reads, and --allow-empty
+# can blank it.
+SPAWNER_VERBS = ['postmortem run', 'events replace']
 
 
-@pytest.mark.parametrize('verb', POSITION_VERBS + CYCLE_VERBS)
+@pytest.mark.parametrize('verb', POSITION_VERBS + CYCLE_VERBS + SPAWNER_VERBS)
 def test_the_deny_list_covers_the_callers_not_just_the_callees(verb):
     assert any(verb in pattern for pattern in cfg.VET_DENIED_TOOLS), \
         f"`zebra {verb}` is not denied to spawned agents"
 
 
-@pytest.mark.parametrize('verb', POSITION_VERBS + CYCLE_VERBS)
+@pytest.mark.parametrize('verb', POSITION_VERBS + CYCLE_VERBS + SPAWNER_VERBS)
 def test_the_settings_backstop_matches_the_spawn_deny_list(verb):
     """settings.json is the layer that still applies when a HUMAN runs claude
     interactively on the Pi, where no --disallowedTools flag is in play. It
