@@ -137,10 +137,16 @@ def _alerts_enabled(trade: dict) -> bool:
 
 def _format_enter_alert(trade: dict, analysis: dict,
                         bcs: Optional[dict] = None) -> str:
-    """Build the ENTER alert. Single recommended Zebra pair (click-copy ready).
+    """Build the ENTER alert — the click-copy ORDER TICKET.
 
-    Picker chose this pair as the best balance of: passes liquidity gates,
-    NetExt ≤ 0 (theta-OK), BE near spot, lowest capital_per_lot.
+    Under `ENTRY_STRUCTURE == 'bcs'` (the pipeline since 2026-08-12) the ticket
+    is the SPREAD, because that is the only structure the engine opens. The
+    zebra back-ratio branch below is kept for the 'zebra' setting and for the
+    15 legacy positions still running that structure — it is not dead code.
+
+    In the zebra branch the picker chose its pair as the best balance of:
+    passes liquidity gates, NetExt ≤ 0 (theta-OK), BE near spot, lowest
+    capital_per_lot.
     """
     stock = trade['stock']
     direction = trade['direction']
@@ -173,10 +179,40 @@ def _format_enter_alert(trade: dict, analysis: dict,
     conviction = ' ⭐ALIGNED' if cfg.is_trend_aligned(
         trade.get('direction'), trade.get('st_direction')) else ''
 
-    msg = (
+    head = (
         f"\U0001F993 <b>ENTER</b>  <code>{stock}</code>  ({direction}){conviction}\n"
         f"Level {st_val:,.2f} | spot {spot:,.2f} | gap {gap:.2f}% "
         f"({pull_dir} Level)\n"
+    )
+
+    # ── BCS-only pipeline: the SPREAD is the order ticket ───────────────────
+    # Zebra was retired 2026-08-12 and its pair is never opened, so leading
+    # with "BUY 2x / SELL 1x" and captioning the spread as a "shadow" told the
+    # reader to place the one order the engine does not take. The alert IS the
+    # order ticket (see the _alerts_enabled comment at the call site) — it must
+    # name the structure that actually gets entered, and nothing else.
+    if cfg.ENTRY_STRUCTURE == 'bcs':
+        if not bcs:
+            return (
+                f"⚠ <b>NO SPREAD</b>  <code>{stock}</code> ({direction})\n"
+                f"spot {spot:,.2f} | Level {st_val:,.2f} | gap {gap:.2f}%\n"
+                f"No tradeable BCS pair at expiry {expiry}."
+            )
+        bwarn = ' ⚠ ' + html.escape(','.join(bcs['warnings'])) \
+            if bcs.get('warnings') else ''
+        return head + (
+            f"expiry {expiry} ({dte} DTE) | lot {lot_size}{bwarn}\n"
+            f"\n"
+            f"Strikes <b>{bcs['long_strike']:g} / {bcs['short_strike']:g}</b>   "
+            f"debit {bcs['debit']:g} "
+            f"({bcs['debit_to_width_pct']:.0f}% of width)\n"
+            f"Max profit {bcs['max_profit_per_share']:g}/share\n"
+            f"\n"
+            f"🟢 BUY 1× <code>{bcs['long_symbol']}</code>  {bcs['long_ask']:g}\n"
+            f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_bid']:g}"
+        )
+
+    msg = head + (
         f"expiry {expiry} ({dte} DTE) | lot {lot_size} | "
         f"Capital (1 lot) = {best['capital_per_lot']:,.0f}{warn}\n"
         f"\n"
@@ -290,7 +326,7 @@ def format_vetoed_alert(trade: dict, reasons: list, red_flags: list) -> str:
         lines.append(f"⚠ {html.escape(str(r))}")
     for r in (reasons or [])[:4]:
         lines.append(f"• {html.escape(str(r))}")
-    lines.append("<i>No entry — neither zebra nor the BCS shadow.</i>")
+    lines.append("<i>No entry taken.</i>")
     return "\n".join(lines)
 
 

@@ -291,3 +291,65 @@ def test_a_dead_underlying_past_expiry_still_settles(store, monkeypatch):
     monitor.check_entered(store, kite=None, dry_run=True)
     assert store.find(1)['status'] == 'exited', \
         'an expired position on a dead symbol is still immortal'
+
+
+# ── The ENTER alert is the order ticket (2026-08-13) ──────────────────────
+# Reported by the owner on day one: "we are not working on zebra anymore -
+# only BCS". The ticket still led with the retired zebra pair (BUY 2x / SELL
+# 1x) and captioned the spread that actually trades as a "BCS shadow
+# (paper A/B)" — i.e. it instructed the reader to place the one order the
+# engine does not take, and labelled the real one as a side experiment.
+
+def _analysis():
+    return {
+        'spot': 96.0, 'current_gap_pct': 4.0, 'expiry': '2026-09-29',
+        'dte': 30, 'lot_size': 500,
+        'best': {'k_l': 90.0, 'k_s': 96.0, 'debit': 4.0, 'be': 98.0,
+                 'be_pct_from_spot': 2.08, 'gate_fails': [],
+                 'capital_per_lot': 2000.0,
+                 'long_symbol': 'ZEBLONG', 'short_symbol': 'ZEBSHORT',
+                 'long_ask': 7.0, 'short_bid': 3.0},
+    }
+
+
+def _bcs():
+    return {'long_strike': 96.0, 'short_strike': 104.0, 'debit': 3.2,
+            'debit_to_width_pct': 40.0, 'max_profit_per_share': 4.8,
+            'warnings': [], 'long_symbol': 'BCSLONG', 'short_symbol': 'BCSSHORT',
+            'long_ask': 5.0, 'short_bid': 1.8}
+
+
+def test_the_ticket_names_the_bcs_and_never_the_retired_zebra_pair(monkeypatch):
+    monkeypatch.setattr(cfg, 'ENTRY_STRUCTURE', 'bcs')
+    trade = {'id': 1, 'stock': 'TESTCO', 'direction': 'CE', 'st_value': 100.0,
+             'st_direction': 'DOWN', 'timeframe': 'weekly'}
+    msg = monitor._format_enter_alert(trade, _analysis(), _bcs())
+
+    assert 'BCSLONG' in msg and 'BCSSHORT' in msg, 'the tradeable legs are missing'
+    assert 'ZEBLONG' not in msg and 'ZEBSHORT' not in msg, \
+        'the ticket still quotes the retired zebra legs'
+    assert '2×' not in msg and '2x' not in msg, \
+        'a 2x leg is the zebra back-ratio — never entered under BCS-only'
+    assert 'shadow' not in msg.lower(), \
+        'the structure that actually trades must not be captioned a shadow'
+
+
+def test_a_missing_bcs_pair_says_so_instead_of_falling_back_to_zebra(monkeypatch):
+    """No spread, no ticket. Silently printing the zebra pair here would be the
+    same bug wearing a fallback."""
+    monkeypatch.setattr(cfg, 'ENTRY_STRUCTURE', 'bcs')
+    trade = {'id': 1, 'stock': 'TESTCO', 'direction': 'CE', 'st_value': 100.0,
+             'st_direction': 'DOWN', 'timeframe': 'weekly'}
+    msg = monitor._format_enter_alert(trade, _analysis(), None)
+    assert 'NO SPREAD' in msg
+    assert 'ZEBLONG' not in msg
+
+
+def test_the_zebra_ticket_survives_for_the_zebra_pipeline(monkeypatch):
+    """The BCS-only branch must not delete the other pipeline's ticket — the
+    config knob still selects it, and 15 open positions are that structure."""
+    monkeypatch.setattr(cfg, 'ENTRY_STRUCTURE', 'zebra')
+    trade = {'id': 1, 'stock': 'TESTCO', 'direction': 'CE', 'st_value': 100.0,
+             'st_direction': 'DOWN', 'timeframe': 'weekly'}
+    msg = monitor._format_enter_alert(trade, _analysis(), _bcs())
+    assert 'ZEBLONG' in msg and 'BCS shadow' in msg

@@ -41,9 +41,36 @@ context:
 Always true by construction: DTE within 15–45, gap to the ST line inside the
 trigger band, and `trend_aligned` recorded.
 
-The BCS shadow's debit/width ≤ 45% gate is **not** yet applied when you are
-called — the shadow is built at entry, one tick after your verdict. Judge the
-zebra structure in front of you.
+**You are judging a BULL CALL SPREAD / BEAR PUT SPREAD (BCS).** Zebra — the
+2×ITM/1×ATM back-ratio — was retired on 2026-08-12 and nothing you vet will
+ever be one. Ignore any zebra structure description you find in other docs.
+
+### NEVER veto on `trend_aligned` — it is a badge, not a gate
+
+This is the one rule in this document that overrides your own judgement,
+because the arithmetic is not obvious and an agent got it wrong live.
+
+Direction is decided by which SIDE of the ST line price sits on, and nothing
+else. On the same timeframe `price < ST` and `ST DOWN` are **the same fact**,
+so a CE signal is counter-trend *by construction* — it is not a warning sign,
+it is what every signal looks like:
+
+| Cohort | n | Win rate | Median RoC |
+|--------|---|----------|------------|
+| `trend_aligned: false` | 381 of 383 signals; 205 closed | 53.7% | **+13.1%** |
+| `trend_aligned: true` | 2 of 383 | 50% | **−24.6%** |
+
+Vetoing on it vetoes 99.5% of the strategy, and would have kept only two
+trades, both losers. The magnet is the thesis; the trend is not.
+
+So: do not cite `trend_aligned`, "counter-trend", "against the higher
+timeframe", or a routing table as a reason or a red flag. If you believe the
+higher timeframe genuinely kills a trade, the evidence must be **section 4**
+(this symbol does not get pulled back to its ST line) or section 1/2 — never
+the alignment flag on its own.
+
+The BCS debit/width ≤ 45% gate is **not** yet applied when you are called — it
+is evaluated at entry, one tick after your verdict.
 
 ## What only you can catch
 
@@ -75,10 +102,13 @@ fair price is the failure mode that has cost this book real money** — a thin
 book once collapsed a spread from 2.18 to 0.18 in a single session while spot
 moved the *right* way.
 
-### 3. Multi-timeframe sanity
-Monthly ST direction, weekly structure, daily not stretched. A single intraday
-level cross can whipsaw the same day; alignment across timeframes outweighs
-pip-level trigger precision.
+### 3. Is the entry chasing an extended move?
+Is price already stretched, or is the trigger a single intraday poke that could
+whipsaw back the same day? That is a timing question about THIS entry.
+
+It is **not** an invitation to re-litigate direction. "The higher timeframe is
+down so a CE is wrong" is the banned `trend_aligned` argument wearing a
+different hat — every CE sits under a falling ST line, that is the setup.
 
 ### 4. Does this symbol actually GET pulled to its ST line?
 `context.st_attraction` is that symbol's own record on its own timeframe. The
@@ -135,8 +165,14 @@ is in this loop rather than another `if` statement.
 
 **Veto** when a concrete, nameable risk makes this a bad entry:
 > results inside the window on a directional debit structure; a material ex-div
-> against the position; an illiquid book you could not exit; a thesis that
-> contradicts the higher timeframe.
+> against the position; an illiquid book you could not exit; a symbol whose own
+> history says it does not get pulled back to its ST line.
+
+*(Until 2026-08-13 this list ended with "a thesis that contradicts the higher
+timeframe." An agent quoted that line back as a veto on a signal that was
+counter-trend by construction, like 381 of the 383 before it. It is removed
+deliberately — see the `trend_aligned` rule above. Do not reinstate it in your
+reasoning.)*
 
 **Allow** when the checks come back clean, or when the risks are known and
 priced. A hedged structure with a capped debit does not need certainty — the
@@ -166,9 +202,38 @@ something important, say so in `--reason` and factor it into `--confidence`.
   mattered. Repeatable.
 - `--confidence` — 0..1, your own read. Honest beats flattering; this is scored.
 
+### Write it in plain English — this goes to a phone
+
+Each `--reason` / `--red-flag` becomes one line of a Telegram alert read on a
+handset, often between other things. Write like you are telling a colleague why
+you passed, not like you are filing a report.
+
+- **One idea per line. Aim for under 15 words.** Split anything longer.
+- **Lead with the point, not the field name.** "Results land 4 days before
+  expiry" — not "event_check=false: results inside window".
+- **No field names, no `key=value`, no `~`, no arrows.** `liquidity_ok=false,
+  gate_fails short_spread>2%` reads as machine output. Say "the short leg is
+  too thin to exit cleanly."
+- **Numbers only when they carry the argument**, and one unit, not three.
+  "2.9% spread on the short leg" — not "2.92% of mid on the short leg".
+- **No jargon the owner did not choose.** Never `trend_aligned`,
+  `median_bars_to_touch`, `st_attraction`, `same_direction`, `gate_fails`.
+  Translate: "this stock usually takes about 5 weeks to get back to the line —
+  longer than this option lives."
+
+Compare:
+
+> ✗ `DTE 12 vs median_bars_to_touch of 5 weekly candles (~25 trading days) —
+> even the thin history says the return typically takes twice the option's life`
+>
+> ✓ `The option expires in 12 days. This stock normally takes about 25 days to
+> get back to the line.`
+
+Same finding, and the second one can be read at a traffic light.
+
 Write for the person reading it in three months trying to work out whether you
 were right. State what you checked, what you found, and what you could not
-determine.
+determine — in that voice.
 
 A veto sends a Telegram; an allow rides on the entry alert. Either way the
 decision is journaled and later joined to the actual outcome.
