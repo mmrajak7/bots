@@ -8,6 +8,7 @@ a property that no single file was responsible for.
 Run:  cd Helper && python -m pytest zebra/tests/test_review_2026_08_13.py -v
 """
 import json
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -766,3 +767,168 @@ def test_the_order_ticket_escapes_symbols_with_ampersands(monkeypatch):
     assert 'M&amp;M' in msg
     assert 'M&M' not in msg.replace('M&amp;M', ''), \
         'a bare & survived into an HTML message'
+
+
+# ── remaining review findings, fixed 2026-08-13 ──────────────────────────
+
+def test_a_refused_review_gives_its_daily_slot_back(store, monkeypatch):
+    """`attempted_at` is stamped BEFORE the spawn so a CRASHING agent cannot
+    re-trigger every cycle. That conflates "crashed" with "never started": with
+    review capped at 3, a 24-position sweep refused 21 and locked each of them
+    out for 24 hours — and tomorrow the same arithmetic repeats, so most
+    positions were never reviewed while the log claimed 24 requests a day."""
+    from zebra import review as review_mod
+    _signal(store)
+    _enter(store, 1)
+    monkeypatch.setattr(review_mod.vet_mod, '_spawn_generic',
+                        lambda *a, **k: None)          # refused
+    assert review_mod.request(store, 1, 'test', context={}) is False
+    assert not (store.find(1).get('review') or {}).get('attempted_at'), \
+        'a refused review still burned the daily slot'
+
+
+def test_a_refused_postmortem_batch_gives_the_day_back(monkeypatch, tmp_path):
+    from zebra import postmortem as pm
+    monkeypatch.setattr(cfg, 'LOG_DIR', tmp_path)
+    pm.mark_run()
+    assert pm._marker_path().exists()
+    pm.clear_run()
+    assert not pm._marker_path().exists(), "the day's slot was not released"
+
+
+def test_accounting_failure_still_bounds_the_batch_channels(store, monkeypatch,
+                                                            tmp_path):
+    """The fallback used to hand every caller a token, which switched the cap
+    OFF: no slot was created, nothing was counted, and on a PERSISTENT failure
+    (a full SD card is persistent) a 24-position sweep would start 24 node
+    processes on the box running live money — through the budget's own error
+    handler. Degrade by priority instead: decisions pass, batches do not."""
+    def boom(*a, **k):
+        raise OSError('read-only file system')
+    # Patch the LOCK, not _load_budget: a corrupt file is caught by an inner
+    # handler on purpose (it must not halt vetting). This is the outer path —
+    # we cannot account at all.
+    monkeypatch.setattr(vet_mod, 'exclusive', boom)
+    assert vet_mod._spawn_budget_ok('entry', channel='entry'), \
+        'a trading decision was blocked by a bookkeeping failure'
+    assert not vet_mod._spawn_budget_ok('sweep', channel='review'), \
+        'a batch channel could fan out unbounded with no accounting'
+
+
+def test_the_unbudgeted_token_never_touches_the_budget_file(store, tmp_path):
+    """'unbudgeted' is truthy, so it sailed past the `if not token` guard, took
+    the lock, matched nothing and rewrote the file — while its comment claimed
+    the slot would self-release. There is no slot."""
+    path = tmp_path / 'zebra_spawn_budget.json'
+    path.write_text(json.dumps([{'t': 0.0, 'pid': None, 'id': 'real'}]))
+    before = path.read_text()
+    vet_mod.claim_slot_pid('unbudgeted', 4242)
+    assert path.read_text() == before
+
+
+def test_the_budget_file_is_written_atomically(store, tmp_path):
+    """A bare write_text truncates first; an unclean power-down on a Pi then
+    leaves a half file, and the next read resets the cap to zero while agents
+    are still alive."""
+    import inspect
+    src = inspect.getsource(vet_mod._write_budget)
+    assert 'os.replace' in src, 'the budget write is not atomic'
+    vet_mod._spawn_budget_ok('a')
+    assert (tmp_path / 'zebra_spawn_budget.json').exists()
+    assert not list(tmp_path.glob('*.tmp')), 'a temp file was left behind'
+
+
+def test_paper_mode_cannot_be_armed_by_a_typo(monkeypatch):
+    """Every numeric threshold is validated; the ONE key that decides whether
+    real orders are placed was taken raw. `"paper_mode": 0` silently means
+    LIVE, and the only visible difference is that the bot starts trading."""
+    for bad in (0, 1, 'false', 'true', '', None, []):
+        monkeypatch.setitem(cfg._runtime, 'paper_mode', bad)
+        assert cfg._strict_bool('paper_mode') is True, (
+            'paper_mode=%r was not rejected' % (bad,))
+    monkeypatch.setitem(cfg._runtime, 'paper_mode', False)
+    assert cfg._strict_bool('paper_mode') is False, 'a real False was ignored'
+
+
+def test_the_reserve_can_never_exceed_the_total_cap():
+    """ZEBRA_AGENT_RESERVE bypasses the config validator; a negative value
+    inverted the reserve (cap 5, reserve -3 -> batch cap 8)."""
+    assert 0 <= cfg.AGENT_RESERVE < cfg.MAX_CONCURRENT_AGENTS
+
+
+def test_a_dropped_entry_is_not_cancelled_until_the_alert_lands(store,
+                                                                monkeypatch):
+    """Cancel-then-send made silence PERMANENT: the reap's status filter
+    excludes cancelled rows, so a Telegram lost to a network blip could never
+    be retried — and 'the halt cannot be silent' is the entire justification
+    for parking entries instead of taking them."""
+    _signal(store)
+    store.mark_triggered(1, 96.0, 4.0, [])
+    vet_mod.request_entry_vet(store, 1, context={}, spawn=False)
+    vet_mod.starve(store, 1, 'gave up')
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: False)
+    assert monitor._reap_starved_vets(store) == []
+    assert store.find(1)['status'] == 'triggered', \
+        'cancelled while the alert never landed — silent forever'
+    # ...and the next cycle, once Telegram is back, completes it.
+    sent = []
+    monkeypatch.setattr(monitor, '_send_telegram',
+                        lambda m, **k: sent.append(m) or True)
+    assert monitor._reap_starved_vets(store) == [1]
+    assert store.find(1)['status'] == 'cancelled' and len(sent) == 1
+
+
+def test_the_queue_is_visible_on_the_one_dashboard(store, monkeypatch, capsys):
+    """A queue nobody can see is a trading pause nobody can see."""
+    from zebra import __main__ as cli
+    import zebra.trade_store as ts_mod
+    _signal(store)
+    store.mark_triggered(1, 96.0, 4.0, [])
+    vet_mod.request_entry_vet(store, 1, context={}, spawn=False)
+    vet_mod.queue_entry_vet(store, 1, 'no agent slot free')
+    monkeypatch.setattr(cfg, 'VET_ENABLED', True)
+    monkeypatch.setattr(ts_mod, 'get_store', lambda: store)
+    cli.cmd_status(type('A', (), {'json': False})())
+    out = capsys.readouterr().out
+    assert 'QUEUED' in out and 'NOT entering' in out
+
+
+def test_a_zero_quantity_never_reports_funds_ok(monkeypatch):
+    """need = debit * 0 = 0, and 'available >= 0' is always true — the ticket
+    would read 'Funds OK — need Rs 0' for an unfundable order."""
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    line = monitor._funds_line(_Kite(avail=0, margin=10_000), _BCS, 0)
+    assert 'Funds OK' not in line and 'lot size unknown' in line
+
+
+def test_a_zero_exchange_margin_is_not_mistaken_for_an_outage(monkeypatch):
+    """`if total:` read a legitimate 0.0 (fully hedged) as 'API unavailable'
+    and silently relabelled the basis."""
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    line = monitor._funds_line(_Kite(avail=50_000, margin=0.0), _BCS, 5000)
+    assert 'exchange margin' in line and 'net debit' not in line
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX liveness probe')
+def test_pid_liveness_is_real_on_posix():
+    """The branch that ACTUALLY runs in production had no test: the suite runs
+    on Windows, where `_pid_alive` returns True unconditionally, so a green run
+    said nothing about live-process semantics on the Pi."""
+    import subprocess
+    p = subprocess.Popen(['true'])
+    p.wait()
+    assert vet_mod._pid_alive(os.getpid()) is True
+    assert vet_mod._pid_alive(p.pid) is False
+
+
+def test_a_future_timestamp_cannot_wedge_a_slot_forever(store, monkeypatch,
+                                                        tmp_path):
+    """A Pi has no RTC and takes its clock from NTP at boot, so it can step
+    BACKWARDS. A negative age made every age test trivially true, so neither
+    backstop could ever free the slot."""
+    import time as _t
+    monkeypatch.setattr(cfg, 'MAX_CONCURRENT_AGENTS', 1)
+    monkeypatch.setattr(cfg, 'AGENT_RESERVE', 0)
+    (tmp_path / 'zebra_spawn_budget.json').write_text(
+        json.dumps([{'t': _t.time() + 99999, 'pid': None, 'id': 'future'}]))
+    assert vet_mod._spawn_budget_ok('x'), 'a future timestamp wedged the budget'

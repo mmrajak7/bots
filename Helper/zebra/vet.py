@@ -300,8 +300,10 @@ def promote_queued(store, trade_id: int, context: dict,
                  decision_id=None)
         t['vet'] = v
         t['version'] = t.get('version', 0) + 1
+    # `v` is the dict we just wrote — no second `find`, which would return None
+    # if a concurrent writer removed the trade and blow up a LOG LINE.
     logger.info("VET RETRY #%d (attempt %d) — deadline %s", trade_id,
-                int((store.find(trade_id).get('vet') or {}).get('attempts', 0)) + 1,
+                int(v.get('attempts') or 0) + 1,
                 deadline.strftime('%H:%M:%S'))
     if spawn and _spawn_cli(trade_id) is None:
         queue_entry_vet(store, trade_id, 'no agent slot free')
@@ -472,6 +474,22 @@ def _load_budget(path) -> list:
     return out
 
 
+def _write_budget(path, entries: list) -> None:
+    """Write the budget file ATOMICALLY (tmp + os.replace).
+
+    A bare `write_text` truncates first, so an unclean power-down or a full SD
+    card — the two expected failures on a Pi — can leave a half-written file.
+    The consequences are asymmetric and both bad: the next read raises and
+    resets the cap to zero while agents are still alive (over-subscription), or
+    `claim_slot_pid` raises and a live agent's slot self-releases at 60s.
+    Every other JSON writer in this package already does it this way
+    (`health.py`, `trade_store.py`); this file was the odd one out.
+    """
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(entries))
+    os.replace(str(tmp), str(path))
+
+
 def _pid_alive(pid: int) -> bool:
     """Is this pid still running?
 
@@ -518,7 +536,12 @@ def claim_slot_pid(token: str, pid: int) -> None:
     Matched by token, never by position: several processes append to this file
     concurrently, so "the last entry" is not reliably ours.
     """
-    if not token:
+    if not token or token == 'unbudgeted':
+        # 'unbudgeted' is the accounting-failed fallback: no slot was reserved,
+        # so there is nothing to bind a pid to. Returning early is not just an
+        # optimisation — without this guard the truthy string sailed past the
+        # `if not token` check, took the lock, matched nothing, and rewrote the
+        # file unchanged, while the comment claimed the slot would self-release.
         return
     path = cfg.LOG_DIR / 'zebra_spawn_budget.json'
     try:
@@ -528,7 +551,7 @@ def claim_slot_pid(token: str, pid: int) -> None:
                 if e.get('id') == token:
                     e['pid'] = pid
                     break
-            path.write_text(json.dumps(entries))
+            _write_budget(path, entries)
     except Exception as e:                       # pragma: no cover - paranoia
         logger.warning('Could not record pid %s for slot %s: %s', pid, token, e)
 
@@ -597,13 +620,31 @@ def _spawn_budget_ok(tag: str, channel: str = 'entry') -> str:
                 return ''
             token = uuid.uuid4().hex
             recent.append({'t': now, 'pid': None, 'id': token})
-            path.write_text(json.dumps(recent))
+            _write_budget(path, recent)
         return token
     except Exception as e:
-        # Fail OPEN on a bookkeeping failure: a broken budget file must not
-        # become a silent vetting halt. No token, so no pid is recorded and the
-        # slot self-releases after _UNCLAIMED_SLOT_SEC.
-        logger.error("Spawn-budget check failed (%s) — allowing %s", e, tag)
+        # BOOKKEEPING FAILURE — a full/read-only SD card, a lock timeout, a
+        # corrupt file. We cannot count, so we cannot enforce a cap.
+        #
+        # This used to return a token unconditionally, which switched the cap
+        # OFF entirely: `claim_slot_pid` found no matching entry, no slot was
+        # ever created, and nothing bounded the fan-out. On a persistent
+        # failure (a full SD card is persistent) a 24-position review sweep
+        # would start 24 node processes on the box that also runs the
+        # live-money monitor — precisely the outcome this budget exists to
+        # prevent, reached through its own error handler.
+        #
+        # So degrade by PRIORITY instead of by trust: decision channels still
+        # go through (an entry or exit vet is one process and gates a trade),
+        # deferrable channels — the numerous ones — do not. That bounds the
+        # fan-out without ever blocking a trading decision.
+        if channel in cfg.DEFERRABLE_CHANNELS:
+            logger.error("Spawn-budget check failed (%s) — REFUSING %s: with "
+                         "no accounting a batch channel could fan out "
+                         "unbounded", e, tag)
+            return ''
+        logger.error("Spawn-budget check failed (%s) — allowing %s unbudgeted "
+                     "(decision channel)", e, tag)
         return 'unbudgeted'
 
 
@@ -641,9 +682,21 @@ def _spawn_generic(prompt: str, model: str, tag: str,
         # have followed). Browning out the box that runs the live-money
         # monitor is the one outcome no verdict is worth.
         return None
-    argv = [cli, '-p', prompt, '--model', model,
-            '--allowedTools'] + _allowed_tools(channel) + \
-           ['--disallowedTools'] + list(cfg.VET_DENIED_TOOLS)
+    # Everything from here is inside the never-raises contract. argv assembly
+    # used to sit OUTSIDE the try below, between the slot reservation and the
+    # handler: `_allowed_tools` formats every pattern and `shutil.which` walks
+    # PATH, so a raise there escaped a function whose own docstring promises it
+    # never propagates — taking the cycle with it and leaking the slot. It is
+    # only theoretical while the tool patterns are hardcoded, which is exactly
+    # the kind of "safe today" that stops being true without anyone noticing.
+    try:
+        argv = [cli, '-p', prompt, '--model', model,
+                '--allowedTools'] + _allowed_tools(channel) + \
+               ['--disallowedTools'] + list(cfg.VET_DENIED_TOOLS)
+    except Exception as e:
+        logger.error("Could not build the CLI command for %s: %s", tag, e)
+        _note_spawn(False, channel)
+        return None
     # Hard wall-clock bound on the CHILD, not just on our bookkeeping. In cron
     # mode — the production path — our process exits within seconds and init
     # adopts the child, so _reap_children can never reach it: without this a

@@ -170,9 +170,36 @@ def request(store, trade_id: int, why: str, context: dict,
         prompt = cfg.REVIEW_PROMPT_TEMPLATE.format(
             trade_id=trade_id, python=sys.executable,
             vetting_doc=cfg.VETTING_DOC)
-        vet_mod._spawn_generic(prompt, cfg.VET_MODEL, 'review #%d' % trade_id,
-                               channel='review')
+        if vet_mod._spawn_generic(prompt, cfg.VET_MODEL,
+                                  'review #%d' % trade_id,
+                                  channel='review') is None:
+            # GIVE THE DAY'S SLOT BACK. `attempted_at` is stamped above, before
+            # the spawn, so a crashing agent cannot re-trigger every cycle —
+            # right for a crash, wrong for a spawn that never happened. With
+            # `review` capped at MAX_CONCURRENT_AGENTS - AGENT_RESERVE, a
+            # 24-position sweep starts 3 and refuses 21, and each refusal was
+            # locking that position out for 24 hours. Tomorrow the same
+            # arithmetic repeats, so most positions were never reviewed at all
+            # while the log claimed 24 requests a day.
+            _release_attempt(store, trade_id)
+            logger.info('REVIEW #%d not started (no agent slot) — daily slot '
+                        'released, retried next cycle', trade_id)
+            return False
     return True
+
+
+def _release_attempt(store, trade_id: int) -> None:
+    """Undo the `attempted_at` stamp when the spawn never happened."""
+    try:
+        with store._mutate():
+            t = store.find(trade_id)
+            m = (t or {}).get('review') if t else None
+            if isinstance(m, dict) and m.get('attempted_at'):
+                m['attempted_at'] = None
+                t['version'] = t.get('version', 0) + 1
+    except Exception as e:                       # pragma: no cover - paranoia
+        logger.warning('Could not release the review slot for #%d: %s',
+                       trade_id, e)
 
 
 def record(store, trade_id: int, action: str, reasons=None,

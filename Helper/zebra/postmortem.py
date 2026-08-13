@@ -323,14 +323,39 @@ def spawn_batch(store, spawn: bool = True) -> bool:
         # one `zebra run --dry-run` silently cancels that day's real batch.
         return False
     mark_run()
-    return _spawn_generic(prompt, cfg.POSTMORTEM_MODEL, 'postmortem',
-                          channel='postmortem') is not None
+    started = _spawn_generic(prompt, cfg.POSTMORTEM_MODEL, 'postmortem',
+                             channel='postmortem') is not None
+    if not started:
+        # Same reasoning as the dry-run guard above: the day's slot must be
+        # spent on a batch that actually RAN. A refused spawn (the budget is
+        # saturated — postmortem is a deferrable channel and goes last) would
+        # otherwise cost the whole day's post-mortems, and the next day's
+        # sweep hits the same contention at the same point in the cycle.
+        clear_run()
+        logger.info('POSTMORTEM batch not started (no agent slot) — the '
+                    "day's slot was released, retried next cycle")
+    return started
 
 
 def _interpreter() -> str:
     import sys
     from .vet import resolve_cli          # noqa: F401  (same resolution rules)
     return sys.executable
+
+
+def clear_run() -> None:
+    """Undo `mark_run` when the batch never started.
+
+    Symmetric with the dry-run guard: the day's slot belongs to a batch that
+    actually ran. Failing to clear costs one day of post-mortems, so it is
+    logged and swallowed rather than raised into the cycle.
+    """
+    try:
+        p = _marker_path()
+        if p.exists():
+            p.unlink()
+    except OSError as e:                         # pragma: no cover - paranoia
+        logger.warning("post-mortem run marker not cleared: %s", e)
 
 
 def mark_run(now: Optional[datetime] = None) -> None:

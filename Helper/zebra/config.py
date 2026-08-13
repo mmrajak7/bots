@@ -107,8 +107,9 @@ VET_DENIED_TOOLS = ['Bash(*zebra close*)', 'Bash(*zebra enter*)',
 # The fail-open deadline is generous because the CLI does live web research
 # (results dates, ex-div, overhangs) and the structure is hedged and non-HFT,
 # so a few minutes of entry drift costs far less than trading an unvetted
-# signal. Past it the signal enters UNVETTED rather than stalling — a vetting
-# outage must never become a silent trading halt.
+# signal. Past it an ENTRY is QUEUED for a fresh agent, not entered unvetted
+# (inverted 2026-08-13); the wait is bounded and a give-up telegraphs, so the
+# outage still cannot become a SILENT trading halt.
 # {python} is filled with sys.executable at spawn time: the Pi runs the bot
 # under a venv and has no guaranteed bare `python` on PATH, and the CLI verbs
 # must import the exact zebra package the bot runs.
@@ -377,16 +378,18 @@ _DEFAULTS = {
                                  # CLI calls plus live event research). A
                                  # deadline under the work just converts every
                                  # vet into a timeout.
-    'child_kill_sec': 720,       # Hard wall-clock bound on a spawned CLI. Past
+    'child_kill_sec': 555,       # Hard wall-clock bound on a spawned CLI. Past
                                  # this the process is killed: the deadline
                                  # fails the MARKER open, but a hung child
                                  # would otherwise live until reboot and this
                                  # Pi also runs live-money bots.
-                                 # 900 -> 720 on 2026-08-13: a verdict arriving
-                                 # after vet_timeout_sec is DISCARDED anyway, so
-                                 # seconds 600-900 bought nothing and burned RAM
-                                 # on a process whose answer was already void.
-                                 # 600 + 120s grace.
+                                 # 900 -> 555 on 2026-08-13. It must be UNDER
+                                 # vet_timeout_sec (600), not over: an agent
+                                 # outliving its own marker can land a verdict
+                                 # on the NEXT attempt's PENDING window, and
+                                 # record_verdict cannot tell the two apart.
+                                 # 600 - 45s covers `timeout`'s -k grace. The
+                                 # clamp below enforces this regardless.
     'max_concurrent_agents': 5,  # LIVE agents box-wide, not starts-per-window.
                                  # Raised 3 -> 5 on 2026-08-13 at the owner's
                                  # call. Each is a node process of a few hundred
@@ -513,7 +516,27 @@ def _positive_int(key: str, val, default: int) -> int:
     return int(checked)
 
 # ── Exports ───────────────────────────────────────────────────────────────
-PAPER_MODE = _runtime['paper_mode']
+def _strict_bool(key: str) -> bool:
+    """A LIVE/PAPER switch may only be a real boolean.
+
+    `PAPER_MODE = _runtime['paper_mode']` took the value raw, so every numeric
+    threshold in this file was validated while the one key that decides whether
+    real orders are placed was not. `"paper_mode": 0` — or `"false"`, or `""`,
+    or a stray `null` from a half-written config — silently means LIVE, and the
+    only visible difference is that the bot starts placing orders. JSON has a
+    real boolean type; anything else here is a typo, and a typo must not be
+    able to arm the money path. Unparseable falls back to the SAFE default.
+    """
+    val = _runtime.get(key, _DEFAULTS[key])
+    if isinstance(val, bool):
+        return val
+    logger.warning("zebra_config.json: %s=%r is not true/false — using the "
+                   "safe default %r. A LIVE/PAPER switch is never inferred.",
+                   key, val, _DEFAULTS[key])
+    return bool(_DEFAULTS[key])
+
+
+PAPER_MODE = _strict_bool('paper_mode')
 _raw_struct = str(_runtime['entry_structure']).strip().lower()
 if _raw_struct not in ('bcs', 'zebra'):
     logger.warning("entry_structure=%r is not 'bcs' or 'zebra' — falling back "
@@ -680,6 +703,19 @@ ENTRY_QUEUE_DROP_AFTER_SEC = _int('entry_queue_drop_after_sec')
 ENTRY_VET_MAX_ATTEMPTS = _int('entry_vet_max_attempts')
 AGENT_RESERVE = int(os.environ.get('ZEBRA_AGENT_RESERVE')
                     or _int('agent_reserve'))
+# The env var bypasses `_positive_int`, so it can carry values the config file
+# cannot. Two of them are actively harmful and both fail SILENTLY:
+#   ZEBRA_AGENT_RESERVE=-3 -> deferrable cap max(1, 5-(-3)) = 8, i.e. BIGGER
+#                             than the total cap: the reserve inverted, and
+#                             batch channels get more room than decisions.
+#   a non-numeric value    -> ValueError at import, killing the whole bot.
+# Clamped into the only range that means anything: at least one reserved slot,
+# and never so many that batch channels can never run.
+if not 0 <= AGENT_RESERVE < MAX_CONCURRENT_AGENTS:
+    _safe = min(max(AGENT_RESERVE, 0), max(MAX_CONCURRENT_AGENTS - 1, 0))
+    logger.warning('agent_reserve %d is outside [0, %d) — clamped to %d',
+                   AGENT_RESERVE, MAX_CONCURRENT_AGENTS, _safe)
+    AGENT_RESERVE = _safe
 VET_MODEL = os.environ.get('ZEBRA_VET_MODEL') or _runtime['vet_model']
 EVENT_FILE = LOG_DIR / 'event_calendar.json'
 EVENT_LOCK = LOG_DIR / 'event_calendar.lock'

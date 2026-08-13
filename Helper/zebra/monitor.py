@@ -301,8 +301,14 @@ def _required_capital(kite, bcs: dict, quantity: int) -> tuple:
         om = kite.basket_order_margins(basket)
         final = (om or {}).get('final') or {}
         total = final.get('total')
-        if total:
+        # `is not None`, not truthiness: a legitimate 0.0 (fully hedged, no
+        # margin blocked) would otherwise be read as "API unavailable" and
+        # silently relabelled `net debit`, so the ticket would quote a
+        # different basis than it claims.
+        if total is not None:
             return float(total), 'exchange'
+        logger.warning('basket_order_margins returned no final.total (%r) — '
+                       'falling back to the net debit', om)
     except Exception as e:
         logger.warning('basket_order_margins failed (%s) — falling back to the '
                        'net debit', e)
@@ -327,8 +333,18 @@ def _funds_line(kite, bcs: dict, quantity: int) -> str:
     """
     if cfg.PAPER_MODE:
         return ""
-    if not kite or not bcs:
+    # Distinct causes, distinct messages — "no broker session" was printed for
+    # a missing spread too, which points the reader at Kite when the problem is
+    # the structure. A zero quantity would make every figure below meaningless
+    # (need = debit * 0 = 0, reported as "Funds OK — need Rs 0"), so it is
+    # refused rather than answered.
+    if not kite:
         return "\n\n⚠ <i>Funds not checked — no broker session.</i>"
+    if not bcs:
+        return "\n\n⚠ <i>Funds not checked — no spread to price.</i>"
+    if not quantity or quantity <= 0:
+        return ("\n\n⚠ <i>Funds not checked — lot size unknown, so the "
+                "requirement cannot be computed.</i>")
     try:
         need, basis = _required_capital(kite, bcs, quantity)
         avail = float(kite.margins('equity')['available']['live_balance'])
@@ -2387,18 +2403,31 @@ def _reap_starved_vets(store: ZebraStore, dry_run: bool = False) -> list:
         if vet_mod.vet_state(t) != vet_mod.STARVED:
             continue
         why = (t.get('vet') or {}).get('failed_open_because') or 'no verdict'
+        msg = (
+            f"🛑 <b>ENTRY DROPPED</b>  <code>{html.escape(str(t.get('stock')))}</code> "
+            f"({html.escape(str(t.get('direction')))})\n"
+            f"Claude never returned a verdict — {html.escape(str(why))}.\n"
+            f"<i>Not entered. No rush: the setup re-qualifies if it still "
+            f"holds tomorrow.</i>")
+        # ANNOUNCE FIRST, then cancel. The whole justification for parking
+        # entries instead of taking them is "the halt cannot be silent" — and
+        # cancelling first made silence permanent: the status filter above
+        # excludes cancelled rows, so a Telegram lost to a network blip or an
+        # HTML 400 could never be retried. Sending first means a failed send
+        # leaves the row STARVED-but-uncancelled, and the next cycle tries
+        # again. A duplicate message is a far cheaper failure than a silent
+        # trading halt.
+        if not _send_telegram(msg, dry_run=dry_run):
+            logger.error('ENTRY DROPPED #%d %s — alert FAILED to send, left '
+                         'uncancelled for retry next cycle',
+                         t['id'], t.get('stock'))
+            continue
         try:
             store.cancel(t['id'], f'vet starved: {why}')
         except Exception as e:
             logger.error('Could not cancel starved #%d: %s', t['id'], e)
             continue
         reaped.append(t['id'])
-        _send_telegram(
-            f"🛑 <b>ENTRY DROPPED</b>  <code>{html.escape(str(t.get('stock')))}</code> "
-            f"({html.escape(str(t.get('direction')))})\n"
-            f"Claude never returned a verdict — {html.escape(str(why))}.\n"
-            f"<i>Not entered. No rush: the setup re-qualifies if it still "
-            f"holds tomorrow.</i>", dry_run=dry_run)
         logger.warning('ENTRY DROPPED #%d %s — %s', t['id'], t.get('stock'), why)
     return reaped
 

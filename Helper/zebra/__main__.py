@@ -194,9 +194,16 @@ def _stop_reason(trade: dict, state, expired: bool, exit_kind=None) -> tuple:
     if exit_kind is not None and trade.get('status') != 'entered':
         return True, ('position is %s, not open — a verdict cannot apply'
                       % trade.get('status'))
+    if exit_kind is None and state == vet_mod.QUEUED:
+        # A queued signal has NO agent attached — this one was requeued while
+        # still running. Its verdict would be discarded (`record_verdict`
+        # accepts only PENDING), so telling it to proceed burns a full research
+        # run for nothing and holds an agent slot the retry needs.
+        return True, ('this signal was requeued for a fresh agent — your '
+                      'verdict would be discarded, so stop here')
     if expired:
-        return True, ('the deadline passed; this signal fails open and enters '
-                      'unvetted, and a verdict now is void')
+        return True, ('the deadline passed; this signal is requeued for a '
+                      'fresh agent and a verdict now is void')
     return False, ''
 
 
@@ -891,6 +898,30 @@ def _print_vet_status(trades: list) -> None:
     if pend:
         print(f"  pending   {len(pend)} signal(s) awaiting a verdict: "
               f"{[t['id'] for t in pend]}")
+    # The QUEUE, on the one dashboard. Entries can legally wait an hour here
+    # and are NOT entering while they do, so a queue nobody can see is a
+    # trading pause nobody can see — the whole reason fail-closed needed to be
+    # observable. Shows how close each one is to being dropped.
+    queued = [t for t in trades if vet_mod.is_queued(t)]
+    if queued:
+        def _left(t):
+            drop = vet_mod._parse((t.get('vet') or {}).get('drop_after'))
+            if drop is None:
+                return '?'
+            mins = int((drop - vet_mod._now()).total_seconds() // 60)
+            return f'{mins}m' if mins > 0 else 'due'
+        print(f"  QUEUED    {len(queued)} entry(s) waiting for an agent slot — "
+              "NOT entering: "
+              + ', '.join('#%s %s (%s left, %d attempt(s))'
+                          % (t['id'], t.get('stock'),
+                             _left(t), (t.get('vet') or {}).get('attempts') or 0)
+                          for t in queued))
+    starved = [t for t in trades
+               if vet_mod.vet_state(t) == vet_mod.STARVED
+               and t.get('status') in ('watching', 'triggered')]
+    if starved:
+        print(f"  STARVED   {len(starved)} entry(s) dropped, awaiting reap: "
+              f"{[t['id'] for t in starved]}")
     held = [(t['id'], k, vet_mod.exit_defers(t, k))
             for t in trades if isinstance(t.get('exit_vet'), dict)
             for k in t['exit_vet']
