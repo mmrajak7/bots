@@ -591,6 +591,19 @@ CHILD_KILL_SEC = int(os.environ.get('ZEBRA_CHILD_KILL_SEC')
 # caller's deadline lapses and the signal fails open as in any other outage.
 MAX_CONCURRENT_AGENTS = int(os.environ.get('ZEBRA_MAX_CONCURRENT_AGENTS')
                             or _runtime.get('max_concurrent_agents') or 3)
+
+# Channels whose work can wait for the next window without a decision going
+# unmade. `review` sweeps every open position and `events` runs on a timer, so
+# they are the NUMEROUS ones — under a single shared cap they win by weight and
+# starve the two channels that gate a trade. `entry`/`exit` are deliberately
+# absent: a signal that enters unvetted cannot be re-vetted afterwards.
+DEFERRABLE_CHANNELS = ('review', 'events', 'postmortem')
+
+# Slots the deferrable channels may never take, so a decision channel always
+# has room. Must stay < MAX_CONCURRENT_AGENTS or the batch channels can never
+# run at all (the cap floors at 1 regardless).
+AGENT_RESERVE = int(os.environ.get('ZEBRA_AGENT_RESERVE')
+                    or _runtime.get('agent_reserve') or 1)
 VET_MODEL = os.environ.get('ZEBRA_VET_MODEL') or _runtime['vet_model']
 EVENT_FILE = LOG_DIR / 'event_calendar.json'
 EVENT_LOCK = LOG_DIR / 'event_calendar.lock'

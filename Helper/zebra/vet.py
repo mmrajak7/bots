@@ -160,8 +160,14 @@ def request_entry_vet(store, trade_id: int, context: dict,
     if fresh_request:
         logger.info("VET REQUESTED #%d %s — deadline %s",
                     trade_id, context.get('stock'), deadline.strftime('%H:%M:%S'))
-        if spawn:
-            _spawn_cli(trade_id)
+        if spawn and _spawn_cli(trade_id) is None:
+            # The spawn was refused (budget) or impossible (no CLI). Waiting out
+            # the full deadline would be a lie: nothing is coming. Stamp the
+            # cause NOW so the ENTER alert can say "never asked" rather than
+            # "did not answer in time" — they need different fixes, and the
+            # scoring record must not count a refusal as an outage.
+            mark_unavailable(store, trade_id, 'no agent slot free (spawn budget)'
+                             if resolve_cli() else 'vetting CLI not found')
     else:
         logger.info("VET already pending for #%d — not re-requesting", trade_id)
     return store.find(trade_id)
@@ -278,7 +284,7 @@ def resolve_cli(refresh: bool = False) -> Optional[str]:
     return None
 
 
-def _spawn_budget_ok(tag: str) -> bool:
+def _spawn_budget_ok(tag: str, channel: str = 'entry') -> bool:
     """Is there room on this box to start another agent right now?
 
     There was no bound of any kind. The caps that exist are PER POSITION and
@@ -311,12 +317,28 @@ def _spawn_budget_ok(tag: str) -> bool:
             # Anything older than the child's own kill deadline is gone.
             recent = [t for t in recent
                       if isinstance(t, (int, float)) and now - t < window]
-            if len(recent) >= cfg.MAX_CONCURRENT_AGENTS:
+            # One pool, but NOT one cap. The five channels are not equally
+            # urgent and they are not equally numerous: `review` fans out over
+            # every entered position and `events` runs on a timer, while
+            # `entry`/`exit` fire a handful of times a day and each one gates a
+            # trading decision that cannot wait for the next window.
+            #
+            # With a single shared cap the batch channels always win, because
+            # they are simply more numerous — 3 review agents in one cycle
+            # exhaust the budget and the entry vet behind them fails open. That
+            # is the layer being switched off by its own throttle, silently, on
+            # exactly the decisions it exists to make. Observed live on day one:
+            # #390 refused, ASHOKLEY entered UNVETTED.
+            cap = cfg.MAX_CONCURRENT_AGENTS
+            if channel in cfg.DEFERRABLE_CHANNELS:
+                cap = max(1, cap - cfg.AGENT_RESERVE)
+            if len(recent) >= cap:
                 logger.warning(
                     "SPAWN BUDGET: %d agent(s) started in the last %ds, cap is "
-                    "%d — refusing to spawn %s. It will fail open on its "
-                    "deadline.", len(recent), int(window),
-                    cfg.MAX_CONCURRENT_AGENTS, tag)
+                    "%d for channel %r (total %d, reserve %d) — refusing to "
+                    "spawn %s. It will fail open on its deadline.",
+                    len(recent), int(window), cap, channel,
+                    cfg.MAX_CONCURRENT_AGENTS, cfg.AGENT_RESERVE, tag)
                 return False
             recent.append(now)
             path.write_text(json.dumps(recent))
@@ -344,7 +366,7 @@ def _spawn_generic(prompt: str, model: str, tag: str,
                      cfg.VET_CLI, tag)
         _note_spawn(False, channel)
         return None
-    if not _spawn_budget_ok(tag):
+    if not _spawn_budget_ok(tag, channel):
         # Refusing to spawn is NOT refusing to trade: the caller's deadline
         # lapses and the signal fails open exactly as it does during any other
         # outage. Losing one verdict is survivable; browning out the box that

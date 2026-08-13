@@ -309,6 +309,19 @@ def _vet_line(trade: dict) -> str:
         return ""
     v = trade.get('vet') or {}
     if state == vet_mod.UNAVAILABLE:
+        # WHY it failed open, not just THAT it did. "did not answer in time"
+        # was printed for every cause, including the one where no agent was
+        # ever started — the owner reasonably read it as "Claude looked and was
+        # slow" when the truth was "Claude was never asked". They call for
+        # different fixes (raise the budget vs investigate the CLI), so an
+        # alert that cannot tell them apart sends the wrong one.
+        why = str((trade.get('vet') or {}).get('failed_open_because') or '')
+        if 'budget' in why.lower():
+            return ("\n\n⚠ <i>Entered UNVETTED — no agent slot free, so Claude "
+                    "was never asked.</i>")
+        if why:
+            return ("\n\n⚠ <i>Entered UNVETTED — vetting could not run "
+                    f"({html.escape(why)}).</i>")
         return "\n\n⚠ <i>Entered UNVETTED — Claude did not answer in time.</i>"
     if state == vet_mod.ALLOWED:
         rid = v.get('decision_id')

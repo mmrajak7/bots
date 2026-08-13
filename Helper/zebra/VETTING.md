@@ -38,8 +38,27 @@ context:
   signal worth a hard look, not a rubber stamp: a `long_OI<5000` here is the
   thin book that item 2 below calls the failure mode that has cost real money.
 
-Always true by construction: DTE within 15–45, gap to the ST line inside the
-trigger band, and `trend_aligned` recorded.
+True by construction: the gap to the ST line is inside the trigger band, and
+`trend_aligned` is recorded.
+
+**Do not assume a DTE range.** This doc used to promise "15–45 by
+construction"; the live config said 10–55, so a 12-DTE signal reached an agent
+that had been told 12 was impossible, and it (reasonably) treated the mismatch
+as a red flag. Read `dte` from the context and judge it on its merits. What the
+book actually says about short-dated entries:
+
+| DTE at entry | Closed | Win rate | Median RoC |
+|--------------|--------|----------|------------|
+| **≤ 12** | 23 | **43.5%** | **−13.8%** |
+| 13–17 | 26 | 57.7% | +19.5% |
+| 18–25 | 40 | 50.0% | −3.0% |
+| 26–40 | 105 | 54.3% | +13.1% |
+| 41+ | 13 | 69.2% | +23.6% |
+
+≤12 DTE is the only losing band, and its most common exit is `time` — the
+option expired before the magnet worked. `min_dte` was raised to 15 on
+2026-08-13 so the picker rolls to the next expiry instead. A short-dated signal
+reaching you now means something is off; say so.
 
 **You are judging a BULL CALL SPREAD / BEAR PUT SPREAD (BCS).** Zebra — the
 2×ITM/1×ATM back-ratio — was retired on 2026-08-12 and nothing you vet will

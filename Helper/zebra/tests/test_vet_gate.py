@@ -71,7 +71,11 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setattr(monitor.strikes_mod, 'analyze_bcs',
                         lambda *a, **k: dict(BCS))
     spawned = []
-    monkeypatch.setattr(vet, '_spawn_cli', lambda tid: spawned.append(tid))
+    # Must return a truthy pid: a None return now MEANS "the spawn was refused"
+    # (budget full or CLI missing) and stamps the signal failed-open. `append`
+    # returns None, so the old stub silently claimed every spawn was refused.
+    monkeypatch.setattr(vet, '_spawn_cli',
+                        lambda tid: (spawned.append(tid), 4242)[1])
 
     store = ZebraStore(config={})
     store._load_local()

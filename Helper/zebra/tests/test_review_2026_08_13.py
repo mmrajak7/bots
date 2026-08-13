@@ -353,3 +353,44 @@ def test_the_zebra_ticket_survives_for_the_zebra_pipeline(monkeypatch):
              'st_direction': 'DOWN', 'timeframe': 'weekly'}
     msg = monitor._format_enter_alert(trade, _analysis(), _bcs())
     assert 'ZEBLONG' in msg and 'BCS shadow' in msg
+
+
+# ── Agent budget: batch channels must not starve the decision ones ────────
+# Day one: three agents (review/events sweep every open position) exhausted a
+# shared cap of 3, the entry vet behind them was refused, and ASHOKLEY entered
+# UNVETTED. The throttle switched off the layer on exactly the decisions it
+# exists to make.
+
+def test_a_batch_channel_cannot_consume_the_last_agent_slot(monkeypatch):
+    monkeypatch.setattr(cfg, 'MAX_CONCURRENT_AGENTS', 3)
+    monkeypatch.setattr(cfg, 'AGENT_RESERVE', 1)
+    # Two batch agents already running: review may not take the third.
+    assert vet_mod._spawn_budget_ok('a', channel='review') is True
+    assert vet_mod._spawn_budget_ok('b', channel='review') is True
+    assert vet_mod._spawn_budget_ok('c', channel='review') is False, \
+        'a batch channel took the slot reserved for a trading decision'
+    # ...but the entry vet still gets through.
+    assert vet_mod._spawn_budget_ok('entry', channel='entry') is True
+
+
+def test_the_decision_channels_still_share_the_total_cap(monkeypatch):
+    """The reserve gives priority, not immunity — the box must stay bounded."""
+    monkeypatch.setattr(cfg, 'MAX_CONCURRENT_AGENTS', 3)
+    monkeypatch.setattr(cfg, 'AGENT_RESERVE', 1)
+    assert [vet_mod._spawn_budget_ok(str(i), channel='entry') for i in range(4)] \
+        == [True, True, True, False]
+
+
+def test_a_refused_spawn_says_never_asked_not_did_not_answer(monkeypatch):
+    """Two different failures needing two different fixes. The alert said
+    'did not answer in time' for both, which points the reader at the CLI when
+    the real cause is a full budget."""
+    trade = {'id': 1, 'stock': 'TESTCO',
+             'vet': {'state': vet_mod.UNAVAILABLE,
+                     'failed_open_because': 'no agent slot free (spawn budget)'}}
+    line = monitor._vet_line(trade)
+    assert 'never asked' in line
+    assert 'did not answer' not in line
+
+    trade['vet']['failed_open_because'] = None
+    assert 'did not answer in time' in monitor._vet_line(trade)
