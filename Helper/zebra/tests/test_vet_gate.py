@@ -122,15 +122,17 @@ def test_vetoed_signal_never_enters(wired):
         assert t['status'] == 'triggered', "a VETOED signal entered"
 
 
-def test_timeout_fails_open_into_a_real_entry(wired):
-    """`unavailable` must not just be a label — the signal must actually
-    trade, exactly as it did before the layer existed."""
+def test_a_timeout_queues_and_the_signal_does_NOT_enter(wired):
+    """Inverted 2026-08-13: an entry with no verdict WAITS. It must not be a
+    label only — the position must genuinely not open, or the queue is
+    decorative and the capital it exists to protect is already committed."""
     store, _ = wired
     cycle(store)
     assert vet.expire_stale(store, now=datetime.now() + timedelta(hours=2)) == [1]
     t = cycle(store)
-    assert t['status'] == 'entered'
-    assert t['vet']['state'] == vet.UNAVAILABLE          # excluded from scoring
+    assert t['status'] != 'entered', 'a queued signal entered anyway'
+    # ...and the retry re-requested it against a freshly quoted book.
+    assert t['vet']['state'] in (vet.QUEUED, vet.PENDING)
 
 
 def test_layer_off_is_the_old_single_tick_behaviour(wired, monkeypatch):

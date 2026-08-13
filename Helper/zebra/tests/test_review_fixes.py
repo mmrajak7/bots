@@ -77,7 +77,10 @@ def test_a_discarded_allow_is_never_scored_as_the_layers_own(store, decisions):
         t = store._must_find(1)
         t['vet']['deadline'] = (datetime.now() - timedelta(minutes=1)).isoformat()
     vet_mod.expire_stale(store)
-    assert vet_mod.vet_state(store.find(1)) == vet_mod.UNAVAILABLE
+    # Since 2026-08-13 a timed-out ENTRY queues rather than entering unvetted.
+    # The journal-attribution bug this test guards is unchanged: the row is
+    # still written before the store can refuse the verdict.
+    assert vet_mod.vet_state(store.find(1)) == vet_mod.QUEUED
 
     d = decisions.record(kind='entry', verdict='allow', trade_ids=[1],
                          stock='TESTCO', direction='CE')
@@ -456,9 +459,16 @@ def test_the_calendar_agent_alone_may_write_files(monkeypatch):
     assert not any(t.startswith('Write') for t in vet_mod._allowed_tools('entry'))
     assert not any(t.startswith('Write') for t in vet_mod._allowed_tools('exit'))
     writes = [t for t in vet_mod._allowed_tools('events') if t.startswith('Write')]
-    assert len(writes) == 1, writes
-    assert writes[0] != 'Write', 'the calendar grant must be path-scoped'
-    assert writes[0].startswith('Write(') and writes[0].endswith(')')
+    # Two grants as of 2026-08-13 — the SAME file in both path forms, because a
+    # bare absolute pattern matched nothing and silently denied the agent. The
+    # property to hold is scope, not count: assert every grant names the one
+    # candidate file and none is a wildcard.
+    assert writes, 'the calendar agent lost its Write grant'
+    assert 'Write' not in writes, 'the calendar grant must be path-scoped'
+    for w in writes:
+        assert w.startswith('Write(') and w.endswith(')')
+        assert 'event_calendar.candidate.json' in w, w
+        assert '*' not in w, ('the grant widened to a wildcard: %s' % w)
     assert 'event_calendar.candidate.json' in writes[0]
 
 

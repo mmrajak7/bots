@@ -532,3 +532,131 @@ def test_pid_liveness_never_probes_off_posix(monkeypatch):
                         lambda *a: killed.append(a))
     assert vet_mod._pid_alive(4242) is True
     assert killed == [], 'os.kill was reached on a non-posix host'
+
+
+# ── the entry queue: fail CLOSED, but never silently (2026-08-13) ─────────
+# "there is no rush to enter. opportunity always exists in market - only
+# qualified entry long time saves capital" — the owner. A missed entry costs
+# nothing; an unqualified one costs capital.
+
+def _queued(s, tid=1):
+    return (s.find(tid).get('vet') or {})
+
+
+def test_a_refused_spawn_queues_instead_of_entering_unvetted(store, monkeypatch):
+    monkeypatch.setattr(cfg, 'VET_ENABLED', True)
+    _signal(store)
+    store.mark_triggered(1, 96.0, 4.0, [])
+    monkeypatch.setattr(vet_mod, '_spawn_cli', lambda tid: None)   # refused
+    vet_mod.request_entry_vet(store, 1, context={})
+    assert vet_mod.vet_state(store.find(1)) == vet_mod.QUEUED
+    assert store.find(1)['status'] == 'triggered', 'a refused vet entered'
+
+
+def test_the_drop_deadline_is_anchored_and_cannot_be_walked_forward(store):
+    """Repeated requeues must not extend the wait forever — the classic way an
+    'awaiting approval' state becomes a permanent halt."""
+    _signal(store)
+    store.mark_triggered(1, 96.0, 4.0, [])
+    vet_mod.request_entry_vet(store, 1, context={}, spawn=False)
+    vet_mod.queue_entry_vet(store, 1, 'first')
+    first = _queued(store)['drop_after']
+    for _ in range(3):
+        vet_mod.queue_entry_vet(store, 1, 'again')
+    assert _queued(store)['drop_after'] == first, 'the drop deadline moved'
+
+
+def test_the_queue_gives_up_after_max_attempts_and_never_enters(store,
+                                                                monkeypatch):
+    monkeypatch.setattr(cfg, 'ENTRY_VET_MAX_ATTEMPTS', 2)
+    _signal(store)
+    store.mark_triggered(1, 96.0, 4.0, [])
+    vet_mod.request_entry_vet(store, 1, context={}, spawn=False)
+    late = datetime.now() + timedelta(hours=2)
+    vet_mod.expire_stale(store, now=late)                 # attempt 1 -> queued
+    assert vet_mod.vet_state(store.find(1)) == vet_mod.QUEUED
+    vet_mod.promote_queued(store, 1, context={}, spawn=False)
+    vet_mod.expire_stale(store, now=late)                 # attempt 2 -> starved
+    assert vet_mod.vet_state(store.find(1)) == vet_mod.STARVED
+    assert store.find(1)['status'] != 'entered'
+
+
+def test_a_dropped_entry_is_cancelled_AND_telegrammed(store, monkeypatch):
+    """The guardrail that makes fail-closed safe. A broken CLI must not be able
+    to stop trading quietly behind a switch that still reads ON."""
+    _signal(store)
+    store.mark_triggered(1, 96.0, 4.0, [])
+    vet_mod.request_entry_vet(store, 1, context={}, spawn=False)
+    vet_mod.starve(store, 1, 'no verdict after 2 attempts')
+    sent = []
+    monkeypatch.setattr(monitor, '_send_telegram',
+                        lambda m, **k: sent.append(m) or True)
+    assert monitor._reap_starved_vets(store) == [1]
+    assert store.find(1)['status'] == 'cancelled'
+    assert len(sent) == 1 and 'ENTRY DROPPED' in sent[0]
+
+
+def test_a_starved_signal_can_never_reach_the_entry_path(store, monkeypatch):
+    """Entering was the DEFAULT for any vet state without an explicit branch,
+    so adding a state silently meant 'enter unvetted'."""
+    monkeypatch.setattr(cfg, 'VET_ENABLED', True)
+    _signal(store)
+    store.mark_triggered(1, 96.0, 4.0, [])
+    vet_mod.request_entry_vet(store, 1, context={}, spawn=False)
+    vet_mod.starve(store, 1, 'gave up')
+    monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {'TESTCO': 96.5})
+    monitor.check_watching(store, kite=None, dry_run=True)
+    assert store.find(1)['status'] != 'entered'
+
+
+def test_promote_is_a_cas_so_overlapping_drainers_spawn_once(store, monkeypatch):
+    """cron overlap, `zebra loop` and a hand-run `zebra run` all drain the same
+    queue; two agents on one signal would race two verdicts."""
+    _signal(store)
+    store.mark_triggered(1, 96.0, 4.0, [])
+    vet_mod.request_entry_vet(store, 1, context={}, spawn=False)
+    vet_mod.queue_entry_vet(store, 1, 'waiting')
+    spawned = []
+    monkeypatch.setattr(vet_mod, '_spawn_cli',
+                        lambda tid: (spawned.append(tid), 99)[1])
+    assert vet_mod.promote_queued(store, 1, context={}) is True
+    assert vet_mod.promote_queued(store, 1, context={}) is False, \
+        'a second drainer promoted an already-pending signal'
+    assert spawned == [1]
+
+
+def test_the_event_write_grant_matches_both_path_forms(monkeypatch):
+    """A permission pattern that matches nothing is indistinguishable from a
+    broken agent: the CLI exits 0 with the work undone. The first cut passed a
+    bare absolute path; Claude Code matches file-tool patterns relative to the
+    project dir, and needs `//` for absolutes. Live result: the calendar agent
+    was silently denied its only Write for a full session."""
+    grants = cfg.EVENT_EXTRA_TOOLS
+    assert len(grants) == 2, 'both path forms must be granted'
+    assert all(g.startswith('Write(') for g in grants)
+    # cwd-relative form, forward slashes even on Windows
+    assert any(g == 'Write(logs/event_calendar.candidate.json)' for g in grants), \
+        grants
+    # absolute form, // prefixed
+    assert any(g.startswith('Write(//') for g in grants), grants
+    # ...and neither widens the scope beyond the one candidate file.
+    assert all('event_calendar.candidate.json' in g for g in grants)
+    assert not any('**' in g or '*' in g for g in grants), \
+        'the grant must not become a wildcard'
+
+
+def test_the_watchdog_does_not_assert_a_cause_it_cannot_know(monkeypatch):
+    """It told the owner "expired login" while the login was fine and the real
+    cause was an unmatched tool grant — sending him to re-login for nothing."""
+    import zebra.health as health
+    monkeypatch.setattr(cfg, 'VET_ENABLED', True)   # check() no-ops when off
+    # Drive it through the real counter rather than stubbing internals, so the
+    # test breaks if the alert stops being reachable at all.
+    for _ in range(health.SILENT_SPAWN_LIMIT + 1):
+        health.record_spawn_result(True, 'events')
+    sent = []
+    health.check(send=lambda m, **k: sent.append(m) or True, dry_run=True)
+    assert sent, 'the watchdog said nothing'
+    msg = sent[0]
+    assert 'vet_cli_' in msg, 'it must point at the agent log, which has the answer'
+    assert 'usually an expired login' not in msg

@@ -85,12 +85,14 @@ def test_verdict_without_a_pending_request_is_discarded(store):
 
 
 def test_verdict_arriving_after_timeout_is_discarded(store):
-    """THE double-entry guard. Once the deadline failed the signal open it is
-    already trading unvetted; applying a late verdict would enter it twice."""
+    """A late verdict was formed against the book of the attempt that timed
+    out. The retry re-snapshots, so accepting the stale one would undo exactly
+    the freshness the queue exists to guarantee — and could race the agent now
+    thinking about the CURRENT book."""
     vet.request_entry_vet(store, 1, CONTEXT, spawn=False)
     vet.expire_stale(store, now=datetime.now() + timedelta(hours=2))
     assert 'discarded' in vet.record_verdict(store, 1, vet.VETOED)
-    assert store.find(1)['vet']['state'] == vet.UNAVAILABLE
+    assert store.find(1)['vet']['state'] == vet.QUEUED
 
 
 def test_rejects_an_invalid_verdict(store):
@@ -99,12 +101,18 @@ def test_rejects_an_invalid_verdict(store):
         vet.record_verdict(store, 1, 'maybe')
 
 
-# ── fail-open ────────────────────────────────────────────────────────────
-def test_expiry_fails_open_not_closed(store):
-    """A vetting outage must degrade to today's behaviour, not a trading halt."""
+# ── fail-CLOSED for entries (2026-08-13) ─────────────────────────────────
+def test_an_entry_timeout_queues_and_does_not_enter(store):
+    """INVERTED on 2026-08-13 at the owner's instruction: "there is no rush to
+    enter. opportunity always exists in market - only qualified entry long time
+    saves capital". A missed entry costs nothing; an unqualified one costs
+    capital. So a timed-out ENTRY waits for another agent instead of entering
+    unvetted. It is safe only because the wait is bounded and every drop
+    telegraphs — see test_the_queue_gives_up_and_drops_rather_than_entering."""
     vet.request_entry_vet(store, 1, CONTEXT, spawn=False)
     assert vet.expire_stale(store, now=datetime.now() + timedelta(hours=2)) == [1]
-    assert store.find(1)['vet']['state'] == vet.UNAVAILABLE
+    assert store.find(1)['vet']['state'] == vet.QUEUED
+    assert store.find(1)['vet']['attempts'] == 1
 
 
 def test_expiry_leaves_fresh_requests_alone(store):

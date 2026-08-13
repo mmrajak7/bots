@@ -71,7 +71,21 @@ VET_ALLOWED_TOOLS = ['WebSearch', 'WebFetch', 'Read', 'Glob', 'Grep',
 # catch it, and the test asserting the OTHER channels lack Write did not bound
 # this one. Scoped to the single file it legitimately produces.
 EVENT_CANDIDATE_FILE = LOG_DIR / 'event_calendar.candidate.json'
-EVENT_EXTRA_TOOLS = ['Write({})'.format(EVENT_CANDIDATE_FILE)]
+# Granted in BOTH forms, because a permission pattern that does not match is
+# indistinguishable from a broken agent. Claude Code matches file-tool patterns
+# relative to the project directory; an ABSOLUTE path needs a `//` prefix. The
+# first cut of this rule passed a bare absolute path, which matched nothing —
+# so the calendar agent was denied its only Write, printed an approval request
+# to a log nobody reads, and exited 0 with the work undone. That is not a hang
+# and not an error: it is the exact silent shape the block comment above warns
+# about, and the auth watchdog reported it as "spawned but never completed",
+# whose suggested cause (expired login) sent the owner to re-login for nothing.
+# Both forms name the same single file, so the scope is unchanged.
+_EVENT_CANDIDATE_REL = EVENT_CANDIDATE_FILE.relative_to(PROJECT_ROOT).as_posix()
+EVENT_EXTRA_TOOLS = [
+    'Write({})'.format(_EVENT_CANDIDATE_REL),                 # cwd-relative
+    'Write(//{})'.format(EVENT_CANDIDATE_FILE.as_posix().lstrip('/')),  # absolute
+]
 # The five position VERBS, plus the four verbs that CALL them. Denying only
 # the explicit verbs left the invariant above false: `zebra run` was granted by
 # the coarse allow rule and denied by nothing, and it runs the whole cycle —
@@ -378,12 +392,32 @@ _DEFAULTS = {
                                  # call. Each is a node process of a few hundred
                                  # MB and this Pi also runs live-money bots —
                                  # MEASURE RSS before raising further.
+    'entry_queue_drop_after_sec': 3600,
+                                 # How long a refused/timed-out ENTRY may wait
+                                 # for a verdict before it is dropped. Anchored
+                                 # at the FIRST vet request and never moved, so
+                                 # requeues cannot walk it forward. An hour of
+                                 # failures means the layer is broken, and the
+                                 # drop telegraphs — a fail-CLOSED entry path is
+                                 # only safe while the halt cannot be silent.
+    'entry_vet_max_attempts': 2,
+                                 # Spawned agents that may time out on one
+                                 # signal. One is an outage blip; two on a
+                                 # freshly re-snapshotted book is a broken
+                                 # layer — stop burning slots and drop it.
     'agent_reserve': 2,          # Slots the DEFERRABLE_CHANNELS may never take,
                                  # so an entry/exit decision always has room.
                                  # Batch channels therefore cap at 5-2=3, which
                                  # still drains a 24-position review sweep while
                                  # leaving the trading decisions unblocked.
-    'vet_model': 'fable',        # Decisions.
+    'vet_model': 'opus',         # Entry/exit decisions. Fable until
+                                 # 2026-08-13; the owner's call to move to
+                                 # Opus. Fable draws down the weekly limit
+                                 # materially faster, and the vetting job is
+                                 # mostly research-and-check (events, liquidity,
+                                 # attraction) against a written checklist —
+                                 # which is the shape Opus is for. Reserve Fable
+                                 # for open-ended design work.
     'event_model': 'sonnet',     # Routine calendar refresh.
     'postmortem_model': 'sonnet',  # Classifying settled trades
                                  # against a CLOSED tag list is
@@ -623,6 +657,8 @@ DEFERRABLE_CHANNELS = ('review', 'events', 'postmortem')
 # Slots the deferrable channels may never take, so a decision channel always
 # has room. Must stay < MAX_CONCURRENT_AGENTS or the batch channels can never
 # run at all (the cap floors at 1 regardless).
+ENTRY_QUEUE_DROP_AFTER_SEC = _int('entry_queue_drop_after_sec')
+ENTRY_VET_MAX_ATTEMPTS = _int('entry_vet_max_attempts')
 AGENT_RESERVE = int(os.environ.get('ZEBRA_AGENT_RESERVE')
                     or _int('agent_reserve'))
 VET_MODEL = os.environ.get('ZEBRA_VET_MODEL') or _runtime['vet_model']

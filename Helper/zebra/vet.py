@@ -58,7 +58,38 @@ PENDING = 'pending'
 ALLOWED = 'allowed'
 VETOED = 'vetoed'
 UNAVAILABLE = 'unavailable'
-TERMINAL = (ALLOWED, VETOED, UNAVAILABLE)
+# Waiting for an agent slot. NOT terminal and NOT an entry: the signal sits
+# here rather than entering unvetted. See the queue note below.
+QUEUED = 'queued'
+# The queue gave up. Terminal, and the signal is CANCELLED, never entered.
+STARVED = 'starved'
+TERMINAL = (ALLOWED, VETOED, UNAVAILABLE, STARVED)
+
+# ── The entry queue (2026-08-13) ─────────────────────────────────────────
+# Invariant 2 above ("fail-open to today's behaviour") is DELIBERATELY INVERTED
+# for entries, at the owner's instruction:
+#
+#   "need a queue to check - there is no rush to enter. opportunity always
+#    exists in market - only qualified entry long time saves capital"
+#
+# The asymmetry is real: a missed entry costs nothing, an unqualified entry
+# costs capital. The measured ≤12-DTE band (43.5% win, −13.8% median) is what
+# unqualified entries look like. So a refused or timed-out ENTRY vet now parks
+# in QUEUED and is retried, instead of entering with no judgement at all.
+#
+# The operative word in invariant 2 was *silently*, and that is what is
+# preserved. Fail-closed is only safe because the halt cannot be silent:
+#   1. every wait is bounded by an absolute stored `drop_after` — a Pi reboot
+#      or a skewed clock cannot park a signal forever (same reasoning as
+#      `is_expired`'s stored deadline);
+#   2. every drop sends a Telegram and CANCELS the signal, so a broken CLI
+#      announces itself within the hour instead of quietly stopping trading;
+#   3. STARVED is terminal and excluded from scoring, so a queue failure never
+#      inflates or deflates the layer's measured precision.
+#
+# EXITS are untouched. Holding a hedged position is bounded (max loss = debit,
+# known at entry) while exiting on a bad print is not, so `exit_gate` keeps its
+# existing defer-and-escalate behaviour.
 
 
 def _now() -> datetime:
@@ -163,15 +194,111 @@ def request_entry_vet(store, trade_id: int, context: dict,
                     trade_id, context.get('stock'), deadline.strftime('%H:%M:%S'))
         if spawn and _spawn_cli(trade_id) is None:
             # The spawn was refused (budget) or impossible (no CLI). Waiting out
-            # the full deadline would be a lie: nothing is coming. Stamp the
-            # cause NOW so the ENTER alert can say "never asked" rather than
-            # "did not answer in time" — they need different fixes, and the
-            # scoring record must not count a refusal as an outage.
-            mark_unavailable(store, trade_id, 'no agent slot free (spawn budget)'
-                             if resolve_cli() else 'vetting CLI not found')
+            # the full deadline would be a lie: nothing is coming. QUEUE it —
+            # do not enter unvetted, and do not sit in PENDING pretending an
+            # agent is thinking about it.
+            queue_entry_vet(store, trade_id,
+                            'no agent slot free' if resolve_cli()
+                            else 'vetting CLI not found')
     else:
         logger.info("VET already pending for #%d — not re-requesting", trade_id)
     return store.find(trade_id)
+
+
+def queue_entry_vet(store, trade_id: int, why: str,
+                    now: Optional[datetime] = None) -> bool:
+    """Park an entry that could not be vetted. It waits; it does not enter.
+
+    `drop_after` is anchored to the FIRST time this signal entered the vet flow
+    and never moves, so repeated requeues cannot walk the deadline forward
+    forever — the classic way an "await approval" state becomes a permanent
+    halt. Stored absolute for the same reason `is_expired` stores its deadline:
+    a reboot or a clock-skewed cron must not extend the wait.
+    """
+    now = now or _now()
+    with store._mutate():
+        t = store.find(trade_id)
+        if not t or vet_state(t) in TERMINAL:
+            return False
+        v = dict(t.get('vet') or {})
+        anchor = (_parse(v.get('queued_at')) or _parse(v.get('requested_at'))
+                  or now)
+        v.update(state=QUEUED,
+                 queued_at=anchor.isoformat(),
+                 drop_after=(anchor + timedelta(
+                     seconds=cfg.ENTRY_QUEUE_DROP_AFTER_SEC)).isoformat(),
+                 queued_because=why)
+        v.setdefault('attempts', 0)
+        t['vet'] = v
+        t['version'] = t.get('version', 0) + 1
+    logger.info("VET QUEUED #%d — %s (waiting for a slot, drop after %ds)",
+                trade_id, why, cfg.ENTRY_QUEUE_DROP_AFTER_SEC)
+    return True
+
+
+def is_queued(trade: dict) -> bool:
+    return vet_state(trade) == QUEUED
+
+
+def queue_exhausted(trade: dict, now: Optional[datetime] = None) -> bool:
+    """Has this queued entry run out of road — by attempts or by wall clock?"""
+    v = trade.get('vet') or {}
+    if int(v.get('attempts') or 0) >= cfg.ENTRY_VET_MAX_ATTEMPTS:
+        return True
+    drop = _parse(v.get('drop_after'))
+    return drop is not None and (now or _now()) >= drop
+
+
+def promote_queued(store, trade_id: int, context: dict,
+                   spawn: bool = True) -> bool:
+    """QUEUED -> PENDING and spawn, as a compare-and-set.
+
+    The CAS matters: a cron overlap, `zebra loop` and a hand-run `zebra run` can
+    all drain the same queue. Only the caller that observes QUEUED *inside the
+    lock* transitions it, so exactly one agent is ever spawned per signal —
+    the same guard, for the same reason, as the overlapping-request check in
+    `request_entry_vet`.
+
+    `context` is re-snapshotted by the caller every attempt, so a queued signal
+    never hands an agent a stale book.
+    """
+    deadline = _now() + timedelta(seconds=cfg.VET_TIMEOUT_SEC)
+    with store._mutate():
+        t = store.find(trade_id)
+        if not t or vet_state(t) != QUEUED:
+            return False                      # someone else won, or it settled
+        v = dict(t.get('vet') or {})
+        v.update(state=PENDING,
+                 requested_at=_now().isoformat(),
+                 deadline=deadline.isoformat(),
+                 context=context,
+                 decision_id=None)
+        t['vet'] = v
+        t['version'] = t.get('version', 0) + 1
+    logger.info("VET RETRY #%d (attempt %d) — deadline %s", trade_id,
+                int((store.find(trade_id).get('vet') or {}).get('attempts', 0)) + 1,
+                deadline.strftime('%H:%M:%S'))
+    if spawn and _spawn_cli(trade_id) is None:
+        queue_entry_vet(store, trade_id, 'no agent slot free')
+        return False
+    return True
+
+
+def starve(store, trade_id: int, why: str,
+           now: Optional[datetime] = None) -> bool:
+    """Give up on an entry. Terminal, excluded from scoring, never entered."""
+    now = now or _now()
+    with store._mutate():
+        t = store.find(trade_id)
+        if not t or vet_state(t) in TERMINAL:
+            return False
+        v = dict(t.get('vet') or {})
+        v.update(state=STARVED, decided_at=now.isoformat(),
+                 failed_open_because=why)
+        t['vet'] = v
+        t['version'] = t.get('version', 0) + 1
+    logger.warning("VET STARVED #%d — %s. NOT entered.", trade_id, why)
+    return True
 
 
 # Detached children we have spawned and not yet reaped, as (proc, kill_after).
@@ -621,7 +748,7 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
     """
     now = now or _now()
     _reap_children()        # runs every cycle: bounds zombies in `zebra loop`
-    expired = []
+    requeued, starved = [], []
     for t in list(store.load_trades()):
         if not is_expired(t, now):
             continue
@@ -629,15 +756,31 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
             fresh = store.find(t['id'])
             # Re-check inside the lock: the CLI may have landed a verdict
             # between the scan and the mutation.
-            if fresh and is_expired(fresh, now):
-                fresh['vet']['state'] = UNAVAILABLE
-                fresh['vet']['decided_at'] = now.isoformat()
-                fresh['version'] = fresh.get('version', 0) + 1
-                expired.append(fresh['id'])
-    for tid in expired:
-        logger.warning("VET TIMED OUT #%d — failing OPEN (enters unvetted, "
-                       "excluded from scoring)", tid)
-    return expired
+            if not (fresh and is_expired(fresh, now)):
+                continue
+            v = dict(fresh.get('vet') or {})
+            # A spawned agent that ran out of clock is a real attempt; a
+            # refusal is not. Only the former burns one.
+            v['attempts'] = int(v.get('attempts') or 0) + 1
+            fresh['vet'] = v
+            fresh['version'] = fresh.get('version', 0) + 1
+        fresh = store.find(t['id'])
+        if queue_exhausted(fresh, now):
+            v = fresh.get('vet') or {}
+            if starve(store, t['id'],
+                      'no verdict after %d attempt(s) and %d min in the queue'
+                      % (v.get('attempts', 0),
+                         cfg.ENTRY_QUEUE_DROP_AFTER_SEC // 60)):
+                starved.append(t['id'])
+        elif queue_entry_vet(store, t['id'], 'agent did not answer in time',
+                             now=now):
+            requeued.append(t['id'])
+    for tid in requeued:
+        logger.warning("VET TIMED OUT #%d — REQUEUED, not entered. There is no "
+                       "rush to enter; an unqualified entry costs capital.", tid)
+    # Returned as one list for backward compatibility with existing callers,
+    # which only ever used it for logging/counting.
+    return requeued + starved
 
 
 # ══ EXIT VETTING ═════════════════════════════════════════════════════════

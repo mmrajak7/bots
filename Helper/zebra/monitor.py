@@ -1051,6 +1051,13 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 continue
             if state == vet_mod.PENDING:
                 continue    # still deciding; expire_stale bounds it
+            # QUEUED falls THROUGH deliberately: the analyzer below re-quotes
+            # the book, and the vetting gate then promotes the signal with that
+            # fresh context. A queued entry therefore never hands an agent a
+            # stale snapshot, and it costs no extra Kite call — this path runs
+            # the analyzer anyway. The band is re-checked above every cycle, so
+            # a queued signal whose price left the zone is drift-cancelled by
+            # the machinery that already exists.
             # ALLOWED / UNAVAILABLE → enter now (re-running the analyzer for a
             # fresh book; entry drift ≤ one tick is the accepted cost of
             # vetting). None → the vet request never landed (crash after
@@ -1113,6 +1120,14 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # silent trading halt. Only an explicit VETO stops the entry.
         if cfg.VET_ENABLED:
             state = vet_mod.vet_state(store.find(trade['id']))
+            if state == vet_mod.QUEUED:
+                # Retry with the book we just re-quoted. promote_queued is a
+                # CAS, so overlapping drainers cannot double-spawn; a loser
+                # simply waits for the next cycle.
+                vet_mod.promote_queued(
+                    store, trade['id'],
+                    context=_vet_context(trade, analysis, gap_pct, kite))
+                continue
             if state is None:
                 try:
                     vet_mod.request_entry_vet(
@@ -1169,6 +1184,14 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 except Exception as e:
                     logger.error("Veto shadow failed for #%d: %s",
                                  trade['id'], e)
+                continue
+            elif state not in (vet_mod.ALLOWED, vet_mod.UNAVAILABLE):
+                # EXPLICIT allowlist, not a bare fall-through. Entering was the
+                # DEFAULT for any state without an `elif` above, so adding a
+                # state to the machine silently meant "enter unvetted" — which
+                # is exactly what STARVED must never do.
+                logger.info("NO ENTRY #%d %s — vet state %r is not an entry "
+                            "state", trade['id'], stock, state)
                 continue
             # ALLOWED or UNAVAILABLE fall through and enter below.
 
@@ -2335,6 +2358,43 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     _flush_mfe(store, pending_mfe)
 
 
+def _reap_starved_vets(store: ZebraStore, dry_run: bool = False) -> list:
+    """Cancel signals the vetting queue gave up on, and SAY SO.
+
+    This is the guardrail that makes a fail-CLOSED entry path safe. Parking
+    entries instead of taking them unvetted is only defensible while the halt
+    announces itself: a broken CLI must not be able to stop trading quietly
+    behind a switch that still reads ON. Every drop is one Telegram naming the
+    signal and the cause, so an outage is visible within the hour rather than
+    at the end of a flat week.
+
+    Cancelling (not leaving it triggered) is deliberate: a cancelled record is
+    NOT deduped by the scanner, so if the setup still holds tomorrow it is
+    re-added, re-triggered and vetted afresh. Nothing is lost but this attempt.
+    """
+    reaped = []
+    for t in list(store.load_trades()):
+        if t.get('status') not in ('watching', 'triggered'):
+            continue
+        if vet_mod.vet_state(t) != vet_mod.STARVED:
+            continue
+        why = (t.get('vet') or {}).get('failed_open_because') or 'no verdict'
+        try:
+            store.cancel(t['id'], f'vet starved: {why}')
+        except Exception as e:
+            logger.error('Could not cancel starved #%d: %s', t['id'], e)
+            continue
+        reaped.append(t['id'])
+        _send_telegram(
+            f"🛑 <b>ENTRY DROPPED</b>  <code>{html.escape(str(t.get('stock')))}</code> "
+            f"({html.escape(str(t.get('direction')))})\n"
+            f"Claude never returned a verdict — {html.escape(str(why))}.\n"
+            f"<i>Not entered. No rush: the setup re-qualifies if it still "
+            f"holds tomorrow.</i>", dry_run=dry_run)
+        logger.warning('ENTRY DROPPED #%d %s — %s', t['id'], t.get('stock'), why)
+    return reaped
+
+
 # ── Cycle ─────────────────────────────────────────────────────────────────
 
 def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
@@ -2355,10 +2415,14 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
         try:
             expired = vet_mod.expire_stale(store)
             if expired:
-                logger.warning("VET fail-open: %d signal(s) timed out and will "
-                               "enter UNVETTED: %s", len(expired), expired)
+                logger.warning("VET sweep: %d entry signal(s) requeued or "
+                               "dropped: %s", len(expired), expired)
         except Exception as e:
             logger.error("Vet expiry sweep failed: %s", e, exc_info=True)
+        try:
+            _reap_starved_vets(store, dry_run=dry_run)
+        except Exception as e:
+            logger.error("Starved-vet sweep failed: %s", e, exc_info=True)
     if do_scan:
         try:
             validate_and_add(store, kite=kite, dry_run=dry_run)

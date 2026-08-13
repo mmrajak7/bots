@@ -139,7 +139,10 @@ def test_late_verdict_reports_discarded_but_exits_zero(wired, capsys):
     vet_mod.expire_stale(store, now=datetime.now() + timedelta(hours=2))
     assert cli.cmd_vet_decide(_decide(verdict='veto')) == 0
     assert 'discarded' in capsys.readouterr().out
-    assert store.find(1)['vet']['state'] == vet_mod.UNAVAILABLE
+    # Since 2026-08-13 the timed-out ENTRY is QUEUED for a fresh agent rather
+    # than entered unvetted. The verdict is still discarded — it judged the
+    # book of the attempt that died, and the retry re-snapshots.
+    assert store.find(1)['vet']['state'] == vet_mod.QUEUED
 
 
 def test_journal_is_written_even_when_the_verdict_is_discarded(wired):

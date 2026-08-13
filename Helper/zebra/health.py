@@ -261,15 +261,25 @@ def check(send=None, now: Optional[datetime] = None, dry_run: bool = False,
             for c in silent)
         alerts.append(
             f"🔑 <b>CLAUDE AGENTS NOT REPORTING BACK</b>\n"
-            f"Spawned but never completed ({detail}). The CLI starts and dies — "
-            f"usually an expired login or a tool-permission denial.")
+            f"Spawned but never completed ({detail}). The CLI starts and exits "
+            f"without finishing its work — an auth failure and a tool grant "
+            f"that matches nothing look identical from here.")
 
     if not alerts:
         return None
+    # Say what to CHECK, not what is wrong. On 2026-08-13 this message asserted
+    # an expired login; the login was fine and the real cause was a tool grant
+    # that matched nothing. Naming the likeliest cause as the cause sent the
+    # owner to re-login for nothing and made the true cause harder to find.
+    # The agent's own log is the only place the answer actually exists.
     msg = ('\n\n'.join(alerts) +
-           "\n<i>Log in on the Pi: <code>claude</code> then /login. "
-           "Vetting is effectively OFF; trading continues unvetted on the "
-           "deterministic rules.</i>")
+           "\n<i>Read the agent's log first — it is the only copy of what it "
+           "tried:\n"
+           "<code>tail -40 logs/vet_cli_$(date +%Y%m%d).log</code>\n"
+           "An approval request there = a tool grant that did not match; an "
+           "auth error = <code>claude</code> then /login.\n"
+           "Entries are QUEUED, not entered unvetted; exits fall back to the "
+           "deterministic guards.</i>")
     if send and send(msg, dry_run=dry_run):
         with _locked_state() as s:
             s['last_warned_on'] = today
