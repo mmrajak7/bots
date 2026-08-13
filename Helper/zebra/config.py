@@ -637,6 +637,25 @@ VET_TIMEOUT_SEC = int(os.environ.get('ZEBRA_VET_TIMEOUT_SEC')
                       or _int('vet_timeout_sec'))
 CHILD_KILL_SEC = int(os.environ.get('ZEBRA_CHILD_KILL_SEC')
                      or _int('child_kill_sec'))
+# The child MUST be dead before its marker expires. It used to outlive it
+# (720 kill vs 600 deadline, plus `timeout`'s own -k grace), and that gap is a
+# correctness bug, not just waste: the expiry sweep requeues and re-promotes
+# the signal in the same cycle, so the ORIGINAL agent — still alive — could
+# land its verdict on the SECOND attempt's PENDING marker. `record_verdict`
+# only checks "PENDING and not expired", so it cannot tell the two apart, and
+# an ALLOW formed against a 10-minute-old book would be applied as though it
+# judged the fresh one. That silently undoes the re-snapshot the queue exists
+# to guarantee. Clamped rather than validated: an operator editing one number
+# should not be able to reintroduce it. The 45s covers `timeout`'s -k grace.
+_KILL_GRACE_SEC = 45
+if CHILD_KILL_SEC > VET_TIMEOUT_SEC - _KILL_GRACE_SEC:
+    _clamped = max(60, VET_TIMEOUT_SEC - _KILL_GRACE_SEC)
+    if CHILD_KILL_SEC != _clamped:
+        logger.warning(
+            'child_kill_sec %d would outlive vet_timeout_sec %d — clamped to '
+            '%d so a killed agent cannot answer for a later attempt',
+            CHILD_KILL_SEC, VET_TIMEOUT_SEC, _clamped)
+    CHILD_KILL_SEC = _clamped
 # How many agents may be ALIVE at once, across every channel, on this box.
 # The other caps are per-position-per-day, which bound how often one trade is
 # looked at and say nothing about how many processes start together: one

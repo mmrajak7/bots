@@ -90,7 +90,7 @@ def test_verdict_arriving_after_timeout_is_discarded(store):
     the freshness the queue exists to guarantee — and could race the agent now
     thinking about the CURRENT book."""
     vet.request_entry_vet(store, 1, CONTEXT, spawn=False)
-    vet.expire_stale(store, now=datetime.now() + timedelta(hours=2))
+    vet.expire_stale(store, now=datetime.now() + timedelta(minutes=11))
     assert 'discarded' in vet.record_verdict(store, 1, vet.VETOED)
     assert store.find(1)['vet']['state'] == vet.QUEUED
 
@@ -110,7 +110,7 @@ def test_an_entry_timeout_queues_and_does_not_enter(store):
     unvetted. It is safe only because the wait is bounded and every drop
     telegraphs — see test_the_queue_gives_up_and_drops_rather_than_entering."""
     vet.request_entry_vet(store, 1, CONTEXT, spawn=False)
-    assert vet.expire_stale(store, now=datetime.now() + timedelta(hours=2)) == [1]
+    assert vet.expire_stale(store, now=datetime.now() + timedelta(minutes=11)) == [1]
     assert store.find(1)['vet']['state'] == vet.QUEUED
     assert store.find(1)['vet']['attempts'] == 1
 
@@ -152,7 +152,7 @@ def test_unvetted_signal_is_distinguishable_from_an_allowed_one(store):
     """`unavailable` must never read as `allowed` — that is what keeps an
     outage out of the layer's measured precision."""
     vet.request_entry_vet(store, 1, CONTEXT, spawn=False)
-    vet.expire_stale(store, now=datetime.now() + timedelta(hours=2))
+    vet.expire_stale(store, now=datetime.now() + timedelta(minutes=11))
     assert store.find(1)['vet']['state'] != vet.ALLOWED
 
 

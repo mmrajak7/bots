@@ -136,7 +136,7 @@ def test_late_verdict_reports_discarded_but_exits_zero(wired, capsys):
     non-zero would invite a retry loop hammering a closed case."""
     store, _ = wired
     vet_mod.request_entry_vet(store, 1, CONTEXT, spawn=False)
-    vet_mod.expire_stale(store, now=datetime.now() + timedelta(hours=2))
+    vet_mod.expire_stale(store, now=datetime.now() + timedelta(minutes=11))
     assert cli.cmd_vet_decide(_decide(verdict='veto')) == 0
     assert 'discarded' in capsys.readouterr().out
     # Since 2026-08-13 the timed-out ENTRY is QUEUED for a fresh agent rather
@@ -150,7 +150,7 @@ def test_journal_is_written_even_when_the_verdict_is_discarded(wired):
     what Claude concluded, even though nothing was acted on."""
     store, journal = wired
     vet_mod.request_entry_vet(store, 1, CONTEXT, spawn=False)
-    vet_mod.expire_stale(store, now=datetime.now() + timedelta(hours=2))
+    vet_mod.expire_stale(store, now=datetime.now() + timedelta(minutes=11))
     cli.cmd_vet_decide(_decide(verdict='veto'))
     assert len(journal.all()) == 1
 
@@ -199,7 +199,7 @@ def test_discarded_veto_sends_nothing(wired, monkeypatch):
     monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: sent.append(m))
     store, _ = wired
     vet_mod.request_entry_vet(store, 1, CONTEXT, spawn=False)
-    vet_mod.expire_stale(store, now=datetime.now() + timedelta(hours=2))
+    vet_mod.expire_stale(store, now=datetime.now() + timedelta(minutes=11))
     cli.cmd_vet_decide(_decide(verdict='veto'))
     assert sent == []
 

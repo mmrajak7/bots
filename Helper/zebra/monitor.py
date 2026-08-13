@@ -185,33 +185,14 @@ def _format_enter_alert(trade: dict, analysis: dict,
         f"({pull_dir} Level)\n"
     )
 
-    # ── BCS-only pipeline: the SPREAD is the order ticket ───────────────────
-    # Zebra was retired 2026-08-12 and its pair is never opened, so leading
-    # with "BUY 2x / SELL 1x" and captioning the spread as a "shadow" told the
-    # reader to place the one order the engine does not take. The alert IS the
-    # order ticket (see the _alerts_enabled comment at the call site) — it must
-    # name the structure that actually gets entered, and nothing else.
-    if cfg.ENTRY_STRUCTURE == 'bcs':
-        if not bcs:
-            return (
-                f"⚠ <b>NO SPREAD</b>  <code>{stock}</code> ({direction})\n"
-                f"spot {spot:,.2f} | Level {st_val:,.2f} | gap {gap:.2f}%\n"
-                f"No tradeable BCS pair at expiry {expiry}."
-            )
-        bwarn = ' ⚠ ' + html.escape(','.join(bcs['warnings'])) \
-            if bcs.get('warnings') else ''
-        return head + (
-            f"expiry {expiry} ({dte} DTE) | lot {lot_size}{bwarn}\n"
-            f"\n"
-            f"Strikes <b>{bcs['long_strike']:g} / {bcs['short_strike']:g}</b>   "
-            f"debit {bcs['debit']:g} "
-            f"({bcs['debit_to_width_pct']:.0f}% of width)\n"
-            f"Max profit {bcs['max_profit_per_share']:g}/share\n"
-            f"\n"
-            f"🟢 BUY 1× <code>{bcs['long_symbol']}</code>  {bcs['long_ask']:g}\n"
-            f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_bid']:g}"
-        )
-
+    # NOTE: there is deliberately NO `ENTRY_STRUCTURE == 'bcs'` branch here.
+    # One was added on 2026-08-13 and was DEAD: `check_watching` handles the
+    # BCS pipeline in its own block, which builds the ticket with
+    # `_format_bcs_enter_alert` and `continue`s long before this function is
+    # reached. So the branch never ran on the path that trades, while its
+    # `not bcs` fallback DID run from `cmd_trigger` (which passes bcs=None) and
+    # Telegrammed "NO SPREAD" about signals that had a perfectly good spread.
+    # The live BCS ticket is `_format_bcs_enter_alert`; edit that one.
     msg = head + (
         f"expiry {expiry} ({dte} DTE) | lot {lot_size} | "
         f"Capital (1 lot) = {best['capital_per_lot']:,.0f}{warn}\n"
@@ -754,7 +735,8 @@ def _format_bcs_enter_alert(trade: dict, analysis: dict, bcs: dict) -> str:
     max_p = bcs['max_profit_per_share']
     rr = (max_p / bcs['debit']) if bcs['debit'] > 0 else 0
     return (
-        f"📐 <b>ENTER BCS</b>  <code>{stock}</code>  ({direction}){conviction}\n"
+        f"📐 <b>ENTER BCS</b>  <code>{html.escape(str(stock))}</code>  "
+        f"({html.escape(str(direction))}){conviction}\n"
         f"Level {st_val:,.2f} | spot {spot:,.2f} | gap {gap:.2f}% "
         f"({pull_dir} Level)\n"
         f"expiry {analysis['expiry']} ({analysis['dte']} DTE) | "
@@ -770,8 +752,10 @@ def _format_bcs_enter_alert(trade: dict, analysis: dict, bcs: dict) -> str:
         f"\n"
         # ASK to buy, BID to sell — this is an order ticket, and the prices on
         # it have to be ones the owner can actually transact at.
-        f"🟢 BUY 1× <code>{bcs['long_symbol']}</code>  {bcs['long_ask']:g}\n"
-        f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_bid']:g}"
+        f"🟢 BUY 1× <code>{html.escape(str(bcs['long_symbol']))}</code>  "
+        f"{bcs['long_ask']:g}\n"
+        f"🔴 SELL 1× <code>{html.escape(str(bcs['short_symbol']))}</code>  "
+        f"{bcs['short_bid']:g}"
     )
 
 
@@ -1114,19 +1098,31 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # requested once; the spawned CLI is never waited on, so this cycle
         # returns immediately and the entry happens on a later tick.
         #
-        # EVERY branch that is not an explicit ALLOW must still let the trade
-        # through eventually — `unavailable` (the fail-open timeout) reads as
-        # "enter unvetted", because a vetting outage must never become a
-        # silent trading halt. Only an explicit VETO stops the entry.
+        # INVERTED 2026-08-13. This used to read "every branch that is not an
+        # explicit ALLOW must still let the trade through eventually", and that
+        # is now false and dangerous as an instruction: entries QUEUE when no
+        # verdict is available, and only ALLOWED / UNAVAILABLE may proceed (see
+        # the explicit allowlist below). A missed entry costs nothing; an
+        # unqualified one costs capital. The halt is kept non-silent by
+        # `drop_after` plus the ENTRY DROPPED Telegram, not by entering.
         if cfg.VET_ENABLED:
             state = vet_mod.vet_state(store.find(trade['id']))
             if state == vet_mod.QUEUED:
                 # Retry with the book we just re-quoted. promote_queued is a
                 # CAS, so overlapping drainers cannot double-spawn; a loser
                 # simply waits for the next cycle.
-                vet_mod.promote_queued(
-                    store, trade['id'],
-                    context=_vet_context(trade, analysis, gap_pct, kite))
+                #
+                # Wrapped: this is the only vet call on this path that was
+                # bare, and `_mutate` can raise LockTimeout. Unwrapped it
+                # propagated out of check_watching and cost EVERY signal after
+                # this one its cycle — including their drift-cancel checks.
+                try:
+                    vet_mod.promote_queued(
+                        store, trade['id'],
+                        context=_vet_context(trade, analysis, gap_pct, kite))
+                except Exception as e:
+                    logger.error("Queue drain failed for #%d: %s — stays "
+                                 "queued, retried next cycle", trade['id'], e)
                 continue
             if state is None:
                 try:
@@ -1142,27 +1138,33 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                                    "re-reading next cycle", trade['id'], e)
                     continue
                 except Exception as e:
-                    # Infra failure (lock timeout, IO). Requesting the vet must
-                    # never block trading: fail open and enter unvetted THIS
-                    # cycle, exactly as the bot behaved before this layer.
-                    logger.error("VET request failed for #%d: %s — proceeding "
-                                 "unvetted", trade['id'], e)
-                    # ...but SAY SO on the record. This was the only fail-open
-                    # that wrote nothing at all: the exception fired before or
-                    # inside `_mutate`, so no `vet` key exists, and a trade
-                    # entered this way is byte-identical to one entered with
-                    # vetting switched off. `_vet_line` then returns "" for a
-                    # missing state, so the ENTER alert carries nothing about
-                    # vetting — and its own docstring says why that is wrong:
-                    # silence reads as "Claude approved this". The UNAVAILABLE
-                    # path is honest about the same outage; this one was not.
-                    # Best-effort by design — we are already in an IO failure.
+                    # Infra failure (lock timeout, IO) while REQUESTING. This
+                    # handler predates the fail-closed inversion and used to
+                    # enter unvetted here — which re-opened the hole the queue
+                    # exists to close, and did it on the likeliest refusal
+                    # path: `request_entry_vet` calls `queue_entry_vet` when a
+                    # spawn is refused, so a LockTimeout in THAT write landed
+                    # right here and turned a refused slot into a live
+                    # position.
+                    #
+                    # A missed entry costs nothing; an unqualified one costs
+                    # capital. So park it and try again next cycle. The queue's
+                    # own drop_after still bounds the wait, and the sweep still
+                    # announces a give-up, so this cannot become a silent halt.
+                    logger.error("VET request failed for #%d: %s — QUEUED, not "
+                                 "entered", trade['id'], e)
                     try:
-                        vet_mod.mark_unavailable(store, trade['id'], str(e))
+                        vet_mod.queue_entry_vet(store, trade['id'],
+                                                'vet request failed: %s' % e)
                     except Exception as e2:
+                        # Even the parking write failed. Leave it `triggered`
+                        # with no marker: the next cycle re-reads state None
+                        # and requests afresh. Entering is never the fallback.
                         logger.warning(
-                            "could not stamp the failed-open marker on #%d: "
-                            "%s", trade['id'], e2)
+                            "could not queue #%d after a failed request: %s — "
+                            "left triggered, retried next cycle",
+                            trade['id'], e2)
+                    continue
                 else:
                     continue          # wait for the verdict
             elif state == vet_mod.PENDING:
@@ -1225,6 +1227,12 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 msg = _format_bcs_enter_alert(target, analysis, bcs)
                 if cfg.VET_ENABLED:
                     msg += _vet_line(store.find(trade['id']) or target)
+                # Funds LAST, closest to the click-copy symbols. This is the
+                # live path — the branch below `continue`s past it, so calling
+                # _funds_line down there ran it exactly never under the BCS
+                # pipeline. Quantity from the BCS's own lot_size: the ticket
+                # and the margin must price the same order.
+                msg += _funds_line(kite, bcs, bcs.get('lot_size') or 0)
                 _send_enter_alert(store, trade, msg, stock, dry_run=dry_run)
             else:
                 logger.info("ENTER alert suppressed for #%d %s "

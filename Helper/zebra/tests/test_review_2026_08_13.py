@@ -315,35 +315,39 @@ def _analysis():
 
 def _bcs():
     return {'long_strike': 96.0, 'short_strike': 104.0, 'debit': 3.2,
+            'lot_size': 500, 'width': 8.0, 'short_extrinsic': 0.5,
             'debit_to_width_pct': 40.0, 'max_profit_per_share': 4.8,
             'warnings': [], 'long_symbol': 'BCSLONG', 'short_symbol': 'BCSSHORT',
             'long_ask': 5.0, 'short_bid': 1.8}
 
 
-def test_the_ticket_names_the_bcs_and_never_the_retired_zebra_pair(monkeypatch):
+def test_the_live_bcs_ticket_names_only_the_spread(monkeypatch):
+    """REWRITTEN 2026-08-13 after review. The first version of this test drove
+    `_format_enter_alert`, which `check_watching` NEVER CALLS under the BCS
+    pipeline — it builds the ticket with `_format_bcs_enter_alert` and
+    `continue`s first. So the test passed against dead code while the live
+    ticket went unasserted. Drive the function that actually sends."""
     monkeypatch.setattr(cfg, 'ENTRY_STRUCTURE', 'bcs')
     trade = {'id': 1, 'stock': 'TESTCO', 'direction': 'CE', 'st_value': 100.0,
              'st_direction': 'DOWN', 'timeframe': 'weekly'}
-    msg = monitor._format_enter_alert(trade, _analysis(), _bcs())
+    msg = monitor._format_bcs_enter_alert(trade, _analysis(), _bcs())
 
     assert 'BCSLONG' in msg and 'BCSSHORT' in msg, 'the tradeable legs are missing'
-    assert 'ZEBLONG' not in msg and 'ZEBSHORT' not in msg, \
-        'the ticket still quotes the retired zebra legs'
-    assert '2×' not in msg and '2x' not in msg, \
-        'a 2x leg is the zebra back-ratio — never entered under BCS-only'
-    assert 'shadow' not in msg.lower(), \
-        'the structure that actually trades must not be captioned a shadow'
+    assert 'ZEBLONG' not in msg and 'ZEBSHORT' not in msg,         'the live ticket quotes the retired zebra legs'
+    assert '2×' not in msg and '2x' not in msg,         'a 2x leg is the zebra back-ratio — never entered under BCS-only'
+    assert 'shadow' not in msg.lower(),         'the structure that actually trades must not be captioned a shadow'
 
 
-def test_a_missing_bcs_pair_says_so_instead_of_falling_back_to_zebra(monkeypatch):
-    """No spread, no ticket. Silently printing the zebra pair here would be the
-    same bug wearing a fallback."""
+def test_format_enter_alert_has_no_dead_bcs_branch(monkeypatch):
+    """A BCS branch was added here and was unreachable from the trading path,
+    while its `not bcs` fallback WAS reachable from `cmd_trigger` (which passes
+    bcs=None) and Telegrammed "NO SPREAD" about signals that had a good spread.
+    Dead code that only runs on the wrong path is worse than none."""
     monkeypatch.setattr(cfg, 'ENTRY_STRUCTURE', 'bcs')
     trade = {'id': 1, 'stock': 'TESTCO', 'direction': 'CE', 'st_value': 100.0,
              'st_direction': 'DOWN', 'timeframe': 'weekly'}
     msg = monitor._format_enter_alert(trade, _analysis(), None)
-    assert 'NO SPREAD' in msg
-    assert 'ZEBLONG' not in msg
+    assert 'NO SPREAD' not in msg,         'cmd_trigger would Telegram a false NO SPREAD for a viable signal'
 
 
 def test_the_zebra_ticket_survives_for_the_zebra_pipeline(monkeypatch):
@@ -572,7 +576,9 @@ def test_the_queue_gives_up_after_max_attempts_and_never_enters(store,
     _signal(store)
     store.mark_triggered(1, 96.0, 4.0, [])
     vet_mod.request_entry_vet(store, 1, context={}, spawn=False)
-    late = datetime.now() + timedelta(hours=2)
+    late = datetime.now() + timedelta(minutes=11)   # past the
+    # 600s verdict deadline, inside the 1h queue window, so the
+    # ATTEMPTS bound is what ends it rather than the clock.
     vet_mod.expire_stale(store, now=late)                 # attempt 1 -> queued
     assert vet_mod.vet_state(store.find(1)) == vet_mod.QUEUED
     vet_mod.promote_queued(store, 1, context={}, spawn=False)
@@ -660,3 +666,103 @@ def test_the_watchdog_does_not_assert_a_cause_it_cannot_know(monkeypatch):
     msg = sent[0]
     assert 'vet_cli_' in msg, 'it must point at the agent log, which has the answer'
     assert 'usually an expired login' not in msg
+
+
+# ── review of the review: gaps the three reviewers found (2026-08-13) ─────
+
+def test_the_funds_check_is_wired_into_the_path_that_actually_trades(
+        store, monkeypatch):
+    """It was called 93 lines BELOW the `continue` that ends the BCS branch, so
+    under the production pipeline it ran exactly never — while six unit tests
+    calling `_funds_line` directly all passed. The `wire_into_live_path`
+    failure shape, again."""
+    import inspect
+    src = inspect.getsource(monitor.check_watching)
+    bcs_branch = src.index("if cfg.ENTRY_STRUCTURE == 'bcs':")
+    tail = src.index('if cfg.PAPER_MODE:', bcs_branch)
+    assert '_funds_line' in src[bcs_branch:tail], \
+        'the funds check is not reachable from the BCS entry path'
+
+
+def test_a_queued_signal_is_starved_even_though_it_is_never_pending(
+        store, monkeypatch):
+    """THE hole in the first cut of the queue. `is_expired` answers only about
+    PENDING markers, so `expire_stale` never visited a QUEUED record — a signal
+    whose spawn was refused every cycle ping-ponged forever: attempts never
+    rose, drop_after was never read, no drop, no Telegram. The module's own
+    guarantee ('a broken CLI announces itself within the hour') was false."""
+    _signal(store)
+    store.mark_triggered(1, 96.0, 4.0, [])
+    vet_mod.request_entry_vet(store, 1, context={}, spawn=False)
+    vet_mod.queue_entry_vet(store, 1, 'no agent slot free')
+    assert vet_mod.vet_state(store.find(1)) == vet_mod.QUEUED
+
+    # An hour later, still queued, never once PENDING-and-expired.
+    vet_mod.expire_stale(store, now=datetime.now() + timedelta(seconds=4000))
+    assert vet_mod.vet_state(store.find(1)) == vet_mod.STARVED, \
+        'a permanently refused signal was never dropped'
+
+
+def test_one_timeout_burns_one_attempt_not_two(store, monkeypatch):
+    """The increment and the requeue/starve decision were in SEPARATE locks, so
+    a second drainer passed the same guard between them and incremented again —
+    starving a signal after one real agent run."""
+    monkeypatch.setattr(cfg, 'ENTRY_VET_MAX_ATTEMPTS', 2)
+    _signal(store)
+    store.mark_triggered(1, 96.0, 4.0, [])
+    vet_mod.request_entry_vet(store, 1, context={}, spawn=False)
+    late = datetime.now() + timedelta(minutes=11)
+    # Two overlapping drainers, same expired marker.
+    vet_mod.expire_stale(store, now=late)
+    vet_mod.expire_stale(store, now=late)
+    assert (store.find(1)['vet'] or {}).get('attempts') == 1, \
+        'one agent run burned two attempts'
+    assert vet_mod.vet_state(store.find(1)) == vet_mod.QUEUED
+
+
+def test_a_killed_agent_cannot_outlive_its_own_verdict_deadline():
+    """CHILD_KILL_SEC was 720 against a 600s deadline, so attempt 1's agent was
+    still alive when attempt 2 was PENDING — and `record_verdict` checks only
+    'PENDING and not expired', so the stale agent's ALLOW would be applied
+    against a book it never saw."""
+    assert cfg.CHILD_KILL_SEC < cfg.VET_TIMEOUT_SEC, (
+        'a spawned agent outlives its marker: %d kill vs %d deadline'
+        % (cfg.CHILD_KILL_SEC, cfg.VET_TIMEOUT_SEC))
+
+
+def test_a_budget_refusal_does_not_claim_the_cli_is_broken(store, monkeypatch,
+                                                           tmp_path):
+    """`_note_spawn(False)` feeds `spawn_failures`, which drives 'CLAUDE CLI NOT
+    STARTING — the binary is missing'. A 24-position sweep against a cap of 3
+    produces 21 refusals: seven times the threshold, blaming a healthy CLI.
+    Same never-asked/asked-and-failed conflation, one commit later."""
+    import zebra.health as health
+    # The counters, directly: a refusal must never touch `spawn_failures`.
+    for _ in range(5):
+        health.record_spawn_refused('review')
+    state = health._read_state()
+    assert int(state.get('spawn_failures') or 0) == 0, \
+        'refusals inflated the missing-binary counter'
+    assert int(health._channels(state)['review'].get('refusals') or 0) == 5
+    # ...and the refusal branch must actually use it. Read the FILE, not the
+    # attribute: the no-real-agents rail replaces `_spawn_generic` autouse, so
+    # `inspect.getsource` would return the stub and assert nothing.
+    src = (Path(vet_mod.__file__)).read_text(encoding='utf-8')
+    body = src[src.index('if not slot:'):][:700]
+    assert 'record_spawn_refused' in body, 'the refusal path lost its counter'
+    assert '_note_spawn(False' not in body, \
+        'a refusal still feeds the missing-binary counter'
+
+
+def test_the_order_ticket_escapes_symbols_with_ampersands(monkeypatch):
+    """M&M is open in the live book right now; M&MFIN, J&KBANK, ARE&M, GVT&D
+    and S&SPOWER are all in the F&O universe. Every alert is parse_mode=HTML
+    and the house rule is escape EVERY runtime value."""
+    trade = {'id': 1, 'stock': 'M&M', 'direction': 'CE', 'st_value': 100.0,
+             'st_direction': 'DOWN', 'timeframe': 'weekly'}
+    bcs = dict(_bcs(), long_symbol='M&M26AUG3450CE',
+               short_symbol='M&M26AUG3550CE')
+    msg = monitor._format_bcs_enter_alert(trade, _analysis(), bcs)
+    assert 'M&amp;M' in msg
+    assert 'M&M' not in msg.replace('M&amp;M', ''), \
+        'a bare & survived into an HTML message'

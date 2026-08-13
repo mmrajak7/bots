@@ -128,7 +128,7 @@ def test_a_timeout_queues_and_the_signal_does_NOT_enter(wired):
     decorative and the capital it exists to protect is already committed."""
     store, _ = wired
     cycle(store)
-    assert vet.expire_stale(store, now=datetime.now() + timedelta(hours=2)) == [1]
+    assert vet.expire_stale(store, now=datetime.now() + timedelta(minutes=11)) == [1]
     t = cycle(store)
     assert t['status'] != 'entered', 'a queued signal entered anyway'
     # ...and the retry re-requested it against a freshly quoted book.
@@ -143,14 +143,18 @@ def test_layer_off_is_the_old_single_tick_behaviour(wired, monkeypatch):
     assert spawned == []                                 # no CLI, no marker
 
 
-def test_request_infra_failure_enters_unvetted_this_cycle(wired, monkeypatch):
-    """A broken vet layer degrades to today's behaviour immediately — it must
-    never turn a tradeable signal into a parked one."""
+def test_request_infra_failure_queues_rather_than_entering_unvetted(wired,
+                                                                    monkeypatch):
+    """INVERTED 2026-08-13. This handler predated the queue and entered
+    unvetted on any exception — which re-opened the hole the queue closes, on
+    the LIKELIEST path: request_entry_vet calls queue_entry_vet when a spawn is
+    refused, so a LockTimeout in that write landed here and turned a refused
+    slot into a live position."""
     store, _ = wired
     monkeypatch.setattr(monitor.vet_mod, 'request_entry_vet',
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError('io')))
     t = cycle(store)
-    assert t['status'] == 'entered', "an infra failure blocked the entry"
+    assert t['status'] != 'entered', "an infra failure still entered unvetted"
 
 
 def test_request_already_vetted_race_does_not_enter_blind(wired, monkeypatch):

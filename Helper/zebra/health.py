@@ -183,6 +183,29 @@ def record_spawn_result(ok: bool, channel: str = 'entry') -> int:
     return seen[0]
 
 
+def record_spawn_refused(channel: str = 'entry') -> None:
+    """We DECLINED to start an agent. This is not a CLI failure.
+
+    Kept off `spawn_failures` deliberately. That counter drives "CLAUDE CLI NOT
+    STARTING — the binary is missing or unrunnable", and a refusal proves the
+    opposite: the budget is working and the box is busy. Routing refusals into
+    it guaranteed a false alarm on any wide sweep — 24 open positions against a
+    deferrable cap of 3 means 21 refusals in one cycle, seven times the
+    threshold, blaming a binary that is fine.
+
+    It is the same mistake, one commit later, that the ENTER alert was fixed
+    for this morning: "never asked" and "asked and failed" need opposite
+    responses, so they must never share a counter.
+    """
+    with _locked_state() as state:
+        ch = _channels(state)
+        row = ch.get(channel) if isinstance(ch.get(channel), dict) else {}
+        row['refusals'] = int(row.get('refusals') or 0) + 1
+        row['last_refused_at'] = datetime.now().isoformat()
+        ch[channel] = row
+        state['channels'] = ch
+
+
 def record_agent_landed(channel: str = 'entry') -> None:
     """A spawned agent completed its job by calling a zebra verb.
 
