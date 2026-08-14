@@ -699,6 +699,67 @@ def test_the_event_write_grant_matches_both_path_forms(monkeypatch):
         'the grant must not become a wildcard'
 
 
+def _silent_check(monkeypatch, channels):
+    """Run health.check() with the given channels silent. Returns the message."""
+    import zebra.health as health
+    monkeypatch.setattr(cfg, 'VET_ENABLED', True)
+    state = {'channels': {c: {'spawns_since_landing': n}
+                          for c, n in channels.items()},
+             'spawn_failures': 0}
+    monkeypatch.setattr(health, '_read_state', lambda *a, **k: state)
+    monkeypatch.setattr(health, 'credential_expiry', lambda *a, **k: None)
+    monkeypatch.setattr(health, '_locked_state',
+                        lambda *a, **k: __import__('contextlib').nullcontext({}))
+    return health.check(send=lambda m, dry_run=False: True, dry_run=True)
+
+
+def test_the_watchdog_names_what_a_dead_channel_COSTS(monkeypatch):
+    """"events: 27" only means something to a reader holding the architecture
+    in their head. The consequence that mattered — the corporate-action
+    interlock reading nothing — was invisible in the message and took a code
+    review to surface, on a morning the owner was watching wave one go live."""
+    msg = _silent_check(monkeypatch, {'events': 27})
+    assert 'events: 27' in msg
+    assert 'corporate-action interlock' in msg, \
+        'the alert must say what a dead events channel costs'
+
+
+def test_the_watchdog_does_not_state_consequences_for_LIVE_channels(monkeypatch):
+    """The regression this replaces: the trailer asserted "Entries are QUEUED,
+    not entered unvetted; exits fall back to the deterministic guards"
+    UNCONDITIONALLY. On the morning only `events` was dead it therefore
+    announced that entries were queueing while entry vetting was working
+    perfectly — a false statement about the subsystem the reader most needs to
+    trust, inside the alert whose entire job is being trustworthy."""
+    msg = _silent_check(monkeypatch, {'events': 27})
+    assert 'QUEUE' not in msg.upper(), \
+        'entry consequence stated while the entry channel is healthy'
+    assert 'deterministic guards' not in msg, \
+        'exit consequence stated while the exit channel is healthy'
+
+
+def test_each_silent_channel_gets_its_own_line(monkeypatch):
+    msg = _silent_check(monkeypatch, {'entry': 9, 'exit': 6})
+    assert 'entry: 9' in msg and 'exit: 6' in msg
+    assert 'DROPPED after 2 attempts' in msg
+    assert 'deterministic guards' in msg
+    assert 'corporate-action' not in msg, 'events is healthy here'
+
+
+def test_every_channel_that_can_spawn_has_a_stated_impact():
+    """A channel with no entry in the table degrades silently to a bare count —
+    which is the exact failure this table was added to fix."""
+    import zebra.health as health
+    from zebra import vet as vet_mod
+    for ch in ('entry', 'exit', 'events', 'review', 'postmortem'):
+        assert ch in health.CHANNEL_IMPACT, \
+            f'channel {ch} can go silent with no stated consequence'
+        assert health.CHANNEL_IMPACT[ch].strip(), ch
+    # And every impact string must be a consequence, not a restatement.
+    for ch, txt in health.CHANNEL_IMPACT.items():
+        assert len(txt) > 40, f'{ch}: impact reads like a label, not a cost'
+
+
 def test_the_watchdog_does_not_assert_a_cause_it_cannot_know(monkeypatch):
     """It told the owner "expired login" while the login was fine and the real
     cause was an unmatched tool grant — sending him to re-login for nothing."""

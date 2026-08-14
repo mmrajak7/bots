@@ -52,6 +52,33 @@ STATE_FILE = 'auth_health.json'
 # so on a working Pi this counter rarely passes 1.
 SILENT_SPAWN_LIMIT = 5
 
+# What a DEAD channel actually costs, in the owner's terms. Added 2026-08-14:
+# the alert named the channel ("events: 27") and stopped there, which only
+# means something to a reader who already holds the architecture in their head.
+# The one that mattered — the corporate-action interlock reading nothing — was
+# invisible in the message and took a code review to surface.
+#
+# One clause each, and only for channels that are ACTUALLY silent. The old
+# trailer asserted the entry/exit consequence unconditionally, so on the
+# morning only `events` was dead it announced "Entries are QUEUED" while entry
+# vetting was working perfectly — a false statement about the one subsystem the
+# reader most needs to trust.
+CHANNEL_IMPACT = {
+    'entry': ("no signal can be vetted, so entries QUEUE and are DROPPED "
+              "after 2 attempts or 1 hour. Nothing enters unvetted — you lose "
+              "opportunities, not capital."),
+    'exit': ("exits fall back to the deterministic guards (debounce, quote "
+             "reliability, intrinsic floor, spot veto). They still fire; they "
+             "just fire without a second opinion."),
+    'events': ("the event calendar goes stale, and the corporate-action "
+               "interlock reads it. On an ex-date your stored stop levels are "
+               "breached by ARITHMETIC, on a share that no longer exists."),
+    'review': ("no macro/event judgement between triggers. Advisory only — no "
+               "stop or target is affected."),
+    'postmortem': ("no precedents accumulate for future vetting. Learning "
+                   "only — nothing live is affected."),
+}
+
 
 def _state_path():
     return cfg.LOG_DIR / STATE_FILE
@@ -282,11 +309,15 @@ def check(send=None, now: Optional[datetime] = None, dry_run: bool = False,
         detail = ', '.join(
             '%s: %d' % (c, int(_channels(state)[c].get('spawns_since_landing') or 0))
             for c in silent)
+        impact = ''.join(
+            '\n• <b>%s</b> — %s' % (c, CHANNEL_IMPACT[c])
+            for c in silent if c in CHANNEL_IMPACT)
         alerts.append(
             f"🔑 <b>CLAUDE AGENTS NOT REPORTING BACK</b>\n"
             f"Spawned but never completed ({detail}). The CLI starts and exits "
             f"without finishing its work — an auth failure and a tool grant "
-            f"that matches nothing look identical from here.")
+            f"that matches nothing look identical from here."
+            f"{impact}")
 
     if not alerts:
         return None
@@ -300,9 +331,7 @@ def check(send=None, now: Optional[datetime] = None, dry_run: bool = False,
            "tried:\n"
            "<code>tail -40 logs/vet_cli_$(date +%Y%m%d).log</code>\n"
            "An approval request there = a tool grant that did not match; an "
-           "auth error = <code>claude</code> then /login.\n"
-           "Entries are QUEUED, not entered unvetted; exits fall back to the "
-           "deterministic guards.</i>")
+           "auth error = <code>claude</code> then /login.</i>")
     if send and send(msg, dry_run=dry_run):
         with _locked_state() as s:
             s['last_warned_on'] = today
