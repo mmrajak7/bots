@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -122,6 +123,239 @@ def _parse(ts: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(ts) if ts else None
     except (TypeError, ValueError):
         return None
+
+
+# ══ THE CLI IS ALIVE AND REFUSING ════════════════════════════════════════
+# A Claude usage limit is not a hang, not a crash and not a busy slot: the
+# binary starts, prints one line, and exits in about two seconds.
+#
+#     You've hit your session limit · resets 2:10pm (Asia/Kolkata)
+#
+# Nothing distinguished that from an agent still thinking, so on 2026-08-14
+# zebra waited the full 600s deadline for ten processes that were already dead,
+# then reported "no agent slot in 60 min" — blaming a queue that was empty.
+# HAVELLS #404 was dropped at 14:05 against a 14:10 reset. This is the same
+# class as the permission bug in `feedback_spawned_cli_permissions`: the CLI
+# exits 0 with the work undone, and silence reads as patience.
+#
+# Detection is GLOBAL and time-bounded, not per-trade: the limit is an account
+# fact, so if it was in force at 13:00 then every spawn at 13:00 died of it.
+_BLOCK_FILE = 'zebra_cli_block.json'
+
+#: Shapes Claude Code prints when it refuses on quota. Matched only against a
+#: transcript whose body is TINY — a real agent writes paragraphs, so a verdict
+#: that happens to discuss "limits" can never be mistaken for a refusal.
+_BLOCK_PATTERNS = (
+    re.compile(r"hit your (?:session|usage) limit", re.I),
+    re.compile(r"(?:usage|session|rate) limit (?:reached|exceeded)", re.I),
+    re.compile(r"\b\d+-hour limit reached", re.I),
+)
+_RESET_RE = re.compile(
+    r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?", re.I)
+#: A refusal transcript is banner + one line. Anything longer is a real run.
+_BLOCK_BODY_MAX_CHARS = 600
+#: The 3-line banner `_spawn_generic` writes, generously over-estimated. Only
+#: used to turn the body bound into a cheap file-SIZE bound.
+_BANNER_MAX_CHARS = 400
+
+
+def _parse_reset(text: str, detected: datetime) -> Optional[datetime]:
+    """The reset instant, on the same naive local clock the rest of this module
+    uses. Returns None when the message states no time — a block with no known
+    end must not extend anything, or an unparseable line becomes an open halt.
+    """
+    m = _RESET_RE.search(text)
+    if not m:
+        return None
+    hour, minute, ampm, tzname = (m.group(1), m.group(2), m.group(3),
+                                  m.group(4))
+    try:
+        hour, minute = int(hour), int(minute or 0)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return None
+    if ampm:
+        ampm = ampm.lower()
+        if ampm == 'pm' and hour != 12:
+            hour += 12
+        elif ampm == 'am' and hour == 12:
+            hour = 0
+    # The wall time is quoted in the tz the message names (Asia/Kolkata on this
+    # box). Build it there, then hand back the naive LOCAL instant — comparing
+    # an IST wall time against `_now()` on a UTC-clocked Pi would move the
+    # reset by hours, which is precisely the mix-up `_now`/`_now_ist` exist to
+    # keep apart.
+    if not ampm and not tzname and hour <= 12 and minute == 0:
+        # "resets 5 minutes", "resets 2 hours" — the regex will happily read a
+        # DURATION as a clock time and hand back a reset up to a day out, which
+        # would hold every queued entry open on a misparse. A real reset is
+        # quoted as a wall time, and a wall time on this box carries either an
+        # am/pm or a timezone. Refuse rather than guess: the block is still
+        # reported, it just extends nothing.
+        return None
+    named_ist = (tzname or '').strip().lower() in ('asia/kolkata',
+                                                   'asia/calcutta', 'ist')
+    tz = cfg.IST if named_ist else None
+    if tz is not None:
+        # Anchored to WHEN THE REFUSAL WAS PRINTED, never to wall-clock now.
+        # Reading "resets 2:10pm" off a 12:55 transcript at 14:30 must still
+        # mean 14:10 today; anchoring to now rolls it to tomorrow and turns a
+        # 75-minute pause into a day-long halt.
+        anchor = detected.astimezone(tz)
+        reset = anchor.replace(hour=hour, minute=minute, second=0,
+                               microsecond=0)
+        if reset <= anchor:
+            reset += timedelta(days=1)
+        return _sane_reset(reset.astimezone().replace(tzinfo=None), detected)
+    reset = detected.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if reset <= detected:
+        reset += timedelta(days=1)
+    return _sane_reset(reset, detected)
+
+
+#: A usage limit resets in hours, not days. Anything further out is a misparse,
+#: and a misparse here holds every queued entry open — CLAMP what is
+#: arithmetic, REFUSE what is a guess, and this is a guess.
+_MAX_BLOCK_HOURS = 8
+
+
+def _sane_reset(reset: Optional[datetime],
+                detected: datetime) -> Optional[datetime]:
+    if reset is None:
+        return None
+    ahead = (reset - detected).total_seconds() / 3600.0
+    if not 0 < ahead <= _MAX_BLOCK_HOURS:
+        logger.warning('Ignoring an implausible agent reset time (%s, %.1fh '
+                       'after the refusal) — the block is reported but will '
+                       'not hold anything open', reset, ahead)
+        return None
+    return reset
+
+
+def _scan_for_cli_block(now: datetime) -> Optional[dict]:
+    """Look for a usage-limit refusal in the recent per-spawn transcripts."""
+    window = cfg.CLI_BLOCK_SCAN_WINDOW_SEC
+    newest = None
+    try:
+        paths = list(cfg.LOG_DIR.glob('vet_cli_*.log'))
+    except Exception as e:                       # pragma: no cover - IO guard
+        logger.debug('could not list vet transcripts: %s', e)
+        return None
+    for p in paths:
+        try:
+            st = p.stat()
+            mtime = datetime.fromtimestamp(st.st_mtime)
+            age = (now - mtime).total_seconds()
+            # Future mtimes are clock skew (or a replay), and a NEGATIVE age
+            # sails through an `age > window` test — so a transcript that has
+            # not happened yet would be adopted as the current block.
+            if age > window or age < -60:
+                continue
+            # A refusal is banner + one line. Skip the big files on their SIZE
+            # rather than reading a day's verdicts off the SD card every cycle
+            # only to discard them on length — this runs on every zebra tick.
+            if st.st_size > _BLOCK_BODY_MAX_CHARS + _BANNER_MAX_CHARS:
+                continue
+            text = p.read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            continue
+        # Drop the 3-line banner this module writes at spawn time.
+        body = '\n'.join(text.splitlines()[3:]).strip()
+        if len(body) > _BLOCK_BODY_MAX_CHARS:
+            continue
+        if not any(pat.search(body) for pat in _BLOCK_PATTERNS):
+            continue
+        if newest is None or mtime > newest[0]:
+            newest = (mtime, body, p.name)
+    if newest is None:
+        return None
+    mtime, body, name = newest
+    reset = _parse_reset(body, mtime)
+    return {'detected_at': mtime.isoformat(),
+            'reset_at': reset.isoformat() if reset else None,
+            'source': name,
+            'raw': body.splitlines()[0][:200] if body else ''}
+
+
+def refresh_cli_block(now: Optional[datetime] = None) -> Optional[dict]:
+    """Re-scan for a usage-limit block and persist what we find.
+
+    Persisted because the cron process exits between cycles — the same reason
+    `_spot_corroborates` stores its reference rather than holding it in memory.
+    Best-effort throughout: this is a diagnostic, and it must never be able to
+    stop the sweep that bounds every pending vet in the book.
+    """
+    now = now or _now()
+    path = cfg.LOG_DIR / _BLOCK_FILE
+    try:
+        found = _scan_for_cli_block(now)
+        if found:
+            prev = _read_cli_block()
+            path.write_text(json.dumps(found, indent=1), encoding='utf-8')
+            # Keyed on the RESET, not the source file. During an outage every
+            # cycle produces a fresh refusal transcript, so keying on the
+            # filename re-announces the same block a dozen times — one signal,
+            # one alert.
+            if not prev or prev.get('reset_at') != found['reset_at']:
+                logger.warning(
+                    'CLI BLOCKED — the agent binary is running but refusing: '
+                    '%s (from %s). Spawns are suppressed until %s; queued '
+                    'entries hold their place rather than burning attempts.',
+                    found.get('raw') or 'usage limit',
+                    found['source'], found.get('reset_at') or 'unknown')
+            return found
+        # Nothing recent. Clear a stale marker so a resolved block cannot go on
+        # suppressing spawns after the reset.
+        existing = _read_cli_block()
+        if existing:
+            reset = _parse(existing.get('reset_at'))
+            if reset is None or now >= reset:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                logger.info('CLI block cleared — agent spawns resume')
+                return None
+        return existing
+    except Exception as e:                       # pragma: no cover - IO guard
+        logger.debug('CLI block refresh failed: %s', e)
+        return None
+
+
+def _read_cli_block() -> Optional[dict]:
+    try:
+        raw = (cfg.LOG_DIR / _BLOCK_FILE).read_text(encoding='utf-8')
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def cli_blocked_until(now: Optional[datetime] = None) -> Optional[datetime]:
+    """The instant the current usage-limit block lifts, or None if not blocked.
+
+    A block whose message carried NO reset time returns None: it is reported,
+    but it may not extend a queue. An unknown end is exactly the shape that
+    turns a bounded wait into a permanent halt.
+    """
+    d = _read_cli_block()
+    if not d:
+        return None
+    reset = _parse(d.get('reset_at'))
+    if reset is None:
+        return None
+    return reset if (now or _now()) < reset else None
+
+
+def cli_block_reason(now: Optional[datetime] = None) -> Optional[str]:
+    """One human sentence for the alert, or None. Never jargon: the owner is
+    told what stopped the trade and when it comes back, not a state name."""
+    until = cli_blocked_until(now)
+    if until is None:
+        return None
+    return 'Claude usage limit — the agent comes back at %s' \
+        % until.strftime('%H:%M')
 
 
 # ── state inspection ─────────────────────────────────────────────────────
@@ -261,6 +495,7 @@ def queue_exhausted(trade: dict, now: Optional[datetime] = None) -> bool:
         attempts = cfg.ENTRY_VET_MAX_ATTEMPTS      # unreadable = exhausted
     if attempts >= cfg.ENTRY_VET_MAX_ATTEMPTS:
         return True
+    now = now or _now()
     drop = _parse(v.get('drop_after'))
     if drop is None:
         # Not yet queued — the FIRST timeout arrives before `drop_after` is
@@ -271,7 +506,17 @@ def queue_exhausted(trade: dict, now: Optional[datetime] = None) -> bool:
         if anchor is None:
             return True          # genuinely malformed: cannot bound the wait
         drop = anchor + timedelta(seconds=cfg.ENTRY_QUEUE_DROP_AFTER_SEC)
-    return (now or _now()) >= drop
+    # A known usage limit holds the clock open to the reset it named, plus one
+    # grace window so a cycle actually spawns before the clock resumes. This is
+    # the ONE extension allowed, and only because the end is stated by the
+    # blocker itself — a block with no reset time returns None from
+    # `cli_blocked_until` and extends nothing. Without it the wait expires
+    # against a wall it was never given a chance to clear: HAVELLS #404 was
+    # dropped at 14:05 for a reset at 14:10.
+    blocked = cli_blocked_until(now)
+    if blocked is not None:
+        drop = max(drop, blocked + timedelta(seconds=cfg.CLI_BLOCK_GRACE_SEC))
+    return now >= drop
 
 
 def promote_queued(store, trade_id: int, context: dict,
@@ -736,6 +981,14 @@ def _spawn_generic(prompt: str, model: str, tag: str,
                      cfg.VET_CLI, tag)
         _note_spawn(False, channel)
         return None
+    # Refusing on quota is not a slot shortage and not a broken binary, so it
+    # gets neither counter — but spawning INTO a known block is pure waste: on
+    # 2026-08-14 ten processes were started, printed one line and died, and the
+    # budget carried them as if agents were working.
+    blocked = cli_blocked_until()
+    if blocked is not None:
+        logger.warning('Not spawning %s — %s', tag, cli_block_reason())
+        return None
     slot = _spawn_budget_ok(tag, channel)
     if not slot:
         # Record it, but on its OWN counter. The spawn-failure counter means
@@ -950,7 +1203,12 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
     """
     now = now or _now()
     _reap_children()        # runs every cycle: bounds zombies in `zebra loop`
-    requeued, starved = [], []
+    # Before anything below reads a block state. This is the only caller that
+    # runs every cycle regardless of what else happens, which makes it the
+    # right place to notice that the agent binary has started refusing.
+    refresh_cli_block(now)
+    blocked_until = cli_blocked_until(now)
+    requeued, starved, blocked = [], [], []
     # QUEUED records FIRST, and separately, because `is_expired` answers only
     # about PENDING markers. Without this pass a signal whose spawn is refused
     # every cycle ping-pongs QUEUED -> PENDING -> QUEUED forever: `attempts`
@@ -963,10 +1221,20 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
         if not is_queued(t) or not queue_exhausted(t, now):
             continue
         v = t.get('vet') or {}
+        try:
+            tries = int(v.get('attempts') or 0)
+        except (TypeError, ValueError):
+            tries = 0
+        # Name what actually stopped it. "no agent slot" was reported on
+        # 2026-08-14 while the slot budget held ONE entry and the real blocker
+        # was a usage limit — an alert that sends the owner to look at the
+        # wrong thing is worse than no alert, because it gets believed.
+        why = (v.get('queued_because')
+               or ('no agent slot free' if tries == 0 else
+                   'the agent did not answer'))
         if starve(store, t['id'],
-                  'no agent slot in %d min (attempts: %d)'
-                  % (cfg.ENTRY_QUEUE_DROP_AFTER_SEC // 60,
-                     int(v.get('attempts') or 0))):
+                  '%s — gave up after %d min (attempts that actually ran: %d)'
+                  % (why, cfg.ENTRY_QUEUE_DROP_AFTER_SEC // 60, tries)):
             starved.append(t['id'])
     for t in list(store.load_trades()):
         if not is_expired(t, now):
@@ -990,6 +1258,24 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
                 # log line claiming a retry that can never happen.
                 continue
             v = dict(fresh.get('vet') or {})
+            # "We declined to start it" and "it started and failed" need
+            # OPPOSITE fixes, so they must never share a counter. A spawn that
+            # died on a usage limit produced no reasoning, cost no slot and
+            # tested nothing about this signal — charging it an attempt is how
+            # a two-attempt queue becomes a zero-attempt one during an outage.
+            # (Attribution is by wall clock, not per-process: a usage limit is
+            # an account fact, so a block in force now is the block that killed
+            # every spawn still pending under it.)
+            if blocked_until is not None:
+                v.update(state=QUEUED,
+                         queued_at=(_parse(v.get('queued_at'))
+                                    or _parse(v.get('requested_at'))
+                                    or now).isoformat(),
+                         queued_because=cli_block_reason(now) or 'agent refused')
+                fresh['vet'] = v
+                fresh['version'] = fresh.get('version', 0) + 1
+                blocked.append(t['id'])
+                continue
             try:
                 attempts = int(v.get('attempts') or 0) + 1
             except (TypeError, ValueError):
@@ -1017,12 +1303,18 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
             fresh['vet'] = v
             fresh['version'] = fresh.get('version', 0) + 1
         (starved if verdict == 'starved' else requeued).append(t['id'])
+    # Logged OUTSIDE the lock, like the requeue list below it: this file
+    # already learned that building a log line inside `_mutate` can raise on a
+    # concurrently-removed trade and take the whole sweep with it.
+    for tid in blocked:
+        logger.warning('VET BLOCKED #%d — %s. Held, and NOT counted as an '
+                       'attempt: nothing ran.', tid, cli_block_reason(now))
     for tid in requeued:
         logger.warning("VET TIMED OUT #%d — REQUEUED, not entered. There is no "
                        "rush to enter; an unqualified entry costs capital.", tid)
     # Returned as one list for backward compatibility with existing callers,
     # which only ever used it for logging/counting.
-    return requeued + starved
+    return requeued + starved + blocked
 
 
 # ══ EXIT VETTING ═════════════════════════════════════════════════════════
@@ -1237,6 +1529,29 @@ def exit_gate(store, trade: dict, kind: str, quote: dict, spot: float,
     if state == DEFER and int(m.get('defers') or 0) >= cfg.EXIT_MAX_DEFERS:
         return 'hold'
     if state == PENDING:
+        # A usage-limit block means no agent is coming, so waiting out the
+        # deadline is pure cost on a stop that has ALREADY fired. ASHOKLEY #390
+        # on 2026-08-14: debit_sl triggered at 13:25 with the structure at 1.01
+        # against a 1.00 stop; the vet had died on quota two seconds after
+        # spawning, the gate waited three cycles for it, and the exit finally
+        # booked at 0.68 — roughly -50% turned into -75%.
+        #
+        # This changes only the TIMING of a decision the code already makes:
+        # the branch below reaches the same UNAVAILABLE/'proceed' after the
+        # deadline. The deterministic guards are untouched and still stand — as
+        # invariant 2 says, exits fail to them.
+        #
+        # Prior DEFERS are excluded deliberately: Claude LOOKED and said it
+        # could not verify the quote, and "the agent is offline" is no more
+        # consent than a timeout is. That escalation runs its normal course.
+        if not int(m.get('defers') or 0) and cli_blocked_until() is not None:
+            if not _set_exit_state(store, trade['id'], kind, UNAVAILABLE,
+                                   expect_state=PENDING):
+                return _cas_lost(trade, kind)
+            logger.warning('EXIT VET #%d %s — %s. Not waiting out the '
+                           'deadline; proceeding on the deterministic guards.',
+                           trade['id'], kind, cli_block_reason())
+            return 'proceed'
         if not _exit_expired(m):
             return 'wait'
         prior = int(m.get('defers') or 0)
@@ -1272,6 +1587,16 @@ def exit_gate(store, trade: dict, kind: str, quote: dict, spot: float,
 
     needed, why = needs_exit_vet(trade, kind, quote)
     if not needed:
+        return 'proceed'
+
+    # Same reasoning as the PENDING branch above, one step earlier: raising a
+    # request we know cannot be answered only buys a 10-minute wait before the
+    # identical fail-open. Marking nothing PENDING also keeps the next cycle
+    # free to raise a real request the moment the block lifts.
+    if cli_blocked_until() is not None:
+        logger.warning('EXIT VET not requested for #%d %s (%s) — %s. '
+                       'Proceeding on the deterministic guards.',
+                       trade['id'], kind, why, cli_block_reason())
         return 'proceed'
 
     defers = int(m.get('defers') or 0) if state == DEFER else 0

@@ -159,8 +159,25 @@ different hat — every CE sits under a falling ST line, that is the setup.
 `context.st_attraction` is that symbol's own record on its own timeframe. The
 magnet IS the thesis — the trade wins by price returning to ST — and until now
 every signal was vetted as though the pull were a property of the setup rather
-than of the symbol. It is not. Measured across the cached universe the touch
-rate ranges from **17% to 100%**, median 69%.
+than of the symbol. It is not. Measured on **live Kite data across all 210 F&O
+stocks**, the weekly touch rate ranges from **12% to 100%**, **median 60%**: 30%
+of symbols read reliably magnetic, 26% often do NOT return.
+
+> Re-measured 2026-08-14. An episode used to open only when a candle CLOSED
+> inside the band, but entries fire on an **intraday** LTP gap, so the statistic
+> was answering a question the strategy never asks. It now opens when the candle
+> TRADED through the band. Two consequences for you: rates are **~11 points
+> lower** than any figure recorded before that date (the old test only caught
+> candles that *stopped* in the band, which flatters the magnet), and the
+> section is present far more often — weekly `usable` went from 41% of symbols
+> to 91%.
+
+**`measured: false` is not a gap in the data.** On a monthly signal this section
+is deliberately absent: six years of monthly candles cannot hold enough episodes
+to say anything (5% of symbols reached a usable sample). Note it in one clause
+and move on — do not treat it as missing evidence, and do not veto on it.
+`st_attraction: null` is different and still means the measurement was attempted
+and failed.
 
 Read it like this:
 

@@ -1049,6 +1049,39 @@ def _format_time_alert(trade: dict, days_left: int,
 
 # ── Watching → triggered ─────────────────────────────────────────────────
 
+def _drain_queued_out_of_band(store: ZebraStore, trade: dict, kite,
+                              price: float, gap_pct: float) -> None:
+    """Retry a QUEUED vet whose gap has drifted out of the trigger band.
+
+    The signal is still inside the watch band — drift and stale cancels ran
+    before this — so it remains a live candidate; it simply cannot enter at
+    this price. Vetting it now means the verdict is ready if price comes back,
+    instead of the queue silently freezing until the drop clock kills it.
+
+    Never raises. This runs inside the per-trade loop, so an exception here
+    would cost every signal after this one its cycle, including its own
+    drift-cancel check — the failure mode `promote_queued`'s caller below was
+    already wrapped against.
+    """
+    try:
+        analysis = strikes_mod.analyze(kite, trade['stock'],
+                                       trade['direction'], price)
+        if analysis.get('error') or not analysis.get('atm_strike'):
+            # No usable book to hand an agent. Staying queued is correct: the
+            # drop clock still bounds the wait and the book is routinely fine
+            # a few cycles later.
+            logger.debug("Queued #%d %s: no usable book out of band (%s)",
+                         trade['id'], trade['stock'],
+                         analysis.get('error') or 'no ATM strike')
+            return
+        vet_mod.promote_queued(
+            store, trade['id'],
+            context=_vet_context(trade, analysis, gap_pct, kite))
+    except Exception as e:
+        logger.error("Out-of-band queue drain failed for #%d: %s — stays "
+                     "queued, retried next cycle", trade['id'], e)
+
+
 def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
     """For each watching/triggered signal, recompute gap; trigger if in zone,
     cancel if drifted. Triggered signals are also re-checked so user doesn't
@@ -1097,7 +1130,25 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             continue
 
         if gap > cfg.TRIGGER_GAP_MAX:
-            # Not yet in trigger zone; just keep watching
+            # Not yet in trigger zone; just keep watching.
+            #
+            # EXCEPT for a signal already waiting on a vet. The queue is
+            # drained by the gate ~140 lines below, which this `continue` puts
+            # out of reach, so a queued signal that drifted back into the watch
+            # band could never be retried — `attempts` froze and the drop clock
+            # ran out underneath it. HAVELLS #404 on 2026-08-14 is the case:
+            # triggered at 3.92%, drifted to 4.46%, and was dropped 60 minutes
+            # later having had exactly one attempt across nine cycles, with the
+            # alert blaming an agent slot that was free the whole time.
+            #
+            # Vetting it here changes nothing about what may ENTER: entry lives
+            # past this `continue` and is still gated on the trigger band, so an
+            # ALLOWED verdict simply waits for price to come back. Costs one
+            # analyzer re-quote per queued signal per cycle, and only while one
+            # is queued — which is rare.
+            if cfg.VET_ENABLED and vet_mod.is_queued(store.find(trade['id'])
+                                                     or trade):
+                _drain_queued_out_of_band(store, trade, kite, price, gap_pct)
             continue
         if gap < cfg.STALE_GAP_MIN:
             # In stale zone: too late
@@ -2513,11 +2564,23 @@ def _reap_starved_vets(store: ZebraStore, dry_run: bool = False) -> list:
             continue
         if vet_mod.vet_state(t) != vet_mod.STARVED:
             continue
-        why = (t.get('vet') or {}).get('failed_open_because') or 'no verdict'
+        v = t.get('vet') or {}
+        why = v.get('failed_open_because') or 'no verdict'
+        # "It ran and stayed silent" and "it never started" need OPPOSITE
+        # fixes, so the alert must not say the first when it means the second.
+        # On 2026-08-14 HAVELLS read "Claude never returned a verdict — no
+        # agent slot", and BOTH halves were wrong: the agent had been started
+        # and had refused on a usage limit, and the slot budget was near empty.
+        try:
+            ran = int(v.get('attempts') or 0)
+        except (TypeError, ValueError):
+            ran = 0
+        lead = ("Claude never returned a verdict" if ran else
+                "Claude was never able to start on this")
         msg = (
             f"🛑 <b>ENTRY DROPPED</b>  <code>{html.escape(str(t.get('stock')))}</code> "
             f"({html.escape(str(t.get('direction')))})\n"
-            f"Claude never returned a verdict — {html.escape(str(why))}.\n"
+            f"{lead} — {html.escape(str(why))}.\n"
             f"<i>Not entered. No rush: the setup re-qualifies if it still "
             f"holds tomorrow.</i>")
         # ANNOUNCE FIRST, then cancel. The whole justification for parking

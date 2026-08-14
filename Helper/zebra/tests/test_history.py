@@ -398,6 +398,111 @@ def test_the_gap_band_is_in_the_same_units(monkeypatch):
     assert r['overall']['episodes'] > 0
 
 
+# ── the band is what the TRIGGER sees, not what the CLOSE says ───────────
+# COALINDIA 2026-08-14: a signal fired at a 3.97% intraday gap and was vetted
+# with NO magnet history, because 0 of its 147 weekly closes had ever landed in
+# the 3-5% band. Re-measured over the 3Y window the live path holds, the
+# close-based test left 71% of weekly symbols null-or-thin and 99.8% of monthly
+# ones. Testing the candle's RANGE instead took weekly `usable` to 83%.
+
+def _stub_range(monkeypatch, low, high, close, st, n=60):
+    """A hand-built series with an explicit high/low, so the band test is
+    exercised on the range rather than on whatever ATR happens to produce."""
+    _candles(monkeypatch, _flat(n))              # length check only
+    series = [{'date': 'd%d' % i, 'close': close, 'high': high, 'low': low,
+               'supertrend': st, 'direction': 'UP'} for i in range(n)]
+    import playbook.compute_st as cst
+    monkeypatch.setattr(cst, 'compute_supertrend', lambda *a, **k: series)
+
+
+def _band(monkeypatch):
+    monkeypatch.setattr(cfg, 'ATTRACTION_GAP_PCT', 3.0)
+    monkeypatch.setattr(cfg, 'WATCH_GAP_MAX', 0.05)          # ceiling = 5%
+
+
+def test_a_candle_that_traded_through_the_band_counts(monkeypatch):
+    """THE COALINDIA SHAPE. Close 6.5% above ST — outside the band, so the old
+    test skipped it — but the low reached 4%, which is precisely where the
+    scanner triggers. If this regresses, the section goes silent again."""
+    _band(monkeypatch)
+    _stub_range(monkeypatch, low=104.0, high=107.0, close=106.5, st=100.0)
+    r = history.attraction(None, 'THROUGH', 'weekly')
+    assert r is not None, "a candle that traded the entry band was not counted"
+    assert r['overall']['episodes'] > 0
+
+
+def test_a_candle_that_never_reached_the_band_is_still_skipped(monkeypatch):
+    """The other half. Without it the test above passes on a function that
+    counts every candle — which is the unbounded threshold this band replaced."""
+    _band(monkeypatch)
+    _stub_range(monkeypatch, low=100.5, high=102.0, close=101.0, st=100.0)
+    assert history.attraction(None, 'NEAR', 'weekly') is None
+    # ...and the far side of the band, which the ceiling owns.
+    _stub_range(monkeypatch, low=118.0, high=122.0, close=120.0, st=100.0)
+    history._attraction_cache.clear()
+    assert history.attraction(None, 'FAR2', 'weekly') is None
+
+
+def test_a_candle_that_also_reached_st_is_not_scored(monkeypatch):
+    """Ordering inside a candle is unknowable, so this one cannot say whether
+    the entry came before the touch or after it. 22.9% of episodes; counting
+    them lifts the median rate 62.5% -> 66.7%, i.e. toward allowing."""
+    _band(monkeypatch)
+    _stub_range(monkeypatch, low=99.0, high=104.0, close=103.5, st=100.0)
+    assert history.attraction(None, 'CROSSED', 'weekly') is None, \
+        "scored an episode whose own candle had already reached ST"
+
+
+def test_the_basis_is_stamped_on_the_result(monkeypatch):
+    """Rates from before 2026-08-14 are close-based and run ~4 points higher.
+    Comparing the two definitions without noticing is a silent regression."""
+    _band(monkeypatch)
+    _stub_range(monkeypatch, low=104.0, high=107.0, close=106.5, st=100.0)
+    assert history.attraction(None, 'BASIS', 'weekly')['band_basis'] == 'candle_range'
+
+
+def test_the_agent_is_told_the_rates_moved():
+    """A doc quoting the old median against the new statistic teaches the agent
+    to read every symbol as ~11 points more magnetic than it measured."""
+    doc = (HELPER / 'zebra' / 'VETTING.md').read_text(encoding='utf-8')
+    assert 'median 60%' in doc, "VETTING.md still quotes a close-based median"
+    assert 'intraday' in doc, "the change of basis is not explained to the agent"
+    assert '210 F&O' in doc, \
+        "the median must state the universe it was measured on"
+
+
+# ── measured on weekly only, and that is a DECISION not a failure ────────
+
+def test_monthly_is_reported_as_not_measured_never_as_null(monkeypatch):
+    """`null` means "we tried and could not say", which VETTING.md tells the
+    agent to flag as a missing section. Reporting a deliberate omission that way
+    would have it flag a non-problem on every monthly signal."""
+    _candles(monkeypatch, _trend(60, 100, 1.0))
+    r = history.attraction(None, 'X', 'monthly')
+    assert r is not None, "a deliberate omission was reported as missing data"
+    assert r['measured'] is False
+    assert 'monthly' in r['why']
+
+
+def test_weekly_is_still_measured(monkeypatch):
+    """The other half — without it the gate could exclude everything."""
+    monkeypatch.setattr(cfg, 'WATCH_GAP_MAX', 1.0)
+    rows = []
+    for _ in range(12):
+        rows += _trend(6, 100, 2.0) + _trend(6, 112, -2.0)
+    _candles(monkeypatch, rows)
+    r = history.attraction(None, 'X', 'weekly')
+    assert r is not None and r['measured'] is True
+    assert r['overall']['episodes'] > 0
+
+
+def test_the_agent_is_told_a_missing_monthly_section_is_deliberate():
+    doc = (HELPER / 'zebra' / 'VETTING.md').read_text(encoding='utf-8')
+    assert 'measured: false' in doc.lower(), \
+        "the agent is never told what a deliberately absent section looks like"
+    assert 'not a gap in the data' in doc.lower()
+
+
 def test_the_agent_is_told_how_to_read_the_new_evidence():
     """Evidence the agent is never told to use is evidence it will not use.
     Both features exist to change a verdict, so both belong in its brief."""

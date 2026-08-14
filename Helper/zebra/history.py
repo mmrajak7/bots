@@ -215,12 +215,14 @@ def attraction(kite, stock: str, timeframe: str,
                direction: Optional[str] = None) -> Optional[dict]:
     """How often this symbol actually gets pulled back to its own ST line.
 
-    An EPISODE begins on the first completed candle whose close sits at least
-    `gap_threshold` away from ST, and ends when price touches ST or the
-    horizon expires. Consecutive qualifying candles belong to ONE episode —
-    otherwise a symbol that sat 5% away for ten weeks would report ten
-    independent outcomes off a single move, and the rate would describe how
-    long it lingered rather than whether it came back.
+    An EPISODE begins on the first completed candle that TRADED inside the
+    entry band — the band is checked against the candle's high/low range, not
+    its close, because the signal that opens a real trade is an intraday LTP
+    reading. It ends when price touches ST or the horizon expires. Consecutive
+    qualifying candles belong to ONE episode — otherwise a symbol that sat 5%
+    away for ten weeks would report ten independent outcomes off a single move,
+    and the rate would describe how long it lingered rather than whether it
+    came back.
 
     Returns None when there is not enough history to say anything. A thin
     sample is reported WITH its size and a 'thin' verdict rather than as a
@@ -228,6 +230,22 @@ def attraction(kite, stock: str, timeframe: str,
     """
     if not cfg.ATTRACTION_ENABLED:
         return None
+    # MEASURED ON WEEKLY ONLY, and this is a decision rather than a failure —
+    # so it does NOT return None. `null` means "we tried and could not say",
+    # which VETTING.md tells the agent to treat as a missing section worth
+    # noting; reporting a deliberate omission that way trains it to flag a
+    # non-problem on every monthly signal. Same distinction as
+    # `feedback_never_asked_is_not_failed`: declined-to-start and
+    # started-and-failed need different words.
+    #
+    # Six years of monthly candles is ~72 bars and an episode consumes at least
+    # nine, so the statistic cannot get a usable sample there — measured, it
+    # reached `usable` on 5.4% of symbols. Monthly signals are also rare
+    # (today's scan: 45 weekly vs 6 monthly).
+    if timeframe not in cfg.ATTRACTION_TIMEFRAMES:
+        return {'timeframe': timeframe, 'measured': False,
+                'why': 'not measured on %s — only weekly has enough candles '
+                       'to build a sample worth reading' % timeframe}
     key = (stock, timeframe, datetime.now().strftime('%Y-%m-%d'))
     if key in _attraction_cache:
         return _attraction_cache[key]
@@ -268,18 +286,55 @@ def _attraction(kite, stock, timeframe, direction):
         if not st:
             i += 1
             continue
-        gap_pct = abs(bar['close'] - st) / st * 100
+
+        from_above = bar['close'] > st
         # BAND, not a floor. An unbounded threshold counts a symbol sitting 20%
         # from its ST as an episode, and of course that does not come back
         # inside two months — but the scanner would never have signalled it
         # either (watch_gap_max caps the setup). Measured: dropping the ceiling
         # is what made the median symbol look non-magnetic. The statistic has
         # to describe the setup that actually gets traded.
-        if not (thresh <= gap_pct <= ceiling):
+        #
+        # And "the setup that actually gets traded" is an INTRADAY LTP reading,
+        # sampled every few minutes — never a close. So the band is tested
+        # against the candle's RANGE, as an interval intersection, not against
+        # its close as a point. The close-based test asked a question the
+        # strategy never asks, and the answer was mostly silence.
+        #
+        # Measured on LIVE Kite data over the 210 F&O names (NOT the disk
+        # cache, which is 22 days stale and carries two partial-day bars per
+        # symbol, and NOT the 827-symbol cached NSE set, which is not what this
+        # bot trades):
+        #
+        #     close in band : 6.7% null, 52.4% thin -> 41.0% usable
+        #     candle range  : 0.0% null,  8.6% thin -> 91.4% usable
+        #
+        # COALINDIA 2026-08-14 is the case that surfaced it: a signal triggering
+        # at a 3.97% intraday gap was vetted with no magnet history at all,
+        # because not one of its weekly closes had ever landed in the band.
+        # It now reads 7 episodes / 28.6% — "often does NOT return to ST".
+        if from_above:
+            near, far = (bar['low'] - st) / st * 100, (bar['high'] - st) / st * 100
+        else:
+            near, far = (st - bar['high']) / st * 100, (st - bar['low']) / st * 100
+        if far < thresh or near > ceiling:
             i += 1
             continue
 
-        from_above = bar['close'] > st
+        # Ordering WITHIN a candle is unknowable, so a candle that also reached
+        # ST cannot say whether the entry came before the touch or after it.
+        # Scoring it either invents a hit or invents a miss, so it is skipped.
+        #
+        # Measured on LIVE data across the 210 F&O names: 16.1% of episodes,
+        # and dropping them moves the population median NOT AT ALL (60.0% both
+        # ways) — it costs 10 of 202 symbols their `usable` verdict and buys
+        # accuracy per symbol rather than a different headline. Kept for the
+        # unknowability, not for the number; do not re-justify it as a rate
+        # effect, because it is not one.
+        if bar['low'] <= st <= bar['high']:
+            i += 1
+            continue
+
         touched_in = None
         # ST moves with every candle, so each forward bar is tested against
         # ITS OWN ST value, not the one at episode start. A rising ST can come
@@ -321,9 +376,15 @@ def _attraction(kite, stock, timeframe, direction):
     rate = overall['touch_rate_pct']
     return {
         'timeframe': timeframe,
+        'measured': True,
         'horizon_bars': horizon,
         'gap_threshold_pct': thresh,
         'gap_band_pct': [thresh, ceiling],
+        # Stamped so a rate can never be compared across the two definitions by
+        # accident: every number recorded before 2026-08-14 is 'close'-based and
+        # runs ~11 points higher (median 71.4% vs 60.0% across the F&O names),
+        # because that test only ever caught candles that STOPPED in the band.
+        'band_basis': 'candle_range',
         'overall': overall,
         'same_direction': same,
         'sample': 'thin' if thin else 'usable',
@@ -331,7 +392,10 @@ def _attraction(kite, stock, timeframe, direction):
                     'reliably magnetic' if rate >= 70 else
                     'usually magnetic' if rate >= 50 else
                     'often does NOT return to ST'),
-        'note': ('An episode is one move away from ST, not one candle. '
-                 'Touch is judged on the wick against the ST value of THAT '
-                 'candle, matching how the TP trigger actually fires.'),
+        'note': ('An episode is one move away from ST, not one candle. It '
+                 'opens when the candle TRADED through the entry band, which '
+                 'is what the intraday trigger sees; candles that also reached '
+                 'ST are skipped as ambiguous. Touch is judged on the wick '
+                 'against the ST value of THAT candle, matching how the TP '
+                 'trigger actually fires.'),
     }

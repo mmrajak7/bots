@@ -499,6 +499,27 @@ _DEFAULTS = {
                                  # signal. One is an outage blip; two on a
                                  # freshly re-snapshotted book is a broken
                                  # layer — stop burning slots and drop it.
+    'attraction_timeframes': ['weekly'],
+                                 # Where the magnet statistic is measured at
+                                 # all. Monthly is excluded deliberately: 6Y of
+                                 # monthly candles is ~72 bars, an episode
+                                 # consumes 9+, and it reached a usable sample
+                                 # on 5.4% of symbols. Monthly signals are rare
+                                 # besides (45 weekly vs 6 monthly on a typical
+                                 # scan), so the section is reported as
+                                 # NOT MEASURED rather than as missing data.
+    'cli_block_scan_window_sec': 1800,
+                                 # How far back to look for a Claude usage-limit
+                                 # refusal in the per-spawn transcripts. Wide
+                                 # enough to still see the block that killed a
+                                 # spawn two cycles ago, short enough that
+                                 # yesterday's is never resurrected.
+    'cli_block_grace_sec': 600,  # Extra time a queued entry gets AFTER the
+                                 # stated reset, so at least one cycle actually
+                                 # spawns before the drop clock resumes. On
+                                 # 2026-08-14 HAVELLS was dropped at 14:05
+                                 # against a 14:10 reset — five minutes short of
+                                 # the attempt it had been waiting an hour for.
     'agent_reserve': 2,          # Slots the DEFERRABLE_CHANNELS may never take,
                                  # so an entry/exit decision always has room.
                                  # Batch channels therefore cap at 5-2=3, which
@@ -728,6 +749,9 @@ ATTRACTION_ENABLED = bool(_runtime['attraction_enabled'])
 ATTRACTION_HORIZON_BARS = _int('attraction_horizon_bars')
 ATTRACTION_GAP_PCT = _num('attraction_gap_pct')
 ATTRACTION_MIN_EPISODES = _int('attraction_min_episodes')
+ATTRACTION_TIMEFRAMES = tuple(_runtime['attraction_timeframes'])
+assert ATTRACTION_TIMEFRAMES, \
+    "measuring the magnet on no timeframe at all silently removes the section"
 assert SWING_PIVOT_BARS >= 1, "a swing needs at least one candle either side"
 assert SWING_LOOKBACK_CANDLES > SWING_PIVOT_BARS * 2, \
     "the lookback window cannot be shorter than one pivot window"
@@ -815,6 +839,8 @@ DEFERRABLE_CHANNELS = ('review', 'events', 'postmortem')
 # run at all (the cap floors at 1 regardless).
 ENTRY_QUEUE_DROP_AFTER_SEC = _int('entry_queue_drop_after_sec')
 ENTRY_VET_MAX_ATTEMPTS = _int('entry_vet_max_attempts')
+CLI_BLOCK_SCAN_WINDOW_SEC = _int('cli_block_scan_window_sec')
+CLI_BLOCK_GRACE_SEC = _int('cli_block_grace_sec')
 AGENT_RESERVE = int(os.environ.get('ZEBRA_AGENT_RESERVE')
                     or _int('agent_reserve'))
 # The env var bypasses `_positive_int`, so it can carry values the config file

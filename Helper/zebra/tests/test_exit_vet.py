@@ -400,3 +400,68 @@ def test_a_held_tp_does_not_suppress_the_time_exit(wired, monkeypatch):
                         lambda m, **k: sent.append(m) or True)
     monitor.check_entered(wired, kite=None, dry_run=True)
     assert wired.find(1).get('time_alerted_at'), "TIME exit lost behind a held TP"
+
+
+# ── a usage-limit block: fail to the guards NOW, not in fifteen minutes ──
+# ASHOKLEY #390, 2026-08-14. debit_sl fired at 13:25 with the structure at 1.01
+# against a 1.00 stop. The vet had died on quota two seconds after spawning;
+# the gate waited three cycles for it and the exit booked at 0.68 — roughly
+# -50% turned into -75%. The verdict never changes, only how long it costs.
+
+def _block(logdir, monkeypatch, when=MIDDAY):
+    """Plant the real refusal transcript and make the CLI read as blocked.
+
+    Both the transcript's mtime and its reset time sit on the SAME pinned clock
+    the gate reads. Leaving either at real wall-clock time makes the reset land
+    hours in the past, which `_sane_reset` then rightly refuses — the fixture
+    would register no block at all and the test would pass on nothing.
+    """
+    import os
+    monkeypatch.setattr(cfg, 'LOG_DIR', logdir)
+    reset = when + timedelta(minutes=45)
+    p = logdir / 'vet_cli_20260814_132531_exit-vet-390-debit-sl.log'
+    p.write_text(
+        '=' * 78 + '\n=== 2026-08-14 13:25:31  vet #390 debit_sl  model=opus  '
+        'channel=exit\n' + '=' * 78 + '\n'
+        "You've hit your session limit · resets %d:%02d%s (Asia/Kolkata)\n"
+        % (reset.hour % 12 or 12, reset.minute,
+           'am' if reset.hour < 12 else 'pm'),
+        encoding='utf-8')
+    os.utime(p, (when.timestamp(), when.timestamp()))
+    vet.refresh_cli_block(when)
+    assert vet.cli_blocked_until(when) is not None, \
+        "fixture did not register a block"
+
+
+def test_a_blocked_exit_vet_is_never_requested(store, tmp_path, monkeypatch):
+    """Raising a request nobody can answer only buys a 10-minute wait before
+    the identical fail-open."""
+    _clock(monkeypatch, MIDDAY)
+    _block(tmp_path, monkeypatch)
+    assert _gate(store) == 'proceed'
+    assert vet.exit_state(store.find(1), 'debit_sl') is None, \
+        "a PENDING marker was left behind for an agent that cannot run"
+
+
+def test_a_pending_exit_vet_stops_waiting_once_the_cli_is_known_blocked(
+        store, tmp_path, monkeypatch):
+    """The three cycles ASHOKLEY spent waiting."""
+    _clock(monkeypatch, MIDDAY)
+    assert _gate(store) == 'wait'                     # request goes out
+    _block(tmp_path, monkeypatch)
+    assert _gate(store) == 'proceed', "still waiting out a dead agent"
+    assert vet.exit_state(store.find(1), 'debit_sl') == vet.UNAVAILABLE
+
+
+def test_a_block_does_not_convert_an_explicit_defer_into_consent(
+        store, tmp_path, monkeypatch):
+    """Claude LOOKED and said it could not verify the quote. "The agent is
+    offline" is no more consent than a timeout is — the escalation must run its
+    normal course to the human, not fall through to the trigger."""
+    _clock(monkeypatch, MIDDAY)
+    assert _gate(store) == 'wait'
+    vet.record_exit_verdict(store, 1, 'debit_sl', 'defer', decision_id=1)
+    assert _gate(store) == 'wait'                     # re-asked
+    _block(tmp_path, monkeypatch)
+    assert _gate(store) != 'proceed', \
+        "a usage limit was read as permission to fire a refused exit"
