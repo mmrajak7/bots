@@ -1251,6 +1251,29 @@ def cmd_report(args):
     )
 
 
+def cmd_digest(args):
+    """One day reduced to something readable — the paper-run record.
+
+    Distinct from `report`, which sends a P&L summary to a phone. This is the
+    diagnostic digest we read together: what ran, what refused, what earns a
+    look. Deterministic and offline, so it can never compete with the trading
+    vets for the agent budget.
+    """
+    from . import digest as digest_mod
+    path = digest_mod.write(args.date)
+    text = path.read_text(encoding='utf-8')
+    # The FILE stays UTF-8; only the console gets downgraded. A Windows cp1252
+    # terminal raises on the arrows and flags, and a digest that crashes on
+    # display is a digest nobody runs twice.
+    enc = getattr(sys.stdout, 'encoding', None) or 'utf-8'
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode(enc, 'replace').decode(enc, 'replace'))
+    print(f"\n[written to {path}]")
+    return 0
+
+
 def cmd_pm_show(args):
     """Evidence bundle for one post-mortem — the agent's only input."""
     import json as _json
@@ -1542,6 +1565,14 @@ def main():
     p_rst.add_argument('--confirm', action='store_true',
                        help='Actually apply; without this, prints what would happen')
     p_rst.set_defaults(func=cmd_reset)
+
+    p_dig = sub.add_parser(
+        'digest',
+        help='diagnostic digest of one day (paper-run record; NOT the P&L '
+             'report — that is `report`)')
+    p_dig.add_argument('--date', default=None,
+                       help='YYYY-MM-DD, default today')
+    p_dig.set_defaults(func=cmd_digest)
 
     p_rep = sub.add_parser('report',
                            help='EOD daily or Friday weekly performance report')
