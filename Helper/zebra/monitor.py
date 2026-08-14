@@ -1436,6 +1436,15 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     'entry_spot': price,
                     # Feeds the intrinsic-floor quote-sanity guard
                     'short_extrinsic_entry': best['short_extrinsic'],
+                    # The entry book per leg. Without it the trade cannot be
+                    # costed at all — STT is charged per leg on that leg's
+                    # premium — and 179 closed zebra records are permanently
+                    # un-costable for exactly this omission. The analyzer has
+                    # always had these; nothing was ever written down.
+                    'long_bid_entry': best.get('long_bid'),
+                    'long_ask_entry': best.get('long_ask'),
+                    'short_bid_entry': best.get('short_bid'),
+                    'short_ask_entry': best.get('short_ask'),
                 })
                 logger.info("PAPER auto-entered #%d %s %d/%d debit=%.2f",
                             trade['id'], stock,

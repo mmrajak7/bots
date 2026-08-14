@@ -395,6 +395,20 @@ class ZebraStore:
         # position. This is the LIVE path, where that guard matters most.
         if 'short_extrinsic_entry' in entry_data:
             t['short_extrinsic_entry'] = float(entry_data['short_extrinsic_entry'])
+        # THE ENTRY BOOK, PER LEG. Zebra rows carried only the net `debit`,
+        # which is not enough to cost the trade: STT is levied per leg, on that
+        # leg's premium, so 179 of the 215 closed records simply cannot be
+        # charged correctly and never will be. The BCS path has stored this
+        # since fill pricing; the zebra path never did, and the gap only
+        # surfaced when the two-month cohort needed a NET number.
+        #
+        # Same lesson as `exit_legs`: an option book cannot be reconstructed
+        # after the fact. Write it down at the moment or the post-mortem is
+        # guesswork forever.
+        for _k in ('long_bid_entry', 'long_ask_entry', 'long_mid_entry',
+                   'short_bid_entry', 'short_ask_entry', 'short_mid_entry'):
+            if entry_data.get(_k) is not None:
+                t[_k] = float(entry_data[_k])
         # WHICH PRICE CONVENTION this position is valued on, for the rest of
         # its life. `_structure_quote` reads it and falls through to MID when
         # absent — so a hand-entered LIVE trade, whose `debit` is what the
@@ -738,6 +752,26 @@ class ZebraStore:
         t['exit_debit'] = exit_debit
         t['pnl'] = pnl
         t['pnl_pct'] = pnl_pct
+        # NET OF CHARGES, beside the gross figure and never replacing it.
+        # The two-month paper run exists to answer one question — does this
+        # strategy clear its own costs — and the measured baseline says the
+        # median trade is +0.90% gross but -0.79% NET. A cohort scored on
+        # `pnl_pct` alone looks fine while losing money.
+        #
+        # `pnl` keeps its meaning so every earlier record stays comparable;
+        # mixing the two definitions is the mistake `band_basis` exists to
+        # prevent on the magnet stat. Best-effort: a costing failure must
+        # never be able to stop a position being closed.
+        try:
+            from . import fees as fees_mod
+            cost = fees_mod.round_trip_for_trade(t, exit_debit)
+            t['fees'] = cost
+            t['pnl_net'] = round(pnl - float(cost.get('total') or 0), 2)
+            t['pnl_net_pct'] = (round((t['pnl_net'] / (debit * qty)) * 100, 2)
+                                if debit > 0 and qty > 0 else 0)
+        except Exception as e:
+            logger.warning("fee stamp failed for #%d: %s — gross P&L stands",
+                           t.get('id'), e)
         t['exit_reason'] = reason
         # THE BOOK WE EXITED ON. Entry books have been persisted since fill
         # pricing landed; exits kept only the two scalars, so the one direction

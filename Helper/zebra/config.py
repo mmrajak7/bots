@@ -499,6 +499,20 @@ _DEFAULTS = {
                                  # signal. One is an outage blip; two on a
                                  # freshly re-snapshotted book is a broken
                                  # layer — stop burning slots and drop it.
+    'fee_rates': {
+        # Published Zerodha equity-OPTION charges. ESTIMATES: the only
+        # authority is a real contract note, and these have changed before
+        # (the Apr 2026 round is in this repo's history). Stamped per trade
+        # with a model version so a correction can be RECOMPUTED from the
+        # stored leg prices instead of guessed at later.
+        # VERIFY AGAINST A LIVE CONTRACT NOTE BEFORE ANY GO-LIVE DECISION.
+        'brokerage_per_order': 20.0,   # flat, per executed order
+        'stt_sell_pct': 0.10,          # SELL side only, on premium
+        'exchange_pct': 0.03503,       # NSE options, both sides
+        'sebi_pct': 0.0001,            # Rs 10 per crore
+        'stamp_buy_pct': 0.003,        # BUY side only
+        'gst_pct': 18.0,               # on brokerage + exchange + SEBI ONLY
+    },
     'attraction_horizon_days': 60,
                                  # Trading days allowed for the DAY-clock
                                  # velocity measure — ~3 months, well past any
@@ -754,6 +768,11 @@ ATTRACTION_ENABLED = bool(_runtime['attraction_enabled'])
 ATTRACTION_HORIZON_BARS = _int('attraction_horizon_bars')
 ATTRACTION_GAP_PCT = _num('attraction_gap_pct')
 ATTRACTION_MIN_EPISODES = _int('attraction_min_episodes')
+FEE_RATES = dict(_runtime['fee_rates'])
+for _k in ('brokerage_per_order', 'stt_sell_pct', 'exchange_pct', 'sebi_pct',
+           'stamp_buy_pct', 'gst_pct'):
+    assert _k in FEE_RATES, f"fee_rates is missing {_k}"
+    assert float(FEE_RATES[_k]) >= 0, f"fee_rates.{_k} cannot be negative"
 ATTRACTION_HORIZON_DAYS = _int('attraction_horizon_days')
 ATTRACTION_TIMEFRAMES = tuple(_runtime['attraction_timeframes'])
 assert ATTRACTION_TIMEFRAMES, \
