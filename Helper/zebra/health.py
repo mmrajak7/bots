@@ -329,7 +329,7 @@ def check(send=None, now: Optional[datetime] = None, dry_run: bool = False,
     msg = ('\n\n'.join(alerts) +
            "\n<i>Read the agent's log first — it is the only copy of what it "
            "tried:\n"
-           "<code>tail -40 logs/vet_cli_$(date +%Y%m%d).log</code>\n"
+           "<code>tail -n 40 logs/vet_cli_$(date +%Y%m%d)_*.log</code>\n"
            "An approval request there = a tool grant that did not match; an "
            "auth error = <code>claude</code> then /login.</i>")
     if send and send(msg, dry_run=dry_run):

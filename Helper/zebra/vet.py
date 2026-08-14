@@ -705,6 +705,21 @@ def _spawn_budget_ok(tag: str, channel: str = 'entry') -> str:
         return 'unbudgeted'
 
 
+def _log_slug(channel: str, tag: str) -> str:
+    """Filename-safe `channel_tag` for a per-spawn transcript.
+
+    Tags carry spaces and `#` (`vet #352 tp`, `review #390`), so they are not
+    usable in a path as-is. Channel goes FIRST so a day's files group by
+    channel when sorted, and the trade id survives the squeeze — that is what
+    makes one transcript findable among a day's fifty.
+    """
+    raw = f'{channel}_{tag}'
+    safe = ''.join(c if c.isalnum() else '-' for c in raw.lower())
+    while '--' in safe:
+        safe = safe.replace('--', '-')
+    return safe.strip('-')[:48] or 'agent'
+
+
 def _spawn_generic(prompt: str, model: str, tag: str,
                    channel: str = 'entry') -> Optional[int]:
     """Fire a detached Claude CLI run. Returns the pid, or None on failure.
@@ -773,23 +788,48 @@ def _spawn_generic(prompt: str, model: str, tag: str,
         # to a log rather than a pipe: nobody is draining a pipe here, and a
         # full pipe buffer would hang the child mid-decision.
         cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
-        # ONE FILE PER DAY, and a banner naming the spawn.
+        # ONE FILE PER SPAWN, and a banner naming it.
         #
         # This file holds the ONLY copy of an agent's reasoning — the verdict
         # reaches the store, but the working-out that produced it exists
         # nowhere else, and it is the whole point of reviewing whether the
-        # layer is any good. It used to be a single unbounded `vet_cli.log`
-        # that every spawn appended to, so an entry vet, a position review and
-        # a post-mortem firing in one cycle interleaved their output line by
-        # line with nothing saying which was which. Unreadable is the same as
-        # unrecorded.
+        # layer is any good.
         #
-        # Dated like the cron log so `find -mtime` can trim it, and so a bad
-        # day's reasoning stays findable.
-        log_path = cfg.LOG_DIR / f"vet_cli_{_now().strftime('%Y%m%d')}.log"
+        # It was a single unbounded `vet_cli.log` that every spawn appended to,
+        # so concurrent agents interleaved line by line. That was "fixed" by
+        # dating the file and writing a banner per spawn — which fixed the
+        # trimming and NOT the interleaving, because the banner is written HERE,
+        # at spawn, while the child writes its body minutes later when it
+        # finishes. With three agents in flight the file gets banner A, banner
+        # B, banner C, then body A, body B, body C, and every body lands under
+        # the wrong name.
+        #
+        # Measured 2026-08-14: the 09:15:47 `postmortem` banner was followed by
+        # the EVENTS agent's permission errors and then the EXIT vet's verdict.
+        # That is strictly worse than the original interleaving: garbled lines
+        # announce themselves, whereas a cleanly misattributed block reads as
+        # true and gets believed. This log is the sole diagnostic instrument
+        # for a layer that gates real money, and it was lying about which agent
+        # said what.
+        #
+        # One file per spawn makes misattribution impossible by construction —
+        # no merging, no pid tracking, no ordering assumptions. Kept FLAT in
+        # logs/ and still prefixed `vet_cli_`, because the Pi's installed trim
+        # cron matches `-name "vet_cli_*.log"` (pi_setup.sh) and moving these
+        # into a subdirectory would silently stop trimming them on the SD card.
+        # Read a whole day with the same glob: `cat logs/vet_cli_YYYYMMDD_*.log`.
+        stamp = _now()
+        slug = _log_slug(channel, tag)
+        base = f"vet_cli_{stamp.strftime('%Y%m%d_%H%M%S')}_{slug}"
+        log_path = cfg.LOG_DIR / f'{base}.log'
+        # Two agents can spawn in the same second on the same channel (the
+        # 09:15:47 collision above was exactly that). Never let one overwrite
+        # or append to another's transcript.
+        if log_path.exists():
+            log_path = cfg.LOG_DIR / f'{base}_{uuid.uuid4().hex[:6]}.log'
         out = open(log_path, 'a')
-        out.write(f"\n{'=' * 78}\n"
-                  f"=== {_now().strftime('%Y-%m-%d %H:%M:%S')}  {tag}  "
+        out.write(f"{'=' * 78}\n"
+                  f"=== {stamp.strftime('%Y-%m-%d %H:%M:%S')}  {tag}  "
                   f"model={model}  channel={channel}\n"
                   f"{'=' * 78}\n")
         out.flush()
