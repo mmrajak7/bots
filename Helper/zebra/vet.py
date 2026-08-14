@@ -68,7 +68,14 @@ UNAVAILABLE = 'unavailable'
 QUEUED = 'queued'
 # The queue gave up. Terminal, and the signal is CANCELLED, never entered.
 STARVED = 'starved'
-TERMINAL = (ALLOWED, VETOED, UNAVAILABLE, STARVED)
+# The signal left the band (drift/stale/crossed) while its agent was still
+# thinking, so the verdict became moot before it arrived. Terminal, never
+# entered, and deliberately NOT `starved`: starved means the queue gave up on a
+# live signal and is what the ENTRY DROPPED alert counts, while this one was
+# already cancelled and already announced by the band-cancel that did it.
+# Without its own state these markers simply stayed `pending` on disk forever.
+ABANDONED = 'abandoned'
+TERMINAL = (ALLOWED, VETOED, UNAVAILABLE, STARVED, ABANDONED)
 
 # ── The entry queue (2026-08-13) ─────────────────────────────────────────
 # Invariant 2 above ("fail-open to today's behaviour") is DELIBERATELY INVERTED
@@ -293,6 +300,15 @@ def refresh_cli_block(now: Optional[datetime] = None) -> Optional[dict]:
         if found:
             prev = _read_cli_block()
             path.write_text(json.dumps(found, indent=1), encoding='utf-8')
+            # Tell the watchdog. Without this a block is INVISIBLE to it:
+            # spawns are suppressed, so nothing goes silent, nothing fails to
+            # start, and the credential is fine — all three of its probes
+            # all-clear through an outage that stops every entry.
+            try:
+                from .health import record_cli_blocked
+                record_cli_blocked(found['reset_at'], found.get('raw') or '')
+            except Exception:                    # pragma: no cover - paranoia
+                pass
             # Keyed on the RESET, not the source file. During an outage every
             # cycle produces a fresh refusal transcript, so keying on the
             # filename re-announces the same block a dozen times — one signal,
@@ -314,6 +330,13 @@ def refresh_cli_block(now: Optional[datetime] = None) -> Optional[dict]:
                 try:
                     path.unlink()
                 except OSError:
+                    pass
+                # Clear the watchdog's copy too, or a lifted block keeps its
+                # alert armed and re-fires on the next unrelated warning.
+                try:
+                    from .health import record_cli_blocked
+                    record_cli_blocked(None)
+                except Exception:                # pragma: no cover - paranoia
                     pass
                 logger.info('CLI block cleared — agent spawns resume')
                 return None
@@ -1208,7 +1231,7 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
     # right place to notice that the agent binary has started refusing.
     refresh_cli_block(now)
     blocked_until = cli_blocked_until(now)
-    requeued, starved, blocked = [], [], []
+    requeued, starved, blocked, abandoned = [], [], [], []
     # QUEUED records FIRST, and separately, because `is_expired` answers only
     # about PENDING markers. Without this pass a signal whose spawn is refused
     # every cycle ping-pongs QUEUED -> PENDING -> QUEUED forever: `attempts`
@@ -1254,8 +1277,22 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
                 continue
             if fresh.get('status') not in ('watching', 'triggered'):
                 # Drift-cancelled (or entered) while its agent was thinking.
-                # Requeuing a cancelled signal creates a zombie marker and a
-                # log line claiming a retry that can never happen.
+                # Requeuing it creates a zombie marker and a log line claiming
+                # a retry that can never happen — but simply skipping left the
+                # marker PENDING on disk FOREVER, which is its own zombie:
+                # ALKEM #382 on 2026-08-14 is still `pending` for an agent that
+                # died at 14:00. Settle it instead. ABANDONED is terminal, so
+                # a late verdict is discarded rather than applied to a signal
+                # that no longer exists.
+                if fresh.get('status') == 'cancelled':
+                    v = dict(fresh.get('vet') or {})
+                    v.update(state=ABANDONED, decided_at=now.isoformat(),
+                             failed_open_because=(
+                                 'signal was %s before a verdict arrived'
+                                 % (fresh.get('cancel_reason') or 'cancelled')))
+                    fresh['vet'] = v
+                    fresh['version'] = fresh.get('version', 0) + 1
+                    abandoned.append(t['id'])
                 continue
             v = dict(fresh.get('vet') or {})
             # "We declined to start it" and "it started and failed" need
@@ -1306,6 +1343,9 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
     # Logged OUTSIDE the lock, like the requeue list below it: this file
     # already learned that building a log line inside `_mutate` can raise on a
     # concurrently-removed trade and take the whole sweep with it.
+    for tid in abandoned:
+        logger.info('VET ABANDONED #%d — the signal was cancelled before a '
+                    'verdict arrived; marker settled, nothing entered.', tid)
     for tid in blocked:
         logger.warning('VET BLOCKED #%d — %s. Held, and NOT counted as an '
                        'attempt: nothing ran.', tid, cli_block_reason(now))
@@ -1314,6 +1354,9 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
                        "rush to enter; an unqualified entry costs capital.", tid)
     # Returned as one list for backward compatibility with existing callers,
     # which only ever used it for logging/counting.
+    # `abandoned` is deliberately NOT returned: the caller logs this list as
+    # "entry signal(s) requeued or dropped", and a marker tidied up on an
+    # already-cancelled signal is neither. It is logged on its own line above.
     return requeued + starved + blocked
 
 

@@ -268,3 +268,84 @@ def test_a_reset_a_few_hours_out_is_still_honoured(logdir):
     vet.refresh_cli_block(BLOCK_AT)
     until = vet.cli_blocked_until(BLOCK_AT)
     assert until is not None and (until.hour, until.minute) == (18, 0), until
+
+
+# ── 5. the watchdog must not all-clear through a block ───────────────────
+# A block suppresses spawns, so `spawns_since_landing` never rises, nothing
+# fails to start, and the credential is valid. All three of the watchdog's
+# probes report healthy while every entry and every exit second opinion is
+# down — the exact shape `feedback_watchdog_must_not_all_clear` exists for.
+
+def test_the_watchdog_sees_a_block_its_other_probes_cannot(logdir, monkeypatch):
+    from zebra import health
+    monkeypatch.setattr(cfg, 'VET_ENABLED', True)
+    _transcript(logdir, REAL)
+    vet.refresh_cli_block(BLOCK_AT)
+    sent = []
+    msg = health.check(send=lambda m, dry_run=False: sent.append(m) or True,
+                       now=BLOCK_AT, paths=[])
+    assert msg and sent, "the watchdog stayed silent through a total outage"
+    assert 'USAGE LIMIT' in msg
+    assert '14:10' in msg, "the owner is not told when it comes back"
+    # ...and it says what it COSTS, not just that a channel is down.
+    assert 'entries QUEUE' in msg and 'deterministic guards' in msg
+
+
+def test_one_block_alerts_once_not_every_cycle(logdir, monkeypatch):
+    from zebra import health
+    monkeypatch.setattr(cfg, 'VET_ENABLED', True)
+    _transcript(logdir, REAL)
+    vet.refresh_cli_block(BLOCK_AT)
+    send = lambda m, dry_run=False: True
+    assert health.check(send=send, now=BLOCK_AT, paths=[])
+    vet.refresh_cli_block(BLOCK_AT)          # the outage continues
+    assert health.check(send=send, now=BLOCK_AT, paths=[]) is None, \
+        "re-announced the same block on the next cycle"
+
+
+def test_a_lifted_block_stops_alerting(logdir, monkeypatch):
+    from zebra import health
+    monkeypatch.setattr(cfg, 'VET_ENABLED', True)
+    _transcript(logdir, REAL)
+    vet.refresh_cli_block(BLOCK_AT)
+    after = datetime(2026, 8, 14, 14, 11)
+    vet.refresh_cli_block(after)             # clears both copies
+    assert health.check(send=lambda m, dry_run=False: True,
+                        now=after, paths=[]) is None
+
+
+# ── 6. a cancelled signal must not leave a pending marker forever ────────
+
+def test_a_cancelled_signal_settles_its_pending_marker(store, logdir, clock):
+    """ALKEM #382 on 2026-08-14 is still `pending` for an agent that died at
+    14:00: the sweep skipped it to avoid a zombie requeue and left a zombie
+    marker instead."""
+    vet.request_entry_vet(store, 1, CONTEXT, spawn=False)
+    store.cancel(1, 'stale: gap 2.18% < 3.0%')
+    clock['t'] = datetime(2026, 8, 14, 13, 20)
+    vet.expire_stale(store, now=clock['t'])
+    v = store.find(1)['vet']
+    assert v['state'] == vet.ABANDONED, v['state']
+    assert 'stale' in v['failed_open_because']
+
+
+def test_an_abandoned_marker_is_terminal(store, logdir, clock):
+    """A verdict arriving after the signal is gone must be discarded, not
+    applied to a trade that no longer exists."""
+    vet.request_entry_vet(store, 1, CONTEXT, spawn=False)
+    store.cancel(1, 'drift: gap 6.10% > watch+20%')
+    clock['t'] = datetime(2026, 8, 14, 13, 20)
+    vet.expire_stale(store, now=clock['t'])
+    assert vet.vet_state(store.find(1)) in vet.TERMINAL
+    with pytest.raises(ValueError):
+        vet.request_entry_vet(store, 1, CONTEXT, spawn=False)
+
+
+def test_abandoning_is_not_counted_as_a_dropped_entry(store, logdir, clock):
+    """The caller logs the return value as "requeued or dropped". A marker
+    tidied on an already-cancelled signal is neither, and counting it there
+    would inflate the number the owner reads as lost opportunities."""
+    vet.request_entry_vet(store, 1, CONTEXT, spawn=False)
+    store.cancel(1, 'stale: gap 2.18% < 3.0%')
+    clock['t'] = datetime(2026, 8, 14, 13, 20)
+    assert vet.expire_stale(store, now=clock['t']) == []

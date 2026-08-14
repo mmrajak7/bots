@@ -233,6 +233,42 @@ def record_spawn_refused(channel: str = 'entry') -> None:
         state['channels'] = ch
 
 
+def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    """Never raises: a hand-edited or half-written state file must not be able
+    to take down the watchdog that is watching for exactly that kind of thing."""
+    try:
+        return datetime.fromisoformat(ts) if ts else None
+    except (TypeError, ValueError):
+        return None
+
+
+def record_cli_blocked(reset_at: Optional[str], reason: str = '') -> None:
+    """The CLI is alive and REFUSING — a usage limit, not a failure.
+
+    Recorded because it is otherwise INVISIBLE to every probe in `check`: a
+    block suppresses spawns, so `spawns_since_landing` never rises, no spawn
+    fails, and the credential is perfectly valid. All three probes report
+    healthy while the entire vetting layer is down — the one failure shape this
+    module's own docstring says it exists to prevent.
+
+    Pass reset_at=None to clear when the block lifts.
+    """
+    with _locked_state() as state:
+        if reset_at is None:
+            state.pop('cli_block', None)
+            return
+        prev = state.get('cli_block')
+        prev = prev if isinstance(prev, dict) else {}
+        state['cli_block'] = {
+            'reset_at': reset_at,
+            'reason': reason,
+            'since': prev.get('since') or datetime.now().isoformat(),
+            # Preserved across refreshes so one block alerts ONCE, not every
+            # cycle for as long as it lasts.
+            'alerted_for': prev.get('alerted_for'),
+        }
+
+
 def record_agent_landed(channel: str = 'entry') -> None:
     """A spawned agent completed its job by calling a zebra verb.
 
@@ -272,7 +308,17 @@ def check(send=None, now: Optional[datetime] = None, dry_run: bool = False,
     now = now or datetime.now()
     state = _read_state()
     today = now.strftime('%Y-%m-%d')
-    if state.get('last_warned_on') == today:
+    # A usage-limit block is an OPERATIONAL event, not a daily credential nag:
+    # it starts and ends within hours, and the owner needs to know inside one
+    # cycle that nothing is being vetted. So it bypasses the once-a-day gate —
+    # but keyed on the block's own reset time, so one block alerts ONCE however
+    # many cycles it spans.
+    block = state.get('cli_block')
+    block = block if isinstance(block, dict) else {}
+    block_reset = _parse_iso(block.get('reset_at'))
+    block_live = block_reset is not None and now < block_reset
+    block_new = block_live and block.get('alerted_for') != block.get('reset_at')
+    if state.get('last_warned_on') == today and not block_new:
         return None
 
     # THREE INDEPENDENT PROBES, deliberately not an if/elif chain.
@@ -286,6 +332,21 @@ def check(send=None, now: Optional[datetime] = None, dry_run: bool = False,
     # while it is dead is the one failure shape this whole layer exists to
     # prevent, so each probe now speaks for itself.
     alerts = []
+    if block_live:
+        # FOURTH independent probe. The other three are all blind here: spawns
+        # are suppressed so nothing goes silent, nothing fails to start, and
+        # the credential is fine. Without this the watchdog all-clears through
+        # an outage that stops every entry and every exit second opinion.
+        alerts.append(
+            f"🔑 <b>CLAUDE IS REFUSING — USAGE LIMIT</b>\n"
+            f"The agent binary runs and exits immediately"
+            f"{': ' + block['reason'] if block.get('reason') else ''}.\n"
+            f"Back at <b>{block_reset.strftime('%H:%M')}</b>. Until then:"
+            f"\n• <b>entry</b> — {CHANNEL_IMPACT['entry']}"
+            f"\n• <b>exit</b> — {CHANNEL_IMPACT['exit']}"
+            f"\n<i>Queued entries hold their place to the reset rather than "
+            f"burning attempts, so nothing is dropped for want of an agent "
+            f"that was never available.</i>")
     expiry = credential_expiry(paths)
     if expiry is not None:
         days = (expiry - now).days
@@ -335,6 +396,14 @@ def check(send=None, now: Optional[datetime] = None, dry_run: bool = False,
     if send and send(msg, dry_run=dry_run):
         with _locked_state() as s:
             s['last_warned_on'] = today
+            if block_live:
+                # Stamp the BLOCK as announced, not just the day: the daily
+                # gate is what this alert deliberately bypassed, so relying on
+                # it would re-send every cycle for the length of the outage.
+                b = s.get('cli_block')
+                if isinstance(b, dict):
+                    b['alerted_for'] = block.get('reset_at')
+                    s['cli_block'] = b
         logger.warning('AUTH WARNING sent')
     else:
         # Do NOT mark it warned: an unsent warning is not a warning.
