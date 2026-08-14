@@ -455,21 +455,32 @@ def test_the_calendar_agent_alone_may_write_files(monkeypatch):
     the trade store, zebra_config.json (which carries vet_enabled), or any .py
     in the package, with no Write rule in the deny list to stop it. Asserting
     the literal string 'Write' could not tell those two apart.
+
+    2026-08-14: the grant is now `Edit(path)`, not `Write(path)`. Claude Code
+    only does file-permission matching on the Edit family — `Write(path)` is
+    silently unmatched — and an Edit rule covers every file-editing tool
+    including Write. So "may write files" is still exactly what this asserts;
+    the permission is simply spelled Edit.
     """
-    assert not any(t.startswith('Write') for t in vet_mod._allowed_tools('entry'))
-    assert not any(t.startswith('Write') for t in vet_mod._allowed_tools('exit'))
-    writes = [t for t in vet_mod._allowed_tools('events') if t.startswith('Write')]
-    # Two grants as of 2026-08-13 — the SAME file in both path forms, because a
-    # bare absolute pattern matched nothing and silently denied the agent. The
-    # property to hold is scope, not count: assert every grant names the one
-    # candidate file and none is a wildcard.
-    assert writes, 'the calendar agent lost its Write grant'
-    assert 'Write' not in writes, 'the calendar grant must be path-scoped'
-    for w in writes:
-        assert w.startswith('Write(') and w.endswith(')')
-        assert 'event_calendar.candidate.json' in w, w
-        assert '*' not in w, ('the grant widened to a wildcard: %s' % w)
-    assert 'event_calendar.candidate.json' in writes[0]
+    editors = ('Write', 'Edit')
+    for ch in ('entry', 'exit'):
+        assert not any(t.startswith(editors) for t in vet_mod._allowed_tools(ch)), \
+            f'{ch} channel must not be able to edit files'
+    grants = [t for t in vet_mod._allowed_tools('events')
+              if t.startswith(editors)]
+    # Two grants — the SAME file in both path forms, because a bare absolute
+    # pattern matched nothing and silently denied the agent. The property to
+    # hold is scope, not count: every grant names the one candidate file and
+    # none is a wildcard.
+    assert grants, 'the calendar agent lost its file-write grant'
+    assert 'Write' not in grants and 'Edit' not in grants, \
+        'the calendar grant must be path-scoped, never a bare tool name'
+    for g in grants:
+        assert g.startswith('Edit(') and g.endswith(')'), (
+            'path-scoped grants must use Edit(path); Write(path) is silently '
+            'unmatched by Claude Code — see vet_cli_20260814.log. Got: %s' % g)
+        assert 'event_calendar.candidate.json' in g, g
+        assert '*' not in g, ('the grant widened to a wildcard: %s' % g)
 
 
 # ── the CLI must be findable where cron actually runs ────────────────────

@@ -81,10 +81,30 @@ EVENT_CANDIDATE_FILE = LOG_DIR / 'event_calendar.candidate.json'
 # about, and the auth watchdog reported it as "spawned but never completed",
 # whose suggested cause (expired login) sent the owner to re-login for nothing.
 # Both forms name the same single file, so the scope is unchanged.
+#
+# 2026-08-14, THE ACTUAL FIX. The two rules below said `Write(...)`, and Claude
+# Code rejects that form outright — it says so in the agent log, verbatim:
+#
+#   Permission allow rule (--allowed-tools): Write(logs/event_calendar.
+#   candidate.json) is not matched by file permission checks — only Edit(path)
+#   rules are. Use Edit(logs/event_calendar.candidate.json) instead (Edit rules
+#   cover all file-editing tools).
+#
+# So a path-scoped grant must be written `Edit(path)` REGARDLESS of which
+# file-editing tool the agent reaches for; `Edit` is the permission family, not
+# the tool name. `Write(path)` matched nothing, the agent printed an approval
+# request to a log nobody reads live, and exited 0 with the calendar unwritten.
+#
+# That is the third distinct cut at this one grant — first the tool had no
+# scope, then the absolute form was missing its `//`, now the family was wrong.
+# Every version "looked right" and every version failed the same silent way,
+# because an unmatched grant and an auth failure are indistinguishable from
+# outside. The lesson is in the log-reading, not the pattern: this was only ever
+# diagnosable from `vet_cli_*.log`, which is why that file exists.
 _EVENT_CANDIDATE_REL = EVENT_CANDIDATE_FILE.relative_to(PROJECT_ROOT).as_posix()
 EVENT_EXTRA_TOOLS = [
-    'Write({})'.format(_EVENT_CANDIDATE_REL),                 # cwd-relative
-    'Write(//{})'.format(EVENT_CANDIDATE_FILE.as_posix().lstrip('/')),  # absolute
+    'Edit({})'.format(_EVENT_CANDIDATE_REL),                 # cwd-relative
+    'Edit(//{})'.format(EVENT_CANDIDATE_FILE.as_posix().lstrip('/')),  # absolute
 ]
 # The five position VERBS, plus the four verbs that CALL them. Denying only
 # the explicit verbs left the invariant above false: `zebra run` was granted by

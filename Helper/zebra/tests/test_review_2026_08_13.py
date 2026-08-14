@@ -70,13 +70,38 @@ POSITION_VERBS = ['close', 'enter', 'cancel', 'reset', 'trigger']
 # class this list exists to catch); `events replace` overwrites the shared
 # event calendar that the corporate-action interlock reads, and --allow-empty
 # can blank it.
-SPAWNER_VERBS = ['postmortem run', 'events replace']
+SPAWNER_VERBS = ['postmortem run']
+# Denied on ARGV to every channel EXCEPT the one whose job it is. Deliberately
+# NOT in settings.json: that file is all-or-nothing and applies to every spawn,
+# so a per-channel rule placed there disables the channel that needs it — which
+# is exactly what happened on 2026-08-14, taking the calendar refresher down.
+PER_CHANNEL_VERBS = ['events replace']
 
 
-@pytest.mark.parametrize('verb', POSITION_VERBS + CYCLE_VERBS + SPAWNER_VERBS)
+@pytest.mark.parametrize(
+    'verb', POSITION_VERBS + CYCLE_VERBS + SPAWNER_VERBS + PER_CHANNEL_VERBS)
 def test_the_deny_list_covers_the_callers_not_just_the_callees(verb):
     assert any(verb in pattern for pattern in cfg.VET_DENIED_TOOLS), \
         f"`zebra {verb}` is not denied to spawned agents"
+
+
+@pytest.mark.parametrize('verb', PER_CHANNEL_VERBS)
+def test_a_per_channel_deny_is_NOT_in_the_settings_backstop(verb):
+    """settings.json is all-or-nothing and applies to every spawned agent.
+
+    A rule that must vary by channel cannot live there: the per-channel
+    carve-out in `vet._denied_tools` only edits the argv --disallowedTools
+    list, and nothing on argv can grant back what this file denies. Putting
+    `events replace` here on 2026-08-14 therefore denied it to the events
+    channel — whose entire job is running it — and took down the calendar
+    refresher that the corporate-action interlock reads. From the outside the
+    failure is indistinguishable from an auth error.
+    """
+    data = json.loads((HELPER / '.claude' / 'settings.json').read_text())
+    deny = data['permissions']['deny']
+    assert not any(verb in pattern for pattern in deny), (
+        f"`{verb}` is per-channel and must NOT be in settings.json — it would "
+        f"disable the channel that needs it, and argv cannot grant it back")
 
 
 @pytest.mark.parametrize('verb', POSITION_VERBS + CYCLE_VERBS + SPAWNER_VERBS)
@@ -640,18 +665,34 @@ def test_promote_is_a_cas_so_overlapping_drainers_spawn_once(store, monkeypatch)
 
 def test_the_event_write_grant_matches_both_path_forms(monkeypatch):
     """A permission pattern that matches nothing is indistinguishable from a
-    broken agent: the CLI exits 0 with the work undone. The first cut passed a
-    bare absolute path; Claude Code matches file-tool patterns relative to the
-    project dir, and needs `//` for absolutes. Live result: the calendar agent
-    was silently denied its only Write for a full session."""
+    broken agent: the CLI exits 0 with the work undone.
+
+    Three cuts at this one grant, each failing the same silent way:
+    1. no path scope at all (the agent could write anything);
+    2. a bare absolute path — Claude Code matches file-tool patterns relative
+       to the project dir and needs `//` for absolutes;
+    3. `Write(path)` — REJECTED OUTRIGHT. Claude Code's own words in
+       `vet_cli_20260814.log`: *"Write(...) is not matched by file permission
+       checks — only Edit(path) rules are. Use Edit(...) instead (Edit rules
+       cover all file-editing tools)."* `Edit` is the permission FAMILY for
+       every file-editing tool, not the name of one tool.
+
+    This test previously asserted `Write(` and so PINNED cut 3 in place — it
+    passed on every run for a day while the calendar refresher was dead and the
+    watchdog cried "AGENTS NOT REPORTING BACK". A test that encodes the wrong
+    contract is worse than no test: it makes the bug look deliberate.
+    """
     grants = cfg.EVENT_EXTRA_TOOLS
     assert len(grants) == 2, 'both path forms must be granted'
-    assert all(g.startswith('Write(') for g in grants)
+    assert all(g.startswith('Edit(') for g in grants), (
+        'path-scoped grants must use the Edit(path) family; Write(path) is '
+        'silently unmatched by Claude Code. See vet_cli_20260814.log.')
+    assert not any(g.startswith('Write(') for g in grants), grants
     # cwd-relative form, forward slashes even on Windows
-    assert any(g == 'Write(logs/event_calendar.candidate.json)' for g in grants), \
+    assert any(g == 'Edit(logs/event_calendar.candidate.json)' for g in grants), \
         grants
     # absolute form, // prefixed
-    assert any(g.startswith('Write(//') for g in grants), grants
+    assert any(g.startswith('Edit(//') for g in grants), grants
     # ...and neither widens the scope beyond the one candidate file.
     assert all('event_calendar.candidate.json' in g for g in grants)
     assert not any('**' in g or '*' in g for g in grants), \

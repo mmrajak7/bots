@@ -60,9 +60,25 @@ option expired before the magnet worked. `min_dte` was raised to 15 on
 2026-08-13 so the picker rolls to the next expiry instead. A short-dated signal
 reaching you now means something is off; say so.
 
-**You are judging a BULL CALL SPREAD / BEAR PUT SPREAD (BCS).** Zebra — the
-2×ITM/1×ATM back-ratio — was retired on 2026-08-12 and nothing you vet will
-ever be one. Ignore any zebra structure description you find in other docs.
+**Every ENTRY you vet is a BULL CALL SPREAD / BEAR PUT SPREAD (BCS).** Zebra —
+the 2×ITM/1×ATM back-ratio — was retired on 2026-08-12, so no NEW signal will
+ever be one.
+
+**EXITS are different, and the previous wording was wrong about it.** Positions
+opened before the retirement are still open and still exit, so an exit vet CAN
+hand you a zebra back-ratio. An agent caught this live on 2026-08-14 vetting
+`#301` and was right to flag it. Tell them apart from the record, not from this
+sentence:
+
+- `structure: 'bcs'` (or a `width`) → 2 legs, value = `long − short`.
+- `structure` absent/`'zebra'` → back-ratio, value = `2 × long − short`. The
+  mid reconciles as `2 × long_mid − short_mid`; if that is the arithmetic that
+  fits the quoted book, you are looking at a zebra.
+
+This matters because the two structures have different payoff shapes: a BCS
+caps its own upside at `width − debit`, a back-ratio does not, and a
+back-ratio's max loss is the debit on 2× the long quantity. Judge the exit on
+the structure in front of you.
 
 ### NEVER veto on `trend_aligned` — it is a badge, not a gate
 

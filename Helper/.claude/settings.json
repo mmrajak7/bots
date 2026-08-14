@@ -29,15 +29,23 @@
     "Telegrams the owner. Deny the callers, not just the callees.",
     "",
     "2026-08-13 (later): the same test applied to the verbs added since found",
-    "two more. `postmortem run` calls spawn_batch -> _spawn_generic, so it is",
-    "a SPAWNER — the very class the paragraph above exists to catch — and it",
-    "was reachable by every channel. `events replace` REPLACES the shared",
-    "event calendar and --allow-empty can wipe it: the same calendar the",
-    "corporate-action interlock reads, so any agent could blank a safety",
-    "input and re-stamp it fresh. Both denied here. The events channel gets",
-    "`events replace` back via a per-channel carve-out in vet._denied_tools,",
-    "because Claude Code resolves deny BEFORE allow — a global deny cannot be",
-    "granted back on the command line, so scoping has to remove the rule."
+    "`postmortem run`, which calls spawn_batch -> _spawn_generic, so it is a",
+    "SPAWNER — the very class the paragraph above exists to catch — and it was",
+    "reachable by every channel. Denied here and on argv; no channel needs it.",
+    "",
+    "2026-08-14, REVERTED SAME DAY: `events replace` was added here too, and",
+    "that was a MISTAKE that broke the calendar refresher. This file's deny",
+    "applies to EVERY spawned agent, and the per-channel carve-out in",
+    "vet._denied_tools only edits the argv --disallowedTools list — it cannot",
+    "grant back something denied here. So the events channel, whose entire job",
+    "is installing the calendar, was denied the one verb it exists to run.",
+    "",
+    "THE RULE THIS FILE NOW ENCODES: a deny that must vary BY CHANNEL cannot",
+    "live in this file. This file is all-or-nothing, and its real job is the",
+    "human-interactive backstop where no argv flags are in play. Per-channel",
+    "scoping belongs in VET_DENIED_TOOLS + vet._denied_tools ONLY. Adding a",
+    "per-channel rule here silently disables the channel that needs it, and",
+    "the failure looks exactly like an auth error from the outside."
   ],
   "permissions": {
     "deny": [
@@ -50,8 +58,7 @@
       "Bash(*zebra loop*)",
       "Bash(*zebra scan*)",
       "Bash(*zebra report*)",
-      "Bash(*postmortem run*)",
-      "Bash(*events replace*)"
+      "Bash(*postmortem run*)"
     ]
   }
 }
