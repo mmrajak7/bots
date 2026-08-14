@@ -554,6 +554,156 @@ def cmd_review_record(args):
     return 0
 
 
+def cmd_quote(args):
+    """Re-quote a signal or an open position LIVE. Read-only, JSON to stdout.
+
+    Why this exists. `vet show` deliberately serves the book CAPTURED AT
+    TRIGGER, so a verdict judges what the bot acted on. The checklist then
+    tells the agent to "re-quote live at decision time (never trust alert
+    pricing)" — and until now nothing let it. Measured on 2026-08-14: eleven
+    separate agents reported they could not obtain a live book (Kite MCP and
+    ad-hoc Python are both unpermitted, correctly), and every one of them
+    docked its own confidence for it. The layer was being asked to run a step
+    its permission set forbade.
+
+    It matters most on the EXIT side. Both incidents that cost real money
+    (ICICI Feb, NHPC Jul) were one garbage top-of-book acted on at the open,
+    and the fix was debounce plus re-verify — a second observation, separated
+    in time. That is exactly what an agent re-quoting here performs, from a
+    different process, before it endorses a close.
+
+    Two shapes, because the two states hold different evidence:
+
+    - ENTERED — re-run the monitor's own `_structure_quote`, so the agent sees
+      the same arithmetic the engine uses: the trade's stamped `pricing_basis`,
+      the mathematical bounds, the intrinsic-floor REJECTION, and per-leg
+      reliability. A second implementation here would eventually disagree with
+      the one that trades, and the disagreement would surface as a verdict.
+    - TRIGGERED/WATCHING — rebuild the live BCS pair through the same builder
+      the cycle uses. The entry context carries only the ATM leg (the short is
+      picked inside `analyze_bcs`, after the snapshot is taken), so this is the
+      only way an entry agent can see the short leg's book at all.
+
+    Read-only by construction: it opens no lock, writes no store, and places
+    nothing. Reachable under the existing coarse `-m zebra` grant; the deny
+    list still blocks every position verb.
+    """
+    import json as _json
+    from datetime import datetime as _dt
+    from .trade_store import get_store
+    from . import config as cfg
+
+    t = get_store().find(args.id)
+    if not t:
+        print(_json.dumps({'error': f'trade #{args.id} not found'}))
+        return 1
+
+    out = {'trade_id': t['id'], 'stock': t.get('stock'),
+           'status': t.get('status'), 'direction': t.get('direction'),
+           'quoted_at': _dt.now().isoformat(timespec='seconds')}
+    try:
+        from .scanner import _get_kite, get_ltp
+        kite = _get_kite()
+        spot = (get_ltp(kite, [t['stock']]) or {}).get(t['stock']) or None
+    except Exception as e:
+        # A dead token is the likeliest cause and it must read as a refusal to
+        # answer, not as a quote of zero. An agent that cannot tell those apart
+        # will endorse an exit on a book it never saw.
+        print(_json.dumps({**out, 'error': f'no live quote: {e}',
+                           'advice': 'treat as NO independent confirmation — '
+                                     'do not upgrade confidence on this'}))
+        return 1
+    out['spot'] = spot
+    if not spot:
+        # "We could not ASK" and "we asked and the book was empty" need
+        # OPPOSITE responses, and they arrive here looking identical: `get_ltp`
+        # swallows an auth failure and returns {}, so a dead token reaches this
+        # point as a missing spot rather than as an exception. Caught by running
+        # the verb for real against an expired token, where it cheerfully
+        # reported "no transactable price" — a statement about the market, made
+        # on evidence that was really a statement about our login.
+        #
+        # The underlying is the most liquid instrument in the chain and is
+        # quoted continuously, so no spot means the pipe is broken, full stop.
+        # Refuse loudly instead of describing a book nobody managed to read.
+        print(_json.dumps({**out,
+                           'error': 'no spot for %s — the underlying is quoted '
+                                    'continuously, so this is an API or token '
+                                    'failure, NOT a thin book' % t.get('stock'),
+                           'advice': 'treat as NO independent confirmation — '
+                                     'do not upgrade confidence on this, and '
+                                     'do not read it as a low valuation'}))
+        return 1
+
+    if t.get('status') == 'entered':
+        from .monitor import _structure_quote
+        q = _structure_quote(kite, t, spot)
+        entry_debit = t.get('debit')
+        out.update({
+            'kind': 'position',
+            'pricing_basis': t.get('pricing_basis') or 'mid',
+            'value': q.get('mid'),
+            'reliable': q.get('reliable'),
+            'unreliable_reason': q.get('reason'),
+            'rejected': q.get('rejected'),
+            'legs': q.get('legs'),
+            'entry_debit': entry_debit,
+            'entry_spot': t.get('entry_spot'),
+            'debit_sl_value': t.get('debit_sl_value'),
+            'tp_spot': t.get('tp_spot'),
+            'sl_spot': t.get('sl_spot'),
+            'expiry': t.get('expiry'),
+        })
+        if q.get('mid') is not None and entry_debit:
+            out['pnl_pct'] = round((q['mid'] - entry_debit) / entry_debit * 100, 1)
+        # State the meaning of a refusal rather than leaving a null to be read
+        # as "fine". `mid: None` is the honest answer to an unusable book, and
+        # an agent skimming JSON will otherwise treat the absence as absence of
+        # a problem.
+        if q.get('mid') is None:
+            out['advice'] = ('no transactable price right now (%s) — this is a '
+                             'REFUSAL, not a low value; the engine defers to '
+                             'the next poll on exactly this read'
+                             % (q.get('reason') or 'unusable book'))
+        print(_json.dumps(out, default=str))
+        return 0
+
+    if t.get('status') not in ('triggered', 'watching'):
+        print(_json.dumps({**out,
+                           'error': 'nothing to quote: only triggered, '
+                                    'watching or entered signals have legs'}))
+        return 1
+
+    # Pre-entry: rebuild what would actually be opened right now.
+    from . import strikes as strikes_mod
+    try:
+        analysis = strikes_mod.analyze(kite, t['stock'], t['direction'], spot)
+        if analysis.get('error'):
+            print(_json.dumps({**out, 'error': analysis['error']}))
+            return 1
+        bcs = strikes_mod.analyze_bcs(
+            kite, t['stock'], t['direction'], spot,
+            target_spot=t.get('st_value'), expiry=analysis['expiry'],
+            atm_strike=analysis['atm_strike'],
+            atm_quote=analysis['atm_quote'],
+            lot_size=analysis['lot_size'])
+    except Exception as e:
+        print(_json.dumps({**out, 'error': f'rebuild failed: {e}'}))
+        return 1
+    out.update({'kind': 'signal', 'expiry': analysis.get('expiry'),
+                'dte': analysis.get('dte'), 'st_value': t.get('st_value')})
+    if bcs.get('error'):
+        # A gate failing NOW is a real answer, not an error to route around:
+        # the structure the agent is vetting would be suppressed at this book.
+        out['buildable'] = False
+        out['reason'] = bcs['error']
+    else:
+        out['buildable'] = True
+        out['bcs'] = bcs
+    print(_json.dumps(out, default=str))
+    return 0
+
+
 def cmd_analyze(args):
     """Run the strike analyzer on a stock outside the scanner. Manual review."""
     from .scanner import _get_kite, get_ltp, compute_st_for_stock
@@ -1318,6 +1468,11 @@ def main():
     p_rvrec.add_argument('--confidence', type=float, default=None)
     p_rvrec.add_argument('--notes', default='')
     p_rvrec.set_defaults(func=cmd_review_record)
+
+    p_qt = sub.add_parser('quote', help='Live re-quote of a signal/position '
+                                        '(read-only, JSON)')
+    p_qt.add_argument('id', type=int)
+    p_qt.set_defaults(func=cmd_quote)
 
     p_anly = sub.add_parser('analyze', help='Strike analyzer for a stock (no save)')
     p_anly.add_argument('symbol')

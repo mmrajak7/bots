@@ -1037,6 +1037,7 @@ python -m zebra loop          # long-running market-hours loop
 python -m zebra status        # dashboard
 python -m zebra list [--status STATUS]
 python -m zebra analyze SYMBOL --direction CE  # manual strike picker
+python -m zebra quote ID      # live re-quote of a signal/position (read-only, JSON)
 python -m zebra trigger ID    # force alert on a watching signal
 python -m zebra enter ID --pair K_L/K_S --debit X --lots N --expiry YYYY-MM-DD
 python -m zebra close ID --exit-debit X --reason tp

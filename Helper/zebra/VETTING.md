@@ -16,8 +16,17 @@ authority.
    `stop_reason` says why (already settled, deadline blown, never requested).
    A verdict in any of those states is discarded, so the whole run is wasted
    tokens. Check this field first, before any research.
-2. Work the checklist below.
-3. `<python> -m zebra vet decide <ID> --verdict allow|veto ...` — **exactly
+2. `<python> -m zebra quote <ID>` — **the live book, right now.** This is your
+   re-quote route; use it whenever the pricing matters, which is most of the
+   time. Do not reach for the Kite MCP tools or an inline Python quote script —
+   they are deliberately unpermitted and will only cost you a turn.
+   For a signal it rebuilds the pair that would actually be opened at the
+   current book, **including the short leg, which the context above does not
+   carry** (the short is chosen after that snapshot is taken). `buildable:
+   false` means the gates would suppress this entry at the current book — that
+   is a finding, not a tool failure.
+3. Work the checklist below.
+4. `<python> -m zebra vet decide <ID> --verdict allow|veto ...` — **exactly
    once.** This is the only way to finish.
 
 Budget roughly 5 minutes. The deadline is 10; past it your verdict is void, so
@@ -132,10 +141,11 @@ is scheduled — it may be stale or the symbol may never have been researched.
 OI ≥ 5,000 says contracts exist, not that you could get out. The context
 carries `long_bid`/`long_ask`, `short_bid`/`short_ask` and
 `long_spread_pct`/`short_spread_pct` as the bot saw them at trigger — start
-there, then re-quote live if the numbers look marginal. **A position you cannot exit at a
-fair price is the failure mode that has cost this book real money** — a thin
-book once collapsed a spread from 2.18 to 0.18 in a single session while spot
-moved the *right* way.
+there, then **re-quote with `zebra quote <ID>`** if the numbers look marginal.
+Note the trigger snapshot covers the ATM leg only; the short leg's book comes
+from `zebra quote`. **A position you cannot exit at a fair price is the failure
+mode that has cost this book real money** — a thin book once collapsed a spread
+from 2.18 to 0.18 in a single session while spot moved the *right* way.
 
 ### 3. Is the entry chasing an extended move?
 Is price already stretched, or is the trigger a single intraday poke that could
@@ -325,8 +335,22 @@ Both at, or just after, market open. Both on prices no one could have traded.
    reference points, and how many times this has already been deferred.
    **If `stop` is true, STOP** — the episode already settled or the position
    closed while you were being spawned. `stop_reason` says which.
-2. Decide whether the price behind the trigger is REAL and EXECUTABLE.
-3. `<python> -m zebra vet exit-decide <ID> --kind <kind> --verdict allow|defer`
+2. `<python> -m zebra quote <ID>` — **the live book, now.** This is the whole
+   job: the trigger fired on ONE observation of the book, and you are the
+   second one, taken later and from a different process. That separation in
+   time is exactly the debounce-and-re-verify that both money-losing incidents
+   lacked. Run it. Do not reach for the Kite MCP tools or an inline Python
+   quote script — they are deliberately unpermitted.
+   - It values the position on the trade's own stamped `pricing_basis` and
+     applies the same bounds and intrinsic-floor rejection the engine uses, so
+     your number and its number mean the same thing.
+   - **`value: null` is a REFUSAL, not a low value** — an unusable book, a
+     one-sided book, or a quote below the intrinsic floor. `advice` says which.
+     A refusal is a reason to DEFER, never to endorse.
+   - If the fresh book has caught up and looks nothing like the trigger's, say
+     so and defer: that is the NHPC signature.
+3. Decide whether the price behind the trigger is REAL and EXECUTABLE.
+4. `<python> -m zebra vet exit-decide <ID> --kind <kind> --verdict allow|defer`
    — exactly once.
 
 ## The question you are answering
