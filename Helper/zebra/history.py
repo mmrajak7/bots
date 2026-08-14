@@ -202,6 +202,95 @@ def swing_tp(kite, stock: str, timeframe: str, direction: str,
     }
 
 
+# ── 2a. how FAST, in the unit the option actually lives in ────────────────
+
+def _days_to_touch(daily: List[dict], series: List[dict]) -> Optional[float]:
+    """Median TRADING DAYS from entering the band to reaching the ST line.
+
+    `attraction` counts weekly bars, which is the wrong unit for a bounded
+    instrument: an option dies on a DTE clock, in days. Worse, weekly bars are
+    too coarse to separate the cases that matter — 18 sessions and 39 sessions
+    both land in the same 4-8 bar bucket, and those are opposite trades.
+
+    Modelled on the REAL entry: a daily bar whose gap to the ST line IN FORCE
+    enters the band. In force means the last COMPLETED weekly bar's ST, which
+    is what the scanner reads intraday — using the current week's own ST is
+    look-ahead, because it is not knowable until Friday.
+
+    Measured across 155 closed weekly trades, this splits the group the touch
+    rate already calls 'reliably magnetic' almost in half:
+
+        rate >=70% and fast (<=7d) : 62% wins, median +26.5%
+        rate >=70% and slow (> 7d) : 53% wins, median  +2.9%
+
+    A +2.9% GROSS median does not survive this book's fee drag, so the two
+    halves are not "good and less good" — they are a trade and a non-trade,
+    and until now they carried the same label.
+    """
+    marks = [(str(b['date'])[:10], b['supertrend'])
+             for b in series if b.get('supertrend')]
+    if len(marks) < 2 or not daily:
+        return None
+    thresh, ceiling = cfg.ATTRACTION_GAP_PCT, cfg.WATCH_GAP_MAX * 100.0
+    horizon = cfg.ATTRACTION_HORIZON_DAYS
+
+    def st_in_force(day: str, hint: int = 0) -> tuple:
+        """ST of the last weekly bar that CLOSED before `day`, plus a cursor so
+        the caller can resume instead of rescanning from the top."""
+        i, st = hint, None
+        while i < len(marks) and marks[i][0] < day:
+            st = marks[i][1]
+            i += 1
+        return st, max(0, i - 1)
+
+    hits, i, n, cur = [], 0, len(daily), 0
+    while i < n:
+        day = str(daily[i]['date'])[:10]
+        st, cur = st_in_force(day, cur)
+        if not st:
+            i += 1
+            continue
+        close = daily[i]['close']
+        gap = abs(close - st) / st * 100
+        if not (thresh <= gap <= ceiling):
+            i += 1
+            continue
+        from_above = close > st
+        touched = None
+        inner = cur
+        for j in range(i + 1, min(i + 1 + horizon, n)):
+            dayj = str(daily[j]['date'])[:10]
+            stj, inner = st_in_force(dayj, inner)
+            if not stj:
+                continue
+            if _touches(daily[j], stj, from_above):
+                touched = j - i
+                break
+        if touched is not None:
+            hits.append(touched)
+        # Advance past this episode, exactly as the weekly pass does, so one
+        # long move away cannot report N independent outcomes.
+        i += (touched or horizon) + 1
+    return round(statistics.median(hits), 1) if hits else None
+
+
+def _daily_candles(kite, stock: str, timeframe: str) -> List[dict]:
+    """The COMPLETED daily bars behind the timeframe series — free.
+
+    `_timeframe_candles` has already filled `_raw_daily_cache` by the time this
+    is called, so there is no second fetch and no extra API call; this is the
+    same trick the aggregation itself uses.
+    """
+    try:
+        from playbook.magnet import scanner as mscan
+        daily = mscan._raw_daily_cache.get(stock) or []
+    except Exception as e:                      # pragma: no cover - import guard
+        logger.debug("daily cache unavailable for %s: %s", stock, e)
+        return []
+    today = datetime.now().strftime('%Y-%m-%d')
+    return [c for c in daily if str(c['date'])[:10] < today]
+
+
 # ── 2. does this symbol get pulled to ST? ─────────────────────────────────
 
 def _touches(candle: dict, st: float, from_above: bool) -> bool:
@@ -212,7 +301,8 @@ def _touches(candle: dict, st: float, from_above: bool) -> bool:
 
 
 def attraction(kite, stock: str, timeframe: str,
-               direction: Optional[str] = None) -> Optional[dict]:
+               direction: Optional[str] = None,
+               dte: Optional[int] = None) -> Optional[dict]:
     """How often this symbol actually gets pulled back to its own ST line.
 
     An EPISODE begins on the first completed candle that TRADED inside the
@@ -247,17 +337,48 @@ def attraction(kite, stock: str, timeframe: str,
                 'why': 'not measured on %s — only weekly has enough candles '
                        'to build a sample worth reading' % timeframe}
     key = (stock, timeframe, datetime.now().strftime('%Y-%m-%d'))
+    # NOTE: no early `return _attraction_cache[key]` here. The cache holds the
+    # symbol's history; `sessions_of_room` belongs to THIS signal's expiry and
+    # is layered on below. Returning the cached dict directly would give the
+    # first caller of the day its room figure and silently deny it to every
+    # other signal on the same stock.
     if key in _attraction_cache:
-        return _attraction_cache[key]
+        result = _attraction_cache[key]
+    else:
+        result = None
+        try:
+            result = _attraction(kite, stock, timeframe, direction)
+        except Exception as e:
+            # Never block an entry on a statistics failure.
+            logger.warning("attraction failed for %s %s: %s",
+                           stock, timeframe, e)
+        _attraction_cache[key] = result
+    return _with_room(result, dte)
 
-    result = None
-    try:
-        result = _attraction(kite, stock, timeframe, direction)
-    except Exception as e:
-        # Never block an entry on a statistics failure.
-        logger.warning("attraction failed for %s %s: %s", stock, timeframe, e)
-    _attraction_cache[key] = result
-    return result
+
+def _with_room(result: Optional[dict], dte: Optional[int]) -> Optional[dict]:
+    """Add "does this option have time for the move this symbol needs?".
+
+    Returned on a COPY. The cache is keyed by symbol and day, but DTE belongs
+    to the SIGNAL, so writing it into the cached dict would stamp one signal's
+    expiry onto every later reader of the same symbol.
+
+    Measured over 155 closed weekly trades: where the option expires before the
+    stock typically arrives, 37 trades ran 41% wins and a -21.1% median; where
+    it does not, ~56% and positive. Computed here rather than left to the agent
+    because it is arithmetic across two units (calendar DTE vs trading
+    sessions) and that is exactly the sort of step a model quietly gets wrong.
+    """
+    if not result or not result.get('measured'):
+        return result
+    need = result.get('median_days_to_touch')
+    if need is None or not dte:
+        return result
+    out = dict(result)
+    sessions = dte * 5.0 / 7.0
+    out['sessions_to_expiry'] = round(sessions, 1)
+    out['sessions_of_room'] = round(sessions - need, 1)
+    return out
 
 
 def _attraction(kite, stock, timeframe, direction):
@@ -365,6 +486,7 @@ def _attraction(kite, stock, timeframe, direction):
                                      if hits else None),
         }
 
+    days = _days_to_touch(_daily_candles(kite, stock, timeframe), series)
     overall = _summary(episodes)
     same = None
     if direction in ('CE', 'PE'):
@@ -386,6 +508,11 @@ def _attraction(kite, stock, timeframe, direction):
         # because that test only ever caught candles that STOPPED in the band.
         'band_basis': 'candle_range',
         'overall': overall,
+        # The same journey in the unit the OPTION lives in. `median_bars_to_
+        # touch` above is weekly bars and cannot separate 18 sessions from 39;
+        # those are opposite trades on a 30-DTE structure.
+        'median_days_to_touch': days,
+        'day_horizon': cfg.ATTRACTION_HORIZON_DAYS,
         'same_direction': same,
         'sample': 'thin' if thin else 'usable',
         'verdict': ('too few episodes to lean on' if thin else

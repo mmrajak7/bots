@@ -513,3 +513,84 @@ def test_the_agent_is_told_how_to_read_the_new_evidence():
     # The two asymmetries that matter most.
     assert 'reason to veto' in doc, "a dead magnet must be stated as veto-worthy"
     assert 'not an all-clear' in doc, "a missing section must not read as a pass"
+
+
+# ── velocity: the unit the OPTION lives in ───────────────────────────────
+# Weekly bars cannot separate 18 sessions from 39 — both land in the same 4-8
+# bar bucket, and on a 30-DTE structure those are opposite trades. Measured
+# over 155 closed weekly trades, speed splits the `reliably magnetic` group in
+# half: 62% wins / +26.5% median when fast, 53% / +2.9% when slow.
+
+def _daily(monkeypatch, rows):
+    """Populate the raw daily cache the velocity measure reads."""
+    from playbook.magnet import scanner as mscan
+    monkeypatch.setitem(mscan._raw_daily_cache, 'X', rows)
+
+
+def test_velocity_is_reported_in_trading_days(monkeypatch):
+    monkeypatch.setattr(cfg, 'WATCH_GAP_MAX', 1.0)
+    rows = []
+    for _ in range(12):
+        rows += _trend(6, 100, 2.0) + _trend(6, 112, -2.0)
+    _candles(monkeypatch, rows)
+    _daily(monkeypatch, [dict(r, date='2020-01-%02d' % ((i % 28) + 1))
+                         for i, r in enumerate(rows)])
+    r = history.attraction(None, 'X', 'weekly')
+    assert 'median_days_to_touch' in r
+    assert r['day_horizon'] == cfg.ATTRACTION_HORIZON_DAYS
+
+
+def test_room_is_the_option_clock_minus_what_the_symbol_needs(monkeypatch):
+    """Arithmetic across two units — calendar DTE vs trading sessions — which
+    is exactly the step a model quietly gets wrong if asked to do it."""
+    base = {'measured': True, 'median_days_to_touch': 20.0}
+    out = history._with_room(base, dte=42)          # 42 calendar ~ 30 sessions
+    assert out['sessions_to_expiry'] == 30.0
+    assert out['sessions_of_room'] == 10.0
+    # the shape that loses money: the option dies before the stock arrives
+    tight = history._with_room({'measured': True, 'median_days_to_touch': 39.0},
+                               dte=21)
+    assert tight['sessions_of_room'] < 0
+
+
+def test_room_never_leaks_one_signals_expiry_into_the_cache(monkeypatch):
+    """The cache is keyed by symbol and DAY; DTE belongs to the SIGNAL. Writing
+    it into the cached dict would stamp the first caller's expiry onto every
+    other signal on the same stock that day."""
+    monkeypatch.setattr(cfg, 'WATCH_GAP_MAX', 1.0)
+    rows = []
+    for _ in range(12):
+        rows += _trend(6, 100, 2.0) + _trend(6, 112, -2.0)
+    _candles(monkeypatch, rows)
+    _daily(monkeypatch, [dict(r, date='2020-01-%02d' % ((i % 28) + 1))
+                         for i, r in enumerate(rows)])
+    first = history.attraction(None, 'X', 'weekly', dte=42)
+    second = history.attraction(None, 'X', 'weekly', dte=14)   # cached path
+    if first.get('sessions_of_room') is not None:
+        assert second['sessions_of_room'] != first['sessions_of_room'], \
+            "the second signal inherited the first one's expiry"
+    # and a caller with no DTE gets no room field rather than a stale one
+    assert 'sessions_of_room' not in history.attraction(None, 'X', 'weekly')
+
+
+def test_room_is_absent_rather_than_wrong_when_unmeasurable(monkeypatch):
+    assert history._with_room(None, 30) is None
+    unmeasured = {'measured': False, 'timeframe': 'monthly'}
+    assert history._with_room(unmeasured, 30) == unmeasured
+    no_days = {'measured': True, 'median_days_to_touch': None}
+    assert 'sessions_of_room' not in history._with_room(no_days, 30)
+
+
+def test_the_agent_is_warned_that_a_fast_rate_is_not_a_green_light():
+    doc = (HELPER / 'zebra' / 'VETTING.md').read_text(encoding='utf-8')
+    assert 'median_days_to_touch' in doc and 'sessions_of_room' in doc
+    assert 'NOT a green light' in doc, \
+        "the rate/speed trap is not stated to the agent"
+    assert '+2.9%' in doc, "the measured split is not shown"
+
+
+def test_velocity_is_wired_into_the_vet_context():
+    """A measure the live path never passes DTE to reports no room at all."""
+    src = (HELPER / 'zebra' / 'monitor.py').read_text(encoding='utf-8')
+    assert "dte=analysis.get('dte')" in src, \
+        "the entry path no longer hands the option clock to the magnet stat"

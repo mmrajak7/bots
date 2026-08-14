@@ -499,6 +499,11 @@ _DEFAULTS = {
                                  # signal. One is an outage blip; two on a
                                  # freshly re-snapshotted book is a broken
                                  # layer — stop burning slots and drop it.
+    'attraction_horizon_days': 60,
+                                 # Trading days allowed for the DAY-clock
+                                 # velocity measure — ~3 months, well past any
+                                 # DTE this book trades, so the median is not
+                                 # truncated by the window itself.
     'attraction_timeframes': ['weekly'],
                                  # Where the magnet statistic is measured at
                                  # all. Monthly is excluded deliberately: 6Y of
@@ -749,6 +754,7 @@ ATTRACTION_ENABLED = bool(_runtime['attraction_enabled'])
 ATTRACTION_HORIZON_BARS = _int('attraction_horizon_bars')
 ATTRACTION_GAP_PCT = _num('attraction_gap_pct')
 ATTRACTION_MIN_EPISODES = _int('attraction_min_episodes')
+ATTRACTION_HORIZON_DAYS = _int('attraction_horizon_days')
 ATTRACTION_TIMEFRAMES = tuple(_runtime['attraction_timeframes'])
 assert ATTRACTION_TIMEFRAMES, \
     "measuring the magnet on no timeframe at all silently removes the section"

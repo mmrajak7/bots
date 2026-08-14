@@ -186,6 +186,8 @@ Read it like this:
 | `overall.touch_rate_pct` | share of past departures that came back to ST inside the horizon |
 | `overall.episodes` | how many departures that rate is built on — ONE per move, not per candle |
 | `median_bars_to_touch` | typical time to return, in candles of `timeframe` |
+| `median_days_to_touch` | the same journey in TRADING DAYS — the unit the option lives in |
+| `sessions_of_room` | sessions to expiry MINUS the sessions this symbol usually needs. **Negative = the option expires before this stock typically arrives.** |
 | `same_direction` | the same numbers restricted to departures on this signal's side |
 | `gap_band_pct` / `horizon_bars` | the band and window the rate was measured over |
 | `sample` | `'thin'` means too few episodes to lean on |
@@ -199,6 +201,27 @@ however high its rate.
 Do NOT treat a high rate as a reason to allow. It removes an objection; it does
 not answer event risk or liquidity. And `sample: 'thin'` means say so in your
 reasoning rather than quoting the percentage — 2 of 3 is not 67%.
+
+**A high rate with slow velocity is NOT a green light** — this is the trap this
+section had until 2026-08-14. Measured over 155 closed weekly trades, the group
+labelled *reliably magnetic* splits almost exactly in half by speed alone:
+
+| within `touch_rate_pct` >= 70% | n | wins | median |
+|---|---|---|---|
+| `median_days_to_touch` <= 7 | 56 | 62% | **+26.5%** |
+| `median_days_to_touch` > 7 | 55 | 53% | **+2.9%** |
+
+A +2.9% GROSS median does not survive this book's fee drag. So those are not
+"good and less good" — they are a trade and a non-trade wearing the same label,
+and speed is what separates them. Say the number out loud in your reasoning
+whenever it is over ~15 sessions.
+
+`sessions_of_room` is the same fact against THIS option's expiry. Negative
+means the stock typically arrives after the option is dead; 37 such trades ran
+41% wins and a −21.1% median against ~56% and positive for the rest. It is a
+real reason to veto on its own, and the clearest one to explain: *"this stock
+usually takes about eight weeks to get back to the line, and the option has
+five."*
 
 `st_attraction: null` means the history was unavailable. That is a missing
 section, not an all-clear.

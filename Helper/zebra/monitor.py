@@ -448,7 +448,8 @@ def _vet_context(trade: dict, analysis: dict, gap_pct: float,
     try:
         attraction = history.attraction(kite, trade['stock'],
                                         trade.get('timeframe'),
-                                        trade.get('direction'))
+                                        trade.get('direction'),
+                                        dte=analysis.get('dte'))
     except Exception as e:
         logger.warning("attraction lookup failed for %s: %s", trade['stock'], e)
         attraction = None
