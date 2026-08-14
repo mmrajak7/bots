@@ -401,10 +401,46 @@ def _allowed_tools(channel: str) -> list:
     the agent to use: on the Pi that is the CROCODILE venv, and a pattern
     naming a different python would match nothing the agent actually types.
     """
-    tools = [t.format(python=sys.executable) for t in cfg.VET_ALLOWED_TOOLS]
+    tools = [t.format(python=sys.executable, python_rel=_interpreter_rel())
+             for t in cfg.VET_ALLOWED_TOOLS]
     if channel == 'events':
         tools += list(cfg.EVENT_EXTRA_TOOLS)
-    return tools
+    # De-dup: on a box where the interpreter lives INSIDE the project the two
+    # spellings can collapse to the same string, and a duplicated grant is
+    # noise in the argv and in every log that echoes it.
+    seen, out = set(), []
+    for t in tools:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _interpreter_rel() -> str:
+    """`sys.executable` spelled relative to the project dir, as the docs spell it.
+
+    On the Pi this is `../CROCODILE/venv/bin/python` — the form every runbook,
+    memory note and README on that box uses, and therefore the form a model
+    that has read them will type. Granting only the absolute path refused the
+    calendar install after the agent had already done all the work.
+
+    Falls back to the absolute path when a relative one is impossible (a
+    different drive on Windows) or absurd — `relpath` happily returns a
+    twelve-level `../../..` climb, which is not something any agent would type
+    and not something worth granting.
+    """
+    try:
+        rel = os.path.relpath(sys.executable, str(cfg.PROJECT_ROOT))
+    except (ValueError, TypeError):       # cross-drive on Windows
+        return sys.executable
+    # Normalise BOTH separators, not `os.sep`. A command line is POSIX-shaped
+    # wherever the agent runs, and keying off os.sep makes the result depend on
+    # which machine built the string — the sort of thing that works on the dev
+    # box and emits `..\CROCODILE\venv\bin\python` somewhere else.
+    rel = rel.replace('\\', '/')
+    if not rel or rel.count('../') > 3:
+        return sys.executable
+    return rel
 
 
 def _denied_tools(channel: str) -> list:

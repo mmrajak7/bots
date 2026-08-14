@@ -60,8 +60,28 @@ VET_CLI = os.environ.get('ZEBRA_VET_CLI', 'claude')
 # The invariant that actually matters — the model can never open or close a
 # position — is carried by the deny list, whose patterns match anywhere in the
 # command string (verified).
+#
+# BOTH interpreter spellings, 2026-08-14. The prompt interpolates `{python}` =
+# `sys.executable`, an ABSOLUTE path, and the grant was built from the same
+# value — so on paper they always matched. In practice the calendar agent typed
+#     ../CROCODILE/venv/bin/python -m zebra events replace --file ...
+# because every doc, runbook and memory note on this box spells the interpreter
+# relatively, and a model reading the repo will reproduce what it sees. The
+# absolute grant does not prefix-match the relative command, so the install was
+# refused with "This command requires approval" — after the agent had already
+# done the research and written a perfect candidate file.
+#
+# Fourth variant of one bug: a grant that names ONE spelling of a thing the
+# agent can legitimately write two ways. (Candidate file: cwd-relative vs `//`
+# absolute. Tool family: Write vs Edit. Now: the interpreter.) The rule that
+# generalises — **grant every form the agent could plausibly type, because an
+# unmatched grant is indistinguishable from a broken agent and costs a whole
+# spawn to discover.** This is not a widening: same interpreter, same module,
+# same `-m zebra` prefix, and the deny list still matches anywhere in the
+# string, so no position verb becomes reachable.
 VET_ALLOWED_TOOLS = ['WebSearch', 'WebFetch', 'Read', 'Glob', 'Grep',
-                     'Bash({python} -m zebra:*)']
+                     'Bash({python} -m zebra:*)',
+                     'Bash({python_rel} -m zebra:*)']
 # The calendar agent builds a candidate JSON file before installing it — and
 # that is ALL it may write. An unscoped `Write` made vet.py's stated invariant
 # ("Claude NEVER writes the store directly ... the vetting layer physically

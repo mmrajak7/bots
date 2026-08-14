@@ -230,6 +230,82 @@ def test_open_position_cap_binds_in_live_and_not_in_paper(monkeypatch):
     _S(99)._refuse_if_book_full(99)                # paper stays uncapped
 
 
+# ── the interpreter grant, both spellings ────────────────────────────────
+
+def _pi_grants(monkeypatch):
+    """Grants as they are built on the Pi, whose venv is a sibling of Helper/."""
+    from pathlib import Path
+    from zebra import vet as vet_mod
+
+    monkeypatch.setattr(
+        vet_mod.sys, 'executable',
+        '/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python')
+    monkeypatch.setattr(cfg, 'PROJECT_ROOT',
+                        Path('/home/trustit/Desktop/BOTS/Helper'))
+    return vet_mod._allowed_tools('events')
+
+
+def test_the_interpreter_is_granted_in_the_form_agents_actually_type(monkeypatch):
+    """The calendar agent typed the RELATIVE interpreter path and was refused.
+
+    The prompt interpolates `sys.executable` (absolute) and the grant was built
+    from the same value, so on paper they always matched. But every doc,
+    runbook and memory note on that box spells it `../CROCODILE/venv/bin/
+    python`, and a model that has read the repo reproduces what it sees. The
+    absolute grant does not prefix-match, so `zebra events replace` came back
+    "This command requires approval" — AFTER the agent had done the research
+    and written a correct candidate file. Fourth variant of one bug: a grant
+    naming one spelling of something the agent can legitimately write two ways.
+    """
+    grants = _pi_grants(monkeypatch)
+    typed = '../CROCODILE/venv/bin/python -m zebra events replace --file x.json'
+    assert any(g.startswith('Bash(') and typed.startswith(g[5:-3])
+               for g in grants if g.endswith(':*)')), \
+        f'no grant prefix-matches what the agent typed: {grants}'
+    assert 'Bash(../CROCODILE/venv/bin/python -m zebra:*)' in grants
+    assert ('Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python '
+            '-m zebra:*)') in grants
+
+
+def test_the_relative_grant_uses_forward_slashes_wherever_it_is_built(monkeypatch):
+    """A command line is POSIX-shaped wherever the agent runs. Keying the
+    normalisation off `os.sep` made the result depend on which machine built
+    the string — fine on the Pi, `..\\CROCODILE\\venv\\bin\\python` elsewhere."""
+    grants = _pi_grants(monkeypatch)
+    assert not any('\\' in g for g in grants), grants
+
+
+def test_the_dual_grant_does_not_reach_a_position_verb(monkeypatch):
+    """Granting a second spelling must not widen WHAT is reachable — same
+    interpreter, same module, same `-m zebra` prefix, and the deny list matches
+    anywhere in the string."""
+    grants = _pi_grants(monkeypatch)
+    for g in grants:
+        if g.startswith('Bash('):
+            assert g.endswith(' -m zebra:*)'), g
+    for verb in ('close', 'enter', 'cancel', 'reset', 'trigger', 'run', 'loop'):
+        assert any(verb in d for d in cfg.VET_DENIED_TOOLS), verb
+
+
+def test_a_pathological_relative_path_falls_back_to_absolute(monkeypatch):
+    """`relpath` will happily return a twelve-level climb. No agent would type
+    that, and granting it is noise — fall back to the absolute form."""
+    from pathlib import Path
+    from zebra import vet as vet_mod
+
+    monkeypatch.setattr(vet_mod.sys, 'executable', '/opt/py/bin/python')
+    monkeypatch.setattr(cfg, 'PROJECT_ROOT', Path('/a/b/c/d/e/f/g/Helper'))
+    assert vet_mod._interpreter_rel() == '/opt/py/bin/python'
+
+
+def test_grants_are_deduplicated(monkeypatch):
+    """Where the interpreter lives inside the project the two spellings can
+    collapse to one string; a duplicated grant is noise in argv and in every
+    log that echoes it."""
+    grants = _pi_grants(monkeypatch)
+    assert len(grants) == len(set(grants)), grants
+
+
 # ── cohort boundary ──────────────────────────────────────────────────────
 
 def test_legacy_records_are_out_of_the_cohort_by_absence():
