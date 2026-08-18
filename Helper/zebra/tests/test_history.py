@@ -594,3 +594,164 @@ def test_velocity_is_wired_into_the_vet_context():
     src = (HELPER / 'zebra' / 'monitor.py').read_text(encoding='utf-8')
     assert "dte=analysis.get('dte')" in src, \
         "the entry path no longer hands the option clock to the magnet stat"
+
+
+# ── 5. an unfinished episode is not a miss ───────────────────────────────
+# 2026-08-17: HAVELLS was vetoed at 28.6% (2 of 7). The seventh episode had
+# opened on 2026-08-03 and WAS the departure the signal was trying to trade —
+# one week into an eight-week horizon, scored as a failure and then used as the
+# reason not to take it. Read on its completed episodes it is 33.3% of 6.
+#
+# The bias only ever runs one way (down) and always lands on the newest
+# episode, which is the one every live signal sits inside. Measured over the
+# 210 F&O names: 37 carry one, population median 60.0% -> 62.5%.
+
+def _bar(low, high, st=100.0, date='d'):
+    return {'date': date, 'low': low, 'high': high, 'close': (low + high) / 2,
+            'supertrend': st, 'direction': 'UP'}
+
+
+#: Below ST and inside 3% — never opens an episode, never counts as a touch.
+def _quiet(i):
+    return _bar(98.5, 99.0, date='q%d' % i)
+
+
+#: Below ST by 3.5–4.5% — the band the scanner actually signals on.
+def _depart(i):
+    return _bar(95.5, 96.5, date='x%d' % i)
+
+
+#: Wick reaches the line. As a FORWARD bar this is the return; as an opener it
+#: is ambiguous and skipped, which is why it never inflates the episode count.
+def _touch(i):
+    return _bar(99.0, 101.0, date='t%d' % i)
+
+
+def _series(monkeypatch, bars):
+    _candles(monkeypatch, _flat(len(bars) + 60))     # length check only
+    import playbook.compute_st as cst
+    monkeypatch.setattr(cst, 'compute_supertrend', lambda *a, **k: bars)
+
+
+def _hit(i):
+    """One episode that came back: departure, then the line."""
+    return [_depart(i), _touch(i)]
+
+
+def _miss(i):
+    """One episode given its full horizon and still not back."""
+    return [_depart(i)] + [_quiet(i * 100 + j)
+                           for j in range(cfg.ATTRACTION_HORIZON_BARS)]
+
+
+def _running(i, elapsed):
+    """A departure with only `elapsed` bars behind it — not yet an outcome."""
+    return [_depart(i)] + [_quiet(i * 100 + j) for j in range(elapsed)]
+
+
+def test_an_unfinished_episode_is_not_scored_as_a_miss(monkeypatch):
+    """THE HAVELLS SHAPE, rebuilt: two returns, four genuine misses, and one
+    departure a week old. 2/6 = 33.3%, not 2/7 = 28.6%."""
+    _band(monkeypatch)
+    bars = _hit(1) + _hit(2) + _miss(3) + _miss(4) + _miss(5) + _miss(6) \
+        + _running(7, elapsed=2)
+    _series(monkeypatch, bars)
+    r = history.attraction(None, 'HAVELLS', 'weekly')
+    assert r is not None
+    assert r['overall']['episodes'] == 6, \
+        "the running departure is still in the denominator"
+    assert r['overall']['touched'] == 2
+    assert r['overall']['touch_rate_pct'] == 33.3
+
+
+def test_the_running_departure_is_reported_not_silently_dropped(monkeypatch):
+    """Dropping it from the RATE is correct; dropping it from the RECORD would
+    hide that this symbol is mid-move, which is the one thing the signal being
+    vetted most needs to know."""
+    _band(monkeypatch)
+    _series(monkeypatch, _hit(1) + _miss(2) + _miss(3) + _miss(4)
+            + _running(5, elapsed=3))
+    r = history.attraction(None, 'X', 'weekly')
+    assert r['in_progress'] is not None, "the omission is invisible"
+    assert r['in_progress']['episodes'] == 1
+    assert r['in_progress']['bars_elapsed'] == 3
+    assert r['in_progress']['of_horizon'] == cfg.ATTRACTION_HORIZON_BARS
+
+
+def test_a_symbol_with_no_open_departure_says_so(monkeypatch):
+    """The other side of the flag: `in_progress` must be None rather than a
+    zero-filled dict, or every symbol reads as mid-move."""
+    _band(monkeypatch)
+    _series(monkeypatch, _hit(1) + _miss(2) + _miss(3) + _miss(4) + _miss(5))
+    r = history.attraction(None, 'X', 'weekly')
+    assert r['in_progress'] is None
+
+
+def test_a_finished_miss_is_still_a_miss(monkeypatch):
+    """The guard from the other side. Without it the fix above passes on a
+    function that has simply stopped counting misses at all — which would make
+    every symbol look magnetic and is a far worse failure than the one fixed."""
+    _band(monkeypatch)
+    _series(monkeypatch, _miss(1) + _miss(2) + _miss(3) + _miss(4) + _miss(5))
+    r = history.attraction(None, 'X', 'weekly')
+    assert r['overall']['episodes'] == 5
+    assert r['overall']['touch_rate_pct'] == 0.0
+    assert r['in_progress'] is None
+
+
+def test_a_touch_at_the_very_edge_still_counts(monkeypatch):
+    """An episode that came back with two bars of history behind it HAS an
+    outcome — the touch happened. Only the ones with no outcome are excluded,
+    and confusing the two would quietly delete the most recent winners."""
+    _band(monkeypatch)
+    _series(monkeypatch, _miss(1) + _miss(2) + _miss(3) + _miss(4) + _hit(9))
+    r = history.attraction(None, 'X', 'weekly')
+    assert r['overall']['episodes'] == 5, "a resolved touch was dropped as unfinished"
+    assert r['overall']['touched'] == 1
+    assert r['in_progress'] is None
+
+
+def test_the_same_direction_split_uses_the_resolved_set_too(monkeypatch):
+    """`same_direction` is what the agent quotes for a CE or PE signal. If it
+    re-admits the running episode the headline is fixed and the number actually
+    cited is not — HAVELLS' CE side was the 1-of-4 the veto leaned on."""
+    _band(monkeypatch)
+    _series(monkeypatch, _hit(1) + _hit(2) + _miss(3) + _running(4, elapsed=1))
+    r = history.attraction(None, 'X', 'weekly', 'CE')   # CE = below ST, rising
+    assert r['same_direction']['episodes'] == 3
+    assert r['same_direction']['touched'] == 2
+
+
+def test_dropping_the_unfinished_one_can_make_the_sample_thin(monkeypatch):
+    """An honest consequence, pinned so nobody 'fixes' it back. WAAREEENER
+    reads 3 episodes today and 2 once the running one is excluded — below
+    `attraction_min_episodes`, so it must stop claiming a usable rate rather
+    than keep one it no longer has."""
+    _band(monkeypatch)
+    monkeypatch.setattr(cfg, 'ATTRACTION_MIN_EPISODES', 3)
+    _series(monkeypatch, _hit(1) + _miss(2) + _running(3, elapsed=2))
+    r = history.attraction(None, 'WAAREEENER', 'weekly')
+    assert r['overall']['episodes'] == 2
+    assert r['sample'] == 'thin'
+    assert 'too few' in r['verdict']
+
+
+def test_every_episode_unfinished_reports_a_rate_of_nothing(monkeypatch):
+    """The degenerate case must not raise and must not invent 0%. A symbol
+    whose only departure is still running has no rate — `thin` short-circuits
+    the verdict before the None rate is ever compared."""
+    _band(monkeypatch)
+    _series(monkeypatch, _running(1, elapsed=2))
+    r = history.attraction(None, 'X', 'weekly')
+    assert r is not None
+    assert r['overall']['episodes'] == 0
+    assert r['overall']['touch_rate_pct'] is None
+    assert r['sample'] == 'thin' and 'too few' in r['verdict']
+    assert r['in_progress']['episodes'] == 1
+
+
+def test_the_agent_is_told_what_in_progress_means():
+    """A field the agent has never been shown is a field it will read as a
+    miss, which is the bug it was added to fix."""
+    doc = (HELPER / 'zebra' / 'VETTING.md').read_text(encoding='utf-8')
+    assert 'in_progress' in doc, "the new field is not explained to the agent"

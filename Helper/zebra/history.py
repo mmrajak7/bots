@@ -464,14 +464,46 @@ def _attraction(kite, stock, timeframe, direction):
             if _touches(series[j], series[j]['supertrend'], from_above):
                 touched_in = j - i
                 break
+        # `room` is how many forward bars this episode was ever given. An
+        # episode opened last week has had one of its eight, and the loop above
+        # cannot tell "did not come back" from "has not come back yet" - both
+        # leave touched_in None. Carried here so the summary can.
         episodes.append({'from_above': from_above, 'bars': touched_in,
-                         'date': str(bar['date'])[:10]})
+                         'date': str(bar['date'])[:10],
+                         'room': len(series) - 1 - i})
         # Advance past this episode — to the touch if there was one, else past
         # the horizon. This is what keeps one long move from counting N times.
         i += (touched_in or horizon) + 1
 
     if not episodes:
         return None
+
+    # CENSORED EPISODES ARE NOT MISSES. An episode resolves when it touches or
+    # when its horizon runs out; one opened inside the last `horizon` bars has
+    # done neither, and counting it as "did not return" states an outcome that
+    # has not happened yet.
+    #
+    # It is not a rounding error, because of WHICH episode it always is. The
+    # unfinished one is by construction the most recent - the departure a live
+    # signal is trading right now. HAVELLS #405 on 2026-08-17 was vetoed at
+    # 28.6% (2 of 7); the seventh episode opened 2026-08-03 and was the very
+    # move being entered, one week into eight, scored as a failure to justify
+    # not taking it. Read correctly it is 33.3% of 6.
+    #
+    # Measured live over the 210 F&O names: 37 (18%) carry one, the population
+    # median moves 60.0% -> 62.5%, and among the affected symbols the median
+    # rate moves 50.0% -> 60.0%. The bias only ever runs one way - down - so
+    # nothing here can make a symbol look more magnetic than it was.
+    #
+    # Dropped from the RATE, never from the record: `in_progress` below says a
+    # departure is open, because "no completed episodes" and "one running" are
+    # different facts and the agent should not have to infer either.
+    def _done(e):
+        return e['bars'] is not None or e['room'] >= horizon
+    # Partitioned by the predicate, not by `not in resolved`: two episodes can
+    # carry identical values and dict equality would then drop the wrong one.
+    resolved = [e for e in episodes if _done(e)]
+    running = [e for e in episodes if not _done(e)]
 
     def _summary(rows):
         if not rows:
@@ -487,12 +519,12 @@ def _attraction(kite, stock, timeframe, direction):
         }
 
     days = _days_to_touch(_daily_candles(kite, stock, timeframe), series)
-    overall = _summary(episodes)
+    overall = _summary(resolved)
     same = None
     if direction in ('CE', 'PE'):
         # PE = price ABOVE ST falling to it. CE = below, rising to it.
         want_above = direction == 'PE'
-        same = _summary([e for e in episodes if e['from_above'] == want_above])
+        same = _summary([e for e in resolved if e['from_above'] == want_above])
 
     thin = overall['episodes'] < cfg.ATTRACTION_MIN_EPISODES
     rate = overall['touch_rate_pct']
@@ -514,6 +546,12 @@ def _attraction(kite, stock, timeframe, direction):
         'median_days_to_touch': days,
         'day_horizon': cfg.ATTRACTION_HORIZON_DAYS,
         'same_direction': same,
+        # A departure that is open right now, excluded from the rate above
+        # because it has not finished. Reported so the omission is visible.
+        'in_progress': ({'episodes': len(running),
+                         'latest': running[-1]['date'],
+                         'bars_elapsed': running[-1]['room'],
+                         'of_horizon': horizon} if running else None),
         'sample': 'thin' if thin else 'usable',
         'verdict': ('too few episodes to lean on' if thin else
                     'reliably magnetic' if rate >= 70 else
@@ -524,5 +562,7 @@ def _attraction(kite, stock, timeframe, direction):
                  'is what the intraday trigger sees; candles that also reached '
                  'ST are skipped as ambiguous. Touch is judged on the wick '
                  'against the ST value of THAT candle, matching how the TP '
-                 'trigger actually fires.'),
+                 'trigger actually fires. An episode too recent to have had '
+                 'its full horizon is NOT counted as a miss - see '
+                 'in_progress.'),
     }

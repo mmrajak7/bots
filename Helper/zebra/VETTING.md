@@ -190,7 +190,19 @@ Read it like this:
 | `sessions_of_room` | sessions to expiry MINUS the sessions this symbol usually needs. **Negative = the option expires before this stock typically arrives.** |
 | `same_direction` | the same numbers restricted to departures on this signal's side |
 | `gap_band_pct` / `horizon_bars` | the band and window the rate was measured over |
+| `in_progress` | a departure that is OPEN RIGHT NOW and therefore not in the rate — see below. `null` when there is none |
 | `sample` | `'thin'` means too few episodes to lean on |
+
+**`in_progress` is not a miss.** An episode ends when price touches the line
+or when its horizon runs out. One that opened a few candles ago has done
+neither, so it is excluded from `touch_rate_pct` and reported here instead.
+It is almost always the departure THIS signal is trading — counting it would
+score the trade as failed before it had a chance, and then quote that as the
+reason to refuse it. That is what happened to HAVELLS on 2026-08-17: vetoed at
+"2 of 7" when one of the seven was the open move, one week into eight. Six
+completed episodes said 33.3%. Do not re-add it to the rate in your own head,
+and do not read a non-null `in_progress` as evidence either way — it has no
+outcome yet.
 
 **A low touch rate is a real reason to veto**, and the strongest one this
 section can give you: it says the magnet does not work on this symbol, which is

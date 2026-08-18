@@ -148,3 +148,34 @@ def test_it_is_wired_as_a_cli_verb():
     src = (HELPER / 'zebra' / '__main__.py').read_text(encoding='utf-8')
     assert "add_parser(\n        'digest'" in src or "add_parser('digest'" in src
     assert 'cmd_digest' in src
+
+
+# ── the Opened table reads a rate that can now legitimately be None ───────
+# `in_progress` (2026-08-18) means a symbol whose only departure is still
+# running has NO completed episodes and therefore no rate. Before that,
+# `touch_rate_pct` was never None on `overall` and the table's `.get` default
+# was never exercised.
+
+def _opened_with_rate(logdir, rate, episodes):
+    row = {'id': 1, 'stock': 'X', 'direction': 'CE', 'status': 'entered',
+           'entry_date': DAY, 'dte_at_entry': 30, 'debit': 10.0,
+           'capital': 500000,
+           'vet': {'context': {'st_attraction': {
+               'overall': {'episodes': episodes, 'touch_rate_pct': rate},
+               'median_days_to_touch': None}}}}
+    (logdir / 'zebra_trades.json').write_text(json.dumps([row]),
+                                              encoding='utf-8')
+    return digest.render(digest.build(DAY))
+
+
+def test_a_symbol_with_no_completed_episodes_does_not_print_None_pct(logdir):
+    """`.get(key, default)` does NOT fall back when the key exists holding
+    None, so the table printed the literal text `None%` — in the one column an
+    entry decision is argued from."""
+    assert 'None%' not in _opened_with_rate(logdir, None, 0)
+
+
+def test_a_genuine_zero_rate_is_still_shown(logdir):
+    """The other half. `rate or '-'` is the obvious one-liner and it erases a
+    real 0.0% — the single most veto-worthy reading this column can hold."""
+    assert '0.0%' in _opened_with_rate(logdir, 0.0, 5)

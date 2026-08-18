@@ -309,9 +309,15 @@ def render(d: dict) -> str:
         for t in tr['opened']:
             a = (((t.get('vet') or {}).get('context') or {}).get('st_attraction')) or {}
             o = a.get('overall') or {}
+            # `.get(k, default)` returns None when the KEY EXISTS holding None,
+            # and a symbol whose only departure is still running now has
+            # exactly that — it would print "None%". Not `or '-'` either: that
+            # swallows a real 0.0% rate, which is a fact worth reading.
+            rate = o.get('touch_rate_pct')
+            rate = '-' if rate is None else '%s%%' % rate
             A(f"| {t['id']} | {t['stock']} | {t.get('direction')} | "
               f"{t.get('dte_at_entry', '—')} | {t.get('debit')} | "
-              f"Rs{t.get('capital', 0):,.0f} | {o.get('touch_rate_pct', '—')}% | "
+              f"Rs{t.get('capital', 0):,.0f} | {rate} | "
               f"{a.get('median_days_to_touch', '—')} | "
               f"{a.get('sessions_of_room', '—')} |")
         A('')
