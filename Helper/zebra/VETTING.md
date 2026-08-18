@@ -179,6 +179,17 @@ and move on — do not treat it as missing evidence, and do not veto on it.
 `st_attraction: null` is different and still means the measurement was attempted
 and failed.
 
+**But refuse on risk, not on silence.** `null`, `measured: false` and
+`sample: 'thin'` are three different ways of saying *we could not check*, and
+none of them is a finding. COALINDIA and KALYANKJIL were both vetoed on
+2026-08-14 for exactly this — "the thesis is unchecked" — which is not a
+statement about those trades, it is a statement about our data, and it is a
+permanent bar: a symbol thin today is thin next week and every week after.
+Fail-closed belongs on an unreliable BOOK, where the thing you cannot trust is
+the price you would actually pay. It does not belong on an unavailable
+statistic. Say the check could not be made, weigh what you DO have, and decide
+on that.
+
 Read it like this:
 
 | Field | Meaning |
@@ -204,15 +215,45 @@ completed episodes said 33.3%. Do not re-add it to the rate in your own head,
 and do not read a non-null `in_progress` as evidence either way — it has no
 outcome yet.
 
-**A low touch rate is a real reason to veto**, and the strongest one this
-section can give you: it says the magnet does not work on this symbol, which is
-the entire trade. Weigh `median_bars_to_touch` against DTE — a symbol that
-usually takes 10 weekly candles to return is a poor fit for a 20-DTE option
-however high its rate.
+**A low touch rate is NEVER on its own a reason to veto.** This is a change
+from what this file said until 2026-08-18, and it is a change because the claim
+was tested and did not hold. Every closed weekly trade in the book (179 of them)
+was re-scored with the symbol's rate as it would have READ ON ITS ENTRY DATE —
+weekly bars strictly before entry, unfinished episodes excluded — so that no bar
+from after the trade could leak into the number:
 
-Do NOT treat a high rate as a reason to allow. It removes an objection; it does
-not answer event risk or liquidity. And `sample: 'thin'` means say so in your
-reasoning rather than quoting the percentage — 2 of 3 is not 67%.
+| point-in-time rate | n | wins | median | mean |
+|---|---|---|---|---|
+| below 60% | 68 | 48.5% | −4.9% | **+4.2%** |
+| 60% and above | 111 | 53.2% | +14.5% | **+3.7%** |
+
+Permutation test, 20,000 shuffles: win rate p=0.64, median p=0.51, mean p=0.95.
+**Nothing separates.** Two specifics that matter more than the p-values:
+
+- **TATASTEEL read 28.6%** point-in-time — the identical number HAVELLS was
+  refused on — and returned **+76% and +107%**.
+- **OBEROIRLTY, the largest trade in the book at +388%, sat at 57.1%.** Below
+  the line. This strategy's edge is the power law and the rule is that upside
+  is never capped; a filter that deletes the biggest winner on record to raise
+  a win rate by 4 points that does not even reach significance is the wrong
+  trade.
+
+There is a version of this cut that looks decisive — 40% wins vs 55%, −21%
+median vs +21%. That version computes the rate TODAY, so it contains bars from
+after each trade, including the trade's own episode. **It is look-ahead. Do not
+quote it, and do not reconstruct it.**
+
+So: **cite the rate as context, and to refuse name a risk that is not this
+statistic.** Things that qualify on their own — debit at the top of the allowed
+band against a losing precedent, an event inside the expiry window, a book too
+wide or too thin to exit, negative `sessions_of_room`. Things that do not — a
+low rate, a thin sample, an absent sample, or any two of those three restated
+in different words. If the magnet history is the only thing you have against a
+signal, that is an allow with the reservation written down.
+
+Do NOT treat a high rate as a reason to allow either. It removes an objection;
+it does not answer event risk or liquidity. And on `sample: 'thin'`, give the
+counts rather than the percentage in your reasoning — 2 of 3 is not 67%.
 
 **A high rate with slow velocity is NOT a green light** — this is the trap this
 section had until 2026-08-14. Measured over 155 closed weekly trades, the group
@@ -235,8 +276,16 @@ real reason to veto on its own, and the clearest one to explain: *"this stock
 usually takes about eight weeks to get back to the line, and the option has
 five."*
 
+> Known gap, stated rather than hidden: this figure and the velocity split above
+> were measured with the symbol's history computed as of TODAY, which is the
+> same look-ahead that made the touch-rate cut look decisive. They ask a
+> different question — whether the option outlives the trip, not whether the
+> trip happens — and they have not been re-tested point-in-time. Treat them as
+> the better-evidenced of the two and still not settled.
+
 `st_attraction: null` means the history was unavailable. That is a missing
-section, not an all-clear.
+section, not an all-clear — and equally not a veto. See "refuse on risk, not on
+silence" above.
 
 ### 5. Is there a level standing in the way?
 `context.swing_tp`, when present, is a prior swing point between spot and the

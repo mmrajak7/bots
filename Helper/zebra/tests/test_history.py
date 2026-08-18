@@ -755,3 +755,63 @@ def test_the_agent_is_told_what_in_progress_means():
     miss, which is the bug it was added to fix."""
     doc = (HELPER / 'zebra' / 'VETTING.md').read_text(encoding='utf-8')
     assert 'in_progress' in doc, "the new field is not explained to the agent"
+
+
+# ── 6. what the agent is allowed to refuse on ────────────────────────────
+# 2026-08-18. Since vetting went on there had been 14 entry verdicts, 12 of
+# them vetoes, and 12 cited the touch rate. The cohort took zero trades in five
+# sessions. Tested point-in-time the statistic does not separate winners from
+# losers, so the guidance was relaxed — these pin the relaxation, because a doc
+# rule with no test is one careless edit from being back.
+
+def _vetting_doc():
+    """Whitespace-collapsed. Every phrase below is a sentence the agent must
+    read, and a markdown line wrap is not a change to it - matching the raw
+    text makes these tests fail on reflow and pass on a rewrite, which is
+    backwards."""
+    import re
+    return re.sub(r'\s+', ' ',
+                  (HELPER / 'zebra' / 'VETTING.md').read_text(encoding='utf-8'))
+
+
+def test_a_low_touch_rate_is_not_a_veto_on_its_own():
+    doc = _vetting_doc()
+    assert 'NEVER on its own a reason to veto' in doc
+    assert 'name a risk that is not this statistic' in doc
+    assert 'A low touch rate is a real reason to veto' not in doc, \
+        "the old rule is back and the agent will refuse on the magnet alone again"
+
+
+def test_the_relaxation_carries_the_evidence_that_justified_it():
+    """Rules without their numbers get re-tightened by the next person who
+    finds them inconvenient. The measurement has to travel with the rule."""
+    doc = _vetting_doc()
+    assert 'p=0.51' in doc and 'p=0.95' in doc, "the null result is not shown"
+    assert 'TATASTEEL' in doc, "the 28.6% counterexample is not shown"
+    assert 'OBEROIRLTY' in doc, "the +388% power-law case is not shown"
+
+
+def test_the_look_ahead_version_is_named_and_forbidden():
+    """The today-computed cut looks decisive (40% vs 55% wins) and is pure
+    look-ahead. Unlabelled, it is exactly what a future reader rediscovers and
+    uses to put the veto back."""
+    doc = _vetting_doc()
+    assert 'look-ahead' in doc.lower()
+    assert 'do not reconstruct it' in doc.lower()
+
+
+def test_an_unavailable_or_thin_sample_is_not_a_veto():
+    """COALINDIA and KALYANKJIL were refused because the history could not be
+    checked. That is a statement about our data, not about those trades, and it
+    bars every thin symbol permanently."""
+    doc = _vetting_doc()
+    assert 'refuse on risk, not on silence' in doc.lower()
+    for token in ('null', "sample: 'thin'", 'COALINDIA', 'KALYANKJIL'):
+        assert token in doc, "%s is not covered by the no-data rule" % token
+
+
+def test_the_agent_actually_receives_this_document():
+    """A rule the live prompt never delivers is a rule that does not exist."""
+    src = (HELPER / 'zebra' / 'vet.py').read_text(encoding='utf-8')
+    assert 'vetting_doc=cfg.VETTING_DOC' in src, \
+        "the entry prompt no longer hands VETTING.md to the agent"
