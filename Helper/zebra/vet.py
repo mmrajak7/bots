@@ -152,9 +152,22 @@ _BLOCK_FILE = 'zebra_cli_block.json'
 #: Shapes Claude Code prints when it refuses on quota. Matched only against a
 #: transcript whose body is TINY — a real agent writes paragraphs, so a verdict
 #: that happens to discuss "limits" can never be mistaken for a refusal.
+#:
+#: THE QUALIFIER IS NOT AN ALLOW-LIST. The first version enumerated
+#: `session|usage`, and on 2026-08-17 at 14:40 the CLI printed "You've hit your
+#: WEEKLY limit · resets 9:30pm (Asia/Kolkata)" - one word outside the
+#: alternation, so five dead spawns read as agents thinking and the watchdog
+#: fell back to a generic silent-channel nag 50 minutes late. It landed on the
+#: `events` channel and cost nothing; the same miss on `entry` is what dropped
+#: HAVELLS #404 three days earlier. Anthropic renames these tiers (session,
+#: 5-hour, weekly, and whatever is next) and every rename would be a fresh
+#: outage, so match a SHORT RUN OF WORDS instead of naming them - the body
+#: bound below, not the wording, is what keeps this from firing on a verdict
+#: that merely discusses limits.
 _BLOCK_PATTERNS = (
-    re.compile(r"hit your (?:session|usage) limit", re.I),
-    re.compile(r"(?:usage|session|rate) limit (?:reached|exceeded)", re.I),
+    re.compile(r"hit your (?:[\w-]+ ){0,3}limit", re.I),
+    re.compile(r"(?:usage|session|rate|weekly|daily|hourly) limit "
+               r"(?:reached|exceeded)", re.I),
     re.compile(r"\b\d+-hour limit reached", re.I),
 )
 _RESET_RE = re.compile(
