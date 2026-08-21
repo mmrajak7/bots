@@ -476,7 +476,8 @@ class OrderMonitor:
                         f"⚠️ *UNPROTECTED POSITION*\n"
                         f"{position_key} has NO GTT/SL!\n"
                         f"Entry: ₹{position.entry_price:.2f}\n"
-                        f"Qty: {position.quantity}"
+                        f"Qty: {position.quantity}",
+                        critical=True
                     )
                     continue
 
@@ -500,7 +501,8 @@ class OrderMonitor:
                             f"{position_key}\n"
                             f"GTT {position.current_gtt_id} not found!\n"
                             f"No sell order detected.\n"
-                            f"Position may be UNPROTECTED!"
+                            f"Position may be UNPROTECTED!",
+                            critical=True
                         )
                     continue
 
@@ -531,7 +533,8 @@ class OrderMonitor:
                         f"⚠️ *GTT NOT ACTIVE*\n"
                         f"{position_key}\n"
                         f"GTT {position.current_gtt_id} status: {gtt_status}\n"
-                        f"Position may be UNPROTECTED!"
+                        f"Position may be UNPROTECTED!",
+                        critical=True
                     )
 
             # Log summary

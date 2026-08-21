@@ -106,6 +106,14 @@ telegram:
   enabled: true
   retry_attempts: 3
   retry_delay: 5  # seconds
+  # Mute every NON-CRITICAL Telegram message while keeping the bot running:
+  # trade notifications (orders placed, fills, SL-hit closes), the daily
+  # report, the EOD GTT summary and the morning startup message.
+  #
+  # What still gets through, always: order-placement failures, a position
+  # found with no GTT/stop-loss, API and token failures. Those are flagged
+  # critical=True in code and this switch cannot reach them.
+  suppress_non_critical: false
 
 # Trading Configuration
 trading:

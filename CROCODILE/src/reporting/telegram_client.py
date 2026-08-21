@@ -21,6 +21,13 @@ class TelegramClient:
         self.chat_id = config.get('telegram.chat_id')
         self.retry_attempts = config.get('telegram.retry_attempts', 3)
         self.retry_delay = config.get('telegram.retry_delay', 5)
+        # Mute every non-critical message: transactions, reports, EOD and
+        # startup summaries. Owner's call 2026-08-21 while the bot is parked
+        # and not trading -- it keeps RUNNING, it just stops narrating.
+        # Defaults OFF: a code default that silences alerts is how a safety
+        # channel goes dark without anyone deciding it should.
+        self.suppress_non_critical = config.get(
+            'telegram.suppress_non_critical', False)
 
         if not self.bot_token or not self.chat_id:
             logger.warning("Telegram bot_token or chat_id not configured - alerts disabled")
@@ -28,12 +35,18 @@ class TelegramClient:
 
         if self.enabled:
             logger.info(f"Telegram client initialized - Chat ID: {self.chat_id}")
+            if self.suppress_non_critical:
+                # Positive log line: a mute that leaves no trace is
+                # indistinguishable from a broken bot.
+                logger.info("Telegram: suppress_non_critical ON - only "
+                            "critical alerts will be sent")
 
     def send_message(
         self,
         message: str,
         parse_mode: str = "HTML",
-        disable_notification: bool = False
+        disable_notification: bool = False,
+        critical: bool = False
     ) -> bool:
         """
         Send message to Telegram
@@ -42,12 +55,22 @@ class TelegramClient:
             message: Message text (supports Markdown or HTML)
             parse_mode: "Markdown" or "HTML" (default: HTML for better compatibility)
             disable_notification: Silent notification
+            critical: Survives `telegram.suppress_non_critical`. Reserved for
+                messages about money or an unprotected position -- an order
+                that failed, a position with no stop-loss, a dead API. NOT for
+                routine trade narration.
 
         Returns:
             Success status
         """
         if not self.enabled:
             logger.debug(f"Telegram disabled - message not sent: {message[:100]}...")
+            return False
+
+        # The gate lives HERE, at the one function that performs the POST, so
+        # no call site can route around it -- including any added later.
+        if self.suppress_non_critical and not critical:
+            logger.info(f"Telegram suppressed (non-critical): {message[:80]}")
             return False
 
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
@@ -103,7 +126,8 @@ class TelegramClient:
         return self.send_message(
             message=message,
             parse_mode="HTML",
-            disable_notification=not critical
+            disable_notification=not critical,
+            critical=critical
         )
 
     def send_formatted_report(self, report: str) -> bool:
@@ -123,7 +147,8 @@ class TelegramClient:
         return self.send_message(
             message=report,
             parse_mode="HTML",
-            disable_notification=True  # Reports are not urgent
+            disable_notification=True,  # Reports are not urgent
+            critical=False              # ...and not critical, so they mute
         )
 
 
