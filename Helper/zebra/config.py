@@ -333,11 +333,16 @@ _DEFAULTS = {
     # design: an alert filter must never become an exit filter.
     'alerts_cohort_only': True,
     # Whether the EOD/weekly Telegram lists every open position with its
-    # unrealized P&L. Off per the same request — with 25 legacy positions the
-    # consolidated block was most of the message, and a report nobody reads to
-    # the bottom is worse than a shorter one. The COUNT still goes out, so a
-    # book quietly emptying or filling is still visible.
-    'eod_open_positions': False,
+    # entry spot, live spot and own unrealized P&L.
+    #
+    # Was OFF while 25 LEGACY positions made that block most of the message.
+    # `alerts_cohort_only` now caps the list at the current engine's book
+    # (max_open_trades = 8), and on 2026-08-21 the owner asked for exactly
+    # this detail — "Positions - Entry (spot price), LTP, our P&L for this
+    # position ... so we know which positions are performing" — for BOTH the
+    # daily and the weekly. The two reasons it was off are both gone, so it
+    # is on. The COUNT and the aggregate go out either way.
+    'eod_open_positions': True,
     'swing_tp_enabled': True,     # Shorten TP to a swing level standing between
                                   # spot and the ST magnet. LUPIN 2026-08: a PE
                                   # signal with a prior swing LOW well above the

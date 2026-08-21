@@ -143,26 +143,97 @@ def _alignment_split(exits: list) -> dict:
 
 
 def _unrealized_for_open(open_trades: list, kite) -> dict:
-    """Optional: fetch live mids for open trades, compute unrealized P&L."""
-    if not open_trades or kite is None:
-        return {t['id']: None for t in open_trades}
+    """Fetch live structure mids AND underlying LTPs for the open book.
+
+    Two independent quotes per position, because they answer different
+    questions and either can fail on its own. The structure mid drives P&L;
+    the underlying LTP read against `entry_spot` says WHY — a position can sit
+    flat on a spot move that has nearly reached its TP, or collapse while spot
+    has barely moved at all (the NHPC signature). A missing quote blanks only
+    its own field, never the other.
+
+    Always returns a dict per trade, never None — callers test the individual
+    fields, so a half-quoted position still reports what it does know.
+    """
+    blank = {'mid': None, 'pnl': None, 'pnl_pct': None,
+             'spot': None, 'spot_pct': None}
+    if not open_trades:
+        return {}
+    if kite is None:
+        return {t['id']: dict(blank) for t in open_trades}
     from .monitor import _quote_zebra_value
+
+    # One batched LTP call for the whole book, not one per position.
+    spots = {}
+    try:
+        from .scanner import get_ltp
+        stocks = sorted({t['stock'] for t in open_trades if t.get('stock')})
+        spots = get_ltp(kite, stocks) or {}
+    except Exception as e:
+        # Spot is the explanatory column here; the P&L must still go out
+        # without it, so this can never be allowed to raise.
+        logger.warning("Spot LTP unavailable for report: %s", e)
+
     out = {}
     for t in open_trades:
+        rec = dict(blank)
         try:
             mid = _quote_zebra_value(kite, t)
         except Exception:
             mid = None
-        if mid is None:
-            out[t['id']] = None
-        else:
+        if mid is not None:
             debit = t.get('debit', 0)
             qty = t.get('quantity', 0)
             pnl_share = mid - debit
-            pnl = pnl_share * qty
-            pct = (pnl_share / debit * 100) if debit > 0 else 0
-            out[t['id']] = {'mid': mid, 'pnl': pnl, 'pnl_pct': pct}
+            rec['mid'] = mid
+            rec['pnl'] = pnl_share * qty
+            rec['pnl_pct'] = (pnl_share / debit * 100) if debit > 0 else 0
+        # get_ltp hands back 0.0 for a symbol it could not map to NSE. That is
+        # a failure marker, not a price — `or None` keeps it out of the report.
+        spot = spots.get(t.get('stock')) or None
+        entry_spot = t.get('entry_spot') or None
+        rec['spot'] = spot
+        if spot and entry_spot:
+            rec['spot_pct'] = (spot - entry_spot) / entry_spot * 100
+        out[t['id']] = rec
     return out
+
+
+def _open_totals(report: dict) -> tuple:
+    """(unrealized P&L, capital deployed, positions actually quoted).
+
+    The aggregate can only sum the positions that quoted. When one did not,
+    the total UNDERSTATES the book by that position's P&L, so the caller
+    prints the quoted count alongside it — an aggregate that silently drops a
+    position reads as a fact when it is a partial.
+    """
+    unreal = sum((u or {}).get('pnl') or 0
+                 for u in report['unrealized'].values())
+    deployed = sum((t.get('capital')
+                    or (t.get('debit') or 0) * (t.get('quantity') or 0))
+                   for t in report['open'])
+    quoted = sum(1 for t in report['open']
+                 if (report['unrealized'].get(t['id']) or {}).get('pnl')
+                 is not None)
+    return unreal, deployed, quoted
+
+
+def _quoted_note(quoted: int, total: int) -> str:
+    """Empty when every position quoted, else names how many did."""
+    return "" if quoted >= total else f" [{quoted}/{total} quoted]"
+
+
+def _open_sorted(report: dict) -> list:
+    """Open positions, best performer first.
+
+    This list is read to answer "which of these is working", so the answer
+    belongs at the top. A position with no quote sorts LAST rather than
+    counting as zero — an unknown is not a flat.
+    """
+    def key(t):
+        pnl = (report['unrealized'].get(t['id']) or {}).get('pnl')
+        return (0, -pnl) if pnl is not None else (1, 0)
+    return sorted(report['open'], key=key)
 
 
 # ── Report builders ──────────────────────────────────────────────────────
@@ -243,14 +314,51 @@ def _fmt_open_line(t: dict, unreal: Optional[dict]) -> str:
     ks = int(t['short_strike']) if t.get('short_strike') else '?'
     sl_txt = f"  SL {t.get('sl_spot',0):.0f}" if cfg.SPOT_SL_ENABLED else ""
     st_tag = '[BCS] ' if t.get('structure') == 'bcs' else ''
+    u = unreal or {}
+    spot_txt = f"{u['spot']:.2f}" if u.get('spot') else "n/a"
+    if u.get('spot_pct') is not None:
+        spot_txt += f" ({u['spot_pct']:+.1f}%)"
     base = (f"  #{t['id']} {st_tag}{t['stock']:<10} {t['direction']:<3} {kl}/{ks}  "
-            f"entry {t.get('entry_date','?')[5:]} @ {t.get('entry_spot',0):.2f}  "
-            f"TP {t.get('tp_spot',0):.0f}{sl_txt}")
-    if unreal:
-        base += f"  | mid {unreal['mid']:.2f}  unrealized Rs {unreal['pnl']:+,.0f} ({unreal['pnl_pct']:+.1f}%)"
+            f"entry {t.get('entry_date','?')[5:]} @ {t.get('entry_spot',0):.2f} "
+            f"-> {spot_txt}  TP {t.get('tp_spot',0):.0f}{sl_txt}")
+    if u.get('mid') is not None:
+        base += (f"  | mid {u['mid']:.2f}  unrealized Rs {u['pnl']:+,.0f} "
+                 f"({u['pnl_pct']:+.1f}%)")
     else:
         base += "  | mid n/a"
     return base
+
+
+def _fmt_open_telegram(t: dict, unreal: Optional[dict]) -> str:
+    """Two lines per open position for the EOD/weekly Telegram.
+
+    Line 1 names the position; line 2 carries the three numbers the owner
+    asked for on 2026-08-21 — the spot we entered at, where spot is NOW, and
+    what the position itself is worth — so the message says which positions
+    are working instead of only what the book nets.
+
+    Every runtime value is html.escape'd: `M&M` is a live NSE symbol in this
+    book, and one bare `&` 400-rejects the entire message silently.
+    """
+    u = unreal or {}
+    kl = int(t['long_strike']) if t.get('long_strike') else '?'
+    ks = int(t['short_strike']) if t.get('short_strike') else '?'
+    pnl = u.get('pnl')
+    # Owner's call 2026-08-21: a coloured ball, nothing else. The direction
+    # arrow duplicated the sign that is already on the P&L, and the 📐 tag
+    # marked a structure EVERY trade in this book has, so it distinguished
+    # nothing. White is the third state — no quote is not a flat position.
+    tag = '⚪' if pnl is None else ('🟢' if pnl > 0 else '🔴')
+    head = (f"{tag} <code>{html.escape(str(t['stock']))}</code> "
+            f"{html.escape(str(t.get('direction') or ''))} {kl}/{ks}")
+    spot_txt = f"{u['spot']:.2f}" if u.get('spot') else "n/a"
+    if u.get('spot_pct') is not None:
+        spot_txt += f" ({u['spot_pct']:+.1f}%)"
+    pnl_txt = (f"Rs {pnl:+,.0f} ({u['pnl_pct']:+.1f}%)" if pnl is not None
+               else "quote n/a")
+    body = (f"    spot {t.get('entry_spot') or 0:.2f} → {spot_txt}"
+            f" · TP {t.get('tp_spot',0):.0f}  |  {pnl_txt}")
+    return head + "\n" + body
 
 
 def format_text(report: dict) -> str:
@@ -305,15 +413,15 @@ def format_text(report: dict) -> str:
     if not report['open']:
         lines.append("Open: 0")
     else:
-        unreal_pnl = sum(
-            (u.get('pnl') or 0)
-            for u in report['unrealized'].values() if u
-        )
+        unreal_pnl, deployed, quoted = _open_totals(report)
+        roc = f" ({unreal_pnl / deployed * 100:+.1f}%)" if deployed else ""
+        note = _quoted_note(quoted, len(report['open']))
         lines.append(
             f"Open: {len(report['open'])} position(s), "
-            f"unrealized Rs {unreal_pnl:+,.0f}"
+            f"Rs {deployed:,.0f} deployed, "
+            f"unrealized Rs {unreal_pnl:+,.0f}{roc}{note}"
         )
-        for t in report['open']:
+        for t in _open_sorted(report):
             u = report['unrealized'].get(t['id'])
             lines.append(_fmt_open_line(t, u))
 
@@ -346,16 +454,15 @@ def format_telegram(report: dict) -> str:
         for t in sorted(report['closed'], key=lambda x: x.get('pnl') or 0,
                         reverse=True):
             pnl = t.get('pnl') or 0
-            tag = '✓' if pnl > 0 else '✗'
+            tag = '🟢' if pnl > 0 else '🔴'
             kl = int(t['long_strike']) if t.get('long_strike') else '?'
             ks = int(t['short_strike']) if t.get('short_strike') else '?'
             reason = (t.get('exit_reason') or '').replace('paper:', '')
-            st_tag = '📐' if t.get('structure') == 'bcs' else ''
             parts.append(
                 # html.escape: the EOD report is parse_mode=HTML too, and `M&M`
                 # is a real NSE symbol sitting in this book right now. Same
                 # class as the exit-alert formatters.
-                f"{tag}{st_tag} <code>{html.escape(str(t['stock']))}</code> "
+                f"{tag} <code>{html.escape(str(t['stock']))}</code> "
                 f"{t['direction']} {kl}/{ks}  Rs {pnl:+,.0f} "
                 f"[{html.escape(str(reason))}]"
             )
@@ -377,37 +484,22 @@ def format_telegram(report: dict) -> str:
             )
 
     if report['open']:
-        unreal_pnl = sum(
-            (u.get('pnl') or 0)
-            for u in report['unrealized'].values() if u
-        )
+        unreal_pnl, deployed, quoted = _open_totals(report)
+        roc = f" ({unreal_pnl / deployed * 100:+.1f}%)" if deployed else ""
+        note = _quoted_note(quoted, len(report['open']))
         # The COUNT and the aggregate always go out — a book quietly emptying
         # or filling up has to stay visible, and that is one line. What is
         # switchable is the position-by-position listing below it, which with a
         # full book was most of the message.
         parts.append(
             f"\n<b>Open:</b> {len(report['open'])} pos, "
-            f"unrealized Rs {unreal_pnl:+,.0f}"
+            f"Rs {deployed:,.0f} deployed, "
+            f"unrealized Rs {unreal_pnl:+,.0f}{roc}{note}"
         )
         if cfg.EOD_OPEN_POSITIONS:
-            for t in report['open']:
-                u = report['unrealized'].get(t['id'])
-                kl = int(t['long_strike']) if t.get('long_strike') else '?'
-                ks = int(t['short_strike']) if t.get('short_strike') else '?'
-                st_tag = '📐' if t.get('structure') == 'bcs' else ''
-                if u:
-                    pnl = u['pnl']
-                    tag = '↑' if pnl > 0 else '↓'
-                    parts.append(
-                        f"{tag}{st_tag} <code>{html.escape(str(t['stock']))}</code> "
-                        f"{t['direction']} {kl}/{ks}  Rs {pnl:+,.0f} "
-                        f"({u['pnl_pct']:+.0f}%)"
-                    )
-                else:
-                    parts.append(
-                        f"•{st_tag} <code>{html.escape(str(t['stock']))}</code> "
-                        f"{t['direction']} {kl}/{ks}  (quote n/a)"
-                    )
+            for t in _open_sorted(report):
+                parts.append(
+                    _fmt_open_telegram(t, report['unrealized'].get(t['id'])))
     else:
         parts.append("\n<b>Open:</b> 0")
 
