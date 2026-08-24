@@ -264,6 +264,7 @@ class MemoryStore:
         self.trades = [dict(t) for t in (trades or [])]
         self._active = list(active_alerts or [])
         self._drive_enabled = False
+        self._corrupt = {}
         self.calls = []          # [(method, args, kwargs)]
 
     # -- recording ----------------------------------------------------------
@@ -296,6 +297,21 @@ class MemoryStore:
 
     def get_active(self):
         return list(self._active)
+
+    # -- B7 quarantine surface (mirrors LockedStoreMixin) --------------------
+    #
+    # `alert_store_corruption` swallows AttributeError per store, so a double
+    # missing these would make the monitor log a warning and carry on — the
+    # test would pass while proving nothing about the quarantine path.
+
+    def read_corruption_marker(self):
+        return dict(self._corrupt)
+
+    def corruption_due_for_alert(self):
+        return dict(self._corrupt)
+
+    def note_corruption_alerted(self):
+        self._rec('note_corruption_alerted')
 
     def maybe_sync(self, force=False):
         self._rec('maybe_sync', force)
