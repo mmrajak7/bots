@@ -27,7 +27,7 @@ Contents
 from __future__ import annotations
 
 import itertools
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 
 # ── Broker ───────────────────────────────────────────────────────────────────
@@ -224,8 +224,26 @@ class FakeClock:
     #: can hang is worse than one that fails: CI reports nothing at all.
     MAX_SLEEPS = 100_000
 
-    def __init__(self, start=1_600_000_000.0):
+    #: The WALL CLOCK the module sees, which is a separate thing from
+    #: `time.time()` and was the more important of the two all along.
+    #:
+    #: Found 2026-08-24, at 18:28: six B10/B11 tests had been passing all day
+    #: and started failing in the evening with "ORDER CUTOFF: 18:28 > 15:20".
+    #: `close_leg` refuses to place orders after LAST_ORDER_TIME and reads
+    #: `datetime.now()` to decide, so patching only `time.time()` left the
+    #: cutoff — and `is_market_settled`, and `is_spread_settled`, and
+    #: `is_expiry_day` — reading the real clock. The suite was green only
+    #: during market hours. A test that depends on when you run it is not a
+    #: test.
+    #:
+    #: Mid-session on purpose: inside market hours, past every open buffer,
+    #: well before the order cutoff. A test that wants a different instant
+    #: passes `at=`.
+    DEFAULT_DT = datetime(2026, 9, 15, 11, 0, 0)
+
+    def __init__(self, start=1_600_000_000.0, at=None):
         self.now = float(start)
+        self.dt = at or self.DEFAULT_DT
         self.slept = []
 
     def time(self):
@@ -240,14 +258,36 @@ class FakeClock:
                 'terminate. Failing loudly instead of hanging.'
                 % len(self.slept))
         self.now += sec
+        self.dt += timedelta(seconds=sec)
 
     def advance(self, sec):
         self.now += sec
+        self.dt += timedelta(seconds=sec)
 
     def install(self, monkeypatch, module):
-        """Patch `module.time.time` and `module.time.sleep` in place."""
+        """Patch the module's `time` AND its wall clock.
+
+        Subclassing `datetime` keeps `.combine`, `.strptime` and arithmetic
+        working; only `.now()` is redirected.
+        """
         monkeypatch.setattr(module.time, 'time', self.time)
         monkeypatch.setattr(module.time, 'sleep', self.sleep)
+        clock = self
+
+        class _DT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock.dt
+
+        class _D(date):
+            @classmethod
+            def today(cls):
+                return clock.dt.date()
+
+        if hasattr(module, 'datetime'):
+            monkeypatch.setattr(module, 'datetime', _DT)
+        if hasattr(module, 'date'):
+            monkeypatch.setattr(module, 'date', _D)
         return self
 
 

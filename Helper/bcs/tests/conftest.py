@@ -44,6 +44,109 @@ def _no_telegram_http(monkeypatch):
     monkeypatch.setattr(requests, 'post', guarded)
 
 
+# ── No test may write into the REAL logs/ directory ─────────────────────────
+#
+# Added 2026-08-24 after one of my own adversarial tests called
+# `monkeypatch.undo()` mid-test. That undoes EVERY patch the fixture made,
+# including the redirection of LOCAL_TRADES_FILE — so the next write went to
+# the live book. It put a junk field on three real closed trades and injected a
+# fake OPEN position into bear_put_trades.json. Local only (Drive was disabled
+# and update_trade_fields never uploads), but an open record in a live book is
+# exactly what the monitor acts on.
+#
+# The Telegram rail above existed because this had already happened twice with
+# a different output channel. The lesson was recorded and the FILESYSTEM was
+# left unrailed. Rail the channel, not the incident.
+#
+# Railed at the syscalls the stores actually use, not at the store API, so a
+# future writer — a new sidecar, a log file, a lock — cannot slip past by not
+# going through TradeStore.
+
+REAL_LOGS = (HELPER / 'logs').resolve()
+
+
+class ProductionWriteAttempted(BaseException):
+    """BaseException on purpose.
+
+    `_write_high_water` and `_flag_corruption` both swallow Exception by
+    design — a trade must not fail to save because a sidecar could not be
+    written. A plain-Exception rail would be caught by exactly those handlers,
+    logged as a warning, and the suite would stay green while the writes kept
+    landing. That is how the Telegram version of this survived two fixes.
+    """
+
+
+def _under_real_logs(path) -> bool:
+    try:
+        p = Path(path)
+        p = p if p.is_absolute() else Path.cwd() / p
+        return REAL_LOGS in p.resolve().parents
+    except Exception:
+        return False
+
+
+def _forbid(path, how):
+    if _under_real_logs(path):
+        raise ProductionWriteAttempted(
+            f'a test tried to {how} inside the real logs/ directory: {path}. '
+            f'Redirect the store with the `book` fixture, and never call '
+            f'monkeypatch.undo() in a test that relies on it.')
+
+
+@pytest.fixture(autouse=True)
+def _no_production_writes():
+    """Deliberately does NOT take the shared `monkeypatch` fixture.
+
+    The first version did, and its own proof-test failed: `monkeypatch.undo()`
+    reverts every patch on that instance, so the rail was removed by exactly
+    the call it exists to catch. A guard that a test can switch off by making
+    the mistake is not a guard. It owns a private MonkeyPatch instead, which
+    nothing in a test can reach.
+    """
+    import builtins
+    import os
+    import tempfile
+
+    monkeypatch = pytest.MonkeyPatch()
+
+    real_open, real_replace = builtins.open, os.replace
+    real_rename, real_mkstemp = os.rename, tempfile.mkstemp
+    real_osopen = os.open
+    real_wtext, real_prename = Path.write_text, Path.rename
+
+    def open_(file, mode='r', *a, **k):
+        if any(c in mode for c in 'wxa+'):
+            _forbid(file, 'open for writing')
+        return real_open(file, mode, *a, **k)
+
+    def osopen_(path, flags, *a, **k):
+        if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
+            _forbid(path, 'os.open for writing')
+        return real_osopen(path, flags, *a, **k)
+
+    def mkstemp_(*a, **k):
+        _forbid(k.get('dir') or (a[2] if len(a) > 2 else '.'), 'mkstemp into')
+        return real_mkstemp(*a, **k)
+
+    monkeypatch.setattr(builtins, 'open', open_)
+    monkeypatch.setattr(os, 'open', osopen_)
+    monkeypatch.setattr(os, 'replace',
+                        lambda s, d: (_forbid(d, 'os.replace onto'), real_replace(s, d))[1])
+    monkeypatch.setattr(os, 'rename',
+                        lambda s, d: (_forbid(d, 'os.rename onto'), real_rename(s, d))[1])
+    monkeypatch.setattr(tempfile, 'mkstemp', mkstemp_)
+    monkeypatch.setattr(Path, 'write_text',
+                        lambda self, *a, **k: (_forbid(self, 'Path.write_text'),
+                                               real_wtext(self, *a, **k))[1])
+    monkeypatch.setattr(Path, 'rename',
+                        lambda self, t: (_forbid(t, 'Path.rename onto'),
+                                         real_prename(self, t))[1])
+    try:
+        yield
+    finally:
+        monkeypatch.undo()
+
+
 # ── The three money books, as one list ──────────────────────────────────────
 #
 # `bcs`, `fallen_hero` and `bear_put` are near-verbatim copies of one another,
