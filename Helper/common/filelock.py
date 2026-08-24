@@ -28,7 +28,11 @@ fd closes or the process dies. A crashed cron therefore cannot strand the lock â
 which matters on an unattended Pi where nobody is watching to clear it.
 
 Advisory means every writer must cooperate. One unlocked writer defeats the
-whole scheme, so all mutation must route through ZebraStore's locked path.
+whole scheme, so all mutation must route through the store's `_mutate()` block â€”
+`ZebraStore._mutate` for zebra, `LockedStoreMixin._mutate` for the three money
+stores (`bcs`, `fallen_hero`, `bear_put`). Each book locks its OWN file: the
+monitor writes all three every poll, and one global lock would serialise them
+against each other for no reason.
 """
 
 from __future__ import annotations

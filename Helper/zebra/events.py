@@ -31,7 +31,7 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 from . import config as cfg
-from .filelock import exclusive
+from common.filelock import exclusive
 
 logger = logging.getLogger(__name__)
 

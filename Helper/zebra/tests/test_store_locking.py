@@ -24,7 +24,7 @@ import pytest
 HELPER = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HELPER))
 
-from zebra import filelock                      # noqa: E402
+from common import filelock                      # noqa: E402
 
 
 # ── the lock primitive itself ────────────────────────────────────────────
@@ -34,7 +34,7 @@ def test_lock_is_exclusive_across_processes(tmp_path):
     probe = textwrap.dedent(f"""
         import sys
         sys.path.insert(0, {str(HELPER)!r})
-        from zebra import filelock
+        from common import filelock
         try:
             with filelock.exclusive({str(lock)!r}, timeout=0.3):
                 print("ACQUIRED")
@@ -62,7 +62,7 @@ def test_lock_released_when_holder_dies(tmp_path):
     killer = textwrap.dedent(f"""
         import sys, os
         sys.path.insert(0, {str(HELPER)!r})
-        from zebra import filelock
+        from common import filelock
         with filelock.exclusive({str(lock)!r}):
             os._exit(1)          # die hard, holding the lock
     """)

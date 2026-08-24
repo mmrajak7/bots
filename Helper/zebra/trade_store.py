@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import config as cfg
-from .filelock import LockTimeout, exclusive
+from common.filelock import LockTimeout, exclusive
 
 logger = logging.getLogger(__name__)
 

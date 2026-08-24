@@ -19,7 +19,7 @@ LOCAL_FILE = LOG_DIR / 'zebra_trades.json'
 # Cross-process mutex for the trade store. Two writers exist as of 2026-08-10
 # (zebra cron + the Claude vetting/review cron), and an unprotected
 # read-modify-write loses trades SILENTLY. A sidecar token file, never read —
-# see zebra/filelock.py for why an OS advisory lock beats a PID lockfile here.
+# see common/filelock.py for why an OS advisory lock beats a PID lockfile here.
 LOCK_FILE = LOG_DIR / 'zebra_trades.lock'
 # Claude vetting journal. SEPARATE lock from the trade store on purpose: sharing
 # one would deadlock any caller that journalled while holding the trade lock
