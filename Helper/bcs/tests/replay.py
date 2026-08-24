@@ -125,13 +125,27 @@ class TickBroker(FakeBroker):
     short leg went to +2100" are both assertions about what the code did.
     """
 
-    def __init__(self, clock, day, ticks, trade, **kw):
+    def __init__(self, clock, day, ticks, trade, faults=None, **kw):
         self._clock = clock
         self._day = day
         self._ticks = sorted(ticks, key=lambda t: t.at)
         self._trade = trade
+        # [(what, 'HH:MM:SS', exc)] — a broker that starts failing PART WAY
+        # through a session. A broker that fails from the first call is a
+        # different and much easier test: the interesting failures (an expired
+        # token, a symbol renamed by a corp action) arrive with positions
+        # already open and the loop already running.
+        self._faults = [(w, tuple(int(x) for x in at.split(':')), e)
+                        for w, at, e in (faults or [])]
         self.seen = []               # every tick the run actually reached
         super().__init__(books={}, spots={}, **kw)
+
+    def _fault(self, what):
+        now = (self._clock.dt.hour, self._clock.dt.minute, self._clock.dt.second)
+        for w, at, exc in self._faults:
+            if w == what and now >= at:
+                return exc
+        return None
 
     def _current(self):
         now = self._clock.dt
@@ -147,14 +161,16 @@ class TickBroker(FakeBroker):
 
     # -- market data, resolved per call --------------------------------------
     def ltp(self, symbols):
-        if self.ltp_raises:
-            raise self.ltp_raises
+        exc = self.ltp_raises or self._fault('ltp')
+        if exc:
+            raise exc
         tick = self._current()
         return {s: {'last_price': tick.spot} for s in _as_list(symbols)}
 
     def quote(self, symbols):
-        if self.quote_raises:
-            raise self.quote_raises
+        exc = self.quote_raises or self._fault('quote')
+        if exc:
+            raise exc
         tick = self._current()
         legs = {self._trade['long_symbol']: _full(tick.long),
                 self._trade['short_symbol']: _full(tick.short)}
@@ -181,7 +197,7 @@ def _as_list(symbols):
 
 
 def run_session(monkeypatch, sm, trade, ticks, day, positions,
-                dry_run=False, fill_policy=None):
+                dry_run=False, fill_policy=None, faults=None):
     """Replay `ticks` through the real `monitor_all`. Returns the evidence.
 
     Only the boundary is stubbed: stores, Telegram, the watchlist alert check,
@@ -210,7 +226,7 @@ def run_session(monkeypatch, sm, trade, ticks, day, positions,
     spy = TelegramSpy().install(monkeypatch, sm)
 
     kite = TickBroker(clock, day, ticks, trade, positions=positions,
-                      fill_policy=fill_policy)
+                      fill_policy=fill_policy, faults=faults)
 
     sm.reset_poll_state()      # trail_state is a monitor_all local, not global
     sm.monitor_all(kite, dry_run=dry_run)
