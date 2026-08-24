@@ -277,8 +277,16 @@ def test_reconcile_is_wired_into_the_success_path():
            'reconcile_after_close' in ' '.join(calls), \
         "the post-close position audit is not called from the close path"
     # ...and specifically after the trade is marked closed, not before.
-    assert src.index('update_trade_exit') < src.index('reconcile_after_close'), \
-        "reconciliation must run AFTER the exit is booked"
+    #
+    # Scoped to the SUCCESS path. B11 (2026-08-24) added a second, EARLIER
+    # reconcile call on the flipped-position abort — a path that deliberately
+    # books no exit at all — so a naive `src.index()` compares the abort's
+    # call against the success path's booking and fails on correct code. What
+    # must hold is that a reconcile follows the exit booking, not that no
+    # reconcile precedes it.
+    booked = src.index('update_trade_exit')
+    assert 'reconcile_after_close' in src[booked:], \
+        "reconciliation must run AFTER the exit is booked, in the same block"
 
 
 def test_reconcile_never_raises(monkeypatch):
