@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from bcs import drive_store
+from common.locked_store import LockTimeout, LockedStoreMixin
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,9 @@ SCRIPT_DIR = Path(__file__).parent.resolve()       # Helper/bear_put/
 PROJECT_ROOT = SCRIPT_DIR.parent                   # Helper/
 LOG_DIR = PROJECT_ROOT / 'logs'
 LOCAL_TRADES_FILE = LOG_DIR / 'bear_put_trades.json'
+#: One lock PER BOOK. The monitor writes all three every
+#: poll; a shared lock would serialise them for no reason.
+LOCK_FILE = LOG_DIR / 'bear_put_trades.lock'
 CONFIG_FILE = PROJECT_ROOT / 'config' / 'bear_put_config.json'
 
 # ── Required fields for add_trade validation ────────────────────────────────
@@ -67,7 +71,7 @@ def _resolve_credentials_path(config: dict) -> Optional[Path]:
     return Path(path_str) if path_str else None
 
 
-class BearPutStore:
+class BearPutStore(LockedStoreMixin):
     """Bear Put Spread trade CRUD with local file + Google Drive sync.
 
     Usage:
@@ -89,6 +93,21 @@ class BearPutStore:
             self._config.get('google_drive', {}).get('sync_interval_sec', 300)
         )
         self._sync_locked = False
+
+    def _lock_path(self) -> Path:
+        """Resolved at call time, not import time.
+
+        `_save_local` and `_read_local` read the module global, so a
+        test that redirects the store by patching LOCAL_TRADES_FILE
+        must move the lock with it. A class attribute would freeze the
+        lock in the real logs/ directory while the data went to
+        tmp_path -- locked, but not against the writer that matters.
+        """
+        return LOCK_FILE
+
+    def _data_path(self) -> Path:
+        """Same call-time resolution as _lock_path, for the same reason."""
+        return LOCAL_TRADES_FILE
 
     def initialize(self):
         """Startup: auth Drive, download fresh copy, fall back to local."""
@@ -136,25 +155,43 @@ class BearPutStore:
             logger.warning("Drive init failed: %s. Running local-only.", e)
 
     def _sync_from_drive(self):
-        """Download trades from Drive and merge with local/in-memory state."""
+        """Download from Drive, then merge the result under the store lock.
+
+        The download is a NETWORK call and stays OUTSIDE the lock. Holding a
+        cross-process mutex across an HTTP round-trip would stall the other
+        process's whole cycle -- and this runs every poll on the live monitor.
+
+        Merge strategy (per trade ID, higher version wins):
+          - Protects against lost trades when a prior Drive upload failed
+          - Picks up new trades added from other machines
+          - If merge differs from Drive, re-uploads to Drive
+        """
+        if not self._drive_file_id:
+            logger.info("No file on Drive yet, loading local")
+            self._load_local()
+            return
         try:
-            if self._drive_file_id:
-                drive_trades = drive_store.download_json(
-                    self._drive_service, self._drive_file_id
-                )
-                base = self._trades if self._trades else self._read_local()
-                merged = self._merge_trades(base, drive_trades)
-                self._trades = merged
-                self._save_local()
-                self._last_sync_time = time.time()
+            drive_trades = drive_store.download_json(
+                self._drive_service, self._drive_file_id
+            )
+            diverged = False
+            with self._mutate(drive=False):
+                # _mutate has already refreshed self._trades from disk, so the
+                # old `base = self._trades if self._trades else _read_local()`
+                # special case is gone: disk is always the base now.
+                self._trades = self._merge_trades(self._trades, drive_trades)
                 drive_versions = {t['id']: t.get('version', 0) for t in drive_trades}
-                merged_versions = {t['id']: t.get('version', 0) for t in merged}
-                if drive_versions != merged_versions:
-                    logger.info("Merge diverged from Drive, re-uploading")
-                    self._upload_to_drive()
-            else:
-                logger.info("No file on Drive yet, loading local")
-                self._load_local()
+                merged_versions = {t['id']: t.get('version', 0) for t in self._trades}
+                diverged = drive_versions != merged_versions
+            self._last_sync_time = time.time()
+            if diverged:
+                logger.info("Merge diverged from Drive, re-uploading")
+                self._upload_to_drive()
+        except LockTimeout as e:
+            # Another process holds the store. The cache stays as it is and the
+            # next poll retries -- a missed refresh is not a reason to abandon
+            # the poll, which is what raising here would do.
+            logger.warning("Drive merge skipped, store busy: %s", e)
         except Exception as e:
             logger.warning("Drive download failed: %s. Using local file.", e)
             self._load_local()
@@ -181,8 +218,9 @@ class BearPutStore:
         if not LOCAL_TRADES_FILE.exists():
             return []
         try:
-            with open(LOCAL_TRADES_FILE) as f:
-                data = json.load(f)
+            with self._read_lock():
+                with open(LOCAL_TRADES_FILE, encoding='utf-8') as f:
+                    data = json.load(f)
             if not isinstance(data, list):
                 raise ValueError(f"Expected list, got {type(data).__name__}")
             return data
@@ -198,6 +236,10 @@ class BearPutStore:
                 "Trade file CORRUPT (%s). Backed up to %s. Starting empty!",
                 e, backup
             )
+            # B7: a log line is not an alert. The monitor turns this marker
+            # into a Telegram BEFORE it concludes "all trades closed" and
+            # stops watching every open position.
+            self._flag_corruption(str(e), backup)
             return []
 
     def _load_local(self):
@@ -256,22 +298,21 @@ class BearPutStore:
 
     def _migrate_trades(self):
         """Backfill version, lot_size, lots fields on existing trades."""
-        changed = False
-        for t in self._trades:
-            if 'version' not in t:
-                t['version'] = 1
-                changed = True
-            if 'lot_size' not in t:
-                t['lot_size'] = t['quantity']
-                t['lots'] = 1
-                changed = True
-            if 'lots' not in t:
-                t['lots'] = t['quantity'] // t['lot_size']
-                changed = True
-        if changed:
-            logger.info("Migrated %d BPS trades (added version/lot_size/lots)", len(self._trades))
-            self._save_local()
-            self._upload_to_drive()
+        with self._mutate():
+            changed = False
+            for t in self._trades:
+                if 'version' not in t:
+                    t['version'] = 1
+                    changed = True
+                if 'lot_size' not in t:
+                    t['lot_size'] = t['quantity']
+                    t['lots'] = 1
+                    changed = True
+                if 'lots' not in t:
+                    t['lots'] = t['quantity'] // t['lot_size']
+                    changed = True
+            if changed:
+                logger.info("Migrated %d BPS trades (added version/lot_size/lots)", len(self._trades))
 
     # ── Read Operations (from cache, zero network) ──────────────────────
 
@@ -285,18 +326,17 @@ class BearPutStore:
         return [t for t in self._trades if t.get('status') == 'closing']
 
     def recover_closing_trade(self, trade_id: int):
-        for t in self._trades:
-            if t['id'] == trade_id and t.get('status') == 'closing':
-                t['status'] = 'open'
-                t['version'] = t.get('version', 0) + 1
-                t.pop('close_reason', None)
-                t.pop('close_started', None)
-                self._sync_locked = False
-                self._save_local()
-                self._upload_to_drive()
-                logger.warning("BPS trade #%d recovered from 'closing' -> 'open'", trade_id)
-                return True
-        return False
+        with self._mutate():
+            for t in self._trades:
+                if t['id'] == trade_id and t.get('status') == 'closing':
+                    t['status'] = 'open'
+                    t['version'] = t.get('version', 0) + 1
+                    t.pop('close_reason', None)
+                    t.pop('close_started', None)
+                    self._sync_locked = False
+                    logger.warning("BPS trade #%d recovered from 'closing' -> 'open'", trade_id)
+                    return True
+            return False
 
     def find_open_trade(self, stock: str, trade_id: Optional[int] = None) -> Optional[dict]:
         for t in self._trades:
@@ -309,9 +349,19 @@ class BearPutStore:
         return None
 
     def next_trade_id(self) -> int:
-        if not self._trades:
-            return 1
-        return max(t['id'] for t in self._trades) + 1
+        """Allocate the next trade ID.
+
+        Delegates to the mixin, which also consults a monotonic high-water
+        sidecar — `max(live) + 1` reissues ids 1, 2, 3 after a quarantine
+        empties the book, and a reissued id is not a cosmetic problem:
+        `_merge_trades` resolves by id, so the Drive copy of the original trade
+        and the new one become the same record and the higher version silently
+        wins.
+
+        Not a pure read: it advances the sidecar. Its only caller is
+        `add_trade`, inside the lock, which is where allocation belongs anyway.
+        """
+        return self.allocate_id()
 
     # ── Write Operations (local first, then Drive) ──────────────────────
 
@@ -369,16 +419,18 @@ class BearPutStore:
                 expected_debit
             )
 
-        # Assign metadata
-        trade_dict['id'] = self.next_trade_id()
-        trade_dict['version'] = 1
-        trade_dict.setdefault('account_id', None)
-        trade_dict.setdefault('status', 'open')
-        trade_dict.setdefault('exit', None)
+        # ID allocation is a read-check-write, so it belongs INSIDE the lock:
+        # two processes racing here hand the same id to two different trades,
+        # after which every lookup by id is ambiguous and the monitor may close
+        # the wrong one.
+        with self._mutate():
+            trade_dict['id'] = self.next_trade_id()
+            trade_dict['version'] = 1
+            trade_dict.setdefault('account_id', None)
+            trade_dict.setdefault('status', 'open')
+            trade_dict.setdefault('exit', None)
 
-        self._trades.append(trade_dict)
-        self._save_local()
-        self._upload_to_drive()
+            self._trades.append(trade_dict)
 
         logger.info("Added BPS trade #%d: %s %s/%s",
                      trade_dict['id'], trade_dict['stock'],
@@ -387,70 +439,67 @@ class BearPutStore:
 
     def update_trade_exit(self, trade_id: int, exit_data: dict):
         """Mark a trade as closed with exit details."""
-        found = False
-        for t in self._trades:
-            if t['id'] == trade_id:
-                t['status'] = 'closed'
-                t['exit'] = exit_data
-                t['version'] = t.get('version', 0) + 1
-                found = True
-                break
+        with self._mutate():
+            found = False
+            for t in self._trades:
+                if t['id'] == trade_id:
+                    t['status'] = 'closed'
+                    t['exit'] = exit_data
+                    t['version'] = t.get('version', 0) + 1
+                    found = True
+                    break
 
-        self._sync_locked = False
+            self._sync_locked = False
 
-        if not found:
-            logger.error("BPS trade #%d not found for exit update", trade_id)
-            return
-        self._save_local()
-        self._upload_to_drive()
-        logger.info("BPS trade #%d closed: %s", trade_id, exit_data.get('exit_reason', ''))
+            if not found:
+                logger.error("BPS trade #%d not found for exit update", trade_id)
+                return
+            logger.info("BPS trade #%d closed: %s", trade_id, exit_data.get('exit_reason', ''))
 
     def begin_close(self, trade_id: int, reason: str) -> bool:
         """Acquire close-lock on a trade."""
-        for t in self._trades:
-            if t['id'] == trade_id:
-                if t['status'] != 'open':
-                    logger.warning(
-                        "BPS trade #%d status is '%s', cannot begin close",
-                        trade_id, t['status']
-                    )
-                    return False
-                t['status'] = 'closing'
-                t['close_reason'] = reason
-                t['close_started'] = datetime.now().isoformat()
-                t['version'] = t.get('version', 0) + 1
-                self._sync_locked = True
-                self._save_local()
-                self._upload_to_drive()
-                logger.info("BPS trade #%d close-lock acquired: %s", trade_id, reason)
-                return True
-        logger.error("BPS trade #%d not found for begin_close", trade_id)
-        return False
+        with self._mutate():
+            for t in self._trades:
+                if t['id'] == trade_id:
+                    if t['status'] != 'open':
+                        logger.warning(
+                            "BPS trade #%d status is '%s', cannot begin close",
+                            trade_id, t['status']
+                        )
+                        return False
+                    t['status'] = 'closing'
+                    t['close_reason'] = reason
+                    t['close_started'] = datetime.now().isoformat()
+                    t['version'] = t.get('version', 0) + 1
+                    self._sync_locked = True
+                    logger.info("BPS trade #%d close-lock acquired: %s", trade_id, reason)
+                    return True
+            logger.error("BPS trade #%d not found for begin_close", trade_id)
+            return False
 
     def set_trade_status(self, trade_id: int, status: str, **extra_fields):
         """Update trade status and optional extra fields."""
-        for t in self._trades:
-            if t['id'] == trade_id:
-                t['status'] = status
-                t['version'] = t.get('version', 0) + 1
-                for k, v in extra_fields.items():
-                    t[k] = v
-                self._sync_locked = False
-                self._save_local()
-                self._upload_to_drive()
-                logger.info("BPS trade #%d status -> %s", trade_id, status)
-                return
-        logger.error("BPS trade #%d not found for set_trade_status", trade_id)
+        with self._mutate():
+            for t in self._trades:
+                if t['id'] == trade_id:
+                    t['status'] = status
+                    t['version'] = t.get('version', 0) + 1
+                    for k, v in extra_fields.items():
+                        t[k] = v
+                    self._sync_locked = False
+                    logger.info("BPS trade #%d status -> %s", trade_id, status)
+                    return
+            logger.error("BPS trade #%d not found for set_trade_status", trade_id)
 
     def update_trade_fields(self, trade_id: int, **fields):
         """Update arbitrary fields on a trade. Local only (no Drive upload)."""
-        for t in self._trades:
-            if t['id'] == trade_id:
-                for k, v in fields.items():
-                    t[k] = v
-                self._save_local()
-                return True
-        return False
+        with self._mutate(drive=False):
+            for t in self._trades:
+                if t['id'] == trade_id:
+                    for k, v in fields.items():
+                        t[k] = v
+                    return True
+            return False
 
     # ── Sync ────────────────────────────────────────────────────────────
 
