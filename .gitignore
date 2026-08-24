@@ -215,3 +215,6 @@ FIFTY/data/breadth/history.json
 FIFTY/data/breadth/breadth_daily.json
 FIFTY/data/regime_state.json
 FIFTY/data/breadth/*.tmp
+
+# derived: expiry closes fetched by zebra/debit_sl_study.py (re-fetchable)
+Helper/zebra/_expiry_close_cache.json
