@@ -926,6 +926,10 @@ def execute_butterfly(
         print(f"\n[{leg}] {order_params['transaction_type']} {order_params['quantity']} "
               f"{order_params['tradingsymbol']} @ {order_params['price']:.2f}")
 
+        # Set the moment place_order returns. A leg is LIVE from that instant,
+        # whatever happens next — see the except branch.
+        order_id = None
+
         try:
             # Place order via Kite
             order_id = kite.place_order(
@@ -936,12 +940,18 @@ def execute_butterfly(
                 order_type='LIMIT'
             )
 
-            # Get order status (for fill price)
+            # Get order status (for fill price).
+            #
+            # `kite.get_order_status` DOES NOT EXIST in kiteconnect — this line
+            # raised AttributeError on every run, after the order was already
+            # live. The real call is order_history(), whose last entry is the
+            # current state.
             import time
             time.sleep(1)  # Wait for order to process
-            order_status = kite.get_order_status(order_id)
+            history = kite.order_history(order_id) or []
+            order_status = history[-1] if history else {}
 
-            fill_price = order_status.get('average_price', order_params['price'])
+            fill_price = order_status.get('average_price') or order_params['price']
             slippage = abs(fill_price - order_params['base_price'])
 
             order_result = {
@@ -972,13 +982,25 @@ def execute_butterfly(
             print(f"    Status: {order_status.get('status', 'UNKNOWN')}")
 
         except Exception as e:
-            error_msg = f"Order failed for {leg}: {str(e)}"
+            # "Never placed" and "placed, then something went wrong" need
+            # OPPOSITE responses and must not share a message. The old code
+            # reported both as "Order failed" and gated the partial-position
+            # warning on `executed_orders`, which is still empty when the
+            # failure lands between place_order and the append — so a LIVE leg
+            # was announced as a failed one, with no manual-intervention
+            # warning at all.
+            placed = order_id is not None
+            error_msg = (
+                f"Order for {leg} was PLACED (id {order_id}) but could not be "
+                f"verified: {str(e)} — THE LEG MAY BE LIVE, check the order book"
+                if placed else
+                f"Order failed for {leg} (never placed): {str(e)}")
             print(f"    ERROR: {error_msg}")
             result.legs_failed.append(leg)
             result.error = error_msg
 
             # CRITICAL: Stop on failure - don't leave partial positions
-            if executed_orders:
+            if executed_orders or placed:
                 result.partial = True
                 print("\n*** PARTIAL EXECUTION - MANUAL INTERVENTION REQUIRED ***")
                 print(f"Executed legs: {result.legs_executed}")
