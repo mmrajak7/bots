@@ -1,0 +1,18 @@
+{
+  "_README": [
+    "THE LIVE-ORDER KILL SWITCH for bcs/spread_monitor.py.",
+    "Set trading.enabled to false to stop the monitor placing real exit orders.",
+    "It keeps watching and alerting -- you then close by hand.",
+    "",
+    "This file is TRACKED in git (force-added; .gitignore excludes Helper/config/)",
+    "so the switch has history and ships with the code. The repo is PUBLIC:",
+    "NEVER put a token, folder id, credential path or account number in here.",
+    "Secret-bearing settings live in the untracked config/*_config.json overlay.",
+    "",
+    "config/bcs_config.json may ALSO carry trading.enabled. Either file saying",
+    "false disarms; there is no precedence, both are stop buttons."
+  ],
+  "trading": {
+    "enabled": true
+  }
+}

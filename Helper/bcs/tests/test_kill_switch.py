@@ -20,8 +20,8 @@ import pytest
 from bcs import spread_monitor as sm
 
 
-def _write(tmp_path, payload) -> None:
-    p = tmp_path / 'bcs_config.json'
+def _write(tmp_path, payload, name='bcs_config.json'):
+    p = tmp_path / name
     if isinstance(payload, str):
         p.write_text(payload)
     else:
@@ -31,9 +31,30 @@ def _write(tmp_path, payload) -> None:
 
 @pytest.fixture
 def cfg(tmp_path, monkeypatch):
-    """Point the module at a throwaway config."""
+    """Point BOTH switch files at throwaways, the second one armed.
+
+    The first version patched only CONFIG_FILE. Once the switch became two
+    ANDed files that quietly left the REAL config/trading_switch.json in the
+    loop, so every case below was reading a live file off the box -- passing
+    for a reason the test did not state, and going red the moment the owner
+    disarmed the monitor for real.
+    """
+    monkeypatch.setattr(sm, 'SWITCH_FILE',
+                        _write(tmp_path, {'trading': {'enabled': True}},
+                               'trading_switch.json'))
+
     def _set(payload):
         monkeypatch.setattr(sm, 'CONFIG_FILE', _write(tmp_path, payload))
+    return _set
+
+
+@pytest.fixture
+def both(tmp_path, monkeypatch):
+    """Set the tracked switch and the overlay independently."""
+    def _set(switch, overlay):
+        monkeypatch.setattr(sm, 'SWITCH_FILE',
+                            _write(tmp_path, switch, 'trading_switch.json'))
+        monkeypatch.setattr(sm, 'CONFIG_FILE', _write(tmp_path, overlay))
     return _set
 
 
@@ -78,6 +99,7 @@ def test_anything_other_than_boolean_false_stays_armed(cfg, payload, why):
 
 def test_a_missing_config_stays_armed(tmp_path, monkeypatch):
     monkeypatch.setattr(sm, 'CONFIG_FILE', tmp_path / 'does_not_exist.json')
+    monkeypatch.setattr(sm, 'SWITCH_FILE', tmp_path / 'also_missing.json')
     assert sm.trading_enabled() is True
 
 
@@ -91,6 +113,7 @@ def test_an_unreadable_config_stays_armed_and_says_so(tmp_path, monkeypatch,
     d = tmp_path / 'bcs_config.json'
     d.mkdir()
     monkeypatch.setattr(sm, 'CONFIG_FILE', d)
+    monkeypatch.setattr(sm, 'SWITCH_FILE', tmp_path / 'absent.json')
     assert sm.trading_enabled() is True
     assert 'unreadable' in capsys.readouterr().out
 
@@ -107,3 +130,79 @@ def test_the_failopen_default_is_not_an_accident(cfg):
     assert sm.trading_enabled() is False
     cfg({'trading': {'enabled': True}})
     assert sm.trading_enabled() is True
+
+
+# ── Two files, ANDed ─────────────────────────────────────────────────────────
+#
+# `config/trading_switch.json` is TRACKED; `config/bcs_config.json` is not, and
+# cannot be, because it carries the Drive folder id and a credentials path and
+# its neighbours in config/ carry live Telegram bot tokens into a PUBLIC repo.
+# So the switch got a second home rather than moving house.
+
+@pytest.mark.parametrize('switch,overlay,expect,why', [
+    (True,  True,  True,  'both armed'),
+    (False, True,  False, 'the TRACKED file alone can disarm'),
+    (True,  False, False, 'the overlay alone can still disarm'),
+    (False, False, False, 'both disarmed'),
+])
+def test_either_file_can_stop_the_money_path(both, switch, overlay, expect,
+                                             why):
+    """ANDed, not ranked. A precedence rule means a reader who edits the wrong
+    file is silently overruled -- the one outcome a stop button may never
+    have. Both are stop buttons; neither is an arm button.
+    """
+    both({'trading': {'enabled': switch}}, {'trading': {'enabled': overlay}})
+    assert sm.trading_enabled() is expect, why
+
+
+def test_an_armed_overlay_cannot_re_arm_a_disarmed_tracked_switch(both):
+    """The failure this ordering exists to prevent: someone re-arms the file
+    they happen to know about and believes the monitor is stopped."""
+    both({'trading': {'enabled': False}}, {'trading': {'enabled': True}})
+    assert sm.trading_enabled() is False
+
+
+def test_a_corrupt_tracked_switch_does_not_disarm(both):
+    """Fail-open applies per file. A truncated switch must not abandon the
+    stops on a live book -- see the module docstring."""
+    both('{ truncated', {'trading': {'enabled': True}})
+    assert sm.trading_enabled() is True
+
+
+def test_the_shipped_tracked_switch_is_armed_and_secret_free():
+    """It is force-added into a PUBLIC repo, so the scan is part of the test.
+
+    Checked against the file's real bytes rather than its parsed values: a
+    secret pasted into a comment key, a new node, or a stray trailing line is
+    still published.
+    """
+    import re
+    raw = sm.SWITCH_FILE.read_text(encoding='utf-8')
+    assert sm._switch_says(sm.SWITCH_FILE) is True
+
+    forbidden = {
+        'telegram bot token': r'\d{8,10}:[A-Za-z0-9_-]{30,}',
+        'a real home directory': r'[Cc]:\\Users\\|/home/[a-z]',
+        'a google drive id': r'1[A-Za-z0-9_-]{27,}',
+        'an api key or token value': r'(?i)"(api_key|access_token|secret)"\s*:',
+        'a kite account id': r'[A-Z]{2}\d{4}',
+    }
+    for what, pat in forbidden.items():
+        assert not re.search(pat, raw), (
+            f'config/trading_switch.json contains {what}. It is TRACKED in a '
+            f'PUBLIC repo -- secrets belong in the untracked overlay.')
+
+
+def test_the_tracked_switch_is_actually_tracked():
+    """Force-added past `.gitignore: Helper/config/`. If a later `git rm
+    --cached` or a clean checkout drops it, the file reverts to being just
+    another untracked config and the whole point is lost -- silently, because
+    fail-open means a missing file still reads as ARMED.
+    """
+    import subprocess
+    out = subprocess.run(
+        ['git', 'ls-files', '--error-unmatch', str(sm.SWITCH_FILE)],
+        cwd=str(sm.PROJECT_ROOT), capture_output=True, text=True)
+    assert out.returncode == 0, (
+        'config/trading_switch.json is NOT tracked by git. Re-add it with '
+        '`git add -f config/trading_switch.json`.')

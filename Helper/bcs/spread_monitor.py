@@ -195,32 +195,26 @@ BOTS_ROOT = PROJECT_ROOT.parent                    # BOTS/
 TOKEN_FILE = BOTS_ROOT / 'data' / 'kite_access_token.json'
 LOG_DIR = PROJECT_ROOT / 'logs'
 CONFIG_FILE = PROJECT_ROOT / 'config' / 'bcs_config.json'
+SWITCH_FILE = PROJECT_ROOT / 'config' / 'trading_switch.json'
 
 
-def trading_enabled() -> bool:
-    """The live-order kill switch: `trading.enabled` in config/bcs_config.json.
+def _switch_says(path: Path) -> bool:
+    """Read one kill-switch file. True unless it says boolean `false`.
 
-    Read on EVERY poll, never cached. A switch consulted once at startup
-    cannot stop a monitor that is already running — and the cron line is
-    `flock -n` on a */5 schedule, so killing the process just restarts it
-    within five minutes. Re-reading each cycle is what makes this an actual
-    stop button rather than a restart-time preference.
-
-    **FAILS OPEN, deliberately.** A missing, unreadable or malformed config
+    **FAILS OPEN, deliberately.** A missing, unreadable or malformed file
     means ENABLED. That is the opposite of the usual instinct and it is
     correct here, because this path only ever CLOSES positions: disarming it
     does not prevent a bad trade, it abandons the stops on a live book.
     "Stop trading" is not "stop watching", and silent unmonitoring is the
     failure mode that has actually cost money (ICICI Feb-2026, NHPC Jul-2026).
-    Only an explicit `false` disarms.
     """
     try:
-        with open(CONFIG_FILE) as f:
+        with open(path) as f:
             cfg = json.load(f)
     except FileNotFoundError:
         return True
     except Exception as e:
-        log(f"  WARNING: {CONFIG_FILE.name} unreadable ({e}) — trading stays "
+        log(f"  WARNING: {path.name} unreadable ({e}) — trading stays "
             f"ENABLED; a config error must not disarm live stops")
         return True
     node = cfg.get('trading')
@@ -232,9 +226,40 @@ def trading_enabled() -> bool:
     # Never infer a live/disarmed switch from a non-boolean. Same discipline
     # as zebra/config.py:_strict_bool — except the safe default there is
     # PAPER, and the safe default here is ARMED, for the reason above.
-    log(f"  WARNING: trading.enabled={val!r} is not true/false — trading "
-        f"stays ENABLED. A kill switch is never inferred.")
+    log(f"  WARNING: trading.enabled={val!r} in {path.name} is not "
+        f"true/false — trading stays ENABLED. A kill switch is never "
+        f"inferred.")
     return True
+
+
+def trading_enabled() -> bool:
+    """The live-order kill switch. Read on EVERY poll, never cached.
+
+    A switch consulted once at startup cannot stop a monitor that is already
+    running — and the cron line is `flock -n` on a */5 schedule, so killing
+    the process just restarts it within five minutes. Re-reading each cycle
+    is what makes this an actual stop button rather than a restart-time
+    preference.
+
+    TWO files, ANDed: `config/trading_switch.json` (TRACKED in git) and
+    `config/bcs_config.json` (untracked, Drive-carried). Either saying boolean
+    `false` disarms.
+
+    The tracked one exists because the flag deciding whether real orders fire
+    had no version history: you could not see when it moved or why, a fresh
+    deploy was armed by whatever untracked file happened to be on the box, and
+    a change to the money switch never appeared in a diff. It could not simply
+    BE `bcs_config.json`, because that file carries the Drive folder id and a
+    credentials path — and its neighbours in `config/` carry live Telegram bot
+    tokens — into a PUBLIC repo.
+
+    ANDed rather than ranked on purpose. A precedence rule means a reader who
+    sets the wrong file gets silently overruled, which is the one outcome a
+    stop button may never have. Both are stop buttons; neither is an arm
+    button.
+    """
+    return _switch_says(SWITCH_FILE) and _switch_says(CONFIG_FILE)
+
 
 # ── Module-level log state (set per-trade in monitor()) ──────────────────────
 _log_file: Optional[Path] = None
@@ -3059,14 +3084,17 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             # money path mid-session.
             if not dry_run and not trading_enabled():
                 dry_run = True
-                log("KILL SWITCH: trading.enabled=false in bcs_config.json — "
+                which = ', '.join(
+                    f.name for f in (SWITCH_FILE, CONFIG_FILE)
+                    if not _switch_says(f)) or '(re-read says armed)'
+                log(f"KILL SWITCH: trading.enabled=false in {which} — "
                     "forcing DRY RUN for the rest of this session. Positions "
                     "are still monitored and alerted; no orders will be placed.")
                 if not kill_switch_announced:
                     kill_switch_announced = True
                     send_telegram(
                         "⛔ BCS MONITOR DISARMED\n"
-                        "trading.enabled=false in bcs_config.json.\n"
+                        f"trading.enabled=false in {which}.\n"
                         "Positions are still watched and alerted, but "
                         "NO EXIT ORDERS WILL BE PLACED - you must close "
                         "by hand.\nRe-arm: set it back to true and "

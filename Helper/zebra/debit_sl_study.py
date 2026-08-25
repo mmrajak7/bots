@@ -106,8 +106,15 @@ def save_cache(c: dict) -> None:
 
 def fetch_expiry_closes(pairs, cache):
     """pairs = {(stock, expiry)}. Returns {key: close}. Cached; Kite only for
-    what is missing, because this is re-run every time an expiry passes."""
-    todo = sorted({p for p in pairs if f'{p[0]}|{p[1]}' not in cache})
+    what is missing, because this is re-run every time an expiry passes.
+
+    A FAILED fetch is never cached. The first draft stored None on failure, and
+    `todo` skips any key already present — so one transient Kite error would
+    have retired that record from the study permanently, and the sample would
+    quietly shrink instead of growing as expiries pass. Absent means "ask
+    again"; present means "we have a close".
+    """
+    todo = sorted({p for p in pairs if cache.get(f'{p[0]}|{p[1]}') is None})
     if not todo:
         return cache
 
@@ -131,27 +138,39 @@ def fetch_expiry_closes(pairs, cache):
                 except Exception as e2:
                     print(f'    {sym}: {e2}')
 
+    # A bar for TODAY is still forming. `close` on it is the last traded price
+    # so far, not a close, and on expiry day that is the one number the whole
+    # study turns on. Refuse it and come back tomorrow rather than settling 20
+    # records against a 10 a.m. print.
+    today = dt.date.today()
+
     for stock, expiry in todo:
         key = f'{stock}|{expiry}'
         it = tokens.get(stock)
         if it is None:
-            cache[key] = None
+            print(f'  {stock}: no instrument token; will retry next run')
             continue
         end = dt.date.fromisoformat(expiry)
         try:
             candles = kite.historical_data(it, end - dt.timedelta(days=10),
                                            end, 'day')
         except Exception as e:
-            print(f'  {stock} {expiry}: {e}')
-            cache[key] = None
+            print(f'  {stock} {expiry}: {e}; will retry next run')
             continue
-        # The last session AT OR BEFORE expiry. Expiry can fall on a holiday,
-        # and taking "the last candle we got" without that check would silently
-        # use a post-expiry close on any symbol whose data ran long.
+        # The last session AT OR BEFORE expiry, and strictly BEFORE today.
+        # Expiry can fall on a holiday, and taking "the last candle we got"
+        # without that check would silently use a post-expiry close on any
+        # symbol whose data ran long.
         usable = [c for c in candles
                   if (c['date'].date() if hasattr(c['date'], 'date')
-                      else c['date']) <= end]
-        cache[key] = float(usable[-1]['close']) if usable else None
+                      else c['date']) <= end
+                  and (c['date'].date() if hasattr(c['date'], 'date')
+                       else c['date']) < today]
+        if not usable:
+            print(f'  {stock} {expiry}: no settled daily bar yet; '
+                  f'will retry next run')
+            continue
+        cache[key] = float(usable[-1]['close'])
     save_cache(cache)
     return cache
 
@@ -225,6 +244,20 @@ def main(argv=None):
             'held_pnl': round(held, 0),
             'stop_saved': round(actual - held, 0),
         })
+
+    if not rows:
+        # `ripe` was non-empty but every record was skipped -- a dead token, a
+        # symbol that no longer resolves, an expiry whose bar has not settled.
+        # Report that as "no answer yet", never as a result: the summary below
+        # divides by n, and a study that crashes on the day its sample is
+        # incomplete is a study nobody re-runs.
+        print()
+        print(f'NONE of the {len(ripe)} ripe records could be valued.')
+        for s in skipped:
+            print('   ', s)
+        print()
+        print('No answer yet. Re-run once the causes above clear.')
+        return 0
 
     rows.sort(key=lambda r: r['stop_saved'])
     print()
