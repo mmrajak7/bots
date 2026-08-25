@@ -1014,45 +1014,66 @@ def _print_cohort_scoreboard(exited, entered):
         return
     wins = sum(1 for t in done if (t.get('pnl') or 0) > 0)
     gross = sum(float(t.get('pnl') or 0) for t in done)
-    fees = sum(_est_fees(t) for t in done)
+    costed = [_trade_cost(t) for t in done]
+    fees = sum(c for c, _ in costed)
+    bases = {}
+    for _, b in costed:
+        bases[b] = bases.get(b, 0) + 1
+    floors = bases.get('brokerage_only', 0)
     pcts = sorted(float(t.get('pnl_pct') or 0) for t in done)
     med = pcts[len(pcts) // 2]
     print(f"  WR {wins}/{len(done)} ({wins / len(done) * 100:.0f}%)   "
           f"median trade {med:+.2f}% gross")
-    print(f"  GROSS Rs {gross:,.0f}   est. fees Rs {fees:,.0f}   "
-          f"NET Rs {gross - fees:,.0f}")
+    print(f"  GROSS Rs {gross:,.0f}   fees Rs {fees:,.0f}"
+          f"{' (a FLOOR)' if floors else ''}   NET Rs {gross - fees:,.0f}")
+    print("  fee basis: "
+          + ', '.join(f'{n} {b}' for b, n in sorted(bases.items())))
+    if floors:
+        # Those rows are missing STT, exchange, SEBI and stamp entirely.
+        print(f"    {floors} record(s) have no per-leg prices, so their cost "
+              f"is brokerage only — the NET above is BETTER than reality")
     n_fill = sum(1 for t in done if t.get('pricing_basis') == 'fill')
     print(f"  fill-basis records: {n_fill}/{len(done)}"
           f"{'' if n_fill >= 30 else '  (need ~30 to judge the cost question)'}")
 
 
-def _est_fees(trade: dict) -> float:
-    """Estimated Zerodha round-trip cost for one BCS, in rupees.
+def _trade_cost(trade: dict):
+    """Round-trip cost for one closed trade: (rupees, basis).
 
-    An ESTIMATE and labelled as one — the store holds no brokerage record, and
-    exit leg prices are not persisted, so exit premiums are approximated by
-    entry premiums. It is here because the alternative (printing gross only) is
-    what makes a strategy whose median trade is negative look positive.
+    Prefers the cost STAMPED at close (`pnl - pnl_net`, computed then from the
+    real exit book) and re-estimates only where that is absent — the records
+    predating the stamp, and anything closed before `fees.py` existed.
 
-    Short leg is OTM so its premium is its extrinsic; long = debit + short.
-    Rs 20/order x 4 legs, STT 0.1% on the two SELL premiums, NSE txn 0.03503%
-    of turnover, GST 18% on brokerage+txn, stamp 0.003% on buys.
+    The scorecard used to hardcode its own copy of the rates. Every literal
+    matched `cfg.FEE_RATES` exactly, which is what made it dangerous rather
+    than merely redundant: nothing was wrong on the day it was written, and
+    nothing would look wrong on the day it went stale. The go-live plan
+    reconciles those rates against the first real contract note, after which
+    the digest would move and this number would not — and this is the number
+    the scale-up decision reads.
+
+    `basis` matters as much as the rupees. `zebra.fees` charges a brokerage
+    FLOOR for records with no per-leg prices, and that floor is missing STT
+    entirely, so those rows UNDERSTATE cost. Counting them separately is the
+    difference between "our fees are X" and "our fees are at least X on a
+    third of the book".
     """
+    pnl, net = trade.get('pnl'), trade.get('pnl_net')
+    if pnl is not None and net is not None:
+        try:
+            return max(0.0, float(pnl) - float(net)), 'stamped'
+        except (TypeError, ValueError):
+            pass
     try:
-        q = float(trade['quantity'])
-        debit = float(trade['debit'])
-        short_p = float(trade.get('short_extrinsic_entry') or 0) or debit * 0.5
-        long_p = debit + short_p
-        buy_turn = q * (long_p + short_p)
-        sell_turn = q * (short_p + long_p)
-        turnover = buy_turn + sell_turn
-        brok = 80.0
-        txn = 0.0003503 * turnover
-        sebi = 0.000001 * turnover
-        return (brok + 0.001 * sell_turn + txn + sebi
-                + 0.18 * (brok + txn + sebi) + 0.00003 * buy_turn)
-    except (KeyError, TypeError, ValueError, ZeroDivisionError):
-        return 0.0
+        from .fees import round_trip_for_trade
+        est = round_trip_for_trade(trade, trade.get('exit_debit'))
+        total = float(est.get('total') or 0.0)
+        if total != total:                      # NaN
+            return 0.0, 'uncostable'
+        return total, str(est.get('basis') or 'modelled')
+    except Exception:
+        # Never let a costing failure take down the scorecard.
+        return 0.0, 'uncostable'
 
 
 def cmd_status(args):
