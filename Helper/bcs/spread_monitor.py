@@ -61,6 +61,8 @@ _socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 from kiteconnect import KiteConnect
 
+from common import option_symbols as _sym
+from common.option_symbols import check_leg_types
 from .trade_store import get_store
 from fallen_hero import get_store as get_fh_store
 from bear_put import get_store as get_bps_store
@@ -398,29 +400,12 @@ def leg_quote_reliable(depth: dict) -> tuple:
     return True, ''
 
 
-def strike_from_symbol(symbol: str):
-    """Strike embedded in an NFO tradingsymbol, or None.
-
-    The BCS trade schema stores `spread_width` but NOT the individual strikes
-    (verified against logs/bcs_trades.json), so the arbitrage floor below has
-    to recover them from the symbols. Returns None on anything unexpected —
-    the floor then simply does not apply, which is the fail-open direction.
-    """
-    m = re.search(r'(\d+(?:\.\d+)?)(CE|PE)$', str(symbol or '').upper())
-    return float(m.group(1)) if m else None
-
-
-def option_type_from_symbol(symbol: str):
-    """'CE', 'PE', or None. Read from the SYMBOL, not from the store.
-
-    Deliberately not `trade.get('_store_type') == 'bps'`: that flag is stamped
-    by whichever store loaded the record, so it is a fact about bookkeeping,
-    while the payoff is a fact about the contract. The symbol is the same
-    source of truth the strikes come from, and both must agree or the floor
-    below computes the wrong shape.
-    """
-    m = re.search(r'(CE|PE)$', str(symbol or '').upper())
-    return m.group(1) if m else None
+#: Re-exported so existing call sites keep their names. The definitions live
+#: in `common/` because the three stores need them too, and the last time a
+#: piece of option arithmetic lived in only one place the bear-put book ran for
+#: months with no intrinsic floor at all (B21).
+strike_from_symbol = _sym.strike
+option_type_from_symbol = _sym.option_type
 
 
 def spread_intrinsic_floor(trade: dict, spot: float):
@@ -2355,7 +2340,25 @@ def _malformed_reason(trade: dict):
         missing += [f for f in ('target_spot', 'sl_spread', 'net_debit',
                                 'long_symbol', 'short_symbol')
                     if trade.get(f) is None]
-    return ('missing ' + ', '.join(missing)) if missing else None
+    if missing:
+        return 'missing ' + ', '.join(missing)
+
+    # A record filed in the wrong book is unmonitorable for a different
+    # reason: every field is present, and the DIRECTION of the stops is wrong.
+    # `_store_type` chooses whether SL_SPOT means "spot fell" or "spot rose",
+    # so a bear put spread in the BCS book fires both SL_SPOT and TP on the
+    # first poll of a perfectly healthy position.
+    #
+    # Routed through the existing malformed path on purpose: the required
+    # behaviour is identical — skip the record, alert once, keep the rest of
+    # the book monitored — and a second parallel quarantine path would be one
+    # more thing to keep in step.
+    wrong = trade_is_misfiled(trade)
+    if wrong:
+        return ('filed in the wrong book: ' + '; '.join(wrong)
+                + '. Its stops would run in the WRONG DIRECTION, so it is not '
+                  'monitored. Move it to the store for its own structure.')
+    return None
 
 
 def _alert_malformed_record(trade: dict, reason: str, alerted: set) -> None:
@@ -2805,23 +2808,52 @@ def _load_all_trades(bcs_store, fh_store, bps_store=None) -> list:
     polluting the store's in-memory trade dicts (which get persisted).
     """
     all_trades = []
-    for t in bcs_store.get_open_trades():
-        tagged = dict(t)
-        tagged['_strategy'] = 'BCS'
-        tagged['_store_type'] = 'bcs'
-        all_trades.append(tagged)
-    if bps_store:
-        for t in bps_store.get_open_trades():
+    for store, strat, st in ((bcs_store, 'BCS', 'bcs'),
+                             (bps_store, 'BPS', 'bps'),
+                             (fh_store, 'FH', 'fh')):
+        if store is None:
+            continue
+        for t in store.get_open_trades():
             tagged = dict(t)
-            tagged['_strategy'] = 'BPS'
-            tagged['_store_type'] = 'bps'
+            tagged['_strategy'] = strat
+            tagged['_store_type'] = st
+            # DIRECTION COMES FROM THE STORE, so a misfiled record has its
+            # stops inverted. `_misfiled` carries the contradiction forward
+            # rather than resolving it here — see `trade_is_misfiled`.
+            tagged['_misfiled'] = check_leg_types(t, LEG_TYPES_BY_STORE[st])
             all_trades.append(tagged)
-    for t in fh_store.get_open_trades():
-        tagged = dict(t)
-        tagged['_strategy'] = 'FH'
-        tagged['_store_type'] = 'fh'
-        all_trades.append(tagged)
     return all_trades
+
+
+#: Per-book leg expectations, indexed by the same tag `_load_all_trades`
+#: stamps. Kept here rather than imported from the three stores so that adding
+#: a book without a row is a KeyError at load, not a silently unchecked record.
+LEG_TYPES_BY_STORE = {
+    'bcs': {'long_symbol': 'CE', 'short_symbol': 'CE'},
+    'bps': {'long_symbol': 'PE', 'short_symbol': 'PE'},
+    'fh': {'long_put_symbol': 'PE', 'short_put_symbol': 'PE',
+           'short_call_symbol': 'CE', 'long_call_symbol': 'CE'},
+}
+
+
+def trade_is_misfiled(trade: dict):
+    """Problems with this record's legs versus its book, or an empty list.
+
+    The stores refuse a mismatched record at `add_trade` since 2026-08-25, but
+    that cannot help anything already open, and the consequence is not subtle:
+    SL_SPOT and TP direction are chosen by `_store_type`, so a bear put spread
+    sitting in the BCS book reads its upside stop as a downside one. On the
+    FIRST poll of a perfectly healthy position both `spot <= sl_spot` and
+    `spot >= target` are true, and the monitor closes it at whatever the book
+    offers.
+
+    Deliberately NOT auto-corrected from the symbols. Every level on the
+    record — sl_spot, target, sl_spread — was written for the structure whoever
+    saved it believed they had, so flipping the comparison would run real
+    money against numbers that may mean nothing. The monitor withholds the
+    ORDER and keeps the WARNING, the same division as the kill switch.
+    """
+    return trade.get('_misfiled') or []
 
 
 def _get_store_for(trade, bcs_store, fh_store, bps_store=None):

@@ -315,11 +315,17 @@ class MemoryStore:
         return [c for c in self.calls if c[0] == name]
 
     # -- reads --------------------------------------------------------------
+    # LIVE REFERENCES, exactly like the real stores. The first version copied,
+    # which made the fake SAFER than production and therefore blind to a whole
+    # class of bug: `_load_all_trades` relies on `tagged = dict(t)` to keep its
+    # tags out of the persisted dicts, and a mutation removing that copy
+    # survived a test built on the copying fake. A fake that cannot reproduce
+    # production's aliasing cannot test the code that guards against it.
     def get_open_trades(self):
-        return [dict(t) for t in self.trades if t.get('status') == 'open']
+        return [t for t in self.trades if t.get('status') == 'open']
 
     def get_closing_trades(self):
-        return [dict(t) for t in self.trades if t.get('status') == 'closing']
+        return [t for t in self.trades if t.get('status') == 'closing']
 
     def find_open_trade(self, stock=None, trade_id=None):  # real: (stock, trade_id=None)
         for t in self.trades:

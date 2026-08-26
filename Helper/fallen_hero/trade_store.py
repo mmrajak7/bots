@@ -32,6 +32,7 @@ from typing import Optional
 
 from bcs import drive_store
 from common.locked_store import LockTimeout, LockedStoreMixin
+from common.option_symbols import check_leg_types
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,15 @@ REQUIRED_FIELDS = [
     'put_spread_width', 'put_spread_credit', 'call_credit', 'total_credit',
     'breakeven', 'sl_spot', 'entry_date', 'entry_spot', 'expiry',
 ]
+
+
+#: What this book's legs must be. Checked on every `add_trade`, because
+#: `bcs/spread_monitor.py` picks SL_SPOT and TP DIRECTION from which store a
+#: record came out of — so a record filed in the wrong book has its stops
+#: inverted, and on the first poll of a healthy position both `spot <= sl_spot`
+#: and `spot >= target` can be true at once. See common/option_symbols.py.
+LEG_TYPES = {'long_put_symbol': 'PE', 'short_put_symbol': 'PE',
+             'short_call_symbol': 'CE', 'long_call_symbol': 'CE'}
 
 
 def _load_config() -> dict:
@@ -427,6 +437,15 @@ class FallenHeroStore(LockedStoreMixin):
         missing = [f for f in REQUIRED_FIELDS if f not in trade_dict]
         if missing:
             raise ValueError(f"Missing required fields: {missing}")
+
+        # Refuse a record whose legs contradict this book. Cheap here, and the
+        # only other place it could be caught is the monitor — after the trade
+        # is already open and being managed with inverted stops.
+        wrong = check_leg_types(trade_dict, LEG_TYPES)
+        if wrong:
+            raise ValueError(
+                "Leg types do not match this book: " + "; ".join(wrong)
+                + ". Save it through the store for its own structure.")
 
         # 2. Lot size validation
         lot_size = trade_dict.get('lot_size')
