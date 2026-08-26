@@ -381,3 +381,51 @@ def test_the_d_w_gate_still_reads_the_mid_basis(monkeypatch):
     assert 'error' not in r, r
     assert r['debit_to_width_pct_mid'] == pytest.approx(cap)
     assert r['debit_to_width_pct'] > cap
+
+
+# ── depth SIZE, not just depth price ────────────────────────────────────────
+
+def test_the_candidate_carries_the_size_at_the_touch(monkeypatch):
+    """`_quote_option` has always returned bid_qty/ask_qty and this dict used
+    to drop them, so everything downstream — the sizing plan, the vetting
+    agent, the ticket — could see WHAT the book quoted but not HOW MUCH.
+
+    OI is a different measurement: it says a strike is traded, not that there
+    are contracts on the touch right now. Without these, `capital.plan` falls
+    back to one lot and the fallback is indistinguishable from a real limit.
+    """
+    _chain(monkeypatch)
+    monkeypatch.setattr(strikes, '_quote_option', lambda kite, sym: dict(
+        _quote(20.0, 20000), bid_qty=3000, ask_qty=2500))
+    r = strikes.analyze_bcs(
+        kite=None, stock=STOCK, direction=DIRECTION, spot=1000.0,
+        target_spot=1040.0, expiry=EXPIRY, atm_strike=ATM,
+        atm_quote=dict(_quote(30.0, 20000), bid_qty=4000, ask_qty=3500),
+        lot_size=LOT)
+    assert 'error' not in r, r
+    # Entry BUYS the long (ASK side) and SELLS the short (BID side).
+    assert r['long_ask_qty'] == 3500
+    assert r['short_bid_qty'] == 3000
+
+
+def test_the_size_reaches_the_sizing_plan(monkeypatch):
+    """End of the chain: the analyzer's numbers actually bound a lot count.
+    Asserting the keys alone would pass on a candidate nothing ever read."""
+    from zebra import capital
+    _chain(monkeypatch)
+    monkeypatch.setattr(strikes, '_quote_option', lambda kite, sym: dict(
+        _quote(20.0, 20000), bid_qty=1500, ask_qty=1500))
+    r = strikes.analyze_bcs(
+        kite=None, stock=STOCK, direction=DIRECTION, spot=1000.0,
+        target_spot=1040.0, expiry=EXPIRY, atm_strike=ATM,
+        atm_quote=dict(_quote(30.0, 20000), bid_qty=1500, ask_qty=1500),
+        lot_size=LOT)
+    pl = capital.plan(
+        [], {'stock': STOCK, 'debit': r['debit'], 'lot_size': LOT},
+        depth={'long': {'ask_qty': r['long_ask_qty']},
+               'short': {'bid_qty': r['short_bid_qty']}},
+        lim=capital.Limits(capital=200000.0, basis='base', max_open=8,
+                           max_per_stock=1, max_lots=10, max_trade=None,
+                           max_deployed=None))
+    assert pl['bounds']['liquidity'] == 3        # 1500 / 500
+    assert pl['lots'] == 3 and pl['bound'] == 'liquidity'

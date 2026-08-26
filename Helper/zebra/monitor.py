@@ -21,6 +21,7 @@ from typing import Optional
 
 import requests
 
+from . import capital
 from . import config as cfg
 from . import events as events_mod
 from . import health as health_mod
@@ -461,7 +462,49 @@ def format_vetoed_alert(trade: dict, reasons: list, red_flags: list) -> str:
     return "\n".join(lines)
 
 
-def _vet_context(trade: dict, analysis: dict, gap_pct: float,
+def _capital_context(store, trade: dict, analysis: dict) -> dict:
+    """What the book can afford, and what it already holds.
+
+    Both halves matter and they answer different questions. `deployed` /
+    `open_positions` is the PORTFOLIO question -- is this one more position
+    than the book should carry. `plan` is the POSITION question -- how many
+    lots this signal may take, and which limit decided it.
+
+    `plan.bounds` carries every limit's own answer, not just the winner, so the
+    agent can tell a size bound by LIQUIDITY (a thin book, which is a reason to
+    be suspicious of this signal) from one bound by BUDGET (a full book, which
+    says nothing about this signal's quality).
+    """
+    best = analysis.get('best') or {}
+    book = store.load_trades()
+    lim = capital.limits(book)
+    held, n_open, unpriced = capital.deployed(book)
+    candidate = {
+        'stock': trade.get('stock'),
+        'debit': best.get('debit'),
+        'lot_size': best.get('lot_size') or analysis.get('lot_size'),
+    }
+    depth = None
+    if best.get('long_ask_qty') is not None:
+        depth = {'long': {'ask_qty': best.get('long_ask_qty')},
+                 'short': {'bid_qty': best.get('short_bid_qty')}}
+    return {
+        'capital_rupees': lim.capital,
+        'capital_basis': lim.basis,
+        'deployed_rupees': round(held, 2),
+        'headroom_rupees': (round(lim.max_deployed - held, 2)
+                            if lim.max_deployed is not None else None),
+        'open_positions': n_open,
+        'open_slots': (lim.max_open - n_open) if lim.max_open else None,
+        'unpriced_positions': unpriced,
+        'limits': capital.describe(book),
+        'plan': capital.plan(book, candidate, depth, lim),
+        'note': 'entry is SLICED into one-lot orders (no per-order brokerage '
+                'on Neo) and each fill is verified before the next goes out',
+    }
+
+
+def _vet_context(store, trade: dict, analysis: dict, gap_pct: float,
                  kite=None) -> dict:
     """The evidence bundle handed to the vetting agent.
 
@@ -492,6 +535,23 @@ def _vet_context(trade: dict, analysis: dict, gap_pct: float,
     # describing only that pair would ask the agent to vet a position that
     # will not exist — and `gates_all_passed` would read TRUE off an empty
     # `best`, i.e. an all-clear derived from having nothing to check.
+    # ── Capital, in the handoff (owner, 2026-08-26: "vet should carefully
+    # handle capital allocation to trade as well ... keep an eye on overall
+    # capital + per-trade capital").
+    #
+    # The agent was being asked to approve an ENTRY while shown nothing about
+    # what the book could afford or what it already held. Same defect the
+    # liquidity fields were fixed for one paragraph down: judge what you
+    # cannot see. Wrapped, because a capital lookup failing must degrade the
+    # evidence, never halt the pipeline -- and `None` reads as "not supplied",
+    # which the agent's checklist can act on, where a zero would read as "no
+    # money at risk".
+    cap_ctx = None
+    try:
+        cap_ctx = _capital_context(store, trade, analysis)
+    except Exception as e:
+        logger.warning("capital context failed for %s: %s", trade['stock'], e)
+
     bcs_ctx = None
     if cfg.ENTRY_STRUCTURE == 'bcs':
         atm = analysis.get('atm_quote') or {}
@@ -511,6 +571,7 @@ def _vet_context(trade: dict, analysis: dict, gap_pct: float,
     return {
         'structure': cfg.ENTRY_STRUCTURE,
         'bcs': bcs_ctx,
+        'capital': cap_ctx,
         'stock': trade['stock'],
         'direction': trade['direction'],
         'timeframe': trade.get('timeframe'),
@@ -867,6 +928,34 @@ def _swing_tp_line(swing) -> str:
             f"spot and ST {swing['st_value']:g}\n")
 
 
+def _size_line(store, trade: dict, bcs: dict, analysis: dict) -> str:
+    """How many lots, what bounded it, and how to place them.
+
+    The ticket used to quote "Capital (1 lot)" and stop there, which answers
+    the cost of a size nobody had decided. This states the DECISION and its
+    binding limit, because those are different facts to act on: bound by
+    LIQUIDITY is a reason to look harder at the signal, bound by BUDGET is a
+    reason to look at the book.
+
+    Never raises. A sizing failure must not cost the owner the ticket -- the
+    symbols and the debit are still the order.
+    """
+    try:
+        pl = _capital_context(store, trade, analysis)['plan']
+    except Exception as e:
+        logger.warning("size line failed for %s: %s", trade.get('stock'), e)
+        return "\n\n⚠ <i>Size not computed — enter 1 lot.</i>"
+    if not pl['lots']:
+        return ("\n\n🚫 <i>Capital says DO NOT ENTER: "
+                f"{html.escape(pl['reason'])}</i>")
+    n, per = pl['lots'], pl['slice_lots']
+    orders = '' if n == per else (f" as {n} x {per}-lot order(s) — no "
+                                  f"per-order brokerage, and each fill is "
+                                  f"confirmed before the next")
+    return (f"\n\n📦 <i>Size <b>{n} lot(s)</b> = Rs {pl['capital']:,.0f} "
+            f"(bound by {html.escape(pl['bound'])}). Place{orders}.</i>")
+
+
 def _format_bcs_enter_alert(trade: dict, analysis: dict, bcs: dict) -> str:
     """BCS-led ENTER alert (zebra silenced): the shadow spread is the story."""
     stock = trade['stock']
@@ -1105,7 +1194,7 @@ def _drain_queued_out_of_band(store: ZebraStore, trade: dict, kite,
             return
         vet_mod.promote_queued(
             store, trade['id'],
-            context=_vet_context(trade, analysis, gap_pct, kite))
+            context=_vet_context(store, trade, analysis, gap_pct, kite))
     except Exception as e:
         logger.error("Out-of-band queue drain failed for #%d: %s — stays "
                      "queued, retried next cycle", trade['id'], e)
@@ -1326,7 +1415,7 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 try:
                     vet_mod.promote_queued(
                         store, trade['id'],
-                        context=_vet_context(trade, analysis, gap_pct, kite))
+                        context=_vet_context(store, trade, analysis, gap_pct, kite))
                 except Exception as e:
                     logger.error("Queue drain failed for #%d: %s — stays "
                                  "queued, retried next cycle", trade['id'], e)
@@ -1335,7 +1424,7 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 try:
                     vet_mod.request_entry_vet(
                         store, trade['id'],
-                        context=_vet_context(trade, analysis, gap_pct, kite))
+                        context=_vet_context(store, trade, analysis, gap_pct, kite))
                 except ValueError as e:
                     # The locked re-check saw a state this cache missed —
                     # already requested or already SETTLED (possibly a veto).
@@ -1439,6 +1528,7 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 # _funds_line down there ran it exactly never under the BCS
                 # pipeline. Quantity from the BCS's own lot_size: the ticket
                 # and the margin must price the same order.
+                msg += _size_line(store, target, bcs, analysis)
                 msg += _funds_line(kite, bcs, bcs.get('lot_size') or 0)
                 _send_enter_alert(store, trade, msg, stock, dry_run=dry_run)
             else:
@@ -2693,6 +2783,11 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
     # first line — so the ONE event that stops all exit monitoring is the one
     # event `_alert_monitoring_blind` structurally cannot report.
     _alert_store_corruption(dry_run=dry_run)
+    # Say which portfolio limits are ARMED, every cycle. An unset rupee cap
+    # behaves exactly like a working one right up to the moment it should have
+    # refused something, and this system has already shipped two controls that
+    # were wired in, looked deployed and could never fire.
+    logger.info(capital.describe(store.load_trades()))
     # FIRST, before anything can read a vet state: fail open any vet that blew
     # its deadline. This is the guard that stops a Claude outage (crash, hung
     # CLI, expired auth, Pi reboot) from quietly parking signals in `pending`

@@ -925,6 +925,29 @@ def cmd_enter(args):
     print(f"  TP at {t['tp_spot']:.2f}, {sl_txt}"
           f"DEBIT SL at {t['debit_sl_value']:.2f}")
 
+    # ── Does the broker agree? (owner: "ensure entries are correct after
+    # entry"). Every stop level printed above is computed from the RECORD, so
+    # a record that does not match the position is a set of stops pointing at
+    # something that is not there. Read-only, never places an order, and never
+    # fatal to the entry -- the trade IS recorded either way; what this decides
+    # is whether the owner is told to go and look.
+    from . import capital
+    try:
+        from .scanner import _get_kite
+        positions = (_get_kite().positions() or {}).get('net')
+    except Exception as e:
+        print(f"  (could not read broker positions: {e})")
+        positions = None
+    v = capital.verify_entry(positions, t)
+    if v['ok']:
+        print("  VERIFIED: the broker shows both legs at the recorded size")
+    else:
+        print("  *** ENTRY NOT VERIFIED ***")
+        for prob in v['problems']:
+            print(f"    - {prob}")
+        print("    The stops above are computed from the RECORD. Fix the "
+              "record or the position before relying on them.")
+
 
 def cmd_close(args):
     from .trade_store import get_store

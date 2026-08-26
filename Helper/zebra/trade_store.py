@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from . import capital
 from . import config as cfg
 from common.filelock import LockTimeout, exclusive
 
@@ -293,7 +294,10 @@ class ZebraStore:
             t = self._must_find(trade_id)
             if t['status'] not in ('watching', 'triggered'):
                 raise ValueError(f"#{trade_id} status={t['status']}, can't enter")
-            self._refuse_if_book_full(trade_id)
+            self._refuse_if_over_budget(trade_id, {
+                'stock': t.get('stock'), 'debit': entry_data.get('debit'),
+                'lot_size': entry_data.get('lot_size'),
+                'lots': entry_data.get('lots') or 1})
             self._apply_entry(t, entry_data)
         logger.info(
             "ENTERED #%d %s %s/%s debit=%.2f qty=%d cap=Rs%.0f TP=%.2f SL=%.2f",
@@ -591,32 +595,58 @@ class ZebraStore:
         """
         t['cohort'] = cfg.COHORT_START
 
-    def _refuse_if_book_full(self, trade_id: int) -> None:
-        """Cap concurrent open positions. MUST be called inside the lock.
+    def _refuse_if_over_budget(self, trade_id: int,
+                               candidate: dict = None) -> None:
+        """Every portfolio-level limit, in one place. MUST hold the lock.
 
-        `MAX_OPEN_TRADES` was defined in config, asserted by a test, and read
-        by NOTHING — the only portfolio-level risk control in the system was
+        Was `_refuse_if_book_full`, and it checked one thing: a COUNT.
+        `MAX_OPEN_TRADES` had been defined in config, asserted by a test and
+        read by NOTHING -- the only portfolio control in the system was
         decorative, and the paper book duly reached 17 simultaneous positions
-        against a stated cap of 8. In paper that only skews the record; with
-        real money it is the difference between a bad day and an account.
+        against a stated cap of 8. Fixing that left the other half untouched:
+        eight positions is not a budget, and measured on the cohort the book
+        held Rs 81,291 across 7 positions with no rupee limit anywhere.
+        `zebra.capital` now answers all of it.
 
-        PAPER is deliberately exempt: capping entries would bias which trades
-        the validation record contains, and an unentered paper signal costs
-        nothing. The cap binds where it means something — live.
+        `candidate` prices the position being opened. Omitted (the legacy
+        call), only the count and per-stock limits can bind -- the rupee ones
+        need to know what is being bought.
+
+        LIVE refuses. PAPER evaluates and LOGS what it WOULD have refused,
+        which is the point:
+
+        * capping paper entries would bias which trades the validation record
+          contains, and an unentered paper signal costs nothing -- the reason
+          the old exemption existed, and still right;
+        * but an exemption that skips the check entirely means the capital
+          layer has never run when it first becomes load-bearing. That is the
+          exit bridge's mistake in a different file. Shadow-logging gives an
+          unbiased record AND evidence, and the WOULD REFUSE lines are how the
+          rupee numbers get chosen from data instead of guessed.
 
         Raises ValueError, which every caller already treats as "did not
         enter" (the monitor logs and leaves the row triggered; the CLI prints
-        and exits non-zero). Refusing to open is always safe; the signal is
-        simply not taken.
+        and exits non-zero). Refusing to open is always safe.
         """
-        if cfg.PAPER_MODE or not cfg.MAX_OPEN_TRADES:
+        cand = dict(candidate or {})
+        cand.setdefault('stock', (self.find(trade_id) or {}).get('stock'))
+        if candidate is None:
+            # Nothing to price. Ask only the limits that do not need a number,
+            # rather than fail the unpriceable-candidate rule and refuse every
+            # legacy entry.
+            cand.setdefault('debit', 0.0)
+            cand.setdefault('quantity', 1)
+        ok, why = capital.check(self._trades, cand)
+        if ok:
             return
-        open_n = sum(1 for x in self._trades if x.get('status') == 'entered')
-        if open_n >= cfg.MAX_OPEN_TRADES:
-            raise ValueError(
-                f"#{trade_id} refused: {open_n} positions already open, cap is "
-                f"{cfg.MAX_OPEN_TRADES} (max_open_trades). Close something or "
-                f"raise the cap deliberately.")
+        if cfg.PAPER_MODE:
+            logger.warning(
+                'CAPITAL WOULD REFUSE #%s %s: %s -- entered anyway (paper '
+                'keeps the record unbiased). %s',
+                trade_id, cand.get('stock'), why, capital.describe(self._trades))
+            return
+        raise ValueError(f"#{trade_id} refused: {why}. Close something or "
+                         f"raise the limit deliberately.")
 
     def mark_entered_bcs(self, trade_id: int, bcs: dict) -> dict:
         """Promote a signal straight into a BCS position — ONE record.
@@ -636,7 +666,9 @@ class ZebraStore:
             t = self._must_find(trade_id)
             if t['status'] not in ('watching', 'triggered'):
                 raise ValueError(f"#{trade_id} status={t['status']}, can't enter")
-            self._refuse_if_book_full(trade_id)
+            self._refuse_if_over_budget(trade_id, {
+                'stock': t.get('stock'), 'debit': debit,
+                'lot_size': lot_size, 'lots': lots})
             direction = t['direction']
             sl_spot = round(entry_spot * (1 - cfg.SPOT_SL_PCT), 2) \
                 if direction == 'CE' else \

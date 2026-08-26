@@ -424,6 +424,43 @@ _DEFAULTS = {
                                  # NOT cap entries — capturing every signal keeps
                                  # the validation P&L unbiased (a cap would skew
                                  # which trades the track record contains).
+    # ── Portfolio capital (Phase 2, 2026-08-26) ─────────────────────────
+    #
+    # Owner: "We shall load 2L as initial and then reserve some per trade...
+    # as the capital grows to say 4L then it can auto go for 2 lots and so
+    # on... so capital based risk and so on + compounding", with Rs 25,000 per
+    # trade and 1 lot for now.
+    #
+    # Those numbers are ONE scheme, so they are stored as ratios:
+    #
+    #     Rs 2,00,000 / 8 slots = Rs 25,000 each = 12.5% of capital
+    #
+    # Store the ratio and everything scales on one number. Store three rupee
+    # figures and they drift apart the first time capital moves, silently: 8
+    # slots at a stale Rs 25,000 against Rs 4,00,000 is a book running at half
+    # size with nothing announcing it.
+    'capital_rupees': 200000,
+    # One lot per this much capital. 2L -> 1 lot, 4L -> 2, and so on, floored.
+    'capital_per_lot': 200000,
+    # 12.5% = Rs 25,000 at 2L, which is the owner's figure, and it stays 1/8th
+    # of the book as capital grows instead of quietly becoming 1/16th.
+    'max_trade_pct': 12.5,
+    # 100%: 8 slots x 12.5% is the whole account by construction, so the count
+    # cap and the per-trade cap are the limits that actually bind. Lower this
+    # to hold cash back.
+    'max_deployed_pct': 100,
+    # Safety ceiling on the DERIVED lot count. A stray zero in capital_rupees
+    # must not be able to order 50 lots.
+    'max_lots_hard': 5,
+    # Add realised net P&L to the base capital, which is what makes size grow
+    # on its own. OFF until it is watched -- `describe()` reports what it would
+    # be every cycle, the same alert-only-first discipline every other control
+    # here shipped with.
+    'compound': False,
+    # Codifies observed behaviour rather than inventing a rule: 10 of 10 cohort
+    # entries were distinct stocks, and the scanner already dedups on open
+    # positions. This makes that a limit instead of a coincidence.
+    'max_open_per_stock': 1,
     'max_watching_signals': 25,
     'watch_max_age_days': 45,  # A watching/triggered row whose symbol has
                                # stopped quoting can never drift- or
@@ -809,6 +846,25 @@ SPOT_SL_PCT = _num('spot_sl_pct')
 DEBIT_SL_PCT = _num('debit_sl_pct')
 TIME_SL_DAYS = _int('time_sl_days_before_expiry')
 MAX_OPEN_TRADES = _int('max_open_trades')
+MAX_OPEN_PER_STOCK = _int('max_open_per_stock')
+CAPITAL_RUPEES = _positive_finite('capital_rupees',
+                                  _runtime.get('capital_rupees'),
+                                  _DEFAULTS['capital_rupees'])
+CAPITAL_PER_LOT = _positive_finite('capital_per_lot',
+                                   _runtime.get('capital_per_lot'),
+                                   _DEFAULTS['capital_per_lot'])
+MAX_TRADE_PCT = _positive_finite('max_trade_pct',
+                                 _runtime.get('max_trade_pct'),
+                                 _DEFAULTS['max_trade_pct'])
+MAX_DEPLOYED_PCT = _positive_finite('max_deployed_pct',
+                                    _runtime.get('max_deployed_pct'),
+                                    _DEFAULTS['max_deployed_pct'])
+MAX_LOTS_HARD = _int('max_lots_hard')
+# `_strict_bool`, not a raw read: this decides position SIZE from a P&L
+# figure, and `"compound": 1` must not be able to arm that by accident.
+COMPOUND = _strict_bool('compound')
+
+
 MAX_WATCHING_SIGNALS = _int('max_watching_signals')
 WATCH_MAX_AGE_DAYS = _int('watch_max_age_days')
 SCAN_INTERVAL_SEC = _int('scan_interval_sec')

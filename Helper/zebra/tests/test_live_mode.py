@@ -214,20 +214,51 @@ def test_open_position_cap_binds_in_live_and_not_in_paper(monkeypatch):
 
     class _S(ZebraStore):
         def __init__(self, n_open):
-            self._trades = [{'id': i, 'status': 'entered'}
+            # PRICEABLE rows. They used to be bare {id, status}, which the
+            # rupee limits correctly refuse as an incomplete book -- a real
+            # rule, but not the one under test here.
+            self._trades = [{'id': i, 'status': 'entered', 'stock': 'S%d' % i,
+                             'debit': 1.0, 'lot_size': 1, 'lots': 1}
                             for i in range(n_open)]
 
     monkeypatch.setattr(cfg, 'MAX_OPEN_TRADES', 3)
+    monkeypatch.setattr(cfg, 'MAX_OPEN_PER_STOCK', 0)   # not under test here
 
     monkeypatch.setattr(cfg, 'PAPER_MODE', False)
-    _S(2)._refuse_if_book_full(99)                 # under the cap: fine
+    _S(2)._refuse_if_over_budget(99)               # under the cap: fine
     with pytest.raises(ValueError, match='cap is 3'):
-        _S(3)._refuse_if_book_full(99)
+        _S(3)._refuse_if_over_budget(99)
     with pytest.raises(ValueError):
-        _S(9)._refuse_if_book_full(99)
+        _S(9)._refuse_if_over_budget(99)
 
     monkeypatch.setattr(cfg, 'PAPER_MODE', True)
-    _S(99)._refuse_if_book_full(99)                # paper stays uncapped
+    _S(99)._refuse_if_over_budget(99)              # paper still enters
+
+
+def test_paper_says_what_it_would_have_refused(monkeypatch, caplog):
+    """Paper stays UNCAPPED but no longer stays SILENT.
+
+    Exempting paper keeps the validation record unbiased -- capping entries
+    would decide which trades the track record contains. But an exemption that
+    skips the check entirely means the capital layer has never executed on the
+    day it first becomes load-bearing, which is the exit bridge's mistake in a
+    different file. The WOULD REFUSE line is also the evidence the rupee
+    limits get chosen from, instead of guessed.
+    """
+    import logging
+    from zebra.trade_store import ZebraStore
+
+    class _S(ZebraStore):
+        def __init__(self, n_open):
+            self._trades = [{'id': i, 'status': 'entered', 'stock': 'S%d' % i,
+                             'debit': 1.0, 'lot_size': 1, 'lots': 1}
+                            for i in range(n_open)]
+
+    monkeypatch.setattr(cfg, 'MAX_OPEN_TRADES', 3)
+    monkeypatch.setattr(cfg, 'PAPER_MODE', True)
+    with caplog.at_level(logging.WARNING, logger='zebra.trade_store'):
+        _S(9)._refuse_if_over_budget(99)
+    assert any('CAPITAL WOULD REFUSE' in r.message for r in caplog.records),         'paper skipped the capital check instead of shadow-running it'
 
 
 # ── the interpreter grant, both spellings ────────────────────────────────

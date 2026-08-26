@@ -608,6 +608,17 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
         'long_ask': atm_quote['ask'], 'long_oi': atm_quote['oi'],
         'short_mid': tgt_q['mid'], 'short_bid': tgt_q['bid'],
         'short_ask': tgt_q['ask'], 'short_oi': tgt_q['oi'],
+        # SIZE at the touch, not just the price. `_quote_option` has always
+        # returned these and this dict has always dropped them, so every
+        # consumer downstream -- the sizing plan, the vetting agent, the
+        # ticket -- could see WHAT the book was quoting but not HOW MUCH of
+        # it. OI is a different measurement: it says a strike is traded, not
+        # that there are contracts on the touch right now.
+        #
+        # Entry buys the long (needs size on the ASK) and sells the short
+        # (needs size on the BID), so those are the two sides carried.
+        'long_ask_qty': atm_quote.get('ask_qty'),
+        'short_bid_qty': tgt_q.get('bid_qty'),
         'short_spread_pct': round(tgt_spread_pct * 100, 2),
         'long_extrinsic': round(long_ext, 2),
         'short_extrinsic': round(short_ext, 2),
