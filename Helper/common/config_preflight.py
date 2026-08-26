@@ -29,6 +29,17 @@ import sys
 from common.layered_config import CONFIG_DIR, DEFAULTS_SUFFIX
 
 
+def _wants_secrets(flat_defaults) -> bool:
+    """Does this subsystem look like it needs an overlay at all?
+
+    A tracked `google_drive.*` or `telegram.*` block means the credentials for
+    it were stripped out and must come from somewhere. A config with neither
+    never had a secret, so a missing overlay costs nothing.
+    """
+    return any(k.startswith(('google_drive.', 'telegram.', 'telegram_'))
+               for k in flat_defaults)
+
+
 def _flatten(d, prefix=''):
     out = {}
     for k, v in (d or {}).items():
@@ -63,7 +74,11 @@ def main() -> int:
         defaults = _flatten(json.loads(f.read_text(encoding='utf-8')))
 
         if not overlay_path.exists():
-            no_overlay.append(name)
+            # Say whether anything is actually MISSING. The generic warning
+            # fired on stock_analyzer_config, which has no credentials of any
+            # kind -- an alarm about a subsystem with nothing to lose trains
+            # the reader to skim past the one that matters.
+            no_overlay.append((name, _wants_secrets(defaults)))
             continue
 
         try:
@@ -106,11 +121,21 @@ def main() -> int:
 
     print()
     if no_overlay:
-        print('No overlay on this box for: %s' % ', '.join(no_overlay))
-        print('  Those subsystems will run on the tracked defaults alone. That')
-        print('  is correct for a fresh checkout and WRONG for a box that is')
-        print('  supposed to have credentials -- check before restarting.')
-        print()
+        harmless = [n for n, wants in no_overlay if not wants]
+        risky = [n for n, wants in no_overlay if wants]
+        if harmless:
+            print('No overlay for: %s' % ', '.join(harmless))
+            print('  Fine. Their tracked defaults carry no credential-shaped')
+            print('  block, so there is no secret for the overlay to be')
+            print('  holding. They run on the defaults alone by design.')
+            print()
+        if risky:
+            print('!! NO OVERLAY for: %s' % ', '.join(risky))
+            print('   These DO have a google_drive/telegram block in their')
+            print('   tracked layer, which means the box needs an overlay to')
+            print('   supply the credentials -- and there is none. Drive sync')
+            print('   and alerts will fail. Fix before restarting.')
+            print()
 
     print('-' * 78)
     if total_new == 0:
