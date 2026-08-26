@@ -161,9 +161,12 @@ class _ScriptedCloseLeg:
         self.results = list(results)
         self.calls = []
 
+    # Mirrors production's `close_leg` signature -- see the note on the
+    # twin in test_b10_partial_short_close.py.
     def __call__(self, kite, exchange, symbol, txn, qty, is_buy=False,
-                 dry_run=False, urgent=False):
-        self.calls.append({'symbol': symbol, 'txn': txn, 'qty': qty})
+                 dry_run=False, urgent=False, context=None):
+        self.calls.append({'symbol': symbol, 'txn': txn, 'qty': qty,
+                           'context': context})
         return self.results.pop(0) if self.results else None
 
     def for_symbol(self, sym):

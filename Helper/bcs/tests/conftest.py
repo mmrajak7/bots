@@ -94,6 +94,31 @@ def _forbid(path, how):
 
 
 @pytest.fixture(autouse=True)
+def _journal_to_tmp(tmp_path):
+    """Point the order journal at a throwaway directory, for EVERY test.
+
+    `place_limit_order` journals every order it intends, dry run and live
+    alike, into `logs/order_intents_<date>.jsonl`. Without this rail any test
+    that reaches the order path writes into the real logs/ -- which the
+    production-write rail below correctly refuses, so the whole B10/B11 family
+    went red the moment the journal was wired in.
+
+    Autouse and at the SOURCE, not opt-in per test: a rail a test has to
+    remember is a rail that catches nothing. Its own private MonkeyPatch, for
+    the same reason `_no_production_writes` has one -- `monkeypatch.undo()`
+    inside a test must not be able to switch it off.
+    """
+    from bcs import order_journal
+
+    mp = pytest.MonkeyPatch()
+    d = tmp_path / 'journal_logs'
+    d.mkdir(exist_ok=True)
+    mp.setattr(order_journal, 'LOG_DIR', d)
+    yield d
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
 def _no_production_writes():
     """Deliberately does NOT take the shared `monkeypatch` fixture.
 

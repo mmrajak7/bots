@@ -64,6 +64,7 @@ from kiteconnect import KiteConnect
 from common import option_symbols as _sym
 from common.option_symbols import check_leg_types
 from common import layered_config
+from bcs import order_journal
 from .trade_store import get_store
 from fallen_hero import get_store as get_fh_store
 from bear_put import get_store as get_bps_store
@@ -1047,28 +1048,67 @@ def round_to_tick(price: float) -> float:
     return round(round(price / TICK_SIZE) * TICK_SIZE, 2)
 
 
+def _order_ctx(trade: dict, reason: str, leg: str, strategy: str) -> dict:
+    """Why this order exists, for the journal.
+
+    Deliberately only fields already on the record -- no re-derivation. A
+    journal that computes anything can disagree with the system it is
+    witnessing, and then it is evidence of nothing.
+    """
+    return {
+        'trade_id': trade.get('id'),
+        'stock': trade.get('stock'),
+        'strategy': strategy,
+        'reason': reason,
+        'leg': leg,
+    }
+
+
 def place_limit_order(kite: KiteConnect, exchange: str, symbol: str,
                       txn_type: str, qty: int, price: float,
-                      dry_run: bool) -> str:
-    """Place a LIMIT NRML order. Returns order_id or 'DRY_RUN_xxx'."""
+                      dry_run: bool, context: dict = None) -> str:
+    """Place a LIMIT NRML order. Returns order_id or 'DRY_RUN_xxx'.
+
+    Every call is journalled to `logs/order_intents_<date>.jsonl`, dry run and
+    live alike, INTENT first and RESULT after. That file is what makes
+    "alert-only first" checkable: a dry-run session's intents can be diffed
+    against what the paper system booked, and the two modes stay comparable
+    because both write the same record. See bcs/order_journal.py — including
+    why an intent with no result is the point rather than a gap.
+    """
     price = round_to_tick(price)
+    intent_id = order_journal.record_intent(
+        symbol=symbol, txn_type=txn_type, qty=qty, price=price,
+        exchange=exchange, dry_run=dry_run, context=context, log=log)
+
     if dry_run:
         fake_id = f"DRY_{datetime.now().strftime('%H%M%S%f')}"
         log(f"    [DRY RUN] {txn_type} {symbol} x {qty} @ {price} -> {fake_id}")
+        order_journal.record_result(intent_id, order_id=fake_id, dry_run=True,
+                                    log=log)
         return fake_id
 
-    order_id = kite.place_order(
-        variety=kite.VARIETY_REGULAR,
-        exchange=exchange,
-        tradingsymbol=symbol,
-        transaction_type=txn_type,
-        quantity=qty,
-        product=PRODUCT,
-        order_type=kite.ORDER_TYPE_LIMIT,
-        price=price,
-        tag=ORDER_TAG,
-    )
+    try:
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange=exchange,
+            tradingsymbol=symbol,
+            transaction_type=txn_type,
+            quantity=qty,
+            product=PRODUCT,
+            order_type=kite.ORDER_TYPE_LIMIT,
+            price=price,
+            tag=ORDER_TAG,
+        )
+    except Exception as e:
+        # Stamp the failure and RE-RAISE. The caller's retry/abort logic is
+        # unchanged -- this only ensures a rejected order leaves a record,
+        # instead of the intent line dangling as if the process had died.
+        order_journal.record_result(intent_id, error=f'{type(e).__name__}: {e}',
+                                    log=log)
+        raise
     log(f"    Order placed: {txn_type} {symbol} x {qty} @ {price} -> {order_id}")
+    order_journal.record_result(intent_id, order_id=str(order_id), log=log)
     return str(order_id)
 
 
@@ -1142,7 +1182,7 @@ def _order_final_state(kite: KiteConnect, order_id: str):
 
 def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
               qty: int, is_buy: bool, dry_run: bool,
-              urgent: bool = False) -> Optional[dict]:
+              urgent: bool = False, context: dict = None) -> Optional[dict]:
     """
     Close one leg with retry + escalating slippage.
 
@@ -1343,7 +1383,20 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
                 f"| LTP: {depth['ltp']} | PrevCl: {depth['prev_close']} | Reliable: {book_reliable}")
             log(f"    Limit price: {round_to_tick(price)}")
 
-        order_id = place_limit_order(kite, exchange, symbol, txn_type, remaining_qty, price, dry_run)
+        # The caller knows the trade and the trigger; this frame knows the
+        # book that produced the price. Both belong on the record -- "would
+        # have sold at 0.35" is only meaningful next to the bid it read.
+        leg_ctx = dict(context or {})
+        leg_ctx.update({
+            'attempt': attempt,
+            'urgent': urgent,
+            'book_reliable': book_reliable,
+            'bid': depth.get('bid'), 'bid_qty': depth.get('bid_qty'),
+            'ask': depth.get('ask'), 'ask_qty': depth.get('ask_qty'),
+            'ltp': depth.get('ltp'), 'prev_close': depth.get('prev_close'),
+        })
+        order_id = place_limit_order(kite, exchange, symbol, txn_type, remaining_qty, price, dry_run,
+                                     context=leg_ctx)
         result = wait_for_fill(kite, order_id, dry_run)
 
         if result and result['status'] == 'COMPLETE':
@@ -1655,7 +1708,8 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
         log("-" * 55)
         short_result = close_leg(
             kite, exchange, short_sym, "BUY", close_qty, is_buy=True, dry_run=dry_run,
-            urgent=urgent
+            urgent=urgent,
+            context=_order_ctx(trade, reason, 'short', label)
         )
 
         if not short_result or short_result['status'] not in ('COMPLETE', 'PARTIAL'):
@@ -1706,7 +1760,8 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             if remaining > 0:
                 log(f"  RETRY: closing the {remaining} qty residual (urgent)")
                 retry = close_leg(kite, exchange, short_sym, "BUY", remaining,
-                                  is_buy=True, dry_run=dry_run, urgent=True)
+                                  is_buy=True, dry_run=dry_run, urgent=True,
+                                  context=_order_ctx(trade, reason, 'short-retry', label))
                 got = retry.get('filled_quantity', 0) if retry else 0
                 remaining -= got
                 log(f"  RETRY filled {got}; {remaining} still short")
@@ -1750,7 +1805,8 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
         long_urgent = urgent or short_closed_now
         long_result = close_leg(
             kite, exchange, long_sym, "SELL", close_qty, is_buy=False, dry_run=dry_run,
-            urgent=long_urgent
+            urgent=long_urgent,
+            context=_order_ctx(trade, reason, 'long', label)
         )
 
         if not long_result or long_result['status'] not in ('COMPLETE', 'PARTIAL'):
@@ -2046,7 +2102,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         log(f"\nSTEP 1: BUY back SHORT CALL {sc_sym} x {close_qty}")
         log("-" * 55)
         result = close_leg(kite, exchange, sc_sym, "BUY", close_qty, is_buy=True, dry_run=dry_run,
-                           urgent=True)
+                           urgent=True,
+                           context=_order_ctx(trade, reason, 'short-call', 'FH'))
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log("!!! CRITICAL: SHORT CALL CLOSE FAILED — naked risk remains !!!")
             send_telegram(f"FH {stock}: SHORT CALL CLOSE FAILED! Naked risk! Manual intervention needed!")
@@ -2066,7 +2123,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         if result['status'] == 'PARTIAL' and sc_remaining > 0:
             log(f"  RETRY: closing the {sc_remaining} qty short-call residual")
             retry = close_leg(kite, exchange, sc_sym, "BUY", sc_remaining,
-                              is_buy=True, dry_run=dry_run, urgent=True)
+                              is_buy=True, dry_run=dry_run, urgent=True,
+                              context=_order_ctx(trade, reason, 'short-call-retry', 'FH'))
             got = retry.get('filled_quantity', 0) if retry else 0
             sc_remaining -= got
         if result['status'] == 'PARTIAL' and sc_remaining > 0:
@@ -2095,7 +2153,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         log(f"\nSTEP 2: SELL LONG CALL {lc_sym} x {close_qty}")
         log("-" * 55)
         result = close_leg(kite, exchange, lc_sym, "SELL", close_qty, is_buy=False, dry_run=dry_run,
-                           urgent=True)
+                           urgent=True,
+                           context=_order_ctx(trade, reason, 'long-call', 'FH'))
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log(f"  WARNING: Long call close failed. Naked long remains — not critical.")
             send_telegram(f"FH {stock}: Long call sell failed. Manual sell {lc_sym}.")
@@ -2111,7 +2170,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         log(f"\nSTEP 3: BUY back SHORT PUT {sp_sym} x {close_qty}")
         log("-" * 55)
         result = close_leg(kite, exchange, sp_sym, "BUY", close_qty, is_buy=True, dry_run=dry_run,
-                           urgent=True)
+                           urgent=True,
+                           context=_order_ctx(trade, reason, 'short-put', 'FH'))
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log("!!! WARNING: SHORT PUT CLOSE FAILED !!!")
             send_telegram(f"FH {stock}: SHORT PUT CLOSE FAILED! Manual intervention needed!")
@@ -2129,7 +2189,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         log(f"\nSTEP 4: SELL LONG PUT {lp_sym} x {close_qty}")
         log("-" * 55)
         result = close_leg(kite, exchange, lp_sym, "SELL", close_qty, is_buy=False, dry_run=dry_run,
-                           urgent=True)
+                           urgent=True,
+                           context=_order_ctx(trade, reason, 'long-put', 'FH'))
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log(f"  WARNING: Long put sell failed. Manual sell {lp_sym}.")
             send_telegram(f"FH {stock}: Long put sell failed. Manual sell {lp_sym}.")

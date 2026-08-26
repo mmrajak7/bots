@@ -75,10 +75,15 @@ class _ScriptedCloseLeg:
         self.results = list(results)
         self.calls = []
 
+    # Signature MIRRORS production's `close_leg`, kwarg for kwarg. When the
+    # order journal added `context` this double went red across nine tests --
+    # which is the right failure: a double looser or tighter than the real
+    # thing is a test of the double. `test_scripted_double_matches_close_leg`
+    # below pins the two together so the next kwarg cannot drift silently.
     def __call__(self, kite, exchange, symbol, txn, qty, is_buy=False,
-                 dry_run=False, urgent=False):
+                 dry_run=False, urgent=False, context=None):
         self.calls.append({'symbol': symbol, 'txn': txn, 'qty': qty,
-                           'urgent': urgent})
+                           'urgent': urgent, 'context': context})
         return self.results.pop(0) if self.results else None
 
     def for_symbol(self, sym):
