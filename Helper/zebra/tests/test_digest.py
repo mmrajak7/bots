@@ -179,3 +179,81 @@ def test_a_genuine_zero_rate_is_still_shown(logdir):
     """The other half. `rate or '-'` is the obvious one-liner and it erases a
     real 0.0% — the single most veto-worthy reading this column can hold."""
     assert '0.0%' in _opened_with_rate(logdir, 0.0, 5)
+
+
+# ── The arming gate ─────────────────────────────────────────────────────────
+#
+# Owner's decision 2026-08-26: the exit path is not armed until the cohort has
+# produced real STOP exits in paper. Every cohort close so far is `paper:tp`,
+# which is a SPOT trigger -- so the machinery automation actually risks (debit
+# SL, trail, spot veto, intrinsic floor, reliability gate, time SL) has zero
+# cohort evidence, and that is the path both real-money losses came from.
+#
+# The gate is reported on every digest so it can only be MET, never forgotten.
+
+def _exit(i, reason, pnl=100.0, cohort='2026-08-14'):
+    return {'id': i, 'stock': 'X%d' % i, 'status': 'exited', 'cohort': cohort,
+            'exit_reason': reason, 'pnl': pnl, 'pnl_net': pnl - 5,
+            'pnl_net_pct': 10.0, 'fees': {'basis': 'modelled'}}
+
+
+def test_a_cohort_of_pure_tps_reports_the_gate_unmet():
+    coh = digest._cohort([_exit(1, 'paper:tp'), _exit(2, 'paper:tp')])
+    assert coh['stop_exits'] == 0
+    flags = digest._flags({'gaps': []},
+                          {'events': {}, 'blocks_at': [], 'transcripts_tiny': 0,
+                           'transcripts': 0},
+                          {'closed': []}, {}, coh, None)
+    assert any('ARMING GATE UNMET' in f for f in flags), flags
+
+
+def test_one_real_stop_exit_flips_the_gate():
+    """Negative control. Without this the test above would also pass against a
+    digest that printed the warning unconditionally."""
+    coh = digest._cohort([_exit(1, 'paper:tp'), _exit(2, 'paper:debit_sl', -50)])
+    assert coh['stop_exits'] == 1
+    flags = digest._flags({'gaps': []},
+                          {'events': {}, 'blocks_at': [], 'transcripts_tiny': 0,
+                           'transcripts': 0},
+                          {'closed': []}, {}, coh, None)
+    assert not any('UNMET' in f for f in flags), flags
+    assert any('1 cohort stop exit' in f and 'debit_sl' in f for f in flags), flags
+
+
+@pytest.mark.parametrize('reason', ['debit_sl', 'spot_sl', 'trail', 'time'])
+def test_every_non_tp_reason_counts_as_stop_evidence(reason):
+    """TP is the ONLY spot-triggered exit. Everything else reads the option
+    book, which is the thing with no cohort evidence."""
+    coh = digest._cohort([_exit(1, 'paper:' + reason, -50)])
+    assert coh['stop_exits'] == 1, reason
+
+
+def test_the_paper_prefix_is_stripped():
+    """Every exit in paper mode is stamped `paper:<reason>`. Without stripping
+    it, `!= 'tp'` is true for a plain TP too and the gate reads as MET on a
+    cohort of pure take-profits -- arming on the strength of no evidence."""
+    coh = digest._cohort([_exit(1, 'paper:tp'), _exit(2, 'paper:tp')])
+    assert coh['exit_reasons'] == {'tp': 2}
+    assert coh['stop_exits'] == 0
+
+
+def test_an_empty_cohort_does_not_claim_the_gate_either_way():
+    """No closes is not evidence of anything. `feedback_watchdog_must_not_all_clear`
+    -- and equally it must not raise an alarm about a book that does not exist."""
+    coh = digest._cohort([])
+    assert coh['closed'] == 0 and coh['stop_exits'] == 0
+    flags = digest._flags({'gaps': []},
+                          {'events': {}, 'blocks_at': [], 'transcripts_tiny': 0,
+                           'transcripts': 0},
+                          {'closed': []}, {}, coh, None)
+    assert not any('ARMING GATE' in f for f in flags), flags
+
+
+def test_a_legacy_exit_cannot_satisfy_the_gate():
+    """The back ratio is dropped and its 70 debit_sl exits are out of scope.
+    Only `cohort == '2026-08-14'` rows count, or the gate is met by history
+    that has nothing to do with what is going live."""
+    coh = digest._cohort([_exit(1, 'paper:tp'),
+                          _exit(2, 'paper:debit_sl', -50, cohort=None)])
+    assert coh['closed'] == 1
+    assert coh['stop_exits'] == 0

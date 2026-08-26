@@ -185,7 +185,18 @@ def _cohort(store_rows: List[dict]) -> dict:
     basis: Counter = Counter(
         (t.get('fees') or {}).get('basis', 'unstamped') for t in ex)
     wins = sum(1 for t in ex if float(t.get('pnl_net', t['pnl'])) > 0)
+    # ARMING GATE. TP is a SPOT trigger; every other exit reason runs through
+    # the book-reading machinery -- debit SL, trail, spot veto, intrinsic
+    # floor, reliability gate, time SL -- which is the half both real-money
+    # losses came from. A cohort of pure TPs is no evidence about it at all.
+    # Strip the `paper:` prefix the way outcomes.label_for_reason does; without
+    # that every reason here is unrecognised and the gate reads as unmet
+    # forever.
+    reasons: Counter = Counter(
+        str(t.get('exit_reason') or 'unknown').replace('paper:', '') for t in ex)
+    stop_exits = sum(v for k, v in reasons.items() if k != 'tp')
     return {'closed': len(ex), 'wins': wins,
+            'exit_reasons': dict(reasons), 'stop_exits': stop_exits,
             'gross': round(gross, 0), 'net': round(net, 0),
             'median_net_pct': (round(statistics.median(
                 [float(t['pnl_net_pct']) for t in ex
@@ -222,6 +233,19 @@ def _flags(cyc, vet, tr, warn, coh, prev: Optional[dict]) -> List[str]:
     if vet['events'].get('exit_timed_out'):
         out.append(f"{vet['events']['exit_timed_out']} exit(s) fired on the "
                    f"deterministic guards alone")
+    # The arming gate, reported every single digest so it cannot be forgotten
+    # rather than met. Owner's decision 2026-08-26: do not arm the exit path
+    # until the cohort has produced real STOP exits in paper.
+    if coh['closed'] and not coh.get('stop_exits'):
+        out.append(f"ARMING GATE UNMET: all {coh['closed']} cohort exit(s) are "
+                   f"TP, a SPOT trigger. The stop path (debit_sl / spot_sl / "
+                   f"trail / time) has NO cohort evidence — do not arm.")
+    elif coh.get('stop_exits'):
+        kinds = ', '.join(f'{k} x{v}' for k, v in
+                          sorted(coh['exit_reasons'].items()) if k != 'tp')
+        out.append(f"arming gate: {coh['stop_exits']} cohort stop exit(s) so "
+                   f"far ({kinds}) — read their books before arming.")
+
     uncostable = coh['fee_basis'].get('brokerage_only', 0)
     if uncostable:
         out.append(f"{uncostable} cohort exit(s) could not be fully costed "
