@@ -3103,6 +3103,50 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
 
 # ── Cron Mode (All Open Trades — BCS + FH) ──────────────────────────────────
 
+def list_cohort_trades() -> int:
+    """Print the cohort positions the ORDER PATH manages. Returns the count.
+
+    Reads through the same adapter `monitor_all` uses, deliberately. A listing
+    built from its own query would be a second definition of "open", and the
+    first definition being wrong -- `Trades: 0 open` with six live -- is what
+    started this whole exercise.
+    """
+    print("\n=== BCS Cohort (zebra store) ===")
+    store = _open_zebra_store()
+    if store is None:
+        print("  cohort store unavailable - the monitor would not see these "
+              "positions either")
+        return 0
+    try:
+        trades = store.get_open_trades()
+    except Exception as e:
+        print(f"  could not read the cohort store: {e}")
+        return 0
+    if not trades:
+        print("  no open cohort positions")
+        return 0
+    print("\n %-4s %-12s %-5s %-13s %-12s %8s %9s %9s %10s" % (
+        'ID', 'Stock', 'Dir', 'Strikes', 'Expiry', 'Debit', 'Lots',
+        'Target', 'SL Spread'))
+    print("-" * 96)
+    for t in sorted(trades, key=lambda x: x.get('id') or 0):
+        # `vertical_direction`, NOT `get_strategy`. The adapter does not stamp
+        # `_store_type` -- `_load_all_trades` does -- so `get_strategy` falls
+        # through to its 'BCS' default here and labelled TMPV, COALINDIA and
+        # CROMPTON as bull call spreads when all three are PE bear puts. The
+        # symbols are the authoritative source, which is the entire point of
+        # the bridge; a listing that reports direction from anything else is
+        # the bug the bridge exists to prevent, wearing a different hat.
+        print(" %-4s %-12s %-5s %-13s %-12s %8s %9s %9s %10s" % (
+            t.get('id'), t.get('stock'), vertical_direction(t) or '?',
+            '%g/%g' % (t.get('long_strike') or 0, t.get('short_strike') or 0),
+            t.get('expiry'), t.get('net_debit'),
+            '%sx%s' % (t.get('lots') or 1, t.get('lot_size') or '?'),
+            t.get('target_spot'), t.get('sl_spread')))
+    print("\nOpen: %d" % len(trades))
+    return len(trades)
+
+
 def _open_zebra_store():
     """The BCS cohort's store, adapted — or None, with a loud line, if not.
 
@@ -4131,6 +4175,13 @@ def main():
         fh_store_inst = get_fh_store()
         print("\n=== Fallen Hero Trades ===")
         fh_store_inst.list_trades()
+        # The COHORT. It was missing here for exactly the reason it was
+        # missing from `monitor_all` until the bridge landed: this command
+        # hardcodes its stores. Fixing the monitor loop and leaving the
+        # LISTING blind meant the owner's "what do I have open" answered
+        # `Open: 0` with eight positions live -- the same misreport the bridge
+        # exists to end, one command over.
+        list_cohort_trades()
         return
 
     # ── --cron mode ──────────────────────────────────────────────────────

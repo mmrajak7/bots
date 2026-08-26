@@ -516,3 +516,85 @@ def test_an_ordinary_position_is_NOT_force_closed_five_sessions_out(
     assert kite.placed == [], (
         'an ordinary BCS position was force-closed five sessions before '
         f'expiry: {kite.placed}')
+
+
+# -- the LISTING, which had the same blind spot one command over -------------
+
+def test_the_cohort_appears_in_the_trade_listing(monkeypatch, capsys):
+    """`--list` hardcoded three stores and never called `_open_zebra_store`.
+
+    So after the bridge fixed `monitor_all`, the owner's "what do I have open"
+    still answered `Open: 0` with eight positions live — the exact misreport
+    the bridge exists to end, in the command they actually type.
+    """
+    trades = [dict(COHORT_TRADE), dict(COHORT_TRADE, id=420, stock='OTHERCO')]
+
+    class _S:
+        def get_open_trades(self):
+            return trades
+    monkeypatch.setattr(sm, '_open_zebra_store', lambda: _S())
+    assert sm.list_cohort_trades() == 2
+    out = capsys.readouterr().out
+    assert 'TESTCO' in out and 'OTHERCO' in out and 'Open: 2' in out
+
+
+def test_the_listing_reads_direction_from_the_SYMBOLS(monkeypatch, capsys):
+    """It used `get_strategy`, which needs `_store_type` — stamped by
+    `_load_all_trades`, NOT by the adapter. So every row fell through to the
+    'BCS' default, and three live PE bear-put spreads (TMPV, COALINDIA,
+    CROMPTON) were listed as bull call spreads.
+
+    Reporting direction from anything but the leg symbols is the bug the
+    bridge exists to prevent, wearing a different hat.
+    """
+    pe = dict(COHORT_TRADE, id=423, stock='TMPV', direction='PE',
+              long_symbol='TMPV26SEP320PE', short_symbol='TMPV26SEP310PE',
+              long_strike=320.0, short_strike=310.0)
+    assert pe.get('_store_type') is None, (
+        'the adapter now stamps _store_type — this test is testing the wrong '
+        'thing and the fallback it guards may be back')
+
+    class _S:
+        def get_open_trades(self):
+            return [pe]
+    monkeypatch.setattr(sm, '_open_zebra_store', lambda: _S())
+    sm.list_cohort_trades()
+    row = [l for l in capsys.readouterr().out.splitlines() if 'TMPV' in l][0]
+    assert ' BPS ' in row, f'a bear put spread was listed as BCS: {row!r}'
+
+
+def test_an_unavailable_cohort_store_says_so_rather_than_showing_nothing(
+        monkeypatch, capsys):
+    """`Open: 0` and "cannot read the book" must never render the same — that
+    ambiguity is the whole reason this listing was wrong for a day."""
+    monkeypatch.setattr(sm, '_open_zebra_store', lambda: None)
+    assert sm.list_cohort_trades() == 0
+    assert 'unavailable' in capsys.readouterr().out
+
+
+def test_the_LIST_COMMAND_actually_calls_it(monkeypatch, capsys):
+    """The tests above call `list_cohort_trades` directly, so they pass just
+    as well when the CLI never calls it — which was the original defect
+    exactly. Asserted on the source, since driving `main()` would need a real
+    Kite session and three real stores."""
+    import inspect
+    src = inspect.getsource(sm.main)
+    i = src.index('if args.list:')
+    j = src.index('return', i)
+    assert 'list_cohort_trades()' in src[i:j], (
+        '--list no longer lists the cohort: it would answer "Open: 0" with '
+        'live positions, which is the misreport the bridge exists to end')
+
+
+def test_a_store_that_RAISES_is_reported_not_shown_as_empty(monkeypatch,
+                                                            capsys):
+    """Same rule as an unavailable store, one failure mode over: "the book is
+    empty" and "the book could not be read" are different facts and must not
+    render the same."""
+    class _Boom:
+        def get_open_trades(self):
+            raise RuntimeError('drive timeout')
+    monkeypatch.setattr(sm, '_open_zebra_store', lambda: _Boom())
+    assert sm.list_cohort_trades() == 0
+    out = capsys.readouterr().out
+    assert 'could not read' in out and 'drive timeout' in out
