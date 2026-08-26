@@ -63,6 +63,7 @@ from kiteconnect import KiteConnect
 
 from common import option_symbols as _sym
 from common.option_symbols import check_leg_types
+from common import layered_config
 from .trade_store import get_store
 from fallen_hero import get_store as get_fh_store
 from bear_put import get_store as get_bps_store
@@ -219,6 +220,16 @@ def _switch_says(path: Path) -> bool:
         log(f"  WARNING: {path.name} unreadable ({e}) — trading stays "
             f"ENABLED; a config error must not disarm live stops")
         return True
+    return _trading_flag(cfg, path.name)
+
+
+def _trading_flag(cfg: dict, label: str) -> bool:
+    """`trading.enabled` out of an already-loaded config. Absent means True.
+
+    One definition, because the two arms of the switch now reach their config
+    by different routes — one raw file, one layered — and a kill switch whose
+    two halves disagree about what `enabled` means is worse than one half.
+    """
     node = cfg.get('trading')
     if not isinstance(node, dict):
         return True
@@ -228,10 +239,27 @@ def _switch_says(path: Path) -> bool:
     # Never infer a live/disarmed switch from a non-boolean. Same discipline
     # as zebra/config.py:_strict_bool — except the safe default there is
     # PAPER, and the safe default here is ARMED, for the reason above.
-    log(f"  WARNING: trading.enabled={val!r} in {path.name} is not "
+    log(f"  WARNING: trading.enabled={val!r} in {label} is not "
         f"true/false — trading stays ENABLED. A kill switch is never "
         f"inferred.")
     return True
+
+
+def _bcs_config_says() -> bool:
+    """The bcs_config arm of the switch, read through BOTH of its layers.
+
+    `config/bcs_config.json` was stripped to secrets on 2026-08-26 when the
+    config was split into a tracked defaults file and an untracked overlay
+    (see common/layered_config.py). Reading it raw would therefore find no
+    `trading` key at all and fail open — silently demoting a deliberately
+    two-source switch to one source. The flag now lives in the TRACKED layer,
+    which is the better place for it: it has history, and it reaches the Pi
+    over git rather than over Drive.
+    """
+    cfg = layered_config.load('bcs_config',
+                              warn=lambda m: log(f'  WARNING: {m} — '
+                                                 f'trading stays ENABLED'))
+    return _trading_flag(cfg, 'bcs_config')
 
 
 def trading_enabled() -> bool:
@@ -260,7 +288,7 @@ def trading_enabled() -> bool:
     stop button may never have. Both are stop buttons; neither is an arm
     button.
     """
-    return _switch_says(SWITCH_FILE) and _switch_says(CONFIG_FILE)
+    return _switch_says(SWITCH_FILE) and _bcs_config_says()
 
 
 # ── Module-level log state (set per-trade in monitor()) ──────────────────────
@@ -3178,8 +3206,11 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             if not dry_run and not trading_enabled():
                 dry_run = True
                 which = ', '.join(
-                    f.name for f in (SWITCH_FILE, CONFIG_FILE)
-                    if not _switch_says(f)) or '(re-read says armed)'
+                    name for name, ok in (
+                        (SWITCH_FILE.name, _switch_says(SWITCH_FILE)),
+                        ('bcs_config (tracked defaults + overlay)',
+                         _bcs_config_says()))
+                    if not ok) or '(re-read says armed)'
                 log(f"KILL SWITCH: trading.enabled=false in {which} — "
                     "forcing DRY RUN for the rest of this session. Positions "
                     "are still monitored and alerted; no orders will be placed.")

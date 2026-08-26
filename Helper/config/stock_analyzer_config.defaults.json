@@ -1,0 +1,56 @@
+{
+  "cache": {
+    "enabled": true,
+    "dir": "data/cache/stock_analyzer",
+    "ttl_screener_hours": 4,
+    "ttl_trendlyne_hours": 4,
+    "ttl_kite_hours": 1
+  },
+  "scoring_weights": {
+    "fundamental": 0.35,
+    "valuation": 0.25,
+    "technical": 0.2,
+    "momentum": 0.1,
+    "risk": 0.1
+  },
+  "thresholds": {
+    "verdict_buy_min": 70,
+    "verdict_wait_min": 50,
+    "verdict_sell_max": 35,
+    "pe_cheap": 15,
+    "pe_expensive": 40,
+    "roce_strong": 20,
+    "roce_weak": 10,
+    "peg_undervalued": 1.0,
+    "peg_overvalued": 2.0,
+    "piotroski_strong": 7,
+    "piotroski_weak": 3,
+    "altman_safe": 2.99,
+    "altman_distress": 1.81,
+    "debt_equity_low": 0.5,
+    "debt_equity_high": 1.5,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "promoter_decline_warning_pct": 2.0,
+    "promoter_low_warning_pct": 30.0,
+    "pledge_warning_pct": 20.0
+  },
+  "scraping": {
+    "screener_delay_sec": 2,
+    "trendlyne_delay_sec": 3,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "request_timeout_sec": 15
+  },
+  "kite": {
+    "lookback_days": 365,
+    "rsi_period": 14,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "dma_short": 50,
+    "dma_long": 200,
+    "volume_ma_period": 20,
+    "bollinger_period": 20,
+    "bollinger_std": 2
+  }
+}

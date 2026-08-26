@@ -17,6 +17,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from common import layered_config
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +31,10 @@ CONFIG_FILE = PROJECT_ROOT / 'config' / 'pyramid_config.json'
 
 
 def _load_config() -> dict:
-    if not CONFIG_FILE.exists():
-        logger.warning("Config %s not found, using defaults", CONFIG_FILE)
-        return {}
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
+    # TWO LAYERS: config/pyramid_config.defaults.json (tracked, secret-free)
+    # under config/pyramid_config.json (untracked, secrets). See
+    # common/layered_config.py — including why the overlay wins.
+    return layered_config.load('pyramid_config')
 
 
 def _resolve_credentials_path(config: dict) -> Optional[Path]:

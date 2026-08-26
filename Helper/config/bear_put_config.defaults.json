@@ -1,0 +1,7 @@
+{
+  "google_drive": {
+    "enabled": true,
+    "file_name": "bear_put_trades.json",
+    "sync_interval_sec": 300
+  }
+}

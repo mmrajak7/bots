@@ -1,0 +1,20 @@
+{
+  "alert_zone_pct": 0.001,
+  "tp_pct": 0.05,
+  "capital_per_trade": 50000,
+  "min_dte": 7,
+  "max_spread_pct": 0.1,
+  "st_period": 10,
+  "st_multiplier": 3,
+  "chartink_interval_sec": 300,
+  "ltp_check_interval_sec": 60,
+  "15m_candle_data_days": 5,
+  "no_reentry_same_day": true,
+  "pre_close_hour": 14,
+  "pre_close_minute": 45,
+  "google_drive": {
+    "enabled": true,
+    "file_name": "flow_trades.json",
+    "sync_interval_sec": 300
+  }
+}

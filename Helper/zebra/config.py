@@ -6,6 +6,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from common import layered_config
 
 logger = logging.getLogger(__name__)
 
@@ -598,10 +599,11 @@ _DEFAULTS = {
 
 def _load_runtime() -> dict:
     cfg = dict(_DEFAULTS)
-    if CONFIG_FILE.exists():
+    # TWO LAYERS: config/zebra_config.defaults.json (tracked, secret-free) under
+    # config/zebra_config.json (untracked, secrets). common/layered_config.py.
+    file_cfg = layered_config.load('zebra_config')
+    if file_cfg:
         try:
-            with open(CONFIG_FILE) as f:
-                file_cfg = json.load(f)
             for key in _DEFAULTS:
                 if key in file_cfg:
                     cfg[key] = file_cfg[key]

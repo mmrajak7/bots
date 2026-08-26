@@ -26,13 +26,14 @@ CONFIG_FILE = PROJECT_ROOT / 'config' / 'portfolio_config.json'
 import sys
 sys.path.insert(0, str(PROJECT_ROOT))
 from bcs import drive_store
+from common import layered_config
 
 
 def _load_config() -> dict:
-    if not CONFIG_FILE.exists():
-        return {}
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
+    # TWO LAYERS: config/portfolio_config.defaults.json (tracked, secret-free)
+    # under config/portfolio_config.json (untracked, secrets). See
+    # common/layered_config.py — including why the overlay wins.
+    return layered_config.load('portfolio_config')
 
 
 def _resolve_credentials(config: dict) -> Optional[Path]:

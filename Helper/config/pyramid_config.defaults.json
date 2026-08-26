@@ -1,0 +1,10 @@
+{
+  "position_size": 500000,
+  "max_positions": 25,
+  "max_per_sector": 3,
+  "google_drive": {
+    "enabled": true,
+    "file_name": "pyramid_positions.json",
+    "sync_interval_sec": 300
+  }
+}

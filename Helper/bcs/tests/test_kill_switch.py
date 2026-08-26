@@ -18,6 +18,7 @@ import json
 import pytest
 
 from bcs import spread_monitor as sm
+from common import layered_config
 
 
 def _write(tmp_path, payload, name='bcs_config.json'):
@@ -42,6 +43,10 @@ def cfg(tmp_path, monkeypatch):
     monkeypatch.setattr(sm, 'SWITCH_FILE',
                         _write(tmp_path, {'trading': {'enabled': True}},
                                'trading_switch.json'))
+    # The bcs arm reads through common.layered_config since the config split,
+    # so pointing sm.CONFIG_FILE alone would leave the REAL config/ in the
+    # loop -- the same hole the two-file note above describes, reopened.
+    monkeypatch.setattr(layered_config, 'CONFIG_DIR', tmp_path)
 
     def _set(payload):
         monkeypatch.setattr(sm, 'CONFIG_FILE', _write(tmp_path, payload))
@@ -51,6 +56,8 @@ def cfg(tmp_path, monkeypatch):
 @pytest.fixture
 def both(tmp_path, monkeypatch):
     """Set the tracked switch and the overlay independently."""
+    monkeypatch.setattr(layered_config, 'CONFIG_DIR', tmp_path)
+
     def _set(switch, overlay):
         monkeypatch.setattr(sm, 'SWITCH_FILE',
                             _write(tmp_path, switch, 'trading_switch.json'))
@@ -98,6 +105,7 @@ def test_anything_other_than_boolean_false_stays_armed(cfg, payload, why):
 
 
 def test_a_missing_config_stays_armed(tmp_path, monkeypatch):
+    monkeypatch.setattr(layered_config, 'CONFIG_DIR', tmp_path)
     monkeypatch.setattr(sm, 'CONFIG_FILE', tmp_path / 'does_not_exist.json')
     monkeypatch.setattr(sm, 'SWITCH_FILE', tmp_path / 'also_missing.json')
     assert sm.trading_enabled() is True
@@ -112,6 +120,7 @@ def test_an_unreadable_config_stays_armed_and_says_so(tmp_path, monkeypatch,
     """
     d = tmp_path / 'bcs_config.json'
     d.mkdir()
+    monkeypatch.setattr(layered_config, 'CONFIG_DIR', tmp_path)
     monkeypatch.setattr(sm, 'CONFIG_FILE', d)
     monkeypatch.setattr(sm, 'SWITCH_FILE', tmp_path / 'absent.json')
     assert sm.trading_enabled() is True
@@ -134,10 +143,16 @@ def test_the_failopen_default_is_not_an_accident(cfg):
 
 # ── Two files, ANDed ─────────────────────────────────────────────────────────
 #
-# `config/trading_switch.json` is TRACKED; `config/bcs_config.json` is not, and
-# cannot be, because it carries the Drive folder id and a credentials path and
-# its neighbours in config/ carry live Telegram bot tokens into a PUBLIC repo.
-# So the switch got a second home rather than moving house.
+# `config/trading_switch.json` is TRACKED. `config/bcs_config.json` could not
+# be, because it carried the Drive folder id and a credentials path and its
+# neighbours in config/ carry live Telegram bot tokens into a PUBLIC repo -- so
+# the switch got a second home rather than moving house.
+#
+# Since the 2026-08-26 config split BOTH arms are tracked: the flag now lives in
+# `config/bcs_config.defaults.json` with the secrets left behind in the
+# untracked overlay. The overlay can still carry a `trading` block and still
+# wins if it does, so the two-source property is unchanged -- what changed is
+# that neither arm can now vanish from a fresh checkout.
 
 @pytest.mark.parametrize('switch,overlay,expect,why', [
     (True,  True,  True,  'both armed'),
@@ -153,6 +168,61 @@ def test_either_file_can_stop_the_money_path(both, switch, overlay, expect,
     """
     both({'trading': {'enabled': switch}}, {'trading': {'enabled': overlay}})
     assert sm.trading_enabled() is expect, why
+
+
+def test_the_tracked_defaults_layer_can_disarm_on_its_own(tmp_path,
+                                                          monkeypatch):
+    """The case that matters on a real box, and the one the fixtures above do
+    NOT cover: since the config split the flag lives in the TRACKED
+    `bcs_config.defaults.json`, and the untracked overlay carries only secrets
+    and has no `trading` block at all. Every other test here writes the
+    overlay, so all of them would still pass if the defaults layer were never
+    read.
+    """
+    monkeypatch.setattr(layered_config, 'CONFIG_DIR', tmp_path)
+    monkeypatch.setattr(sm, 'SWITCH_FILE',
+                        _write(tmp_path, {'trading': {'enabled': True}},
+                               'trading_switch.json'))
+    monkeypatch.setattr(sm, 'CONFIG_FILE', tmp_path / 'bcs_config.json')
+    _write(tmp_path, {'google_drive': {'folder_id': 'x'}}, 'bcs_config.json')
+
+    _write(tmp_path, {'trading': {'enabled': False}},
+           'bcs_config.defaults.json')
+    assert sm.trading_enabled() is False, 'the tracked layer cannot disarm'
+
+    _write(tmp_path, {'trading': {'enabled': True}},
+           'bcs_config.defaults.json')
+    assert sm.trading_enabled() is True, 'negative control'
+
+
+def test_a_secrets_only_overlay_does_not_re_arm_a_disarmed_tracked_flag(
+        tmp_path, monkeypatch):
+    """The split's own footgun, pointed at the money path: an overlay that has
+    no opinion must not count as an opinion. Absence is not `true`."""
+    monkeypatch.setattr(layered_config, 'CONFIG_DIR', tmp_path)
+    monkeypatch.setattr(sm, 'SWITCH_FILE',
+                        _write(tmp_path, {'trading': {'enabled': True}},
+                               'trading_switch.json'))
+    monkeypatch.setattr(sm, 'CONFIG_FILE', tmp_path / 'bcs_config.json')
+    _write(tmp_path, {'google_drive': {'folder_id': 'x'}}, 'bcs_config.json')
+    _write(tmp_path, {'trading': {'enabled': False}},
+           'bcs_config.defaults.json')
+    assert sm.trading_enabled() is False
+
+
+def test_an_overlay_trading_block_still_wins_over_the_tracked_one(
+        tmp_path, monkeypatch):
+    """Overlay-wins is the documented direction, and a stop button has to work
+    from the file the person in front of the box actually edits."""
+    monkeypatch.setattr(layered_config, 'CONFIG_DIR', tmp_path)
+    monkeypatch.setattr(sm, 'SWITCH_FILE',
+                        _write(tmp_path, {'trading': {'enabled': True}},
+                               'trading_switch.json'))
+    monkeypatch.setattr(sm, 'CONFIG_FILE', tmp_path / 'bcs_config.json')
+    _write(tmp_path, {'trading': {'enabled': True}},
+           'bcs_config.defaults.json')
+    _write(tmp_path, {'trading': {'enabled': False}}, 'bcs_config.json')
+    assert sm.trading_enabled() is False
 
 
 def test_an_armed_overlay_cannot_re_arm_a_disarmed_tracked_switch(both):

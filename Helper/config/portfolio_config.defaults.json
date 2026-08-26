@@ -1,0 +1,44 @@
+{
+  "google_drive": {
+    "enabled": true,
+    "decisions_file": "portfolio_decisions.json",
+    "journal_file": "investment_journal.json",
+    "sync_interval_sec": 300
+  },
+  "tier_classification": {
+    "tier1_parking": [
+      "LIQUIDBEES",
+      "KOTAKARBFUND"
+    ],
+    "tier2_etfs": [
+      "NIFTYBEES",
+      "JUNIORBEES",
+      "MID150BEES",
+      "MON100",
+      "ITBEES",
+      "PHARMABEES",
+      "PSUBNKBEES",
+      "CPSEETF",
+      "MOM30ETF",
+      "ALPHA",
+      "EBBETF0431"
+    ],
+    "tier2_gold_silver": [
+      "GOLDBEES",
+      "SILVERBEES"
+    ],
+    "tier2_reits": [
+      "EMBASSY-RR",
+      "MINDSPACE-RR",
+      "BIRET-RR",
+      "NXST-RR"
+    ]
+  },
+  "allocation_caps": {
+    "max_per_etf_pct": 20,
+    "max_per_stock_pct": 3,
+    "max_equity_pct": 60,
+    "min_parking_pct": 10
+  },
+  "review_interval_days": 30
+}

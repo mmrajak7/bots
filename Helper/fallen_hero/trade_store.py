@@ -33,6 +33,7 @@ from typing import Optional
 from bcs import drive_store
 from common.locked_store import LockTimeout, LockedStoreMixin
 from common.option_symbols import check_leg_types
+from common import layered_config
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +69,10 @@ LEG_TYPES = {'long_put_symbol': 'PE', 'short_put_symbol': 'PE',
 
 def _load_config() -> dict:
     """Load Fallen Hero config from config/fallen_hero_config.json."""
-    if not CONFIG_FILE.exists():
-        logger.warning("Config file not found at %s, using defaults", CONFIG_FILE)
-        return {}
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
+    # TWO LAYERS: config/fallen_hero_config.defaults.json (tracked, secret-free)
+    # under config/fallen_hero_config.json (untracked, secrets). See
+    # common/layered_config.py — including why the overlay wins.
+    return layered_config.load('fallen_hero_config')
 
 
 def _resolve_credentials_path(config: dict) -> Optional[Path]:

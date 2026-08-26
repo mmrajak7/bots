@@ -1,0 +1,47 @@
+{
+  "lots_per_trade": 1,
+  "max_open_trades": 10,
+  "chartink_gap_max": 0.08,
+  "signal_gap_max": 0.05,
+  "entry_gap": 0.04,
+  "entry_gap_min": 0.03,
+  "cost_sl_gap": 0.02,
+  "hedge_gap": 0.055,
+  "hedge_max_debit_ratio": 0.35,
+  "premium_sl_pct": 0.25,
+  "trail_pct": 0.5,
+  "trail_min_gain_pct": 0.15,
+  "entry_max_retries": 5,
+  "sl_gap": 0.07,
+  "tight_sl_pct": 0.025,
+  "sl_time_days": 5,
+  "freshness_days": 5,
+  "slippage_pct": 0.0,
+  "min_dte": 3,
+  "scan_interval_sec": 300,
+  "monitor_interval_sec": 30,
+  "daily_velocity_3d_max": -0.5,
+  "daily_momentum_min": 60,
+  "daily_gap_max": 0.03,
+  "enabled_timeframes": [
+    "monthly",
+    "weekly"
+  ],
+  "daily_eod_exit_time": [
+    15,
+    15
+  ],
+  "daily_premium_sl_pct": 0.25,
+  "use_confidence_tracker": true,
+  "confidence_poll_sec": 300,
+  "spot_tracker_enabled": false,
+  "telegram_watching": {
+    "enabled": false
+  },
+  "google_drive": {
+    "enabled": true,
+    "file_name": "magnet_trades.json",
+    "confidence_file_name": "confidence_tracker.json",
+    "sync_interval_sec": 300
+  }
+}

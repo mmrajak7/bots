@@ -1,0 +1,36 @@
+{
+  "paper_mode": true,
+  "watch_gap_max": 0.05,
+  "trigger_gap_max": 0.04,
+  "stale_gap_min": 0.03,
+  "freshness_days": 5,
+  "min_dte": 15,
+  "max_dte": 55,
+  "min_leg_oi": 5000,
+  "max_leg_spread_pct": 0.015,
+  "tp_target": "st_line",
+  "spot_sl_pct": 0.03,
+  "debit_sl_pct": 0.5,
+  "time_sl_days_before_expiry": 5,
+  "max_open_trades": 8,
+  "max_watching_signals": 25,
+  "scan_interval_sec": 300,
+  "monitor_interval_sec": 300,
+  "enabled_directions": [
+    "CE",
+    "PE"
+  ],
+  "enabled_timeframes": [
+    "monthly",
+    "weekly"
+  ],
+  "telegram": {
+    "enabled": true,
+    "use_main_bot": true
+  },
+  "google_drive": {
+    "enabled": true,
+    "file_name": "zebra_trades.json",
+    "sync_interval_sec": 300
+  }
+}

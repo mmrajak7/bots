@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from bcs import drive_store
+from common import layered_config
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +46,10 @@ VALID_STATUSES = ('watching', 'triggered', 'entered', 'expired', 'cancelled')
 
 
 def _load_config() -> dict:
-    if not CONFIG_FILE.exists():
-        logger.warning("Config file not found at %s, using defaults", CONFIG_FILE)
-        return {}
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
+    # TWO LAYERS: config/watchlist_config.defaults.json (tracked, secret-free)
+    # under config/watchlist_config.json (untracked, secrets). See
+    # common/layered_config.py — including why the overlay wins.
+    return layered_config.load('watchlist_config')
 
 
 def _resolve_credentials_path(config: dict) -> Optional[Path]:

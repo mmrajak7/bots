@@ -1,0 +1,7 @@
+{
+  "google_drive": {
+    "enabled": true,
+    "file_name": "watchlist.json",
+    "sync_interval_sec": 300
+  }
+}

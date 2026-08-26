@@ -1,0 +1,10 @@
+{
+  "trading": {
+    "enabled": true
+  },
+  "google_drive": {
+    "enabled": true,
+    "file_name": "bcs_trades.json",
+    "sync_interval_sec": 300
+  }
+}

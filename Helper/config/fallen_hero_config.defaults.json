@@ -1,0 +1,7 @@
+{
+  "google_drive": {
+    "enabled": true,
+    "file_name": "fallen_hero_trades.json",
+    "sync_interval_sec": 300
+  }
+}

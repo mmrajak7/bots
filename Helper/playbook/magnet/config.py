@@ -1,6 +1,7 @@
 """Magnet strategy configuration — constants, thresholds, Chartink scan clauses."""
 
 from pathlib import Path
+from common import layered_config
 
 # ── Paths ─────────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent.resolve()          # playbook/magnet/
@@ -104,10 +105,11 @@ _cfg_logger = _logging.getLogger(__name__)
 def _load_runtime() -> dict:
     """Load runtime config from magnet_config.json, merged with defaults."""
     cfg = dict(_DEFAULTS)
-    if CONFIG_FILE.exists():
+    # TWO LAYERS: config/magnet_config.defaults.json (tracked, secret-free)
+    # under config/magnet_config.json (untracked, secrets).
+    file_cfg = layered_config.load('magnet_config')
+    if file_cfg:
         try:
-            with open(CONFIG_FILE) as f:
-                file_cfg = _json.load(f)
             # Merge file values over defaults (only known keys)
             for key in _DEFAULTS:
                 if key in file_cfg:
