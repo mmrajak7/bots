@@ -617,16 +617,47 @@ def get_spread_value(kite: KiteConnect, trade: dict, spot: float = None) -> dict
 
 # ── Strategy Detection ───────────────────────────────────────────────────────
 
+def vertical_direction(trade: dict):
+    """'BCS' | 'BPS' | None, read from the LEG SYMBOLS.
+
+    Every store but one holds a single direction, so `_store_type` has always
+    been enough. The zebra store is not like that: it holds bull call spreads
+    (`direction: 'CE'`, long the LOWER strike, TP on a RISE) and bear put
+    spreads (`direction: 'PE'`, long the HIGHER strike, TP on a FALL) side by
+    side in one book. KOTAKBANK 395/410 CE has tp_spot 407.8 above sl_spot
+    383.63; TMPV 320/310 PE has tp_spot 309.29 BELOW sl_spot 330.78.
+
+    So direction has to come from the contract, not the bookkeeping — the same
+    conclusion B21 reached for the intrinsic floor and B23 for misfiled
+    records. Both legs CE is a call vertical, both PE a put vertical; anything
+    else (a missing symbol, an unreadable suffix, mixed legs) returns None and
+    the caller must refuse to guess.
+    """
+    lo = _sym.option_type(trade.get('long_symbol'))
+    sh = _sym.option_type(trade.get('short_symbol'))
+    if lo is None or sh is None or lo != sh:
+        return None
+    return 'BCS' if lo == 'CE' else 'BPS'
+
+
 def get_strategy(trade: dict) -> str:
     """Detect strategy from trade fields.
 
     FH has long_put_symbol + short_call_symbol.
-    BPS has _store_type='bps' (same field names as BCS).
+    A zebra record is classified from its SYMBOLS — that store holds both
+    directions, see `vertical_direction`. An unreadable pair falls back to
+    'BCS' here, but `_malformed_reason` has already quarantined such a record,
+    so the fallback is never what actually manages a position.
+    BPS otherwise has _store_type='bps' (same field names as BCS).
     BCS is the default.
     """
+    if 'long_put_symbol' in trade:
+        return 'FH'
+    if trade.get('_store_type') == 'zebra':
+        return vertical_direction(trade) or 'BCS'
     if trade.get('_store_type') == 'bps':
         return 'BPS'
-    return 'FH' if 'long_put_symbol' in trade else 'BCS'
+    return 'BCS'
 
 
 def get_fh_position_value(kite: KiteConnect, trade: dict) -> dict:
@@ -2294,13 +2325,92 @@ def verify_positions(kite: KiteConnect, trade: dict, fatal: bool = True):
 
 # ── Trigger-Confirmation / Trail / Blind-Mode Helpers (2026-07-24) ──────────
 
+def _gain_anchored_levels(trade: dict, peak: float):
+    """zebra's trail arithmetic, or None if it cannot be computed.
+
+    Delegates to `zebra.mfe.trail_levels` rather than restating the formula.
+    That function is the single definition of this rule — it carries the
+    reasoning about arming off the PEAK rather than the live gain, and the
+    warning that `level` bounds the trigger and not the fill. A second copy
+    here would be one more thing to keep in step, which is exactly how the
+    intrinsic floor ended up call-only (B21).
+
+    Imported lazily: `zebra/strikes.py` already imports from this module, so a
+    module-level import in the other direction would close the cycle.
+    """
+    try:
+        from zebra import mfe as _mfe
+    except Exception:
+        return None
+    width = trade.get('spread_width', trade.get('width'))
+    debit = trade.get('net_debit', trade.get('debit'))
+    if width is None or debit is None:
+        return None
+    lv = _mfe.trail_levels({'width': float(width), 'debit': float(debit),
+                            'mfe_mid': float(peak)})
+    if lv is None:
+        return None
+    lv['engage_level'] = round(float(debit) + lv['engage_gain'], 2)
+    return lv
+
+
+def trail_engage_level(trade: dict) -> float:
+    """Spread value at which the trail arms, per THIS trade's policy.
+
+    Two rules, and they are not the same rule with different numbers:
+
+    * `debit_anchored` (the three original books) arms at 2x the entry debit.
+      What that means varies wildly with the spread — 43% of max gain at 30%
+      debit/width, 82% at 45%.
+    * `gain_anchored` (the BCS cohort) arms when the peak has taken half of
+      MAX gain, so the trigger means the same thing across spreads. The two
+      cross at d/w = 1/3, and 34 of 42 records sit above it, so this one arms
+      earlier on roughly 80% of that book.
+
+    Falls back to the debit anchor whenever the gain anchor cannot be computed
+    (missing width, or a debit at or above width). Falling back to the EXISTING
+    behaviour is the conservative direction: it can only delay the trail, never
+    arm one early.
+    """
+    if trade.get('trail_policy') == 'gain_anchored':
+        lv = _gain_anchored_levels(trade, float(trade.get('net_debit') or 0.0))
+        if lv is not None:
+            return lv['engage_level']
+    return float(trade['net_debit']) * TRAIL_ENGAGE_MULTIPLIER
+
+
+def trail_level_for(trade: dict, peak: float) -> float:
+    """Where the trail sits, given an accepted peak, per this trade's policy.
+
+    `debit_anchored` gives back 40% of the PEAK VALUE; `gain_anchored` gives
+    back half the peak GAIN, which is strictly above the entry debit while the
+    position is up. Neither is a promise about the fill — the trigger is
+    `value <= level` and the booking price is the value, so a gap through the
+    level books wherever it landed.
+    """
+    if trade.get('trail_policy') == 'gain_anchored':
+        lv = _gain_anchored_levels(trade, peak)
+        if lv is not None:
+            return lv['level']
+    return peak * TRAIL_PERCENT
+
+
 def new_trail_state(trade: dict) -> dict:
     """Trail state dict, restored from persisted trade fields."""
     return {
         'peak': trade.get('trail_peak', 0.0),
         'trail': trade.get('trail_sl', 0.0),
         'active': trade.get('trail_active', False),
-        'engage_level': trade['net_debit'] * TRAIL_ENGAGE_MULTIPLIER,
+        'engage_level': trail_engage_level(trade),
+        # The trail RULE rides on the state dict, not just its engage level.
+        # `update_trail` computes where the trail sits every time the peak
+        # moves, and it is called from two places that have the state but not
+        # the trade. Carrying the three fields the rule needs beats threading
+        # the trade through both call sites, and keeps the state dict the one
+        # thing that describes this position's trail.
+        'policy': trade.get('trail_policy'),
+        'net_debit': float(trade['net_debit']),
+        'spread_width': trade.get('spread_width', trade.get('width')),
         'cand_count': 0,     # jump-gate candidate confirmation counter
         'cand_min': 0.0,     # minimum spread seen across the candidate window
     }
@@ -2349,7 +2459,9 @@ def update_trail(ts: dict, spread_val: float) -> bool:
         return False
     ts['active'] = True
     ts['peak'] = accepted
-    ts['trail'] = accepted * TRAIL_PERCENT
+    ts['trail'] = trail_level_for(
+        {'trail_policy': ts.get('policy'), 'net_debit': ts['net_debit'],
+         'spread_width': ts.get('spread_width')}, accepted)
     return True
 
 
@@ -2890,26 +3002,84 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
 
 # ── Cron Mode (All Open Trades — BCS + FH) ──────────────────────────────────
 
-def _load_all_trades(bcs_store, fh_store, bps_store=None) -> list:
+def _open_zebra_store():
+    """The BCS cohort's store, adapted — or None, with a loud line, if not.
+
+    Returns None rather than raising. The cohort is a FOURTH book: if it cannot
+    be opened, the right outcome is that the other three stay monitored and
+    somebody is told, not that a whole session of exit monitoring dies over a
+    store that may hold nothing today.
+
+    But it is never silent. A cohort position with no monitor is precisely the
+    failure that has cost real money here — twice — so an unavailable book
+    reaches Telegram, not just the log.
+    """
+    try:
+        from bcs.zebra_adapter import get_adapter, cohort_label
+        store = get_adapter()
+        n = len(store.get_open_trades())
+        log(f"  Cohort store ({cohort_label()}): {n} open position(s).")
+        return store
+    except Exception as e:
+        log(f"  WARNING: cohort store unavailable ({e}). Its positions are "
+            f"NOT being monitored this session.")
+        # NOT html.escape'd, deliberately. `send_telegram` in this module
+        # posts with no parse_mode, so Telegram treats the text as plain and
+        # escaping would put a literal `&lt;` in the alert. The escaping rule
+        # in feedback_telegram_html_escape is about zebra's sender, which does
+        # set parse_mode. Two senders, two rules; check which one you are in.
+        send_telegram(f"Cohort store unavailable ({str(e)[:120]}) "
+                      f"- those positions are NOT monitored. The other books "
+                      f"continue.")
+        return None
+
+
+def trade_key(trade: dict):
+    """The per-position key for every in-loop state dict.
+
+    `(store, strategy, id)`. All three parts are load-bearing:
+
+    * `id` alone collides — each book numbers its own trades from 1.
+    * `strategy` alone does not separate them either, now that the zebra store
+      produces BOTH BCS and BPS records: two of its rows can share a strategy
+      while a bcs-store row shares an id.
+    * `store` alone would merge a zebra BCS with a zebra BPS of the same id.
+
+    One function because the key was previously built in two places — the
+    startup block wrote `('BCS', id)` while the loop wrote `close_key` — and
+    the moment those two disagreed, `trail_state[close_key]` raised inside the
+    cron loop on every cycle. It surfaced as "too many values to unpack",
+    twenty consecutive errors, and a FATAL "Unmonitored" Telegram; the trail
+    state was silently never restored in the meantime.
+    """
+    return (trade.get('_store_type'), trade.get('_strategy'), trade.get('id'))
+
+
+def _load_all_trades(bcs_store, fh_store, bps_store=None,
+                     zebra_store=None) -> list:
     """Load and tag open trades from all stores.
 
     Returns shallow copies with _strategy/_store_type tags to avoid
     polluting the store's in-memory trade dicts (which get persisted).
     """
     all_trades = []
+    # `strat` is None for zebra: that book holds bull call spreads AND bear
+    # put spreads together, so the direction cannot come from which store a
+    # record arrived in. It is read from the record's own legs below.
     for store, strat, st in ((bcs_store, 'BCS', 'bcs'),
                              (bps_store, 'BPS', 'bps'),
-                             (fh_store, 'FH', 'fh')):
+                             (fh_store, 'FH', 'fh'),
+                             (zebra_store, None, 'zebra')):
         if store is None:
             continue
         for t in store.get_open_trades():
             tagged = dict(t)
-            tagged['_strategy'] = strat
             tagged['_store_type'] = st
+            tagged['_strategy'] = strat if strat else get_strategy(tagged)
             # DIRECTION COMES FROM THE STORE, so a misfiled record has its
             # stops inverted. `_misfiled` carries the contradiction forward
             # rather than resolving it here — see `trade_is_misfiled`.
-            tagged['_misfiled'] = check_leg_types(t, LEG_TYPES_BY_STORE[st])
+            tagged['_misfiled'] = _leg_problems(tagged, st)
             all_trades.append(tagged)
     return all_trades
 
@@ -2920,9 +3090,50 @@ def _load_all_trades(bcs_store, fh_store, bps_store=None) -> list:
 LEG_TYPES_BY_STORE = {
     'bcs': {'long_symbol': 'CE', 'short_symbol': 'CE'},
     'bps': {'long_symbol': 'PE', 'short_symbol': 'PE'},
+    # 'zebra' is deliberately ABSENT. That store holds both directions, so
+    # there is no single pair of leg types it must satisfy — see
+    # `_leg_problems`, which checks it a different way. A KeyError here for any
+    # future book without a row is the point.
     'fh': {'long_put_symbol': 'PE', 'short_put_symbol': 'PE',
            'short_call_symbol': 'CE', 'long_call_symbol': 'CE'},
 }
+
+
+def _leg_problems(trade: dict, store_type: str):
+    """Leg problems for a record from `store_type`, or an empty list.
+
+    Two different checks, because the books are two different shapes.
+
+    A single-direction book (bcs / bps / fh) has one right answer, so the legs
+    are compared against a fixed table.
+
+    The zebra book holds bull call spreads and bear put spreads together, so
+    there is no fixed answer — what must hold instead is that the record agrees
+    with ITSELF. The legs must form a readable vertical (both CE or both PE),
+    and that must match the `direction` field the scanner wrote. When the
+    contract and the bookkeeping disagree, neither is trusted: the record is
+    quarantined rather than resolved in favour of one, exactly as B23 does,
+    because sl_spot / tp_spot / debit_sl_value were all computed for whichever
+    one the writer believed.
+    """
+    if store_type != 'zebra':
+        return check_leg_types(trade, LEG_TYPES_BY_STORE[store_type])
+
+    lo = _sym.option_type(trade.get('long_symbol'))
+    sh = _sym.option_type(trade.get('short_symbol'))
+    if lo is None or sh is None:
+        return [f"long_symbol={trade.get('long_symbol')!r} / "
+                f"short_symbol={trade.get('short_symbol')!r}: one or both are "
+                f"not option symbols, so the direction cannot be read"]
+    if lo != sh:
+        return [f"legs are mixed ({lo} long, {sh} short) — not a vertical, so "
+                f"SL_SPOT and TP have no defined direction"]
+    want = trade.get('direction')
+    if want is not None and str(want).upper() != lo:
+        return [f"symbols say {lo} but direction={want!r}. The stops were "
+                f"computed for one of these and the payoff follows the other; "
+                f"which is wrong cannot be inferred here"]
+    return []
 
 
 def trade_is_misfiled(trade: dict):
@@ -2945,13 +3156,22 @@ def trade_is_misfiled(trade: dict):
     return trade.get('_misfiled') or []
 
 
-def _get_store_for(trade, bcs_store, fh_store, bps_store=None):
-    """Return the correct store for a trade based on its _store_type tag."""
+def _get_store_for(trade, bcs_store, fh_store, bps_store=None,
+                   zebra_store=None):
+    """Return the correct store for a trade based on its _store_type tag.
+
+    Routed by _store_type and NOT by _strategy, which is the distinction the
+    zebra book forces: one of its records can be tagged BPS while still
+    belonging to the zebra store. Getting this backwards would write a cohort
+    exit into the bear_put book.
+    """
     st = trade.get('_store_type')
     if st == 'fh':
         return fh_store
     if st == 'bps' and bps_store:
         return bps_store
+    if st == 'zebra' and zebra_store:
+        return zebra_store
     return bcs_store
 
 
@@ -3028,16 +3248,20 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     fh_store = get_fh_store()
     bps_store = get_bps_store()
     wl_store = get_watchlist_store()
+    zebra_store = _open_zebra_store()
     set_log_file(LOG_DIR / f"spread_monitor_cron_{date.today().strftime('%Y%m%d')}.log")
 
     # ── Recover trades stuck in 'closing' from a previous crash ─────────
-    for label, store in [('BCS', bcs_store), ('BPS', bps_store), ('FH', fh_store)]:
+    for label, store in [('BCS', bcs_store), ('BPS', bps_store), ('FH', fh_store),
+                         ('COHORT', zebra_store)]:
+        if store is None:
+            continue
         for t in store.get_closing_trades():
             log(f"  RECOVERY: {label} #{t['id']} {t['stock']} stuck in 'closing'. Resetting to 'open'.")
             send_telegram(f"{label} #{t['id']} {t['stock']}: Recovered from 'closing' (previous crash). Re-monitoring.")
             store.recover_closing_trade(t['id'])
 
-    all_trades = _load_all_trades(bcs_store, fh_store, bps_store)
+    all_trades = _load_all_trades(bcs_store, fh_store, bps_store, zebra_store)
     wl_active = wl_store.get_active()
 
     # B7: an empty book may mean "everything closed" or "the file was corrupt
@@ -3091,15 +3315,15 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
         lots_str = f"{t.get('lots', '?')}x{t.get('lot_size', '?')}"
 
         if strat == 'BCS':
-            trail_state[('BCS', t['id'])] = new_trail_state(t)
-            if trail_state[('BCS', t['id'])]['active']:
+            trail_state[trade_key(t)] = new_trail_state(t)
+            if trail_state[trade_key(t)]['active']:
                 log(f"  BCS #{t['id']} {t['stock']}: Restored trail: peak={t.get('trail_peak', 0):.2f}, trail={t.get('trail_sl', 0):.2f}")
             log(f"  BCS #{t['id']} {t['stock']} {t['long_symbol']}/{t['short_symbol']} "
                 f"| Lots: {lots_str} "
                 f"| TP: {t['target_spot']} | SL: {t['sl_spot']} | SL Spread: {t['sl_spread']:.2f}")
         elif strat == 'BPS':
-            trail_state[('BPS', t['id'])] = new_trail_state(t)
-            if trail_state[('BPS', t['id'])]['active']:
+            trail_state[trade_key(t)] = new_trail_state(t)
+            if trail_state[trade_key(t)]['active']:
                 log(f"  BPS #{t['id']} {t['stock']}: Restored trail: peak={t.get('trail_peak', 0):.2f}, trail={t.get('trail_sl', 0):.2f}")
             log(f"  BPS #{t['id']} {t['stock']} {t['long_symbol']}/{t['short_symbol']} "
                 f"| Lots: {lots_str} "
@@ -3175,11 +3399,11 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 log(f"  FH  #{t['id']} {t['stock']} — all legs verified")
 
     # ── Expiry day warnings ──────────────────────────────────────────────
-    expiry_trades = {}  # {(strategy, trade_id): True}
+    expiry_trades = {}  # keyed by trade_key(), like every other state dict
     for t in all_trades:
         if is_expiry_day(t):
             strat = t['_strategy']
-            expiry_trades[(strat, t['id'])] = True
+            expiry_trades[trade_key(t)] = True
             log(f"  *** {strat} #{t['id']} {t['stock']}: EXPIRY DAY! Force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
             send_telegram(f"{strat} #{t['id']} {t['stock']}: EXPIRY DAY. Will force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
             continue
@@ -3193,7 +3417,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             if t.get('_strategy') in ('BCS', 'BPS'):
                 _sv = get_spread_value(kite, t, spot=_spot).get('spread')
             maybe_warn_expiry_proximity(
-                _get_store_for(t, bcs_store, fh_store, bps_store), t, _spot,
+                _get_store_for(t, bcs_store, fh_store, bps_store, zebra_store), t, _spot,
                 t.get('_strategy', '?'), spread_val=_sv)
         except Exception as e:
             log(f"  WARNING: expiry-proximity check failed for "
@@ -3215,9 +3439,11 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 now_t = datetime.now().time()
                 if now_t > MARKET_CLOSE:
                     log("Market closed for the day. Cron monitor exiting.")
-                    for (strat_key, tid_key), ts in trail_state.items():
+                    for (store_key, strat_key, tid_key), ts in trail_state.items():
                         if ts['active']:
-                            log(f"  {strat_key} #{tid_key} trail state: peak={ts['peak']:.2f}, trail={ts['trail']:.2f}")
+                            log(f"  {strat_key} #{tid_key} ({store_key}) trail "
+                                f"state: peak={ts['peak']:.2f}, "
+                                f"trail={ts['trail']:.2f}")
                     return
                 log(f"Market not open yet ({now_t.strftime('%H:%M')}). Waiting...")
                 time.sleep(30)
@@ -3227,8 +3453,13 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             bcs_store.maybe_sync()
             bps_store.maybe_sync()
             fh_store.maybe_sync()
+            if zebra_store is not None:
+                # Same reason as the other three: the cohort book is written
+                # by the zebra cron on this same machine, so a monitor holding
+                # a stale copy would manage a position that has already moved.
+                zebra_store.maybe_sync()
             wl_store.maybe_sync()
-            all_trades = _load_all_trades(bcs_store, fh_store, bps_store)
+            all_trades = _load_all_trades(bcs_store, fh_store, bps_store, zebra_store)
             wl_active = wl_store.get_active()
 
             if not all_trades and not wl_active:
@@ -3307,11 +3538,15 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 stock = trade['stock']
                 strat = trade['_strategy']
                 sl_spot_val = trade['sl_spot']
-                trade_store = _get_store_for(trade, bcs_store, fh_store, bps_store)
+                trade_store = _get_store_for(trade, bcs_store, fh_store, bps_store, zebra_store)
 
-                # Skip trades where close is already in progress
-                # Use (strategy, id) as key since BCS and FH IDs are independent
-                close_key = (strat, tid)
+                # Skip trades where close is already in progress.
+                # Keyed by (store, strategy, id): each book numbers its trades
+                # independently, so id alone collides across books. `strat` is
+                # in the key too but cannot carry it alone — the zebra store
+                # produces both BCS and BPS records, so two of its rows can
+                # share a strategy while a bcs-store row shares an id.
+                close_key = trade_key(trade)
                 # Outside the BCS/BPS branch below on purpose: FH reads spot
                 # too, and FH's only stop IS a spot stop, so a spot-blind FH
                 # record is the most completely unmanaged case of all.
@@ -3549,7 +3784,25 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     # the --cron entrypoint on the Pi — kept firing on ONE
                     # print. The constant and its unit test both passed the
                     # whole time. BCS risk is DOWN (spot <= sl), BPS risk is UP.
-                    sl_spot_hit = (spot <= sl_spot_val) if strat == 'BCS' else (spot >= sl_spot_val)
+                    #
+                    # ...unless this record's owner switched the spot stop
+                    # OFF. `spot_sl_enabled` is a property of the TRADE, not
+                    # of this engine, because a position can be managed here
+                    # while having been measured elsewhere. The BCS cohort
+                    # runs with it False: over 147 records a 3% spot stop cut
+                    # 31 of 78 winners for a Rs 8.9L giveaway, while the
+                    # losers it "caught" only halved their depth. In that book
+                    # spot is a VETO on an exit the option book asked for,
+                    # never a reason to ask for one.
+                    #
+                    # Absent means True, so the three original books are
+                    # untouched. Only the REPORTED number survives the switch:
+                    # the blind alert below still says where spot sits against
+                    # sl_spot, which is the whole point of keeping it stored.
+                    sl_spot_armed = trade.get('spot_sl_enabled', True) is not False
+                    sl_spot_hit = sl_spot_armed and (
+                        (spot <= sl_spot_val) if strat == 'BCS'
+                        else (spot >= sl_spot_val))
                     if sl_spot_hit:
                         # confirm_state[...] directly: the `confirm` local is
                         # bound below, after the TP cooldown gate.
@@ -3695,7 +3948,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
 
         except KeyboardInterrupt:
             log("\nCron monitor stopped by user (Ctrl+C)")
-            remaining = _load_all_trades(bcs_store, fh_store, bps_store)
+            remaining = _load_all_trades(bcs_store, fh_store, bps_store, zebra_store)
             log(f"Remaining open trades: {len(remaining)}")
             return
         except Exception as e:
@@ -3705,13 +3958,13 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             # handler — see _is_auth_error.
             if _is_auth_error(e):
                 log("FATAL: Kite token appears expired. Cannot continue.")
-                remaining = _load_all_trades(bcs_store, fh_store, bps_store)
+                remaining = _load_all_trades(bcs_store, fh_store, bps_store, zebra_store)
                 stocks = ', '.join(f"{t['_strategy']}:{t['stock']}" for t in remaining)
                 send_telegram(f"SPREAD MONITOR FATAL: Kite token expired! Unmonitored: {stocks}")
                 return
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 log(f"FATAL: {MAX_CONSECUTIVE_ERRORS} consecutive errors. Exiting.")
-                remaining = _load_all_trades(bcs_store, fh_store, bps_store)
+                remaining = _load_all_trades(bcs_store, fh_store, bps_store, zebra_store)
                 stocks = ', '.join(f"{t['_strategy']}:{t['stock']}" for t in remaining)
                 send_telegram(f"SPREAD MONITOR FATAL: {MAX_CONSECUTIVE_ERRORS} errors. Unmonitored: {stocks}")
                 return

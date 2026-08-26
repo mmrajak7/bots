@@ -787,6 +787,87 @@ class ZebraStore:
             t['id'], t['stock'], reason, exit_spot, pnl, pnl_pct
         )
 
+    # ── The close lock ───────────────────────────────────────────────────
+    #
+    # Added 2026-08-26 so `bcs/spread_monitor.py` can manage cohort exits with
+    # a real order. `mark_exited` is already idempotent inside `_mutate`, which
+    # stops a position being BOOKED twice — but booking is not the dangerous
+    # half. Two processes can both read `entered`, both place a closing order,
+    # and only then does one of them lose the status check. The Feb-2026
+    # incident was four unwanted BUYs on one short leg; this is the same shape.
+    #
+    # So the lock is taken and PERSISTED before any order goes out, and the
+    # status it writes — 'closing' — is a new state for this schema. Reads that
+    # ask for 'entered' will stop seeing a trade the moment a close begins,
+    # which is the intended behaviour everywhere: the paper monitor must not
+    # re-alert on a position the order path is already unwinding.
+
+    def begin_close(self, trade_id: int, reason: str) -> bool:
+        """Take the close lock. True if acquired, False if not ours to take.
+
+        False is the normal, expected answer when another process got there
+        first. It is not an error and must not be logged as one.
+        """
+        with self._mutate():
+            t = self._must_find(trade_id)
+            if t['status'] != 'entered':
+                logger.info("#%d status=%s — close lock not taken (%s)",
+                            trade_id, t['status'], reason)
+                return False
+            t['status'] = 'closing'
+            t['close_reason'] = reason
+            t['close_started'] = datetime.now().isoformat()
+            t['version'] = t.get('version', 0) + 1
+            logger.info("#%d close lock acquired: %s", trade_id, reason)
+            return True
+
+    def recover_closing_trade(self, trade_id: int) -> bool:
+        """Put a stranded 'closing' record back to 'entered'.
+
+        A process that dies between taking the lock and booking the exit
+        leaves the trade locked forever: no engine will touch it again, and it
+        silently stops being managed — the failure mode that has actually cost
+        money here, twice. Recovery is deliberately a separate, explicit call
+        rather than a timeout, because "the close may have partly filled" is
+        not something a clock can decide.
+        """
+        with self._mutate():
+            t = self._must_find(trade_id)
+            if t['status'] != 'closing':
+                return False
+            t['status'] = 'entered'
+            t.pop('close_reason', None)
+            t.pop('close_started', None)
+            t['version'] = t.get('version', 0) + 1
+            logger.warning("#%d recovered from 'closing' back to 'entered' — "
+                           "verify at the broker whether legs were closed",
+                           trade_id)
+            return True
+
+    def update_trade_fields(self, trade_id: int, **fields) -> dict:
+        """Patch arbitrary fields on a record. Used for trail state.
+
+        Refuses to write `status` — that has dedicated transitions which do
+        the version bump and the logging, and letting it through here would
+        make the state machine editable from anywhere.
+        """
+        if 'status' in fields:
+            raise ValueError("use the status transitions, not "
+                             "update_trade_fields, to change status")
+        with self._mutate():
+            t = self._must_find(trade_id)
+            t.update(fields)
+            t['version'] = t.get('version', 0) + 1
+        return t
+
+    def set_trade_status(self, trade_id: int, status: str, **extra) -> dict:
+        with self._mutate():
+            t = self._must_find(trade_id)
+            t['status'] = status
+            t.update(extra)
+            t['version'] = t.get('version', 0) + 1
+        return t
+
     def cancel(self, trade_id: int, reason: str) -> dict:
         """Cancel a watching/triggered signal."""
         with self._mutate():

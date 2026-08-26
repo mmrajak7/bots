@@ -135,6 +135,7 @@ class TickBroker(FakeBroker):
         # different and much easier test: the interesting failures (an expired
         # token, a symbol renamed by a corp action) arrive with positions
         # already open and the loop already running.
+        self.quoted = []
         self._faults = [(w, tuple(int(x) for x in at.split(':')), e)
                         for w, at, e in (faults or [])]
         self.seen = []               # every tick the run actually reached
@@ -168,6 +169,12 @@ class TickBroker(FakeBroker):
         return {s: {'last_price': tick.spot} for s in _as_list(symbols)}
 
     def quote(self, symbols):
+        # Recorded so a test can tell "monitored and correctly held" apart
+        # from "never monitored at all". Both place zero orders, and a test
+        # that only asserts on `placed` passes just as happily when the
+        # position was never loaded -- which is the failure that actually
+        # costs money. feedback_never_asked_is_not_failed.
+        self.quoted.extend(_as_list(symbols))
         exc = self.quote_raises or self._fault('quote')
         if exc:
             raise exc
@@ -197,7 +204,7 @@ def _as_list(symbols):
 
 
 def run_session(monkeypatch, sm, trade, ticks, day, positions,
-                dry_run=False, fill_policy=None, faults=None):
+                dry_run=False, fill_policy=None, faults=None, cohort=None):
     """Replay `ticks` through the real `monitor_all`. Returns the evidence.
 
     Only the boundary is stubbed: stores, Telegram, the watchlist alert check,
@@ -214,12 +221,26 @@ def run_session(monkeypatch, sm, trade, ticks, day, positions,
     # slack means the final book is actually looked at.
     clock.stop_at = last.when(day) + timedelta(seconds=30)
 
-    store = MemoryStore(trades=[trade])
+    # `cohort` moves the position into the COHORT book instead of the bcs one.
+    # The broker still needs `trade` to know which symbols to quote -- what
+    # changes is which store the monitor loads it from, which is the whole
+    # point of a bridge test. Without this the bcs store kept the trade and a
+    # "cohort" test passed while never touching the zebra path at all; the
+    # mutation that dropped the fourth store from the loader SURVIVED.
+    store = MemoryStore(trades=[] if cohort else [trade])
     empty = MemoryStore()
     monkeypatch.setattr(sm, 'get_store', lambda: store)
     monkeypatch.setattr(sm, 'get_bps_store', lambda: empty)
     monkeypatch.setattr(sm, 'get_fh_store', lambda: MemoryStore())
     monkeypatch.setattr(sm, 'get_watchlist_store', lambda: MemoryStore())
+    # No cohort book by default. `_open_zebra_store` reaches the REAL
+    # logs/zebra_trades.json otherwise -- which the production-write rail
+    # correctly refused the moment the fourth store was wired in. A replay of
+    # the Feb-2026 or Jul-2026 incidents has no cohort positions in it anyway;
+    # a test that wants one passes `cohort=[...]`.
+    monkeypatch.setattr(
+        sm, '_open_zebra_store',
+        lambda: MemoryStore(trades=list(cohort)) if cohort else None)
     monkeypatch.setattr(sm, 'check_watchlist_alerts',
                         lambda *a, **k: None)
     monkeypatch.setattr(sm, 'set_log_file', lambda p: None)
