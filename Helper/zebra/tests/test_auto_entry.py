@@ -291,3 +291,58 @@ def test_paper_mode_never_reaches_the_live_entry_path(store, monkeypatch,
     i = src.index('_auto_enter_bcs')
     assert 'if not cfg.PAPER_MODE:' in src[:i], (
         'the live auto-entry call is no longer guarded by paper mode')
+
+
+# ── adversarial review, 2026-08-26 ──────────────────────────────────────────
+
+def test_a_filled_position_is_recorded_even_when_it_BREACHES_the_budget(
+        store, monkeypatch, armed, sent, caplog):
+    """C5. The budget gate lives inside `mark_entered_bcs`, which runs AFTER
+    the orders have filled — and in LIVE it RAISES.
+
+    Reachable in ordinary operation, not just in theory: `plan()` sizes
+    against the QUOTED debit and the record carries the PAID one, which is
+    higher by construction because entry crosses the touch. So a sized-to-fit
+    entry can breach on the way in.
+
+    Refusing here does not undo the trade. It only loses the record, leaving a
+    live position nothing is watching — the exact failure the whole design
+    exists to prevent, produced by a risk control.
+    """
+    import logging
+    # One lot costs Rs 3,000 at the paid debit; the book allows Rs 1,000.
+    monkeypatch.setattr(cfg, 'CAPITAL_RUPEES', 8000.0)
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    fake_exec(monkeypatch, lots_filled=1, long_fills=[40.0], short_fills=[10.0])
+    # Sized against a book it DID fit, so `plan` cannot be what stops it.
+    monkeypatch.setattr(capital, 'plan',
+                        lambda *a, **k: {'lots': 1, 'slice_lots': 1,
+                                         'capital': 2000.0, 'bound': 'max_lots',
+                                         'reason': '1 lot(s)', 'bounds': {}})
+    with caplog.at_level(logging.ERROR, logger='zebra.trade_store'):
+        fresh = enter(store)
+    assert fresh is not None, (
+        'a filled position was refused a record by the budget gate — the '
+        'trade is live and now unmanaged')
+    assert store.find(1)['status'] == 'entered'
+    assert any('CAPITAL BREACHED' in r.message for r in caplog.records), (
+        'it recorded the breach silently')
+
+
+def test_an_UNFILLED_entry_is_still_refused_by_the_budget(store, monkeypatch,
+                                                          armed, sent):
+    """The negative control. The gate must still do its job BEFORE the money
+    is spent — that is the whole point of it."""
+    monkeypatch.setattr(cfg, 'CAPITAL_RUPEES', 8000.0)
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    calls = fake_exec(monkeypatch, lots_filled=1)
+    assert enter(store) is None
+    assert calls == [], 'the pre-trade budget gate stopped refusing'
+
+
+def test_the_gated_debit_reaches_the_executor(store, monkeypatch, armed, sent):
+    """C3's other half: the cap is useless if the decision price never travels
+    to the code that pays."""
+    calls = fake_exec(monkeypatch, lots_filled=1)
+    enter(store)
+    assert calls[0]['gated_debit'] == BCS['debit']

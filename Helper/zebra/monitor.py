@@ -768,6 +768,14 @@ def _send_enter_alert(store: ZebraStore, trade: dict, msg: str, stock: str,
                      "retrying next cycle", trade['id'], stock)
 
 
+def _as_float(v):
+    """A number, or None. The debit cap must never be built from a string."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
                     dry_run: bool = False):
     """LIVE auto-entry. Returns the fresh record, or None to fall back to the
@@ -816,6 +824,7 @@ def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
             kite, stock=trade['stock'], long_symbol=bcs['long_symbol'],
             short_symbol=bcs['short_symbol'], exchange='NFO',
             lot_size=int(bcs['lot_size']), lots=plan['lots'],
+            gated_debit=_as_float(bcs.get('debit')),
             dry_run=dry_run, trade_id=trade['id'],
             log=lambda m: logger.info('%s', m),
             telegram=lambda m: _send_telegram(m, dry_run=dry_run))
@@ -851,6 +860,12 @@ def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
     filled = dict(bcs)
     filled['debit'] = paid
     filled['lots'] = out['lots_filled']
+    # The orders are DONE. The budget gate inside the store must not be able
+    # to refuse the record now -- refusing would not undo the trade, only lose
+    # it, and an unrecorded live position is the worst state available here. It
+    # is reachable in ordinary operation: `plan` sized against the QUOTED
+    # debit, this carries the PAID one, which is higher by construction.
+    filled['already_filled'] = True
     try:
         fresh = store.mark_entered_bcs(trade['id'], filled)
     except Exception as e:

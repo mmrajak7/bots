@@ -361,3 +361,212 @@ def test_dry_run_exercises_the_path_without_the_gate(broker):
     assert ee.entries_allowed()[0] is False
     out, _said, _sent = run(broker, lots=1, dry_run=True)
     assert out['lots_filled'] == 1
+
+
+# ── adversarial review, 2026-08-26 ──────────────────────────────────────────
+#
+# Five findings, all in this file's first version. Each test below is the one
+# that would have caught it.
+
+def test_a_PARTIAL_fill_is_a_position_not_a_non_event(broker, monkeypatch):
+    """C1. The first version accepted only status COMPLETE and returned None
+    for everything else, reasoning that "the order is one lot, so it fills or
+    it does not". A lot is hundreds of shares and NSE fills partially —
+    `wait_for_fill` documents returning a CANCELLED order carrying
+    `filled_quantity > 0`, and those shares are HELD."""
+    def half(kite, order_id, dry_run):
+        return {'status': 'CANCELLED', 'average_price': 30.3,
+                'order_id': order_id, 'filled_quantity': LOT // 2}
+    monkeypatch.setattr(sm, 'wait_for_fill', half)
+    out, _said, sent = run(broker, lots=1)
+    assert out['lots_filled'] == 0
+    assert out['partials'] == [{'symbol': LONG, 'qty': LOT // 2,
+                                'fill': 30.3, 'round': 1}]
+    assert sent and 'PARTIAL' in sent[0], (
+        'shares are held at the broker and the owner was not told')
+    assert not any('nothing extra held' in p for p in out['problems']), (
+        'it reported holding nothing while holding half a lot')
+
+
+def test_a_partial_short_against_a_full_long_reports_BOTH(broker, monkeypatch):
+    """Worse than an orphan: neither a spread nor a clean single leg."""
+    real = sm.wait_for_fill
+
+    def script(kite, order_id, dry_run):
+        sym = next(p['symbol'] for p in broker.placed
+                   if p['order_id'] == order_id)
+        if sym == SHORT:
+            return {'status': 'CANCELLED', 'average_price': 9.9,
+                    'order_id': order_id, 'filled_quantity': LOT // 4}
+        return real(kite, order_id, dry_run)
+    monkeypatch.setattr(sm, 'wait_for_fill', script)
+    out, _said, _sent = run(broker, lots=1)
+    assert out['lots_filled'] == 0
+    assert out['orphan'] is not None, 'the full long went unreported'
+    assert out['partials'] and out['partials'][0]['symbol'] == SHORT
+
+
+def test_an_exception_mid_run_KEEPS_the_rounds_that_filled(broker,
+                                                           monkeypatch):
+    """C2. `place_limit_order` RE-RAISES on a broker exception, and nothing
+    caught it — so an exception on round 3 escaped with the result discarded,
+    taking two real spreads with it. The caller then recorded nothing."""
+    calls = {'n': 0}
+    real = broker.place
+
+    def boom(*a, **k):
+        calls['n'] += 1
+        if calls['n'] == 5:              # round 3's long
+            raise RuntimeError('broker rejected: margin')
+        return real(*a, **k)
+    monkeypatch.setattr(sm, 'place_limit_order', boom)
+    out, _said, sent = run(broker, lots=3)
+    assert out['lots_filled'] == 2, (
+        'the completed spreads were lost with the exception')
+    assert len(out['long_fills']) == 2
+    assert any('raised' in p for p in out['problems'])
+    assert sent, 'an exception mid-entry said nothing to the owner'
+
+
+def test_a_book_that_moved_past_the_gate_is_NOT_entered(broker):
+    """C3. The signal was gated (debit/width <= 45%, entry cost <= 15%)
+    against a book that no longer exists. Nothing re-checked the price at
+    execution, so the executor would pay whatever the new book said and open a
+    trade the gates had rejected. CLAUDE.md: ASHOKLEY read 33% at signal and
+    40.5% next morning — a hard fail."""
+    # gated at 15.0; the live book prices it at 20.3 - 9.9 = 20.4
+    out, _said, _sent = run(broker, lots=1, gated_debit=15.0)
+    assert out['lots_filled'] == 0
+    assert broker.placed == [], 'it paid a price the gates would have rejected'
+    assert any('book moved' in p for p in out['problems'])
+
+
+def test_a_book_INSIDE_the_slippage_allowance_still_enters(broker):
+    """The negative control, and the one that matters more: the cap must not
+    refuse the slippage this file already intends to pay. Two legs crossing by
+    ENTRY_SLIPPAGE_TICKS is the design, not a moved market."""
+    gated = GOOD['ask'] - GOOD_SHORT['bid']          # 20.2
+    out, _said, _sent = run(broker, lots=1, gated_debit=gated)
+    assert out['lots_filled'] == 1, (
+        'the cap refused the buffer the executor is designed to pay')
+
+
+def test_with_no_gated_debit_the_cap_does_not_apply(broker):
+    """A caller that has no gate to check against must not be silently
+    blocked by one it never supplied."""
+    out, _said, _sent = run(broker, lots=1)
+    assert out['lots_filled'] == 1
+
+
+def test_the_switch_is_re_read_EVERY_round(broker, monkeypatch):
+    """C4. Read once per entry, a 3-lot entry places 6 orders over minutes.
+    `trading_enabled`'s own docstring: a switch consulted once at startup
+    cannot stop something already running."""
+    from zebra import config as cfg
+    monkeypatch.setattr(cfg, 'AUTO_ENTRY', True)
+    def flips():
+        # Disarmed the moment anything has actually been bought. Keyed on the
+        # ORDERS rather than a call count, so the test does not silently
+        # depend on how many times the gate happens to be consulted.
+        return not any(p['txn'] == 'BUY' for p in broker.placed)
+    monkeypatch.setattr(sm, 'trading_enabled', flips)
+    out, _said, _sent = run(broker, lots=3, dry_run=False)
+    assert out['lots_filled'] == 1, (
+        'the kill switch was thrown mid-entry and orders kept going out')
+    assert any('disarmed' in p or 'kill switch' in p for p in out['problems'])
+    assert len([p for p in broker.placed if p['txn'] == 'BUY']) == 1
+
+
+def test_a_cancelled_order_that_filled_the_WHOLE_lot_is_a_full_fill(
+        broker, monkeypatch):
+    """An order can be cancelled after it has completely filled.
+
+    The first version of the partial-fill fix returned None for
+    `filled >= qty`, throwing away an entire real leg because a string did not
+    say COMPLETE. Found by a mutation, not by reading.
+    """
+    from zebra import config as cfg
+    monkeypatch.setattr(cfg, 'AUTO_ENTRY', True)
+    monkeypatch.setattr(sm, 'trading_enabled', lambda: True)
+    monkeypatch.setattr(sm, 'wait_for_fill', lambda k, oid, d: None)
+    monkeypatch.setattr(
+        sm, '_order_final_state',
+        lambda kite, oid: {'status': 'CANCELLED', 'average_price': 30.3,
+                           'order_id': oid, 'filled_quantity': LOT})
+    out, _said, _sent = run(broker, lots=1, dry_run=False)
+    assert out['lots_filled'] == 1, 'a complete leg was discarded as "no fill"'
+    assert out['partials'] == []
+
+
+def test_a_partial_in_the_CANCEL_RACE_is_still_held(broker, monkeypatch):
+    """The race path had its own `status == COMPLETE` test, so a partial that
+    landed while cancelling was discarded exactly like the main path's was."""
+    from zebra import config as cfg
+    monkeypatch.setattr(cfg, 'AUTO_ENTRY', True)
+    monkeypatch.setattr(sm, 'trading_enabled', lambda: True)
+    monkeypatch.setattr(sm, 'wait_for_fill', lambda k, oid, d: None)
+    monkeypatch.setattr(
+        sm, '_order_final_state',
+        lambda kite, oid: {'status': 'CANCELLED', 'average_price': 30.3,
+                           'order_id': oid, 'filled_quantity': LOT // 4})
+    out, _said, sent = run(broker, lots=1, dry_run=False)
+    assert out['lots_filled'] == 0
+    assert out['partials'] and out['partials'][0]['qty'] == LOT // 4
+    assert sent and 'PARTIAL' in sent[0]
+
+
+def test_an_unpriceable_book_stops_the_entry(broker, monkeypatch):
+    """`prospective_debit` returning None must mean DO NOT ENTER, not "no cap
+    applies". Absent is not unlimited — the same rule the sizing layer uses
+    for missing depth."""
+    monkeypatch.setattr(ee, 'prospective_debit', lambda *a, **k: None)
+    out, _said, _sent = run(broker, lots=1, gated_debit=20.2)
+    assert out['lots_filled'] == 0 and broker.placed == []
+    assert any('could not price' in p for p in out['problems'])
+
+
+def test_the_prospective_debit_prices_the_sides_we_actually_TRADE():
+    """ASK on the long plus the buffer, BID on the short minus it — the same
+    numbers `open_leg` sends. Reading the other two sides quotes a cheaper
+    spread than anyone could open, which is the mid-pricing error in a new
+    costume: it would let a moved book through the cap."""
+    books = {LONG: GOOD, SHORT: GOOD_SHORT}
+    import bcs.spread_monitor as _sm
+    real = _sm.get_option_depth
+    try:
+        _sm.get_option_depth = lambda k, e, sym: books[sym]
+        got = ee.prospective_debit(None, EX, LONG, SHORT)
+    finally:
+        _sm.get_option_depth = real
+    buf = ee.ENTRY_SLIPPAGE_TICKS * sm.TICK_SIZE
+    assert got == pytest.approx((GOOD['ask'] + buf) - (GOOD_SHORT['bid'] - buf))
+    # ...and it must be DEARER than the touch-to-touch figure, never cheaper.
+    assert got > GOOD['ask'] - GOOD_SHORT['bid']
+
+
+def test_the_cap_refuses_a_book_that_moved_only_slightly(broker):
+    """Discrimination test. gated 19.6 -> cap 19.8; the real cost to open is
+    20.4. A version reading the wrong sides of the books computes 19.8 and
+    lets it through, which no coarser scenario separates."""
+    out, _said, _sent = run(broker, lots=1, gated_debit=19.6)
+    assert out['lots_filled'] == 0, (
+        'a spread costing 20.4 was opened against a 19.8 cap')
+
+
+def test_an_ordinary_cancel_with_no_fill_is_not_reported_as_a_partial(
+        broker, monkeypatch):
+    """`filled_quantity: 0` is the NORMAL timeout-then-cancel result, not a
+    position. Without the zero guard every routine non-fill would announce
+    "PARTIAL fill 0 x SYM is held" — a false alarm on the commonest path,
+    which makes the real partial alert worth less."""
+    from zebra import config as cfg
+    monkeypatch.setattr(cfg, 'AUTO_ENTRY', True)
+    monkeypatch.setattr(sm, 'trading_enabled', lambda: True)
+    monkeypatch.setattr(sm, 'wait_for_fill', lambda k, oid, d: None)
+    monkeypatch.setattr(
+        sm, '_order_final_state',
+        lambda kite, oid: {'status': 'CANCELLED', 'average_price': 0,
+                           'order_id': oid, 'filled_quantity': 0})
+    out, _said, sent = run(broker, lots=1, dry_run=False)
+    assert out['partials'] == [], 'a no-fill was announced as a held position'
+    assert not any('PARTIAL' in m for m in sent)

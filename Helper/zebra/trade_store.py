@@ -618,7 +618,8 @@ class ZebraStore:
         t['cohort'] = cfg.COHORT_START
 
     def _refuse_if_over_budget(self, trade_id: int,
-                               candidate: dict = None) -> None:
+                               candidate: dict = None,
+                               already_filled: bool = False) -> None:
         """Every portfolio-level limit, in one place. MUST hold the lock.
 
         Was `_refuse_if_book_full`, and it checked one thing: a COUNT.
@@ -661,6 +662,23 @@ class ZebraStore:
         ok, why = capital.check(self._trades, cand)
         if ok:
             return
+        if already_filled:
+            # THE MONEY IS ALREADY SPENT. This gate exists to prevent OPENING
+            # a position, never to prevent recording one that is already at
+            # the broker -- and refusing here does not undo the trade, it only
+            # loses the record, leaving a live position nothing is watching.
+            # That is the precise failure this whole design is built to avoid,
+            # produced by a risk control.
+            #
+            # It is reachable in ordinary operation: `plan()` sizes against the
+            # QUOTED debit and the record carries the PAID one, which is higher
+            # by construction because entry crosses the touch.
+            logger.error(
+                'CAPITAL BREACHED #%s %s: %s -- recording it ANYWAY because '
+                'the orders have already filled. Reduce or close manually. %s',
+                trade_id, cand.get('stock'), why,
+                capital.describe(self._trades))
+            return
         if cfg.PAPER_MODE:
             logger.warning(
                 'CAPITAL WOULD REFUSE #%s %s: %s -- entered anyway (paper '
@@ -690,7 +708,8 @@ class ZebraStore:
                 raise ValueError(f"#{trade_id} status={t['status']}, can't enter")
             self._refuse_if_over_budget(trade_id, {
                 'stock': t.get('stock'), 'debit': debit,
-                'lot_size': lot_size, 'lots': lots})
+                'lot_size': lot_size, 'lots': lots},
+                already_filled=bool(bcs.get('already_filled')))
             direction = t['direction']
             sl_spot = round(entry_spot * (1 - cfg.SPOT_SL_PCT), 2) \
                 if direction == 'CE' else \
