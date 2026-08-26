@@ -14,6 +14,7 @@
   "debit_sl_pct": 0.5,
   "time_sl_days_before_expiry": 5,
   "max_open_trades": 8,
+  "auto_entry": false,
   "capital_rupees": 200000,
   "capital_per_lot": 200000,
   "max_trade_pct": 12.5,

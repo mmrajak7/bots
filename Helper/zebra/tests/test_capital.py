@@ -479,3 +479,35 @@ def test_the_capital_keys_agree_across_both_sources():
               'max_deployed_pct', 'max_lots_hard', 'compound',
               'max_open_trades', 'max_open_per_stock'):
         assert tracked[k] == cfg._DEFAULTS[k], k
+
+
+# ── the lot count on the record ─────────────────────────────────────────────
+
+def test_both_entry_builders_read_the_lot_count_from_the_record():
+    """`add_bcs_shadow` and `mark_entered_bcs` BOTH said `lots = 1`.
+
+    Correct while every entry was one lot; silently wrong the moment sizing
+    arrived — a 3-lot fill booked as one understates `quantity`, `capital` and
+    every P&L by two thirds, while the record looks perfectly healthy and
+    every stop level is computed off it.
+
+    Asserted on the source because the two sites are reached from different
+    pipelines, and fixing the one the test happened to drive is exactly how
+    this survived in two places at once.
+    """
+    import inspect
+    from zebra import trade_store
+    src = inspect.getsource(trade_store)
+    assert 'lots = _lots_from(bcs)' in src
+    assert src.count('lots = _lots_from(bcs)') == 2, (
+        'an entry builder went back to hardcoding the lot count')
+    assert '\n        lots = 1\n' not in src
+
+
+@pytest.mark.parametrize('given,want', [
+    (None, 1), (1, 1), (3, 3), (0, 1), (-2, 1), ('4', 4), ('junk', 1),
+])
+def test_the_lot_count_floors_at_one(given, want):
+    """A zero-lot entry is not a position, and a malformed one must not be."""
+    from zebra.trade_store import _lots_from
+    assert _lots_from({} if given is None else {'lots': given}) == want

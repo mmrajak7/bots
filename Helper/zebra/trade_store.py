@@ -82,6 +82,28 @@ def _resolve_credentials_path(config: dict) -> Optional[Path]:
     return Path(path_str) if path_str else None
 
 
+def _lots_from(bcs: dict) -> int:
+    """Lots for this entry, from the record rather than hardcoded.
+
+    Both entry builders said `lots = 1`. That was correct while every entry
+    was one lot and silently wrong the moment sizing arrived: a 3-lot fill
+    would be booked as ONE, so `quantity`, `capital` and every P&L derived
+    from them would understate the position by two thirds -- while the record
+    looked perfectly healthy and every stop level was computed off it.
+
+    ONE definition for both call sites, because that is exactly how the bug
+    was able to exist in two places at once
+    (`feedback_copy_pasted_modules_fix_once`).
+
+    Defaults to 1, so a caller that does not size still gets the old
+    behaviour, and floors at 1 -- a zero-lot entry is not a position.
+    """
+    try:
+        return max(1, int(bcs.get('lots') or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 class ZebraStore:
     """Zebra trades with local JSON + Drive sync."""
 
@@ -440,7 +462,7 @@ class ZebraStore:
         A/B legs; excluded from all scanner dedup.
         """
         lot_size = int(bcs['lot_size'])
-        lots = 1
+        lots = _lots_from(bcs)
         quantity = lot_size * lots
         debit = float(bcs['debit'])
         entry_spot = float(bcs['entry_spot'])
@@ -657,7 +679,7 @@ class ZebraStore:
         the scanner will not hand out a duplicate on the same thesis.
         """
         lot_size = int(bcs['lot_size'])
-        lots = 1
+        lots = _lots_from(bcs)
         quantity = lot_size * lots
         debit = float(bcs['debit'])
         entry_spot = float(bcs['entry_spot'])

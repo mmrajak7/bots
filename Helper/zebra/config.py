@@ -439,6 +439,14 @@ _DEFAULTS = {
     # figures and they drift apart the first time capital moves, silently: 8
     # slots at a stale Rs 25,000 against Rs 4,00,000 is a book running at half
     # size with nothing announcing it.
+    # Place the ENTRY orders instead of printing a ticket (Phase 3).
+    #
+    # OFF, and it is the third switch that has to be thrown deliberately --
+    # alongside `--dry-run` off the monitor crontab and
+    # `exits_managed_externally`. Unlike those two, this one arms code that
+    # OPENS positions, so `bcs.entry_executor.entries_allowed` fails CLOSED on
+    # it: an unreadable config means no entries, never "default to yes".
+    'auto_entry': False,
     'capital_rupees': 200000,
     # One lot per this much capital. 2L -> 1 lot, 4L -> 2, and so on, floored.
     'capital_per_lot': 200000,
@@ -863,6 +871,8 @@ MAX_LOTS_HARD = _int('max_lots_hard')
 # `_strict_bool`, not a raw read: this decides position SIZE from a P&L
 # figure, and `"compound": 1` must not be able to arm that by accident.
 COMPOUND = _strict_bool('compound')
+# `_strict_bool` again: this one arms code that places OPENING orders.
+AUTO_ENTRY = _strict_bool('auto_entry')
 
 
 MAX_WATCHING_SIGNALS = _int('max_watching_signals')

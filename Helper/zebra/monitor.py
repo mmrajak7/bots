@@ -768,6 +768,160 @@ def _send_enter_alert(store: ZebraStore, trade: dict, msg: str, stock: str,
                      "retrying next cycle", trade['id'], stock)
 
 
+def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
+                    dry_run: bool = False):
+    """LIVE auto-entry. Returns the fresh record, or None to fall back to the
+    ticket.
+
+    Order of operations, and every step is a refusal point:
+
+    1. **Is auto-entry armed at all?** Off by default; fails closed. Off means
+       the owner gets the ticket exactly as before.
+    2. **What does capital allow?** `capital.plan` against the live book and
+       the touch depth. Zero lots is a refusal, not a smaller trade.
+    3. **Place it**, long-first, one lot per order, stopping on any failure.
+    4. **Record what FILLED**, never what was asked for, at the debit PAID --
+       every stop and the trail derive from it.
+    5. **Verify against the broker**, because the code that placed the orders
+       is exactly the code that cannot be trusted to say what it placed.
+
+    Never raises. A failure here must cost the entry and nothing else: the
+    caller still sends the ticket, so the worst case is the behaviour LIVE had
+    before auto-entry existed.
+    """
+    from bcs import entry_executor as ee
+
+    allowed, why = _entries_allowed_or_log(trade)
+    if not allowed:
+        return None
+
+    book = store.load_trades()
+    lim = capital.limits(book)
+    candidate = {'stock': trade.get('stock'), 'debit': bcs.get('debit'),
+                 'lot_size': bcs.get('lot_size')}
+    depth = None
+    if bcs.get('long_ask_qty') is not None:
+        depth = {'long': {'ask_qty': bcs.get('long_ask_qty')},
+                 'short': {'bid_qty': bcs.get('short_bid_qty')}}
+    plan = capital.plan(book, candidate, depth, lim)
+    if not plan['lots']:
+        logger.warning("AUTO-ENTRY REFUSED #%d %s: %s", trade['id'],
+                       trade['stock'], plan['reason'])
+        return None
+    logger.info("AUTO-ENTRY #%d %s: %s | %s", trade['id'], trade['stock'],
+                plan['reason'], capital.describe(book))
+
+    try:
+        out = ee.open_spread(
+            kite, stock=trade['stock'], long_symbol=bcs['long_symbol'],
+            short_symbol=bcs['short_symbol'], exchange='NFO',
+            lot_size=int(bcs['lot_size']), lots=plan['lots'],
+            dry_run=dry_run, trade_id=trade['id'],
+            log=lambda m: logger.info('%s', m),
+            telegram=lambda m: _send_telegram(m, dry_run=dry_run))
+    except Exception as e:
+        logger.error("AUTO-ENTRY #%d %s: executor raised (%s) -- falling back "
+                     "to the ticket", trade['id'], trade['stock'], e)
+        return None
+
+    if not out['lots_filled']:
+        # Nothing established. The ticket still goes out: the signal is
+        # unchanged and the owner may want it by hand.
+        logger.warning("AUTO-ENTRY #%d %s: nothing filled -- ticket stands",
+                       trade['id'], trade['stock'])
+        return None
+
+    paid = ee.entry_debit(out)
+    if paid is None:
+        # Filled but unpriceable, which must NOT be recorded: every stop is
+        # derived from the debit, so a record without one is a position with
+        # no levels at all. Loud, and left to a human.
+        logger.error("AUTO-ENTRY #%d %s: %d lot(s) FILLED but the debit could "
+                     "not be computed -- NOT recorded, the position is live "
+                     "and unmanaged", trade['id'], trade['stock'],
+                     out['lots_filled'])
+        _send_telegram(
+            "\U0001F6A8 BCS %s: %d lot(s) FILLED but the entry debit could "
+            "not be computed, so nothing was recorded. The position is LIVE "
+            "and UNMANAGED -- record it by hand now."
+            % (html.escape(str(trade['stock'])), out['lots_filled']),
+            dry_run=dry_run)
+        return None
+
+    filled = dict(bcs)
+    filled['debit'] = paid
+    filled['lots'] = out['lots_filled']
+    try:
+        fresh = store.mark_entered_bcs(trade['id'], filled)
+    except Exception as e:
+        logger.error("AUTO-ENTRY #%d %s: %d lot(s) FILLED but the record "
+                     "FAILED (%s) -- the position is live and unmanaged",
+                     trade['id'], trade['stock'], out['lots_filled'], e)
+        _send_telegram(
+            "\U0001F6A8 BCS %s: %d lot(s) FILLED but the trade store refused "
+            "the record (%s). LIVE and UNMANAGED -- record it by hand now."
+            % (html.escape(str(trade['stock'])), out['lots_filled'],
+               html.escape(str(e)[:80])),
+            dry_run=dry_run)
+        return None
+
+    _verify_entry(kite, fresh, out, dry_run=dry_run)
+    return fresh
+
+
+def _entries_allowed_or_log(trade: dict) -> tuple:
+    """The auto-entry gate, with one log line either way.
+
+    Separate so the refusal is OBSERVABLE. A gate that returns False in
+    silence is indistinguishable from a signal that never arrived, and this
+    book has been bitten by exactly that ambiguity before.
+    """
+    from bcs import entry_executor as ee
+    allowed, why = ee.entries_allowed(log=lambda m: logger.warning('%s', m))
+    if not allowed:
+        logger.info("AUTO-ENTRY off for #%d %s (%s) -- sending the ticket",
+                    trade['id'], trade['stock'], why)
+    return allowed, why
+
+
+def _verify_entry(kite, trade: dict, out: dict, dry_run: bool = False) -> None:
+    """Ask the BROKER whether the position matches the record just written.
+
+    The exit path has had this since Feb-2026 (`reconcile_after_close`); entry
+    had nothing. Every stop level is computed from the RECORD, so a record
+    that does not match the position is a set of stops pointing at something
+    that is not there.
+
+    Read-only, never raises, never places an order.
+    """
+    if dry_run:
+        logger.info("[DRY RUN] entry verification skipped for #%d",
+                    trade['id'])
+        return
+    try:
+        positions = (kite.positions() or {}).get('net')
+    except Exception as e:
+        logger.warning("entry verification could not read positions: %s", e)
+        positions = None
+    v = capital.verify_entry(positions, trade)
+    if v['ok']:
+        logger.info("ENTRY VERIFIED #%d %s: the broker shows both legs at the "
+                    "recorded size", trade['id'], trade['stock'])
+        return
+    detail = '; '.join(v['problems'])
+    logger.error("ENTRY NOT VERIFIED #%d %s: %s", trade['id'],
+                 trade['stock'], detail)
+    _send_telegram(
+        "\u26A0 BCS %s #%d: entry recorded but NOT verified against the "
+        "broker.\n%s\nEvery stop is computed from the record. Check Kite now."
+        % (html.escape(str(trade['stock'])), trade['id'],
+           html.escape(detail)),
+        dry_run=dry_run)
+    if out.get('orphan'):
+        logger.error("ENTRY #%d also left an ORPHAN long: %s",
+                     trade['id'], out['orphan'])
+
+
 def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
                   price: float, dry_run: bool = False):
     """Build and open a first-class BCS from a triggered signal.
@@ -839,7 +993,15 @@ def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
                     trade['id'], trade['stock'], s['kind'], s['level'],
                     s['reason'])
     if not cfg.PAPER_MODE:
-        return bcs, None       # alert-only; the alert is the order ticket
+        # ── LIVE. Alert-only unless auto-entry is armed ──────────────────
+        #
+        # `entries_allowed` fails CLOSED, which is the opposite of the exit
+        # kill switch and correct for the opposite reason: there, a config
+        # error must not abandon the stops on a live book; here, it must not
+        # start opening positions. So the fall-through is the ticket, which is
+        # exactly what LIVE did before this branch existed.
+        fresh = _auto_enter_bcs(store, kite, trade, bcs, dry_run=dry_run)
+        return bcs, fresh      # fresh is None when the ticket is the answer
 
     try:
         fresh = store.mark_entered_bcs(trade['id'], bcs)
