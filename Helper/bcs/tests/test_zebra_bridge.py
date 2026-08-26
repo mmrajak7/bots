@@ -338,8 +338,19 @@ _LONG_BOOK = {'bid': 40.00, 'bid_qty': 1400, 'ask': 40.20, 'ask_qty': 1400,
               'ltp': 40.10, 'prev_close': 21.0}
 _SHORT_BOOK = {'bid': 10.05, 'bid_qty': 1400, 'ask': 10.30, 'ask_qty': 1400,
                'ltp': 10.20, 'prev_close': 7.6}
-_POS = [{'tradingsymbol': _S, 'quantity': -_QTY},
-        {'tradingsymbol': _L, 'quantity': _QTY}]
+def _pos():
+    """A FRESH position list per replay.
+
+    `TickBroker` mutates the dicts it is given as legs fill, so a module-level
+    list is drained by the first test that closes and every later replay then
+    starts with both legs already flat -- it reports "closed by another
+    process", places nothing, and an assertion on `kite.placed` fails for a
+    reason that has nothing to do with the code under test. Same family as
+    `feedback_fake_must_not_be_safer_than_production`: shared mutable state in
+    the harness inventing behaviour production does not have.
+    """
+    return [{'tradingsymbol': _S, 'quantity': -_QTY},
+            {'tradingsymbol': _L, 'quantity': _QTY}]
 
 #: Spot well through sl_spot 1319, held for many polls so no debounce saves us.
 _BREACH = [Tick(t, 1300.0, _LONG_BOOK, _SHORT_BOOK, 'spot far below sl_spot')
@@ -357,10 +368,10 @@ def _run(monkeypatch, trade, store_kind):
     """
     if store_kind == 'zebra':
         _, kite, _, spy = run_session(
-            monkeypatch, sm, trade, _BREACH, _DAY, _POS,
+            monkeypatch, sm, trade, _BREACH, _DAY, _pos(),
             dry_run=False, cohort=[trade])
         return kite, spy
-    _, kite, _, spy = run_session(monkeypatch, sm, trade, _BREACH, _DAY, _POS,
+    _, kite, _, spy = run_session(monkeypatch, sm, trade, _BREACH, _DAY, _pos(),
                                   dry_run=False)
     return kite, spy
 
@@ -408,3 +419,100 @@ def test_the_disarmed_stop_is_still_reported(monkeypatch):
     kite, spy = _run(monkeypatch, dict(COHORT_TRADE), 'zebra')
     assert '1319' in ''.join(str(x) for x in spy.sent) or not spy.sent, \
         'sl_spot vanished from the reporting as well as the triggering'
+
+
+# -- the TIME policy ---------------------------------------------------------
+#
+# zebra closes unconditionally N trading SESSIONS before expiry; the monitor
+# warns from E-5 and force-closes on EXPIRY DAY -- four sessions later. Once
+# `exits_managed_externally` makes zebra stand down, applying only the
+# monitor's own rule would silently DELETE a stop. A migration must not weaken
+# a rule by omission.
+
+def test_an_ordinary_trade_still_stops_on_expiry_day_only():
+    from datetime import date as _d
+    t = {'id': 1, 'stock': 'X', 'expiry': '2026-09-29'}
+    assert sm.time_stop_due(t, _d(2026, 9, 29)) is True
+    assert sm.time_stop_due(t, _d(2026, 9, 22)) is False
+
+
+def test_a_cohort_trade_stops_five_sessions_out():
+    from datetime import date as _d
+    t = {'id': 1, 'stock': 'X', 'expiry': '2026-09-29',
+         'time_policy': 'sessions_before_expiry', 'time_stop_sessions': 5}
+    # 2026-09-29 is a Tuesday: 22 Sep is 5 weekday sessions before it.
+    assert sm.sessions_to_expiry(t, _d(2026, 9, 22)) == 5
+    assert sm.time_stop_due(t, _d(2026, 9, 22)) is True
+    assert sm.time_stop_due(t, _d(2026, 9, 21)) is False
+
+
+def test_the_cohort_time_stop_is_earlier_than_the_expiry_day_one():
+    """The whole point. If these two ever agree, the handover has quietly
+    reverted the cohort to the weaker rule."""
+    from datetime import date as _d
+    cohort = {'expiry': '2026-09-29', 'time_policy': 'sessions_before_expiry',
+              'time_stop_sessions': 5}
+    plain = {'expiry': '2026-09-29'}
+    day = _d(2026, 9, 22)
+    assert sm.time_stop_due(cohort, day) and not sm.time_stop_due(plain, day)
+
+
+def test_a_broken_session_count_falls_back_to_expiry_day_not_to_never():
+    """A time stop that cannot be computed must still fire on expiry day. The
+    other direction is a position that rides into physical settlement."""
+    from datetime import date as _d
+    t = {'id': 1, 'stock': 'X', 'expiry': '2026-09-29',
+         'time_policy': 'sessions_before_expiry', 'time_stop_sessions': None}
+    assert sm.time_stop_due(t, _d(2026, 9, 22)) is False
+    assert sm.time_stop_due(t, _d(2026, 9, 29)) is True
+
+
+def test_the_adapter_stamps_the_session_count_zebra_measured():
+    """The N travels on the record, so the monitor never has to read zebra's
+    config to honour zebra's rule."""
+    from zebra import config as zcfg
+    assert za.ZEBRA_EXIT_POLICY['time_stop_sessions'] == zcfg.TIME_SL_DAYS
+    assert za.ZEBRA_EXIT_POLICY['time_policy'] == 'sessions_before_expiry'
+
+
+def test_the_cohort_time_stop_actually_force_closes_through_monitor_all(
+        monkeypatch):
+    """End to end, because the unit tests above only prove the PREDICATE.
+
+    The startup arming loop read `is_expiry_day` and nothing noticed: swapping
+    `time_stop_due` back for it left every test green, so the policy existed
+    and was never consulted by the code that runs. 2026-09-22 is a Tuesday,
+    five weekday sessions before the 29th — the day zebra's rule fires and the
+    monitor's expiry-day rule does not.
+    """
+    from datetime import date as _d
+    day = _d(2026, 9, 22)
+    trade = dict(COHORT_TRADE, expiry='2026-09-29', time_stop_sessions=5)
+    ticks = [Tick(t, 1360.0, _LONG_BOOK, _SHORT_BOOK, 'quiet, five sessions out')
+             for t in ('15:16:00', '15:16:10', '15:16:20')]
+    _c, kite, _s, _spy = run_session(monkeypatch, sm, trade, ticks, day, _pos(),
+                                     dry_run=False, cohort=[trade])
+    assert kite.placed, (
+        'the cohort time stop never fired: the position rode past the session '
+        'zebra would have closed it on, into the delivery-margin ramp')
+
+
+def test_an_ordinary_position_is_NOT_force_closed_five_sessions_out(
+        monkeypatch):
+    """Negative control. The three original books keep the expiry-day rule;
+    arming them five sessions early would close every one of them a week
+    before its time."""
+    from datetime import date as _d
+    day = _d(2026, 9, 22)
+    plain = {k: v for k, v in COHORT_TRADE.items()
+             if k not in ('spot_sl_enabled', 'trail_policy', 'time_policy',
+                          'time_stop_sessions', 'cohort', 'structure',
+                          'direction')}
+    plain['expiry'] = '2026-09-29'
+    ticks = [Tick(t, 1360.0, _LONG_BOOK, _SHORT_BOOK, 'quiet, five sessions out')
+             for t in ('15:16:00', '15:16:10', '15:16:20')]
+    _c, kite, _s, _spy = run_session(monkeypatch, sm, plain, ticks, day, _pos(),
+                                     dry_run=False)
+    assert kite.placed == [], (
+        'an ordinary BCS position was force-closed five sessions before '
+        f'expiry: {kite.placed}')

@@ -64,6 +64,7 @@ from kiteconnect import KiteConnect
 from common import option_symbols as _sym
 from common.option_symbols import check_leg_types
 from common import layered_config
+from bcs import exit_vet
 from bcs import order_journal
 from .trade_store import get_store
 from fallen_hero import get_store as get_fh_store
@@ -780,12 +781,19 @@ def is_spread_settled(now: Optional[float] = None) -> bool:
     return _resume_settle_at is None or now >= _resume_settle_at
 
 
-def is_expiry_day(trade: dict) -> bool:
-    """Check if today is the trade's expiry date."""
+def is_expiry_day(trade: dict, today: Optional[date] = None) -> bool:
+    """Check if today is the trade's expiry date.
+
+    `today` is injectable so `time_stop_due` can answer for a given date
+    without this branch quietly reading the wall clock while the other branch
+    honours the argument — a function that disagrees with its own parameter is
+    untestable off expiry day (`feedback_pin_the_wall_clock_in_tests`).
+    Every existing caller passes nothing and gets the old behaviour.
+    """
     try:
         expiry_str = trade.get('expiry', '')
         expiry_date = datetime.strptime(expiry_str, '%Y-%m-%d').date()
-        return date.today() == expiry_date
+        return (today or date.today()) == expiry_date
     except (ValueError, TypeError):
         return False
 
@@ -837,6 +845,73 @@ def sessions_to_expiry(trade: dict, today: Optional[date] = None) -> Optional[in
         if cur.weekday() < 5:
             sessions += 1
     return sessions
+
+
+def time_stop_due(trade: dict, today: Optional[date] = None) -> bool:
+    """Does this trade's TIME policy say close it today?
+
+    Two policies, and which one applies is a property of the TRADE:
+
+    * default (`None`) -- EXPIRY DAY itself. What the three original books have
+      always done: warn from E-5, force-close on the last day.
+    * `sessions_before_expiry` -- N trading SESSIONS before expiry,
+      unconditional. zebra's rule, and what the BCS cohort was measured with.
+      It fires EARLIER and is therefore the stricter of the two.
+
+    The rule has to travel with the record for the same reason `spot_sl_enabled`
+    does: `zebra/monitor.py` stands down for a cohort position once the order
+    path owns it (`exits_managed_externally`), and if this engine then applied
+    only its own expiry-day rule, the handover would quietly DELETE a stop that
+    fires four sessions earlier. A migration must not weaken a rule by omission.
+
+    A malformed session count falls back to the default rather than to "never":
+    a time stop that cannot be computed must still fire on expiry day.
+    """
+    if trade.get('time_policy') != 'sessions_before_expiry':
+        return is_expiry_day(trade, today)
+    try:
+        n = int(trade.get('time_stop_sessions'))
+    except (TypeError, ValueError):
+        log(f"  WARNING: #{trade.get('id')} {trade.get('stock')} has "
+            f"time_policy=sessions_before_expiry but "
+            f"time_stop_sessions={trade.get('time_stop_sessions')!r} — "
+            f"falling back to the expiry-day rule")
+        return is_expiry_day(trade, today)
+    if n < 0:
+        return is_expiry_day(trade, today)
+    left = sessions_to_expiry(trade, today)
+    # `left is None` means the expiry itself is unparseable, which
+    # `is_expiry_day` also reports as False. Nothing to stand on either way.
+    return left is not None and left <= n
+
+
+def arm_time_stop(trade: dict, key, expiry_trades: dict, label: str,
+                  note: str = '', today: Optional[date] = None) -> bool:
+    """Arm the force-close flag when this trade's TIME policy says today.
+
+    ONE call site for `time_stop_due`, deliberately. There were three -- the
+    startup sweep, the BCS mid-session init and the FH mid-session check -- and
+    a mutation reverting only the mid-session pair to `is_expiry_day` survived
+    the entire suite. The policy was honoured on the path the tests drive and
+    silently not on the other two, which is the same shape as the trail_state /
+    expiry_trades key mismatch: a rule applied in one place and quietly not in
+    its copy.
+
+    Returns True when it armed this call (False if already armed, or not due).
+    """
+    if key in expiry_trades or not time_stop_due(trade, today):
+        return False
+    expiry_trades[key] = True
+    early = (trade.get('time_policy') == 'sessions_before_expiry'
+             and not is_expiry_day(trade, today))
+    why = 'TIME STOP' if early else 'EXPIRY DAY'
+    tail = f" ({note})" if note else ''
+    when = EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')
+    log(f"  *** {label} #{trade['id']} {trade['stock']}: {why}{tail}! "
+        f"Force-close by {when} ***")
+    send_telegram(f"{label} #{trade['id']} {trade['stock']}: {why}{tail}. "
+                  f"Will force-close by {when}.")
+    return True
 
 
 def delivery_exposure(trade: dict, spot: float) -> dict:
@@ -1526,7 +1601,8 @@ URGENT_CLOSE_REASONS = ('SL_SPOT', 'EXPIRY_FORCE_CLOSE')
 def close_spread(kite: KiteConnect, trade: dict, spot: float,
                  reason: str, dry_run: bool, store=None,
                  strategy_label: str = 'BCS',
-                 reverify_sl: Optional[float] = None):
+                 reverify_sl: Optional[float] = None,
+                 quote: Optional[dict] = None):
     """
     Close the full spread. Short FIRST, then long (margin rules).
     Works for both BCS and BPS (same 2-leg structure).
@@ -1545,6 +1621,12 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
     order, one FRESH quote is taken after REVERIFY_DELAY_SEC; if the fresh
     spread is reliable and back ABOVE the threshold (or is unreliable), the
     close aborts. Kills single-poll artifacts that healed. (2026-07-24)
+
+    quote: the `get_spread_value` dict the trigger fired on, passed through to
+    the exit vet so Claude judges the book that caused this, not a fresh one.
+    Superseded by the re-verify quote when there is one. Omitting it is safe
+    but pessimistic: a missing book reads as unreliable, which is the one state
+    that always earns a vet.
 
     Urgency: SL_SPOT / EXPIRY_FORCE_CLOSE closes are URGENT — they may pay
     through unreliable books (bounded by anchor caps until the final
@@ -1611,6 +1693,25 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
                           f"{fresh['spread']:.2f} > SL {reverify_sl:.2f}. NOT closed (quote artifact).")
             return 'ABORT'
         log(f"  RE-VERIFY CONFIRMED: fresh spread {fresh['spread']:.2f} <= {reverify_sl:.2f}. Proceeding.")
+        # The freshest book wins. The vet is being asked "could this price be
+        # a lie", and the price we are about to trade on is this one.
+        quote = fresh
+
+    # ── Claude exit vet — AFTER the deterministic guards, BEFORE the lock ──
+    #
+    # After the guards so an exit they were going to abort never spends an
+    # agent, and so the agent judges the re-verified book. Before the lock for
+    # the same reason zebra calls it before `set_alert_flag`: that flag is
+    # consume-once and burning it on an exit that does not execute strands the
+    # exit permanently.
+    #
+    # 'ABORT', not False: nothing has been placed and the trade is still open,
+    # which is exactly what the caller's ABORT branch is for. It re-arms the
+    # trigger, so a `wait` costs one confirm cycle and a `hold` re-nags at most
+    # once a day until the human answers.
+    if not exit_vet.exit_cleared(store, trade, reason, quote, spot,
+                                 dry_run=dry_run, log=log):
+        return 'ABORT'
 
     # ── Acquire close-lock (prevents concurrent close from another machine) ──
     close_lock_acquired = False
@@ -3401,11 +3502,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     # ── Expiry day warnings ──────────────────────────────────────────────
     expiry_trades = {}  # keyed by trade_key(), like every other state dict
     for t in all_trades:
-        if is_expiry_day(t):
-            strat = t['_strategy']
-            expiry_trades[trade_key(t)] = True
-            log(f"  *** {strat} #{t['id']} {t['stock']}: EXPIRY DAY! Force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
-            send_telegram(f"{strat} #{t['id']} {t['stock']}: EXPIRY DAY. Will force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
+        if arm_time_stop(t, trade_key(t), expiry_trades, t['_strategy']):
             continue
         # Not expiry day, but close enough that physical-delivery margin is
         # about to build. Every strategy here is physically settled, so all of
@@ -3566,10 +3663,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     # Initialize state for new trades added mid-session
                     if close_key not in trail_state:
                         trail_state[close_key] = new_trail_state(trade)
-                        if is_expiry_day(trade):
-                            expiry_trades[close_key] = True
-                            log(f"  {strat} #{tid} {stock}: EXPIRY DAY (added mid-session)")
-                            send_telegram(f"{strat} #{tid} {stock}: EXPIRY DAY (added mid-session). Force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
+                        arm_time_stop(trade, close_key, expiry_trades,
+                                      strat, note='added mid-session')
                     if close_key not in confirm_state:
                         confirm_state[close_key] = {'sl_spread': 0, 'sl_trail': 0}
                     if close_key not in blind_state:
@@ -3578,10 +3673,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         corrob_state[close_key] = {}
                 else:
                     # FH: check for new expiry-day trades added mid-session
-                    if close_key not in expiry_trades and is_expiry_day(trade):
-                        expiry_trades[close_key] = True
-                        log(f"  FH #{tid} {stock}: EXPIRY DAY (added mid-session)")
-                        send_telegram(f"FH #{tid} {stock}: EXPIRY DAY (added mid-session). Force-close by {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')}.")
+                    arm_time_stop(trade, close_key, expiry_trades, 'FH',
+                                  note='added mid-session')
 
                 # B9 + B12 — two failure classes, opposite responses.
                 #
@@ -3819,7 +3912,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                             f"(confirmed x{SL_SPOT_CONFIRM_POLLS}) ***")
                         closing_in_progress[close_key] = "SL_SPOT"
                         success = close_spread(kite, trade, spot, "SL_SPOT", dry_run,
-                                               store=trade_store, strategy_label=strat)
+                                               store=trade_store, strategy_label=strat,
+                                               quote=spread_data)
                         if success == 'ABORT':
                             closing_in_progress.pop(close_key, None)
                         else:
@@ -3855,7 +3949,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                             closing_in_progress[close_key] = "SL_SPREAD"
                             success = close_spread(kite, trade, spot, "SL_SPREAD", dry_run,
                                                    store=trade_store, strategy_label=strat,
-                                                   reverify_sl=sl_spread_val)
+                                                   reverify_sl=sl_spread_val,
+                                                   quote=spread_data)
                             if success == 'ABORT':
                                 closing_in_progress.pop(close_key, None)
                                 confirm['sl_spread'] = 0
@@ -3880,7 +3975,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                             closing_in_progress[close_key] = "SL_TRAIL"
                             success = close_spread(kite, trade, spot, "SL_TRAIL", dry_run,
                                                    store=trade_store, strategy_label=strat,
-                                                   reverify_sl=ts['trail'])
+                                                   reverify_sl=ts['trail'],
+                                                   quote=spread_data)
                             if success == 'ABORT':
                                 closing_in_progress.pop(close_key, None)
                                 confirm['sl_trail'] = 0
@@ -3902,7 +3998,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         log(f"\n  {strat} #{tid} {stock} *** TP HIT: {spot:.2f} {op} {target} ***")
                         closing_in_progress[close_key] = "TP"
                         success = close_spread(kite, trade, spot, "TP", dry_run,
-                                               store=trade_store, strategy_label=strat)
+                                               store=trade_store, strategy_label=strat,
+                                               quote=spread_data)
                         if success == 'ABORT':
                             closing_in_progress.pop(close_key, None)
                             abort_until[close_key] = time.time() + ABORT_COOLDOWN_SEC

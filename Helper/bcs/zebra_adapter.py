@@ -69,8 +69,14 @@ ZEBRA_EXIT_POLICY = {
     # spreads, which 2x-debit does not (43% of max gain at 30% d/w, 82% at 45%).
     'trail_policy': 'gain_anchored',
     # Trading SESSIONS before expiry, unconditional. Not the monitor's
-    # warn-from-E-5-then-force-close-on-expiry-day.
+    # warn-from-E-5-then-force-close-on-expiry-day, which fires FOUR SESSIONS
+    # LATER -- so without this the handover would silently delete a stop.
     'time_policy': 'sessions_before_expiry',
+    # The N, carried on the record rather than read from zebra's config by the
+    # monitor. Same rule as every other field here: the exit policy travels
+    # with the TRADE, so the engine holding it does not need to know which
+    # book it came from.
+    'time_stop_sessions': zcfg.TIME_SL_DAYS,
 }
 
 

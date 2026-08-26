@@ -1,5 +1,6 @@
 {
   "paper_mode": true,
+  "exits_managed_externally": false,
   "watch_gap_max": 0.05,
   "trigger_gap_max": 0.04,
   "stale_gap_min": 0.03,

@@ -227,6 +227,18 @@ _ALL_SCANNERS = [
 # ── Defaults ──────────────────────────────────────────────────────────────
 _DEFAULTS = {
     'paper_mode': True,          # PAPER: auto-enter on trigger + auto-close on exit signal
+    # Hand this book's EXITS to `bcs/spread_monitor.py`, the only code in the
+    # fleet that can place a real order. Cohort records only — everything else
+    # in this store is the dropped back ratio and no other engine can see it.
+    #
+    # Default FALSE, and it must stay false until the monitor is armed. The
+    # two switches move TOGETHER: `--dry-run` off the monitor's crontab line
+    # and this on. Turning this on alone leaves those positions with NO exit
+    # engine at all — the monitor would watch and place nothing while zebra
+    # stands aside — and nothing in either log would look wrong. Turning it on
+    # LATE is the safe direction: two engines racing is visible, an
+    # unmonitored position is not.
+    'exits_managed_externally': False,
     'entry_structure': 'bcs',    # What a triggered signal actually opens.
                                  # 'bcs'   — ONE record, structure='bcs', no
                                  #           shadow. The pipeline as of
@@ -675,6 +687,10 @@ def _strict_bool(key: str) -> bool:
 
 
 PAPER_MODE = _strict_bool('paper_mode')
+# `_strict_bool`, not a raw read, for the same reason PAPER_MODE is: this
+# decides which process closes real positions, and `"exits_managed_
+# externally": 0` must not be able to answer that question by accident.
+EXITS_MANAGED_EXTERNALLY = _strict_bool('exits_managed_externally')
 _raw_struct = str(_runtime['entry_structure']).strip().lower()
 if _raw_struct not in ('bcs', 'zebra'):
     logger.warning("entry_structure=%r is not 'bcs' or 'zebra' — falling back "

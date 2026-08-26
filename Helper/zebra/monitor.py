@@ -236,6 +236,34 @@ def _format_enter_alert(trade: dict, analysis: dict,
     return msg
 
 
+#: Exits `bcs/spread_monitor.py` takes over when it manages a position.
+#:
+#: `expiry` is deliberately ABSENT. That is not an exit rule -- it is
+#: `_settle_if_expired`, the terminal net that books a record whose expiry has
+#: PASSED and whose book has died. Nothing else can ever price that position,
+#: and leaving it `entered` forever bans its stock from the scanner. It stays
+#: here whatever else moves.
+EXTERNALLY_MANAGED_EXITS = frozenset({'tp', 'trail', 'spot_sl', 'debit_sl',
+                                      'time'})
+
+
+def _exits_external(trade: dict) -> bool:
+    """True when another engine owns this position's exits.
+
+    Two conditions, both required. `EXITS_MANAGED_EXTERNALLY` is the operator's
+    switch, thrown in the same step `--dry-run` comes off the monitor's crontab
+    line; `in_cohort` is the scope, because the monitor only ever loads cohort
+    records (`bcs/zebra_adapter.py`) and the other 450 rows in this store have
+    no other engine watching them at all.
+
+    Getting the AND wrong in the permissive direction is loud -- two engines
+    closing one position shows up immediately. Getting it wrong the other way
+    is silent: a position with NO exit engine looks exactly like a quiet one.
+    So the cohort test is here rather than left to the caller.
+    """
+    return cfg.EXITS_MANAGED_EXTERNALLY and in_cohort(trade)
+
+
 def _exit_cleared(store, trade: dict, kind: str, quote: dict, spot: float,
                   dry_run: bool = False) -> bool:
     """True if this exit may fire now. False = wait or hold.
@@ -1787,6 +1815,23 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
     """
     if not cfg.PAPER_MODE:
         return None
+    if reason in EXTERNALLY_MANAGED_EXITS and _exits_external(trade):
+        # THE BACKSTOP, and the reason it lives here rather than only at the
+        # call sites: every close in this module funnels through this function,
+        # so a future exit branch cannot forget it. The cascade in
+        # `check_entered` stands down earlier to save the wasted vet and alert;
+        # this catches anything that gets past it.
+        #
+        # Booking a paper exit on a position another engine holds for real is
+        # the worst outcome available here -- the record leaves `get_entered()`,
+        # so the monitor's `get_open_trades()` stops returning it, and a LIVE
+        # position goes unwatched with nothing anywhere reporting a problem.
+        logger.warning(
+            "PAPER close DECLINED #%d %s reason=%s: exits are managed by "
+            "spread_monitor for this trade - booking it here would hide a "
+            "live position from the engine that owns it",
+            trade['id'], trade['stock'], reason)
+        return None
     if trade.get('status') != 'entered':
         return None  # already closed by an earlier trigger this cycle
     if mid is None or not reliable:
@@ -2413,6 +2458,28 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                         "DEFER #%d %s: no usable book (%s) — spot=%.2f, nothing "
                         "booked this cycle", tid, stock,
                         sq.get('rejected') or sq['reason'] or 'no_quote', spot)
+                continue
+
+            # Stand down: another engine owns this position's exits.
+            #
+            # Placed AFTER the POLL line and the MFE/corroboration writes and
+            # BEFORE the cascade, deliberately. Measurement is not an exit
+            # decision: the peak, the spot-corroboration reference and the
+            # forensic POLL line are this book's research record and must keep
+            # accruing whoever is holding the trigger. What stops is deciding.
+            #
+            # Skipping the whole cascade rather than only the closes also stops
+            # the duplicate work that would otherwise be invisible: two engines
+            # raising vet requests against ONE shared marker per (trade, kind),
+            # double-incrementing its defer count and escalating to the human
+            # twice as fast, plus two Telegrams per trigger.
+            #
+            # `_settle_if_expired` above is untouched -- see
+            # EXTERNALLY_MANAGED_EXITS.
+            if _exits_external(trade):
+                logger.info(
+                    "EXITS EXTERNAL #%d %s: spread_monitor owns this "
+                    "position's exits - measured, not acted on", tid, stock)
                 continue
 
             # ── TP ──────────────────────────────────────────────────────────
