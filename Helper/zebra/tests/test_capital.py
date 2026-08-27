@@ -442,16 +442,21 @@ def test_compounding_is_read_strictly():
 #: Keys where the code fallback and the tracked defaults file disagree.
 #:
 #: They are not equivalent: `config/zebra_config.defaults.json` is a real
-#: config LAYER and wins at runtime, so for these three the `_DEFAULTS` value
-#: in `config.py` is dead and reading it gives the wrong answer. All three
-#: predate the capital work and are left as they are — the effective values
-#: (55 / 0.015 / 5) are the ones the book has been running on.
+#: config LAYER and wins at runtime, so for these two the `_DEFAULTS` value in
+#: `config.py` is dead and reading it gives the wrong answer. Both predate the
+#: capital work and are left as they are pending an owner decision — the
+#: effective values (0.015 / 5) are the ones the book has been running on.
+#:
+#: `max_dte` came OFF this list on 2026-08-27: the owner settled it at 45, the
+#: documented cohort rule and the value `_DEFAULTS` already carried. The 55 in
+#: the tracked file was snapshotted out of the live overlay by the config-split
+#: commit rather than chosen. Verified before changing it: all 12 cohort
+#: entries sit at 34-41 DTE, so no existing record is affected.
 #:
 #: The list exists so a NEW divergence fails here instead of being discovered
 #: the way these were: by a mutation that changed a default and altered
 #: nothing.
 KNOWN_DEFAULT_DRIFT = {
-    'max_dte': (45, 55),
     'max_leg_spread_pct': (0.01, 0.015),
     'time_sl_days_before_expiry': (4, 5),
 }
@@ -467,6 +472,42 @@ def test_the_two_default_sources_do_not_drift_further():
         'the code fallback and the tracked defaults file disagree on a key '
         'that is not on the known list. The FILE wins at runtime, so the '
         'code default is dead and misleading to read: %r' % (drift,))
+
+
+def test_max_dte_is_45_in_BOTH_sources():
+    """Owner decision, 2026-08-27: 45, the documented cohort rule.
+
+    Pinned in both places and named on its own, because dropping the key from
+    `KNOWN_DEFAULT_DRIFT` above only asserts that the two AGREE — it does not
+    say on what. Agreeing at 55 would pass that test and quietly widen the
+    entry window past the rule the cohort was measured under.
+    """
+    import json
+    tracked = json.loads(
+        (HELPER / 'config' / 'zebra_config.defaults.json').read_text())
+    assert tracked['max_dte'] == 45
+    assert cfg._DEFAULTS['max_dte'] == 45
+
+
+def test_the_vetting_master_switch_is_in_the_TRACKED_config():
+    """`vet_enabled` lived only in the Pi's untracked overlay.
+
+    So the master switch for the entire Claude vetting layer could not be
+    read, reviewed or flipped from git, and a routine overlay rebuild would
+    have disarmed it with no trace — after which `vet.exit_gate` returns
+    'proceed' for every exit and every entry alert goes out unvetted.
+
+    Asserted on the FILE, not on `cfg.VET_ENABLED`: the suite pins that
+    constant False (see conftest `_pinned_vet_flag`), so reading it here would
+    assert the fixture rather than the config.
+    """
+    import json
+    tracked = json.loads(
+        (HELPER / 'config' / 'zebra_config.defaults.json').read_text())
+    assert tracked.get('vet_enabled') is True, \
+        'the vetting master switch is absent from the tracked defaults'
+    assert cfg._DEFAULTS['vet_enabled'] is True, \
+        'the code fallback disagrees with the tracked file on vet_enabled'
 
 
 def test_the_capital_keys_agree_across_both_sources():

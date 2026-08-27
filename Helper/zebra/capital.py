@@ -147,7 +147,16 @@ def limits(trades: List[dict]) -> Limits:
 #: Statuses that are still holding money. `closing` counts: the close lock is
 #: taken but the position is not out of the market, and treating it as free
 #: capital would let a replacement be sized against money still committed.
-HOLDING = ('entered', 'closing')
+#:
+#: `partial_close` counts for a STRONGER version of the same reason. It is the
+#: state a close is frozen in when a leg failed after orders went out: the
+#: position is live at the broker, nothing is monitoring it, and it is waiting
+#: on a human. Reading its rupees as FREE was the worst of the three readings —
+#: the capital is not merely committed, it is committed to a position whose
+#: size nobody currently knows. `max_open_per_stock` counts from this same
+#: tuple, so omitting it also stopped a stranded position from blocking a
+#: replacement on the same stock.
+HOLDING = ('entered', 'closing', 'partial_close')
 
 
 def position_capital(trade: dict) -> Optional[float]:

@@ -157,9 +157,21 @@ def test_the_entry_leg_book_is_persisted(tmp_path, monkeypatch):
         assert k in t, f"{k} was dropped — the trade is un-costable"
 
 
-def test_the_zebra_entry_path_hands_over_its_leg_book():
+def test_the_live_entry_path_hands_over_its_leg_book():
     """Wiring. A field the live entry path never passes is a field that is
-    never stored, however well `_apply_entry` handles it."""
-    src = (HELPER / 'zebra' / 'monitor.py').read_text(encoding='utf-8')
-    assert "'long_ask_entry': best.get('long_ask')" in src
-    assert "'short_bid_entry': best.get('short_bid')" in src
+    never stored, however well `_apply_entry` handles it.
+
+    Retargeted 2026-08-27: this used to read `best.get(...)` out of the
+    back-ratio entry branch in `monitor.py`. That structure was
+    decommissioned and the branch removed; the surviving entry path is
+    `mark_entered_bcs`, so the property is pinned where it now lives.
+    179 old zebra records are permanently un-costable for exactly this
+    omission, which is why it is pinned at all."""
+    src = (HELPER / 'zebra' / 'trade_store.py').read_text(encoding='utf-8')
+    assert "'long_ask_entry': bcs.get('long_ask')" in src
+    assert "'long_bid_entry': bcs.get('long_bid')" in src
+    assert "'short_ask_entry': bcs.get('short_ask')" in src
+    assert "'short_bid_entry': bcs.get('short_bid')" in src
+    mon = (HELPER / 'zebra' / 'monitor.py').read_text(encoding='utf-8')
+    assert "best.get('long_ask')" not in mon, \
+        'the retired back-ratio entry path is back'

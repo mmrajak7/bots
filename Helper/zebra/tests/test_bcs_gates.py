@@ -289,7 +289,9 @@ def test_no_telegram_formatter_for_suppression_remains():
 def test_live_alerts_still_escape_interpolated_tags():
     from zebra import monitor
     import inspect
-    for fn in (monitor._format_enter_alert, monitor._format_bcs_enter_alert):
+    # `_format_enter_alert` was retired on 2026-08-27 with the back ratio and
+    # now raises, so there is one live ticket left to check.
+    for fn in (monitor._format_bcs_enter_alert,):
         assert 'html.escape' in inspect.getsource(fn), fn.__name__
 
 

@@ -6,6 +6,8 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
+
 from common import layered_config
 
 logger = logging.getLogger(__name__)
@@ -30,9 +32,22 @@ DECISIONS_FILE = LOG_DIR / 'zebra_decisions.json'
 DECISIONS_LOCK = LOG_DIR / 'zebra_decisions.lock'
 
 # ── Claude vetting layer ──────────────────────────────────────────────────
-# Master switch. OFF by default: the layer ships dark and is enabled explicitly
-# once the CLI is authenticated on the Pi and the prompt has been exercised.
-# With this False, zebra behaves exactly as it did before the layer existed.
+# Master switch. ON by default since 2026-08-27, and the default now agrees
+# with `config/zebra_config.defaults.json`, which is TRACKED.
+#
+# It shipped dark (default False, key absent from the tracked file), so the ON
+# state existed only in the Pi's untracked overlay: the master switch for the
+# whole layer could not be read, reviewed or flipped from git, and a routine
+# overlay rebuild would have disarmed it silently. Silently is the operative
+# word — with the flag False `vet.exit_gate` returns 'proceed' unconditionally
+# and every entry alert goes out unvetted, which looks exactly like a healthy
+# system.
+#
+# True is not an arming step and cannot cause an unvetted entry: the entry path
+# fails CLOSED on this layer (no verdict, no entry), so a broken CLI holds
+# signals rather than releasing them. Exits fail OPEN on the vet timeout, back
+# onto the deterministic guards. What changes is only that the layer can no
+# longer vanish without anyone noticing.
 # (VET_ENABLED is exported further down — it reads zebra_config.json, which is
 # not loaded yet at this point in the module.)
 # CLI ONLY — never the Anthropic API/SDK. The Pi is authenticated once
@@ -484,7 +499,7 @@ _DEFAULTS = {
     'enabled_timeframes': ['monthly', 'weekly'],
     'st_period': 10,
     'st_multiplier': 3,
-    'vet_enabled': False,        # Claude vetting layer master switch. Lives HERE
+    'vet_enabled': True,         # Claude vetting layer master switch. Lives HERE
                                  # rather than env-only so it cannot be ON in the
                                  # cron and OFF in a manual `python -m zebra run`
                                  # — a half-enabled fleet is worse than a dark
@@ -493,6 +508,11 @@ _DEFAULTS = {
                                  # vetted process is deliberately holding.
                                  # ZEBRA_VET_ENABLED still overrides, for a
                                  # one-off test without editing config.
+                                 # True since 2026-08-27 and MIRRORED in the
+                                 # tracked defaults file, so the two sources
+                                 # agree and the switch is auditable from git.
+                                 # See the block comment at the top of this
+                                 # module for why ON is the safe default here.
     'veto_shadow_days': 30,      # Horizon for scoring a VETOED signal. A veto
                                  # blocks a trade that never happens, so without
                                  # a shadow the layer's most important decisions
@@ -736,10 +756,27 @@ PAPER_MODE = _strict_bool('paper_mode')
 # decides which process closes real positions, and `"exits_managed_
 # externally": 0` must not be able to answer that question by accident.
 EXITS_MANAGED_EXTERNALLY = _strict_bool('exits_managed_externally')
+# DECOMMISSIONED 2026-08-27 (owner): the back-ratio structure — BUY 2x ITM +
+# SELL 1x ATM — is retired. `entry_structure` is now SINGLE-VALUED: 'bcs' is
+# the only accepted value and anything else, including the old 'zebra', is
+# refused here rather than routed to code that no longer exists.
+#
+# The KEY is deliberately kept. Removing a config key is the owner's call, not
+# a side effect of a code change, and an unknown-key preflight would flag its
+# disappearance on the Pi. Keeping it also means the refusal is LOUD: an
+# overlay still saying 'zebra' logs an error every start-up instead of silently
+# behaving as 'bcs'.
+_ENTRY_STRUCTURES = ('bcs',)
 _raw_struct = str(_runtime['entry_structure']).strip().lower()
-if _raw_struct not in ('bcs', 'zebra'):
-    logger.warning("entry_structure=%r is not 'bcs' or 'zebra' — falling back "
-                   "to %r", _runtime['entry_structure'],
+if _raw_struct == 'zebra':
+    logger.error("entry_structure='zebra' is RETIRED — the back-ratio "
+                 "structure was decommissioned on 2026-08-27 and its entry, "
+                 "pricing and alert paths are gone. Using 'bcs'. Remove the "
+                 "key from the overlay, or set it to 'bcs'.")
+    _raw_struct = 'bcs'
+elif _raw_struct not in _ENTRY_STRUCTURES:
+    logger.warning("entry_structure=%r is not one of %s — falling back to %r",
+                   _runtime['entry_structure'], _ENTRY_STRUCTURES,
                    _DEFAULTS['entry_structure'])
     _raw_struct = _DEFAULTS['entry_structure']
 ENTRY_STRUCTURE = _raw_struct
@@ -891,6 +928,85 @@ ST_MULTIPLIER = _num('st_multiplier')
 _vet_env = os.environ.get('ZEBRA_VET_ENABLED', '').strip()
 VET_ENABLED = (_vet_env.lower() in ('1', 'true', 'yes') if _vet_env
                else bool(_runtime['vet_enabled']))
+
+
+#: Statuses that mean rupees and legs are live for a cohort record. `closing`
+#: and `partial_close` count: a position half-way out of the market is the
+#: LAST one you want judged by a layer nobody noticed had gone.
+OPEN_COHORT_STATUSES = ('entered', 'closing', 'partial_close')
+
+
+def open_cohort_positions() -> Optional[int]:
+    """Best-effort count of open cohort positions. None = could not tell.
+
+    Reads the local trade file directly rather than going through
+    `zebra.trade_store.get_store()`, for two reasons: that module imports this
+    one (a circular import at module scope), and its `initialize()` reaches
+    for Google Drive — neither belongs in a config import.
+
+    Never raises. This exists to decorate a log line; a missing or malformed
+    book must not stop the process that was about to say so.
+    """
+    try:
+        with open(LOCAL_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        trades = data if isinstance(data, list) else data.get('trades', [])
+        return sum(1 for t in trades
+                   if isinstance(t, dict)
+                   and t.get('status') in OPEN_COHORT_STATUSES
+                   and t.get('cohort') == COHORT_START)
+    except Exception:
+        return None
+
+
+def vet_state_line(enabled: bool, open_cohort: Optional[int]) -> tuple:
+    """(log level, message) for where the vetting master switch resolved.
+
+    A pure function so the WARNING case can be asserted without arranging a
+    disarmed box. The level is the point of it: `vet_enabled` used to live
+    only in the Pi's untracked overlay, so the layer could disappear in a
+    routine overlay rebuild and nothing anywhere would say a word — while
+    `exit_gate` returned 'proceed' unvetted on every exit.
+
+    UNKNOWN open-position count warns like a non-zero one. "We could not look"
+    must never render as "we looked and it is fine".
+    """
+    src = ('the ZEBRA_VET_ENABLED env var' if _vet_env
+           else 'config (zebra_config.defaults.json <- zebra_config.json)')
+    if enabled:
+        return 'info', ('Claude vetting layer ENABLED (resolved from %s)' % src)
+    tail = ('Entries are unvetted and vet.exit_gate() returns "proceed" for '
+            'every exit. This is the DARK state, and it looks identical to a '
+            'healthy one from the outside.')
+    if open_cohort is None:
+        return 'warning', (
+            'Claude vetting layer DISABLED (resolved from %s) and the cohort '
+            'book could not be read, so whether positions are open is UNKNOWN. '
+            '%s' % (src, tail))
+    if open_cohort > 0:
+        return 'warning', (
+            'Claude vetting layer DISABLED (resolved from %s) with %d open '
+            'cohort position(s). %s' % (src, open_cohort, tail))
+    return 'info', (
+        'Claude vetting layer DISABLED (resolved from %s); no cohort '
+        'positions are open. %s' % (src, tail))
+
+
+def _log_vet_state() -> None:
+    """Say where the switch resolved. Called at import, which is startup for
+    every process in this fleet — cron run, manual CLI and monitor alike, so
+    none of them can be dark without saying so in its own log.
+
+    The cohort book is read only in the DISABLED branch, the one where the
+    count changes the level, so the healthy path costs nothing.
+    """
+    level, msg = vet_state_line(
+        VET_ENABLED, None if VET_ENABLED else open_cohort_positions())
+    getattr(logger, level)('%s', msg)
+
+
+_log_vet_state()
+
 EXIT_VET_TTL_SEC = _int('exit_vet_ttl_sec')
 EXIT_HOLD_TTL_SEC = _int('exit_hold_ttl_sec')
 VETO_SHADOW_DAYS = _int('veto_shadow_days')

@@ -34,10 +34,13 @@ record and the monitor reads it from there.
 """
 from __future__ import annotations
 
+import logging
 from typing import List, Optional
 
 from zebra import config as zcfg
 from zebra.trade_store import in_cohort
+
+logger = logging.getLogger(__name__)
 
 #: zebra field -> the name `spread_monitor` reads. Renames only; nothing here
 #: computes. A translation layer that derives a number can disagree with the
@@ -101,6 +104,56 @@ def map_trade(t: dict) -> dict:
     return out
 
 
+def _filled(v) -> Optional[float]:
+    """A fill price, or None when the monitor had none to report.
+
+    `_close_spread_inner` initialises both fill variables to 0.0 and the
+    ALREADY_FLAT path leaves them there when `_find_last_fill_price` finds
+    nothing in the order history. Zero is therefore "no price", not "traded at
+    zero" — and persisting it under `price` would hand `zebra/fees.py` a
+    fabricated book: it stops falling back to its estimate the moment it finds
+    a price on both legs, so a zero would silently zero out the STT on the leg
+    where STT actually lands. A missing price must LOOK missing.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def _leg(price: Optional[float]) -> dict:
+    """One leg of the persisted exit book."""
+    return {'price': price, 'source': 'fill' if price is not None else None}
+
+
+def _warn_if_unrecognised(reason: str, trade_id) -> None:
+    """Say so, loudly, if this engine just emitted a reason no reader knows.
+
+    The bug this closes was silent drift: the monitor's five reason strings
+    meant nothing to `zebra.outcomes`, so a real stop scored as "no signal" and
+    a take-profit cleared the arming gate. Catching it here puts the complaint
+    next to the exit that caused it, in the log of the run that placed the
+    order, instead of leaving it to be inferred from a gate weeks later.
+
+    Wrapped whole. This is OBSERVABILITY sitting inside the only code path in
+    the fleet that can place a real order, and an observability check that can
+    raise is a new way to fail booking an exit that has already happened at the
+    broker. It may complain; it may never interfere.
+    """
+    try:
+        from zebra.outcomes import classify
+        if not classify(reason)['known']:
+            logger.warning(
+                'Exit reason %r for cohort #%s is not in '
+                'zebra.outcomes._EXIT_KIND. It is being STORED verbatim (that '
+                'is correct — the record is forensic), but every reader will '
+                'count it as nothing: no signal-quality label, and no credit '
+                'at the arming gate. Add it to the map.', reason, trade_id)
+    except Exception as e:                       # pragma: no cover - never fatal
+        logger.debug('exit-reason vocabulary check skipped: %s', e)
+
+
 class ZebraStoreAdapter:
     """`ZebraStore` wearing the BCS store interface. Cohort records only."""
 
@@ -121,8 +174,38 @@ class ZebraStoreAdapter:
                 if in_cohort(t)]
 
     def get_closing_trades(self) -> List[dict]:
+        """Records stranded mid-close by a crash. RECOVERABLE — the sweep in
+        `monitor_all` puts each one back to 'entered'.
+
+        Deliberately NOT including 'partial_close'. The sweep calls
+        `recover_closing_trade` on everything this returns and announces
+        "Recovered from 'closing'. Re-monitoring."; the store refuses that
+        transition for a frozen record, so widening this tuple would produce a
+        daily Telegram claiming a recovery that did not happen. A frozen record
+        is a DIFFERENT fact and gets its own method below.
+        """
         return [map_trade(t) for t in self._store.load_trades()
                 if t.get('status') == 'closing' and in_cohort(t)]
+
+    def get_frozen_trades(self) -> List[dict]:
+        """Cohort records frozen at 'partial_close' — live legs, no monitor.
+
+        This is the state a close lands in when a leg failed AFTER orders went
+        out: the short may be flat and the long not, or the book may be the
+        flipped Feb-2026 shape. It is terminal by design — the position needs a
+        human at the broker, and no automated path may put orders on top of it.
+
+        What it must never be is INVISIBLE. `get_entered` skips it, so it
+        leaves the monitored book; `get_closing_trades` skips it, so the
+        crash-recovery sweep never mentions it; and until this method existed
+        nothing in the bridge could name it at all. An unmonitored live
+        position that nobody is told about is the failure that has cost real
+        money here twice.
+
+        Read-only, and no caller may treat these as open positions.
+        """
+        return [map_trade(t) for t in self._store.load_trades()
+                if t.get('status') == 'partial_close' and in_cohort(t)]
 
     def find_open_trade(self, stock: str, trade_id: Optional[int] = None):
         for t in self.get_open_trades():
@@ -157,13 +240,70 @@ class ZebraStoreAdapter:
         own vocabulary (SL_SPREAD, TP, ...) lowercased to match the store's --
         deliberately WITHOUT a `paper:` prefix, because a record closed through
         this path was closed by a real order.
+
+        THE KEY NAMES ARE THE MONITOR'S, and they are asserted by
+        `test_the_adapter_reads_the_keys_the_monitor_actually_writes`. Read
+        `bcs/spread_monitor.py`, not this docstring, if they ever move: every
+        `exit_data` dict it builds (the ALREADY_FLAT recovery path at
+        `:2024` and the normal close path at `:2227`) carries
+
+            exit_spot, exit_reason, exit_spread, short_fill, long_fill
+
+        and NOTHING ELSE this method needs. It has never written `exit_value`
+        or a bare `reason`, which is what this used to read: both `.get()`s
+        returned None on every real call, so `exit_debit=None` sent
+        `_apply_exit` down its "structure went to -debit" branch and booked
+        MAX LOSS for every cohort exit — take-profits included — under
+        `exit_reason='unknown'`. A silent -100% on a winner is worse than the
+        crash it would have replaced, which is why this and the `mark_exited`
+        precondition had to ship together.
+
+        THE REASON IS STORED VERBATIM (lowercased), NOT NORMALISED. It is
+        tempting to translate `SL_SPREAD` to zebra's `debit_sl` right here and
+        give every reader one vocabulary — and it would be wrong. The record is
+        FORENSIC: `already_flat_tp` says the monitor found both legs flat and
+        recovered the price from order history rather than transacting it, and
+        `expiry_force_close` says the 15:15 deadline fired, not that time ran
+        out. Normalising at the write boundary destroys those facts in the one
+        artefact that survives the process, and an option book cannot be
+        reconstructed after the fact. Translation belongs at the READ boundary,
+        where `zebra.outcomes.classify` does it from a single map.
+
+        What DOES belong here is noticing when this engine emits a string that
+        map has never heard of, at the moment it is written rather than weeks
+        later when someone reads a gate. Detection only.
         """
+        # THE EXIT BOOK. The monitor reports the two fills as scalars; the
+        # store persists a leg dict, and `zebra/fees.py:144` costs the exit
+        # from `exit_legs[side]['price']` when it is there and falls back to a
+        # decay estimate when it is not. These are REAL FILLS — the best exit
+        # prices this system will ever hold — so they go in under 'price' and
+        # the net figure stops being an estimate for bridged closes.
+        #
+        # An explicit `exit_legs` in exit_data wins: a caller that assembled a
+        # full book knows more than two scalars do.
+        legs = exit_data.get('exit_legs')
+        if not legs:
+            short_fill = _filled(exit_data.get('short_fill'))
+            long_fill = _filled(exit_data.get('long_fill'))
+            if short_fill is not None or long_fill is not None:
+                # No symbols here on purpose. They are not in `exit_data` --
+                # reading a key the producer does not write is the exact defect
+                # this method just had, and a `None` symbol in the persisted
+                # book is worse than no symbol at all. The record already
+                # carries `long_symbol` / `short_symbol`.
+                legs = {
+                    'long': _leg(long_fill),
+                    'short': _leg(short_fill),
+                }
+        reason = str(exit_data.get('exit_reason', 'unknown')).lower()
+        _warn_if_unrecognised(reason, trade_id)
         return self._store.mark_exited(
             trade_id,
             exit_spot=exit_data.get('exit_spot'),
-            exit_debit=exit_data.get('exit_value'),
-            reason=str(exit_data.get('reason', 'unknown')).lower(),
-            exit_legs=exit_data.get('exit_legs'))
+            exit_debit=exit_data.get('exit_spread'),
+            reason=reason,
+            exit_legs=legs)
 
     def update_trade_fields(self, trade_id: int, **fields):
         return self._store.update_trade_fields(trade_id, **fields)

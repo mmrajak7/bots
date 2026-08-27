@@ -7,7 +7,14 @@ Three jobs per cycle:
      If gap >= WATCH_GAP_MAX*1.2 (drifted away), cancel.
   3. Check ENTERED trades: TP / SPOT SL / DEBIT SL / TIME alerts.
 
-User executes manually and uses `zebra enter ID ...` / `zebra close ID ...`.
+Entry and exit are each gated by their own switch, off by default, falling
+back to a manual step when off or refused -- never alert-only unconditionally:
+  - Entry: `_auto_enter_bcs` (armed by `cfg.AUTO_ENTRY`), else the alert is
+    the order ticket and the user runs `zebra enter ID ...`.
+  - Exit: in PAPER mode `_paper_auto_close` always books the trigger; in LIVE
+    mode `_exits_external` (armed by `cfg.EXITS_MANAGED_EXTERNALLY` AND
+    cohort membership) hands the close to `bcs/spread_monitor.py`'s real
+    order path, else it is an alert and the user runs `zebra close ID ...`.
 """
 
 from __future__ import annotations
@@ -21,6 +28,8 @@ from typing import Optional
 
 import requests
 
+from common import kite_errors
+
 from . import capital
 from . import config as cfg
 from . import events as events_mod
@@ -33,6 +42,7 @@ from . import review as review_mod
 from . import strikes as strikes_mod
 from . import vet as vet_mod
 from .scanner import _get_kite, get_ltp, compute_st_for_stock, validate_and_add
+from playbook.magnet import scanner as scanner_mod
 from .trade_store import ZebraStore, get_store, in_cohort
 
 logger = logging.getLogger(__name__)
@@ -157,84 +167,27 @@ def _alerts_enabled(trade: dict) -> bool:
 
 def _format_enter_alert(trade: dict, analysis: dict,
                         bcs: Optional[dict] = None) -> str:
-    """Build the ENTER alert — the click-copy ORDER TICKET.
+    """RETIRED 2026-08-27 — the back-ratio order ticket.
 
-    Under `ENTRY_STRUCTURE == 'bcs'` (the pipeline since 2026-08-12) the ticket
-    is the SPREAD, because that is the only structure the engine opens. The
-    zebra back-ratio branch below is kept for the 'zebra' setting and for the
-    15 legacy positions still running that structure — it is not dead code.
+    This rendered the BUY 2x ITM / SELL 1x ATM back ratio from
+    `analysis['best']`. The owner decommissioned that structure; `analyze()`
+    no longer produces a `best`, so every call would have fallen into the old
+    "ZEBRA NO-PAIR" arm and Telegrammed a failure notice about a perfectly
+    healthy signal — a dead branch still talking to the operator, which is
+    precisely the shape this whole change exists to remove. (It had already
+    done that once: the `not bcs` fallback of a dead BCS branch here
+    Telegrammed "NO SPREAD" about signals that had a good spread.)
 
-    In the zebra branch the picker chose its pair as the best balance of:
-    passes liquidity gates, NetExt ≤ 0 (theta-OK), BE near spot, lowest
-    capital_per_lot.
+    It raises rather than returning a caption, and it is not deleted, so that
+    a caller reintroduced by a merge fails loudly instead of sending a wrong
+    ticket. The live ticket is `_format_bcs_enter_alert`.
+
+    Historical records opened as back ratios are unaffected: they are read
+    from the store, not re-rendered through here.
     """
-    stock = trade['stock']
-    direction = trade['direction']
-    spot = analysis['spot']
-    st_val = trade['st_value']
-    # Magnet gap: how far the price is from the ST attractor.
-    gap = analysis.get('current_gap_pct', abs(spot - st_val) / st_val * 100)
-    expiry = analysis['expiry']
-    dte = analysis['dte']
-    lot_size = analysis['lot_size']
-    pull_dir = 'up to' if direction == 'CE' else 'down to'
-
-    best = analysis.get('best')
-    if not best:
-        # No tradeable pair (all candidates failed gates). Surface this clearly.
-        return (
-            f"⚠ <b>ZEBRA NO-PAIR</b>  <code>{stock}</code> ({direction})\n"
-            f"spot {spot:,.2f} | Level {st_val:,.2f} | gap {gap:.2f}%\n"
-            f"Strike analyzer found no viable (K_L,K_S) at expiry {expiry} "
-            f"— OI/spread/regime gates all failed."
-        )
-
-    k_l = int(best['k_l']) if best['k_l'].is_integer() else best['k_l']
-    k_s = int(best['k_s']) if best['k_s'].is_integer() else best['k_s']
-    # escape: gate tags contain '<' (long_OI<5000) — a bare '<' makes
-    # Telegram's HTML parser reject the whole message.
-    warn = ' ⚠ ' + html.escape(','.join(best['gate_fails'])) \
-        if best['gate_fails'] else ''
-
-    conviction = ' ⭐ALIGNED' if cfg.is_trend_aligned(
-        trade.get('direction'), trade.get('st_direction')) else ''
-
-    head = (
-        f"\U0001F993 <b>ENTER</b>  <code>{stock}</code>  ({direction}){conviction}\n"
-        f"Level {st_val:,.2f} | spot {spot:,.2f} | gap {gap:.2f}% "
-        f"({pull_dir} Level)\n"
-    )
-
-    # NOTE: there is deliberately NO `ENTRY_STRUCTURE == 'bcs'` branch here.
-    # One was added on 2026-08-13 and was DEAD: `check_watching` handles the
-    # BCS pipeline in its own block, which builds the ticket with
-    # `_format_bcs_enter_alert` and `continue`s long before this function is
-    # reached. So the branch never ran on the path that trades, while its
-    # `not bcs` fallback DID run from `cmd_trigger` (which passes bcs=None) and
-    # Telegrammed "NO SPREAD" about signals that had a perfectly good spread.
-    # The live BCS ticket is `_format_bcs_enter_alert`; edit that one.
-    msg = head + (
-        f"expiry {expiry} ({dte} DTE) | lot {lot_size} | "
-        f"Capital (1 lot) = {best['capital_per_lot']:,.0f}{warn}\n"
-        f"\n"
-        f"Strikes <b>{k_l} / {k_s}</b>   debit {best['debit']:g} | "
-        f"BE {best['be']:,.2f} ({best['be_pct_from_spot']:+.2f}%)\n"
-        f"\n"
-        f"🟢 BUY 2× <code>{best['long_symbol']}</code>  {best['long_ask']:g}\n"
-        f"🔴 SELL 1× <code>{best['short_symbol']}</code>  {best['short_bid']:g}"
-    )
-    if bcs:
-        warn = ' ⚠ ' + html.escape(','.join(bcs['warnings'])) \
-            if bcs.get('warnings') else ''
-        msg += (
-            f"\n\n📐 <b>BCS shadow</b> (paper A/B): "
-            f"{bcs['long_strike']:g}/{bcs['short_strike']:g}  "
-            f"debit {bcs['debit']:g} ({bcs['debit_to_width_pct']:.0f}% of width) | "
-            f"maxP {bcs['max_profit_per_share']:g}{warn}\n"
-            f"🟢 BUY 1× <code>{bcs['long_symbol']}</code>  {bcs['long_ask']:g}\n"
-            f"🔴 SELL 1× <code>{bcs['short_symbol']}</code>  {bcs['short_bid']:g}"
-        )
-    return msg
+    raise RuntimeError(
+        "_format_enter_alert is retired: it renders the back-ratio structure, "
+        "decommissioned 2026-08-27. Use _format_bcs_enter_alert.")
 
 
 #: Exits `bcs/spread_monitor.py` takes over when it manages a position.
@@ -263,6 +216,213 @@ def _exits_external(trade: dict) -> bool:
     So the cohort test is here rather than left to the caller.
     """
     return cfg.EXITS_MANAGED_EXTERNALLY and in_cohort(trade)
+
+
+# ── Is the engine we stood down for actually there? ─────────────────────────
+#
+# `_exits_external` above is a ONE-SIDED stand-down: it reads this process's
+# own config and nothing else. Handing the stops to a peer without ever
+# checking the peer exists produces the system's most dangerous silent state —
+# flag on, `bcs/spread_monitor.py` not running, NO exit engine at all — and
+# nothing looks wrong. This process logs "EXITS EXTERNAL ... measured, not
+# acted on" every cycle and carries on; its other alerts keep arriving.
+#
+# The kill switch gets there by a different road: tripping it does not stop
+# the monitor, it forces the monitor to DRY RUN for the session. Alive,
+# polling, alerting — and unable to place a single closing order. Which is
+# why a heartbeat that only said "I am running" would certify exactly the
+# state it exists to catch. `bcs/spread_monitor.write_heartbeat` records
+# whether the engine can BOOK, not merely whether it breathes.
+#
+# Four bad states, each needing a different sentence from whoever reads the
+# Telegram at 11:00 (`feedback_never_asked_is_not_failed` — "never started"
+# and "started and died" are not one condition):
+HEARTBEAT_NAME = 'exit_engine_heartbeat.json'      # written by the peer
+ALERT_STATE_NAME = 'exit_engine_alert_state.json'  # this file's own dedup
+HEARTBEAT_STALE_SEC = 15 * 60      # ~3 missed cron restarts of a 5-min line
+HEARTBEAT_REPEAT_SEC = 30 * 60     # re-arm, so a standing fault is not forgotten
+
+
+def _heartbeat_path():
+    """Resolved per call. `cfg.LOG_DIR` is repointed by tests, and the writer
+    resolves the SAME filename through its own LOG_DIR — pinned equal by a
+    test, because one constant living in two modules is how a fix lands in the
+    copy nobody opened."""
+    return cfg.LOG_DIR / HEARTBEAT_NAME
+
+
+def read_exit_engine_heartbeat(now: Optional[float] = None) -> dict:
+    """Classify the peer exit engine. Never raises.
+
+    Returns `{'state', 'detail', 'age', 'beat'}` where state is one of:
+
+      ok            polled recently AND armed to place orders
+      missing       no file at all — the engine has never run here
+      stale         a file, but old: it ran, then stopped
+      dry_run       polling, but every close is a no-op
+      no_cohort_book  polling and armed, but the cohort store would not open
+      unreadable    a file that is not a heartbeat
+
+    `missing` and `stale` are deliberately separate. They look identical from
+    here — no fresh beat — and they need opposite responses: one is "start
+    it", the other is "find out what killed it, and it was watching positions
+    when it died".
+    """
+    now = time.time() if now is None else now
+    path = _heartbeat_path()
+    try:
+        with open(path) as f:
+            beat = json.load(f)
+        if not isinstance(beat, dict):
+            raise ValueError(f'not an object: {type(beat).__name__}')
+        ts = float(beat['ts'])
+    except FileNotFoundError:
+        return {'state': 'missing', 'detail': f'no {path.name} exists',
+                'age': None, 'beat': None}
+    except Exception as e:
+        # A heartbeat this process cannot parse is NOT evidence of health.
+        return {'state': 'unreadable', 'age': None, 'beat': None,
+                'detail': f'{path.name} is unreadable ({type(e).__name__}: '
+                          f'{str(e)[:80]})'}
+    age = now - ts
+    when = beat.get('at') or '?'
+    if age > HEARTBEAT_STALE_SEC:
+        return {'state': 'stale', 'age': age, 'beat': beat,
+                'detail': f'last beat {when} ({int(age / 60)} min ago, '
+                          f'state={beat.get("state")})'}
+    if beat.get('dry_run'):
+        why = ('the kill switch tripped this session'
+               if beat.get('kill_switch') else '--dry-run on its crontab line')
+        return {'state': 'dry_run', 'age': age, 'beat': beat,
+                'detail': f'running ({when}) but in DRY RUN — {why}'}
+    if not beat.get('cohort_store', True):
+        return {'state': 'no_cohort_book', 'age': age, 'beat': beat,
+                'detail': f'running ({when}) but it could not open the cohort '
+                          f'store, so it loaded none of these positions'}
+    return {'state': 'ok', 'age': age, 'beat': beat,
+            'detail': f'polling ({when}), armed'}
+
+
+def _read_alert_state() -> dict:
+    """Last thing this alert said, and when. PERSISTED, not in-memory: the
+    zebra cron process exits between cycles, so an in-process flag would
+    re-alert every five minutes — the same reason the spot-corroboration
+    reference is persisted."""
+    try:
+        with open(cfg.LOG_DIR / ALERT_STATE_NAME) as f:
+            prev = json.load(f)
+        return prev if isinstance(prev, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_alert_state(state: str, now: float) -> None:
+    try:
+        cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = cfg.LOG_DIR / ALERT_STATE_NAME
+        tmp = path.with_name(path.name + '.tmp')
+        with open(tmp, 'w') as f:
+            json.dump({'state': state, 'alerted_at': now}, f)
+        tmp.replace(path)
+    except Exception as e:
+        # Losing the dedup makes this NOISY, never silent. Right direction.
+        logger.warning("could not persist exit-engine alert state: %s", e)
+
+
+def _format_exit_engine_alert(hb: dict, n_positions: int, cohort_seen) -> str:
+    fix = {
+        'missing': 'START IT: the cron line for `bcs.spread_monitor --cron` '
+                   'is not running, or it never reached its first poll.',
+        'stale': 'FIND OUT WHAT KILLED IT. It was watching these positions '
+                 'and stopped; the cron line should have restarted it '
+                 'within 5 minutes and did not.',
+        'dry_run': 'It watches and alerts but places NO closing order. Either '
+                   're-arm it, or set exits_managed_externally=false so this '
+                   'engine books the exits again. The two switches move '
+                   'TOGETHER.',
+        'no_cohort_book': 'Its adapter onto the cohort book failed. Check the '
+                          'cohort store, then restart it.',
+        'unreadable': 'Treat as DOWN until proven otherwise.',
+        'not_watching': 'It is alive and armed but reports 0 cohort positions '
+                        'while this engine has %d stood down. One of the two '
+                        'is reading the book wrong — the same shape as '
+                        '"--list answered Open: 0 with eight positions live".'
+                        % n_positions,
+    }.get(hb['state'], 'Investigate.')
+    return (
+        f"\U0001F534 NO EXIT ENGINE\n"
+        f"This engine has STOOD DOWN from {n_positions} cohort position(s) "
+        f"(exits_managed_externally=true), but bcs/spread_monitor.py "
+        f"{html.escape(str(hb['detail']))}.\n"
+        f"Peer reports {cohort_seen} cohort position(s) loaded.\n"
+        f"Nothing is holding their stops right now.\n"
+        f"{html.escape(fix)}")
+
+
+def alert_if_exit_engine_down(n_positions: int, dry_run: bool = False,
+                              now: Optional[float] = None,
+                              market_open: Optional[bool] = None
+                              ) -> Optional[str]:
+    """Telegram when the engine we stood down for cannot close. Never raises.
+
+    Returns the state alerted on, or None. Called ONCE per cycle from the
+    EXITS-EXTERNAL branch — the branch is the trigger because the alert is
+    only ever true when this engine has actually handed the stops away.
+
+    Noise discipline: alert on a TRANSITION into a bad state, then re-arm
+    every `HEARTBEAT_REPEAT_SEC`. Not every poll — an alert that repeats every
+    five minutes is one the reader learns to ignore, which is precisely how
+    the OI flag on COCHINSHIP got waved through.
+
+    `market_open` is injectable and not read from the wall clock by default in
+    tests: outside market hours the peer exits on purpose and its heartbeat
+    goes stale by design, so alerting then would cry wolf every evening
+    (`feedback_pin_the_wall_clock_in_tests` — this must pass at 02:00 Sunday).
+    """
+    now = time.time() if now is None else now
+    if market_open is None:
+        market_open = _is_market_open()
+    hb = read_exit_engine_heartbeat(now=now)
+    state = hb['state']
+    beat = hb.get('beat') or {}
+    cohort_seen = beat.get('cohort_trades', '?')
+    if state == 'ok' and isinstance(cohort_seen, int) and cohort_seen == 0 \
+            and n_positions > 0:
+        # Alive, armed, and watching NONE of them. `--list answered Open: 0
+        # with eight positions live` was this exact disagreement, and a
+        # heartbeat that only reported liveness would have called it healthy.
+        state = 'not_watching'
+        hb = dict(hb, state=state,
+                  detail=f'{hb["detail"]} but reports 0 cohort positions')
+    prev = _read_alert_state()
+    if state == 'ok':
+        if prev.get('state') not in (None, 'ok'):
+            _write_alert_state('ok', now)
+            if market_open:
+                _send_telegram(
+                    f"✅ EXIT ENGINE BACK\nbcs/spread_monitor.py is "
+                    f"{html.escape(str(hb['detail']))}. "
+                    f"{n_positions} cohort position(s) are covered again.",
+                    dry_run=dry_run)
+                return 'recovered'
+        return None
+    logger.error("EXIT ENGINE %s: %s (%d cohort position(s) stood down here)",
+                 state.upper(), hb['detail'], n_positions)
+    if not market_open:
+        # Logged above regardless — the log is the forensic record. Only the
+        # Telegram is held, and only outside the session.
+        return None
+    same = prev.get('state') == state
+    try:
+        since = now - float(prev.get('alerted_at', 0))
+    except (TypeError, ValueError):
+        since = HEARTBEAT_REPEAT_SEC + 1
+    if same and since < HEARTBEAT_REPEAT_SEC:
+        return None
+    _send_telegram(_format_exit_engine_alert(hb, n_positions, cohort_seen),
+                   dry_run=dry_run)
+    _write_alert_state(state, now)
+    return state
 
 
 def _exit_cleared(store, trade: dict, kind: str, quote: dict, spot: float,
@@ -462,7 +622,49 @@ def format_vetoed_alert(trade: dict, reasons: list, red_flags: list) -> str:
     return "\n".join(lines)
 
 
-def _capital_context(store, trade: dict, analysis: dict) -> dict:
+def _entry_candidate(trade: dict, analysis: dict,
+                     bcs: Optional[dict] = None) -> tuple:
+    """(candidate, depth) for `zebra.capital` — the structure ACTUALLY opened.
+
+    WAAREEENER #449, 2026-08-27. The capital layer priced
+    `analysis['best']`: the ZEBRA BACK-RATIO pair, a structure retired on
+    2026-08-12 that nothing has opened since. One Telegram consequently
+    quoted the same position twice, at two prices that were both computed
+    correctly from two different trades —
+
+        ticket line  "Capital (1 lot) = 6,361"   = BCS debit 36.35 x 175
+        sizing line  "one position at Rs 121700" = (2 x long_mid - short_mid)
+                                                   on the 3000/2600 PE back
+                                                   ratio, 695.43 x 175
+
+    — refused the signal on the per-trade cap using the second, and spent a
+    Claude vet arguing with it (decision #92 spotted the discrepancy itself).
+
+    So the candidate is sourced from the BCS dict whenever the BCS pipeline is
+    what runs. The back-ratio `best` it used to fall back on is RETIRED
+    (2026-08-27) and no longer exists. With no BCS to price, `debit` is
+    None and
+    `capital.check` fails closed on an unknown candidate — the honest answer,
+    and never a number belonging to some other spread.
+    """
+    # Always the BCS. The `analysis['best']` fallback that used to sit here
+    # priced the RETIRED back ratio (decommissioned 2026-08-27) and is gone:
+    # `analyze()` no longer produces a `best` at all.
+    src = bcs or {}
+    candidate = {
+        'stock': trade.get('stock'),
+        'debit': src.get('debit'),
+        'lot_size': src.get('lot_size') or analysis.get('lot_size'),
+    }
+    depth = None
+    if src.get('long_ask_qty') is not None:
+        depth = {'long': {'ask_qty': src.get('long_ask_qty')},
+                 'short': {'bid_qty': src.get('short_bid_qty')}}
+    return candidate, depth
+
+
+def _capital_context(store, trade: dict, analysis: dict,
+                     bcs: Optional[dict] = None) -> dict:
     """What the book can afford, and what it already holds.
 
     Both halves matter and they answer different questions. `deployed` /
@@ -474,20 +676,16 @@ def _capital_context(store, trade: dict, analysis: dict) -> dict:
     agent can tell a size bound by LIQUIDITY (a thin book, which is a reason to
     be suspicious of this signal) from one bound by BUDGET (a full book, which
     says nothing about this signal's quality).
+
+    `bcs` is the pair the ticket describes and the store records. It is not
+    optional in spirit — see `_entry_candidate` for what pricing the wrong
+    structure cost on 2026-08-27 — and `priced` is echoed back so a stored
+    plan can be checked afterwards against the position it was meant to size.
     """
-    best = analysis.get('best') or {}
+    candidate, depth = _entry_candidate(trade, analysis, bcs)
     book = store.load_trades()
     lim = capital.limits(book)
     held, n_open, unpriced = capital.deployed(book)
-    candidate = {
-        'stock': trade.get('stock'),
-        'debit': best.get('debit'),
-        'lot_size': best.get('lot_size') or analysis.get('lot_size'),
-    }
-    depth = None
-    if best.get('long_ask_qty') is not None:
-        depth = {'long': {'ask_qty': best.get('long_ask_qty')},
-                 'short': {'bid_qty': best.get('short_bid_qty')}}
     return {
         'capital_rupees': lim.capital,
         'capital_basis': lim.basis,
@@ -498,6 +696,12 @@ def _capital_context(store, trade: dict, analysis: dict) -> dict:
         'open_slots': (lim.max_open - n_open) if lim.max_open else None,
         'unpriced_positions': unpriced,
         'limits': capital.describe(book),
+        # WHICH structure the plan below priced. Without it a wrong number is
+        # indistinguishable from a right one at a glance, which is exactly how
+        # #449 shipped.
+        'priced': {'structure': cfg.ENTRY_STRUCTURE,
+                   'debit': candidate.get('debit'),
+                   'lot_size': candidate.get('lot_size')},
         'plan': capital.plan(book, candidate, depth, lim),
         'note': 'entry is SLICED into one-lot orders (no per-order brokerage '
                 'on Neo) and each fill is verified before the next goes out',
@@ -505,14 +709,13 @@ def _capital_context(store, trade: dict, analysis: dict) -> dict:
 
 
 def _vet_context(store, trade: dict, analysis: dict, gap_pct: float,
-                 kite=None) -> dict:
+                 kite=None, bcs: Optional[dict] = None) -> dict:
     """The evidence bundle handed to the vetting agent.
 
     Snapshotted here rather than re-quoted by the agent so its verdict judges
     exactly the book the bot acted on. Live re-quoting is a step INSIDE the
     agent's checklist, not part of the handoff.
     """
-    best = analysis.get('best') or {}
     # Both of these read candles. They are wrapped because a statistics or
     # chart failure must never stop a signal being vetted — a missing section
     # is a gap in the evidence, an exception here is a halted pipeline.
@@ -548,26 +751,41 @@ def _vet_context(store, trade: dict, analysis: dict, gap_pct: float,
     # money at risk".
     cap_ctx = None
     try:
-        cap_ctx = _capital_context(store, trade, analysis)
+        cap_ctx = _capital_context(store, trade, analysis, bcs)
     except Exception as e:
         logger.warning("capital context failed for %s: %s", trade['stock'], e)
 
-    bcs_ctx = None
-    if cfg.ENTRY_STRUCTURE == 'bcs':
-        atm = analysis.get('atm_quote') or {}
-        bcs_ctx = {
-            'atm_strike': analysis.get('atm_strike'),
-            'atm_bid': atm.get('bid'), 'atm_ask': atm.get('ask'),
-            'atm_mid': atm.get('mid'), 'atm_oi': atm.get('oi'),
-            'target_spot': trade.get('st_value'),
-            'max_debit_to_width_pct': cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT,
-            'min_leg_oi': cfg.MIN_LEG_OI,
-            # The short leg is picked, quoted and gated INSIDE analyze_bcs,
-            # after this snapshot is taken. Say so rather than leave the agent
-            # to assume the omission means "nothing there".
-            'note': 'short leg is chosen and gated at entry; if this signal '
-                    'entered, both OI and debit/width gates passed',
-        }
+    atm = analysis.get('atm_quote') or {}
+    bcs_ctx = {
+        'atm_strike': analysis.get('atm_strike'),
+        'atm_bid': atm.get('bid'), 'atm_ask': atm.get('ask'),
+        'atm_mid': atm.get('mid'), 'atm_oi': atm.get('oi'),
+        'target_spot': trade.get('st_value'),
+        'max_debit_to_width_pct': cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT,
+        'min_leg_oi': cfg.MIN_LEG_OI,
+        # The short leg is picked, quoted and gated INSIDE analyze_bcs,
+        # after this snapshot is taken. Say so rather than leave the agent
+        # to assume the omission means "nothing there".
+        'note': 'short leg is chosen and gated at entry; if this signal '
+                'entered, both OI and debit/width gates passed',
+    }
+    if bcs:
+        # The pair itself, once it has been built — the same dict the
+        # ticket renders and `mark_entered_bcs` stores. The agent used to
+        # be handed the ATM book and told the rest was decided later, so
+        # it re-quoted the spread itself to argue with a capital figure
+        # that belonged to a different structure (#449).
+        bcs_ctx.update({
+            k: bcs.get(k) for k in
+            ('long_strike', 'short_strike', 'long_symbol', 'short_symbol',
+             'width', 'debit', 'debit_mid', 'debit_to_width_pct',
+             'debit_to_width_pct_mid', 'entry_cost', 'entry_cost_pct',
+             'max_profit_per_share', 'long_bid', 'long_ask', 'short_bid',
+             'short_ask', 'long_oi', 'short_oi', 'short_spread_pct',
+             'long_ask_qty', 'short_bid_qty', 'lot_size',
+             'pricing_basis', 'warnings')})
+        bcs_ctx['note'] = ('this is the pair that would open, priced on '
+                           'the fill basis: ask(long) - bid(short)')
     return {
         'structure': cfg.ENTRY_STRUCTURE,
         'bcs': bcs_ctx,
@@ -588,22 +806,17 @@ def _vet_context(store, trade: dict, analysis: dict, gap_pct: float,
         # the agent was asked to judge the one thing it could not see. That is
         # the failure mode (a book you cannot exit) the same doc calls the one
         # that has actually cost this book money.
-        'zebra': {k: best.get(k) for k in
-                  ('k_l', 'k_s', 'debit', 'be', 'be_pct_from_spot',
-                   'long_symbol', 'short_symbol', 'long_oi', 'short_oi',
-                   'long_bid', 'long_ask', 'short_bid', 'short_ask',
-                   'long_spread_pct', 'short_spread_pct',
-                   'long_extrinsic', 'short_extrinsic', 'net_ext',
-                   'liquidity_ok', 'capital_per_lot', 'gate_fails')},
-        # Explicit, because the agent's instructions used to say these gates
-        # "passed by construction". Under 'zebra' that is true for most picks
-        # but `_pick_best` has a last-resort tier that returns a candidate WITH
-        # failed gates. Under 'bcs' the zebra pair is not traded at all, so
-        # None ("not applicable") is the honest value — an empty `best` would
-        # otherwise compute to True and hand the agent an all-clear about a
-        # structure nobody is opening.
-        'gates_all_passed': (None if cfg.ENTRY_STRUCTURE == 'bcs'
-                             else not (best.get('gate_fails') or [])),
+        #
+        # The RETIRED back-ratio block that used to sit here is GONE
+        # (decommissioned 2026-08-27). It shipped `liquidity_ok`, `gate_fails`
+        # and per-leg spreads belonging to a pair NOBODY OPENS, and decision
+        # #92 (WAAREEENER #449) read them as facts about the trade it was
+        # vetting and had to work out unaided that they were not. A caption
+        # saying "ignore this" is not as good as not sending it. Judge `bcs`.
+        #
+        # `gates_all_passed` went with it: it was `not best['gate_fails']`,
+        # which computed to True off an empty `best` — an all-clear derived
+        # from having nothing to check.
         # ── does this symbol actually GET pulled to its ST line? ─────────
         # The magnet IS the thesis, and every signal was vetted as though the
         # pull were a property of the setup rather than of the symbol. Some
@@ -766,6 +979,83 @@ def _send_enter_alert(store: ZebraStore, trade: dict, msg: str, stock: str,
         store.clear_alert_flag(trade['id'], 'vet_enter')
         logger.error("Deferred ENTER ticket for #%d %s released — "
                      "retrying next cycle", trade['id'], stock)
+
+
+def _format_capital_refused_alert(trade: dict, bcs: dict, plan: dict) -> str:
+    """What a signal the book cannot fund is allowed to look like.
+
+    NOT an order ticket. No click-copy symbols, no BUY/SELL lines, no debit to
+    fill against, no vetting tick — everything on #449's message that told the
+    reader to place a trade the same message then forbade.
+
+    It still names the pair, because "WAAREEENER PE was refused" with no
+    strikes is not something anyone can check afterwards, and it still says
+    which limit bound, because a full book and a too-rich position call for
+    completely different responses.
+    """
+    bcs = bcs or {}
+    plan = plan or {}
+    per_lot = 0.0
+    try:
+        per_lot = float(bcs.get('debit') or 0) * float(bcs.get('lot_size') or 0)
+    except (TypeError, ValueError):
+        pass
+    pair = ''
+    try:
+        pair = (f"{float(bcs['long_strike']):g}/{float(bcs['short_strike']):g} "
+                f"debit {float(bcs['debit']):g} x {int(bcs['lot_size'])} "
+                f"= Rs {per_lot:,.0f}/lot\n")
+    except (KeyError, TypeError, ValueError):
+        # A malformed pair must not cost the operator the refusal itself.
+        pair = ''
+    paper = ('\n<i>Paper recorded it anyway — the validation book keeps every '
+             'signal, funded or not.</i>' if cfg.PAPER_MODE else '')
+    return (
+        f"🚫 <b>NO ENTRY — capital</b>  "
+        f"{html.escape(str(trade.get('stock')))} "
+        f"({html.escape(str(trade.get('direction')))})\n"
+        f"{pair}"
+        f"{html.escape(str(plan.get('reason') or 'refused by the capital gate'))}"
+        f"{paper}")
+
+
+def _send_capital_refused_alert(store: ZebraStore, trade: dict, bcs: dict,
+                                plan: dict, stock: str,
+                                dry_run: bool = False) -> None:
+    """Tell the operator once, without eating the order ticket's claim.
+
+    Its own flag, deliberately. `vet_enter` is the LIVE ticket's consume-once
+    claim, and spending it here would mean that when a slot frees an hour
+    later the real ticket is silently suppressed as "already sent" — turning a
+    temporary refusal into a permanently lost entry.
+
+    Once ever in PAPER (the position is booked in this same cycle and will
+    never be refused again); once a DAY in LIVE, where the signal keeps
+    re-evaluating and a book that is full at 10:00 may not be at 14:00.
+    """
+    try:
+        if not _refused_alert_claimed(store, trade['id']):
+            return
+        msg = _format_capital_refused_alert(trade, bcs, plan)
+    except Exception as e:
+        # Never raise into the cycle: this runs inside the per-trade loop and
+        # an exception here would cost every signal after it its own checks.
+        logger.error("CAPITAL REFUSED alert could not be built for #%s %s: %s",
+                     trade.get('id'), stock, e)
+        return
+    if _send_telegram(msg, dry_run=dry_run):
+        logger.info("CAPITAL REFUSED alert sent for #%d %s", trade['id'], stock)
+        return
+    logger.warning("CAPITAL REFUSED alert FAILED for #%d %s — claim released",
+                   trade['id'], stock)
+    store.clear_alert_flag(trade['id'], 'capital_refused')
+
+
+def _refused_alert_claimed(store: ZebraStore, trade_id: int) -> bool:
+    """Consume-once in PAPER, once-a-day in LIVE. Same rule as the exit nag."""
+    if cfg.PAPER_MODE:
+        return store.set_alert_flag(trade_id, 'capital_refused')
+    return store.set_alert_flag_daily(trade_id, 'capital_refused')
 
 
 def _as_float(v):
@@ -937,23 +1227,21 @@ def _verify_entry(kite, trade: dict, out: dict, dry_run: bool = False) -> None:
                      trade['id'], out['orphan'])
 
 
-def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
-                  price: float, dry_run: bool = False):
-    """Build and open a first-class BCS from a triggered signal.
+def _build_bcs(kite, trade: dict, analysis: dict,
+               price: float) -> Optional[dict]:
+    """Price the vertical this signal would open, or None if a gate killed it.
 
-    Returns:
-      None            — skipped; the signal stays 'triggered' and the
-                        drift/stale checks clean it up, as the zebra path does
-      (bcs, trade)    — PAPER: entered, `trade` is the fresh record
-      (bcs, None)     — LIVE: nothing entered, the alert IS the order ticket
+    Split out of `_enter_as_bcs` so the pair exists BEFORE the vet is
+    requested. Two things depended on that ordering and both were wrong:
 
-    The three-way return is deliberate. An earlier version returned None for
-    both "skipped" and "live", and the caller's `continue` then suppressed
-    every entry alert in LIVE mode — where the alert is the only way a trade
-    ever gets placed. Auto-entry is a paper-mode behaviour; alerting is not.
+    - the capital gate priced `analysis['best']`, the retired back ratio, and
+      refused #449 on a figure 19x the real one (`_entry_candidate`);
+    - a Claude vet was spent on every triggered signal, INCLUDING the ones
+      `analyze_bcs`'s own hard gates were about to suppress a moment later.
 
-    Never raises into the cycle: one bad chain must not stop the other
-    positions being monitored.
+    Pure pricing: no store write, no Telegram, no swing lookup (that costs a
+    candle fetch and only moves the TP, never the cost). Never raises — one
+    bad chain must not stop the other positions being monitored.
     """
     atm_strike = analysis.get('atm_strike')
     atm_quote = analysis.get('atm_quote')
@@ -981,6 +1269,36 @@ def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
 
     bcs['expiry'] = analysis['expiry']
     bcs['entry_spot'] = price
+    return bcs
+
+
+def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
+                  price: float, bcs: Optional[dict] = None,
+                  dry_run: bool = False):
+    """Open a first-class BCS from a triggered signal.
+
+    Returns:
+      None            — skipped; the signal stays 'triggered' and the
+                        drift/stale checks clean it up, as the zebra path does
+      (bcs, trade)    — PAPER: entered, `trade` is the fresh record
+      (bcs, None)     — LIVE: nothing entered, the alert IS the order ticket
+
+    The three-way return is deliberate. An earlier version returned None for
+    both "skipped" and "live", and the caller's `continue` then suppressed
+    every entry alert in LIVE mode — where the alert is the only way a trade
+    ever gets placed. Auto-entry is a paper-mode behaviour; alerting is not.
+
+    `bcs` is the pair `_build_bcs` already priced for the capital gate and the
+    vet handoff; it is re-built here only for callers that did not.
+
+    Never raises into the cycle: one bad chain must not stop the other
+    positions being monitored.
+    """
+    if bcs is None:
+        bcs = _build_bcs(kite, trade, analysis, price)
+        if bcs is None:
+            return None
+
     # A swing level standing between spot and the magnet shortens the TP. Done
     # HERE, before either branch, so the LIVE order ticket quotes the same
     # target the paper position books against — the ticket is the only exit
@@ -1040,9 +1358,16 @@ def _log_bcs_suppressed(trade: dict, reason: Optional[str]) -> None:
         grep 'BCS SUPPRESSED' logs/cron_zebra.log
     No html-escaping here — a log line is not parsed as markup.
     """
-    logger.warning("BCS SUPPRESSED #%d %s (%s): %s — no trade; zebra entered "
-                   "silently for the A/B record", trade['id'], trade['stock'],
-                   trade['direction'], reason or "no viable BCS pair")
+    # The tail of this line used to read "zebra entered silently for the A/B
+    # record". That was true only while the back ratio was the primary
+    # structure and the BCS was its shadow. Under the BCS-only pipeline —
+    # and after the back ratio was decommissioned on 2026-08-27 — a suppressed
+    # BCS means NOTHING entered at all, which is the opposite fact and the one
+    # a reader needs.
+    logger.warning("BCS SUPPRESSED #%d %s (%s): %s — NO position opened "
+                   "(the BCS is the only structure; nothing enters behind it)",
+                   trade['id'], trade['stock'], trade['direction'],
+                   reason or "no viable BCS pair")
 
 
 def _swing_clears_breakeven(trade: dict, bcs: dict, swing):
@@ -1105,7 +1430,7 @@ def _swing_tp_line(swing) -> str:
             f"spot and ST {swing['st_value']:g}\n")
 
 
-def _size_line(store, trade: dict, bcs: dict, analysis: dict) -> str:
+def _size_line(plan: Optional[dict]) -> str:
     """How many lots, what bounded it, and how to place them.
 
     The ticket used to quote "Capital (1 lot)" and stop there, which answers
@@ -1114,15 +1439,22 @@ def _size_line(store, trade: dict, bcs: dict, analysis: dict) -> str:
     LIQUIDITY is a reason to look harder at the signal, bound by BUDGET is a
     reason to look at the book.
 
+    Takes the plan the caller already made rather than making a second one.
+    It used to re-run `capital.plan` here, and in PAPER that is AFTER the
+    position has been booked -- so the ticket sized the signal against a book
+    that already contained it, and `max_open_per_stock: 1` made every paper
+    ticket refuse itself. Two calls to `capital.check` per signal, on
+    different inputs, is also how #449 came to state two prices for one trade.
+
     Never raises. A sizing failure must not cost the owner the ticket -- the
     symbols and the debit are still the order.
     """
-    try:
-        pl = _capital_context(store, trade, analysis)['plan']
-    except Exception as e:
-        logger.warning("size line failed for %s: %s", trade.get('stock'), e)
+    if not plan:
         return "\n\n⚠ <i>Size not computed — enter 1 lot.</i>"
+    pl = plan
     if not pl['lots']:
+        # Defence in depth: `check_watching` sends the refusal notice instead
+        # of a ticket, so a refused plan should never reach a ticket at all.
         return ("\n\n🚫 <i>Capital says DO NOT ENTER: "
                 f"{html.escape(pl['reason'])}</i>")
     n, per = pl['lots'], pl['slice_lots']
@@ -1369,9 +1701,14 @@ def _drain_queued_out_of_band(store: ZebraStore, trade: dict, kite,
                          trade['id'], trade['stock'],
                          analysis.get('error') or 'no ATM strike')
             return
+        # Price the pair here too. Without it the handoff carries a capital
+        # plan built from an unpriceable candidate, and before 2026-08-27 it
+        # carried one built from the retired back ratio — either way a number
+        # about a position nobody would open.
+        bcs = _build_bcs(kite, trade, analysis, price)
         vet_mod.promote_queued(
             store, trade['id'],
-            context=_vet_context(store, trade, analysis, gap_pct, kite))
+            context=_vet_context(store, trade, analysis, gap_pct, kite, bcs))
     except Exception as e:
         logger.error("Out-of-band queue drain failed for #%d: %s — stays "
                      "queued, retried next cycle", trade['id'], e)
@@ -1536,35 +1873,68 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         if analysis.get('error'):
             logger.warning("Strike analysis %s skipped: %s", stock, analysis['error'])
             continue
-        # Require what the structure we ACTUALLY trade needs. Under BCS-only
-        # the zebra pair is never opened, so gating the whole signal on a
-        # tradeable zebra `best` would let the zebra's constraints
-        # (net-extrinsic, deep-ITM liquidity) veto a spread that shares none of
-        # them — a retired structure still deciding which trades happen.
-        if cfg.ENTRY_STRUCTURE == 'bcs':
-            atm_q = analysis.get('atm_quote') or {}
-            if not analysis.get('atm_strike') or not atm_q.get('mid'):
-                logger.info("No usable ATM book for %s, leaving in watching",
-                            stock)
-                continue
-        elif not analysis.get('best'):
-            logger.info("No tradeable best pick for %s, leaving in watching", stock)
+        # Require what the structure we ACTUALLY trade needs: the ATM book.
+        # This used to have a second arm gating on a tradeable back-ratio
+        # `best`, which let a retired structure's constraints (net-extrinsic,
+        # deep-ITM liquidity) veto a spread that shares none of them. The back
+        # ratio was decommissioned on 2026-08-27 and `analyze()` no longer
+        # produces a `best` at all.
+        atm_q = analysis.get('atm_quote') or {}
+        if not analysis.get('atm_strike') or not atm_q.get('mid'):
+            logger.info("No usable ATM book for %s, leaving in watching",
+                        stock)
             continue
 
         analysis['current_gap_pct'] = gap_pct
-        # Store just the best pick + ranked list for traceability. Under
-        # BCS-only these are zebra pairs nobody will trade, so the record
-        # carries none rather than a list that reads like a shortlist.
-        best = analysis.get('best')
-        alert_strikes = [] if cfg.ENTRY_STRUCTURE == 'bcs' or not best else \
-            [best] + [c for c in analysis.get('candidates', [])
-                      if (c['k_l'], c['k_s']) != (best['k_l'], best['k_s'])]
+        # `alert_strikes` recorded the back-ratio shortlist. There is no such
+        # shortlist any more, so the record carries an empty list rather than
+        # something that reads like a set of options the operator could pick
+        # from. Historical records keep whatever they were written with.
+        alert_strikes: list = []
         if trade['status'] == 'watching':
             try:
                 store.mark_triggered(trade['id'], price, gap_pct, alert_strikes)
             except ValueError as e:
                 logger.warning("mark_triggered failed for #%d: %s", trade['id'], e)
                 continue
+
+        # ── Price the structure that would actually open, BEFORE the vet ──
+        # Everything below reasons about a position: the capital gate sizes
+        # it, the vet judges it, the ticket quotes it. Building it here means
+        # all three see ONE pair. Before 2026-08-27 it was built AFTER the
+        # vet, so the capital layer had nothing to price but the retired back
+        # ratio in `analysis['best']` (#449), and `analyze_bcs`'s own hard
+        # gates ran only after a Claude call had already been spent.
+        bcs = _build_bcs(kite, trade, analysis, price)
+        if bcs is None:
+            continue          # gated and logged; nothing to vet or alert
+
+        # ── Capital, BEFORE the vet ──────────────────────────────────────
+        # A deterministic check costing one store read decides the same thing
+        # a Claude spawn costs a slot and ~4 minutes to decide. #449 was
+        # refused for having no free slot AFTER the vet had already run on it,
+        # and the operator was then shown a full order ticket — click-copy
+        # symbols, "Vetted by Claude" — with "DO NOT ENTER" underneath it.
+        #
+        # This is a SHADOW in paper and stays one: `_refuse_if_over_budget`
+        # still records the position so the validation book keeps every
+        # signal. What changes is that the vet is not spent and the operator
+        # is not handed an order ticket for a trade the book cannot take.
+        cap_plan = None
+        try:
+            cap_plan = _capital_context(store, trade, analysis, bcs)['plan']
+        except Exception as e:
+            # A capital lookup that fails must not decide anything. Fall
+            # through exactly as before: the vet runs, the ticket renders, and
+            # `_refuse_if_over_budget` is still the backstop at entry.
+            logger.warning("capital pre-gate failed for #%d %s: %s — "
+                           "continuing unsized", trade['id'], stock, e)
+        capital_refused = bool(cap_plan) and not cap_plan['lots']
+        if capital_refused:
+            logger.warning(
+                "CAPITAL REFUSES #%d %s: %s — no vet spent, no order ticket. "
+                "%s", trade['id'], stock, cap_plan['reason'],
+                capital.describe(store.load_trades()))
 
         # ── Claude vetting gate ──────────────────────────────────────────
         # A triggered signal waits for a verdict before it enters. The vet is
@@ -1578,7 +1948,20 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # the explicit allowlist below). A missed entry costs nothing; an
         # unqualified one costs capital. The halt is kept non-silent by
         # `drop_after` plus the ENTRY DROPPED Telegram, not by entering.
-        if cfg.VET_ENABLED:
+        #
+        # A signal the book cannot fund is not a judgement call, so it does not
+        # reach an agent — but ONLY when nothing is in flight for it yet. A
+        # verdict already being decided is still honoured: entering behind a
+        # PENDING vet would let a VETO land on a position that is already open.
+        # Nothing is dropped either way — the row stays where it is and every
+        # later cycle re-asks, so the moment a slot frees the vet is requested
+        # normally.
+        vet_skipped = (cfg.VET_ENABLED and capital_refused
+                       and vet_mod.vet_state(store.find(trade['id'])) is None)
+        if vet_skipped:
+            logger.info("VET NOT REQUESTED #%d %s — capital refuses the "
+                        "signal; no agent slot spent", trade['id'], stock)
+        if cfg.VET_ENABLED and not vet_skipped:
             state = vet_mod.vet_state(store.find(trade['id']))
             if state == vet_mod.QUEUED:
                 # Retry with the book we just re-quoted. promote_queued is a
@@ -1592,7 +1975,8 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 try:
                     vet_mod.promote_queued(
                         store, trade['id'],
-                        context=_vet_context(store, trade, analysis, gap_pct, kite))
+                        context=_vet_context(store, trade, analysis,
+                                             gap_pct, kite, bcs))
                 except Exception as e:
                     logger.error("Queue drain failed for #%d: %s — stays "
                                  "queued, retried next cycle", trade['id'], e)
@@ -1601,7 +1985,8 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 try:
                     vet_mod.request_entry_vet(
                         store, trade['id'],
-                        context=_vet_context(store, trade, analysis, gap_pct, kite))
+                        context=_vet_context(store, trade, analysis,
+                                             gap_pct, kite, bcs))
                 except ValueError as e:
                     # The locked re-check saw a state this cache missed —
                     # already requested or already SETTLED (possibly a veto).
@@ -1676,158 +2061,53 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # drift/stale-cancel checks next cycle); we deliberately do NOT cancel
         # here, because a 'cancelled' record isn't deduped by the scanner and
         # would be re-added + re-alerted every scan (alert churn).
-        bcs = None
-        bcs_skip_reason = None      # why a gate suppressed the shadow, if it did
-
-        # ── BCS-only pipeline (2026-08-12) ──────────────────────────────
-        # One record, no zebra leg, no shadow. The strike analyzer still runs
-        # because it owns expiry selection, lot size and the ATM book — but a
-        # BCS is built from `atm_quote` at the TOP level of that result, not
-        # from the zebra's recommended pair, so the zebra's own gates
-        # (net-extrinsic, deep-ITM liquidity) can no longer veto a spread that
-        # shares none of those constraints.
-        if cfg.ENTRY_STRUCTURE == 'bcs':
-            built = _enter_as_bcs(store, kite, trade, analysis, price,
-                                  dry_run=dry_run)
-            if built is None:
-                continue
-            bcs, fresh = built
-            # `fresh` is None in LIVE mode (nothing entered). The alert still
-            # goes out — it is the order ticket, and _alerts_enabled always
-            # returns True when paper mode is off for exactly that reason.
-            target = fresh or trade
-            if _alerts_enabled(target):
-                msg = _format_bcs_enter_alert(target, analysis, bcs)
-                if cfg.VET_ENABLED:
-                    msg += _vet_line(store.find(trade['id']) or target)
-                # Funds LAST, closest to the click-copy symbols. This is the
-                # live path — the branch below `continue`s past it, so calling
-                # _funds_line down there ran it exactly never under the BCS
-                # pipeline. Quantity from the BCS's own lot_size: the ticket
-                # and the margin must price the same order.
-                msg += _size_line(store, target, bcs, analysis)
-                msg += _funds_line(kite, bcs, bcs.get('lot_size') or 0)
-                _send_enter_alert(store, trade, msg, stock, dry_run=dry_run)
-            else:
-                logger.info("ENTER alert suppressed for #%d %s "
-                            "(alert_structures=%s)", trade['id'], stock,
-                            cfg.ALERT_STRUCTURES)
+        # ── The only entry path: one BCS record, no shadow ──────────────
+        # The `if cfg.ENTRY_STRUCTURE == 'bcs':` that used to wrap this, and
+        # the ~120-line back-ratio entry branch that followed it, were removed
+        # on 2026-08-27 when the owner decommissioned the back ratio. That
+        # branch is the one logged as F2: it ignored `capital_refused` and
+        # would still have rendered a full order ticket for a signal the book
+        # had already refused.
+        #
+        # The strike analyzer still runs because it owns expiry selection, lot
+        # size and the ATM book — but it no longer prices anything else.
+        built = _enter_as_bcs(store, kite, trade, analysis, price,
+                              bcs=bcs, dry_run=dry_run)
+        if built is None:
             continue
-
-        if cfg.PAPER_MODE:
-            best = analysis.get('best')
-            if not best:
-                continue
-            try:
-                store.mark_entered(trade['id'], {
-                    'long_strike': best['k_l'],
-                    'short_strike': best['k_s'],
-                    'long_symbol': best['long_symbol'],
-                    'short_symbol': best['short_symbol'],
-                    'debit': best['debit'],
-                    'lot_size': best['lot_size'],
-                    'lots': 1,
-                    'expiry': analysis['expiry'],
-                    'entry_spot': price,
-                    # Feeds the intrinsic-floor quote-sanity guard
-                    'short_extrinsic_entry': best['short_extrinsic'],
-                    # The entry book per leg. Without it the trade cannot be
-                    # costed at all — STT is charged per leg on that leg's
-                    # premium — and 179 closed zebra records are permanently
-                    # un-costable for exactly this omission. The analyzer has
-                    # always had these; nothing was ever written down.
-                    'long_bid_entry': best.get('long_bid'),
-                    'long_ask_entry': best.get('long_ask'),
-                    'short_bid_entry': best.get('short_bid'),
-                    'short_ask_entry': best.get('short_ask'),
-                })
-                logger.info("PAPER auto-entered #%d %s %d/%d debit=%.2f",
-                            trade['id'], stock,
-                            int(best['k_l']), int(best['k_s']), best['debit'])
-            except Exception as e:  # broad: bad data OR persist/IO failure
-                logger.error("PAPER auto-enter failed for #%d %s: %s — left "
-                             "triggered (will drift-cancel), no alert sent",
-                             trade['id'], stock, e)
-                continue
-
-            # Shadow BCS (paper A/B): buy the same ATM strike zebra shorts,
-            # sell the strike nearest the ST target. Best-effort — a failure
-            # here never blocks the zebra flow or its alert.
-            if cfg.BCS_PAPER_ENABLED:
-                try:
-                    bcs = strikes_mod.analyze_bcs(
-                        kite, stock, trade['direction'], price,
-                        target_spot=trade['st_value'],
-                        expiry=analysis['expiry'],
-                        atm_strike=best['k_s'],
-                        atm_quote={'mid': best['short_mid'],
-                                   'bid': best['short_bid'],
-                                   'ask': best['short_ask'],
-                                   'oi': best['short_oi']},
-                        lot_size=best['lot_size'],
-                    )
-                    if bcs.get('error'):
-                        logger.warning("BCS shadow skipped for #%d %s: %s",
-                                       trade['id'], stock, bcs['error'])
-                        bcs_skip_reason = bcs['error']
-                        bcs = None
-                    else:
-                        bcs['expiry'] = analysis['expiry']
-                        bcs['entry_spot'] = price
-                        store.add_bcs_shadow(store.find(trade['id']), bcs)
-                except Exception as e:
-                    logger.error("BCS shadow failed for #%d %s: %s",
-                                 trade['id'], stock, e)
-                    # Attribute honestly: this is a crash (or a persist
-                    # failure AFTER a clean analysis), not a gate rejection —
-                    # the alert must not imply the pair was unviable.
-                    bcs_skip_reason = f"shadow build failed: {e}"
-                    bcs = None
-
-        # Who talks on Telegram (both structures auto-trade regardless):
-        #   zebra in alert_structures  -> classic zebra alert (+BCS block if on)
-        #   bcs only                   -> BCS-led alert, ONLY when there is a
-        #                                 tradeable pair. A gated shadow is a
-        #                                 non-event: it goes to the log, never
-        #                                 to Telegram (user's call 2026-08-10 —
-        #                                 one notification per rejected signal
-        #                                 is the alert fatigue the gates exist
-        #                                 to cure).
-        # LIVE-mode override: the zebra ENTER alert is the user's order
-        # ticket — with no paper auto-entry it must never be suppressed.
-        send_zebra = 'zebra' in cfg.ALERT_STRUCTURES or not cfg.PAPER_MODE
-        send_bcs = 'bcs' in cfg.ALERT_STRUCTURES
-        if bcs is None and bcs_skip_reason:
-            _log_bcs_suppressed(trade, bcs_skip_reason)
-        if send_zebra:
-            msg = _format_enter_alert(trade, analysis,
-                                      bcs=bcs if send_bcs else None)
-        elif send_bcs and bcs:
-            msg = _format_bcs_enter_alert(trade, analysis, bcs)
-        else:
-            msg = None
-        # One signal, one alert: an ALLOW rides on the ticket already being
-        # sent rather than firing a second notification. Read from the FRESH
-        # record — `trade` predates the verdict that let us reach this line.
-        if msg is not None and cfg.VET_ENABLED:
-            msg += _vet_line(store.find(trade['id']) or trade)
-        # Funds last, so the money line sits closest to the click-copy symbols.
-        # No-ops entirely in paper mode.
-        if msg is not None:
-            msg += _funds_line(kite, bcs,
-                               (analysis.get('lot_size') or 0) * 1)
-        if msg is None:
-            # Two distinct reasons land here; say which, or a gated signal
-            # looks like a config problem when reading the log later.
-            if bcs is None and bcs_skip_reason:
-                logger.info("No ENTER alert for #%d %s — shadow gated "
-                            "(logged above), zebra silenced",
-                            trade['id'], stock)
-            else:
-                logger.info("ENTER alert suppressed for #%d %s "
-                            "(alert_structures=%s)", trade['id'], stock,
-                            cfg.ALERT_STRUCTURES)
+        bcs, fresh = built
+        # `fresh` is None in LIVE mode when nothing auto-entered -- the
+        # default, since `auto_entry` is off; `_auto_enter_bcs` inside
+        # `_enter_as_bcs` can also fill it when auto-entry is armed and
+        # the fill succeeds. Either way the alert still goes out (as the
+        # order ticket, or as a record of what was just filled), and
+        # _alerts_enabled always returns True when paper mode is off for
+        # exactly that reason.
+        target = fresh or trade
+        if not _alerts_enabled(target):
+            logger.info("ENTER alert suppressed for #%d %s "
+                        "(alert_structures=%s)", trade['id'], stock,
+                        cfg.ALERT_STRUCTURES)
             continue
+        if capital_refused:
+            # ONE signal, ONE alert -- and this one is not an order.
+            # Rendering the ticket and appending "DO NOT ENTER" is what
+            # #449 did: click-copy symbols, a debit, a lot size and a
+            # Claude tick, contradicted by its own last line. Whatever a
+            # reader acts on there, the message was wrong.
+            _send_capital_refused_alert(store, target, bcs, cap_plan,
+                                        stock, dry_run=dry_run)
+            continue
+        msg = _format_bcs_enter_alert(target, analysis, bcs)
+        if cfg.VET_ENABLED:
+            msg += _vet_line(store.find(trade['id']) or target)
+        # Funds LAST, closest to the click-copy symbols. Quantity from the
+        # BCS's own lot_size: the ticket and the margin must price the same
+        # order. (This used to sit BELOW the retired branch's `continue`, so
+        # under the BCS pipeline it ran exactly never — the wire-into-the-live-
+        # path shape, pinned by a test.)
+        msg += _size_line(cap_plan)
+        msg += _funds_line(kite, bcs, bcs.get('lot_size') or 0)
         _send_enter_alert(store, trade, msg, stock, dry_run=dry_run)
 
 
@@ -2290,38 +2570,117 @@ def _expire_if_ancient(store: ZebraStore, trade: dict) -> bool:
         return False
 
 
+# Kite's quote family (/quote, /quote/ltp, /quote/ohlc) is capped at 1 req/s
+# and a 429 opens a 10-second sliding cooldown that every further request
+# EXTENDS. Exactly ONE call in this file is allowed to wait that cooldown out:
+# the spot fetch for open positions, on which TP, the spot veto and the expiry
+# nag all depend. Everything discretionary fails fast, so it can never queue
+# ahead of this one.
+_LTP_RETRIES_EXIT_PATH = 2
+_RATE_LIMIT_COOLDOWN_SEC = 10.0
+
+
+def _spot_ltps(kite, stocks: list):
+    """Spot for every open position, plus WHY the fetch failed.
+
+    Returns ``(prices, error)``. Two things this does that a bare `get_ltp`
+    cannot, both of them lessons from 2026-08-27:
+
+    1. **It carries the cause.** `get_ltp` returns a bare dict — it is the seam
+       the test suite substitutes and it must stay that shape — so the reason
+       is read from `scanner.last_ltp_error()`, cleared immediately before the
+       call so a stale cause can never be reported as a fresh one. A
+       substituted `get_ltp` simply leaves it None, and the blind alert then
+       says "no exception was captured" rather than inventing one.
+    2. **It waits out a rate limit, and only a rate limit.** A 429 clears in
+       ~10 seconds; a dead token does not, and Kite throttles sustained 403s
+       into a 429 lockout, so retrying an auth failure would both fail and
+       disguise itself as the other thing.
+    """
+    scanner_mod.clear_ltp_error()
+    ltps = get_ltp(kite, stocks)
+    err = scanner_mod.last_ltp_error()
+    priced = any((ltps.get(s) or 0) > 0 for s in stocks)
+    attempt = 0
+    while (not priced and kite_errors.is_rate_limit(err)
+           and attempt < _LTP_RETRIES_EXIT_PATH):
+        attempt += 1
+        logger.warning(
+            "SPOT fetch for %d open position(s) was RATE-LIMITED (429) — "
+            "waiting %.0fs for Kite's sliding cooldown, retry %d/%d. Exit "
+            "monitoring is blind until this succeeds.",
+            len(stocks), _RATE_LIMIT_COOLDOWN_SEC, attempt,
+            _LTP_RETRIES_EXIT_PATH)
+        time.sleep(_RATE_LIMIT_COOLDOWN_SEC)
+        scanner_mod.clear_ltp_error()
+        ltps = get_ltp(kite, stocks)
+        err = scanner_mod.last_ltp_error()
+        priced = any((ltps.get(s) or 0) > 0 for s in stocks)
+    return ltps, err
+
+
 def _alert_monitoring_blind(n_open: int, stocks: list,
+                            error: Optional[BaseException] = None,
                             dry_run: bool = False) -> None:
-    """One Telegram a day when NO open position can be priced at all.
+    """One Telegram per CAUSE per day when NO open position can be priced.
 
     Deliberately not a per-trade flag: the condition is about the data feed,
     not about any one position, and 24 identical messages would train the
     reader to ignore the one that matters. The marker is a file rather than a
     module global because the cron process exits between cycles, so an
     in-memory guard would re-alert every five minutes.
+
+    **It reports what happened; it does not guess.** Until 2026-08-27 this
+    said "Most likely the Kite access token has expired" unconditionally. On
+    that day it fired at 14:40 with the token generated at 08:45:05 the same
+    morning and the real cause — `Too many requests`, a rate limit — logged on
+    the line immediately above. The alert would have sent the owner to
+    regenerate a healthy token while the actual fault continued. So:
+
+    * the exception is CARRIED here (`get_ltp_ex`) rather than swallowed at
+      the fetch, and classified by `common.kite_errors`
+    * expiry is asserted only when the token file on disk supports it — its
+      `generated_at` is READ, never assumed
+    * the dedup marker is keyed on (date, CAUSE), so a rate limit in the
+      morning does not silence a genuine token death in the afternoon. That is
+      the one way "once a day" could have turned this alert into the thing it
+      is meant to prevent.
     """
+    diag = kite_errors.diagnose(error, cfg.KITE_TOKEN_FILE)
+    cause = diag['cause']
     today = datetime.now(IST).strftime('%Y-%m-%d')
     marker = cfg.LOG_DIR / 'zebra_blind_alert.json'
     try:
-        seen = json.loads(marker.read_text()).get('date') if marker.exists() else None
+        prev = json.loads(marker.read_text()) if marker.exists() else {}
     except Exception:
-        seen = None
+        prev = {}
+    seen = (prev.get('date'), prev.get('cause'))
+
     logger.error(
         "MONITORING BLIND: no LTP for ANY of %d open position(s) (%s) — "
-        "TP, spot SL and the expiry nag are all dark this cycle. Check the "
-        "Kite access token.", n_open, ', '.join(sorted(stocks)[:12]))
-    if seen == today:
+        "TP, spot SL and the expiry nag are all dark this cycle. "
+        "CAUSE=%s: %s | %s", n_open, ', '.join(sorted(stocks)[:12]),
+        cause.upper(), diag['error'],
+        (diag['token'] or {}).get('summary', 'token not checked'))
+    if seen == (today, cause):
         return
     try:
-        marker.write_text(json.dumps({'date': today}))
+        marker.write_text(json.dumps({'date': today, 'cause': cause}))
     except Exception as e:
         logger.warning("Could not write the blind-alert marker: %s", e)
+    tok = diag['token'] or {}
     _send_telegram(
         f"🚨 <b>ZEBRA MONITORING BLIND</b>\n"
         f"No price for ANY of {n_open} open position(s).\n"
-        f"TP, spot SL and the expiry nag are all dark. Most likely the Kite "
-        f"access token has expired — check "
-        f"<code>data/kite_access_token.json</code>.",
+        f"TP, spot SL and the expiry nag are all dark.\n\n"
+        f"<b>{html.escape(diag['headline'])}</b>\n"
+        f"Kite said: <code>{html.escape(diag['error'][:200])}</code>\n"
+        # Name the file even when it is healthy. The alert this replaced
+        # pointed at it while ASSERTING expiry; this one points at it while
+        # REPORTING what it says, so the reader can check rather than trust.
+        f"<code>data/kite_access_token.json</code>: "
+        f"{html.escape(str(tok.get('summary', 'not checked')))}\n\n"
+        f"{html.escape(diag['advice'])}",
         dry_run=dry_run)
 
 
@@ -2523,7 +2882,10 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     """Monitor entered trades for TP/SL/time exits.
 
     PAPER mode (default): auto-close at structure mid after each exit alert.
-    LIVE mode: alert only, user runs `zebra close` manually.
+    LIVE mode: alert only UNLESS `_exits_external(trade)` is true (armed by
+    `cfg.EXITS_MANAGED_EXTERNALLY` AND cohort membership), in which case
+    `bcs/spread_monitor.py` places the real closing orders through the exit
+    bridge instead; otherwise the user runs `zebra close` manually.
     Dedup via persistent <kind>_alerted_at flags on each trade (survives
     cron restarts).
     """
@@ -2539,21 +2901,28 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     # counter untouched because it lives inside the per-trade loop below that
     # never ran. health.py watches the Claude CLI credential and nothing has
     # ever watched Kite's.
+    # This is the ONLY fetch in the file whose failure stops exit monitoring
+    # outright, so it is the one that must be able to say WHY it failed and
+    # the one worth waiting out a rate limit for. `_spot_ltps` does both.
+    ltp_error: Optional[BaseException] = None
     try:
-        ltps = get_ltp(kite, stocks)
+        ltps, ltp_error = _spot_ltps(kite, stocks)
     except Exception as e:
         logger.error("LTP fetch RAISED for %d open position(s): %s",
                      len(entered), e, exc_info=True)
-        ltps = {}
+        ltps, ltp_error = {}, e
     if not any((ltps.get(s) or 0) > 0 for s in stocks):
         # Not one price for any open position. Blind on the SPOT source, which
         # is the one TP and the expiry nag run off, so this is a full stop of
         # exit monitoring rather than a degraded mode. Blind means Telegram.
-        _alert_monitoring_blind(len(entered), stocks, dry_run=dry_run)
+        _alert_monitoring_blind(len(entered), stocks, error=ltp_error,
+                                dry_run=dry_run)
         return
     today = datetime.now(IST).date()
     # One store write for the whole cycle's peak tracking — see _flush_mfe.
     pending_mfe: dict = {}
+    # Once-per-cycle latch for the peer-engine heartbeat check below.
+    stood_down = False
 
     for trade in entered:
         # An earlier exit-check this cycle may have already auto-closed.
@@ -2747,6 +3116,21 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 logger.info(
                     "EXITS EXTERNAL #%d %s: spread_monitor owns this "
                     "position's exits - measured, not acted on", tid, stock)
+                # Standing down is only safe if somebody stood UP. Checked
+                # here rather than at the top of the cycle because this branch
+                # is the only place the hand-off actually happens, and once
+                # per cycle rather than once per trade because a fault common
+                # to the whole book must not produce one Telegram per row.
+                if not stood_down:
+                    stood_down = True
+                    try:
+                        alert_if_exit_engine_down(
+                            sum(1 for t in entered if _exits_external(t)),
+                            dry_run=dry_run)
+                    except Exception as e:
+                        logger.warning(
+                            "exit-engine heartbeat check failed: %s", e,
+                            exc_info=True)
                 continue
 
             # ── TP ──────────────────────────────────────────────────────────
@@ -2983,6 +3367,21 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
             _reap_starved_vets(store, dry_run=dry_run)
         except Exception as e:
             logger.error("Starved-vet sweep failed: %s", e, exc_info=True)
+    # ── EXITS FIRST. This ordering is a rate-limit control, not a tidy-up ──
+    # Kite allows ONE quote-family request per second and answers the rest with
+    # a 429 that opens a 10-second sliding cooldown. On 2026-08-27 the scanner
+    # ran first, spent ~20 seconds burning historical and LTP calls on ~49
+    # discretionary candidates, and `check_entered` then asked for the spot of
+    # all 9 OPEN POSITIONS and was refused — MONITORING BLIND at 14:40:36,
+    # three seconds after the scan finished. Exit monitoring is the only phase
+    # here that can lose money by not running; scanning a candidate five
+    # minutes later costs nothing (`feedback_no_rush_to_enter`). So the phase
+    # that manages open risk now takes the budget first and the discretionary
+    # phases take what is left.
+    try:
+        check_entered(store, kite, dry_run=dry_run)
+    except Exception as e:
+        logger.error("Entered cycle failed: %s", e, exc_info=True)
     if do_scan:
         try:
             validate_and_add(store, kite=kite, dry_run=dry_run)
@@ -2992,10 +3391,6 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
         check_watching(store, kite, dry_run=dry_run)
     except Exception as e:
         logger.error("Watching cycle failed: %s", e, exc_info=True)
-    try:
-        check_entered(store, kite, dry_run=dry_run)
-    except Exception as e:
-        logger.error("Entered cycle failed: %s", e, exc_info=True)
     # Everything below is OBSERVATION, never trading. It runs last and each
     # piece is independently caught, so a failure in the learning/monitoring
     # half can never stop the half that trades.

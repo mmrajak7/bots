@@ -1,0 +1,234 @@
+"""The fake must never be safer than the strictest real store.
+
+`feedback_fake_must_not_be_safer_than_production`, sixth instance. The five
+before it were argued one at a time and each fix covered exactly the method
+that had already burned somebody. This file is the general fix: it PROBES the
+real stores for what they accept, and fails if `fakes.MemoryStore` accepts
+anything they refuse.
+
+The instance that prompted it:
+
+    def update_trade_exit(self, trade_id, exit_data):
+        t = self._find(trade_id)
+        t.update(exit_data)
+        t['status'] = 'closed'          # <- no status check, ever
+
+`ZebraStore.mark_exited` refuses anything that is not 'entered' or 'closing'.
+Because `bcs/tests/replay.py` substitutes `MemoryStore` for the cohort book,
+every replay of a live close booked cleanly while production raised on the
+identical call — which is how a 100%-reproducible bug on the money path
+reached the Pi under a green suite.
+
+The vocabularies differ, so the table is expressed in ROLES
+-----------------------------------------------------------
+`bcs`/`bear_put`/`fallen_hero` say 'open' and 'closed'; `zebra` says 'entered'
+and 'exited'. Comparing raw status strings would compare the wrong things. Each
+store declares its own name for each role and the contract is stated once.
+
+A known, deliberate divergence
+------------------------------
+The three BCS-family stores have NO status check on `update_trade_exit` at all
+— they will book an exit onto a closed or a frozen record. That is laxer than
+zebra and is asserted below rather than glossed over, so the day it changes,
+this file says so. It is not fixed here: those stores are outside this change's
+file ownership. See `test_the_bcs_family_is_laxer_than_zebra_on_booking`.
+"""
+from __future__ import annotations
+
+import importlib
+import json
+
+import pytest
+
+from bcs.tests.fakes import MemoryStore
+from bcs.zebra_adapter import ZebraStoreAdapter
+from zebra import config as zcfg
+from zebra.trade_store import ZebraStore
+
+#: The four roles a record can be in when a close path touches it.
+OPEN, CLOSING, FROZEN, TERMINAL = 'open', 'closing', 'frozen', 'terminal'
+ROLES = (OPEN, CLOSING, FROZEN, TERMINAL)
+
+#: THE CONTRACT. What the strictest real store does, per (role, method).
+#: True = the call is accepted and the record moves; False = refused.
+#:
+#: FROZEN ('partial_close') refuses everything on purpose: legs are live at the
+#: broker, nothing is monitoring them, and the record is waiting for a human.
+#: An automated path that could book or re-lock it would be putting orders on
+#: top of a position whose real size nobody knows.
+#: TERMINAL refuses everything because that is what idempotence IS — the
+#: guarantee that two processes racing to close cannot both book.
+CONTRACT = {
+    ('begin_close', OPEN): True,
+    ('begin_close', CLOSING): False,
+    ('begin_close', FROZEN): False,
+    ('begin_close', TERMINAL): False,
+    ('update_trade_exit', OPEN): True,
+    ('update_trade_exit', CLOSING): True,
+    ('update_trade_exit', FROZEN): False,
+    ('update_trade_exit', TERMINAL): False,
+    ('recover_closing_trade', OPEN): False,
+    ('recover_closing_trade', CLOSING): True,
+    ('recover_closing_trade', FROZEN): False,
+    ('recover_closing_trade', TERMINAL): False,
+}
+
+#: (module, class, file-stem, {role: that store's status string})
+BCS_FAMILY_STATUSES = {OPEN: 'open', CLOSING: 'closing',
+                       FROZEN: 'partial_close', TERMINAL: 'closed'}
+ZEBRA_STATUSES = {OPEN: 'entered', CLOSING: 'closing',
+                  FROZEN: 'partial_close', TERMINAL: 'exited'}
+
+REAL_BOOKS = [
+    ('bcs', 'bcs.trade_store', 'TradeStore', 'bcs_trades'),
+    ('bear_put', 'bear_put.trade_store', 'BearPutStore', 'bear_put_trades'),
+    ('fallen_hero', 'fallen_hero.trade_store', 'FallenHeroStore',
+     'fallen_hero_trades'),
+]
+
+_EXIT_DATA = {'exit_reason': 'TP', 'exit_spot': 1401.0,
+              'exit_spread': 40.00, 'short_fill': 10.20, 'long_fill': 50.20}
+
+
+def _record(status):
+    """One record carrying every field any of the four stores needs to book."""
+    return {
+        'id': 1, 'version': 1, 'status': status, 'stock': 'TESTCO',
+        'quantity': 700, 'lot_size': 700, 'lots': 1,
+        # bcs/bps/fh vocabulary
+        'long_symbol': 'TESTCO26SEP1340CE', 'short_symbol': 'TESTCO26SEP1390CE',
+        'spot_symbol': 'NSE:TESTCO', 'exchange': 'NFO', 'net_debit': 13.55,
+        'spread_width': 50, 'expiry': '2026-09-29',
+        # zebra vocabulary
+        'cohort': zcfg.COHORT_START, 'structure': 'bcs',
+        'debit': 13.55, 'width': 50, 'timeframe': 'monthly', 'direction': 'CE',
+        'entry_spot': 1360.0, 'tp_spot': 1400.0, 'sl_spot': 1319.0,
+    }
+
+
+def _probe(store, method):
+    """Did the call take effect? Refusal is False OR an exception — both are a
+    refusal, and which one a store chooses is not what this contract is about.
+    """
+    try:
+        if method == 'update_trade_exit':
+            store.update_trade_exit(1, dict(_EXIT_DATA))
+            return True                      # returns None on success
+        if method == 'recover_closing_trade':
+            return bool(store.recover_closing_trade(1))
+        return bool(getattr(store, method)(1, 'TP'))
+    except TypeError:
+        # A signature mismatch is a harness bug, not a refusal, and silently
+        # scoring it as one would let every cell in the column read "refused"
+        # while proving nothing. It cost three green-looking failures here.
+        raise
+    except Exception:
+        return False
+
+
+def _bcs_family_store(modname, clsname, stem, tmp_path, monkeypatch, status):
+    mod = importlib.import_module(modname)
+    data = tmp_path / f'{stem}.json'
+    monkeypatch.setattr(mod, 'LOG_DIR', tmp_path)
+    monkeypatch.setattr(mod, 'LOCAL_TRADES_FILE', data)
+    monkeypatch.setattr(mod, 'LOCK_FILE', tmp_path / f'{stem}.lock')
+    data.write_text(json.dumps([_record(status)]), encoding='utf-8')
+    s = getattr(mod, clsname)(config={'google_drive': {'enabled': False}})
+    s.initialize()
+    return s
+
+
+def _zebra_store(tmp_path, monkeypatch, status):
+    d = tmp_path / 'zebra'
+    d.mkdir(exist_ok=True)
+    monkeypatch.setattr(zcfg, 'LOG_DIR', d)
+    monkeypatch.setattr(zcfg, 'LOCAL_FILE', d / 'zebra_trades.json')
+    monkeypatch.setattr(zcfg, 'LOCK_FILE', d / 'zebra_trades.lock')
+    (d / 'zebra_trades.json').write_text(json.dumps([_record(status)]))
+    s = ZebraStore(config={'google_drive': {'enabled': False}})
+    s.initialize()
+    return ZebraStoreAdapter(s)
+
+
+@pytest.mark.parametrize('method,role', sorted(CONTRACT))
+def test_the_cohort_store_matches_the_contract(tmp_path, monkeypatch,
+                                               method, role):
+    """`ZebraStore` through the adapter IS the strictest real store, and it is
+    the one the money path talks to for this cohort. The contract table is
+    pinned to it, not merely compared with it."""
+    store = _zebra_store(tmp_path, monkeypatch, ZEBRA_STATUSES[role])
+    assert _probe(store, method) is CONTRACT[(method, role)]
+
+
+@pytest.mark.parametrize('method,role', sorted(CONTRACT))
+def test_the_fake_matches_the_contract(method, role):
+    """The whole point of the file.
+
+    Against the pre-fix `MemoryStore` this fails on five of the twelve cells —
+    every `update_trade_exit` refusal, plus `begin_close` and
+    `recover_closing_trade` from states the real stores decline — because the
+    fake had no status checks at all and answered True unconditionally.
+
+    A fake that accepts what production refuses does not merely fail to catch a
+    bug; it actively certifies the broken code.
+    """
+    store = MemoryStore(trades=[_record(BCS_FAMILY_STATUSES[role])])
+    assert _probe(store, method) is CONTRACT[(method, role)]
+
+
+@pytest.mark.parametrize('method,role', sorted(CONTRACT))
+def test_the_fake_speaks_zebras_vocabulary_too(method, role):
+    """`replay.py` hands `MemoryStore` to `_open_zebra_store`, so the same fake
+    stands in for a store whose open state is called 'entered'. If it only
+    understood 'open' it would refuse every cohort close — stricter than
+    production this time, but equally a fake testing something production does
+    not do."""
+    store = MemoryStore(trades=[_record(ZEBRA_STATUSES[role])])
+    assert _probe(store, method) is CONTRACT[(method, role)]
+
+
+@pytest.mark.parametrize('name,modname,clsname,stem', REAL_BOOKS,
+                         ids=[b[0] for b in REAL_BOOKS])
+@pytest.mark.parametrize('role', ROLES)
+def test_the_fake_is_never_laxer_than_a_real_book(tmp_path, monkeypatch,
+                                                  name, modname, clsname,
+                                                  stem, role):
+    """The inequality, stated directly and over every book.
+
+    The table above says what the fake SHOULD do. This says the weaker thing
+    that must hold no matter what the table says: for each real store and each
+    role, anything the real store refuses, the fake must refuse too. It is the
+    assertion that survives a future store being made stricter.
+    """
+    for method in ('begin_close', 'update_trade_exit', 'recover_closing_trade'):
+        real = _probe(
+            _bcs_family_store(modname, clsname, stem, tmp_path, monkeypatch,
+                              BCS_FAMILY_STATUSES[role]),
+            method)
+        fake = _probe(MemoryStore(trades=[_record(BCS_FAMILY_STATUSES[role])]),
+                      method)
+        if not real:
+            assert not fake, (
+                f'{name}.{method} refuses a {role} record and MemoryStore '
+                f'accepts it — the fake is safer than production, which is '
+                f'how the exit-bridge bug shipped under a green suite')
+
+
+def test_the_bcs_family_is_laxer_than_zebra_on_booking(tmp_path, monkeypatch):
+    """A known divergence, asserted so it cannot change unnoticed.
+
+    `TradeStore.update_trade_exit` (and its two copies) has no status check at
+    all: it will stamp 'closed' onto a record that is already closed, or one
+    frozen at 'partial_close' with live legs. Zebra refuses both.
+
+    NOT fixed here — those three files are outside this change's ownership, and
+    tightening a store the live monitor books through deserves its own change
+    with its own review. Recorded, with the consequence spelled out: on those
+    three books a double-close still double-books, and the only thing standing
+    between that and a real order is `begin_close`, which IS checked.
+    """
+    frozen = _bcs_family_store('bcs.trade_store', 'TradeStore', 'bcs_trades',
+                               tmp_path, monkeypatch, 'partial_close')
+    assert _probe(frozen, 'update_trade_exit') is True, (
+        'bcs.TradeStore.update_trade_exit grew a status check — good; update '
+        'CONTRACT and delete this test')

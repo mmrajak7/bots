@@ -185,18 +185,42 @@ def _cohort(store_rows: List[dict]) -> dict:
     basis: Counter = Counter(
         (t.get('fees') or {}).get('basis', 'unstamped') for t in ex)
     wins = sum(1 for t in ex if float(t.get('pnl_net', t['pnl'])) > 0)
-    # ARMING GATE. TP is a SPOT trigger; every other exit reason runs through
-    # the book-reading machinery -- debit SL, trail, spot veto, intrinsic
-    # floor, reliability gate, time SL -- which is the half both real-money
-    # losses came from. A cohort of pure TPs is no evidence about it at all.
-    # Strip the `paper:` prefix the way outcomes.label_for_reason does; without
-    # that every reason here is unrecognised and the gate reads as unmet
-    # forever.
-    reasons: Counter = Counter(
-        str(t.get('exit_reason') or 'unknown').replace('paper:', '') for t in ex)
-    stop_exits = sum(v for k, v in reasons.items() if k != 'tp')
+    # ARMING GATE. TP is a SPOT trigger; the stop reasons run through the
+    # book-reading machinery -- debit SL, trail, spot veto, intrinsic floor,
+    # reliability gate, time SL -- which is the half both real-money losses
+    # came from. A cohort of pure TPs is no evidence about it at all.
+    #
+    # This is an ALLOWLIST (`outcomes.is_stop_exit`), never a `!= 'tp'`. The
+    # not-equal test counted every string it did not recognise as a stop, and
+    # it recognised almost nothing: `already_flat_tp` -- a TAKE-PROFIT the
+    # monitor found already flat at the broker -- cleared the gate, as did all
+    # five of the order path's own reason strings. Worse, already-flat is
+    # exactly what arming exits against paper positions produces, so the gate
+    # would have been cleared by the mistake it exists to prevent.
+    #
+    # Unrecognised reasons count for NOTHING and are reported separately, so
+    # the vocabulary cannot drift quietly a second time.
+    from .outcomes import classify, is_stop_exit
+    reasons: Counter = Counter()          # canonical kind -> count
+    stop_kinds: Counter = Counter()       # only those that COUNT at the gate
+    recovered: Counter = Counter()        # already-flat bookings, by kind
+    unrecognised: Counter = Counter()     # raw string -> count
+    for t in ex:
+        c = classify(t.get('exit_reason'))
+        key = c['kind'] or 'unrecognised'
+        reasons[key] += 1
+        if not c['known']:
+            unrecognised[c['raw'] or '(empty)'] += 1
+        if c['recovered']:
+            recovered[key] += 1
+        if is_stop_exit(t.get('exit_reason')):
+            stop_kinds[key] += 1
+    stop_exits = sum(stop_kinds.values())
     return {'closed': len(ex), 'wins': wins,
             'exit_reasons': dict(reasons), 'stop_exits': stop_exits,
+            'stop_exit_kinds': dict(stop_kinds),
+            'recovered_exits': dict(recovered),
+            'unrecognised_exit_reasons': dict(unrecognised),
             'gross': round(gross, 0), 'net': round(net, 0),
             'median_net_pct': (round(statistics.median(
                 [float(t['pnl_net_pct']) for t in ex
@@ -237,14 +261,31 @@ def _flags(cyc, vet, tr, warn, coh, prev: Optional[dict]) -> List[str]:
     # rather than met. Owner's decision 2026-08-26: do not arm the exit path
     # until the cohort has produced real STOP exits in paper.
     if coh['closed'] and not coh.get('stop_exits'):
-        out.append(f"ARMING GATE UNMET: all {coh['closed']} cohort exit(s) are "
-                   f"TP, a SPOT trigger. The stop path (debit_sl / spot_sl / "
-                   f"trail / time) has NO cohort evidence — do not arm.")
+        out.append(f"ARMING GATE UNMET: none of the {coh['closed']} cohort "
+                   f"exit(s) is a transacted stop. The stop path (debit_sl / "
+                   f"spot_sl / trail / time / expiry) has NO cohort evidence "
+                   f"— do not arm.")
     elif coh.get('stop_exits'):
         kinds = ', '.join(f'{k} x{v}' for k, v in
-                          sorted(coh['exit_reasons'].items()) if k != 'tp')
+                          sorted((coh.get('stop_exit_kinds') or {}).items()))
         out.append(f"arming gate: {coh['stop_exits']} cohort stop exit(s) so "
                    f"far ({kinds}) — read their books before arming.")
+    # Vocabulary drift is what let a take-profit clear the gate. It must never
+    # again be able to happen without a line in this list.
+    unrec = coh.get('unrecognised_exit_reasons') or {}
+    if unrec:
+        out.append(f"{sum(unrec.values())} cohort exit(s) carry an "
+                   f"UNRECOGNISED reason ({', '.join('%s x%d' % (k, v) for k, v in sorted(unrec.items()))}) "
+                   f"— they count for NOTHING at the arming gate until "
+                   f"zebra/outcomes.py names them")
+    rec = coh.get('recovered_exits') or {}
+    if rec:
+        out.append(f"{sum(rec.values())} cohort exit(s) booked ALREADY-FLAT "
+                   f"({', '.join('%s x%d' % (k, v) for k, v in sorted(rec.items()))}) "
+                   f"— no close machinery ran and the price was recovered from "
+                   f"order history, not transacted. They do NOT count as stop "
+                   f"evidence. A RUN of these is the signature of exits armed "
+                   f"against paper positions.")
 
     uncostable = coh['fee_basis'].get('brokerage_only', 0)
     if uncostable:

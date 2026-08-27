@@ -373,23 +373,76 @@ class MemoryStore:
         self._rec('update_trade_fields', trade_id, **fields)
         self._find(trade_id).update(fields)
 
+    # ── The state machine, pinned to the STRICTEST real store ───────────────
+    #
+    # `feedback_fake_must_not_be_safer_than_production`, sixth instance, and
+    # this one cost more than the others: `update_trade_exit` below set
+    # `status='closed'` UNCONDITIONALLY, so every replay booked an exit that
+    # the real `ZebraStore.mark_exited` would have refused outright. The
+    # `begin_close -> update_trade_exit` cycle — the entire live close path —
+    # was green in the harness and raised on every call in production.
+    #
+    # The three real stores disagree about how strict they are, so the fake
+    # takes the STRICTEST of them, per method:
+    #
+    #   begin_close           bcs: from 'open' only     zebra: from 'entered' only
+    #   update_trade_exit     bcs: NO CHECK AT ALL      zebra: 'entered'/'closing'
+    #   recover_closing_trade bcs: from 'closing' only  zebra: from 'closing' only
+    #
+    # 'open' and 'entered' are the same fact in two vocabularies (bcs vs
+    # zebra), so both are accepted; nothing else is. Refusing what only the
+    # LAXEST store permits is the point — a fake calibrated to the laxest
+    # store proves nothing about the strictest one, which is the one on the
+    # money path.
+    #
+    # `test_store_contract.py` drives this table against the real stores and
+    # fails if the fake ever drifts back to being more permissive.
+
+    #: 'open' (bcs/bps/fh vocabulary) == 'entered' (zebra vocabulary).
+    OPEN_LIKE = ('open', 'entered')
+    #: A close lock may only be taken from an open position.
+    BEGIN_CLOSE_FROM = OPEN_LIKE
+    #: An exit may be booked from an open position or one mid-close. NOT from
+    #: a terminal state (idempotence) and NOT from 'partial_close', which is
+    #: frozen for a human.
+    EXIT_FROM = OPEN_LIKE + ('closing',)
+    #: Only a stranded close lock is recoverable.
+    RECOVER_FROM = ('closing',)
+
     def update_trade_exit(self, trade_id, exit_data):
         # Signature MIRRORS bcs/trade_store.py:413 — a positional dict, not
         # kwargs. A double that accepts a looser signature than the real thing
         # lets a genuine TypeError pass in tests and blow up in production.
         self._rec('update_trade_exit', trade_id, exit_data)
         t = self._find(trade_id)
+        if t.get('status') not in self.EXIT_FROM:
+            # ValueError, matching `ZebraStore.mark_exited`. A double-book is
+            # the thing the status check exists to stop, so it must be as loud
+            # here as it is in production.
+            raise ValueError(
+                f"#{trade_id} status={t.get('status')}, can't exit")
         t.update(exit_data)
         t['status'] = 'closed'
 
     def begin_close(self, trade_id, reason):
         self._rec('begin_close', trade_id, reason)
-        self._find(trade_id)['status'] = 'closing'
+        t = self._find(trade_id)
+        if t.get('status') not in self.BEGIN_CLOSE_FROM:
+            # False, not an exception: "somebody else got there first" is the
+            # normal answer in both real stores and the caller branches on it.
+            return False
+        t['status'] = 'closing'
+        t['close_reason'] = reason
         return True
 
     def recover_closing_trade(self, trade_id):
         self._rec('recover_closing_trade', trade_id)
-        self._find(trade_id)['status'] = 'open'
+        t = self._find(trade_id)
+        if t.get('status') not in self.RECOVER_FROM:
+            return False
+        t['status'] = 'open'
+        t.pop('close_reason', None)
+        return True
 
     def set_trade_status(self, trade_id, status, **extra_fields):
         self._rec('set_trade_status', trade_id, status, **extra_fields)

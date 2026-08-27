@@ -119,6 +119,36 @@ def _journal_to_tmp(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _monitor_logs_to_tmp(tmp_path):
+    """Point `spread_monitor.LOG_DIR` at a throwaway directory, for EVERY test.
+
+    Second instance of `_journal_to_tmp` above, and for the same reason: H4
+    added a per-poll heartbeat file (`logs/exit_engine_heartbeat.json`) that
+    `monitor_all` writes on every path including the empty-book one, so the
+    replay family went red against the production-write rail the moment it was
+    wired in. `replay.py` stubs `set_log_file`, which covered the session log
+    but not a second artifact in the same directory.
+
+    Redirecting the DIRECTORY rather than stubbing the writer, so the next
+    file written beside it is covered without anyone remembering — the whole
+    lesson of `feedback_the_copy_you_did_not_open`. It is strictly safer than
+    the status quo: with this in place no test can write the real session log
+    either.
+
+    A test that wants to observe the heartbeat repoints `sm.LOG_DIR` itself; a
+    test-body monkeypatch runs after fixtures and wins.
+    """
+    from bcs import spread_monitor
+
+    mp = pytest.MonkeyPatch()
+    d = tmp_path / 'monitor_logs'
+    d.mkdir(exist_ok=True)
+    mp.setattr(spread_monitor, 'LOG_DIR', d)
+    yield d
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
 def _no_production_writes():
     """Deliberately does NOT take the shared `monkeypatch` fixture.
 

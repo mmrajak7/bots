@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -22,7 +23,44 @@ from bs4 import BeautifulSoup
 
 from . import config as cfg
 
+try:
+    from common import kite_errors
+except Exception:                       # pragma: no cover - import safety
+    kite_errors = None
+
 logger = logging.getLogger(__name__)
+
+# Kite's published per-second limits (kite.trade/docs/connect/v3/exceptions):
+#   quote family (/quote, /quote/ltp, /quote/ohlc) — 1 req/s, batch 500/1000
+#   historical candles                             — 3 req/s
+# A 429 opens a 10-SECOND SLIDING COOLDOWN, and every request made during that
+# window EXTENDS it. So a retry loop with no backoff does not merely fail, it
+# lengthens the outage — which is why the sleeps below are not optional
+# politeness.
+# Backing off from a 429 lives in ONE place: `zebra.monitor._spot_ltps`. Only
+# that caller knows the fetch is exit-critical and therefore worth 10 seconds;
+# every other caller here is discretionary and must fail fast so it cannot
+# queue ahead of the one that matters. A second retry loop in this module
+# would be the 'copy you did not open' shape, on the path where it costs most.
+
+# Historical candles are capped at 3 req/s. The scanner issues them in a tight
+# loop over ~48 candidates with no pacing at all, which is how 48 of these
+# failed with `Too many requests` on 2026-08-27. Pacing is cheap here — a scan
+# is discretionary and runs after exit monitoring — and it also makes the
+# ONE-TIME cache warm-up below safe: the first cycle of the day now fetches a
+# full 6Y history per symbol, which would otherwise be the worst burst of all.
+_HISTORICAL_MIN_INTERVAL_SEC = 1.0 / 3.0
+_last_historical_at = 0.0
+
+
+def _historical_throttle() -> None:
+    """Block just long enough to stay inside Kite's 3 req/s historical cap."""
+    global _last_historical_at
+    wait = _last_historical_at + _HISTORICAL_MIN_INTERVAL_SEC - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _last_historical_at = time.monotonic()
+
 
 # ── Caches ────────────────────────────────────────────────────────────────
 _st_cache: dict = {}               # {(stock, timeframe): {st, direction, atr, computed_at}}
@@ -155,8 +193,56 @@ _KNOWN_NON_EQUITY = frozenset({'NIFTY', 'BANKNIFTY', 'CNXMIDCAP', 'FINNIFTY',
                                'MIDCPNIFTY', 'NIFTYNXT50', 'SENSEX'})
 
 
+# The cause of the most recent `get_ltp` failure, or None. Read it with
+# `last_ltp_error()` and clear it with `clear_ltp_error()` immediately BEFORE
+# the call you intend to interrogate — a stale cause is worse than none, and
+# `get_ltp` is monkeypatched in tests, so the slot cannot rely on being reset
+# by the call itself.
+#
+# It exists because `get_ltp` has to keep returning a bare dict: it is the
+# seam the whole test suite substitutes, and every caller but one is happy to
+# treat "no price" as "no price". The ONE caller that must know why — the spot
+# fetch for open positions in `zebra.monitor.check_entered` — reads this.
+_last_ltp_error: Optional[Exception] = None
+
+
+def last_ltp_error() -> Optional[Exception]:
+    """The exception that stopped the last real `get_ltp`, or None."""
+    return _last_ltp_error
+
+
+def clear_ltp_error() -> None:
+    """Forget the last failure. Call BEFORE a fetch you will interrogate."""
+    global _last_ltp_error
+    _last_ltp_error = None
+
+
 def get_ltp(kite, symbols: List[str]) -> Dict[str, float]:
     """Get LTP for multiple symbols. Returns {symbol: price}.
+
+    Wrapper over `get_ltp_ex`, which also returns WHY the call failed. The
+    cause is additionally stashed in `last_ltp_error()`, because swallowing it
+    here is what let `zebra.monitor` tell the owner his access token had
+    expired when the real answer, one line above in the same log, was
+    `Too many requests`.
+    """
+    global _last_ltp_error
+    out, err = get_ltp_ex(kite, symbols)
+    _last_ltp_error = err
+    return out
+
+
+def get_ltp_ex(kite, symbols: List[str]
+               ) -> Tuple[Dict[str, float], Optional[Exception]]:
+    """Get LTP for multiple symbols. Returns ``({symbol: price}, error)``.
+
+    `error` is the exception that stopped the fetch, or None on success. It is
+    RETURNED rather than logged-and-dropped so the caller can say what actually
+    happened instead of guessing — see `common.kite_errors`.
+
+    It does NOT retry. Backing off from a 429 is the caller's judgement call
+    and lives in `zebra.monitor._spot_ltps`, the one caller whose failure stops
+    exit monitoring.
 
     Validates symbols against Kite instrument cache first to avoid
     silent failures from Chartink symbols that don't match NSE exactly.
@@ -164,7 +250,7 @@ def get_ltp(kite, symbols: List[str]) -> Dict[str, float]:
     "valid but suspended" (which just won't appear in the result).
     """
     if not symbols:
-        return {}
+        return {}, None
     # Ensure instrument cache is loaded so we can validate
     _load_instrument_cache(kite)
 
@@ -195,19 +281,26 @@ def get_ltp(kite, symbols: List[str]) -> Dict[str, float]:
                        len(unmapped), ', '.join(sorted(unmapped)[:20]))
 
     if not valid:
-        return result
+        return result, None
 
-    # Kite LTP accepts "NSE:SYMBOL" format
+    # Kite LTP accepts "NSE:SYMBOL" format. /quote/ltp batches up to 1000
+    # instruments in ONE request, so this is a single call however long `valid`
+    # gets — the per-second budget is spent on the number of CALLS, not names.
     instruments = [f"NSE:{s}" for s in valid]
     try:
         data = kite.ltp(instruments)
         for key, val in data.items():
             sym = key.replace('NSE:', '')
             result[sym] = val['last_price']
-        return result
+        return result, None
     except Exception as e:
-        logger.error("LTP fetch failed: %s", e)
-        return result
+        # Name the CAUSE in the log line, not just the message. This log was
+        # the only record of the 2026-08-27 outage and it read
+        # "LTP fetch failed: Too many requests" — accurate, while the alert
+        # built on top of it said "token expired".
+        cause = kite_errors.classify(e) if kite_errors else 'unclassified'
+        logger.error("LTP fetch failed [%s]: %s", cause, e)
+        return result, e
 
 
 def _load_instrument_cache(kite):
@@ -296,6 +389,43 @@ def _aggregate_to_weekly(daily_data: list) -> list:
     return weekly
 
 
+def _write_daily_cache(cache_file, symbol: str, daily_data: list) -> None:
+    """Persist freshly fetched daily candles so the next cycle costs nothing.
+
+    THE fix for the 2026-08-27 historical-quota burn. `compute_st_for_stock`
+    has always READ `backtest_cache/<SYM>.json` and never written it, and the
+    in-memory `_st_cache` is defeated by the cron process exiting between
+    5-minute cycles. So every stale symbol re-fetched its whole history on
+    EVERY cycle — ~48 symbols x 2 chunks against Kite's 3 req/s historical
+    limit, in a ~20-second burst. The files on this box were last written
+    2026-07-23, i.e. 35 days stale, which is past the reader's own 5-day
+    freshness bar: every symbol, every cycle.
+
+    TODAY'S BAR IS EXCLUDED. It is incomplete until the close, and this
+    directory is shared with research and backtest code
+    (`playbook/st_watch/regime_monitor.py` reads it) — writing a partial
+    session into it would put a half-formed candle into a backtest. The
+    caller's own aggregation already drops the current month/week/day, so
+    nothing downstream loses anything.
+
+    Best-effort and silent-on-failure by design: a cache write is an
+    optimisation, and a read-only or full disk must never stop a scan.
+    """
+    try:
+        today = datetime.now().strftime('%Y-%m-%d')
+        complete = [c for c in daily_data if str(c['date'])[:10] < today]
+        if len(complete) < cfg.ST_PERIOD + 1:
+            return                       # not worth caching, and never trust it
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_file.with_suffix('.json.tmp')
+        with open(tmp, 'w') as f:
+            json.dump(complete, f)
+        os.replace(str(tmp), str(cache_file))   # atomic: readers never see half
+        logger.debug("Cached %d daily candles for %s", len(complete), symbol)
+    except Exception as e:
+        logger.debug("Could not cache daily data for %s: %s", symbol, e)
+
+
 def compute_st_for_stock(kite, symbol: str, timeframe: str) -> dict:
     """Compute ST(10,3) for a stock. Uses cache if available.
 
@@ -343,38 +473,55 @@ def compute_st_for_stock(kite, symbol: str, timeframe: str) -> dict:
             daily_data = None
 
     if not daily_data:
-        # Fetch from Kite API
+        # Fetch from Kite API.
+        #
+        # ALWAYS the full 6Y span, whatever this timeframe needs, so the
+        # result can be written back to the shared cache below and reused by
+        # every timeframe. A 3Y file read later by the MONTHLY path would
+        # compute ST(10,3) off 3 years of monthly candles and silently
+        # disagree with the 6Y answer — the exact error `feedback_st_computation`
+        # exists to prevent. Costing one extra call on the first miss of the
+        # day buys ~76 cycles of zero calls for that symbol.
         try:
             token = get_instrument_token(kite, symbol)
             now = datetime.now()
-            start = now - timedelta(days=365 * data_years)
+            fetch_years = max(_DATA_YEARS.values())
+            start = now - timedelta(days=365 * fetch_years)
 
-            if data_years > 5:
-                # 6Y: 2 chunks to avoid 2000-day limit
-                mid = now - timedelta(days=365 * 3)
-                chunk1 = kite.historical_data(
-                    token, start.strftime('%Y-%m-%d'),
-                    mid.strftime('%Y-%m-%d'), 'day'
-                )
-                chunk2 = kite.historical_data(
-                    token, (mid + timedelta(days=1)).strftime('%Y-%m-%d'),
-                    now.strftime('%Y-%m-%d'), 'day'
-                )
-                daily_data = chunk1 + chunk2
-            else:
-                # 3Y or 1Y: single chunk (well within 2000-day limit)
-                daily_data = kite.historical_data(
-                    token, start.strftime('%Y-%m-%d'),
-                    now.strftime('%Y-%m-%d'), 'day'
-                )
+            # 2 chunks to stay inside Kite's 2000-day per-request cap on
+            # daily candles.
+            mid = now - timedelta(days=365 * 3)
+            _historical_throttle()
+            chunk1 = kite.historical_data(
+                token, start.strftime('%Y-%m-%d'),
+                mid.strftime('%Y-%m-%d'), 'day'
+            )
+            _historical_throttle()
+            chunk2 = kite.historical_data(
+                token, (mid + timedelta(days=1)).strftime('%Y-%m-%d'),
+                now.strftime('%Y-%m-%d'), 'day'
+            )
+            daily_data = chunk1 + chunk2
 
             # Normalize date format
             for c in daily_data:
                 if not isinstance(c['date'], str):
                     c['date'] = c['date'].isoformat()
 
+            _write_daily_cache(cache_file, symbol, daily_data)
+
+            # Now trim to what THIS timeframe asked for, so the ST computed
+            # below is unchanged by the wider fetch.
+            cutoff = (now - timedelta(days=365 * data_years)).strftime('%Y-%m-%d')
+            daily_data = [c for c in daily_data if c['date'][:10] >= cutoff]
+
         except Exception as e:
-            logger.error("Historical data fetch failed for %s: %s", symbol, e)
+            # Name the CAUSE. 48 of these lines on 2026-08-27 all said
+            # "Too many requests" and nothing anywhere joined them up to the
+            # blind-monitoring alert three hours later.
+            cause = kite_errors.classify(e) if kite_errors else 'unclassified'
+            logger.error("Historical data fetch failed for %s [%s]: %s",
+                         symbol, cause, e)
             return {}
 
     # Cache raw daily data for velocity reuse
@@ -520,6 +667,7 @@ def compute_daily_velocity(kite, symbol: str, st_value: float,
             token = get_instrument_token(kite, symbol)
             now = datetime.now()
             start = now - timedelta(days=15)
+            _historical_throttle()
             daily = kite.historical_data(
                 token, start.strftime('%Y-%m-%d'),
                 now.strftime('%Y-%m-%d'), 'day'

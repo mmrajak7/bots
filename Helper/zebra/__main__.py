@@ -720,6 +720,7 @@ def cmd_analyze(args):
 
     timeframe = args.timeframe
     direction = args.direction.upper() if args.direction else None
+    st = None       # set only when we route the direction ourselves
     if direction is None:
         st = compute_st_for_stock(kite, stock, timeframe)
         if not st:
@@ -751,43 +752,46 @@ def cmd_analyze(args):
         sys.exit(1)
 
     print(f"  expiry {result['expiry']} ({result['dte']} DTE), lot={result['lot_size']}")
-    print(f"  K_S (ATM): {result['k_s_used']}")
-    print(f"  evaluated {result['all_evaluated']} K_L candidates\n")
+    atm = result.get('atm_quote') or {}
+    print(f"  ATM strike {result['atm_strike']}  "
+          f"bid={atm.get('bid')} ask={atm.get('ask')} mid={atm.get('mid')} "
+          f"OI={atm.get('oi')}")
+    if result.get('back_ratio'):
+        print("  back ratio: RETIRED 2026-08-27 — not priced, not tradeable")
+    print("")
 
-    best = result.get('best')
-
-    def _print_row(c, label):
-        warn = ' [' + ','.join(c['gate_fails']) + ']' if c['gate_fails'] else ''
-        print(f"  {label}  K_L={c['k_l']}, K_S={c['k_s']}, width={c['width']:.0f}{warn}")
-        print(f"        long  {c['long_symbol']}  mid={c['long_mid']:.2f} "
-              f"(b={c['long_bid']:.2f}/a={c['long_ask']:.2f}, "
-              f"sprd={c['long_spread_pct']:.1f}%) OI={c['long_oi']:,}")
-        print(f"        short {c['short_symbol']}  mid={c['short_mid']:.2f} "
-              f"(b={c['short_bid']:.2f}/a={c['short_ask']:.2f}, "
-              f"sprd={c['short_spread_pct']:.1f}%) OI={c['short_oi']:,}")
-        print(f"        debit={c['debit']:.2f}  BE={c['be']:.2f} ({c['be_pct_from_spot']:+.2f}%)  "
-              f"NetExt={c['net_ext']:+.2f}  regime={c['regime']}")
-        print(f"        cap/lot=Rs {c['capital_per_lot']:,.0f}\n")
-
-    if best:
-        print("  >>> BEST PICK <<<")
-        _print_row(best, '       ')
-        print(f"  Place this trade then run:")
-        print(f"    python -m zebra enter ID --pair {int(best['k_l'])}/{int(best['k_s'])} "
-              f"--debit X --lots 1 --expiry {result['expiry']}\n")
-
-    best_key = (best['k_l'], best['k_s']) if best else (None, None)
-    alternatives = [c for c in result['candidates']
-                    if (c['k_l'], c['k_s']) != best_key]
-    if alternatives:
-        print("  Alternatives (top by theta-positivity):")
-        for i, c in enumerate(alternatives, 1):
-            _print_row(c, f'  [{i}]')
+    # The BCS is the structure that trades, so it is the structure this verb
+    # reports. It used to print a ranked list of back-ratio (K_L, K_S) pairs,
+    # which is empty by design now — a verb whose entire output describes a
+    # retired structure is a verb that lies.
+    #
+    # The short leg is picked nearest the ST target, exactly as the live path
+    # does; with no ST value to hand (`--direction` given explicitly) the ATM
+    # strike is the honest fallback and `analyze_bcs` forces at least one
+    # strike beyond it, so the spread always has width.
+    target = st['st'] if st else result['atm_strike']
+    bcs = strikes_mod.analyze_bcs(
+        kite, stock, direction, spot, target_spot=target,
+        expiry=result['expiry'], atm_strike=result['atm_strike'],
+        atm_quote=atm, lot_size=result['lot_size'])
+    if bcs.get('error'):
+        print(f"  BCS: SUPPRESSED — {bcs['error']}")
+        return
+    print("  >>> BCS (the structure that trades) <<<")
+    print(f"    long  {bcs['long_symbol']}  "
+          f"b={bcs['long_bid']:g}/a={bcs['long_ask']:g} OI={bcs['long_oi']:,}")
+    print(f"    short {bcs['short_symbol']}  "
+          f"b={bcs['short_bid']:g}/a={bcs['short_ask']:g} OI={bcs['short_oi']:,}")
+    print(f"    width={bcs['width']:g}  debit={bcs['debit']:g} (fill) / "
+          f"{bcs['debit_mid']:g} (mid)  d/w={bcs['debit_to_width_pct_mid']:.1f}%")
+    print(f"    max profit/share={bcs['max_profit_per_share']:g}  "
+          f"entry cost={bcs['entry_cost']:g} ({bcs['entry_cost_pct']:.1f}% of max gain)")
 
 
 def cmd_trigger(args):
     """Force-run analyzer + alert on a specific watching signal."""
-    from .monitor import _send_telegram, _format_enter_alert
+    from .monitor import (_send_telegram, _format_bcs_enter_alert,
+                          _build_bcs)
     from .scanner import _get_kite, get_ltp
     from . import strikes as strikes_mod
     from .trade_store import get_store
@@ -819,7 +823,14 @@ def cmd_trigger(args):
     if trade['status'] == 'watching':
         store.mark_triggered(trade['id'], spot, gap, analysis['candidates'])
 
-    msg = _format_enter_alert(trade, analysis)
+    # The BCS, not the retired back ratio. `_format_enter_alert` rendered
+    # the latter and now raises; this verb is a manual re-run of the live
+    # alert, so it must build the same ticket the live path builds.
+    bcs = _build_bcs(kite, trade, analysis, spot)
+    if bcs is None:
+        print('BCS suppressed by a gate (see the log) — no ticket')
+        sys.exit(1)
+    msg = _format_bcs_enter_alert(trade, analysis, bcs)
     if args.dry_run:
         print(msg)
     else:

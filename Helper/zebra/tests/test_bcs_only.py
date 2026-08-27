@@ -244,24 +244,58 @@ def test_the_real_analyzer_returns_an_atm_quote(monkeypatch):
         "analyze() no longer surfaces the ATM book the BCS path builds from"
 
 
-# ── rollback ─────────────────────────────────────────────────────────────
-def test_entry_structure_zebra_restores_the_old_path(wired, monkeypatch):
-    """The migration is one config flip, both ways. Open positions are never
-    touched, so there is no data migration to undo either."""
-    monkeypatch.setattr(cfg, 'ENTRY_STRUCTURE', 'zebra')
-    monkeypatch.setattr(cfg, 'BCS_PAPER_ENABLED', False)
-    trades = cycle(wired)
-    assert trades[0]['status'] == 'entered'
-    assert trades[0].get('structure') is None, "zebra path stamped a structure"
-    assert trades[0]['long_strike'] == 90.0        # the zebra pair, not the BCS
+# ── the back ratio is DECOMMISSIONED, not merely unselected ──────────────
+# REPLACES `test_entry_structure_zebra_restores_the_old_path`, which asserted
+# the config flip still restored the back-ratio entry path. The owner
+# decommissioned that structure on 2026-08-27: the rollback it pinned is gone
+# on purpose, and a test guarding a removed rollback would have to be deleted
+# or the removal reverted. These pin the removal instead.
+def test_entry_structure_zebra_is_refused_not_honoured(wired, monkeypatch):
+    """The old value must not quietly route anywhere. The entry code that
+    consumed it no longer exists, so honouring it would be worse than
+    refusing it."""
+    from zebra import config
+    assert config._ENTRY_STRUCTURES == ('bcs',),         'entry_structure is no longer single-valued'
+    assert 'zebra' not in config._ENTRY_STRUCTURES
+
+
+def test_the_analyzer_no_longer_prices_the_back_ratio(monkeypatch):
+    """THE rate-limit fix. `analyze()` used to quote up to 8 deep-ITM strikes
+    per triggered signal — 1 kite.quote each, against a 1 req/s cap — for a
+    `best` nothing trades. It must now cost exactly ONE quote: the ATM book."""
+    from zebra import strikes
+    quoted = []
+
+    def fake_quote(kite, symbol):
+        quoted.append(symbol)
+        return {'bid': 1.9, 'ask': 2.1, 'mid': 2.0, 'oi': 9000, 'last': 2.0,
+                'bid_qty': 100, 'ask_qty': 100, 'ltp': 2.0, 'ltp_fresh': True,
+                'reliable': True, 'unreliable_reason': ''}
+
+    monkeypatch.setattr(strikes, '_load_options_csv', lambda: None)
+    monkeypatch.setattr(strikes, '_pick_expiry', lambda stock: '2026-09-30')
+    monkeypatch.setattr(strikes, '_list_strikes',
+                        lambda *a, **k: [80.0, 85.0, 90.0, 95.0, 100.0, 105.0])
+    monkeypatch.setattr(strikes, '_OPTIONS_CACHE', {'TESTCO': {'2026-09-30': {
+        k: {'CE': {'tradingsymbol': 'TESTCO26SEP%dCE' % k, 'lot_size': 100}}
+        for k in (80, 85, 90, 95, 100, 105)}}})
+    monkeypatch.setattr(strikes, '_quote_option', fake_quote)
+
+    out = strikes.analyze(None, 'TESTCO', 'CE', 99.0)
+
+    assert not out.get('error'), out.get('error')
+    assert len(quoted) == 1,         'analyze() quoted %d legs; the deep-ITM back-ratio loop is back' % len(quoted)
+    assert out['atm_strike'] == 100.0
+    assert out['best'] is None, 'the retired back ratio was priced again'
+    assert out['candidates'] == []
+    assert out['back_ratio'] == strikes.BACK_RATIO_RETIRED,         'a caller cannot tell "retired" from "nothing viable found"'
 
 
 def test_an_unknown_entry_structure_falls_back_loudly():
     """A typo'd config value must not silently pick a structure. config._raw
     validation is import-time, so assert on the validator's own behaviour."""
-    import importlib
     from zebra import config
-    assert config.ENTRY_STRUCTURE in ('bcs', 'zebra')
+    assert config.ENTRY_STRUCTURE == 'bcs'
     assert config._DEFAULTS['entry_structure'] == 'bcs'
 
 

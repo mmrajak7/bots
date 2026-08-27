@@ -34,6 +34,25 @@ logger = logging.getLogger(__name__)
 # the batching removed.
 _BATCHED_POLL_FIELDS = frozenset({'corrob_spot', 'corrob_value', 'corrob_t'})
 
+#: Statuses that mean this thesis is ALREADY LIVE somewhere and a second
+#: signal on the same (stock, timeframe, direction) must be refused.
+#:
+#: The set is deliberately wider than "entered". Dedup is not asking "is money
+#: deployed", it is asking "could a new entry end up beside an existing
+#: obligation at the broker" — and the two transient close states both answer
+#: yes:
+#:
+#: * 'closing'       — the close lock is taken, orders are out, the legs are
+#:                     still there until they fill.
+#: * 'partial_close' — the close FAILED part-way and the record is frozen for a
+#:                     human. Legs are live and nothing is monitoring them.
+#:                     Omitting it let the scanner re-signal and re-enter the
+#:                     same stock while the stranded position sat at the broker.
+#:
+#: One tuple, imported by the dedup check, so a future state cannot be added to
+#: the machine and silently missed here (`feedback_the_copy_you_did_not_open`).
+OPEN_STATUSES = ('watching', 'triggered', 'entered', 'closing', 'partial_close')
+
 
 def in_cohort(trade: dict, cohort: Optional[str] = None) -> bool:
     """Was this position opened by the CURRENT engine?
@@ -245,7 +264,7 @@ class ZebraStore:
                         and t.get('timeframe') == timeframe
                         and t.get('direction') == direction
                         and t.get('shadow_of') is None
-                        and t.get('status') in ('watching', 'triggered', 'entered')):
+                        and t.get('status') in OPEN_STATUSES):
                     raise ValueError(
                         f"{stock} {timeframe} {direction} already open as #{t['id']}"
                     )
@@ -746,7 +765,22 @@ class ZebraStore:
             # across processes: if the other cron already closed this trade,
             # we see 'exited' here and refuse, instead of double-booking a
             # close on stale in-memory state.
-            if t['status'] != 'entered':
+            #
+            # 'closing' IS accepted, and that is the whole point of the state.
+            # `begin_close` persists it BEFORE any order leaves for the broker,
+            # so the order path's own book-the-exit call arrives here with
+            # status='closing' every single time. Requiring 'entered' made
+            # `mark_exited` raise on 100% of bridged closes: the caller
+            # (`bcs/spread_monitor.py`) caught it, froze the record at
+            # `partial_close` and Telegrammed "manual intervention needed" —
+            # after the legs were already flat at the broker. The paper path
+            # (`zebra/monitor.py`) books straight from 'entered' and never saw
+            # it, which is why this survived a review.
+            #
+            # 'exited' stays refused. That is the idempotence guarantee and it
+            # is unaffected: a second booking of the same close is still a
+            # double-book, whichever state it came from.
+            if t['status'] not in ('entered', 'closing'):
                 raise ValueError(f"#{trade_id} status={t['status']}, can't exit")
             self._apply_exit(t, exit_spot, exit_debit, reason, exit_legs)
         return t
@@ -825,6 +859,24 @@ class ZebraStore:
         t['exit_debit'] = exit_debit
         t['pnl'] = pnl
         t['pnl_pct'] = pnl_pct
+        # THE BOOK WE EXITED ON. Entry books have been persisted since fill
+        # pricing landed; exits kept only the two scalars, so the one direction
+        # that has twice cost real money (ICICI Feb, NHPC Jul) was also the one
+        # direction with no evidence. An option book cannot be reconstructed
+        # after the fact -- if it is not written down at the moment of the
+        # exit, the post-mortem is guesswork forever.
+        #
+        # WRITTEN BEFORE THE FEE STAMP, deliberately. `round_trip_for_trade`
+        # reads `t['exit_legs'][side]['price']` and falls back to scaling the
+        # ENTRY legs by the structure's decay when it cannot find one. This
+        # assignment used to sit below the stamp, so the costing never saw the
+        # book even when the book held real fills -- every bridged exit would
+        # have been costed by the estimate meant for the 208 historical records
+        # that have no leg prices at all. The paper run exists to answer
+        # whether this strategy clears its own costs; estimating a cost that is
+        # known is the one avoidable way to get that answer wrong.
+        if exit_legs:
+            t['exit_legs'] = exit_legs
         # NET OF CHARGES, beside the gross figure and never replacing it.
         # The two-month paper run exists to answer one question — does this
         # strategy clear its own costs — and the measured baseline says the
@@ -846,14 +898,6 @@ class ZebraStore:
             logger.warning("fee stamp failed for #%d: %s — gross P&L stands",
                            t.get('id'), e)
         t['exit_reason'] = reason
-        # THE BOOK WE EXITED ON. Entry books have been persisted since fill
-        # pricing landed; exits kept only the two scalars, so the one direction
-        # that has twice cost real money (ICICI Feb, NHPC Jul) was also the one
-        # direction with no evidence. An option book cannot be reconstructed
-        # after the fact -- if it is not written down at the moment of the
-        # exit, the post-mortem is guesswork forever.
-        if exit_legs:
-            t['exit_legs'] = exit_legs
         t['version'] = t.get('version', 0) + 1
         logger.info(
             "EXITED #%d %s reason=%s spot=%.2f P&L=Rs%.0f (%.1f%%)",

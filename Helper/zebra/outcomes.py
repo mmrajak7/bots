@@ -50,24 +50,164 @@ HIT = 'hit'          # reached the target the strategy was aiming at
 MISS = 'miss'        # went the other way by the same distance first
 FLAT = 'flat'        # neither, before the position ran out of time
 
-# Exit reasons mapped onto the same labels. TIME is deliberately FLAT, not a
-# miss: expiring without resolution says the signal was slow, not wrong, and
-# scoring it as a loss would make every veto of a slow signal look brilliant.
+
+# ── THE exit-reason vocabulary ───────────────────────────────────────────
+#
+# TWO engines close a cohort position and they do not share a vocabulary:
+#
+#   zebra/monitor.py::_paper_auto_close   stamps `paper:<reason>` with
+#       reason in {tp, trail, spot_sl, debit_sl, time, expiry}
+#   bcs/spread_monitor.py                 writes its OWN names — TP, SL_SPOT,
+#       SL_SPREAD, SL_TRAIL, EXPIRY_FORCE_CLOSE — and prefixes the recovery
+#       path with ALREADY_FLAT_; bcs/zebra_adapter.py lowercases them.
+#
+# Every reader of `exit_reason` therefore has to translate, and every reader
+# that translates SEPARATELY is a place the vocabulary can drift. It drifted:
+# the arming gate counted "anything that is not `tp`" as a stop exit, so
+# `already_flat_tp` — a TAKE-PROFIT — reported the gate cleared, and so did
+# every one of the monitor's five real reason strings mapping to nothing.
+#
+# So: ONE map, here, and both the label and the gate read it. Anything absent
+# from it is UNRECOGNISED, which is never silently treated as anything.
+TP = 'tp'
+TRAIL = 'trail'
+SPOT_SL = 'spot_sl'
+DEBIT_SL = 'debit_sl'
+TIME = 'time'
+EXPIRY = 'expiry'
+MANUAL = 'manual'
+
+#: raw reason (lowercased, prefixes stripped) -> canonical kind.
+#: Derived from the writers, not from memory: grep `_paper_auto_close(` in
+#: zebra/monitor.py and `close_spread(` / `close_fallen_hero(` in
+#: bcs/spread_monitor.py before adding to it.
+_EXIT_KIND = {
+    # zebra/monitor.py, the paper engine
+    'tp': TP,
+    'trail': TRAIL,
+    'spot_sl': SPOT_SL,
+    'debit_sl': DEBIT_SL,
+    'time': TIME,
+    'expiry': EXPIRY,
+    # bcs/spread_monitor.py, the engine that can place orders
+    'sl_spot': SPOT_SL,
+    'sl_spread': DEBIT_SL,
+    'sl_trail': TRAIL,
+    'expiry_force_close': EXPIRY,
+    # `zebra close ID` with no --reason
+    'manual': MANUAL,
+    'manual close': MANUAL,
+}
+
+#: Prefixes that qualify a reason without changing WHICH trigger fired.
+#: `already_flat_tp` is a take-profit; the prefix says how it was booked.
+_PAPER_PREFIX = 'paper:'
+_RECOVERED_PREFIX = 'already_flat_'
+
+#: The kinds that are evidence about the STOP path — the arming gate's whole
+#: subject. TP is excluded because it is a SPOT trigger: it never reads the
+#: option book, so it says nothing about debit SL, the trail, the spot veto,
+#: the intrinsic floor or the reliability gate, which is the machinery both
+#: real-money losses came from. EXPIRY joins TIME for the same reason TIME is
+#: here: both fire on the calendar but book through the same valuation path.
+#: MANUAL is excluded deliberately — a human typing a close is not evidence
+#: that the automation's stop path works, but it IS a known reason, so it must
+#: not be reported as vocabulary drift either.
+STOP_KINDS = frozenset({TRAIL, SPOT_SL, DEBIT_SL, TIME, EXPIRY})
+
+
+def classify(reason) -> dict:
+    """Take one stored `exit_reason` apart. Never raises.
+
+    Returns ``{'raw', 'kind', 'known', 'paper', 'recovered'}``:
+
+    ``kind``       one of the canonical constants above, or None if the string
+                   is not in the vocabulary. None is a REFUSAL, not a default —
+                   see `is_stop_exit`.
+    ``known``      False for exactly the strings that produce ``kind=None``.
+                   Surfaced by the digest so drift is loud instead of silent.
+    ``paper``      the exit was auto-booked by the paper engine at a mid it
+                   never transacted at.
+    ``recovered``  the ALREADY_FLAT path: the monitor found BOTH legs already
+                   flat at the broker, placed no orders, and back-filled the
+                   price from order history — or, when
+                   `_find_last_fill_price` found nothing, from 0.0.
+    """
+    raw = str(reason or '').strip().lower()
+    s, paper, recovered = raw, False, False
+    # Loop rather than two `.replace`s: the two prefixes can in principle
+    # arrive in either order, and a fixed order would silently mis-read one.
+    changed = True
+    while changed:
+        changed = False
+        if s.startswith(_PAPER_PREFIX):
+            s, paper, changed = s[len(_PAPER_PREFIX):], True, True
+        if s.startswith(_RECOVERED_PREFIX):
+            s, recovered, changed = s[len(_RECOVERED_PREFIX):], True, True
+    kind = _EXIT_KIND.get(s)
+    if kind is None:
+        # LOUD. The bug this module exists to close was a vocabulary the
+        # readers had drifted away from and nothing said so.
+        logger.warning(
+            'UNRECOGNISED exit reason %r (normalised %r) — it is counted as '
+            'NOTHING: not a stop exit, not a signal-quality label. Add it to '
+            'zebra.outcomes._EXIT_KIND if a writer really emits it.', raw, s)
+    return {'raw': raw, 'kind': kind, 'known': kind is not None,
+            'paper': paper, 'recovered': recovered}
+
+
+def is_stop_exit(reason) -> bool:
+    """Is this exit EVIDENCE that the stop path works? Fails closed.
+
+    An ALLOWLIST, deliberately, and not `!= 'tp'`. The not-equal test treats
+    every unknown string as a stop, so a vocabulary that drifts by one writer
+    manufactures the very evidence the arming gate is waiting for.
+
+    ``already_flat_*`` returns False even for a real stop kind, and that is the
+    substantive judgement here rather than a technicality:
+
+    * No close machinery ran. The legs were flat before the monitor acted, so
+      nothing was proved about ordering, depth, slippage or the price the stop
+      actually fills at — which is the entire question the gate is asking.
+    * The booked price is RECOVERED, not transacted, and degrades to 0.0 when
+      the order history yields nothing. Scoring a fabricated price as stop-path
+      evidence is worse than having none.
+    * It is the shape the known open defect MANUFACTURES. Arming exits against
+      paper positions finds no legs at the broker, so every close lands here.
+      Counting these would let one mistake produce the evidence authorising the
+      next — a self-clearing gate.
+    """
+    c = classify(reason)
+    return c['kind'] in STOP_KINDS and not c['recovered']
+
+
+# Canonical kinds mapped onto signal-quality labels. TIME (and EXPIRY, which
+# is the same fact with a harder deadline) is deliberately FLAT, not a miss:
+# expiring without resolution says the signal was slow, not wrong, and scoring
+# it as a loss would make every veto of a slow signal look brilliant. MANUAL is
+# FLAT because a human's decision is not a verdict on the signal.
 # TRAIL is nominally a HIT — the level sits above the entry debit, so a trail
 # that fires ON its level books a profit and the signal did what it was
 # supposed to. But the reason string alone is NOT proof of that; see below.
-_REASON_LABEL = {'tp': HIT, 'trail': HIT,
-                 'spot_sl': MISS, 'debit_sl': MISS, 'time': FLAT}
+_REASON_LABEL = {TP: HIT, TRAIL: HIT,
+                 SPOT_SL: MISS, DEBIT_SL: MISS,
+                 TIME: FLAT, EXPIRY: FLAT, MANUAL: FLAT}
 
 
 def label_for_reason(reason, pnl=None) -> str:
     """Map an exit reason to a signal-quality label.
 
-    Strips the `paper:` prefix that `_paper_auto_close` stamps on every
-    auto-booked exit. Without this, PAPER mode — the only mode running today —
-    labels every single allow FLAT, allow-precision is None forever, and the
-    veto-vs-allow comparison this whole score exists for can never produce a
-    number. report.py strips the same prefix in three places.
+    Normalises through `classify`, which strips the `paper:` prefix that
+    `_paper_auto_close` stamps on every auto-booked exit and the
+    `already_flat_` prefix the order path stamps on a recovery close. Without
+    the first, PAPER mode — the only mode running today — labels every single
+    allow FLAT, allow-precision is None forever, and the veto-vs-allow
+    comparison this whole score exists for can never produce a number.
+    report.py strips the same prefix in three places.
+
+    An already-flat exit keeps its trigger's label: an already-flat take-profit
+    IS a take-profit and the signal was right. What it is not is evidence about
+    the stop machinery, and that distinction lives in `is_stop_exit`, not here.
 
     `pnl`, when known, OVERRIDES a positive label. The trail fires on
     `mid <= level`, and books at `mid` — the two are not the same number. A gap
@@ -78,7 +218,7 @@ def label_for_reason(reason, pnl=None) -> str:
     reverse is not symmetric — a MISS that somehow booked a profit stays a
     MISS, because the stop firing is the fact being scored.
     """
-    label = _REASON_LABEL.get(str(reason or '').replace('paper:', ''), FLAT)
+    label = _REASON_LABEL.get(classify(reason)['kind'], FLAT)
     if label == HIT and pnl is not None:
         try:
             v = float(pnl)

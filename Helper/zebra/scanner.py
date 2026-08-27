@@ -3,11 +3,16 @@
 Pipeline:
   1. Chartink scan (monthly + weekly): F&O stocks within ±8% of ST line
   2. For each candidate: compute ST(10,3) independently, get LTP
-  3. Direction:
-       - price > ST + ST direction UP   → bullish pullback to support  → CE-Zebra
-       - price < ST + ST direction DOWN → bearish rally to resistance  → PE-Zebra
-     Other states (price > ST + ST DOWN, price < ST + ST UP) are flagged
-     SKIP — the ST flipped, this is a trend change, not a pullback.
+  3. Direction: routed by `_direction_for` below, the single source of truth
+     — price vs the ST line ONLY (price < ST -> CE, price > ST -> PE, exactly
+     equal -> SKIP, rare). ST direction/trend alignment plays no part in this
+     routing: it is a conviction tag only (see `cfg.is_trend_aligned`) and
+     must NEVER be used as an entry filter — it reads false on nearly every
+     historical record, so gating entry on it would veto almost the entire
+     strategy. (This is the exact rule a stale copy of this docstring got
+     wrong on 2026-08-13, when a vetting agent quoted a "SKIP if trend not
+     aligned" branch that this code has never implemented and killed a valid
+     signal on it.)
   4. Freshness filter (same as magnet): skip if price was within 1% of ST in
      last N days (bounce, not fresh approach)
   5. Add to ZebraStore as WATCHING if gap <= watch_gap_max (5%)
@@ -36,6 +41,7 @@ from playbook.magnet.scanner import (
     _normalize_symbol,
     _get_kite,
     get_ltp,
+    get_ltp_ex,
     compute_st_for_stock,
     check_freshness,
 )
@@ -125,7 +131,12 @@ def validate_and_add(store: ZebraStore, kite=None,
         st_val = st_info['st']
         st_dir = st_info['direction']
 
-        # Direction routing
+        # Direction routing. NOTE: despite the key/message below, this branch
+        # is NOT a trend-misalignment check -- `_direction_for` only ever
+        # returns 'SKIP' for price == st_val exactly (rare). Trend direction
+        # is not consulted at all. The counter name is left as-is because it
+        # is read elsewhere as this exact string; renaming it is a code
+        # change, not a docstring one -- see the task notes for this file.
         direction = _direction_for(price, st_val, st_dir)
         if direction == 'SKIP':
             skips['trend_misaligned'] += 1

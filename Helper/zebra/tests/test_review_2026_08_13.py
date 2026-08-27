@@ -370,26 +370,46 @@ def test_the_live_bcs_ticket_names_only_the_spread(monkeypatch):
     assert 'shadow' not in msg.lower(),         'the structure that actually trades must not be captioned a shadow'
 
 
-def test_format_enter_alert_has_no_dead_bcs_branch(monkeypatch):
-    """A BCS branch was added here and was unreachable from the trading path,
-    while its `not bcs` fallback WAS reachable from `cmd_trigger` (which passes
-    bcs=None) and Telegrammed "NO SPREAD" about signals that had a good spread.
-    Dead code that only runs on the wrong path is worse than none."""
-    monkeypatch.setattr(cfg, 'ENTRY_STRUCTURE', 'bcs')
+def test_the_retired_ticket_raises_instead_of_telegramming(monkeypatch):
+    """This used to assert `_format_enter_alert` had no dead BCS branch,
+    because that branch's `not bcs` fallback WAS reachable from `cmd_trigger`
+    and Telegrammed "NO SPREAD" about signals that had a good spread.
+
+    The whole formatter is retired now (the back ratio was decommissioned on
+    2026-08-27), and the same hazard applies with more force: with no `best`
+    to render, EVERY call would fall into its failure caption and announce a
+    problem that does not exist. So it raises, loudly, instead of speaking.
+    `cmd_trigger` builds the BCS ticket like the live path."""
+    import pytest as _pytest
     trade = {'id': 1, 'stock': 'TESTCO', 'direction': 'CE', 'st_value': 100.0,
              'st_direction': 'DOWN', 'timeframe': 'weekly'}
-    msg = monitor._format_enter_alert(trade, _analysis(), None)
-    assert 'NO SPREAD' not in msg,         'cmd_trigger would Telegram a false NO SPREAD for a viable signal'
+    with _pytest.raises(RuntimeError):
+        monitor._format_enter_alert(trade, _analysis(), None)
+
+    import inspect
+    from zebra import __main__ as zmain
+    src = inspect.getsource(zmain.cmd_trigger)
+    assert '_format_bcs_enter_alert(' in src, \
+        'zebra trigger no longer renders the structure that trades'
+    assert '_format_enter_alert(' not in src
 
 
-def test_the_zebra_ticket_survives_for_the_zebra_pipeline(monkeypatch):
-    """The BCS-only branch must not delete the other pipeline's ticket — the
-    config knob still selects it, and 15 open positions are that structure."""
-    monkeypatch.setattr(cfg, 'ENTRY_STRUCTURE', 'zebra')
-    trade = {'id': 1, 'stock': 'TESTCO', 'direction': 'CE', 'st_value': 100.0,
-             'st_direction': 'DOWN', 'timeframe': 'weekly'}
-    msg = monitor._format_enter_alert(trade, _analysis(), _bcs())
-    assert 'ZEBLONG' in msg and 'BCS shadow' in msg
+def test_the_back_ratio_has_no_entry_path_left(monkeypatch):
+    """REPLACES `test_the_zebra_ticket_survives_for_the_zebra_pipeline`.
+
+    That test guarded the back-ratio ticket because "the config knob still
+    selects it". The owner decommissioned the structure on 2026-08-27, so the
+    knob no longer selects anything: `check_watching` has ONE entry path and
+    no `ENTRY_STRUCTURE == 'zebra'` branch anywhere. Pinned on the SOURCE,
+    because the failure mode being prevented is a retired branch left quietly
+    wired in and still deciding trades."""
+    import inspect
+    src = inspect.getsource(monitor.check_watching)
+    assert "ENTRY_STRUCTURE == 'zebra'" not in src, \
+        'the retired back-ratio entry branch is back in check_watching'
+    assert "analysis.get('best')" not in src, \
+        'check_watching reads the retired back-ratio pick again'
+    assert '_enter_as_bcs(' in src, 'the only entry path is missing'
 
 
 # ── Agent budget: batch channels must not starve the decision ones ────────
@@ -787,9 +807,13 @@ def test_the_funds_check_is_wired_into_the_path_that_actually_trades(
     failure shape, again."""
     import inspect
     src = inspect.getsource(monitor.check_watching)
-    bcs_branch = src.index("if cfg.ENTRY_STRUCTURE == 'bcs':")
-    tail = src.index('if cfg.PAPER_MODE:', bcs_branch)
-    assert '_funds_line' in src[bcs_branch:tail], \
+    # The two markers this used to slice between were removed on
+    # 2026-08-27 with the back-ratio entry branch. The property is
+    # unchanged: _funds_line must sit in the entry path, AFTER the BCS is
+    # opened and BEFORE the alert is sent.
+    entry = src.index('_enter_as_bcs(')
+    send = src.index('_send_enter_alert(store, trade, msg', entry)
+    assert '_funds_line' in src[entry:send], \
         'the funds check is not reachable from the BCS entry path'
 
 

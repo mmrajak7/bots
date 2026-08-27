@@ -17,8 +17,9 @@ What it deliberately does not do
 --------------------------------
 **It does not re-implement the gate.** `zebra.vet.exit_gate` holds a great deal
 of hard-won sequencing — the marker staleness rules, the ancient-PENDING
-discard, the usage-block short-circuit, and the compare-and-swap at
-`vet.py:1630` whose failure mode is "the NHPC direction exactly". A port would
+discard, the usage-block short-circuit, and the compare-and-swap in
+`zebra.vet._set_exit_state` (named here rather than by line number, which
+drifts) whose failure mode is "the NHPC direction exactly". A port would
 be a second copy to keep correct (`feedback_copy_pasted_modules_fix_once`), so
 this calls `zebra.monitor._exit_cleared`, which is the gate AS DEPLOYED,
 escalation Telegram included.

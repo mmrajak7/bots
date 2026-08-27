@@ -37,15 +37,31 @@ a fast good-enough answer beats a slow perfect one.
 ## What the mechanical gates already enforce
 
 These are already measured, so do not re-derive them from scratch — but do not
-assume they PASSED either. Read `gates_all_passed` and `gate_fails` in the
-context:
+assume they PASSED either.
 
-- **`gates_all_passed: true`** — OI ≥ 5,000 on both legs, per-leg spread within
-  1% of mid, and breakeven below the short strike all hold. Don't re-litigate.
-- **`gates_all_passed: false`** — the strike picker found NO clean pair and fell
-  back to the least-bad one. `gate_fails` names exactly what failed. This is a
-  signal worth a hard look, not a rubber stamp: a `long_OI<5000` here is the
-  thin book that item 2 below calls the failure mode that has cost real money.
+**`gates_all_passed` and `gate_fails` are GONE from the context** (2026-08-27).
+They described the retired back-ratio pair, not the spread being vetted;
+decision #92 read their `liquidity_ok: false` / `long_spread>2%` as facts about
+its trade and had to work out unaided that they belonged to a structure nobody
+opens. The back ratio was decommissioned, so the fields were removed rather
+than captioned. **If you see them in a context, the code has regressed — say
+so in your reasoning.**
+
+What is enforced mechanically for the pair in `bcs`, and is therefore true of
+any signal that reaches you at all — `analyze_bcs` returns an ERROR and the
+signal is SUPPRESSED, never alerted with a warning:
+
+- **OI ≥ `min_leg_oi` on BOTH legs.** Unknown OI fails CLOSED. This is the thin
+  book that item 2 below calls the failure mode that has cost real money.
+- **debit/width ≤ `max_debit_to_width_pct`**, evaluated on the MID basis (the
+  basis it was fitted on). Both numbers are in the `bcs` block.
+- **entry cost ≤ `BCS_MAX_ENTRY_COST_PCT` of the max gain** — what the book
+  charges just to open. **UNCALIBRATED**: reasoned, not fitted. Worth your
+  judgement rather than deference.
+- a two-way book on both legs, and a reliable (non-garbage) top-of-book.
+
+So a suppressed signal never reaches you. Your job is the judgement the gates
+cannot make, not a recount of the gates.
 
 True by construction: the gap to the ST line is inside the trigger band, and
 `trend_aligned` is recorded.
@@ -399,6 +415,15 @@ fire on real trades in the underlying and are only vetted for the other
 reasons.) So being called does not mean the quote IS bad; it means nobody has
 checked. This is the dangerous direction, and a routine-looking `allow` here is
 a perfectly good outcome.
+
+**Dry run: this call site does not run at all.** `bcs/exit_vet.py` returns
+`True` immediately when the monitor is in dry run, without spawning you or
+consulting anything — because in dry run zebra still owns this trade's exits,
+and vetting here would race zebra's own gate over one shared marker. Concretely:
+a dry-run session produces ZERO evidence about this call site working, no
+matter how many exit triggers fire during it. `exit_gate` itself still runs
+every day inside `zebra run` (that part is exercised); what dry run never
+exercises is the call FROM `close_spread`.
 
 ## The four exit kinds
 

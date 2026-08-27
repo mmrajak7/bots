@@ -356,11 +356,19 @@ python position_checker.py ICICIBANK    # Specific position
 
 ## Open Positions
 
-### Current Positions (Updated: 2026-07-23)
+### Current Positions
 
-| Underlying | Type | Strikes | Entry Credit | Expiry | SL |
-|------------|------|---------|-------------|--------|-----|
-| INFY | Modified Fallen Hero | 1280/1320 PE + 1400/1520 CE | Rs 16,600 (41.50/sh) | 2026-04-28 | 1,440 (breakeven) |
+This table goes stale the moment a trade opens or closes — check the live
+source of truth instead of trusting a snapshot:
+```bash
+python -m zebra status                 # zebra/BCS cohort (paper mode)
+python -m bcs.spread_monitor --list    # manually-entered BCS trades
+python -c "from fallen_hero import get_store; get_store().list_trades()"  # Fallen Hero
+```
+As of 2026-08-27: 8 open positions, all zebra-cohort BCS entries from
+`cohort='2026-08-14'` (paper mode — no real money); no open manual BCS or
+Fallen Hero trades (the INFY Modified Fallen Hero listed as a live position
+in earlier versions of this file closed 2026-03-18 — see `logs/fallen_hero_trades.json`).
 
 ### Closed Positions (2026)
 
@@ -453,7 +461,7 @@ never alerted with a warning nobody reads.
 | entry cost / max gain | <= 15% | fill vs mid | Added 2026-08-12 with fill pricing. What the book charges just to open. **UNCALIBRATED — reasoned, not fitted.** Replaces the per-leg rupee bid-ask cap (below); denominated in the payoff, which is the same logic the d/w gate uses. Review once ~30 fill-basis records exist. |
 | Bid-ask per leg | **REMOVED** | — | Fired on 17 of 25 closed shadows (68%) and carried no signal at all: 58.8% WR flagged vs 62.5% clean. Its only real effect was training the reader to ignore the warning marker, which is how the OI flag on COCHINSHIP got waved through. The measurement still ships as `short_spread_pct`. |
 | debit floor | **NONE, ever** | — | Cheap spreads are the high-payoff tail (avg win +127%). Power-law rule: never cap the upside. |
-| DTE | first expiry 15-45 | — | Takes the first expiry >= 15 DTE, so entries routinely sit below the manual 20-30 band. |
+| DTE | first expiry 15-45 | — | Takes the first expiry >= 15 DTE, so entries routinely sit below the manual 20-30 band. **45 (owner decision, 2026-08-27; both sources now agree).** 55 had drifted into the tracked config — snapshotted from the live overlay by the config-split commit `7d1b107`, never chosen. No cohort trade ever entered above 41 DTE, so the two values never differed in effect. |
 | Short strike | nearest the ST target | — | Not a % band. At least one strike beyond ATM so the spread always has width. |
 
 `_leg_reliable` (leg width <= 25% of mid) is **not** a tradeability gate — it
@@ -959,6 +967,111 @@ python -c "from fallen_hero import get_store; get_store().list_trades()"
 
 ## Zebra Strategy (Synthetic Long/Short via Back Ratio)
 
+> ⚠ **STRUCTURE DROPPED.** The back-ratio structure described below (2× long
+> ITM + 1× short ATM) no longer trades. The `zebra/` package is still live and
+> still runs the ST-magnet scan/trigger pipeline, but every signal it enters
+> now builds a **Bull Call Spread** instead (`zebra/strikes.py analyze_bcs`,
+> `zebra/monitor.py _enter_as_bcs` / `mark_entered_bcs`) — records carry
+> `structure: 'bcs'`. See "What zebra runs now" immediately below. The
+> back-ratio description further down is kept only because trade records
+> entered before the switch still use that structure.
+
+### What zebra runs now (BCS cohort)
+
+BUY 1× ATM + SELL 1× the strike nearest the ST target (forced at least one
+strike beyond ATM) — a Bull Call Spread on the CE side, a Bear Put Spread on
+the PE side — gated by the "Entry Criteria — AUTOMATED BCS (zebra)" table in
+the Bull Call Spread section above. Three independent switches, all in
+`config/zebra_config.defaults.json` (an untracked `config/zebra_config.json`
+overlay can override):
+
+| Switch | Config key | Currently | Controls |
+|---|---|---|---|
+| Paper simulation | `paper_mode` | **true** | On: zebra auto-enters a triggered signal as a paper BCS position and auto-closes it itself on TP/trail/spot_sl/debit_sl/time — no manual step. Off: the Telegram alert IS the order ticket; entry is manual unless `auto_entry` is armed. |
+| Exit bridge | `exits_managed_externally` | **false** | On: `bcs/spread_monitor.py` (via `bcs/zebra_adapter.py`) takes over exit management for the cohort using the BCS engine's own vetted exits, instead of zebra's own paper auto-close. Off today. |
+| Automated entry | `auto_entry` | **false** | Gates `bcs/entry_executor.py`, the automated LIVE order-placement path. Off today — no real order is placed without a human. |
+
+**Current state: paper mode only, nothing armed** — cohort positions
+(`logs/zebra_trades.json`, `cohort='2026-08-14'`) are simulated, not real
+money. `python -m zebra status` shows the live count.
+
+### ⚠ ARMING — the switch states that are silently dangerous
+
+**Verified 2026-08-27 by an audit of the running code. The arming order that
+stood in `docs/GO_LIVE_DOSSIER.md` before that date was found UNSAFE. That file
+is NOT tracked in git and therefore does NOT reach the Pi — this section is the
+copy that does. If the two ever disagree, re-verify against the code, not
+against either document.**
+
+There are FOUR switches, not three: `paper_mode` gates whether either of the
+other two means anything (`zebra/monitor.py` only consults auto-entry under
+`if not cfg.PAPER_MODE:`), and `--dry-run` on the `bcs.spread_monitor` crontab
+line is a fourth that lives in no config file at all.
+
+| paper_mode | `--dry-run` | exits_managed_externally | What actually happens |
+|---|---|---|---|
+| true | ON | false | Today. zebra books paper exits; the monitor shadows. Safe. |
+| true | ON | **true** | **NO BOOKING ENGINE AT ALL.** zebra stands down; the monitor cannot book. Positions ride untended, silently. |
+| true | **OFF** | false | **TWO EXIT ENGINES** racing one record. |
+| true | OFF | true | Live orders aimed at PAPER positions that have no legs at the broker. |
+| false | OFF | true | The intended end state for exits. |
+
+Two more traps, both verified:
+
+- **The stand-down is one-sided.** `exits_managed_externally` is read only by
+  `zebra/monitor.py`; the string appears nowhere in `bcs/spread_monitor.py`.
+  zebra stops managing exits on its own config, without ever checking that the
+  other engine is alive.
+- **The kill switch creates the no-engine state.** Tripping it forces the
+  monitor to dry-run for the session; if `exits_managed_externally` is true,
+  zebra has already stood down, so nothing books. Alerts continue, which is
+  what makes it look healthy.
+
+**Arm exits and entries in this order, never in one step:**
+
+1. Fix the store-bridge write path first — `ZebraStore.mark_exited`'s status
+   precondition and the `exit_value` / `exit_spread` key mismatch in
+   `bcs/zebra_adapter.py` — with a regression test that drives the REAL
+   `ZebraStore`, not the test `MemoryStore`. **Nothing below is safe until
+   this is done.** ✅ **DONE 2026-08-27** — a cohort TP now books correctly
+   (+195% on the test case) instead of raising or booking −100%; 81 tests,
+   including one that drives the REAL `ZebraStore` rather than the test fake.
+2. Fix `bcs/journal_report.py` cohort visibility, THEN run the dry-run
+   evidence week — the compare tool must name cohort trades, or it is
+   reporting the book under test as missing. ✅ **DONE 2026-08-27** — it now
+   names cohort rows and flags id ambiguity instead of guessing (all four
+   books number from 1).
+3. Put `vet_enabled` in the tracked defaults. It lives only in the Pi's
+   untracked overlay today, so a routine overlay rebuild silently disarms
+   vetting and the exit gate returns `proceed` unconditionally.
+   ✅ **DONE 2026-08-27** — in the tracked defaults, and the code default is
+   now `True` too so both sources agree. Safe because entry vetting fails
+   CLOSED: no verdict, no entry. The Pi's overlay still wins, so its effective
+   value is unchanged.
+
+   > **⚠ Before ANY of this: the arming gate itself could be cleared by a
+   > TAKE-PROFIT.** `ALREADY_FLAT_TP` lowercases to `already_flat_tp`, and
+   > `zebra/digest.py` counted anything `!= 'tp'` as a stop exit. The
+   > already-flat branch fires when the monitor finds no legs at the broker —
+   > i.e. exactly the arm-against-paper-positions mistake step 4 exists to
+   > prevent — so that mistake would have manufactured the evidence
+   > authorising the next step. Being fixed 2026-08-27; the rule is an
+   > ALLOWLIST of known stop reasons, because an unrecognised reason must
+   > leave the gate UNMET.
+4. Let the open paper positions close on their own. Never point the live order
+   path at a record that has no legs at the broker.
+5. Arm exits in ONE market-closed window: confirm the monitor runs and lists
+   the cohort, set `exits_managed_externally: true`, remove `--dry-run`. Next
+   morning verify BOTH zebra's "EXITS EXTERNAL" line AND the monitor's cohort
+   banner showing the same count — the two lines cross-confirm the handoff.
+6. Only after a live exit has correctly booked a real STOP: `paper_mode: false`
+   (it changes alert semantics for the WHOLE store), then separately and later
+   `auto_entry: true` — and not before the entry path has had a review by
+   someone other than its author.
+7. `compound: true` last.
+
+### Back-ratio structure (HISTORICAL — dropped, kept for reading old records)
+
 Bullish (CE-Zebra) and bearish (PE-Zebra) synthetic positions:
 - **CE-Zebra:** BUY 2× ITM CE + SELL 1× ATM CE (same expiry)
 - **PE-Zebra:** BUY 2× ITM PE + SELL 1× ATM PE (same expiry)
@@ -974,13 +1087,16 @@ Chartink scan (monthly + weekly, ±8% of ST)
    ↓ filter: trend alignment + gap ≤ 5% + freshness + price > Rs 100
 add to zebra watchlist (silent — no Telegram)
    ↓ LTP enters trigger zone (gap ≤ 4%, ≥ 3%)
-strike analyzer pulls live option chain (Kite quote)
-   ↓ picks 2-3 (K_L, K_S) pairs ranked by NetExt + BE proximity
-Telegram ENTER alert with click-copy symbols, debit, BE, OI, lots
-   ↓ user places manually
-zebra enter ID --pair K_L/K_S --debit X --lots N --expiry YYYY-MM-DD
-   ↓ monitor every 5 min: TP / SPOT SL / DEBIT SL / TIME alerts
-zebra close ID --exit-debit X --reason ...
+strike analyzer builds a BCS shadow (analyze_bcs) from the live option chain
+   ↓ ATM long leg + nearest-to-target short leg beyond ATM
+Telegram ENTER alert carries the BCS shadow (debit, BE, OI, lots) — the
+classic back-ratio (K_L/K_S) alert is silenced by default (`alert_structures: ['bcs']`)
+   ↓ paper_mode=true (current default): auto-entered here, no manual step
+      paper_mode=false: the alert IS the order ticket; manual, or auto_entry
+monitor every 5 min: TP / SPOT SL / DEBIT SL / TIME — zebra auto-closes its
+   own paper positions unless exits_managed_externally hands the cohort to
+   bcs/spread_monitor.py
+zebra close ID --exit-debit X --reason ...   (manual override / LIVE mode)
 ```
 
 ### Direction routing
@@ -1010,23 +1126,32 @@ to get pulled back to it. Source of truth is `zebra/scanner.py _direction_for`.
 > `trend_aligned` is a CONVICTION TAG (the ⭐ALIGNED badge), never a filter —
 > see `cfg.is_trend_aligned`, whose docstring says exactly this.
 
-### Strike selection rules (HARD)
+### Strike selection rules — back-ratio criteria (HISTORICAL)
+
+K_S/K_L/NetExt describe the dropped back-ratio structure; the live BCS entry
+criteria are the "Entry Criteria — AUTOMATED BCS (zebra)" table in the Bull
+Call Spread section above. The expiry window is shared infrastructure and
+still applies to BCS entries.
 
 - K_S = strike closest to spot (ATM)
 - K_L = 5-10% ITM (deep enough that `2·long_extrinsic ≤ short_extrinsic`)
 - Both legs OI ≥ 5,000
 - Bid-ask spread per leg < 1% of mid (warning if exceeded, not block)
-- DTE 15-45 (auto-picks first expiry ≥ 15 DTE)
+- DTE 15-45 (auto-picks first expiry ≥ 15 DTE — see the `max_dte` note above)
 - BE within ±0.5% of spot (warning beyond 1%)
 
-### Exit triggers (alerts only — user closes manually)
+### Exit triggers
 
 | Trigger | Condition | When |
 |---|---|---|
 | TP | spot reaches ST line | hit max-profit zone |
 | SPOT SL | spot moves 3% adverse from entry | salvage remaining premium |
 | DEBIT SL | structure value drops to 50% of entry debit | half the debit gone |
-| TIME | T-3 days from expiry | pin risk on short ATM |
+| TIME | T-5 days from expiry (`time_sl_days_before_expiry`) | pin risk on short ATM |
+
+In paper mode (current default) zebra auto-closes on these triggers itself —
+see "What zebra runs now" above. They are alert-only / user-closes-manually
+only in LIVE mode, which is not armed today.
 
 ### CLI
 
@@ -1132,7 +1257,7 @@ tail -f /home/trustit/Desktop/BOTS/Helper/logs/spread_monitor_cron_$(date +%Y%m%
 - [x] Debit Spreads (Bull Call / Bear Put) - BCS playbook documented
 - [x] BCS trade store with Google Drive sync (`bcs/` package)
 - [x] Fallen Hero trade store with Google Drive sync (`fallen_hero/` package)
-- [x] Zebra (synthetic long/short via back ratio) — full pipeline (`zebra/` package, 2026-05-11)
+- [x] Zebra (synthetic long/short via back ratio) — full pipeline (`zebra/` package, 2026-05-11); back ratio since DROPPED, package now runs a BCS cohort — see the deprecation banner in "Zebra Strategy" above
 - [ ] Fallen Hero monitor (spread_monitor equivalent)
 - [ ] BCS analyzer/scanner script
 - [ ] Iron Condor analysis

@@ -198,10 +198,8 @@ def test_live_mode_sends_the_order_ticket_exactly_once(wired, monkeypatch):
     store, _ = wired
     monkeypatch.setattr(cfg, 'PAPER_MODE', False)
     sent = []
-    # Stub BOTH formatters: which one runs depends on entry_structure, and a
-    # test that stubs only the retired one silently stops testing the live path.
-    monkeypatch.setattr(monitor, '_format_enter_alert',
-                        lambda *a, **k: 'TICKET')
+    # One formatter left: `_format_enter_alert` was retired with the back
+    # ratio on 2026-08-27 and raises if anything calls it.
     monkeypatch.setattr(monitor, '_format_bcs_enter_alert',
                         lambda *a, **k: 'TICKET')
     monkeypatch.setattr(monitor, '_send_telegram',
@@ -230,7 +228,6 @@ def test_live_order_ticket_survives_one_telegram_failure(wired, monkeypatch):
     """
     store, _ = wired
     monkeypatch.setattr(cfg, 'PAPER_MODE', False)
-    monkeypatch.setattr(monitor, '_format_enter_alert', lambda *a, **k: 'TICKET')
     monkeypatch.setattr(monitor, '_format_bcs_enter_alert', lambda *a, **k: 'TICKET')
     sent, working = [], [False]
     monkeypatch.setattr(

@@ -36,6 +36,7 @@ Usage:
 
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -64,6 +65,7 @@ from kiteconnect import KiteConnect
 from common import option_symbols as _sym
 from common.option_symbols import check_leg_types
 from common import layered_config
+from common import kite_errors
 from bcs import exit_vet
 from bcs import order_journal
 from .trade_store import get_store
@@ -781,6 +783,107 @@ def is_spread_settled(now: Optional[float] = None) -> bool:
     return _resume_settle_at is None or now >= _resume_settle_at
 
 
+# ── Exit-engine heartbeat ───────────────────────────────────────────────────
+# `exits_managed_externally` is a ONE-SIDED stand-down. It is read only by
+# `zebra/monitor.py`; this file has never contained the string. So zebra hands
+# the cohort's stops to this process on the strength of its own config alone,
+# without ever checking that this process exists. Flag on + this monitor not
+# running = NO exit engine at all, and nothing anywhere looks wrong: zebra logs
+# "EXITS EXTERNAL ... measured, not acted on" and carries on, its alerts keep
+# arriving, and the book is unmanaged. `feedback_never_asked_is_not_failed`:
+# "we stood down" and "we stood down and nobody took over" need opposite
+# responses and had one indistinguishable appearance.
+#
+# The kill switch reaches the same state by a different road. Tripping it does
+# not stop this monitor, it forces DRY RUN for the session — so the process is
+# alive, polling and alerting while unable to place a single closing order. If
+# zebra has already stood down, nothing books. Alerts continuing is exactly
+# what makes that look healthy.
+#
+# Hence two facts per beat, never one: that the engine polled, and whether it
+# could actually book. RUNNING IS NOT ABLE-TO-CLOSE.
+#
+# This module only ever WRITES. `zebra/monitor.py` is the reader and resolves
+# the same filename through its own LOG_DIR; a test pins the two paths equal,
+# because a constant copied into two modules is the single most frequent bug
+# shape in this codebase (`feedback_the_copy_you_did_not_open`).
+HEARTBEAT_NAME = 'exit_engine_heartbeat.json'
+HEARTBEAT_SCHEMA = 1
+
+
+def heartbeat_path() -> Path:
+    """Resolved per call, never cached at import — tests repoint LOG_DIR."""
+    return LOG_DIR / HEARTBEAT_NAME
+
+
+def write_heartbeat(state: str, dry_run: bool, *, open_trades: int = 0,
+                    cohort_trades: int = 0, cohort_store: bool = False,
+                    kill_switch: bool = False,
+                    now: Optional[float] = None) -> bool:
+    """Stamp one poll of the exit engine. Best-effort; never raises.
+
+    `state` is what this process is doing — 'startup', 'waiting' (pre-open),
+    'polling', 'idle' (started, nothing to watch) or 'closed' (session over).
+    A beat is written even with an EMPTY book, deliberately: a monitor with
+    nothing to do is not a dead one, and "quiet" must never read as "dead".
+
+    Written atomically (tmp + replace) so a reader on its own 5-minute cron can
+    never see a half-written file and conclude the peer is corrupt.
+
+    Raising here would be the tail wagging the dog: a failure to write the
+    health file must not be able to stop the monitoring the file describes.
+    """
+    now = time.time() if now is None else now
+    payload = {
+        'schema': HEARTBEAT_SCHEMA,
+        'ts': now,
+        'at': datetime.fromtimestamp(now).isoformat(timespec='seconds'),
+        'state': state,
+        # The whole reason this is not a touch-file. `dry_run` True means this
+        # process watches and alerts but places NO order — safe on its own,
+        # catastrophic in combination with a stood-down zebra.
+        'dry_run': bool(dry_run),
+        'kill_switch': bool(kill_switch),
+        'open_trades': int(open_trades),
+        'cohort_trades': int(cohort_trades),
+        # False = the fourth book could not be opened, so cohort positions are
+        # not being watched even though this process is alive and armed.
+        'cohort_store': bool(cohort_store),
+        'pid': os.getpid(),
+    }
+    try:
+        LOG_DIR.mkdir(exist_ok=True)
+        path = heartbeat_path()
+        tmp = path.with_name(path.name + '.tmp')
+        with open(tmp, 'w') as f:
+            json.dump(payload, f)
+        tmp.replace(path)
+        return True
+    except Exception as e:
+        log(f"  WARNING: heartbeat write failed ({e}) — zebra cannot tell "
+            f"this engine is alive")
+        return False
+
+
+def _beat_all(state: str, dry_run: bool, trades: list, zebra_store,
+              kill_switch: bool = False) -> bool:
+    """`write_heartbeat` with the counts read off the book `monitor_all` holds.
+
+    One derivation of "how many cohort positions is this engine watching",
+    used by every call site, so a beat can never disagree with another beat
+    about what the same loaded book contained.
+    """
+    return write_heartbeat(
+        state, dry_run,
+        open_trades=len(trades),
+        # `_store_type` is stamped by `_load_all_trades`; 'zebra' IS the
+        # cohort book, and it is the only one zebra stands down over.
+        cohort_trades=sum(1 for t in trades
+                          if t.get('_store_type') == 'zebra'),
+        cohort_store=zebra_store is not None,
+        kill_switch=kill_switch)
+
+
 def is_expiry_day(trade: dict, today: Optional[date] = None) -> bool:
     """Check if today is the trade's expiry date.
 
@@ -885,8 +988,193 @@ def time_stop_due(trade: dict, today: Optional[date] = None) -> bool:
     return left is not None and left <= n
 
 
+# ── The time stop has THREE outcomes, not two (M11) ────────────────────────
+#
+# It used to have two: armed, or absent. `expiry_trades[key] = True` was set
+# once and every later poll short-circuited on `if key in expiry_trades`, so a
+# force-close that did NOT fill was indistinguishable from one that did. The
+# dict is per-process, so the only retry was TOMORROW, from a fresh process.
+#
+# That is expensive because of what the delivery-margin ramp costs. The margin
+# is levied on the long ITM leg at its STRIKE — full contract value, ~Rs 2.82L
+# against a Rs 2L account — and ramps 10/25/45/70% at EOD of E-4/E-3/E-2/E-1.
+# The close is scheduled six sessions out precisely to stay clear of it, so a
+# day lost to a silent retry spends a sixth of that buffer and moves the
+# position one tranche closer. For a bear put spread the tail has no ceiling:
+# a long ITM put is a GIVE-delivery obligation against an empty demat, and
+# short delivery goes to auction with a 20% floor and no cap.
+#
+# So: ARMED / CLOSED / FAILED, explicitly, and the third is PERSISTED on the
+# record. The in-memory dict loses it on restart, which is exactly when it
+# matters — a restarted monitor would otherwise re-arm and re-send the routine
+# "will force-close by 15:15" line for a stop that has already failed twice.
+#
+# What did NOT change: arming is still once per session. That flag exists so
+# the alert is not repeated every five minutes and that behaviour is correct.
+TIME_STOP_MAX_ATTEMPTS = 3
+#: Seconds to wait before attempt 2, then attempt 3. SHRINKING, deliberately:
+#: the whole retry window is 15:15 -> HARD_ORDER_CUTOFF_TIME, ten minutes, and
+#: each attempt burns its own MAX_RETRIES of order timeouts inside close_leg.
+#: Urgency escalates as the cutoff approaches; it cannot escalate through the
+#: order pricing, which is already at maximum for an URGENT_CLOSE_REASON.
+TIME_STOP_RETRY_WAITS = (120, 60)
+
+
+def time_stop_window_open(now_time: Optional[dtime] = None) -> bool:
+    """Is the clock past the force-close time? ONE definition of that test.
+
+    Trivial on its own; it exists so the three places that ask cannot drift
+    apart, which is the single most frequent bug shape in this codebase.
+    """
+    now_time = datetime.now().time() if now_time is None else now_time
+    return now_time >= EXPIRY_FORCE_CLOSE_TIME
+
+
+def new_time_stop_state(trade: dict, stamp: str) -> dict:
+    """ARMED, unless the RECORD says a process already tried today and failed.
+
+    A restart mid-session is the case this exists for: the cron relaunches this
+    process every five minutes after a crash, and an in-memory-only flag comes
+    back as "not yet armed", which then reads as a first arming and re-alerts
+    accordingly. The persisted counter makes the resumed state honest.
+
+    A stamp from a PREVIOUS day is ignored: attempts do not accumulate across
+    sessions, and a stale counter would silently spend today's retries.
+    """
+    prior = trade.get('time_stop_attempt')
+    if isinstance(prior, dict) and prior.get('date') == stamp:
+        try:
+            attempts = int(prior.get('attempts') or 0)
+        except (TypeError, ValueError):
+            attempts = 0
+        state = prior.get('state')
+        if state not in ('failed', 'escalated', 'closed'):
+            state = 'failed'   # unrecognised -> the pessimistic reading
+        return {'date': stamp, 'state': state, 'attempts': max(0, attempts),
+                'next_attempt_after': 0.0}
+    return {'date': stamp, 'state': 'armed', 'attempts': 0,
+            'next_attempt_after': 0.0}
+
+
+def time_stop_attempt_due(state: Optional[dict], now: Optional[float] = None,
+                          now_time: Optional[dtime] = None) -> bool:
+    """May a force-close be ATTEMPTED for this trade right now?
+
+    Separate from `time_stop_due`, which answers "does the policy say close it
+    TODAY" and remains the only place that decides that. This answers "has the
+    close already been discharged", which is a different question and the one
+    the old `key in expiry_trades` conflated with it.
+
+      armed     -> yes, first attempt
+      failed    -> yes, again, THIS session, after a shrinking backoff
+      closed    -> never
+      escalated -> never; a human has been called
+    """
+    if not state or state.get('state') in ('closed', 'escalated'):
+        return False
+    if state.get('attempts', 0) >= TIME_STOP_MAX_ATTEMPTS:
+        return False
+    now = time.time() if now is None else now
+    if now < state.get('next_attempt_after', 0.0):
+        return False
+    return time_stop_window_open(now_time)
+
+
+def _persist_time_stop(trade: dict, store, state: dict) -> None:
+    """Write the attempt counter to the record. Never raises.
+
+    Same doctrine as `expiry_warn_date`: losing the flag costs a duplicated
+    alert, losing the CLOSE costs a delivery obligation, so a failed write can
+    never block the close path.
+    """
+    payload = {'date': state['date'], 'state': state['state'],
+               'attempts': state['attempts']}
+    trade['time_stop_attempt'] = payload
+    if store is None:
+        return
+    try:
+        store.update_trade_fields(trade['id'], time_stop_attempt=payload)
+    except Exception as e:
+        log(f"  WARNING: could not persist time-stop attempt state for "
+            f"#{trade.get('id')}: {e} — a restart will re-arm as if this "
+            f"close had never been tried")
+
+
+def record_time_stop_result(state: dict, success, trade: dict, store,
+                            label: str, now: Optional[float] = None,
+                            now_time: Optional[dtime] = None) -> str:
+    """Fold one force-close outcome into the three-state machine.
+
+    Returns the new state name. Telegram-escalates exactly ONCE, on the final
+    failure — the point at which no further automatic attempt will be made
+    today and the position is still open inside the delivery ramp.
+
+    `'ABORT'` is not a failure to close: nothing was placed and the trade is
+    still open, so it does not consume an attempt. It still backs off, because
+    an abort that repeats every five seconds is a spin, not a retry.
+    """
+    now = time.time() if now is None else now
+    now_time = datetime.now().time() if now_time is None else now_time
+
+    if success == 'ABORT':
+        state['state'] = 'armed'
+        state['next_attempt_after'] = now + TIME_STOP_RETRY_WAITS[0]
+        log(f"  {label} #{trade.get('id')} {trade.get('stock')}: force close "
+            f"ABORTED before any order. Time stop stays armed.")
+        return 'armed'
+
+    if success is True:
+        state['state'] = 'closed'
+        state['next_attempt_after'] = 0.0
+        # Deliberately NOT persisted: a closed record leaves get_open_trades,
+        # so no restart can re-arm it, and writing to a just-closed record is
+        # a store mutation this path has no reason to make.
+        return 'closed'
+
+    state['attempts'] = state.get('attempts', 0) + 1
+    attempts = state['attempts']
+    # No more attempts today when the retries are spent OR when the broker's
+    # hard reduce-only cutoff has passed — past it `close_spread`'s late-day
+    # guard refuses to place anything, so "retrying" would only delay the one
+    # thing that still helps, which is telling the human.
+    final = (attempts >= TIME_STOP_MAX_ATTEMPTS
+             or now_time >= HARD_ORDER_CUTOFF_TIME)
+    state['state'] = 'escalated' if final else 'failed'
+    wait = TIME_STOP_RETRY_WAITS[min(attempts - 1,
+                                     len(TIME_STOP_RETRY_WAITS) - 1)]
+    state['next_attempt_after'] = 0.0 if final else now + wait
+    _persist_time_stop(trade, store, state)
+
+    who = f"{label} #{trade.get('id')} {trade.get('stock')}"
+    if final:
+        log(f"  {who}: EXPIRY FORCE CLOSE FAILED after {attempts} attempt(s). "
+            f"No further automatic attempt today. Manual intervention needed!")
+        send_telegram(
+            f"🚨 {who}: EXPIRY FORCE CLOSE FAILED\n"
+            f"{attempts} attempt(s) this session, none filled. No further "
+            f"automatic attempt today.\n"
+            f"The position is OPEN inside the delivery-margin ramp — close it "
+            f"by hand in Kite NOW.")
+    else:
+        # "while the position is still open" is not hedging. Every close
+        # failure past the close-lock freezes the record at `partial_close`,
+        # which leaves `get_open_trades` and therefore leaves this loop — by
+        # design, because a frozen position must not be given more orders.
+        # Those paths send their own CRITICAL/FLIPPED alert, so promising an
+        # unconditional retry here would be the only untrue line in the thread.
+        log(f"  {who}: force close attempt {attempts}/"
+            f"{TIME_STOP_MAX_ATTEMPTS} did not fill. Retrying in {wait}s "
+            f"(same session) while the position is still open.")
+        send_telegram(
+            f"⚠️ {who}: force-close attempt {attempts}/"
+            f"{TIME_STOP_MAX_ATTEMPTS} did not fill. Retrying in ~{wait}s "
+            f"while the position is still open.")
+    return state['state']
+
+
 def arm_time_stop(trade: dict, key, expiry_trades: dict, label: str,
-                  note: str = '', today: Optional[date] = None) -> bool:
+                  note: str = '', today: Optional[date] = None,
+                  store=None) -> bool:
     """Arm the force-close flag when this trade's TIME policy says today.
 
     ONE call site for `time_stop_due`, deliberately. There were three -- the
@@ -897,16 +1185,41 @@ def arm_time_stop(trade: dict, key, expiry_trades: dict, label: str,
     expiry_trades key mismatch: a rule applied in one place and quietly not in
     its copy.
 
+    The RETRY lives behind this same call site for the same reason: the value
+    stored in `expiry_trades` is the attempt state, so there is nowhere else to
+    decide whether a time stop is outstanding.
+
     Returns True when it armed this call (False if already armed, or not due).
     """
     if key in expiry_trades or not time_stop_due(trade, today):
         return False
-    expiry_trades[key] = True
+    stamp = (today or date.today()).isoformat()
+    state = new_time_stop_state(trade, stamp)
+    expiry_trades[key] = state
+    tail = f" ({note})" if note else ''
+    when = EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')
+
+    if state['state'] != 'armed':
+        # A process earlier TODAY already tried this close and it did not fill.
+        # Re-arming must not read as a first arming: the routine line below
+        # would announce a force-close that has already failed twice as though
+        # nothing had happened, which is the exact silence M11 exists to end.
+        more = (". No further automatic attempt — close it by hand."
+                if state['state'] in ('escalated', 'closed')
+                else f". Retrying this session "
+                     f"(max {TIME_STOP_MAX_ATTEMPTS} attempts).")
+        log(f"  *** {label} #{trade['id']} {trade['stock']}: TIME STOP RESUMED"
+            f"{tail} — state={state['state']}, "
+            f"{state['attempts']} failed attempt(s) today ***")
+        send_telegram(
+            f"{label} #{trade['id']} {trade['stock']}: TIME STOP RESUMED after "
+            f"a monitor restart{tail}. {state['attempts']} force-close "
+            f"attempt(s) already FAILED today{more}")
+        return True
+
     early = (trade.get('time_policy') == 'sessions_before_expiry'
              and not is_expiry_day(trade, today))
     why = 'TIME STOP' if early else 'EXPIRY DAY'
-    tail = f" ({note})" if note else ''
-    when = EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')
     log(f"  *** {label} #{trade['id']} {trade['stock']}: {why}{tail}! "
         f"Force-close by {when} ***")
     send_telegram(f"{label} #{trade['id']} {trade['stock']}: {why}{tail}. "
@@ -1216,6 +1529,39 @@ def place_limit_order(kite: KiteConnect, exchange: str, symbol: str,
     log(f"    Order placed: {txn_type} {symbol} x {qty} @ {price} -> {order_id}")
     order_journal.record_result(intent_id, order_id=str(order_id), log=log)
     return str(order_id)
+
+
+def close_alert_text(label: str, stock: str, reason: str, spot,
+                     value_lines: list, total_pnl: float, dry_run: bool) -> str:
+    """The Telegram body for a completed close. ONE definition, both books.
+
+    **A dry run never carries a P&L figure.** `wait_for_fill`'s dry stub
+    returns `average_price: 0.0` — correctly, since no order was placed and
+    there is no fill to report — so every close computes `exit_net = 0` and
+    lands on exactly minus-the-entry-debit. During the planned dry-run
+    evidence week that is a stream of fabricated MAXIMUM LOSSES arriving next
+    to zebra's real paper bookings of the same positions, including on the
+    take-profit winners. A number that is wrong is worse than no number: the
+    reader cannot tell it apart from the real ones, and the arming gate is
+    read off exactly this evidence.
+
+    The alert itself is NOT suppressed. "The monitor would have closed here,
+    for this reason, at this spot" is the entire point of running the week —
+    what is withheld is the one line that is not a measurement.
+
+    Both close paths call this, because fixing the copy you happened to open
+    is the most repeated bug in this codebase (`feedback_the_copy_you_did_not_open`).
+    """
+    head = f"[DRY RUN] {label} WOULD CLOSE: {stock}" if dry_run \
+        else f"{label} CLOSED: {stock}"
+    lines = [head, f"Reason: {reason}"] + list(value_lines)
+    if dry_run:
+        lines.append("P&L: not computed - no order was placed, so there is "
+                     "no fill to price the exit at.")
+    else:
+        lines.append(f"P&L: Rs {total_pnl:+,.0f}")
+    lines.append(f"Spot: {spot}")
+    return "\n".join(lines)
 
 
 def wait_for_fill(kite: KiteConnect, order_id: str, dry_run: bool) -> Optional[dict]:
@@ -1992,25 +2338,32 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
 
     log("")
     log("=" * 70)
-    log("  SPREAD CLOSED SUCCESSFULLY")
+    log(f"  SPREAD {'WOULD CLOSE [DRY RUN]' if dry_run else 'CLOSED SUCCESSFULLY'}")
     log("=" * 70)
     log(f"  Reason:                 {reason}")
-    log(f"  Short (BUY back) fill:  {short_fill}")
-    log(f"  Long  (SELL)     fill:  {long_fill}")
-    log(f"  Exit spread value:      {exit_net:.2f}/share")
-    log(f"  Entry spread cost:      {entry_net:.2f}/share")
-    log(f"  P&L per share:          {pnl_per_share:+.2f}")
-    log(f"  Total P&L:              Rs {total_pnl:+,.0f}")
+    if dry_run:
+        # Every one of these is 0.0 from the dry stub, and the arithmetic on
+        # them is a fabricated max loss — see `close_alert_text`. The log is
+        # the forensic record of the dry-run week, so it must not carry the
+        # invented numbers either.
+        log( "  Fills:                  none — no order was placed")
+        log(f"  Entry spread cost:      {entry_net:.2f}/share")
+        log( "  P&L:                    not computed (dry run has no fills)")
+    else:
+        log(f"  Short (BUY back) fill:  {short_fill}")
+        log(f"  Long  (SELL)     fill:  {long_fill}")
+        log(f"  Exit spread value:      {exit_net:.2f}/share")
+        log(f"  Entry spread cost:      {entry_net:.2f}/share")
+        log(f"  P&L per share:          {pnl_per_share:+.2f}")
+        log(f"  Total P&L:              Rs {total_pnl:+,.0f}")
     log(f"  Spot at close:          {spot}")
     log("=" * 70)
 
-    send_telegram(
-        f"{label} CLOSED: {stock}\n"
-        f"Reason: {reason}\n"
-        f"Exit spread: {exit_net:.2f} | Entry: {entry_net:.2f}\n"
-        f"P&L: Rs {total_pnl:+,.0f}\n"
-        f"Spot: {spot}"
-    )
+    send_telegram(close_alert_text(
+        label, stock, reason, spot,
+        ([f"Entry: {entry_net:.2f} | Exit: not priced (no fill)"] if dry_run
+         else [f"Exit spread: {exit_net:.2f} | Entry: {entry_net:.2f}"]),
+        total_pnl, dry_run))
 
     # ── Update trade store ───────────────────────────────────────────────
     exit_data = {
@@ -2339,27 +2692,34 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
 
     log("")
     log("=" * 70)
-    log("  FH POSITION CLOSED")
+    log(f"  FH POSITION {'WOULD CLOSE [DRY RUN]' if dry_run else 'CLOSED'}")
     log("=" * 70)
     log(f"  Reason:              {reason}")
-    log(f"  Short Call fill:     {fills['short_call']:.2f} (BUY back)")
-    log(f"  Long Call fill:      {fills['long_call']:.2f} (SELL)")
-    log(f"  Short Put fill:      {fills['short_put']:.2f} (BUY back)")
-    log(f"  Long Put fill:       {fills['long_put']:.2f} (SELL)")
-    log(f"  Close cost/share:    {close_cost:.2f}")
-    log(f"  Entry credit/share:  {total_credit:.2f}")
-    log(f"  P&L per share:       {pnl_per_share:+.2f}")
-    log(f"  Total P&L:           Rs {total_pnl:+,.0f}")
+    if dry_run:
+        # Same dry stub, same fabricated arithmetic — and here it reads as the
+        # FULL credit banked rather than a max loss, i.e. wrong in the
+        # flattering direction. See `close_alert_text`.
+        log( "  Fills:               none — no order was placed")
+        log(f"  Entry credit/share:  {total_credit:.2f}")
+        log( "  P&L:                 not computed (dry run has no fills)")
+    else:
+        log(f"  Short Call fill:     {fills['short_call']:.2f} (BUY back)")
+        log(f"  Long Call fill:      {fills['long_call']:.2f} (SELL)")
+        log(f"  Short Put fill:      {fills['short_put']:.2f} (BUY back)")
+        log(f"  Long Put fill:       {fills['long_put']:.2f} (SELL)")
+        log(f"  Close cost/share:    {close_cost:.2f}")
+        log(f"  Entry credit/share:  {total_credit:.2f}")
+        log(f"  P&L per share:       {pnl_per_share:+.2f}")
+        log(f"  Total P&L:           Rs {total_pnl:+,.0f}")
     log(f"  Spot at close:       {spot}")
     log("=" * 70)
 
-    send_telegram(
-        f"FH CLOSED: {stock}\n"
-        f"Reason: {reason}\n"
-        f"Credit: {total_credit:.2f} | Close cost: {close_cost:.2f}\n"
-        f"P&L: Rs {total_pnl:+,.0f}\n"
-        f"Spot: {spot}"
-    )
+    send_telegram(close_alert_text(
+        'FH', stock, reason, spot,
+        ([f"Credit: {total_credit:.2f} | Close cost: not priced (no fill)"]
+         if dry_run
+         else [f"Credit: {total_credit:.2f} | Close cost: {close_cost:.2f}"]),
+        total_pnl, dry_run))
 
     exit_data = {
         'exit_date': datetime.now().isoformat(),
@@ -2582,10 +2942,17 @@ def _is_auth_error(exc) -> bool:
     the per-trade path could not recognise the very failure that makes the
     outer handler's alert necessary — and any future edit to one copy would
     have silently diverged from the other.
+
+    2026-08-27: it now delegates to `common.kite_errors`, which is the same
+    definition `zebra.monitor` uses. Two systems watching the same broker for
+    the same failure had two independent substring rules, which is the
+    "copy you did not open" shape this repo keeps paying for. The delegate
+    also classifies on the exception CLASS and HTTP status rather than only on
+    the message, so a 429 `NetworkException('Too many requests')` is a rate
+    limit here too — the local rule happened to get that one right by luck
+    (the word "token" is absent), not by design.
     """
-    s = str(exc).lower()
-    return ('token' in s or 'invalidtoken' in s or 'sessionexpired' in s
-            or 'api_key' in s)
+    return kite_errors.is_auth_error(exc)
 
 
 def track_spot_blindness(bs: dict, spot_ok: bool, reason: str, label: str):
@@ -2973,7 +3340,11 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
                 last_status_time = now
 
             # ── EXPIRY DAY: Force close by EXPIRY_FORCE_CLOSE_TIME ──────
-            if expiry_today and datetime.now().time() >= EXPIRY_FORCE_CLOSE_TIME:
+            # Single-trade mode: no retry state here on purpose. It closes and
+            # RETURNS, so there is no later poll to retry on, and adding a
+            # second place that owns time-stop state is the shape M11 is
+            # fixing. Only the clock test is shared.
+            if expiry_today and time_stop_window_open():
                 log(f"\n  *** EXPIRY FORCE CLOSE: {datetime.now().strftime('%H:%M')} >= {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
                 success = close_spread(kite, trade, spot, "EXPIRY_FORCE_CLOSE", dry_run)
                 if success:
@@ -3432,6 +3803,13 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     corrupt = alert_store_corruption(
         [('BCS', bcs_store), ('BPS', bps_store), ('FH', fh_store)])
 
+    # First beat of the session, BEFORE the empty-book return below. A monitor
+    # that started and found nothing to watch is alive; without this beat that
+    # case is indistinguishable from one that never started, and zebra would
+    # shout about a healthy morning. See `write_heartbeat`.
+    _beat_all(('idle' if not all_trades and not wl_active else 'startup'),
+              dry_run, all_trades, zebra_store)
+
     if not all_trades and not wl_active:
         if corrupt:
             log("Book is empty because a store was QUARANTINED — NOT exiting "
@@ -3561,9 +3939,14 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 log(f"  FH  #{t['id']} {t['stock']} — all legs verified")
 
     # ── Expiry day warnings ──────────────────────────────────────────────
+    # Values are the three-state attempt dicts from `new_time_stop_state`, not
+    # bare True. Membership still means "armed today"; the value carries
+    # whether the close has been discharged, which is what M11 restored.
     expiry_trades = {}  # keyed by trade_key(), like every other state dict
     for t in all_trades:
-        if arm_time_stop(t, trade_key(t), expiry_trades, t['_strategy']):
+        _store = _get_store_for(t, bcs_store, fh_store, bps_store, zebra_store)
+        if arm_time_stop(t, trade_key(t), expiry_trades, t['_strategy'],
+                         store=_store):
             continue
         # Not expiry day, but close enough that physical-delivery margin is
         # about to build. Every strategy here is physically settled, so all of
@@ -3575,7 +3958,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             if t.get('_strategy') in ('BCS', 'BPS'):
                 _sv = get_spread_value(kite, t, spot=_spot).get('spread')
             maybe_warn_expiry_proximity(
-                _get_store_for(t, bcs_store, fh_store, bps_store, zebra_store), t, _spot,
+                _store, t, _spot,
                 t.get('_strategy', '?'), spread_val=_sv)
         except Exception as e:
             log(f"  WARNING: expiry-proximity check failed for "
@@ -3602,8 +3985,18 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                             log(f"  {strat_key} #{tid_key} ({store_key}) trail "
                                 f"state: peak={ts['peak']:.2f}, "
                                 f"trail={ts['trail']:.2f}")
+                    # A finished session and a crashed one leave the same
+                    # silence behind. Stamp which this was.
+                    _beat_all('closed', dry_run, all_trades, zebra_store,
+                              kill_switch=kill_switch_announced)
                     return
                 log(f"Market not open yet ({now_t.strftime('%H:%M')}). Waiting...")
+                # The cron line starts this process at 09:00; without a beat
+                # here the only stamp for the whole pre-open wait is the
+                # startup one, which ages past the staleness window on a slow
+                # morning.
+                _beat_all('waiting', dry_run, all_trades, zebra_store,
+                          kill_switch=kill_switch_announced)
                 time.sleep(30)
                 continue
 
@@ -3628,8 +4021,12 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                                            ('FH', fh_store)]):
                     log("Book emptied MID-SESSION by a store QUARANTINE. "
                         "Alert sent. Exiting — there is nothing left to read.")
+                    _beat_all('idle', dry_run, all_trades, zebra_store,
+                              kill_switch=kill_switch_announced)
                     return
                 log("All trades closed and no active watchlist alerts. Cron monitor exiting.")
+                _beat_all('idle', dry_run, all_trades, zebra_store,
+                          kill_switch=kill_switch_announced)
                 return
 
             now = time.time()
@@ -3673,6 +4070,14 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         "NO EXIT ORDERS WILL BE PLACED - you must close "
                         "by hand.\nRe-arm: set it back to true and "
                         "restart the monitor.")
+
+            # AFTER the kill-switch block, never before: a beat claiming this
+            # engine can book, written on the very poll the switch forced it
+            # to DRY RUN, is worse than no beat at all. That combination
+            # (zebra stood down + this engine unable to place an order) is the
+            # exact silent state the heartbeat exists to expose.
+            _beat_all('polling', dry_run, all_trades, zebra_store,
+                      kill_switch=kill_switch_announced)
             print_status = (now - last_status_time >= STATUS_PRINT_INTERVAL_SEC)
 
             for trade in all_trades:
@@ -3725,7 +4130,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     if close_key not in trail_state:
                         trail_state[close_key] = new_trail_state(trade)
                         arm_time_stop(trade, close_key, expiry_trades,
-                                      strat, note='added mid-session')
+                                      strat, note='added mid-session',
+                                      store=trade_store)
                     if close_key not in confirm_state:
                         confirm_state[close_key] = {'sl_spread': 0, 'sl_trail': 0}
                     if close_key not in blind_state:
@@ -3735,7 +4141,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 else:
                     # FH: check for new expiry-day trades added mid-session
                     arm_time_stop(trade, close_key, expiry_trades, 'FH',
-                                  note='added mid-session')
+                                  note='added mid-session', store=trade_store)
 
                 # B9 + B12 — two failure classes, opposite responses.
                 #
@@ -3783,8 +4189,10 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         # book can still quote an impossible price.
                         spread_data = get_spread_value(kite, trade, spot=spot)
                         spread_val = spread_data['spread']
-                        # B8 — the independent cross-check, ported from
-                        # monitor():2282. This is the direct descendant of the
+                        # B8 — the independent cross-check, ported from the
+                        # `spot_corroborates(corrob, ...)` call inside
+                        # `monitor()` (named rather than by line number, which
+                        # drifts). This is the direct descendant of the
                         # NHPC loss and the ONLY guard here reading a source
                         # other than the order book. Its absence from the cron
                         # path meant the 3-poll debounce and the re-verify both
@@ -3904,10 +4312,20 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     except Exception:
                         log(f"  {strat} #{tid} {stock}: Spot={spot:.2f}{settle_tag}")
 
-                # ── EXPIRY DAY: Force close by EXPIRY_FORCE_CLOSE_TIME ──
-                if close_key in expiry_trades and datetime.now().time() >= EXPIRY_FORCE_CLOSE_TIME:
-                    if close_key not in closing_in_progress:
-                        log(f"\n  {strat} #{tid} {stock} *** EXPIRY FORCE CLOSE: {datetime.now().strftime('%H:%M')} >= {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
+                # ── TIME STOP: force close from EXPIRY_FORCE_CLOSE_TIME ──
+                # The outer test suppresses every other trigger for an armed
+                # trade past the force-close clock, exactly as before. The
+                # inner one decides whether an ATTEMPT is owed — the two were
+                # the same question until M11, which is how a close that never
+                # filled read as a close that did.
+                if close_key in expiry_trades and time_stop_window_open():
+                    ts_state = expiry_trades[close_key]
+                    if (close_key not in closing_in_progress
+                            and time_stop_attempt_due(ts_state)):
+                        attempt = ts_state.get('attempts', 0) + 1
+                        log(f"\n  {strat} #{tid} {stock} *** EXPIRY FORCE CLOSE "
+                            f"(attempt {attempt}/{TIME_STOP_MAX_ATTEMPTS}): "
+                            f"{datetime.now().strftime('%H:%M')} >= {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
                         closing_in_progress[close_key] = "EXPIRY_FORCE_CLOSE"
                         if strat == 'BCS':
                             success = close_spread(kite, trade, spot, "EXPIRY_FORCE_CLOSE", dry_run,
@@ -3917,10 +4335,20 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                                                    store=trade_store, strategy_label='BPS')
                         else:
                             success = close_fh_position(kite, trade, spot, "EXPIRY_FORCE_CLOSE", dry_run)
-                        if not success:
-                            log(f"  {strat} #{tid} {stock}: Expiry force close FAILED. Manual intervention needed!")
-                            send_telegram(f"{strat} #{tid} {stock}: EXPIRY FORCE CLOSE FAILED! Manual intervention needed!")
-                        trail_state.pop(close_key, None)
+                        outcome = record_time_stop_result(
+                            ts_state, success, trade, trade_store, strat)
+                        if outcome == 'closed':
+                            trail_state.pop(close_key, None)
+                        else:
+                            # RELEASE the in-progress lock so the retry can run
+                            # on a later poll THIS session. Safe by structure,
+                            # not by inspection: every close failure past the
+                            # close-lock freezes the record at `partial_close`,
+                            # which drops out of `get_open_trades`, so the next
+                            # `_load_all_trades` cannot hand this loop a frozen
+                            # position. Only a close that touched nothing —
+                            # the late-day guard, an abort — comes back.
+                            closing_in_progress.pop(close_key, None)
                     continue
 
                 # ── SL/TP checks ─────────────────────────────────────────

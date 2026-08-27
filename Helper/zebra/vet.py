@@ -1215,6 +1215,15 @@ def mark_unavailable(store, trade_id: int, why: str,
 
     `failed_open_because` is kept so the forensic record says WHICH kind of
     outage this was.
+
+    WARNING — currently UNCALLED (verified 2026-08-27; no caller anywhere in
+    the tree). `UNAVAILABLE` is meant to mean "vetting could not even be
+    requested", but `zebra/monitor.py` treats `UNAVAILABLE` exactly like
+    `ALLOWED` — it lets the signal enter (see the `state in (vet_mod.ALLOWED,
+    vet_mod.UNAVAILABLE)` checks there). So wiring this function in without
+    also reviewing that treatment would let an entry-that-was-never-vetted
+    proceed as if it had been reviewed and cleared, not merely as a fail-open.
+    Needs a code decision, not a doc fix — see the review notes for this file.
     """
     now = now or _now()
     with store._mutate():
@@ -1230,11 +1239,17 @@ def mark_unavailable(store, trade_id: int, why: str,
 
 
 def expire_stale(store, now: Optional[datetime] = None) -> list:
-    """Fail-open sweep: flip timed-out pending vets to `unavailable`.
+    """Fail-open sweep for timed-out PENDING vets. Despite the name, this does
+    NOT produce `unavailable` anywhere -- it requeues a timed-out request for
+    another attempt (state -> QUEUED, up to `ENTRY_VET_MAX_ATTEMPTS`), and
+    once the queue's `drop_after` deadline is exhausted, marks it STARVED
+    (terminal; the entry does NOT proceed on it). `mark_unavailable` above is
+    the only function that ever sets `unavailable`, and it has no caller.
 
     Called at the top of every zebra cycle. This is the guard that keeps a
-    vetting outage from becoming a trading halt — the signal proceeds exactly
-    as it would have before this layer existed, and is tagged so it never
+    vetting outage from becoming a trading halt — a signal without a verdict
+    is retried against a re-quoted book rather than parked forever, and
+    STARVED/ABANDONED records are excluded from scoring so an outage never
     counts toward the layer's measured precision.
     """
     now = now or _now()

@@ -7,6 +7,12 @@ have done and whether that matches what the stores actually booked.
     python -m bcs.journal_report                # today
     python -m bcs.journal_report --day 20260915
     python -m bcs.journal_report --unresolved   # only the dangling intents
+    python -m bcs.journal_report --compare      # beside what the books recorded
+
+`--compare` reads all FOUR books the order path can touch — bcs, fallen_hero,
+bear_put and the BCS cohort in `logs/zebra_trades.json`. The fourth was missing
+until 2026-08-27, so every cohort trade read "not found in any store" in the
+one tool the dry-run evidence week is gated on.
 
 It computes nothing about the market. Every number printed is read straight off
 the journal line or off the trade store — a report that re-derives a price can
@@ -17,8 +23,147 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from datetime import datetime
+from typing import Callable, List, Optional
 
 from bcs import order_journal
+
+
+# ── the books a journalled order could belong to ────────────────────────────
+#
+# The BCS cohort lives in `logs/zebra_trades.json`, and until 2026-08-27 this
+# report did not load it — so every cohort trade printed "not found in any
+# store" while the dry-run evidence week was gated on exactly this tool.
+#
+# zebra is reached through `bcs.zebra_adapter`, the SAME seam the money path
+# uses, rather than by importing `zebra.trade_store` here. A report that finds
+# the cohort by a different route than the monitor does can agree with itself
+# while disagreeing with the system it audits.
+#
+# One try per book, not one around all four: a single import error used to
+# take out the whole store side, so an unreadable BCS store printed "Journal
+# side only" and the other three books went unlooked-at.
+
+def _load_bcs():
+    from bcs.trade_store import get_store
+    return get_store().load_trades()
+
+
+def _load_fh():
+    from fallen_hero import get_store
+    return get_store().load_trades()
+
+
+def _load_bps():
+    from bear_put import get_store
+    return get_store().load_trades()
+
+
+def _load_zebra():
+    from bcs.zebra_adapter import get_adapter
+    adapter = get_adapter()
+    # `load_trades` on the adapter is deliberately the RAW zebra records, not
+    # `map_trade`d ones: the report reads `exit_date`, `status` and `cohort`
+    # by zebra's own names, and a mapped copy would rename half of them.
+    return adapter.load_trades() if adapter is not None else []
+
+
+#: (tag, loader). The tag is stamped onto every record as `_strategy` and is
+#: what selects the exit-date schema below, so the two lists cannot drift.
+STORES = (
+    ('BCS', _load_bcs),
+    ('FH', _load_fh),
+    ('BPS', _load_bps),
+    ('ZEBRA', _load_zebra),
+)
+
+#: Which of the TWO exit schemas each book writes, named per book.
+#:
+#: Deliberately not a fallback chain. `(t.get('exit') or {}).get('exit_date')
+#: or t.get('exit_date')` answers for both shapes without ever saying which
+#: one matched, so the day a store changes shape this report reads "0 trades
+#: closed today" — the quietest possible failure in a tool whose entire job is
+#: to notice that the journal and the stores disagree.
+#:
+#:   nested — `t['exit']['exit_date']`  (bcs / fallen_hero / bear_put)
+#:   flat   — `t['exit_date']`          (zebra, `zebra/trade_store.py:822`)
+EXIT_SCHEMA = {
+    'BCS': 'nested',
+    'FH': 'nested',
+    'BPS': 'nested',
+    'ZEBRA': 'flat',
+}
+
+
+def exit_day(trade: dict) -> Optional[str]:
+    """The trade's exit date as YYYYMMDD, or None while it is still open.
+
+    Raises on a record with no known schema rather than guessing: the only
+    thing that stamps `_strategy` is `load_all_trades` below, so an unknown
+    tag is a wiring mistake in this file, and silently treating it as "never
+    exited" would hide a whole book.
+    """
+    tag = trade.get('_strategy')
+    schema = EXIT_SCHEMA.get(tag)
+    if schema is None:
+        raise ValueError(
+            'no exit-date schema for strategy %r - add it to EXIT_SCHEMA '
+            'beside its entry in STORES' % (tag,))
+    if schema == 'nested':
+        raw = (trade.get('exit') or {}).get('exit_date')
+    else:
+        raw = trade.get('exit_date')
+    raw = str(raw or '').replace('-', '').strip()
+    return raw or None
+
+
+def load_all_trades(warn: Optional[Callable[[str], None]] = None) -> List[dict]:
+    """Every record from every book, each tagged with `_strategy`.
+
+    ALL trades, not just open ones: an order placed today most likely CLOSED
+    its trade, so filtering to open would hide every row this report exists to
+    show.
+    """
+    say = warn or print
+    out: List[dict] = []
+    for tag, loader in STORES:
+        try:
+            rows = loader()
+        except Exception as e:
+            say('  (%s store unreadable: %s)' % (tag, e))
+            continue
+        for t in rows or []:
+            out.append(dict(t, _strategy=tag))
+    return out
+
+
+def _describe(trade: dict) -> str:
+    """One store row, named by book and id. The book matters: the four stores
+    number their trades from 1 independently, so `#1` alone names four
+    different positions."""
+    bit = '%s#%s %s' % (trade.get('_strategy'), trade.get('id'),
+                        trade.get('status'))
+    if trade.get('cohort'):
+        bit += ' [cohort %s]' % trade['cohort']
+    return bit
+
+
+def match_state(trades: List[dict], trade_id) -> str:
+    """How the stores answer for one journalled trade id.
+
+    Ambiguity is REPORTED, never resolved. Ids collide across the four books
+    and the journal line carries only the number, so picking the first match
+    would silently name the wrong position in an incident report.
+    """
+    if trade_id is None:
+        return 'no trade id on the journal line'
+    hits = [t for t in trades if t.get('id') == trade_id]
+    if not hits:
+        return 'not found in any store'
+    if len(hits) == 1:
+        return 'store says ' + _describe(hits[0])
+    return ('AMBIGUOUS - id %s exists in %d books: %s (the journal line names '
+            'only the number)' % (trade_id, len(hits),
+                                  ', '.join(_describe(t) for t in hits)))
 
 
 def _fmt_ctx(ctx: dict) -> str:
@@ -135,40 +280,25 @@ def compare_to_store(day=None) -> None:
     for i in intents:
         placed[(i.get('context') or {}).get('trade_id')].append(i)
 
-    # ALL trades, not just open ones: an order placed today most likely
-    # CLOSED its trade, so filtering to open would hide every row this report
-    # exists to show.
-    try:
-        from bcs.trade_store import get_store as get_bcs
-        from fallen_hero import get_store as get_fh
-        from bear_put import get_store as get_bps
-        trades = []
-        for get, tag in ((get_bcs, 'BCS'), (get_fh, 'FH'), (get_bps, 'BPS')):
-            try:
-                for t in get().load_trades():
-                    trades.append(dict(t, _strategy=tag))
-            except Exception as e:
-                print(f'  ({tag} store unreadable: {e})')
-    except Exception as e:
-        print(f'Could not read the stores ({e}). Journal side only.')
-        trades = []
+    trades = load_all_trades()
 
     day_str = day or datetime.now().strftime('%Y%m%d')
-    closed_today = [
-        t for t in trades
-        if str((t.get('exit') or {}).get('exit_date', '')).replace('-', '')
-        == day_str]
+    closed_today = [t for t in trades if exit_day(t) == day_str]
+    by_book = defaultdict(int)
+    for t in closed_today:
+        by_book[t['_strategy']] += 1
 
     print(f'journal: {len(intents)} intent(s) across '
           f'{len(placed)} trade(s)')
-    print(f'stores:  {len(closed_today)} trade(s) recorded as closed today')
+    breakdown = ', '.join('%s %d' % (tag, by_book.get(tag, 0))
+                          for tag, _ in STORES)
+    print(f'stores:  {len(closed_today)} trade(s) recorded as closed today '
+          f'({breakdown})')
     print()
     for tid, rows in sorted(placed.items(), key=lambda kv: (kv[0] is None, kv[0])):
-        match = next((t for t in trades if t.get('id') == tid), None)
-        state = (match.get('status') if match else 'not found in any store')
         reasons = {(r.get('context') or {}).get('reason') for r in rows}
         print(f'  trade #{tid}: {len(rows)} order(s), reason(s) '
-              f'{sorted(x for x in reasons if x)} - store says {state}')
+              f'{sorted(x for x in reasons if x)} - {match_state(trades, tid)}')
     if not placed:
         print('  (no orders intended)')
     print()

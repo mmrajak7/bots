@@ -1,19 +1,28 @@
-"""Zebra strike analyzer — pulls live option chain, returns 2-3 valid (K_L, K_S) pairs.
+"""Zebra strike analyzer — expiry, ATM strike, ATM book, and the BCS pair.
 
-For CE-Zebra (bullish): K_L deep ITM (below spot), K_S near ATM at spot.
-For PE-Zebra (bearish): K_L deep ITM (above spot), K_S near ATM at spot.
+The name is historical. This module served the back-ratio ("zebra") structure
+— BUY 2x deep-ITM + SELL 1x ATM — which was **DECOMMISSIONED on 2026-08-27**.
+Two functions live here now:
 
-Rules from PLAYBOOK.md:
-  - K_S is closest strike to spot (ATM).
-  - K_L 5-10% ITM for high-IV F&O names.
-  - NetExt = 2 × long_extrinsic - short_extrinsic. Target ≤ 0 (theta-neutral or positive).
-  - BE within ±0.5% of spot (≤1% acceptable).
-  - OI ≥ 5,000 per leg.
-  - Bid-ask spread < 1% of leg price.
-  - DTE 15-45.
-  - Capital ₹75k-₹1L.
+  `analyze()`      resolves the expiry, the ATM strike and the ATM book. It no
+                   longer prices the back ratio; `best` is always None and
+                   `back_ratio` reads `'retired'`. See its docstring for why
+                   (rate limit: it cost up to 8 deep-ITM quotes per signal).
+  `analyze_bcs()`  builds the pair that actually trades — BUY 1x ATM +
+                   SELL 1x the strike nearest the ST target — with its own
+                   hard gates. `cfg.ENTRY_STRUCTURE` is `'bcs'` and config
+                   accepts no other value.
 
-Returns a sorted list of candidate dicts ordered by NetExt (lowest first).
+Rules for the live BCS path are documented on `analyze_bcs` itself, not here,
+so this text cannot drift from them. Shared inputs:
+
+  - K_S / the BCS long leg is the closest strike to spot (ATM).
+  - OI >= cfg.MIN_LEG_OI per leg (a HARD gate in `analyze_bcs`).
+  - DTE cfg.MIN_DTE - cfg.MAX_DTE, first expiry at or beyond the floor.
+
+~450 historical records were opened as back ratios. They remain fully
+readable: each stores its own strikes, symbols and prices, and no read,
+report or close path calls `analyze()`.
 """
 
 from __future__ import annotations
@@ -28,6 +37,13 @@ from typing import Optional
 from . import config as cfg
 
 logger = logging.getLogger(__name__)
+
+# The back-ratio (BUY 2x ITM + SELL 1x ATM) structure was decommissioned by
+# the owner on 2026-08-27. `analyze()` stamps this on every result so a caller
+# reading `best is None` can tell "retired by decision" from "nothing viable
+# was found", which are opposite facts. Historical records that USED the
+# structure stay readable — they carry their own strikes and prices.
+BACK_RATIO_RETIRED = 'retired'
 
 # ── Quote-reliability guard (2026-07-24 NHPC false-SL incident) ────────────
 # Reuse the BCS monitor's leg reliability rule so both systems judge a garbage
@@ -209,57 +225,41 @@ def _extrinsic(opt_type: str, spot: float, strike: float, mid_price: float) -> f
     return max(0.0, mid_price - intr)
 
 
-def _breakeven(opt_type: str, k_l: float, k_s: float, debit: float) -> dict:
-    """Compute BE per Zebra math. Returns {'be': float, 'regime': str, 'be_pct_from_spot': float|None}."""
-    width = k_s - k_l if opt_type == 'CE' else k_l - k_s
-    if opt_type == 'CE':
-        if debit <= 2 * width:
-            be = k_l + debit / 2.0
-            regime = 'good'
-        else:
-            be = 2 * k_l - k_s + debit
-            regime = 'sub_optimal'
-    else:  # PE-mirror: K_L > K_S (long deeper ITM = higher strike)
-        if debit <= 2 * width:
-            be = k_l - debit / 2.0
-            regime = 'good'
-        else:
-            be = 2 * k_l - k_s - debit
-            regime = 'sub_optimal'
-    return {'be': round(be, 2), 'regime': regime, 'width': abs(width)}
-
-
 def analyze(kite, stock: str, direction: str, spot: float,
             *, max_candidates: int = 3,
             target_capital: float = 90000) -> dict:
-    """Pull option chain, evaluate Zebra pairs, return ranked candidates.
+    """Resolve the expiry, the ATM strike and the ATM book for a signal.
+
+    **The back-ratio pricing this function used to do is DECOMMISSIONED**
+    (owner, 2026-08-27). It quoted up to 8 deep-ITM strikes on every triggered
+    signal to rank `2*long_mid - short_mid` pairs for a structure that has not
+    been traded since 2026-08-12 and has no open position left. Under
+    `ENTRY_STRUCTURE == 'bcs'` — now the only value config accepts — the only
+    keys any caller reads are `atm_quote`, `atm_strike`, `expiry`, `dte` and
+    `lot_size`, all of which cost ONE quote.
+
+    That waste was not theoretical. Kite's quote family allows 1 request per
+    second; on 2026-08-27 the per-cycle budget was exceeded all day and at
+    14:40 the spot fetch for all 9 open positions was refused with
+    `Too many requests`, leaving TP, the spot veto and the expiry nag dark.
+    Nine deep-ITM quotes per triggered signal, for a `best` nothing trades,
+    were part of what spent it.
+
+    `best` is therefore always None and `candidates` always empty; the
+    `back_ratio` key says `'retired'` so a reader sees a decision rather than
+    an unexplained absence. ~450 historical records carry the old structure and
+    remain fully readable — they store their own strikes and prices, and
+    nothing on the read, reporting or close path calls this function.
 
     Returns:
       {
         'stock': ..., 'direction': 'CE'|'PE', 'spot': ..., 'expiry': ...,
         'dte': ..., 'lot_size': ...,
         'atm_strike': ..., 'k_s_used': ...,
-        'candidates': [
-          {
-            'k_l': float, 'k_s': float, 'width': float,
-            'long_symbol': str, 'short_symbol': str,
-            'long_mid': float, 'long_ask': float, 'long_bid': float,
-            'short_mid': float, 'short_bid': float, 'short_ask': float,
-            'long_oi': int, 'short_oi': int,
-            'long_spread_pct': float, 'short_spread_pct': float,
-            'long_intrinsic': float, 'long_extrinsic': float,
-            'short_intrinsic': float, 'short_extrinsic': float,
-            'debit': float,                  # 2*long_ask - 1*short_bid
-            'net_ext': float,                # 2*long_ext - short_ext
-            'be': float, 'be_pct_from_spot': float,
-            'regime': 'good'|'sub_optimal',
-            'capital_per_lot': float,
-            'lots': int,                     # how many fit in target_capital
-            'liquidity_ok': bool,
-            'gate_fails': [str],
-          }, ...
-        ],
-        'note': str  (any high-level diagnostic)
+        'atm_quote': {bid, ask, mid, oi},
+        'best': None,             # RETIRED — the back ratio is not priced
+        'back_ratio': 'retired',
+        'candidates': [],         # RETIRED — always empty
       }
     """
     if direction not in ('CE', 'PE'):
@@ -282,134 +282,30 @@ def analyze(kite, stock: str, direction: str, spot: float,
     # K_S = ATM (closest strike to spot)
     k_s = min(strikes, key=lambda k: abs(k - spot))
 
-    # For CE-Zebra: K_L < K_S (deeper ITM = lower strike)
-    # For PE-Zebra: K_L > K_S (deeper ITM = higher strike)
-    if direction == 'CE':
-        k_l_candidates = sorted([k for k in strikes if k < k_s], reverse=True)
-    else:
-        k_l_candidates = sorted([k for k in strikes if k > k_s])
-
-    if len(k_l_candidates) < 1:
-        return {'error': f"No ITM K_L candidates for {stock} {direction} (K_S={k_s})"}
-
-    # Get K_S quote once
+    # ── RETIRED 2026-08-27: the deep-ITM back-ratio candidate loop ──────
+    # What stood here quoted up to 8 K_L strikes one at a time (each
+    # `_quote_option` is its own kite.quote call, and the quote family is
+    # capped at 1 req/s), priced `2*long_mid - short_mid`, ranked the pairs
+    # and returned a `best`. Nothing has traded that structure since
+    # 2026-08-12 and no back-ratio position is open. It is deleted rather
+    # than gated because a dropped thing left wired in stays authoritative —
+    # #449 refused a signal on this `best`'s Rs 121,700 debit while the trade
+    # actually on the table cost Rs 6,361.
+    #
+    # Everything below this point is what the BCS path needs, and it is one
+    # quote: the ATM book.
     k_s_meta = chain_at_expiry[k_s][direction]
     k_s_q = _quote_option(kite, k_s_meta['tradingsymbol'])
     if k_s_q.get('error') or k_s_q['mid'] <= 0:
-        return {'error': f"Bad quote for short leg {k_s_meta['tradingsymbol']}: {k_s_q.get('error')}"}
-    # ATM book is shared by every candidate — if it's garbage there is no
-    # tradeable pair. Skip (no alert) and let the next 5-min cycle retry once
-    # the book forms, rather than alert click-copy prices off an unformed book.
+        return {'error': f"Bad quote for ATM leg {k_s_meta['tradingsymbol']}: "
+                         f"{k_s_q.get('error')}"}
+    # A garbage ATM book means there is no tradeable spread at all — the BCS
+    # buys this exact strike. Skip (no alert) and let the next 5-min cycle
+    # retry once the book forms, rather than alert click-copy prices off an
+    # unformed book.
     if not k_s_q.get('reliable', True):
-        return {'error': f"Unreliable short-leg book {k_s_meta['tradingsymbol']}: "
+        return {'error': f"Unreliable ATM book {k_s_meta['tradingsymbol']}: "
                          f"{k_s_q.get('unreliable_reason')}"}
-
-    short_int = _intrinsic(direction, spot, k_s)
-    short_ext = _extrinsic(direction, spot, k_s, k_s_q['mid'])
-    short_spread_pct = ((k_s_q['ask'] - k_s_q['bid']) / k_s_q['mid']) if k_s_q['mid'] > 0 else 1.0
-
-    lot_size = k_s_meta['lot_size']
-
-    candidates = []
-    # Try up to 8 K_L candidates (deeper ITM = more depth options)
-    for k_l in k_l_candidates[:8]:
-        leg_meta = chain_at_expiry.get(k_l, {}).get(direction)
-        if not leg_meta:
-            continue
-        long_q = _quote_option(kite, leg_meta['tradingsymbol'])
-        if long_q.get('error') or long_q['mid'] <= 0:
-            continue
-        # Never price a candidate off a garbage ITM book (the false-SL leg).
-        if not long_q.get('reliable', True):
-            logger.info("Skip K_L=%s for %s: unreliable book (%s)",
-                        k_l, stock, long_q.get('unreliable_reason'))
-            continue
-
-        long_int = _intrinsic(direction, spot, k_l)
-        long_ext = _extrinsic(direction, spot, k_l, long_q['mid'])
-        long_spread_pct = ((long_q['ask'] - long_q['bid']) / long_q['mid']) if long_q['mid'] > 0 else 1.0
-
-        # Debit = 2 × long_ask - 1 × short_bid (worst-case entry pricing)
-        # But for analysis display, use mids — fill prices come at place time.
-        debit = round(2.0 * long_q['mid'] - 1.0 * k_s_q['mid'], 2)
-        if debit <= 0:
-            # Theta-positive credit Zebra is rare; skip if negative debit (suggests data noise)
-            continue
-
-        net_ext = round(2.0 * long_ext - short_ext, 2)
-        be_info = _breakeven(direction, k_l, k_s, debit)
-        be = be_info['be']
-        be_pct_from_spot = round((be - spot) / spot * 100, 2)
-        capital_per_lot = round(debit * lot_size, 2)
-        # Suggest 1 lot by default. User can scale via --lots N at zebra enter.
-        lots = 1
-
-        # Gates
-        gate_fails = []
-        if long_q['oi'] < cfg.MIN_LEG_OI:
-            gate_fails.append(f'long_OI<{cfg.MIN_LEG_OI}')
-        if k_s_q['oi'] < cfg.MIN_LEG_OI:
-            gate_fails.append(f'short_OI<{cfg.MIN_LEG_OI}')
-        if long_spread_pct > cfg.MAX_LEG_SPREAD_PCT:
-            gate_fails.append(f'long_spread>{cfg.MAX_LEG_SPREAD_PCT*100:.0f}%')
-        if short_spread_pct > cfg.MAX_LEG_SPREAD_PCT:
-            gate_fails.append(f'short_spread>{cfg.MAX_LEG_SPREAD_PCT*100:.0f}%')
-        if be_info['regime'] == 'sub_optimal':
-            gate_fails.append('BE>K_S')
-
-        # Match on the PREFIX, never on a baked-in threshold. This used to test
-        # `g.endswith('_OI<5000')` while the string it matches is built from
-        # cfg.MIN_LEG_OI — so raising the config to 6000 would emit
-        # 'long_OI<6000', match nothing, and silently mark an illiquid leg
-        # liquid. A liquidity check that switches itself off when you tighten
-        # the threshold is worse than none.
-        liquidity_ok = not any(g.startswith(('long_OI<', 'short_OI<',
-                                             'long_spread', 'short_spread'))
-                               for g in gate_fails)
-
-        candidates.append({
-            'k_l': k_l, 'k_s': k_s, 'width': abs(k_s - k_l),
-            'long_symbol': leg_meta['tradingsymbol'],
-            'short_symbol': k_s_meta['tradingsymbol'],
-            'long_mid': long_q['mid'], 'long_bid': long_q['bid'], 'long_ask': long_q['ask'],
-            'short_mid': k_s_q['mid'], 'short_bid': k_s_q['bid'], 'short_ask': k_s_q['ask'],
-            'long_oi': long_q['oi'], 'short_oi': k_s_q['oi'],
-            'long_spread_pct': round(long_spread_pct * 100, 2),
-            'short_spread_pct': round(short_spread_pct * 100, 2),
-            'long_intrinsic': round(long_int, 2),
-            'long_extrinsic': round(long_ext, 2),
-            'short_intrinsic': round(short_int, 2),
-            'short_extrinsic': round(short_ext, 2),
-            'debit': debit,
-            'net_ext': net_ext,
-            'be': be,
-            'be_pct_from_spot': be_pct_from_spot,
-            'regime': be_info['regime'],
-            'capital_per_lot': capital_per_lot,
-            'lots': lots,
-            'lot_size': lot_size,
-            'liquidity_ok': liquidity_ok,
-            'gate_fails': gate_fails,
-        })
-
-    if not candidates:
-        return {
-            'error': f"No tradeable K_L found for {stock} {direction} {expiry}",
-            'stock': stock, 'direction': direction, 'spot': spot,
-            'expiry': expiry, 'dte': dte, 'lot_size': lot_size,
-            'k_s_used': k_s, 'atm_strike': k_s, 'atm_quote': _atm_quote(k_s_q),
-            'candidates': [],
-        }
-
-    best = _pick_best(candidates, spot)
-
-    # Full ranked list (best first) — kept for inspection / debugging via
-    # the analyze CLI, but the Telegram ENTER alert uses only `best`.
-    ranked = sorted(candidates, key=lambda c: (
-        len(c['gate_fails']),
-        c['net_ext'],
-        abs(c['be'] - spot),
-    ))
 
     return {
         'stock': stock,
@@ -417,18 +313,18 @@ def analyze(kite, stock: str, direction: str, spot: float,
         'spot': spot,
         'expiry': expiry,
         'dte': dte,
-        'lot_size': lot_size,
+        'lot_size': k_s_meta['lot_size'],
         'atm_strike': k_s,
         'k_s_used': k_s,
-        # The ATM book, at the top level rather than only inside `best`. A BCS
-        # buys this exact strike, so tucking the quote inside the zebra's
-        # recommended PAIR meant the zebra's own gates (net-extrinsic, deep-ITM
-        # liquidity) could veto a perfectly tradeable spread that shares none
-        # of those constraints.
+        # The ATM book, at the top level. A BCS buys this exact strike.
         'atm_quote': _atm_quote(k_s_q),
-        'best': best,                         # the recommended pair (or None)
-        'candidates': ranked[:max_candidates], # for `zebra analyze` inspection
-        'all_evaluated': len(candidates),
+        # RETIRED. Kept as explicit None + a labelled marker rather than
+        # dropped, so a caller that still reads `best` gets "there is no such
+        # thing any more" instead of a KeyError that reads like a bug.
+        'best': None,
+        'back_ratio': BACK_RATIO_RETIRED,
+        'candidates': [],
+        'all_evaluated': 0,
     }
 
 
@@ -441,7 +337,16 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
                 target_spot: float, expiry: str,
                 atm_strike: float, atm_quote: dict,
                 lot_size: int) -> dict:
-    """Build the shadow BCS pair for a triggered zebra signal.
+    """Build the BCS pair for a triggered zebra signal.
+
+    Dual role, by `cfg.ENTRY_STRUCTURE`: when it is `'bcs'` (the default, and
+    the pipeline since 2026-08-12) the caller (`_enter_as_bcs` in
+    `zebra/monitor.py`) opens THIS as the first-class, only position for the
+    signal -- not a shadow. When it is `'zebra'` the back-ratio pair from
+    `analyze()` is what opens, and this is called separately to record a
+    passive measurement companion (a "shadow") that never places an order.
+    Same function either way; only what the caller does with the result
+    differs.
 
     BUY 1× ATM (the same strike/quote as the zebra short leg — passed in so
     both structures share one snapshot) + SELL 1× the strike nearest the ST
@@ -634,51 +539,3 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
         'lot_size': lot_size,
         'warnings': warnings,
     }
-
-
-def _pick_best(candidates: list, spot: float) -> Optional[dict]:
-    """Pick the single best Zebra pair.
-
-    Order of preference:
-      1. ALL gates pass (OI ≥ 5k both legs, spread ≤ 1% both legs, BE inside body).
-      2. NetExt ≤ 0 (theta-neutral or positive).
-      3. BE within ±0.5% of spot (closest to ideal).
-      4. Among the above, prefer LOWEST capital_per_lot (most capital-efficient).
-
-    Each gate is relaxed in turn if no candidate passes; we never return None
-    when at least one viable structure exists — fallback is the deepest one
-    with smallest gate-fail count.
-
-    The picker balances the user's three asks: least slippage (gate 1 covers
-    bid-ask), better OI (gate 1), capital efficient (tiebreaker).
-    """
-    if not candidates:
-        return None
-
-    # Tier 1: clean (no gate fails) + theta-OK + BE near spot
-    tier1 = [c for c in candidates
-             if not c['gate_fails']
-             and c['net_ext'] <= 0
-             and abs(c['be_pct_from_spot']) <= 0.5]
-    if tier1:
-        return min(tier1, key=lambda c: c['capital_per_lot'])
-
-    # Tier 2: clean + theta-OK (BE constraint relaxed)
-    tier2 = [c for c in candidates
-             if not c['gate_fails']
-             and c['net_ext'] <= 0]
-    if tier2:
-        return min(tier2, key=lambda c: c['capital_per_lot'])
-
-    # Tier 3: clean (theta constraint relaxed)
-    tier3 = [c for c in candidates if not c['gate_fails']]
-    if tier3:
-        return min(tier3, key=lambda c: (c['net_ext'], c['capital_per_lot']))
-
-    # Tier 4: ranked best-effort (gate fails allowed)
-    ranked = sorted(candidates, key=lambda c: (
-        len(c['gate_fails']),
-        c['net_ext'],
-        c['capital_per_lot'],
-    ))
-    return ranked[0]
