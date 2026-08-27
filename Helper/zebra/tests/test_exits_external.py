@@ -53,8 +53,20 @@ def store(tmp_path, monkeypatch):
 
 
 def _cohortise(store, yes=True):
+    """Make record #1 one the ORDER PATH owns (or not).
+
+    `paper` moved here on 2026-08-27 (C5). Being in the cohort is no longer
+    sufficient for `_exits_external`: the adapter withholds paper records from
+    the order path entirely, so for a paper record there is no peer to stand
+    down for and `_exits_external` must say False. A record the bridge really
+    holds is one that was PLACED — cohort AND not paper. That third condition
+    is tested on its own in `bcs/tests/test_paper_vs_live_close.py`; here it is
+    part of the fixture's definition of "the order path owns this".
+    """
     with store._mutate():
-        store.find(1)['cohort'] = cfg.COHORT_START if yes else '1999-01-01'
+        t = store.find(1)
+        t['cohort'] = cfg.COHORT_START if yes else '1999-01-01'
+        t['paper'] = False
 
 
 # ── the predicate ───────────────────────────────────────────────────────────

@@ -92,10 +92,29 @@ def test_a_flipped_fh_short_call_says_the_leg_is_naked(env):
     assert spy.any('+1200')
 
 
+def _tagged_fh_fills(kite):
+    """The four BCS_MON fills a real all-flat FH close would have left.
+
+    See the BCS twin in `test_b11_flipped_position.py`: since 2026-08-27 the
+    all-flat branch books only when OUR OWN orders can price every leg, and a
+    fixture with an empty order book now exercises the REFUSAL instead of the
+    flipped-vs-flat question this file is about.
+    """
+    for i, (sym, txn) in enumerate(((SC, 'BUY'), (SP, 'BUY'),
+                                    (LP, 'SELL'), (LC, 'SELL'))):
+        kite.order_book.append({
+            'order_id': str(900 + i), 'tradingsymbol': sym,
+            'transaction_type': txn, 'status': 'COMPLETE',
+            'average_price': 10.0 + i, 'tag': 'BCS_MON',
+            'order_timestamp': '2026-09-21 14:30:0%d' % i})
+    return kite
+
+
 def test_a_genuinely_flat_fh_book_is_still_marked_closed(env):
     """Negative control: all four legs at exactly zero."""
     spy, store = env
-    kite = FakeBroker(books=BOOKS, positions=_pos(sc=0, sp=0, lp=0, lc=0))
+    kite = _tagged_fh_fills(
+        FakeBroker(books=BOOKS, positions=_pos(sc=0, sp=0, lp=0, lc=0)))
     ok = _run(kite, store)
 
     assert ok is True

@@ -16,11 +16,51 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from . import config as cfg
+from . import outcomes
 from .trade_store import ZebraStore, in_cohort
 
 logger = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+
+# ── Exit reasons: ONE classification, this module's own wording ──────────
+
+def _reason_label(reason) -> str:
+    """The name this report gives one stored `exit_reason`.
+
+    TWO engines close a cohort position and they write different strings for
+    the same trigger: zebra's paper engine stamps `paper:debit_sl`, while
+    `bcs/spread_monitor.py` — the one that can place orders — writes
+    `SL_SPREAD`, and prefixes a recovery close with `ALREADY_FLAT_`.
+
+    This module used to strip the `paper:` prefix itself, in three separate
+    places, and print whatever was left — the literal spelling is absent on
+    purpose, because the test that keeps this fixed greps the module source
+    for it. That is fine for the engine it was written
+    against and wrong for the other one: a bridged stop printed `SL_SPREAD`
+    and opened its OWN `by_reason` bucket beside `debit_sl`, so one trigger
+    became two rows and each under-counted the other. Three copies of a
+    mapping is how the arming gate drifted (C0); a fourth is not the fix.
+
+    So the CLASSIFICATION comes from `outcomes.classify`, the single
+    vocabulary the arming gate and the vet scorecard already read, and only
+    the WORDING lives here:
+
+    * a recognised reason prints as its canonical kind, whichever engine
+      wrote it — `SL_SPREAD` and `paper:debit_sl` are both `debit_sl`;
+    * `already_flat_` survives as a visible qualifier rather than being
+      folded away. It is a forensic fact — no close machinery ran and the
+      price was recovered from order history, not transacted — and it is the
+      distinction `is_stop_exit` turns on, so a reader must be able to see it;
+    * an UNRECOGNISED string prints verbatim. Hiding it inside a tidy bucket
+      is precisely the silence this vocabulary exists to end (`classify`
+      logs a WARNING of its own on the way past).
+    """
+    c = outcomes.classify(reason)
+    if not c['known']:
+        return c['raw'] or 'unknown'
+    return f"{c['kind']} (already-flat)" if c['recovered'] else c['kind']
 
 
 # ── Date helpers ──────────────────────────────────────────────────────────
@@ -74,7 +114,7 @@ def _summarize_exits(exits: list) -> dict:
             holds.append((d_out - d_in).days)
     by_reason = {}
     for t in exits:
-        r = (t.get('exit_reason') or 'unknown').replace('paper:', '')
+        r = _reason_label(t.get('exit_reason'))
         by_reason.setdefault(r, {'count': 0, 'pnl': 0.0})
         by_reason[r]['count'] += 1
         by_reason[r]['pnl'] += t.get('pnl') or 0
@@ -301,7 +341,7 @@ def _fmt_trade_line(t: dict) -> str:
     pct = t.get('pnl_pct') or 0
     kl = int(t['long_strike']) if t.get('long_strike') else '?'
     ks = int(t['short_strike']) if t.get('short_strike') else '?'
-    reason = (t.get('exit_reason') or '').replace('paper:', '')
+    reason = _reason_label(t.get('exit_reason'))
     tag = ' [BCS]' if t.get('structure') == 'bcs' else ''
     return (f"  #{t['id']} {t['stock']:<10} {t['direction']:<3} {kl}/{ks}  "
             f"{t.get('entry_date','?')[5:]}->{t.get('exit_date','?')[5:]}  "
@@ -457,7 +497,7 @@ def format_telegram(report: dict) -> str:
             tag = '🟢' if pnl > 0 else '🔴'
             kl = int(t['long_strike']) if t.get('long_strike') else '?'
             ks = int(t['short_strike']) if t.get('short_strike') else '?'
-            reason = (t.get('exit_reason') or '').replace('paper:', '')
+            reason = _reason_label(t.get('exit_reason'))
             parts.append(
                 # html.escape: the EOD report is parse_mode=HTML too, and `M&M`
                 # is a real NSE symbol sitting in this book right now. Same

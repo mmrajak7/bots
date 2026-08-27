@@ -72,6 +72,33 @@ def in_cohort(trade: dict, cohort: Optional[str] = None) -> bool:
     return stamped == (cohort or cfg.COHORT_START)
 
 
+def is_paper_record(trade: dict) -> bool:
+    """Did this record's legs NEVER reach a broker?
+
+    ONE definition, for the same reason `in_cohort` is one: the adapter that
+    decides whether the money path may see a record and the monitor that
+    decides whether it may still book one in paper have to agree, or the
+    position falls between them and NO engine holds it. That is the silent
+    state this whole interlock exists to prevent.
+
+    **Absence means PAPER, and that is a statement about THIS store.** Every
+    writer here stamps the key — `zebra/scanner.py` on the signal,
+    `_bcs_entry_fields` on the position — so within `zebra_trades.json` a
+    missing flag can only be a record written by something that did not know
+    about the flag, which is not evidence that a broker ever saw it. The
+    conservative reading is the one that keeps a booking engine attached: a
+    paper record that zebra keeps is watched; a live record the bridge drops
+    is not.
+
+    The BCS-family stores (bcs / bear_put / fallen_hero) hold real positions
+    and no `paper` key at all, so they must NEVER be asked this question.
+    `bcs/spread_monitor._record_says_paper` is the predicate for that side and
+    reads the flag POSITIVELY on purpose — see its docstring for why the two
+    defaults are deliberately opposite.
+    """
+    return bool(trade.get('paper', True))
+
+
 def cohort_split(trades: list, cohort: Optional[str] = None) -> tuple:
     """(current-engine trades, legacy trades). Order matters — current first,
     because it is the one anybody is actually asking about."""
@@ -529,6 +556,24 @@ class ZebraStore:
         return {
             'status': 'entered',
             'structure': 'bcs',
+            # ── The ONLY place a position stops being paper ──────────────
+            #
+            # `zebra/scanner.py` stamps `paper: True` on every signal and,
+            # until 2026-08-27, nothing ever flipped it: the flag was
+            # vestigial, and the money path could not tell a paper record
+            # from a real one. That matters because the owner's decision is
+            # that paper keeps running through go-live — so open paper
+            # positions WILL exist when the switches flip, and the live exit
+            # bridge would otherwise adopt them and place real closing orders
+            # against records that have no legs at any broker.
+            #
+            # `placed_at_broker` is set by `zebra/monitor._auto_enter_bcs`
+            # ONLY after `entry_executor.open_spread` reports filled lots on
+            # a non-dry run. It is deliberately NOT `already_filled` (which
+            # means "the budget gate may no longer refuse this") — one key,
+            # one meaning, because these two will diverge the first time
+            # anything else needs to bypass the budget.
+            'paper': not bool(bcs.get('placed_at_broker')),
             'entry_date': now.strftime('%Y-%m-%d'),
             'entry_time': now.strftime('%H:%M:%S'),
             'entry_spot': entry_spot,
@@ -591,7 +636,9 @@ class ZebraStore:
             'signal_gap_pct': zebra_trade['signal_gap_pct'],
             'signal_date': zebra_trade.get('signal_date'),
             'signal_time': zebra_trade.get('signal_time'),
-            'paper': True,
+            # `paper` is NOT set here. `_bcs_entry_fields` below owns it for
+            # every record that becomes a position, so the two cannot drift;
+            # a shadow is paper by construction anyway (nothing places it).
             'notes': f"BCS shadow of zebra #{zebra_trade['id']}",
         }
         trade.update(self._bcs_entry_fields(

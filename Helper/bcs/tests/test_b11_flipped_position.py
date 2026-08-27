@@ -149,11 +149,34 @@ def test_a_normal_book_still_closes(env):
     assert store.called('update_trade_exit'), "a clean close was not booked"
 
 
+def _tagged_close_fills(kite, short_px=10.20, long_px=50.20):
+    """Give the fake account the two BCS_MON fills a real already-flat close
+    would have left behind.
+
+    Needed since 2026-08-27 (N1): the flat branch books only when OUR OWN
+    orders can price the exit. Without this the fixture describes a position
+    that went flat with no order history at all, which is now a REFUSAL — the
+    subject of `bcs/tests/test_paper_vs_live_close.py`, not of this file. This
+    file is about flipped-vs-flat, so it supplies the fills and keeps testing
+    that.
+    """
+    kite.order_book.extend([
+        {'order_id': '900', 'tradingsymbol': SHORT, 'transaction_type': 'BUY',
+         'status': 'COMPLETE', 'average_price': short_px, 'tag': 'BCS_MON',
+         'order_timestamp': '2026-09-21 14:30:00'},
+        {'order_id': '901', 'tradingsymbol': LONG, 'transaction_type': 'SELL',
+         'status': 'COMPLETE', 'average_price': long_px, 'tag': 'BCS_MON',
+         'order_timestamp': '2026-09-21 14:30:05'},
+    ])
+    return kite
+
+
 def test_a_genuinely_flat_book_is_still_marked_closed(env):
     """Both legs at exactly zero — the case the old branch was written for."""
     spy, store = env
-    kite = FakeBroker(books=BOOKS, positions=[{'tradingsymbol': SHORT, 'quantity': 0},
-                                 {'tradingsymbol': LONG, 'quantity': 0}])
+    kite = _tagged_close_fills(FakeBroker(
+        books=BOOKS, positions=[{'tradingsymbol': SHORT, 'quantity': 0},
+                                {'tradingsymbol': LONG, 'quantity': 0}]))
     ok = _run(kite, store)
 
     assert ok is True

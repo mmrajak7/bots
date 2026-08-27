@@ -149,6 +149,50 @@ def _monitor_logs_to_tmp(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _pinned_vet_flag(monkeypatch):
+    """This suite must not read the MACHINE's live vetting switch either.
+
+    `zebra/tests/conftest.py` has had this rail since 2026-08-13, when five
+    tests failed on the Pi and passed on the dev box on the same commit:
+    `cfg.VET_ENABLED` is resolved from config at import, the Pi had vetting ON
+    and the dev box had no vet key at all, so the gated exits under test simply
+    never fired there. A suite whose result depends on the config of the box it
+    runs on cannot certify a deploy — which is exactly what it is used for.
+
+    `bcs/` had no equivalent, and it reaches the same flag: `bcs/exit_vet.py`
+    calls `zebra.monitor._exit_cleared` -> `zebra.vet.exit_gate`, whose FIRST
+    line is `if not cfg.VET_ENABLED: return 'proceed'`. With the flag on, that
+    call instead writes vet markers into the store under test and can spawn a
+    Claude agent. So every `_close_spread_inner` test on a `_store_type:
+    'zebra'` trade has been taking whichever branch the box happened to be
+    configured for.
+
+    Latent until 2026-08-27, when H3 moved the switch into tracked config and
+    flipped the CODE default from False to True so it would be auditable from
+    git. The resolved value on a box with no overlay key went False -> True
+    that day, silently, for these tests only. The suite is green either way
+    today; a rail on one side of a copied pair and not the other is the shape
+    that has produced six separate bugs in this repo, and the fix is the rail,
+    not the audit that found it green this time.
+
+    Pinned FALSE for the same reason zebra pins it there: what most tests here
+    want to assert is what the DETERMINISTIC engine does. Deliberately on the
+    shared `monkeypatch` — unlike `_journal_to_tmp` and `_monitor_logs_to_tmp`
+    above, which own private MonkeyPatches so a test cannot switch them off.
+    Those two rail against a mistake; this one pins a DEFAULT, and a test that
+    genuinely wants to exercise a vet path must be able to say so. Fixtures
+    and test-body monkeypatches both run after this one and win, which is how
+    `zebra/tests/test_exit_vet.py` and its 14 siblings set it True.
+
+    This does NOT change the resolved production value; the config is
+    untouched. Reproduce either state with `ZEBRA_VET_ENABLED=1 pytest` (env
+    wins over the file, see `zebra/config.py`).
+    """
+    from zebra import config as cfg
+    monkeypatch.setattr(cfg, 'VET_ENABLED', False)
+
+
+@pytest.fixture(autouse=True)
 def _no_production_writes():
     """Deliberately does NOT take the shared `monkeypatch` fixture.
 

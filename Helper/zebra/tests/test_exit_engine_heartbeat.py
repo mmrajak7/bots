@@ -328,7 +328,12 @@ def store(logs, monkeypatch):
                              'debit': 10.0, 'lot_size': 100, 'lots': 1,
                              'expiry': '2026-09-30', 'structure': 'bcs'})
         with s._mutate():
-            s.find(sid)['cohort'] = cfg.COHORT_START
+            # cohort AND placed. `_exits_external` gained a third condition on
+            # 2026-08-27 (C5) -- a PAPER record is withheld from the order path
+            # entirely, so there is no peer to stand down for and no heartbeat
+            # to check. These two stand in for positions the bridge really
+            # holds.
+            s.find(sid).update({'cohort': cfg.COHORT_START, 'paper': False})
     return s
 
 

@@ -137,11 +137,16 @@ def test_only_cohort_records_reach_the_order_path():
     order path must never see one."""
     class FakeZebra:
         def get_entered(self):
+            # `paper: False` since 2026-08-27 (C5): cohort membership is
+            # necessary but no longer sufficient — a record the order path may
+            # manage is one that was actually PLACED at the broker. The paper
+            # half of that filter is tested in test_paper_vs_live_close.py.
             return [{'id': 1, 'cohort': '2026-08-14', 'stock': 'IN',
-                     'debit': 1.0, 'width': 5.0},
-                    {'id': 2, 'stock': 'LEGACY', 'debit': 1.0, 'width': 5.0},
+                     'debit': 1.0, 'width': 5.0, 'paper': False},
+                    {'id': 2, 'stock': 'LEGACY', 'debit': 1.0, 'width': 5.0,
+                     'paper': False},
                     {'id': 3, 'cohort': '2020-01-01', 'stock': 'OLD',
-                     'debit': 1.0, 'width': 5.0}]
+                     'debit': 1.0, 'width': 5.0, 'paper': False}]
     got = za.ZebraStoreAdapter(FakeZebra()).get_open_trades()
     assert [t['stock'] for t in got] == ['IN']
 

@@ -43,7 +43,8 @@ from . import strikes as strikes_mod
 from . import vet as vet_mod
 from .scanner import _get_kite, get_ltp, compute_st_for_stock, validate_and_add
 from playbook.magnet import scanner as scanner_mod
-from .trade_store import ZebraStore, get_store, in_cohort
+from .trade_store import (ZebraStore, get_store, in_cohort,
+                          is_paper_record)
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,20 @@ def _format_enter_alert(trade: dict, analysis: dict,
 #: PASSED and whose book has died. Nothing else can ever price that position,
 #: and leaving it `entered` forever bans its stock from the scanner. It stays
 #: here whatever else moves.
+#:
+#: Re-audited 2026-08-27 (N2) on the suspicion that the omission was a hole in
+#: the interlock on the one date where being wrong is uncapped. It is not, and
+#: here is the whole argument so nobody has to re-derive it a third time:
+#: `_settle_if_expired` is the ONLY caller that passes `'expiry'`, and it
+#: refuses unless `today > exp` -- strictly PAST expiry, when the contracts
+#: have already auto-exercised and there is no option left for the order path
+#: to close. Declining there protects nothing (nothing is tradeable) and costs
+#: everything (the record sits at `entered` for good, and its stock is banned
+#: from the scanner by dedup). The omission is only safe while that caller
+#: stays the only one, so `test_only_the_terminal_settle_may_close_on_expiry`
+#: reads this module's own source and fails if a second `'expiry'` close
+#: appears -- particularly one on expiry DAY, where the legs are still live
+#: and the argument above does not hold.
 EXTERNALLY_MANAGED_EXITS = frozenset({'tp', 'trail', 'spot_sl', 'debit_sl',
                                       'time'})
 
@@ -204,18 +219,27 @@ EXTERNALLY_MANAGED_EXITS = frozenset({'tp', 'trail', 'spot_sl', 'debit_sl',
 def _exits_external(trade: dict) -> bool:
     """True when another engine owns this position's exits.
 
-    Two conditions, both required. `EXITS_MANAGED_EXTERNALLY` is the operator's
-    switch, thrown in the same step `--dry-run` comes off the monitor's crontab
-    line; `in_cohort` is the scope, because the monitor only ever loads cohort
-    records (`bcs/zebra_adapter.py`) and the other 450 rows in this store have
-    no other engine watching them at all.
+    Three conditions, all required. `EXITS_MANAGED_EXTERNALLY` is the
+    operator's switch, thrown in the same step `--dry-run` comes off the
+    monitor's crontab line; `in_cohort` is the scope, because the monitor only
+    ever loads cohort records (`bcs/zebra_adapter.py`) and the other 450 rows
+    in this store have no other engine watching them at all.
+
+    `not is_paper_record` is the third, added 2026-08-27, and it MIRRORS the
+    filter in `ZebraStoreAdapter.get_open_trades`: the bridge refuses to hand a
+    paper record to the order path, so for a paper record there is no peer to
+    stand down FOR. These two predicates must agree exactly — if the adapter
+    drops a record and this function still claims someone else owns it, the
+    position has no exit engine at all and nothing says so. That is why both
+    call one imported definition rather than each testing the flag.
 
     Getting the AND wrong in the permissive direction is loud -- two engines
     closing one position shows up immediately. Getting it wrong the other way
     is silent: a position with NO exit engine looks exactly like a quiet one.
     So the cohort test is here rather than left to the caller.
     """
-    return cfg.EXITS_MANAGED_EXTERNALLY and in_cohort(trade)
+    return (cfg.EXITS_MANAGED_EXTERNALLY and in_cohort(trade)
+            and not is_paper_record(trade))
 
 
 # ── Is the engine we stood down for actually there? ─────────────────────────
@@ -1156,6 +1180,14 @@ def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
     # is reachable in ordinary operation: `plan` sized against the QUOTED
     # debit, this carries the PAID one, which is higher by construction.
     filled['already_filled'] = True
+    # THE ONE PLACE A RECORD BECOMES REAL. Orders went out and lots came back
+    # filled, so this position exists at the broker and the live exit path is
+    # the engine that owns it. `not dry_run` is load-bearing: the dry stub in
+    # `wait_for_fill` reports COMPLETE at 0.0, so a dry run reaches this line
+    # with `lots_filled` set and nothing whatsoever placed — stamping that
+    # record live would hand the money path a phantom position, which is the
+    # exact failure this flag exists to prevent, only inverted.
+    filled['placed_at_broker'] = not dry_run
     try:
         fresh = store.mark_entered_bcs(trade['id'], filled)
     except Exception as e:
@@ -2360,7 +2392,26 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
     `spot` is the live underlying LTP at exit — recorded for post-trade
     spot-movement analysis. P&L itself is driven by `mid`, not spot.
     """
-    if not cfg.PAPER_MODE:
+    if not (cfg.PAPER_MODE or is_paper_record(trade)):
+        # A PAPER RECORD KEEPS ITS BOOKING ENGINE AFTER THE SWITCH FLIPS.
+        #
+        # This line used to read `if not cfg.PAPER_MODE`, which disabled paper
+        # booking for the WHOLE store the moment the mode changed. The owner's
+        # decision of 2026-08-27 is that paper keeps running through go-live
+        # and every paper position resolves NATURALLY -- "not the 8 cohort
+        # positions, not any other" -- so a global gate would strand every
+        # open paper record on the day of the flip: no auto-close here, and
+        # (by the adapter's filter) no live engine either. Two engines, zero
+        # coverage, silently.
+        #
+        # Gating on the RECORD rather than the mode is the smaller of the two
+        # available fixes and the one that stays true afterwards: what makes a
+        # close bookable at mid is that no broker was ever involved, which is
+        # a property of the position, not of a config file. The alternative --
+        # routing paper records back to zebra from inside the adapter -- puts
+        # a paper-booking branch inside the only module in the fleet that can
+        # place a real order, which is precisely where this codebase has twice
+        # lost money.
         return None
     if reason in EXTERNALLY_MANAGED_EXITS and _exits_external(trade):
         # THE BACKSTOP, and the reason it lives here rather than only at the
@@ -2373,6 +2424,19 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
         # the worst outcome available here -- the record leaves `get_entered()`,
         # so the monitor's `get_open_trades()` stops returning it, and a LIVE
         # position goes unwatched with nothing anywhere reporting a problem.
+        #
+        # REASON-SCOPED, and it stays that way. `expiry` is absent from the set
+        # by design -- see the constant's docstring and
+        # `test_the_terminal_expiry_settle_is_never_declined`. It was audited
+        # again on 2026-08-27 (N2) on the theory that the omission was a hole,
+        # and it is not one: `_settle_if_expired` is the ONLY caller that
+        # passes 'expiry', and it fires strictly PAST expiry (`today > exp`),
+        # at which point the options no longer exist and there is nothing for
+        # the order path to close. Declining there would strand the record at
+        # `entered` forever and ban its stock from the scanner, in exchange for
+        # protecting a position that cannot be traded either way.
+        # `test_only_the_terminal_settle_may_close_on_expiry` pins that single
+        # call site, because the omission is only safe while it stays single.
         logger.warning(
             "PAPER close DECLINED #%d %s reason=%s: exits are managed by "
             "spread_monitor for this trade - booking it here would hide a "

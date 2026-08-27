@@ -1388,38 +1388,83 @@ ORDER_TAG = "BCS_MON"   # Tag for all orders placed by this script
 _TERMINAL_ORDER_STATUS = frozenset({'COMPLETE', 'REJECTED', 'CANCELLED'})
 
 
-def _find_last_fill_price(kite: KiteConnect, symbol: str, txn_type: str) -> float:
-    """Find the fill price of the most recent COMPLETE order for a symbol+side.
+def find_recoverable_fill(kite: KiteConnect, symbol: str,
+                          txn_type: str) -> dict:
+    """The fill price of the most recent COMPLETE **ORDER_TAG** order, with
+    enough context for the caller to say what went wrong.
 
-    Used to recover the actual fill when close_leg detects the position changed
-    before it could observe the fill directly. Returns 0 if not found.
+    Returns `{'price', 'untagged': int, 'error': str|None}` where `price` is
+    None whenever no order THIS SCRIPT placed can be found. Three outcomes, and
+    they need three different sentences from whoever reads the alert:
 
-    Prefers orders tagged with ORDER_TAG (placed by this script). Falls back
-    to any matching order if no tagged order found.
+      price set              -- our order, our fill, safe to book
+      price None, untagged>0 -- somebody else's fill for this symbol+side
+      price None, untagged=0 -- nothing at all in today's order book
+
+    ONLY OUR OWN ORDERS COUNT, and that is the change. This used to return
+    `tagged_best or any_best`: with no tagged order it adopted the most recent
+    matching order in the ACCOUNT and reported it as this trade's exit fill,
+    with a "(WARNING: not tagged by BCS_MON)" note in a log nobody reads at
+    14:35. Three ways that goes wrong, and the third is why it had to change:
+
+      * a manual close of the same leg, at a price the operator chose, booked
+        as though the monitor had transacted it;
+      * `kite.orders()` is TODAY only, so an unrelated same-symbol order from
+        this morning outranks the real close from yesterday;
+      * a PAPER record adopted by the live bridge has no orders of its own by
+        construction, so the fallback is the ONLY thing it could ever find --
+        it manufactures an exit price for a position that never existed.
+
+    `average_price > 0` is kept as the acceptance test. A COMPLETE order with a
+    zero average price is a broker-side anomaly, not a free fill.
     """
+    out = {'price': None, 'untagged': 0, 'error': None}
     try:
-        tagged_best = None
-        any_best = None
+        best = None
         for o in kite.orders():
             if (o.get('tradingsymbol') == symbol
                     and o.get('transaction_type') == txn_type
                     and o.get('status') == 'COMPLETE'
                     and o.get('average_price', 0) > 0):
+                if o.get('tag') != ORDER_TAG:
+                    out['untagged'] += 1
+                    continue
                 ts = str(o.get('order_timestamp', ''))
-                if o.get('tag') == ORDER_TAG:
-                    if tagged_best is None or ts > str(tagged_best.get('order_timestamp', '')):
-                        tagged_best = o
-                if any_best is None or ts > str(any_best.get('order_timestamp', '')):
-                    any_best = o
-
-        best = tagged_best or any_best
-        if best:
-            tag_note = "" if best.get('tag') == ORDER_TAG else " (WARNING: not tagged by BCS_MON)"
-            log(f"    Recovered fill: {symbol} {txn_type} @ {best['average_price']} (order {best['order_id']}){tag_note}")
-            return best['average_price']
+                if best is None or ts > str(best.get('order_timestamp', '')):
+                    best = o
+        if best is not None:
+            log(f"    Recovered fill: {symbol} {txn_type} @ "
+                f"{best['average_price']} (order {best['order_id']}, "
+                f"tag={ORDER_TAG})")
+            out['price'] = best['average_price']
+            return out
+        if out['untagged']:
+            log(f"    REFUSING to recover a fill for {symbol} {txn_type}: "
+                f"{out['untagged']} COMPLETE order(s) match, none tagged "
+                f"{ORDER_TAG}. Those are somebody else's fills — adopting one "
+                f"would book a price this system never transacted.")
+        else:
+            log(f"    No {ORDER_TAG} fill found for {symbol} {txn_type} in "
+                f"today's order book (kite.orders() covers today only).")
     except Exception as e:
-        log(f"    Could not recover fill price: {e}")
-    return 0.0
+        out['error'] = str(e)
+        log(f"    Could not read the order book to recover a fill: {e}")
+    return out
+
+
+def _find_last_fill_price(kite: KiteConnect, symbol: str,
+                          txn_type: str) -> Optional[float]:
+    """`find_recoverable_fill`'s price, or None. **None is not zero.**
+
+    The return type changed from `float` to `Optional[float]` on 2026-08-27.
+    Returning 0.0 for "not found" is what let the already-flat close path book
+    `exit_net = 0.0` — a full max loss computed from a price that was never
+    observed, on a structure whose max loss is the debit. An unobserved price
+    is UNKNOWN, and the project's own rule (CLAUDE.md, "Valuation bounds")
+    is to CLAMP what is mathematically achievable and REFUSE what is only
+    estimated. Nothing about an empty order book estimates zero.
+    """
+    return find_recoverable_fill(kite, symbol, txn_type)['price']
 
 
 def _find_pending_orders(kite: KiteConnect, symbol: str, txn_type: str):
@@ -1691,10 +1736,18 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
 
             if actual_remaining == 0:
                 log(f"    Position {symbol} already flat (qty={current_qty}). Nothing to close.")
+                # `average_price` may be None here, and callers must keep it
+                # None rather than coercing it: it means "this leg went flat
+                # and no order of ours priced it". Our OWN partial fills win
+                # when there are any -- those are observed prices.
                 fill_price = _find_last_fill_price(kite, symbol, txn_type)
                 total_filled = cumulative_fill_qty if cumulative_fill_qty > 0 else qty
                 if cumulative_fill_qty > 0:
                     fill_price = cumulative_fill_value / cumulative_fill_qty
+                elif fill_price is None:
+                    log(f"    WARNING: {symbol} is flat with no {ORDER_TAG} "
+                        f"fill to price it. Reporting the leg as CLOSED with "
+                        f"NO price — the caller must not invent one.")
                 return {'status': 'COMPLETE', 'average_price': fill_price,
                         'order_id': 'position_verified', 'filled_quantity': total_filled}
 
@@ -1941,6 +1994,90 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
     return None
 
 
+# ── Refusing to price a close, instead of inventing one ─────────────────────
+
+#: (strategy-label, trade-id) -> date string already escalated. In memory, like
+#: `expiry_trades`: losing it on restart costs one repeated Telegram, which is
+#: the correct direction for an escalation that is still unresolved.
+_unpriced_close_alerted: dict = {}
+
+
+def _record_says_paper(trade: dict) -> bool:
+    """Did this record POSITIVELY declare that no broker ever saw it?
+
+    Deliberately the OPPOSITE default to `zebra.trade_store.is_paper_record`,
+    and the asymmetry is the point rather than an oversight:
+
+      * There, absence means paper. That predicate answers "may the money
+        engine own this?" for records in `zebra_trades.json`, where every
+        writer stamps the flag; refusing means zebra keeps booking it, so the
+        record still has an engine and the conservative answer is safe.
+      * Here, absence means REAL. This runs on all four books, and the
+        bcs / bear_put / fallen_hero stores hold nothing but real positions
+        and have never carried a `paper` key. Defaulting those to paper would
+        refuse to close live spreads on three books at once — a guard that
+        abandons the stops on real money is not a safer guard.
+
+    So each side defaults toward the engine that will actually act on the
+    record. A future refactor that "unifies" them breaks one or the other;
+    `test_the_two_paper_predicates_default_in_opposite_directions` fails if
+    someone tries.
+    """
+    return trade.get('paper') is True
+
+
+def _refuse_unpriced_close(trade, label, reason, spot, dry_run, legs):
+    """A close that CANNOT be priced is not booked. Escalate and stop.
+
+    `legs` is a list of `(side, symbol, txn_type, recovery)` where recovery is
+    a `find_recoverable_fill` result. Returns False — "manual intervention
+    alerted", which is exactly what this is.
+
+    The record is left wherever the caller found it (`closing`, having taken
+    the lock). That is deliberate: it stays inside `OPEN_STATUSES` so capital
+    and scanner dedup keep counting it, `get_closing_trades` surfaces it, and
+    the crash-recovery sweep un-freezes it at the next process start. Booking
+    it would be the only way to lose it silently.
+    """
+    lines = []
+    for side, symbol, txn, rec in legs:
+        if rec['price'] is not None:
+            lines.append(f"{side} {symbol}: {rec['price']}")
+        elif rec.get('error'):
+            lines.append(f"{side} {symbol}: order book unreadable "
+                         f"({str(rec['error'])[:60]})")
+        elif rec['untagged']:
+            lines.append(f"{side} {symbol}: {rec['untagged']} COMPLETE "
+                         f"{txn} order(s) found, NONE tagged {ORDER_TAG} — "
+                         f"not ours, refused")
+        else:
+            lines.append(f"{side} {symbol}: no {ORDER_TAG} {txn} fill today")
+    detail = '\n'.join(lines)
+
+    log("")
+    log("  *** CLOSE NOT PRICED — REFUSING TO BOOK ***")
+    log(f"  {reason}: both legs are flat but no fill this system placed can "
+        f"price the exit.")
+    for ln in lines:
+        log(f"    {ln}")
+    log(f"  Trade #{trade.get('id')} left at 'closing'. It is NOT booked and "
+        f"NOT lost — close it by hand with the real exit price.")
+
+    key = (label, trade.get('id'))
+    today = datetime.now().strftime('%Y-%m-%d')
+    if _unpriced_close_alerted.get(key) != today and not dry_run:
+        _unpriced_close_alerted[key] = today
+        send_telegram(
+            f"⚠️ {label} {trade.get('stock')}: {reason} triggered, both legs "
+            f"already flat, and the exit CANNOT BE PRICED.\n"
+            f"{detail}\n"
+            f"Nothing was booked — booking a guess here would record a "
+            f"max loss that never happened.\n"
+            f"Trade #{trade.get('id')} is parked at 'closing'. Close it by "
+            f"hand with the real exit price.")
+    return False
+
+
 URGENT_CLOSE_REASONS = ('SL_SPOT', 'EXPIRY_FORCE_CLOSE')
 
 
@@ -1999,6 +2136,49 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
     log(f"  {reason} TRIGGERED! {stock} spot = {spot}")
     log(f"  Initiating spread close sequence... ({'URGENT' if urgent else 'normal'})")
     log("=" * 70)
+
+    # ── A PAPER RECORD NEVER REACHES THE ORDER PATH ──────────────────────
+    #
+    # `ZebraStoreAdapter.get_open_trades` already withholds these, so this is
+    # not that filter repeated: it is the WRITE boundary rather than the read
+    # one, and it is here because the two fail differently. The adapter decides
+    # what the monitor SEES — it cannot cover a trade loaded by the CLI, by a
+    # recovery sweep, or by whatever the next caller does. This decides what
+    # the monitor may PLACE, and every route to a real order goes through this
+    # function.
+    #
+    # `'ABORT'`, not False: nothing was placed and the position (such as it is)
+    # is untouched, which is precisely the contract the callers' ABORT branch
+    # is written against. It also means a misconfiguration cannot freeze the
+    # record — a paper trade must never end up at partial_close.
+    if _record_says_paper(trade):
+        if dry_run:
+            # A DRY RUN CANNOT PLACE AN ORDER, so refusing here buys no safety
+            # and costs the evidence week: `journal_report --compare` works by
+            # letting the monitor walk the whole close and journal what it
+            # WOULD have done, then setting that beside zebra's real paper
+            # booking. Aborting here would journal nothing, and that
+            # comparison is what gates arming anything. Say what the armed
+            # engine would have done, then carry on measuring.
+            log(f"  [DRY RUN] trade #{trade.get('id')} is a PAPER record — "
+                f"armed, this close would be REFUSED and nothing placed. "
+                f"Continuing so the intended orders are journalled.")
+        else:
+            log(f"  REFUSED: trade #{trade.get('id')} is a PAPER record. It "
+                f"has no legs at any broker, so a close here would either "
+                f"book a price nobody transacted or put real orders on "
+                f"somebody else's position. zebra books this one; nothing "
+                f"is placed.")
+            key = ('PAPER', trade.get('id'))
+            today = datetime.now().strftime('%Y-%m-%d')
+            if _unpriced_close_alerted.get(key) != today:
+                _unpriced_close_alerted[key] = today
+                send_telegram(
+                    f"⚠️ {label} {stock}: {reason} reached the ORDER PATH for "
+                    f"paper trade #{trade.get('id')}. No order placed. "
+                    f"The exit bridge should never have been handed this "
+                    f"record — check who called close_spread for it.")
+            return 'ABORT'
 
     # ── Late-day guard (urgent closes are reduce-only and get 5 more min) ──
     now_t = datetime.now().time()
@@ -2149,13 +2329,38 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
     if short_qty == 0 and long_qty == 0:
         log(f"\n  Both legs already flat (short={short_qty}, long={long_qty}).")
         log(f"  Trade was closed by another process or manually. Recovering fill prices...")
-        short_fill = _find_last_fill_price(kite, short_sym, "BUY")
-        long_fill = _find_last_fill_price(kite, long_sym, "SELL")
+        short_rec = find_recoverable_fill(kite, short_sym, "BUY")
+        long_rec = find_recoverable_fill(kite, long_sym, "SELL")
+        short_fill = short_rec['price']
+        long_fill = long_rec['price']
         entry_net = trade['net_debit']
-        if short_fill > 0 and long_fill > 0:
-            exit_net = long_fill - short_fill
-        else:
-            exit_net = 0.0
+        if short_fill is None or long_fill is None:
+            # N1. THIS USED TO BOOK `exit_net = 0.0`.
+            #
+            # Zero is not a missing price, it is the WORST price a vertical can
+            # close at, so the fallback computed `pnl_per_share = 0.0 - debit`
+            # and booked a silent MAX LOSS from a number nobody observed --
+            # take-profits included. It survived the `exit_value` fix because
+            # 0.0 is not None and the adapter's None-guard never saw it.
+            #
+            # Refuse, exactly as the paper engine refuses an unusable book:
+            # "Paper never books a price it could not have transacted at", and
+            # the money path is held to at least that standard. The position is
+            # flat either way -- nothing here is at risk -- so the only thing
+            # lost by waiting is a P&L figure, and the only thing lost by
+            # guessing is the truth about it.
+            #
+            # The record stays at 'closing' ON PURPOSE. It remains in
+            # OPEN_STATUSES (capital keeps counting it, the scanner keeps
+            # blocking its stock), `get_closing_trades` surfaces it, and the
+            # crash-recovery sweep un-freezes it at the next process start --
+            # which is also what rate-limits this escalation to roughly once
+            # per run rather than once per five-second poll.
+            return _refuse_unpriced_close(
+                trade, label, reason, spot, dry_run,
+                [('short', short_sym, 'BUY', short_rec),
+                 ('long', long_sym, 'SELL', long_rec)])
+        exit_net = long_fill - short_fill
         exit_data = {
             'exit_date': datetime.now().isoformat(),
             'exit_reason': f"ALREADY_FLAT_{reason}",
@@ -2163,9 +2368,15 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             'short_fill': short_fill,
             'long_fill': long_fill,
             'exit_spread': exit_net,
-            'pnl_per_share': exit_net - entry_net if exit_net else 0,
-            'total_pnl': (exit_net - entry_net) * qty if exit_net else 0,
-            'notes': 'Both legs flat when close triggered. Fills recovered from order history.',
+            # No `if exit_net else 0` any more. Both fills are OBSERVED by the
+            # time this runs, so an exit_net of exactly 0.00 is a real price
+            # (long 10.00 / short 10.00 nets zero) and reporting its P&L as
+            # zero rather than -debit was a second, smaller lie riding on the
+            # same falsy test that produced the first one.
+            'pnl_per_share': exit_net - entry_net,
+            'total_pnl': (exit_net - entry_net) * qty,
+            'notes': (f'Both legs flat when close triggered. Fills recovered '
+                      f'from {ORDER_TAG} order history.'),
         }
         if not dry_run:
             store.update_trade_exit(trade['id'], exit_data)
@@ -2320,6 +2531,25 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
         long_closed_now = True
     else:
         log(f"\n  LONG leg {long_sym} already flat/short (qty={long_qty}). Skipping SELL.")
+
+    # ── A leg that went flat without one of OUR fills has NO price ───────
+    #
+    # `close_leg` returns `average_price: None` when it finds the leg already
+    # flat and no ORDER_TAG order priced it (its "position_verified" return).
+    # Before 2026-08-27 that was 0.0 and it flowed straight into the arithmetic
+    # below — the same N1 lie as the already-flat branch, reached by a
+    # different door, which is exactly the shape that keeps recurring here.
+    # Same answer: refuse, escalate, book nothing.
+    unpriced = []
+    if short_closed_now and short_fill is None:
+        unpriced.append(('short', short_sym, 'BUY',
+                         {'price': None, 'untagged': 0, 'error': None}))
+    if long_closed_now and long_fill is None:
+        unpriced.append(('long', long_sym, 'SELL',
+                         {'price': None, 'untagged': 0, 'error': None}))
+    if unpriced:
+        return _refuse_unpriced_close(trade, label, reason, spot, dry_run,
+                                      unpriced)
 
     # ── Summary ──────────────────────────────────────────────────────────
     entry_net = trade['net_debit']
@@ -2556,10 +2786,30 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                 and (not lc_sym or lc_qty == 0))
     if all_flat:
         log(f"\n  All legs already flat. Recovering fill prices...")
-        sc_fill = _find_last_fill_price(kite, sc_sym, "BUY")
-        lc_fill = _find_last_fill_price(kite, lc_sym, "SELL") if lc_sym else 0.0
-        sp_fill = _find_last_fill_price(kite, sp_sym, "BUY")
-        lp_fill = _find_last_fill_price(kite, lp_sym, "SELL")
+        # The FH twin of N1, fixed in the same change as its BCS original.
+        # [[feedback_copy_pasted_modules_fix_once]]: the last two times a rule
+        # was fixed on one of these two paths and not the other, the untested
+        # twin shipped broken. Four legs instead of two, and the same rule —
+        # every leg priced by one of OUR fills, or nothing is booked.
+        fh_recs = [('short call', sc_sym, 'BUY',
+                    find_recoverable_fill(kite, sc_sym, "BUY")),
+                   ('short put', sp_sym, 'BUY',
+                    find_recoverable_fill(kite, sp_sym, "BUY")),
+                   ('long put', lp_sym, 'SELL',
+                    find_recoverable_fill(kite, lp_sym, "SELL"))]
+        if lc_sym:
+            fh_recs.append(('long call', lc_sym, 'SELL',
+                            find_recoverable_fill(kite, lc_sym, "SELL")))
+        if any(r['price'] is None for _, _, _, r in fh_recs):
+            return _refuse_unpriced_close(trade, 'FH', reason, spot,
+                                          dry_run, fh_recs)
+        prices = {side: r['price'] for side, _, _, r in fh_recs}
+        sc_fill = prices['short call']
+        sp_fill = prices['short put']
+        lp_fill = prices['long put']
+        # An ABSENT hedge leg is worth zero; a leg that exists and cannot be
+        # priced was refused above. The two must not share a literal.
+        lc_fill = prices['long call'] if lc_sym else 0.0
         close_cost = sc_fill + sp_fill - lc_fill - lp_fill
         total_credit = trade['total_credit']
         pnl_per_share = total_credit - close_cost
@@ -2683,6 +2933,24 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
             fills['long_put'] = result.get('average_price', 0)
     else:
         log(f"\n  LONG PUT {lp_sym} already flat (qty={lp_qty}). Skipping.")
+
+    # The FH twin of the unpriced-leg guard on the BCS path. `close_leg` can
+    # report a leg CLOSED with `average_price: None` when it found the leg
+    # already flat and nothing of ours priced it; here that would not even
+    # produce a wrong number, it would raise inside the arithmetic below and
+    # land in close_spread's blanket handler as "EXCEPTION during close" — a
+    # true statement about the wrong thing.
+    fh_unpriced = [(side, sym, txn,
+                    {'price': None, 'untagged': 0, 'error': None})
+                   for side, sym, txn, key in (
+                       ('short call', sc_sym, 'BUY', 'short_call'),
+                       ('long call', lc_sym, 'SELL', 'long_call'),
+                       ('short put', sp_sym, 'BUY', 'short_put'),
+                       ('long put', lp_sym, 'SELL', 'long_put'))
+                   if fills[key] is None]
+    if fh_unpriced:
+        return _refuse_unpriced_close(trade, 'FH', reason, spot, dry_run,
+                                      fh_unpriced)
 
     # ── Summary ──────────────────────────────────────────────────────────
     total_credit = trade['total_credit']

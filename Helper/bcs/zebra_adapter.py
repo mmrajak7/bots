@@ -169,6 +169,24 @@ class ZebraStoreAdapter:
         through `update_trade_fields` / `update_trade_exit` below, which reach
         the real record; handing out an aliased dict here would let a caller
         mutate a mapped copy and believe it had persisted.
+
+        **Paper records ARE returned, and that is deliberate.** They must not
+        be TRADED — `spread_monitor.close_spread` refuses them outright, and
+        `update_trade_exit` below refuses to book one through this path — but
+        withholding them here was tried on 2026-08-27 and reverted the same
+        day, because this method is the WATCH path, not the order path:
+
+          * `--list` reads it. Hiding the cohort here reproduces `b3fabf6`
+            exactly — "Open: 0" with eight positions live — which is the
+            misreport the bridge was built to end.
+          * the dry-run evidence week reads it. `journal_report --compare`
+            works by having the monitor poll the paper cohort, journal what it
+            WOULD have done, and set that beside zebra's real paper booking.
+            A monitor that cannot see the cohort has nothing to compare, and
+            that comparison is the gate on arming anything.
+
+        So the boundary is where the ORDER is, not where the read is. See
+        `spread_monitor._record_says_paper`.
         """
         return [map_trade(t) for t in self._store.get_entered()
                 if in_cohort(t)]
@@ -272,6 +290,21 @@ class ZebraStoreAdapter:
         What DOES belong here is noticing when this engine emits a string that
         map has never heard of, at the moment it is written rather than weeks
         later when someone reads a gate. Detection only.
+
+        NO PAPER CHECK HERE, and that was a deliberate reversal. A guard
+        refusing a `paper: True` record was written on 2026-08-27 and taken
+        back out: the only caller of this method is `_close_spread_inner`, and
+        the only caller of THAT is `close_spread`, which refuses paper records
+        before the vet, before the close lock and before any order. A second
+        test of the same flag on the same record, downstream of the first and
+        unreachable while the first stands, is the shape
+        `feedback_a_second_guard_you_cannot_observe_is_decorative` describes —
+        it cannot be observed failing, so it cannot be known to work.
+
+        The property it was trying to buy is bought structurally instead:
+        `test_the_paper_guard_sits_on_the_only_route_to_an_order` re-derives
+        the call graph from the source and fails if a second route to booking
+        ever appears.
         """
         # THE EXIT BOOK. The monitor reports the two fills as scalars; the
         # store persists a leg dict, and `zebra/fees.py:144` costs the exit
