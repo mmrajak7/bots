@@ -2567,8 +2567,11 @@ def update_trail(ts: dict, spread_val: float) -> bool:
 
 
 def new_blind_state() -> dict:
+    # 'alerted' is what makes recovery announceable. 'since' is set on the
+    # FIRST failed poll, long before the escalation clock says anything, so
+    # it cannot stand in for "the owner was told" — see track_spot_blindness.
     return {'since': None, 'reason': '', 'last_alert': 0.0, 'last_prox': 0.0,
-            'ok_streak': 0}
+            'ok_streak': 0, 'alerted': False}
 
 
 def _is_auth_error(exc) -> bool:
@@ -2606,10 +2609,23 @@ def track_spot_blindness(bs: dict, spot_ok: bool, reason: str, label: str):
     if spot_ok:
         bs['ok_streak'] += 1
         if bs['ok_streak'] >= BLIND_CLEAR_OK_POLLS:
-            if bs['since'] is not None:
+            # Announce recovery only to someone who was told about the
+            # outage. `since` is set on the FIRST failed poll, but the SPOT
+            # UNAVAILABLE alert needs SPOT_BLIND_ALERT_SEC of unbroken
+            # blindness — so gating the all-clear on `since` announced the end
+            # of an alarm that never rang. At a 5s poll one Kite read timeout
+            # (they land roughly hourly on api.kite.trade, and 503s arrive in
+            # bursts) produced a RECOVERED message ~15s later, per open
+            # position, all session. An alert nobody can act on is what trains
+            # the owner to swipe past the alert that matters.
+            if bs['alerted']:
                 send_telegram(f"{label}: spot quotes RECOVERED — triggers "
                               f"re-armed.")
             bs['since'] = None
+            bs['alerted'] = False
+            # The repeat clock belongs to the spell that just ended. Left
+            # standing it would swallow the FIRST alert of the next outage.
+            bs['last_alert'] = 0.0
         return
     bs['ok_streak'] = 0
     bs['reason'] = reason or 'no_data'
@@ -2625,6 +2641,7 @@ def track_spot_blindness(bs: dict, spot_ok: bool, reason: str, label: str):
                       f"SL_SPOT, SL_SPREAD and TP are all dark. Check the "
                       f"spot_symbol and consider managing it by hand.")
         bs['last_alert'] = now
+        bs['alerted'] = True
 
 
 def _malformed_reason(trade: dict):

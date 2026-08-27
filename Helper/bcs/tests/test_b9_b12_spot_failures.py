@@ -187,6 +187,58 @@ def test_recovery_is_announced_and_only_after_a_streak(monkeypatch):
     assert bs['since'] is None
 
 
+def test_a_transient_blip_is_silent_in_both_directions(monkeypatch):
+    """The spam bug: one failed poll set `since`, and three good polls later
+    the all-clear fired for an alarm that had never rung.
+
+    This is the real shape of a Kite hiccup — a single 7s read timeout or a
+    503 burst — and at a 5s poll it produced a RECOVERED Telegram roughly
+    every 15 seconds, multiplied by every open position. Below the alert
+    threshold the tracker must say NOTHING, either way.
+    """
+    sent = []
+    monkeypatch.setattr(sm, 'send_telegram', lambda m: sent.append(m))
+    bs = sm.new_blind_state()
+    t = [1_000_000.0]
+    monkeypatch.setattr(sm.time, 'time', lambda: t[0])
+
+    for _ in range(20):                      # twenty separate blips
+        sm.track_spot_blindness(bs, False, 'Read timed out.', 'BCS #1 TESTCO')
+        t[0] += 5
+        for _ in range(sm.BLIND_CLEAR_OK_POLLS):
+            sm.track_spot_blindness(bs, True, '', 'BCS #1 TESTCO')
+            t[0] += 5
+    assert sent == [], f"transient blips produced {len(sent)} alert(s): {sent}"
+
+
+def test_the_next_outage_alerts_on_its_own_clock(monkeypatch):
+    """Clearing must reset the repeat timer too, or the FIRST alert of the
+    next outage is swallowed by the previous spell's SPOT_BLIND_REPEAT_SEC."""
+    sent = []
+    monkeypatch.setattr(sm, 'send_telegram', lambda m: sent.append(m))
+    bs = sm.new_blind_state()
+    t = [1_000_000.0]
+    monkeypatch.setattr(sm.time, 'time', lambda: t[0])
+
+    # Spell 1: blind past the threshold -> alert, then recover.
+    sm.track_spot_blindness(bs, False, 'KeyError', 'BCS #1 TESTCO')
+    t[0] += sm.SPOT_BLIND_ALERT_SEC + 1
+    sm.track_spot_blindness(bs, False, 'KeyError', 'BCS #1 TESTCO')
+    assert len(sent) == 1 and 'NO live triggers' in sent[0]
+    for _ in range(sm.BLIND_CLEAR_OK_POLLS):
+        t[0] += 5
+        sm.track_spot_blindness(bs, True, '', 'BCS #1 TESTCO')
+    assert len(sent) == 2 and 'RECOVERED' in sent[1]
+
+    # Spell 2 starts well inside the old repeat window.
+    t[0] += 60
+    sm.track_spot_blindness(bs, False, 'KeyError', 'BCS #1 TESTCO')
+    t[0] += sm.SPOT_BLIND_ALERT_SEC + 1
+    sm.track_spot_blindness(bs, False, 'KeyError', 'BCS #1 TESTCO')
+    assert len(sent) == 3 and 'NO live triggers' in sent[2], (
+        "the second outage was silenced by the first spell's repeat clock")
+
+
 # ── The error budget ─────────────────────────────────────────────────────────
 
 def test_the_error_budget_is_reset_at_the_bottom_of_the_loop():
