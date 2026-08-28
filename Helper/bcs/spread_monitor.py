@@ -6058,6 +6058,243 @@ def alert_store_corruption(books) -> bool:
     return flagged
 
 
+#: The books `--book-frozen` / `--reopen-frozen` can address, by CLI name.
+#: Keyed by the word the operator types, so an unknown one is refused with the
+#: list rather than silently resolving to the first store.
+FROZEN_BOOKS = ('bcs', 'bps', 'fh', 'cohort')
+
+
+def _frozen_book(name):
+    """`(label, store)` for a CLI book name, or `(None, None)`."""
+    name = (name or '').strip().lower()
+    if name == 'bcs':
+        return 'BCS', get_store()
+    if name == 'bps':
+        return 'BPS', get_bps_store()
+    if name == 'fh':
+        return 'FH', get_fh_store()
+    if name == 'cohort':
+        return 'COHORT', _open_zebra_store()
+    return None, None
+
+
+def _parse_frozen_ref(ref):
+    """`STORE:ID` -> `(label, store, id)`. Prints and returns None on nonsense.
+
+    Deliberately strict. These two verbs are the ONLY way an escalated incident
+    is ever cleared, and they write to the money book; guessing which store the
+    operator meant is not a convenience worth having.
+    """
+    if ':' not in str(ref or ''):
+        print('Expected STORE:ID, e.g. bcs:7. Books: %s'
+              % ', '.join(FROZEN_BOOKS))
+        return None
+    book, _, raw = str(ref).partition(':')
+    label, store = _frozen_book(book)
+    if store is None:
+        print('Unknown book %r. Books: %s' % (book, ', '.join(FROZEN_BOOKS)))
+        return None
+    try:
+        tid = int(raw)
+    except ValueError:
+        print('Trade id must be a number, got %r' % raw)
+        return None
+    return label, store, tid
+
+
+def _show_broker_reality(kite, trade, label):
+    """Print the LIVE book for a record. Returns `{symbol: qty}`.
+
+    Printed before either verb acts, always. The operator is about to assert
+    something about reality ("it is flat", "it is intact") and the whole point
+    of the frozen state is that the record cannot be trusted to say which.
+    """
+    live = {}
+    for sym, _sign in _legs_of(trade):
+        try:
+            live[sym] = get_net_position(kite, sym)
+        except Exception as e:
+            print('  %s: could not read position (%s)' % (sym, e))
+            live[sym] = None
+    print('  Broker says, right now:')
+    for sym, q in live.items():
+        print('    %-28s %s' % (sym, 'UNREADABLE' if q is None else '%+d' % q))
+    return live
+
+
+def book_frozen(kite, ref, short_price=None, long_price=None):
+    """Clear a frozen incident by BOOKING it — for a book that is already flat.
+
+    The missing tool S5 always needed: an unpriced refusal leaves a record
+    frozen precisely because this system could not price it, and no automated
+    path ever will. The operator supplies what they actually filled at.
+
+    REFUSES if the broker still shows a live leg. Booking a position that is
+    not flat would write an exit for quantity still at risk — the same lie
+    D2/D3 were about, typed in by hand instead of computed.
+    """
+    parsed = _parse_frozen_ref(ref)
+    if not parsed:
+        return 1
+    label, store, tid = parsed
+    trade = next((t for t in store.get_frozen_trades() if t['id'] == tid), None)
+    if trade is None:
+        print('%s #%s is not frozen (nothing at partial_close with that id).'
+              % (label, tid))
+        return 1
+
+    print('\n%s #%s %s — frozen at %s'
+          % (label, tid, trade.get('stock', '?'),
+             (trade.get('close_failure') or {}).get('frozen_at', '?')))
+    live = _show_broker_reality(kite, trade, label)
+    if any(q is None for q in live.values()):
+        print('\nREFUSING: a leg could not be read. Try again when the broker '
+              'answers — booking against an unknown book is guessing.')
+        return 1
+    if any(q for q in live.values()):
+        print('\nREFUSING: a leg is still LIVE at the broker. Close it first, '
+              'or use --reopen-frozen to put the trade back under the monitor.')
+        return 1
+
+    fills = {}
+    if short_price is not None:
+        fills['short_fill'] = float(short_price)
+    if long_price is not None:
+        fills['long_fill'] = float(long_price)
+    if not fills:
+        print('\nNo prices given. Re-run with --short-price/--long-price for '
+              'what you actually filled at; this command will not invent one.')
+        return 1
+
+    exit_net = fills.get('long_fill', 0.0) - fills.get('short_fill', 0.0)
+    entry = float(trade.get('net_debit') or trade.get('debit') or 0.0)
+    exit_data = dict(fills)
+    exit_data.update({
+        'exit_date': datetime.now().isoformat(),
+        'exit_reason': (trade.get('close_failure') or {}).get('reason')
+                       or 'MANUAL',
+        'exit_spot': None,
+        'exit_spread': exit_net,
+        'pnl_per_share': exit_net - entry,
+        'total_pnl': (exit_net - entry) * float(trade.get('quantity') or 0),
+    })
+    # A leg the operator did NOT price is UNKNOWN, never zero — the store's
+    # `bound_bcs_exit` reads these Nones and marks the whole figure
+    # approximate, which is exactly right for a hand-booked exit.
+    for key in ('short_fill', 'long_fill'):
+        exit_data.setdefault(key, None)
+
+    # Through `begin_recovery`, not straight into `update_trade_exit`.
+    # `partial_close` REFUSES a booking by contract — legs are live at the
+    # broker and nothing may write an exit over them — and the one door out of
+    # that state is the recovery lock. A hand-booking is still a booking, so it
+    # walks the same state machine as the sweep's; skipping the lock raised
+    # `ValueError: #7 status=partial_close, can't exit` on every real store.
+    if not store.begin_recovery(tid, exit_data['exit_reason']):
+        print('\nCould not take the lock on %s #%s — another process may be '
+              'working on it. Nothing was booked.' % (label, tid))
+        return 1
+    store.update_trade_exit(tid, exit_data)
+    cf = dict(trade.get('close_failure') or {})
+    cf['state'] = 'resolved'
+    try:
+        store.update_trade_fields(tid, close_failure=cf)
+    except Exception:
+        pass
+    # `format()`, not `%` — the thousands comma (`+,.0f`) is only valid in the
+    # newer mini-language, and `%` raises `unsupported format character ','`
+    # on the LAST line of a hand-booking, after the store has already been
+    # written. The operator would see a traceback over a completed booking.
+    pnl = '{:+,.0f}'.format(exit_data['total_pnl'])
+    print('\n{} #{} booked: exit {:.2f} vs entry {:.2f}, P&L Rs {}'
+          .format(label, tid, exit_net, entry, pnl))
+    send_telegram('{} #{} {}: frozen close BOOKED BY HAND. Exit {:.2f}, '
+                  'P&L Rs {}.'.format(label, tid, trade.get('stock', '?'),
+                                      exit_net, pnl),
+                  alert_class=alert_policy.SAFETY)
+    return 0
+
+
+def reopen_frozen(kite, ref):
+    """Clear a frozen incident by RE-MONITORING it — for an intact spread.
+
+    S7: the close failed before anything filled, so the position is exactly
+    what the record says and its only real problem is that nothing is watching
+    it. Putting it back under the monitor restores its stops.
+
+    REFUSES if the broker shows a leg flat or inverted. A half-closed or
+    flipped position must NOT go back into the open book: the monitor would
+    then compute a spread value for legs that are not both there.
+    """
+    parsed = _parse_frozen_ref(ref)
+    if not parsed:
+        return 1
+    label, store, tid = parsed
+    trade = next((t for t in store.get_frozen_trades() if t['id'] == tid), None)
+    if trade is None:
+        print('%s #%s is not frozen (nothing at partial_close with that id).'
+              % (label, tid))
+        return 1
+
+    print('\n%s #%s %s' % (label, tid, trade.get('stock', '?')))
+    live = _show_broker_reality(kite, trade, label)
+    expected = dict(_legs_of(trade))
+    bad = [sym for sym, q in live.items()
+           if q is None or q == 0 or (q > 0) != (expected[sym] > 0)]
+    if bad:
+        print('\nREFUSING: %s not live in the direction the record claims. '
+              'This spread is not intact, so re-monitoring it would price a '
+              'position that is not there. Use --book-frozen once it is flat.'
+              % ', '.join(bad))
+        return 1
+
+    open_status = 'entered' if label == 'COHORT' else 'open'
+    store.set_trade_status(tid, open_status, close_failure=None)
+    print('\n%s #%s returned to %r and is monitored again.'
+          % (label, tid, open_status))
+    send_telegram('%s #%s %s: frozen close cleared by hand — the spread is '
+                  'intact and back under the monitor.'
+                  % (label, tid, trade.get('stock', '?')),
+                  alert_class=alert_policy.SAFETY)
+    return 0
+
+
+def list_frozen_trades():
+    """Every frozen record in every book, with what it is owed.
+
+    `get_frozen_trades` existed on one adapter and nothing called it. A method
+    nobody invokes is indistinguishable from one that does not exist, which is
+    how eight live positions once answered `Open: 0`.
+    """
+    rows = []
+    for name in FROZEN_BOOKS:
+        label, store = _frozen_book(name)
+        if store is None:
+            continue
+        try:
+            for t in store.get_frozen_trades():
+                rows.append((label, t))
+        except Exception as e:
+            print('  %s: could not read frozen trades (%s)' % (label, e))
+    if not rows:
+        print('No frozen trades. (Nothing stuck at partial_close.)')
+        return
+    print('\n=== FROZEN (partial_close — live legs, NOT monitored) ===')
+    print('%-8s %-5s %-12s %-12s %-11s %-9s %s'
+          % ('book', 'id', 'stock', 'cause', 'state', 'attempts', 'frozen_at'))
+    for label, t in rows:
+        cf = t.get('close_failure') or {}
+        print('%-8s %-5s %-12s %-12s %-11s %-9s %s'
+              % (label, t.get('id'), t.get('stock', '?'),
+                 cf.get('cause', '—'), cf.get('state', 'legacy'),
+                 '%s/%s' % (cf.get('attempts', 0), RECOVERY_MAX_ATTEMPTS),
+                 cf.get('frozen_at', '—')))
+    print('\nClear with:  --book-frozen BOOK:ID --short-price X --long-price Y'
+          '   (flat book)')
+    print('             --reopen-frozen BOOK:ID'
+          '                              (spread intact)')
+
+
 def monitor_all(kite: KiteConnect, dry_run: bool):
     """
     Monitor ALL open trades (BCS + BPS + Fallen Hero) in a single loop.
@@ -6923,6 +7160,17 @@ def main():
                         help='List all watchlist items')
     parser.add_argument('--cancel-alert', type=int, default=None,
                         metavar='ID', help='Cancel a watchlist alert by ID')
+    # ── M14 clearance verbs ──────────────────────────────────────────────
+    parser.add_argument('--frozen', action='store_true',
+                        help='List trades stuck at partial_close')
+    parser.add_argument('--book-frozen', default=None, metavar='BOOK:ID',
+                        help='Book a frozen trade whose legs are all flat')
+    parser.add_argument('--reopen-frozen', default=None, metavar='BOOK:ID',
+                        help='Return an INTACT frozen spread to monitoring')
+    parser.add_argument('--short-price', type=float, default=None,
+                        help='Fill price for the short leg (--book-frozen)')
+    parser.add_argument('--long-price', type=float, default=None,
+                        help='Fill price for the long leg (--book-frozen)')
     args = parser.parse_args()
 
     # Set up logging for bcs package
@@ -6947,6 +7195,20 @@ def main():
         wl_store.update_status(args.cancel_alert, 'cancelled')
         print(f"Watchlist item #{args.cancel_alert} cancelled.")
         return
+
+    # ── M14 clearance verbs ──────────────────────────────────────────────
+    #
+    # Before `--list`, because they are the ones that WRITE. Both print the
+    # live broker book first and refuse if reality contradicts the verb.
+    if args.frozen:
+        list_frozen_trades()
+        return
+    if args.book_frozen or args.reopen_frozen:
+        kite = load_kite()
+        if args.book_frozen:
+            sys.exit(book_frozen(kite, args.book_frozen,
+                                 args.short_price, args.long_price))
+        sys.exit(reopen_frozen(kite, args.reopen_frozen))
 
     # ── --list mode ──────────────────────────────────────────────────────
     if args.list:

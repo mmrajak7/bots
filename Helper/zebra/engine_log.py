@@ -143,7 +143,12 @@ CATALOGUE: Tuple[Event, ...] = (
           "M14's SAFE side — max loss is the long's premium — but a leg is "
           'unintentionally open'),
     Event('close_retries_exhausted', ACTION,
-          r'FAILED to close \S+ after \d+ attempts',
+          # `attempt(s)` since M14 gave `close_leg` a caller-supplied ceiling:
+          # the recovery path passes 1, and "after 1 attempts" reads wrong. The
+          # `probe` below still matched the changed wording, so the drift test
+          # could not catch this — a reminder that a probe pins the PHRASE and
+          # only the pattern pins the MATCH.
+          r'FAILED to close \S+ after \d+ attempt',
           'FAILED to close',
           'every retry for one leg is spent'),
     Event('expiry_force_close_failed', ACTION,
@@ -294,6 +299,49 @@ class LogRead(NamedTuple):
                 'first': self.rows[0][0] if self.rows else None,
                 'last': self.rows[-1][0] if self.rows else None,
                 'problems': list(self.problems)}
+
+
+# ── M14 · the structured EVENT grammar ──────────────────────────────────────
+#
+# Everything above catalogues PROSE, matched by regex, because that is what the
+# monitor's log lines are. The recovery sweep is new code and emits a
+# structured line instead:
+#
+#     [HH:MM:SS] EVENT recovery_attempt cls=bounded id=1 n=1/3 store=BCS
+#
+# Parsed rather than pattern-matched, so the digest counts BY NAME and never by
+# warning tally. That distinction is the whole point: "223 degraded events"
+# tells a reader to stop reading, while "2 recovery attempts, 1 escalation"
+# tells them what to do. A new event name needs no new regex and cannot be
+# silently absorbed by an existing one.
+
+EVENT_LINE = re.compile(r'\bEVENT\s+([a-z_]+)((?:\s+[a-z_]+=[^\s]+)*)')
+
+
+def parse_events(rows):
+    """`[(name, {k: v}), ...]` for every structured EVENT line in `rows`.
+
+    `rows` is the `(timestamp, text)` shape `read_monitor_log` returns. Values
+    stay strings: the digest displays them and any that must be compared are
+    compared as the strings they were written as, which cannot silently coerce
+    `n=1/3` into something numeric-looking.
+    """
+    out = []
+    for row in rows:
+        text = row[1] if isinstance(row, (tuple, list)) and len(row) > 1 else row
+        m = EVENT_LINE.search(str(text))
+        if not m:
+            continue
+        kv = dict(pair.split('=', 1) for pair in m.group(2).split() if '=' in pair)
+        out.append((m.group(1), kv))
+    return out
+
+
+#: Recovery events that mean a HUMAN must do something. Counted separately so
+#: they cannot be averaged away into a total: an exhausted incident is a live
+#: position with dead stops, and one of them matters more than fifty waits.
+RECOVERY_NEEDS_HUMAN = ('recovery_exhausted', 'unpriced_refusal',
+                        'recovery_blind')
 
 
 def monitor_log_path(day: str) -> Path:
@@ -590,6 +638,9 @@ def analyse(day: str, zebra_rows: Optional[List[tuple]] = None) -> dict:
         'logs': logs,
         'mode': _mode(mon.rows),
         'events': events,
+        # M14. Structured, not catalogued: counted BY NAME so an escalation
+        # cannot be averaged into a degraded total.
+        'recovery': recovery_summary(mon.rows),
         'uncatalogued': unc[:8],
         'uncatalogued_total': sum(u['count'] for u in unc),
         'unwatched': unwatched(mon.rows, day),
@@ -598,11 +649,86 @@ def analyse(day: str, zebra_rows: Optional[List[tuple]] = None) -> dict:
     }
 
 
+def recovery_summary(rows):
+    """What the frozen-close sweep did today, by name.
+
+    Kept apart from `events` on purpose. Those are PROSE matched by regex and
+    are mostly degraded-and-self-recovering; these are decisions the sweep
+    made about a position nobody is watching, and one of them can matter more
+    than fifty rate limits. Averaging the two together is how the thing that
+    needs a human ends up inside a number that says "noisy day".
+    """
+    parsed = parse_events(rows)
+    if not parsed:
+        return {}
+    counts, per_trade = {}, {}
+    for name, kv in parsed:
+        counts[name] = counts.get(name, 0) + 1
+        who = (kv.get('store'), kv.get('id'))
+        if who != (None, None):
+            per_trade.setdefault(who, []).append(name)
+    return {
+        'counts': counts,
+        'needs_human': {n: c for n, c in counts.items()
+                        if n in RECOVERY_NEEDS_HUMAN},
+        'trades': {'%s#%s' % w: v for w, v in sorted(
+            per_trade.items(), key=lambda kv: (kv[0][0] or '', kv[0][1] or ''))},
+    }
+
+
+def render_recovery(rec):
+    """The FROZEN section. Absent entirely when nothing froze — a heading that
+    says "0" every day is a heading people stop reading."""
+    if not rec or not rec.get('counts'):
+        return []
+    out = ['## Frozen closes (M14 recovery)', '']
+    out.append('| event | n |')
+    out.append('|---|---|')
+    for name, n in sorted(rec['counts'].items(), key=lambda kv: (-kv[1], kv[0])):
+        mark = ' ⚠' if name in RECOVERY_NEEDS_HUMAN else ''
+        out.append('| `%s`%s | %d |' % (name, mark, n))
+    if rec.get('trades'):
+        out.append('')
+        for who, names in rec['trades'].items():
+            out.append('- **%s** — %s' % (who, ' → '.join(names)))
+    return out
+
+
+def recovery_flags(rec):
+    """Only what a human must act on. A recovery that RESOLVED is good news and
+    belongs in the section above, not in the list of things to read first."""
+    out = []
+    if not rec:
+        return out
+    for name, n in sorted((rec.get('needs_human') or {}).items()):
+        if name == 'recovery_exhausted':
+            out.append('%d frozen close(s) EXHAUSTED recovery — a position is '
+                       'live at the broker with dead stops and no further '
+                       'automatic attempt will be made. Close it by hand.' % n)
+        elif name == 'unpriced_refusal':
+            out.append('%d frozen close(s) could not be PRICED from our own '
+                       'fills and were not booked — book them by hand with '
+                       'the real exit price.' % n)
+        elif name == 'recovery_blind':
+            out.append('%d recovery sweep pass(es) could not read broker '
+                       'positions, so nothing was classified.' % n)
+    if (rec.get('counts') or {}).get('frozen_paper_skipped'):
+        # Not a problem — but it IS the line that proves the paper guard ran,
+        # and its silence would be indistinguishable from the guard's absence.
+        out.append('%d paper record(s) skipped by the recovery sweep (correct '
+                   '— paper never reaches the order path).'
+                   % rec['counts']['frozen_paper_skipped'])
+    return out
+
+
 def flags(a: dict) -> List[str]:
     """Facts that earn a look, in the digest's own voice: what, never why."""
     out: List[str] = []
     for p in a.get('problems') or []:
         out.append(p)
+    # Before the catalogue's own flags: a frozen position with dead stops
+    # outranks every degraded-and-recovering count below it.
+    out.extend(recovery_flags(a.get('recovery')))
     for ev in a.get('events') or []:
         if ev['severity'] != ACTION:
             continue
@@ -645,6 +771,13 @@ def render(a: dict) -> List[str]:
     """The digest section, as markdown lines. Compact enough to paste."""
     L: List[str] = []
     A = L.append
+    # The frozen-close section goes FIRST when there is one: it is about
+    # positions nothing is watching, and everything below it is about engines
+    # that are, by definition, still running.
+    rec = render_recovery(a.get('recovery'))
+    if rec:
+        L.extend(rec)
+        A('')
     A('## Engines')
     for lg in a.get('logs') or []:
         if not lg['present']:

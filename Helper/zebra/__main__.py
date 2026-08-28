@@ -1135,6 +1135,30 @@ def cmd_status(args):
                   f"debit={t['debit']:.2f} TP={t['tp_spot']:.2f} "
                   f"{sl_txt}exp={t['expiry']}{st_tag}")
 
+    # ── FROZEN (M14) ─────────────────────────────────────────────────────
+    #
+    # Above `Watching`, deliberately: a frozen record is a position that may be
+    # LIVE at the broker with nothing monitoring it, while a watchlist entry is
+    # a trade that does not exist yet. Ordering a dashboard by risk is the job.
+    #
+    # These are counted in NO other line here — `partial_close` is not one of
+    # the statuses looped over above — so before this section the answer to
+    # "what do I have open" simply omitted them, which is the same misreport
+    # that once answered `Open: 0` with eight positions live.
+    frozen = by_status.get('partial_close', [])
+    if frozen:
+        print(f"\n  --- FROZEN: live legs, NOT monitored ({len(frozen)}) ---")
+        for t in frozen:
+            cf = t.get('close_failure') or {}
+            print(f"  #{t['id']} {t['stock']:<12} "
+                  f"{t.get('direction', '?'):<3} "
+                  f"cause={cf.get('cause', 'legacy')} "
+                  f"state={cf.get('state', 'legacy')} "
+                  f"attempts={cf.get('attempts', 0)} "
+                  f"since={cf.get('frozen_at', '?')}")
+        print("  Clear with: python -m bcs.spread_monitor "
+              "--book-frozen cohort:ID  |  --reopen-frozen cohort:ID")
+
     watching = by_status.get('watching', [])
     if watching:
         print(f"\n  --- Watching ---")
