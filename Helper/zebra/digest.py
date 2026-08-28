@@ -191,12 +191,39 @@ def _trades(store_rows: List[dict], day: str) -> dict:
             'cancelled': len(cancelled), 'cancel_reasons': dict(reasons)}
 
 
-def _cohort(store_rows: List[dict]) -> dict:
-    """Everything since `cohort_start`, which is the only book that counts."""
+def _cohort(store_rows: List[dict], day: Optional[str] = None) -> dict:
+    """Everything since `cohort_start` and up to `day` — the only book that counts.
+
+    **`day` bounds the running total, and it has to.** This used to read the
+    whole store, which is right for the same-day run (the normal path) and a
+    LOOK-AHEAD for any other. Backfilling 08-19's digest today would have
+    printed "7 closed, net Rs 30,569" — six of those closed on 08-24, 08-26 and
+    08-28, i.e. AFTER the day the file claims to describe. The digest is the
+    paper run's dated record; a dated record that quietly contains the future
+    is the mistake `feedback_measure_as_of_the_decision_date` is about, and it
+    would have arrived the moment a missing session's log was recovered (M18).
+
+    A record whose `exit_date` cannot be parsed cannot be placed in time, so it
+    is EXCLUDED and counted in `undated` rather than silently folded into a
+    total it may not belong to.
+    """
     from .trade_store import in_cohort
-    ex = [t for t in store_rows
-          if t.get('status') == 'exited' and in_cohort(t)
-          and t.get('pnl') is not None]
+    cand = [t for t in store_rows
+            if t.get('status') == 'exited' and in_cohort(t)
+            and t.get('pnl') is not None]
+    ex, undated = [], 0
+    for t in cand:
+        if day is None:
+            ex.append(t)
+            continue
+        raw = str(t.get('exit_date') or '')[:10]
+        try:
+            datetime.strptime(raw, '%Y-%m-%d')
+        except ValueError:
+            undated += 1
+            continue
+        if raw <= day:            # ISO dates compare correctly as strings
+            ex.append(t)
     gross = sum(float(t['pnl']) for t in ex)
     net = sum(float(t.get('pnl_net', t['pnl'])) for t in ex)
     basis: Counter = Counter(
@@ -233,7 +260,16 @@ def _cohort(store_rows: List[dict]) -> dict:
         if is_stop_exit(t.get('exit_reason')):
             stop_kinds[key] += 1
     stop_exits = sum(stop_kinds.values())
-    return {'closed': len(ex), 'wins': wins,
+    # N14 — how much of this total is a figure the producer flagged as
+    # inexact. A bridged close that found one leg already flat counts it at
+    # 0.00, so the P&L is wrong in a KNOWN direction; folding it silently into
+    # the cohort's running net presents it as a measurement. Counted, never
+    # excluded: it is still the best number available and dropping it would
+    # understate the book instead.
+    approx = sum(1 for t in ex if t.get('exit_approximate') is True
+                 or (t.get('exit') or {}).get('pnl_approximate') is True)
+    return {'closed': len(ex), 'wins': wins, 'undated': undated,
+            'approximate': approx,
             'exit_reasons': dict(reasons), 'stop_exits': stop_exits,
             'stop_exit_kinds': dict(stop_kinds),
             'recovered_exits': dict(recovered),
@@ -252,6 +288,36 @@ def _warnings(rows: List[tuple]) -> dict:
         if lvl in ('WARNING', 'ERROR', 'CRITICAL'):
             c[f"{lvl} {name}: {_NUM.sub('N', m)[:70]}"] += 1
     return dict(c.most_common(12))
+
+
+#: Config switches that make a stop kind UNREACHABLE. A kind listed here with a
+#: falsey switch can never produce the cohort evidence the arming gate waits
+#: for, so naming it in the gate's message without saying so invites exactly
+#: the wait-for-evidence-that-cannot-arrive mistake. Keyed by the canonical
+#: `outcomes` kind, valued by the `cfg` attribute that gates it.
+_STOP_KIND_SWITCH = {'spot_sl': 'SPOT_SL_ENABLED'}
+
+
+def _stop_path_desc() -> str:
+    """The stop kinds, derived from `outcomes.STOP_KINDS`, disabled ones marked.
+
+    Derived, never spelled out. The old hardcoded literal
+    ``"debit_sl / spot_sl / trail / time / expiry"`` had already drifted twice
+    over: it is the vocabulary's job to say what the kinds ARE (it gained
+    `expiry` without this string noticing), and config's job to say which can
+    fire. `spot_sl` has been disabled since the 2026-08-12 measurement
+    (`spot_sl_enabled: False` — spot is a VETO, not a trigger), so listing it
+    unqualified told the reader to wait for evidence the code cannot generate.
+    """
+    from .outcomes import STOP_KINDS
+    parts = []
+    for kind in sorted(STOP_KINDS):
+        switch = _STOP_KIND_SWITCH.get(kind)
+        if switch and not getattr(cfg, switch, False):
+            parts.append(f'{kind} [disabled]')
+        else:
+            parts.append(kind)
+    return ' / '.join(parts)
 
 
 def _flags(cyc, vet, tr, warn, coh, prev: Optional[dict],
@@ -290,8 +356,8 @@ def _flags(cyc, vet, tr, warn, coh, prev: Optional[dict],
     # until the cohort has produced real STOP exits in paper.
     if coh['closed'] and not coh.get('stop_exits'):
         out.append(f"ARMING GATE UNMET: none of the {coh['closed']} cohort "
-                   f"exit(s) is a transacted stop. The stop path (debit_sl / "
-                   f"spot_sl / trail / time / expiry) has NO cohort evidence "
+                   f"exit(s) is a transacted stop. The stop path "
+                   f"({_stop_path_desc()}) has NO cohort evidence "
                    f"— do not arm.")
     elif coh.get('stop_exits'):
         kinds = ', '.join(f'{k} x{v}' for k, v in
@@ -355,6 +421,10 @@ def _flags(cyc, vet, tr, warn, coh, prev: Optional[dict],
         if str(t.get('exit_time') or '')[:5] < '09:30':
             out.append(f"#{t['id']} {t['stock']} exited before 09:30 — the "
                        f"window both real-money losses came from")
+    if coh.get('approximate'):
+        out.append(f"{coh['approximate']} of {coh['closed']} cohort exit(s) "
+                   f"has an APPROXIMATE P&L — a leg was counted at 0.00, so "
+                   f"the running net is wrong in a known direction")
     if prev:
         new = set(warn) - set(prev.get('warnings') or {})
         for k in sorted(new)[:4]:
@@ -384,7 +454,7 @@ def build(day: Optional[str] = None) -> dict:
         pass
     cyc, fun = _cycles(rows), _funnel(rows)
     vet, tr = _vetting(rows, day), _trades(store_rows, day)
-    coh, warn = _cohort(store_rows), _warnings(rows)
+    coh, warn = _cohort(store_rows, day), _warnings(rows)
     try:
         # WHOLE store, not the cohort: the latch fields can only exist on
         # records touched since 2026-08-28, so every one of them is in the
@@ -567,7 +637,13 @@ def render(d: dict) -> str:
       f"gross Rs{coh['gross']:,.0f} → **net Rs{coh['net']:,.0f}**"
       + (f", median {coh['median_net_pct']:+.2f}%" if coh['median_net_pct'] is not None else '')
       + (f"  [{', '.join('%s %d' % (k, v) for k, v in coh['fee_basis'].items())}]"
-         if coh['fee_basis'] else ''))
+         if coh['fee_basis'] else '')
+      + (f"  ⚠ {coh['approximate']} APPROXIMATE" if coh.get('approximate')
+         else ''))
+    if coh.get('undated'):
+        A(f"_{coh['undated']} exited cohort record(s) carry no usable "
+          f"`exit_date` and are excluded from that total — they cannot be "
+          f"placed in time._")
     A('')
     L.extend(_render_tp_latch(d.get('tp_latch') or {}))
     A('')

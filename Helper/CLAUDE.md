@@ -1093,7 +1093,7 @@ Telegram ENTER alert carries the BCS shadow (debit, BE, OI, lots) — the
 classic back-ratio (K_L/K_S) alert is silenced by default (`alert_structures: ['bcs']`)
    ↓ paper_mode=true (current default): auto-entered here, no manual step
       paper_mode=false: the alert IS the order ticket; manual, or auto_entry
-monitor every 5 min: TP / SPOT SL / DEBIT SL / TIME — zebra auto-closes its
+monitor every 5 min: TP / DEBIT SL / TIME (SPOT SL disabled) — zebra auto-closes its
    own paper positions unless exits_managed_externally hands the cohort to
    bcs/spread_monitor.py
 zebra close ID --exit-debit X --reason ...   (manual override / LIVE mode)
@@ -1144,14 +1144,28 @@ still applies to BCS entries.
 
 | Trigger | Condition | When |
 |---|---|---|
-| TP | spot reaches ST line | hit max-profit zone |
-| SPOT SL | spot moves 3% adverse from entry | salvage remaining premium |
+| TP | spot reaches ST line (or the swing TP, if nearer) | hit max-profit zone |
 | DEBIT SL | structure value drops to 50% of entry debit | half the debit gone |
-| TIME | T-5 days from expiry (`time_sl_days_before_expiry`) | pin risk on short ATM |
+| TIME | T-5 sessions from expiry (`time_sl_days_before_expiry`) | pin risk on short ATM |
+| EXPIRY | expiry day | last resort |
+| ~~SPOT SL~~ | **DISABLED** (`spot_sl_enabled: False`) | see below |
 
 In paper mode (current default) zebra auto-closes on these triggers itself —
 see "What zebra runs now" above. They are alert-only / user-closes-manually
 only in LIVE mode, which is not armed today.
+
+> **SPOT SL is OFF and has been since the 2026-08-12 measurement.** The switch
+> is `spot_sl_enabled` (`zebra/config.py`, default `False`); the branch at
+> `zebra/monitor.py` is guarded by `cfg.SPOT_SL_ENABLED` and cannot fire. Spot
+> is a **VETO, never a trigger** — see "Spot-based stops" in the Bull Call
+> Spread section for the 147-record table behind that. `sl_spot` is still
+> STORED and still PRINTED on every POLL line and alert, so a position sitting
+> below its `sl_spot` and staying open is CORRECT, not a stuck exit.
+>
+> This matters to the arming gate: a disabled kind can never produce the cohort
+> stop evidence the gate waits for. `zebra/digest.py` now derives the stop-path
+> list from `outcomes.STOP_KINDS` and marks disabled kinds `[disabled]`, so
+> that message cannot drift from the code again.
 
 ### CLI
 

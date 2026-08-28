@@ -197,6 +197,73 @@ def _exit(i, reason, pnl=100.0, cohort='2026-08-14'):
             'pnl_net_pct': 10.0, 'fees': {'basis': 'modelled'}}
 
 
+# ── The running total is AS OF the digest's own date ────────────────────────
+#
+# `_cohort` read the whole store regardless of `day`. Correct for the same-day
+# run and a LOOK-AHEAD for any other: backfilling an older session's digest
+# (which is exactly what recovering a missing log enables — M18) would print a
+# cohort total containing trades that closed days LATER than the file claims to
+# describe. The digest is the paper run's dated record; a dated record must not
+# quietly contain the future.
+
+
+def _dated(i, reason, day, pnl=100.0):
+    t = _exit(i, reason, pnl)
+    t['exit_date'] = day
+    return t
+
+
+def test_the_running_total_excludes_trades_that_close_after_the_digest_date():
+    rows = [_dated(1, 'paper:tp', '2026-08-24'),
+            _dated(2, 'paper:tp', '2026-08-26'),
+            _dated(3, 'paper:tp', '2026-08-28')]
+    assert digest._cohort(rows, '2026-08-24')['closed'] == 1
+    assert digest._cohort(rows, '2026-08-26')['closed'] == 2
+    assert digest._cohort(rows, '2026-08-28')['closed'] == 3
+
+
+def test_a_day_before_the_first_close_reports_an_empty_cohort():
+    """Not an error, and not the whole book either."""
+    rows = [_dated(1, 'paper:tp', '2026-08-24')]
+    coh = digest._cohort(rows, '2026-08-19')
+    assert coh['closed'] == 0 and coh['net'] == 0
+
+
+def test_the_gate_is_judged_as_of_the_date_too():
+    """A stop that has not happened yet must not clear an earlier day's gate."""
+    rows = [_dated(1, 'paper:tp', '2026-08-24'),
+            _dated(2, 'paper:debit_sl', '2026-08-28', -50)]
+    assert digest._cohort(rows, '2026-08-24')['stop_exits'] == 0
+    assert digest._cohort(rows, '2026-08-28')['stop_exits'] == 1
+
+
+def test_an_undated_exit_is_counted_not_silently_folded_in():
+    """It cannot be placed in time, so it is excluded and REPORTED."""
+    rows = [_dated(1, 'paper:tp', '2026-08-24'), _exit(2, 'paper:tp')]
+    coh = digest._cohort(rows, '2026-08-28')
+    assert coh['closed'] == 1
+    assert coh['undated'] == 1
+
+
+def test_no_date_still_means_the_whole_book():
+    """The unbounded call is still available and still unbounded."""
+    rows = [_dated(1, 'paper:tp', '2026-08-24'), _exit(2, 'paper:tp')]
+    assert digest._cohort(rows)['closed'] == 2
+
+
+def test_the_real_store_as_of_08_26_matches_what_that_day_reported():
+    """Cross-check against history: FLAGS.md for 2026-08-26 says "all 4 cohort
+    exit(s) are TP". If the bounding is right, as-of that date gives 4."""
+    import json
+    p = HELPER / 'logs' / 'zebra_trades.json'
+    if not p.exists():                       # pragma: no cover - CI without logs
+        pytest.skip('no local trade store')
+    rows = json.loads(p.read_text(encoding='utf-8'))
+    coh = digest._cohort(rows, '2026-08-26')
+    assert coh['closed'] == 4, coh
+    assert coh['stop_exits'] == 0
+
+
 def test_a_cohort_of_pure_tps_reports_the_gate_unmet():
     coh = digest._cohort([_exit(1, 'paper:tp'), _exit(2, 'paper:tp')])
     assert coh['stop_exits'] == 0
