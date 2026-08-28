@@ -51,6 +51,8 @@ from pathlib import Path
 HELPER = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HELPER))
 
+from zebra import outcomes                                         # noqa: E402
+
 TRADES = HELPER / 'logs' / 'zebra_trades.json'
 TOKEN = HELPER.parent / 'data' / 'kite_access_token.json'
 CACHE = HELPER / 'zebra' / '_expiry_close_cache.json'
@@ -186,9 +188,38 @@ def main(argv=None):
 
     asof = dt.date.fromisoformat(a.asof) if a.asof else dt.date.today()
     book = json.loads(TRADES.read_text(encoding='utf-8'))
-    dsl = [t for t in book
-           if t.get('status') == 'exited'
-           and 'debit_sl' in (t.get('exit_reason') or '')]
+
+    # N11 — ONE vocabulary, `zebra.outcomes`, not a substring test.
+    #
+    # This was `'debit_sl' in (t.get('exit_reason') or '')`. That matches the
+    # paper engine's `paper:debit_sl` and MISSES `sl_spread` and
+    # `already_flat_sl_spread` — the names the ORDER ENGINE writes for the same
+    # trigger. Latent while the book held only `paper:*` reasons, and it starts
+    # under-counting at the exact moment the bridge books its first real stop:
+    # the arming decision this study informs. A study that silently sees fewer
+    # stops than happened is worse than no study.
+    #
+    # `classify` strips the `already_flat_` prefix, so a recovery-path close
+    # still counts — the position WAS closed on a debit-stop trigger, which is
+    # the question here. That differs from the arming gate, which cares whether
+    # orders were transacted; same vocabulary, different predicate.
+    exited = [t for t in book if t.get('status') == 'exited']
+    dsl, unrecognised = [], {}
+    for t in exited:
+        c = outcomes.classify(t.get('exit_reason'))
+        if not c['known'] and c['raw']:
+            unrecognised[c['raw']] = unrecognised.get(c['raw'], 0) + 1
+        if c['kind'] == outcomes.DEBIT_SL:
+            dsl.append(t)
+    if unrecognised:
+        # Never silently dropped: an exit reason no reader understands is a
+        # record this study cannot classify either way, and the reader has to
+        # know the denominator is uncertain.
+        print('WARNING: %d exit(s) carry a reason no reader understands and '
+              'are NOT classified: %s'
+              % (sum(unrecognised.values()),
+                 ', '.join('%s x%d' % kv
+                           for kv in sorted(unrecognised.items()))))
 
     if a.structure == 'bcs':
         dsl = [t for t in dsl if t.get('structure') == 'bcs']
