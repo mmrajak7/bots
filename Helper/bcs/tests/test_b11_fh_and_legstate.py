@@ -183,7 +183,8 @@ class _ScriptedCloseLeg:
     # Mirrors production's `close_leg` signature -- see the note on the
     # twin in test_b10_partial_short_close.py.
     def __call__(self, kite, exchange, symbol, txn, qty, is_buy=False,
-                 dry_run=False, urgent=False, context=None):
+                 dry_run=False, urgent=False, context=None, attempts=None,
+                 allow_pay_through=True):
         self.calls.append({'symbol': symbol, 'txn': txn, 'qty': qty,
                            'context': context})
         return self.results.pop(0) if self.results else None

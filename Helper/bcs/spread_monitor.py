@@ -2122,7 +2122,9 @@ def _order_final_state(kite: KiteConnect, order_id: str):
 
 def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
               qty: int, is_buy: bool, dry_run: bool,
-              urgent: bool = False, context: dict = None) -> Optional[dict]:
+              urgent: bool = False, context: dict = None,
+              attempts: int = None,
+              allow_pay_through: bool = True) -> Optional[dict]:
     """
     Close one leg with retry + escalating slippage.
 
@@ -2146,6 +2148,26 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
       4. Price guards anchored EXTERNALLY (LTP/prev_close), never to the
          quote being sanity-checked (the old 5x-ask check was self-referential
          and mathematically could not fire)
+
+    M14 adds two knobs, both defaulting to today's behaviour so no existing
+    caller changes:
+
+    `attempts` — how many escalating orders this call may place (default
+      MAX_RETRIES). The recovery sweep passes 1: the initial close already
+      spent three escalating orders on this leg, and the design reads the
+      owner's "try 3 times" as 3 CLOSE attempts, not 3x3 = 9 orders. Ceiling
+      per leg per incident becomes 3 initial + 3 recovery = 6 placements, each
+      position-verified and pending-order-checked first.
+
+    `allow_pay_through` — whether the FINAL urgent attempt may lift an
+      unreliable book uncapped (default True, which is what urgent has always
+      meant). The sweep passes False for BOUNDED states: a naked long's
+      downside is the premium already paid, and paying through a garbage book
+      to exit it can cost more than holding it does. Uncapped pay-through is
+      reserved for the naked-short class, where the exposure is unbounded and
+      gap-shaped. With this False the anchor cap simply stays on for every
+      attempt — the order rests as a working limit and often fills as the book
+      forms, which is the same non-catastrophic outcome as not trying.
       5. Don't retry REJECTED orders (margin, price band — won't resolve)
       6. After cancel, always re-check for race-condition fills
       7. Re-check order-time cutoff EVERY attempt (a close that starts 15:19
@@ -2158,7 +2180,14 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
     cumulative_fill_value = 0.0   # sum of (fill_price × filled_qty) across attempts
     cumulative_fill_qty = 0       # sum of filled qty across attempts
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    # Clamped, not trusted: a caller passing 0 or a negative would place no
+    # order and return None, which reads to `_close_spread_inner` as "the leg
+    # was not tradeable" — a lie about the book. Capped at MAX_RETRIES so a
+    # caller cannot widen the order ceiling this function exists to bound.
+    max_attempts = MAX_RETRIES if attempts is None else max(
+        1, min(int(attempts), MAX_RETRIES))
+
+    for attempt in range(1, max_attempts + 1):
         # ── Order-time cutoff, re-checked EVERY attempt ───────────────
         cutoff = HARD_ORDER_CUTOFF_TIME if urgent else LAST_ORDER_TIME
         if datetime.now().time() > cutoff:
@@ -2287,7 +2316,8 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
 
         slippage = (SLIPPAGE_TICKS_BASE + SLIPPAGE_TICKS_INCREMENT * (attempt - 1)) * TICK_SIZE
         anchor = price_anchor(depth)
-        final_urgent_attempt = urgent and attempt == MAX_RETRIES
+        final_urgent_attempt = (urgent and attempt == max_attempts
+                                and allow_pay_through)
 
         if is_buy:
             price = depth['ask'] + slippage
@@ -2308,7 +2338,7 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
                 log(f"    URGENT FINAL ATTEMPT: paying through ask {depth['ask']} (anchor {anchor}).")
                 send_telegram(f"URGENT close paying through: BUY {symbol} at ask {depth['ask']} "
                               f"vs anchor {anchor} — exiting anyway.")
-            log(f"  Attempt {attempt}/{MAX_RETRIES}: BUY {symbol} x {remaining_qty}")
+            log(f"  Attempt {attempt}/{max_attempts}: BUY {symbol} x {remaining_qty}")
             log(f"    Depth -> Ask: {depth['ask']} x {depth['ask_qty']} | Bid: {depth['bid']} x {depth['bid_qty']} "
                 f"| LTP: {depth['ltp']} | PrevCl: {depth['prev_close']} | Reliable: {book_reliable}")
             log(f"    Limit price: {round_to_tick(price)}")
@@ -2329,7 +2359,7 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
                     price = floor_p
             elif final_urgent_attempt and not book_reliable:
                 log(f"    URGENT FINAL ATTEMPT: selling at bid {depth['bid']} (anchor {anchor}).")
-            log(f"  Attempt {attempt}/{MAX_RETRIES}: SELL {symbol} x {remaining_qty}")
+            log(f"  Attempt {attempt}/{max_attempts}: SELL {symbol} x {remaining_qty}")
             log(f"    Depth -> Bid: {depth['bid']} x {depth['bid_qty']} | Ask: {depth['ask']} x {depth['ask_qty']} "
                 f"| LTP: {depth['ltp']} | PrevCl: {depth['prev_close']} | Reliable: {book_reliable}")
             log(f"    Limit price: {round_to_tick(price)}")
@@ -2424,7 +2454,7 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
                 except Exception as e:
                     log(f"    Post-cancel check failed: {e}")
 
-        if attempt < MAX_RETRIES:
+        if attempt < max_attempts:
             log(f"    Retrying with +{SLIPPAGE_TICKS_INCREMENT} ticks slippage... (remaining: {remaining_qty})")
             time.sleep(1)
 
@@ -2436,7 +2466,7 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
         return {'status': 'PARTIAL', 'average_price': avg,
                 'order_id': 'cumulative', 'filled_quantity': cumulative_fill_qty}
 
-    log(f"    FAILED to close {symbol} after {MAX_RETRIES} attempts!")
+    log(f"    FAILED to close {symbol} after {max_attempts} attempt(s)!")
     return None
 
 
@@ -2446,6 +2476,205 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
 #: `expiry_trades`: losing it on restart costs one repeated Telegram, which is
 #: the correct direction for an escalation that is still unresolved.
 _unpriced_close_alerted: dict = {}
+
+
+# ── M14 · frozen-close recovery: the DECISION layer ─────────────────────────
+#
+# Classification and gating only. Nothing here places an order, reads a book or
+# touches a store; it answers "what is this record, and may anything be done
+# about it right now". The order-placing orchestrator is a separate, thinner
+# piece that does what these functions say — which is the point of the split:
+# the reasoning is pure and exhaustively testable, and the part that can lose
+# money has almost no reasoning left in it.
+
+#: A bounded position can wait: its max loss is already fixed, so the grace
+#: window buys free optionality on a human taking a BETTER action than the
+#: machine would. A naked short cannot: the exposure is unbounded and
+#: gap-shaped, and there is no better human action to wait for — a human would
+#: buy it back, which is exactly what the machine will do. Waiting buys nothing
+#: and can cost a lakh. Telegram fires simultaneously either way, so the human
+#: can still intervene between attempts.
+RECOVERY_GRACE_SEC = 300
+NAKED_SHORT_GRACE_SEC = 0
+
+#: Per INCIDENT, not per day. A freeze at 15:10 with one attempt spent does NOT
+#: get three fresh attempts tomorrow. Deliberately unlike the time stop, whose
+#: attempts reset each session — a time stop is a daily deadline, a frozen
+#: close is one incident.
+RECOVERY_MAX_ATTEMPTS = 3
+RECOVERY_WAIT_BOUNDED_SEC = 180
+RECOVERY_WAIT_NAKED_SEC = 60
+
+#: Classes, in the order the sweep cares about them.
+RC_NAKED_SHORT = 'naked_short'   # unbounded. zero grace, urgent, pay through
+RC_BOUNDED = 'bounded'           # spread intact or naked long. grace, capped
+RC_FLAT = 'flat'                 # nothing live. book it, place nothing
+RC_NO_ORDERS = 'no_orders'       # flipped / rejected / unknown. escalate only
+
+#: Terminal for the incident: no further orders, ever, for this freeze. Not
+#: re-armed by a restart, a new day, or a config reload.
+RECOVERY_TERMINAL_STATES = ('escalated', 'resolved')
+
+
+def _legs_of(trade):
+    """(symbol, sign) for every leg a record declares, shorts as -1.
+
+    One reader for both books so the classifier does not need to know which
+    kind of trade it holds. FH is included even though nothing will order on
+    it — classification is what produces the alert, and an FH freeze that
+    cannot be described is exactly the invisible position M14 is about.
+    """
+    pairs = [('short_symbol', -1), ('long_symbol', +1),
+             ('short_call_symbol', -1), ('long_call_symbol', +1),
+             ('short_put_symbol', -1), ('long_put_symbol', +1)]
+    return [(trade[k], sign) for k, sign in pairs if trade.get(k)]
+
+
+def classify_frozen(trade, net_by_symbol):
+    """What IS this frozen record, judged from LIVE broker positions.
+
+    **Never from the freeze-time snapshot.** The human may have fixed it, and
+    self-resolution on a now-flat book — booking with zero orders — is the
+    outcome this whole mechanism most wants. A classifier reading its own
+    freeze record would never see that.
+
+    `net_by_symbol` comes from ONE `kite.positions()` per sweep pass, shared
+    across every record. Per-leg calls here would multiply broker requests by
+    the size of the frozen book, which is the rate-limit lesson the monitor
+    already learned the expensive way.
+
+    Returns `(class, detail)`. The classes are deliberately coarse — the sweep
+    branches on RISK, not on the sixteen states of the design's table, because
+    what an action must obey is the risk class and nothing else.
+    """
+    cf = trade.get('close_failure') or {}
+
+    # A record frozen before this shipped has no `close_failure`. It is
+    # alert-and-nag, never automated: retrofitting recovery onto a freeze
+    # nobody diagnosed is how helpfulness loses money.
+    if not cf:
+        return RC_NO_ORDERS, 'legacy freeze, no close_failure record'
+
+    cause = cf.get('cause')
+    if cause == 'flipped':
+        # The Feb-2026 amplifier. The book is not what the record says, so
+        # every quantity an order would be sized from is untrusted.
+        return RC_NO_ORDERS, 'FLIPPED — the book contradicts the record'
+    if cause == 'rejected':
+        # The broker's reason (margin, price band, frozen scrip) will repeat.
+        return RC_NO_ORDERS, 'the broker REJECTED the close; it will reject again'
+    if cause not in CLOSE_FAILURE_CAUSES:
+        return RC_NO_ORDERS, 'unrecognised cause %r' % (cause,)
+
+    state = cf.get('state')
+    if state in RECOVERY_TERMINAL_STATES:
+        return RC_NO_ORDERS, 'incident already %s' % state
+    if state not in ('frozen', 'recovering'):
+        # Polarity, in the direction that matters for PERMISSION TO ORDER: an
+        # unknown must count as no. (For exit REASONS the opposite holds — an
+        # unknown must not count as a stop. Same lesson, opposite direction,
+        # and getting it backwards here places orders.)
+        return RC_NO_ORDERS, 'unrecognised recovery state %r' % (state,)
+
+    legs = _legs_of(trade)
+    if not legs:
+        return RC_NO_ORDERS, 'record declares no legs'
+
+    live = {sym: net_by_symbol.get(sym, 0) for sym, _ in legs}
+    if all(q == 0 for q in live.values()):
+        return RC_FLAT, 'every leg is flat at the broker'
+
+    # A leg live in the OPPOSITE direction to the one the record claims is the
+    # flipped shape reached by a different door — the freeze cause said
+    # something else, but the book says the record is wrong about its own
+    # position. Trust the book and place nothing.
+    for sym, sign in legs:
+        q = live.get(sym, 0)
+        if q and (q > 0) != (sign > 0):
+            return RC_NO_ORDERS, ('%s is %+d, opposite the %s the record '
+                                  'claims' % (sym, q,
+                                              'long' if sign > 0 else 'short'))
+
+    shorts_live = sum(1 for sym, sign in legs if sign < 0 and live.get(sym, 0))
+    longs_live = sum(1 for sym, sign in legs if sign > 0 and live.get(sym, 0))
+    if shorts_live and not longs_live:
+        return RC_NAKED_SHORT, 'short leg live with no long against it'
+    if shorts_live:
+        # Short and long both live: the spread is intact, or over-hedged after
+        # a partial buyback. Either way max loss is already fixed.
+        return RC_BOUNDED, 'short and long both live — hedged'
+    return RC_BOUNDED, 'long leg only — bounded by the premium already paid'
+
+
+def recovery_grace_sec(rclass):
+    return (NAKED_SHORT_GRACE_SEC if rclass == RC_NAKED_SHORT
+            else RECOVERY_GRACE_SEC)
+
+
+def recovery_wait_sec(rclass):
+    return (RECOVERY_WAIT_NAKED_SEC if rclass == RC_NAKED_SHORT
+            else RECOVERY_WAIT_BOUNDED_SEC)
+
+
+def recovery_gate(trade, rclass, *, now=None, now_time=None,
+                  market_settled=True):
+    """May the sweep place an order for this record RIGHT NOW?
+
+    Returns `(ok, why)`. `why` is always populated — a refusal nobody can read
+    is a position nobody looks at, which is the failure one level up.
+
+    Every gate here fails CLOSED. The order of the checks is not cosmetic: the
+    ones that can never become true (class, terminal state, attempts spent) are
+    asked before the ones that are merely not-yet-true (grace, backoff,
+    cutoff), so an escalated incident never reports itself as "waiting".
+    """
+    cf = trade.get('close_failure') or {}
+    now = time.time() if now is None else now
+    now_time = datetime.now().time() if now_time is None else now_time
+
+    if rclass in (RC_NO_ORDERS, RC_FLAT):
+        return False, 'class %s never orders' % rclass
+    if cf.get('state') in RECOVERY_TERMINAL_STATES:
+        return False, 'incident is %s' % cf.get('state')
+
+    attempts = int(cf.get('attempts') or 0)
+    if attempts >= RECOVERY_MAX_ATTEMPTS:
+        return False, 'all %d attempts spent' % RECOVERY_MAX_ATTEMPTS
+
+    # The kill switch forces dry-run for every order path; recovery is not an
+    # exception to it. Checked here rather than at the order so a tripped
+    # switch reads as a refusal with a reason, not as a silent no-op.
+    if not trading_enabled():
+        return False, 'kill switch: trading disabled'
+
+    frozen_at = cf.get('frozen_at')
+    grace = recovery_grace_sec(rclass)
+    if grace and frozen_at:
+        try:
+            age = now - datetime.fromisoformat(frozen_at).timestamp()
+        except (TypeError, ValueError):
+            # An unparseable stamp cannot prove the grace window has passed.
+            return False, 'unreadable frozen_at %r' % (frozen_at,)
+        if age < grace:
+            return False, 'grace: %ds of %ds elapsed' % (age, grace)
+
+    nxt = cf.get('next_attempt_after')
+    if nxt and now < float(nxt):
+        return False, 'backing off for %ds' % (float(nxt) - now)
+
+    # Both real-money incidents were opening prints, so recovery orders stay
+    # dark for the same first 15 minutes as the value triggers.
+    if not market_settled:
+        return False, 'market not settled — recovery orders are dark at the open'
+
+    cutoff = (HARD_ORDER_CUTOFF_TIME if rclass == RC_NAKED_SHORT
+              else LAST_ORDER_TIME)
+    if now_time > cutoff:
+        return False, 'past %s cutoff for class %s' % (
+            cutoff.strftime('%H:%M'), rclass)
+
+    return True, 'attempt %d of %d, class %s' % (
+        attempts + 1, RECOVERY_MAX_ATTEMPTS, rclass)
 
 
 def _record_says_paper(trade: dict) -> bool:

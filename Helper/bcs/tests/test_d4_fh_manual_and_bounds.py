@@ -109,7 +109,8 @@ class _LegScript:
         self.calls = []
 
     def __call__(self, kite, exchange, symbol, txn, qty, is_buy=False,
-                 dry_run=False, urgent=False, context=None):
+                 dry_run=False, urgent=False, context=None, attempts=None,
+                 allow_pay_through=True):
         self.calls.append({'symbol': symbol, 'txn': txn, 'qty': qty})
         if symbol in self.failures:
             return self.failures[symbol]

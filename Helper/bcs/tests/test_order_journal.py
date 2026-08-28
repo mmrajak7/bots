@@ -207,30 +207,77 @@ def test_order_ctx_only_copies_and_never_derives():
 
 # -- The doubles may not drift from production -------------------------------
 
-@pytest.mark.parametrize('module', [
-    'bcs.tests.test_b10_partial_short_close',
-    'bcs.tests.test_b11_fh_and_legstate',
-])
-def test_scripted_double_matches_close_leg(module):
-    """Both `_ScriptedCloseLeg` doubles went red across nine tests when
-    `context` was added -- the right failure, and one that would have been
-    silently absorbed by a `**kwargs` catch-all.
+def _close_leg_doubles():
+    """Every `close_leg` stand-in in the suite, DISCOVERED rather than listed.
 
-    Pinning them here is the general form of the lesson that
-    `MemoryStore.get_open_trades` taught by returning copies where the real
-    stores alias: a double that does not match production is a test of the
-    double.
+    This used to be a hardcoded list of two modules, and it was incomplete:
+    `test_d2_partial_close_residue._LegScript` - which D2/D3, N13 and N14 all
+    drive - was never pinned, so it could drift from production silently. The
+    hardcoded list is itself the bug it was written to prevent, one level up,
+    and a list is exactly what nobody updates when adding the third double.
+
+    Discovery is by SHAPE: any class in `bcs/tests/` whose `__call__` takes the
+    leading positional run `(kite, exchange, symbol, ...)`. That cannot miss a
+    double for being named something new.
     """
     import importlib
-    mod = importlib.import_module(module)
+    import pkgutil
+    import bcs.tests as pkg
+
+    found = []
+    for mod_info in pkgutil.iter_modules(pkg.__path__):
+        name = 'bcs.tests.%s' % mod_info.name
+        try:
+            mod = importlib.import_module(name)
+        except Exception:                      # pragma: no cover - import-time
+            continue
+        for attr in vars(mod).values():
+            call = getattr(attr, '__call__', None)
+            if not (isinstance(attr, type) and call
+                    and getattr(attr, '__module__', None) == name):
+                continue
+            try:
+                params = list(inspect.signature(call).parameters)
+            except (TypeError, ValueError):
+                continue
+            params = [x for x in params if x != 'self']
+            if params[:3] == ['kite', 'exchange', 'symbol']:
+                found.append(('%s.%s' % (name, attr.__name__), call))
+    return found
+
+
+def test_the_double_discovery_finds_the_known_ones():
+    """A discovery that matches nothing passes forever. These three exist
+    today; the point of discovery is the fourth, not these."""
+    names = {n for n, _ in _close_leg_doubles()}
+    for expected in ('test_b10_partial_short_close._ScriptedCloseLeg',
+                     'test_b11_fh_and_legstate._ScriptedCloseLeg',
+                     'test_d2_partial_close_residue._LegScript'):
+        assert any(n.endswith(expected) for n in names), (expected, names)
+
+
+def test_scripted_double_matches_close_leg():
+    """A double that does not match production is a test of the double.
+
+    Both `_ScriptedCloseLeg` doubles went red across nine tests when `context`
+    was added -- the right failure, and one a `**kwargs` catch-all would have
+    absorbed silently. The same happened when M14 added `attempts` and
+    `allow_pay_through`, and that time it caught only two of the three doubles,
+    which is why discovery replaced the list.
+
+    The general form of the lesson `MemoryStore.get_open_trades` taught by
+    returning copies where the real stores alias.
+    """
     real = list(inspect.signature(sm.close_leg).parameters)
-    fake = list(inspect.signature(mod._ScriptedCloseLeg.__call__).parameters)
-    fake = [p for p in fake if p != 'self']
-    # names differ by position-only spelling (txn vs txn_type); compare the
-    # keyword tail, which is what a caller actually binds by name.
-    assert fake[5:] == real[5:], (
-        f'{module}._ScriptedCloseLeg has {fake[5:]} but close_leg has '
-        f'{real[5:]} -- update the double, do not add **kwargs')
+    doubles = _close_leg_doubles()
+    assert doubles, 'no close_leg doubles discovered at all'
+    for name, call in doubles:
+        fake = [p for p in inspect.signature(call).parameters if p != 'self']
+        # names differ by position-only spelling (txn vs txn_type); compare the
+        # keyword tail, which is what a caller actually binds by name.
+        assert fake[5:] == real[5:], (
+            f'{name} has {fake[5:]} but close_leg has {real[5:]} -- update '
+            f'the double, do not add **kwargs')
 
 
 def test_place_limit_order_is_still_the_only_order_choke_point():
