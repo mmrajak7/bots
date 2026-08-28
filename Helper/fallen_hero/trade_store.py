@@ -768,6 +768,61 @@ class FallenHeroStore(LockedStoreMixin):
             logger.error("Trade #%d not found for begin_close", trade_id)
             return False
 
+    def begin_recovery(self, trade_id: int, reason: str) -> bool:
+        """M14 - take the close-lock on a FROZEN record so recovery can finish it.
+
+        The ONE door out of `partial_close`, and a separate door on purpose.
+
+        **Do not overload `begin_close`.** Its `status == 'open'` check is the
+        concurrency lock that stops two processes both closing the same trade -
+        the 2x-order shape that cost real money in Feb 2026. Widening it to
+        also accept `partial_close` would weaken that guarantee for every
+        ordinary close in order to serve a rare one.
+
+        Refuses every other state, and each refusal earns its own reasoning:
+        `'open'` was never frozen and belongs to `begin_close`; `closing`
+        means an attempt is already in flight, and a second would be the 2x
+        order again; `'closed'` is terminal, and ordering on a booked
+        record is what S3 exists to forbid.
+
+        Returns False rather than raising - "somebody else got there first" is
+        an ordinary answer on a shared store, and the caller branches on it.
+        """
+        with self._mutate():
+            for t in self._trades:
+                if t['id'] != trade_id:
+                    continue
+                if t['status'] != 'partial_close':
+                    logger.warning(
+                        "Trade #%d status is '%s', cannot begin recovery",
+                        trade_id, t['status'])
+                    return False
+                t['status'] = 'closing'
+                t['close_reason'] = reason
+                t['close_started'] = datetime.now().isoformat()
+                t['version'] = t.get('version', 0) + 1
+                self._sync_locked = True
+                logger.info("Trade #%d recovery-lock acquired: %s",
+                            trade_id, reason)
+                return True
+            logger.error("Trade #%d not found for begin_recovery", trade_id)
+            return False
+
+    def get_frozen_trades(self) -> list:
+        """Records stuck at `partial_close` - live legs, nothing monitoring them.
+
+        This is the state a close lands in when a leg failed AFTER orders went
+        out. It drops out of the open book, so before M14 nothing retried it,
+        nothing re-alerted, and one Telegram at freeze time was the entire
+        lifecycle of a position that may be live at the broker with its stops
+        dead. That is the unwatched-position failure that has cost this account
+        real money twice.
+
+        Read-only. No caller may treat these as open positions.
+        """
+        return [t for t in self._trades if t.get('status') == 'partial_close']
+
+
     def set_trade_status(self, trade_id: int, status: str, **extra_fields):
         """Update trade status and optional extra fields. Saves local + Drive."""
         with self._mutate():

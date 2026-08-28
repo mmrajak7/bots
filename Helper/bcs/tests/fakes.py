@@ -91,6 +91,37 @@ class HedgeInvariantViolation(BaseException):
     """
 
 
+class ReduceOnlyViolation(BaseException):
+    """A RECOVERY order tried to move a position AWAY from zero.
+
+    **M14 §4, the invariant the whole recovery sweep rests on:** the sweep can
+    never increase the absolute quantity of any leg. Every order it places
+    moves a position toward zero.
+
+    The design names it "implement first, test hardest" for a specific reason.
+    Recovery is the only automation in this system that places orders at a
+    position the machine has already failed to close once, without a human in
+    the loop, on a record whose state it inferred rather than observed. The
+    action space is what keeps that safe, and this is the wall around it. An
+    entry-shaped order on that path — most temptingly "re-buy the long to
+    restore the hedge" — is rejected categorically: it increases premium at
+    risk, re-opens a position a stop already wanted closed, and makes the
+    invariant untestable.
+
+    **`reduce_only` is opt-IN per fixture, exactly like `hedge_pairs`**, and
+    for the same reason: an ENTRY legitimately increases a position, so an
+    always-on rule would condemn `bcs/entry_executor.py` for doing its job.
+    The sweep's tests arm it; `test_the_recovery_sweep_arms_the_invariant`
+    keeps them honest about arming it.
+
+    `BaseException`, not `Exception` — `close_spread` and `close_fh_position`
+    wrap their sequences in `except Exception`, so an ordinary exception here
+    would be swallowed and presented to the test as a tidy freeze, hiding the
+    violation behind the handler that exists to contain surprises. Same
+    reasoning as its sibling above.
+    """
+
+
 class FakeBroker:
     """Stands in for `KiteConnect`. Only the surface the monitor actually uses.
 
@@ -104,7 +135,13 @@ class FakeBroker:
     ORDER_TYPE_LIMIT = 'LIMIT'
 
     def __init__(self, spots=None, books=None, positions=None,
-                 fill_policy=None, tag='BCS_MON', hedge_pairs=None):
+                 fill_policy=None, tag='BCS_MON', hedge_pairs=None,
+                 reduce_only=False):
+        #: M14 §4. When armed, every order must move a position toward zero.
+        #: Opt-in because an ENTRY legitimately opens one; see
+        #: `ReduceOnlyViolation`.
+        self.reduce_only = reduce_only
+        self.reduce_only_violations = []
         #: [(short_symbol, long_symbol)] — the hedge relationships this fixture
         #: wants policed. Declared rather than inferred, because an ENTRY
         #: legitimately buys the long while the short is open; only a CLOSE
@@ -185,6 +222,7 @@ class FakeBroker:
         if self.place_order_raises:
             raise self.place_order_raises
         self._check_hedge_invariant(kw)
+        self._check_reduce_only(kw)
         self.placed.append(dict(kw))
         oid = str(next(self._ids))
         status, filled, avg = self.fill_policy(kw)
@@ -238,6 +276,41 @@ class FakeBroker:
                        f"it.")
                 self.hedge_violations.append(msg)
                 raise HedgeInvariantViolation(msg)
+
+    def _check_reduce_only(self, kw):
+        """M14 §4 — refuse an order that moves a position AWAY from zero.
+
+        Fires on the ORDER, before it is recorded or filled, so `placed` never
+        contains the forbidden order and a test cannot assert against a book
+        the invariant already condemned. Same placement as the hedge check.
+
+        The rule is on the ABSOLUTE quantity, which is what makes it one rule
+        instead of two: a BUY is reducing when the position is short and
+        opening when it is flat or long, and the mirror holds for a SELL. A
+        BUY against a flat book is the "re-buy the long to restore the hedge"
+        order the design rejects categorically, and it is caught here by the
+        same arithmetic that catches an oversized buyback.
+
+        **Over-closing is a violation too.** Buying back 700 against a short of
+        200 leaves the book LONG 500 — a new position, opened by a routine
+        whose entire licence is that it only ever removes them. `close_leg`
+        re-reads the position and sizes to it, so this can only fire if that
+        stops being true, which is exactly when it needs to.
+        """
+        if not self.reduce_only:
+            return
+        sym = kw.get('tradingsymbol')
+        qty = int(kw.get('quantity') or 0)
+        before = self.net_qty(sym)
+        after = before + (qty if kw.get('transaction_type') == 'BUY' else -qty)
+        if abs(after) <= abs(before):
+            return
+        msg = (f"REDUCE-ONLY INVARIANT VIOLATED: {kw.get('transaction_type')} "
+               f"{sym} x {qty} moves the position from {before} to {after} — "
+               f"|{before}| -> |{after}|, AWAY from zero. The recovery sweep "
+               f"may only ever close.")
+        self.reduce_only_violations.append(msg)
+        raise ReduceOnlyViolation(msg)
 
     # -- internals ----------------------------------------------------------
     def _apply_fill(self, symbol, txn, qty, price):
@@ -499,6 +572,25 @@ class MemoryStore:
         t['status'] = 'open'
         t.pop('close_reason', None)
         return True
+
+    def begin_recovery(self, trade_id, reason):
+        """M14 - mirrors the real stores: ONLY from `partial_close`.
+
+        A fake that accepted this from any state would certify a sweep that
+        re-locks an open trade or orders on a booked one. `test_store_contract`
+        pins the whole table; this is the half that has to be right for the
+        pin to mean anything.
+        """
+        self._rec('begin_recovery', trade_id, reason)
+        t = self._find(trade_id)
+        if t.get('status') != 'partial_close':
+            return False
+        t['status'] = 'closing'
+        t['close_reason'] = reason
+        return True
+
+    def get_frozen_trades(self):
+        return [t for t in self.trades if t.get('status') == 'partial_close']
 
     def set_trade_status(self, trade_id, status, **extra_fields):
         self._rec('set_trade_status', trade_id, status, **extra_fields)

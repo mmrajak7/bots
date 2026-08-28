@@ -1335,6 +1335,51 @@ class ZebraStore:
             t['version'] = t.get('version', 0) + 1
         return t
 
+    def begin_recovery(self, trade_id: int, reason: str) -> bool:
+        """M14 - take the close-lock on a FROZEN record so recovery can finish it.
+
+        The zebra twin of the BCS-family method, and the ONE door out of
+        `partial_close`. Deliberately NOT folded into `begin_close`: that
+        method's status check is the cross-process concurrency lock, and
+        widening it to accept `partial_close` would weaken it for every
+        ordinary close in order to serve a rare one.
+
+        `entered` belongs to `begin_close`; `closing` means an attempt is
+        already in flight and a second would be the Feb-2026 2x-order shape;
+        `exited` is terminal. Returns False rather than raising - "somebody
+        else got there first" is an ordinary answer on a shared store.
+        """
+        with self._mutate():
+            t = self._must_find(trade_id)
+            if t['status'] != 'partial_close':
+                logger.warning("#%d status=%s, cannot begin recovery",
+                               trade_id, t['status'])
+                return False
+            t['status'] = 'closing'
+            t['close_reason'] = reason
+            t['close_started'] = datetime.now().isoformat()
+            t['version'] = t.get('version', 0) + 1
+            self._sync_locked = True
+            logger.info("#%d recovery-lock acquired: %s", trade_id, reason)
+            return True
+
+    def get_frozen_trades(self) -> list:
+        """Records stuck at `partial_close` - live legs, nothing monitoring them.
+
+        `get_entered` skips them, `get_closing_trades` skips them, so before
+        M14 nothing in this store could name them at all. An unmonitored live
+        position nobody is told about is the failure that has cost real money
+        here twice.
+
+        Read-only, and NOT cohort-filtered - the adapter narrows to the cohort
+        (`bcs/zebra_adapter.py`). A store method that silently dropped
+        non-cohort frozen records would hide the older generation's freezes
+        from every reader that goes direct.
+        """
+        return [t for t in self.load_trades()
+                if t.get('status') == 'partial_close']
+
+
     def set_trade_status(self, trade_id: int, status: str, **extra) -> dict:
         with self._mutate():
             t = self._must_find(trade_id)

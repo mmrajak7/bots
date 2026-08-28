@@ -52,10 +52,13 @@ ROLES = (OPEN, CLOSING, FROZEN, TERMINAL)
 #: THE CONTRACT. What the strictest real store does, per (role, method).
 #: True = the call is accepted and the record moves; False = refused.
 #:
-#: FROZEN ('partial_close') refuses everything on purpose: legs are live at the
-#: broker, nothing is monitoring them, and the record is waiting for a human.
-#: An automated path that could book or re-lock it would be putting orders on
-#: top of a position whose real size nobody knows.
+#: FROZEN ('partial_close') refuses everything EXCEPT `begin_recovery`: legs
+#: are live at the broker and nothing is monitoring them, so no ordinary path
+#: may book or re-lock the record. M14 opens exactly one door, and only for the
+#: recovery sweep, whose action space is reduce-only, cause-gated,
+#: count-limited and journalled. `begin_recovery` is a SEPARATE verb rather
+#: than a widened `begin_close` precisely so this table can say that: the
+#: FROZEN column below is the difference between the two, stated as data.
 #: TERMINAL refuses everything because that is what idempotence IS — the
 #: guarantee that two processes racing to close cannot both book.
 CONTRACT = {
@@ -71,6 +74,13 @@ CONTRACT = {
     ('recover_closing_trade', CLOSING): True,
     ('recover_closing_trade', FROZEN): False,
     ('recover_closing_trade', TERMINAL): False,
+    # M14. The exact inverse of `begin_close`, which is the point of it being
+    # its own verb: FROZEN is the only state it accepts, and the only state
+    # `begin_close` must never accept.
+    ('begin_recovery', OPEN): False,
+    ('begin_recovery', CLOSING): False,
+    ('begin_recovery', FROZEN): True,
+    ('begin_recovery', TERMINAL): False,
 }
 
 #: (module, class, file-stem, {role: that store's status string})
@@ -232,3 +242,78 @@ def test_the_bcs_family_is_laxer_than_zebra_on_booking(tmp_path, monkeypatch):
     assert _probe(frozen, 'update_trade_exit') is True, (
         'bcs.TradeStore.update_trade_exit grew a status check — good; update '
         'CONTRACT and delete this test')
+
+
+# ── M14 · every book can NAME its frozen records ────────────────────────────
+#
+# `get_frozen_trades` existed on the adapter and nowhere else, and nothing
+# called it. A `partial_close` record drops out of the open book, so a store
+# that cannot list them has no way to tell anyone a live position stopped being
+# watched — the failure M14's sweep exists to end. Presence is checked over
+# every book so a fifth store cannot be added without one.
+
+ALL_BOOKS = REAL_BOOKS + [('zebra', None, None, None)]
+
+
+@pytest.mark.parametrize('name,modname,clsname,stem', ALL_BOOKS,
+                         ids=[b[0] for b in ALL_BOOKS])
+def test_every_book_can_list_its_frozen_records(tmp_path, monkeypatch,
+                                                name, modname, clsname, stem):
+    if name == 'zebra':
+        store = _zebra_store(tmp_path, monkeypatch, 'partial_close')
+    else:
+        store = _bcs_family_store(modname, clsname, stem, tmp_path,
+                                  monkeypatch, 'partial_close')
+    frozen = store.get_frozen_trades()
+    assert [t['id'] for t in frozen] == [1], (
+        f'{name}.get_frozen_trades() cannot see a partial_close record')
+
+
+@pytest.mark.parametrize('name,modname,clsname,stem', ALL_BOOKS,
+                         ids=[b[0] for b in ALL_BOOKS])
+@pytest.mark.parametrize('status', ['open', 'closing', 'closed'])
+def test_only_frozen_records_are_listed(tmp_path, monkeypatch, name, modname,
+                                        clsname, stem, status):
+    """The inverse review. A method that returned everything would make the
+    sweep act on OPEN positions — orders on a live, correctly-monitored trade."""
+    if name == 'zebra':
+        zstatus = {'open': 'entered', 'closing': 'closing',
+                   'closed': 'exited'}[status]
+        store = _zebra_store(tmp_path, monkeypatch, zstatus)
+    else:
+        store = _bcs_family_store(modname, clsname, stem, tmp_path,
+                                  monkeypatch, status)
+    assert store.get_frozen_trades() == []
+
+
+def test_the_fake_can_list_frozen_records_too():
+    """`replay.py` hands `MemoryStore` to the monitor, so the sweep's own tests
+    run against this. A fake without the method makes them unwritable."""
+    frozen, open_rec = _record('partial_close'), _record('open')
+    open_rec['id'] = 2
+    store = MemoryStore(trades=[frozen, open_rec])
+    assert [t['id'] for t in store.get_frozen_trades()] == [1]
+
+
+def test_the_adapter_narrows_frozen_records_to_the_cohort(tmp_path,
+                                                          monkeypatch):
+    """The store method is deliberately NOT cohort-filtered — going direct must
+    show the older generation's freezes too — and the adapter narrows. Both
+    halves matter: filtering in the store would hide records from every direct
+    reader, and not filtering in the adapter would hand the cohort sweep
+    positions from a strategy that no longer trades."""
+    d = tmp_path / 'zebra'
+    d.mkdir(exist_ok=True)
+    monkeypatch.setattr(zcfg, 'LOG_DIR', d)
+    monkeypatch.setattr(zcfg, 'LOCAL_FILE', d / 'zebra_trades.json')
+    monkeypatch.setattr(zcfg, 'LOCK_FILE', d / 'zebra_trades.lock')
+    outsider = _record('partial_close')
+    outsider['id'] = 2
+    outsider.pop('cohort')
+    (d / 'zebra_trades.json').write_text(
+        json.dumps([_record('partial_close'), outsider]))
+    raw = ZebraStore(config={'google_drive': {'enabled': False}})
+    raw.initialize()
+
+    assert sorted(t['id'] for t in raw.get_frozen_trades()) == [1, 2]
+    assert [t['id'] for t in ZebraStoreAdapter(raw).get_frozen_trades()] == [1]

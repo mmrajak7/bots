@@ -205,6 +205,17 @@ class ZebraStoreAdapter:
         return [map_trade(t) for t in self._store.load_trades()
                 if t.get('status') == 'closing' and in_cohort(t)]
 
+    def begin_recovery(self, trade_id: int, reason: str) -> bool:
+        """M14 - the one door out of `partial_close`, for the recovery sweep.
+
+        Straight through to the store, like `begin_close`. No cohort check
+        here: the sweep selects what it acts on via `get_frozen_trades()`,
+        which IS cohort-scoped, and a second filter downstream of the first
+        would be a guard that cannot be observed failing
+        (`feedback_a_second_guard_you_cannot_observe_is_decorative`).
+        """
+        return self._store.begin_recovery(trade_id, reason)
+
     def get_frozen_trades(self) -> List[dict]:
         """Cohort records frozen at 'partial_close' — live legs, no monitor.
 

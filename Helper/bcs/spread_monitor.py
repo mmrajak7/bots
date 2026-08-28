@@ -2716,12 +2716,75 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
         send_telegram(f"{label} {stock}: EXCEPTION during {reason} close! {e}\nManual intervention needed!", alert_class=alert_policy.SAFETY)
         if close_lock_acquired:
             try:
-                store.set_trade_status(trade['id'], 'partial_close',
-                                       close_error=str(e), close_reason=reason)
+                store.set_trade_status(
+                    trade['id'], 'partial_close',
+                    close_error=str(e), close_reason=reason,
+                    close_failure=_close_failure(
+                        cause='exception', leg=None, reason=reason))
             except Exception as inner_e:
                 log(f"  Could not set partial_close status: {inner_e}")
                 store._sync_locked = False  # Last resort: clear lock directly
         return False
+
+
+#: M14 - the causes a close can freeze for. `rejected` is the one that CHANGES
+#: BEHAVIOUR: the recovery sweep escalates on it immediately and places zero
+#: orders, because the reason a broker rejected (margin, price band, frozen
+#: scrip) will repeat, and re-firing into it is the Feb-2026 "firing into a
+#: broken state" failure. The rest are forensic - the sweep classifies from
+#: LIVE broker positions, never from this snapshot, because the human may have
+#: fixed it in the meantime.
+CLOSE_FAILURE_CAUSES = ('unfilled', 'rejected', 'unreadable_book',
+                        'exception', 'flipped')
+
+
+def _close_failure_cause(result):
+    """Read the freeze cause off a `close_leg` result.
+
+    `None` means the leg was never tradeable - no book, no order, nothing
+    placed - which is `unreadable_book` and NOT `unfilled`: one says we could
+    not look, the other says we looked and nobody traded. They earn different
+    recovery treatment, and collapsing them is the
+    `feedback_never_asked_is_not_failed` mistake.
+    """
+    if result is None:
+        return 'unreadable_book'
+    status = str((result or {}).get('status') or '').upper()
+    return 'rejected' if status == 'REJECTED' else 'unfilled'
+
+
+def _close_failure(*, cause, leg, reason):
+    """The frozen-close record M14's recovery sweep reads.
+
+    Stamped in the SAME `set_trade_status` call that freezes the trade, never
+    at Telegram-send time: a dropped send must not postpone recovery, and
+    acting is the safe direction when nobody was told.
+
+    `attempts` starts at 0 and is incremented BEFORE an order is placed, so a
+    crash mid-attempt costs one attempt and never gains one - the order
+    journal's intent-before-broker-call doctrine, applied to retries. `state`
+    starts `frozen`; the sweep moves it to `recovering` / `escalated` /
+    `resolved`, and an unrecognised value must resolve to `escalated`, the
+    pessimistic side. (C0's polarity lesson applied in the direction that
+    matters here: for exit REASONS an unknown must not count as a stop; for
+    PERMISSION TO PLACE ORDERS an unknown must count as no.)
+
+    A `partial_close` record with NO `close_failure` is a freeze from before
+    this shipped and is treated as `escalated` - alert and nag, never order.
+    Retrofitting automation onto a freeze nobody diagnosed is how helpfulness
+    loses money.
+    """
+    assert cause in CLOSE_FAILURE_CAUSES, cause
+    return {
+        'frozen_at': datetime.now().isoformat(),
+        'cause': cause,
+        'leg': leg,
+        'reason': reason,
+        'state': 'frozen',
+        'attempts': 0,
+        'next_attempt_after': None,
+        'recovery_fills': {},
+    }
 
 
 def _blend_fill(first_price, first_qty, retry_price, retry_qty):
@@ -2816,7 +2879,9 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                 trade['id'], 'partial_close',
                 close_reason=f"FLIPPED_{reason}",
                 flipped=detail,
-                short_qty_seen=short_qty, long_qty_seen=long_qty)
+                short_qty_seen=short_qty, long_qty_seen=long_qty,
+                close_failure=_close_failure(
+                    cause='flipped', leg=None, reason=reason))
             reconcile_after_close(kite, trade, label)
         send_telegram(
             f"🔴 {label} {stock}: FLIPPED POSITION\n"
@@ -2927,8 +2992,12 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             send_telegram(msg)
             if not dry_run:
-                store.set_trade_status(trade['id'], 'partial_close',
-                                       close_failed_leg='short', close_reason=reason)
+                store.set_trade_status(
+                    trade['id'], 'partial_close',
+                    close_failed_leg='short', close_reason=reason,
+                    close_failure=_close_failure(
+                        cause=_close_failure_cause(short_result),
+                        leg='short', reason=reason))
             return False
 
         short_fill = short_result.get('average_price', 0)
@@ -2976,7 +3045,9 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                         trade['id'], 'partial_close',
                         close_reason=f"PARTIAL_SHORT_{reason}",
                         residual_short_qty=remaining,
-                        short_fill=short_fill)
+                        short_fill=short_fill,
+                        close_failure=_close_failure(
+                            cause='unfilled', leg='short', reason=reason))
                     reconcile_after_close(kite, trade, label)
                 send_telegram(
                     f"🔴 {label} {stock}: PARTIAL SHORT CLOSE\n"
@@ -3031,9 +3102,13 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             send_telegram(msg)
             if not dry_run:
-                store.set_trade_status(trade['id'], 'partial_close',
-                                       close_failed_leg='long', close_reason=reason,
-                                       short_fill=short_fill)
+                store.set_trade_status(
+                    trade['id'], 'partial_close',
+                    close_failed_leg='long', close_reason=reason,
+                    short_fill=short_fill,
+                    close_failure=_close_failure(
+                        cause=_close_failure_cause(long_result),
+                        leg='long', reason=reason))
             return False
 
         long_fill = long_result.get('average_price', 0)
@@ -3074,7 +3149,9 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                         close_failed_leg='long',
                         close_reason=f"PARTIAL_LONG_{reason}",
                         residual_long_qty=remaining,
-                        short_fill=short_fill, long_fill=long_fill)
+                        short_fill=short_fill, long_fill=long_fill,
+                        close_failure=_close_failure(
+                            cause='unfilled', leg='long', reason=reason))
                     reconcile_after_close(kite, trade, label)
                 send_telegram(
                     f"🔴 {label} {stock}: PARTIAL LONG CLOSE\n"
@@ -3505,7 +3582,7 @@ def _fh_clamp_pnl(pnl_per_share, total_credit, trade, where):
 def _freeze_fh_leg_failure(fh_store, trade, reason, dry_run, leg_key,
                            leg_label, symbol, close_qty, closed_now,
                            remaining, residual=None, hedge_label=None,
-                           kite=None):
+                           kite=None, cause='unfilled'):
     """D1/D2/D3 — a leg that did NOT fully close FREEZES the record. It never books.
 
     Both FH long legs (Step 2's long call, Step 4's long put) used to log a
@@ -3580,6 +3657,8 @@ def _freeze_fh_leg_failure(fh_store, trade, reason, dry_run, leg_key,
             close_failed_leg=leg_key,
             close_reason=(f"PARTIAL_{leg_key.upper()}_{reason}" if partial
                           else reason),
+            close_failure=_close_failure(cause=cause, leg=leg_key,
+                                         reason=reason),
             **extra)
         if partial and kite is not None:
             reconcile_after_close(kite, trade, 'FH')
@@ -3760,7 +3839,9 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                 trade['id'], 'partial_close',
                 close_reason=f"FLIPPED_{reason}", flipped=detail,
                 sc_qty_seen=sc_qty, lc_qty_seen=lc_qty,
-                sp_qty_seen=sp_qty, lp_qty_seen=lp_qty)
+                sp_qty_seen=sp_qty, lp_qty_seen=lp_qty,
+                close_failure=_close_failure(
+                    cause='flipped', leg=None, reason=reason))
             reconcile_after_close(kite, trade, 'FH')
         send_telegram(
             f"🔴 FH {stock}: FLIPPED POSITION\n"
@@ -3857,8 +3938,12 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
             log("!!! CRITICAL: SHORT CALL CLOSE FAILED — naked risk remains !!!")
             send_telegram(f"FH {stock}: SHORT CALL CLOSE FAILED! Naked risk! Manual intervention needed!", alert_class=alert_policy.SAFETY)
             if not dry_run:
-                fh_store.set_trade_status(trade['id'], 'partial_close',
-                                          close_failed_leg='short_call', close_reason=reason)
+                fh_store.set_trade_status(
+                    trade['id'], 'partial_close',
+                    close_failed_leg='short_call', close_reason=reason,
+                    close_failure=_close_failure(
+                        cause=_close_failure_cause(result),
+                        leg='short_call', reason=reason))
             return False
         fills['short_call'] = result.get('average_price', 0)
         closed_now['short_call'] = fills['short_call']
@@ -3908,7 +3993,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
             return _freeze_fh_leg_failure(
                 fh_store, trade, reason, dry_run, 'long_call', 'long call',
                 lc_sym, close_qty, closed_now,
-                _fh_put_legs_open(sp_sym, sp_qty, lp_sym, lp_qty))
+                _fh_put_legs_open(sp_sym, sp_qty, lp_sym, lp_qty),
+                cause=_close_failure_cause(result))
         fills['long_call'] = result.get('average_price', 0)
         closed_now['long_call'] = fills['long_call']
         # D3 — a PARTIAL sale leaves long-call residue live under what would
@@ -3942,8 +4028,12 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
             log("!!! WARNING: SHORT PUT CLOSE FAILED !!!")
             send_telegram(f"FH {stock}: SHORT PUT CLOSE FAILED! Manual intervention needed!", alert_class=alert_policy.SAFETY)
             if not dry_run:
-                fh_store.set_trade_status(trade['id'], 'partial_close',
-                                          close_failed_leg='short_put', close_reason=reason)
+                fh_store.set_trade_status(
+                    trade['id'], 'partial_close',
+                    close_failed_leg='short_put', close_reason=reason,
+                    close_failure=_close_failure(
+                        cause=_close_failure_cause(result),
+                        leg='short_put', reason=reason))
             return False
         fills['short_put'] = result.get('average_price', 0)
         closed_now['short_put'] = fills['short_put']
@@ -3987,7 +4077,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
             # never happened. See `_freeze_fh_leg_failure`.
             return _freeze_fh_leg_failure(
                 fh_store, trade, reason, dry_run, 'long_put', 'long put',
-                lp_sym, close_qty, closed_now, [])
+                lp_sym, close_qty, closed_now, [],
+                cause=_close_failure_cause(result))
         fills['long_put'] = result.get('average_price', 0)
         closed_now['long_put'] = fills['long_put']
         # D3, on the last leg: a PARTIAL sale leaves long-put residue live
