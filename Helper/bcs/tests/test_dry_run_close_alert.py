@@ -97,7 +97,9 @@ def test_a_dry_run_close_says_it_is_a_dry_run(env):
     spy, store = env
     _close(store, dry_run=True)
     msg = _closed_alert(spy)
-    assert msg.startswith('[DRY RUN]')
+    # 2026-08-28: the head gained a leading marker emoji, so the check is
+    # "the first LINE says dry run" rather than "the first CHARACTERS do".
+    assert '[DRY RUN]' in msg.splitlines()[0]
     assert 'WOULD CLOSE' in msg
 
 
@@ -119,7 +121,10 @@ def test_the_exit_value_is_not_reported_either(env):
     _close(store, dry_run=True)
     msg = _closed_alert(spy)
     assert 'Exit spread: 0.00' not in msg
-    assert 'not priced' in msg
+    # Wording changed 2026-08-28 ("not priced (no fill)" read as a
+    # malfunction on a phone); the contract — say WHY there is no number —
+    # did not.
+    assert 'no order placed' in msg
 
 
 def test_a_live_close_still_reports_everything(env):
@@ -168,10 +173,34 @@ def test_the_fh_twin_is_fixed_too(env):
     spy, store = env
     assert _fh_close(store, dry_run=True) is True
     msg = _closed_alert(spy)
-    assert msg.startswith('[DRY RUN] FH WOULD CLOSE')
+    assert '[DRY RUN] FH WOULD CLOSE' in msg.splitlines()[0]
     assert 'P&L: Rs' not in msg
     assert '+39,100' not in msg          # 97.75 * 400, the flattering fiction
     assert 'Close cost: 0.00' not in msg
+
+
+def test_a_dry_run_close_of_a_PAPER_record_is_not_telegrammed_at_all(env):
+    """The 2026-08-28 scope change. A real record in dry run still alerts (the
+    tests above) because nothing else books it; a PAPER record does not,
+    because zebra sends the message that carries the real P&L a few minutes
+    later and two messages for one position is the confusion the owner asked
+    to lose. The LOG still has everything."""
+    spy, store = env
+    paper = _trade()
+    paper['paper'] = True
+    kite = FakeBroker(books=BOOKS,
+                      positions=[{'tradingsymbol': SHORT, 'quantity': -QTY},
+                                 {'tradingsymbol': LONG, 'quantity': QTY}])
+    sm._close_spread_inner(kite, store, paper, spot=1400.0, reason='TP',
+                           dry_run=True, label='BCS')
+    assert not [m for m in spy.sent if 'CLOSE' in m], (
+        'a paper rehearsal reached Telegram: %r' % spy.sent)
+    withheld = [m for _c, m in spy.suppressed if 'WOULD CLOSE' in m
+                or 'SHADOW CLOSE' in m]
+    assert withheld, 'the close alert was never even offered to the policy'
+    assert 'zebra (paper)' in withheld[0], (
+        'the withheld message must still name the booking engine, because it '
+        'is what the log now carries')
 
 
 def test_a_live_fh_close_still_reports_everything(env):

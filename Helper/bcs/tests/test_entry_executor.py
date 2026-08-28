@@ -95,7 +95,7 @@ def run(b, lots=1, dry_run=True, **kw):
     out = ee.open_spread(
         kite=None, stock='TESTCO', long_symbol=LONG, short_symbol=SHORT,
         exchange=EX, lot_size=LOT, lots=lots, dry_run=dry_run,
-        log=said.append, telegram=lambda m: sent.append(m), **kw)
+        log=said.append, telegram=lambda m, *a, **k: sent.append(m), **kw)
     return out, said, sent
 
 
@@ -534,7 +534,7 @@ def test_the_prospective_debit_prices_the_sides_we_actually_TRADE():
     import bcs.spread_monitor as _sm
     real = _sm.get_option_depth
     try:
-        _sm.get_option_depth = lambda k, e, sym: books[sym]
+        _sm.get_option_depth = lambda k, e, sym, fresh=False: books[sym]
         got = ee.prospective_debit(None, EX, LONG, SHORT)
     finally:
         _sm.get_option_depth = real

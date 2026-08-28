@@ -66,6 +66,7 @@ from common import option_symbols as _sym
 from common.option_symbols import check_leg_types
 from common import layered_config
 from common import kite_errors
+from bcs import alert_policy
 from bcs import exit_vet
 from bcs import order_journal
 from .trade_store import get_store
@@ -336,7 +337,7 @@ def load_kite() -> KiteConnect:
                f"starting but every Kite call may fail. Open positions would "
                f"be UNMONITORED. Re-run SNAIL auth.")
         log(f"WARNING: {msg}")
-        send_telegram(f"⚠️ BCS MONITOR: STALE KITE TOKEN\n{msg}")
+        send_telegram(f"⚠️ BCS MONITOR: STALE KITE TOKEN\n{msg}", alert_class=alert_policy.SAFETY)
 
     kite = KiteConnect(api_key=token_data['api_key'])
     kite.set_access_token(token_data['access_token'])
@@ -351,16 +352,325 @@ def is_market_open() -> bool:
     return MARKET_OPEN <= now < MARKET_CLOSE
 
 
-def get_spot(kite: KiteConnect, spot_symbol: str) -> float:
-    """Fetch spot price for given symbol."""
-    q = kite.ltp([spot_symbol])
+# ── Batched quotes (F7) ─────────────────────────────────────────────────────
+#
+# THE PROBLEM, measured on the Pi 2026-08-28: this monitor issued ONE
+# `/quote` per option leg and ONE `/ltp` per underlying, every poll, for every
+# open position. At 8 positions that is 8 + 16 = 24 requests every 5 seconds
+# = 4.8 req/s against a quote family capped at **1 req/s**. The log for that
+# morning carries 58 `Too many requests` failures still arriving at 10:02, and
+# each one is a position that went UNWATCHED for that poll:
+#
+#   [09:59:40]  BCS #457 JINDALSTEL: ... [QUOTE-FAIL Too many requests]
+#
+# Kite's `/quote` and `/ltp` both take up to 500 instruments in ONE call, so
+# the entire book fits in two requests. The fix is a per-poll PREFETCH plus a
+# read-through cache, giving **2 requests per poll regardless of book size**.
+#
+# WHAT THIS MUST NOT CHANGE. Every valuation guard — `leg_quote_reliable`, the
+# intrinsic floor, `spot_corroborates`, the depth/quantity checks in the order
+# path — reads the dict `get_option_depth` derives. Kite returns the SAME
+# per-instrument payload whether one instrument was asked for or five hundred,
+# so the derivation is byte-identical and the guards receive exactly what they
+# received before. What changes is only how many HTTP calls produced it.
+#
+# The one place batching WOULD change a guard's input is anywhere the code
+# deliberately wants a NEW read of a book it has already seen this poll: the
+# re-verify after a valuation trigger, and the wait-for-depth loop that prices
+# an order. Those pass `fresh=True` and bypass the cache entirely. A cached
+# answer there would turn "wait for the book to re-form" into an infinite loop
+# over a frozen snapshot — the opposite of the guard's purpose.
+#
+# BACKING OFF, not retrying. A 429 carries a ~10s sliding cooldown that
+# FURTHER requests EXTEND, so the old behaviour (18 calls, all failing, all
+# extending) was self-sustaining. After a rate-limited batch, calls are
+# refused LOCALLY for QUOTE_COOLDOWN_SEC — the refusal is raised as an
+# exception the shared `common.kite_errors` classifier already reads as
+# RATE_LIMIT, so every caller's existing handling applies unchanged and no
+# second classifier is born.
+
+#: Kite documents 500 per call. 200 keeps the query string comfortably short
+#: and still puts any realistic book in a single request.
+QUOTE_BATCH_MAX = 200
+
+#: Kite's 429 window is ~10s and sliding. Wait longer than the window, never
+#: shorter, or the first call back is what extends it again.
+QUOTE_COOLDOWN_SEC = 12.0
+
+#: How old a cached quote may be before it is refetched rather than served.
+#: The cache is ALREADY dropped at the top of every poll, so this is a
+#: structural backstop, not the mechanism: it makes a stale price unable to
+#: reach a valuation guard even from a caller that forgot to prefetch, or on
+#: the tail of a poll where `close_spread` spent 30 seconds in the middle.
+#: Set below the poll interval on purpose — an exit guard reading a quote
+#: older than one poll is the failure this whole file is built around.
+QUOTE_CACHE_TTL_SEC = 5.0
+
+
+class QuoteRateLimited(Exception):
+    """Refused locally because Kite rate-limited us moments ago.
+
+    Carries `.code = 429` and Kite's own wording so
+    `common.kite_errors.classify` returns RATE_LIMIT without needing to know
+    this class exists. That matters: the blind-mode alert, `_is_auth_error`
+    and the diagnosis text all route through that one classifier, and a
+    locally-generated backoff must read to them exactly like the server's own
+    refusal — otherwise a backoff would be reported as an auth problem, which
+    is the mistake `common/kite_errors.py` was written to end.
+    """
+    code = 429
+
+
+#: 'NFO:SYM' -> (fetched_at, the raw per-instrument dict Kite returned).
+_quote_cache: dict = {}
+#: 'NSE:SYM' -> (fetched_at, the raw per-instrument dict `/ltp` returned).
+_ltp_cache: dict = {}
+#: Instruments this poll's prefetch ASKED for. An instrument in here but not
+#: in the cache was genuinely absent from Kite's answer — that is a KeyError,
+#: exactly as the old single-instrument `q[full]` produced, and must NOT
+#: silently fall back to a per-instrument call.
+_quote_requested: set = set()
+_ltp_requested: set = set()
+#: The exception a failed prefetch died of, replayed to every consumer of the
+#: instruments it covered. One failure, one cause, N honest per-trade reports.
+_quote_batch_error: Optional[BaseException] = None
+_ltp_batch_error: Optional[BaseException] = None
+#: Wall-clock instant before which no quote-family call may be made.
+_quote_cooldown_until: float = 0.0
+#: Request accounting, for the log line and for tests that assert the budget.
+quote_stats: dict = {'batches': 0, 'singles': 0, 'instruments': 0,
+                     'cache_hits': 0}
+
+
+def reset_quote_cache() -> None:
+    """Drop the per-poll cache. Called at the top of every poll, and by tests.
+
+    The cooldown deliberately SURVIVES this: it is a property of the broker's
+    rate limiter, not of our polling cycle, and clearing it every 5 seconds
+    would defeat the whole back-off.
+    """
+    global _quote_batch_error, _ltp_batch_error
+    _quote_cache.clear()
+    _ltp_cache.clear()
+    _quote_requested.clear()
+    _ltp_requested.clear()
+    _quote_batch_error = None
+    _ltp_batch_error = None
+
+
+def reset_quote_cooldown() -> None:
+    """Clear the local rate-limit backoff (process start, and tests)."""
+    global _quote_cooldown_until
+    _quote_cooldown_until = 0.0
+
+
+def quote_cooldown_remaining(now: Optional[float] = None) -> float:
+    """Seconds left on the local backoff; 0.0 when clear."""
+    now = time.time() if now is None else now
+    return max(0.0, _quote_cooldown_until - now)
+
+
+def _guard_cooldown() -> None:
+    """Raise rather than make a call that would extend Kite's 429 window."""
+    left = quote_cooldown_remaining()
+    if left > 0:
+        raise QuoteRateLimited(
+            f"Too many requests — local backoff, {left:.0f}s left. Kite's 429 "
+            f"window is sliding and a call now would extend it.")
+
+
+def _note_rate_limit(exc) -> None:
+    """Start the local backoff if Kite said 429."""
+    global _quote_cooldown_until
+    if kite_errors.is_rate_limit(exc):
+        _quote_cooldown_until = time.time() + QUOTE_COOLDOWN_SEC
+
+
+def _chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def _cache_get(cache: dict, key: str, now: Optional[float] = None):
+    """The cached payload, or None if absent OR older than the TTL."""
+    hit = cache.get(key)
+    if hit is None:
+        return None
+    ts, payload = hit
+    now = time.time() if now is None else now
+    if now - ts > QUOTE_CACHE_TTL_SEC:
+        return None
+    return payload
+
+
+def prefetch_quotes(kite: KiteConnect, instruments) -> int:
+    """Fill the per-poll quote cache in as few `/quote` calls as possible.
+
+    Returns the number of HTTP requests made. Never raises: a failure is
+    stored and replayed to whichever consumer asks for a covered instrument,
+    so one broken batch produces one honest per-trade error rather than an
+    exception escaping into the middle of the poll.
+    """
+    global _quote_batch_error
+    wanted = sorted({i for i in instruments if i})
+    wanted = [i for i in wanted if _cache_get(_quote_cache, i) is None]
+    if not wanted:
+        return 0
+    _quote_requested.update(wanted)
+    made = 0
+    for chunk in _chunks(wanted, QUOTE_BATCH_MAX):
+        try:
+            _guard_cooldown()
+            data = kite.quote(chunk) or {}
+            made += 1
+            quote_stats['batches'] += 1
+            quote_stats['instruments'] += len(chunk)
+            stamp = time.time()
+            for k, v in data.items():
+                _quote_cache[k] = (stamp, v)
+        except Exception as e:
+            _note_rate_limit(e)
+            _quote_batch_error = e
+            log(f"  QUOTE BATCH FAILED for {len(chunk)} instrument(s): {e}")
+            break
+    return made
+
+
+def prefetch_ltps(kite: KiteConnect, symbols) -> int:
+    """Fill the per-poll LTP cache. Same contract as `prefetch_quotes`."""
+    global _ltp_batch_error
+    wanted = sorted({s for s in symbols if s})
+    wanted = [s for s in wanted if _cache_get(_ltp_cache, s) is None]
+    if not wanted:
+        return 0
+    _ltp_requested.update(wanted)
+    made = 0
+    for chunk in _chunks(wanted, QUOTE_BATCH_MAX):
+        try:
+            _guard_cooldown()
+            data = kite.ltp(chunk) or {}
+            made += 1
+            quote_stats['batches'] += 1
+            quote_stats['instruments'] += len(chunk)
+            stamp = time.time()
+            for k, v in data.items():
+                _ltp_cache[k] = (stamp, v)
+        except Exception as e:
+            _note_rate_limit(e)
+            _ltp_batch_error = e
+            log(f"  LTP BATCH FAILED for {len(chunk)} symbol(s): {e}")
+            break
+    return made
+
+
+def trade_instruments(trade: dict) -> list:
+    """Every option leg of a record, as `EXCHANGE:SYMBOL`.
+
+    Reads `*_symbol` keys generically rather than naming BCS's pair, for the
+    same reason `delivery_exposure` does: this file manages four books, one of
+    which (FH) has three or four legs, and a hand-written list is the shape
+    that silently misses the leg someone added later. `spot_symbol` is
+    excluded — it is an equity and goes through `/ltp`, and it already carries
+    its own exchange prefix.
+    """
+    exch = trade.get('exchange') or 'NFO'
+    out = []
+    for key, val in trade.items():
+        if not key.endswith('_symbol') or key == 'spot_symbol':
+            continue
+        if isinstance(val, str) and val:
+            out.append(f"{exch}:{val}")
+    return out
+
+
+def prefetch_book(kite: KiteConnect, trades) -> int:
+    """Prefetch every leg and every underlying for a whole book.
+
+    This is the entire F7 fix at the call site: two requests replace
+    `2 x len(trades)` quote calls and `len(trades)` ltp calls.
+    """
+    reset_quote_cache()
+    legs = []
+    spots = []
+    for t in trades or []:
+        try:
+            legs.extend(trade_instruments(t))
+            if t.get('spot_symbol'):
+                spots.append(t['spot_symbol'])
+        except Exception:
+            # A malformed record must not cost the whole book its prefetch;
+            # `_malformed_reason` quarantines it a few lines later anyway.
+            continue
+    return prefetch_quotes(kite, legs) + prefetch_ltps(kite, spots)
+
+
+def get_spot(kite: KiteConnect, spot_symbol: str, fresh: bool = False) -> float:
+    """Fetch spot price for given symbol.
+
+    Served from this poll's prefetch when there is one. `fresh=True` forces a
+    new read for the rare caller that needs the book to have moved.
+    """
+    if not fresh:
+        hit = _cache_get(_ltp_cache, spot_symbol)
+        if hit is not None:
+            quote_stats['cache_hits'] += 1
+            return hit['last_price']
+        if spot_symbol in _ltp_requested and spot_symbol not in _ltp_cache:
+            # Asked for and not returned, or the batch died. Either way this
+            # is the same failure the old per-symbol call produced, and it
+            # must reach the caller's per-trade handler rather than being
+            # papered over with an extra request. (An entry that merely aged
+            # past the TTL is still in `_ltp_cache` and falls through to a
+            # refetch below — expiry is not absence.)
+            if _ltp_batch_error is not None:
+                raise _ltp_batch_error
+            raise KeyError(spot_symbol)
+    _guard_cooldown()
+    try:
+        q = kite.ltp([spot_symbol])
+        quote_stats['singles'] += 1
+    except Exception as e:
+        _note_rate_limit(e)
+        raise
+    _ltp_cache[spot_symbol] = (time.time(), q[spot_symbol])
     return q[spot_symbol]['last_price']
 
 
-def get_option_depth(kite: KiteConnect, exchange: str, symbol: str) -> dict:
-    """Fetch full depth for an option symbol."""
+def get_option_depth(kite: KiteConnect, exchange: str, symbol: str,
+                     fresh: bool = False) -> dict:
+    """Fetch full depth for an option symbol.
+
+    Served from this poll's prefetch when there is one — the derived dict is
+    identical either way, because Kite's per-instrument payload does not
+    depend on how many instruments were requested alongside it.
+
+    `fresh=True` bypasses the cache. Use it wherever the code is waiting for
+    the book to CHANGE (the order path's depth loop) or deliberately taking a
+    second look (the post-trigger re-verify). A cached answer in either place
+    would turn a guard into a tautology.
+    """
     full = f"{exchange}:{symbol}"
-    q = kite.quote([full])[full]
+    q = None
+    if not fresh:
+        q = _cache_get(_quote_cache, full)
+        if q is not None:
+            quote_stats['cache_hits'] += 1
+        elif full in _quote_requested and full not in _quote_cache:
+            # Requested and genuinely absent from Kite's answer — the same
+            # KeyError the old `kite.quote([full])[full]` raised. An entry
+            # that merely aged past the TTL is still present and refetches.
+            if _quote_batch_error is not None:
+                raise _quote_batch_error
+            raise KeyError(full)
+    if q is None:
+        _guard_cooldown()
+        try:
+            q = kite.quote([full])[full]
+            quote_stats['singles'] += 1
+        except Exception as e:
+            _note_rate_limit(e)
+            raise
+        _quote_cache[full] = (time.time(), q)
     depth = q.get('depth', {})
     best_bid = depth['buy'][0] if depth.get('buy') else {'price': 0, 'quantity': 0}
     best_ask = depth['sell'][0] if depth.get('sell') else {'price': 0, 'quantity': 0}
@@ -567,7 +877,8 @@ def price_anchor(depth: dict) -> float:
     return max(ltp, depth.get('prev_close') or 0)
 
 
-def get_spread_value(kite: KiteConnect, trade: dict, spot: float = None) -> dict:
+def get_spread_value(kite: KiteConnect, trade: dict, spot: float = None,
+                     fresh: bool = False) -> dict:
     """Fetch both legs and compute spread value (long bid - short ask).
 
     Returns dict with long depth, short depth, computed spread, and
@@ -579,9 +890,15 @@ def get_spread_value(kite: KiteConnect, trade: dict, spot: float = None) -> dict
     rejected. Note this catches a DIFFERENT failure from the width/LTP tests:
     those judge the book's SHAPE, this judges whether the number is possible at
     all. A well-formed book can still quote an impossible price.
+
+    `fresh=True` forces a new read of both legs, bypassing the per-poll quote
+    cache. The re-verify after a valuation trigger MUST pass it: re-checking a
+    trigger against the very quote that caused it is not a check.
     """
-    long_d = get_option_depth(kite, trade['exchange'], trade['long_symbol'])
-    short_d = get_option_depth(kite, trade['exchange'], trade['short_symbol'])
+    long_d = get_option_depth(kite, trade['exchange'], trade['long_symbol'],
+                              fresh=fresh)
+    short_d = get_option_depth(kite, trade['exchange'], trade['short_symbol'],
+                               fresh=fresh)
 
     long_ok, long_why = leg_quote_reliable(long_d)
     short_ok, short_why = leg_quote_reliable(short_d)
@@ -1350,9 +1667,27 @@ _telegram_cfg: Optional[dict] = None
 _telegram_cfg_loaded = False
 
 
-def send_telegram(msg: str):
-    """Send Telegram alert. Best-effort: never blocks or crashes trading."""
+def send_telegram(msg: str, alert_class: Optional[str] = None):
+    """Send Telegram alert. Best-effort: never blocks or crashes trading.
+
+    `alert_class` is one of `bcs.alert_policy`'s classes. Omitting it SENDS —
+    the default is deliberate and is the whole reason the policy is a module
+    rather than a scatter of `if dry_run` at the call sites: silence has to be
+    something someone chose, and it has to be readable in one place.
+
+    A suppressed alert is still LOGGED, in full, with the policy's reason. The
+    phone is not the evidence channel; `logs/spread_monitor_cron_*.log` and the
+    order journal are, and neither is affected by anything decided here.
+    """
     global _telegram_cfg, _telegram_cfg_loaded
+
+    ok, why = alert_policy.should_send(alert_class)
+    if not ok:
+        first = (msg or '').split('\n')[0]
+        log(f"  [telegram suppressed: {why}] {first}")
+        for extra in (msg or '').split('\n')[1:]:
+            log(f"    | {extra}")
+        return
 
     try:
         # Load config once and cache
@@ -1576,8 +1911,82 @@ def place_limit_order(kite: KiteConnect, exchange: str, symbol: str,
     return str(order_id)
 
 
+def booking_engine(trade: Optional[dict]) -> Optional[str]:
+    """Which engine will actually BOOK this record's exit, or None for this one.
+
+    A record that positively declares itself paper is booked by zebra's
+    `_paper_auto_close`; this monitor only SHADOWS it during the dry-run
+    evidence week. Naming the engine is the whole of the 2026-08-28 fix for
+    "two messages, two numbers, one position": at 09:18 the monitor announced
+    COFORGE #436's TP and at 09:25 zebra announced the same TP with the real
+    +Rs 7,790, and neither message said which of the two was the booking. Both
+    were correct; the owner still had to reconcile them by hand.
+
+    Deliberately keyed on `_record_says_paper` rather than on `paper_mode`:
+    the question is who owns THIS record, not what mode the process is in.
+    """
+    if trade and _record_says_paper(trade):
+        return 'zebra (paper)'
+    return None
+
+
+def rehearsal_lines(trade: Optional[dict], dry_run: bool) -> list:
+    """Say plainly that a dry-run alert is a rehearsal, and who books instead.
+
+    Two situations wear the same words if nobody separates them, and they need
+    opposite reactions from the reader:
+
+    * **dry run over a PAPER record** — expected, routine, zebra owns the
+      booking and carries the real P&L. Nothing is wrong.
+    * **dry run over a REAL record** — also expected, but nobody books it: the
+      position is still open at the broker and the only engine that could
+      close it is disarmed. Worth knowing.
+
+    Neither is the third thing, which stays alarming and lives in
+    `_refuse_unpriced_close`: ARMED, and no fill could be found to price a
+    close that really happened.
+
+    Returns [] when not a dry run, so callers can splice unconditionally.
+    """
+    if not dry_run:
+        return []
+    engine = booking_engine(trade)
+    if engine:
+        return ["REHEARSAL — this is expected, not a malfunction. The monitor "
+                "is in DRY RUN, so no order was placed and there is no fill "
+                "to price an exit at. No P&L belongs in THIS message.",
+                f"Booked by: {engine}. Its own alert for this position "
+                f"carries the real exit price and P&L."]
+    return ["⚠️ NO ORDER WAS PLACED. The monitor is in DRY RUN and this is a "
+            "REAL record — the position is STILL OPEN at the broker and "
+            "NOTHING ELSE BOOKS IT.",
+            "ACTION NEEDED: close it by hand, or arm the monitor."]
+
+
+def trigger_alert_text(label: str, stock: str, reason: str, spot,
+                       dry_run: bool, trade: Optional[dict],
+                       live_tail: str) -> str:
+    """The Telegram sent the moment a trigger fires, BEFORE any order.
+
+    ONE definition for the spread and FH paths, for the usual reason. In a dry
+    run "Closing spread..." is a claim about the future that will not happen,
+    and it is the FIRST of the two messages the owner has to reconcile against
+    zebra's — so it names the shadow and the booking engine too.
+    """
+    lines = [f"{label} {reason} TRIGGERED", f"{stock} spot={spot}"]
+    if dry_run:
+        lines[0] = f"🧪 [DRY RUN] {lines[0]}"
+        lines.extend(rehearsal_lines(trade, dry_run))
+        lines.append("Walking the close so the intended orders are "
+                     "journalled. Nothing will be placed.")
+    else:
+        lines.append(live_tail)
+    return "\n".join(lines)
+
+
 def close_alert_text(label: str, stock: str, reason: str, spot,
-                     value_lines: list, total_pnl: float, dry_run: bool) -> str:
+                     value_lines: list, total_pnl: float, dry_run: bool,
+                     trade: Optional[dict] = None) -> str:
     """The Telegram body for a completed close. ONE definition, both books.
 
     **A dry run never carries a P&L figure.** `wait_for_fill`'s dry stub
@@ -1596,13 +2005,24 @@ def close_alert_text(label: str, stock: str, reason: str, spot,
 
     Both close paths call this, because fixing the copy you happened to open
     is the most repeated bug in this codebase (`feedback_the_copy_you_did_not_open`).
+
+    2026-08-28: withholding the number was right but not enough. On a phone,
+    "P&L: not computed - no order was placed, so there is no fill to price the
+    exit at" reads as a malfunction, and it fires on EVERY dry-run close
+    because in dry run no order is EVER placed. The monitor's own log already
+    said the reassuring thing ("armed, this close would be REFUSED … zebra
+    still owns this trade's exits") and the alert did not. `trade` is passed so
+    the alert can carry it too — see `rehearsal_lines`.
     """
-    head = f"[DRY RUN] {label} WOULD CLOSE: {stock}" if dry_run \
-        else f"{label} CLOSED: {stock}"
+    if dry_run:
+        head = (f"🧪 [DRY RUN] {label} SHADOW CLOSE: {stock}"
+                if booking_engine(trade)
+                else f"🧪 [DRY RUN] {label} WOULD CLOSE: {stock}")
+    else:
+        head = f"{label} CLOSED: {stock}"
     lines = [head, f"Reason: {reason}"] + list(value_lines)
     if dry_run:
-        lines.append("P&L: not computed - no order was placed, so there is "
-                     "no fill to price the exit at.")
+        lines.extend(rehearsal_lines(trade, dry_run))
     else:
         lines.append(f"P&L: Rs {total_pnl:+,.0f}")
     lines.append(f"Spot: {spot}")
@@ -1722,7 +2142,7 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
             log(f"    ORDER CUTOFF: {datetime.now().strftime('%H:%M:%S')} > {cutoff.strftime('%H:%M')} "
                 f"({'urgent' if urgent else 'normal'}). No more orders for {symbol}.")
             send_telegram(f"Order cutoff reached closing {symbol} — "
-                          f"{remaining_qty} qty NOT closed. Manual intervention needed!")
+                          f"{remaining_qty} qty NOT closed. Manual intervention needed!", alert_class=alert_policy.SAFETY)
             break
         # ── Safety: Re-check position to compute actual remaining ─────
         if not dry_run:
@@ -1815,7 +2235,10 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
         depth = None
         book_reliable = False
         for wait_i in range(NO_DEPTH_MAX_WAITS):
-            depth = get_option_depth(kite, exchange, symbol)
+            # fresh=True: this loop exists to WAIT for the book to re-form and
+            # then price an order off it. A cached snapshot would neither
+            # change between waits nor reflect what the order will meet.
+            depth = get_option_depth(kite, exchange, symbol, fresh=True)
             has_side = (depth['ask'] > 0 and depth['ask_qty'] > 0) if is_buy \
                        else (depth['bid'] > 0 and depth['bid_qty'] > 0)
             book_reliable, why = leg_quote_reliable(depth)
@@ -1922,7 +2345,7 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
         if result and result['status'] == 'REJECTED':
             msg = result.get('status_message', 'unknown')
             log(f"    ORDER REJECTED: {msg}. Will not retry (same error likely).")
-            send_telegram(f"Order REJECTED: {txn_type} {symbol} x {remaining_qty} — {msg}")
+            send_telegram(f"Order REJECTED: {txn_type} {symbol} x {remaining_qty} — {msg}", alert_class=alert_policy.SAFETY)
             if cumulative_fill_qty > 0:
                 avg = cumulative_fill_value / cumulative_fill_qty
                 log(f"    PARTIAL before rejection: {cumulative_fill_qty}/{qty} @ avg {avg:.2f}")
@@ -1986,7 +2409,7 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
     if cumulative_fill_qty > 0:
         avg = cumulative_fill_value / cumulative_fill_qty
         log(f"    PARTIAL CLOSE: {cumulative_fill_qty}/{qty} filled @ avg {avg:.2f}. {remaining_qty} remaining!")
-        send_telegram(f"PARTIAL CLOSE: {symbol} {cumulative_fill_qty}/{qty} filled. {remaining_qty} remaining!")
+        send_telegram(f"PARTIAL CLOSE: {symbol} {cumulative_fill_qty}/{qty} filled. {remaining_qty} remaining!", alert_class=alert_policy.SAFETY)
         return {'status': 'PARTIAL', 'average_price': avg,
                 'order_id': 'cumulative', 'filled_quantity': cumulative_fill_qty}
 
@@ -2073,8 +2496,15 @@ def _refuse_unpriced_close(trade, label, reason, spot, dry_run, legs):
             f"{detail}\n"
             f"Nothing was booked — booking a guess here would record a "
             f"max loss that never happened.\n"
+            # Said in as many words because the dry-run rehearsal alert now
+            # ALSO reports "no fill". These are the two situations that wear
+            # the same words and need opposite reactions: a rehearsal is
+            # routine, this is not. The alert has to settle which it is before
+            # the reader has to guess.
+            f"THIS IS NOT A DRY-RUN REHEARSAL — the monitor is ARMED and a "
+            f"real close could not be priced. ACTION NEEDED.\n"
             f"Trade #{trade.get('id')} is parked at 'closing'. Close it by "
-            f"hand with the real exit price.")
+            f"hand with the real exit price.", alert_class=alert_policy.SAFETY)
     return False
 
 
@@ -2177,7 +2607,7 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
                     f"⚠️ {label} {stock}: {reason} reached the ORDER PATH for "
                     f"paper trade #{trade.get('id')}. No order placed. "
                     f"The exit bridge should never have been handed this "
-                    f"record — check who called close_spread for it.")
+                    f"record — check who called close_spread for it.", alert_class=alert_policy.SAFETY)
             return 'ABORT'
 
     # ── Late-day guard (urgent closes are reduce-only and get 5 more min) ──
@@ -2189,8 +2619,7 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
         send_telegram(
             f"{label} {reason} TRIGGERED {stock} @ {spot}\n"
             f"BUT past {cutoff.strftime('%H:%M')} — NOT auto-closing.\n"
-            f"Close manually in Kite!"
-        )
+            f"Close manually in Kite!", alert_class=alert_policy.SAFETY)
         return False
 
     # ── Re-verify valuation triggers on a FRESH quote before any order ────
@@ -2200,7 +2629,10 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
             # Spot passed so the re-verify applies the arbitrage floor too —
             # otherwise the freshest, most decision-relevant quote in the whole
             # flow would be the one quote nobody floor-checks.
-            fresh = get_spread_value(kite, trade, spot=spot)
+            # fresh=True: this is THE second look. Serving it from the poll
+            # cache would re-verify the trigger against the quote that caused
+            # the trigger, which passes every time.
+            fresh = get_spread_value(kite, trade, spot=spot, fresh=True)
         except Exception as e:
             log(f"  RE-VERIFY: quote fetch failed ({e}). Aborting close — trigger will re-arm.")
             return 'ABORT'
@@ -2208,7 +2640,10 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
             log(f"  RE-VERIFY ABORT: fresh quote unreliable ({fresh['unreliable']}). "
                 f"Not closing on a garbage book — trigger re-arms.")
             send_telegram(f"{label} {stock}: {reason} suppressed — fresh quote unreliable "
-                          f"({fresh['unreliable']}). Trade still open, monitoring continues.")
+                          f"({fresh['unreliable']}). Trade still open, "
+                          f"monitoring continues.",
+                          alert_class=alert_policy.close_alert_class(
+                              dry_run, _record_says_paper(trade)))
             return 'ABORT'
         if fresh['spread'] > reverify_sl:
             log(f"  RE-VERIFY ABORT: fresh spread {fresh['spread']:.2f} > {reverify_sl:.2f} — "
@@ -2216,7 +2651,10 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
                 f"(L bid {fresh['long']['bid']}/ask {fresh['long']['ask']} | "
                 f"S bid {fresh['short']['bid']}/ask {fresh['short']['ask']})")
             send_telegram(f"{label} {stock}: {reason} near-miss — fresh spread "
-                          f"{fresh['spread']:.2f} > SL {reverify_sl:.2f}. NOT closed (quote artifact).")
+                          f"{fresh['spread']:.2f} > SL {reverify_sl:.2f}. "
+                          f"NOT closed (quote artifact).",
+                          alert_class=alert_policy.close_alert_class(
+                              dry_run, _record_says_paper(trade)))
             return 'ABORT'
         log(f"  RE-VERIFY CONFIRMED: fresh spread {fresh['spread']:.2f} <= {reverify_sl:.2f}. Proceeding.")
         # The freshest book wins. The vet is being asked "could this price be
@@ -2252,7 +2690,7 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
                                    urgent=urgent)
     except Exception as e:
         log(f"  EXCEPTION during close_spread: {e}")
-        send_telegram(f"{label} {stock}: EXCEPTION during {reason} close! {e}\nManual intervention needed!")
+        send_telegram(f"{label} {stock}: EXCEPTION during {reason} close! {e}\nManual intervention needed!", alert_class=alert_policy.SAFETY)
         if close_lock_acquired:
             try:
                 store.set_trade_status(trade['id'], 'partial_close',
@@ -2272,7 +2710,13 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
     qty = trade['quantity']
     exchange = trade['exchange']
 
-    send_telegram(f"{label} {reason} TRIGGERED\n{stock} spot={spot}\nClosing spread...")
+    # SHADOW for a paper record (zebra sends the one that carries the P&L a
+    # few minutes later); SAFETY for a real record the disarmed monitor cannot
+    # close. Logged either way — see `send_telegram`.
+    send_telegram(trigger_alert_text(label, stock, reason, spot, dry_run,
+                                     trade, 'Closing spread...'),
+                  alert_class=alert_policy.close_alert_class(
+                      dry_run, _record_says_paper(trade)))
 
     # ── Pre-flight: Check actual position state ──────────────────────────
     if not dry_run:
@@ -2321,7 +2765,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             f"No orders placed. The trade is frozen at "
             f"partial_close and will NOT be monitored further.\n"
             f"This is the Feb-2026 shape — audit the order history for this "
-            f"leg before doing anything else.")
+            f"leg before doing anything else.", alert_class=alert_policy.SAFETY)
         return False
 
     # ── Guard: Both legs already flat — mark closed with recovered fills ──
@@ -2432,7 +2876,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
         if short_result['status'] == 'PARTIAL':
             remaining = close_qty - short_result.get('filled_quantity', 0)
             log(f"  WARNING: Short leg partially filled. {remaining} qty still short!")
-            send_telegram(f"{label} {stock}: Short leg partial fill. {remaining} still short!")
+            send_telegram(f"{label} {stock}: Short leg partial fill. {remaining} still short!", alert_class=alert_policy.SAFETY)
 
             # ── B10 · the long leg is sold ONLY when the short is flat ──────
             #
@@ -2476,7 +2920,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                     f"naked short. You are over-hedged, which is the bounded "
                     f"side.\n"
                     f"Trade frozen at partial_close and NOT monitored further. "
-                    f"Close the residue by hand.")
+                    f"Close the residue by hand.", alert_class=alert_policy.SAFETY)
                 return False
     else:
         log(f"\n  SHORT leg {short_sym} already flat/long (qty={short_qty}). Skipping BUY.")
@@ -2591,9 +3035,11 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
 
     send_telegram(close_alert_text(
         label, stock, reason, spot,
-        ([f"Entry: {entry_net:.2f} | Exit: not priced (no fill)"] if dry_run
+        ([f"Entry: {entry_net:.2f} | Exit: n/a (no order placed)"] if dry_run
          else [f"Exit spread: {exit_net:.2f} | Entry: {entry_net:.2f}"]),
-        total_pnl, dry_run))
+        total_pnl, dry_run, trade=trade),
+        alert_class=alert_policy.close_alert_class(
+            dry_run, _record_says_paper(trade)))
 
     # ── Update trade store ───────────────────────────────────────────────
     exit_data = {
@@ -2650,7 +3096,7 @@ def reconcile_after_close(kite: KiteConnect, trade: dict, label: str = 'BCS'
             f"🚨 {label} {trade.get('stock')}: POSITION NOT FLAT AFTER CLOSE\n"
             f"The trade is marked closed but the broker still shows: {detail}\n"
             f"Check Kite NOW — this is the shape of the Feb 2026 bug that "
-            f"flipped a short leg long."
+            f"flipped a short leg long.", alert_class=alert_policy.SAFETY
         )
         return False
     except Exception as e:
@@ -2691,8 +3137,7 @@ def close_fh_position(kite: KiteConnect, trade: dict, spot: float,
         send_telegram(
             f"FH {reason} TRIGGERED {stock} @ {spot}\n"
             f"BUT past {HARD_ORDER_CUTOFF_TIME.strftime('%H:%M')} — NOT auto-closing.\n"
-            f"Close manually in Kite!"
-        )
+            f"Close manually in Kite!", alert_class=alert_policy.SAFETY)
         return False
 
     # ── Acquire close-lock ────────────────────────────────────────────────
@@ -2707,7 +3152,7 @@ def close_fh_position(kite: KiteConnect, trade: dict, spot: float,
         return _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run)
     except Exception as e:
         log(f"  EXCEPTION during close_fh_position: {e}")
-        send_telegram(f"FH {stock}: EXCEPTION during {reason} close! {e}\nManual intervention needed!")
+        send_telegram(f"FH {stock}: EXCEPTION during {reason} close! {e}\nManual intervention needed!", alert_class=alert_policy.SAFETY)
         if close_lock_acquired:
             try:
                 fh_store.set_trade_status(trade['id'], 'partial_close',
@@ -2729,7 +3174,10 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
     sp_sym = trade['short_put_symbol']
     lp_sym = trade['long_put_symbol']
 
-    send_telegram(f"FH {reason} TRIGGERED\n{stock} spot={spot}\nClosing position...")
+    send_telegram(trigger_alert_text('FH', stock, reason, spot, dry_run,
+                                     trade, 'Closing position...'),
+                  alert_class=alert_policy.close_alert_class(
+                      dry_run, _record_says_paper(trade)))
 
     # ── Pre-flight: Check actual position state ──────────────────────────
     if not dry_run:
@@ -2777,7 +3225,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
             f"{detail}\n"
             f"No orders placed. The trade is frozen at partial_close and "
             f"will NOT be monitored further.\n"
-            f"An FH short leg is NAKED — check Kite now.")
+            f"An FH short leg is NAKED — check Kite now.", alert_class=alert_policy.SAFETY)
         return False
 
     # ── Guard: All legs already flat ─────────────────────────────────────
@@ -2841,7 +3289,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                            context=_order_ctx(trade, reason, 'short-call', 'FH'))
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log("!!! CRITICAL: SHORT CALL CLOSE FAILED — naked risk remains !!!")
-            send_telegram(f"FH {stock}: SHORT CALL CLOSE FAILED! Naked risk! Manual intervention needed!")
+            send_telegram(f"FH {stock}: SHORT CALL CLOSE FAILED! Naked risk! Manual intervention needed!", alert_class=alert_policy.SAFETY)
             if not dry_run:
                 fh_store.set_trade_status(trade['id'], 'partial_close',
                                           close_failed_leg='short_call', close_reason=reason)
@@ -2877,7 +3325,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                 f"The long call was NOT sold — it is the hedge on that naked "
                 f"short.\n"
                 f"Trade frozen at partial_close and NOT monitored further. "
-                f"Close the residue by hand.")
+                f"Close the residue by hand.", alert_class=alert_policy.SAFETY)
             return False
     else:
         log(f"\n  SHORT CALL {sc_sym} already flat (qty={sc_qty}). Skipping.")
@@ -2892,7 +3340,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                            context=_order_ctx(trade, reason, 'long-call', 'FH'))
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log(f"  WARNING: Long call close failed. Naked long remains — not critical.")
-            send_telegram(f"FH {stock}: Long call sell failed. Manual sell {lc_sym}.")
+            send_telegram(f"FH {stock}: Long call sell failed. Manual sell {lc_sym}.", alert_class=alert_policy.SAFETY)
         else:
             fills['long_call'] = result.get('average_price', 0)
     else:
@@ -2909,7 +3357,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                            context=_order_ctx(trade, reason, 'short-put', 'FH'))
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log("!!! WARNING: SHORT PUT CLOSE FAILED !!!")
-            send_telegram(f"FH {stock}: SHORT PUT CLOSE FAILED! Manual intervention needed!")
+            send_telegram(f"FH {stock}: SHORT PUT CLOSE FAILED! Manual intervention needed!", alert_class=alert_policy.SAFETY)
             if not dry_run:
                 fh_store.set_trade_status(trade['id'], 'partial_close',
                                           close_failed_leg='short_put', close_reason=reason)
@@ -2928,7 +3376,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                            context=_order_ctx(trade, reason, 'long-put', 'FH'))
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
             log(f"  WARNING: Long put sell failed. Manual sell {lp_sym}.")
-            send_telegram(f"FH {stock}: Long put sell failed. Manual sell {lp_sym}.")
+            send_telegram(f"FH {stock}: Long put sell failed. Manual sell {lp_sym}.", alert_class=alert_policy.SAFETY)
         else:
             fills['long_put'] = result.get('average_price', 0)
     else:
@@ -2984,10 +3432,12 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
 
     send_telegram(close_alert_text(
         'FH', stock, reason, spot,
-        ([f"Credit: {total_credit:.2f} | Close cost: not priced (no fill)"]
+        ([f"Credit: {total_credit:.2f} | Close cost: n/a (no order placed)"]
          if dry_run
          else [f"Credit: {total_credit:.2f} | Close cost: {close_cost:.2f}"]),
-        total_pnl, dry_run))
+        total_pnl, dry_run, trade=trade),
+        alert_class=alert_policy.close_alert_class(
+            dry_run, _record_says_paper(trade)))
 
     exit_data = {
         'exit_date': datetime.now().isoformat(),
@@ -3019,7 +3469,17 @@ def verify_positions(kite: KiteConnect, trade: dict, fatal: bool = True):
     Args:
         fatal: If True (default, single-trade mode), sys.exit on missing.
                If False (cron mode), return None and let caller handle.
+
+    A paper record is exempt: it has no legs at any broker by definition, so
+    `fatal=True` here would `sys.exit(1)` on a perfectly healthy cohort trade.
+    Same predicate and same reasoning as the cron startup sweep — this is the
+    copy of that check, and fixing only the one you opened is the most
+    repeated defect in this repo.
     """
+    if _record_says_paper(trade):
+        log(f"  #{trade.get('id')} {trade.get('stock')} — PAPER record, no "
+            f"broker legs expected (position check does not apply)")
+        return
     positions = kite.positions()['net']
 
     long_pos = None
@@ -3274,7 +3734,7 @@ def track_spot_blindness(bs: dict, spot_ok: bool, reason: str, label: str):
         send_telegram(f"{label}: SPOT UNAVAILABLE for {int(dur / 60)} min "
                       f"({bs['reason']}). This position has NO live triggers — "
                       f"SL_SPOT, SL_SPREAD and TP are all dark. Check the "
-                      f"spot_symbol and consider managing it by hand.")
+                      f"spot_symbol and consider managing it by hand.", alert_class=alert_policy.SAFETY)
         bs['last_alert'] = now
         bs['alerted'] = True
 
@@ -3378,14 +3838,14 @@ def track_spread_blindness(bs: dict, spread_ok: bool, reason: str,
     if now - bs['last_alert'] >= SPREAD_BLIND_REPEAT_SEC:
         send_telegram(f"{label}: spread quotes unreliable for {int(dur / 60)} min "
                       f"({bs['reason']}). SL_SPREAD/SL_TRAIL suspended. "
-                      f"SL_SPOT still armed at {sl_spot}.")
+                      f"SL_SPOT still armed at {sl_spot}.", alert_class=alert_policy.SAFETY)
         bs['last_alert'] = now
     near = (spot <= sl_spot * (1 + SPOT_PROXIMITY_ALERT_PCT)) if adverse_below \
         else (spot >= sl_spot * (1 - SPOT_PROXIMITY_ALERT_PCT))
     if near and now - bs['last_prox'] >= PROXIMITY_REPEAT_SEC:
         send_telegram(f"{label}: BLIND NEAR SL! spot {spot} vs SL {sl_spot}, quotes "
                       f"unreliable ({bs['reason']}). Spread SLs cannot fire — "
-                      f"consider manual action.")
+                      f"consider manual action.", alert_class=alert_policy.SAFETY)
         bs['last_prox'] = now
 
 
@@ -3524,6 +3984,11 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
             if cli_sl_spread is None:
                 sl_spread = trade['sl_spread']
 
+            # F7, single-trade mode: 3 requests per poll become 2. A smaller
+            # win than the cron loop's, but the same call is doing it, so
+            # leaving this path unbatched would just be a second definition of
+            # how a poll reads prices.
+            prefetch_book(kite, [trade])
             spot = get_spot(kite, trade['spot_symbol'])
             now = time.time()
             consecutive_errors = 0  # Reset on successful API call
@@ -3746,14 +4211,14 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
             # handler — see _is_auth_error.
             if _is_auth_error(e):
                 log("FATAL: Kite token appears expired. Cannot continue.")
-                send_telegram(f"BCS MONITOR FATAL: Kite token expired! {stock} is UNMONITORED.")
+                send_telegram(f"BCS MONITOR FATAL: Kite token expired! {stock} is UNMONITORED.", alert_class=alert_policy.SAFETY)
                 return
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 log(f"FATAL: {MAX_CONSECUTIVE_ERRORS} consecutive errors. Exiting.")
-                send_telegram(f"BCS MONITOR FATAL: {MAX_CONSECUTIVE_ERRORS} consecutive errors. {stock} is UNMONITORED!")
+                send_telegram(f"BCS MONITOR FATAL: {MAX_CONSECUTIVE_ERRORS} consecutive errors. {stock} is UNMONITORED!", alert_class=alert_policy.SAFETY)
                 return
             if consecutive_errors == 10:
-                send_telegram(f"BCS MONITOR WARNING: 10 consecutive errors for {stock}. Last: {e}")
+                send_telegram(f"BCS MONITOR WARNING: 10 consecutive errors for {stock}. Last: {e}", alert_class=alert_policy.SAFETY)
             time.sleep(10)
 
 
@@ -3831,7 +4296,7 @@ def _open_zebra_store():
         # set parse_mode. Two senders, two rules; check which one you are in.
         send_telegram(f"Cohort store unavailable ({str(e)[:120]}) "
                       f"- those positions are NOT monitored. The other books "
-                      f"continue.")
+                      f"continue.", alert_class=alert_policy.SAFETY)
         return None
 
 
@@ -3994,6 +4459,67 @@ def _leg_state(positions, symbol, want_long: bool) -> str:
                 return 'OK'
             return 'FLIPPED %+d' % q
     return 'MISSING'
+
+
+def position_check_line(trade: dict, strat: str, positions) -> tuple:
+    """`(is_warning, message)` for one record's broker-leg verification.
+
+    Extracted from the cron startup sweep 2026-08-28, for two reasons. The
+    small one: three near-identical branches, and this repo's most repeated
+    defect is a rule fixed in one of them. The load-bearing one: it makes the
+    PAPER exemption below a single testable decision rather than a `continue`
+    buried in a 4,000-line function.
+
+    **A paper record has no broker legs and never had any.** On 2026-08-28 the
+    startup sweep logged
+
+        WARNING: BCS #436 COFORGE — positions MISSING! (long=MISSING, short=MISSING)
+
+    for all eight cohort records. Every one was accurate and every one was
+    noise: the whole book is `paper: True`, so absent legs are the DEFINITION
+    of the record and not a discrepancy. A warning that fires on the healthy
+    case trains the reader to skip it, which is precisely how the OI flag on
+    COCHINSHIP got waved through.
+
+    It reports as a plain line rather than "verified", because claiming a
+    verification that never ran is the opposite lie.
+
+    The predicate is `_record_says_paper` — which DEFAULTS TO REAL — and not
+    `paper_mode`, because the question is who owns THIS record, not what mode
+    the process is in. The bcs / bear_put / fallen_hero books have never
+    carried a `paper` key, so they keep the loud warning they need, and a real
+    record with missing legs stays a WARNING in every mode.
+    """
+    tid, stock = trade.get('id'), trade.get('stock')
+    if _record_says_paper(trade):
+        return False, (f"{strat} #{tid} {stock} — PAPER record, no broker legs "
+                       f"expected (position check does not apply)")
+    if strat in ('BCS', 'BPS'):
+        long_st = _leg_state(positions, trade['long_symbol'], want_long=True)
+        short_st = _leg_state(positions, trade['short_symbol'], want_long=False)
+        if long_st != 'OK' or short_st != 'OK':
+            bad = 'FLIPPED' if 'FLIPPED' in (long_st + short_st) else 'MISSING'
+            return True, (f"{strat} #{tid} {stock} — positions {bad}! "
+                          f"(long={long_st}, short={short_st})")
+        return False, f"{strat} #{tid} {stock} — positions verified"
+    # FH: 3-4 legs
+    def _held(sym, want_long):
+        return any(p['tradingsymbol'] == sym
+                   and (p['quantity'] > 0 if want_long else p['quantity'] < 0)
+                   for p in positions)
+    missing = []
+    if not _held(trade['short_call_symbol'], False):
+        missing.append('SC')
+    if not _held(trade['short_put_symbol'], False):
+        missing.append('SP')
+    if not _held(trade['long_put_symbol'], True):
+        missing.append('LP')
+    if trade.get('long_call_symbol') and not _held(trade['long_call_symbol'],
+                                                   True):
+        missing.append('LC')
+    if missing:
+        return True, f"FH #{tid} {stock} — legs missing: {', '.join(missing)}"
+    return False, f"FH  #{tid} {stock} — all legs verified"
 
 
 def alert_store_corruption(books) -> bool:
@@ -4159,7 +4685,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             send_telegram(f"🔴 BCS MONITOR CANNOT START\nKite auth failed "
                           f"at startup ({e}).\nUNMONITORED: {stocks}\n"
                           f"Cron will keep retrying every 5 min and keep "
-                          f"failing until the token is refreshed.")
+                          f"failing until the token is refreshed.", alert_class=alert_policy.SAFETY)
             return
         # Not auth: the verification is a nicety, the monitoring is not. Carry
         # on watching rather than abandoning live positions over a hiccup.
@@ -4170,47 +4696,18 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
         positions = []
     for t in all_trades:
         strat = t['_strategy']
-        if strat == 'BCS':
-            long_st = _leg_state(positions, t['long_symbol'], want_long=True)
-            short_st = _leg_state(positions, t['short_symbol'], want_long=False)
-            if long_st != 'OK' or short_st != 'OK':
-                bad = 'FLIPPED' if 'FLIPPED' in (long_st + short_st) else 'MISSING'
-                log(f"  WARNING: BCS #{t['id']} {t['stock']} — positions {bad}! "
-                    f"(long={long_st}, short={short_st})")
-            else:
-                log(f"  BCS #{t['id']} {t['stock']} — positions verified")
-        elif strat == 'BPS':
-            long_st = _leg_state(positions, t['long_symbol'], want_long=True)
-            short_st = _leg_state(positions, t['short_symbol'], want_long=False)
-            if long_st != 'OK' or short_st != 'OK':
-                bad = 'FLIPPED' if 'FLIPPED' in (long_st + short_st) else 'MISSING'
-                log(f"  WARNING: BPS #{t['id']} {t['stock']} — positions {bad}! "
-                    f"(long={long_st}, short={short_st})")
-            else:
-                log(f"  BPS #{t['id']} {t['stock']} — positions verified")
-        else:
-            # FH: verify 3-4 legs
-            sc_ok = any(p['tradingsymbol'] == t['short_call_symbol'] and p['quantity'] < 0 for p in positions)
-            sp_ok = any(p['tradingsymbol'] == t['short_put_symbol'] and p['quantity'] < 0 for p in positions)
-            lp_ok = any(p['tradingsymbol'] == t['long_put_symbol'] and p['quantity'] > 0 for p in positions)
-            lc_ok = True
-            if t.get('long_call_symbol'):
-                lc_ok = any(p['tradingsymbol'] == t['long_call_symbol'] and p['quantity'] > 0 for p in positions)
-            missing = []
-            if not sc_ok: missing.append('SC')
-            if not sp_ok: missing.append('SP')
-            if not lp_ok: missing.append('LP')
-            if not lc_ok: missing.append('LC')
-            if missing:
-                log(f"  WARNING: FH #{t['id']} {t['stock']} — legs missing: {', '.join(missing)}")
-            else:
-                log(f"  FH  #{t['id']} {t['stock']} — all legs verified")
+        warn, msg = position_check_line(t, strat, positions)
+        log(("  WARNING: " if warn else "  ") + msg)
 
     # ── Expiry day warnings ──────────────────────────────────────────────
     # Values are the three-state attempt dicts from `new_time_stop_state`, not
     # bare True. Membership still means "armed today"; the value carries
     # whether the close has been discharged, which is what M11 restored.
     expiry_trades = {}  # keyed by trade_key(), like every other state dict
+    # Same F7 batching as the poll loop. This runs at 09:00 alongside the
+    # positions fetch and the store syncs, so an unbatched burst here is the
+    # one most likely to open the session already inside a 429 cooldown.
+    prefetch_book(kite, all_trades)
     for t in all_trades:
         _store = _get_store_for(t, bcs_store, fh_store, bps_store, zebra_store)
         if arm_time_stop(t, trade_key(t), expiry_trades, t['_strategy'],
@@ -4337,7 +4834,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         "Positions are still watched and alerted, but "
                         "NO EXIT ORDERS WILL BE PLACED - you must close "
                         "by hand.\nRe-arm: set it back to true and "
-                        "restart the monitor.")
+                        "restart the monitor.", alert_class=alert_policy.SAFETY)
 
             # AFTER the kill-switch block, never before: a beat claiming this
             # engine can book, written on the very poll the switch forced it
@@ -4347,6 +4844,22 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             _beat_all('polling', dry_run, all_trades, zebra_store,
                       kill_switch=kill_switch_announced)
             print_status = (now - last_status_time >= STATUS_PRINT_INTERVAL_SEC)
+
+            # ── F7: one batched read for the WHOLE book, once per poll ─────
+            # Before this line the loop below issued 1 `/ltp` + 2 `/quote` per
+            # BCS/BPS record (3-4 quotes for an FH one) EVERY five seconds. At
+            # 8 positions that is 24 requests/poll against a 1 req/s family,
+            # and the 2026-08-28 log has 58 `Too many requests` failures to
+            # show for it — each one a position unwatched for that poll.
+            # `/quote` and `/ltp` take 500 instruments apiece, so the whole
+            # book costs 2 requests no matter how big it gets. Everything
+            # below reads through the cache this fills; nothing below changed.
+            _pf = prefetch_book(kite, all_trades)
+            if print_status:
+                log(f"  [quotes] {_pf} batched request(s) for "
+                    f"{len(all_trades)} position(s) "
+                    f"({quote_stats['cache_hits']} served from cache "
+                    f"since start, {quote_stats['singles']} unbatched)")
 
             for trade in all_trades:
                 # ── Per-record isolation ───────────────────────────────────
@@ -4677,7 +5190,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                             closed = True
                             if not success:
                                 log(f"  {strat} #{tid} {stock}: Close failed. Trade locked — manual intervention needed.")
-                                send_telegram(f"{strat} #{tid} {stock}: SL_SPOT close FAILED. Manual intervention needed!")
+                                send_telegram(f"{strat} #{tid} {stock}: SL_SPOT close FAILED. Manual intervention needed!", alert_class=alert_policy.SAFETY)
 
                     # Cooldown gate: TP needs settled market
                     if not closed and not settled:
@@ -4716,7 +5229,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                                 closed = True
                                 if not success:
                                     log(f"  {strat} #{tid} {stock}: Close failed — manual intervention needed.")
-                                    send_telegram(f"{strat} #{tid} {stock}: SL_SPREAD close FAILED. Manual intervention needed!")
+                                    send_telegram(f"{strat} #{tid} {stock}: SL_SPREAD close FAILED. Manual intervention needed!", alert_class=alert_policy.SAFETY)
                     elif not closed and spread_val is not None and spread_val > sl_spread_val:
                         confirm['sl_spread'] = 0
 
@@ -4742,7 +5255,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                                 closed = True
                                 if not success:
                                     log(f"  {strat} #{tid} {stock}: Close failed — manual intervention needed.")
-                                    send_telegram(f"{strat} #{tid} {stock}: SL_TRAIL close FAILED. Manual intervention needed!")
+                                    send_telegram(f"{strat} #{tid} {stock}: SL_TRAIL close FAILED. Manual intervention needed!", alert_class=alert_policy.SAFETY)
                     elif not closed and spread_val is not None and (not ts['active'] or spread_val > ts['trail']):
                         confirm['sl_trail'] = 0
 
@@ -4765,7 +5278,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                             closed = True
                             if not success:
                                 log(f"  {strat} #{tid} {stock}: Close failed — manual intervention needed.")
-                                send_telegram(f"{strat} #{tid} {stock}: TP close FAILED. Manual intervention needed!")
+                                send_telegram(f"{strat} #{tid} {stock}: TP close FAILED. Manual intervention needed!", alert_class=alert_policy.SAFETY)
 
                 else:
                     # ── FH SL_SPOT: spot >= sl_spot (upside/bullish risk) ──
@@ -4776,7 +5289,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         closed = True
                         if not success:
                             log(f"  FH #{tid} {stock}: Close failed — manual intervention needed.")
-                            send_telegram(f"FH #{tid} {stock}: SL_SPOT close FAILED. Manual intervention needed!")
+                            send_telegram(f"FH #{tid} {stock}: SL_SPOT close FAILED. Manual intervention needed!", alert_class=alert_policy.SAFETY)
 
                 if closed:
                     trail_state.pop(close_key, None)
@@ -4814,16 +5327,16 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 log("FATAL: Kite token appears expired. Cannot continue.")
                 remaining = _load_all_trades(bcs_store, fh_store, bps_store, zebra_store)
                 stocks = ', '.join(f"{t['_strategy']}:{t['stock']}" for t in remaining)
-                send_telegram(f"SPREAD MONITOR FATAL: Kite token expired! Unmonitored: {stocks}")
+                send_telegram(f"SPREAD MONITOR FATAL: Kite token expired! Unmonitored: {stocks}", alert_class=alert_policy.SAFETY)
                 return
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 log(f"FATAL: {MAX_CONSECUTIVE_ERRORS} consecutive errors. Exiting.")
                 remaining = _load_all_trades(bcs_store, fh_store, bps_store, zebra_store)
                 stocks = ', '.join(f"{t['_strategy']}:{t['stock']}" for t in remaining)
-                send_telegram(f"SPREAD MONITOR FATAL: {MAX_CONSECUTIVE_ERRORS} errors. Unmonitored: {stocks}")
+                send_telegram(f"SPREAD MONITOR FATAL: {MAX_CONSECUTIVE_ERRORS} errors. Unmonitored: {stocks}", alert_class=alert_policy.SAFETY)
                 return
             if consecutive_errors == 10:
-                send_telegram(f"SPREAD MONITOR WARNING: 10 consecutive errors. Last: {e}")
+                send_telegram(f"SPREAD MONITOR WARNING: 10 consecutive errors. Last: {e}", alert_class=alert_policy.SAFETY)
             time.sleep(10)
 
 

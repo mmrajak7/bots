@@ -111,7 +111,7 @@ def test_an_optional_field_does_not_quarantine_a_live_position():
 
 def test_malformed_alert_fires_once_per_record(monkeypatch):
     sent = []
-    monkeypatch.setattr(sm, 'send_telegram', lambda m: sent.append(m))
+    monkeypatch.setattr(sm, 'send_telegram', lambda m, *a, **k: sent.append(m))
     seen = set()
     bad = _bcs_record()
     bad.pop('sl_spot')

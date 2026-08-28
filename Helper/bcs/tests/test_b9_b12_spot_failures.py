@@ -142,7 +142,7 @@ def test_spot_blind_escalates_harder_than_spread_blind():
 
 def test_the_spot_blind_tracker_alerts_after_the_threshold(monkeypatch):
     sent = []
-    monkeypatch.setattr(sm, 'send_telegram', lambda m: sent.append(m))
+    monkeypatch.setattr(sm, 'send_telegram', lambda m, *a, **k: sent.append(m))
     bs = sm.new_blind_state()
     t0 = 1_000_000.0
     monkeypatch.setattr(sm.time, 'time', lambda: t0)
@@ -158,7 +158,7 @@ def test_the_spot_blind_tracker_alerts_after_the_threshold(monkeypatch):
 def test_the_spot_blind_tracker_is_silent_below_the_threshold(monkeypatch):
     """Negative control for the test above: same calls, clock not advanced."""
     sent = []
-    monkeypatch.setattr(sm, 'send_telegram', lambda m: sent.append(m))
+    monkeypatch.setattr(sm, 'send_telegram', lambda m, *a, **k: sent.append(m))
     bs = sm.new_blind_state()
     t0 = 1_000_000.0
     monkeypatch.setattr(sm.time, 'time', lambda: t0)
@@ -169,7 +169,7 @@ def test_the_spot_blind_tracker_is_silent_below_the_threshold(monkeypatch):
 
 def test_recovery_is_announced_and_only_after_a_streak(monkeypatch):
     sent = []
-    monkeypatch.setattr(sm, 'send_telegram', lambda m: sent.append(m))
+    monkeypatch.setattr(sm, 'send_telegram', lambda m, *a, **k: sent.append(m))
     bs = sm.new_blind_state()
     t0 = 1_000_000.0
     monkeypatch.setattr(sm.time, 'time', lambda: t0)
@@ -197,7 +197,7 @@ def test_a_transient_blip_is_silent_in_both_directions(monkeypatch):
     threshold the tracker must say NOTHING, either way.
     """
     sent = []
-    monkeypatch.setattr(sm, 'send_telegram', lambda m: sent.append(m))
+    monkeypatch.setattr(sm, 'send_telegram', lambda m, *a, **k: sent.append(m))
     bs = sm.new_blind_state()
     t = [1_000_000.0]
     monkeypatch.setattr(sm.time, 'time', lambda: t[0])
@@ -215,7 +215,7 @@ def test_the_next_outage_alerts_on_its_own_clock(monkeypatch):
     """Clearing must reset the repeat timer too, or the FIRST alert of the
     next outage is swallowed by the previous spell's SPOT_BLIND_REPEAT_SEC."""
     sent = []
-    monkeypatch.setattr(sm, 'send_telegram', lambda m: sent.append(m))
+    monkeypatch.setattr(sm, 'send_telegram', lambda m, *a, **k: sent.append(m))
     bs = sm.new_blind_state()
     t = [1_000_000.0]
     monkeypatch.setattr(sm.time, 'time', lambda: t[0])
@@ -291,7 +291,7 @@ def test_a_stale_token_at_startup_telegrams(monkeypatch, tmp_path):
                                'generated_at': old}))
     monkeypatch.setattr(sm, 'TOKEN_FILE', tok)
     sent = []
-    monkeypatch.setattr(sm, 'send_telegram', lambda m: sent.append(m))
+    monkeypatch.setattr(sm, 'send_telegram', lambda m, *a, **k: sent.append(m))
     monkeypatch.setattr(sm, 'KiteConnect', lambda api_key: type(
         'K', (), {'set_access_token': lambda self, t: None})())
     sm.load_kite()
@@ -307,7 +307,7 @@ def test_a_fresh_token_at_startup_is_silent(monkeypatch, tmp_path):
                                'generated_at': datetime.now().isoformat()}))
     monkeypatch.setattr(sm, 'TOKEN_FILE', tok)
     sent = []
-    monkeypatch.setattr(sm, 'send_telegram', lambda m: sent.append(m))
+    monkeypatch.setattr(sm, 'send_telegram', lambda m, *a, **k: sent.append(m))
     monkeypatch.setattr(sm, 'KiteConnect', lambda api_key: type(
         'K', (), {'set_access_token': lambda self, t: None})())
     sm.load_kite()

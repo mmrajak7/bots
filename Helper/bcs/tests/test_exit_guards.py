@@ -94,7 +94,7 @@ def test_a_value_below_intrinsic_is_refused_not_traded():
     monkey = {'NHPC26AUG80CE': _depth(10.00, 10.10),
               'NHPC26AUG86CE': _depth(8.00, 8.10)}   # spread = 1.90, impossible
     orig = m.get_option_depth
-    m.get_option_depth = lambda kite, exch, sym: monkey[sym]
+    m.get_option_depth = lambda kite, exch, sym, fresh=False: monkey[sym]
     try:
         r = m.get_spread_value(None, NHPC, spot=90.0)
     finally:
@@ -119,7 +119,7 @@ def test_without_spot_the_floor_is_not_applied_at_all():
     monkey = {'NHPC26AUG80CE': _depth(10.00, 10.10),
               'NHPC26AUG86CE': _depth(8.00, 8.10)}
     orig = m.get_option_depth
-    m.get_option_depth = lambda kite, exch, sym: monkey[sym]
+    m.get_option_depth = lambda kite, exch, sym, fresh=False: monkey[sym]
     try:
         r = m.get_spread_value(None, NHPC)
     finally:
@@ -143,7 +143,8 @@ def test_the_reverify_quote_is_floor_checked_too(monkeypatch):
 
     seen = {}
 
-    def _fake_gsv(kite, trade, spot=None):
+    def _fake_gsv(kite, trade, spot=None, fresh=False):
+        seen['fresh'] = fresh
         seen['spot'] = spot
         return {'spread': 9.99, 'unreliable': None,
                 'long': _depth(5.0, 5.1), 'short': _depth(0.1, 0.2)}
@@ -154,6 +155,13 @@ def test_the_reverify_quote_is_floor_checked_too(monkeypatch):
     assert r == 'ABORT'                       # healed above the threshold
     assert seen['spot'] == 80.65, "re-verify quote was taken without spot, so " \
                                   "the arbitrage floor could not apply"
+    # Added 2026-08-28 with the F7 quote batching. The poll now caches every
+    # leg for the duration of a poll; if the re-verify were served from that
+    # cache it would re-check the trigger against the very quote that caused
+    # it, and pass every time.
+    assert seen['fresh'] is True, "re-verify was served from the per-poll " \
+                                  "quote cache, so it re-checked the trigger " \
+                                  "against the quote that caused it"
 
 
 # ── 3. spot corroboration (the NHPC signature) ───────────────────────────
@@ -306,7 +314,7 @@ def test_nhpc_replay_the_book_never_produces_a_tradeable_value():
     monkey = {'NHPC26AUG80CE': _depth(1.68, 1.75),
               'NHPC26AUG86CE': _depth(0.28, 1.40)}
     orig = m.get_option_depth
-    m.get_option_depth = lambda kite, exch, sym: monkey[sym]
+    m.get_option_depth = lambda kite, exch, sym, fresh=False: monkey[sym]
     try:
         r = m.get_spread_value(None, NHPC, spot=80.65)
     finally:
@@ -325,7 +333,7 @@ def test_nhpc_replay_even_a_tidy_book_is_caught_by_corroboration():
     monkey = {'NHPC26AUG80CE': _depth(0.70, 0.74),
               'NHPC26AUG86CE': _depth(0.30, 0.32)}      # tidy, spread 0.38
     orig = m.get_option_depth
-    m.get_option_depth = lambda kite, exch, sym: monkey[sym]
+    m.get_option_depth = lambda kite, exch, sym, fresh=False: monkey[sym]
     try:
         r = m.get_spread_value(None, NHPC, spot=80.65)
     finally:

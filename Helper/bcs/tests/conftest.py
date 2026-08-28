@@ -331,3 +331,26 @@ def book(request, tmp_path, monkeypatch):
         mod=mod, cls=cls, make=make, data=data, lock=lock, stem=stem,
         payload=dict(payload), tmp=tmp_path,
         read=lambda: json.loads(data.read_text(encoding='utf-8')))
+
+
+# ── The per-poll quote cache is MODULE state; no test may inherit it ────────
+#
+# Added 2026-08-28 with the F7 batching. `spread_monitor._quote_cache` /
+# `_ltp_cache` live for a poll in production (`prefetch_book` drops them at the
+# top of every one) but for the whole PROCESS in a test run — so without this
+# rail, `test_a_one_sided_book_reports_zero_not_a_crash` read a book left
+# behind by an earlier file and asserted against a price from another test's
+# fixture. It failed loudly, which was luck: the same leak could just as easily
+# have made a guard test PASS on a quote it never fetched.
+#
+# The rate-limit cooldown is reset too. It is wall-clock state that a test
+# simulating a 429 would otherwise leave armed for every test that runs after
+# it in the same process, silently turning their quote calls into refusals.
+@pytest.fixture(autouse=True)
+def _fresh_quote_cache():
+    from bcs import spread_monitor as _sm
+    _sm.reset_quote_cache()
+    _sm.reset_quote_cooldown()
+    yield
+    _sm.reset_quote_cache()
+    _sm.reset_quote_cooldown()

@@ -454,12 +454,38 @@ class MemoryStore:
 # ── Telegram ─────────────────────────────────────────────────────────────────
 
 class TelegramSpy:
+    """Records what the monitor tried to send, THROUGH the real alert policy.
+
+    `sent` holds only what `bcs.alert_policy` would actually deliver, and
+    `suppressed` holds what it withheld, because a spy that captures
+    everything is a fake that is LAXER than production — the exact shape
+    `feedback_fake_must_not_be_safer_than_production` was written about, only
+    inverted. A test asserting "the owner was told" must fail when the policy
+    would have silenced the message.
+
+    `offered` keeps every (class, message) pair regardless, so a test can still
+    tell "the monitor never noticed" apart from "the monitor noticed and the
+    policy withheld it" — two states that both leave `sent` empty and need
+    opposite fixes (feedback_never_asked_is_not_failed).
+    """
+
     def __init__(self):
         self.sent = []
+        self.suppressed = []
+        self.offered = []
 
-    def __call__(self, msg):
+    def __call__(self, msg, alert_class=None):
+        from bcs import alert_policy
+        self.offered.append((alert_class, msg))
+        ok, _why = alert_policy.should_send(alert_class)
+        if not ok:
+            self.suppressed.append((alert_class, msg))
+            return True
         self.sent.append(msg)
         return True
+
+    def offered_containing(self, needle):
+        return [m for _c, m in self.offered if needle in m]
 
     def install(self, monkeypatch, module):
         monkeypatch.setattr(module, 'send_telegram', self)
