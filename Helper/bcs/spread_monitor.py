@@ -1440,6 +1440,15 @@ def record_time_stop_result(state: dict, success, trade: dict, store,
             f"ABORTED before any order. Time stop stays armed.")
         return 'armed'
 
+    #: `'MANUAL'` — Fallen Hero, which the system does not trade. It consumes
+    #: an attempt and walks the same retry-then-escalate ladder, because the
+    #: ladder's real product is ESCALATING PRESSURE ON A HUMAN and that is
+    #: exactly what is wanted here. Only the words differ, and they have to:
+    #: "force close FAILED, none filled" would describe an order this system
+    #: never places, and an alert that misdescribes itself is how a reader
+    #: learns to skip it.
+    manual = (success == 'MANUAL')
+
     if success is True:
         state['state'] = 'closed'
         state['next_attempt_after'] = 0.0
@@ -1463,7 +1472,17 @@ def record_time_stop_result(state: dict, success, trade: dict, store,
     _persist_time_stop(trade, store, state)
 
     who = f"{label} #{trade.get('id')} {trade.get('stock')}"
-    if final:
+    if final and manual:
+        log(f"  {who}: {attempts} manual-close alert(s) sent and the position "
+            f"is STILL OPEN. No further reminder today.")
+        send_telegram(
+            f"🚨 {who}: STILL OPEN ON EXPIRY DAY\n"
+            f"{attempts} reminder(s) sent this session. This is a Fallen Hero "
+            f"— the system places NO orders for it, by design.\n"
+            f"The position is OPEN inside the delivery-margin ramp and its "
+            f"short call is the largest delivery exposure in the book. "
+            f"CLOSE IT BY HAND IN KITE NOW.")
+    elif final:
         log(f"  {who}: EXPIRY FORCE CLOSE FAILED after {attempts} attempt(s). "
             f"No further automatic attempt today. Manual intervention needed!")
         send_telegram(
@@ -1472,6 +1491,10 @@ def record_time_stop_result(state: dict, success, trade: dict, store,
             f"automatic attempt today.\n"
             f"The position is OPEN inside the delivery-margin ramp — close it "
             f"by hand in Kite NOW.")
+    elif manual:
+        log(f"  {who}: manual-close reminder {attempts}/"
+            f"{TIME_STOP_MAX_ATTEMPTS} sent. Next in {wait}s while the "
+            f"position is still open.")
     else:
         # "while the position is still open" is not hedging. Every close
         # failure past the close-lock freezes the record at `partial_close`,
@@ -3150,59 +3173,157 @@ def reconcile_after_close(kite: KiteConnect, trade: dict, label: str = 'BCS'
 
 # ── FH Close ────────────────────────────────────────────────────────────────
 
-def close_fh_position(kite: KiteConnect, trade: dict, spot: float,
-                      reason: str, dry_run: bool) -> bool:
-    """
-    Close a Fallen Hero position. Naked risk (short call) first.
-    Updates FH TradeStore on success (local + Drive).
-    Returns True if fully closed, False if any leg failed.
+#: (trade id, reason, date) already told to the owner. FH triggers evaluate on
+#: every five-second poll and the record STAYS OPEN afterwards — a manual close
+#: is not something the monitor can complete — so without this the SL breach
+#: would Telegram roughly 700 times an hour. In memory, like
+#: `_unpriced_close_alerted`: the process is long-lived within a session, and a
+#: new session re-alerting a still-breached FH stop is correct, not noise.
+_fh_manual_alerted: dict = {}
 
-    Close order (naked risk first):
-      1. BUY back short call (naked — most dangerous)
-      2. SELL long call (if exists — hedge, no longer needed)
-      3. BUY back short put
-      4. SELL long put
+#: The order the OWNER should work in by hand, and the reason for it. Same
+#: sequence `_close_fh_inner` used to place: the naked short first, then its
+#: hedge, then the put spread's short before its long. Never sell a hedge while
+#: the short it covers is live.
+_FH_MANUAL_SEQUENCE = (
+    ('short_call_symbol', 'BUY back', 'SHORT CALL', 'naked — do this FIRST'),
+    ('long_call_symbol', 'SELL', 'LONG CALL', 'only after the short call is flat'),
+    ('short_put_symbol', 'BUY back', 'SHORT PUT', 'before its long put'),
+    ('long_put_symbol', 'SELL', 'LONG PUT', 'last — it is the hedge'),
+)
+
+
+def _fh_manual_close_required(trade, spot, reason, live, dry_run):
+    """FH is traded BY HAND. Say so, with the symbols and quantities, and stop.
+
+    Returns `'MANUAL'` — a third outcome beside True/False, deliberately, so
+    neither call site can read this as a close that failed. Nothing was
+    attempted; there is nothing to have failed.
+    """
+    stock = trade.get('stock')
+    #: Quantities come from `live`, i.e. from the BROKER's net position, not
+    #: from the record's `quantity`. A leg partially closed by hand already
+    #: must not be re-quoted at its original size.
+    lines = [f"{i}. {action} {label}  {sym}  x {abs(q)}   ({why})"
+             for i, (sym, q, action, label, why) in enumerate(live, 1)]
+
+    log("")
+    log("=" * 70)
+    log(f"  FH {reason} TRIGGERED — {stock} spot = {spot}")
+    log(f"  FALLEN HERO IS TRADED BY HAND. NO ORDER WILL BE PLACED.")
+    log("=" * 70)
+    for ln in lines:
+        log(f"    {ln}")
+    log(f"  Record the exit afterwards with the real fill prices — see "
+        f"`fallen_hero.trade_store.update_trade_exit`.")
+
+    key = (trade.get('id'), reason, datetime.now().strftime('%Y-%m-%d'))
+    if _fh_manual_alerted.get(key) is None:
+        _fh_manual_alerted[key] = True
+        send_telegram(
+            f"🔴 FH {stock}: {reason} TRIGGERED @ {spot}\n"
+            f"Fallen Hero is traded BY HAND — the monitor places no FH "
+            f"orders. Close it yourself, in this order:\n"
+            + '\n'.join(lines) + "\n"
+            f"Then record the exit with the real fill prices, or the book "
+            f"will keep showing this position open."
+            + ("\n[DRY RUN]" if dry_run else ""),
+            alert_class=alert_policy.SAFETY)
+    return 'MANUAL'
+
+
+def close_fh_position(kite: KiteConnect, trade: dict, spot: float,
+                      reason: str, dry_run: bool):
+    """**FALLEN HERO IS TRADED BY HAND. THIS PLACES NO ORDERS. EVER.**
+
+    Owner decision, 2026-08-28: *"FH is done manually — only monitoring we
+    need"*. The system's job for a Fallen Hero is to WATCH and ALERT. Triggers
+    still evaluate, the SL still fires, the delivery-margin nag still runs —
+    and the action is a Telegram telling the owner what to do in Kite, with the
+    symbols and the quantities.
+
+    **The refusal is structural, not a switch.** FH orders were inert before
+    today only because the crontab carries `--dry-run`, which is a property of
+    a flag rather than of the design: the day the exit bridge arms for BCS,
+    every FH order in `_close_fh_inner` would have come along for the ride, on
+    the one structure in the fleet with a NAKED SHORT CALL. So the gate is
+    here, above the close lock and above every order, and it is unconditional:
+
+        any leg live at the broker  ->  alert the owner, place nothing
+        every leg already flat      ->  nothing to trade; try to BOOK it
+
+    The second branch is the only route left into `_close_fh_inner`, and it
+    lands in that function's all-legs-flat recovery, which places no orders and
+    books only from ORDER_TAG fills this system itself made. It cannot reach
+    Steps 1-4. Those steps are RETAINED, not deleted — ~450 historical records
+    and the D1/D2/D3 regression suite are built on that structure, and deleting
+    a store method's last caller is how a store method quietly loses its
+    contract — but they are unreachable from the monitor and must stay that
+    way. See `_close_fh_inner`'s own banner.
+
+    NO CLOSE LOCK is taken on the flat path either. `begin_close` exists to
+    stop two processes placing the same orders; with no orders it buys nothing
+    and costs something real — a record parked at `'closing'` when the booking
+    is then refused for want of a priceable fill, which for a hand-closed
+    position (the owner's orders are UNTAGGED, so `find_recoverable_fill`
+    correctly refuses them) is the NORMAL outcome, not the exception.
+
+    THE LATE-DAY GUARD IS GONE, on purpose. It existed to stop this function
+    placing an order past `HARD_ORDER_CUTOFF_TIME`; with no order to stop it
+    would only have SUPPRESSED the manual alert in the last minutes of the
+    session, which is when the owner most needs to hear that a stop has been
+    breached and there is no automation behind it.
+
+    Returns `'MANUAL'` when the owner must act, True when the record was
+    booked, False when it could not be.
     """
     fh_store = get_fh_store()
     stock = trade['stock']
 
+    # ── Read the book. READ-ONLY: this is the whole of the money path now. ──
+    #
+    # The read is guarded because it is no longer inside the try/except that
+    # used to wrap `_close_fh_inner`: a dead token or a rate-limited
+    # `kite.positions()` would otherwise raise out of here into the poll loop.
+    # An unreadable book means we do not know whether the legs are live, and
+    # the honest response to "I cannot see it" is to tell the owner the trigger
+    # fired — never to conclude it is flat, which is what an empty list would
+    # mean one branch further down.
+    try:
+        live = []
+        for field, action, label, why in _FH_MANUAL_SEQUENCE:
+            sym = trade.get(field)
+            if not sym:
+                continue                  # 3-leg FH has no long call
+            qty = get_net_position(kite, sym) if not dry_run else (
+                -trade['quantity'] if 'short' in field else trade['quantity'])
+            if qty != 0:
+                live.append((sym, qty, action, label, why))
+    except Exception as e:
+        log(f"  FH #{trade.get('id')} {stock}: could not read positions ({e}). "
+            f"Assuming the legs are LIVE and alerting.")
+        live = [(trade[f], trade.get('quantity', 0), a, lb,
+                 f"{w} — QUANTITY UNVERIFIED, the position book was unreadable")
+                for f, a, lb, w in _FH_MANUAL_SEQUENCE if trade.get(f)]
+
+    if live:
+        return _fh_manual_close_required(trade, spot, reason, live, dry_run)
+
+    # ── Every leg is flat. Nothing to trade — only something to record. ────
     log("")
     log("=" * 70)
     log(f"  FH {reason} TRIGGERED! {stock} spot = {spot}")
-    log(f"  Initiating FH close sequence...")
+    log(f"  Every leg is already FLAT at the broker — no order is owed. "
+        f"Attempting to BOOK the exit.")
     log("=" * 70)
-
-    # ── Late-day guard (FH closes are always urgent: SL_SPOT/expiry only) ──
-    now_t = datetime.now().time()
-    if now_t > HARD_ORDER_CUTOFF_TIME:
-        log(f"  LATE-DAY GUARD: {now_t.strftime('%H:%M')} > {HARD_ORDER_CUTOFF_TIME.strftime('%H:%M')}.")
-        log(f"  Too close to market close. Not placing orders — manual intervention needed.")
-        send_telegram(
-            f"FH {reason} TRIGGERED {stock} @ {spot}\n"
-            f"BUT past {HARD_ORDER_CUTOFF_TIME.strftime('%H:%M')} — NOT auto-closing.\n"
-            f"Close manually in Kite!", alert_class=alert_policy.SAFETY)
-        return False
-
-    # ── Acquire close-lock ────────────────────────────────────────────────
-    close_lock_acquired = False
-    if not dry_run:
-        if not fh_store.begin_close(trade['id'], reason):
-            log(f"  Trade #{trade['id']} is already closing/closed. Skipping.")
-            return True  # Not an error — another process has it
-        close_lock_acquired = True
-
     try:
         return _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run)
     except Exception as e:
         log(f"  EXCEPTION during close_fh_position: {e}")
-        send_telegram(f"FH {stock}: EXCEPTION during {reason} close! {e}\nManual intervention needed!", alert_class=alert_policy.SAFETY)
-        if close_lock_acquired:
-            try:
-                fh_store.set_trade_status(trade['id'], 'partial_close',
-                                          close_error=str(e), close_reason=reason)
-            except Exception as inner_e:
-                log(f"  Could not set partial_close status: {inner_e}")
-                fh_store._sync_locked = False
+        send_telegram(f"FH {stock}: EXCEPTION while booking the {reason} "
+                      f"close! {e}\nNo order was placed (FH is manual). "
+                      f"Record the exit by hand.",
+                      alert_class=alert_policy.SAFETY)
         return False
 
 
@@ -3212,6 +3333,100 @@ def close_fh_position(kite: KiteConnect, trade: dict, spot: float,
 #: half-finished case.
 _FH_FILL_FIELD = {'short_call': 'short_call_fill', 'long_call': 'long_call_fill',
                   'short_put': 'short_put_fill', 'long_put': 'long_put_fill'}
+
+
+def _fh_skipped_leg(kite, fills, unpriced_skips, *, leg_key, leg_label,
+                    symbol, txn, qty_seen, dry_run):
+    """D4 — a leg ALREADY FLAT on arrival is not a leg that closed at 0.00.
+
+    The close sequence skips a leg the broker says is already flat. `fills` is
+    pre-seeded with `0.0`, so before this existed the skip left the seed
+    standing and the summary arithmetic read it as an OBSERVED price:
+
+        close_cost = SC + SP - LC - LP
+
+    A skipped SHORT leg therefore contributed a buyback cost of zero, which is
+    the CHEAPEST buyback that exists — so the error runs in the FLATTERING
+    direction, silently, with no note on the record and `update_trade_exit`
+    called as though everything had been transacted. Measured on the reported
+    case: `short_put_fill 0.0`, `close_cost 7.00`, `pnl_per_share 90.75`
+    against a truthful 15.00 / 82.75 — Rs 3,200 of P&L that did not exist.
+    Same `0.0`-seed ambiguity as D1: skipped, failed and genuinely-zero all
+    read alike. D1/D2 answered it with `closed_now`; this is the third face of
+    it and reuses the same idea rather than inventing a fourth.
+
+    Two outcomes, and only two:
+
+      * **the price is KNOWABLE** — one of OUR ORDER_TAG orders closed that leg
+        earlier this session, so `find_recoverable_fill` can supply the real
+        fill. Nothing is approximate then; it is an observed price that simply
+        arrived through the order book instead of through this sequence.
+      * **the price is NOT knowable** — book APPROXIMATE, with a marker.
+        Deliberately NOT `_refuse_unpriced_close`: that guard exists for the
+        case where a price is unknown AND something needs a human. Here the
+        position genuinely IS flat, nothing is at risk, and refusing would
+        strand ordinary closes on a non-dangerous state. The cost of booking
+        is a P&L figure known to be optimistic and SAID to be; the cost of
+        refusing is a live-looking record for a position that no longer
+        exists. See `feedback_guards_need_the_inverse_review`.
+
+    An ABSENT leg (a 3-leg FH with no long call) never reaches here — the
+    caller guards on the symbol. An absent hedge is worth exactly zero and must
+    not share a literal with a leg that exists and could not be priced.
+    """
+    log(f"\n  {leg_label.upper()} {symbol} already flat (qty={qty_seen}). Skipping.")
+    if dry_run:
+        # No order was placed and none will be booked; reading the live order
+        # book to price a rehearsal would be a real API call for a fiction.
+        return
+    rec = find_recoverable_fill(kite, symbol, txn)
+    if rec['price'] is not None:
+        fills[leg_key] = rec['price']
+        log(f"    Priced from our own {txn} fill: {rec['price']} — this leg is "
+            f"EXACT, not approximate.")
+        return
+    unpriced_skips.append((leg_key, leg_label, symbol, txn, rec))
+    log(f"    No {ORDER_TAG} {txn} fill prices it. Its close cost is UNKNOWN "
+        f"and is counted as 0.00 — the P&L below is APPROXIMATE and, for a "
+        f"short leg, optimistic.")
+
+
+def _fh_clamp_pnl(pnl_per_share, total_credit, trade, where):
+    """CLAMP `pnl_per_share` to `total_credit` — a Fallen Hero cannot beat it.
+
+    `close_cost = SC + SP - LC - LP`, and both long strikes sit further OTM
+    than their shorts, so `SC >= LC` and `SP >= LP` for the same expiry:
+    close_cost is non-negative and `credit - close_cost` can never exceed the
+    credit. That makes `total_credit` a MATHEMATICALLY ACHIEVABLE bound (every
+    leg expiring worthless reaches it), which per CLAUDE.md's "Valuation
+    bounds" is a thing to CLAMP, not an estimate to refuse.
+
+    It is applied on every booking path regardless of cause, not only where D4
+    can reach: the reported number was 102.75 against a credit of 97.75, and a
+    figure that is arithmetically impossible must not be reachable by any
+    future route either.
+
+    Returns `(pnl, clamped_from)` — `clamped_from` is None when the clamp did
+    not bind. It is LOUD when it does. A clamp that fires silently converts a
+    visible bug into a plausible number, which is the failure it exists to
+    prevent, not a fix for it.
+    """
+    if pnl_per_share <= total_credit:
+        return pnl_per_share, None
+    log("")
+    log("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    log(f"  !!! IMPOSSIBLE P&L CLAMPED ({where})")
+    log(f"  !!! computed {pnl_per_share:+.2f}/share on a structure whose "
+        f"maximum is its credit, {total_credit:.2f}")
+    log(f"  !!! booking {total_credit:.2f}. Something priced a leg wrongly — "
+        f"read the fills above.")
+    log("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    logger.error(
+        'FH #%s %s: pnl_per_share %.2f exceeds total_credit %.2f at %s — '
+        'clamped. This is arithmetically impossible for a Fallen Hero; a leg '
+        'was mispriced.', trade.get('id'), trade.get('stock'),
+        pnl_per_share, total_credit, where)
+    return total_credit, pnl_per_share
 
 
 def _freeze_fh_leg_failure(fh_store, trade, reason, dry_run, leg_key,
@@ -3389,7 +3604,27 @@ def _fh_put_legs_open(sp_sym, sp_qty, lp_sym, lp_qty):
 
 
 def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
-    """Inner FH close logic, separated so close_fh_position() can wrap with try/except."""
+    """Inner FH close logic, separated so close_fh_position() can wrap with try/except.
+
+    ⚠ **STEPS 1-4 BELOW PLACE ORDERS AND ARE NO LONGER REACHABLE FROM THE
+    MONITOR.** Fallen Hero is traded BY HAND (owner, 2026-08-28). Its only
+    caller, `close_fh_position`, refuses any close with a leg live at the
+    broker before it ever gets here, so the only branch this function can now
+    reach in production is the all-legs-flat recovery below — which places
+    nothing and books only from ORDER_TAG fills this system itself made.
+
+    They are RETAINED rather than deleted, deliberately: ~450 historical
+    records were closed by this exact sequence, and the D1/D2/D3 regression
+    suite (`test_d1_fh_long_leg_freeze.py`, `test_d2_partial_close_residue.py`,
+    `test_b11_fh_and_legstate.py`) drives this function directly to pin the
+    freeze-don't-book invariants. Deleting them would delete the only executable
+    statement of what an FH close is supposed to do.
+
+    **If you are wiring a new caller into this function, do not.** Route it
+    through `close_fh_position` and it will be refused, which is the answer.
+    `test_the_monitor_places_no_fh_order` fails if a live-leg FH trigger ever
+    reaches a `place_order`.
+    """
     stock = trade['stock']
     qty = trade['quantity']
     exchange = trade['exchange']
@@ -3486,6 +3721,13 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         close_cost = sc_fill + sp_fill - lc_fill - lp_fill
         total_credit = trade['total_credit']
         pnl_per_share = total_credit - close_cost
+        # Every leg here is priced by one of OUR fills or the close was
+        # refused above, so the clamp cannot bind on any input this branch
+        # accepts. It is applied anyway: `_fh_clamp_pnl`'s whole point is that
+        # an impossible number must be unreachable by ANY route, including one
+        # that does not exist yet. It is loud, so a bind is a bug report.
+        pnl_per_share, clamped_from = _fh_clamp_pnl(
+            pnl_per_share, total_credit, trade, 'already-flat recovery')
         total_pnl = pnl_per_share * qty
         exit_data = {
             'exit_date': datetime.now().isoformat(),
@@ -3497,6 +3739,9 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
             'pnl_per_share': pnl_per_share, 'total_pnl': total_pnl,
             'notes': 'All legs flat when close triggered. Fills recovered from order history.',
         }
+        if clamped_from is not None:
+            exit_data['pnl_clamped_from'] = clamped_from
+            exit_data['pnl_approximate'] = True
         if not dry_run:
             fh_store.update_trade_exit(trade['id'], exit_data)
         send_telegram(f"FH {stock}: {reason} but all legs already flat. Marked closed.")
@@ -3510,6 +3755,12 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
     #: same. D1 turned on exactly that ambiguity, so the freeze paths below
     #: read this instead of guessing from `fills`.
     closed_now = {}
+
+    #: D4 — legs ALREADY FLAT on arrival that no ORDER_TAG fill of ours could
+    #: price. Their close cost is genuinely unknown; the arithmetic below
+    #: counts it as 0.00 and the exit is stamped APPROXIMATE so no reader can
+    #: present it as exact. `[(leg_key, leg_label, symbol, txn, recovery)]`.
+    unpriced_skips: list = []
 
     # ── Step 1: BUY back short call (naked risk — MOST DANGEROUS) ────────
     if sc_qty < 0:
@@ -3547,7 +3798,9 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                                sp_sym, sp_qty, lp_sym, lp_qty)):
             return False
     else:
-        log(f"\n  SHORT CALL {sc_sym} already flat (qty={sc_qty}). Skipping.")
+        _fh_skipped_leg(kite, fills, unpriced_skips, leg_key='short_call',
+                        leg_label='short call', symbol=sc_sym, txn='BUY',
+                        qty_seen=sc_qty, dry_run=dry_run)
 
     # ── Step 2: SELL long call (if exists — hedge, no longer needed) ─────
     if lc_sym and lc_qty > 0:
@@ -3585,9 +3838,13 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                            remaining_legs=_fh_put_legs_open(
                                sp_sym, sp_qty, lp_sym, lp_qty)):
             return False
-    else:
-        if lc_sym:
-            log(f"\n  LONG CALL {lc_sym} already flat (qty={lc_qty}). Skipping.")
+    elif lc_sym:
+        # An ABSENT long call is worth exactly zero and is NOT unpriced; only a
+        # leg that EXISTS and was flat on arrival can be unknown. The two must
+        # never share a literal — the all-flat branch above says the same.
+        _fh_skipped_leg(kite, fills, unpriced_skips, leg_key='long_call',
+                        leg_label='long call', symbol=lc_sym, txn='SELL',
+                        qty_seen=lc_qty, dry_run=dry_run)
 
     # ── Step 3: BUY back short put ───────────────────────────────────────
     if sp_qty < 0:
@@ -3626,7 +3883,9 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
             # the hedge line together say everything true about this state.
             return False
     else:
-        log(f"\n  SHORT PUT {sp_sym} already flat (qty={sp_qty}). Skipping.")
+        _fh_skipped_leg(kite, fills, unpriced_skips, leg_key='short_put',
+                        leg_label='short put', symbol=sp_sym, txn='BUY',
+                        qty_seen=sp_qty, dry_run=dry_run)
 
     # ── Step 4: SELL long put ────────────────────────────────────────────
     if lp_qty > 0:
@@ -3656,7 +3915,9 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                            closed_now=closed_now):
             return False
     else:
-        log(f"\n  LONG PUT {lp_sym} already flat (qty={lp_qty}). Skipping.")
+        _fh_skipped_leg(kite, fills, unpriced_skips, leg_key='long_put',
+                        leg_label='long put', symbol=lp_sym, txn='SELL',
+                        qty_seen=lp_qty, dry_run=dry_run)
 
     # The FH twin of the unpriced-leg guard on the BCS path. `close_leg` can
     # report a leg CLOSED with `average_price: None` when it found the leg
@@ -3680,6 +3941,27 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
     total_credit = trade['total_credit']
     close_cost = fills['short_call'] + fills['short_put'] - fills['long_call'] - fills['long_put']
     pnl_per_share = total_credit - close_cost
+
+    # D4 — an unpriced skipped leg contributes 0.00 above. That is not a
+    # price, it is a hole, and it runs one way per side: a SHORT leg counted
+    # at zero is the cheapest buyback there is, so the P&L is optimistic. Say
+    # it, on the record and in the alert, and never let a reader downstream
+    # meet the number without the caveat.
+    approx_notes = []
+    if unpriced_skips:
+        log("")
+        log("  *** P&L IS APPROXIMATE — a leg could not be priced ***")
+        for leg_key, leg_label, symbol, txn, rec in unpriced_skips:
+            side = 'optimistic' if leg_key.startswith('short') else 'conservative'
+            why = ('the order book was unreadable' if rec.get('error')
+                   else f"{rec['untagged']} untagged {txn} order(s), none ours"
+                   if rec.get('untagged') else f"no {ORDER_TAG} {txn} fill today")
+            log(f"    {leg_label} {symbol}: already flat, {why}. "
+                f"Counted as 0.00 — {side}.")
+            approx_notes.append(f"{leg_label} ({why})")
+
+    pnl_per_share, clamped_from = _fh_clamp_pnl(
+        pnl_per_share, total_credit, trade, 'close summary')
     total_pnl = pnl_per_share * qty
 
     log("")
@@ -3695,38 +3977,66 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         log(f"  Entry credit/share:  {total_credit:.2f}")
         log( "  P&L:                 not computed (dry run has no fills)")
     else:
-        log(f"  Short Call fill:     {fills['short_call']:.2f} (BUY back)")
-        log(f"  Long Call fill:      {fills['long_call']:.2f} (SELL)")
-        log(f"  Short Put fill:      {fills['short_put']:.2f} (BUY back)")
-        log(f"  Long Put fill:       {fills['long_put']:.2f} (SELL)")
-        log(f"  Close cost/share:    {close_cost:.2f}")
+        unknown = {k for k, *_ in unpriced_skips}
+
+        def _f(key):
+            return ('UNKNOWN (counted 0.00)' if key in unknown
+                    else f"{fills[key]:.2f}")
+        log(f"  Short Call fill:     {_f('short_call')} (BUY back)")
+        log(f"  Long Call fill:      {_f('long_call')} (SELL)")
+        log(f"  Short Put fill:      {_f('short_put')} (BUY back)")
+        log(f"  Long Put fill:       {_f('long_put')} (SELL)")
+        log(f"  Close cost/share:    {close_cost:.2f}"
+            + ('  [APPROXIMATE]' if unpriced_skips else ''))
         log(f"  Entry credit/share:  {total_credit:.2f}")
-        log(f"  P&L per share:       {pnl_per_share:+.2f}")
+        log(f"  P&L per share:       {pnl_per_share:+.2f}"
+            + ('  [APPROXIMATE]' if unpriced_skips or clamped_from else ''))
         log(f"  Total P&L:           Rs {total_pnl:+,.0f}")
     log(f"  Spot at close:       {spot}")
     log("=" * 70)
 
+    _fh_lines = ([f"Credit: {total_credit:.2f} | Close cost: n/a (no order placed)"]
+                 if dry_run
+                 else [f"Credit: {total_credit:.2f} | Close cost: {close_cost:.2f}"])
+    if unpriced_skips and not dry_run:
+        _fh_lines.append(
+            "P&L is APPROXIMATE — " + ', '.join(l for _, l, *_ in unpriced_skips)
+            + " was already flat and could not be priced (counted at 0.00).")
+    if clamped_from is not None:
+        _fh_lines.append(
+            f"P&L was CLAMPED from {clamped_from:+.2f} to the structure's "
+            f"maximum {total_credit:.2f}/share — a leg was mispriced.")
     send_telegram(close_alert_text(
-        'FH', stock, reason, spot,
-        ([f"Credit: {total_credit:.2f} | Close cost: n/a (no order placed)"]
-         if dry_run
-         else [f"Credit: {total_credit:.2f} | Close cost: {close_cost:.2f}"]),
+        'FH', stock, reason, spot, _fh_lines,
         total_pnl, dry_run, trade=trade),
         alert_class=alert_policy.close_alert_class(
             dry_run, _record_says_paper(trade)))
+
+    # An unpriced leg is recorded as UNKNOWN, never as 0.00. The arithmetic
+    # above had to put a number somewhere; the RECORD must not, or the next
+    # reader meets a price nobody observed and has no way to tell.
+    recorded = {field: fills[key] for key, field in _FH_FILL_FIELD.items()}
+    for leg_key, *_ in unpriced_skips:
+        recorded[_FH_FILL_FIELD[leg_key]] = None
 
     exit_data = {
         'exit_date': datetime.now().isoformat(),
         'exit_reason': reason,
         'exit_spot': spot,
-        'short_call_fill': fills['short_call'],
-        'long_call_fill': fills['long_call'],
-        'short_put_fill': fills['short_put'],
-        'long_put_fill': fills['long_put'],
+        **recorded,
         'close_cost': close_cost,
         'pnl_per_share': pnl_per_share,
         'total_pnl': total_pnl,
     }
+    if unpriced_skips:
+        exit_data['pnl_approximate'] = True
+        exit_data['unpriced_legs'] = [k for k, *_ in unpriced_skips]
+        exit_data['notes'] = (
+            'P&L is APPROXIMATE: ' + '; '.join(approx_notes)
+            + '. Each was already flat on arrival and is counted at 0.00.')
+    if clamped_from is not None:
+        exit_data['pnl_clamped_from'] = clamped_from
+        exit_data['pnl_approximate'] = True
 
     if not dry_run:
         fh_store.update_trade_exit(trade['id'], exit_data)
@@ -5720,12 +6030,28 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     # ── FH SL_SPOT: spot >= sl_spot (upside/bullish risk) ──
                     if spot >= sl_spot_val:
                         log(f"\n  FH #{tid} {stock} *** SL_SPOT HIT: {spot:.2f} >= {sl_spot_val} ***")
-                        closing_in_progress[close_key] = "SL_SPOT"
+                        # NO `closing_in_progress` MARKER FOR FH, and this is
+                        # load-bearing. The marker stops a second close being
+                        # started while orders are in flight; FH places none,
+                        # so it protects nothing — and it would never be
+                        # released, because neither FH outcome moves the record
+                        # out of `get_open_trades()` any more (the close lock
+                        # is gone with the orders). A held marker means the
+                        # position is never polled again: the M16 shape, made
+                        # permanent. A hand-traded position must stay WATCHED.
                         success = close_fh_position(kite, trade, spot, "SL_SPOT", dry_run)
-                        closed = True
-                        if not success:
-                            log(f"  FH #{tid} {stock}: Close failed — manual intervention needed.")
-                            send_telegram(f"FH #{tid} {stock}: SL_SPOT close FAILED. Manual intervention needed!", alert_class=alert_policy.SAFETY)
+                        if success is True:
+                            closed = True
+                        else:
+                            # 'MANUAL' — legs live, the owner must trade it —
+                            # or False — legs flat but the exit cannot be
+                            # priced. Neither is fixed by retrying and both
+                            # alert with their OWN once-per-day dedup
+                            # (`_fh_manual_alerted`, `_unpriced_close_alerted`).
+                            # A Telegram here would fire on every 5s poll.
+                            log(f"  FH #{tid} {stock}: SL_SPOT needs the owner "
+                                f"({'no order placed — FH is manual' if success == 'MANUAL' else 'flat but unpriceable'}). "
+                                f"Still monitoring.")
 
                 if closed:
                     trail_state.pop(close_key, None)

@@ -91,6 +91,116 @@ def _resolve_credentials_path(config: dict) -> Optional[Path]:
     return Path(path_str) if path_str else None
 
 
+#: The four leg-price fields an FH exit record may carry. Same names the
+#: monitor writes, so a hand-built exit and a machine-built one are the same
+#: shape and there is one vocabulary, not two.
+EXIT_FILL_FIELDS = ('short_call_fill', 'long_call_fill',
+                    'short_put_fill', 'long_put_fill')
+
+
+def exit_is_approximate(trade: dict) -> bool:
+    """Is this closed trade's P&L known to be an approximation?
+
+    True when a leg could not be priced, or when the figure had to be clamped
+    to the structure's ceiling. Read BOTH the top-level marker and the one
+    inside `exit`: the top-level copy exists for readers that scan trade dicts
+    (`list_trades`, `journal_report`, the dashboard) and older records predate
+    it entirely, so neither alone is sufficient.
+
+    Absence means EXACT — deliberately, and it is the safe default here in a
+    way it would not be on the order path: a book of ~450 historical records
+    was closed before this marker existed, and defaulting those to approximate
+    would print a caveat on every line, which is how a caveat stops being read.
+    """
+    if trade.get('exit_approximate') is True:
+        return True
+    ex = trade.get('exit') or {}
+    return ex.get('pnl_approximate') is True
+
+
+def bound_fh_exit(trade: dict, exit_data: dict) -> dict:
+    """Bound a Fallen Hero exit to what the structure can arithmetically do.
+
+    Two things, and only two. It never invents a price and never computes a
+    P&L the caller did not supply — that would be the `0.0`-seed defect (D1/D4)
+    with better manners.
+
+    **1. CLAMP `pnl_per_share` to `total_credit`.** For a Fallen Hero,
+
+        close_cost   = SC + SP - LC - LP
+        pnl_per_share = total_credit - close_cost
+
+    and both long strikes sit further OTM than the shorts they hedge, so for
+    the same expiry `SC >= LC` and `SP >= LP`: `close_cost` is non-negative and
+    the P&L can never exceed the credit. Every leg expiring worthless REACHES
+    that bound, so it is mathematically achievable — which per CLAUDE.md's
+    "Valuation bounds — clamp the arithmetic, refuse the estimate" makes it a
+    CLAMP, not an estimate to defer on. The defect that motivated it (D4)
+    reported `pnl_per_share 102.75` against a `total_credit` of 97.75, from an
+    already-flat short put counted at 0.00; but the clamp is applied here,
+    at the write boundary, precisely so it does not depend on which code
+    produced the number. A hand-built `exit_data` gets it too.
+
+    **2. MARK approximate.** An explicit `None` in any leg-fill field is an
+    acknowledged unknown, and a record carrying one cannot present its P&L as
+    exact. A MISSING field is not the same thing and is left alone: a human
+    recording "I closed the whole thing for Rs X" has an exact number and no
+    per-leg detail, and inferring doubt from silence would put a caveat on
+    every hand-written record.
+
+    It is LOUD when the clamp binds. A clamp that fires silently turns a
+    visible bug into a plausible number, which is the failure it exists to
+    catch rather than a fix for it.
+
+    Returns a NEW dict; the caller's is never mutated.
+    """
+    out = dict(exit_data or {})
+
+    # An explicitly-unknown leg price makes the whole figure approximate.
+    if any(f in out and out[f] is None for f in EXIT_FILL_FIELDS):
+        out['pnl_approximate'] = True
+        out.setdefault('unpriced_legs',
+                       [f for f in EXIT_FILL_FIELDS
+                        if f in out and out[f] is None])
+
+    try:
+        credit = float(trade.get('total_credit'))
+        pnl = float(out.get('pnl_per_share'))
+    except (TypeError, ValueError):
+        # No credit on the record, or no per-share P&L in the exit. Nothing to
+        # bound against — and refusing the whole write over a missing optional
+        # field would strand a close the owner has already made at the broker.
+        return out
+
+    if pnl <= credit:
+        return out
+
+    out['pnl_per_share'] = credit
+    out['pnl_clamped_from'] = pnl
+    out['pnl_approximate'] = True
+
+    # Keep `total_pnl` consistent with the clamped per-share figure, or it
+    # contradicts the very number it is derived from. Quantity is a required
+    # field on `add_trade`, so it is normally there; the ratio fallback covers
+    # a record that predates the check or was written by hand.
+    qty = trade.get('quantity')
+    try:
+        if qty:
+            out['total_pnl'] = credit * float(qty)
+        elif out.get('total_pnl') is not None and pnl:
+            out['total_pnl'] = float(out['total_pnl']) * (credit / pnl)
+    except (TypeError, ValueError):
+        out['total_pnl'] = None
+
+    logger.error(
+        'FH #%s %s: exit pnl_per_share %.2f EXCEEDS total_credit %.2f — '
+        'arithmetically impossible for a Fallen Hero (close_cost cannot be '
+        'negative). Clamped to %.2f and marked approximate. A leg was '
+        'mispriced; read the exit fills.',
+        trade.get('id'), trade.get('stock'), pnl, credit, credit)
+    return out
+
+
 class FallenHeroStore(LockedStoreMixin):
     """Trade CRUD with local file + Google Drive sync.
 
@@ -581,13 +691,42 @@ class FallenHeroStore(LockedStoreMixin):
         return trade_dict
 
     def update_trade_exit(self, trade_id: int, exit_data: dict):
-        """Mark a trade as closed with exit details. Saves local + Drive."""
+        """Mark a trade as closed with exit details. Saves local + Drive.
+
+        **This is the ONLY choke point every FH close passes through**, and
+        since the 2026-08-28 decision that Fallen Hero is traded BY HAND it is
+        also the only booking path with a live caller: the monitor places no FH
+        orders, so an FH exit reaches the book because a human — or Claude
+        acting on what a human reports — calls this with an `exit_data` dict
+        they built themselves. There is no CLI verb, no argparse route and no
+        validation upstream of here. Whatever bounds an FH P&L has to obey,
+        this method is where they can be enforced, so this is where they are
+        (`feedback_guard_the_money_system_first`: count the write boundaries,
+        not the callers).
+
+        It does NOT compute anything. Inventing a P&L from leg prices the
+        caller did not supply would be the `0.0`-seed defect wearing a
+        different hat. It only BOUNDS what it is handed, and says so.
+        """
         with self._mutate():
             found = False
             for t in self._trades:
                 if t['id'] == trade_id:
+                    # Bounded against THIS record, inside the lock — the
+                    # structure's ceiling is a property of the trade, so
+                    # reading it anywhere else is a read that could race a
+                    # concurrent write of the very field it depends on.
+                    exit_data = bound_fh_exit(t, exit_data)
                     t['status'] = 'closed'
                     t['exit'] = exit_data
+                    # Surfaced at the TOP LEVEL as well as inside `exit`.
+                    # Every reader of this book — `list_trades`,
+                    # `bcs/journal_report.py`, the portfolio dashboard —
+                    # scans trade dicts, and a marker that can only be found
+                    # by opening a nested dict is a marker most readers will
+                    # miss. Absent means exact; the key is never written False.
+                    if exit_data.get('pnl_approximate'):
+                        t['exit_approximate'] = True
                     t['version'] = t.get('version', 0) + 1
                     found = True
                     break
@@ -701,7 +840,10 @@ class FallenHeroStore(LockedStoreMixin):
             lot_size = t.get('lot_size', '?')
             lots_str = f"{lots}x{lot_size}"
 
-            print(f"{t['id']:>3}  {t['stock']:<12} {t['status']:<8} "
+            # '~' rather than a whole column: it has to survive the eye
+            # skimming for the number, and a marker in the margin does not.
+            status = t['status'] + ('~' if exit_is_approximate(t) else '')
+            print(f"{t['id']:>3}  {t['stock']:<12} {status:<8} "
                   f"{put_spread_str:<16} {call_str:>10}  {t['expiry']:<12} "
                   f"{t['total_credit']:>8.2f} {lots_str:>8} "
                   f"{t['sl_spot']:>8.1f} {t['breakeven']:>10.2f}")
@@ -713,10 +855,17 @@ class FallenHeroStore(LockedStoreMixin):
 
         if closed_trades:
             total_pnl = sum(
-                t['exit'].get('total_pnl', 0)
+                (t['exit'].get('total_pnl') or 0)
                 for t in closed_trades if t.get('exit')
             )
-            print(f"Closed P&L: Rs {total_pnl:+,.0f}")
+            approx = [t for t in closed_trades if exit_is_approximate(t)]
+            # The total is only as exact as its least exact term, so the
+            # caveat rides on the TOTAL, not just on the rows. A reader who
+            # only ever looks at the bottom line still sees it.
+            note = (f"  (~ {len(approx)} of {len(closed_trades)} approximate: "
+                    f"#{', #'.join(str(t['id']) for t in approx)})"
+                    if approx else "")
+            print(f"Closed P&L: Rs {total_pnl:+,.0f}{note}")
 
 
 # -- Backward-compatible free functions (delegate to singleton) ------------

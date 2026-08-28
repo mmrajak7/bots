@@ -12,22 +12,24 @@ from __future__ import annotations
 
 import html
 import logging
+import statistics
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from . import config as cfg
 from . import outcomes
-from .trade_store import ZebraStore, in_cohort
+from .trade_store import (TP_LATCH_EXPIRED, TP_TOUCHED_AT, ZebraStore,
+                          in_cohort)
 
 logger = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-# ── Exit reasons: ONE classification, this module's own wording ──────────
+# ── Exit reasons: ONE classification, ONE wording ────────────────────────
 
-def _reason_label(reason) -> str:
-    """The name this report gives one stored `exit_reason`.
+def reason_label(reason) -> str:
+    """The name this system gives one stored `exit_reason`.
 
     TWO engines close a cohort position and they write different strings for
     the same trigger: zebra's paper engine stamps `paper:debit_sl`, while
@@ -42,6 +44,12 @@ def _reason_label(reason) -> str:
     and opened its OWN `by_reason` bucket beside `debit_sl`, so one trigger
     became two rows and each under-counted the other. Three copies of a
     mapping is how the arming gate drifted (C0); a fourth is not the fix.
+
+    `zebra/digest.py` had a FIFTH copy — its Closed table did the same strip
+    and printed a bridged `SL_SPREAD` raw, in the very file that owns the
+    arming gate. It now calls this function rather than growing a sixth
+    wording, so the two summaries a human reads name a trigger identically.
+    That is why this is public: it is no longer "this module's wording".
 
     So the CLASSIFICATION comes from `outcomes.classify`, the single
     vocabulary the arming gate and the vet scorecard already read, and only
@@ -61,6 +69,256 @@ def _reason_label(reason) -> str:
     if not c['known']:
         return c['raw'] or 'unknown'
     return f"{c['kind']} (already-flat)" if c['recovered'] else c['kind']
+
+
+#: The name the three call sites in this module have always used. Kept so the
+#: rename to a public spelling is not a behaviour change anywhere.
+_reason_label = reason_label
+
+
+# ── The TP latch: reading the evidence it writes ─────────────────────────
+#
+# `zebra/trade_store.py` stamps three kinds of fact and, until now, NOTHING
+# read any of them — which makes them decoration rather than evidence, and
+# they were written to answer two live owner questions:
+#
+#   1. **Is same-day the right bound?** Every touch that reached the end of
+#      its session without booking is appended to `tp_latch_expired`. If that
+#      list stays empty the bound costs nothing; if it fills up, touches are
+#      not converting within a session and the rule is costing exits.
+#   2. **Is M12 worth building?** M12 would consume the exit vet inside the
+#      same cycle instead of on the next tick, saving ~3 minutes of a measured
+#      ~4m50s latency. `tp_touch_to_exit_sec` is the time that lag actually
+#      takes and `tp_touch_spot_move*` is what price did during it — time AND
+#      rupees, so the answer is priced rather than argued.
+#
+# Two readers (the phone report and the digest) and therefore ONE computation,
+# here, for the same reason `outcomes.classify` exists: the last vocabulary
+# that grew a private copy per reader drifted, and the arming gate read the
+# drift as evidence.
+#
+# ABSENCE IS NOT ZERO, and this is the whole handling contract. Every record
+# written before 2026-08-28 carries none of these fields, and a latch that has
+# never armed is not a latch that armed and never expired. `n` is therefore
+# reported alongside every statistic and is 0 — never a zero median — when
+# there is nothing to say.
+
+#: Stamped by `zebra.trade_store.tp_touch_to_fill`. The three keys are literals
+#: there rather than module constants, so they are literals here too — pinned
+#: by a test that calls that function and asserts this reader knows every key
+#: it returns. A renamed field must fail loudly, not read as "no data".
+TP_TOUCH_SEC = 'tp_touch_to_exit_sec'
+TP_TOUCH_MOVE = 'tp_touch_spot_move'
+TP_TOUCH_MOVE_PCT = 'tp_touch_spot_move_pct'
+TP_TOUCH_GAVE_BACK = 'tp_touch_gave_back'
+
+
+def _adverse_pct(t: dict) -> Optional[float]:
+    """The touch->fill spot move as an ADVERSE percentage, or None.
+
+    The stored move is SIGNED against spot, so a CE position that gave back
+    reads negative and a PE position that gave back reads positive. Averaging
+    the two cancels them — a blended statistic that hides the answer — so both
+    are normalised to "how far did price move AGAINST this position while the
+    exit was in flight", positive meaning give-back.
+
+    The sign convention is taken from the stored `tp_touch_gave_back` flag
+    first, because that is the writer's own answer to the same question, and
+    only falls back to `direction`. When neither is available the move is left
+    OUT of the distribution rather than guessed into it.
+    """
+    pct = t.get(TP_TOUCH_MOVE_PCT)
+    if pct is None:
+        return None
+    try:
+        pct = float(pct)
+    except (TypeError, ValueError):
+        return None
+    gave = t.get(TP_TOUCH_GAVE_BACK)
+    if gave is True:
+        return abs(pct)
+    if gave is False:
+        return -abs(pct)
+    d = t.get('direction')
+    if d == 'CE':
+        return -pct
+    if d == 'PE':
+        return pct
+    return None
+
+
+def _peak_giveback_rs(t: dict) -> Optional[float]:
+    """Rupees of STRUCTURE value between the position's peak mid and the mid it
+    booked at, or None when that cannot be attributed to the latency.
+
+    The spot give-back says which way price went; this says what it cost, in
+    the only currency the owner spends. It is a real number off stored fields
+    (`mfe_mid`, `exit_debit`, `quantity`) rather than a delta model.
+
+    Attributed ONLY when the peak was reached at or after the touch. A peak
+    from three sessions earlier is a fact about the trade, not about the five
+    minutes this section is pricing, and charging it to the lag would inflate
+    exactly the number M12 is being judged on.
+    """
+    try:
+        peak = float(t['mfe_mid'])
+        booked = float(t['exit_debit'])
+        qty = float(t['quantity'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    peak_at, touched_at = t.get('mfe_mid_at'), t.get(TP_TOUCHED_AT)
+    if not peak_at or not touched_at:
+        return None
+    try:
+        a = datetime.fromisoformat(str(peak_at))
+        b = datetime.fromisoformat(str(touched_at))
+        # One aware, one naive cannot be compared. Both engines write aware
+        # stamps now; a mixed pair is old data and is simply not attributed.
+        if (a.tzinfo is None) != (b.tzinfo is None) or a < b:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return round((peak - booked) * qty, 0)
+
+
+def tp_touch_rows(trades: list) -> list:
+    """One row per exit that carries a touch->fill measurement.
+
+    An exit that fired and booked inside a single observation has no gap and
+    `tp_touch_to_fill` returns nothing for it, so it is absent here rather
+    than present as a zero — the distribution below is of latencies that
+    HAPPENED, and padding it with structural zeros would report the lag as
+    smaller than it is.
+    """
+    rows = []
+    for t in trades:
+        if t.get(TP_TOUCH_SEC) is None:
+            continue
+        try:
+            sec = float(t[TP_TOUCH_SEC])
+        except (TypeError, ValueError):
+            continue
+        rows.append({
+            'id': t.get('id'), 'stock': t.get('stock'),
+            'exit_date': t.get('exit_date'), 'sec': sec,
+            'move': t.get(TP_TOUCH_MOVE),
+            'move_pct': t.get(TP_TOUCH_MOVE_PCT),
+            'adverse_pct': _adverse_pct(t),
+            'gave_back': t.get(TP_TOUCH_GAVE_BACK),
+            'giveback_rs': _peak_giveback_rs(t),
+            'pnl_net': t.get('pnl_net', t.get('pnl')),
+        })
+    return rows
+
+
+def tp_touch_stats(trades: list) -> dict:
+    """Distributions for the touch->fill lag. `n=0` means NO DATA.
+
+    Median and worst, never a mean: the owner's question is whether the lag
+    ever costs real money, and one bad give-back is the answer to that — a
+    mean would dilute it against every exit that booked on the touch.
+    """
+    rows = tp_touch_rows(trades)
+    out = {'n': len(rows), 'rows': rows,
+           'median_sec': None, 'max_sec': None, 'worst_sec': None,
+           'n_move': 0, 'median_adverse_pct': None,
+           'max_adverse_pct': None, 'worst_move': None,
+           'gave_back': 0, 'giveback_rs_total': None,
+           'max_giveback_rs': None, 'worst_rs': None}
+    if not rows:
+        return out
+    secs = [r['sec'] for r in rows]
+    out['median_sec'] = round(statistics.median(secs), 1)
+    out['max_sec'] = round(max(secs), 1)
+    out['worst_sec'] = max(rows, key=lambda r: r['sec'])
+    adverse = [r for r in rows if r['adverse_pct'] is not None]
+    out['n_move'] = len(adverse)
+    if adverse:
+        out['median_adverse_pct'] = round(
+            statistics.median([r['adverse_pct'] for r in adverse]), 4)
+        out['max_adverse_pct'] = round(
+            max(r['adverse_pct'] for r in adverse), 4)
+        out['worst_move'] = max(adverse, key=lambda r: r['adverse_pct'])
+    out['gave_back'] = sum(1 for r in rows if r['gave_back'] is True)
+    rs = [r for r in rows if r['giveback_rs'] is not None]
+    if rs:
+        out['giveback_rs_total'] = round(sum(r['giveback_rs'] for r in rs), 0)
+        out['max_giveback_rs'] = round(max(r['giveback_rs'] for r in rs), 0)
+        out['worst_rs'] = max(rs, key=lambda r: r['giveback_rs'])
+    return out
+
+
+def tp_latch_expiries(trades: list) -> list:
+    """Every touch that reached the end of its session unbooked, newest last.
+
+    Read from the append-only `tp_latch_expired` list, which lives on OPEN
+    records as well as closed ones — a latch that lapsed on Tuesday and
+    re-armed on Wednesday is still holding the position, and a reader that
+    only walked the exits would report the same-day bound as costless.
+    """
+    out = []
+    for t in trades:
+        for e in (t.get(TP_LATCH_EXPIRED) or []):
+            if not isinstance(e, dict):
+                continue
+            out.append({'id': t.get('id'), 'stock': t.get('stock'),
+                        'status': t.get('status'),
+                        'touched_at': e.get('touched_at'),
+                        'touch_spot': e.get('touch_spot'),
+                        'noticed_at': e.get('noticed_at'),
+                        'tp_spot': t.get('tp_spot')})
+    return sorted(out, key=lambda r: str(r['touched_at'] or ''))
+
+
+def tp_touch_days(trades: list) -> int:
+    """How many DISTINCT touch-days the latch has ever armed on.
+
+    The denominator for everything above, and the one number that separates
+    "the latch has never fired" from "it fires and never expires". Counted as
+    a union per record because `tp_touched_at` is OVERWRITTEN on a re-arm
+    while the lapsed stamp is preserved in `tp_latch_expired`: adding the two
+    would double-count a latch that expired and was never re-armed, and taking
+    either alone would miss the other case.
+    """
+    n = 0
+    for t in trades:
+        stamps = {e.get('touched_at') for e in (t.get(TP_LATCH_EXPIRED) or [])
+                  if isinstance(e, dict) and e.get('touched_at')}
+        cur = t.get(TP_TOUCHED_AT)
+        if cur:
+            stamps.add(cur)
+        n += len(stamps)
+    return n
+
+
+def tp_latch_evidence(trades: list, day: Optional[str] = None) -> dict:
+    """Everything the latch has recorded, as one block. `touch_days=0` = NO DATA.
+
+    `day`, when given, adds the same-day counts a daily reader needs without
+    hiding the to-date totals the two questions are actually answered from.
+    """
+    exp = tp_latch_expiries(trades)
+    stats = tp_touch_stats(trades)
+    armed = [t for t in trades if t.get(TP_TOUCHED_AT)]
+    days = tp_touch_days(trades)
+    ev = {
+        'touch_days': days,
+        'armed_records': len(armed),
+        'expired': exp,
+        'measured': stats,
+        # The one predicate every renderer branches on. NOT `expired == 0`:
+        # "the latch has never armed" and "it armed and never lapsed" are
+        # opposite answers to question 1 and must never share a rendering.
+        'has_data': bool(days or stats['n']),
+    }
+    if day:
+        ev['expired_today'] = sum(1 for e in exp
+                                  if str(e.get('noticed_at') or '')[:10] == day)
+        ev['measured_today'] = sum(1 for r in stats['rows']
+                                   if str(r.get('exit_date') or '')[:10] == day)
+        ev['armed_today'] = sum(1 for t in armed
+                                if str(t.get(TP_TOUCHED_AT))[:10] == day)
+    return ev
 
 
 # ── Date helpers ──────────────────────────────────────────────────────────
@@ -130,6 +388,10 @@ def _summarize_exits(exits: list) -> dict:
         'by_reason': by_reason,
         'by_alignment': _alignment_split(exits),
         'by_structure': _structure_split(exits),
+        # Absent from the rendered report when nothing was measured, rather
+        # than printed as a row of zeros — an exit that booked on its own touch
+        # has no gap, and a latch that never armed has no answer.
+        'tp_touch': tp_touch_stats(exits),
     }
 
 
@@ -447,6 +709,34 @@ def format_text(report: dict) -> str:
                 lines.append(f"    {label:<6} {st['count']:>2} trades  "
                              f"Rs {st['net_pnl']:+,.0f}  WR {st['win_rate']:.0f}%  "
                              f"RoC {roc:+.1f}%")
+        tp = s.get('tp_touch') or {}
+        if tp.get('n'):
+            # What the ~5-minute exit lag cost the exits it applied to. Median
+            # and worst; the mean of two exits, one of which booked on its own
+            # touch, is the shape of statistic that answers nothing.
+            lines.append("")
+            # ASCII arrow: `format_text` is PRINTED, and a Windows console
+            # encodes stdout as cp1252, where a `→` raises UnicodeEncodeError
+            # and takes the whole EOD summary with it. Every other line in
+            # this formatter is ASCII for the same reason; the Telegram half
+            # is UTF-8 over HTTP and keeps the real arrow.
+            lines.append("  TP touch -> fill (the lag M12 would remove):")
+            w = tp['worst_sec']
+            lines.append(f"    latency     {tp['n']:>2} exit(s)  "
+                         f"median {tp['median_sec']:.0f}s  "
+                         f"worst {tp['max_sec']:.0f}s (#{w['id']} {w['stock']})")
+            if tp['n_move']:
+                wm = tp['worst_move']
+                lines.append(f"    spot        {tp['gave_back']} of {tp['n']} "
+                             f"gave back  median {tp['median_adverse_pct']:+.2f}%  "
+                             f"worst {tp['max_adverse_pct']:+.2f}% "
+                             f"(#{wm['id']} {wm['stock']})")
+            if tp['giveback_rs_total'] is not None:
+                wr = tp['worst_rs']
+                lines.append(f"    value       Rs {tp['giveback_rs_total']:,.0f} "
+                             f"from peak mid to booked mid  "
+                             f"worst Rs {tp['max_giveback_rs']:,.0f} "
+                             f"(#{wr['id']} {wr['stock']})")
 
     # Open section
     lines.append("")
@@ -521,6 +811,21 @@ def format_telegram(report: dict) -> str:
                 f"<i>📐 A/B — zebra {zb['count']}: Rs {zb['net_pnl']:+,.0f} "
                 f"(WR {zb['win_rate']:.0f}%) | BCS {bc['count']}: "
                 f"Rs {bc['net_pnl']:+,.0f} (WR {bc['win_rate']:.0f}%)</i>"
+            )
+        tp = s.get('tp_touch') or {}
+        if tp.get('n'):
+            # One line, and only when there is something to say. Nothing here
+            # is a runtime string from an exchange, but it is built the same
+            # way as its neighbours and stays inside the HTML parse mode.
+            move = ('' if not tp['n_move'] else
+                    f" | spot {tp['median_adverse_pct']:+.2f}% median "
+                    f"({tp['gave_back']}/{tp['n']} gave back)")
+            rs = ('' if tp['giveback_rs_total'] is None else
+                  f" | Rs {tp['giveback_rs_total']:,.0f} from peak")
+            parts.append(
+                f"<i>⏱ TP touch→fill {tp['n']}: median "
+                f"{tp['median_sec']:.0f}s, worst {tp['max_sec']:.0f}s"
+                f"{move}{rs}</i>"
             )
 
     if report['open']:

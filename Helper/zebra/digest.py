@@ -52,6 +52,12 @@ from typing import List, Optional
 
 from . import config as cfg
 from . import engine_log
+# `reason_label` is the report's wording, imported rather than re-derived: the
+# Closed table below did its own `paper:` strip and printed a bridged
+# `SL_SPREAD` raw — the FIFTH copy of that vocabulary, in the file that owns
+# the arming gate. `tp_latch_evidence` is shared for the same reason: two
+# readers of a brand-new set of fields is exactly when the second copy starts.
+from .report import reason_label, tp_latch_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -249,12 +255,12 @@ def _warnings(rows: List[tuple]) -> dict:
 
 
 def _flags(cyc, vet, tr, warn, coh, prev: Optional[dict],
-           eng: Optional[dict] = None) -> List[str]:
+           eng: Optional[dict] = None, tpl: Optional[dict] = None) -> List[str]:
     """Facts that earn a look. Each one names what happened, never why.
 
-    `eng` (the order engine's failure record) defaults to None so that a
-    caller which knows nothing about it — every pre-2026-08-28 call site and
-    test — keeps working. It is NOT optional in `build`.
+    `eng` (the order engine's failure record) and `tpl` (the TP latch's) both
+    default to None so that a caller which knows nothing about them — every
+    older call site and test — keeps working. Neither is optional in `build`.
     """
     out = []
     for a, b, mins in cyc['gaps']:
@@ -309,6 +315,34 @@ def _flags(cyc, vet, tr, warn, coh, prev: Optional[dict],
                    f"evidence. A RUN of these is the signature of exits armed "
                    f"against paper positions.")
 
+    # THE TP LATCH. Both lines are the answer to a question the owner has open,
+    # so they are stated when there is data and SILENT when there is none —
+    # never "0 expired", which would read as the same-day bound having been
+    # tested and found free when it may simply never have armed.
+    if tpl and tpl.get('expired'):
+        exp = tpl['expired']
+        names = ', '.join('#%s %s' % (e['id'], e['stock']) for e in exp[:5])
+        more = '' if len(exp) <= 5 else f" +{len(exp) - 5} more"
+        out.append(f"{len(exp)} TP latch(es) EXPIRED UNBOOKED ({names}{more}) "
+                   f"— a touch reached the end of its session with no close. "
+                   f"This is the only price the same-day bound charges; read "
+                   f"it against the exits an unbounded latch would have booked "
+                   f"days late before deciding the rule is right.")
+    m = (tpl or {}).get('measured') or {}
+    if m.get('n'):
+        w = m['worst_sec']
+        line = (f"TP touch→fill over {m['n']} exit(s): median "
+                f"{m['median_sec']:.0f}s, worst {m['max_sec']:.0f}s "
+                f"(#{w['id']} {w['stock']})")
+        if m.get('n_move'):
+            line += (f"; spot gave back {m['gave_back']}/{m['n']}, median "
+                     f"{m['median_adverse_pct']:+.2f}%, worst "
+                     f"{m['max_adverse_pct']:+.2f}%")
+        if m.get('giveback_rs_total') is not None:
+            line += f"; Rs {m['giveback_rs_total']:,.0f} peak→booked"
+        out.append(line + " — this is the M12 evidence: the lag in seconds "
+                          "and what price did during it.")
+
     uncostable = coh['fee_basis'].get('brokerage_only', 0)
     if uncostable:
         out.append(f"{uncostable} cohort exit(s) could not be fully costed "
@@ -352,6 +386,16 @@ def build(day: Optional[str] = None) -> dict:
     vet, tr = _vetting(rows, day), _trades(store_rows, day)
     coh, warn = _cohort(store_rows), _warnings(rows)
     try:
+        # WHOLE store, not the cohort: the latch fields can only exist on
+        # records touched since 2026-08-28, so every one of them is in the
+        # cohort already, and filtering would only add a way to lose one.
+        tpl = tp_latch_evidence(store_rows, day)
+    except Exception as e:                        # pragma: no cover - guard
+        logger.warning('TP latch evidence failed: %s', e)
+        tpl = {'touch_days': 0, 'armed_records': 0, 'expired': [],
+               'measured': {'n': 0, 'rows': []}, 'has_data': False,
+               'error': str(e)}
+    try:
         eng = engine_log.analyse(day, rows)
     except Exception as e:                        # pragma: no cover - guard
         # Loud, not silent: a broken reader must not read as a clean day.
@@ -364,9 +408,94 @@ def build(day: Optional[str] = None) -> dict:
     return {'date': day, 'cycles': cyc, 'funnel': fun, 'vetting': vet,
             'trades': {k: (v if not isinstance(v, list) else len(v))
                        for k, v in tr.items()},
-            'cohort': coh, 'warnings': warn, 'engines': eng,
-            'flags': _flags(cyc, vet, tr, warn, coh, prev, eng),
+            'cohort': coh, 'warnings': warn, 'engines': eng, 'tp_latch': tpl,
+            'flags': _flags(cyc, vet, tr, warn, coh, prev, eng, tpl),
             '_detail': tr}
+
+
+def _render_tp_latch(tpl: dict) -> List[str]:
+    """The TP latch section. Two open owner questions, one block.
+
+    Rendered EVERY day, including the days it has nothing — an absent section
+    reads as an oversight, and "no touch has been recorded" is itself the
+    answer to question 1 for as long as it holds. What it must never do is
+    render absence as zero: a bound that has never been tested and a bound
+    that has been tested and cost nothing are opposite findings.
+    """
+    L: List[str] = ['## TP latch']
+    if not tpl:
+        L.append('_not computed_')
+        return L
+    if not tpl.get('has_data'):
+        L.append("_**no data** — no touch has been recorded on any record "
+                 "yet, so neither question this evidence exists for can be "
+                 "answered from this book. Not the same as zero: the latch "
+                 "shipped 2026-08-28 and every exit booked before that "
+                 "carries none of its fields._")
+        return L
+    m = tpl.get('measured') or {}
+    exp = tpl.get('expired') or []
+    # `touch_days` counts every distinct day a latch armed on, ever;
+    # `armed_records` counts the records still carrying a live stamp. They are
+    # different numbers and named as such — a lapsed touch keeps its evidence
+    # entry and loses its stamp, so the two diverge the moment one expires.
+    L.append(f"**Armed** {tpl['touch_days']} touch-day(s) recorded; "
+             f"{tpl['armed_records']} record(s) carry a stamp"
+             + (f", {tpl['armed_today']} armed today"
+                if tpl.get('armed_today') else ''))
+    # Q2 — is M12 worth building? Time first, then what price did during it.
+    if not m.get('n'):
+        L.append("**Touch→fill** _no data — no exit has booked through a "
+                 "latch yet (an exit that fires and books inside one "
+                 "observation has no gap to report)_")
+    else:
+        w = m['worst_sec']
+        L.append(f"**Touch→fill** {m['n']} exit(s): median "
+                 f"{m['median_sec']:.0f}s, worst {m['max_sec']:.0f}s "
+                 f"(#{w['id']} {w['stock']})")
+        if not m.get('n_move'):
+            L.append("**Spot give-back** _no data — no measured exit carries "
+                     "a signed move_")
+        else:
+            wm = m['worst_move']
+            L.append(f"**Spot give-back** {m['gave_back']} of {m['n']} gave "
+                     f"back; median {m['median_adverse_pct']:+.2f}%, worst "
+                     f"{m['max_adverse_pct']:+.2f}% (#{wm['id']} {wm['stock']}) "
+                     f"— positive is AGAINST the position")
+        if m.get('giveback_rs_total') is not None:
+            wr = m['worst_rs']
+            L.append(f"**Value peak→booked** Rs {m['giveback_rs_total']:,.0f} "
+                     f"total, worst Rs {m['max_giveback_rs']:,.0f} "
+                     f"(#{wr['id']} {wr['stock']}) — structure mid at its peak "
+                     f"against the mid it booked at, counted only where the "
+                     f"peak came at or after the touch")
+        L.append('')
+        L.append('| # | stock | exit | touch→fill | spot | gave back | Rs peak→booked |')
+        L.append('|---|---|---|---|---|---|---|')
+        for r in sorted(m['rows'], key=lambda x: -x['sec']):
+            adv = ('—' if r['adverse_pct'] is None
+                   else f"{r['adverse_pct']:+.2f}%")
+            gb = {True: 'yes', False: 'no'}.get(r['gave_back'], '—')
+            rs = ('—' if r['giveback_rs'] is None
+                  else f"Rs{r['giveback_rs']:,.0f}")
+            L.append(f"| {r['id']} | {r['stock']} | {r['exit_date'] or '—'} | "
+                     f"{r['sec']:.0f}s | {adv} | {gb} | {rs} |")
+    # Q1 — is same-day the right bound? Every lapse, named.
+    L.append('')
+    if not exp:
+        L.append(f"**Expired unbooked** 0 of {tpl['touch_days']} touch-day(s) "
+                 f"— every touch so far booked inside its own session, so the "
+                 f"same-day bound has cost nothing yet")
+    else:
+        L.append(f"**Expired unbooked** {len(exp)} of {tpl['touch_days']} "
+                 f"touch-day(s)"
+                 + (f", {tpl['expired_today']} today" if tpl.get('expired_today')
+                    else '') + ' — the price of the same-day bound:')
+        for e in exp:
+            L.append(f"- #{e['id']} {e['stock']} ({e['status']}): touched "
+                     f"{e['touched_at']} at spot {e['touch_spot']} "
+                     f"(tp {e['tp_spot']}), lapsed by {e['noticed_at']}")
+    return L
 
 
 def render(d: dict) -> str:
@@ -427,7 +556,7 @@ def render(d: dict) -> str:
         for t in tr['closed']:
             fee = t.get('fees') or {}
             A(f"| {t['id']} | {t['stock']} | "
-              f"{str(t.get('exit_reason', '')).replace('paper:', '')} | "
+              f"{reason_label(t.get('exit_reason'))} | "
               f"Rs{t.get('pnl', 0):,.0f} ({t.get('pnl_pct', 0):+.1f}%) | "
               f"Rs{t.get('pnl_net', t.get('pnl', 0)):,.0f} | "
               f"{fee.get('basis', 'unstamped')} |")
@@ -439,6 +568,8 @@ def render(d: dict) -> str:
       + (f", median {coh['median_net_pct']:+.2f}%" if coh['median_net_pct'] is not None else '')
       + (f"  [{', '.join('%s %d' % (k, v) for k, v in coh['fee_basis'].items())}]"
          if coh['fee_basis'] else ''))
+    A('')
+    L.extend(_render_tp_latch(d.get('tp_latch') or {}))
     A('')
     # The order engine. Rendered from its own module so the vocabulary and its
     # presentation stay in one place — this section exists because the digest
