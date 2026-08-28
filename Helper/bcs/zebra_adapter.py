@@ -331,12 +331,18 @@ class ZebraStoreAdapter:
                 }
         reason = str(exit_data.get('exit_reason', 'unknown')).lower()
         _warn_if_unrecognised(reason, trade_id)
+        # N14 — carry the approximation marker across the bridge. Without it a
+        # bridged close that counted an already-flat leg at 0.00 lands in the
+        # zebra book reading as exact, and every downstream reader (`pnl_net`,
+        # the digest's cohort total, the arming gate's own evidence) treats a
+        # figure wrong in a known direction as a measurement.
         return self._store.mark_exited(
             trade_id,
             exit_spot=exit_data.get('exit_spot'),
             exit_debit=exit_data.get('exit_spread'),
             reason=reason,
-            exit_legs=legs)
+            exit_legs=legs,
+            approximate=bool(exit_data.get('pnl_approximate')))
 
     def update_trade_fields(self, trade_id: int, **fields):
         return self._store.update_trade_fields(trade_id, **fields)

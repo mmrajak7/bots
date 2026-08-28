@@ -281,18 +281,57 @@ def test_a_value_beyond_the_width_is_still_clamped(bridge):
 # ── The key names, pinned to the live source ────────────────────────────────
 
 def _exit_data_keys(fn):
-    """Every key of every dict literal assigned to `exit_data` in `fn`."""
+    """Every key `fn` puts into `exit_data`, by either route.
+
+    TWO routes, and reading only the first made this guard under-report. The
+    dict literal is the common one; keys added afterwards by subscript —
+
+        exit_data['pnl_approximate'] = True
+
+    — are how BOTH books mark an optional, conditionally-present fact (N14
+    here, D4 in `_close_fh_inner`), because the convention is that absence
+    means exact and the key is never written False. A literal cannot express
+    "sometimes". Missing those made the guard claim the monitor never writes a
+    key it demonstrably does, which fails in the SAFE direction but is still a
+    false report from the one test whose job is joining the two sides.
+    """
     tree = ast.parse(inspect.getsource(fn).lstrip())
     keys = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
+        # route 1 — `exit_data = {...}`
         names = {t.id for t in node.targets if isinstance(t, ast.Name)}
-        if 'exit_data' not in names or not isinstance(node.value, ast.Dict):
-            continue
-        keys |= {k.value for k in node.value.keys
-                 if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+        if 'exit_data' in names and isinstance(node.value, ast.Dict):
+            keys |= {k.value for k in node.value.keys
+                     if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+        # route 2 — `exit_data['key'] = ...`
+        for t in node.targets:
+            if not (isinstance(t, ast.Subscript)
+                    and isinstance(t.value, ast.Name)
+                    and t.value.id == 'exit_data'):
+                continue
+            # py3.8 wraps the subscript in `ast.Index`; 3.9+ inlines it. The Pi
+            # and this box both run 3.8, so unwrapping is not optional here.
+            sl = t.slice
+            sl = sl.value if isinstance(sl, getattr(ast, 'Index', ())) else sl
+            if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+                keys.add(sl.value)
     return keys
+
+
+def test_the_key_extractor_sees_both_routes():
+    """The guard above is only as good as this. Pinned on the REAL function so
+    it cannot pass on a fixture while missing production."""
+    written = _exit_data_keys(sm._close_spread_inner)
+    assert 'exit_spread' in written, 'dict-literal route'
+    assert 'pnl_approximate' in written, 'subscript route (N14)'
+
+
+def test_the_fh_close_marks_approximate_by_the_same_route():
+    """D4 and N14 use one convention across both books; if FH ever stops, the
+    twin's justification above is stale."""
+    assert 'pnl_approximate' in _exit_data_keys(sm._close_fh_inner)
 
 
 def test_the_adapter_reads_the_keys_the_monitor_actually_writes():

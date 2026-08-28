@@ -1098,7 +1098,8 @@ class ZebraStore:
 
     def mark_exited(self, trade_id: int, exit_spot: float,
                     exit_debit: Optional[float],
-                    reason: str, exit_legs: Optional[dict] = None) -> dict:
+                    reason: str, exit_legs: Optional[dict] = None,
+                    approximate: bool = False) -> dict:
         """Close an entered trade. exit_debit = closing net debit per share
         (positive if still costs money to close, negative if closes for credit)."""
         with self._mutate():
@@ -1124,7 +1125,8 @@ class ZebraStore:
             # double-book, whichever state it came from.
             if t['status'] not in ('entered', 'closing'):
                 raise ValueError(f"#{trade_id} status={t['status']}, can't exit")
-            self._apply_exit(t, exit_spot, exit_debit, reason, exit_legs)
+            self._apply_exit(t, exit_spot, exit_debit, reason, exit_legs,
+                             approximate=approximate)
         return t
 
     @staticmethod
@@ -1173,8 +1175,17 @@ class ZebraStore:
 
     def _apply_exit(self, t: dict, exit_spot: float,
                     exit_debit: Optional[float], reason: str,
-                    exit_legs: Optional[dict] = None) -> None:
-        """Field-level exit mutation — runs inside the store lock."""
+                    exit_legs: Optional[dict] = None,
+                    approximate: bool = False) -> None:
+        """Field-level exit mutation — runs inside the store lock.
+
+        `approximate` is set when the producer knows the figure is not exact —
+        a bridged BCS close that found one leg already flat counts it at 0.00,
+        so its P&L is wrong in a KNOWN direction. It rides in here rather than
+        being written by a follow-up call so the marker and the number it
+        qualifies land in the SAME locked write; a second write could fail and
+        leave an approximation on the record reading as exact (N14).
+        """
         debit = float(t['debit'])
         qty = int(t['quantity'])
         exit_debit = self._bound_exit_value(t, exit_debit)
@@ -1201,6 +1212,11 @@ class ZebraStore:
         t['exit_debit'] = exit_debit
         t['pnl'] = pnl
         t['pnl_pct'] = pnl_pct
+        # Absent means EXACT; the key is never written False. ~450 records
+        # predate the marker and defaulting those to approximate would put a
+        # caveat on every line, which is how a caveat stops being read.
+        if approximate:
+            t['exit_approximate'] = True
         # THE BOOK WE EXITED ON. Entry books have been persisted since fill
         # pricing landed; exits kept only the two scalars, so the one direction
         # that has twice cost real money (ICICI Feb, NHPC Jul) was also the one

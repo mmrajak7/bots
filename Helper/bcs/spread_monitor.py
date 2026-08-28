@@ -2724,6 +2724,43 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
         return False
 
 
+def _blend_fill(first_price, first_qty, retry_price, retry_qty):
+    """N13 — quantity-weighted price for a leg that filled in TWO tranches.
+
+    A partial close gets one urgent retry on the residual. The retry's
+    `filled_quantity` was read (to decide whether residue remains); its PRICE
+    was thrown away, and the leg kept the FIRST tranche's `average_price`. That
+    is not an approximation, it is the wrong number weighted at 100%:
+
+        short 600 @ 5.00, retry 100 @ 50.00
+          booked   short_fill  5.00   -> pnl/share +1.45, total +Rs 1,015
+          true     short_fill 11.4286 -> pnl/share -4.98, total -Rs 4,980
+
+    Rs 4,500 out, and it reports a LOSS AS A WIN. It bites only when a retry
+    clears the residue — the path D2/D3 just made reachable, so it gets MORE
+    likely, not less.
+
+    **An unpriced tranche makes the whole leg unpriced.** If a tranche filled
+    quantity but carries no usable price, there is no honest weighted average,
+    so this returns None rather than silently weighting the half it can see.
+    None is the established signal here: `_close_spread_inner` routes a None
+    leg fill to `_refuse_unpriced_close`, which books nothing and escalates.
+    Returning the known tranche's price instead would be the
+    default-that-looks-like-a-value mistake this file keeps relearning — a
+    price nobody transacted at, presented as one.
+    """
+    if not retry_qty or retry_qty <= 0:
+        return first_price            # no second tranche; nothing to blend
+    if retry_price is None or retry_price <= 0:
+        return None                   # filled, but at a price we never saw
+    if not first_qty or first_qty <= 0:
+        return retry_price            # first tranche filled nothing
+    if first_price is None or first_price <= 0:
+        return None                   # ditto, other tranche
+    total = first_qty + retry_qty
+    return (first_price * first_qty + retry_price * retry_qty) / total
+
+
 def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                         urgent=False):
     """Inner close logic, separated so close_spread() can wrap with try/except."""
@@ -2921,6 +2958,11 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                 got = retry.get('filled_quantity', 0) if retry else 0
                 remaining -= got
                 log(f"  RETRY filled {got}; {remaining} still short")
+                # N13 — fold the retry's PRICE in, not just its quantity.
+                short_fill = _blend_fill(
+                    short_fill, short_result.get('filled_quantity', 0),
+                    (retry or {}).get('average_price'), got)
+                log(f"  Short fill after blend: {short_fill}")
 
             if remaining > 0:
                 # Leaving 700 long against 200 short is an OVER-HEDGED debit
@@ -3017,6 +3059,11 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                 got = retry.get('filled_quantity', 0) if retry else 0
                 remaining -= got
                 log(f"  RETRY filled {got}; {remaining} still long")
+                # N13 — fold the retry's PRICE in, not just its quantity.
+                long_fill = _blend_fill(
+                    long_fill, long_result.get('filled_quantity', 0),
+                    (retry or {}).get('average_price'), got)
+                log(f"  Long fill after blend: {long_fill}")
             if remaining > 0:
                 log("")
                 log("  *** LONG RESIDUE REMAINS — NOT BOOKING ***")
@@ -3063,16 +3110,30 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
 
     # ── Summary ──────────────────────────────────────────────────────────
     entry_net = trade['net_debit']
+    # N14 — a leg we did not close is counted at 0.00, so the figure is not
+    # merely uncertain, it is WRONG IN A KNOWN DIRECTION. The log already said
+    # so and the RECORD did not, which meant `pnl_net`, the digest and the
+    # journal report all read an approximation as exact. `approx_legs` names
+    # the unpriced side; `bound_bcs_exit` turns that into the marker.
+    approx_legs = []
     if short_closed_now and long_closed_now:
         exit_net = long_fill - short_fill
     elif long_closed_now and not short_closed_now:
         exit_net = long_fill
+        approx_legs.append('short_fill')
         log(f"  NOTE: Short was already flat. P&L is approximate (long fill only).")
     elif short_closed_now and not long_closed_now:
         exit_net = -short_fill
+        approx_legs.append('long_fill')
         log(f"  NOTE: Long was already flat. P&L is approximate (short fill only).")
     else:
+        # NEITHER leg was closed by us. There is no fill anywhere in this
+        # figure — it is not an approximation of a close, it is a close that
+        # did not happen — so both legs are unknown, not zero.
         exit_net = 0.0
+        approx_legs.extend(('short_fill', 'long_fill'))
+        log(f"  NOTE: Neither leg was closed by us. P&L is NOT computed from "
+            f"any fill.")
     pnl_per_share = exit_net - entry_net
     total_pnl = pnl_per_share * qty
 
@@ -3118,6 +3179,18 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
         'pnl_per_share': pnl_per_share,
         'total_pnl': total_pnl,
     }
+    if approx_legs:
+        # An unclosed leg is recorded as UNKNOWN, never as the 0.00 the
+        # arithmetic above had to use. `bound_bcs_exit` reads these Nones at
+        # the store's write boundary and sets `pnl_approximate` there, so a
+        # hand-built exit gets the same treatment.
+        for f in approx_legs:
+            exit_data[f] = None
+        exit_data['pnl_approximate'] = True
+        exit_data['unpriced_legs'] = list(approx_legs)
+        exit_data['notes'] = (
+            'P&L is APPROXIMATE: ' + ', '.join(approx_legs)
+            + ' — the leg was already flat on arrival and is counted at 0.00.')
 
     if not dry_run:
         store.update_trade_exit(trade['id'], exit_data)
@@ -3533,7 +3606,7 @@ def _freeze_fh_leg_failure(fh_store, trade, reason, dry_run, leg_key,
 
 def _fh_residue(kite, fh_store, trade, exchange, reason, dry_run, result,
                 close_qty, *, leg_key, leg_label, symbol, txn, closed_now,
-                remaining_legs=(), hedge_label=None):
+                remaining_legs=(), hedge_label=None, fills=None):
     """D2/D3 — a PARTIALLY closed FH leg gets ONE urgent retry, then FREEZES.
 
     `'PARTIAL'` satisfies `if result['status'] not in ('COMPLETE', 'PARTIAL')`,
@@ -3576,6 +3649,16 @@ def _fh_residue(kite, fh_store, trade, exchange, reason, dry_run, result,
     got = retry.get('filled_quantity', 0) if retry else 0
     remaining -= got
     log(f"  RETRY filled {got}; {remaining} still open on {symbol}")
+    # N13 — the retry's PRICE, not just its quantity. The caller owns `fills`
+    # and `closed_now`, so both are corrected here rather than at four call
+    # sites: one definition, for the same reason this function exists at all.
+    if fills is not None and leg_key in fills:
+        fills[leg_key] = _blend_fill(fills[leg_key],
+                                     result.get('filled_quantity', 0),
+                                     (retry or {}).get('average_price'), got)
+        if leg_key in closed_now:
+            closed_now[leg_key] = fills[leg_key]
+        log(f"  {leg_label} fill after blend: {fills[leg_key]}")
     if remaining <= 0:
         return True
 
@@ -3793,7 +3876,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         if not _fh_residue(kite, fh_store, trade, exchange, reason, dry_run,
                            result, close_qty, leg_key='short_call',
                            leg_label='short call', symbol=sc_sym, txn='BUY',
-                           closed_now=closed_now, hedge_label='long call',
+                           closed_now=closed_now, fills=fills,
+                           hedge_label='long call',
                            remaining_legs=_fh_put_legs_open(
                                sp_sym, sp_qty, lp_sym, lp_qty)):
             return False
@@ -3834,7 +3918,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         if not _fh_residue(kite, fh_store, trade, exchange, reason, dry_run,
                            result, close_qty, leg_key='long_call',
                            leg_label='long call', symbol=lc_sym, txn='SELL',
-                           closed_now=closed_now,
+                           closed_now=closed_now, fills=fills,
                            remaining_legs=_fh_put_legs_open(
                                sp_sym, sp_qty, lp_sym, lp_qty)):
             return False
@@ -3876,7 +3960,8 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         if not _fh_residue(kite, fh_store, trade, exchange, reason, dry_run,
                            result, close_qty, leg_key='short_put',
                            leg_label='short put', symbol=sp_sym, txn='BUY',
-                           closed_now=closed_now, hedge_label='long put'):
+                           closed_now=closed_now, fills=fills,
+                           hedge_label='long put'):
             # No `remaining_legs` here, deliberately: `sp_qty` is the
             # PRE-close reading, so listing it would tell the reader 400 are
             # still short one line after saying 100 are. The residual line and
@@ -3912,7 +3997,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         if not _fh_residue(kite, fh_store, trade, exchange, reason, dry_run,
                            result, close_qty, leg_key='long_put',
                            leg_label='long put', symbol=lp_sym, txn='SELL',
-                           closed_now=closed_now):
+                           closed_now=closed_now, fills=fills):
             return False
     else:
         _fh_skipped_leg(kite, fills, unpriced_skips, leg_key='long_put',

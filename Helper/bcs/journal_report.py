@@ -184,6 +184,23 @@ def _fmt_ctx(ctx: dict) -> str:
     return s + ('   [' + ', '.join(tail) + ']' if tail else '')
 
 
+def _exit_is_approximate(trade: dict) -> bool:
+    """Does this closed record admit its P&L is an approximation?
+
+    One reader for ALL FOUR books. `bcs`, `bear_put` and `zebra` surface the
+    marker at the top level as `exit_approximate`; every book that writes a
+    nested exit also carries `pnl_approximate` inside it, and records closed
+    before the marker existed carry neither. Reading both is what makes this
+    schema-agnostic — the same reason `EXIT_SCHEMA` exists a few lines up.
+
+    Absence means EXACT, deliberately: ~450 historical records predate the
+    marker, and defaulting them to approximate puts a caveat on every line.
+    """
+    if trade.get('exit_approximate') is True:
+        return True
+    return ((trade.get('exit') or {}).get('pnl_approximate') is True)
+
+
 def report(day=None, only_unresolved=False) -> int:
     """Prints the report. Returns the number of unresolved intents, which is
     the one condition a person must act on, so it doubles as an exit code."""
@@ -294,6 +311,18 @@ def compare_to_store(day=None) -> None:
                           for tag, _ in STORES)
     print(f'stores:  {len(closed_today)} trade(s) recorded as closed today '
           f'({breakdown})')
+    # N14 — a closed record whose P&L is known to be an approximation must say
+    # so HERE, where the day's closes are reconciled against the orders. The
+    # marker means a leg was counted at 0.00 (already flat on arrival, or a
+    # fill that could not be recovered), so the figure is wrong in a KNOWN
+    # direction. Silence in this tool is what let it read as a measurement.
+    approx = [t for t in closed_today if _exit_is_approximate(t)]
+    if approx:
+        print('         ~ %d of %d has an APPROXIMATE P&L (a leg counted at '
+              '0.00): %s' % (
+                  len(approx), len(closed_today),
+                  ', '.join('#%s %s' % (t.get('id'), t.get('stock', '?'))
+                            for t in approx)))
     print()
     for tid, rows in sorted(placed.items(), key=lambda kv: (kv[0] is None, kv[0])):
         reasons = {(r.get('context') or {}).get('reason') for r in rows}

@@ -56,6 +56,112 @@ REQUIRED_FIELDS = [
 LEG_TYPES = {'long_symbol': 'CE', 'short_symbol': 'CE'}
 
 
+#: The per-leg exit prices a BCS close records. An explicit ``None`` in one of
+#: these is an ACKNOWLEDGED unknown (the leg was already flat, or its fill could
+#: not be recovered); a MISSING key is a hand-written exit with no per-leg
+#: detail and is left alone. Mirrors `fallen_hero.trade_store.EXIT_FILL_FIELDS`
+#: so the two books share one vocabulary rather than inventing two.
+EXIT_FILL_FIELDS = ('short_fill', 'long_fill')
+
+
+def exit_is_approximate(trade: dict) -> bool:
+    """Is this closed trade's P&L known to be an approximation?
+
+    The BCS twin of `fallen_hero.trade_store.exit_is_approximate`, and it reads
+    BOTH the top-level marker and the one inside `exit`: the top-level copy is
+    for readers that scan trade dicts (`list_trades`, `journal_report`, the
+    digest), and records closed before the marker existed carry neither.
+
+    Absence means EXACT, deliberately. ~450 historical records predate this;
+    defaulting them to approximate would print a caveat on every line, which is
+    how a caveat stops being read.
+    """
+    if trade.get('exit_approximate') is True:
+        return True
+    ex = trade.get('exit') or {}
+    return ex.get('pnl_approximate') is True
+
+
+def bound_bcs_exit(trade: dict, exit_data: dict) -> dict:
+    """Bound a vertical-spread exit to what the structure can arithmetically do.
+
+    **N14.** `bcs/spread_monitor.py` logged "P&L is approximate (long fill
+    only)" when one leg was found already flat — and then persisted a record
+    that read as exact. The missing leg is counted at 0.00, so the figure is
+    not merely uncertain, it is WRONG IN A KNOWN DIRECTION, and nothing
+    downstream (`pnl_net`, the digest, the journal report) could tell.
+
+    Two things, and only two. It never invents a price and never computes a
+    P&L the caller did not supply — that would be the `0.0`-seed defect
+    (`feedback_a_default_that_looks_like_a_value`) with better manners.
+
+    **1. MARK approximate** when a leg fill is explicitly `None`.
+
+    **2. CLAMP `exit_spread` to ``[0, width]``** and re-derive the P&L from it.
+    A vertical's exit value cannot be negative (expiry is always available and
+    costs nothing) nor exceed its width; both bounds are MATHEMATICAL and both
+    are reachable, which per CLAUDE.md's "Valuation bounds — clamp the
+    arithmetic, refuse the estimate" makes them clamps rather than estimates to
+    defer on. This is the write boundary on purpose: a hand-built `exit_data`
+    gets the same treatment as a machine-built one, so the guard does not
+    depend on which code produced the number. It is the same bound PIIND #50
+    breached (`-112.4%` on a `-100%`-capped structure) for want of one existing
+    anywhere.
+
+    LOUD when the clamp binds. A clamp that fires silently turns a visible bug
+    into a plausible number, which is the failure it exists to catch rather
+    than a fix for it.
+
+    Returns a NEW dict; the caller's is never mutated.
+    """
+    out = dict(exit_data or {})
+
+    unpriced = [f for f in EXIT_FILL_FIELDS if f in out and out[f] is None]
+    if unpriced:
+        out['pnl_approximate'] = True
+        out.setdefault('unpriced_legs', unpriced)
+
+    try:
+        width = float(trade['spread_width'])
+        exit_net = float(out['exit_spread'])
+    except (KeyError, TypeError, ValueError):
+        # No width on the record, or no exit value in the exit. Nothing to
+        # bound against — and refusing the whole write over a missing optional
+        # field would strand a close already made at the broker.
+        return out
+    if width <= 0:
+        return out
+
+    bounded = min(max(exit_net, 0.0), width)
+    if bounded == exit_net:
+        return out
+
+    out['exit_spread'] = bounded
+    out['pnl_clamped_from'] = exit_net
+    out['pnl_approximate'] = True
+
+    # Re-derive rather than scale: for a vertical the P&L is exactly
+    # `exit_spread - net_debit`, so the clamped value has one correct answer
+    # and guessing a ratio would be inventing a second.
+    try:
+        debit = float(trade['net_debit'])
+    except (KeyError, TypeError, ValueError):
+        return out
+    out['pnl_per_share'] = bounded - debit
+    qty = trade.get('quantity')
+    try:
+        out['total_pnl'] = out['pnl_per_share'] * float(qty) if qty else None
+    except (TypeError, ValueError):
+        out['total_pnl'] = None
+
+    logger.error(
+        'BCS #%s %s: exit_spread %.2f is outside [0, %.2f] — arithmetically '
+        'impossible for a vertical. Clamped to %.2f and marked approximate. '
+        'A leg was mispriced or counted at 0.00; read the exit fills.',
+        trade.get('id'), trade.get('stock'), exit_net, width, bounded)
+    return out
+
+
 def _load_config() -> dict:
     """Load BCS config from config/bcs_config.json."""
     # TWO LAYERS: config/bcs_config.defaults.json (tracked, secret-free)
@@ -479,8 +585,16 @@ class TradeStore(LockedStoreMixin):
             found = False
             for t in self._trades:
                 if t['id'] == trade_id:
+                    exit_data = bound_bcs_exit(t, exit_data)
                     t['status'] = 'closed'
                     t['exit'] = exit_data
+                    # Surfaced at the TOP LEVEL as well as inside `exit`, for
+                    # the same reason the FH store does it: every reader of
+                    # this book scans trade dicts, and a marker findable only
+                    # by opening a nested dict is one most readers will miss.
+                    # Absent means exact; the key is never written False.
+                    if exit_data.get('pnl_approximate'):
+                        t['exit_approximate'] = True
                     t['version'] = t.get('version', 0) + 1
                     found = True
                     break
