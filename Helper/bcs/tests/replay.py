@@ -27,6 +27,8 @@ surfaces from one timeline.
 """
 from datetime import date as _date, datetime as _datetime, timedelta
 
+from zebra import trade_store as _zebra_trade_store
+
 from bcs.tests.fakes import FakeBroker, MemoryStore, TelegramSpy
 
 
@@ -86,7 +88,11 @@ class ReplayClock:
                 return clock.dt.date()
 
         monkeypatch.setattr(module, 'datetime', _DT)
-        monkeypatch.setattr(module, 'date', _D)
+        if hasattr(module, 'date'):
+            # Not every module the engine reads a clock through imports `date`
+            # (`zebra.trade_store` does not), and setattr would invent the name
+            # rather than patch it.
+            monkeypatch.setattr(module, 'date', _D)
         return self
 
 
@@ -214,6 +220,14 @@ def run_session(monkeypatch, sm, trade, ticks, day, positions,
     """
     clock = ReplayClock(day, at='%02d:%02d:%02d' % sorted(ticks, key=lambda t: t.at)[0].at)
     clock.install(monkeypatch, sm)
+    # The engine does not hold every clock it reasons on. The take-profit latch
+    # is decided in `zebra.trade_store` — one function, deliberately, because
+    # both engines hold these triggers — and its same-day expiry asks that
+    # module what today is. Left on the wall clock, a replay dated 2026-09-15
+    # arms a latch that the very next read calls stale, and the harness would
+    # be measuring the calendar rather than the engine
+    # (`feedback_pin_the_wall_clock_in_tests`).
+    clock.install(monkeypatch, _zebra_trade_store)
     last = sorted(ticks, key=lambda t: t.at)[-1]
     # Margin, not +1s: the loop only OBSERVES a tick when a poll lands at or
     # after its timestamp, so ending the recording the instant the last tick
@@ -246,8 +260,16 @@ def run_session(monkeypatch, sm, trade, ticks, day, positions,
     monkeypatch.setattr(sm, 'set_log_file', lambda p: None)
     spy = TelegramSpy().install(monkeypatch, sm)
 
+    # Every replay policies the D2 invariant for free: while the short leg
+    # still carries quantity, selling the long is a NAKED SHORT and the broker
+    # refuses the order with a BaseException rather than filling it. Derived
+    # from the trade under replay, so no fixture has to remember to ask.
+    hedge_pairs = ([(trade['short_symbol'], trade['long_symbol'])]
+                   if trade.get('short_symbol') and trade.get('long_symbol')
+                   else [])
     kite = TickBroker(clock, day, ticks, trade, positions=positions,
-                      fill_policy=fill_policy, faults=faults)
+                      fill_policy=fill_policy, faults=faults,
+                      hedge_pairs=hedge_pairs)
 
     sm.reset_poll_state()      # trail_state is a monitor_all local, not global
     sm.monitor_all(kite, dry_run=dry_run)

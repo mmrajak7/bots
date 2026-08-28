@@ -2973,6 +2973,49 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
 
         long_fill = long_result.get('average_price', 0)
         long_closed_now = True
+
+        # ── D3 · a PARTIAL long sale is not a closed long leg ───────────────
+        #
+        # 'PARTIAL' passes the check above, so this used to fall through to the
+        # summary: `update_trade_exit` booked the trade CLOSED, `total_pnl` was
+        # computed on the FULL quantity, and the unsold residue sat live at the
+        # broker under a record no engine looks at again. Bounded risk — it is
+        # a long option — but the same invisibility as D2 and a P&L that is
+        # simply wrong. One urgent retry (the short is already flat, so the
+        # escalation invariant applies), then FREEZE rather than book a lie.
+        if long_result['status'] == 'PARTIAL':
+            remaining = close_qty - long_result.get('filled_quantity', 0)
+            if remaining > 0:
+                log(f"  WARNING: Long leg partially filled. {remaining} qty still long!")
+                log(f"  RETRY: closing the {remaining} qty residual (urgent)")
+                retry = close_leg(kite, exchange, long_sym, "SELL", remaining,
+                                  is_buy=False, dry_run=dry_run, urgent=True,
+                                  context=_order_ctx(trade, reason, 'long-retry', label))
+                got = retry.get('filled_quantity', 0) if retry else 0
+                remaining -= got
+                log(f"  RETRY filled {got}; {remaining} still long")
+            if remaining > 0:
+                log("")
+                log("  *** LONG RESIDUE REMAINS — NOT BOOKING ***")
+                log(f"  {remaining} qty still long on {long_sym}.")
+                if not dry_run:
+                    store.set_trade_status(
+                        trade['id'], 'partial_close',
+                        close_failed_leg='long',
+                        close_reason=f"PARTIAL_LONG_{reason}",
+                        residual_long_qty=remaining,
+                        short_fill=short_fill, long_fill=long_fill)
+                    reconcile_after_close(kite, trade, label)
+                send_telegram(
+                    f"🔴 {label} {stock}: PARTIAL LONG CLOSE\n"
+                    f"{remaining} of {close_qty} qty still LONG on {long_sym} "
+                    f"after an urgent retry.\n"
+                    f"The short leg is flat, so nothing is naked — but the "
+                    f"residue is a live option and NOTHING was booked: the "
+                    f"P&L would have been computed on the full quantity.\n"
+                    f"Trade frozen at partial_close and NOT monitored further. "
+                    f"Sell the residue by hand.", alert_class=alert_policy.SAFETY)
+                return False
     else:
         log(f"\n  LONG leg {long_sym} already flat/short (qty={long_qty}). Skipping SELL.")
 
@@ -3173,8 +3216,9 @@ _FH_FILL_FIELD = {'short_call': 'short_call_fill', 'long_call': 'long_call_fill'
 
 def _freeze_fh_leg_failure(fh_store, trade, reason, dry_run, leg_key,
                            leg_label, symbol, close_qty, closed_now,
-                           remaining):
-    """D1 — a leg that did NOT close FREEZES the record. It never books.
+                           remaining, residual=None, hedge_label=None,
+                           kite=None):
+    """D1/D2/D3 — a leg that did NOT fully close FREEZES the record. It never books.
 
     Both FH long legs (Step 2's long call, Step 4's long put) used to log a
     warning, leave `fills[<leg>]` at its 0.0 seed and FALL THROUGH into the
@@ -3204,11 +3248,35 @@ def _freeze_fh_leg_failure(fh_store, trade, reason, dry_run, leg_key,
     Every fill this close DID observe is written onto the record. The BCS twin
     carries `short_fill` through for the same reason: after the freeze, the
     record is the only place those prices exist.
+
+    **`residual` (D2/D3) — the PARTIAL twin of the same defect.** A leg can
+    also fail by half-succeeding: `close_leg` returns `'PARTIAL'`, which passes
+    every caller's success check, so the sequence walked on with part of the
+    leg still live. Pass the unfilled quantity as `residual` and the record
+    freezes exactly as above, plus `residual_<leg>_qty` so the next reader (a
+    human, or M14's sweep) knows how much is out there. `closed_now[leg_key]`
+    is then the average of the part that DID fill — a real observation of a
+    partial, which is precisely why the residual quantity must sit beside it.
+
+    `hedge_label` names the leg deliberately NOT being closed, so the alert
+    cannot be read as "tidy the rest up by hand". `kite` is needed only on the
+    residual path, where orders DID go out and a broker-side audit is worth
+    running.
     """
+    partial = residual is not None
+    headline = (f"PARTIAL {leg_label.upper()} CLOSE" if partial
+                else f"{leg_label.upper()} CLOSE FAILED")
+    #: Buying back a short is not "selling" it, and this alert is read under
+    #: stress by someone about to place an order by hand.
+    action = 'buy back' if leg_key.startswith('short') else 'sell'
+    live_qty = residual if partial else close_qty
+
     log("")
     log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    log(f"!!! {leg_label.upper()} CLOSE FAILED — NOT BOOKING     !!!")
-    log(f"!!! {symbol} x {close_qty} is STILL LIVE at the broker")
+    log(f"!!! {headline} — NOT BOOKING     !!!")
+    log(f"!!! {symbol} x {live_qty} is STILL LIVE at the broker")
+    if hedge_label:
+        log(f"!!! the {hedge_label} will NOT be sold — it is the hedge")
     log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     for k, v in closed_now.items():
         log(f"    observed this close: {k} = {v}")
@@ -3217,21 +3285,107 @@ def _freeze_fh_leg_failure(fh_store, trade, reason, dry_run, leg_key,
 
     if not dry_run:
         extra = {_FH_FILL_FIELD[k]: v for k, v in closed_now.items()}
-        fh_store.set_trade_status(trade['id'], 'partial_close',
-                                  close_failed_leg=leg_key,
-                                  close_reason=reason, **extra)
+        if partial:
+            extra[f'residual_{leg_key}_qty'] = residual
+        fh_store.set_trade_status(
+            trade['id'], 'partial_close',
+            close_failed_leg=leg_key,
+            close_reason=(f"PARTIAL_{leg_key.upper()}_{reason}" if partial
+                          else reason),
+            **extra)
+        if partial and kite is not None:
+            reconcile_after_close(kite, trade, 'FH')
 
     send_telegram(
-        f"🔴 FH {trade.get('stock')}: {leg_label.upper()} CLOSE FAILED\n"
-        f"{reason} triggered but {symbol} x {close_qty} did NOT sell — it is "
-        f"still LIVE at the broker.\n"
+        f"🔴 FH {trade.get('stock')}: {headline}\n"
+        + (f"{residual} of {close_qty} qty on {symbol} is STILL LIVE at the "
+           f"broker after an urgent retry.\n" if partial else
+           f"{reason} triggered but {symbol} x {close_qty} did NOT {action} — "
+           f"it is still LIVE at the broker.\n")
+        + (f"The {hedge_label} was NOT sold — it is the hedge on that naked "
+           f"short. You are over-hedged, which is the bounded side.\n"
+           if hedge_label else "")
         + (f"Still open: {'; '.join(remaining)}\n" if remaining else "")
-        + f"NOTHING was booked. Pricing that leg at 0.00 would record a P&L "
-          f"for a sale that never happened.\n"
-          f"Trade #{trade.get('id')} is frozen at partial_close and NOT "
+        + (f"NOTHING was booked — the P&L would have been computed on the "
+           f"FULL quantity while {residual} is still live.\n" if partial else
+           f"NOTHING was booked. Pricing that leg at 0.00 would record a P&L "
+           f"for a sale that never happened.\n")
+        + f"Trade #{trade.get('id')} is frozen at partial_close and NOT "
           f"monitored further. Close it by hand.",
         alert_class=alert_policy.SAFETY)
     return False
+
+
+def _fh_residue(kite, fh_store, trade, exchange, reason, dry_run, result,
+                close_qty, *, leg_key, leg_label, symbol, txn, closed_now,
+                remaining_legs=(), hedge_label=None):
+    """D2/D3 — a PARTIALLY closed FH leg gets ONE urgent retry, then FREEZES.
+
+    `'PARTIAL'` satisfies `if result['status'] not in ('COMPLETE', 'PARTIAL')`,
+    so before this existed the sequence walked straight on to the next leg with
+    part of this one still live at the broker.
+
+    On a SHORT leg that is the worst state this system can reach. Step 3
+    filling 300 of 400 short puts let Step 4 sell the FULL long put, leaving
+    **100 naked short puts** live under a record marked `closed` (D2) — not in
+    `get_open_trades()`, not in `get_frozen_trades()`, no stop, no monitor, and
+    nothing that will ever look at it again. On a LONG leg the risk is bounded
+    (it is a long option), but the residue is just as invisible and the booked
+    P&L is computed on the FULL quantity (D3).
+
+    **THE INVARIANT: a close sequence never leaves the book LESS hedged than it
+    found it.** While short residue exists the hedge is NOT sold. Over-hedged
+    is bounded, naked short is not, and we take the bounded side every time —
+    the same sentence the BCS twin already states in `_close_spread_inner`.
+
+    One retry, on the residual quantity only. `close_leg` re-reads the position
+    itself and `_find_pending_orders` blocks doubling up, so this cannot become
+    the Feb-2026 multiple-order shape.
+
+    Returns True when the leg is flat and the sequence may continue; False when
+    residue remains and the record has been frozen.
+    """
+    if result['status'] != 'PARTIAL':
+        return True
+    remaining = close_qty - result.get('filled_quantity', 0)
+    if remaining <= 0:
+        return True
+
+    log(f"  WARNING: {leg_label} partially filled. {remaining} qty still open!")
+    log(f"  RETRY: closing the {remaining} qty {leg_label} residual (urgent)")
+    retry = close_leg(kite, exchange, symbol, txn, remaining,
+                      is_buy=(txn == 'BUY'), dry_run=dry_run, urgent=True,
+                      context=_order_ctx(trade, reason,
+                                         f"{leg_key.replace('_', '-')}-retry",
+                                         'FH'))
+    got = retry.get('filled_quantity', 0) if retry else 0
+    remaining -= got
+    log(f"  RETRY filled {got}; {remaining} still open on {symbol}")
+    if remaining <= 0:
+        return True
+
+    return _freeze_fh_leg_failure(
+        fh_store, trade, reason, dry_run, leg_key, leg_label, symbol,
+        close_qty, closed_now, list(remaining_legs), residual=remaining,
+        hedge_label=hedge_label, kite=kite)
+
+
+def _fh_put_legs_open(sp_sym, sp_qty, lp_sym, lp_qty):
+    """The put legs still live, described for a freeze alert.
+
+    Shared by every FH freeze that lands BEFORE the put spread is closed, so
+    the reader is always told what they have been handed. The one genuinely
+    uncomfortable combination — a short put whose long put was already flat on
+    arrival — is named out loud rather than described as an ordinary spread.
+    """
+    out = []
+    if sp_qty < 0:
+        out.append(f"SHORT PUT {sp_sym} {sp_qty:+d}"
+                   + ("" if lp_qty > 0
+                      else " — UNHEDGED, the long put was already flat"))
+    if lp_qty > 0:
+        out.append(f"LONG PUT {lp_sym} {lp_qty:+d}")
+    return out
 
 
 def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
@@ -3381,30 +3535,16 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         # long call in full while part of the short call is still open — i.e.
         # it REMOVES THE HEDGE FROM A NAKED SHORT. That is the worst version of
         # the B10 shape anywhere in this file.
-        sc_remaining = close_qty - result.get('filled_quantity', 0)
-        if result['status'] == 'PARTIAL' and sc_remaining > 0:
-            log(f"  RETRY: closing the {sc_remaining} qty short-call residual")
-            retry = close_leg(kite, exchange, sc_sym, "BUY", sc_remaining,
-                              is_buy=True, dry_run=dry_run, urgent=True,
-                              context=_order_ctx(trade, reason, 'short-call-retry', 'FH'))
-            got = retry.get('filled_quantity', 0) if retry else 0
-            sc_remaining -= got
-        if result['status'] == 'PARTIAL' and sc_remaining > 0:
-            log("")
-            log("  *** SHORT CALL RESIDUE — HEDGE WILL NOT BE SOLD ***")
-            if not dry_run:
-                fh_store.set_trade_status(
-                    trade['id'], 'partial_close',
-                    close_reason=f"PARTIAL_SHORT_CALL_{reason}",
-                    residual_short_call_qty=sc_remaining)
-                reconcile_after_close(kite, trade, 'FH')
-            send_telegram(
-                f"🔴 FH {stock}: PARTIAL SHORT CALL CLOSE\n"
-                f"{sc_remaining} qty still SHORT on {sc_sym} after a retry.\n"
-                f"The long call was NOT sold — it is the hedge on that naked "
-                f"short.\n"
-                f"Trade frozen at partial_close and NOT monitored further. "
-                f"Close the residue by hand.", alert_class=alert_policy.SAFETY)
+        #
+        # This used to be an inline copy of the block Step 3 did NOT have (D2).
+        # One definition now serves all four legs — the copy nobody opened is
+        # how the short PUT went uncovered for as long as it did.
+        if not _fh_residue(kite, fh_store, trade, exchange, reason, dry_run,
+                           result, close_qty, leg_key='short_call',
+                           leg_label='short call', symbol=sc_sym, txn='BUY',
+                           closed_now=closed_now, hedge_label='long call',
+                           remaining_legs=_fh_put_legs_open(
+                               sp_sym, sp_qty, lp_sym, lp_qty)):
             return False
     else:
         log(f"\n  SHORT CALL {sc_sym} already flat (qty={sc_qty}). Skipping.")
@@ -3426,20 +3566,25 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
             # premium. No new risk is created by stopping, and continuing would
             # mean placing further orders into a book that has just refused
             # one. The one shape worth knowing about is named in the alert:
-            # `remaining` reports the short put if it is still open.
-            remaining = []
-            if sp_qty < 0:
-                remaining.append(
-                    f"SHORT PUT {sp_sym} {sp_qty:+d}"
-                    + ("" if lp_qty > 0
-                       else " — UNHEDGED, the long put was already flat"))
-            if lp_qty > 0:
-                remaining.append(f"LONG PUT {lp_sym} {lp_qty:+d}")
+            # `_fh_put_legs_open` reports the short put if it is still open,
+            # and says UNHEDGED when its long put was already flat.
             return _freeze_fh_leg_failure(
                 fh_store, trade, reason, dry_run, 'long_call', 'long call',
-                lc_sym, close_qty, closed_now, remaining)
+                lc_sym, close_qty, closed_now,
+                _fh_put_legs_open(sp_sym, sp_qty, lp_sym, lp_qty))
         fills['long_call'] = result.get('average_price', 0)
         closed_now['long_call'] = fills['long_call']
+        # D3 — a PARTIAL sale leaves long-call residue live under what would
+        # otherwise become a CLOSED record, with the P&L computed on the full
+        # quantity. Bounded risk, but the same invisibility as D2. Stopping is
+        # safe: the put spread is left intact and bounded by its width.
+        if not _fh_residue(kite, fh_store, trade, exchange, reason, dry_run,
+                           result, close_qty, leg_key='long_call',
+                           leg_label='long call', symbol=lc_sym, txn='SELL',
+                           closed_now=closed_now,
+                           remaining_legs=_fh_put_legs_open(
+                               sp_sym, sp_qty, lp_sym, lp_qty)):
+            return False
     else:
         if lc_sym:
             log(f"\n  LONG CALL {lc_sym} already flat (qty={lc_qty}). Skipping.")
@@ -3461,6 +3606,25 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
             return False
         fills['short_put'] = result.get('average_price', 0)
         closed_now['short_put'] = fills['short_put']
+
+        # ── D2 · THE LONG PUT IS THE SHORT PUT'S HEDGE ─────────────────────
+        #
+        # This is the defect that made a naked short under a CLOSED record
+        # reachable. 'PARTIAL' passed the check above with nothing behind it —
+        # Step 1 had the B10 retry-then-freeze and Step 3 had none — so a short
+        # put filling 300 of 400 fell through and Step 4 sold the FULL long
+        # put: 100 NAKED SHORT PUTS live, `status: 'closed'`,
+        # `update_trade_exit` called, and no engine that will ever look at it
+        # again. Same guard, same helper, same invariant as Step 1.
+        if not _fh_residue(kite, fh_store, trade, exchange, reason, dry_run,
+                           result, close_qty, leg_key='short_put',
+                           leg_label='short put', symbol=sp_sym, txn='BUY',
+                           closed_now=closed_now, hedge_label='long put'):
+            # No `remaining_legs` here, deliberately: `sp_qty` is the
+            # PRE-close reading, so listing it would tell the reader 400 are
+            # still short one line after saying 100 are. The residual line and
+            # the hedge line together say everything true about this state.
+            return False
     else:
         log(f"\n  SHORT PUT {sp_sym} already flat (qty={sp_qty}). Skipping.")
 
@@ -3482,6 +3646,15 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                 lp_sym, close_qty, closed_now, [])
         fills['long_put'] = result.get('average_price', 0)
         closed_now['long_put'] = fills['long_put']
+        # D3, on the last leg: a PARTIAL sale leaves long-put residue live
+        # under a record that would otherwise book CLOSED, with the P&L
+        # computed on the full quantity. Every short leg is flat by now, so
+        # nothing is naked — but nothing would watch the residue either.
+        if not _fh_residue(kite, fh_store, trade, exchange, reason, dry_run,
+                           result, close_qty, leg_key='long_put',
+                           leg_label='long put', symbol=lp_sym, txn='SELL',
+                           closed_now=closed_now):
+            return False
     else:
         log(f"\n  LONG PUT {lp_sym} already flat (qty={lp_qty}). Skipping.")
 

@@ -3190,8 +3190,11 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 pending_mfe.setdefault(tid, {}).update(patch)
 
             # ── THE TP LATCH ────────────────────────────────────────────────
-            # The FIRST observed touch arms this exit permanently; from here on
-            # it proceeds wherever spot has gone (owner, 2026-08-28). The
+            # The FIRST observed touch arms this exit for the REST OF THAT
+            # TRADING DAY; from here on it proceeds wherever spot has gone
+            # (owner, 2026-08-28, bounded to the session the same day: "TP
+            # latch should be for same day"). The expiry is evaluated on read
+            # inside `tp_latched`, so nothing here has to run to end it. The
             # trigger is a fact about SPOT, so it is captured here — above the
             # dark-book defer and above the stand-down — and NOT in the TP
             # branch below, which several guards `continue` past. A touch the
@@ -3235,8 +3238,8 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     trade.update(latch['patch'])
                     logger.info(
                         "TP LATCHED #%d %s spot=%.2f tp=%.2f — this exit is "
-                        "now armed permanently, wherever spot goes next",
-                        tid, stock, spot, tp_spot)
+                        "armed for the rest of today's session, wherever spot "
+                        "goes next", tid, stock, spot, tp_spot)
                 except Exception as e:
                     # The exit can still fire THIS cycle (tp_hit is true), so
                     # nothing is lost yet; what is lost is the arming if the
@@ -3252,6 +3255,45 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     "(touched %s at %s) — exiting anyway",
                     tid, stock, spot, tp_spot, trade.get('tp_touch_spot'),
                     trade.get('tp_touched_at'))
+
+            # A touch that reached the end of its session unbooked. The owner
+            # bounded the latch to the day it was armed on (2026-08-28), so
+            # this is the rule working — and it is the ONLY way the bound can
+            # cost anything, which makes it the number that says whether the
+            # bound is right. Recorded on the position that paid it and said
+            # out loud once, never per poll.
+            #
+            # `expired_patch` is empty unless there is something new to write,
+            # so this cannot fire twice for the same lapse. It is deliberately
+            # NOT folded into the branch above: nothing is being armed here.
+            # The write is what makes it once: the evidence is keyed on the
+            # lapsed stamp, so the next poll finds it already recorded and says
+            # nothing. Where this engine is stood down it cannot write, so it
+            # must not shout either — an unwritable notice on every poll of
+            # every position for the rest of the position's life is how a
+            # reader learns to skim the log this system is being judged on.
+            if latch['expired_patch']:
+                if _exits_external(trade):
+                    logger.debug(
+                        "TP latch on #%d %s expired unbooked; exits are "
+                        "EXTERNAL so spread_monitor owns the record",
+                        tid, stock)
+                else:
+                    try:
+                        store.update_trade_fields(tid, **latch['expired_patch'])
+                        trade.update(latch['expired_patch'])
+                        logger.info(
+                            "TP LATCH EXPIRED #%d %s: touched %s at spot %s "
+                            "and never booked — a latch arms for its own "
+                            "session only, so this exit is back to the live "
+                            "comparison (spot=%.2f tp=%.2f)",
+                            tid, stock, trade.get('tp_touched_at'),
+                            trade.get('tp_touch_spot'), spot, tp_spot)
+                    except Exception as e:
+                        logger.warning(
+                            "TP LATCH EXPIRED #%d %s but the evidence was not "
+                            "recorded: %s — the latch IS expired either way",
+                            tid, stock, e)
 
             if cfg.PAPER_MODE and mid is None:
                 # Terminal net first: without it a position whose book has gone

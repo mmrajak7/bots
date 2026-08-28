@@ -114,8 +114,39 @@ def is_paper_record(trade: dict) -> bool:
 # structural, not a bug: the trigger was re-evaluated from scratch on a later
 # price than the one that fired it.
 #
-# THE RULE. The FIRST observed touch arms the exit PERMANENTLY. From then on the
-# exit proceeds regardless of where spot has moved.
+# THE RULE. The FIRST observed touch arms the exit FOR THE REST OF THAT TRADING
+# DAY. From then on the exit proceeds regardless of where spot has moved — until
+# the session it was armed in ends, at which point it simply stops counting.
+#
+# THE BOUND, owner 2026-08-28: *"TP latch should be for same day"*. As first
+# built the latch never expired, so a touch followed by a permanently unusable
+# book would exit on the first usable one, days later if need be — a Monday
+# touch booking on Thursday's first print. The trigger is a statement about
+# where the market was, and it stops being one overnight.
+#
+# HOW THE EXPIRY WORKS, and why it is not a sweep. It is evaluated on READ:
+# `tp_latched` compares the stamp's trading day with today's and answers False
+# when they differ. Nothing has to RUN to expire a latch, so a missed cron
+# cycle, a weekend, a dead process or a box that was switched off cannot leave
+# one armed — which a nightly sweep, or an in-memory timer, all could. Nothing
+# is ever deleted either: the stale stamp stays on the record as evidence and
+# the READ is what changes.
+#
+# THE DAY IS THE IST CALENDAR DATE. The session is 09:15-15:30 IST and cannot
+# straddle midnight, so the IST date IS the trading day. It is emphatically not
+# the host's naive date (`bcs/spread_monitor.py` still gates its session on
+# `datetime.now()` — open item M7 — and a UTC-clocked box reads 09:15 IST as
+# 03:45) and not the UTC date (01:30 IST is the previous UTC day, mid-session
+# for nobody but a rule that would expire a latch two hours after arming it).
+# Naive datetimes handed in by callers are normalised through `_ist`.
+#
+# AT THE BOUNDARY. A touch at 15:29 that has not booked by the close expires
+# unbooked. That is the rule doing its job, not a failure — but it is also the
+# only way this rule can cost anything, so it is RECORDED: `tp_latch` returns an
+# `expired_patch` appending the lapsed touch to `TP_LATCH_EXPIRED`, and the
+# engine that owns the record writes it. Count those against the exits the
+# unbounded version would have booked days late, and the question of whether
+# same-day is the right rule stops being an argument.
 #
 # WHY IT LIVES IN THE STORE MODULE. Two engines hold this trigger — `zebra/
 # monitor.py` books it in paper, `bcs/spread_monitor.py` books it with real
@@ -148,21 +179,103 @@ def is_paper_record(trade: dict) -> bool:
 # The asymmetry is the point: a missed TP costs an opportunity, and a latched
 # stop on a bad print costs capital.
 
-#: When the first touch was seen (ISO, naive local — the same clock every other
-#: timestamp in this store is written on).
+#: When the first touch of the CURRENT trading day was seen. Written as an
+#: IST-AWARE ISO timestamp (`...+05:30`): the day boundary is the whole rule
+#: now, and a naive stamp is a boundary nobody can settle after the fact.
+#: Records written before 2026-08-28 carry naive local time and are read
+#: through `_ist`, which resolves them on the host clock they were written on.
 TP_TOUCHED_AT = 'tp_touched_at'
 #: The spot that did it. FORENSIC AND MEASUREMENT ONLY — never a booking price.
 TP_TOUCH_SPOT = 'tp_touch_spot'
+#: Append-only list of touches that reached the end of their session without
+#: booking: `{'touched_at', 'touch_spot', 'noticed_at'}`. The price of the
+#: same-day bound, on the records that paid it.
+TP_LATCH_EXPIRED = 'tp_latch_expired'
 
 
-def tp_latched(trade: dict) -> bool:
-    """Has this record's take-profit already been armed by an earlier touch?
+def _ist(dt: Optional[datetime] = None) -> datetime:
+    """`dt` as an IST-aware instant; now, in IST, when `dt` is None.
+
+    A NAIVE input is system-local, because that is what `datetime.now()`
+    returns and both engines hand one over (`bcs/spread_monitor.py` passes its
+    own `datetime.now()` deliberately, so the touch and the latency stamp read
+    off one clock). `astimezone` is the documented conversion for it and is the
+    identity on the IST-clocked Pi.
+    """
+    if dt is None:
+        return datetime.now(cfg.IST)
+    try:
+        return dt.astimezone(cfg.IST)
+    except (OSError, OverflowError, ValueError):    # pragma: no cover
+        # A host with no resolvable local zone, or a datetime near the range
+        # ends. Reading it as IST is the assumption the rest of this system
+        # already makes; raising inside an exit path is not an option.
+        return dt.replace(tzinfo=cfg.IST)
+
+
+def tp_trading_day(dt: Optional[datetime] = None):
+    """The trading day `dt` falls in — i.e. its IST calendar date.
+
+    The session is 09:15-15:30 IST, so it cannot straddle midnight and the date
+    is the whole answer. One function, because a second spelling of "which day
+    is this" is how the two engines would drift apart.
+    """
+    return _ist(dt).date()
+
+
+def _touch_day(trade: dict):
+    """The trading day this record's latch was armed on, or None if it has no
+    stamp or the stamp cannot be read."""
+    stamp = trade.get(TP_TOUCHED_AT)
+    if not stamp or not isinstance(stamp, str):
+        return None
+    try:
+        return tp_trading_day(datetime.fromisoformat(stamp))
+    except (TypeError, ValueError):
+        return None
+
+
+def tp_latched(trade: dict, now: Optional[datetime] = None) -> bool:
+    """Is this record's take-profit armed by a touch seen EARLIER TODAY?
 
     Absence means NOT YET TOUCHED. All 462 existing records predate the field
     and must read as unlatched, which is what `.get()` on a missing key gives —
     stated here because it is a property, not an accident.
+
+    A stamp from any other trading day means NOT ARMED (owner, 2026-08-28:
+    *"TP latch should be for same day"*). "Any other" and not "any earlier": a
+    stamp in the future is a clock nobody can trust, and an unbounded arming
+    off one is the thing this bound exists to prevent. An unreadable stamp is
+    treated the same way — it cannot be shown to be today's, and falling back
+    to the live spot comparison costs an opportunity, while honouring a stamp
+    of unknown age is the pre-bound behaviour the owner has just ruled out.
     """
-    return bool(trade.get(TP_TOUCHED_AT))
+    day = _touch_day(trade)
+    return day is not None and day == tp_trading_day(now)
+
+
+def _expiry_evidence(trade: dict, now: datetime) -> dict:
+    """The patch that records a touch which lapsed unbooked, or `{}`.
+
+    Idempotent by the stamp itself: `tp_latch` is called every poll of every
+    open position, and an evidence log that grows every five minutes is not
+    evidence. Nothing is cleared — the lapsed stamp stays where it is, and the
+    list is what a later reader counts.
+    """
+    stamp = trade.get(TP_TOUCHED_AT)
+    if not stamp:
+        return {}
+    prior = trade.get(TP_LATCH_EXPIRED) or []
+    if not isinstance(prior, list):             # pragma: no cover - corrupt
+        prior = []
+    if any(isinstance(e, dict) and e.get('touched_at') == stamp
+           for e in prior):
+        return {}
+    return {TP_LATCH_EXPIRED: list(prior) + [{
+        'touched_at': stamp,
+        'touch_spot': trade.get(TP_TOUCH_SPOT),
+        'noticed_at': _ist(now).isoformat(timespec='seconds'),
+    }]}
 
 
 def tp_latch(trade: dict, hit_now: bool, spot,
@@ -175,18 +288,35 @@ def tp_latch(trade: dict, hit_now: bool, spot,
     shared is the DECISION, which is the part that must not diverge.
 
     Returns
-      armed      — the exit may proceed this cycle (touched now, or before)
-      latched    — the record was ALREADY armed when this cycle started
-      new_touch  — this cycle is the first touch, so `patch` must be persisted
-      patch      — the fields to write, or `{}`. The caller writes them BEFORE
-                   the vet and before any order, because a verdict in flight is
-                   exactly when the trigger used to evaporate.
+      armed         — the exit may proceed this cycle (touched now, or earlier
+                      TODAY)
+      latched       — the record was ALREADY armed when this cycle started
+      new_touch     — this cycle is the first touch OF THIS TRADING DAY, so
+                      `patch` must be persisted
+      patch         — the fields to write, or `{}`. The caller writes them
+                      BEFORE the vet and before any order, because a verdict in
+                      flight is exactly when the trigger used to evaporate.
+      expired       — a stamp is present but belongs to another trading day, so
+                      it no longer arms anything
+      expired_patch — the evidence write for that lapse, or `{}`. SEPARATE from
+                      `patch` on purpose: `patch` means "a touch just happened"
+                      and its callers log and alert accordingly, so folding
+                      bookkeeping into it would have an engine announce a touch
+                      that is not happening. A caller that ignores this key is
+                      correct, merely silent.
+
+    `now` is the caller's clock and may be naive (the order path passes its own
+    `datetime.now()` so the touch and the latency stamp share one clock); it is
+    normalised to IST here, and the stamp is WRITTEN with its offset.
     """
-    latched = tp_latched(trade)
+    ist_now = _ist(now)
+    latched = tp_latched(trade, now=ist_now)
     new_touch = bool(hit_now) and not latched
+    expired = bool(trade.get(TP_TOUCHED_AT)) and not latched
+    evidence = _expiry_evidence(trade, ist_now) if expired else {}
     patch: dict = {}
     if new_touch:
-        patch[TP_TOUCHED_AT] = (now or datetime.now()).isoformat()
+        patch[TP_TOUCHED_AT] = ist_now.isoformat()
         try:
             patch[TP_TOUCH_SPOT] = float(spot)
         except (TypeError, ValueError):
@@ -194,16 +324,15 @@ def tp_latch(trade: dict, hit_now: bool, spot,
             # matters; the number is measurement, and losing the measurement
             # must never cost the arming.
             patch[TP_TOUCH_SPOT] = None
+        # A re-arm OVERWRITES the stamp, so yesterday's lapse has to be
+        # preserved in the same write or it is gone. Folded into `patch` rather
+        # than left in `expired_patch` because here a caller that only writes
+        # `patch` is not being misled — a touch really is happening this cycle.
+        patch.update(evidence)
+        evidence = {}
     return {'armed': bool(hit_now) or latched, 'latched': latched,
-            'new_touch': new_touch, 'patch': patch}
-
-
-def _naive(dt: datetime) -> datetime:
-    """Drop the tzinfo. The two engines timestamp on different clocks (zebra
-    reasons in IST-aware datetimes, this store writes naive local time), and
-    subtracting one from the other raises. A measurement must not be able to
-    throw inside an exit path."""
-    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+            'new_touch': new_touch, 'patch': patch, 'expired': expired,
+            'expired_patch': evidence}
 
 
 def tp_touch_to_fill(trade: dict, exit_spot, rising: Optional[bool] = None,
@@ -218,21 +347,29 @@ def tp_touch_to_fill(trade: dict, exit_spot, rising: Optional[bool] = None,
 
     Returns `{}` for an unlatched record — a TP that fired and booked inside one
     observation has no gap to report, and inventing a zero would make the
-    distribution unreadable.
+    distribution unreadable. An EXPIRED latch reads as unlatched here too: a
+    close on the morning after a lapsed touch would otherwise report a
+    seventeen-hour give-back into a distribution that is meant to price a
+    five-minute one.
 
     `rising` says which way this position's TP points (True for CE / BCS). When
     omitted it is inferred from the touch itself: the touch spot sat at or above
     the level for a rising target. Purely for the `gave_back` label; the signed
     move is reported either way.
     """
-    if not tp_latched(trade):
+    if not tp_latched(trade, now=now):
         return {}
     out: dict = {}
     touched = trade.get(TP_TOUCHED_AT)
     try:
-        t0 = _naive(datetime.fromisoformat(str(touched)))
+        # BOTH sides through `_ist`. The two engines timestamp on different
+        # clocks — zebra reasons in IST-aware datetimes, the order path passes
+        # naive local — and subtracting one from the other raises. Normalising
+        # (rather than the old blanket tzinfo-strip) also stops a UTC-clocked
+        # host reporting a 5.5-hour lag on a five-minute one.
+        t0 = _ist(datetime.fromisoformat(str(touched)))
         out['tp_touch_to_exit_sec'] = round(
-            (_naive(now or datetime.now()) - t0).total_seconds(), 1)
+            (_ist(now) - t0).total_seconds(), 1)
     except (TypeError, ValueError):
         pass
     try:

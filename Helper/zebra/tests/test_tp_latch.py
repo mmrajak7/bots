@@ -1,7 +1,12 @@
-"""M13 — the FIRST observed take-profit touch arms the exit permanently.
+"""M13 — the FIRST observed take-profit touch arms the exit.
 
 Owner, 2026-08-28: *"touch that doesn't persist — does not matter -> exit -> if
 seeing touch once, proven is ok."*
+
+The arming was originally permanent. The same owner bounded it to the trading
+day it was armed on later the same day (*"TP latch should be for same day"*);
+that bound and its boundary cases live in `test_tp_latch_same_day.py`. Every
+test below runs inside ONE session, which is what it was always describing.
 
 What was broken
 ---------------
@@ -123,10 +128,19 @@ def test_the_first_touch_produces_the_patch_and_the_second_does_not():
 
 
 def test_a_latched_record_is_armed_with_the_trigger_gone():
-    """The whole rule, in one line: hit_now False, armed True."""
-    latched = {ts.TP_TOUCHED_AT: '2026-08-27T09:25:00',
+    """The whole rule, in one line: hit_now False, armed True.
+
+    The stamp is 09:25 on the day of the poll, not a fixed date. The owner
+    bounded the latch to its own trading day on 2026-08-28 (M13a,
+    `test_tp_latch_same_day.py`), so a hardcoded date here would be asserting
+    the arming and the expiry at the same time and would answer differently
+    depending on when it ran.
+    """
+    now = datetime(2026, 8, 27, 14, 30, tzinfo=cfg.IST)
+    latched = {ts.TP_TOUCHED_AT: datetime(2026, 8, 27, 9, 25,
+                                          tzinfo=cfg.IST).isoformat(),
                ts.TP_TOUCH_SPOT: 1934.2}
-    assert ts.tp_latch(latched, False, 1900.0)['armed'] is True
+    assert ts.tp_latch(latched, False, 1900.0, now=now)['armed'] is True
 
 
 def test_the_latch_carries_no_price_to_book_at():

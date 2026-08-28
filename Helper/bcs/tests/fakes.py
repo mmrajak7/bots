@@ -66,6 +66,31 @@ def partial_status(fraction):
     return _policy
 
 
+class HedgeInvariantViolation(BaseException):
+    """A close sequence tried to leave the book LESS hedged than it found it.
+
+    **The invariant (D2):** while a SHORT leg still carries open quantity, its
+    LONG hedge is never sold. Selling it converts a bounded spread into an
+    unbounded naked short — and in the incident that produced this class, into
+    a naked short under a record marked `closed`: not in `get_open_trades()`,
+    not in `get_frozen_trades()`, no stop, no monitor, nothing that would ever
+    look at it again.
+
+    Asserted at the BROKER, not at the call site, so every fixture and every
+    replay checks it for free and a future edit to any close path trips it
+    without anyone having to remember to test for it (M14 §4 argues for exactly
+    this placement).
+
+    `BaseException`, not `Exception`, deliberately: `close_spread` and
+    `close_fh_position` wrap the whole sequence in `except Exception`, so an
+    ordinary exception here would be swallowed, logged as "EXCEPTION during
+    close" and presented to the test as a tidy freeze — hiding the violation
+    behind the very handler that exists to contain surprises. Same reasoning as
+    the production-write rails in `conftest.py`
+    ([[feedback_tests_must_not_touch_production]]).
+    """
+
+
 class FakeBroker:
     """Stands in for `KiteConnect`. Only the surface the monitor actually uses.
 
@@ -79,7 +104,13 @@ class FakeBroker:
     ORDER_TYPE_LIMIT = 'LIMIT'
 
     def __init__(self, spots=None, books=None, positions=None,
-                 fill_policy=None, tag='BCS_MON'):
+                 fill_policy=None, tag='BCS_MON', hedge_pairs=None):
+        #: [(short_symbol, long_symbol)] — the hedge relationships this fixture
+        #: wants policed. Declared rather than inferred, because an ENTRY
+        #: legitimately buys the long while the short is open; only a CLOSE
+        #: sequence is bound by the invariant. See `HedgeInvariantViolation`.
+        self.hedge_pairs = [tuple(p) for p in (hedge_pairs or [])]
+        self.hedge_violations = []
         self.spots = dict(spots or {})            # {'NSE:X': 100.0}
         self.books = dict(books or {})            # {'NFO:XCE': {...}}
         self._positions = list(positions or [])   # [{tradingsymbol, quantity, ...}]
@@ -153,6 +184,7 @@ class FakeBroker:
     def place_order(self, **kw):
         if self.place_order_raises:
             raise self.place_order_raises
+        self._check_hedge_invariant(kw)
         self.placed.append(dict(kw))
         oid = str(next(self._ids))
         status, filled, avg = self.fill_policy(kw)
@@ -182,6 +214,30 @@ class FakeBroker:
                     'COMPLETE', 'REJECTED'):
                 o['status'] = 'CANCELLED'
         return order_id
+
+    # -- invariants ---------------------------------------------------------
+    def _check_hedge_invariant(self, kw):
+        """Refuse, loudly, to sell a hedge that is still hedging something.
+
+        Fires on the ORDER, before it is recorded or filled, so `placed` never
+        contains the forbidden order and a test cannot accidentally assert
+        against a book the invariant already condemned.
+        """
+        if not self.hedge_pairs or kw.get('transaction_type') != 'SELL':
+            return
+        sym = kw.get('tradingsymbol')
+        for short_sym, long_sym in self.hedge_pairs:
+            if sym != long_sym:
+                continue
+            short_qty = self.net_qty(short_sym)
+            if short_qty < 0:
+                msg = (f"HEDGE INVARIANT VIOLATED: SELL {sym} x "
+                       f"{kw.get('quantity')} while {short_sym} is still SHORT "
+                       f"{short_qty}. That leaves a NAKED SHORT — the close "
+                       f"sequence has made the book LESS hedged than it found "
+                       f"it.")
+                self.hedge_violations.append(msg)
+                raise HedgeInvariantViolation(msg)
 
     # -- internals ----------------------------------------------------------
     def _apply_fill(self, symbol, txn, qty, price):
