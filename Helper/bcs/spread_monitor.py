@@ -2677,6 +2677,337 @@ def recovery_gate(trade, rclass, *, now=None, now_time=None,
         attempts + 1, RECOVERY_MAX_ATTEMPTS, rclass)
 
 
+def _refreeze_after_recovery(store, trade, label, cf):
+    """Put a record the recovery close did NOT book back to `partial_close`.
+
+    `_refuse_unpriced_close` deliberately leaves the record at `closing` — on
+    the NORMAL path that is right, because `closing` sits inside
+    `OPEN_STATUSES` and the crash-recovery sweep at monitor start will restore
+    it to `open` for re-monitoring.
+
+    On the RECOVERY path that same behaviour LOSES THE INCIDENT: the record
+    came from `partial_close`, and `recover_closing_trade` would flip it to
+    `open` at the next restart, dropping it out of `get_frozen_trades()` while
+    keeping a stale `close_failure` nobody reads. The frozen position would go
+    back to looking like a healthy open one — the exact invisibility M14 exists
+    to end, manufactured by M14.
+
+    So the sweep returns what it borrowed. `set_trade_status` (not
+    `recover_closing_trade`, whose Telegram would announce a recovery that did
+    not happen).
+    """
+    # Read the status back through `get_frozen_trades`'s sibling rather than a
+    # method only some books have: every store exposes the frozen list, so
+    # "not frozen and not booked" is decidable without a new store verb.
+    try:
+        still_closing = any(
+            t.get('id') == trade['id'] and t.get('status') == 'closing'
+            for t in store.get_closing_trades())
+        if still_closing:
+            store.set_trade_status(trade['id'], 'partial_close',
+                                   close_failure=cf)
+            log('  #%s %s: recovery could not book it; returned to '
+                'partial_close so the sweep keeps seeing it.'
+                % (trade.get('id'), label))
+    except Exception as e:                     # pragma: no cover - store-level
+        log('  Could not re-freeze #%s after recovery: %s'
+            % (trade.get('id'), e))
+
+
+def _recovery_event(name, **kv):
+    """One machine-parseable line per recovery decision, for the digest.
+
+    `EVENT <name> k=v ...` on its own line. The digest counts BY NAME, never by
+    warning tally, so a recovery that ran and a recovery that was refused are
+    different facts rather than two entries in a blob of WARNING text.
+    """
+    log('EVENT %s %s' % (name, ' '.join('%s=%s' % (k, v)
+                                        for k, v in sorted(kv.items()))))
+
+
+def _persist_recovery(store, trade, cf):
+    """Write `close_failure` back. Never touches `status`.
+
+    Status moves only through `begin_recovery` / `set_trade_status`, which is
+    what keeps the concurrency lock meaningful; zebra's `update_trade_fields`
+    refuses status writes outright and this respects that on every book.
+    """
+    trade['close_failure'] = cf
+    try:
+        store.update_trade_fields(trade['id'], close_failure=cf)
+    except Exception as e:                     # pragma: no cover - store-level
+        log('  Could not persist close_failure for #%s: %s' % (trade.get('id'), e))
+
+
+def _escalate_recovery(store, trade, label, cf, why, nagged):
+    """Terminal for the incident: alerting continues, ordering never resumes.
+
+    No restart, no new day and no config reload re-arms it. Clearance is
+    explicit and human. The alert fires ONCE at escalation and then at most
+    once a day, keyed `(label, id, cause, date)` — a safety alert nobody can
+    silence is right, but one that repeats every five seconds trains the reader
+    to swipe it away, which is the same thing as silencing it.
+    """
+    first = cf.get('state') != 'escalated'
+    if first:
+        cf['state'] = 'escalated'
+        cf['next_attempt_after'] = None
+        _persist_recovery(store, trade, cf)
+        _recovery_event('recovery_exhausted', store=label, id=trade['id'],
+                        cause=cf.get('cause'))
+    key = (label, trade['id'], cf.get('cause'), date.today().isoformat())
+    if key in nagged:
+        return
+    nagged.add(key)
+    send_telegram(
+        "\U0001F6A8 %s #%s %s: FROZEN CLOSE NEEDS A HUMAN\n"
+        "%s\n"
+        "Automatic recovery will place NO further orders for this incident.\n"
+        "Close it by hand in Kite, then clear it with "
+        "`--book-frozen %s:%s` or `--reopen-frozen %s:%s`."
+        % (label, trade['id'], trade.get('stock', '?'), why,
+           label.lower(), trade['id'], label.lower(), trade['id']),
+        alert_class=alert_policy.SAFETY)
+
+
+def recover_frozen_positions(kite, books, dry_run, *, nagged=None,
+                             now=None, market_settled=None):
+    """M14 - finish, or escalate, closes that froze half-done.
+
+    **The gap this closes.** A `partial_close` record drops out of
+    `get_open_trades()`. Nothing retried it, nothing re-monitored it, nothing
+    re-alerted: one Telegram at freeze time was the entire lifecycle of a
+    position that may be live at the broker with its stops dead. That is the
+    unwatched-position failure that has cost this account real money twice.
+
+    **The recovery routine IS `_close_spread_inner`.** It is already
+    position-driven, reduce-only, skip-flat-legs, flip-guarded, already-flat
+    booking and unpriced-refusing. A second "recovery close" would be the
+    copy-nobody-opens shape that produced D2. This function decides WHETHER and
+    with what urgency; the close itself is the same code that has been reviewed
+    into shape all year.
+
+    **Fallen Hero is ALERT-ONLY (owner, 2026-08-28).** FH is traded by hand and
+    the monitor places no FH orders at all, so its frozen records are
+    classified and nagged and never ordered on. That is a deliberate departure
+    from the design's S13/S14, which were written before that decision.
+    `books` carries the flag per book rather than inferring it from the record,
+    so the rule is stated where it is decided.
+
+    `books` is `[(label, store, orders_allowed)]`.
+
+    Skipped on this path, deliberately: the exit vet (a safety action past its
+    window), the re-verify (meaningless on a half-closed position and dangerous
+    - it could "abort" a naked long back to open), and the trigger debounce.
+    Kept: the paper guard, the flip guard, both cutoffs and the kill switch.
+    """
+    nagged = _RECOVERY_NAGGED if nagged is None else nagged
+    if market_settled is None:
+        market_settled = is_market_settled()
+
+    frozen = []
+    for label, store, orders_allowed in books:
+        if store is None:
+            continue
+        try:
+            for t in store.get_frozen_trades():
+                frozen.append((label, store, orders_allowed, t))
+        except Exception as e:                 # pragma: no cover - store-level
+            log('  Could not read frozen trades from %s: %s' % (label, e))
+    if not frozen:
+        return 0
+
+    # ONE positions read for the whole sweep, shared. Per-leg calls would
+    # multiply broker requests by the size of the frozen book - the same F7
+    # lesson the poll loop already learned expensively.
+    try:
+        net_by_symbol = {p['tradingsymbol']: p['quantity']
+                         for p in kite.positions()['net']}
+    except Exception as e:
+        log('  Recovery sweep: positions() failed, nothing classified: %s' % e)
+        _recovery_event('recovery_blind', reason=str(e)[:60].replace(' ', '_'))
+        return 0
+
+    acted = 0
+    for label, store, orders_allowed, trade in frozen:
+        try:
+            acted += _recover_one(kite, label, store, orders_allowed, trade,
+                                  net_by_symbol, dry_run, nagged,
+                                  now, market_settled)
+        except Exception as e:
+            # Per-record isolation, the same lesson the poll loop learned: one
+            # malformed frozen record must not stop the sweep for every other.
+            log('  Recovery sweep: #%s in %s raised: %s'
+                % (trade.get('id'), label, e))
+    return acted
+
+
+def _recover_one(kite, label, store, orders_allowed, trade, net_by_symbol,
+                 dry_run, nagged, now, market_settled):
+    """One frozen record. Returns 1 if an action was taken, else 0."""
+    tid = trade.get('id')
+    cf = dict(trade.get('close_failure') or {})
+
+    # ── A PAPER RECORD NEVER REACHES THE ORDER PATH ────────────────────────
+    #
+    # The sweep is the SECOND route into `_close_spread_inner`; `close_spread`
+    # was the first and only one, and its guard cannot cover a caller that does
+    # not go through it. This is not that check repeated — it is the same check
+    # at a different door, and the door is what makes it observable: remove it
+    # and a paper cohort record gets real orders aimed at legs that do not
+    # exist at the broker, which is precisely the mistake the arming order
+    # exists to prevent.
+    #
+    # Placed before classification so a paper record is not even described in
+    # terms of an action. It is not an error and earns no alert: paper freezes
+    # are ordinary, and zebra owns them.
+    if _record_says_paper(trade):
+        _recovery_event('frozen_paper_skipped', store=label, id=tid)
+        return 0
+
+    rclass, why = classify_frozen(trade, net_by_symbol)
+    _recovery_event('frozen_seen', store=label, id=tid, cls=rclass)
+
+    # A record already booked or reopened by hand needs nothing.
+    if rclass == RC_FLAT:
+        if not orders_allowed:
+            # FH: the human books it. Saying "resolved" here would claim a
+            # booking this path never made.
+            _escalate_recovery(store, trade, label, cf,
+                               'every leg is flat at the broker - book the '
+                               'exit by hand', nagged)
+            return 0
+        return _finish_flat(kite, label, store, trade, cf, dry_run)
+
+    if rclass == RC_NO_ORDERS:
+        _escalate_recovery(store, trade, label, cf, why, nagged)
+        return 0
+
+    if not orders_allowed:
+        _escalate_recovery(
+            store, trade, label, cf,
+            '%s - %s. This book is traded by hand; no automatic order will be '
+            'placed.' % (rclass, why), nagged)
+        return 0
+
+    ok, gate_why = recovery_gate(trade, rclass, now=now,
+                                 market_settled=market_settled)
+    if not ok:
+        # A spent-attempt refusal is terminal; every other refusal is "not
+        # yet" and must not escalate, or a grace window would end the incident.
+        if 'attempts spent' in gate_why:
+            _escalate_recovery(store, trade, label, cf,
+                               '%d recovery attempts, none finished the close'
+                               % RECOVERY_MAX_ATTEMPTS, nagged)
+        else:
+            _recovery_event('recovery_waiting', store=label, id=tid,
+                            why=gate_why.split(':')[0].replace(' ', '_'))
+        return 0
+
+    # ── THE ATTEMPT ────────────────────────────────────────────────────────
+    # Persisted BEFORE the order, deliberately stricter than the time stop
+    # (which persists after failure): the risk being bought off is a restart
+    # silently resetting the counter and re-firing. A crash mid-attempt costs
+    # one attempt and never gains one - the order journal's
+    # intent-before-broker-call doctrine, applied to retries.
+    urgent = rclass == RC_NAKED_SHORT
+    cf['attempts'] = int(cf.get('attempts') or 0) + 1
+    cf['state'] = 'recovering'
+    cf['next_attempt_after'] = (time.time() if now is None else now) \
+        + recovery_wait_sec(rclass)
+    _persist_recovery(store, trade, cf)
+    _recovery_event('recovery_attempt', store=label, id=tid,
+                    n='%d/%d' % (cf['attempts'], RECOVERY_MAX_ATTEMPTS),
+                    cls=rclass)
+    send_telegram(
+        "%s #%s %s: recovering a frozen close (attempt %d/%d, %s).\n%s"
+        % (label, tid, trade.get('stock', '?'), cf['attempts'],
+           RECOVERY_MAX_ATTEMPTS, rclass, why),
+        alert_class=alert_policy.SAFETY)
+
+    if not store.begin_recovery(tid, cf.get('reason') or 'RECOVERY'):
+        # Somebody else moved it. Not a failure of ours and not an attempt we
+        # should have spent - but it IS spent, and that is the safe direction.
+        log('  #%s %s: begin_recovery refused; another process has it.'
+            % (tid, label))
+        return 0
+
+    result = _close_spread_inner(
+        kite, store, trade, spot=None, reason=cf.get('reason') or 'RECOVERY',
+        dry_run=dry_run, label=label, recovery=True,
+        recovery_urgent=urgent)
+
+    if result is True:
+        cf['state'] = 'resolved'
+        _persist_recovery(store, trade, cf)
+        _recovery_event('recovery_resolved', store=label, id=tid, via='orders',
+                        attempts=cf['attempts'])
+        send_telegram("\u2705 %s #%s %s: frozen close FINISHED by recovery "
+                      "(attempt %d)." % (label, tid, trade.get('stock', '?'),
+                                         cf['attempts']),
+                      alert_class=alert_policy.SAFETY)
+        return 1
+
+    # Anything else re-froze the record inside `_close_spread_inner`, which
+    # rewrote `close_failure` with a FRESH state - so re-read and carry the
+    # attempt count forward, or the next pass gets a free attempt.
+    fresh = dict(trade.get('close_failure') or {})
+    fresh['attempts'] = cf['attempts']
+    fresh['next_attempt_after'] = cf['next_attempt_after']
+    fresh['state'] = 'recovering'
+    _persist_recovery(store, trade, fresh)
+    # `_close_spread_inner` re-freezes most failures itself, but the unpriced
+    # refusal parks the record at `closing` — see `_refreeze_after_recovery`.
+    _refreeze_after_recovery(store, trade, label, fresh)
+    if fresh.get('cause') == 'rejected':
+        _escalate_recovery(store, trade, label, fresh,
+                           'the broker REJECTED the recovery order; the same '
+                           'reason will reject the next one', nagged)
+    elif fresh['attempts'] >= RECOVERY_MAX_ATTEMPTS:
+        _escalate_recovery(store, trade, label, fresh,
+                           '%d recovery attempts, none finished the close'
+                           % RECOVERY_MAX_ATTEMPTS, nagged)
+    return 1
+
+
+def _finish_flat(kite, label, store, trade, cf, dry_run):
+    """Every leg flat: book it from OUR OWN tagged fills, or refuse.
+
+    Zero orders by construction - `_close_spread_inner` skips flat legs - so
+    this is the self-resolution the grace window exists to allow: a human fixed
+    it at the broker and the sweep simply records what happened.
+
+    It can still refuse: with no ORDER_TAG fill to price a leg, the inner close
+    routes to `_refuse_unpriced_close` and books nothing rather than inventing
+    a price. That is the right answer and it leaves the record frozen for the
+    CLI to book with operator prices.
+    """
+    tid = trade['id']
+    if not store.begin_recovery(tid, cf.get('reason') or 'RECOVERY'):
+        return 0
+    result = _close_spread_inner(
+        kite, store, trade, spot=None, reason=cf.get('reason') or 'RECOVERY',
+        dry_run=dry_run, label=label, recovery=True, recovery_urgent=False)
+    if result is True:
+        cf['state'] = 'resolved'
+        _persist_recovery(store, trade, cf)
+        _recovery_event('recovery_resolved', store=label, id=tid,
+                        via='human_flat', attempts=cf.get('attempts', 0))
+        send_telegram("\u2705 %s #%s %s: the book went flat and the exit is "
+                      "booked. No recovery order was placed."
+                      % (label, tid, trade.get('stock', '?')),
+                      alert_class=alert_policy.SAFETY)
+        return 1
+    _recovery_event('unpriced_refusal', store=label, id=tid)
+    _refreeze_after_recovery(store, trade, label, cf)
+    return 0
+
+
+#: Daily-nag dedup, keyed `(label, id, cause, date)`. Module-level because the
+#: monitor is one long-lived process per session and the sweep runs every poll.
+_RECOVERY_NAGGED = set()
+
+
 def _record_says_paper(trade: dict) -> bool:
     """Did this record POSITIVELY declare that no broker ever saw it?
 
@@ -3054,18 +3385,46 @@ def _blend_fill(first_price, first_qty, retry_price, retry_qty):
 
 
 def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
-                        urgent=False):
-    """Inner close logic, separated so close_spread() can wrap with try/except."""
+                        urgent=False, recovery=False, recovery_urgent=False):
+    """Inner close logic, separated so close_spread() can wrap with try/except.
+
+    **M14 recovery reuses this function rather than copying it.** It is already
+    position-driven, reduce-only, skip-flat-legs, flip-guarded, already-flat
+    booking and unpriced-refusing; a second "recovery close" would be the
+    copy-nobody-opens shape that produced D2. `recovery=True` changes exactly
+    three things and nothing else:
+
+      * ONE order per leg (`attempts=1`). The initial close already spent three
+        escalating orders on this leg; "try 3 times" means 3 CLOSE attempts,
+        not 3x3 = 9 orders. Ceiling per leg per incident: 3 + 3 = 6.
+      * urgency comes from the RISK CLASS (`recovery_urgent`), not from the
+        original trigger, which may have been a leisurely valuation stop on a
+        position that is now a naked short.
+      * uncapped pay-through only for that urgent class. Never pay through a
+        garbage book to exit a bounded long — its downside is the premium
+        already paid, and the pay-through can cost more than holding does.
+
+    `spot` may be None on the recovery path: the sweep classifies from broker
+    POSITIONS, not from price, and fetching a spot it does not use would be a
+    request per frozen record for a number that decides nothing here.
+    """
     stock = trade['stock']
     short_sym = trade['short_symbol']
     long_sym = trade['long_symbol']
     qty = trade['quantity']
     exchange = trade['exchange']
 
+    # DISPLAY only. `spot` itself stays None on the record, which is the honest
+    # value: the recovery sweep classifies from broker POSITIONS and never
+    # reads a price, so there is no spot to record. Rendering a bare None in
+    # the alert would read as a FAILED FETCH — the opposite of what happened.
+    spot_disp = (spot if spot is not None
+                 else 'n/a (recovery: classified from positions)')
+
     # SHADOW for a paper record (zebra sends the one that carries the P&L a
     # few minutes later); SAFETY for a real record the disarmed monitor cannot
     # close. Logged either way — see `send_telegram`.
-    send_telegram(trigger_alert_text(label, stock, reason, spot, dry_run,
+    send_telegram(trigger_alert_text(label, stock, reason, spot_disp, dry_run,
                                      trade, 'Closing spread...'),
                   alert_class=alert_policy.close_alert_class(
                       dry_run, _record_says_paper(trade)))
@@ -3195,8 +3554,10 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
         log("-" * 55)
         short_result = close_leg(
             kite, exchange, short_sym, "BUY", close_qty, is_buy=True, dry_run=dry_run,
-            urgent=urgent,
-            context=_order_ctx(trade, reason, 'short', label)
+            urgent=(recovery_urgent if recovery else urgent),
+            context=_order_ctx(trade, reason, 'short', label),
+            attempts=1 if recovery else None,
+            allow_pay_through=(recovery_urgent if recovery else True)
         )
 
         if not short_result or short_result['status'] not in ('COMPLETE', 'PARTIAL'):
@@ -3248,7 +3609,10 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             # remaining quantity itself and `_find_pending_orders` already
             # prevents doubling up, so this cannot become the Feb-2026
             # multiple-order shape.
-            if remaining > 0:
+            # On the RECOVERY path this retry is skipped: the one order per
+            # leg per attempt is already spent, and firing a second here would
+            # silently double the ceiling the sweep is counting against.
+            if remaining > 0 and not recovery:
                 log(f"  RETRY: closing the {remaining} qty residual (urgent)")
                 retry = close_leg(kite, exchange, short_sym, "BUY", remaining,
                                   is_buy=True, dry_run=dry_run, urgent=True,
@@ -3304,7 +3668,9 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
         long_result = close_leg(
             kite, exchange, long_sym, "SELL", close_qty, is_buy=False, dry_run=dry_run,
             urgent=long_urgent,
-            context=_order_ctx(trade, reason, 'long', label)
+            context=_order_ctx(trade, reason, 'long', label),
+            attempts=1 if recovery else None,
+            allow_pay_through=(recovery_urgent if recovery else True)
         )
 
         if not long_result or long_result['status'] not in ('COMPLETE', 'PARTIAL'):
@@ -3354,7 +3720,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
         # escalation invariant applies), then FREEZE rather than book a lie.
         if long_result['status'] == 'PARTIAL':
             remaining = close_qty - long_result.get('filled_quantity', 0)
-            if remaining > 0:
+            if remaining > 0 and not recovery:
                 log(f"  WARNING: Long leg partially filled. {remaining} qty still long!")
                 log(f"  RETRY: closing the {remaining} qty residual (urgent)")
                 retry = close_leg(kite, exchange, long_sym, "SELL", remaining,
@@ -6465,6 +6831,30 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     corrob_state.pop(close_key, None)
                     spot_blind_state.pop(close_key, None)
                     abort_until.pop(close_key, None)
+
+            # ── M14 · frozen-close recovery ──────────────────────────
+            #
+            # AFTER the per-trade loop, deliberately. The loop is what watches
+            # live positions and its stops must not be delayed by a sweep over
+            # records that are, by definition, already stuck. Frozen records
+            # are not in `all_trades` at all — dropping out of the open book is
+            # the whole defect — so this reads them from the stores directly.
+            #
+            # FH is ALERT-ONLY (owner, 2026-08-28): it is traded by hand and
+            # this monitor places no FH order anywhere, so its frozen records
+            # are classified and nagged, never ordered on. The flag rides on
+            # the book rather than being inferred from the record, so the rule
+            # sits where it was decided.
+            try:
+                recover_frozen_positions(
+                    kite,
+                    [('BCS', bcs_store, True), ('BPS', bps_store, True),
+                     ('COHORT', zebra_store, True), ('FH', fh_store, False)],
+                    dry_run)
+            except Exception as e:
+                # Never let the sweep take down the poll loop: the loop is what
+                # protects the LIVE book, and a frozen record is already stuck.
+                log(f"  Recovery sweep raised, continuing: {e}")
 
             # ── Watchlist price alerts (after trade checks) ──────────
             if wl_active:

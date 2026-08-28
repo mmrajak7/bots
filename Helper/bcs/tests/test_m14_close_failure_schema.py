@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import ast
 import inspect
-import re
 import sys
 from pathlib import Path
 
@@ -168,19 +167,43 @@ def test_every_freeze_site_stamps_close_failure():
         'record, so M14\'s sweep cannot see them: %s' % missing)
 
 
-def test_every_stamp_is_built_by_the_one_helper():
-    """Not hand-rolled per site. A literal dict at a call site is how the
-    schema drifts, and the sweep reads a key that is sometimes absent."""
-    src = inspect.getsource(sm)
-    stamps = re.findall(r'close_failure=(\w+)', src)
-    assert stamps, 'no stamps found at all'
-    assert set(stamps) == {'_close_failure'}, set(stamps)
+def test_every_FREEZE_stamp_is_built_by_the_one_helper():
+    """Not hand-rolled per site. A literal dict at a freeze site is how the
+    schema drifts, and the sweep then reads a key that is sometimes absent.
+
+    Scoped to the `set_trade_status(..., 'partial_close', ...)` calls, not to
+    every mention of the keyword in the module: the recovery sweep legitimately
+    writes an UPDATED record back through `update_trade_fields`, and a guard
+    that could not tell a freeze from an update would forbid the sweep from
+    recording its own progress.
+    """
+    bad = []
+    for fname, node in _partial_close_writes(*CLOSE_FNS):
+        for kw in node.keywords:
+            if kw.arg != 'close_failure':
+                continue
+            ok = (isinstance(kw.value, ast.Call)
+                  and isinstance(kw.value.func, ast.Name)
+                  and kw.value.func.id == '_close_failure')
+            if not ok:
+                bad.append('%s line %d' % (fname, node.lineno))
+    assert not bad, (
+        'these freeze sites build `close_failure` by hand instead of calling '
+        '_close_failure(): %s' % bad)
 
 
 def test_the_helper_is_used_at_every_site_the_guard_found():
     found = _partial_close_writes(*CLOSE_FNS)
-    src_lines = inspect.getsource(sm).splitlines()
-    assert len(found) == sum(
-        1 for l in src_lines if 'close_failure=_close_failure' in l), (
+    stamped = sum(1 for _, node in found
+                  for kw in node.keywords if kw.arg == 'close_failure')
+    assert len(found) == stamped, (
         'count of freeze sites and count of stamps disagree - one site is '
         'either stamping twice or not at all')
+
+
+def test_the_sweep_may_still_update_a_record_it_did_not_freeze():
+    """The inverse review. Narrowing the guard above must not have narrowed it
+    to nothing, and the sweep's own progress writes must stay legal."""
+    src = inspect.getsource(sm._persist_recovery)
+    assert 'close_failure=cf' in src
+    assert 'update_trade_fields' in src

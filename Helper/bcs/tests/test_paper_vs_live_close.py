@@ -305,18 +305,59 @@ def test_the_paper_guard_sits_on_the_only_route_to_an_order():
                                          '_close_fh_inner')):
                 callers.setdefault(node.func.id, set()).add(fn.name)
 
-    assert callers['_close_spread_inner'] == {'close_spread'}, (
-        'the guarded wrapper is no longer the only way into the spread close '
-        '(%s). Either route the new caller through close_spread or give it '
-        'its own paper guard.' % (callers['_close_spread_inner'],))
+    # TWO routes now, and that is allowed — but only because each carries its
+    # own guard. M14's recovery sweep cannot go through `close_spread`: that
+    # wrapper re-verifies the trigger and re-locks from 'open', both of which
+    # are wrong for a record already frozen at 'partial_close'. So the rule is
+    # not "one route" but "every route is guarded", and the test says so.
+    #
+    # `_finish_flat` is exempt from carrying its own copy for a structural
+    # reason, asserted below rather than assumed: its ONLY caller is
+    # `_recover_one`, which guards before reaching it.
+    guarded_routes = {'close_spread': sm.close_spread,
+                      '_recover_one': sm._recover_one}
+    assert callers['_close_spread_inner'] == set(guarded_routes) | {
+        '_finish_flat'}, (
+        'a new caller reaches the spread close (%s). Give it its own paper '
+        'guard and add it here, or route it through an existing guarded one.'
+        % (callers['_close_spread_inner'],))
     assert callers['_close_fh_inner'] == {'close_fh_position'}
 
-    # And the wrapper actually carries the guard, before any order.
+    # `_finish_flat` is reachable ONLY from the guarded sweep entry point.
+    finish_flat_callers = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == '_finish_flat'):
+                finish_flat_callers.add(fn.name)
+    assert finish_flat_callers == {'_recover_one'}, (
+        '_finish_flat has a new caller (%s) and carries no paper guard of its '
+        'own' % (finish_flat_callers,))
+
+    # And every guarded route actually carries the guard, before any order.
+    for name, fn in guarded_routes.items():
+        body = inspect.getsource(fn)
+        assert '_record_says_paper' in body, (
+            '%s reaches the order path with no paper guard' % name)
+
+    # In `close_spread` the refusal must precede the close lock, or a paper
+    # record is moved to 'closing' before being refused.
     body = inspect.getsource(sm.close_spread)
-    assert '_record_says_paper' in body
     assert body.index('_record_says_paper') < body.index('begin_close'), (
         'the paper refusal now sits AFTER the close lock — a paper record '
         'would be moved to "closing" before being refused')
+
+    # Same property on the sweep, whose lock is `begin_recovery`, and whose
+    # guard must also precede CLASSIFICATION — a paper record should not even
+    # be described in terms of an action it can never take.
+    body = inspect.getsource(sm._recover_one)
+    assert body.index('_record_says_paper') < body.index('begin_recovery'), (
+        'the sweep takes the recovery lock on a paper record before refusing '
+        'it')
+    assert body.index('_record_says_paper') < body.index('classify_frozen')
 
 
 def test_the_two_paper_predicates_default_in_opposite_directions():
