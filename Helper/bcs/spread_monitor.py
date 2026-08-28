@@ -3163,6 +3163,77 @@ def close_fh_position(kite: KiteConnect, trade: dict, spot: float,
         return False
 
 
+#: fills-key -> the field an FH exit record stores that leg's price in. A
+#: frozen record uses the SAME names as a booked one, so whatever reads a close
+#: (a human, or M14's recovery sweep) does not need a second vocabulary for the
+#: half-finished case.
+_FH_FILL_FIELD = {'short_call': 'short_call_fill', 'long_call': 'long_call_fill',
+                  'short_put': 'short_put_fill', 'long_put': 'long_put_fill'}
+
+
+def _freeze_fh_leg_failure(fh_store, trade, reason, dry_run, leg_key,
+                           leg_label, symbol, close_qty, closed_now,
+                           remaining):
+    """D1 — a leg that did NOT close FREEZES the record. It never books.
+
+    Both FH long legs (Step 2's long call, Step 4's long put) used to log a
+    warning, leave `fills[<leg>]` at its 0.0 seed and FALL THROUGH into the
+    booking arithmetic. Two lies in one write:
+
+      * a live long option sits at the broker under a record marked CLOSED, so
+        nothing monitors it, nothing re-alerts and its stops are dead — the
+        unwatched-position shape that has cost this account real money twice;
+      * `close_cost = SC + SP - LC - LP` is then computed with that leg at
+        0.00, which is not a missing price but the WORST price a long option
+        can fetch. The booked P&L is wrong on a leg that was never sold.
+
+    The `fh_unpriced` guard downstream catches `None` — `close_leg`'s "flat and
+    nothing of ours priced it" — and structurally cannot catch this, because
+    `0.0 is not None`. Same family as N1 and the `exit_value` key mismatch,
+    both already fixed on the BCS path: **an unobserved price is UNKNOWN, never
+    zero** ([[feedback_copy_pasted_modules_fix_once]] — this was the copy
+    nobody opened).
+
+    Mirrors `_close_spread_inner`'s `close_failed_leg='long'` freeze and its
+    `partial_close` semantics exactly, including the uncomfortable part: a
+    `partial_close` record drops out of `get_open_trades()` and is therefore
+    NOT re-monitored. That is the honest state — a position needing a human —
+    and it is what M14's recovery sweep is designed to pick up. Booking it
+    closed does not make it monitored; it makes it invisible.
+
+    Every fill this close DID observe is written onto the record. The BCS twin
+    carries `short_fill` through for the same reason: after the freeze, the
+    record is the only place those prices exist.
+    """
+    log("")
+    log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    log(f"!!! {leg_label.upper()} CLOSE FAILED — NOT BOOKING     !!!")
+    log(f"!!! {symbol} x {close_qty} is STILL LIVE at the broker")
+    log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    for k, v in closed_now.items():
+        log(f"    observed this close: {k} = {v}")
+    if remaining:
+        log(f"    still open: {'; '.join(remaining)}")
+
+    if not dry_run:
+        extra = {_FH_FILL_FIELD[k]: v for k, v in closed_now.items()}
+        fh_store.set_trade_status(trade['id'], 'partial_close',
+                                  close_failed_leg=leg_key,
+                                  close_reason=reason, **extra)
+
+    send_telegram(
+        f"🔴 FH {trade.get('stock')}: {leg_label.upper()} CLOSE FAILED\n"
+        f"{reason} triggered but {symbol} x {close_qty} did NOT sell — it is "
+        f"still LIVE at the broker.\n"
+        + (f"Still open: {'; '.join(remaining)}\n" if remaining else "")
+        + f"NOTHING was booked. Pricing that leg at 0.00 would record a P&L "
+          f"for a sale that never happened.\n"
+          f"Trade #{trade.get('id')} is frozen at partial_close and NOT "
+          f"monitored further. Close it by hand.",
+        alert_class=alert_policy.SAFETY)
+    return False
+
+
 def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
     """Inner FH close logic, separated so close_fh_position() can wrap with try/except."""
     stock = trade['stock']
@@ -3279,6 +3350,13 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
 
     fills = {'short_call': 0.0, 'long_call': 0.0, 'short_put': 0.0, 'long_put': 0.0}
 
+    #: What THIS close actually traded, and at what price. `fills` cannot say:
+    #: it is pre-seeded with 0.0, so a leg that was skipped (already flat), a
+    #: leg that failed, and a leg that genuinely filled at zero all read the
+    #: same. D1 turned on exactly that ambiguity, so the freeze paths below
+    #: read this instead of guessing from `fills`.
+    closed_now = {}
+
     # ── Step 1: BUY back short call (naked risk — MOST DANGEROUS) ────────
     if sc_qty < 0:
         close_qty = min(abs(sc_qty), qty)
@@ -3295,6 +3373,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                                           close_failed_leg='short_call', close_reason=reason)
             return False
         fills['short_call'] = result.get('average_price', 0)
+        closed_now['short_call'] = fills['short_call']
 
         # ── B10 (FH twin) · the long call is the short call's HEDGE ────────
         #
@@ -3339,10 +3418,28 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                            urgent=True,
                            context=_order_ctx(trade, reason, 'long-call', 'FH'))
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
-            log(f"  WARNING: Long call close failed. Naked long remains — not critical.")
-            send_telegram(f"FH {stock}: Long call sell failed. Manual sell {lc_sym}.", alert_class=alert_policy.SAFETY)
-        else:
-            fills['long_call'] = result.get('average_price', 0)
+            # D1. This used to warn and FALL THROUGH, booking the trade closed
+            # with `fills['long_call']` still at 0.0. See
+            # `_freeze_fh_leg_failure`. Freezing here leaves the short put open
+            # against the long put — the ORIGINAL bull put spread, bounded by
+            # its width — plus an unsold long call, which is bounded by its own
+            # premium. No new risk is created by stopping, and continuing would
+            # mean placing further orders into a book that has just refused
+            # one. The one shape worth knowing about is named in the alert:
+            # `remaining` reports the short put if it is still open.
+            remaining = []
+            if sp_qty < 0:
+                remaining.append(
+                    f"SHORT PUT {sp_sym} {sp_qty:+d}"
+                    + ("" if lp_qty > 0
+                       else " — UNHEDGED, the long put was already flat"))
+            if lp_qty > 0:
+                remaining.append(f"LONG PUT {lp_sym} {lp_qty:+d}")
+            return _freeze_fh_leg_failure(
+                fh_store, trade, reason, dry_run, 'long_call', 'long call',
+                lc_sym, close_qty, closed_now, remaining)
+        fills['long_call'] = result.get('average_price', 0)
+        closed_now['long_call'] = fills['long_call']
     else:
         if lc_sym:
             log(f"\n  LONG CALL {lc_sym} already flat (qty={lc_qty}). Skipping.")
@@ -3363,6 +3460,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                                           close_failed_leg='short_put', close_reason=reason)
             return False
         fills['short_put'] = result.get('average_price', 0)
+        closed_now['short_put'] = fills['short_put']
     else:
         log(f"\n  SHORT PUT {sp_sym} already flat (qty={sp_qty}). Skipping.")
 
@@ -3375,10 +3473,15 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                            urgent=True,
                            context=_order_ctx(trade, reason, 'long-put', 'FH'))
         if not result or result['status'] not in ('COMPLETE', 'PARTIAL'):
-            log(f"  WARNING: Long put sell failed. Manual sell {lp_sym}.")
-            send_telegram(f"FH {stock}: Long put sell failed. Manual sell {lp_sym}.", alert_class=alert_policy.SAFETY)
-        else:
-            fills['long_put'] = result.get('average_price', 0)
+            # D1, the leg the defect was reported against. Every short leg is
+            # flat by the time we get here, so nothing is naked — but the long
+            # put is LIVE, and booking it at 0.00 records a loss on a sale that
+            # never happened. See `_freeze_fh_leg_failure`.
+            return _freeze_fh_leg_failure(
+                fh_store, trade, reason, dry_run, 'long_put', 'long put',
+                lp_sym, close_qty, closed_now, [])
+        fills['long_put'] = result.get('average_price', 0)
+        closed_now['long_put'] = fills['long_put']
     else:
         log(f"\n  LONG PUT {lp_sym} already flat (qty={lp_qty}). Skipping.")
 
@@ -3541,6 +3644,130 @@ def _gain_anchored_levels(trade: dict, peak: float):
         return None
     lv['engage_level'] = round(float(debit) + lv['engage_gain'], 2)
     return lv
+
+
+def _tp_latch_mod():
+    """`zebra.trade_store`'s latch vocabulary, or None if it cannot be reached.
+
+    Lazily imported for the reason `_gain_anchored_levels` documents:
+    `zebra/strikes.py` imports from this module, and a module-level import in
+    the other direction is one edge away from closing that cycle.
+
+    None on failure, and every caller degrades to the LIVE comparison alone —
+    i.e. exactly the behaviour this engine had before the latch existed. A
+    broken import must not be able to disarm a take-profit.
+    """
+    try:
+        from zebra import trade_store as _ts
+        return _ts
+    except Exception as e:                      # pragma: no cover - import guard
+        log(f"  WARNING: TP latch unavailable ({e}) — take-profits fall back "
+            f"to the live spot comparison only")
+        return None
+
+
+def tp_armed(trade: dict, hit_now: bool, spot: float, store=None,
+             dry_run: bool = False, label: str = 'BCS') -> bool:
+    """May the take-profit fire — now, or on a touch seen in an earlier poll?
+
+    THE DECISION IS NOT MADE HERE. It is `zebra.trade_store.tp_latch`, which
+    `zebra/monitor.py` calls too, because a latch honoured by one engine and
+    not the other is this codebase's most repeated defect and both engines can
+    hold the same cohort record. This function is the WIRING: it supplies this
+    engine's own live comparison and owns the persistence decision below.
+
+    WHO MAY WRITE THE LATCH. Only the engine that would actually place the
+    order for this record:
+
+    * `dry_run` writes nothing. Dry run means "monitor everything, change
+      nothing", and while the monitor is in dry run zebra is still the engine
+      that books these exits — and it latches them itself. A dry run mutating
+      the live cohort record would be this engine arming a trigger it is not
+      allowed to pull.
+    * a PAPER record writes nothing, for the same reason `close_spread`
+      refuses one outright: no broker ever saw it, zebra owns it, and zebra
+      does the arming.
+
+    Both still HONOUR an existing latch, which is the half that matters for
+    the dry-run evidence week: what gets journalled must be what an armed
+    engine would have done.
+    """
+    ts = _tp_latch_mod()
+    if ts is None:
+        return bool(hit_now)
+    # `datetime.now()` from THIS module, not the store's own default: the
+    # timestamp and the touch->fill measurement below must be read off one
+    # clock, and this is the one the engine (and the replay harness) runs on.
+    latch = ts.tp_latch(trade, hit_now, spot, now=datetime.now())
+    tid, stock = trade.get('id'), trade.get('stock')
+    if latch['patch']:
+        if dry_run or _record_says_paper(trade):
+            log(f"  {label} #{tid} {stock}: TP touched at {spot} — latch NOT "
+                f"written ({'dry run' if dry_run else 'paper record'}); the "
+                f"engine that owns this record's exits arms it.")
+        elif store is None:
+            log(f"  {label} #{tid} {stock}: TP touched at {spot} but no store "
+                f"to persist the latch — this trigger can still evaporate.")
+        else:
+            try:
+                store.update_trade_fields(tid, **latch['patch'])
+                trade.update(latch['patch'])
+                log(f"  {label} #{tid} {stock}: TP LATCHED at spot {spot}. "
+                    f"This exit is armed permanently now, wherever spot goes.")
+            except Exception as e:
+                # The close still goes ahead this poll (hit_now is true), so
+                # nothing is lost yet. What is lost is the arming if it does
+                # not fill — a silent reversion to pre-latch behaviour.
+                log(f"  {label} #{tid} {stock}: TP LATCH WRITE FAILED ({e}) — "
+                    f"the touch is not persisted and this trigger can still "
+                    f"evaporate.")
+    # No per-poll line for "still armed": this loop polls every 5 seconds and
+    # an armed exit can sit through a 300s abort cooldown, so saying it here
+    # would print sixty identical lines and train the reader to skim. The
+    # ACTION is logged by the caller, and `_tp_latch_tag` puts the state on the
+    # 30-second status line so an armed position is never indistinguishable
+    # from a quiet one.
+    return latch['armed']
+
+
+def _tp_latch_tag(trade: dict) -> str:
+    """' [TP-LATCHED]' for a position whose take-profit is already armed.
+
+    Empty for FH and for anything untouched — nothing outside the two vertical
+    books can carry the field.
+    """
+    ts = _tp_latch_mod()
+    return ' [TP-LATCHED]' if ts is not None and ts.tp_latched(trade) else ''
+
+
+def stamp_tp_touch_to_fill(trade: dict, store, exit_spot: float,
+                           rising: bool, dry_run: bool = False,
+                           label: str = 'BCS') -> None:
+    """Record what the touch-to-fill lag cost, on the trade it cost it on.
+
+    Called AFTER a take-profit has actually booked, and wrapped whole: an exit
+    that happened must never be endangered by an accounting stamp. The booking
+    price is the one the close transacted at — this measures the SPOT
+    give-back between the touch and the fill, it does not adjust anything
+    (`feedback_trigger_is_not_the_fill`).
+    """
+    if dry_run or store is None or _record_says_paper(trade):
+        return
+    ts = _tp_latch_mod()
+    if ts is None:
+        return
+    try:
+        gap = ts.tp_touch_to_fill(trade, exit_spot, rising=rising,
+                                  now=datetime.now())
+        if gap:
+            store.update_trade_fields(trade.get('id'), **gap)
+            log(f"  {label} #{trade.get('id')} {trade.get('stock')}: TP "
+                f"touch->fill {gap.get('tp_touch_to_exit_sec')}s, spot moved "
+                f"{gap.get('tp_touch_spot_move')} "
+                f"({gap.get('tp_touch_spot_move_pct')}%) from the touch.")
+    except Exception as e:
+        log(f"  WARNING: TP touch->fill stamp failed for #{trade.get('id')}: "
+            f"{e} — the exit IS booked; only the measurement is missing.")
 
 
 def trail_engage_level(trade: dict) -> float:
@@ -3921,9 +4148,15 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
             if close_spread(kite, trade, spot, "SL_SPOT", dry_run) != 'ABORT':
                 return
 
-        elif spot >= target:
-            log(f"Spot already at/above target!")
-            if close_spread(kite, trade, spot, "TP", dry_run) != 'ABORT':
+        elif tp_armed(trade, spot >= target, spot, store=store,
+                      dry_run=dry_run, label='BCS'):
+            log("Spot already at/above target!" if spot >= target else
+                "TP was touched in an earlier session and is still armed!")
+            res = close_spread(kite, trade, spot, "TP", dry_run)
+            if res != 'ABORT':
+                if res is True:
+                    stamp_tp_touch_to_fill(trade, store, spot, rising=True,
+                                           dry_run=dry_run, label='BCS')
                 return
     else:
         log(f"\n  Skipping immediate checks — market-open buffer active")
@@ -4181,8 +4414,17 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
                     confirm['sl_trail'] = 0
 
             # ── CHECK 4: TP ──────────────────────────────────────────────
-            if spot >= target and not in_abort_cooldown:
+            # Same latch as the cron loop, from the same shared decision. This
+            # mode is the one nobody runs, which is exactly why it gets the
+            # rule too: a trigger honoured in one copy and not the other is
+            # this codebase's most repeated defect.
+            tp_go = tp_armed(trade, spot >= target, spot, store=store,
+                             dry_run=dry_run, label='BCS')
+            if tp_go and not in_abort_cooldown:
                 success = close_spread(kite, trade, spot, "TP", dry_run)
+                if success is True:
+                    stamp_tp_touch_to_fill(trade, store, spot, rising=True,
+                                           dry_run=dry_run, label='BCS')
                 if success == 'ABORT':
                     log(f"  TP close aborted — retrying after {ABORT_COOLDOWN_SEC}s cooldown "
                         f"(spot trigger persists).")
@@ -5042,7 +5284,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                             settle_tag += f" [SUSPECT {spread_data['unreliable']}]"
                         elif spread_fail:
                             settle_tag += f" [QUOTE-FAIL {spread_fail[:40]}]"
-                    expiry_tag = " [EXPIRY]" if close_key in expiry_trades else ""
+                    expiry_tag = (" [EXPIRY]" if close_key in expiry_trades
+                                  else "") + _tp_latch_tag(trade)
                     try:
                         if strat == 'BCS':
                             if spread_data and spread_val is not None:
@@ -5263,9 +5506,24 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     # BPS: spot <= target dropping). ABORT re-fires after the
                     # cooldown since the spot condition persists.
                     tp_hit = (spot >= target) if strat == 'BCS' else (spot <= target)
-                    if not closed and tp_hit and not in_abort_cooldown:
+                    # THE LATCH. The first touch arms this exit permanently —
+                    # written to the RECORD before the vet and before any
+                    # order, so it survives a defer, a restart and a spot that
+                    # has since backed off (COFORGE #436, 2026-08-27). Called
+                    # unconditionally, not inside the `if`, so the touch is
+                    # captured even on a poll the abort cooldown is holding:
+                    # the cooldown delays the close, it does not un-see the
+                    # trigger.
+                    tp_go = (not closed) and tp_armed(
+                        trade, tp_hit, spot, store=trade_store,
+                        dry_run=dry_run, label=strat)
+                    if tp_go and not in_abort_cooldown:
                         op = '>=' if strat == 'BCS' else '<='
-                        log(f"\n  {strat} #{tid} {stock} *** TP HIT: {spot:.2f} {op} {target} ***")
+                        if tp_hit:
+                            log(f"\n  {strat} #{tid} {stock} *** TP HIT: {spot:.2f} {op} {target} ***")
+                        else:
+                            log(f"\n  {strat} #{tid} {stock} *** TP LATCHED: touched "
+                                f"{target} earlier; spot now {spot:.2f} ***")
                         closing_in_progress[close_key] = "TP"
                         success = close_spread(kite, trade, spot, "TP", dry_run,
                                                store=trade_store, strategy_label=strat,
@@ -5276,6 +5534,11 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                             log(f"  {strat} #{tid} {stock}: TP close aborted — cooldown {ABORT_COOLDOWN_SEC}s.")
                         else:
                             closed = True
+                            if success:
+                                stamp_tp_touch_to_fill(
+                                    trade, trade_store, spot,
+                                    rising=(strat == 'BCS'), dry_run=dry_run,
+                                    label=strat)
                             if not success:
                                 log(f"  {strat} #{tid} {stock}: Close failed — manual intervention needed.")
                                 send_telegram(f"{strat} #{tid} {stock}: TP close FAILED. Manual intervention needed!", alert_class=alert_policy.SAFETY)

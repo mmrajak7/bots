@@ -25,6 +25,16 @@ Authority is split on purpose: TRADE facts come from the store, which is
 structured and correct; PROCESS facts come from the log, which is the only
 place they exist.
 
+**BOTH engines, not one.** Until 2026-08-28 this file read `cron_zebra_*.log`
+and the vet transcripts and nothing else — so the accountability record was
+blind to `bcs/spread_monitor.py`, the process that places orders. It could not
+see a failed close, a hard-cutoff miss, a `partial_close` freeze, a flipped or
+naked position, or that morning's 70 `Too many requests` failures. The monitor
+writes a different line format, so a naive attempt would have yielded nothing
+rather than failing loudly. `zebra/engine_log.py` gives it its own parser and
+its own named-event vocabulary; every finding here carries the engine that
+produced it.
+
     python -m zebra digest              # today
     python -m zebra digest --date 2026-08-15
 """
@@ -41,6 +51,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import config as cfg
+from . import engine_log
 
 logger = logging.getLogger(__name__)
 
@@ -237,11 +248,22 @@ def _warnings(rows: List[tuple]) -> dict:
     return dict(c.most_common(12))
 
 
-def _flags(cyc, vet, tr, warn, coh, prev: Optional[dict]) -> List[str]:
-    """Facts that earn a look. Each one names what happened, never why."""
+def _flags(cyc, vet, tr, warn, coh, prev: Optional[dict],
+           eng: Optional[dict] = None) -> List[str]:
+    """Facts that earn a look. Each one names what happened, never why.
+
+    `eng` (the order engine's failure record) defaults to None so that a
+    caller which knows nothing about it — every pre-2026-08-28 call site and
+    test — keeps working. It is NOT optional in `build`.
+    """
     out = []
     for a, b, mins in cyc['gaps']:
         out.append(f"cycle gap {mins}m ({a}->{b}) — positions unmonitored")
+    # The ORDER ENGINE's failures come first among the counted ones: a failed
+    # close outranks a warning-line tally, and until 2026-08-28 none of them
+    # reached this list at all.
+    if eng:
+        out.extend(engine_log.flags(eng))
     errs = sum(v for k, v in warn.items() if k.startswith('ERROR')
                or k.startswith('CRITICAL'))
     if errs:
@@ -329,11 +351,21 @@ def build(day: Optional[str] = None) -> dict:
     cyc, fun = _cycles(rows), _funnel(rows)
     vet, tr = _vetting(rows, day), _trades(store_rows, day)
     coh, warn = _cohort(store_rows), _warnings(rows)
+    try:
+        eng = engine_log.analyse(day, rows)
+    except Exception as e:                        # pragma: no cover - guard
+        # Loud, not silent: a broken reader must not read as a clean day.
+        logger.warning('engine log analysis failed: %s', e)
+        eng = {'logs': [], 'events': [], 'uncatalogued': [],
+               'uncatalogued_total': 0, 'unwatched': [], 'stalls': [],
+               'mode': None,
+               'problems': ['the order-engine log could not be analysed '
+                            '(%s) — its failures are NOT covered today' % e]}
     return {'date': day, 'cycles': cyc, 'funnel': fun, 'vetting': vet,
             'trades': {k: (v if not isinstance(v, list) else len(v))
                        for k, v in tr.items()},
-            'cohort': coh, 'warnings': warn,
-            'flags': _flags(cyc, vet, tr, warn, coh, prev),
+            'cohort': coh, 'warnings': warn, 'engines': eng,
+            'flags': _flags(cyc, vet, tr, warn, coh, prev, eng),
             '_detail': tr}
 
 
@@ -408,6 +440,12 @@ def render(d: dict) -> str:
       + (f"  [{', '.join('%s %d' % (k, v) for k, v in coh['fee_basis'].items())}]"
          if coh['fee_basis'] else ''))
     A('')
+    # The order engine. Rendered from its own module so the vocabulary and its
+    # presentation stay in one place — this section exists because the digest
+    # was blind to the process that places orders.
+    if d.get('engines'):
+        L.extend(engine_log.render(d['engines']))
+        A('')
     if d['flags']:
         A('## ⚑ Earns a look')
         for x in d['flags']:

@@ -99,6 +99,164 @@ def is_paper_record(trade: dict) -> bool:
     return bool(trade.get('paper', True))
 
 
+# ── The take-profit latch ────────────────────────────────────────────────────
+#
+# Owner decision, 2026-08-28: *"touch that doesn't persist — does not matter ->
+# exit -> if seeing touch once, proven is ok."*
+#
+# THE PROBLEM IT SOLVES. Exits are decided on a 5-minute cron tick and a vetted
+# exit adds ~90 seconds on top (measured 83-106s), so the round trip from
+# "trigger observed" to "close executed" is about one whole cycle. A take-profit
+# therefore only converted if the touch SURVIVED that window. On 2026-08-27
+# COFORGE #436 traded THROUGH its TP (`mfe_spot` 1934.2 against tp 1931.91 at
+# 09:25), the exit vet re-quoted and allowed at 09:27, and by the next
+# actionable poll spot had backed off — nothing was booked. The cause is
+# structural, not a bug: the trigger was re-evaluated from scratch on a later
+# price than the one that fired it.
+#
+# THE RULE. The FIRST observed touch arms the exit PERMANENTLY. From then on the
+# exit proceeds regardless of where spot has moved.
+#
+# WHY IT LIVES IN THE STORE MODULE. Two engines hold this trigger — `zebra/
+# monitor.py` books it in paper, `bcs/spread_monitor.py` books it with real
+# orders once armed — and a latch honoured by one and not the other is this
+# codebase's single most repeated defect (`feedback_the_copy_you_did_not_open`,
+# six instances on 2026-08-26 alone). So the decision is ONE function that both
+# import, sitting beside `in_cohort` and `is_paper_record`, which are here for
+# exactly the same reason.
+#
+# WHAT LATCHES AND WHAT DOES NOT. **The TRIGGER latches; the PRICE does not.**
+# Nothing here records a price to book at, and no caller may treat the touch
+# spot as one — booking is done at the book observed when the close actually
+# executes, and a latched exit still faces every valuation guard it always did
+# (the reliability gate, the intrinsic floor, refuse-the-estimate, the
+# debounce). Latching decides WHETHER to exit, never at what price
+# (`feedback_trigger_is_not_the_fill`). Expect a booked P&L below the one the
+# touch implied; that is the accepted cost of the decision.
+#
+# SCOPE IS TAKE-PROFIT ONLY, deliberately:
+#   * SPOT SL is a VETO in this system and never a trigger (measured: a 3% spot
+#     stop cut 31 of 78 winners for Rs 8.9L). Latching it would promote it to a
+#     trigger, and a latched one at that — the exact inversion `CLAUDE.md`'s
+#     "Spot-based stops — VETO, never TRIGGER" section forbids.
+#   * DEBIT SL and TRAIL are VALUE triggers whose whole defence is the
+#     N-consecutive-reliable-polls debounce that exists because ONE garbage
+#     print cost Rs 7,297 (NHPC, 2026-07-24). A latch is a debounce of one, in
+#     the loss direction, on the source that has twice been wrong.
+#   * TIME/EXPIRY is calendar-driven and re-arms daily by design; it has nothing
+#     that can evaporate.
+# The asymmetry is the point: a missed TP costs an opportunity, and a latched
+# stop on a bad print costs capital.
+
+#: When the first touch was seen (ISO, naive local — the same clock every other
+#: timestamp in this store is written on).
+TP_TOUCHED_AT = 'tp_touched_at'
+#: The spot that did it. FORENSIC AND MEASUREMENT ONLY — never a booking price.
+TP_TOUCH_SPOT = 'tp_touch_spot'
+
+
+def tp_latched(trade: dict) -> bool:
+    """Has this record's take-profit already been armed by an earlier touch?
+
+    Absence means NOT YET TOUCHED. All 462 existing records predate the field
+    and must read as unlatched, which is what `.get()` on a missing key gives —
+    stated here because it is a property, not an accident.
+    """
+    return bool(trade.get(TP_TOUCHED_AT))
+
+
+def tp_latch(trade: dict, hit_now: bool, spot,
+             now: Optional[datetime] = None) -> dict:
+    """Should the TP exit proceed, and what must be persisted to keep it armed?
+
+    `hit_now` is the engine's own live comparison — zebra reads
+    `direction == 'CE'`, the monitor reads `_strategy == 'BCS'`, and those two
+    vocabularies are left where they are rather than unified here. What is
+    shared is the DECISION, which is the part that must not diverge.
+
+    Returns
+      armed      — the exit may proceed this cycle (touched now, or before)
+      latched    — the record was ALREADY armed when this cycle started
+      new_touch  — this cycle is the first touch, so `patch` must be persisted
+      patch      — the fields to write, or `{}`. The caller writes them BEFORE
+                   the vet and before any order, because a verdict in flight is
+                   exactly when the trigger used to evaporate.
+    """
+    latched = tp_latched(trade)
+    new_touch = bool(hit_now) and not latched
+    patch: dict = {}
+    if new_touch:
+        patch[TP_TOUCHED_AT] = (now or datetime.now()).isoformat()
+        try:
+            patch[TP_TOUCH_SPOT] = float(spot)
+        except (TypeError, ValueError):
+            # A latch with no spot is still a latch. The touch is the fact that
+            # matters; the number is measurement, and losing the measurement
+            # must never cost the arming.
+            patch[TP_TOUCH_SPOT] = None
+    return {'armed': bool(hit_now) or latched, 'latched': latched,
+            'new_touch': new_touch, 'patch': patch}
+
+
+def _naive(dt: datetime) -> datetime:
+    """Drop the tzinfo. The two engines timestamp on different clocks (zebra
+    reasons in IST-aware datetimes, this store writes naive local time), and
+    subtracting one from the other raises. A measurement must not be able to
+    throw inside an exit path."""
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
+def tp_touch_to_fill(trade: dict, exit_spot, rising: Optional[bool] = None,
+                     now: Optional[datetime] = None) -> dict:
+    """What the latency between the touch and the booking actually cost.
+
+    Stamped by whichever engine books the exit, AFTER it is booked. This is the
+    number that says whether M12 (consuming the vet verdict inside the same
+    cycle instead of on the next tick) is worth building: if the give-back is
+    routinely near zero, the ~5-minute lag is a tidiness problem; if it is not,
+    it is a P&L problem with a price on it.
+
+    Returns `{}` for an unlatched record — a TP that fired and booked inside one
+    observation has no gap to report, and inventing a zero would make the
+    distribution unreadable.
+
+    `rising` says which way this position's TP points (True for CE / BCS). When
+    omitted it is inferred from the touch itself: the touch spot sat at or above
+    the level for a rising target. Purely for the `gave_back` label; the signed
+    move is reported either way.
+    """
+    if not tp_latched(trade):
+        return {}
+    out: dict = {}
+    touched = trade.get(TP_TOUCHED_AT)
+    try:
+        t0 = _naive(datetime.fromisoformat(str(touched)))
+        out['tp_touch_to_exit_sec'] = round(
+            (_naive(now or datetime.now()) - t0).total_seconds(), 1)
+    except (TypeError, ValueError):
+        pass
+    try:
+        touch_spot = float(trade.get(TP_TOUCH_SPOT))
+        exit_spot = float(exit_spot)
+    except (TypeError, ValueError):
+        return out
+    move = round(exit_spot - touch_spot, 4)
+    out['tp_touch_spot_move'] = move
+    if touch_spot:
+        out['tp_touch_spot_move_pct'] = round(move / touch_spot * 100, 4)
+    if rising is None:
+        try:
+            rising = touch_spot >= float(trade.get('tp_spot'))
+        except (TypeError, ValueError):
+            rising = None
+    if rising is not None:
+        # Did spot retreat back through the touch while the exit was in flight?
+        # That is the COFORGE shape, and the thing this latch exists to stop
+        # from cancelling an exit.
+        out['tp_touch_gave_back'] = bool(move < 0) if rising else bool(move > 0)
+    return out
+
+
 def cohort_split(trades: list, cohort: Optional[str] = None) -> tuple:
     """(current-engine trades, legacy trades). Order matters — current first,
     because it is the one anybody is actually asking about."""

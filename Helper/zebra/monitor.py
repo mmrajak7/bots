@@ -44,7 +44,8 @@ from . import vet as vet_mod
 from .scanner import _get_kite, get_ltp, compute_st_for_stock, validate_and_add
 from playbook.magnet import scanner as scanner_mod
 from .trade_store import (ZebraStore, get_store, in_cohort,
-                          is_paper_record)
+                          is_paper_record, tp_latch, tp_latched,
+                          tp_touch_to_fill)
 
 logger = logging.getLogger(__name__)
 
@@ -1554,12 +1555,29 @@ def _paper_close_line(trade: dict, mid: Optional[float]) -> str:
             f"P&L Rs {pnl:+,.0f} ({pct:+.1f}%)")
 
 
-def _format_tp_alert(trade: dict, spot: float, mid: Optional[float] = None) -> str:
+def _format_tp_alert(trade: dict, spot: float, mid: Optional[float] = None,
+                     on_latch: bool = False) -> str:
+    """The TP ticket.
+
+    `on_latch` says this exit is firing on a touch seen in an EARLIER cycle,
+    which the caller knows and this function cannot re-derive without copying
+    the direction rule. It matters because the old first line — "spot X hit TP
+    Y" — is simply false when spot has since retreated, and the reader acts on
+    this message. The touch is what fired; say so, and say where spot is now.
+    """
     paper = _paper_close_line(trade, mid)
+    if on_latch:
+        touch = trade.get('tp_touch_spot')
+        seen = f"{touch:,.2f}" if isinstance(touch, (int, float)) else 'NA'
+        line = (f"TP {trade['tp_spot']:,.2f} was TOUCHED at {seen}"
+                f" ({html.escape(str(trade.get('tp_touched_at') or 'earlier'))})\n"
+                f"spot is now {spot:,.2f} — exiting on the latched touch")
+    else:
+        line = f"spot {spot:,.2f} hit TP {trade['tp_spot']:,.2f}"
     return (
         f"\U0001F3AF <b>{_struct_label(trade)} TP</b>  "
         f"{html.escape(str(trade['stock']))} ({trade['direction']})\n"
-        f"spot {spot:,.2f} hit TP {trade['tp_spot']:,.2f}\n"
+        f"{line}\n"
         f"Long: <code>{html.escape(str(trade['long_symbol']))}</code>\n"
         f"Short: <code>{html.escape(str(trade['short_symbol']))}</code>{paper}"
     )
@@ -2507,6 +2525,33 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
             f'{spot:.2f}' if spot is not None else 'NA',
             lo.get('symbol'), lo.get('bid'), lo.get('ask'), lo.get('oi'),
             sh.get('symbol'), sh.get('bid'), sh.get('ask'), sh.get('oi'))
+        # WHAT THE LATENCY COST, measured on the trade it cost it on.
+        #
+        # Booked at `mid` — the book observed HERE, never the touch price
+        # (`feedback_trigger_is_not_the_fill`). This records the give-back so
+        # the price of the ~5-minute lag is a number rather than an argument;
+        # it is the evidence M12 is gated on. Measurement only: it runs AFTER
+        # the exit is booked and is wrapped whole, because an accounting stamp
+        # that can raise is a new way to lose an exit that already happened.
+        if reason == 'tp':
+            try:
+                gap = tp_touch_to_fill(trade, spot,
+                                       rising=trade.get('direction') == 'CE')
+                if gap:
+                    store.update_trade_fields(trade['id'], **gap)
+                    updated.update(gap)
+                    logger.info(
+                        "TP touch->fill #%d %s: %ss later, spot moved %s "
+                        "(%s%%) from the touch",
+                        trade['id'], trade['stock'],
+                        gap.get('tp_touch_to_exit_sec'),
+                        gap.get('tp_touch_spot_move'),
+                        gap.get('tp_touch_spot_move_pct'))
+            except Exception as e:
+                logger.warning(
+                    "TP touch->fill measurement failed for #%d: %s — the exit "
+                    "IS booked; only the latency stamp is missing",
+                    trade['id'], e)
         # Mutate the in-loop dict so subsequent checks in this cycle skip it
         trade['status'] = 'exited'
         return updated
@@ -3108,9 +3153,13 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # forensic record, and a record of exits only is a record of the
             # cycles that were already interesting.
             logger.info(
-                "POLL #%d %s %s spot=%.2f tp=%.2f sl=%.2f | value=%s "
+                "POLL #%d %s %s spot=%.2f tp=%.2f%s sl=%.2f | value=%s "
                 "(%s) debit_sl=%.2f | long %s/%s short %s/%s",
-                tid, stock, direction, spot, tp_spot, sl_spot,
+                tid, stock, direction, spot, tp_spot,
+                # The state the cycle STARTS in. An armed TP that is waiting on
+                # a vet or an unusable book looks identical to a quiet position
+                # otherwise, and this log is the whole forensic record in paper.
+                ' [TP-LATCHED]' if tp_latched(trade) else '', sl_spot,
                 f'{mid:.2f}' if mid is not None else 'NA',
                 'ok' if debit_usable else (sq.get('rejected') or sq['reason']
                                            or 'unusable'),
@@ -3139,6 +3188,70 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 # advanced — leaving the veto with a baseline that only updated on
                 # quiet cycles, which is precisely backwards.
                 pending_mfe.setdefault(tid, {}).update(patch)
+
+            # ── THE TP LATCH ────────────────────────────────────────────────
+            # The FIRST observed touch arms this exit permanently; from here on
+            # it proceeds wherever spot has gone (owner, 2026-08-28). The
+            # trigger is a fact about SPOT, so it is captured here — above the
+            # dark-book defer and above the stand-down — and NOT in the TP
+            # branch below, which several guards `continue` past. A touch the
+            # engine watched and did not record is the whole defect: COFORGE
+            # #436 traded through its TP at 09:25, the vet allowed at 09:27,
+            # and by the next actionable poll spot had backed off with nothing
+            # booked.
+            #
+            # Written to the RECORD because this process exits between cycles —
+            # the same reason the corroboration reference and the time-stop
+            # state are persisted — and BEFORE the vet, because a verdict in
+            # flight is exactly when the trigger used to evaporate.
+            #
+            # Deliberately BELOW the corporate-action guard. On a bonus/split
+            # ex-date the exchange re-prices the underlying while `tp_spot`
+            # still refers to yesterday's scale, so a halved spot would "touch"
+            # a PE target for a reason that has nothing to do with the market.
+            # A permanent arming off a stale level is the one version of this
+            # rule that could lose money, and that guard `continue`s above.
+            #
+            # The PRICE does not latch, only the trigger: nothing here is a
+            # booking, the exit below still faces every valuation guard it
+            # always did, and the close books at the book observed when it runs
+            # (`feedback_trigger_is_not_the_fill`).
+            tp_hit = (direction == 'CE' and spot >= tp_spot) or \
+                     (direction == 'PE' and spot <= tp_spot)
+            latch = tp_latch(trade, tp_hit, spot)
+            if latch['patch'] and _exits_external(trade):
+                # The peer engine owns this position's exits AND watches the
+                # same spot every 5 seconds, so it arms its own trigger. Both
+                # engines READ the latch; only the one holding the trigger
+                # writes it. Said out loud because a stood-down engine that
+                # silently declines to record something looks identical to one
+                # that never saw it.
+                logger.info(
+                    "TP touched #%d %s at %.2f but exits are EXTERNAL — "
+                    "spread_monitor arms this one", tid, stock, spot)
+            elif latch['patch']:
+                try:
+                    store.update_trade_fields(tid, **latch['patch'])
+                    trade.update(latch['patch'])
+                    logger.info(
+                        "TP LATCHED #%d %s spot=%.2f tp=%.2f — this exit is "
+                        "now armed permanently, wherever spot goes next",
+                        tid, stock, spot, tp_spot)
+                except Exception as e:
+                    # The exit can still fire THIS cycle (tp_hit is true), so
+                    # nothing is lost yet; what is lost is the arming if the
+                    # close does not book. Loud, because that is a silent
+                    # reversion to the behaviour this replaces.
+                    logger.error(
+                        "TP LATCH WRITE FAILED #%d %s: %s — the touch is not "
+                        "persisted, so this trigger can still evaporate",
+                        tid, stock, e, exc_info=True)
+            elif latch['latched'] and not tp_hit:
+                logger.info(
+                    "TP LATCHED-ARMED #%d %s spot=%.2f has retreated from tp=%.2f "
+                    "(touched %s at %s) — exiting anyway",
+                    tid, stock, spot, tp_spot, trade.get('tp_touch_spot'),
+                    trade.get('tp_touched_at'))
 
             if cfg.PAPER_MODE and mid is None:
                 # Terminal net first: without it a position whose book has gone
@@ -3198,17 +3311,22 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 continue
 
             # ── TP ──────────────────────────────────────────────────────────
-            tp_hit = (direction == 'CE' and spot >= tp_spot) or \
-                     (direction == 'PE' and spot <= tp_spot)
+            # `latch` was decided ABOVE, before the dark-book defer and the
+            # stand-down, because the touch is a fact about spot and several
+            # guards `continue` past this point. `armed` is the trigger:
+            # touched on this poll, or touched in some earlier one and never
+            # un-touched. `tp_hit` is only used to word the alert honestly.
             # A blocked trigger skips ONLY ITS OWN branch. It must not `continue`:
             # that would also skip the DEBIT-SL and TIME checks below, so a TP held
             # on an untradeable book would suppress the T-3 expiry nag entirely and
             # ride the position into settlement week unnoticed.
-            if tp_hit and _exit_cleared(store, trade, 'tp', sq, spot,
-                                        dry_run=dry_run) \
+            if latch['armed'] and _exit_cleared(store, trade, 'tp', sq, spot,
+                                                dry_run=dry_run) \
                     and _claim_exit_alert(store, tid, 'tp'):
                 _send_exit_alert(store, trade, 'tp',
-                                 _format_tp_alert(trade, spot, mid), dry_run=dry_run)
+                                 _format_tp_alert(trade, spot, mid,
+                                                  on_latch=not tp_hit),
+                                 dry_run=dry_run)
                 logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
                 _paper_auto_close(store, trade, mid, 'tp', spot,
                                   pending_mfe=pending_mfe, reliable=sq['reliable'],
