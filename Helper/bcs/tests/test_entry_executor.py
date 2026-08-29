@@ -314,14 +314,25 @@ def test_a_complete_entry_does_not_telegram(broker):
 
 def test_past_the_cutoff_nothing_is_placed(monkeypatch, broker):
     """Entries get the NORMAL cutoff and never the urgent one — there is no
-    entry worth placing at 15:24."""
+    entry worth placing at 15:24.
+
+    The clock is pinned on `spread_monitor`, not on this module. That is the
+    point of the change it caught: `LAST_ORDER_TIME` is an IST time-of-day,
+    and this cutoff used to compare the BOX clock against it — so on a UTC box
+    (box time 03:45-10:00 during Indian market hours) it would NEVER fire and
+    a retry loop could place an entry order past 15:25 IST. The executor now
+    reads `sm.now_ist()`, the fleet's one clock, so a test that stubs only
+    this module's `datetime` no longer reaches it — which is how this test
+    failed and said so.
+    """
     import datetime as _dt
 
     class _Late(_dt.datetime):
         @classmethod
         def now(cls, tz=None):
-            return _dt.datetime(2026, 9, 15, 15, 22, 0)
-    monkeypatch.setattr(ee, 'datetime', _Late)
+            late = _dt.datetime(2026, 9, 15, 15, 22, 0)
+            return late.replace(tzinfo=tz) if tz else late
+    monkeypatch.setattr(sm, 'datetime', _Late)
     out, _said, _sent = run(broker, lots=1)
     assert out['lots_filled'] == 0 and broker.placed == []
 

@@ -384,6 +384,28 @@ def today_ist() -> date:
     return now_ist().date()
 
 
+def ist_epoch(stamp: str) -> float:
+    """Absolute epoch seconds for one of THIS module's naive-IST ISO stamps.
+
+    A REGRESSION FIXED, created by the clock sweep that preceded it. Every
+    stamp this module writes (`frozen_at`, `exit_date`, ...) is now naive IST,
+    and `datetime.fromisoformat(s).timestamp()` interprets a naive value in
+    the BOX's zone — so `recovery_gate` compared an IST-derived epoch against
+    `time.time()` and, on a UTC box, read a freeze as 5.5 HOURS IN THE FUTURE.
+    `age` goes negative, and the bounded class's 300-second recovery grace
+    becomes about five and a half hours: the M14 sweep dark for most of a
+    session, on exactly the positions it exists to finish.
+
+    Before the sweep both sides were box-local and agreed by accident. This
+    makes them agree on purpose. Reading historical stamps is safe too — they
+    were written box-local on a box that is IST.
+
+    (The naked-short class has grace 0 and never reaches this branch, so the
+    unbounded case was never affected.)
+    """
+    return datetime.fromisoformat(stamp).replace(tzinfo=IST).timestamp()
+
+
 # ── Market & Price ───────────────────────────────────────────────────────────
 
 def is_market_open() -> bool:
@@ -2776,7 +2798,7 @@ def recovery_gate(trade, rclass, *, now=None, now_time=None,
     grace = recovery_grace_sec(rclass)
     if grace and frozen_at:
         try:
-            age = now - datetime.fromisoformat(frozen_at).timestamp()
+            age = now - ist_epoch(frozen_at)
         except (TypeError, ValueError):
             # An unparseable stamp cannot prove the grace window has passed.
             return False, 'unreadable frozen_at %r' % (frozen_at,)
@@ -4317,8 +4339,31 @@ def sweep_reconcile_residue(kite, books, *, nagged=None):
                 #
                 # The counter lives on the RECORD, so a restart cannot bank a
                 # half-confirmation, and any live reading resets it.
+                # ...AND NOT IN THE OPENING WINDOW, AND NOT ACROSS SESSIONS.
+                #
+                # Two reads five seconds apart do not defeat a CORRELATED
+                # burst, and the sync window at the open is exactly that: at
+                # 09:15:00 and 09:15:05 both reads are the same lie. Value
+                # triggers are already dark for 15 minutes for this reason;
+                # resolving a terminal, one-way incident is at least as
+                # consequential as firing a stop, so it waits too.
+                #
+                # And the counter is dated. Persisting it was right — a
+                # restart must not lose a confirmation — but an UNDATED
+                # counter banks Friday 15:29's read against Monday 09:15's,
+                # which resolves on the first read of the session and is the
+                # burst problem with a weekend in the middle.
+                if not is_market_settled():
+                    log('  RESIDUE #%s (%s): flat, but the book is not '
+                        'settled yet — not resolving in the opening window.'
+                        % (trade.get('id'), label))
+                    still += 1
+                    continue
                 res = dict(trade.get('reconcile_residue') or {})
-                seen = int(res.get('flat_reads') or 0) + 1
+                today = today_ist().isoformat()
+                seen = (int(res.get('flat_reads') or 0) + 1
+                        if res.get('flat_reads_date') == today else 1)
+                res['flat_reads_date'] = today
                 if seen < RESIDUE_FLAT_CONFIRMATIONS:
                     log('  RESIDUE #%s (%s): reads FLAT (%d/%d) — confirming '
                         'before resolving.'

@@ -52,7 +52,10 @@ from __future__ import annotations
 import json
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+#: One exchange, one timezone. See `_now_ist`.
+_IST = timezone(timedelta(hours=5, minutes=30))
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -64,6 +67,16 @@ _counter = 0
 _lock = threading.Lock()
 
 
+def _now_ist() -> datetime:
+    """IST wall-clock, naive — the fleet's one clock.
+
+    Defined here rather than imported from `bcs.spread_monitor` because that
+    module imports THIS one; a back-import would be circular. The offset is
+    asserted equal to the monitor's and zebra's by test.
+    """
+    return datetime.now(_IST).replace(tzinfo=None)
+
+
 def journal_path(day: Optional[str] = None) -> Path:
     """One file per day, matching the cron log's date stamp.
 
@@ -71,7 +84,10 @@ def journal_path(day: Optional[str] = None) -> Path:
     and Python cannot rotate that, so the two would drift apart under any
     scheme where only one of them rolls.
     """
-    day = day or datetime.now().strftime('%Y%m%d')
+    # IST: this file is read beside the monitor's session log, which is
+    # IST-stamped. Two artefacts of one incident on two clocks is the
+    # forensic hazard, not the convenience.
+    day = day or _now_ist().strftime('%Y%m%d')
     return LOG_DIR / f'order_intents_{day}.jsonl'
 
 
@@ -136,7 +152,7 @@ def record_intent(*, symbol: str, txn_type: str, qty: int, price: float,
         _append({
             'kind': 'intent',
             'intent_id': intent_id,
-            'ts': datetime.now().isoformat(timespec='seconds'),
+            'ts': _now_ist().isoformat(timespec='seconds'),
             'dry_run': bool(dry_run),
             'exchange': exchange,
             'symbol': symbol,
@@ -165,7 +181,7 @@ def record_result(intent_id: str, *, order_id: Optional[str] = None,
         _append({
             'kind': 'result',
             'intent_id': intent_id,
-            'ts': datetime.now().isoformat(timespec='seconds'),
+            'ts': _now_ist().isoformat(timespec='seconds'),
             'dry_run': bool(dry_run),
             'order_id': order_id,
             'error': error,

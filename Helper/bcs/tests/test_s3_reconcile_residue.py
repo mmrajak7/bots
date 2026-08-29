@@ -602,10 +602,14 @@ def test_a_live_reading_RESETS_the_confirmation(spy):
     assert store.trades[0]['reconcile_residue']['state'] == 'open'
 
 
-def test_the_confirmation_survives_a_restart(spy):
+def test_the_confirmation_survives_a_restart_WITHIN_the_session(spy):
     """It lives on the RECORD, not in memory: a process restart between the
-    two reads must not bank half a confirmation, and must not lose one
-    either."""
+    two reads must not lose a confirmation.
+
+    WITHIN the session — the counter is dated. Banking Friday 15:29's flat
+    read against Monday 09:15's would resolve on the first read of the new
+    session, which is the correlated-burst problem with a weekend in the
+    middle. See `test_a_confirmation_does_not_carry_across_SESSIONS`."""
     store = MemoryStore(trades=[_seed_residue(_closed())])
     kite = FakeBroker(positions=[])
     sm.sweep_reconcile_residue(kite, _books(store))
@@ -640,3 +644,35 @@ def test_the_digest_flags_a_close_nobody_verified():
     flags = recovery_flags({'counts': {'reconcile_blind': 1},
                             'needs_human': {'reconcile_blind': 1}})
     assert any('could not be VERIFIED' in f for f in flags)
+
+
+def test_the_opening_window_cannot_resolve_an_incident(spy, monkeypatch):
+    """Two reads five seconds apart do not defeat a CORRELATED burst, and the
+    sync window at the open is exactly that: at 09:15:00 and 09:15:05 both
+    reads are the same lie. Value triggers are already dark for 15 minutes for
+    this reason; resolving a TERMINAL, one-way incident is at least as
+    consequential as firing a stop."""
+    monkeypatch.setattr(sm, 'is_market_settled', lambda: False)
+    store = MemoryStore(trades=[_seed_residue(_closed())])
+    kite = FakeBroker(positions=[])
+
+    for _ in range(10):
+        sm.sweep_reconcile_residue(kite, _books(store))
+    assert store.trades[0]['reconcile_residue']['state'] == 'open'
+    assert spy.sent == []
+
+
+def test_a_confirmation_does_not_carry_across_SESSIONS(spy):
+    """The counter is dated. An undated one banks Friday's last read against
+    Monday's first — resolving on the opening read of a new session, which is
+    the burst problem with a weekend in the middle."""
+    rec = _seed_residue(_closed())
+    rec['reconcile_residue']['flat_reads'] = 1
+    rec['reconcile_residue']['flat_reads_date'] = '2026-08-28'   # yesterday
+    store = MemoryStore(trades=[rec])
+    kite = FakeBroker(positions=[])
+
+    assert sm.sweep_reconcile_residue(kite, _books(store)) == 1
+    assert store.trades[0]['reconcile_residue']['state'] == 'open'
+    assert store.trades[0]['reconcile_residue']['flat_reads'] == 1, (
+        "yesterday's read was counted toward today's confirmation")

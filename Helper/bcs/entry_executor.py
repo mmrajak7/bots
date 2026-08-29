@@ -164,7 +164,12 @@ def open_leg(kite, exchange: str, symbol: str, is_buy: bool, qty: int,
         # Re-checked every attempt, like the close path. Entries get the
         # NORMAL cutoff and never the urgent one -- there is no entry worth
         # placing at 15:24.
-        if datetime.now().time() > sm.LAST_ORDER_TIME:
+        # `sm.now_ist()`, not `datetime.now()`: LAST_ORDER_TIME is an IST
+        # time-of-day, and comparing the BOX clock against it is the
+        # `is_spread_settled` shape. On a UTC box, box time during Indian
+        # market hours is 03:45-10:00, so this cutoff would NEVER fire and a
+        # retry loop could place an entry order past 15:25 IST.
+        if sm.now_ist().time() > sm.LAST_ORDER_TIME:
             say(f"    ENTRY CUTOFF: past "
                 f"{sm.LAST_ORDER_TIME.strftime('%H:%M')} — not opening {symbol}")
             return None

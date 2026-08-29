@@ -145,3 +145,35 @@ def test_an_unreadable_config_never_mutes(monkeypatch):
         raise OSError('gone')
     monkeypatch.setattr(layered_config, 'load', _boom)
     assert cfg.telegram_enabled() is True
+
+
+# ── round two: defects in the FIXES ────────────────────────────────────────
+
+def test_a_hand_entry_is_always_already_filled():
+    """`--debit` is what was actually PAID, so the trade exists at the broker
+    before `mark_entered` is called. Refusing on a capital limit there does
+    not undo it — it only loses the RECORD, and a live position with no record
+    has no stops, no monitor and no exit engine. `mark_entered_bcs` has
+    threaded `already_filled` since it was written; the manual path, which is
+    always-filled, did not. Latent while paper mode exempts the check, and it
+    arms the moment `paper_mode` goes false — which is where `zebra enter`
+    becomes the money path."""
+    from zebra import trade_store
+
+    src = Path(trade_store.__file__).read_text(encoding='utf-8')
+    body = src[src.index('def mark_entered(self'):]
+    body = body[:body.index('def _apply_entry')]
+    assert 'already_filled=True' in body, (
+        'a real fill can be refused by a capital limit and lose its record')
+
+
+def test_the_capital_check_still_runs_on_a_hand_entry():
+    """`already_filled` must relax the BUDGET limits, not skip the check —
+    an exemption that skipped it means the capital layer has never run when it
+    first becomes load-bearing."""
+    from zebra import trade_store
+
+    src = Path(trade_store.__file__).read_text(encoding='utf-8')
+    body = src[src.index('def mark_entered(self'):]
+    body = body[:body.index('def _apply_entry')]
+    assert '_refuse_if_over_budget' in body

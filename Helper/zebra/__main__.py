@@ -978,6 +978,15 @@ def cmd_enter(args):
     # under it would be answering different questions.
     if pos_err:
         print(f"  (could not read broker positions: {pos_err})")
+    if paper:
+        # A paper record has no broker legs BY DEFINITION, so `verify_entry`
+        # would print "*** ENTRY NOT VERIFIED *** broker shows NO position"
+        # directly under "Recorded as PAPER". A guaranteed contradiction on
+        # every paper entry is #449 in miniature, and it trains the reader to
+        # scroll past NOT VERIFIED — which is the line that matters on the
+        # entries that ARE real.
+        print("  (paper — no broker legs expected, nothing to verify)")
+        return
     v = capital.verify_entry(positions, t)
     if v['ok']:
         print("  VERIFIED: the broker shows both legs at the recorded size")
@@ -1037,8 +1046,24 @@ def _entry_ownership(args, entry_data, positions, pos_err):
     hit = want & live_syms
     if len(hit) == len(want):
         return False, 'the broker shows both legs live'
+    if not hit and not positions:
+        # AN EMPTY BOOK IS NOT EVIDENCE OF ANYTHING.
+        #
+        # `positions()` returning no rows at all is what the early-session
+        # sync window looks like, and what positions-lag looks like in the
+        # minutes after a fill — which is exactly when `zebra enter` is run.
+        # Reading it as "neither leg is live" classifies a real, just-placed
+        # trade as PAPER: the stranding bug, reached through its own fix.
+        #
+        # A book with OTHER rows in it and not ours IS evidence: the broker
+        # answered about a populated account and our legs were not in it.
+        # That distinction is the whole difference between "no data" and
+        # "no position", and this one bit decides which engine owns a live
+        # position for the rest of its life.
+        return None, ('the broker returned an EMPTY position book — that is '
+                      'what a sync lag looks like, not proof of no position')
     if not hit:
-        return True, 'the broker shows neither leg'
+        return True, 'the broker shows other positions but neither of these legs'
     return None, ('the broker shows only %s of the two legs — half a spread '
                   'is not an ownership answer' % ', '.join(sorted(hit)))
 

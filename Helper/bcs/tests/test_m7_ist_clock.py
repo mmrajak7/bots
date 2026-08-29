@@ -90,6 +90,95 @@ def test_the_replay_harness_can_still_drive_it(monkeypatch):
     assert sm.today_ist() == pinned.date()
 
 
+#: Every module that reasons about EXCHANGE time — a session gate, a date
+#: stamp on a shared record, an age measured against a broker timestamp.
+#: DISCOVERED per module by its own IST helper, so adding a fifth needs no
+#: edit here beyond the tuple.
+IST_MODULES = (
+    ('bcs.spread_monitor', 'now_ist'),
+    ('bcs.entry_executor', None),        # uses sm.now_ist()
+    ('bcs.order_journal', '_now_ist'),
+    ('zebra.strikes', '_now_ist'),
+)
+
+
+@pytest.mark.parametrize('modname,helper', IST_MODULES,
+                         ids=[m for m, _ in IST_MODULES])
+def test_no_module_on_the_exchange_path_reads_the_box_clock(modname, helper):
+    """THE GUARD'S OWN BOUNDARY WAS THE BUG.
+
+    The first version parsed `bcs/spread_monitor.py` and nothing else, so
+    "every bare `datetime.now()` is now `now_ist()`" was true of one file
+    while three live mixed-clock reads sat one module over:
+
+      * `bcs/entry_executor.py` compared the BOX clock against
+        `LAST_ORDER_TIME`, an IST time-of-day, on the LIVE ENTRY ORDER PATH.
+        On a UTC box that cutoff never fires.
+      * `zebra/strikes._ltp_fresh` — the same-named TWIN of the function the
+        sweep had just fixed, docstring "Mirrors bcs.get_option_depth" —
+        still aged an exchange timestamp against the box clock.
+      * `bcs/order_journal` stamped its intents and chose its day file on the
+        box clock, so an intent would read 04:05 beside a monitor log line
+        saying 09:35 — the forensic hazard the sweep's own message described.
+
+    A guard scoped to the file its author happened to be editing is the
+    module-boundary version of `feedback_the_copy_you_did_not_open`.
+    """
+    import ast
+    import importlib
+
+    mod = importlib.import_module(modname)
+    tree = ast.parse(Path(mod.__file__).read_text(encoding='utf-8'))
+    skip = (0, 0)
+    if helper:
+        fn = next((n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == helper), None)
+        assert fn is not None, '%s has no %s' % (modname, helper)
+        skip = (fn.lineno, fn.end_lineno)
+    bad = [n.lineno for n in ast.walk(tree)
+           if isinstance(n, ast.Call)
+           and isinstance(n.func, ast.Attribute) and n.func.attr == 'now'
+           and getattr(n.func.value, 'id', None) == 'datetime'
+           and not n.args and not n.keywords
+           and not (skip[0] <= n.lineno <= skip[1])]
+    assert not bad, (
+        '%s reads the box clock at line(s) %s — every date decision in it is '
+        'an EXCHANGE fact' % (modname, bad))
+
+
+def test_every_ist_helper_agrees_on_the_offset():
+    """Four definitions of "now" across three packages. One disagreeing by an
+    hour would put the engines a session apart on exactly the dates that
+    matter, and each is defined locally to avoid a circular import — which is
+    precisely how they would drift."""
+    import importlib
+
+    from zebra import config as zcfg
+
+    assert sm.IST == zcfg.IST
+    from bcs import order_journal
+    assert order_journal._IST == sm.IST
+    for modname, helper in IST_MODULES:
+        if not helper:
+            continue
+        mod = importlib.import_module(modname)
+        a, b = getattr(mod, helper)(), sm.now_ist()
+        assert abs((a - b).total_seconds()) < 5, modname
+
+
+def test_a_stamp_this_module_writes_reads_back_as_the_same_instant():
+    """The regression the sweep CREATED. Every stamp is naive IST now, and
+    `datetime.fromisoformat(s).timestamp()` interprets a naive value in the
+    BOX's zone — so `recovery_gate` compared an IST-derived epoch against
+    `time.time()` and, on a UTC box, read a freeze as 5.5 hours in the FUTURE.
+    `age` goes negative and the bounded class's 300s recovery grace becomes
+    about five and a half hours: the M14 sweep dark for most of a session, on
+    exactly the positions it exists to finish."""
+    import time
+
+    assert abs(time.time() - sm.ist_epoch(sm.now_ist().isoformat())) < 5
+
+
 def test_no_naive_wall_clock_reads_are_left_on_the_session_gates():
     """DISCOVERY, not a list. The whole defect was that these reads were
     scattered, so a test naming the ones already fixed would pass at every

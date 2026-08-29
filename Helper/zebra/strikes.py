@@ -64,6 +64,17 @@ except Exception as _e:  # pragma: no cover - import safety fallback
     _LTP_FRESH_SEC = 30 * 60
 
 
+def _now_ist():
+    """IST wall-clock, naive — the same clock `bcs.spread_monitor.now_ist`
+    reads, so the two engines agree about what time it is at the exchange.
+
+    Every date/DTE decision in this module is an EXCHANGE fact (is this print
+    from today, how many days to expiry), so none of them may be answered from
+    the box's timezone.
+    """
+    return datetime.now(cfg.IST).replace(tzinfo=None)
+
+
 def _ltp_fresh(ltt) -> bool:
     """True if the option printed a trade within _LTP_FRESH_SEC (today only).
 
@@ -76,9 +87,15 @@ def _ltp_fresh(ltt) -> bool:
     try:
         ltt_dt = ltt if hasattr(ltt, 'date') else \
             datetime.strptime(str(ltt)[:19], '%Y-%m-%d %H:%M:%S')
-        if ltt_dt.date() != datetime.now().date():
+        # IST both sides. `ltt` is the EXCHANGE's last-trade time; measuring
+        # its age against the box clock made every print read fresh (or every
+        # print read stale) by the offset. This is the twin of
+        # `bcs.spread_monitor._ltp_fresh` — same name, same docstring, fixed
+        # there first and not here. [[feedback_the_copy_you_did_not_open]]
+        now = _now_ist()
+        if ltt_dt.date() != now.date():
             return False
-        return (datetime.now() - ltt_dt).total_seconds() <= _LTP_FRESH_SEC
+        return (now - ltt_dt).total_seconds() <= _LTP_FRESH_SEC
     except Exception:
         return False
 
@@ -120,7 +137,7 @@ def options_csv_age_days(now=None):
         st = cfg.OPTIONS_CSV.stat()
     except OSError:
         return None
-    now = now or datetime.now()
+    now = now or _now_ist()
     return (now - datetime.fromtimestamp(st.st_mtime)).total_seconds() / 86400.0
 
 
@@ -205,7 +222,7 @@ def _pick_expiry(stock: str, today: Optional[datetime] = None) -> Optional[str]:
     Returns the expiry string (YYYY-MM-DD) or None.
     """
     _load_options_csv()
-    today = today or datetime.now()
+    today = today or _now_ist()
     expiries = sorted(_OPTIONS_CACHE.get(stock, {}).keys())
     for exp in expiries:
         try:
@@ -321,7 +338,7 @@ def analyze(kite, stock: str, direction: str, spot: float,
     if not expiry:
         return {'error': f"No expiry found with {cfg.MIN_DTE}-{cfg.MAX_DTE} DTE for {stock}"}
 
-    dte = (datetime.strptime(expiry, '%Y-%m-%d').date() - datetime.now().date()).days
+    dte = (datetime.strptime(expiry, '%Y-%m-%d').date() - _now_ist().date()).days
     chain_at_expiry = _OPTIONS_CACHE.get(stock, {}).get(expiry, {})
     if not chain_at_expiry:
         return {'error': f"No chain in CSV for {stock} {expiry}"}

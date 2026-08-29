@@ -657,10 +657,21 @@ class ZebraStore:
             t = self._must_find(trade_id)
             if t['status'] not in ('watching', 'triggered'):
                 raise ValueError(f"#{trade_id} status={t['status']}, can't enter")
+            # `already_filled=True`, ALWAYS. This is the hand-entry path:
+            # `--debit` is what was actually PAID, so by definition the trade
+            # exists at the broker before this method is called. Refusing here
+            # does not undo it — it only loses the RECORD, and a live position
+            # with no record has no stops, no monitor and no exit engine.
+            # `mark_entered_bcs` has threaded this flag since it was written;
+            # the manual path, which is always-filled, did not. Latent while
+            # paper mode exempts the check, and it arms the moment
+            # `paper_mode` goes false — which is where `zebra enter` becomes
+            # the money path.
             self._refuse_if_over_budget(trade_id, {
                 'stock': t.get('stock'), 'debit': entry_data.get('debit'),
                 'lot_size': entry_data.get('lot_size'),
-                'lots': entry_data.get('lots') or 1})
+                'lots': entry_data.get('lots') or 1},
+                already_filled=True)
             self._apply_entry(t, entry_data)
         logger.info(
             "ENTERED #%d %s %s/%s debit=%.2f qty=%d cap=Rs%.0f TP=%.2f SL=%.2f",

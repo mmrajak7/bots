@@ -88,14 +88,39 @@ def test_both_legs_live_means_the_trade_is_REAL():
     assert 'both legs' in why
 
 
-def test_neither_leg_live_means_PAPER():
-    paper, why = zmain._entry_ownership(_Args(), ENTRY, [], None)
+def test_a_POPULATED_book_without_our_legs_means_PAPER():
+    """Evidence, not absence: the broker answered about an account that holds
+    other things, and our legs were not among them."""
+    paper, why = zmain._entry_ownership(
+        _Args(), ENTRY, [_pos('SOMETHINGELSE26SEP100CE', 50)], None)
     assert paper is True
-    assert 'neither' in why
+    assert 'neither of these legs' in why
+
+
+def test_an_EMPTY_book_is_not_evidence_and_REFUSES():
+    """The one-read defect, found by the re-review. `positions()` returning no
+    rows at all is what the early-session sync window looks like, and what
+    positions-lag looks like in the minutes after a fill — which is exactly
+    when `zebra enter` is run. Reading it as "neither leg is live" classifies
+    a real, just-placed trade as PAPER: the stranding bug reached through its
+    own fix."""
+    paper, why = zmain._entry_ownership(_Args(), ENTRY, [], None)
+    assert paper is None
+    assert 'EMPTY position book' in why
+
+
+def test_the_empty_book_refusal_is_escapable():
+    """It must be, or a genuine paper entry on an empty account becomes
+    impossible to record."""
+    a = _Args()
+    a.paper = True
+    paper, _ = zmain._entry_ownership(a, ENTRY, [], None)
+    assert paper is True
 
 
 def test_a_flat_row_is_not_a_live_leg():
-    """A zero-quantity row is the broker saying "closed", not "held"."""
+    """A zero-quantity row is the broker saying "closed", not "held" — and
+    unlike an empty book it IS an answer, so it decides rather than refusing."""
     paper, _ = zmain._entry_ownership(
         _Args(), ENTRY, [_pos(S, 0), _pos(L, 0)], None)
     assert paper is True
@@ -144,7 +169,8 @@ def test_live_flag_wins_over_a_broker_that_says_otherwise():
     are open for a different reason."""
     a = _Args()
     a.live = True
-    paper, why = zmain._entry_ownership(a, ENTRY, [], None)
+    paper, why = zmain._entry_ownership(
+        a, ENTRY, [_pos('SOMETHINGELSE26SEP100CE', 50)], None)
     assert paper is False and 'you said' in why
 
 
@@ -159,7 +185,8 @@ def test_paper_flag_wins_too():
 def test_both_flags_is_a_refusal_not_a_precedence_rule():
     a = _Args()
     a.live = a.paper = True
-    paper, why = zmain._entry_ownership(a, ENTRY, [], None)
+    paper, why = zmain._entry_ownership(
+        a, ENTRY, [_pos(S, -700), _pos(L, 700)], None)
     assert paper is None and 'contradictory' in why
 
 
