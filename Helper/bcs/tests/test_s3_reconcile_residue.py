@@ -215,10 +215,16 @@ def test_the_nag_is_once_a_day_not_once_a_poll(spy):
 def test_the_incident_resolves_ITSELF_when_the_broker_goes_flat(spy):
     """Self-resolution read from the BROKER, never from our own record: the
     human fixing it by hand is the outcome this most wants, and a sweep that
-    re-read the freeze-time snapshot could never see it."""
+    re-read the freeze-time snapshot could never see it.
+
+    TWO passes, since 2026-08-29: one flat read is not proof — see
+    `test_ONE_flat_read_does_not_resolve_the_incident`. This test used to make
+    one pass and assert resolution, which ENSHRINED the defect rather than
+    catching it."""
     store = MemoryStore(trades=[_seed_residue(_closed())])
     kite = FakeBroker(positions=[])
 
+    sm.sweep_reconcile_residue(kite, _books(store))
     assert sm.sweep_reconcile_residue(kite, _books(store)) == 0
     res = store.trades[0]['reconcile_residue']
     assert res['state'] == 'resolved' and res['resolved_at']
@@ -228,7 +234,8 @@ def test_the_incident_resolves_ITSELF_when_the_broker_goes_flat(spy):
 def test_a_resolved_incident_is_not_swept_again(spy):
     store = MemoryStore(trades=[_seed_residue(_closed())])
     kite = FakeBroker(positions=[])
-    sm.sweep_reconcile_residue(kite, _books(store))
+    sm.sweep_reconcile_residue(kite, _books(store))   # confirm 1
+    sm.sweep_reconcile_residue(kite, _books(store))   # confirm 2 -> resolved
     spy.sent.clear()
 
     assert sm.sweep_reconcile_residue(kite, _books(store)) == 0
@@ -299,7 +306,8 @@ def test_one_bad_record_does_not_stop_the_sweep_for_the_rest(spy):
     kite = FakeBroker(positions=[])
 
     # The legless one cannot be checked and must not be called resolved; the
-    # other still resolves.
+    # other resolves on its second confirmed flat read.
+    assert sm.sweep_reconcile_residue(kite, _books(store)) == 2
     assert sm.sweep_reconcile_residue(kite, _books(store)) == 1
     assert store.trades[0]['reconcile_residue']['state'] == 'open'
     assert store.trades[1]['reconcile_residue']['state'] == 'resolved'
@@ -544,3 +552,91 @@ def test_the_post_close_audit_uses_that_one_reader():
         assert "'%s'" % field not in body, (
             'reconcile_after_close names leg fields itself again — that is the '
             'two-field list that reported an FH naked short as flat')
+
+
+# ── 8. found by the 2026-08-29 adversarial review ──────────────────────────
+
+def test_ONE_flat_read_does_not_resolve_the_incident(spy):
+    """Resolution is TERMINAL and one-way: `get_residue_trades` returns only
+    `state == 'open'`, and the only writer of a new incident is
+    `reconcile_after_close`, which runs at close time on an already-terminal
+    record. So a single successful-but-wrong `positions()` — an empty list in
+    the early-session sync window, a degraded response, a missing row — would
+    resolve every open incident, send a green "the leftover leg is now FLAT",
+    and permanently disarm the guard for the shape that has cost real money
+    twice.
+
+    A RAISING positions() was already handled. A LYING one was not.
+    """
+    store = MemoryStore(trades=[_seed_residue(_closed())])
+    kite = FakeBroker(positions=[])
+
+    assert sm.sweep_reconcile_residue(kite, _books(store)) == 1
+    assert store.trades[0]['reconcile_residue']['state'] == 'open'
+    assert spy.sent == [], 'an all-clear was announced on one read'
+
+
+def test_two_consecutive_flat_reads_DO_resolve_it(spy):
+    """The negative control. Confirmation must not become never-resolving —
+    the incident has to be able to end, or the nag is the new failure."""
+    store = MemoryStore(trades=[_seed_residue(_closed())])
+    kite = FakeBroker(positions=[])
+
+    sm.sweep_reconcile_residue(kite, _books(store))
+    assert sm.sweep_reconcile_residue(kite, _books(store)) == 0
+    assert store.trades[0]['reconcile_residue']['state'] == 'resolved'
+    assert spy.any('FLAT')
+
+
+def test_a_live_reading_RESETS_the_confirmation(spy):
+    """Two flat reads separated by a live one are not two CONSECUTIVE flat
+    reads. Without the reset, an intermittent broker view would accumulate
+    confirmations across a leg that keeps reappearing."""
+    store = MemoryStore(trades=[_seed_residue(_closed())])
+    flat = FakeBroker(positions=[])
+    live = FakeBroker(positions=[_pos(SHORT, -QTY)])
+
+    sm.sweep_reconcile_residue(flat, _books(store))          # 1 flat
+    sm.sweep_reconcile_residue(live, _books(store))          # reset
+    sm.sweep_reconcile_residue(flat, _books(store))          # 1 flat again
+    assert store.trades[0]['reconcile_residue']['state'] == 'open'
+
+
+def test_the_confirmation_survives_a_restart(spy):
+    """It lives on the RECORD, not in memory: a process restart between the
+    two reads must not bank half a confirmation, and must not lose one
+    either."""
+    store = MemoryStore(trades=[_seed_residue(_closed())])
+    kite = FakeBroker(positions=[])
+    sm.sweep_reconcile_residue(kite, _books(store))
+    assert store.trades[0]['reconcile_residue']['flat_reads'] == 1
+
+    # a "restart": a fresh nag set, same store
+    assert sm.sweep_reconcile_residue(kite, _books(store), nagged=set()) == 0
+    assert store.trades[0]['reconcile_residue']['state'] == 'resolved'
+
+
+def test_residue_blind_is_a_daily_event_not_a_per_poll_one(spy, capsys):
+    """A needs-human digest event at 12/min is the "one live leg reads as
+    thousands of findings" shape this same change forbade for the persist
+    path — written correctly there and copied wrong here."""
+    store = MemoryStore(trades=[_seed_residue(_closed())])
+    kite = FakeBroker(positions=[])
+    kite.positions_raises = RuntimeError('rate limited')
+
+    for _ in range(20):
+        sm.sweep_reconcile_residue(kite, _books(store))
+    assert capsys.readouterr().out.count('EVENT residue_blind') == 1
+
+
+def test_the_digest_flags_a_close_nobody_verified():
+    """`reconcile_blind` is emitted with a comment saying "the digest counts
+    it by name", and it was the ONE of the four S3 events left out of
+    `RECOVERY_NEEDS_HUMAN` — arguably the most dangerous, since it means the
+    post-close audit itself failed."""
+    from zebra.engine_log import RECOVERY_NEEDS_HUMAN, recovery_flags
+
+    assert 'reconcile_blind' in RECOVERY_NEEDS_HUMAN
+    flags = recovery_flags({'counts': {'reconcile_blind': 1},
+                            'needs_human': {'reconcile_blind': 1}})
+    assert any('could not be VERIFIED' in f for f in flags)

@@ -924,6 +924,36 @@ def cmd_enter(args):
     if args.tp is not None:
         entry_data['tp_spot'] = args.tp
 
+    # ── WHO OWNS THIS POSITION? Ask the broker, before writing the record ──
+    #
+    # This one bit decides which engine manages the trade for the rest of its
+    # life, and it used to be left at the scanner's `paper: True` by default.
+    # A hand-entered LIVE trade then belonged to the paper engine: it books
+    # exits at mid, the armed monitor declines it, and the startup broker
+    # check skips it — so the real legs strand on the first trigger with every
+    # safety line reading green.
+    #
+    # The broker's own view is the evidence, and this command was ALREADY
+    # fetching it a few lines below to print "VERIFIED". Reading it before the
+    # write instead of after turns an observation into a decision.
+    positions, pos_err = _broker_positions()
+    # `entry_data`, not `args`: the symbols may have been RESOLVED from the
+    # alert a few lines up, and `args.long_symbol` is None in that ordinary
+    # case. Asking the broker about None would refuse every entry that did
+    # not spell its symbols out by hand.
+    paper, why = _entry_ownership(args, entry_data, positions, pos_err)
+    if paper is None:
+        # UNKNOWN OWNERSHIP IS NOT A DEFAULT. Guessing 'real' would hand the
+        # live order path a record with no legs; guessing 'paper' is the bug
+        # above. Refuse, and say which flag settles it.
+        print(f"REFUSING to record #{args.id}: {why}")
+        print("  The `paper` flag decides which engine manages this trade for "
+              "the rest of its life. Pass --live (you placed it at the "
+              "broker) or --paper (you did not) to settle it by hand.")
+        sys.exit(1)
+    entry_data['paper'] = paper
+    print(f"  Recorded as {'PAPER' if paper else 'LIVE'} — {why}")
+
     try:
         t = store.mark_entered(args.id, entry_data)
     except ValueError as e:
@@ -943,12 +973,11 @@ def cmd_enter(args):
     # fatal to the entry -- the trade IS recorded either way; what this decides
     # is whether the owner is told to go and look.
     from . import capital
-    try:
-        from .scanner import _get_kite
-        positions = (_get_kite().positions() or {}).get('net')
-    except Exception as e:
-        print(f"  (could not read broker positions: {e})")
-        positions = None
+    # The SAME read that decided ownership above — not a second call. Two
+    # reads could disagree, and then the record's owner and the line printed
+    # under it would be answering different questions.
+    if pos_err:
+        print(f"  (could not read broker positions: {pos_err})")
     v = capital.verify_entry(positions, t)
     if v['ok']:
         print("  VERIFIED: the broker shows both legs at the recorded size")
@@ -958,6 +987,60 @@ def cmd_enter(args):
             print(f"    - {prob}")
         print("    The stops above are computed from the RECORD. Fix the "
               "record or the position before relying on them.")
+
+
+def _broker_positions():
+    """`(net_positions, error)`. Never raises — a broker outage must not stop
+    a trade being RECORDED, only stop it being recorded as the wrong kind."""
+    try:
+        from .scanner import _get_kite
+        return (_get_kite().positions() or {}).get('net'), None
+    except Exception as e:
+        return None, str(e)
+
+
+def _entry_ownership(args, entry_data, positions, pos_err):
+    """`(paper, why)` for a hand-entered trade. `paper is None` means REFUSE.
+
+    Three sources, in this order:
+
+    1. an explicit `--live` / `--paper` — the operator is the authority on
+       what they did, and there are real cases the broker cannot settle (a
+       trade placed in another account, a paper entry recorded while real
+       positions in the same symbol are open);
+    2. the BROKER, when it can be read — this is the ordinary path and needs
+       no flag;
+    3. nothing. Then REFUSE, because unknown is not a default here: guessing
+       'real' hands the live order path a record with no legs at the broker,
+       and guessing 'paper' is the defect this function exists to close.
+
+    The broker is consulted for LEG PRESENCE only, not size — `verify_entry`
+    reports the size mismatch separately, and a half-filled real position is
+    still real. Answering "paper" because the quantity was short would be the
+    original bug wearing a stricter face.
+    """
+    if getattr(args, 'live', False) and getattr(args, 'paper', False):
+        return None, '--live and --paper are contradictory'
+    if getattr(args, 'live', False):
+        return False, 'you said --live'
+    if getattr(args, 'paper', False):
+        return True, 'you said --paper'
+    if pos_err or positions is None:
+        return None, 'the broker could not be read (%s)' % (pos_err or 'no data')
+
+    want = {entry_data.get('long_symbol'),
+            entry_data.get('short_symbol')} - {None}
+    if not want:
+        return None, 'the leg symbols are not known, so the broker cannot be asked'
+    live_syms = {p.get('tradingsymbol') for p in positions
+                 if p.get('quantity')}
+    hit = want & live_syms
+    if len(hit) == len(want):
+        return False, 'the broker shows both legs live'
+    if not hit:
+        return True, 'the broker shows neither leg'
+    return None, ('the broker shows only %s of the two legs — half a spread '
+                  'is not an ownership answer' % ', '.join(sorted(hit)))
 
 
 def cmd_close(args):
@@ -1619,6 +1702,14 @@ def main():
     p_ent.add_argument('--short-symbol', default=None)
     p_ent.add_argument('--lot-size', type=int, default=None)
     p_ent.add_argument('--entry-spot', type=float, default=None)
+    p_ent.add_argument('--live', action='store_true',
+                       help='This was PLACED AT THE BROKER. Sets paper=False, '
+                            'so the live monitor owns its exits. Normally '
+                            'unnecessary — the broker is read and decides.')
+    p_ent.add_argument('--paper', action='store_true',
+                       help='This was NOT placed. Sets paper=True. Normally '
+                            'unnecessary; needed when real legs in the same '
+                            'symbols exist for another reason.')
     p_ent.add_argument('--pricing-basis', choices=['fill', 'mid'],
                        default='fill',
                        help="How --debit was priced. 'fill' (default) = what "

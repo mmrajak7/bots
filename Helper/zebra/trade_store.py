@@ -672,7 +672,34 @@ class ZebraStore:
     def _apply_entry(self, t: dict, entry_data: dict) -> None:
         """Field-level entry mutation. Split out of mark_entered so the whole
         computation runs INSIDE the lock without a 60-line critical section
-        being visually lost in the middle of the method."""
+        being visually lost in the middle of the method.
+
+        **`paper` — WHO OWNS THIS POSITION (added 2026-08-29).**
+
+        `add_signal` stamps every signal `paper: True`, and until now nothing
+        on THIS path ever changed it: only `mark_entered_bcs` set it, and only
+        from `_auto_enter_bcs`. So a trade entered by hand — which is the
+        FIRST live-money action in the arming order, back when "the alert IS
+        the order ticket" — kept `paper: True` while its legs sat at the
+        broker.
+
+        Every consequence of that runs the wrong way and none of it is loud:
+        `is_paper_record` says paper, so `_exits_external` keeps the position
+        with THIS engine and `_paper_auto_close` books its exit at mid;
+        `close_spread` correctly refuses it, so the armed monitor will not
+        touch it; and the startup broker-leg check SKIPS it ("PAPER record, no
+        broker legs expected"), so the one sweep that could notice the
+        contradiction is disabled by the same flag that causes it. On the
+        first trigger the record leaves `entered` on a paper booking and the
+        REAL legs stay open with no engine and no record in any open book.
+
+        C5 fixed exactly this on the automated door and not on this one —
+        [[feedback_the_copy_you_did_not_open]], on the paper/real boundary
+        itself. The caller must now decide, and `cmd_enter` decides it from
+        the BROKER, which it was already reading and printing.
+        """
+        if 'paper' in entry_data:
+            t['paper'] = bool(entry_data['paper'])
         lot_size = int(entry_data['lot_size'])
         lots = int(entry_data['lots'])
         quantity = lot_size * lots

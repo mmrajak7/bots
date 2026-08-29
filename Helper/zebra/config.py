@@ -753,10 +753,25 @@ _file_cfg = layered_config.load('zebra_config', warn_on_shadow=False) or {}
 
 _runtime = _load_runtime()
 
-#: Telegram's master switch, resolved through BOTH layers. Defaults to True:
-#: absence has always meant "send", and a config that stops existing must not
-#: silently mute a safety channel.
-TELEGRAM_ENABLED = bool((_file_cfg.get('telegram') or {}).get('enabled', True))
+def telegram_enabled() -> bool:
+    """Telegram's master switch, resolved through BOTH config layers.
+
+    A FUNCTION, not an import-time constant. The code this replaced opened
+    `CONFIG_FILE` on every send — which was wrong about the LAYER (overlay
+    only) but right about the TIMING: `zebra loop` is long-lived, and an
+    import-time constant means an operator muting alerts mid-session has to
+    restart the process for it to take effect. Fixing the layer bug by
+    freezing the value would have traded one defect for another.
+
+    Only `false` mutes. `None`/absent means SEND: absence has always meant
+    send, a config that stops existing must not silently mute a safety
+    channel, and `bool(None)` would have made a null key do it.
+    """
+    try:
+        cfg = layered_config.load('zebra_config', warn_on_shadow=False) or {}
+    except Exception:
+        return True             # unreadable config never mutes the alerts
+    return (cfg.get('telegram') or {}).get('enabled') is not False
 
 
 def _positive_finite(key: str, val, default: float) -> float:

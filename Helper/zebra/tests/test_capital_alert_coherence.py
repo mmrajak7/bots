@@ -192,7 +192,14 @@ def _fill_the_book(store, monkeypatch, n=1):
 def test_a_refused_signal_renders_no_order_ticket(wired, sent, monkeypatch):
     """#449's message carried BUY/SELL lines with click-copy symbols and a
     fillable debit, and then said DO NOT ENTER. Whichever half the reader
-    acted on, the message was wrong."""
+    acted on, the message was wrong.
+
+    **LIVE**, since 2026-08-29. The rule is about an ORDER TICKET, and in
+    paper there is no order — the position is already open by the time the
+    alert renders, so a DO-NOT-ENTER line there is #449's contradiction
+    arrived at from the other side. See the paper twin below.
+    """
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
     _fill_the_book(wired, monkeypatch)
     cycle(wired)
     assert len(sent) == 1, "one signal, one alert"
@@ -217,7 +224,14 @@ def test_paper_still_enters_a_refused_signal(wired, sent, monkeypatch):
 
 def test_a_refused_signal_spends_no_vet(wired, sent, monkeypatch):
     """A store read decides what a Claude spawn was being asked to decide.
-    #449 burned entry decision #92 on a book that was already full."""
+    #449 burned entry decision #92 on a book that was already full.
+
+    **LIVE**, since 2026-08-29: there the refusal binds, so no entry follows
+    and the vet would decide nothing. In PAPER the entry happens regardless,
+    and an unvetted entry is a hole in the evidence the paper run exists to
+    produce — see the twin below.
+    """
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
     monkeypatch.setattr(cfg, 'VET_ENABLED', True)
     asked = []
     monkeypatch.setattr(vet_mod, 'request_entry_vet',
@@ -225,6 +239,43 @@ def test_a_refused_signal_spends_no_vet(wired, sent, monkeypatch):
     _fill_the_book(wired, monkeypatch)
     cycle(wired)
     assert asked == [], "a Claude vet was spent on an unfundable signal"
+
+
+def test_PAPER_still_vets_a_signal_the_live_cap_would_refuse(wired, sent,
+                                                             monkeypatch):
+    """The twin, and the regression that made it necessary.
+
+    `max_open_trades` 8 -> 4 (M9, a LIVE decision) against a book holding 6
+    open PAPER positions refused every new signal in the pre-gate — which
+    skipped the vet — while the store's paper exemption entered the record
+    anyway. Paper trades with NO VERDICT, and the vetting pipeline THE GOAL
+    exists to validate going dark, from a change documented as live-only.
+    """
+    monkeypatch.setattr(cfg, 'VET_ENABLED', True)
+    asked = []
+    monkeypatch.setattr(vet_mod, 'request_entry_vet',
+                        lambda *a, **k: asked.append(a) or None)
+    _fill_the_book(wired, monkeypatch)
+    cycle(wired)
+    assert asked, ("paper entered without asking for a verdict — the "
+                   "validation record now has a hole in it")
+
+
+def test_the_PAPER_ticket_says_a_live_book_would_have_refused(wired, sent,
+                                                              monkeypatch):
+    """Vetting it is not the same as pretending the cap did not speak. The
+    alert must not render `_size_line`'s DO-NOT-ENTER over a position that is
+    already open, and must not silently omit the refusal either."""
+    _fill_the_book(wired, monkeypatch)
+    cycle(wired)
+    assert len(sent) == 1, "one signal, one alert"
+    msg = sent[0]
+    assert 'PAPER entry' in msg
+    assert 'would have REFUSED' in msg
+    assert 'cap is 1 (max_open_trades)' in msg
+    assert 'DO NOT ENTER' not in msg, (
+        "a refusal rendered over an entry that already happened — #449's "
+        "contradiction from the other side")
 
 
 def test_a_pending_vet_is_still_honoured_when_capital_refuses(wired, sent,

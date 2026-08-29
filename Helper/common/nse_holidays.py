@@ -100,21 +100,45 @@ def is_session(d: date) -> bool:
     return d.weekday() < 5 and not is_holiday(d)
 
 
+#: Coverage ends this process has already complained about. The order engine
+#: calls `sessions_to_expiry` per open trade per FIVE-SECOND poll, so an
+#: un-deduped warning would write ~30,000 five-line notices a session the
+#: moment a trade with a next-year expiry exists — burying the log it was
+#: written to protect. Keyed by the end date, so a SECOND expiry past coverage
+#: still gets its own line; per-process rather than per-day because the
+#: monitor is one process per session and zebra's cron re-warns each cycle,
+#: which is the right cadence for each.
+_WARNED_PAST_COVERAGE = set()
+
+
+def _warn_once(end: date) -> bool:
+    if end in _WARNED_PAST_COVERAGE:
+        return False
+    _WARNED_PAST_COVERAGE.add(end)
+    return True
+
+
+def reset_coverage_warnings() -> None:
+    """For tests. A module-level set that survives between them makes the
+    second test measure the first."""
+    _WARNED_PAST_COVERAGE.clear()
+
+
 def sessions_between(start: date, end: date, *, warn=None) -> int:
     """Trading sessions in `(start, end]` — start exclusive, end inclusive.
 
     That half-open shape is what both callers already meant by "sessions
     remaining": today does not count, expiry day does.
 
-    `warn` takes one string and is called ONCE when any part of the range
-    falls outside `COVERAGE_END`. The count is still returned — degraded to
+    `warn` takes one string and is called ONCE PER PROCESS per uncovered end
+    date when any part of the range falls outside `COVERAGE_END`. The count is still returned — degraded to
     weekday-only for the uncovered part, which is exactly the old behaviour —
     but it is returned NOISILY. A calendar that quietly stops knowing things
     is worse than no calendar, because the number keeps looking authoritative.
     """
     if end <= start:
         return 0
-    if not covers(end) and warn is not None:
+    if not covers(end) and warn is not None and _warn_once(end):
         warn('NSE holiday calendar covers to %s; counting sessions to %s '
              'WEEKDAYS-ONLY past that. A holiday in the uncovered stretch '
              'makes this an OVER-estimate — it will report more sessions '

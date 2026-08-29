@@ -84,10 +84,20 @@ def test_a_spent_budget_refuses_a_NEW_entry_with_a_reason(caplog):
 
 
 def test_the_budget_is_checked_BEFORE_the_arming_switch():
-    """So it is exercised on a box where auto-entry is off. A guard first
-    observed on the day it starts mattering has never been observed at all —
-    this repo has shipped two controls that were wired in, looked deployed and
-    could never fire."""
+    """Before `ee.entries_allowed`, so an auto-entry-off box still exercises
+    it — a guard first observed on the day it starts mattering has never been
+    observed at all.
+
+    **But not before PAPER_MODE, and that limit is worth stating.**
+    `_entries_allowed_or_log` is reached only through `_auto_enter_bcs`, which
+    `check_watching` calls only under `not cfg.PAPER_MODE`. So on today's box
+    this code path does not execute at all, and the honest claim is "exercised
+    where AUTO-ENTRY is off", not "where paper is on". The budget is for the
+    live entry path and cannot be validated by the paper book — which is
+    exactly why the arithmetic it bounds is pinned by
+    `test_the_budget_leaves_a_one_lot_entry_its_full_attempts` rather than by
+    observation.
+    """
     src = Path(monitor_mod.__file__).read_text(encoding='utf-8')
     body = src[src.index('def _entries_allowed_or_log('):]
     body = body[:body.index('\ndef ', 1)]
@@ -113,3 +123,17 @@ def test_the_budget_never_interrupts_an_entry_in_flight():
     from bcs import entry_executor as ee
     src = Path(ee.__file__).read_text(encoding='utf-8')
     assert 'entry_budget_open' not in src
+
+
+def test_the_budget_does_not_execute_in_paper_mode():
+    """Pinned so the limitation above cannot be forgotten and then relied on.
+
+    `_entries_allowed_or_log` sits behind `_auto_enter_bcs`, which
+    `check_watching` calls only when paper mode is OFF. A future reader
+    assuming the budget protects the paper cycle would be wrong.
+    """
+    src = Path(monitor_mod.__file__).read_text(encoding='utf-8')
+    body = src[src.index('def check_watching('):]
+    call = body.index('_auto_enter_bcs') if '_auto_enter_bcs' in body else None
+    assert call is not None or 'not cfg.PAPER_MODE' in src, (
+        'the entry path moved — re-derive where the budget actually runs')

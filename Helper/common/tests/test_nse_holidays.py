@@ -94,6 +94,15 @@ def test_a_range_that_ends_after_expiry_day_is_zero():
 
 # ── running out of calendar: loud, not silent ───────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _fresh_warnings():
+    """The dedup set is module-level; without this the second test measures
+    the first."""
+    h.reset_coverage_warnings()
+    yield
+    h.reset_coverage_warnings()
+
+
 def test_counting_past_coverage_WARNS():
     """A calendar that quietly stops knowing things is worse than no calendar,
     because the number keeps looking authoritative. Same shape as an options
@@ -111,6 +120,27 @@ def test_counting_INSIDE_coverage_is_silent():
     said = []
     h.sessions_between(date(2026, 9, 21), date(2026, 9, 29), warn=said.append)
     assert said == []
+
+
+def test_the_warning_is_deduped_per_uncovered_date():
+    """The order engine calls `sessions_to_expiry` per open trade per
+    FIVE-SECOND poll. Un-deduped, the moment a next-year expiry exists it
+    would write ~30,000 five-line notices a session — burying the log it was
+    written to protect. Found by the 2026-08-29 review; it fires ~Dec 2026."""
+    said = []
+    for _ in range(50):
+        h.sessions_between(date(2026, 12, 20), date(2027, 1, 20),
+                           warn=said.append)
+    assert len(said) == 1
+
+
+def test_a_SECOND_uncovered_expiry_still_gets_its_own_line():
+    """Deduping on "we already warned once" rather than on WHAT we warned
+    about would hide the second contract past coverage."""
+    said = []
+    h.sessions_between(date(2026, 12, 20), date(2027, 1, 20), warn=said.append)
+    h.sessions_between(date(2026, 12, 20), date(2027, 2, 24), warn=said.append)
+    assert len(said) == 2
 
 
 def test_past_coverage_it_still_ANSWERS():

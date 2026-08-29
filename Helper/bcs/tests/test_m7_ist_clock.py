@@ -95,10 +95,12 @@ def test_no_naive_wall_clock_reads_are_left_on_the_session_gates():
     scattered, so a test naming the ones already fixed would pass at every
     moment of the bug's life.
 
-    `datetime.now()` on its own is still allowed — the recovery/journal
-    timestamps are LOCAL on purpose, because they sit beside a log line an
-    operator reads on the box. What must not come back is a naive read feeding
-    a session GATE or a DATE STAMP.
+    NOTHING may read the box clock — not the gates, not the date stamps, and
+    not the log/journal timestamps either. The first version of this exempted
+    "timestamps an operator reads beside the log", which sounded reasonable
+    and was the loophole the two residual bugs lived in. The operator reads
+    them on the Pi, which is IST; a log stamped in a different zone from the
+    exchange is a forensic hazard, not a convenience. One module, one clock.
     """
     import ast
 
@@ -107,6 +109,9 @@ def test_no_naive_wall_clock_reads_are_left_on_the_session_gates():
     # sentence in `now_ist`'s own docstring explaining why it does not use
     # `date.today()` — a text proxy flagging the documentation of the fix.
     tree = ast.parse(Path(sm.__file__).read_text(encoding='utf-8'))
+    now_ist_fn = next(n for n in ast.walk(tree)
+                      if isinstance(n, ast.FunctionDef) and n.name == 'now_ist')
+    now_ist_lines = (now_ist_fn.lineno, now_ist_fn.end_lineno)
     bad = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -115,13 +120,32 @@ def test_no_naive_wall_clock_reads_are_left_on_the_session_gates():
         if (isinstance(f, ast.Attribute) and f.attr == 'today'
                 and getattr(f.value, 'id', None) == 'date'):
             bad.append(('date.today()', node.lineno))
-        if (isinstance(f, ast.Attribute) and f.attr == 'time'
-                and isinstance(f.value, ast.Call)
-                and isinstance(f.value.func, ast.Attribute)
-                and f.value.func.attr == 'now'
-                and getattr(f.value.func.value, 'id', None) == 'datetime'
-                and not f.value.args and not f.value.keywords):
-            bad.append(('datetime.now().time()', node.lineno))
+        # ANY bare `datetime.now()`, not just `.time()`. The first version of
+        # this guard looked for exactly two shapes — `date.today()` and
+        # `datetime.now().time()` — and the SAME COMMIT that added it left two
+        # bare `datetime.now()` calls feeding session logic:
+        #
+        #   `is_spread_settled`  compared an IST `settle_time` against the BOX
+        #                        clock, so on a UTC box the value stops (
+        #                        SL_SPREAD, SL_TRAIL) stayed dark until 14:46
+        #                        IST while `is_market_open()` — now correct —
+        #                        reported a healthy running loop. WORSE than
+        #                        before the fix, which is what a half-migrated
+        #                        clock buys.
+        #   `_ltp_fresh`         subtracted an exchange IST timestamp from the
+        #                        box clock, so every print read fresh (or
+        #                        every print read stale) depending on sign.
+        #
+        # Both passed the two-shape guard. A guard that enumerates the shapes
+        # it already knows about passes at every moment of the bug's life —
+        # `feedback_a_guard_can_pin_the_wrong_thing`. The property is that
+        # this module has ONE clock, so the rule is: no bare `datetime.now()`
+        # anywhere except inside `now_ist` itself.
+        if (isinstance(f, ast.Attribute) and f.attr == 'now'
+                and getattr(f.value, 'id', None) == 'datetime'
+                and not node.args and not node.keywords
+                and not (now_ist_lines[0] <= node.lineno <= now_ist_lines[1])):
+            bad.append(('datetime.now()', node.lineno))
     assert not bad, (
         'the box clock is being read again at %s — use now_ist()/today_ist()'
         % ', '.join('%s line %d' % b for b in bad))

@@ -71,7 +71,7 @@ def _send_telegram(msg: str, dry_run: bool = False) -> bool:
     # had no effect, and on a box whose overlay has been trimmed to secrets
     # (all of them since 2026-08-26) the key was simply absent. A switch that
     # only works from the layer you are not supposed to edit is not a switch.
-    if not cfg.TELEGRAM_ENABLED:
+    if not cfg.telegram_enabled():
         logger.debug("Telegram disabled by config (telegram.enabled=false)")
         return True
 
@@ -1524,6 +1524,22 @@ def _swing_tp_line(swing) -> str:
             f"spot and ST {swing['st_value']:g}\n")
 
 
+def _shadow_size_line(reason: str) -> str:
+    """What the ticket says for a PAPER entry a live book would have refused.
+
+    Not `_size_line`: that one answers "how many lots shall I place", and for
+    this signal the honest answer is "none, but one was opened anyway because
+    paper deliberately does not cap". Rendering its DO-NOT-ENTER text over an
+    entry that already happened is #449's contradiction from the other side.
+
+    Says PAPER first, so the reader never mistakes it for an order.
+    """
+    return ("\n\n📝 <i>PAPER entry — a live book would have REFUSED "
+            "this: %s. Recorded anyway so the validation set is not biased "
+            "by which trades the cap happened to allow.</i>"
+            % html.escape(str(reason)))
+
+
 def _size_line(plan: Optional[dict]) -> str:
     """How many lots, what bounded it, and how to place them.
 
@@ -2043,7 +2059,47 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             logger.warning("capital pre-gate failed for #%d %s: %s — "
                            "continuing unsized", trade['id'], stock, e)
         capital_refused = bool(cap_plan) and not cap_plan['lots']
-        if capital_refused:
+        # ── PAPER SHADOW-LOGS WHAT IT WOULD HAVE REFUSED ────────────────
+        #
+        # `ZebraStore._refuse_if_over_budget` states the rule: "LIVE refuses.
+        # PAPER evaluates and LOGS what it WOULD have refused" — capping paper
+        # entries would bias which trades the validation record contains, and
+        # an unentered paper signal costs nothing. The STORE implements that.
+        # This pre-gate, the other place the cap is enforced, did not.
+        #
+        # What it cost, immediately: `max_open_trades` went 8 -> 4 on
+        # 2026-08-29 (M9, a LIVE decision) while the cohort held 6 open paper
+        # positions, so from the next session EVERY new signal was refused
+        # here — which skips the vet (below) and swaps the order ticket for a
+        # capital notice — while the store's paper exemption let the record
+        # enter anyway. A paper trade entered with NO VERDICT on it, and the
+        # vetting pipeline THE GOAL exists to validate going dark, from a
+        # config change that was supposed to be live-only.
+        # [[feedback_the_copy_you_did_not_open]], on the paper/live boundary.
+        #
+        # The log line stays either way: shadow evidence is how the rupee
+        # numbers get chosen from data instead of guessed.
+        capital_shadow = ''
+        if capital_refused and cfg.PAPER_MODE:
+            # THREE consequences were bundled behind one flag, and only two of
+            # them are right in paper:
+            #   * do not ENTER      — paper enters anyway (the store exempts
+            #                         it), so this one never applied here;
+            #   * spend no VET      — WRONG in paper: the record enters, so an
+            #                         unvetted entry is a hole in the very
+            #                         evidence the paper run exists to produce;
+            #   * send no TICKET    — RIGHT in both: an order ticket that says
+            #                         DO NOT ENTER underneath is #449.
+            # So the refusal stops binding, and the reason is carried forward
+            # to keep the ALERT honest instead of silently ticketing.
+            capital_shadow = cap_plan['reason']
+            logger.warning(
+                "CAPITAL WOULD REFUSE #%d %s: %s — PAPER enters anyway and is "
+                "vetted normally, so the validation record stays unbiased. "
+                "%s", trade['id'], stock, capital_shadow,
+                capital.describe(store.load_trades()))
+            capital_refused = False
+        elif capital_refused:
             logger.warning(
                 "CAPITAL REFUSES #%d %s: %s — no vet spent, no order ticket. "
                 "%s", trade['id'], stock, cap_plan['reason'],
@@ -2240,7 +2296,12 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
         # order. (This used to sit BELOW the retired branch's `continue`, so
         # under the BCS pipeline it ran exactly never — the wire-into-the-live-
         # path shape, pinned by a test.)
-        msg += _size_line(cap_plan)
+        # A refused plan must never render as a size. In PAPER the position
+        # HAS been opened at one lot while the plan says zero, so
+        # `_size_line`'s "DO NOT ENTER" would contradict the entry that just
+        # happened — #449's incoherence, arrived at from the other side.
+        msg += (_shadow_size_line(capital_shadow) if capital_shadow
+                else _size_line(cap_plan))
         msg += _funds_line(kite, bcs, bcs.get('lot_size') or 0)
         _send_enter_alert(store, trade, msg, stock, dry_run=dry_run)
 

@@ -341,3 +341,106 @@ def test_nhpc_replay_even_a_tidy_book_is_caught_by_corroboration():
     assert r['spread'] is not None, "the book itself looks fine"
     ok, why = m.spot_corroborates(st, 80.65, r['spread'])
     assert not ok and 'uncorroborated' in why
+
+
+# ── the loss path: CLAMP the arithmetic, refuse only the ESTIMATE ───────────
+#
+# Found by the 2026-08-29 arming review. `get_spread_value` returned None on a
+# negative spread ("treat as unreliable data") while `zebra`'s
+# `_structure_quote` had been fixed to clamp, and CLAUDE.md's valuation-bounds
+# table has said clamp since it was written. The engine about to own LIVE
+# exits held the old semantics — `feedback_the_copy_you_did_not_open`, on the
+# loss path.
+#
+# What refusing cost: after a gap straight through the debit stop the book
+# looks exactly like a worthless spread (long bid 0.55 / short ask 0.60), so
+# SL_SPREAD could never CONFIRM, the TIME close aborted on it daily, and the
+# position rode to EXPIRY_FORCE_CLOSE — the one close allowed to pay through
+# anything, at the worst prices of its life.
+
+def _worthless_book():
+    return {'NFO:X26SEPCE': {'depth': {'buy': [{'price': 0.55, 'quantity': 900}],
+                                       'sell': [{'price': 0.60, 'quantity': 900}]},
+                             'last_price': 0.55, 'oi': 9000},
+            'NFO:Y26SEPCE': {'depth': {'buy': [{'price': 0.55, 'quantity': 900}],
+                                       'sell': [{'price': 0.60, 'quantity': 900}]},
+                             'last_price': 0.60, 'oi': 9000}}
+
+
+def test_a_worthless_spread_is_worth_ZERO_not_unpriceable(monkeypatch):
+    """Expiry is always available and costs nothing, so a debit structure is
+    never worth less than zero. -0.05 means "worth about nothing", not
+    "unpriceable" — and booking the loss beats stranding the position."""
+    from bcs import spread_monitor as m
+
+    trade = {'long_symbol': 'X26SEPCE', 'short_symbol': 'Y26SEPCE',
+             'exchange': 'NFO', 'spread_width': 50}
+    monkeypatch.setattr(m, 'get_option_depth', lambda k, e, s, **kw: {
+        'bid': 0.55 if s == 'X26SEPCE' else 0.60,
+        'ask': 0.60 if s == 'X26SEPCE' else 0.65,
+        'bid_qty': 900, 'ask_qty': 900, 'ltp': 0.57,
+        'traded_today': True, 'prev_close': 1.0})
+    monkeypatch.setattr(m, 'leg_quote_reliable', lambda d: (True, ''))
+
+    out = m.get_spread_value(None, trade)
+    assert out['spread'] == 0.0, out
+    assert out['unreliable'] is None, (
+        'the valuation was refused — SL_SPREAD can never confirm on this book')
+
+
+def test_a_value_above_the_width_is_clamped_to_the_width(monkeypatch):
+    """The mirror bound, and the same table: a vertical's ceiling is
+    arithmetic, not information."""
+    from bcs import spread_monitor as m
+
+    trade = {'long_symbol': 'X26SEPCE', 'short_symbol': 'Y26SEPCE',
+             'exchange': 'NFO', 'spread_width': 50}
+    monkeypatch.setattr(m, 'get_option_depth', lambda k, e, s, **kw: {
+        'bid': 200.0 if s == 'X26SEPCE' else 1.0,
+        'ask': 201.0 if s == 'X26SEPCE' else 2.0,
+        'bid_qty': 900, 'ask_qty': 900, 'ltp': 200.0,
+        'traded_today': True, 'prev_close': 200.0})
+    monkeypatch.setattr(m, 'leg_quote_reliable', lambda d: (True, ''))
+
+    assert m.get_spread_value(None, trade)['spread'] == 50.0
+
+
+def test_the_intrinsic_floor_still_refuses_the_IMPOSSIBLE(monkeypatch):
+    """The clamp must not swallow the ABB #242 shape. An inverted ITM book
+    clamps to 0 and is then caught by the floor, which is large and positive
+    exactly there — so the clamp only survives where the spread really is
+    worthless."""
+    from bcs import spread_monitor as m
+
+    # Real symbols: the floor derives its strikes from the SYMBOL, not from
+    # `long_strike`/`short_strike` — caught by this test failing to refuse.
+    lo, sh = 'TESTCO26SEP1340CE', 'TESTCO26SEP1400CE'
+    trade = {'long_symbol': lo, 'short_symbol': sh,
+             'exchange': 'NFO', 'spread_width': 60,
+             # The floor's allowance comes from `entry_short_price` (+
+             # `entry_spot`), not from a precomputed extrinsic.
+             'entry_short_price': 1.0, 'entry_spot': 1360.0}
+    monkeypatch.setattr(m, 'get_option_depth', lambda k, e, s, **kw: {
+        'bid': 0.5 if s == lo else 0.9,
+        'ask': 0.6 if s == lo else 1.0,
+        'bid_qty': 900, 'ask_qty': 900, 'ltp': 0.5,
+        'traded_today': True, 'prev_close': 0.5})
+    monkeypatch.setattr(m, 'leg_quote_reliable', lambda d: (True, ''))
+
+    # Spot far above BOTH strikes: the spread must be worth ~its full width,
+    # so a near-zero book is proof of a broken quote, not a loss.
+    out = m.get_spread_value(None, trade, spot=1500.0)
+    assert out['spread'] is None
+    assert 'below_intrinsic' in out['unreliable']
+
+
+def test_the_two_engines_bound_a_negative_the_same_way():
+    """One position, two engines. A valuation that is zero in one and refused
+    in the other is a stop that exists in one engine and not the other."""
+    from bcs import spread_monitor as m
+
+    src = Path(m.__file__).read_text(encoding='utf-8')
+    fn = src[src.index('def get_spread_value('):]
+    fn = fn[:fn.index('\ndef ', 1)]
+    assert 'spread_val = 0.0' in fn
+    assert "unreliable = f\"negative_spread" not in fn

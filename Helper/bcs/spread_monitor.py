@@ -309,7 +309,7 @@ def set_log_file(path: Path):
 
 def log(msg: str):
     """Print and append to log file with timestamp."""
-    ts = datetime.now().strftime('%H:%M:%S')
+    ts = now_ist().strftime('%H:%M:%S')
     line = f"[{ts}] {msg}"
     print(line)
     if _log_file:
@@ -730,7 +730,7 @@ def get_option_depth(kite: KiteConnect, exchange: str, symbol: str,
                 ltt_dt = datetime.strptime(str(ltt)[:19], '%Y-%m-%d %H:%M:%S')
             traded_today = (ltt_dt.date() == today_ist())
             if traded_today:
-                ltp_fresh = (datetime.now() - ltt_dt).total_seconds() <= LTP_FRESH_SEC
+                ltp_fresh = (now_ist() - ltt_dt).total_seconds() <= LTP_FRESH_SEC
     except Exception:
         traded_today = False
         ltp_fresh = False
@@ -788,6 +788,18 @@ def leg_quote_reliable(depth: dict) -> tuple:
 #: months with no intrinsic floor at all (B21).
 strike_from_symbol = _sym.strike
 option_type_from_symbol = _sym.option_type
+
+
+def _spread_width(trade: dict):
+    """The vertical's width in points, or None when the record cannot say.
+
+    None rather than 0 on purpose: 0 would clamp every valuation to zero.
+    """
+    try:
+        w = float(trade.get('spread_width') or trade.get('width') or 0)
+    except (TypeError, ValueError):
+        return None
+    return w if w > 0 else None
 
 
 def spread_intrinsic_floor(trade: dict, spot: float):
@@ -951,12 +963,41 @@ def get_spread_value(kite: KiteConnect, trade: dict, spot: float = None,
         unreliable = f'short {short_why}'
     else:
         spread_val = long_d['bid'] - short_d['ask']
-        # Negative spread = bid-ask inversion or market dislocation.
-        # Not a real loss signal, treat as unreliable data.
+        # ── MATHEMATICAL BOUNDS: clamp. Do not refuse. ──────────────────
+        #
+        # This used to read "negative spread = dislocation, treat as
+        # unreliable" and return None. `zebra/monitor._structure_quote` was
+        # fixed to clamp in August and this — the engine that will own LIVE
+        # exits — was not. CLAUDE.md's valuation-bounds table has said clamp
+        # since it was written. [[feedback_the_copy_you_did_not_open]], on the
+        # LOSS path.
+        #
+        # Why clamping is right: expiry is always available and costs nothing,
+        # so a debit structure is never worth less than zero, and long bid
+        # 0.55 / short ask 0.60 is an ORDINARY book for a worthless spread —
+        # "worth about nothing", not "unpriceable". Both legs have already
+        # passed `leg_quote_reliable` to get here, so the shape is not junk.
+        #
+        # What refusing cost: after a gap straight through the debit stop the
+        # book looks exactly like that, so SL_SPREAD could never CONFIRM, the
+        # TIME close (normal urgency, never trades a garbage book) aborted on
+        # it daily, and the position rode to EXPIRY_FORCE_CLOSE — the one
+        # close allowed to pay through anything, at the worst prices of its
+        # life. Booking the loss beats stranding the position.
+        #
+        # The genuinely impossible is still refused, one branch down: an
+        # inverted ITM book clamps to 0 and is then caught by the intrinsic
+        # floor, which is large and positive exactly there. The clamp only
+        # survives where the floor is at or below zero, which is where the
+        # spread really is worthless.
         if spread_val < 0:
-            spread_val = None
-            unreliable = f"negative_spread {long_d['bid']} - {short_d['ask']}"
-        elif spot is not None and spot > 0:
+            spread_val = 0.0
+        width = _spread_width(trade)
+        if width and spread_val > width:
+            # A vertical's ceiling. The mirror of the clamp above, and the
+            # same table: a value above width is arithmetic, not information.
+            spread_val = float(width)
+        if spot is not None and spot > 0:
             floor = spread_intrinsic_floor(trade, spot)
             if floor is not None and spread_val < floor:
                 # Below what the structure could be unwound for. Impossible,
@@ -1134,7 +1175,7 @@ def is_spread_settled(now: Optional[float] = None) -> bool:
     """
     from datetime import timedelta
     settle_time = datetime.combine(today_ist(), MARKET_OPEN) + timedelta(seconds=SPREAD_TRIGGER_OPEN_BUFFER_SEC)
-    if datetime.now() < settle_time:
+    if now_ist() < settle_time:
         return False
     now = time.time() if now is None else now
     return _resume_settle_at is None or now >= _resume_settle_at
@@ -1276,6 +1317,27 @@ EXPIRY_FORCE_CLOSE_TIME = dtime(15, 15)   # Force close by 15:15 on expiry day
 # before relying on the numbers.
 DELIVERY_MARGIN_SESSIONS = 4    # ramp is widely documented as starting at E-4
 EXPIRY_WARN_SESSIONS = 5        # warn one session BEFORE the ramp starts
+
+
+def expiry_warn_sessions(trade: dict) -> int:
+    """When to start warning about THIS trade's expiry.
+
+    A flat 5 was a silent no-op for the cohort the moment M10 moved its time
+    stop to 6 sessions: the stop fires at 6, the warn only starts at 5, so the
+    position is already closed before its own "expiry is close" nag can fire.
+    A warning that can only arrive after the thing it warns about is not a
+    warning, and nothing would have said so — it just stops appearing.
+
+    So it is derived per-record: one session ahead of whichever close comes
+    first for that trade. The three default-policy books keep 5 (their close
+    is expiry day itself); a cohort record with `time_stop_sessions: 6` warns
+    from 7.
+    """
+    try:
+        n = int(trade.get('time_stop_sessions') or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return max(EXPIRY_WARN_SESSIONS, n + 1)
 
 
 def sessions_to_expiry(trade: dict, today: Optional[date] = None) -> Optional[int]:
@@ -1686,7 +1748,7 @@ def maybe_warn_expiry_proximity(store, trade: dict, spot: float, label: str,
     Returns True if a warning was sent this call.
     """
     sessions = sessions_to_expiry(trade, today)
-    if sessions is None or sessions > EXPIRY_WARN_SESSIONS or sessions <= 0:
+    if sessions is None or sessions > expiry_warn_sessions(trade) or sessions <= 0:
         return False        # expiry day has its own force-close path
     stamp = (today or today_ist()).isoformat()
     if trade.get('expiry_warn_date') == stamp:
@@ -1967,7 +2029,7 @@ def place_limit_order(kite: KiteConnect, exchange: str, symbol: str,
         exchange=exchange, dry_run=dry_run, context=context, log=log)
 
     if dry_run:
-        fake_id = f"DRY_{datetime.now().strftime('%H%M%S%f')}"
+        fake_id = f"DRY_{now_ist().strftime('%H%M%S%f')}"
         log(f"    [DRY RUN] {txn_type} {symbol} x {qty} @ {price} -> {fake_id}")
         order_journal.record_result(intent_id, order_id=fake_id, dry_run=True,
                                     log=log)
@@ -2254,7 +2316,7 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
         # ── Order-time cutoff, re-checked EVERY attempt ───────────────
         cutoff = HARD_ORDER_CUTOFF_TIME if urgent else LAST_ORDER_TIME
         if now_ist().time() > cutoff:
-            log(f"    ORDER CUTOFF: {datetime.now().strftime('%H:%M:%S')} > {cutoff.strftime('%H:%M')} "
+            log(f"    ORDER CUTOFF: {now_ist().strftime('%H:%M:%S')} > {cutoff.strftime('%H:%M')} "
                 f"({'urgent' if urgent else 'normal'}). No more orders for {symbol}.")
             send_telegram(f"Order cutoff reached closing {symbol} — "
                           f"{remaining_qty} qty NOT closed. Manual intervention needed!", alert_class=alert_policy.SAFETY)
@@ -3160,7 +3222,7 @@ def _refuse_unpriced_close(trade, label, reason, spot, dry_run, legs):
         f"NOT lost — close it by hand with the real exit price.")
 
     key = (label, trade.get('id'))
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_ist().strftime('%Y-%m-%d')
     if _unpriced_close_alerted.get(key) != today and not dry_run:
         _unpriced_close_alerted[key] = today
         send_telegram(
@@ -3273,7 +3335,7 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
                 f"somebody else's position. zebra books this one; nothing "
                 f"is placed.")
             key = ('PAPER', trade.get('id'))
-            today = datetime.now().strftime('%Y-%m-%d')
+            today = now_ist().strftime('%Y-%m-%d')
             if _unpriced_close_alerted.get(key) != today:
                 _unpriced_close_alerted[key] = today
                 send_telegram(
@@ -3426,7 +3488,7 @@ def _close_failure(*, cause, leg, reason):
     """
     assert cause in CLOSE_FAILURE_CAUSES, cause
     return {
-        'frozen_at': datetime.now().isoformat(),
+        'frozen_at': now_ist().isoformat(),
         'cause': cause,
         'leg': leg,
         'reason': reason,
@@ -3610,7 +3672,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                  ('long', long_sym, 'SELL', long_rec)])
         exit_net = long_fill - short_fill
         exit_data = {
-            'exit_date': datetime.now().isoformat(),
+            'exit_date': now_ist().isoformat(),
             'exit_reason': f"ALREADY_FLAT_{reason}",
             'exit_spot': spot,
             'short_fill': short_fill,
@@ -3942,7 +4004,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
 
     # ── Update trade store ───────────────────────────────────────────────
     exit_data = {
-        'exit_date': datetime.now().isoformat(),
+        'exit_date': now_ist().isoformat(),
         'exit_reason': reason,
         'exit_spot': spot,
         'short_fill': short_fill,
@@ -4066,7 +4128,7 @@ def _persist_residue(store, trade, label, detail, live):
     it was seen. Only `last_seen` and the live quantities move.
     """
     res = dict(trade.get('reconcile_residue') or {})
-    now_iso = datetime.now().isoformat()
+    now_iso = now_ist().isoformat()
     if res.get('state') != 'open':
         res = {'detected_at': now_iso, 'state': 'open', 'resolved_at': None}
     res['label'] = label
@@ -4109,11 +4171,32 @@ def _persist_residue(store, trade, label, detail, live):
     trade['reconcile_residue'] = res
 
 
+#: Consecutive flat broker reads required before a residue incident is
+#: RESOLVED. Resolution is terminal and one-way, so a single bad read must not
+#: reach it. Two, at the sweep's 5-second cadence, costs ten seconds.
+RESIDUE_FLAT_CONFIRMATIONS = 2
+
+
+def _persist_residue_state(store, trade, res):
+    """Write the incident dict back without touching its detail/legs.
+
+    Separate from `_persist_residue` because that one is the DETECTION writer
+    and re-stamps `last_seen`, `detail` and `legs` from a live observation.
+    This only moves the confirmation counter.
+    """
+    trade['reconcile_residue'] = res
+    try:
+        store.update_trade_fields(trade['id'], reconcile_residue=res)
+    except Exception as e:                     # pragma: no cover - store-level
+        log('  Could not persist residue state for #%s: %s'
+            % (trade.get('id'), e))
+
+
 def _resolve_residue(store, trade, label, nagged):
     """The book went flat. Close the incident, and say so ONCE."""
     res = dict(trade.get('reconcile_residue') or {})
     res['state'] = 'resolved'
-    res['resolved_at'] = datetime.now().isoformat()
+    res['resolved_at'] = now_ist().isoformat()
     try:
         store.update_trade_fields(trade['id'], reconcile_residue=res)
     except Exception as e:                     # pragma: no cover - store-level
@@ -4184,7 +4267,16 @@ def sweep_reconcile_residue(kite, books, *, nagged=None):
                          for p in kite.positions()['net']}
     except Exception as e:
         log('  Residue sweep: positions() failed, nothing checked: %s' % e)
-        _recovery_event('residue_blind', reason=str(e)[:60].replace(' ', '_'))
+        # ONCE A DAY, not once per pass. This runs every five seconds while
+        # any incident is open, and a needs-human digest event at 12/min is
+        # the "one live leg reads as thousands of findings" shape this same
+        # change forbade for the persist path — written correctly there and
+        # copied wrong here from `recovery_blind`, which has the same defect.
+        key = ('RESIDUE', 'sweep', 'residue_blind', today_ist().isoformat())
+        if key not in nagged:
+            nagged.add(key)
+            _recovery_event('residue_blind',
+                            reason=str(e)[:60].replace(' ', '_'))
         return len(pending)
 
     still = 0
@@ -4204,11 +4296,49 @@ def sweep_reconcile_residue(kite, books, *, nagged=None):
                 continue
             live = {sym: net_by_symbol.get(sym, 0) for sym, _s in legs}
             if not any(live.values()):
+                # ── TWO CONSECUTIVE FLAT READS, NOT ONE ─────────────────
+                #
+                # Resolution is TERMINAL and one-way: `get_residue_trades`
+                # only returns `state == 'open'`, and the only writer of a new
+                # incident is `reconcile_after_close`, which runs at close
+                # time on a record that is already terminal. So a single
+                # successful-but-wrong `positions()` — an empty list during
+                # the early-session sync window, a degraded response, a row
+                # simply missing — would resolve every open incident, send a
+                # green "the leftover leg is now FLAT", and permanently disarm
+                # the guard for the shape that has cost real money twice.
+                #
+                # A RAISING positions() was already handled (`residue_blind`);
+                # a LYING one was not. Everything else on this path debounces
+                # or defers on a first print — value triggers are dark for 15
+                # minutes, refused quotes defer, and the detection half of
+                # this very function says "unknown is not flat". Resolution
+                # was the one transition with no second look.
+                #
+                # The counter lives on the RECORD, so a restart cannot bank a
+                # half-confirmation, and any live reading resets it.
+                res = dict(trade.get('reconcile_residue') or {})
+                seen = int(res.get('flat_reads') or 0) + 1
+                if seen < RESIDUE_FLAT_CONFIRMATIONS:
+                    log('  RESIDUE #%s (%s): reads FLAT (%d/%d) — confirming '
+                        'before resolving.'
+                        % (trade.get('id'), label, seen,
+                           RESIDUE_FLAT_CONFIRMATIONS))
+                    res['flat_reads'] = seen
+                    _persist_residue_state(store, trade, res)
+                    still += 1
+                    continue
                 _resolve_residue(store, trade, label, nagged)
                 continue
             still += 1
             detail = '; '.join('%s net %+d' % (s, q)
                                for s, q in live.items() if q)
+            # A live reading RESETS the confirmation counter: two flat reads
+            # separated by a live one are not two consecutive flat reads.
+            res = dict(trade.get('reconcile_residue') or {})
+            if res.get('flat_reads'):
+                res['flat_reads'] = 0
+                _persist_residue_state(store, trade, res)
             _persist_residue(store, trade, label, detail, live)
             _nag_residue(label, trade, detail, nagged)
         except Exception as e:
@@ -4296,7 +4426,7 @@ def _fh_manual_close_required(trade, spot, reason, live, dry_run):
     log(f"  Record the exit afterwards with the real fill prices — see "
         f"`fallen_hero.trade_store.update_trade_exit`.")
 
-    key = (trade.get('id'), reason, datetime.now().strftime('%Y-%m-%d'))
+    key = (trade.get('id'), reason, now_ist().strftime('%Y-%m-%d'))
     if _fh_manual_alerted.get(key) is None:
         _fh_manual_alerted[key] = True
         send_telegram(
@@ -4823,7 +4953,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
             pnl_per_share, total_credit, trade, 'already-flat recovery')
         total_pnl = pnl_per_share * qty
         exit_data = {
-            'exit_date': datetime.now().isoformat(),
+            'exit_date': now_ist().isoformat(),
             'exit_reason': f"ALREADY_FLAT_{reason}",
             'exit_spot': spot,
             'short_call_fill': sc_fill, 'long_call_fill': lc_fill,
@@ -5125,7 +5255,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
         recorded[_FH_FILL_FIELD[leg_key]] = None
 
     exit_data = {
-        'exit_date': datetime.now().isoformat(),
+        'exit_date': now_ist().isoformat(),
         'exit_reason': reason,
         'exit_spot': spot,
         **recorded,
@@ -5283,10 +5413,10 @@ def tp_armed(trade: dict, hit_now: bool, spot: float, store=None,
     ts = _tp_latch_mod()
     if ts is None:
         return bool(hit_now)
-    # `datetime.now()` from THIS module, not the store's own default: the
+    # `now_ist()` from THIS module, not the store's own default: the
     # timestamp and the touch->fill measurement below must be read off one
     # clock, and this is the one the engine (and the replay harness) runs on.
-    latch = ts.tp_latch(trade, hit_now, spot, now=datetime.now())
+    latch = ts.tp_latch(trade, hit_now, spot, now=now_ist())
     tid, stock = trade.get('id'), trade.get('stock')
     if latch['patch']:
         if dry_run or _record_says_paper(trade):
@@ -5346,7 +5476,7 @@ def stamp_tp_touch_to_fill(trade: dict, store, exit_spot: float,
         return
     try:
         gap = ts.tp_touch_to_fill(trade, exit_spot, rising=rising,
-                                  now=datetime.now())
+                                  now=now_ist())
         if gap:
             store.update_trade_fields(trade.get('id'), **gap)
             log(f"  {label} #{trade.get('id')} {trade.get('stock')}: TP "
@@ -5899,7 +6029,7 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
             # second place that owns time-stop state is the shape M11 is
             # fixing. Only the clock test is shared.
             if expiry_today and time_stop_window_open():
-                log(f"\n  *** EXPIRY FORCE CLOSE: {datetime.now().strftime('%H:%M')} >= {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
+                log(f"\n  *** EXPIRY FORCE CLOSE: {now_ist().strftime('%H:%M')} >= {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
                 success = close_spread(kite, trade, spot, "EXPIRY_FORCE_CLOSE", dry_run)
                 if success:
                     log("\nMonitor complete. Position closed (expiry day force close).")
@@ -6504,7 +6634,7 @@ def book_frozen(kite, ref, short_price=None, long_price=None):
     entry = float(trade.get('net_debit') or trade.get('debit') or 0.0)
     exit_data = dict(fills)
     exit_data.update({
-        'exit_date': datetime.now().isoformat(),
+        'exit_date': now_ist().isoformat(),
         'exit_reason': (trade.get('close_failure') or {}).get('reason')
                        or 'MANUAL',
         'exit_spot': None,
@@ -6630,7 +6760,7 @@ def clear_residue(kite, ref):
     unread = [sym for sym, q in live.items() if q is None]
 
     res['state'] = 'cleared'
-    res['cleared_at'] = datetime.now().isoformat()
+    res['cleared_at'] = now_ist().isoformat()
     res['cleared_while_live'] = ({'legs': still} if still else None)
     if unread:
         # Not the same as flat, and not the same as live. Say which it was.
@@ -6941,7 +7071,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             log(f"  WARNING: expiry-proximity check failed for "
                 f"#{t['id']} {t.get('stock')}: {e}")
 
-    log(f"\nCron monitoring started at {datetime.now().strftime('%H:%M:%S')}...")
+    log(f"\nCron monitoring started at {now_ist().strftime('%H:%M:%S')}...")
     if not is_market_settled():
         log(f"  Market-open buffer active: SL/TP checks delayed until {MARKET_OPEN_BUFFER_SEC}s after open")
     log("")
@@ -7335,7 +7465,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         attempt = ts_state.get('attempts', 0) + 1
                         log(f"\n  {strat} #{tid} {stock} *** EXPIRY FORCE CLOSE "
                             f"(attempt {attempt}/{TIME_STOP_MAX_ATTEMPTS}): "
-                            f"{datetime.now().strftime('%H:%M')} >= {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
+                            f"{now_ist().strftime('%H:%M')} >= {EXPIRY_FORCE_CLOSE_TIME.strftime('%H:%M')} ***")
                         closing_in_progress[close_key] = "EXPIRY_FORCE_CLOSE"
                         if strat == 'BCS':
                             success = close_spread(kite, trade, spot, "EXPIRY_FORCE_CLOSE", dry_run,

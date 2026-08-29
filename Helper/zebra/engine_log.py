@@ -347,7 +347,14 @@ RECOVERY_NEEDS_HUMAN = ('recovery_exhausted', 'unpriced_refusal',
                         # only thing standing between it and invisibility is
                         # somebody reading this line.
                         'reconcile_residue', 'residue_unresolved',
-                        'residue_blind', 'reconcile_unknown_shape')
+                        'residue_blind', 'reconcile_unknown_shape',
+                        # The post-close audit itself failed. Arguably the
+                        # most dangerous of the four — a close NOBODY
+                        # VERIFIED — and it was the one left out of this
+                        # tuple while its own emitter's comment claimed "the
+                        # digest counts it by name". It landed in the generic
+                        # counts and was never surfaced.
+                        'reconcile_blind')
 
 
 def monitor_log_path(day: str) -> Path:
@@ -723,6 +730,10 @@ def recovery_flags(rec):
                        'a trade already booked closed. No order will ever be '
                        'placed against a closed record - close the leg in '
                        'Kite, or clear it with --clear-residue.' % n)
+        elif name == 'reconcile_blind':
+            out.append('%d close(s) could not be VERIFIED against the broker '
+                       'at all — the post-close position read failed. Treat '
+                       'those closes as unconfirmed and check Kite.' % n)
         elif name == 'residue_unresolved':
             out.append('%d day(s) on which a post-close residue was still '
                        'live and un-cleared.' % n)

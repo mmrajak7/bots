@@ -75,10 +75,22 @@ ZEBRA_EXIT_POLICY = {
     # warn-from-E-5-then-force-close-on-expiry-day, which fires FOUR SESSIONS
     # LATER -- so without this the handover would silently delete a stop.
     'time_policy': 'sessions_before_expiry',
-    # The N, carried on the record rather than read from zebra's config by the
-    # monitor. Same rule as every other field here: the exit policy travels
-    # with the TRADE, so the engine holding it does not need to know which
-    # book it came from.
+    # The N the monitor reads instead of consulting zebra's config itself, so
+    # the engine holding a trade does not need to know which book it came
+    # from.
+    #
+    # **It is stamped at MAP time from the LIVE config, not frozen at entry**,
+    # and the earlier wording here ("carried on the record") wrongly implied
+    # otherwise. The consequence is real and was observed: moving
+    # `time_sl_days_before_expiry` 5 -> 6 on 2026-08-29 retimed the SIX
+    # already-open cohort positions one session earlier, on the next map.
+    #
+    # That direction is safe and is left deliberate — M10's rule is that the
+    # session count is a FLOOR, never a ceiling, so a config change may only
+    # pull a close EARLIER. What must not happen quietly is the reverse: a
+    # LATER value would push open positions further into the delivery ramp
+    # they were sized to clear. If this is ever raised, the open book needs
+    # checking by hand, because nothing here will stop it.
     'time_stop_sessions': zcfg.TIME_SL_DAYS,
 }
 
