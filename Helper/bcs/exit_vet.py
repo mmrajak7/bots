@@ -131,6 +131,14 @@ def exit_cleared(store, trade: dict, reason: str, quote: Optional[dict],
       `set_alert_flag` — that lock is consume-once, and burning it on an exit
       that does not execute strands the exit.
 
+    **`incycle_wait=0`, and it is not an oversight.** M12 lets a CRON-PACED
+    caller block in-line for a verdict it just requested, because zebra's next
+    look at the marker is five minutes away. This engine's next look is FIVE
+    SECONDS away, so the same verdict is picked up 22 polls later for free --
+    and blocking the poll loop for two minutes would stop watching every OTHER
+    open position, on all four books, to buy nothing. The optimisation is a
+    property of the caller's cadence, so the caller states it.
+
     `dry_run` returns True WITHOUT consulting the gate. Dry run means "monitor
     everything, change nothing", and `exit_gate` is not read-only: it writes
     vet markers to the live store and spawns Claude agents. While the monitor
@@ -153,7 +161,7 @@ def exit_cleared(store, trade: dict, reason: str, quote: Optional[dict],
         from zebra.monitor import _exit_cleared as _gate
         raw = getattr(store, 'raw', store)
         ok = _gate(raw, trade, kind, as_vet_quote(trade, quote), spot,
-                   dry_run=False)
+                   dry_run=False, incycle_wait=0)
     except Exception as e:
         # FAIL OPEN, loudly. The deterministic guards already cleared this
         # exit; a broken vetting layer is not a reason to leave a stop unfilled.

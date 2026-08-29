@@ -107,9 +107,18 @@ class _Gate:
     def __init__(self, answer=True, boom=None):
         self.answer, self.boom, self.calls = answer, boom, []
 
-    def __call__(self, store, trade, kind, quote, spot, dry_run=False):
+    def __call__(self, store, trade, kind, quote, spot, dry_run=False,
+                 **kw):
+        # **kw, because `exit_cleared` wraps this call in `except Exception ->
+        # True`. A stub with a narrower signature than production turns a
+        # TypeError into a SILENT FAIL-OPEN: every test in this file passed
+        # while asserting the opposite of what it meant. That is not only a
+        # test problem -- the same mismatch in production disables vetting on
+        # the live order path and logs it as "EXIT VET ERROR ... proceeding".
+        # `test_the_real_gate_accepts_what_this_module_sends` pins it there.
         self.calls.append({'store': store, 'trade': trade, 'kind': kind,
-                           'quote': quote, 'spot': spot, 'dry_run': dry_run})
+                           'quote': quote, 'spot': spot, 'dry_run': dry_run,
+                           **kw})
         if self.boom:
             raise self.boom
         return self.answer
@@ -126,6 +135,44 @@ def gate(monkeypatch):
 class _Store:
     def __init__(self):
         self.raw = object()
+
+
+def test_the_real_gate_accepts_what_this_module_sends():
+    """A signature mismatch here disables vetting SILENTLY in production.
+
+    `exit_cleared` wraps the gate call in `except Exception -> True`, which is
+    the right contract for a dead vetting layer and the wrong one for a typo:
+    a keyword the real `zebra.monitor._exit_cleared` does not accept raises
+    TypeError, is caught, and every live value stop then fires unvetted while
+    the log says "EXIT VET ERROR ... proceeding on the deterministic guards".
+    That reads exactly like a Claude outage.
+
+    So the call is checked against the real signature, without running it.
+    """
+    import inspect
+    import re
+    from zebra import monitor
+    sig = inspect.signature(monitor._exit_cleared)
+    src = inspect.getsource(exit_vet.exit_cleared)
+    call = src[src.index('_gate('):]
+    call = call[:call.index(')')]
+    sent = set(re.findall(r'(\w+)=', call))
+    assert sent <= set(sig.parameters), (
+        'bcs/exit_vet.py sends %r; zebra.monitor._exit_cleared takes %r'
+        % (sorted(sent), sorted(sig.parameters)))
+
+
+def test_the_order_path_never_blocks_in_line_for_a_verdict():
+    """M12 is a CRON optimisation and a five-second-poll pessimisation.
+
+    zebra looks at the marker once every 5 minutes, so waiting 2 minutes
+    in-line converts ~3 minutes of a fired-but-unfilled stop into nothing.
+    This engine looks again in 5 seconds; blocking its loop would stop
+    watching every OTHER position on all four books to buy nothing.
+    """
+    import inspect
+    src = inspect.getsource(exit_vet.exit_cleared)
+    assert 'incycle_wait=0' in src
 
 
 def test_a_held_verdict_stops_the_exit(gate):

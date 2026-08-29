@@ -1545,19 +1545,119 @@ def needs_exit_vet(trade: dict, kind: str, quote: dict,
 
 
 def exit_gate(store, trade: dict, kind: str, quote: dict, spot: float,
-              spawn: bool = True) -> str:
+              spawn: bool = True, incycle_wait: Optional[int] = None,
+              now: Optional[datetime] = None) -> str:
     """May this exit fire THIS cycle?
 
     Returns:
-      'proceed' — fire it (vetted, not worth vetting, or Claude is down and the
-                  deterministic guards stand on their own)
+      'proceed' — fire it (vetted, not worth vetting, Claude is down and the
+                  deterministic guards stand on their own, or the hold budget
+                  is spent)
       'wait'    — a verdict is pending; re-evaluate next cycle
       'hold'    — deferred to the cap and escalated; the human decides
 
     MUST be called BEFORE `set_alert_flag`. That flag is consume-once, and
     burning it on an exit that does not execute strands the exit permanently —
     the monitor's own comments warn about exactly this.
+
+    THE POLICY IS `_exit_gate_policy`; this wrapper adds ONE thing to it, the
+    hold budget, and it is a wrapper rather than another branch inside because
+    every non-'proceed' return has to be covered. A budget checked in three of
+    four branches is a budget that does not exist on the fourth, which is the
+    branch shape this codebase keeps paying for.
+
+    `incycle_wait` is M12: seconds this caller may spend, right here, waiting
+    for a verdict it just requested. Only a CRON-PACED caller passes a nonzero
+    value -- see `cfg.EXIT_VET_INCYCLE_WAIT_SEC`. None means "read the config",
+    0 means "never block".
     """
+    verdict = _exit_gate_policy(store, trade, kind, quote, spot, spawn=spawn,
+                                incycle_wait=incycle_wait, now=now)
+    return _apply_hold_budget(store, trade, kind, verdict, now=now)
+
+
+#: Marker field: when this (trade, kind) episode first failed to proceed, and
+#: on which trading date. DATED, because an undated budget banks Friday
+#: 15:29's wait against Monday 09:15's first poll and fires the exit on the
+#: opening print — the same defect the residue sweep's flat-read counter had,
+#: and the opening print is where both real-money losses happened.
+HELD_SINCE = 'held_since'
+HELD_DATE = 'held_date'
+
+
+def _hold_budget_sec() -> int:
+    try:
+        return max(0, int(cfg.EXIT_VET_MAX_HOLD_SEC))
+    except (TypeError, ValueError, AttributeError):
+        # A malformed budget must not become an UNBOUNDED one. It also must
+        # not become a zero-second one that fires every stop unvetted, so it
+        # falls back to the declared default rather than to either extreme.
+        return int(cfg._DEFAULTS['exit_vet_max_hold_sec'])
+
+
+def _stamp_held(store, trade_id: int, kind: str, when: datetime) -> None:
+    """Record when this episode started waiting. Best effort, never raises."""
+    try:
+        with store._mutate():
+            t = store._must_find(trade_id)
+            ev = t.get('exit_vet') if isinstance(t.get('exit_vet'), dict) else {}
+            m = ev.get(kind) if isinstance(ev.get(kind), dict) else {}
+            m[HELD_SINCE] = when.isoformat()
+            m[HELD_DATE] = when.date().isoformat()
+            ev[kind] = m
+            t['exit_vet'] = ev
+            t['version'] = t.get('version', 0) + 1
+    except Exception as e:
+        # Losing the stamp makes the budget START LATER, never earlier — the
+        # conservative direction, and the exit still holds meanwhile.
+        logger.warning('EXIT VET #%s %s: could not stamp the hold clock (%s) '
+                       '— the budget restarts next cycle', trade_id, kind, e)
+
+
+def _apply_hold_budget(store, trade: dict, kind: str, verdict: str,
+                       now: Optional[datetime] = None) -> str:
+    """Bound how long a fired stop may wait for permission. Never raises.
+
+    The vet is ADDITIVE, never load-bearing: `exit_cleared` is called AFTER the
+    deterministic guards have already cleared the exit, and the whole layer's
+    safety argument is that it can only delay one. An unbounded hold inverts
+    that — it turns an optional second opinion into a load-bearing precondition
+    for a stop, and the cohort's only loss-side exits are value-based, so it
+    inverts it on every stop this book can take. ASHOKLEY #390 is the shape:
+    -50% at the trigger, -75% by the time the wait ended.
+
+    So the wait is bounded PER SESSION. Once spent, the exit proceeds on the
+    guards alone and says so loudly. The escalation Telegram has already been
+    sent by then, so the human is not surprised — they are simply no longer the
+    thing the stop is waiting for.
+    """
+    if verdict == 'proceed':
+        return verdict
+    budget = _hold_budget_sec()
+    if not budget:
+        return verdict                     # explicitly unbounded, by config
+    n = now or _now()
+    today = n.date().isoformat()
+    m = _exit_marker(store.find(trade['id']) or trade, kind)
+    since = _parse(m.get(HELD_SINCE)) if m.get(HELD_DATE) == today else None
+    if since is None:
+        _stamp_held(store, trade['id'], kind, n)
+        return verdict
+    waited = (n - since).total_seconds()
+    if waited < budget:
+        return verdict
+    logger.warning(
+        'EXIT VET BUDGET SPENT #%d %s: the stop has waited %.0fs for a verdict '
+        '(cap %ds) and is now PROCEEDING on the deterministic guards alone. '
+        'The stop was REQUESTED at the trigger; this is when it is taken.',
+        trade['id'], kind, waited, budget)
+    return 'proceed'
+
+
+def _exit_gate_policy(store, trade: dict, kind: str, quote: dict, spot: float,
+                      spawn: bool = True, incycle_wait: Optional[int] = None,
+                      now: Optional[datetime] = None) -> str:
+    """The gate's decision, before the hold budget. See `exit_gate`."""
     if not cfg.VET_ENABLED:
         return 'proceed'
 
@@ -1702,6 +1802,128 @@ def exit_gate(store, trade: dict, kind: str, quote: dict, spot: float,
         logger.error('EXIT VET request failed #%d %s: %s — proceeding on the '
                      'deterministic guards', trade['id'], kind, e)
         return 'proceed'
+    return _await_verdict(store, trade, kind, incycle_wait)
+
+
+#: M12. Wall clock a whole CYCLE may spend waiting in-line for verdicts, not
+#: one trade. Several positions can trigger in one cycle, and N trades x the
+#: per-request wait would push a 5-minute cron past its own interval -- whose
+#: `flock -n` then SKIPS the next run, so exit monitoring does not happen for
+#: ten minutes because it was busy waiting. Same arithmetic, and the same
+#: answer, as `ENTRY_PHASE_BUDGET_SEC`.
+INCYCLE_CYCLE_BUDGET_SEC = 180
+_incycle_deadline = None
+
+#: How often the in-line wait re-reads the store for a verdict. Five seconds
+#: matches the live monitor's poll, so the in-cycle path is never coarser than
+#: the path it is replacing.
+INCYCLE_POLL_SEC = 5.0
+
+
+def start_incycle_budget(now: Optional[float] = None) -> None:
+    """Arm the per-cycle in-line waiting budget. Called once per cycle."""
+    global _incycle_deadline
+    _incycle_deadline = (time.time() if now is None else now)         + INCYCLE_CYCLE_BUDGET_SEC
+
+
+def end_incycle_budget() -> None:
+    """Disarm. A budget leaking into the next cycle would refuse to wait for
+    reasons that have nothing to do with it."""
+    global _incycle_deadline
+    _incycle_deadline = None
+
+
+def _incycle_left(now: Optional[float] = None) -> Optional[float]:
+    """Seconds of cycle budget remaining, or None when none is armed.
+
+    None means "not in a budgeted cycle", which is how the LIVE monitor and
+    every test reach this code -- and it must read as NO in-line waiting, not
+    as unlimited. A caller that never armed a budget is a caller whose timing
+    this module knows nothing about.
+    """
+    if _incycle_deadline is None:
+        return None
+    return _incycle_deadline - (time.time() if now is None else now)
+
+
+def _await_verdict(store, trade: dict, kind: str,
+                   incycle_wait: Optional[int]) -> str:
+    """Wait in-line for the verdict just requested, or 'wait' for next cycle.
+
+    M12. Measured: the agent answers in ~1m50s of a ~4m50s round trip, and the
+    remaining ~3 minutes is the request sitting on disk until the next
+    5-minute cron tick. Spending the poll thread instead converts most of that
+    into nothing.
+
+    THREE bounds, and all three are required:
+
+    * the per-request wait (`cfg.EXIT_VET_INCYCLE_WAIT_SEC`, or whatever the
+      caller passed);
+    * the per-CYCLE budget, so several triggering positions cannot run the
+      cron past its own interval;
+    * NO budget armed means NO waiting at all. `bcs/spread_monitor.py` polls
+      every five seconds, so a verdict landing 110s from now is picked up 22
+      polls later regardless -- blocking that loop for two minutes would stop
+      watching every OTHER position to save nothing. It passes 0 and never
+      arms a budget, so both roads say no.
+
+    Returns 'proceed', 'wait' or 'hold' exactly as the caller's next cycle
+    would have, so nothing downstream can tell whether the verdict was
+    consumed here or one cycle later.
+    """
+    want = cfg.EXIT_VET_INCYCLE_WAIT_SEC if incycle_wait is None         else incycle_wait
+    try:
+        want = max(0, int(want))
+    except (TypeError, ValueError):
+        want = 0
+    left = _incycle_left()
+    if not want or left is None or left <= 0:
+        return 'wait'
+    if not hasattr(store, 'reload'):
+        # The whole mechanism is "re-read what another PROCESS wrote". A store
+        # that cannot re-read would poll its own unchanging cache for two
+        # minutes and always conclude 'wait' -- the old behaviour, reached
+        # slowly and silently. Fail to the old behaviour QUICKLY and say so.
+        logger.warning('EXIT VET #%d %s: this store cannot reload, so an '
+                       'in-cycle wait could only re-read a stale cache — '
+                       'falling back to the next cycle', trade['id'], kind)
+        return 'wait'
+    started = time.time()
+    deadline = started + min(want, left)
+    while True:
+        time.sleep(max(0.0, min(INCYCLE_POLL_SEC, deadline - time.time())))
+        # RE-READ from the store, not from `trade`: the verdict is written by
+        # a SEPARATE process, so the in-memory record can never show it.
+        try:
+            store.reload()
+        except Exception as e:
+            # A failed refresh means this poll saw a stale cache. Not fatal --
+            # the loop simply learns nothing this pass and the next cycle
+            # picks the verdict up -- but silence here would make a store that
+            # NEVER refreshes indistinguishable from an agent that is slow.
+            logger.debug('EXIT VET in-cycle reload failed for #%d %s: %s',
+                         trade['id'], kind, e)
+        m = _exit_marker(store.find(trade['id']) or {}, kind)
+        state = m.get('state')
+        if state == ALLOWED:
+            logger.info('EXIT VET #%d %s answered in-cycle after %.0fs — '
+                        'proceeding now instead of next cycle',
+                        trade['id'], kind, time.time() - started)
+            return 'proceed'
+        if state == DEFER:
+            defers = int(m.get('defers') or 0)
+            logger.info('EXIT VET #%d %s DEFERRED in-cycle (%d/%d)',
+                        trade['id'], kind, defers, cfg.EXIT_MAX_DEFERS)
+            return 'hold' if defers >= cfg.EXIT_MAX_DEFERS else 'wait'
+        if state not in (PENDING, None):
+            # Anything else terminal (UNAVAILABLE) means what the next cycle
+            # would conclude: nobody is coming, fail open.
+            return 'proceed'
+        if time.time() >= deadline:
+            break
+    logger.info('EXIT VET #%d %s not answered within the %.0fs in-cycle wait '
+                '— falling back to the next cycle',
+                trade['id'], kind, time.time() - started)
     return 'wait'
 
 

@@ -95,7 +95,11 @@ class _Gate:
         self.answers = list(answers or [])
         self.calls = []
 
-    def __call__(self, store, trade, kind, quote, spot, dry_run=False):
+    def __call__(self, store, trade, kind, quote, spot, dry_run=False, **kw):
+        # **kw: see the note on the twin stub in test_exit_vet.py. A narrower
+        # signature than production fails OPEN through `exit_cleared`'s
+        # exception handler, so every latch test here would silently stop
+        # exercising the deferral it exists to test.
         self.calls.append((kind, spot))
         return self.answers.pop(0) if len(self.answers) > 1 else (
             self.answers[0] if self.answers else True)

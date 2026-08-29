@@ -594,6 +594,52 @@ _DEFAULTS = {
                                  # reached. The human has been told and the
                                  # loss is capped, so holding quietly until
                                  # tomorrow is both cheaper and safer.
+    'exit_vet_max_hold_sec': 900,
+                                 # THE STOP IS BOUNDED, AND SO IS THE WAIT FOR
+                                 # PERMISSION TO TAKE IT. Owner decision,
+                                 # 2026-08-29. `needs_exit_vet` flags every
+                                 # non-spot-corroborated exit, and the cohort's
+                                 # only loss-side exits ARE value-based
+                                 # (spot_sl_enabled is False) -- so EVERY stop
+                                 # waits on an agent, and a single `defer`
+                                 # means a later timeout no longer fails open:
+                                 # it counts as another failure to verify and
+                                 # lands on 'hold', waiting on a human while
+                                 # the position loses. ASHOKLEY #390 went -50%
+                                 # to -75% over three cycles on a dead agent.
+                                 #
+                                 # The vet is ADDITIVE, never load-bearing --
+                                 # the deterministic guards cleared the exit
+                                 # before it was ever asked. An unbounded hold
+                                 # inverts that. 900s is the designed sequence
+                                 # run to completion (request + up to
+                                 # exit_max_defers re-checks at roughly one
+                                 # monitor_interval each); past it, the exit
+                                 # proceeds on the guards alone and says so
+                                 # loudly. PER SESSION, not per episode: an
+                                 # undated budget banks Friday's wait against
+                                 # Monday's first poll, which is the residue
+                                 # sweep's dating lesson exactly. 0 disables
+                                 # the bound, restoring the old behaviour
+                                 # without a code change.
+    'exit_vet_incycle_wait_sec': 120,
+                                 # M12. How long a CRON-PACED cycle may wait,
+                                 # in-cycle, for a verdict it just requested.
+                                 # Measured: the agent answers in ~1m50s of a
+                                 # ~4m50s round trip, and the other ~3 min is
+                                 # purely waiting for the next 5-minute cycle.
+                                 # This spends the poll thread instead.
+                                 #
+                                 # NOT used by `bcs/spread_monitor.py`, which
+                                 # polls every 5s: there the verdict is picked
+                                 # up within 5 seconds anyway, and blocking
+                                 # that loop would stop watching every OTHER
+                                 # position for two minutes to save nothing.
+                                 # The cap is per CYCLE, not per trade, so
+                                 # several triggering positions cannot push a
+                                 # 5-minute cron past its own interval (whose
+                                 # `flock -n` then SKIPS the next run).
+                                 # 0 disables it.
     'vet_timeout_sec': 600,      # Fail-open deadline for one agent run. NOT
                                  # shortened with child_kill_sec: VETTING.md
                                  # itself budgets the agent ~5 min and promises
@@ -1088,6 +1134,8 @@ _log_vet_state()
 
 EXIT_VET_TTL_SEC = _int('exit_vet_ttl_sec')
 EXIT_HOLD_TTL_SEC = _int('exit_hold_ttl_sec')
+EXIT_VET_MAX_HOLD_SEC = _int('exit_vet_max_hold_sec')
+EXIT_VET_INCYCLE_WAIT_SEC = _int('exit_vet_incycle_wait_sec')
 VETO_SHADOW_DAYS = _int('veto_shadow_days')
 EVENT_REFRESH_SEC = _int('event_refresh_sec')
 EVENT_HORIZON_DAYS = _int('event_horizon_days')

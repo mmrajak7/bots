@@ -546,6 +546,30 @@ Additional manual triggers:
 - P&L > 70% of max profit → book profits *(judgement call; not automated anywhere)*
 - DTE < 5 and spread < 80% max → close, gamma risk
 
+> **A value stop is REQUESTED at its level, not TAKEN at it.** SL_SPREAD and
+> SL_TRAIL are priced off the option book, so `needs_exit_vet` flags both — and
+> with `spot_sl_enabled: False` those are the cohort's ONLY loss-side exits, so
+> every stop this book can take waits on a Claude agent (~1m50s, plus a cycle
+> per `defer`). Do not read "50% of debit" as the price it fills at.
+>
+> **That wait is now BOUNDED** (`exit_vet_max_hold_sec`, default 900s, owner
+> decision 2026-08-29). Past it the exit proceeds on the deterministic guards
+> alone and says so loudly. The vet is ADDITIVE, never load-bearing — the
+> guards had already cleared the exit before it was asked — and an unbounded
+> hold inverted that: one `defer` means a later timeout no longer fails open,
+> it escalates to a human and waits. ASHOKLEY #390 went −50% → −75% over three
+> cycles on an agent that had died on quota two seconds after spawning. The
+> budget is PER SESSION, so a Friday hold cannot fire Monday's opening print.
+> `0` restores the unbounded behaviour without a code change.
+>
+> **M12** (`exit_vet_incycle_wait_sec`, default 120s): zebra's cron looks at
+> the marker once every 5 minutes, so it now waits in-line for a verdict it
+> just requested — ~3 minutes of a measured ~4m50s round trip. Capped per
+> CYCLE, not per trade, so several triggering positions cannot run the cron
+> past its own interval. `bcs/spread_monitor.py` passes 0: its poll is 5
+> seconds, so the same verdict arrives free and blocking would stop watching
+> every other position.
+
 **The live monitor (`bcs/spread_monitor.py`) keeps rows 1-4 exactly as above.**
 The automated paper system uses a DIFFERENT trail — see below. Do not port one
 into the other until the paper scorecard earns it.

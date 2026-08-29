@@ -499,6 +499,22 @@ class ZebraStore:
                 return t
         return None
 
+    def reload(self) -> None:
+        """Re-read the local file into this process's cache.
+
+        Public because a reader in one process sometimes has to see a write
+        made by ANOTHER one without going through `_mutate`: the exit vet's
+        in-cycle wait (M12) polls for a verdict that the Claude CLI writes from
+        a separate process, and every read below this line answers from
+        `self._trades`, which that write cannot touch.
+
+        Takes the same lock `_load_local` does, so it is never safe to call
+        from inside `_mutate` -- flock on a second fd in one process
+        deadlocks. Callers wait BEFORE they mutate, which is the only ordering
+        that makes sense anyway.
+        """
+        self._load_local()
+
     # ── Cross-process mutation guard ──────────────────────────────────────
     @contextmanager
     def _mutate(self, drive: bool = True, persist: bool = True):

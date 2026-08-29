@@ -453,7 +453,8 @@ def alert_if_exit_engine_down(n_positions: int, dry_run: bool = False,
 
 
 def _exit_cleared(store, trade: dict, kind: str, quote: dict, spot: float,
-                  dry_run: bool = False) -> bool:
+                  dry_run: bool = False,
+                  incycle_wait: Optional[int] = None) -> bool:
     """True if this exit may fire now. False = wait or hold.
 
     Called BEFORE `set_alert_flag` on every price-driven exit, because that
@@ -463,8 +464,15 @@ def _exit_cleared(store, trade: dict, kind: str, quote: dict, spot: float,
     TIME exits are deliberately NOT gated: they are calendar-driven rather than
     quote-driven, and their flag re-arms daily, so a bad mid there costs one
     day of paper accounting instead of a stranded position.
+
+    `incycle_wait` is M12 and defaults to "read the config", which is right for
+    THIS engine: it looks at the marker once every five minutes, so a verdict
+    that lands two minutes from now costs three minutes of a fired stop.
+    `bcs/exit_vet.py` passes 0 -- see its docstring for why the same
+    optimisation is a pessimisation on a five-second poll.
     """
-    gate = vet_mod.exit_gate(store, trade, kind, quote, spot)
+    gate = vet_mod.exit_gate(store, trade, kind, quote, spot,
+                             incycle_wait=incycle_wait)
     if gate == 'proceed':
         return True
     if gate == 'wait':
@@ -3967,10 +3975,19 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
     # minutes later costs nothing (`feedback_no_rush_to_enter`). So the phase
     # that manages open risk now takes the budget first and the discretionary
     # phases take what is left.
+    # M12. Arm the in-line vet wait for THIS cycle only. A verdict requested
+    # here otherwise sits on disk until the next 5-minute tick -- ~3 minutes of
+    # a measured ~4m50s round trip spent doing nothing while a stop is fired
+    # and unfilled. The budget is per CYCLE, not per trade, so several
+    # triggering positions cannot push this cron past its own interval; the
+    # `finally` is what keeps it from leaking into the next one.
+    vet_mod.start_incycle_budget()
     try:
         check_entered(store, kite, dry_run=dry_run)
     except Exception as e:
         logger.error("Entered cycle failed: %s", e, exc_info=True)
+    finally:
+        vet_mod.end_incycle_budget()
     if do_scan:
         try:
             validate_and_add(store, kite=kite, dry_run=dry_run)
