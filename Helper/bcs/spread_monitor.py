@@ -2877,7 +2877,7 @@ def _recover_one(kite, label, store, orders_allowed, trade, net_by_symbol,
                                'every leg is flat at the broker - book the '
                                'exit by hand', nagged)
             return 0
-        return _finish_flat(kite, label, store, trade, cf, dry_run)
+        return _finish_flat(kite, label, store, trade, cf, dry_run, nagged)
 
     if rclass == RC_NO_ORDERS:
         _escalate_recovery(store, trade, label, cf, why, nagged)
@@ -2970,7 +2970,7 @@ def _recover_one(kite, label, store, orders_allowed, trade, net_by_symbol,
     return 1
 
 
-def _finish_flat(kite, label, store, trade, cf, dry_run):
+def _finish_flat(kite, label, store, trade, cf, dry_run, nagged):
     """Every leg flat: book it from OUR OWN tagged fills, or refuse.
 
     Zero orders by construction - `_close_spread_inner` skips flat legs - so
@@ -2998,8 +2998,20 @@ def _finish_flat(kite, label, store, trade, cf, dry_run):
                       % (label, tid, trade.get('stock', '?')),
                       alert_class=alert_policy.SAFETY)
         return 1
+    # ESCALATE, do not retry. The legs are flat, so no order exists that could
+    # ever price this: the only thing that can resolve it is an operator typing
+    # what they filled at (`--book-frozen`). Left merely re-frozen, the sweep
+    # re-classified it as flat on the NEXT POLL and refused again — an
+    # `unpriced_refusal` event and a SAFETY Telegram every five seconds for the
+    # rest of the session, roughly four thousand of them. An alert that repeats
+    # that way is not louder than one that fires once; it is quieter, because
+    # the reader learns to swipe it away.
     _recovery_event('unpriced_refusal', store=label, id=tid)
     _refreeze_after_recovery(store, trade, label, cf)
+    _escalate_recovery(store, trade, label, cf,
+                       'every leg is flat but no fill this system placed can '
+                       'price the exit — book it by hand with the real price',
+                       nagged)
     return 0
 
 
@@ -3565,7 +3577,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             # (valuation-triggered) close the position is untouched, so abort
             # back to 'open' and let the trigger re-arm instead of freezing
             # the trade in partial_close. (2026-07-24 guard design.)
-            if not urgent and short_result is None:
+            if not recovery and not urgent and short_result is None:
                 log(f"\n  NORMAL close abort: short leg not tradeable/fillable, nothing filled.")
                 log(f"  Trade stays OPEN — trigger re-arms on the next reliable poll.")
                 send_telegram(f"{label} {stock}: {reason} close aborted — short-leg book not "
@@ -3677,7 +3689,16 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             # Same pre-fill abort as the short leg: if this close hasn't
             # touched the position at all (short was already flat, long fill
             # zero) a NORMAL close aborts back to open instead of freezing.
-            if not long_urgent and long_result is None and not short_closed_now:
+            # NOT on the recovery path. `recover_closing_trade` puts the
+            # record back to `open`, which is right for a NORMAL close that
+            # never touched the position (the trigger simply re-arms) and
+            # WRONG for a recovery: this record was already frozen, so
+            # "aborting" it to `open` drops it out of `get_frozen_trades()`,
+            # discards the attempt count, and hands a half-closed position to
+            # a per-trade loop that will price it as a whole spread. The
+            # incident must stay an incident.
+            if (not recovery and not long_urgent and long_result is None
+                    and not short_closed_now):
                 log(f"\n  NORMAL close abort: long leg not tradeable/fillable, nothing filled.")
                 log(f"  Trade stays OPEN — trigger re-arms on the next reliable poll.")
                 send_telegram(f"{label} {stock}: {reason} close aborted — long-leg book not "
@@ -6337,13 +6358,33 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     _beat_all(('idle' if not all_trades and not wl_active else 'startup'),
               dry_run, all_trades, zebra_store)
 
-    if not all_trades and not wl_active:
+    # FROZEN records are not in `all_trades` — dropping out of the open book is
+    # the whole M14 defect — so they have to be counted separately HERE, or a
+    # book whose only record is frozen returns "Nothing to monitor" and the
+    # recovery sweep never runs. That is M14's own failure mode reproduced one
+    # level up: a position live at the broker with dead stops, and a log line
+    # saying there is nothing to watch.
+    frozen_books = [('BCS', bcs_store, True), ('BPS', bps_store, True),
+                    ('COHORT', zebra_store, True), ('FH', fh_store, False)]
+    frozen_n = 0
+    for _label, _store, _ in frozen_books:
+        if _store is None:
+            continue
+        try:
+            frozen_n += len(_store.get_frozen_trades())
+        except Exception:
+            pass
+
+    if not all_trades and not wl_active and not frozen_n:
         if corrupt:
             log("Book is empty because a store was QUARANTINED — NOT exiting "
                 "quietly. Alert sent; fix the store before the next session.")
             return
         log("No open trades and no active watchlist alerts. Nothing to monitor.")
         return
+    if frozen_n:
+        log(f"  {frozen_n} FROZEN record(s) at partial_close — legs may be "
+            f"live at the broker. The recovery sweep runs every poll.")
 
     bcs_count = sum(1 for t in all_trades if t['_strategy'] == 'BCS')
     bps_count = sum(1 for t in all_trades if t['_strategy'] == 'BPS')
@@ -6511,7 +6552,23 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             all_trades = _load_all_trades(bcs_store, fh_store, bps_store, zebra_store)
             wl_active = wl_store.get_active()
 
-            if not all_trades and not wl_active:
+            # Recomputed every poll for the same reason as the startup guard:
+            # a frozen record is NOT in `all_trades`, so without this the loop
+            # exits the moment the last open trade closes — abandoning any
+            # position that froze earlier in the session, mid-recovery,
+            # with its stops dead. The startup guard alone was not enough; a
+            # book can also go frozen-only DURING a session, which is in fact
+            # the likelier way to get there.
+            frozen_n = 0
+            for _label, _store, _ in frozen_books:
+                if _store is None:
+                    continue
+                try:
+                    frozen_n += len(_store.get_frozen_trades())
+                except Exception:
+                    pass
+
+            if not all_trades and not wl_active and not frozen_n:
                 # A book that went empty MID-SESSION is far more suspicious
                 # than one that started empty: the trades were there at 09:15.
                 if alert_store_corruption([('BCS', bcs_store),
@@ -7083,11 +7140,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             # the book rather than being inferred from the record, so the rule
             # sits where it was decided.
             try:
-                recover_frozen_positions(
-                    kite,
-                    [('BCS', bcs_store, True), ('BPS', bps_store, True),
-                     ('COHORT', zebra_store, True), ('FH', fh_store, False)],
-                    dry_run)
+                recover_frozen_positions(kite, frozen_books, dry_run)
             except Exception as e:
                 # Never let the sweep take down the poll loop: the loop is what
                 # protects the LIVE book, and a frozen record is already stuck.

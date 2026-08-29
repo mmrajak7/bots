@@ -281,9 +281,20 @@ def test_every_all_closed_exit_checks_for_a_quarantine_first(exit_line):
     assert exit_line in src, "the exit line moved; re-anchor this test"
     at_exit = src.index(exit_line)
 
-    # The guard must be the nearest preceding call, within the same block.
+    # The guard must be checked before the exit, within the same block.
+    #
+    # TWO spellings, because the STARTUP path hoists the call: it does
+    # `corrupt = alert_store_corruption(...)` well above and branches on
+    # `if corrupt:` at the exit, so only the second is nearby. Looking for the
+    # call alone made this test a proximity check rather than a guard check —
+    # it went red when M14 inserted a frozen-record count between the two,
+    # pushing the CALL out of the window while the CHECK stayed exactly where
+    # it was. A guard that fails on unrelated edits gets its window widened
+    # until it means nothing, so it asks the right question instead.
     window = src[max(0, at_exit - 1400):at_exit]
-    assert _call_pos(window, 'alert_store_corruption') >= 0, (
+    guarded = (_call_pos(window, 'alert_store_corruption') >= 0
+               or 'if corrupt:' in window)
+    assert guarded, (
         f"'{exit_line[:40]}...' can be reached without checking whether the "
         f"book is empty because it was QUARANTINED")
 
