@@ -574,6 +574,22 @@ class BearPutStore(LockedStoreMixin):
                 if t.get('status') == 'closed'
                 and (t.get('reconcile_residue') or {}).get('state') == 'open']
 
+    def get_entry_residue_trades(self) -> list:
+        """Records carrying an ENTRY residue. See `bcs.trade_store` for why.
+
+        No status filter, unlike the post-close twin: an entry residue can sit
+        on a record in any state, because the incident is a leg the entry left
+        behind rather than a property of the record's lifecycle.
+
+        This book has no automated entry path today, so the list is expected to
+        be empty. It exists so the sweep can ask every book the same question
+        instead of asking three of them and logging "cannot list residues" at
+        every poll for the other one.
+        """
+        return [t for t in self._trades
+                if (t.get('entry_residue') or {}).get('state') == 'open']
+
+
 
 
     def set_trade_status(self, trade_id: int, status: str, **extra_fields):

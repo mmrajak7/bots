@@ -1156,11 +1156,35 @@ def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
     except Exception as e:
         logger.error("AUTO-ENTRY #%d %s: executor raised (%s) -- falling back "
                      "to the ticket", trade['id'], trade['stock'], e)
+        # THE ONE BRANCH WITH NO REPORT. `open_spread` documents that it
+        # returns what actually filled whatever happens, so reaching here
+        # means the failure was OUTSIDE its own guard -- and `out` is gone,
+        # taking any orphan or partial with it. We cannot say what is at the
+        # broker; the SWEEP can, so record the intended legs and let it ask.
+        # If nothing filled they both read flat and the incident resolves
+        # itself in two confirmations. The alternative is the pre-2026-08-29
+        # behaviour on the least understood path of the four.
+        _record_entry_residue(
+            store, trade, {},
+            'the order path RAISED (%s) after orders may have gone out, so '
+            'what filled is unknown -- these are the legs it was placing'
+            % str(e)[:80],
+            extra={bcs.get('long_symbol'): 0, bcs.get('short_symbol'): 0},
+            dry_run=dry_run)
         return None
 
     if not out['lots_filled']:
-        # Nothing established. The ticket still goes out: the signal is
-        # unchanged and the owner may want it by hand.
+        # Nothing established -- but "no COMPLETE spread" is not "nothing
+        # held". A round that bought its long and could not sell its short
+        # leaves a real position, and a partial fill leaves odd-sized shares;
+        # both report here with `lots_filled == 0`. Record the incident BEFORE
+        # returning, or the only trace of that leg is a Telegram.
+        _record_entry_residue(
+            store, trade, out,
+            'the entry established no complete spread, so nothing was '
+            'recorded as a position', dry_run=dry_run)
+        # The ticket still goes out: the signal is unchanged and the owner may
+        # want it by hand.
         logger.warning("AUTO-ENTRY #%d %s: nothing filled -- ticket stands",
                        trade['id'], trade['stock'])
         return None
@@ -1180,6 +1204,14 @@ def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
             "and UNMANAGED -- record it by hand now."
             % (html.escape(str(trade['stock'])), out['lots_filled']),
             dry_run=dry_run)
+        # EVERY leg is unaccounted for here, not just an orphan: complete
+        # spreads filled and no record was written, so the whole position is
+        # invisible to every sweep that reads records.
+        _record_entry_residue(
+            store, trade, out,
+            '%d complete spread(s) FILLED but the entry debit could not be '
+            'computed, so no record was written' % out['lots_filled'],
+            extra=_filled_legs(bcs, out), dry_run=dry_run)
         return None
 
     filled = dict(bcs)
@@ -1211,8 +1243,21 @@ def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
             % (html.escape(str(trade['stock'])), out['lots_filled'],
                html.escape(str(e)[:80])),
             dry_run=dry_run)
+        _record_entry_residue(
+            store, trade, out,
+            '%d complete spread(s) FILLED but the trade store refused the '
+            'record (%s)' % (out['lots_filled'], str(e)[:80]),
+            extra=_filled_legs(bcs, out), dry_run=dry_run)
         return None
 
+    # RECORDED, and still carrying something the record does not describe.
+    # `lots_filled` spreads are a valid position with stops; the orphan leg is
+    # not part of them and no stop applies to it.
+    _record_entry_residue(
+        store, fresh, out,
+        'the recorded position is %d complete spread(s); this leg is not part '
+        'of it and no stop applies to it' % out['lots_filled'],
+        dry_run=dry_run)
     _verify_entry(kite, fresh, out, dry_run=dry_run)
     return fresh
 
@@ -1290,6 +1335,116 @@ def _entries_allowed_or_log(trade: dict) -> tuple:
         logger.info("AUTO-ENTRY off for #%d %s (%s) -- sending the ticket",
                     trade['id'], trade['stock'], why)
     return allowed, why
+
+
+def _filled_legs(bcs: dict, out: dict) -> dict:
+    """Both legs of every spread that DID fill, by symbol.
+
+    Used only where complete spreads filled and no record was written. In that
+    state the orphan report is not enough: the spreads themselves are the
+    unaccounted position, and naming only an orphan would understate what is
+    at the broker.
+    """
+    n = int(out.get('lots_filled') or 0)
+    if n <= 0:
+        return {}
+    try:
+        qty = n * int(bcs['lot_size'])
+    except (KeyError, TypeError, ValueError):
+        qty = 0
+    return {bcs.get('long_symbol'): qty, bcs.get('short_symbol'): -qty}
+
+
+def _entry_residue_legs(out: dict, extra: Optional[dict] = None) -> dict:
+    """Symbols an entry left at the broker that no record accounts for.
+
+    Three sources, all of them things `open_spread` reports and then declines
+    to act on:
+
+      orphan    a round bought its long and could not sell its short;
+      partials  a leg filled odd-sized -- those shares are held;
+      extra     the caller's own case, for when COMPLETE spreads filled and
+                the RECORD could not be written (an uncomputable debit, a
+                store that refused). Both legs are then unaccounted for.
+
+    Quantities are what the executor reported, i.e. what we believe we hold.
+    The sweep reads the BROKER for the live figure; these are only the
+    symbols to ask about and the size to print.
+    """
+    legs = {}
+    orphan = out.get('orphan') or {}
+    if orphan.get('symbol'):
+        legs[orphan['symbol']] = int(orphan.get('qty') or 0)
+    for pt in out.get('partials') or ():
+        if pt.get('symbol'):
+            legs[pt['symbol']] = legs.get(pt['symbol'], 0) + int(pt.get('qty') or 0)
+    for sym, qty in (extra or {}).items():
+        if sym:
+            legs[sym] = legs.get(sym, 0) + int(qty or 0)
+    return legs
+
+
+def _record_entry_residue(store, trade: dict, out: dict, why: str,
+                          extra: Optional[dict] = None,
+                          dry_run: bool = False) -> bool:
+    """Persist an entry orphan as an incident a sweep can chase. Never raises.
+
+    `bcs/entry_executor.py` never unwinds an orphan leg and never will --
+    placing a corrective order through the book that just failed to fill is
+    the amplification that turned a Feb-2026 stop into a four-fill loss. So
+    the orphan is REPORTED and left alone, which was right and incomplete:
+    reporting meant one Telegram, and the leg then existed in NO store. The
+    frozen sweep, the residue sweep, the startup verification and `--list`
+    all read RECORDS, so every one of them missed it. That is the entry-side
+    twin of S3, and S3 was judged worth building.
+
+    The incident goes on the SIGNAL/POSITION record this entry was for, which
+    exists in every case -- including the one where nothing filled and the
+    record never became a position. `bcs/spread_monitor.sweep_entry_residue`
+    chases it from there and resolves it when the broker goes flat.
+
+    Never raises: this runs immediately after real orders, and an accounting
+    failure must not become a second failure on top of a live position.
+    """
+    legs = _entry_residue_legs(out, extra)
+    if not legs:
+        return False
+    detail = '; '.join('%s x%s' % (sym, qty) for sym, qty in sorted(legs.items()))
+    logger.error('ENTRY RESIDUE #%d %s: %s (%s)', trade['id'], trade['stock'],
+                 detail, why)
+    if dry_run:
+        # A dry run places nothing, so there is nothing at the broker to
+        # chase. Recording one would manufacture an incident and then nag
+        # about it daily until someone cleared a leg that never existed.
+        logger.info('[DRY RUN] entry residue for #%d not recorded',
+                    trade['id'])
+        return False
+    try:
+        from bcs.spread_monitor import _persist_residue, ENTRY_RESIDUE
+        _persist_residue(store, trade, 'COHORT', detail + ' — ' + why,
+                         legs, kind=ENTRY_RESIDUE)
+        # VERIFIED, not assumed. `_persist_residue` swallows a store-level
+        # failure and logs it, which is right for a sweep running every five
+        # seconds and wrong here: this is the ONE moment the incident gets
+        # written, and returning True on a write that did not land would make
+        # the alert below unreachable -- a guard nobody can observe failing.
+        # The record only carries the incident when the store took it.
+        if (trade.get(ENTRY_RESIDUE.field) or {}).get('state') != 'open':
+            raise RuntimeError('the store did not accept the incident')
+        return True
+    except Exception as e:
+        logger.error(
+            'ENTRY RESIDUE #%d could NOT be recorded (%s) — the leg is at the '
+            'broker and nothing will chase it. This alert is all there is.',
+            trade['id'], e)
+        _send_telegram(
+            '🚨 BCS %s: an entry left %s at the broker and the '
+            'incident could NOT be recorded (%s). Nothing will chase it — '
+            'check Kite by hand.'
+            % (html.escape(str(trade.get('stock'))), html.escape(detail),
+               html.escape(str(e)[:80])),
+            dry_run=dry_run)
+        return False
 
 
 def _verify_entry(kite, trade: dict, out: dict, dry_run: bool = False) -> None:

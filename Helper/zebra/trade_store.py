@@ -1463,6 +1463,31 @@ class ZebraStore:
                 if t.get('status') == 'exited'
                 and (t.get('reconcile_residue') or {}).get('state') == 'open']
 
+    def get_entry_residue_trades(self) -> list:
+        """Records carrying an ENTRY residue — a leg an entry left behind.
+
+        The entry-side twin of `get_residue_trades`, and it exists for the
+        same reason: `bcs/entry_executor.py` never unwinds an orphan leg (a
+        corrective order through the book that just failed to fill is how a
+        Feb-2026 stop became a four-fill loss), so it REPORTS one and stops.
+        Until this method existed "reports" meant one Telegram: the orphan was
+        in no store, so the frozen sweep, the residue sweep, the startup
+        verification and `--list` all missed it, because every one of them
+        reads RECORDS.
+
+        NO status filter, and that is the difference from the post-close twin.
+        An entry residue can sit on a record in any state: `entered` when the
+        round completed some spreads and orphaned a leg, or the pre-entry
+        state when nothing filled at all and the record never became a
+        position. The incident, not the status, is the query.
+
+        Read-only and escalate-only. No caller may place an order on the
+        strength of this list.
+        """
+        return [t for t in self.load_trades()
+                if (t.get('entry_residue') or {}).get('state') == 'open']
+
+
 
 
     def set_trade_status(self, trade_id: int, status: str, **extra) -> dict:

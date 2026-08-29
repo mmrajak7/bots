@@ -266,6 +266,22 @@ class ZebraStoreAdapter:
                 and (t.get('reconcile_residue') or {}).get('state') == 'open'
                 and in_cohort(t)]
 
+    def get_entry_residue_trades(self) -> List[dict]:
+        """Cohort records carrying an ENTRY residue — a leg an entry left.
+
+        Cohort-narrowed like its post-close twin, and mapped for the same
+        reason: the sweep names legs by the BCS vocabulary that `map_trade`
+        produces.
+
+        This is the ONE book that can actually hold one: `bcs/entry_executor.py`
+        is only reached from `zebra/monitor._enter_as_bcs`. The other three
+        answer the same question with an empty list rather than not answering
+        it, so the sweep has no per-book special case.
+        """
+        return [map_trade(t) for t in self._store.load_trades()
+                if (t.get('entry_residue') or {}).get('state') == 'open'
+                and in_cohort(t)]
+
     def find_open_trade(self, stock: str, trade_id: Optional[int] = None):
         for t in self.get_open_trades():
             if trade_id is not None and t['id'] == trade_id:

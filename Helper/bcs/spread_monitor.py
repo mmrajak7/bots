@@ -4142,17 +4142,133 @@ def reconcile_after_close(kite: KiteConnect, trade: dict, label: str = 'BCS',
         return False
 
 
-def _persist_residue(store, trade, label, detail, live):
-    """Write the S3 incident onto the record so a sweep can find it tomorrow.
+# ── Residue: a leg is live and no record accounts for it ───────────────────
+#
+# TWO SPECIES, ONE MECHANISM. They arrive from opposite ends of a position's
+# life and they need different sentences from whoever reads the Telegram, but
+# everything between detection and resolution is identical: persist the
+# incident on the record, re-read the broker every sweep, nag once a day,
+# resolve on two DATED consecutive flat reads outside the opening window, and
+# never, ever place an order.
+#
+# So the machinery is parameterised rather than copied
+# (`feedback_copy_pasted_modules_fix_once`). The second species is the one
+# that made this necessary:
+#
+#   POST-CLOSE (S3) — the record is booked terminal and a leg is still live.
+#     `reconcile_after_close` finds it. This is the ICICI Feb-2026 shape.
+#   ENTRY — an entry round bought its long and could not sell its short. The
+#     executor REPORTS the orphan and deliberately never unwinds it (placing a
+#     corrective order through the book that just failed is the amplification
+#     that turned a Feb-2026 stop into a four-fill loss). Until now "reports"
+#     meant one Telegram and nothing else: the orphan exists in NO store, so
+#     the frozen sweep, this sweep, the startup verification and `--list` all
+#     miss it — they read RECORDS. It is the entry-side twin of S3, and S3 was
+#     judged worth building.
+
+
+class ResidueKind:
+    """One species of residue, as data the shared machinery reads."""
+
+    def __init__(self, *, field, lister, headline, provenance, detect_event,
+                 unresolved_event, resolved_event, blind_event, clear_hint):
+        #: Record field the incident lives under. Also the nag key, so two
+        #: species on one record cannot silence each other.
+        self.field = field
+        #: Store method listing records carrying an OPEN incident of this kind.
+        self.lister = lister
+        #: First line of the alert.
+        self.headline = headline
+        #: How the leg came to be there — one sentence, because the reader's
+        #: next action differs completely between the two.
+        self.provenance = provenance
+        #: Event names are DECLARED, never derived from `field`. `zebra/
+        #: engine_log.py` renders each by name and its list of known events is
+        #: a literal; a name assembled here would render as an unknown event
+        #: in the digest the arming decision is read from.
+        self.detect_event = detect_event
+        self.unresolved_event = unresolved_event
+        self.resolved_event = resolved_event
+        self.blind_event = blind_event
+        self.clear_hint = clear_hint
+
+
+POST_CLOSE_RESIDUE = ResidueKind(
+    field='reconcile_residue',
+    lister='get_residue_trades',
+    headline='A LEG IS STILL LIVE ON A CLOSED TRADE',
+    provenance='The record was booked closed on %(detected_at)s and the '
+               'broker still shows that leg.',
+    detect_event='reconcile_residue',
+    unresolved_event='residue_unresolved',
+    resolved_event='reconcile_residue_resolved',
+    blind_event='residue_blind',
+    clear_hint='NO order will be placed against a closed record - close it by '
+               'hand in Kite, or clear the incident with '
+               '`--clear-residue %(book)s:%(id)s` if you are holding it on '
+               'purpose.',
+)
+
+ENTRY_RESIDUE = ResidueKind(
+    field='entry_residue',
+    lister='get_entry_residue_trades',
+    headline='AN ENTRY LEFT A LEG NOTHING IS MANAGING',
+    provenance='An entry round on %(detected_at)s filled this leg and could '
+               'not complete its spread. It is NOT part of any recorded '
+               'position, so no stop, no trail and no target applies to it.',
+    detect_event='entry_residue',
+    unresolved_event='entry_residue_unresolved',
+    resolved_event='entry_residue_resolved',
+    blind_event='entry_residue_blind',
+    clear_hint='NO order will be placed against it - the entry path never '
+               'unwinds (a corrective order through the book that just failed '
+               'is how a Feb-2026 stop became a four-fill loss). Close or keep '
+               'it by hand, or clear the incident with '
+               '`--clear-residue %(book)s:%(id)s`.',
+)
+
+RESIDUE_KINDS = (POST_CLOSE_RESIDUE, ENTRY_RESIDUE)
+
+
+def _residue_watch(trade, kind, res):
+    """The symbols this incident is about, as [(symbol, sign)].
+
+    Recorded on the incident at DETECTION (`watch`) rather than re-derived
+    from the record each sweep. For an entry residue that is the only way to
+    know: the record's declared legs are the spread that was INTENDED, and the
+    orphan is precisely the part of it that did not happen.
+
+    Legacy post-close incidents carry no `watch` and fall back to the record's
+    legs, which is what they were swept on before.
+    """
+    watch = res.get('watch')
+    if watch:
+        return [(sym, 0) for sym in watch]
+    if kind is POST_CLOSE_RESIDUE:
+        return _legs_of(trade)
+    return []
+
+
+def _persist_residue(store, trade, label, detail, live,
+                     kind=None):
+    """Write the incident onto the record so a sweep can find it tomorrow.
 
     Idempotent on `detected_at`: a residue re-observed is the SAME incident,
     and resetting its clock would make an unresolved one look new every time
     it was seen. Only `last_seen` and the live quantities move.
+
+    `watch` is written ONCE, at detection, and never moved afterwards: it is
+    the set of symbols the incident is about. Re-deriving it each sweep from
+    the record works for a post-close residue (the record declares the legs it
+    just closed) and cannot work for an entry one (the record declares the
+    spread that was INTENDED, and the orphan is the half that did not happen).
     """
-    res = dict(trade.get('reconcile_residue') or {})
+    kind = kind or POST_CLOSE_RESIDUE
+    res = dict(trade.get(kind.field) or {})
     now_iso = now_ist().isoformat()
     if res.get('state') != 'open':
-        res = {'detected_at': now_iso, 'state': 'open', 'resolved_at': None}
+        res = {'detected_at': now_iso, 'state': 'open', 'resolved_at': None,
+               'watch': sorted(live)}
     res['label'] = label
     res['detail'] = detail
     res['legs'] = dict(live)
@@ -4163,8 +4279,8 @@ def _persist_residue(store, trade, label, detail, live):
     #: nothing that `detected_at` does not already say. A CHANGE in the legs
     #: is a different matter and is always written.
     unchanged = (store is not None
-                 and (trade.get('reconcile_residue') or {}).get('legs') == res['legs']
-                 and (trade.get('reconcile_residue') or {}).get('state') == 'open')
+                 and (trade.get(kind.field) or {}).get('legs') == res['legs']
+                 and (trade.get(kind.field) or {}).get('state') == 'open')
     if unchanged:
         return
     #: No EVENT here, deliberately. This runs on EVERY sweep pass - once per
@@ -4176,21 +4292,21 @@ def _persist_residue(store, trade, label, detail, live):
     if store is None:
         # Nothing to sweep it with. Say so, rather than implying it is tracked.
         # The in-memory record is all there is, so it is written here.
-        trade['reconcile_residue'] = res
-        log("  RECONCILE: no store supplied - the residue was ALERTED but "
-            "NOT recorded, so nothing will chase it.")
+        trade[kind.field] = res
+        log("  RESIDUE: no store supplied - the %s incident was ALERTED but "
+            "NOT recorded, so nothing will chase it." % kind.field)
         return
     try:
-        store.update_trade_fields(trade['id'], reconcile_residue=res)
+        store.update_trade_fields(trade['id'], **{kind.field: res})
     except Exception as e:                     # pragma: no cover - store-level
-        log('  Could not persist reconcile_residue for #%s: %s'
-            % (trade.get('id'), e))
+        log('  Could not persist %s for #%s: %s'
+            % (kind.field, trade.get('id'), e))
         return
     # THE RECORD SAYS WHAT THE STORE SAYS. The BCS-family stores hand out the
     # live dict rather than a copy, so assigning before the write would leave
     # an in-memory record asserting something that was never saved - and the
     # next unrelated write would then persist it.
-    trade['reconcile_residue'] = res
+    trade[kind.field] = res
 
 
 #: Consecutive flat broker reads required before a residue incident is
@@ -4199,52 +4315,62 @@ def _persist_residue(store, trade, label, detail, live):
 RESIDUE_FLAT_CONFIRMATIONS = 2
 
 
-def _persist_residue_state(store, trade, res):
+def _persist_residue_state(store, trade, res, kind=None):
     """Write the incident dict back without touching its detail/legs.
 
     Separate from `_persist_residue` because that one is the DETECTION writer
     and re-stamps `last_seen`, `detail` and `legs` from a live observation.
     This only moves the confirmation counter.
     """
-    trade['reconcile_residue'] = res
+    kind = kind or POST_CLOSE_RESIDUE
+    trade[kind.field] = res
     try:
-        store.update_trade_fields(trade['id'], reconcile_residue=res)
+        store.update_trade_fields(trade['id'], **{kind.field: res})
     except Exception as e:                     # pragma: no cover - store-level
-        log('  Could not persist residue state for #%s: %s'
-            % (trade.get('id'), e))
+        log('  Could not persist %s state for #%s: %s'
+            % (kind.field, trade.get('id'), e))
 
 
-def _resolve_residue(store, trade, label, nagged):
+def _resolve_residue(store, trade, label, nagged, kind=None):
     """The book went flat. Close the incident, and say so ONCE."""
-    res = dict(trade.get('reconcile_residue') or {})
+    kind = kind or POST_CLOSE_RESIDUE
+    res = dict(trade.get(kind.field) or {})
     res['state'] = 'resolved'
     res['resolved_at'] = now_ist().isoformat()
     try:
-        store.update_trade_fields(trade['id'], reconcile_residue=res)
+        store.update_trade_fields(trade['id'], **{kind.field: res})
     except Exception as e:                     # pragma: no cover - store-level
         # The incident is NOT resolved if the record does not say so, and the
         # write is the only thing that makes it say so. Assigning first would
         # mark it resolved IN MEMORY on the very stores that hand out the live
         # dict - ending the nag on a leg whose all-clear was never saved.
-        log('  Could not clear reconcile_residue for #%s: %s'
-            % (trade.get('id'), e))
+        log('  Could not clear %s for #%s: %s'
+            % (kind.field, trade.get('id'), e))
         return
-    trade['reconcile_residue'] = res
-    _recovery_event('reconcile_residue_resolved', store=label,
-                    id=trade.get('id'))
-    log("  RESIDUE #%s (%s) is FLAT at the broker - incident closed."
-        % (trade.get('id'), label))
+    trade[kind.field] = res
+    _recovery_event(kind.resolved_event, store=label, id=trade.get('id'))
+    log("  RESIDUE #%s (%s, %s) is FLAT at the broker - incident closed."
+        % (trade.get('id'), label, kind.field))
     send_telegram(
-        "\u2705 %s #%s %s: the leftover leg is now FLAT.\n"
-        "The post-close residue reported earlier is resolved; nothing further "
-        "is needed." % (label, trade['id'], trade.get('stock', '?')),
+        "✅ %s #%s %s: the leftover leg is now FLAT.\n"
+        "The residue reported earlier is resolved; nothing further is needed."
+        % (label, trade['id'], trade.get('stock', '?')),
         alert_class=alert_policy.SAFETY)
-    nagged.discard((label, trade['id'], 'reconcile_residue',
-                    today_ist().isoformat()))
+    nagged.discard((label, trade['id'], kind.field, today_ist().isoformat()))
 
 
-def sweep_reconcile_residue(kite, books, *, nagged=None):
-    """S3 - chase every booked-closed record that still has a live leg.
+
+def sweep_reconcile_residue(kite, books, *, nagged=None,
+                            kind=POST_CLOSE_RESIDUE):
+    """Chase every record carrying a live leg nothing is managing.
+
+    ONE sweep for both species (see `ResidueKind`). `kind` selects which store
+    method lists the records, which field the incident lives under, and what
+    the alert says; everything else -- the shared positions() read, the two
+    dated flat confirmations, the settled-book gate, the daily nag, the
+    per-record isolation -- is identical and is therefore not written twice.
+
+    S3 - a booked-closed record that still has a live leg.
 
     **Escalate-only. This function places no orders and never will.** The
     record is terminal: there is no close lock to take, no stop to re-arm, and
@@ -4270,15 +4396,16 @@ def sweep_reconcile_residue(kite, books, *, nagged=None):
         # (`MemoryStore.get_frozen_trades` read a field that does not exist on
         # that class); catching the exception here would have reported that
         # bug as "an old store without the method" and moved on.
-        if not hasattr(store, 'get_residue_trades'):
-            log('  Residue sweep: %s cannot list residues (no '
-                'get_residue_trades)' % label)
+        if not hasattr(store, kind.lister):
+            log('  Residue sweep: %s cannot list residues (%s: no %s)'
+                % (label, kind.field, kind.lister))
             continue
         try:
-            for t in store.get_residue_trades():
+            for t in getattr(store, kind.lister)():
                 pending.append((label, store, t))
         except Exception as e:                 # pragma: no cover - store-level
-            log('  Could not read residues from %s: %s' % (label, e))
+            log('  Could not read residues (%s) from %s: %s'
+                % (kind.field, label, e))
     if not pending:
         return 0
 
@@ -4294,27 +4421,29 @@ def sweep_reconcile_residue(kite, books, *, nagged=None):
         # the "one live leg reads as thousands of findings" shape this same
         # change forbade for the persist path — written correctly there and
         # copied wrong here from `recovery_blind`, which has the same defect.
-        key = ('RESIDUE', 'sweep', 'residue_blind', today_ist().isoformat())
+        key = ('RESIDUE', 'sweep', kind.blind_event, today_ist().isoformat())
         if key not in nagged:
             nagged.add(key)
-            _recovery_event('residue_blind',
+            _recovery_event(kind.blind_event,
                             reason=str(e)[:60].replace(' ', '_'))
         return len(pending)
 
     still = 0
     for label, store, trade in pending:
         try:
-            legs = _legs_of(trade)
+            res0 = dict(trade.get(kind.field) or {})
+            legs = _residue_watch(trade, kind, res0)
             if not legs:
-                # It got onto this list by declaring legs; a record that no
+                # It got onto this list by naming symbols; an incident that no
                 # longer does cannot be checked - and must not be called
                 # resolved either. Through the DAILY nag, not straight to an
                 # event: this branch runs every five seconds like the rest, and
                 # a per-poll event would bury the incident it is reporting.
                 still += 1
                 _nag_residue(label, trade,
-                             'the record no longer declares any option leg, '
-                             'so nothing could be checked', nagged)
+                             'neither the incident nor the record names any '
+                             'option leg, so nothing could be checked',
+                             nagged, kind=kind)
                 continue
             live = {sym: net_by_symbol.get(sym, 0) for sym, _s in legs}
             if not any(live.values()):
@@ -4359,7 +4488,7 @@ def sweep_reconcile_residue(kite, books, *, nagged=None):
                         % (trade.get('id'), label))
                     still += 1
                     continue
-                res = dict(trade.get('reconcile_residue') or {})
+                res = dict(res0)
                 today = today_ist().isoformat()
                 seen = (int(res.get('flat_reads') or 0) + 1
                         if res.get('flat_reads_date') == today else 1)
@@ -4370,22 +4499,22 @@ def sweep_reconcile_residue(kite, books, *, nagged=None):
                         % (trade.get('id'), label, seen,
                            RESIDUE_FLAT_CONFIRMATIONS))
                     res['flat_reads'] = seen
-                    _persist_residue_state(store, trade, res)
+                    _persist_residue_state(store, trade, res, kind=kind)
                     still += 1
                     continue
-                _resolve_residue(store, trade, label, nagged)
+                _resolve_residue(store, trade, label, nagged, kind=kind)
                 continue
             still += 1
             detail = '; '.join('%s net %+d' % (s, q)
                                for s, q in live.items() if q)
             # A live reading RESETS the confirmation counter: two flat reads
             # separated by a live one are not two consecutive flat reads.
-            res = dict(trade.get('reconcile_residue') or {})
+            res = dict(res0)
             if res.get('flat_reads'):
                 res['flat_reads'] = 0
-                _persist_residue_state(store, trade, res)
-            _persist_residue(store, trade, label, detail, live)
-            _nag_residue(label, trade, detail, nagged)
+                _persist_residue_state(store, trade, res, kind=kind)
+            _persist_residue(store, trade, label, detail, live, kind=kind)
+            _nag_residue(label, trade, detail, nagged, kind=kind)
         except Exception as e:
             # Per-record isolation, the rule the recovery sweep already
             # follows: one malformed record must not stop the sweep for the
@@ -4396,33 +4525,51 @@ def sweep_reconcile_residue(kite, books, *, nagged=None):
     return still
 
 
-def _nag_residue(label, trade, detail, nagged):
+def sweep_entry_residue(kite, books, *, nagged=None):
+    """Chase every leg an ENTRY left behind. Escalate-only, like its twin.
+
+    A thin call, deliberately: the sweep is `sweep_reconcile_residue` with a
+    different `ResidueKind`, and writing it twice is how the two would drift
+    on the detail that matters (the two dated flat confirmations, the
+    settled-book gate, the one shared positions() read).
+
+    The name exists so the CALL SITE reads as two distinct sweeps, because
+    they are two distinct facts about the book and a reader scanning
+    `monitor_all` should see both.
+    """
+    return sweep_reconcile_residue(kite, books, nagged=nagged,
+                                   kind=ENTRY_RESIDUE)
+
+
+def _nag_residue(label, trade, detail, nagged, kind=None):
     """At most one Telegram a day per incident, keyed like every other nag.
 
     Same reasoning as `_escalate_recovery`: a safety alert nobody can silence
     is right, and one that repeats every five seconds trains the reader to
     swipe it away, which is the same thing as silencing it.
+
+    Keyed on `kind.field`, so two species of incident on one record cannot
+    silence each other.
     """
-    key = (label, trade['id'], 'reconcile_residue', today_ist().isoformat())
+    kind = kind or POST_CLOSE_RESIDUE
+    key = (label, trade['id'], kind.field, today_ist().isoformat())
     if key in nagged:
         return
     nagged.add(key)
     #: A DIFFERENT name from the detection event, deliberately. Both firing on
     #: the same day would report ONE live leg as two findings, and the digest
-    #: renders these as counts a human reads as incidents. `reconcile_residue`
-    #: means "a close found a live leg"; this means "a day it was still there".
-    _recovery_event('residue_unresolved', store=label, id=trade['id'])
+    #: renders these as counts a human reads as incidents. The detection event
+    #: means "a leg was found"; this one means "a day it was still there".
+    _recovery_event(kind.unresolved_event, store=label, id=trade['id'])
+    subs = {'detected_at': (trade.get(kind.field) or {}).get('detected_at',
+                                                             '?'),
+            'book': label.lower(), 'id': trade['id']}
     send_telegram(
-        "\U0001F6A8 %s #%s %s: A LEG IS STILL LIVE ON A CLOSED TRADE\n"
-        "%s\n"
-        "The record was booked closed on %s and the broker still shows that "
-        "leg. NO order will be placed against a closed record - close it by "
-        "hand in Kite, or clear the incident with `--clear-residue %s:%s` if "
-        "you are holding it on purpose."
-        % (label, trade['id'], trade.get('stock', '?'), detail,
-           (trade.get('reconcile_residue') or {}).get('detected_at', '?'),
-           label.lower(), trade['id']),
+        "\U0001F6A8 %s #%s %s: %s\n%s\n%s %s"
+        % (label, trade['id'], trade.get('stock', '?'), kind.headline, detail,
+           kind.provenance % subs, kind.clear_hint % subs),
         alert_class=alert_policy.SAFETY)
+
 
 
 # ── FH Close ────────────────────────────────────────────────────────────────
@@ -6823,37 +6970,56 @@ def reopen_frozen(kite, ref):
 
 
 def clear_residue(kite, ref):
-    """S3 - stop nagging about a post-close residue the owner owns.
+    """Stop nagging about a residue the owner owns. Either species.
 
-    The residue sweep resolves itself the moment the broker goes flat, so the
-    ONLY reason to reach for this is the case the machine cannot infer: the
-    leg is still live and that is deliberate - it was rolled, adopted into
-    another position, or is being held. Refusing to clear it would leave a
-    daily safety alert firing forever about a decision already made, and an
-    alert nobody can end is one the reader learns to swipe away.
+    The sweep resolves itself the moment the broker goes flat, so the ONLY
+    reason to reach for this is the case the machine cannot infer: the leg is
+    still live and that is deliberate - it was rolled, adopted into another
+    position, or is being held. Refusing to clear it would leave a daily
+    safety alert firing forever about a decision already made, and an alert
+    nobody can end is one the reader learns to swipe away.
 
     So it clears while live - and RECORDS that it did. `cleared_while_live`
     keeps the leg and its quantity on the record, because the difference
     between "the residue went away" and "somebody silenced it" is exactly the
     fact a later reader needs and the one a bare `state: cleared` would lose.
+
+    ONE ref clears whichever species is open on that record, and BOTH if both
+    are: `BOOK:ID` is how the owner identifies the thing that is nagging them,
+    and making them learn which of two incident names it was would be an
+    interface built around this file's internals.
     """
     parsed = _parse_frozen_ref(ref)
     if not parsed:
         return 1
     label, store, tid = parsed
-    try:
-        pending = store.get_residue_trades()
-    except AttributeError:
-        print('%s cannot list residues (no get_residue_trades).' % label)
+    cleared = 0
+    missing = []
+    for kind in RESIDUE_KINDS:
+        try:
+            pending = getattr(store, kind.lister)()
+        except AttributeError:
+            print('%s cannot list residues (%s: no %s).'
+                  % (label, kind.field, kind.lister))
+            continue
+        trade = next((t for t in pending if t['id'] == tid), None)
+        if trade is None:
+            missing.append(kind.field)
+            continue
+        if _clear_one_residue(kite, store, label, tid, trade, kind):
+            cleared += 1
+    if not cleared:
+        print('%s #%s has no unresolved residue (%s).'
+              % (label, tid, ', '.join(missing) or 'none listable'))
         return 1
-    trade = next((t for t in pending if t['id'] == tid), None)
-    if trade is None:
-        print('%s #%s has no unresolved post-close residue.' % (label, tid))
-        return 1
+    return 0
 
-    res = dict(trade.get('reconcile_residue') or {})
-    print('\n%s #%s %s - residue first seen %s'
-          % (label, tid, trade.get('stock', '?'), res.get('detected_at', '?')))
+
+def _clear_one_residue(kite, store, label, tid, trade, kind) -> bool:
+    res = dict(trade.get(kind.field) or {})
+    print('\n%s #%s %s - %s first seen %s'
+          % (label, tid, trade.get('stock', '?'), kind.field,
+             res.get('detected_at', '?')))
     live = _show_broker_reality(kite, trade, label)
     still = {sym: q for sym, q in live.items() if q}
     unread = [sym for sym, q in live.items() if q is None]
@@ -6865,12 +7031,11 @@ def clear_residue(kite, ref):
         # Not the same as flat, and not the same as live. Say which it was.
         res['cleared_unreadable'] = unread
     try:
-        store.update_trade_fields(tid, reconcile_residue=res)
+        store.update_trade_fields(tid, **{kind.field: res})
     except Exception as e:
         print('Could not write the record: %s' % e)
-        return 1
-    _RECOVERY_NAGGED.discard(
-        (label, tid, 'reconcile_residue', today_ist().isoformat()))
+        return False
+    _RECOVERY_NAGGED.discard((label, tid, kind.field, today_ist().isoformat()))
 
     if still:
         detail = '; '.join('%s net %+d' % (s_, q) for s_, q in still.items())
@@ -6878,47 +7043,68 @@ def clear_residue(kite, ref):
         print('The nag stops. The leg does not - nothing here closed it, and '
               'nothing will monitor it.')
         send_telegram(
-            '%s #%s %s: post-close residue CLEARED BY HAND while still live '
-            '(%s). No further alerts for this incident.'
-            % (label, tid, trade.get('stock', '?'), detail),
+            '%s #%s %s: %s CLEARED BY HAND while still live (%s). No further '
+            'alerts for this incident.'
+            % (label, tid, trade.get('stock', '?'), kind.field, detail),
             alert_class=alert_policy.SAFETY)
     else:
         print('\nCleared. The broker shows nothing live on this record.')
-    return 0
+    return True
+
+
+#: Heading and closing note per species, for `list_residue_trades`.
+RESIDUE_LISTING = {
+    'reconcile_residue': (
+        '=== POST-CLOSE RESIDUE (booked CLOSED, a leg is still live) ===',
+        'No order is ever placed against these - the record is closed.'),
+    'entry_residue': (
+        '=== ENTRY RESIDUE (an entry left a leg no record describes) ===',
+        'No order is ever placed against these - the entry path never '
+        'unwinds.'),
+}
 
 
 def list_residue_trades():
-    """Every unresolved post-close residue, in every book.
+    """Every unresolved residue, of either species, in every book.
 
     Printed by `--list-frozen` alongside the frozen book rather than behind a
     switch of its own. They are the same fact from the reader's side - a live
     leg with nothing watching it - and splitting them across two commands is
-    how one of them ends up being the one nobody runs.
+    how one of them ends up being the one nobody runs. Same argument, one
+    level down, for listing both SPECIES here instead of adding a command.
     """
+    for kind in RESIDUE_KINDS:
+        _list_residues_of(kind)
+
+
+def _list_residues_of(kind):
     rows = []
     for name in FROZEN_BOOKS:
         label, store = _frozen_book(name)
         if store is None:
             continue
         try:
-            for t in store.get_residue_trades():
+            for t in getattr(store, kind.lister)():
                 rows.append((label, t))
         except AttributeError:
-            print('  %s: cannot list residues (no get_residue_trades)' % label)
+            print('  %s: cannot list residues (%s: no %s)'
+                  % (label, kind.field, kind.lister))
         except Exception as e:
-            print('  %s: could not read residues (%s)' % (label, e))
+            print('  %s: could not read residues (%s: %s)'
+                  % (label, kind.field, e))
     if not rows:
         return
-    print('\n=== POST-CLOSE RESIDUE (booked CLOSED, a leg is still live) ===')
+    heading, note = RESIDUE_LISTING[kind.field]
+    print('\n' + heading)
     print('%-8s %-5s %-12s %-19s %s'
           % ('book', 'id', 'stock', 'detected', 'legs'))
     for label, t in rows:
-        res = t.get('reconcile_residue') or {}
+        res = t.get(kind.field) or {}
         print('%-8s %-5s %-12s %-19s %s'
               % (label, t.get('id'), t.get('stock', '?'),
                  str(res.get('detected_at', '-'))[:19],
                  res.get('detail', '-')))
-    print('\nNo order is ever placed against these - the record is closed.')
+    print('\n' + note)
     print('Close the leg in Kite and it resolves itself on the next sweep,')
     print('or  --clear-residue BOOK:ID   if you are holding it on purpose.')
 
@@ -6959,6 +7145,25 @@ def list_frozen_trades():
     print('             --reopen-frozen BOOK:ID'
           '                              (spread intact)')
     list_residue_trades()
+
+
+def _count_residues(books, kind) -> int:
+    """How many records carry an OPEN incident of this kind, across the fleet.
+
+    Swallows per-book failures on purpose: this is a startup banner, and a
+    book that cannot answer must not stop the monitor from watching the other
+    three. The SWEEP is where an unanswerable book is reported, once per poll
+    and by name.
+    """
+    n = 0
+    for _label, store, _ in books:
+        if store is None:
+            continue
+        try:
+            n += len(getattr(store, kind.lister)())
+        except Exception:
+            pass
+    return n
 
 
 def _arming_preflight(dry_run: bool, all_trades) -> dict:
@@ -7092,18 +7297,17 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     # S3. Counted and announced on the same footing as the frozen book: both
     # are live legs that nothing else in this process is watching, and the
     # only difference between them is which door they came out of.
-    residue_n = 0
-    for _label, _store, _ in frozen_books:
-        if _store is None:
-            continue
-        try:
-            residue_n += len(_store.get_residue_trades())
-        except Exception:
-            pass
+    residue_n = _count_residues(frozen_books, POST_CLOSE_RESIDUE)
     if residue_n:
         log(f"  {residue_n} CLOSED record(s) with an unresolved post-close "
             f"RESIDUE — a leg is still live at the broker. Escalate-only: no "
             f"order will be placed against a closed record.")
+    entry_residue_n = _count_residues(frozen_books, ENTRY_RESIDUE)
+    if entry_residue_n:
+        log(f"  {entry_residue_n} record(s) with an unresolved ENTRY RESIDUE "
+            f"— an entry left a leg that is not part of any recorded "
+            f"position, so no stop applies to it. Escalate-only: the entry "
+            f"path never unwinds.")
 
     bcs_count = sum(1 for t in all_trades if t['_strategy'] == 'BCS')
     bps_count = sum(1 for t in all_trades if t['_strategy'] == 'BPS')
@@ -7906,6 +8110,11 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             # which is the normal state of never.
             try:
                 sweep_reconcile_residue(kite, frozen_books)
+                # The entry-side twin. Separate call, one shared machine —
+                # see `ResidueKind`. A leg an entry left behind is not a leg
+                # a close left behind, and telling the owner the wrong story
+                # about which sends them to the wrong screen.
+                sweep_entry_residue(kite, frozen_books)
             except Exception as e:
                 log(f"  Residue sweep raised, continuing: {e}")
 

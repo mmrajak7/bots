@@ -311,7 +311,9 @@ def test_one_bad_record_does_not_stop_the_sweep_for_the_rest(spy):
     assert sm.sweep_reconcile_residue(kite, _books(store)) == 1
     assert store.trades[0]['reconcile_residue']['state'] == 'open'
     assert store.trades[1]['reconcile_residue']['state'] == 'resolved'
-    assert spy.any('no longer declares any option leg')
+    assert spy.any('names any option leg'), (
+        'a residue that cannot be checked must still be nagged about — the '
+        'one thing it must NOT be is called resolved')
 
 
 def test_a_legless_record_nags_daily_not_every_poll(spy):

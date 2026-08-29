@@ -600,6 +600,13 @@ class MemoryStore:
                 if t.get('status') == 'closed'
                 and (t.get('reconcile_residue') or {}).get('state') == 'open']
 
+    def get_entry_residue_trades(self):
+        #: NO status filter, matching every real store: an entry residue is a
+        #: leg the entry left behind, which can sit on a record in any state --
+        #: including one that never became a position because nothing filled.
+        return [t for t in self.trades
+                if (t.get('entry_residue') or {}).get('state') == 'open']
+
     def set_trade_status(self, trade_id, status, **extra_fields):
         self._rec('set_trade_status', trade_id, status, **extra_fields)
         t = self._find(trade_id)
