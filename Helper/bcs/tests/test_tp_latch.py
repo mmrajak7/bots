@@ -26,6 +26,15 @@ from bcs import spread_monitor as sm
 from bcs.tests import replay as replay_mod
 from bcs.tests.replay import Tick, run_session
 
+#: N9. A FIXED date, and it has to be: the fixture's symbols say `26SEP` and
+#: its expiry is 2026-09-29, so a `DAY` derived from the wall clock would
+#: replay a September contract in whatever month the suite happens to run.
+#:
+#: It is safe to fix because the harness pins the clock in BOTH modules that
+#: reason about "today" on this path — `bcs.spread_monitor` and
+#: `zebra.trade_store`, where the TP latch's same-day expiry lives — so
+#: nothing here compares a stored stamp against the real calendar. The
+#: guard below states that coupling rather than trusting it to stay true.
 DAY = date(2026, 9, 15)
 L, S = 'TESTCO26SEP1340CE', 'TESTCO26SEP1390CE'
 QTY = 700
@@ -50,6 +59,25 @@ LONG_BOOK = {'bid': 100.00, 'bid_qty': 1400, 'ask': 100.20, 'ask_qty': 1400,
              'ltp': 100.10, 'prev_close': 21.0}
 SHORT_BOOK = {'bid': 52.00, 'bid_qty': 1400, 'ask': 52.20, 'ask_qty': 1400,
               'ltp': 52.10, 'prev_close': 7.6}
+
+
+def test_the_replay_date_is_consistent_with_the_contract_it_replays():
+    """The three dated facts in this file must agree, or the replay is testing
+    a contract that does not exist on the day it claims.
+
+    Cheap insurance against the half-edit: somebody moves the expiry forward a
+    cycle, leaves `DAY` behind, and the suite goes on passing while the
+    scenario stops meaning anything. `feedback_pin_the_wall_clock_in_tests`
+    covers the other half — that the day must not come from the calendar.
+    """
+    exp = date(*(int(x) for x in COHORT['expiry'].split('-')))
+    assert DAY < exp, 'the replay day is on or after the contract expiry'
+    assert (exp - DAY).days <= 45, 'the replay day is a different cycle'
+    month = '%d%s' % (DAY.year % 100, DAY.strftime('%b').upper())
+    for sym in (L, S):
+        assert month in sym, (
+            '%s is not a %s contract — the symbols and DAY have drifted apart'
+            % (sym, month))
 
 
 def _pos():

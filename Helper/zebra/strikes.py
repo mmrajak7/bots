@@ -109,6 +109,50 @@ _OPTIONS_CACHE: dict = {}      # {stock: {expiry: {strike: {CE: {...}, PE: {...}
 _OPTIONS_CACHE_LOADED = False
 
 
+def options_csv_age_days(now=None):
+    """How old `nse_stocks_options.csv` is, in days. None when it is missing.
+
+    Read from the file's mtime rather than from anything inside it: the file
+    has no header row saying when it was built, and the only thing that
+    rewrites it is the 09:00 refresh job.
+    """
+    try:
+        st = cfg.OPTIONS_CSV.stat()
+    except OSError:
+        return None
+    now = now or datetime.now()
+    return (now - datetime.fromtimestamp(st.st_mtime)).total_seconds() / 86400.0
+
+
+def options_csv_stale(now=None):
+    """`(stale, why)` for the ENTRY gate. Missing counts as STALE.
+
+    **This file is where LOT SIZES come from, and a lot size becomes an order
+    QUANTITY at the broker.** It is rebuilt by its own 09:00 Mon-Fri cron and
+    nothing checked that the cron had run: a job that dies quietly leaves
+    every entry sizing itself from whatever was true the last time it worked,
+    and the failure is invisible because a stale chain still parses, still
+    has strikes, and still returns a number.
+
+    Missing fails CLOSED for the same reason an unknown OI does: the answer
+    "I could not look" must not be spendable as "it is fine".
+    ([[feedback_never_asked_is_not_failed]] - the two states differ, and
+    `why` says which.)
+
+    EXITS ARE NEVER GATED ON THIS and must never be. A close reads its
+    symbols and quantity off the trade record; refusing to exit because a
+    scanner input went stale would abandon a live position over a cron job.
+    """
+    age = options_csv_age_days(now=now)
+    if age is None:
+        return True, 'options CSV is MISSING at %s' % cfg.OPTIONS_CSV
+    if age > cfg.OPTIONS_CSV_MAX_AGE_DAYS:
+        return True, ('options CSV is %.1f days old (max %d) - the 09:00 '
+                      'refresh has not run; lot sizes may be wrong'
+                      % (age, cfg.OPTIONS_CSV_MAX_AGE_DAYS))
+    return False, ''
+
+
 def _load_options_csv() -> None:
     """Load nse_stocks_options.csv into the in-memory chain map."""
     global _OPTIONS_CACHE, _OPTIONS_CACHE_LOADED
@@ -145,7 +189,14 @@ def _load_options_csv() -> None:
             rows += 1
     _OPTIONS_CACHE = chain
     _OPTIONS_CACHE_LOADED = True
-    logger.info("Options CSV loaded: %d rows, %d stocks", rows, len(_OPTIONS_CACHE))
+    # The AGE, on every load, whether or not it passes. A gate that only
+    # speaks when it fires leaves "the file is fresh" and "nobody ever looked"
+    # printing the same thing, which is how this input went six weeks stale
+    # without a line in any log.
+    age = options_csv_age_days()
+    logger.info("Options CSV loaded: %d rows, %d stocks, %s",
+                rows, len(_OPTIONS_CACHE),
+                'age unknown' if age is None else 'age %.1f days' % age)
 
 
 def _pick_expiry(stock: str, today: Optional[datetime] = None) -> Optional[str]:
@@ -364,6 +415,19 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     Together they rejected 32% of the closed sample, and that rejected third
     ran 37.5% WR / -22.9% ROC / PF 0.27 — it lost money outright.
     """
+    # ── HARD GATE 0: is the chain we are about to size from CURRENT? ─────
+    # First, before a single quote is spent, because a stale file makes every
+    # answer below untrustworthy rather than merely unattractive. An `error`
+    # like the gates beneath it, so the signal is SUPPRESSED rather than
+    # alerted with a warning nobody reads - but unlike them this is an
+    # OPERATIONAL fault, not an unclean signal, so `zebra/monitor.py` also
+    # alerts on it once a day. Suppressing entries silently until somebody
+    # notices would stall the cohort's evidence, which is the one thing the
+    # arming gate is waiting on.
+    stale, why = options_csv_stale()
+    if stale:
+        return {'error': why}
+
     _load_options_csv()
     strikes = _list_strikes(stock, expiry, direction)
     if direction == 'CE':

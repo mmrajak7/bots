@@ -2834,6 +2834,59 @@ def _alert_store_corruption(dry_run: bool = False) -> bool:
         return False
 
 
+def _alert_options_csv_stale(dry_run: bool = False) -> bool:
+    """M3 - say it OUT LOUD when the options chain stops being refreshed.
+
+    `analyze_bcs` already refuses to build on a stale chain, and that refusal
+    is silent by design: it looks like every other hard gate, one
+    `bcs_suppressed` line per signal. That is right for an unclean SIGNAL and
+    wrong here. A dead refresh job suppresses EVERY signal, every cycle,
+    indefinitely - and the cohort's missing evidence is the one thing standing
+    between this system and being armed. Stalling it quietly is the expensive
+    outcome, so the fault gets a voice separate from the trades it blocks.
+
+    Once a day, on a MARKER FILE rather than in memory: this process is a
+    five-minute cron that exits between cycles, so an in-process set would
+    re-alert 78 times a session. (The BCS monitor's nags can use a set because
+    that one is a single long-lived process; the difference is the process
+    model, not the policy.)
+    """
+    stale, why = strikes_mod.options_csv_stale()
+    seen = cfg.LOG_DIR / 'zebra_options_csv_stale.alerted'
+    #: IST-aware, like every other date in this module. A naive `date.today()`
+    #: would key the dedup to the box's timezone (M7).
+    today = datetime.now(IST).date().isoformat()
+    if not stale:
+        # Clear the marker so a REPEAT of the fault next week alerts again
+        # rather than being deduped against a stamp from the last outage.
+        try:
+            if seen.exists():
+                seen.unlink()
+        except OSError:
+            pass
+        return False
+    logger.error("ENTRIES BLOCKED: %s", why)
+    try:
+        if seen.exists() and seen.read_text().strip() == today:
+            return False
+    except OSError:
+        pass
+    _send_telegram(
+        "\u26a0\ufe0f <b>OPTIONS CHAIN IS STALE - ENTRIES BLOCKED</b>\n"
+        "%s\n"
+        "Lot sizes come from that file and a lot size becomes an order "
+        "quantity, so no new entry will be built until it is refreshed. "
+        "Open positions are UNAFFECTED - exits never read it.\n"
+        "Fix: run <code>helper/kite_nse_options.py</code> (its 09:00 Mon-Fri "
+        "cron has not produced a file)." % html.escape(why),
+        dry_run=dry_run)
+    try:
+        seen.write_text(today)
+    except OSError as e:                        # pragma: no cover - fs-level
+        logger.error("Could not stamp the stale-CSV marker: %s", e)
+    return True
+
+
 def _settlement_value(trade: dict, spot: float) -> Optional[float]:
     """What the structure is worth at expiry, from spot alone.
 
@@ -3568,6 +3621,14 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
     # first line — so the ONE event that stops all exit monitoring is the one
     # event `_alert_monitoring_blind` structurally cannot report.
     _alert_store_corruption(dry_run=dry_run)
+    # M3. Beside the corruption check and for the same reason: both are inputs
+    # that fail in a way the trading code reads as "nothing to do". Never
+    # allowed to raise into the cycle — an input-freshness check that can stop
+    # exit monitoring would be a worse bug than the one it reports.
+    try:
+        _alert_options_csv_stale(dry_run=dry_run)
+    except Exception as e:
+        logger.error("Options-CSV freshness check failed: %s", e)
     # Say which portfolio limits are ARMED, every cycle. An unset rupee cap
     # behaves exactly like a working one right up to the moment it should have
     # refused something, and this system has already shipped two controls that

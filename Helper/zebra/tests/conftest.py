@@ -49,6 +49,7 @@ sys.path.insert(0, str(HELPER))
 
 from zebra import config as cfg           # noqa: E402
 from zebra import monitor as monitor_mod  # noqa: E402
+from zebra import strikes as strikes_mod  # noqa: E402
 from zebra import vet as vet_mod          # noqa: E402
 
 
@@ -211,6 +212,30 @@ def _value_triggers_awake(monkeypatch):
     monkeypatch.setattr(
         monitor_mod, '_value_triggers_live',
         lambda now=None: real(now) if now is not None else True)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_options_csv(monkeypatch):
+    """The suite must not depend on WHEN THE BOX last refreshed the option chain.
+
+    M3 added an entry gate on `nse_stocks_options.csv`'s mtime, because that
+    file is where lot sizes come from and a lot size becomes an order quantity.
+    The gate reads a PRODUCTION file, so without this rail every
+    `analyze_bcs` test answers differently on a box whose 09:00 refresh ran
+    this morning and on one whose copy is six weeks old — which is exactly
+    what this dev box holds. Sixth instance of the class, and the same shape as
+    `_value_triggers_awake`: production reaching IN, through an input nobody
+    thought of as configuration.
+
+    It pins the READING, not the RULE. `options_csv_age_days` is mtime
+    arithmetic and is the only environmental part; `options_csv_stale` — what
+    counts as too old, and what `why` says — stays real and under test, as
+    does every caller's handling of it. A test proving the gate FIRES
+    overrides this attribute itself, and a test-body monkeypatch runs after
+    fixtures and wins.
+    """
+    monkeypatch.setattr(strikes_mod, 'options_csv_age_days',
+                        lambda now=None: 0.0)
 
 
 @pytest.fixture(autouse=True)

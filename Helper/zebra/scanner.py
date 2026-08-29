@@ -131,16 +131,26 @@ def validate_and_add(store: ZebraStore, kite=None,
         st_val = st_info['st']
         st_dir = st_info['direction']
 
-        # Direction routing. NOTE: despite the key/message below, this branch
-        # is NOT a trend-misalignment check -- `_direction_for` only ever
-        # returns 'SKIP' for price == st_val exactly (rare). Trend direction
-        # is not consulted at all. The counter name is left as-is because it
-        # is read elsewhere as this exact string; renaming it is a code
-        # change, not a docstring one -- see the task notes for this file.
+        # Direction routing. `_direction_for` returns 'SKIP' in exactly ONE
+        # case: price == st_val to the tick, so there is no distance to the
+        # magnet to trade. Trend direction is not consulted here at all.
+        #
+        # M5, renamed 2026-08-29. This counter was called `trend_misaligned`
+        # and its log line read "trend not aligned" — a name and a message
+        # describing a filter this scanner has never implemented. That exact
+        # fiction has already cost a trade: on 2026-08-13 a spawned vetting
+        # agent read "SKIP, trend not aligned" out of the docs and vetoed a
+        # valid signal with it. `trend_aligned` is a CONVICTION TAG here, never
+        # a filter (381 of 383 records are counter-trend, and the 2 aligned
+        # ones averaged -24.6%), so a counter implying otherwise is a standing
+        # invitation to re-derive the wrong rule. Free to rename: grep found
+        # this line to be the key's ONLY occurrence in the tree, which also
+        # falsifies the old comment's claim that it was read elsewhere.
         direction = _direction_for(price, st_val, st_dir)
         if direction == 'SKIP':
-            skips['trend_misaligned'] += 1
-            logger.debug("SKIP %s %s: trend not aligned (price=%.2f vs ST=%.2f, dir=%s)",
+            skips['price_exactly_on_st'] += 1
+            logger.debug("SKIP %s %s: price is ON the ST line, nothing to "
+                         "travel to (price=%.2f vs ST=%.2f, dir=%s)",
                          stock, timeframe, price, st_val, st_dir)
             continue
         if direction not in cfg.ENABLED_DIRECTIONS:

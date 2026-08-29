@@ -288,6 +288,20 @@ _DEFAULTS = {
     'min_dte': 15,
     'max_dte': 45,
     'min_leg_oi': 5000,
+    # M3. How old `nse_stocks_options.csv` may be before ENTRIES are refused.
+    #
+    # That file is where LOT SIZES come from, and a lot size becomes an order
+    # QUANTITY at the broker. It is refreshed by its own 09:00 Mon-Fri cron
+    # (`flow/server_setup/README_SERVER.txt`) and nothing checked that the
+    # cron had actually run - a job that dies quietly leaves every entry
+    # sizing itself from whatever was true the last time it worked.
+    #
+    # 4 days, not 1: Friday's file is correct on Monday, and a holiday makes
+    # that three calendar days. The number is not trying to catch a
+    # lot-size circular the day it lands - it is trying to catch a refresh
+    # that has STOPPED. EXITS are never gated on it; they read symbols off
+    # the trade record and never touch this file.
+    'options_csv_max_age_days': 4,
     'max_leg_spread_pct': 0.01,  # bid-ask spread cap per leg (1% of mid)
     'bcs_max_entry_cost_pct': 15.0,
                                  # HARD gate: (ask(long) - bid(short)) minus
@@ -831,6 +845,7 @@ FRESH_ENTRY_GAP = _num('fresh_entry_gap')
 MIN_DTE = _int('min_dte')
 MAX_DTE = _int('max_dte')
 MIN_LEG_OI = _int('min_leg_oi')
+OPTIONS_CSV_MAX_AGE_DAYS = _int('options_csv_max_age_days')
 MAX_LEG_SPREAD_PCT = _num('max_leg_spread_pct')
 BCS_MAX_DEBIT_TO_WIDTH_PCT = _num('bcs_max_debit_to_width_pct')
 BCS_MAX_ENTRY_COST_PCT = _num('bcs_max_entry_cost_pct')

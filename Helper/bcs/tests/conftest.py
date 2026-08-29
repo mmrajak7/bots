@@ -1,14 +1,42 @@
-"""Test-wide safety rail for the LIVE-money package.
+"""Test-wide safety RAILS for the LIVE-money package.
 
-No test here may send a real Telegram. Reported by the owner 2026-08-12: the
-zebra suite had been messaging his phone on every run (a VETOED alert for
-TESTCO, the fixture symbol). `bcs/` had no conftest at all, so its only
-protection was whatever each file happened to patch for itself — which is the
-arrangement that failed next door.
+Six of them now, autouse, listed here because a rail nobody can find is one
+the next file re-implements badly. Each exists because something already
+escaped:
 
-Blocked at the NETWORK call rather than at the wrapper, so a future sender or a
-copy-pasted requests.post cannot slip past it. It RAISES: a silent stub would
-let "we never send anything" pass as healthy.
+1. **No real Telegram** (`_no_telegram_http`). Reported by the owner
+   2026-08-12: the zebra suite had been messaging his phone on every run (a
+   VETOED alert for TESTCO, the fixture symbol). `bcs/` had no conftest at all,
+   so its only protection was whatever each file happened to patch for itself
+   — the arrangement that failed next door. Blocked at the NETWORK call rather
+   than at the wrapper, so a future sender or a copy-pasted `requests.post`
+   cannot slip past it, and it RAISES: a silent stub would let "we never send
+   anything" pass as healthy.
+2. **No production order journal** (`_journal_to_tmp`) — that file is the
+   evidence of what this engine intended to trade; a test row in it is a lie
+   about a real order.
+3. **No production monitor log** (`_monitor_logs_to_tmp`) — the digest parses
+   those, and the digest is what the arming decision is read from.
+4. **The vetting switch is PINNED, not read** (`_pinned_vet_flag`). The
+   2026-08-13 incident: `cfg.VET_ENABLED` is resolved at import from the
+   machine's config, so the suite's answer depended on the box it ran on. It
+   pins a DEFAULT rather than railing a MISTAKE, so unlike its neighbours it
+   stays overridable per test.
+5. **No writes under the real `logs/`** (`_no_production_writes`) — the
+   backstop for a path nobody thought to redirect, stated as a location rather
+   than as a list of files.
+6. **A clean quote cache per test** (`_fresh_quote_cache`) — a cache that
+   survives between tests makes the second one measure the first.
+
+Two rails from `zebra/tests/conftest.py` are deliberately NOT here: the spawn
+block and the production-path redirect for the vet's own files. The vet flag
+above is pinned False, and the exit gate short-circuits on it before reaching
+any spawn, so the route is currently unreachable — but it REOPENS the moment a
+test here sets that flag True. Adding an unrequested autouse rail to the
+live-money package wants its own review; until then this paragraph is the
+warning. See N7 in the work order and
+`[[feedback_tests_must_not_touch_production]]` — this class of escape has
+happened four times.
 """
 import sys
 from pathlib import Path
