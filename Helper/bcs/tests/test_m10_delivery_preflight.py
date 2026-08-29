@@ -115,14 +115,24 @@ def test_the_floor_can_only_RAISE_the_count():
 def test_the_floor_is_expressed_as_max_not_as_care():
     """Read off the source. The direction is counter-intuitive enough that the
     next person to edit this arithmetic will get it wrong unless the invariant
-    is an operation rather than a convention."""
+    is an operation rather than a convention.
+
+    RETIRES WHEN: the session count becomes a type that cannot decrease
+    (a monotonic accumulator), making the `max()` redundant rather than
+    load-bearing.
+    """
     import inspect
     assert 'max(base' in inspect.getsource(sm.delivery_stop_sessions)
 
 
 def test_the_time_stop_consults_the_floor():
     """A rule applied in one place and quietly not in its copy is the most
-    frequent bug shape in this codebase."""
+    frequent bug shape in this codebase.
+
+    RETIRES WHEN: `time_stop_due` takes the effective session count as an
+    argument instead of deriving it, so a caller that skipped the floor
+    cannot type-check.
+    """
     import inspect
     assert 'delivery_stop_sessions' in inspect.getsource(sm.time_stop_due)
 
@@ -241,7 +251,11 @@ def test_CLOSE_ON_SCHEDULE_does_not_telegram(spy):
 
 def test_it_places_no_order():
     """Alert-only. The scheduled close is still the only automated close this
-    file does on expiry proximity."""
+    file does on expiry proximity.
+
+    RETIRES WHEN: the preflight moves into a module with no import path to
+    the order primitives at all.
+    """
     import inspect
     for fn in (sm.delivery_preflight, sm.record_delivery_preflight,
                sm.delivery_stop_sessions):
@@ -253,7 +267,11 @@ def test_it_places_no_order():
 
 def test_it_runs_from_the_monitor():
     """A gate nobody calls is indistinguishable from one that does not
-    exist."""
+    exist.
+
+    RETIRES WHEN: the expiry-window checks are driven from one list the
+    monitor iterates, so adding a check wires it in.
+    """
     import inspect
     assert 'record_delivery_preflight' in inspect.getsource(sm.monitor_all)
 

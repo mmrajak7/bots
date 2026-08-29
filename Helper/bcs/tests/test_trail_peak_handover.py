@@ -141,6 +141,10 @@ def test_zebra_keeps_recording_the_peak_while_it_is_stood_down():
     the stand-down `continue` -- if it ever moves below, `mfe_mid` freezes at
     the moment of handover and this whole reconciliation restores a stale
     number while looking correct.
+
+    RETIRES WHEN: peak recording moves out of `check_entered` into a
+    measurement pass that runs before any stand-down decision exists, so
+    ordering is structural rather than positional.
     """
     import inspect
     from zebra import monitor
@@ -156,7 +160,11 @@ def test_zebra_keeps_recording_the_peak_while_it_is_stood_down():
 def test_the_startup_line_reports_the_reconciled_peak():
     """The log line is what a human checks the record against by hand. Printing
     the stored field while running on a different peak is the same class of
-    lie as `--list` answering 'Open: 0' with eight positions live."""
+    lie as `--list` answering 'Open: 0' with eight positions live.
+
+    RETIRES WHEN: the startup line is rendered from the trail STATE object
+    rather than from the record, so there is no second source to print.
+    """
     import inspect
     src = inspect.getsource(sm.monitor_all)
     assert "peak={_ts['peak']:.2f}" in src

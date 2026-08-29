@@ -80,7 +80,11 @@ def test_it_does_not_extrapolate():
 
 def test_the_engine_checks_coverage_every_cycle():
     """Beside the store-corruption and options-CSV checks, because it fails the
-    same way they do: the number keeps looking authoritative."""
+    same way they do: the number keeps looking authoritative.
+
+    RETIRES WHEN: the input-freshness checks (store corruption, options CSV,
+    calendar) are driven from one registry the cycle iterates.
+    """
     import inspect
     from zebra import monitor
     assert '_alert_calendar_coverage' in inspect.getsource(monitor.run_cycle)
@@ -89,7 +93,11 @@ def test_the_engine_checks_coverage_every_cycle():
 def test_the_alert_reads_the_IST_date():
     """M7. A naive `date.today()` would move the lapse warning by a day on a
     UTC box — small here, and the same defect that made `is_market_open()`
-    answer for the wrong timezone."""
+    answer for the wrong timezone.
+
+    RETIRES WHEN: the module has no access to a naive clock -- `date.today`
+    unimported and the IST clock the only one reachable.
+    """
     import inspect
     # CODE ONLY: the comment beside that line explains the bug by naming it,
     # so a raw substring search matches the explanation and passes whatever
@@ -108,7 +116,11 @@ def zebra_monitor():
 
 def test_a_broken_coverage_check_cannot_stop_the_cycle(monkeypatch):
     """An input-freshness check that can stop exit monitoring would be a worse
-    bug than the one it reports — the rule the other two already follow."""
+    bug than the one it reports — the rule the other two already follow.
+
+    RETIRES WHEN: the freshness registry above runs every check inside one
+    shared guard, so per-call `try` blocks stop being the mechanism.
+    """
     import inspect
     from zebra import monitor
     src = inspect.getsource(monitor.run_cycle)

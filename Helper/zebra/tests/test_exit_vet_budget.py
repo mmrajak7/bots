@@ -172,7 +172,12 @@ def test_an_unwritable_clock_delays_the_budget_rather_than_skipping_it(
 def test_the_budget_wraps_the_policy_rather_than_branching_inside_it():
     """Every non-'proceed' return has to be covered. A budget checked in three
     of four branches is a budget that does not exist on the fourth, which is
-    the shape this codebase keeps paying for."""
+    the shape this codebase keeps paying for.
+
+    RETIRES WHEN: the gate returns a verdict OBJECT that carries its own
+    elapsed-hold clock, so the budget is a property of the verdict rather
+    than a wrapper that must not be bypassed.
+    """
     import inspect
     src = inspect.getsource(vet_mod.exit_gate)
     assert '_exit_gate_policy' in src and '_apply_hold_budget' in src
@@ -284,7 +289,11 @@ def test_the_cycle_budget_caps_the_total_not_each_trade(store, monkeypatch):
 
 def test_the_budget_does_not_leak_into_the_next_cycle():
     """An armed budget surviving the cycle would make the NEXT one wait for
-    reasons that have nothing to do with it."""
+    reasons that have nothing to do with it.
+
+    RETIRES WHEN: the in-cycle budget becomes a context manager the cycle
+    enters, making the `finally` structural.
+    """
     import inspect
     from zebra import monitor
     src = inspect.getsource(monitor.run_cycle)

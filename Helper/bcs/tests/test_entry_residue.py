@@ -185,6 +185,10 @@ def test_every_entry_branch_that_can_orphan_a_leg_records_it(branch):
     property of the branch structure. A missed branch is the whole defect
     reappearing on the one path nobody exercised — and this test found one
     (`executor_raised`) that the design had not.
+
+    RETIRES WHEN: the entry path returns a single result object that the
+    caller must consume, so "leaving without recording" stops being
+    expressible and there is no branch structure left to check.
     """
     import inspect
     # `_auto_enter_bcs` is the function that calls the executor; `_enter_as_bcs`
@@ -231,7 +235,12 @@ def test_the_branch_where_the_report_itself_is_lost_still_records():
 def test_the_executor_still_never_unwinds():
     """The residue is BOOKKEEPING. If recording it ever turned into acting on
     it, this change would have introduced the exact amplification the entry
-    path was designed to refuse."""
+    path was designed to refuse.
+
+    RETIRES WHEN: the executor's order-placing primitives move behind an
+    interface that is write-only for entries, so "it never unwinds"
+    becomes a type rather than an absence of calls.
+    """
     import inspect
     from bcs import entry_executor as ee
     src = inspect.getsource(zmon._record_entry_residue)
@@ -308,7 +317,12 @@ def test_it_does_not_resolve_in_the_opening_window(monkeypatch):
 
 def test_the_sweep_places_no_order():
     """The rule both species are bound by. `orders_allowed` is in the books
-    tuple and no value of it authorises anything here."""
+    tuple and no value of it authorises anything here.
+
+    RETIRES WHEN: the sweeps take a broker handle that exposes reads only,
+    at which point placing an order from here is a compile-time error
+    rather than something a test has to look for.
+    """
     import inspect
     src = inspect.getsource(sm.sweep_reconcile_residue)
     for forbidden in ('place_limit_order', 'close_spread', 'close_leg',
@@ -352,7 +366,12 @@ def test_the_two_species_do_not_silence_each_other(spy):
 
 def test_both_sweeps_run_from_the_poll_loop():
     """A sweep nobody calls is indistinguishable from one that does not exist
-    — which is how eight live positions once answered `Open: 0`."""
+    — which is how eight live positions once answered `Open: 0`.
+
+    RETIRES WHEN: the poll loop builds its sweeps from a registry
+    (`RESIDUE_KINDS` already exists), so a species that is declared is
+    swept by construction and cannot be forgotten at the call site.
+    """
     import inspect
     src = inspect.getsource(sm.monitor_all)
     assert 'sweep_reconcile_residue(' in src

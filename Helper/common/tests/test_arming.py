@@ -118,6 +118,10 @@ def test_zebra_books_only_records_whose_legs_never_reached_a_broker():
     `is_paper_record(t)` agree on every paper record and differ only on a live
     one in paper mode -- which is the exact state that was wrong, and which a
     behavioural test would have to construct to notice.
+
+    RETIRES WHEN: `_paper_auto_close` takes the booking decision as an
+    argument from `common.arming` instead of re-deriving it, so the two
+    cannot disagree and there is no predicate here to pin.
     """
     import inspect
     from zebra import monitor
@@ -265,7 +269,11 @@ def test_both_engines_call_it():
     """Announced from BOTH, deliberately: these are exactly the states in
     which the other engine may be absent, so a single sender would go quiet
     when it matters. Read off the source, because the alternative is running
-    two market-hours processes."""
+    two market-hours processes.
+
+    RETIRES WHEN: both engines are started through one entrypoint that runs
+    the preflight itself, so an engine cannot start without it.
+    """
     import inspect
     from bcs import spread_monitor as sm
     from zebra import monitor
@@ -275,7 +283,12 @@ def test_both_engines_call_it():
 
 def test_the_kill_switch_transition_re_states_the_arming():
     """Tripping the kill switch to be SAFE is how the no-engine state is most
-    often reached: the monitor does not stop, it stops BOOKING."""
+    often reached: the monitor does not stop, it stops BOOKING.
+
+    RETIRES WHEN: `dry_run` becomes observable state that the arming verdict
+    recomputes from on read, so no transition needs to remember to
+    re-announce.
+    """
     import inspect
     from bcs import spread_monitor as sm
     src = inspect.getsource(sm.monitor_all)
