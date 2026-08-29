@@ -1693,7 +1693,8 @@ def delivery_exposure(trade: dict, spot: float) -> dict:
 # ── M10 remainders: moneyness, and the E-9 preflight ───────────────────────
 #
 # The 6-session close (`time_stop_sessions`) is sized to clear the delivery
-# ramp, which starts at E-4. Two things were designed with it and not built.
+# ramp, which starts at E-4. Two things were designed with it and are built
+# below (2026-08-30); the reasoning is kept because both run backwards.
 #
 # **The session count is a FLOOR, never a ceiling.** The intuition runs
 # backwards, which is why it is written down: a far-OTM spread is worth pennies
