@@ -41,54 +41,28 @@ import json
 import pytest
 
 from bcs.tests.fakes import MemoryStore
+from common import store_contract
 from bcs.zebra_adapter import ZebraStoreAdapter
 from zebra import config as zcfg
 from zebra.trade_store import ZebraStore
 
-#: The four roles a record can be in when a close path touches it.
-OPEN, CLOSING, FROZEN, TERMINAL = 'open', 'closing', 'frozen', 'terminal'
-ROLES = (OPEN, CLOSING, FROZEN, TERMINAL)
-
-#: THE CONTRACT. What the strictest real store does, per (role, method).
-#: True = the call is accepted and the record moves; False = refused.
+#: THE CONTRACT AND THE VOCABULARIES ARE IMPORTED, not declared here.
 #:
-#: FROZEN ('partial_close') refuses everything EXCEPT `begin_recovery`: legs
-#: are live at the broker and nothing is monitoring them, so no ordinary path
-#: may book or re-lock the record. M14 opens exactly one door, and only for the
-#: recovery sweep, whose action space is reduce-only, cause-gated,
-#: count-limited and journalled. `begin_recovery` is a SEPARATE verb rather
-#: than a widened `begin_close` precisely so this table can say that: the
-#: FROZEN column below is the difference between the two, stated as data.
-#: TERMINAL refuses everything because that is what idempotence IS — the
-#: guarantee that two processes racing to close cannot both book.
-CONTRACT = {
-    ('begin_close', OPEN): True,
-    ('begin_close', CLOSING): False,
-    ('begin_close', FROZEN): False,
-    ('begin_close', TERMINAL): False,
-    ('update_trade_exit', OPEN): True,
-    ('update_trade_exit', CLOSING): True,
-    ('update_trade_exit', FROZEN): False,
-    ('update_trade_exit', TERMINAL): False,
-    ('recover_closing_trade', OPEN): False,
-    ('recover_closing_trade', CLOSING): True,
-    ('recover_closing_trade', FROZEN): False,
-    ('recover_closing_trade', TERMINAL): False,
-    # M14. The exact inverse of `begin_close`, which is the point of it being
-    # its own verb: FROZEN is the only state it accepts, and the only state
-    # `begin_close` must never accept.
-    ('begin_recovery', OPEN): False,
-    ('begin_recovery', CLOSING): False,
-    ('begin_recovery', FROZEN): True,
-    ('begin_recovery', TERMINAL): False,
-}
+#: They were declared here until 2026-08-30, and this file's own docstring
+#: explained why that was a problem without naming it as one: the BCS family
+#: diverged from the table and the divergence was recorded in a test rather
+#: than fixed, because the table was not something production could consult.
+#: `common/store_contract.py` is that table now, every store asks it, and this
+#: file went back to being a test of an implementation against its spec.
+OPEN, CLOSING = store_contract.OPEN, store_contract.CLOSING
+FROZEN, TERMINAL = store_contract.FROZEN, store_contract.TERMINAL
+ROLES = store_contract.ROLES
+CONTRACT = store_contract.CONTRACT
+BCS_FAMILY_STATUSES = store_contract.BCS_FAMILY_STATUSES
+ZEBRA_STATUSES = store_contract.ZEBRA_STATUSES
 
-#: (module, class, file-stem, {role: that store's status string})
-BCS_FAMILY_STATUSES = {OPEN: 'open', CLOSING: 'closing',
-                       FROZEN: 'partial_close', TERMINAL: 'closed'}
-ZEBRA_STATUSES = {OPEN: 'entered', CLOSING: 'closing',
-                  FROZEN: 'partial_close', TERMINAL: 'exited'}
-
+#: (module, class, file-stem) per real book. The vocabularies that used to sit
+#: here are imported above.
 REAL_BOOKS = [
     ('bcs', 'bcs.trade_store', 'TradeStore', 'bcs_trades'),
     ('bear_put', 'bear_put.trade_store', 'BearPutStore', 'bear_put_trades'),
@@ -224,24 +198,100 @@ def test_the_fake_is_never_laxer_than_a_real_book(tmp_path, monkeypatch,
                 f'how the exit-bridge bug shipped under a green suite')
 
 
-def test_the_bcs_family_is_laxer_than_zebra_on_booking(tmp_path, monkeypatch):
-    """A known divergence, asserted so it cannot change unnoticed.
+@pytest.mark.parametrize('name,modname,clsname,stem', REAL_BOOKS,
+                         ids=[b[0] for b in REAL_BOOKS])
+@pytest.mark.parametrize('method,role', sorted(CONTRACT))
+def test_every_real_book_matches_the_contract(tmp_path, monkeypatch, name,
+                                              modname, clsname, stem,
+                                              method, role):
+    """The divergence this file used to RECORD is now closed.
 
-    `TradeStore.update_trade_exit` (and its two copies) has no status check at
-    all: it will stamp 'closed' onto a record that is already closed, or one
-    frozen at 'partial_close' with live legs. Zebra refuses both.
+    Until 2026-08-30 there was a test here called
+    `test_the_bcs_family_is_laxer_than_zebra_on_booking`, and it asserted that
+    `TradeStore.update_trade_exit` (and its two copies) had no status check at
+    all — it would stamp 'closed' onto a record already closed, or onto one
+    FROZEN at `partial_close` with live legs. It was recorded rather than fixed
+    because those files were "outside this change's ownership", with the
+    consequence spelled out: on those three books a double-close still
+    double-books, and the only thing between that and a real order was
+    `begin_close`.
 
-    NOT fixed here — those three files are outside this change's ownership, and
-    tightening a store the live monitor books through deserves its own change
-    with its own review. Recorded, with the consequence spelled out: on those
-    three books a double-close still double-books, and the only thing standing
-    between that and a real order is `begin_close`, which IS checked.
+    That is what a specification only a test reads always becomes. The table
+    moved into `common/store_contract.py`, every store asks it, and the four
+    books now hold to ONE rule set instead of two. So this replaces the
+    divergence test with the assertion it was standing in for.
     """
-    frozen = _bcs_family_store('bcs.trade_store', 'TradeStore', 'bcs_trades',
-                               tmp_path, monkeypatch, 'partial_close')
-    assert _probe(frozen, 'update_trade_exit') is True, (
-        'bcs.TradeStore.update_trade_exit grew a status check — good; update '
-        'CONTRACT and delete this test')
+    store = _bcs_family_store(modname, clsname, stem, tmp_path, monkeypatch,
+                              BCS_FAMILY_STATUSES[role])
+    assert _probe(store, method) is CONTRACT[(method, role)]
+
+
+def test_the_table_is_the_implementation_not_a_copy_of_it():
+    """The point of the whole item.
+
+    `CONTRACT` here IS `common.store_contract.CONTRACT` — imported, not
+    restated. A test that declared its own copy would be checking two
+    implementations against each other again, which is exactly the arrangement
+    that let the BCS family drift for as long as it did.
+
+    RETIRES WHEN: nothing. This is an identity check on an import and costs
+    nothing to keep; it fails only if somebody reintroduces a local table.
+    """
+    # The module-level import, NOT a fresh one inside the function: under
+    # pytest's rootdir handling `common.store_contract` can be reached by two
+    # import paths and therefore exist as two module objects, and an identity
+    # check against the wrong one fails while proving nothing.
+    assert CONTRACT is store_contract.CONTRACT
+    assert BCS_FAMILY_STATUSES is store_contract.BCS_FAMILY_STATUSES
+    assert ZEBRA_STATUSES is store_contract.ZEBRA_STATUSES
+    # And the table is not ALSO written down here. Identity above catches a
+    # copy assigned from the import; this catches one that was typed out —
+    # which is what the file held before 2026-08-30.
+    #
+    # Parsed, not searched for. A substring check matches this very
+    # assertion -- the self-reference trap two other guards in this session
+    # walked into -- so the question is asked of the syntax tree: how many
+    # module-level bindings of CONTRACT are there, and is the one that exists
+    # an attribute read rather than a dict literal?
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(inspect.getmodule(_probe)))
+    binds = [n for n in tree.body if isinstance(n, ast.Assign)
+             for t in n.targets
+             if isinstance(t, ast.Name) and t.id == 'CONTRACT']
+    assert len(binds) == 1, (
+        'CONTRACT is bound %d times at module level — the table is being '
+        'restated again' % len(binds))
+    assert isinstance(binds[0].value, ast.Attribute), (
+        'CONTRACT is built here rather than imported')
+
+
+def test_every_store_asks_the_table_rather_than_a_literal():
+    """Read off the source, over all four books and the fake.
+
+    The behavioural tests above prove the stores AGREE with the table today.
+    They cannot prove the agreement is structural rather than coincidental, and
+    the coincidence is the failure mode: two implementations that happen to
+    match are exactly what this file spent months certifying.
+
+    RETIRES WHEN: the four stores share one base class that owns the
+    precondition, so there is one call site rather than four to check.
+    """
+    import inspect
+    import importlib
+    from bcs.tests import fakes
+    from zebra.trade_store import ZebraStore
+
+    subjects = [(importlib.import_module(m), c) for _n, m, c, _s in REAL_BOOKS]
+    subjects.append((importlib.import_module('zebra.trade_store'),
+                     'ZebraStore'))
+    subjects.append((fakes, 'MemoryStore'))
+    for mod, clsname in subjects:
+        src = inspect.getsource(getattr(mod, clsname))
+        assert 'store_contract.' in src, (
+            '%s.%s does not consult common.store_contract — it is back to '
+            'holding its own copy of the rules' % (mod.__name__, clsname))
+    assert ZebraStore is not None
 
 
 # ── M14 · every book can NAME its frozen records ────────────────────────────

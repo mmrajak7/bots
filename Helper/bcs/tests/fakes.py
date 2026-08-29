@@ -29,6 +29,8 @@ from __future__ import annotations
 import itertools
 from datetime import date, datetime, timedelta
 
+from common import store_contract
+
 
 # ── Broker ───────────────────────────────────────────────────────────────────
 
@@ -527,16 +529,21 @@ class MemoryStore:
     # `test_store_contract.py` drives this table against the real stores and
     # fails if the fake ever drifts back to being more permissive.
 
-    #: 'open' (bcs/bps/fh vocabulary) == 'entered' (zebra vocabulary).
-    OPEN_LIKE = ('open', 'entered')
-    #: A close lock may only be taken from an open position.
-    BEGIN_CLOSE_FROM = OPEN_LIKE
-    #: An exit may be booked from an open position or one mid-close. NOT from
-    #: a terminal state (idempotence) and NOT from 'partial_close', which is
-    #: frozen for a human.
-    EXIT_FROM = OPEN_LIKE + ('closing',)
-    #: Only a stranded close lock is recoverable.
-    RECOVER_FROM = ('closing',)
+    #: THE SAME TABLE PRODUCTION USES, imported rather than restated.
+    #:
+    #: These were four literal tuples, kept in step with the real stores by
+    #: `test_store_contract.py` noticing when they drifted. That worked, and it
+    #: is one copy more than the invariant needs: `common/store_contract.py`
+    #: now holds the rules and every store -- including this fake -- asks it.
+    #: A fake cannot be laxer than production when both read one table.
+    #:
+    #: `ANY_ROLES`, because this double stands in for the cohort store as well
+    #: as for the BCS family: `bcs/tests/replay.py` hands it to
+    #: `_open_zebra_store`, so it must recognise 'entered' and 'exited' too.
+    ROLES = store_contract.ANY_ROLES
+
+    def _allows(self, method, status):
+        return store_contract.allows(method, status, self.ROLES)
 
     def update_trade_exit(self, trade_id, exit_data):
         # Signature MIRRORS bcs/trade_store.py:413 — a positional dict, not
@@ -544,19 +551,21 @@ class MemoryStore:
         # lets a genuine TypeError pass in tests and blow up in production.
         self._rec('update_trade_exit', trade_id, exit_data)
         t = self._find(trade_id)
-        if t.get('status') not in self.EXIT_FROM:
-            # ValueError, matching `ZebraStore.mark_exited`. A double-book is
-            # the thing the status check exists to stop, so it must be as loud
-            # here as it is in production.
-            raise ValueError(
-                f"#{trade_id} status={t.get('status')}, can't exit")
+        if not self._allows(store_contract.UPDATE_TRADE_EXIT,
+                            t.get('status')):
+            # ValueError, matching every real store since 2026-08-30. A
+            # double-book is the thing the status check exists to stop, so
+            # it must be as loud here as it is in production.
+            raise ValueError(store_contract.refusal(
+                store_contract.UPDATE_TRADE_EXIT, t.get('status'),
+                trade_id, self.ROLES))
         t.update(exit_data)
         t['status'] = 'closed'
 
     def begin_close(self, trade_id, reason):
         self._rec('begin_close', trade_id, reason)
         t = self._find(trade_id)
-        if t.get('status') not in self.BEGIN_CLOSE_FROM:
+        if not self._allows(store_contract.BEGIN_CLOSE, t.get('status')):
             # False, not an exception: "somebody else got there first" is the
             # normal answer in both real stores and the caller branches on it.
             return False
@@ -567,7 +576,8 @@ class MemoryStore:
     def recover_closing_trade(self, trade_id):
         self._rec('recover_closing_trade', trade_id)
         t = self._find(trade_id)
-        if t.get('status') not in self.RECOVER_FROM:
+        if not self._allows(store_contract.RECOVER_CLOSING,
+                            t.get('status')):
             return False
         t['status'] = 'open'
         t.pop('close_reason', None)
@@ -583,7 +593,7 @@ class MemoryStore:
         """
         self._rec('begin_recovery', trade_id, reason)
         t = self._find(trade_id)
-        if t.get('status') != 'partial_close':
+        if not self._allows(store_contract.BEGIN_RECOVERY, t.get('status')):
             return False
         t['status'] = 'closing'
         t['close_reason'] = reason

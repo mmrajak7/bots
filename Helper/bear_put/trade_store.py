@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from bcs import drive_store
+from common import store_contract
 from common.locked_store import LockTimeout, LockedStoreMixin
 from common.option_symbols import check_leg_types
 from common import layered_config
@@ -337,7 +338,10 @@ class BearPutStore(LockedStoreMixin):
     def recover_closing_trade(self, trade_id: int):
         with self._mutate():
             for t in self._trades:
-                if t['id'] == trade_id and t.get('status') == 'closing':
+                # The table, not a literal. See `common/store_contract.py`.
+                if t['id'] == trade_id and store_contract.allows(
+                        store_contract.RECOVER_CLOSING,
+                        t.get('status')):
                     t['status'] = 'open'
                     t['version'] = t.get('version', 0) + 1
                     t.pop('close_reason', None)
@@ -461,6 +465,25 @@ class BearPutStore(LockedStoreMixin):
             found = False
             for t in self._trades:
                 if t['id'] == trade_id:
+                    # THE CONTRACT, enforced rather than described.
+                    # `common/store_contract.py`. Until 2026-08-30 this method
+                    # had no status check at all: it would stamp 'closed' onto
+                    # a record that was already closed, or onto one FROZEN at
+                    # `partial_close` with legs live at the broker. The only
+                    # thing between that and a real order was `begin_close`.
+                    # The divergence from `ZebraStore` was recorded in a test
+                    # named after it and left standing, which is what a
+                    # specification nothing consults always becomes.
+                    #
+                    # RAISES rather than returning: every caller has ALREADY
+                    # placed the closing orders, so a silent no-op would leave
+                    # the position flat at the broker and open in the book. A
+                    # refusal here is a bug upstream and has to be loud.
+                    if not store_contract.allows(
+                            store_contract.UPDATE_TRADE_EXIT, t['status']):
+                        raise ValueError(store_contract.refusal(
+                            store_contract.UPDATE_TRADE_EXIT, t['status'],
+                            trade_id))
                     t['status'] = 'closed'
                     t['exit'] = exit_data
                     t['version'] = t.get('version', 0) + 1
@@ -479,7 +502,10 @@ class BearPutStore(LockedStoreMixin):
         with self._mutate():
             for t in self._trades:
                 if t['id'] == trade_id:
-                    if t['status'] != 'open':
+                    # The table, not a literal. See `common/store_contract.py`
+                    # for why the specification moved out of the test that held it.
+                    if not store_contract.allows(
+                            store_contract.BEGIN_CLOSE, t['status']):
                         logger.warning(
                             "BPS trade #%d status is '%s', cannot begin close",
                             trade_id, t['status']
@@ -519,7 +545,11 @@ class BearPutStore(LockedStoreMixin):
             for t in self._trades:
                 if t['id'] != trade_id:
                     continue
-                if t['status'] != 'partial_close':
+                # The table, not a literal. `begin_recovery` is the
+                # exact inverse of `begin_close`, and stating that as
+                # data is the point of it being its own verb.
+                if not store_contract.allows(
+                        store_contract.BEGIN_RECOVERY, t['status']):
                     logger.warning(
                         "BPS trade #%d status is '%s', cannot begin recovery",
                         trade_id, t['status'])

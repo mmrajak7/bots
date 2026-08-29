@@ -21,6 +21,7 @@ from typing import Optional
 
 from . import capital
 from . import config as cfg
+from common import store_contract
 from common.filelock import LockTimeout, exclusive
 
 logger = logging.getLogger(__name__)
@@ -1177,8 +1178,15 @@ class ZebraStore:
             # 'exited' stays refused. That is the idempotence guarantee and it
             # is unaffected: a second booking of the same close is still a
             # double-book, whichever state it came from.
-            if t['status'] not in ('entered', 'closing'):
-                raise ValueError(f"#{trade_id} status={t['status']}, can't exit")
+            # The table, not a literal. `common/store_contract.py` holds the
+            # rules and this store supplies its own vocabulary for them --
+            # the four books use different words for the same four states,
+            # so comparing raw status strings would compare the wrong things.
+            if not store_contract.allows(store_contract.UPDATE_TRADE_EXIT,
+                                         t['status'], store_contract.ZEBRA_STATUSES):
+                raise ValueError(store_contract.refusal(
+                    store_contract.UPDATE_TRADE_EXIT, t['status'], trade_id,
+                    store_contract.ZEBRA_STATUSES))
             self._apply_exit(t, exit_spot, exit_debit, reason, exit_legs,
                              approximate=approximate)
         return t
@@ -1339,7 +1347,8 @@ class ZebraStore:
         """
         with self._mutate():
             t = self._must_find(trade_id)
-            if t['status'] != 'entered':
+            if not store_contract.allows(store_contract.BEGIN_CLOSE,
+                                         t['status'], store_contract.ZEBRA_STATUSES):
                 logger.info("#%d status=%s — close lock not taken (%s)",
                             trade_id, t['status'], reason)
                 return False
@@ -1362,7 +1371,8 @@ class ZebraStore:
         """
         with self._mutate():
             t = self._must_find(trade_id)
-            if t['status'] != 'closing':
+            if not store_contract.allows(store_contract.RECOVER_CLOSING,
+                                         t['status'], store_contract.ZEBRA_STATUSES):
                 return False
             t['status'] = 'entered'
             t.pop('close_reason', None)
@@ -1405,7 +1415,9 @@ class ZebraStore:
         """
         with self._mutate():
             t = self._must_find(trade_id)
-            if t['status'] != 'partial_close':
+            # The exact inverse of `begin_close`, stated as data.
+            if not store_contract.allows(store_contract.BEGIN_RECOVERY,
+                                         t['status'], store_contract.ZEBRA_STATUSES):
                 logger.warning("#%d status=%s, cannot begin recovery",
                                trade_id, t['status'])
                 return False
