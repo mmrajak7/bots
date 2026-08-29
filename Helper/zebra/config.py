@@ -302,7 +302,14 @@ _DEFAULTS = {
     # that has STOPPED. EXITS are never gated on it; they read symbols off
     # the trade record and never touch this file.
     'options_csv_max_age_days': 4,
-    'max_leg_spread_pct': 0.01,  # bid-ask spread cap per leg (1% of mid)
+    # 0.01 -> 0.015 on 2026-08-29 (M1). NOT a threshold change: the tracked
+    # defaults file is a real config LAYER and wins at runtime, so 0.015 is
+    # what the book has always run on and 0.01 here was dead. Aligning the
+    # dead fallback to the live value removes a source that would take effect
+    # only if the config file ever went missing - i.e. exactly when nobody
+    # would notice the gate had moved. Measurement-only for BCS: it governs
+    # the retired back-ratio path.
+    'max_leg_spread_pct': 0.015,  # bid-ask spread cap per leg (1% of mid)
     'bcs_max_entry_cost_pct': 15.0,
                                  # HARD gate: (ask(long) - bid(short)) minus
                                  # the same spread at mid, as a share of the
@@ -436,20 +443,48 @@ _DEFAULTS = {
     'spot_sl_enabled': False,     # master switch for the adverse-spot SL (off: debit floor only)
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
-    'time_sl_days_before_expiry': 4,
+    'time_sl_days_before_expiry': 6,
                                  # TRADING SESSIONS, not calendar days (the
                                  # count was calendar until 2026-08-12, so a
                                  # Friday read "3 days left" when one session
                                  # remained). Indian stock options are
                                  # PHYSICALLY settled and the exchange ramps a
                                  # delivery margin on ITM legs over the last
-                                 # ~4 sessions; 3 sessions sat INSIDE that
-                                 # ramp. Firing at the start of the E-4 session
-                                 # means acting before that day's end-of-day
-                                 # risk run, while keeping the time value that
-                                 # exiting a session earlier would give up.
+                                 # ~4 sessions.
+                                 #
+                                 # 4 -> 6 on 2026-08-29 (M10), from sourced
+                                 # research rather than from the estimate this
+                                 # comment used to carry. NSE Clearing levies
+                                 # 10% at EOD of E-4, 25% at E-3, 45% at E-2,
+                                 # 70% at E-1 (Risk Management FAQ Q24; F&O
+                                 # circular NCL/CMPT/73997, 30 Apr 2026), and
+                                 # THREE facts move the number:
+                                 #
+                                 #  1. the base is the long ITM leg at its
+                                 #     STRIKE - full contract value, not the
+                                 #     width and not the debit. For this book
+                                 #     that is ~Rs 2.82L demanded at E-3
+                                 #     against a Rs 2L account.
+                                 #  2. the BROKER does not net the legs even
+                                 #     though the exchange does, so budget the
+                                 #     gross per-leg figure.
+                                 #  3. a holiday moves each tranche EARLIER
+                                 #     while `sessions_to_expiry` counts
+                                 #     weekdays and moves the close LATER. The
+                                 #     two errors compound in one direction,
+                                 #     and 4 sat inside the ramp outright.
+                                 #
+                                 # 5 is only clear in a holiday-free month.
+                                 # This is a FLOOR, never a ceiling: an ITM
+                                 # long leg closes EARLIER (see M10), never
+                                 # later, because the spread that most rewards
+                                 # holding is the one with the most delivery
+                                 # exposure.
                                  # Raise to 5 if your broker levies intraday.
-    'max_open_trades': 8,        # LIVE guidance only. PAPER intentionally does
+    # 8 -> 4 on 2026-08-29 (M9; owner, 2026-08-27: "start at 4 slots, move to
+    # 8 once it is going well"). LIVE-only by construction, so this does not
+    # slow the paper book's evidence: see the note below.
+    'max_open_trades': 4,        # LIVE guidance only. PAPER intentionally does
                                  # NOT cap entries — capturing every signal keeps
                                  # the validation P&L unbiased (a cap would skew
                                  # which trades the track record contains).
@@ -707,7 +742,21 @@ def _load_runtime() -> dict:
     return cfg
 
 
+#: The MERGED file config (tracked defaults under the untracked overlay), kept
+#: so callers that need a non-`_DEFAULTS` block do not re-read the files - and,
+#: more importantly, do not read ONE LAYER. `zebra/monitor._send_telegram`
+#: opened `CONFIG_FILE` directly for `telegram.enabled`, which is the overlay
+#: alone: an edit to the tracked defaults silently did nothing, and on a box
+#: whose overlay has been trimmed to secrets (all of them, since 2026-08-26)
+#: the key was not there at all. M8.
+_file_cfg = layered_config.load('zebra_config', warn_on_shadow=False) or {}
+
 _runtime = _load_runtime()
+
+#: Telegram's master switch, resolved through BOTH layers. Defaults to True:
+#: absence has always meant "send", and a config that stops existing must not
+#: silently mute a safety channel.
+TELEGRAM_ENABLED = bool((_file_cfg.get('telegram') or {}).get('enabled', True))
 
 
 def _positive_finite(key: str, val, default: float) -> float:

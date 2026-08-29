@@ -41,7 +41,7 @@ import re
 import sys
 import time
 import argparse
-from datetime import datetime, date, time as dtime, timedelta
+from datetime import datetime, date, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -66,6 +66,7 @@ from common import option_symbols as _sym
 from common.option_symbols import check_leg_types
 from common import layered_config
 from common import kite_errors
+from common import nse_holidays
 from bcs import alert_policy
 from bcs import exit_vet
 from bcs import order_journal
@@ -329,7 +330,7 @@ def load_kite() -> KiteConnect:
         token_data = json.load(f)
 
     generated = datetime.fromisoformat(token_data['generated_at'])
-    if generated.date() != date.today():
+    if generated.date() != today_ist():
         # A log line is not an alert. This runs unattended under cron; a stale
         # token here becomes "every stop is dark today" and the only witness
         # was a line in a file nobody opens until something has gone wrong.
@@ -344,11 +345,50 @@ def load_kite() -> KiteConnect:
     return kite
 
 
+# ── The clock ────────────────────────────────────────────────────────────────
+
+#: This engine trades ONE exchange in ONE timezone. Every session gate here
+#: (market open, the order cutoffs, the settle buffers) and every date stamp
+#: (the token's freshness, the daily nag keys, the log file name) used to read
+#: `datetime.now()` / `date.today()` — the BOX's local time. zebra next door
+#: has been IST-aware since it was written, so the two engines managing the
+#: same positions disagreed about what day it was on any box not set to IST.
+#:
+#: Latent, not harmless: the Pi is IST today, and the failure mode if it ever
+#: is not would be a monitor that thinks the market is shut, or a token it
+#: reads as stale, or a daily nag that fires twice — silently, at the open.
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def now_ist() -> datetime:
+    """IST wall-clock, returned NAIVE.
+
+    Naive on purpose. Every comparison in this module is naive-vs-naive
+    (`datetime.combine(today, MARKET_OPEN)`, the `.time()` gates), and handing
+    back an aware datetime would raise `TypeError: can't compare offset-naive
+    and offset-aware` at a session gate — turning a timezone tidy-up into an
+    outage on the money path. This changes WHICH wall clock is read, never the
+    arithmetic that reads it.
+
+    Goes through `datetime.now(...)` rather than `date.today()` so that
+    `bcs/tests/replay.py`'s ReplayClock — which substitutes this module's
+    `datetime` with a subclass whose `.now()` ignores its tz argument — keeps
+    driving it. A helper the harness cannot reach would make every replay run
+    on the wall clock.
+    """
+    return datetime.now(IST).replace(tzinfo=None)
+
+
+def today_ist() -> date:
+    """The IST trading date. See `now_ist`."""
+    return now_ist().date()
+
+
 # ── Market & Price ───────────────────────────────────────────────────────────
 
 def is_market_open() -> bool:
     """Check if within NSE trading hours."""
-    now = datetime.now().time()
+    now = now_ist().time()
     return MARKET_OPEN <= now < MARKET_CLOSE
 
 
@@ -688,7 +728,7 @@ def get_option_depth(kite: KiteConnect, exchange: str, symbol: str,
                 ltt_dt = ltt
             else:
                 ltt_dt = datetime.strptime(str(ltt)[:19], '%Y-%m-%d %H:%M:%S')
-            traded_today = (ltt_dt.date() == date.today())
+            traded_today = (ltt_dt.date() == today_ist())
             if traded_today:
                 ltp_fresh = (datetime.now() - ltt_dt).total_seconds() <= LTP_FRESH_SEC
     except Exception:
@@ -1033,8 +1073,8 @@ def is_market_settled() -> bool:
     Returns True once MARKET_OPEN_BUFFER_SEC has elapsed after open.
     """
     from datetime import timedelta
-    settle_time = datetime.combine(date.today(), MARKET_OPEN) + timedelta(seconds=MARKET_OPEN_BUFFER_SEC)
-    return datetime.now() >= settle_time
+    settle_time = datetime.combine(today_ist(), MARKET_OPEN) + timedelta(seconds=MARKET_OPEN_BUFFER_SEC)
+    return now_ist() >= settle_time
 
 
 # ── Resumption after an interruption ───────────────────────────────────────
@@ -1093,7 +1133,7 @@ def is_spread_settled(now: Optional[float] = None) -> bool:
     Also False during a post-interruption buffer — see note_poll.
     """
     from datetime import timedelta
-    settle_time = datetime.combine(date.today(), MARKET_OPEN) + timedelta(seconds=SPREAD_TRIGGER_OPEN_BUFFER_SEC)
+    settle_time = datetime.combine(today_ist(), MARKET_OPEN) + timedelta(seconds=SPREAD_TRIGGER_OPEN_BUFFER_SEC)
     if datetime.now() < settle_time:
         return False
     now = time.time() if now is None else now
@@ -1213,7 +1253,7 @@ def is_expiry_day(trade: dict, today: Optional[date] = None) -> bool:
     try:
         expiry_str = trade.get('expiry', '')
         expiry_date = datetime.strptime(expiry_str, '%Y-%m-%d').date()
-        return (today or date.today()) == expiry_date
+        return (today or today_ist()) == expiry_date
     except (ValueError, TypeError):
         return False
 
@@ -1241,30 +1281,30 @@ EXPIRY_WARN_SESSIONS = 5        # warn one session BEFORE the ramp starts
 def sessions_to_expiry(trade: dict, today: Optional[date] = None) -> Optional[int]:
     """Trading sessions remaining, expiry inclusive. 0 = expiry day.
 
-    Counts WEEKDAYS, not calendar days: over a weekend a calendar count reads
+    Counts SESSIONS, not calendar days: over a weekend a calendar count reads
     "3 days left" when only one session remains, which is precisely when this
     warning matters most.
 
-    No holiday calendar exists in this repo, so a holiday inside the window
-    makes this an OVER-estimate — it will say more sessions remain than really
-    do. That is why the warning threshold sits one session before the ramp
-    starts: it absorbs a single holiday. It is not a substitute for a real
-    calendar, and a long holiday stretch will still surprise it.
+    **Holidays included since 2026-08-29 (M4/M10).** This used to skip
+    weekends and nothing else, and the omission pointed the wrong way against
+    real money: a holiday inside the window made this an OVER-estimate — more
+    sessions reported than remain — so the close fired LATER, while NSE moves
+    each delivery-margin tranche EARLIER around a holiday (it collects a
+    holiday's margins on the preceding session). The two errors compounded in
+    one direction, and that direction is "still holding when the ramp starts".
+
+    `common/nse_holidays.py` is a STATIC list with a coverage window. Past it
+    this degrades to weekday-only — the old behaviour — and says so in the
+    log rather than continuing to look authoritative.
     """
     try:
         expiry = datetime.strptime(trade.get('expiry', ''), '%Y-%m-%d').date()
     except (ValueError, TypeError):
         return None
-    d = today or date.today()
+    d = today or today_ist()
     if expiry < d:
         return 0
-    sessions = 0
-    cur = d
-    while cur < expiry:
-        cur += timedelta(days=1)
-        if cur.weekday() < 5:
-            sessions += 1
-    return sessions
+    return nse_holidays.sessions_between(d, expiry, warn=log)
 
 
 def time_stop_due(trade: dict, today: Optional[date] = None) -> bool:
@@ -1343,7 +1383,7 @@ def time_stop_window_open(now_time: Optional[dtime] = None) -> bool:
     Trivial on its own; it exists so the three places that ask cannot drift
     apart, which is the single most frequent bug shape in this codebase.
     """
-    now_time = datetime.now().time() if now_time is None else now_time
+    now_time = now_ist().time() if now_time is None else now_time
     return now_time >= EXPIRY_FORCE_CLOSE_TIME
 
 
@@ -1431,7 +1471,7 @@ def record_time_stop_result(state: dict, success, trade: dict, store,
     an abort that repeats every five seconds is a spin, not a retry.
     """
     now = time.time() if now is None else now
-    now_time = datetime.now().time() if now_time is None else now_time
+    now_time = now_ist().time() if now_time is None else now_time
 
     if success == 'ABORT':
         state['state'] = 'armed'
@@ -1533,7 +1573,7 @@ def arm_time_stop(trade: dict, key, expiry_trades: dict, label: str,
     """
     if key in expiry_trades or not time_stop_due(trade, today):
         return False
-    stamp = (today or date.today()).isoformat()
+    stamp = (today or today_ist()).isoformat()
     state = new_time_stop_state(trade, stamp)
     expiry_trades[key] = state
     tail = f" ({note})" if note else ''
@@ -1648,7 +1688,7 @@ def maybe_warn_expiry_proximity(store, trade: dict, spot: float, label: str,
     sessions = sessions_to_expiry(trade, today)
     if sessions is None or sessions > EXPIRY_WARN_SESSIONS or sessions <= 0:
         return False        # expiry day has its own force-close path
-    stamp = (today or date.today()).isoformat()
+    stamp = (today or today_ist()).isoformat()
     if trade.get('expiry_warn_date') == stamp:
         return False        # already nagged today; survives a monitor restart
 
@@ -2213,7 +2253,7 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
     for attempt in range(1, max_attempts + 1):
         # ── Order-time cutoff, re-checked EVERY attempt ───────────────
         cutoff = HARD_ORDER_CUTOFF_TIME if urgent else LAST_ORDER_TIME
-        if datetime.now().time() > cutoff:
+        if now_ist().time() > cutoff:
             log(f"    ORDER CUTOFF: {datetime.now().strftime('%H:%M:%S')} > {cutoff.strftime('%H:%M')} "
                 f"({'urgent' if urgent else 'normal'}). No more orders for {symbol}.")
             send_telegram(f"Order cutoff reached closing {symbol} — "
@@ -2653,7 +2693,7 @@ def recovery_gate(trade, rclass, *, now=None, now_time=None,
     """
     cf = trade.get('close_failure') or {}
     now = time.time() if now is None else now
-    now_time = datetime.now().time() if now_time is None else now_time
+    now_time = now_ist().time() if now_time is None else now_time
 
     if rclass in (RC_NO_ORDERS, RC_FLAT):
         return False, 'class %s never orders' % rclass
@@ -2778,7 +2818,7 @@ def _escalate_recovery(store, trade, label, cf, why, nagged):
         _persist_recovery(store, trade, cf)
         _recovery_event('recovery_exhausted', store=label, id=trade['id'],
                         cause=cf.get('cause'))
-    key = (label, trade['id'], cf.get('cause'), date.today().isoformat())
+    key = (label, trade['id'], cf.get('cause'), today_ist().isoformat())
     if key in nagged:
         return
     nagged.add(key)
@@ -3244,7 +3284,7 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
             return 'ABORT'
 
     # ── Late-day guard (urgent closes are reduce-only and get 5 more min) ──
-    now_t = datetime.now().time()
+    now_t = now_ist().time()
     cutoff = HARD_ORDER_CUTOFF_TIME if urgent else LAST_ORDER_TIME
     if now_t > cutoff:
         log(f"  LATE-DAY GUARD: {now_t.strftime('%H:%M')} > {cutoff.strftime('%H:%M')}.")
@@ -4095,7 +4135,7 @@ def _resolve_residue(store, trade, label, nagged):
         "is needed." % (label, trade['id'], trade.get('stock', '?')),
         alert_class=alert_policy.SAFETY)
     nagged.discard((label, trade['id'], 'reconcile_residue',
-                    date.today().isoformat()))
+                    today_ist().isoformat()))
 
 
 def sweep_reconcile_residue(kite, books, *, nagged=None):
@@ -4188,7 +4228,7 @@ def _nag_residue(label, trade, detail, nagged):
     is right, and one that repeats every five seconds trains the reader to
     swipe it away, which is the same thing as silencing it.
     """
-    key = (label, trade['id'], 'reconcile_residue', date.today().isoformat())
+    key = (label, trade['id'], 'reconcile_residue', today_ist().isoformat())
     if key in nagged:
         return
     nagged.add(key)
@@ -5646,7 +5686,7 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
     """
     store = get_store()
     stock = trade['stock']
-    set_log_file(LOG_DIR / f"spread_monitor_{stock}_{date.today().strftime('%Y%m%d')}.log")
+    set_log_file(LOG_DIR / f"spread_monitor_{stock}_{today_ist().strftime('%Y%m%d')}.log")
 
     entry_net = trade['net_debit']
     trail_engage_level = entry_net * TRAIL_ENGAGE_MULTIPLIER
@@ -5737,7 +5777,7 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
     while True:
         try:
             if not is_market_open():
-                now_t = datetime.now().time()
+                now_t = now_ist().time()
                 if now_t > MARKET_CLOSE:
                     log("Market closed for the day. Exiting monitor.")
                     if ts['active']:
@@ -6601,7 +6641,7 @@ def clear_residue(kite, ref):
         print('Could not write the record: %s' % e)
         return 1
     _RECOVERY_NAGGED.discard(
-        (label, tid, 'reconcile_residue', date.today().isoformat()))
+        (label, tid, 'reconcile_residue', today_ist().isoformat()))
 
     if still:
         detail = '; '.join('%s net %+d' % (s_, q) for s_, q in still.items())
@@ -6706,7 +6746,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     bps_store = get_bps_store()
     wl_store = get_watchlist_store()
     zebra_store = _open_zebra_store()
-    set_log_file(LOG_DIR / f"spread_monitor_cron_{date.today().strftime('%Y%m%d')}.log")
+    set_log_file(LOG_DIR / f"spread_monitor_cron_{today_ist().strftime('%Y%m%d')}.log")
 
     # ── Recover trades stuck in 'closing' from a previous crash ─────────
     for label, store in [('BCS', bcs_store), ('BPS', bps_store), ('FH', fh_store),
@@ -6914,7 +6954,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     while True:
         try:
             if not is_market_open():
-                now_t = datetime.now().time()
+                now_t = now_ist().time()
                 if now_t > MARKET_CLOSE:
                     log("Market closed for the day. Cron monitor exiting.")
                     for (store_key, strat_key, tid_key), ts in trail_state.items():
@@ -7739,7 +7779,7 @@ def main():
         sys.exit(1)
 
     # ── Connect and run ──────────────────────────────────────────────────
-    set_log_file(LOG_DIR / f"spread_monitor_{stock}_{date.today().strftime('%Y%m%d')}.log")
+    set_log_file(LOG_DIR / f"spread_monitor_{stock}_{today_ist().strftime('%Y%m%d')}.log")
     log(f"Loading Kite token from {TOKEN_FILE}...")
     kite = load_kite()
     log("Kite authenticated.")

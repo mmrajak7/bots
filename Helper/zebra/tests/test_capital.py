@@ -58,21 +58,39 @@ def closed(pnl_net=None, **kw):
 # ── the owner's scheme, as one coherent thing ───────────────────────────────
 
 def test_the_shipped_numbers_are_the_owners_numbers():
-    """Rs 2L, 8 slots, Rs 25,000 each. If any of the three drifts, the other
-    two silently stop meaning what they were chosen to mean."""
+    """Rs 2L, 4 LIVE slots, Rs 25,000 each. If any of the three drifts, the
+    other two silently stop meaning what they were chosen to mean.
+
+    8 -> 4 on 2026-08-29 (M9). The owner's words, 2026-08-27: "start at 4
+    slots, move to 8 once it is going well". LIVE guidance only — paper does
+    not cap, deliberately, so the cohort's evidence accrues at full rate.
+    """
     L = capital.limits([])
     assert L.capital == 200000
-    assert L.max_open == 8
+    assert L.max_open == 4
     assert L.max_trade == 25000
     assert L.max_lots == 1
 
 
-def test_the_per_trade_cap_is_exactly_one_slot():
-    """8 x 12.5% = 100%. Stored as ratios so the whole scheme scales on ONE
-    number; stored as three rupee figures they drift apart the first time
-    capital moves, and nothing announces it."""
+def test_the_per_trade_cap_is_still_one_EIGHTH_of_capital():
+    """The per-trade cap did NOT move with the slot count, and that is the
+    point of the change.
+
+    It used to be asserted as `max_trade * max_open == max_deployed`, which
+    held only because 8 x 12.5% happens to be 100%. That was a coincidence of
+    the old slot count being asserted as a rule: raising the per-trade share
+    to 25% to restore it would keep total deployment identical and DOUBLE the
+    size of each position — the opposite of "start at 4 slots". Fewer
+    positions is the whole request.
+
+    So the ratio is what is pinned, and `max_deployed` is now a ceiling that
+    cannot bind (4 x 25,000 = Rs 1L against a Rs 2L cap). Stored as ratios so
+    the scheme still scales on ONE number; stored as rupee figures they drift
+    apart the first time capital moves and nothing announces it.
+    """
     L = capital.limits([])
-    assert L.max_trade * L.max_open == pytest.approx(L.max_deployed)
+    assert L.max_trade == pytest.approx(L.capital / 8)
+    assert L.max_trade * L.max_open == pytest.approx(L.max_deployed / 2)
 
 
 # ── capital-driven sizing: the compounding the owner asked for ──────────────
@@ -269,7 +287,7 @@ def test_describe_states_the_capital_and_everything_derived():
     assert 'CAPITAL Rs 200000' in d and 'base' in d
     assert '1 lot(s)/position' in d
     assert 'Rs 25000 (12.5%)' in d          # the owner's per-trade figure
-    assert 'max 8 open' in d
+    assert 'max 4 open' in d                # M9: LIVE slots, 8 -> 4
 
 
 def test_describe_reports_what_compounding_would_give():
@@ -441,11 +459,23 @@ def test_compounding_is_read_strictly():
 
 #: Keys where the code fallback and the tracked defaults file disagree.
 #:
-#: They are not equivalent: `config/zebra_config.defaults.json` is a real
-#: config LAYER and wins at runtime, so for these two the `_DEFAULTS` value in
-#: `config.py` is dead and reading it gives the wrong answer. Both predate the
-#: capital work and are left as they are pending an owner decision — the
-#: effective values (0.015 / 5) are the ones the book has been running on.
+#: EMPTY since 2026-08-29 (M1/M10) — the two sources now agree on every key.
+#:
+#: They were never equivalent: `config/zebra_config.defaults.json` is a real
+#: config LAYER and wins at runtime, so a differing `_DEFAULTS` value in
+#: `config.py` is DEAD, and reading it gives the wrong answer — a fallback
+#: that takes effect only if the config file goes missing, i.e. exactly when
+#: nobody would notice the gate had moved.
+#:
+#: How the last two were settled:
+#:   `max_leg_spread_pct` 0.01/0.015 — aligned the dead fallback UP to the
+#:   live 0.015. Not a threshold change; it is measurement-only for BCS and
+#:   governs the retired back-ratio path.
+#:   `time_sl_days_before_expiry` 4/5 — BOTH set to 6 from the M10 delivery-
+#:   margin research (NSE ramps 10/25/45/70% over E-4..E-1 on the long ITM leg
+#:   AT STRIKE; the broker does not net the legs; a holiday moves the ramp
+#:   EARLIER while a weekday count moves the close LATER). 4 sat inside the
+#:   ramp outright and 5 is clear only in a holiday-free month.
 #:
 #: `max_dte` came OFF this list on 2026-08-27: the owner settled it at 45, the
 #: documented cohort rule and the value `_DEFAULTS` already carried. The 55 in
@@ -456,10 +486,7 @@ def test_compounding_is_read_strictly():
 #: The list exists so a NEW divergence fails here instead of being discovered
 #: the way these were: by a mutation that changed a default and altered
 #: nothing.
-KNOWN_DEFAULT_DRIFT = {
-    'max_leg_spread_pct': (0.01, 0.015),
-    'time_sl_days_before_expiry': (4, 5),
-}
+KNOWN_DEFAULT_DRIFT = {}
 
 
 def test_the_two_default_sources_do_not_drift_further():

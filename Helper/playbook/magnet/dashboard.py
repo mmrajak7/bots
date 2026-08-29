@@ -529,23 +529,57 @@ def _days_since(date_str: Optional[str]) -> Optional[int]:
         return None
 
 
+def _closed_verdict(reason) -> str:
+    """N12. One vocabulary for exit reasons, borrowed rather than re-invented.
+
+    What stood here was substring matching: `any(x in reason for x in
+    ('tp', 'target'))` fires on `already_flat_tp` — a close where the monitor
+    found NO LEGS at the broker and placed no orders — and reports it as a
+    plain TP HIT. Its SL list named `sl_spot`/`sl_cost`/`sl_time` and missed
+    `sl_spread` outright, so the debit stop, which is the one this book
+    actually fires, read as a bare EXITED.
+
+    `zebra.outcomes.classify` is the fleet's single exit-reason vocabulary
+    (built after the same defect cleared an ARMING GATE with a take-profit).
+    This subsystem is DEPRECATED and silenced, and it reads its own archived
+    store — so the stakes are a stale dashboard, not money. It is fixed anyway
+    because a second vocabulary is how the first one drifts, and because the
+    next person to read this file should not learn the wrong pattern from it.
+
+    Falls back to the old shape only when `zebra` is not importable: this
+    module must keep working standalone against an archived JSON.
+    """
+    raw = (reason or '')
+    try:
+        from zebra.outcomes import classify
+        c = classify(raw)
+    except Exception:
+        c = None
+    if c and c.get('known'):
+        kind = c['kind']
+        if kind == 'tp':
+            # `already_flat_tp` is NOT a plain TP: nothing was traded, the
+            # legs were gone before we looked. Saying so is the whole point.
+            return 'TP HIT (flat)' if c.get('recovered') else 'TP HIT'
+        if kind == 'expiry':
+            return 'EXPIRED'
+        return 'SL HIT'
+    low = raw.lower()
+    if 'expir' in low:
+        return 'EXPIRED'
+    if 'stale' in low:
+        return 'STALE'
+    return 'EXITED'
+
+
 def _classify_opportunity(rec: dict) -> str:
     """Verdict tag: TP HIT / SL HIT / EXPIRED / CANCELLED / LIVE / PAST TGT /
     CHASED / STALE / STOPPED / NO DATA."""
     # Closed trades first
     if rec.get('row_status') == 'closed':
-        reason = (rec.get('exit_reason') or '').lower()
         if rec.get('exit_type') == 'cancelled':
             return 'CANCELLED'
-        if any(x in reason for x in ('tp', 'target')):
-            return 'TP HIT'
-        if any(x in reason for x in ('sl_spot', 'sl_cost', 'sl_time', 'sl ', 'stop')):
-            return 'SL HIT'
-        if 'expir' in reason:
-            return 'EXPIRED'
-        if 'stale' in reason:
-            return 'STALE'
-        return 'EXITED'
+        return _closed_verdict(rec.get('exit_reason'))
 
     now = rec.get('spot_now')
     tgt = rec.get('target')

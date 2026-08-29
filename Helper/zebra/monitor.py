@@ -39,6 +39,7 @@ from . import mfe as mfe_mod
 from . import outcomes as outcomes_mod
 from . import postmortem as postmortem_mod
 from . import review as review_mod
+from common import nse_holidays
 from . import strikes as strikes_mod
 from . import vet as vet_mod
 from .scanner import _get_kite, get_ltp, compute_st_for_stock, validate_and_add
@@ -64,15 +65,15 @@ def _send_telegram(msg: str, dry_run: bool = False) -> bool:
         print(f"[DRY] Telegram:\n{safe}\n")
         return True
 
-    # Honor zebra_config.json telegram.enabled flag
-    try:
-        with open(cfg.CONFIG_FILE) as f:
-            zcfg = json.load(f)
-        if zcfg.get('telegram', {}).get('enabled') is False:
-            logger.debug("Telegram disabled in zebra_config.json")
-            return True
-    except Exception:
-        pass
+    # M8. Through the MERGED config, not by opening the overlay file.
+    # This used to `json.load(cfg.CONFIG_FILE)`, which is the untracked
+    # secrets overlay ALONE — so `telegram.enabled` in the tracked defaults
+    # had no effect, and on a box whose overlay has been trimmed to secrets
+    # (all of them since 2026-08-26) the key was simply absent. A switch that
+    # only works from the layer you are not supposed to edit is not a switch.
+    if not cfg.TELEGRAM_ENABLED:
+        logger.debug("Telegram disabled by config (telegram.enabled=false)")
+        return True
 
     global _tg_cfg, _tg_loaded
     try:
@@ -1207,6 +1208,55 @@ def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
     return fresh
 
 
+#: M2. Wall-clock an ENTRY phase may spend in one cycle, in seconds.
+#:
+#: The arithmetic it bounds: one leg can spend `ENTRY_MAX_ATTEMPTS` (2) x
+#: (`ORDER_WAIT_SEC` 30 + a 5s re-quote sleep) = 70s, there are two legs per
+#: round and one round per lot -- so ~140s for a single one-lot spread, and
+#: `check_watching` can enter several signals in a cycle. Four of them is
+#: ~9 minutes against a 5-minute cron whose `flock -n` SKIPS the next run.
+#: Exit monitoring would then not run for ten minutes because an ENTRY was
+#: slow, which inverts the ordering `run_cycle` was deliberately given.
+#:
+#: 180s leaves a one-lot entry its full two attempts on both legs and refuses
+#: to START a second one that could push the cycle past the cron interval.
+ENTRY_PHASE_BUDGET_SEC = 180
+
+#: Set at the top of each entry phase; None outside one. Module-level rather
+#: than threaded through, because the check belongs at the ONE place a new
+#: entry begins and the callers between here and there carry no cycle state.
+_entry_deadline = None
+
+
+def entry_budget_open(now=None) -> bool:
+    """May a NEW entry start? True when no budget is armed.
+
+    Checked only BEFORE an entry begins, never during one. A budget that could
+    interrupt a running entry would abandon it between the long leg and the
+    short -- an ORPHAN LONG, which is a real position nobody asked for. The
+    safe granularity is whole entries: a signal not started stays 'triggered'
+    and the next cycle picks it up, and a missed entry costs nothing
+    (`feedback_no_rush_to_enter`).
+    """
+    if _entry_deadline is None:
+        return True
+    return (time.time() if now is None else now) < _entry_deadline
+
+
+def start_entry_phase(now=None) -> None:
+    """Arm the budget for this cycle."""
+    global _entry_deadline
+    _entry_deadline = (time.time() if now is None else now) \
+        + ENTRY_PHASE_BUDGET_SEC
+
+
+def end_entry_phase() -> None:
+    """Disarm. An armed budget leaking into the next phase would refuse
+    entries for reasons that have nothing to do with this cycle."""
+    global _entry_deadline
+    _entry_deadline = None
+
+
 def _entries_allowed_or_log(trade: dict) -> tuple:
     """The auto-entry gate, with one log line either way.
 
@@ -1215,6 +1265,17 @@ def _entries_allowed_or_log(trade: dict) -> tuple:
     book has been bitten by exactly that ambiguity before.
     """
     from bcs import entry_executor as ee
+    # M2. The cycle's wall clock, BEFORE the arming switch, because a blown
+    # budget is a fact about this cycle rather than about the configuration --
+    # and it must be logged even on a box where auto-entry is off, or the
+    # budget would first be observed on the day it starts mattering.
+    if not entry_budget_open():
+        logger.warning(
+            "ENTRY BUDGET SPENT (%ds) -- not starting #%d %s this cycle. It "
+            "stays 'triggered' and the next cycle picks it up; exit "
+            "monitoring is not delayed further.",
+            ENTRY_PHASE_BUDGET_SEC, trade['id'], trade['stock'])
+        return False, 'entry phase budget spent'
     allowed, why = ee.entries_allowed(log=lambda m: logger.warning('%s', m))
     if not allowed:
         logger.info("AUTO-ENTRY off for #%d %s (%s) -- sending the ticket",
@@ -1902,12 +1963,14 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # the analyzer anyway. The band is re-checked above every cycle, so
             # a queued signal whose price left the zone is drift-cancelled by
             # the machinery that already exists.
-            # ALLOWED / UNAVAILABLE → enter now (re-running the analyzer for a
-            # fresh book; entry drift ≤ one tick is the accepted cost of
-            # vetting). None → the vet request never landed (crash after
+            # ALLOWED → enter now (re-running the analyzer for a fresh book;
+            # entry drift ≤ one tick is the accepted cost of vetting).
+            # None → the vet request never landed (crash after
             # mark_triggered): fall through so the gate below re-requests it —
             # recoverable instead of parked until drift-cancel.
-            if state in (vet_mod.ALLOWED, vet_mod.UNAVAILABLE) \
+            #
+            # M6: UNAVAILABLE is NOT an entry state — see the gate below.
+            if state == vet_mod.ALLOWED \
                     and not cfg.PAPER_MODE \
                     and (store.find(trade['id']) or {}).get('vet_enter_alerted_at'):
                 continue    # LIVE: the order-ticket alert already went out
@@ -2095,15 +2158,36 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     logger.error("Veto shadow failed for #%d: %s",
                                  trade['id'], e)
                 continue
-            elif state not in (vet_mod.ALLOWED, vet_mod.UNAVAILABLE):
+            elif state != vet_mod.ALLOWED:
                 # EXPLICIT allowlist, not a bare fall-through. Entering was the
                 # DEFAULT for any state without an `elif` above, so adding a
                 # state to the machine silently meant "enter unvetted" — which
                 # is exactly what STARVED must never do.
+                #
+                # M6 (2026-08-29): UNAVAILABLE CAME OFF THIS ALLOWLIST.
+                #
+                # It means "the vet request could not even be made" — a lock
+                # timeout, an IO error, no agent slot. Letting it enter made an
+                # entry that was never reviewed indistinguishable from one that
+                # was reviewed and cleared, and that contradicts the standing
+                # rule this whole layer exists to serve: ENTRIES FAIL CLOSED.
+                # A missed entry costs nothing; an unqualified one costs
+                # capital (`feedback_no_rush_to_enter`).
+                #
+                # **EXITS ARE THE OPPOSITE and must stay that way.**
+                # `vet.exit_gate` returns 'proceed' on UNAVAILABLE, on purpose:
+                # there the bounded outcome is ACTING, and an exit deadline
+                # that depends on an LLM being reachable is how a stop stops
+                # working. Same word, opposite safe direction, because the two
+                # sides have opposite asymmetries. Do not "unify" them.
+                #
+                # This branch was unreachable before today — `mark_unavailable`
+                # (`zebra/vet.py`) has never had a caller, which is why the
+                # contradiction survived. It is now safe to wire in.
                 logger.info("NO ENTRY #%d %s — vet state %r is not an entry "
                             "state", trade['id'], stock, state)
                 continue
-            # ALLOWED or UNAVAILABLE fall through and enter below.
+            # Only ALLOWED falls through and enters below.
 
         # PAPER mode: auto-record the entry FIRST, then alert — so the ENTER
         # alert only goes out for a position that actually opened. If the fill
@@ -2364,18 +2448,23 @@ def _quote_zebra_value(kite, trade: dict) -> Optional[float]:
 def _sessions_left(today, expiry) -> int:
     """Trading sessions from `today` (exclusive) to `expiry` (inclusive).
 
-    Weekdays only. Returns 0 on or after expiry day. Holidays are not known to
-    this repo, so a holiday inside the window makes this an OVER-estimate —
-    it reports more sessions than really remain, never fewer.
+    **Holidays included since 2026-08-29 (M4/M10)**, through the SAME module
+    the order engine uses (`common/nse_holidays.py`). Two counters that
+    disagreed about how many sessions remain would put the two engines
+    managing one position on different close dates — the copy-nobody-opens
+    shape, applied to a date.
+
+    It used to be weekdays-only, and that error was not neutral: a holiday
+    inside the window made it an OVER-estimate, so the close fired LATER,
+    while NSE moves each delivery-margin tranche EARLIER around a holiday.
+    Both errors pointed at "still holding when the ramp starts".
+
+    Returns 0 on or after expiry day.
     """
     if expiry <= today:
         return 0
-    sessions, cur = 0, today
-    while cur < expiry:
-        cur += timedelta(days=1)
-        if cur.weekday() < 5:
-            sessions += 1
-    return sessions
+    return nse_holidays.sessions_between(
+        today, expiry, warn=lambda m: logger.warning('%s', m))
 
 
 def _flush_mfe(store: ZebraStore, pending: dict) -> None:
@@ -3672,10 +3761,19 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
             validate_and_add(store, kite=kite, dry_run=dry_run)
         except Exception as e:
             logger.error("Scanner cycle failed: %s", e, exc_info=True)
+    # M2. `check_watching` is where entries are placed, and a slow multi-lot
+    # entry used to be able to run the cycle past the 5-minute cron interval --
+    # whose `flock -n` then SKIPS the next run, so the phase that manages open
+    # risk does not execute for ten minutes because an entry was slow. The
+    # EXITS-FIRST ordering above fixed the within-cycle half of that; this
+    # bounds the across-cycle half.
+    start_entry_phase()
     try:
         check_watching(store, kite, dry_run=dry_run)
     except Exception as e:
         logger.error("Watching cycle failed: %s", e, exc_info=True)
+    finally:
+        end_entry_phase()
     # Everything below is OBSERVATION, never trading. It runs last and each
     # piece is independently caught, so a failure in the learning/monitoring
     # half can never stop the half that trades.

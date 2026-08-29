@@ -1216,14 +1216,19 @@ def mark_unavailable(store, trade_id: int, why: str,
     `failed_open_because` is kept so the forensic record says WHICH kind of
     outage this was.
 
-    WARNING — currently UNCALLED (verified 2026-08-27; no caller anywhere in
-    the tree). `UNAVAILABLE` is meant to mean "vetting could not even be
-    requested", but `zebra/monitor.py` treats `UNAVAILABLE` exactly like
-    `ALLOWED` — it lets the signal enter (see the `state in (vet_mod.ALLOWED,
-    vet_mod.UNAVAILABLE)` checks there). So wiring this function in without
-    also reviewing that treatment would let an entry-that-was-never-vetted
-    proceed as if it had been reviewed and cleared, not merely as a fail-open.
-    Needs a code decision, not a doc fix — see the review notes for this file.
+    Still UNCALLED, but SAFE TO WIRE IN since 2026-08-29 (M6).
+
+    It used to carry a warning here: `zebra/monitor.py` treated `UNAVAILABLE`
+    exactly like `ALLOWED` on the ENTRY path, so stamping it would have let an
+    entry that was never reviewed proceed as though it had been reviewed and
+    cleared. That was decided rather than documented — UNAVAILABLE came off
+    the entry allowlist, because entries FAIL CLOSED: a missed entry costs
+    nothing, an unqualified one costs capital.
+
+    The EXIT path still proceeds on UNAVAILABLE (`exit_gate`), and that
+    asymmetry is deliberate: there the bounded outcome is ACTING, and an exit
+    deadline that depends on an LLM being reachable is how a stop stops
+    working. Same word, opposite safe direction.
     """
     now = now or _now()
     with store._mutate():
