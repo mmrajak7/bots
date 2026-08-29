@@ -199,6 +199,26 @@ def test_the_engine_checks_coverage_every_cycle():
     assert '_alert_calendar_coverage' in inspect.getsource(monitor.run_cycle)
 
 
+def test_a_HEALTHY_calendar_still_says_so_in_the_log():
+    """A check that is silent when it passes cannot be confirmed working.
+
+    This logged the healthy case at `debug` until the owner said they would
+    watch the Pi logs for it — which would have shown nothing, leaving "the
+    calendar is fine" and "the check is not wired in" looking identical. The
+    same distinction `test_the_M10_worked_example` exists for.
+
+    RETIRES WHEN: the cycle prints one status block assembled from every
+    input-freshness check, so no check chooses its own visibility.
+    """
+    import inspect
+    from zebra import monitor
+    src = inspect.getsource(monitor._alert_calendar_coverage)
+    i = src.index("st['state'] == 'ok'")
+    assert 'logger.info' in src[i:i + 500], (
+        'the healthy calendar is not logged at INFO — a passing check that '
+        'says nothing cannot be observed passing')
+
+
 def test_a_broken_calendar_is_alerted_DAILY_and_a_lapsing_one_weekly():
     """`expiring` is a diary note about December; the other four mean the
     session counts have ALREADY degraded. Same fault class, same cadence.

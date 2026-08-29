@@ -3240,7 +3240,12 @@ def _alert_calendar_coverage(dry_run: bool = False) -> Optional[str]:
     # move the lapse warning by a day on a UTC box.
     st = nse_holidays.coverage_status(datetime.now(IST).date())
     if st['state'] == 'ok':
-        logger.debug('NSE holiday calendar %s', st['detail'])
+        # INFO, not debug. A healthy calendar that logs NOTHING is
+        # indistinguishable from a check that is not wired in, which is the
+        # distinction this whole file keeps insisting on -- and the calendar
+        # is being watched in the Pi logs precisely to confirm it works.
+        # One line per cron invocation, the same cadence as the capital line.
+        logger.info('NSE holiday calendar OK: %s', st['detail'])
         return None
     logger.warning('NSE HOLIDAY CALENDAR: %s', st['detail'])
     # Daily for anything that means the calendar is NOT WORKING right now;
