@@ -359,10 +359,77 @@ def test_the_sweep_is_wired_into_the_poll_loop_after_the_per_trade_work():
 
 
 def test_the_fh_book_is_wired_with_orders_disabled():
-    """The one place the alert-only decision is expressed."""
+    """The one place the alert-only decision is expressed.
+
+    Read as (store, orders_allowed) PAIRS rather than as source strings.
+    The first version of this guard asserted the literal text
+    `"('FH', fh_store, False)"`, which made it fail the moment the LABEL
+    changed spelling (N5 routed those through `STORE_TYPE_LABEL`) while the
+    decision it exists to protect had not moved at all — a spelling guard
+    wearing a property guard's name, `feedback_a_guard_can_pin_the_wrong_thing`.
+    What must never change silently is which book may place orders.
+    """
+    import ast
     import inspect
-    src = inspect.getsource(sm.monitor_all)
-    assert "('FH', fh_store, False)" in src
-    for book in ("('BCS', bcs_store, True)", "('BPS', bps_store, True)",
-                 "('COHORT', zebra_store, True)"):
-        assert book in src
+    tree = ast.parse(inspect.getsource(sm.monitor_all).lstrip())
+    pairs = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign)
+                and any(getattr(t, 'id', None) == 'frozen_books'
+                        for t in node.targets)):
+            continue
+        for elt in node.value.elts:
+            store = elt.elts[1].id                    # bcs_store, fh_store, ...
+            pairs[store] = elt.elts[2].value          # orders_allowed
+    assert pairs, 'frozen_books is no longer a literal list of tuples'
+    assert pairs['fh_store'] is False, (
+        'FALLEN HERO IS ALERT-ONLY (owner, 2026-08-28) — this monitor places '
+        'no FH order anywhere, and its frozen records are nagged, never '
+        'traded')
+    for store in ('bcs_store', 'bps_store', 'zebra_store'):
+        assert pairs[store] is True, store
+
+
+# ── N5 · a recovery order must name its book on the journal line ────────────
+
+def test_a_recovery_order_carries_the_BOOK_on_its_journal_line(spy, monkeypatch):
+    """`_store_type` is stamped by `_load_all_trades`, and a frozen record
+    never goes through it — the sweep reads the stores directly, which is the
+    whole point of it. Without the stamp the ONLY orders with no book on their
+    journal line would be the recovery orders: the ones placed on a position
+    nobody was watching, which is exactly when an incident report needs to
+    name it. All four books number from 1.
+    """
+    ctxs = []
+    real_ctx = sm._order_ctx
+    monkeypatch.setattr(sm, '_order_ctx',
+                        lambda *a, **k: ctxs.append(real_ctx(*a, **k)) or ctxs[-1])
+    store = MemoryStore(trades=[_frozen()])
+    kite = _broker([{'tradingsymbol': B_LONG, 'quantity': B_QTY}])
+    script = _LegScript(**{B_LONG: [_complete(B_QTY, 40.00)]})
+
+    assert _run(store, kite, monkeypatch, script) == 1
+
+    assert ctxs, 'the recovery built no order context at all'
+    assert all(c['book'] == 'bcs' for c in ctxs), [c['book'] for c in ctxs]
+    assert '_store_type' not in store.trades[0], (
+        'the sweep wrote a monitor-internal tag into the STORE record — '
+        '`get_frozen_trades` hands out the live dict on every book, so that '
+        'persists into the trade file on the next save')
+
+
+def test_the_sweep_label_and_the_journal_book_come_from_ONE_table():
+    """Two names for the same four books. A second hardcoded map is how the
+    sweep's `COHORT` and the journal's `zebra` drift apart."""
+    assert sm.LABEL_STORE_TYPE == {v: k for k, v in sm.STORE_TYPE_LABEL.items()}
+    assert sm.LABEL_STORE_TYPE['COHORT'] == 'zebra'
+
+
+def test_an_unknown_label_stamps_NOTHING_rather_than_guessing(spy, monkeypatch):
+    """A label the table does not know must leave `book` null. Inventing one
+    would put a confident wrong name in the forensic record."""
+    trade = _frozen()
+    trade.pop('_store_type', None)
+    trade.setdefault('_store_type', sm.LABEL_STORE_TYPE.get('NOSUCHBOOK'))
+    assert trade['_store_type'] is None
+    assert sm._order_ctx(trade, 'SL', 'short', 'BCS')['book'] is None

@@ -154,3 +154,60 @@ def test_the_gate_itself_short_circuits_on_the_flag(marker_spy):
     assert vet_mod.exit_gate(object(), dict(_TRADE), 'debit_sl', {},
                              100.0) == 'proceed'
     assert marker_spy == []
+
+
+# ── N7 · the spawn rail, proven rather than assumed ─────────────────────────
+#
+# A rail with no test that fires it is decoration. These are the companions to
+# `_no_real_agents` in conftest, and they exist because the flag rail above is
+# deliberately overridable: the moment a test here sets `VET_ENABLED` True, the
+# route from `_exit_cleared` -> `exit_gate` -> `_spawn_cli` reopens, and that
+# is exactly the route that wrote ~30 junk rows into the production decision
+# journal from zebra's suite in August.
+
+def test_the_named_spawn_doors_refuse():
+    from bcs.tests.conftest import RealAgentSpawnAttempted
+    from zebra import vet as vet_mod
+
+    for door in (vet_mod._spawn_generic, vet_mod._spawn_cli):
+        with pytest.raises(RealAgentSpawnAttempted):
+            door('prompt', 'model', 'tag')
+
+
+def test_the_POPEN_backstop_refuses_a_claude_command():
+    """The second layer. One SOURCE beats N call sites — it catches a future
+    spawn path that goes through neither named door, the same way the Telegram
+    rail guards `requests.post` and not only our own sender."""
+    import subprocess
+
+    from bcs.tests.conftest import RealAgentSpawnAttempted
+
+    with pytest.raises(RealAgentSpawnAttempted):
+        subprocess.Popen(['claude', '-p', 'hello'])
+    with pytest.raises(RealAgentSpawnAttempted):
+        subprocess.Popen('/usr/local/bin/claude --help')
+
+
+def test_the_backstop_is_a_guard_and_not_a_sandbox():
+    """Non-claude subprocesses still work. A rail that blocked every Popen
+    would be switched off by the first test that legitimately needed one,
+    which is how rails die."""
+    import subprocess
+    import sys
+
+    out = subprocess.check_output([sys.executable, '-c', 'print(1)'])
+    assert out.strip() == b'1'
+
+
+def test_the_spawn_rail_survives_monkeypatch_undo(monkeypatch):
+    """It rails against a MISTAKE, so it owns a private MonkeyPatch. The first
+    version of `_no_production_writes` took the shared one and its own proof
+    failed: `undo()` reverts every patch on that instance, so the rail was
+    removed by exactly the call it exists to catch.
+    """
+    from bcs.tests.conftest import RealAgentSpawnAttempted
+    from zebra import vet as vet_mod
+
+    monkeypatch.undo()
+    with pytest.raises(RealAgentSpawnAttempted):
+        vet_mod._spawn_cli(1)

@@ -292,3 +292,67 @@ def test_the_compare_output_is_pure_ascii(books, capsys):
     assert out.strip()
     assert not [c for c in out if ord(c) > 127]
     out.encode('cp1252')
+
+
+# ── N5 · the journal can NAME the book, so the collision resolves ───────────
+#
+# All four stores number their trades from 1, so `#1` on a journal line named
+# four different positions and this tool could only report the collision.
+# `context.book` (a `_store_type`) resolves it. Lines written before
+# 2026-08-29 do not carry it, and those stay AMBIGUOUS rather than guessing —
+# picking the first match would silently name the wrong position in the one
+# file that says what this engine intended to trade.
+
+def _booked_intent(trade_id, book, reason='TP'):
+    return oj.record_intent(
+        symbol='KOTAKBANK26SEP2100CE', txn_type='BUY', qty=400, price=12.5,
+        exchange='NFO', dry_run=True,
+        context={'trade_id': trade_id, 'book': book, 'stock': 'KOTAKBANK',
+                 'reason': reason, 'leg': 'short', 'strategy': 'BCS'})
+
+
+def test_a_colliding_id_is_resolved_by_the_book(books):
+    trades = [dict(bcs_row(1), _strategy='BCS'),
+              dict(zebra_row(1), _strategy='ZEBRA')]
+    assert 'AMBIGUOUS' in jr.match_state(trades, 1)
+    assert jr.match_state(trades, 1, book='zebra').startswith('store says ZEBRA#1')
+
+
+def test_an_OLD_line_without_a_book_still_reports_the_collision(books):
+    """The pre-2026-08-29 journal. Not resolvable, and it must not pretend to
+    be — but it now says WHY it cannot be, which is a different instruction to
+    the reader than "we cannot tell"."""
+    trades = [dict(bcs_row(1), _strategy='BCS'),
+              dict(zebra_row(1), _strategy='ZEBRA')]
+    out = jr.match_state(trades, 1, book=None)
+    assert 'AMBIGUOUS' in out and 'predates' in out
+
+
+def test_a_book_the_id_is_NOT_in_is_reported_not_swallowed(books):
+    """The journal and the stores disagreeing is the whole point of this tool.
+    Falling back to "well, there is one match, use that" would hide exactly
+    the disagreement it exists to surface."""
+    trades = [dict(bcs_row(7), _strategy='BCS')]
+    out = jr.match_state(trades, 7, book='zebra')
+    assert 'NOT in that book' in out and 'BCS' in out
+
+
+def test_the_compare_line_names_the_book(books, capsys):
+    books['ZEBRA'].append(zebra_row(419))
+    _booked_intent(419, 'zebra')
+    jr.compare_to_store()
+    out = capsys.readouterr().out
+    assert 'trade zebra#419' in out
+    assert 'ZEBRA#419' in out
+
+
+def test_orders_tagged_with_TWO_books_under_one_id_are_flagged(books, capsys):
+    """Should never happen. If it does, saying so is the report's job —
+    resolving it by picking one is the silent mis-naming this field ended."""
+    books['ZEBRA'].append(zebra_row(5))
+    books['BCS'].append(bcs_row(5))
+    _booked_intent(5, 'zebra')
+    _booked_intent(5, 'bcs')
+    jr.compare_to_store()
+    out = capsys.readouterr().out
+    assert '2 different books' in out

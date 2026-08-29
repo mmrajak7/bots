@@ -1870,15 +1870,38 @@ def round_to_tick(price: float) -> float:
     return round(round(price / TICK_SIZE) * TICK_SIZE, 2)
 
 
-def _order_ctx(trade: dict, reason: str, leg: str, strategy: str) -> dict:
+#: The frozen-book LABEL for each `_store_type`. One table, because the two
+#: vocabularies already exist and a third place inventing a third one is how
+#: they drift. `_load_all_trades` stamps the keys; `frozen_books` uses the
+#: values; `bcs/journal_report.py` reads the keys uppercased.
+STORE_TYPE_LABEL = {'bcs': 'BCS', 'bps': 'BPS', 'fh': 'FH', 'zebra': 'COHORT'}
+LABEL_STORE_TYPE = {v: k for k, v in STORE_TYPE_LABEL.items()}
+
+
+def _order_ctx(trade: dict, reason: str, leg: str, strategy: str,
+               book: Optional[str] = None) -> dict:
     """Why this order exists, for the journal.
 
     Deliberately only fields already on the record -- no re-derivation. A
     journal that computes anything can disagree with the system it is
     witnessing, and then it is evidence of nothing.
+
+    **N5 - `book` is not `strategy`.** `strategy` is the DIRECTION this
+    structure trades ('BCS' for a bull call spread, 'BPS' for a bear put), and
+    the cohort store holds BOTH, so it can never name which of the four books
+    a record came from. All four number their trades from 1, so `#1` on a
+    journal line named four different positions and `journal_report` could
+    only report the collision, never resolve it - in the one file that exists
+    to say what this engine intended to trade.
+
+    `book` is stamped even when it is None, and that is the point: a key
+    missing from a jsonl line and a key holding null read the same to a human
+    and differently to a reader. Null says WE LOOKED AND DID NOT KNOW, which
+    is a fact about the code path, not about the trade.
     """
     return {
         'trade_id': trade.get('id'),
+        'book': book or trade.get('_store_type'),
         'stock': trade.get('stock'),
         'strategy': strategy,
         'reason': reason,
@@ -2935,7 +2958,22 @@ def _recover_one(kite, label, store, orders_allowed, trade, net_by_symbol,
     result = _close_spread_inner(
         kite, store, trade, spot=None, reason=cf.get('reason') or 'RECOVERY',
         dry_run=dry_run, label=label, recovery=True,
-        recovery_urgent=urgent)
+        recovery_urgent=urgent,
+        # N5. `_store_type` is stamped by `_load_all_trades`, and a frozen
+        # record never went through it - the sweep reads the stores directly,
+        # which is the whole point of it. Without this the ONLY orders with no
+        # book on their journal line would be the RECOVERY orders: the ones
+        # placed on a position nobody was watching, which is exactly when an
+        # incident report needs to name it.
+        #
+        # Passed, never stamped onto the record. `get_frozen_trades` hands out
+        # the store's LIVE dict on every book, so writing a monitor-internal
+        # tag into it would persist `_store_type` into the trade file on the
+        # next save — the pollution `_load_all_trades` takes shallow copies to
+        # avoid. And it is passed rather than GUESSED from `label`: three of
+        # the four labels collide with strategy names, so a fallback would
+        # confidently file a cohort bull-call under 'bcs'.
+        book=LABEL_STORE_TYPE.get(label))
 
     if result is True:
         cf['state'] = 'resolved'
@@ -3397,7 +3435,8 @@ def _blend_fill(first_price, first_qty, retry_price, retry_qty):
 
 
 def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
-                        urgent=False, recovery=False, recovery_urgent=False):
+                        urgent=False, recovery=False, recovery_urgent=False,
+                        book=None):
     """Inner close logic, separated so close_spread() can wrap with try/except.
 
     **M14 recovery reuses this function rather than copying it.** It is already
@@ -3567,7 +3606,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
         short_result = close_leg(
             kite, exchange, short_sym, "BUY", close_qty, is_buy=True, dry_run=dry_run,
             urgent=(recovery_urgent if recovery else urgent),
-            context=_order_ctx(trade, reason, 'short', label),
+            context=_order_ctx(trade, reason, 'short', label, book=book),
             attempts=1 if recovery else None,
             allow_pay_through=(recovery_urgent if recovery else True)
         )
@@ -3628,7 +3667,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                 log(f"  RETRY: closing the {remaining} qty residual (urgent)")
                 retry = close_leg(kite, exchange, short_sym, "BUY", remaining,
                                   is_buy=True, dry_run=dry_run, urgent=True,
-                                  context=_order_ctx(trade, reason, 'short-retry', label))
+                                  context=_order_ctx(trade, reason, 'short-retry', label, book=book))
                 got = retry.get('filled_quantity', 0) if retry else 0
                 remaining -= got
                 log(f"  RETRY filled {got}; {remaining} still short")
@@ -3680,7 +3719,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
         long_result = close_leg(
             kite, exchange, long_sym, "SELL", close_qty, is_buy=False, dry_run=dry_run,
             urgent=long_urgent,
-            context=_order_ctx(trade, reason, 'long', label),
+            context=_order_ctx(trade, reason, 'long', label, book=book),
             attempts=1 if recovery else None,
             allow_pay_through=(recovery_urgent if recovery else True)
         )
@@ -3746,7 +3785,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                 log(f"  RETRY: closing the {remaining} qty residual (urgent)")
                 retry = close_leg(kite, exchange, long_sym, "SELL", remaining,
                                   is_buy=False, dry_run=dry_run, urgent=True,
-                                  context=_order_ctx(trade, reason, 'long-retry', label))
+                                  context=_order_ctx(trade, reason, 'long-retry', label, book=book))
                 got = retry.get('filled_quantity', 0) if retry else 0
                 remaining -= got
                 log(f"  RETRY filled {got}; {remaining} still long")
@@ -6701,8 +6740,14 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     # recovery sweep never runs. That is M14's own failure mode reproduced one
     # level up: a position live at the broker with dead stops, and a log line
     # saying there is nothing to watch.
-    frozen_books = [('BCS', bcs_store, True), ('BPS', bps_store, True),
-                    ('COHORT', zebra_store, True), ('FH', fh_store, False)]
+    #: Labels come from `STORE_TYPE_LABEL` rather than being typed again here,
+    #: so the sweep's `label` and the journal's `book` cannot drift apart.
+    #: FH carries orders_allowed=False: it is traded by hand (owner,
+    #: 2026-08-28) and this monitor places no FH order anywhere.
+    frozen_books = [(STORE_TYPE_LABEL['bcs'], bcs_store, True),
+                    (STORE_TYPE_LABEL['bps'], bps_store, True),
+                    (STORE_TYPE_LABEL['zebra'], zebra_store, True),
+                    (STORE_TYPE_LABEL['fh'], fh_store, False)]
     frozen_n = 0
     for _label, _store, _ in frozen_books:
         if _store is None:

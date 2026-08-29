@@ -147,28 +147,48 @@ def _describe(trade: dict) -> str:
     return bit
 
 
-def match_state(trades: List[dict], trade_id) -> str:
+def match_state(trades: List[dict], trade_id, book=None) -> str:
     """How the stores answer for one journalled trade id.
 
-    Ambiguity is REPORTED, never resolved. Ids collide across the four books
-    and the journal line carries only the number, so picking the first match
-    would silently name the wrong position in an incident report.
+    Ids collide across the four books - all of them number from 1 - so the
+    number alone names up to four different positions.
+
+    **N5.** Journal lines written from 2026-08-29 carry `context.book`, which
+    resolves the collision outright. Lines written before that do not, and
+    ambiguity there is still REPORTED, never resolved: picking the first match
+    would silently name the wrong position in an incident report. The two
+    cases are distinguished in the text, because "we cannot tell" and "this
+    journal is too old to say" need different responses from a reader.
     """
     if trade_id is None:
         return 'no trade id on the journal line'
     hits = [t for t in trades if t.get('id') == trade_id]
     if not hits:
         return 'not found in any store'
+    if book:
+        # `book` is a `_store_type` ('bcs'/'bps'/'fh'/'zebra'); `_strategy`
+        # here is the same word uppercased. Pinned by
+        # `test_the_journals_book_vocabulary_matches_this_reports`.
+        named = [t for t in hits if t.get('_strategy') == str(book).upper()]
+        if len(named) == 1:
+            return 'store says ' + _describe(named[0])
+        if not named:
+            return ('journal says book %r, and id %s is NOT in that book '
+                    '(found in: %s)'
+                    % (book, trade_id,
+                       ', '.join(sorted({str(t.get('_strategy'))
+                                         for t in hits}))))
     if len(hits) == 1:
         return 'store says ' + _describe(hits[0])
     return ('AMBIGUOUS - id %s exists in %d books: %s (the journal line names '
-            'only the number)' % (trade_id, len(hits),
-                                  ', '.join(_describe(t) for t in hits)))
+            'only the number - it predates `context.book`)'
+            % (trade_id, len(hits),
+               ', '.join(_describe(t) for t in hits)))
 
 
 def _fmt_ctx(ctx: dict) -> str:
     bits = []
-    for k in ('stock', 'strategy', 'reason', 'leg'):
+    for k in ('book', 'stock', 'strategy', 'reason', 'leg'):
         if ctx.get(k) is not None:
             bits.append(str(ctx[k]))
     tail = []
@@ -325,9 +345,21 @@ def compare_to_store(day=None) -> None:
                             for t in approx)))
     print()
     for tid, rows in sorted(placed.items(), key=lambda kv: (kv[0] is None, kv[0])):
-        reasons = {(r.get('context') or {}).get('reason') for r in rows}
-        print(f'  trade #{tid}: {len(rows)} order(s), reason(s) '
-              f'{sorted(x for x in reasons if x)} - {match_state(trades, tid)}')
+        ctxs = [r.get('context') or {} for r in rows]
+        reasons = {c.get('reason') for c in ctxs}
+        # N5. The book, from the journal's own lines. A set, not the first
+        # one: if two books' orders somehow landed under one id, saying so is
+        # the report's job — resolving it by picking one is exactly the
+        # silent mis-naming this field was added to end.
+        books = {c.get('book') for c in ctxs if c.get('book')}
+        book = next(iter(books)) if len(books) == 1 else None
+        named = ('#%s' % tid) if book is None else ('%s#%s' % (book, tid))
+        print(f'  trade {named}: {len(rows)} order(s), reason(s) '
+              f'{sorted(x for x in reasons if x)} - '
+              f'{match_state(trades, tid, book=book)}')
+        if len(books) > 1:
+            print('         !! this id carries orders tagged with %d different '
+                  'books: %s' % (len(books), sorted(books)))
     if not placed:
         print('  (no orders intended)')
     print()

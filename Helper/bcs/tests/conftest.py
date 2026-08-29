@@ -220,6 +220,86 @@ def _pinned_vet_flag(monkeypatch):
     monkeypatch.setattr(cfg, 'VET_ENABLED', False)
 
 
+class RealAgentSpawnAttempted(BaseException):
+    """A BaseException, for the reason its two neighbours are.
+
+    `zebra.vet` wraps its spawn bookkeeping in `except Exception` — correctly,
+    since a failed spawn must not take down the cycle that asked for it — and
+    that handler would swallow a plain-Exception rail, log it as a failed
+    spawn, and let the suite pass while agents kept launching.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _no_real_agents():
+    """N7. No test in the LIVE-MONEY package may launch a real Claude process.
+
+    `zebra/tests/conftest.py` has had this rail since 2026-08-11, when it was
+    found that `monitor._exit_cleared` calls `vet.exit_gate` with `spawn`
+    defaulting to True: every test that exercised the monitor's exit path
+    launched a REAL detached `claude`, which inherited the production cwd,
+    ran against the LIVE store and wrote ~30 junk rows into the production
+    decision journal — one more per suite run.
+
+    `bcs/` had no equivalent. The route is currently unreachable because
+    `_pinned_vet_flag` pins the flag False and `exit_gate`'s first line
+    short-circuits on it — but that rail pins a DEFAULT and is deliberately
+    overridable, so the hole reopens the moment a test here sets it True, which
+    is a one-line change nobody would think twice about. A rail that depends on
+    another rail's default is not a rail.
+
+    TWO layers, the same shape as the Telegram pair above:
+
+    1. the two NAMED doors (`_spawn_generic`, `_spawn_cli`), because callers
+       reach the CLI through both;
+    2. `subprocess.Popen` itself, filtered to a `claude` command — one SOURCE
+       beats N call sites, and it catches a future spawn path that goes
+       through neither door. Non-claude subprocesses are left alone; this is a
+       guard, not a sandbox.
+
+    It RAISES rather than recording, unlike zebra's, because nothing here has
+    any business observing a spawn: `bcs/` holds the order path, and its vet
+    tests all assert that the gate short-circuits. A recorder would let "we
+    spawned an agent" pass quietly as data.
+
+    Private MonkeyPatch: this rails against a MISTAKE, so `monkeypatch.undo()`
+    in a test body must not be able to switch it off.
+    """
+    import subprocess
+
+    from zebra import vet as vet_mod
+
+    mp = pytest.MonkeyPatch()
+
+    def _refuse(*a, **k):
+        raise RealAgentSpawnAttempted(
+            'a test in bcs/ tried to spawn a real Claude agent. It would '
+            'inherit the production cwd and config and write the real '
+            'decision journal. Assert that the gate short-circuits, or stub '
+            'the vet.')
+
+    mp.setattr(vet_mod, '_spawn_generic', _refuse)
+    mp.setattr(vet_mod, '_spawn_cli', _refuse)
+
+    real_popen = subprocess.Popen
+
+    def guarded(args, *a, **k):
+        first = ''
+        if isinstance(args, (list, tuple)) and args:
+            first = str(args[0])
+        elif isinstance(args, str):
+            first = args
+        if 'claude' in first.lower():
+            raise RealAgentSpawnAttempted(
+                'a test in bcs/ reached subprocess.Popen for %r — a spawn '
+                'path that bypasses both named doors' % first[:80])
+        return real_popen(args, *a, **k)
+
+    mp.setattr(subprocess, 'Popen', guarded)
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def _no_production_writes():
     """Deliberately does NOT take the shared `monkeypatch` fixture.

@@ -195,10 +195,49 @@ def test_the_trigger_reason_and_the_book_reach_the_record(jdir):
 def test_order_ctx_only_copies_and_never_derives():
     """A journal that computes something can disagree with the system it is
     witnessing, and then it is evidence of nothing."""
-    trade = {'id': 3, 'stock': 'NHPC', 'net_debit': 1.41, 'quantity': 5400}
+    trade = {'id': 3, 'stock': 'NHPC', 'net_debit': 1.41, 'quantity': 5400,
+             '_store_type': 'bcs'}
     ctx = sm._order_ctx(trade, 'SL_SPOT', 'short', 'BCS')
-    assert ctx == {'trade_id': 3, 'stock': 'NHPC', 'strategy': 'BCS',
-                   'reason': 'SL_SPOT', 'leg': 'short'}
+    assert ctx == {'trade_id': 3, 'book': 'bcs', 'stock': 'NHPC',
+                   'strategy': 'BCS', 'reason': 'SL_SPOT', 'leg': 'short'}
+
+
+def test_the_book_is_stamped_even_when_it_is_UNKNOWN():
+    """N5. A key missing from a jsonl line and a key holding null read the
+    same to a human and differently to a reader. Null says WE LOOKED AND DID
+    NOT KNOW — a fact about the code path, not about the trade."""
+    ctx = sm._order_ctx({'id': 3, 'stock': 'NHPC'}, 'SL_SPOT', 'short', 'BCS')
+    assert 'book' in ctx and ctx['book'] is None
+
+
+def test_the_book_is_not_the_strategy():
+    """The cohort store holds bull call spreads AND bear put spreads, so
+    `strategy` can never name which of the four books a record came from —
+    and all four number their trades from 1."""
+    ctx = sm._order_ctx({'id': 1, 'stock': 'X', '_store_type': 'zebra'},
+                        'TP', 'short', 'BPS')
+    assert (ctx['book'], ctx['strategy']) == ('zebra', 'BPS')
+
+
+def test_the_journals_book_vocabulary_matches_the_reports():
+    """`context.book` is a `_store_type`; `journal_report` tags its rows with
+    `_strategy`, and `match_state` bridges the two by uppercasing. Pinned, so
+    a fifth book cannot be added to one side only."""
+    from bcs import journal_report as jr
+    assert ({b.upper() for b in sm.STORE_TYPE_LABEL}
+            == {tag for tag, _loader in jr.STORES})
+
+
+def test_every_frozen_book_label_comes_from_the_one_table():
+    """The sweep's `label` and the journal's `book` are two names for the same
+    four books. A second hardcoded list is how they drift."""
+    src = inspect.getsource(sm.monitor_all)
+    frozen = src[src.index('frozen_books = '):]
+    frozen = frozen[:frozen.index(']') + 1]
+    for label in ('BCS', 'BPS', 'COHORT', 'FH'):
+        assert "'%s'" % label not in frozen, (
+            'frozen_books types %r again instead of reading STORE_TYPE_LABEL'
+            % label)
     src = inspect.getsource(sm._order_ctx)
     body = src.split('return', 1)[1]
     for op in ('*', '/', '+', ' - '):
