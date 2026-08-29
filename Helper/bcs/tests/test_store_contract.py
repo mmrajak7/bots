@@ -287,11 +287,29 @@ def test_every_store_asks_the_table_rather_than_a_literal():
                      'ZebraStore'))
     subjects.append((fakes, 'MemoryStore'))
     for mod, clsname in subjects:
-        src = inspect.getsource(getattr(mod, clsname))
+        cls = getattr(mod, clsname)
+        # THE WHOLE MRO. Since 2026-08-30 the three BCS-family books inherit
+        # their preconditions from `common.spread_store.SpreadStoreBase`, so
+        # reading only the leaf class would find no `store_contract.` and fail
+        # on three books that are now MORE correct than before — a guard
+        # measuring the file layout instead of the invariant, which is exactly
+        # what `common/tests/test_source_guard_policy.py` exists to bound.
+        src = '\n'.join(inspect.getsource(k) for k in cls.__mro__
+                        if k is not object and _has_source(k))
         assert 'store_contract.' in src, (
-            '%s.%s does not consult common.store_contract — it is back to '
-            'holding its own copy of the rules' % (mod.__name__, clsname))
+            '%s.%s does not consult common.store_contract anywhere in its '
+            'MRO — it is back to holding its own copy of the rules'
+            % (mod.__name__, clsname))
     assert ZebraStore is not None
+
+
+def _has_source(cls):
+    import inspect
+    try:
+        inspect.getsource(cls)
+        return True
+    except (OSError, TypeError):     # pragma: no cover - builtins
+        return False
 
 
 # ── M14 · every book can NAME its frozen records ────────────────────────────

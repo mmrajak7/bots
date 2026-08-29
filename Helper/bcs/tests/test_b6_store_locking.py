@@ -326,30 +326,45 @@ def test_two_processes_writing_the_same_book_lose_nothing(book):
 
 # ── The invariant that keeps a fourth copy honest ────────────────────────────
 
+#: The three books, plus the base they now share. `common/spread_store.py`
+#: joined the list on 2026-08-30: the writers moved there, so a check that only
+#: read the three books would have gone quiet about the file that actually
+#: holds them — a guard pinning the wrong thing
+#: ([[feedback_a_guard_can_pin_the_wrong_thing]]).
 STORE_FILES = ['bcs/trade_store.py', 'fallen_hero/trade_store.py',
-               'bear_put/trade_store.py']
+               'bear_put/trade_store.py', 'common/spread_store.py']
 
 
 @pytest.mark.parametrize('rel', STORE_FILES)
 def test_no_store_persists_outside_the_mutate_block(rel):
     """Advisory locking is defeated by one unlocked writer, and this codebase
-    grows stores by copy-paste. Every `_save_local()` now lives in the mixin,
-    so its absence here is a mechanical check that no writer escaped.
+    grows stores by copy-paste. Every `_save_local()` lives in the mixin, so
+    its absence here is a mechanical check that no writer escaped.
     """
     src = (HELPER / rel).read_text(encoding='utf-8')
     assert 'self._save_local()' not in src, (
         f"{rel} persists outside _mutate(); route it through the mixin")
-    assert src.count('self._upload_to_drive()') == 1, (
-        f"{rel} should call _upload_to_drive exactly once — in "
-        f"_sync_from_drive, deliberately outside the lock. The mixin does the "
-        f"rest.")
+    #: The base defines `_upload_to_drive` and calls it once, from
+    #: `_sync_from_drive`, deliberately outside the lock. The three books
+    #: should now call it ZERO times — they inherit both halves.
+    expected = 1 if rel == 'common/spread_store.py' else 0
+    assert src.count('self._upload_to_drive()') == expected, (
+        f"{rel} calls _upload_to_drive {src.count('self._upload_to_drive()')} "
+        f"time(s); expected {expected}.")
 
 
 @pytest.mark.parametrize('modname,clsname,stem,payload', BOOKS, ids=IDS)
 def test_every_store_is_locked_and_names_its_own_file(modname, clsname, stem, payload):
     cls = getattr(importlib.import_module(modname), clsname)
     assert issubclass(cls, LockedStoreMixin), f"{clsname} is not locked at all"
-    assert '_lock_path' in cls.__dict__, (
+    # It must not inherit the MIXIN's raising `_lock_path`, which would refuse
+    # every write. Since 2026-08-30 the override lives on `SpreadStoreBase`
+    # rather than in each book, so this asks whether the resolved method is
+    # still the mixin's — the property that actually matters — instead of
+    # asking which class happens to hold it. The line below is the real test
+    # either way: the resolved lock must name THIS book's file, which is what
+    # a shared implementation could plausibly get wrong.
+    assert cls._lock_path is not LockedStoreMixin._lock_path, (
         f"{clsname} inherits the mixin's raising _lock_path — it would refuse "
         f"every write")
     assert cls(config=dict(NO_DRIVE))._lock_path().name == f'{stem}.lock'
