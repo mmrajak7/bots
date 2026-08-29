@@ -52,7 +52,7 @@ def store(tmp_path, monkeypatch):
     return s
 
 
-def _cohortise(store, yes=True):
+def _cohortise(store, yes=True, paper=False):
     """Make record #1 one the ORDER PATH owns (or not).
 
     `paper` moved here on 2026-08-27 (C5). Being in the cohort is no longer
@@ -66,7 +66,7 @@ def _cohortise(store, yes=True):
     with store._mutate():
         t = store.find(1)
         t['cohort'] = cfg.COHORT_START if yes else '1999-01-01'
-        t['paper'] = False
+        t['paper'] = paper
 
 
 # ── the predicate ───────────────────────────────────────────────────────────
@@ -136,24 +136,78 @@ def test_no_exit_the_order_path_owns_is_booked_here(store, monkeypatch,
 
 @pytest.mark.parametrize('reason', ['tp', 'trail', 'spot_sl', 'debit_sl',
                                     'time'])
-def test_the_same_exit_books_normally_with_the_switch_off(store, monkeypatch,
-                                                          reason):
+def test_the_same_exit_books_normally_for_a_paper_record(store, monkeypatch,
+                                                         reason):
     """Negative control. Without it every test above passes just as well when
-    `_paper_auto_close` is broken outright."""
-    monkeypatch.setattr(cfg, 'EXITS_MANAGED_EXTERNALLY', False)
+    `_paper_auto_close` is broken outright.
+
+    The control used to keep `paper: False` and merely turn the switch off.
+    That stopped being a control on 2026-08-29: a record with real legs is now
+    refused whatever the switch says, because booking one at the structure mid
+    is a fiction rather than a close. So the control is a record zebra is
+    genuinely entitled to book -- a paper one -- and it runs with the switch
+    ON, which also pins the other half of `_exits_external`: a paper record has
+    no peer to stand down for, so the backstop must let it through.
+    """
+    monkeypatch.setattr(cfg, 'EXITS_MANAGED_EXTERNALLY', True)
     monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: True)
-    _cohortise(store)
+    _cohortise(store, paper=True)
     assert monitor._paper_auto_close(store, store.find(1), 12.0, reason,
                                      spot=110.0) is not None
     assert store.find(1)['status'] == 'exited'
 
 
+@pytest.mark.parametrize('reason', ['tp', 'trail', 'spot_sl', 'debit_sl',
+                                    'time'])
+def test_a_live_record_is_never_booked_at_mid_even_with_the_switch_off(
+        store, monkeypatch, reason):
+    """The last reachable two-engine state, closed.
+
+    `paper_mode: true` with a `paper: False` record is not hypothetical: it is
+    what `zebra enter` files for a hand-placed live trade, which is the FIRST
+    live-money action in the arming order. The old gate read
+    `cfg.PAPER_MODE or is_paper_record(trade)`, so in paper mode zebra would
+    book that position at the structure mid while the order path held the same
+    legs at the broker.
+
+    Fails against the pre-fix code on all five reasons.
+    """
+    monkeypatch.setattr(cfg, 'EXITS_MANAGED_EXTERNALLY', False)
+    monkeypatch.setattr(cfg, 'PAPER_MODE', True)
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: True)
+    _cohortise(store)                       # cohort, paper=False
+    assert monitor._paper_auto_close(store, store.find(1), 12.0, reason,
+                                     spot=110.0) is None
+    assert store.find(1)['status'] == 'entered'
+
+
+def test_a_live_NON_cohort_record_is_refused_too(store, monkeypatch):
+    """The record gate is not a cohort rule.
+
+    `_exits_external` is cohort-scoped because the other 450 rows have no peer
+    engine. The mid-price objection is not: a record with real legs cannot be
+    closed at a price nobody transacted whatever book it sits in.
+    """
+    monkeypatch.setattr(cfg, 'EXITS_MANAGED_EXTERNALLY', False)
+    monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: True)
+    _cohortise(store, yes=False)            # not cohort, paper=False
+    assert monitor._paper_auto_close(store, store.find(1), 12.0, 'tp',
+                                     spot=110.0) is None
+    assert store.find(1)['status'] == 'entered'
+
+
 def test_a_non_cohort_position_is_still_closed_by_zebra(store, monkeypatch):
     """The 450 back-ratio rows have no other engine. Standing down for them
-    would strand them with nothing watching at all."""
+    would strand them with nothing watching at all.
+
+    Paper, because that is what those rows are: the back-ratio generation ran
+    entirely in paper and `is_paper_record` reads a missing flag as paper. The
+    cohort scope of `_exits_external` is what this pins, so the record must be
+    one zebra is otherwise entitled to book.
+    """
     monkeypatch.setattr(cfg, 'EXITS_MANAGED_EXTERNALLY', True)
     monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: True)
-    _cohortise(store, yes=False)
+    _cohortise(store, yes=False, paper=True)
     assert monitor._paper_auto_close(store, store.find(1), 12.0, 'tp',
                                      spot=110.0) is not None
     assert store.find(1)['status'] == 'exited'
@@ -224,7 +278,9 @@ def test_the_same_cycle_DOES_close_with_the_switch_off(store, monkeypatch):
     """Negative control for the cascade skip: proves the TP was genuinely
     firing and the test above is not passing on a stale spot."""
     monkeypatch.setattr(cfg, 'EXITS_MANAGED_EXTERNALLY', False)
-    _cohortise(store)
+    # Paper: with the switch off there is no peer engine, so the record zebra
+    # is meant to close here is one it may legitimately book at mid.
+    _cohortise(store, paper=True)
     sent, vetted = _drive(store, monkeypatch)
     assert store.find(1)['status'] == 'exited'
     assert vetted == ['tp']

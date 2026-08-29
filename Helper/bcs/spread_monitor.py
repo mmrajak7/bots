@@ -6907,6 +6907,49 @@ def list_frozen_trades():
     list_residue_trades()
 
 
+def _arming_preflight(dry_run: bool, all_trades) -> dict:
+    """Announce the arming verdict for this session. Never raises.
+
+    This engine knows its own `dry_run` exactly -- it is the switch that lives
+    on a crontab line and in no config file -- so unlike zebra's copy there is
+    no unknown here. It reads the other three switches from zebra's config,
+    which is where they live.
+
+    Startup-only, not per poll: this is a long-lived process and the switches
+    it reads cannot change under it. The one that CAN change mid-session is
+    the kill switch, which forces this engine into dry run for the rest of the
+    session -- and that transition is announced by `announce_kill_switch`,
+    which now says what it does to the arming state rather than leaving the
+    reader to consult a table.
+    """
+    from common import arming
+    try:
+        from zebra import config as zcfg
+        paper_mode = bool(zcfg.PAPER_MODE)
+        exits_external = bool(zcfg.EXITS_MANAGED_EXTERNALLY)
+        auto_entry = bool(zcfg.AUTO_ENTRY)
+    except Exception as e:
+        # Unreadable switches are not a reason to stop monitoring three books
+        # that have nothing to do with the cohort. Said out loud, and skipped.
+        log(f"  ARMING: could not read the zebra switches ({e}) — the arming "
+            f"verdict is UNAVAILABLE this session.")
+        return {'legal': True, 'faults': [], 'latent': [], 'warnings': [],
+                'engines': {}, 'summary': 'unavailable'}
+    population = set()
+    for t in all_trades or ():
+        if t.get('_store_type') != 'zebra':
+            continue
+        population.add(arming.PAPER_RECORD if _record_says_paper(t)
+                       else arming.LIVE_RECORD)
+    state = arming.check(
+        paper_mode=paper_mode, exits_external=exits_external,
+        auto_entry=auto_entry, dry_run=bool(dry_run),
+        population=population, engine='bcs/spread_monitor.py',
+        log=lambda line: log('  ' + line),
+        telegram=lambda m: send_telegram(m, alert_class=alert_policy.SAFETY))
+    return state
+
+
 def monitor_all(kite: KiteConnect, dry_run: bool):
     """
     Monitor ALL open trades (BCS + BPS + Fallen Hero) in a single loop.
@@ -6941,6 +6984,15 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     # is the one that leaves live positions unwatched.
     corrupt = alert_store_corruption(
         [('BCS', bcs_store), ('BPS', bps_store), ('FH', fh_store)])
+
+    # WHICH ENGINE MAY BOOK, stated before this one starts polling. The
+    # combinations that leave a cohort record with no exit engine, or with
+    # two, used to live only in a table in CLAUDE.md -- and the table went
+    # stale, could not be consulted by either process, and described states
+    # whose defining property is that every log looks healthy. See
+    # `common/arming.py`. Announced from BOTH engines deliberately: these are
+    # exactly the states where the other one may be absent.
+    _arming_preflight(dry_run, all_trades)
 
     # First beat of the session, BEFORE the empty-book return below. A monitor
     # that started and found nothing to watch is alive; without this beat that
@@ -7238,6 +7290,15 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         "NO EXIT ORDERS WILL BE PLACED - you must close "
                         "by hand.\nRe-arm: set it back to true and "
                         "restart the monitor.", alert_class=alert_policy.SAFETY)
+                    # THE STATE THIS TRANSITION JUST CREATED, computed
+                    # rather than left to a table. Tripping the kill switch to
+                    # be SAFE is how the no-engine state is most often
+                    # reached: this process does not stop, it stops BOOKING,
+                    # and if zebra has already stood down then nothing books
+                    # at all while both logs keep looking healthy. Re-run
+                    # because the verdict is a function of `dry_run`, which
+                    # the line above just changed.
+                    _arming_preflight(dry_run, all_trades)
 
             # AFTER the kill-switch block, never before: a beat claiming this
             # engine can book, written on the very poll the switch forced it

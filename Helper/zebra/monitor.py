@@ -28,6 +28,7 @@ from typing import Optional
 
 import requests
 
+from common import arming as arming_mod
 from common import kite_errors
 
 from . import capital
@@ -2560,27 +2561,6 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
     `spot` is the live underlying LTP at exit — recorded for post-trade
     spot-movement analysis. P&L itself is driven by `mid`, not spot.
     """
-    if not (cfg.PAPER_MODE or is_paper_record(trade)):
-        # A PAPER RECORD KEEPS ITS BOOKING ENGINE AFTER THE SWITCH FLIPS.
-        #
-        # This line used to read `if not cfg.PAPER_MODE`, which disabled paper
-        # booking for the WHOLE store the moment the mode changed. The owner's
-        # decision of 2026-08-27 is that paper keeps running through go-live
-        # and every paper position resolves NATURALLY -- "not the 8 cohort
-        # positions, not any other" -- so a global gate would strand every
-        # open paper record on the day of the flip: no auto-close here, and
-        # (by the adapter's filter) no live engine either. Two engines, zero
-        # coverage, silently.
-        #
-        # Gating on the RECORD rather than the mode is the smaller of the two
-        # available fixes and the one that stays true afterwards: what makes a
-        # close bookable at mid is that no broker was ever involved, which is
-        # a property of the position, not of a config file. The alternative --
-        # routing paper records back to zebra from inside the adapter -- puts
-        # a paper-booking branch inside the only module in the fleet that can
-        # place a real order, which is precisely where this codebase has twice
-        # lost money.
-        return None
     if reason in EXTERNALLY_MANAGED_EXITS and _exits_external(trade):
         # THE BACKSTOP, and the reason it lives here rather than only at the
         # call sites: every close in this module funnels through this function,
@@ -2610,6 +2590,66 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
             "spread_monitor for this trade - booking it here would hide a "
             "live position from the engine that owns it",
             trade['id'], trade['stock'], reason)
+        return None
+    if reason in EXTERNALLY_MANAGED_EXITS and not is_paper_record(trade):
+        # THE RECORD DECIDES, AND ONLY THE RECORD.
+        #
+        # `if not (cfg.PAPER_MODE or is_paper_record(trade))` stood here until
+        # 2026-08-29, and that `or` was the last reachable TWO-ENGINE state in
+        # the system. A record with `paper: False` in a store running
+        # `paper_mode: true` -- exactly what `zebra enter` files for a
+        # HAND-PLACED LIVE TRADE, the first live-money action in the arming
+        # order -- was bookable BOTH here at the structure mid AND by the order
+        # path at the broker. The CLAUDE.md arming table blamed that state on
+        # the mode switch. The mode switch was never the cause.
+        # `common/arming.py` now derives that whole table from one invariant,
+        # and this predicate is half of it.
+        #
+        # Booking at MID is licensed by one fact and one only: no broker was
+        # ever involved, so there is no fill to contradict. That is a property
+        # of the POSITION, never of a config file, and a mid close of a record
+        # with real legs is a fiction whatever mode the process is in.
+        #
+        # Absence still means paper (`is_paper_record`), so no legacy record
+        # loses its booking engine here.
+        #
+        # SECOND, not first, and reason-scoped like the backstop above. Both
+        # orderings decline the same set of closes; this one keeps BOTH guards
+        # observable. `_exits_external` implies `not is_paper_record`, so with
+        # this test first the backstop could never fire, and a guard nobody can
+        # watch fail is one nobody can know works
+        # (`feedback_a_second_guard_you_cannot_observe_is_decorative`). The
+        # backstop's message names the engine that owns the trade, which is
+        # what the reader needs; this one fires for the cases it does not
+        # cover -- a live record outside the cohort, or inside it with the
+        # switch off.
+        #
+        # The reason scope carries the `expiry` exemption across for the same
+        # reason the backstop has it, argued in full at EXTERNALLY_MANAGED_EXITS:
+        # `_settle_if_expired` fires strictly PAST expiry, when the contracts
+        # have auto-exercised and there is nothing left for any order path to
+        # close. Declining there protects nothing and strands the record at
+        # `entered` for good, which also bans its stock from the scanner.
+        #
+        # A PAPER RECORD KEEPS ITS BOOKING ENGINE AFTER THE SWITCH FLIPS.
+        #
+        # This line once read `if not cfg.PAPER_MODE`, which disabled paper
+        # booking for the WHOLE store the moment the mode changed. The owner's
+        # decision of 2026-08-27 is that paper keeps running through go-live
+        # and every paper position resolves NATURALLY -- "not the 8 cohort
+        # positions, not any other" -- so a global gate would strand every
+        # open paper record on the day of the flip: no auto-close here, and
+        # (by the adapter's filter) no live engine either. Two engines, zero
+        # coverage, silently.
+        #
+        # Gating on the RECORD rather than the mode is the smaller of the two
+        # available fixes and the one that stays true afterwards: what makes a
+        # close bookable at mid is that no broker was ever involved, which is
+        # a property of the position, not of a config file. The alternative --
+        # routing paper records back to zebra from inside the adapter -- puts
+        # a paper-booking branch inside the only module in the fleet that can
+        # place a real order, which is precisely where this codebase has twice
+        # lost money.
         return None
     if trade.get('status') != 'entered':
         return None  # already closed by an earlier trigger this cycle
@@ -2982,6 +3022,113 @@ def _alert_store_corruption(dry_run: bool = False) -> bool:
     except Exception as e:
         logger.error("Could not process the store-corruption marker: %s", e)
         return False
+
+
+#: This process's own dedup for the arming verdict. Persisted for the same
+#: reason the exit-engine alert's is: the zebra cron process exits between
+#: cycles, so an in-memory flag would re-alert every five minutes and train the
+#: reader to swipe past the one message that says nothing is holding the stops.
+ARMING_ALERT_STATE_NAME = 'arming_alert_state.json'
+ARMING_REPEAT_SEC = 60 * 60     # a standing fault is re-stated hourly
+
+
+def _monitor_dry_run() -> Optional[bool]:
+    """Is the peer engine armed to place orders? None when unknowable.
+
+    Read from the heartbeat the peer writes, which records whether it can BOOK
+    rather than merely whether it breathes -- the kill switch forces it into
+    dry run for the session without stopping it, so "alive" is not the
+    question. A missing, stale or unparseable beat is None, NOT False: an
+    unknown that answers "armed" would let the arming verdict certify the one
+    state it exists to catch. `alert_if_exit_engine_down` owns the ABSENCE of
+    the peer; this owns the switch combination.
+    """
+    hb = read_exit_engine_heartbeat()
+    if hb['state'] == 'dry_run':
+        return True
+    if hb['state'] in ('ok', 'no_cohort_book'):
+        return False
+    return None
+
+
+def _cohort_population(trades) -> set:
+    """Which classes of cohort record are OPEN right now.
+
+    The arming verdict turns on this: today's deployed state cannot book a
+    LIVE cohort record and there are none, so reporting it as ILLEGAL every
+    five minutes would be noise. `common/arming.py` renders the same finding
+    as LATENT instead, which is the honest description -- one `zebra enter` on
+    a hand-placed trade away from being real.
+    """
+    pop = set()
+    for t in trades or ():
+        if t.get('status') != 'entered' or not in_cohort(t):
+            continue
+        pop.add(arming_mod.PAPER_RECORD if is_paper_record(t)
+                else arming_mod.LIVE_RECORD)
+    return pop
+
+
+def _arming_preflight(store, dry_run: bool = False) -> dict:
+    """State the switch combination, every cycle. Never raises.
+
+    Beside the store-corruption and options-CSV checks, and for the same
+    reason: all three are conditions the trading code reads as "nothing to
+    do". This one is the worst of the three that way -- an illegal arming
+    state produces no error anywhere, and its logs look healthy from both
+    engines at once, which is why it was a table in a document instead of a
+    check in a process.
+    """
+    try:
+        trades = store.load_trades()
+    except Exception as e:
+        logger.warning("arming preflight could not read the book: %s", e)
+        trades = None
+    state = arming_mod.check(
+        paper_mode=cfg.PAPER_MODE,
+        exits_external=cfg.EXITS_MANAGED_EXTERNALLY,
+        auto_entry=cfg.AUTO_ENTRY,
+        dry_run=_monitor_dry_run(),
+        population=_cohort_population(trades),
+        engine='zebra/monitor.py',
+        log=lambda line: logger.info('%s', line))
+    if not state['legal']:
+        _alert_arming(state, dry_run=dry_run)
+    return state
+
+
+def _alert_arming(state: dict, dry_run: bool = False) -> None:
+    """Telegram an illegal arming state on TRANSITION, then hourly.
+
+    Same noise discipline as `alert_if_exit_engine_down`, and keyed on the
+    fault SHAPE rather than on a bare boolean: moving from "no engine" to "two
+    engines" is a different fault and must not be silenced by the dedup for
+    the one before it.
+    """
+    key = '|'.join(sorted('%s:%s' % (f['state'], f['record_class'])
+                          for f in state['faults']))
+    now = time.time()
+    try:
+        with open(cfg.LOG_DIR / ARMING_ALERT_STATE_NAME) as f:
+            prev = json.load(f)
+        prev = prev if isinstance(prev, dict) else {}
+    except Exception:
+        prev = {}
+    if prev.get('key') == key and             now - float(prev.get('alerted_at') or 0) < ARMING_REPEAT_SEC:
+        return
+    msg = arming_mod.telegram_text(state, 'zebra/monitor.py')
+    if msg:
+        _send_telegram(html.escape(msg), dry_run=dry_run)
+    try:
+        cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = cfg.LOG_DIR / ARMING_ALERT_STATE_NAME
+        tmp = path.with_name(path.name + '.tmp')
+        with open(tmp, 'w') as f:
+            json.dump({'key': key, 'alerted_at': now}, f)
+        tmp.replace(path)
+    except Exception as e:
+        # Losing the dedup makes this NOISY, never silent. Right direction.
+        logger.warning("could not persist the arming alert state: %s", e)
 
 
 def _alert_options_csv_stale(dry_run: bool = False) -> bool:
@@ -3779,6 +3926,13 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
         _alert_options_csv_stale(dry_run=dry_run)
     except Exception as e:
         logger.error("Options-CSV freshness check failed: %s", e)
+    # Which engine may BOOK, stated out loud before anything trades. The
+    # illegal combinations used to live only in a CLAUDE.md table -- see
+    # `common/arming.py` for why a document could not do this job.
+    try:
+        _arming_preflight(store, dry_run=dry_run)
+    except Exception as e:
+        logger.error("Arming preflight failed: %s", e, exc_info=True)
     # Say which portfolio limits are ARMED, every cycle. An unset rupee cap
     # behaves exactly like a working one right up to the moment it should have
     # refused something, and this system has already shipped two controls that

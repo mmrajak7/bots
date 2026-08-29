@@ -1,9 +1,10 @@
 """H4 — the exit engine can die silently, and the stand-down is one-sided.
 
-`exits_managed_externally` is read ONLY by `zebra/monitor.py`. The string has
-never appeared in `bcs/spread_monitor.py` — pinned below — so this process
-hands the cohort's stops to a peer on the strength of its own config and
-nothing else. Two roads lead from there to the same silent state:
+`exits_managed_externally` is DECIDED ON only by `zebra/monitor.py`. Since
+2026-08-29 the peer reads it too, but only to compute and announce
+`common.arming`'s verdict — pinned below — so this process still hands the
+cohort's stops away on the strength of its own config and nothing else. Two
+roads lead from there to the same silent state:
 
 1. the flag is on and the peer is NOT RUNNING. Nothing books. The log says
    "EXITS EXTERNAL ... measured, not acted on" on every cycle, the other
@@ -61,20 +62,46 @@ def check(n=8, now=NOW, market_open=True):
 
 # ── the premise ─────────────────────────────────────────────────────────────
 
-def test_the_stand_down_is_one_sided_in_the_source():
-    """The whole reason this file exists. If `bcs/spread_monitor.py` ever
-    starts reading the switch itself, the heartbeat is no longer the only
-    thing connecting the two engines and this test should be revisited —
-    deliberately, not by accident."""
+def test_the_peer_reads_the_stand_down_switch_ONLY_to_report_it():
+    """The whole reason this file exists — restated, not weakened.
+
+    The original assertion was that `bcs/spread_monitor.py` never mentions
+    `exits_managed_externally` at all, with a note that a change here should be
+    deliberate. It was, on 2026-08-29: the monitor now reads all four switches
+    to compute `common.arming`'s verdict and announce it. That is the OPPOSITE
+    of the coupling this test guards against — the one-sidedness that matters
+    is that the peer never DECIDES on the switch, because a stand-down each
+    engine resolves for itself is how a position ends up with no engine at all.
+
+    So the property is now scoped rather than absolute: the switch may be read
+    inside `_arming_preflight`, which places no order and changes no behaviour,
+    and nowhere else.
+    """
+    import inspect
     src = (HELPER / 'bcs' / 'spread_monitor.py').read_text(encoding='utf-8')
-    # Prose mentions it (in backticks); reading it would need the key as a
-    # string literal or the zebra constant by name.
-    reads = [ln.strip() for ln in src.splitlines()
-             if "'exits_managed_externally'" in ln
-             or '"exits_managed_externally"' in ln
-             or 'EXITS_MANAGED_EXTERNALLY' in ln]
+    reporting = set(
+        inspect.getsource(sm._arming_preflight).splitlines())
+    # Prose mentions it (in backticks); reading it needs the key as a string
+    # literal or the zebra constant by name.
+    reads = [ln for ln in src.splitlines()
+             if ("'exits_managed_externally'" in ln
+                 or '"exits_managed_externally"' in ln
+                 or 'EXITS_MANAGED_EXTERNALLY' in ln)
+             and ln not in reporting]
     assert reads == [], (
-        'the peer now reads the stand-down switch itself: %r' % reads)
+        'the peer reads the stand-down switch outside the arming preflight, '
+        'i.e. somewhere it could act on it: %r' % [ln.strip() for ln in reads])
+
+
+def test_the_arming_preflight_places_no_order():
+    """The scope above is only safe while the preflight stays inert. It reads
+    four switches and speaks; anything else in there would be behaviour keyed
+    on a switch this engine does not own."""
+    import inspect
+    src = inspect.getsource(sm._arming_preflight)
+    for forbidden in ('place_limit_order', 'close_spread', 'begin_close',
+                      'update_trade_exit', 'kite.'):
+        assert forbidden not in src, forbidden
 
 
 def test_both_engines_resolve_the_same_file():

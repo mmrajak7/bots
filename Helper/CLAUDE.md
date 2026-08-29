@@ -1003,29 +1003,63 @@ is NOT tracked in git and therefore does NOT reach the Pi — this section is th
 copy that does. If the two ever disagree, re-verify against the code, not
 against either document.**
 
-There are FOUR switches, not three: `paper_mode` gates whether either of the
-other two means anything (`zebra/monitor.py` only consults auto-entry under
-`if not cfg.PAPER_MODE:`), and `--dry-run` on the `bcs.spread_monitor` crontab
-line is a fourth that lives in no config file at all.
+There are FOUR switches, not three: `paper_mode` gates whether auto-entry means
+anything (`zebra/monitor.py` only consults it under `if not cfg.PAPER_MODE:`),
+and `--dry-run` on the `bcs.spread_monitor` crontab line is a fourth that lives
+in no config file at all.
 
-| paper_mode | `--dry-run` | exits_managed_externally | What actually happens |
-|---|---|---|---|
-| true | ON | false | Today. zebra books paper exits; the monitor shadows. Safe. |
-| true | ON | **true** | **NO BOOKING ENGINE AT ALL.** zebra stands down; the monitor cannot book. Positions ride untended, silently. |
-| true | **OFF** | false | **TWO EXIT ENGINES** racing one record. |
-| true | OFF | true | Live orders aimed at PAPER positions that have no legs at the broker. |
-| false | OFF | true | The intended end state for exits. |
+> **THE TABLE THAT USED TO BE HERE IS NOW CODE: `common/arming.py`.**
+> It went stale exactly as you would expect a document to — its two-engine row
+> was narrowed by the C5 record-level paper gate and nobody moved it — and
+> neither engine could consult it. Both engines now call `arming.check()` at
+> startup (zebra every cycle, the monitor once a session and again the moment
+> the kill switch trips) and print the verdict. **Read that line, not this
+> section.** What follows is why it exists, not what it decides.
+
+The whole table is derived from one invariant:
+
+> **Every cohort record must have EXACTLY ONE engine that can book its exit.**
+
+Two predicates settle it, and `paper_mode` is in neither:
+
+- **zebra books at MID**, which only a record whose legs never reached a broker
+  could have transacted at. So it books a record iff `paper: True` and it has
+  not stood down (`exits_managed_externally` AND cohort AND not paper).
+- **the monitor places real orders**, so it refuses a `paper: True` record
+  outright and books nothing at all under `--dry-run`.
+
+From which: a **paper record always has exactly one engine, whatever the
+switches** — the two predicates are opposite readings of one fact. Every
+illegal state is therefore about a LIVE record, and there is only one:
+**`--dry-run` is on and a live cohort record exists → NO ENGINE.** The single
+fix is taking `--dry-run` off the crontab line;
+`exits_managed_externally=false` is NOT an alternative, because zebra cannot
+book a position with real legs at any price it knows.
+
+That state is reported as **latent** while no live cohort record is open (today:
+eight paper positions, so it is latent) and as a **fault** with a red Telegram
+from both engines the moment one appears. `zebra enter` filing a hand-placed
+live trade is exactly how one appears.
+
+The two-engine state is now **unreachable**, and that is a code change rather
+than a re-reading. `_paper_auto_close` gated on
+`cfg.PAPER_MODE or is_paper_record(trade)` until 2026-08-29, so a `paper: False`
+record in a `paper_mode: true` store — a hand-placed live trade, the FIRST
+live-money action in the arming order — was bookable at mid by zebra and at the
+broker by the monitor. The mode switch was never the cause; the `or` was.
 
 Two more traps, both verified:
 
 - **The stand-down is one-sided.** `exits_managed_externally` is read only by
   `zebra/monitor.py`; the string appears nowhere in `bcs/spread_monitor.py`.
   zebra stops managing exits on its own config, without ever checking that the
-  other engine is alive.
+  other engine is alive. The heartbeat (`exit_engine_heartbeat.json`) is what
+  closes that: it records whether the peer can BOOK, not whether it breathes.
 - **The kill switch creates the no-engine state.** Tripping it forces the
   monitor to dry-run for the session; if `exits_managed_externally` is true,
   zebra has already stood down, so nothing books. Alerts continue, which is
-  what makes it look healthy.
+  what makes it look healthy. The monitor now re-runs the arming preflight on
+  that transition, so the state is announced instead of inferred.
 
 **Arm exits and entries in this order, never in one step:**
 

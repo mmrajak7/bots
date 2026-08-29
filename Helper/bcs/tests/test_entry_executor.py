@@ -10,6 +10,8 @@ The asymmetry driving every rule: a missed entry costs nothing, a bad one
 costs capital. So the entry path never escalates, never pays through, never
 retries the whole spread and never unwinds.
 """
+import datetime as _dt
+
 import pytest
 
 from bcs import entry_executor as ee
@@ -69,6 +71,20 @@ class Broker:
         return None
 
 
+def _pin_clock(monkeypatch, when):
+    """Pin the fleet clock `entry_executor` actually gates on.
+
+    `sm.now_ist()` reads `sm.datetime.now(IST)` and strips the tzinfo, so the
+    stub must accept the tz argument and apply it — returning a naive datetime
+    for an aware call makes `now_ist` raise rather than answer.
+    """
+    class _DT(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return when.replace(tzinfo=tz) if tz else when
+    monkeypatch.setattr(sm, 'datetime', _DT)
+
+
 @pytest.fixture
 def broker(monkeypatch):
     b = Broker()
@@ -79,13 +95,16 @@ def broker(monkeypatch):
     monkeypatch.setattr(sm, '_order_final_state', b.final)
     monkeypatch.setattr(sm.time, 'sleep', lambda s: None)
     # Well inside the order window, so the cutoff is not what is under test.
-    import datetime as _dt
-
-    class _DT(_dt.datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return _dt.datetime(2026, 9, 15, 11, 0, 0)
-    monkeypatch.setattr(ee, 'datetime', _DT)
+    #
+    # PINNED ON `spread_monitor`, not on `entry_executor`. This fixture used
+    # to stub `ee.datetime`, and the M7 IST-clock sweep moved the cutoff read
+    # to `sm.now_ist()` — after which the pin reached nothing and these tests
+    # silently started running on the REAL wall clock. They passed all day and
+    # failed as a block after 15:20 IST, which is not a schedule anybody would
+    # think to check. `ee` no longer imports `datetime` at all, so a pin there
+    # cannot even be spelled now; `test_the_suite_pins_the_clock_it_gates_on`
+    # re-derives that from the source.
+    _pin_clock(monkeypatch, _dt.datetime(2026, 9, 15, 11, 0, 0))
     return b
 
 
@@ -335,6 +354,42 @@ def test_past_the_cutoff_nothing_is_placed(monkeypatch, broker):
     monkeypatch.setattr(sm, 'datetime', _Late)
     out, _said, _sent = run(broker, lots=1)
     assert out['lots_filled'] == 0 and broker.placed == []
+
+
+def test_the_suite_pins_the_clock_it_gates_on():
+    """The fixture's clock pin must reach the cutoff it claims to disarm.
+
+    For three days it did not. `open_leg` gates on `sm.now_ist()`; the fixture
+    stubbed `ee.datetime`, which the M7 sweep had already made irrelevant —
+    and `ee` does not even import `datetime` any more. Twenty tests in this
+    file then ran on the REAL wall clock and failed as a block after 15:20
+    IST, passing every other hour of the day.
+
+    Asserted structurally rather than by "it passes right now", which is the
+    property that was false: this reads the source and fails if the cutoff
+    ever moves onto a clock the fixture does not pin.
+    """
+    import inspect
+    src = inspect.getsource(ee.open_leg)
+    assert 'sm.now_ist()' in src, (
+        'open_leg no longer gates on sm.now_ist(); _pin_clock pins '
+        'sm.datetime and would now be pinning nothing')
+    assert not hasattr(ee, 'datetime'), (
+        'entry_executor imports datetime again — a fixture that pins '
+        'ee.datetime would look like it works and would not')
+
+
+def test_the_pinned_clock_is_inside_the_order_window(broker):
+    """And the pin is on the RIGHT side of the cutoff.
+
+    Separate from the test above on purpose: that one proves the pin lands,
+    this one proves it lands somewhere that lets an order through. A pin at
+    15:22 would satisfy the first and silently zero every fill assertion in
+    the file, which is exactly the symptom the real clock produced.
+    """
+    assert sm.now_ist().time() <= sm.LAST_ORDER_TIME
+    out, _said, _sent = run(broker, lots=1)
+    assert out['lots_filled'] == 1
 
 
 def test_it_never_raises_on_a_broken_broker(monkeypatch, broker):

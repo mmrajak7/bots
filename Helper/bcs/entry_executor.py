@@ -42,7 +42,6 @@ records what actually filled.
 from __future__ import annotations
 
 import time
-from datetime import datetime
 from typing import Callable, Optional
 
 from bcs import spread_monitor as sm
