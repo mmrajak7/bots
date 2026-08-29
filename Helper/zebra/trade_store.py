@@ -964,6 +964,31 @@ class ZebraStore:
             'short_mid_entry': bcs.get('short_mid'),
             'long_oi_entry': bcs.get('long_oi'),
             'short_oi_entry': bcs.get('short_oi'),
+            # ── DEPTH AT THE TOUCH, persisted (2026-08-30) ───────────────
+            # The same argument as the entry books above, one field over.
+            # `capital.liquidity_lots` sizes the position from exactly these
+            # two numbers -- they are the only thing standing between "3 lots"
+            # and an order bigger than the book -- and NOTHING kept them. 13
+            # cohort records, zero with depth on them, so "how many lots would
+            # the touch have absorbed" cannot be answered for a single
+            # historical entry, and the lot ladder cannot be calibrated from
+            # anything but argument.
+            #
+            # OI is not a substitute and must not be used as one: it counts
+            # open contracts, not resting size at the touch. The cohort's
+            # thinner-leg OI runs 8,550 to 2.1M, which says nothing about
+            # whether one lot fills without walking the book.
+            'long_ask_qty_entry': bcs.get('long_ask_qty'),
+            'short_bid_qty_entry': bcs.get('short_bid_qty'),
+            # ── WHICH LIMIT DECIDED THE SIZE ─────────────────────────────
+            # `capital.plan` returns every limit's own answer and says so in
+            # its docstring: "a size is a decision, and '3 lots' with no
+            # record of what the other four limits said cannot be audited
+            # after the fact". It was computed on every triggered signal and
+            # spent on a log line. Now it rides on the record, so the question
+            # "what actually binds as capital grows" is answered from the book
+            # instead of re-derived.
+            'entry_plan': bcs.get('entry_plan'),
             'short_extrinsic_entry': float(bcs.get('short_extrinsic', 0)
                                            or bcs.get('short_extrinsic_entry', 0)),
             'entry_warnings': bcs.get('warnings', []),

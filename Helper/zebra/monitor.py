@@ -2224,6 +2224,15 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
             logger.warning("capital pre-gate failed for #%d %s: %s — "
                            "continuing unsized", trade['id'], stock, e)
         capital_refused = bool(cap_plan) and not cap_plan['lots']
+        # THE SIZING DECISION RIDES ON THE RECORD, not just on a log line.
+        # `bcs` is the same dict `_bcs_entry_fields` reads at entry, so
+        # stamping it here needs no plumbing and covers the paper shadow too
+        # -- which is the only book there is to calibrate the lot ladder from.
+        if cap_plan:
+            bcs['entry_plan'] = {'lots': cap_plan['lots'],
+                                 'bound': cap_plan['bound'],
+                                 'bounds': cap_plan['bounds'],
+                                 'capital': cap_plan['capital']}
         # ── PAPER SHADOW-LOGS WHAT IT WOULD HAVE REFUSED ────────────────
         #
         # `ZebraStore._refuse_if_over_budget` states the rule: "LIVE refuses.
