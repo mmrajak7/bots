@@ -266,12 +266,16 @@ def test_the_brokers_own_view_is_recorded_at_the_short_put_freeze(fh_env,
     """Orders went out, so the broker-side audit runs — as it does at the
     short-call residue freeze."""
     seen = []
-    monkeypatch.setattr(sm, 'reconcile_after_close',
-                        lambda k, t, l='FH': seen.append(t['id']) or False)
     spy, store = fh_env
+    monkeypatch.setattr(sm, 'reconcile_after_close',
+                        lambda k, t, l='FH', store=None:
+                            seen.append((t['id'], store)) or False)
     _run_fh(store, _LegScript(**{SP: [_partial(300), _partial(0)]}),
             monkeypatch)
-    assert seen == [7]
+    # With the FH store. Until S3 this audit read `short_symbol`/`long_symbol`
+    # and an FH record has neither, so it reported "flat" on a book holding a
+    # live NAKED SHORT CALL - it now reads all six leg fields via `_legs_of`.
+    assert seen == [(7, store)]
 
 
 def test_a_short_put_retry_that_clears_lets_the_close_finish(fh_env,

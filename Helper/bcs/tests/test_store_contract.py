@@ -317,3 +317,145 @@ def test_the_adapter_narrows_frozen_records_to_the_cohort(tmp_path,
 
     assert sorted(t['id'] for t in raw.get_frozen_trades()) == [1, 2]
     assert [t['id'] for t in ZebraStoreAdapter(raw).get_frozen_trades()] == [1]
+
+
+# ── S3 · every book can NAME its post-close residues ────────────────────────
+#
+# The residue twin of the frozen block above, and the same argument: a record
+# BOOKED CLOSED whose reconcile found a live leg is out of the open book, out
+# of `get_frozen_trades()`, and out of every sweep there is. A store that
+# cannot list them has no way to tell anyone that a live leg stopped being
+# watched — one Telegram at close time was the entire lifecycle.
+#
+# Presence is checked over every book so a fifth store cannot be added without
+# one, and the sweep's `AttributeError` branch stays a belt on top of a brace.
+
+def _with_residue(status, state='open'):
+    r = _record(status)
+    r['reconcile_residue'] = {'detected_at': '2026-08-29T10:00:00',
+                              'state': state, 'detail': 'X net -700'}
+    return r
+
+
+def _seeded(name, modname, clsname, stem, tmp_path, monkeypatch, record):
+    """One store holding exactly `record`, by whichever route it is built."""
+    if name == 'zebra':
+        d = tmp_path / 'zebra'
+        d.mkdir(exist_ok=True)
+        monkeypatch.setattr(zcfg, 'LOG_DIR', d)
+        monkeypatch.setattr(zcfg, 'LOCAL_FILE', d / 'zebra_trades.json')
+        monkeypatch.setattr(zcfg, 'LOCK_FILE', d / 'zebra_trades.lock')
+        (d / 'zebra_trades.json').write_text(json.dumps([record]))
+        s = ZebraStore(config={'google_drive': {'enabled': False}})
+        s.initialize()
+        return ZebraStoreAdapter(s)
+    # Same construction as `_bcs_family_store`, which seeds `_record(status)`;
+    # this one needs an arbitrary record, so the two share the recipe rather
+    # than one calling the other with a flag.
+    mod = importlib.import_module(modname)
+    data = tmp_path / f'{stem}.json'
+    monkeypatch.setattr(mod, 'LOG_DIR', tmp_path)
+    monkeypatch.setattr(mod, 'LOCAL_TRADES_FILE', data)
+    monkeypatch.setattr(mod, 'LOCK_FILE', tmp_path / f'{stem}.lock')
+    data.write_text(json.dumps([record]), encoding='utf-8')
+    store = getattr(mod, clsname)(config={'google_drive': {'enabled': False}})
+    store.initialize()
+    return store
+
+
+@pytest.mark.parametrize('name,modname,clsname,stem', ALL_BOOKS,
+                         ids=[b[0] for b in ALL_BOOKS])
+def test_every_book_can_list_its_post_close_residues(tmp_path, monkeypatch,
+                                                     name, modname, clsname,
+                                                     stem):
+    terminal = ZEBRA_STATUSES if name == 'zebra' else BCS_FAMILY_STATUSES
+    store = _seeded(name, modname, clsname, stem, tmp_path, monkeypatch,
+                    _with_residue(terminal[TERMINAL]))
+    assert [t['id'] for t in store.get_residue_trades()] == [1], (
+        f'{name}.get_residue_trades() cannot see a closed record with an '
+        f'unresolved residue')
+
+
+@pytest.mark.parametrize('name,modname,clsname,stem', ALL_BOOKS,
+                         ids=[b[0] for b in ALL_BOOKS])
+@pytest.mark.parametrize('state', ['resolved', 'cleared'])
+def test_a_settled_residue_is_not_listed(tmp_path, monkeypatch, name, modname,
+                                         clsname, stem, state):
+    """The inverse review. A method that kept returning settled incidents would
+    nag forever about a leg that is gone, or one the owner cleared on purpose —
+    and an alert nobody can end is one the reader learns to ignore."""
+    terminal = ZEBRA_STATUSES if name == 'zebra' else BCS_FAMILY_STATUSES
+    store = _seeded(name, modname, clsname, stem, tmp_path, monkeypatch,
+                    _with_residue(terminal[TERMINAL], state=state))
+    assert store.get_residue_trades() == []
+
+
+@pytest.mark.parametrize('name,modname,clsname,stem', ALL_BOOKS,
+                         ids=[b[0] for b in ALL_BOOKS])
+@pytest.mark.parametrize('role', [OPEN, CLOSING, FROZEN])
+def test_only_BOOKED_records_carry_a_residue_incident(tmp_path, monkeypatch,
+                                                      name, modname, clsname,
+                                                      stem, role):
+    """Deliberately NOT the frozen list, and not the open one.
+
+    A `partial_close` record already has a watcher (the M14 recovery sweep) and
+    a nag of its own; naming it here too would double every alert for one
+    position and would put a residue reader on a record the ORDER path owns.
+    An OPEN record's legs are supposed to be live. The only records this may
+    name are the ones nothing else can see.
+    """
+    statuses = ZEBRA_STATUSES if name == 'zebra' else BCS_FAMILY_STATUSES
+    store = _seeded(name, modname, clsname, stem, tmp_path, monkeypatch,
+                    _with_residue(statuses[role]))
+    assert store.get_residue_trades() == []
+
+
+def test_the_fake_can_list_residues_too():
+    """`replay.py` hands `MemoryStore` to the monitor, so the sweep's own tests
+    run against this. A fake without the method makes them unwritable."""
+    store = MemoryStore(trades=[_with_residue('closed'),
+                                dict(_with_residue('closed'), id=2,
+                                     reconcile_residue={'state': 'resolved'})])
+    assert [t['id'] for t in store.get_residue_trades()] == [1]
+
+
+def test_the_adapter_narrows_residues_to_the_cohort(tmp_path, monkeypatch):
+    """Same split as the frozen twin: the store method sees every generation,
+    the adapter narrows. Not filtering in the adapter would hand the residue
+    sweep a retired strategy's positions; filtering in the store would hide
+    them from every reader that goes direct."""
+    d = tmp_path / 'zebra'
+    d.mkdir(exist_ok=True)
+    monkeypatch.setattr(zcfg, 'LOG_DIR', d)
+    monkeypatch.setattr(zcfg, 'LOCAL_FILE', d / 'zebra_trades.json')
+    monkeypatch.setattr(zcfg, 'LOCK_FILE', d / 'zebra_trades.lock')
+    outsider = _with_residue('exited')
+    outsider['id'] = 2
+    outsider.pop('cohort')
+    (d / 'zebra_trades.json').write_text(
+        json.dumps([_with_residue('exited'), outsider]))
+    raw = ZebraStore(config={'google_drive': {'enabled': False}})
+    raw.initialize()
+
+    assert sorted(t['id'] for t in raw.get_residue_trades()) == [1, 2]
+    assert [t['id'] for t in ZebraStoreAdapter(raw).get_residue_trades()] == [1]
+
+
+def test_the_adapter_maps_a_residue_record_into_the_monitors_vocabulary(
+        tmp_path, monkeypatch):
+    """The sweep names legs by `_legs_of`, which reads `short_symbol` /
+    `long_symbol`. Handing it a RAW zebra record would give it a record with no
+    legs it can read — a false clean of exactly the kind this item exists to
+    end."""
+    d = tmp_path / 'zebra'
+    d.mkdir(exist_ok=True)
+    monkeypatch.setattr(zcfg, 'LOG_DIR', d)
+    monkeypatch.setattr(zcfg, 'LOCAL_FILE', d / 'zebra_trades.json')
+    monkeypatch.setattr(zcfg, 'LOCK_FILE', d / 'zebra_trades.lock')
+    (d / 'zebra_trades.json').write_text(json.dumps([_with_residue('exited')]))
+    raw = ZebraStore(config={'google_drive': {'enabled': False}})
+    raw.initialize()
+
+    from bcs.spread_monitor import _legs_of
+    [mapped] = ZebraStoreAdapter(raw).get_residue_trades()
+    assert _legs_of(mapped), 'the adapter handed the sweep a legless record'

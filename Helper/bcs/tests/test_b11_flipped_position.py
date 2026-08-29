@@ -102,13 +102,15 @@ def test_a_flipped_short_leg_alerts_with_the_signed_quantity(env):
 def test_a_flipped_leg_records_the_brokers_own_view(env, monkeypatch):
     """`reconcile_after_close` was never reached on the old branch."""
     seen = []
-    monkeypatch.setattr(sm, 'reconcile_after_close',
-                        lambda k, t, l='BCS': seen.append(t['id']) or False)
     spy, store = env
+    monkeypatch.setattr(sm, 'reconcile_after_close',
+                        lambda k, t, l='BCS', store=None:
+                            seen.append((t['id'], store)) or False)
     kite = FakeBroker(books=BOOKS, positions=[{'tradingsymbol': SHORT, 'quantity': 2100},
                                  {'tradingsymbol': LONG, 'quantity': QTY}])
     _run(kite, store)
-    assert seen == [1], "reconcile_after_close was not called on the flip"
+    # With the store, so S3 can persist what it finds - see the b10 twin.
+    assert seen == [(1, store)], "reconcile_after_close was not called on the flip"
 
 
 # ── The other three flip shapes ──────────────────────────────────────────────

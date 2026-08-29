@@ -236,6 +236,24 @@ class ZebraStoreAdapter:
         return [map_trade(t) for t in self._store.load_trades()
                 if t.get('status') == 'partial_close' and in_cohort(t)]
 
+    def get_residue_trades(self) -> List[dict]:
+        """S3 - cohort records BOOKED EXITED that still show a live leg.
+
+        The residue twin of `get_frozen_trades`, narrowed the same way and for
+        the same reason: the sweep that reads this must never be handed a
+        retired strategy's positions. The store method sees every generation;
+        this sees the cohort.
+
+        Mapped, because the residue sweep names legs by the BCS vocabulary
+        (`short_symbol` / `long_symbol`) that `map_trade` produces. Handing it
+        raw zebra records would give it a record with no legs it can read —
+        which is exactly the false-clean this whole item is about.
+        """
+        return [map_trade(t) for t in self._store.load_trades()
+                if t.get('status') == 'exited'
+                and (t.get('reconcile_residue') or {}).get('state') == 'open'
+                and in_cohort(t)]
+
     def find_open_trade(self, stock: str, trade_id: Optional[int] = None):
         for t in self.get_open_trades():
             if trade_id is not None and t['id'] == trade_id:

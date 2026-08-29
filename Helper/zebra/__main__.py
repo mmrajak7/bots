@@ -1159,6 +1159,25 @@ def cmd_status(args):
         print("  Clear with: python -m bcs.spread_monitor "
               "--book-frozen cohort:ID  |  --reopen-frozen cohort:ID")
 
+    # ── POST-CLOSE RESIDUE (S3) ──────────────────────────────────────────
+    #
+    # Beside FROZEN and for the identical reason. These records ARE counted
+    # elsewhere on this dashboard - under `exited`, as finished trades - which
+    # makes them worse to omit, not better: the book says the position is over
+    # and the broker says a leg is still there. Escalate-only; nothing in the
+    # fleet will ever place an order against a closed record.
+    residue = [t for t in trades
+               if (t.get('reconcile_residue') or {}).get('state') == 'open']
+    if residue:
+        print(f"\n  --- POST-CLOSE RESIDUE: booked EXITED, a leg is still "
+              f"LIVE ({len(residue)}) ---")
+        for t in residue:
+            r = t.get('reconcile_residue') or {}
+            print(f"  #{t['id']} {t['stock']:<12} "
+                  f"{r.get('detail', '?')}  since={r.get('detected_at', '?')}")
+        print("  Close the leg in Kite and it resolves itself, or: "
+              "python -m bcs.spread_monitor --clear-residue cohort:ID")
+
     watching = by_status.get('watching', [])
     if watching:
         print(f"\n  --- Watching ---")

@@ -1379,6 +1379,37 @@ class ZebraStore:
         return [t for t in self.load_trades()
                 if t.get('status') == 'partial_close']
 
+    def get_residue_trades(self) -> list:
+        """S3 - records BOOKED CLOSED that still show a live leg at the broker.
+
+        `reconcile_after_close` reads the broker's own view after a close
+        reports success. When it finds a leg that is not flat, the record is
+        already `exited`: it is out of the open book, out of
+        `get_frozen_trades()`, and out of every sweep there is. Before this
+        method the entire lifecycle of that fact was ONE Telegram — the same
+        invisible-position shape M14 exists to end, one door over.
+
+        Deliberately NOT the frozen list. A frozen record has a watcher (the
+        recovery sweep) and a nag of its own; a second one for the same
+        position would be noise. This names only the records nothing else can
+        see, which is why the status filter is part of the query rather than
+        left to the caller.
+
+        Read-only, and terminal: no caller may place an order on the strength
+        of this list. The record is closed — there is no close lock to take,
+        no stop to re-arm, and the residue may be a leg the owner is holding
+        on purpose. Escalate, never act.
+
+        NOT cohort-filtered, for the same reason `get_frozen_trades` is not:
+        the adapter narrows, and a store method that hid the older
+        generation's residues from every direct reader would be answering a
+        different question than the one it is named for.
+        """
+        return [t for t in self.load_trades()
+                if t.get('status') == 'exited'
+                and (t.get('reconcile_residue') or {}).get('state') == 'open']
+
+
 
     def set_trade_status(self, trade_id: int, status: str, **extra) -> dict:
         with self._mutate():

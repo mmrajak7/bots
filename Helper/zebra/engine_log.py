@@ -341,7 +341,13 @@ def parse_events(rows):
 #: they cannot be averaged away into a total: an exhausted incident is a live
 #: position with dead stops, and one of them matters more than fifty waits.
 RECOVERY_NEEDS_HUMAN = ('recovery_exhausted', 'unpriced_refusal',
-                        'recovery_blind')
+                        'recovery_blind',
+                        # S3. A leg still live on a record already booked
+                        # CLOSED. Nothing will ever order against it - the
+                        # only thing standing between it and invisibility is
+                        # somebody reading this line.
+                        'reconcile_residue', 'residue_unresolved',
+                        'residue_blind', 'reconcile_unknown_shape')
 
 
 def monitor_log_path(day: str) -> Path:
@@ -712,6 +718,21 @@ def recovery_flags(rec):
         elif name == 'recovery_blind':
             out.append('%d recovery sweep pass(es) could not read broker '
                        'positions, so nothing was classified.' % n)
+        elif name == 'reconcile_residue':
+            out.append('%d post-close reconcile(s) found a leg STILL LIVE on '
+                       'a trade already booked closed. No order will ever be '
+                       'placed against a closed record - close the leg in '
+                       'Kite, or clear it with --clear-residue.' % n)
+        elif name == 'residue_unresolved':
+            out.append('%d day(s) on which a post-close residue was still '
+                       'live and un-cleared.' % n)
+        elif name == 'residue_blind':
+            out.append('%d residue sweep pass(es) could not read broker '
+                       'positions, so no residue was re-checked.' % n)
+        elif name == 'reconcile_unknown_shape':
+            out.append('%d close(s) could not be VERIFIED at all: the record '
+                       'declared no option legs, so the post-close check had '
+                       'nothing to read. Treat as unverified, not clean.' % n)
     if (rec.get('counts') or {}).get('frozen_paper_skipped'):
         # Not a problem — but it IS the line that proves the paper guard ran,
         # and its silence would be indistinguishable from the guard's absence.

@@ -592,6 +592,14 @@ class MemoryStore:
     def get_frozen_trades(self):
         return [t for t in self.trades if t.get('status') == 'partial_close']
 
+    def get_residue_trades(self):
+        #: The fake's book is the BCS family's vocabulary, so 'closed' is the
+        #: terminal status here. The contract test pins that the real stores
+        #: agree with this on their own names.
+        return [t for t in self.trades
+                if t.get('status') == 'closed'
+                and (t.get('reconcile_residue') or {}).get('state') == 'open']
+
     def set_trade_status(self, trade_id, status, **extra_fields):
         self._rec('set_trade_status', trade_id, status, **extra_fields)
         t = self._find(trade_id)

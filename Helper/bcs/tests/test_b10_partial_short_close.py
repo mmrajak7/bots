@@ -171,14 +171,19 @@ def test_the_alert_names_the_residue_and_says_the_long_was_kept(env, monkeypatch
 
 
 def test_the_brokers_own_view_is_recorded(env, monkeypatch):
+    #: The STORE is captured, not just the id. S3 made the audit's finding a
+    #: persisted incident, so calling it without a store would alert once and
+    #: record nothing - the very shape S3 closed. That the freeze paths pass
+    #: their store is therefore part of what "recorded" means here.
     seen = []
-    monkeypatch.setattr(sm, 'reconcile_after_close',
-                        lambda k, t, l='BCS': seen.append(t['id']) or False)
     spy, store = env
+    monkeypatch.setattr(sm, 'reconcile_after_close',
+                        lambda k, t, l='BCS', store=None:
+                            seen.append((t['id'], store)) or False)
     monkeypatch.setattr(sm, 'close_leg',
                         _ScriptedCloseLeg(_partial(500), _partial(0)))
     _run(FakeBroker(books=BOOKS, positions=_normal_positions()), store)
-    assert seen == [1]
+    assert seen == [(1, store)]
 
 
 # ── End to end: prove close_leg can actually emit PARTIAL ────────────────────

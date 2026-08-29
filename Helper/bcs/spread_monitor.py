@@ -3482,7 +3482,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                 short_qty_seen=short_qty, long_qty_seen=long_qty,
                 close_failure=_close_failure(
                     cause='flipped', leg=None, reason=reason))
-            reconcile_after_close(kite, trade, label)
+            reconcile_after_close(kite, trade, label, store=store)
         send_telegram(
             f"🔴 {label} {stock}: FLIPPED POSITION\n"
             f"{reason} triggered, but the book is not what the trade says:\n"
@@ -3653,7 +3653,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                         short_fill=short_fill,
                         close_failure=_close_failure(
                             cause='unfilled', leg='short', reason=reason))
-                    reconcile_after_close(kite, trade, label)
+                    reconcile_after_close(kite, trade, label, store=store)
                 send_telegram(
                     f"🔴 {label} {stock}: PARTIAL SHORT CLOSE\n"
                     f"{remaining} qty still SHORT on {short_sym} after a retry.\n"
@@ -3768,7 +3768,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                         short_fill=short_fill, long_fill=long_fill,
                         close_failure=_close_failure(
                             cause='unfilled', leg='long', reason=reason))
-                    reconcile_after_close(kite, trade, label)
+                    reconcile_after_close(kite, trade, label, store=store)
                 send_telegram(
                     f"🔴 {label} {stock}: PARTIAL LONG CLOSE\n"
                     f"{remaining} of {close_qty} qty still LONG on {long_sym} "
@@ -3888,53 +3888,287 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
     if not dry_run:
         store.update_trade_exit(trade['id'], exit_data)
         log(f"  Trade #{trade['id']} marked closed (local + Drive)")
-        reconcile_after_close(kite, trade, label)
+        reconcile_after_close(kite, trade, label, store=store)
     else:
         log(f"  [DRY RUN] Would mark trade #{trade['id']} closed")
 
     return True
 
 
-def reconcile_after_close(kite: KiteConnect, trade: dict, label: str = 'BCS'
-                          ) -> bool:
-    """After a close reports success, PROVE both legs are actually flat.
+def reconcile_after_close(kite: KiteConnect, trade: dict, label: str = 'BCS',
+                          *, store=None) -> bool:
+    """After a close reports success, PROVE every leg is actually flat.
 
     This is the ICICI-class guard, and it is the one thing the vetting layer
     cannot supply: in Feb 2026 a monitor bug placed 4x BUY on the short leg and
     flipped the position long, turning a +190% spread into +Rs 2K. The bug was
-    in the code that placed the orders — so the code that placed them was never
+    in the code that placed the orders - so the code that placed them was never
     going to catch it. This check reads the BROKER's view instead, and it is
     deliberately independent of every fill/quantity variable the close path
     computed.
 
-    Read-only and never raises: it cannot make an exit worse, only visible.
-    Returns True when flat.
+    **S3.** A residue found here is persisted as `reconcile_residue` on the
+    record and swept until the book goes flat. Until 2026-08-29 it was one
+    Telegram and nothing else: the record is already booked terminal, so it is
+    out of the open book, out of `get_frozen_trades()` and out of every sweep
+    there is. An unwatched live leg is the failure that has cost this account
+    real money twice. `store` is optional only because a caller with nothing
+    to write to (a probe, a test) is a real case; when it is None the alert
+    still fires and only the sweep is lost, which the log says out loud.
+
+    Read-only against the broker and never raises: it cannot make an exit
+    worse, only visible. Returns True when flat.
     """
     try:
-        residues = []
-        for leg in ('short_symbol', 'long_symbol'):
-            sym = trade.get(leg)
-            if not sym:
-                continue
+        legs = _legs_of(trade)
+        if not legs:
+            # UNKNOWN IS NOT FLAT.
+            #
+            # Until 2026-08-29 this read `short_symbol` and `long_symbol` and
+            # nothing else, so all four FH call sites - the ones guarding the
+            # only NAKED SHORT this fleet ever holds - found no symbols,
+            # collected no residues, and logged "both legs flat OK" for a book
+            # they had not looked at. A guard that reports CLEAN on a position
+            # it never read is worse than no guard, because it answers the
+            # question. `_legs_of` is the fleet's one leg reader, and a record
+            # it cannot describe fails here rather than passing.
+            log("  *** RECONCILE: #%s declares NO LEGS - nothing was "
+                "verified ***" % trade.get('id'))
+            _recovery_event('reconcile_unknown_shape', store=label,
+                            id=trade.get('id'))
+            send_telegram(
+                "\U0001F6A8 %s %s: CLOSE NOT VERIFIED\n"
+                "The record declares no option legs, so the post-close check "
+                "could not read the broker at all. This is NOT a clean close "
+                "- check Kite by hand." % (label, trade.get('stock')),
+                alert_class=alert_policy.SAFETY)
+            return False
+
+        residues, live = [], {}
+        for sym, _sign in legs:
             qty = get_net_position(kite, sym)
+            live[sym] = qty
             if qty != 0:
-                residues.append(f'{sym} net {qty:+d}')
+                residues.append('%s net %+d' % (sym, qty))
         if not residues:
-            log("  RECONCILE: both legs flat at the broker ✓")
+            log("  RECONCILE: all %d leg(s) flat at the broker \u2713" % len(legs))
             return True
         detail = '; '.join(residues)
-        log(f"  *** RECONCILE FAILED: {detail} ***")
+        log("  *** RECONCILE FAILED: %s ***" % detail)
+        _recovery_event('reconcile_residue', store=label, id=trade.get('id'))
+        _persist_residue(store, trade, label, detail, live)
         send_telegram(
-            f"🚨 {label} {trade.get('stock')}: POSITION NOT FLAT AFTER CLOSE\n"
-            f"The trade is marked closed but the broker still shows: {detail}\n"
-            f"Check Kite NOW — this is the shape of the Feb 2026 bug that "
-            f"flipped a short leg long.", alert_class=alert_policy.SAFETY
-        )
+            "\U0001F6A8 %s %s: POSITION NOT FLAT AFTER CLOSE\n"
+            #: The record's own status, not the word "closed". This runs from
+            #: the FREEZE paths too, where the record sits at `partial_close`;
+            #: telling the owner it is "marked closed" would send them looking
+            #: for the wrong record.
+            "The record is at status=%s but the broker still shows: %s\n"
+            "Check Kite NOW - this is the shape of the Feb 2026 bug that "
+            "flipped a short leg long."
+            % (label, trade.get('stock'), trade.get('status', '?'), detail),
+            alert_class=alert_policy.SAFETY)
         return False
     except Exception as e:
-        # Never let the audit break the close it is auditing.
-        log(f"  RECONCILE: could not verify positions ({e})")
+        # Never let the audit break the close it is auditing. It does not go
+        # quiet either: a reconcile that could not run is a close nobody
+        # verified, and the digest counts it by name.
+        log("  RECONCILE: could not verify positions (%s)" % e)
+        _recovery_event('reconcile_blind', store=label, id=trade.get('id'),
+                        reason=str(e)[:60].replace(' ', '_'))
         return False
+
+
+def _persist_residue(store, trade, label, detail, live):
+    """Write the S3 incident onto the record so a sweep can find it tomorrow.
+
+    Idempotent on `detected_at`: a residue re-observed is the SAME incident,
+    and resetting its clock would make an unresolved one look new every time
+    it was seen. Only `last_seen` and the live quantities move.
+    """
+    res = dict(trade.get('reconcile_residue') or {})
+    now_iso = datetime.now().isoformat()
+    if res.get('state') != 'open':
+        res = {'detected_at': now_iso, 'state': 'open', 'resolved_at': None}
+    res['label'] = label
+    res['detail'] = detail
+    res['legs'] = dict(live)
+    res['last_seen'] = now_iso
+    #: The sweep re-observes an open incident every five seconds. Writing an
+    #: unchanged one back each time is a disk write per poll per incident for
+    #: no new fact; `last_seen` alone is not worth it, and its absence costs
+    #: nothing that `detected_at` does not already say. A CHANGE in the legs
+    #: is a different matter and is always written.
+    unchanged = (store is not None
+                 and (trade.get('reconcile_residue') or {}).get('legs') == res['legs']
+                 and (trade.get('reconcile_residue') or {}).get('state') == 'open')
+    if unchanged:
+        return
+    #: No EVENT here, deliberately. This runs on EVERY sweep pass - once per
+    #: five seconds while an incident is open - and an event emitted here
+    #: would report one live leg as thousands, which is the "223 degraded
+    #: events" shape that makes a reader stop reading. The event is emitted
+    #: where a DECISION is made instead: once at detection, and once a day by
+    #: the nag, so the digest counts incident-days.
+    if store is None:
+        # Nothing to sweep it with. Say so, rather than implying it is tracked.
+        # The in-memory record is all there is, so it is written here.
+        trade['reconcile_residue'] = res
+        log("  RECONCILE: no store supplied - the residue was ALERTED but "
+            "NOT recorded, so nothing will chase it.")
+        return
+    try:
+        store.update_trade_fields(trade['id'], reconcile_residue=res)
+    except Exception as e:                     # pragma: no cover - store-level
+        log('  Could not persist reconcile_residue for #%s: %s'
+            % (trade.get('id'), e))
+        return
+    # THE RECORD SAYS WHAT THE STORE SAYS. The BCS-family stores hand out the
+    # live dict rather than a copy, so assigning before the write would leave
+    # an in-memory record asserting something that was never saved - and the
+    # next unrelated write would then persist it.
+    trade['reconcile_residue'] = res
+
+
+def _resolve_residue(store, trade, label, nagged):
+    """The book went flat. Close the incident, and say so ONCE."""
+    res = dict(trade.get('reconcile_residue') or {})
+    res['state'] = 'resolved'
+    res['resolved_at'] = datetime.now().isoformat()
+    try:
+        store.update_trade_fields(trade['id'], reconcile_residue=res)
+    except Exception as e:                     # pragma: no cover - store-level
+        # The incident is NOT resolved if the record does not say so, and the
+        # write is the only thing that makes it say so. Assigning first would
+        # mark it resolved IN MEMORY on the very stores that hand out the live
+        # dict - ending the nag on a leg whose all-clear was never saved.
+        log('  Could not clear reconcile_residue for #%s: %s'
+            % (trade.get('id'), e))
+        return
+    trade['reconcile_residue'] = res
+    _recovery_event('reconcile_residue_resolved', store=label,
+                    id=trade.get('id'))
+    log("  RESIDUE #%s (%s) is FLAT at the broker - incident closed."
+        % (trade.get('id'), label))
+    send_telegram(
+        "\u2705 %s #%s %s: the leftover leg is now FLAT.\n"
+        "The post-close residue reported earlier is resolved; nothing further "
+        "is needed." % (label, trade['id'], trade.get('stock', '?')),
+        alert_class=alert_policy.SAFETY)
+    nagged.discard((label, trade['id'], 'reconcile_residue',
+                    date.today().isoformat()))
+
+
+def sweep_reconcile_residue(kite, books, *, nagged=None):
+    """S3 - chase every booked-closed record that still has a live leg.
+
+    **Escalate-only. This function places no orders and never will.** The
+    record is terminal: there is no close lock to take, no stop to re-arm, and
+    the residue may well be a leg the owner is deliberately holding. What it
+    owes the owner is that the fact does not go quiet, and that it STOPS when
+    the book goes flat - self-resolution read from the broker rather than from
+    our own record, exactly as the M14 sweep classifies.
+
+    `books` is `[(label, store, orders_allowed)]`, the same shape
+    `recover_frozen_positions` takes. `orders_allowed` is ignored here, and
+    that is the point: no value of it authorises anything.
+
+    Returns the number of records that still carry a residue.
+    """
+    nagged = _RECOVERY_NAGGED if nagged is None else nagged
+
+    pending = []
+    for label, store, _orders_allowed in books:
+        if store is None:
+            continue
+        # `hasattr`, not `except AttributeError` around the call. The M14
+        # twin of this method shipped with an AttributeError INSIDE it
+        # (`MemoryStore.get_frozen_trades` read a field that does not exist on
+        # that class); catching the exception here would have reported that
+        # bug as "an old store without the method" and moved on.
+        if not hasattr(store, 'get_residue_trades'):
+            log('  Residue sweep: %s cannot list residues (no '
+                'get_residue_trades)' % label)
+            continue
+        try:
+            for t in store.get_residue_trades():
+                pending.append((label, store, t))
+        except Exception as e:                 # pragma: no cover - store-level
+            log('  Could not read residues from %s: %s' % (label, e))
+    if not pending:
+        return 0
+
+    # ONE positions read for the whole sweep, shared - the same F7 rate-limit
+    # lesson the poll loop and the recovery sweep both learned expensively.
+    try:
+        net_by_symbol = {p['tradingsymbol']: p['quantity']
+                         for p in kite.positions()['net']}
+    except Exception as e:
+        log('  Residue sweep: positions() failed, nothing checked: %s' % e)
+        _recovery_event('residue_blind', reason=str(e)[:60].replace(' ', '_'))
+        return len(pending)
+
+    still = 0
+    for label, store, trade in pending:
+        try:
+            legs = _legs_of(trade)
+            if not legs:
+                # It got onto this list by declaring legs; a record that no
+                # longer does cannot be checked - and must not be called
+                # resolved either. Through the DAILY nag, not straight to an
+                # event: this branch runs every five seconds like the rest, and
+                # a per-poll event would bury the incident it is reporting.
+                still += 1
+                _nag_residue(label, trade,
+                             'the record no longer declares any option leg, '
+                             'so nothing could be checked', nagged)
+                continue
+            live = {sym: net_by_symbol.get(sym, 0) for sym, _s in legs}
+            if not any(live.values()):
+                _resolve_residue(store, trade, label, nagged)
+                continue
+            still += 1
+            detail = '; '.join('%s net %+d' % (s, q)
+                               for s, q in live.items() if q)
+            _persist_residue(store, trade, label, detail, live)
+            _nag_residue(label, trade, detail, nagged)
+        except Exception as e:
+            # Per-record isolation, the rule the recovery sweep already
+            # follows: one malformed record must not stop the sweep for the
+            # rest of the book.
+            log('  Residue sweep: #%s in %s raised: %s'
+                % (trade.get('id'), label, e))
+            still += 1
+    return still
+
+
+def _nag_residue(label, trade, detail, nagged):
+    """At most one Telegram a day per incident, keyed like every other nag.
+
+    Same reasoning as `_escalate_recovery`: a safety alert nobody can silence
+    is right, and one that repeats every five seconds trains the reader to
+    swipe it away, which is the same thing as silencing it.
+    """
+    key = (label, trade['id'], 'reconcile_residue', date.today().isoformat())
+    if key in nagged:
+        return
+    nagged.add(key)
+    #: A DIFFERENT name from the detection event, deliberately. Both firing on
+    #: the same day would report ONE live leg as two findings, and the digest
+    #: renders these as counts a human reads as incidents. `reconcile_residue`
+    #: means "a close found a live leg"; this means "a day it was still there".
+    _recovery_event('residue_unresolved', store=label, id=trade['id'])
+    send_telegram(
+        "\U0001F6A8 %s #%s %s: A LEG IS STILL LIVE ON A CLOSED TRADE\n"
+        "%s\n"
+        "The record was booked closed on %s and the broker still shows that "
+        "leg. NO order will be placed against a closed record - close it by "
+        "hand in Kite, or clear the incident with `--clear-residue %s:%s` if "
+        "you are holding it on purpose."
+        % (label, trade['id'], trade.get('stock', '?'), detail,
+           (trade.get('reconcile_residue') or {}).get('detected_at', '?'),
+           label.lower(), trade['id']),
+        alert_class=alert_policy.SAFETY)
 
 
 # ── FH Close ────────────────────────────────────────────────────────────────
@@ -4277,7 +4511,7 @@ def _freeze_fh_leg_failure(fh_store, trade, reason, dry_run, leg_key,
                                          reason=reason),
             **extra)
         if partial and kite is not None:
-            reconcile_after_close(kite, trade, 'FH')
+            reconcile_after_close(kite, trade, 'FH', store=fh_store)
 
     send_telegram(
         f"🔴 FH {trade.get('stock')}: {headline}\n"
@@ -4458,7 +4692,7 @@ def _close_fh_inner(kite, fh_store, trade, spot, reason, dry_run):
                 sp_qty_seen=sp_qty, lp_qty_seen=lp_qty,
                 close_failure=_close_failure(
                     cause='flipped', leg=None, reason=reason))
-            reconcile_after_close(kite, trade, 'FH')
+            reconcile_after_close(kite, trade, 'FH', store=fh_store)
         send_telegram(
             f"🔴 FH {stock}: FLIPPED POSITION\n"
             f"{reason} triggered, but the book is not what the trade says:\n"
@@ -6280,6 +6514,107 @@ def reopen_frozen(kite, ref):
     return 0
 
 
+def clear_residue(kite, ref):
+    """S3 - stop nagging about a post-close residue the owner owns.
+
+    The residue sweep resolves itself the moment the broker goes flat, so the
+    ONLY reason to reach for this is the case the machine cannot infer: the
+    leg is still live and that is deliberate - it was rolled, adopted into
+    another position, or is being held. Refusing to clear it would leave a
+    daily safety alert firing forever about a decision already made, and an
+    alert nobody can end is one the reader learns to swipe away.
+
+    So it clears while live - and RECORDS that it did. `cleared_while_live`
+    keeps the leg and its quantity on the record, because the difference
+    between "the residue went away" and "somebody silenced it" is exactly the
+    fact a later reader needs and the one a bare `state: cleared` would lose.
+    """
+    parsed = _parse_frozen_ref(ref)
+    if not parsed:
+        return 1
+    label, store, tid = parsed
+    try:
+        pending = store.get_residue_trades()
+    except AttributeError:
+        print('%s cannot list residues (no get_residue_trades).' % label)
+        return 1
+    trade = next((t for t in pending if t['id'] == tid), None)
+    if trade is None:
+        print('%s #%s has no unresolved post-close residue.' % (label, tid))
+        return 1
+
+    res = dict(trade.get('reconcile_residue') or {})
+    print('\n%s #%s %s - residue first seen %s'
+          % (label, tid, trade.get('stock', '?'), res.get('detected_at', '?')))
+    live = _show_broker_reality(kite, trade, label)
+    still = {sym: q for sym, q in live.items() if q}
+    unread = [sym for sym, q in live.items() if q is None]
+
+    res['state'] = 'cleared'
+    res['cleared_at'] = datetime.now().isoformat()
+    res['cleared_while_live'] = ({'legs': still} if still else None)
+    if unread:
+        # Not the same as flat, and not the same as live. Say which it was.
+        res['cleared_unreadable'] = unread
+    try:
+        store.update_trade_fields(tid, reconcile_residue=res)
+    except Exception as e:
+        print('Could not write the record: %s' % e)
+        return 1
+    _RECOVERY_NAGGED.discard(
+        (label, tid, 'reconcile_residue', date.today().isoformat()))
+
+    if still:
+        detail = '; '.join('%s net %+d' % (s_, q) for s_, q in still.items())
+        print('\nCLEARED WHILE LIVE: %s' % detail)
+        print('The nag stops. The leg does not - nothing here closed it, and '
+              'nothing will monitor it.')
+        send_telegram(
+            '%s #%s %s: post-close residue CLEARED BY HAND while still live '
+            '(%s). No further alerts for this incident.'
+            % (label, tid, trade.get('stock', '?'), detail),
+            alert_class=alert_policy.SAFETY)
+    else:
+        print('\nCleared. The broker shows nothing live on this record.')
+    return 0
+
+
+def list_residue_trades():
+    """Every unresolved post-close residue, in every book.
+
+    Printed by `--list-frozen` alongside the frozen book rather than behind a
+    switch of its own. They are the same fact from the reader's side - a live
+    leg with nothing watching it - and splitting them across two commands is
+    how one of them ends up being the one nobody runs.
+    """
+    rows = []
+    for name in FROZEN_BOOKS:
+        label, store = _frozen_book(name)
+        if store is None:
+            continue
+        try:
+            for t in store.get_residue_trades():
+                rows.append((label, t))
+        except AttributeError:
+            print('  %s: cannot list residues (no get_residue_trades)' % label)
+        except Exception as e:
+            print('  %s: could not read residues (%s)' % (label, e))
+    if not rows:
+        return
+    print('\n=== POST-CLOSE RESIDUE (booked CLOSED, a leg is still live) ===')
+    print('%-8s %-5s %-12s %-19s %s'
+          % ('book', 'id', 'stock', 'detected', 'legs'))
+    for label, t in rows:
+        res = t.get('reconcile_residue') or {}
+        print('%-8s %-5s %-12s %-19s %s'
+              % (label, t.get('id'), t.get('stock', '?'),
+                 str(res.get('detected_at', '-'))[:19],
+                 res.get('detail', '-')))
+    print('\nNo order is ever placed against these - the record is closed.')
+    print('Close the leg in Kite and it resolves itself on the next sweep,')
+    print('or  --clear-residue BOOK:ID   if you are holding it on purpose.')
+
+
 def list_frozen_trades():
     """Every frozen record in every book, with what it is owed.
 
@@ -6299,6 +6634,7 @@ def list_frozen_trades():
             print('  %s: could not read frozen trades (%s)' % (label, e))
     if not rows:
         print('No frozen trades. (Nothing stuck at partial_close.)')
+        list_residue_trades()
         return
     print('\n=== FROZEN (partial_close — live legs, NOT monitored) ===')
     print('%-8s %-5s %-12s %-12s %-11s %-9s %s'
@@ -6314,6 +6650,7 @@ def list_frozen_trades():
           '   (flat book)')
     print('             --reopen-frozen BOOK:ID'
           '                              (spread intact)')
+    list_residue_trades()
 
 
 def monitor_all(kite: KiteConnect, dry_run: bool):
@@ -6385,6 +6722,22 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     if frozen_n:
         log(f"  {frozen_n} FROZEN record(s) at partial_close — legs may be "
             f"live at the broker. The recovery sweep runs every poll.")
+
+    # S3. Counted and announced on the same footing as the frozen book: both
+    # are live legs that nothing else in this process is watching, and the
+    # only difference between them is which door they came out of.
+    residue_n = 0
+    for _label, _store, _ in frozen_books:
+        if _store is None:
+            continue
+        try:
+            residue_n += len(_store.get_residue_trades())
+        except Exception:
+            pass
+    if residue_n:
+        log(f"  {residue_n} CLOSED record(s) with an unresolved post-close "
+            f"RESIDUE — a leg is still live at the broker. Escalate-only: no "
+            f"order will be placed against a closed record.")
 
     bcs_count = sum(1 for t in all_trades if t['_strategy'] == 'BCS')
     bps_count = sum(1 for t in all_trades if t['_strategy'] == 'BPS')
@@ -7146,6 +7499,23 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 # protects the LIVE book, and a frozen record is already stuck.
                 log(f"  Recovery sweep raised, continuing: {e}")
 
+            # ── S3 · post-close residue ──────────────────────────────
+            #
+            # A record BOOKED CLOSED whose reconcile found a live leg is not
+            # frozen, so the sweep above cannot see it — it is out of the open
+            # book, out of `get_frozen_trades()`, out of everything. One
+            # Telegram at close time was its entire lifecycle. This chases it
+            # until the broker says flat, and places no order ever: the record
+            # is terminal, and the leg may be one the owner is holding on
+            # purpose.
+            #
+            # It costs a `positions()` call ONLY while an incident is open,
+            # which is the normal state of never.
+            try:
+                sweep_reconcile_residue(kite, frozen_books)
+            except Exception as e:
+                log(f"  Residue sweep raised, continuing: {e}")
+
             # ── Watchlist price alerts (after trade checks) ──────────
             if wl_active:
                 check_watchlist_alerts(kite, log_fn=log, telegram_fn=send_telegram,
@@ -7218,6 +7588,10 @@ def main():
                         help='List trades stuck at partial_close')
     parser.add_argument('--book-frozen', default=None, metavar='BOOK:ID',
                         help='Book a frozen trade whose legs are all flat')
+    parser.add_argument('--clear-residue', default=None, metavar='BOOK:ID',
+                        help='S3: stop nagging about a post-close residue you '
+                             'are holding on purpose. Places no orders; '
+                             'records that it was cleared while live.')
     parser.add_argument('--reopen-frozen', default=None, metavar='BOOK:ID',
                         help='Return an INTACT frozen spread to monitoring')
     parser.add_argument('--short-price', type=float, default=None,
@@ -7256,6 +7630,10 @@ def main():
     if args.frozen:
         list_frozen_trades()
         return
+    if args.clear_residue:
+        kite = load_kite()
+        sys.exit(clear_residue(kite, args.clear_residue))
+
     if args.book_frozen or args.reopen_frozen:
         kite = load_kite()
         if args.book_frozen:

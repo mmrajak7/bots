@@ -690,6 +690,32 @@ class TradeStore(LockedStoreMixin):
         """
         return [t for t in self._trades if t.get('status') == 'partial_close']
 
+    def get_residue_trades(self) -> list:
+        """S3 - records BOOKED CLOSED that still show a live leg at the broker.
+
+        `reconcile_after_close` reads the broker's own view after a close
+        reports success. When it finds a leg that is not flat, the record is
+        already `closed`: it is out of the open book, out of
+        `get_frozen_trades()`, and out of every sweep there is. Before this
+        method the entire lifecycle of that fact was ONE Telegram — the same
+        invisible-position shape M14 exists to end, one door over.
+
+        Deliberately NOT the frozen list. A frozen record has a watcher (the
+        recovery sweep) and a nag of its own; a second one for the same
+        position would be noise. This names only the records nothing else can
+        see, which is why the status filter is part of the query rather than
+        left to the caller.
+
+        Read-only, and terminal: no caller may place an order on the strength
+        of this list. The record is closed — there is no close lock to take,
+        no stop to re-arm, and the residue may be a leg the owner is holding
+        on purpose. Escalate, never act.
+        """
+        return [t for t in self._trades
+                if t.get('status') == 'closed'
+                and (t.get('reconcile_residue') or {}).get('state') == 'open']
+
+
 
     def set_trade_status(self, trade_id: int, status: str, **extra_fields):
         """Update trade status and optional extra fields. Saves local + Drive.
