@@ -3243,7 +3243,14 @@ def _alert_calendar_coverage(dry_run: bool = False) -> Optional[str]:
         logger.debug('NSE holiday calendar %s', st['detail'])
         return None
     logger.warning('NSE HOLIDAY CALENDAR: %s', st['detail'])
-    every = 24 * 3600 if st['state'] == 'expired' else 7 * 24 * 3600
+    # Daily for anything that means the calendar is NOT WORKING right now;
+    # weekly for `expiring`, which is a diary note about December. A missing
+    # or stale file is the same fault class as an expired one -- session
+    # counts have silently degraded to weekdays-only -- so it gets the same
+    # cadence.
+    every = (24 * 3600
+             if st['state'] in ('expired', 'missing', 'unreadable', 'stale')
+             else 7 * 24 * 3600)
     now = time.time()
     try:
         with open(cfg.LOG_DIR / CALENDAR_ALERT_STATE_NAME) as f:

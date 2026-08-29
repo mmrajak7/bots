@@ -603,12 +603,35 @@ and only now built:
   `EXPIRY_FORCE_CLOSE` stays out of `VET_KIND`. CLOSE_NOW on a long ITM put
   unconditionally, or a long ITM call with ≥90% of max value already captured.
 
-**The holiday calendar covers 2026 ONLY, and now says so BEFORE it lapses.**
-`nse_holidays.coverage_status()` reports `ok / expiring / expired`; zebra
-checks it every cycle and Telegrams weekly from 60 days out, daily once past.
-Refreshing it needs next year's NSE circular (published in December) — it is
-data, not logic, and past coverage the session count degrades to weekdays-only,
-which OVER-estimates the sessions left and fires every delivery close LATER.
+**The holiday calendar is `BOTS/data/holiday_calendar.json`, scraped daily
+from Zerodha by `SNAIL/src/utils/holiday_scraper.py`.** `common/nse_holidays.py`
+reads it at call time, cached on the file's mtime, so a refresh lands without
+restarting either engine. It is NOT in git — a `git pull` does not deliver it;
+SNAIL's daily startup has to produce it on the box.
+
+> ⚠ **The static list this replaced was mostly WRONG.** It shipped 2026-08-29
+> claiming three independent publications of the NSE calendar agreed on it.
+> Checked against 160 FIFTY daemon logs — a real holiday leaves a ~20-35 line
+> log (daemon started, found the market closed, exited) against ~5,700 on a
+> trading day — it scored **2 of 6** evidenced holidays and listed **6 dates
+> that were full trading days** (2026-03-03, 03-26, 03-31, 04-14, 05-01,
+> 05-28, 06-26). The three it MISSED (2026-02-19, 03-19, 04-01) are the half
+> that costs money: a missing holiday makes the session count over-estimate,
+> so the delivery close fires LATER, into the ramp.
+
+`coverage_status()` reports `ok / expiring / expired / stale / missing /
+unreadable`. zebra checks it every cycle: **daily** Telegram for anything that
+means the calendar is not working now (missing, unreadable, stale, expired),
+weekly for `expiring`, which is only a diary note about December. Every bad
+state degrades the count to weekday-only and says which way the error points.
+
+**The file is taken AS-IS** (owner decision, 2026-08-30) — no hand-patching and
+no reconciliation against observed sessions. Two divergences are therefore live
+and deliberate, both pinned in
+`test_the_known_imperfections_are_still_the_known_ones`: 2026-06-23 is an
+evidenced closure the file omits (count over-estimates, close fires later), and
+2026-08-26 is listed while `logs/cron_zebra_20260826.log` shows a full 347-poll
+session (count under-estimates, close fires earlier).
 
 **A fired TRAIL is not proof of a profit.** The trigger is `mid <= level` and
 the booking price is `mid`; a gap straight through the level books wherever it

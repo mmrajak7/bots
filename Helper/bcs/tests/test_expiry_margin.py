@@ -19,8 +19,13 @@ sys.path.insert(0, str(HELPER))
 
 from bcs import spread_monitor as sm      # noqa: E402
 
-# Expiry is Thursday 2026-08-27.
-EXPIRY = '2026-08-27'
+# Expiry is Tuesday 2026-09-29, and NO holiday falls in the fortnight before
+# it. That is why this week and not another: these tests are about weekend
+# skipping and the countdown, and they used to sit on the week of 2026-08-27
+# — which the daily NSE calendar now says contains a closure (2026-08-26),
+# so every expected number here moved by one. A fixture that straddles a
+# holiday is testing the calendar, not the arithmetic it means to test.
+EXPIRY = '2026-09-29'
 BCS_TRADE = {'id': 1, 'stock': 'TESTCO', 'expiry': EXPIRY,
              'spot_symbol': 'NSE:TESTCO',
              'long_symbol': 'TESTCO26AUG100CE',
@@ -52,21 +57,22 @@ def _no_telegram(monkeypatch):
 def test_weekend_does_not_count_as_time_left():
     """THE bug this replaces. On the Friday before expiry week a calendar count
     says 6 days remain; only 4 sessions do, and the delivery ramp has started."""
-    friday = date(2026, 8, 21)
-    assert (date(2026, 8, 27) - friday).days == 6      # what calendar says
-    assert sm.sessions_to_expiry(BCS_TRADE, friday) == 4
+    friday = date(2026, 9, 25)
+    assert (date(2026, 9, 29) - friday).days == 4      # what calendar says
+    assert sm.sessions_to_expiry(BCS_TRADE, friday) == 2
 
 
 def test_sessions_countdown_through_expiry_week():
-    for day, expected in ((date(2026, 8, 24), 3),      # Mon
-                          (date(2026, 8, 25), 2),      # Tue
-                          (date(2026, 8, 26), 1),      # Wed
-                          (date(2026, 8, 27), 0)):     # Thu = expiry
+    for day, expected in ((date(2026, 9, 24), 3),      # Thu
+                          (date(2026, 9, 25), 2),      # Fri
+                          (date(2026, 9, 28), 1),      # Mon
+                          (date(2026, 9, 29), 0)):     # Tue = expiry
         assert sm.sessions_to_expiry(BCS_TRADE, day) == expected, day
 
 
 def test_expired_and_unparseable_are_handled():
-    assert sm.sessions_to_expiry(BCS_TRADE, date(2026, 9, 1)) == 0
+    # PAST expiry, so zero. Moved with the fixture week.
+    assert sm.sessions_to_expiry(BCS_TRADE, date(2026, 10, 1)) == 0
     assert sm.sessions_to_expiry({'expiry': 'not-a-date'}, date(2026, 8, 1)) is None
     assert sm.sessions_to_expiry({}, date(2026, 8, 1)) is None
 
@@ -99,14 +105,14 @@ def test_unreadable_legs_report_unknown_not_none():
 def test_warns_one_session_before_the_ramp(_no_telegram):
     store = FakeStore()
     sent = sm.maybe_warn_expiry_proximity(store, dict(BCS_TRADE), 150.0, 'BCS',
-                                          today=date(2026, 8, 20))   # 5 left
+                                          today=date(2026, 9, 22))   # 5 left
     assert sent and 'session' in _no_telegram[0]
     assert 'starts in 1 session' in _no_telegram[0]
 
 
 def test_says_the_ramp_is_active_inside_it(_no_telegram):
     sm.maybe_warn_expiry_proximity(FakeStore(), dict(BCS_TRADE), 150.0, 'BCS',
-                                   today=date(2026, 8, 25))          # 2 left
+                                   today=date(2026, 9, 25))          # 2 left
     assert 'ramp ACTIVE' in _no_telegram[0]
 
 
@@ -120,7 +126,7 @@ def test_expiry_day_is_left_to_the_force_close(_no_telegram):
     """Expiry day already has its own alert and its own automated close. A
     second message there is noise on the one day the user is already watching."""
     assert not sm.maybe_warn_expiry_proximity(
-        FakeStore(), dict(BCS_TRADE), 150.0, 'BCS', today=date(2026, 8, 27))
+        FakeStore(), dict(BCS_TRADE), 150.0, 'BCS', today=date(2026, 9, 29))
     assert _no_telegram == []
 
 
@@ -130,17 +136,17 @@ def test_one_warning_per_day_survives_a_monitor_restart(_no_telegram):
     ignore the one alert that costs real money."""
     store = FakeStore()
     t = dict(BCS_TRADE)
-    day = date(2026, 8, 25)
+    day = date(2026, 9, 25)
     assert sm.maybe_warn_expiry_proximity(store, t, 150.0, 'BCS', today=day)
-    assert store.writes == [(1, {'expiry_warn_date': '2026-08-25'})]
+    assert store.writes == [(1, {'expiry_warn_date': '2026-09-25'})]
 
-    restarted = dict(BCS_TRADE, expiry_warn_date='2026-08-25')
+    restarted = dict(BCS_TRADE, expiry_warn_date='2026-09-25')
     assert not sm.maybe_warn_expiry_proximity(store, restarted, 150.0, 'BCS',
                                               today=day)
     assert len(_no_telegram) == 1
     # ...but the next session nags again.
     assert sm.maybe_warn_expiry_proximity(store, restarted, 150.0, 'BCS',
-                                          today=date(2026, 8, 26))
+                                          today=date(2026, 9, 28))
     assert len(_no_telegram) == 2
 
 
@@ -152,7 +158,7 @@ def test_a_failed_flag_write_never_swallows_the_warning(_no_telegram):
             raise RuntimeError('drive down')
 
     assert sm.maybe_warn_expiry_proximity(Broken(), dict(BCS_TRADE), 150.0,
-                                          'BCS', today=date(2026, 8, 25))
+                                          'BCS', today=date(2026, 9, 25))
     assert len(_no_telegram) == 1
 
 
@@ -163,7 +169,7 @@ def test_warning_closes_nothing(monkeypatch, _no_telegram):
     monkeypatch.setattr(sm, 'close_spread',
                         lambda *a, **k: closed.append(a) or 'CLOSED')
     sm.maybe_warn_expiry_proximity(FakeStore(), dict(BCS_TRADE), 150.0, 'BCS',
-                                   today=date(2026, 8, 25))
+                                   today=date(2026, 9, 25))
     assert closed == []
 
 
@@ -284,7 +290,7 @@ def test_gamma_note_rides_on_the_expiry_warning(_no_telegram):
     position, so a second alert would be pure fatigue."""
     t = dict(BCS_TRADE, spread_width=40.0, net_debit=10.0)
     sm.maybe_warn_expiry_proximity(FakeStore(), t, 150.0, 'BCS',
-                                   today=date(2026, 8, 25), spread_val=20.0)
+                                   today=date(2026, 9, 25), spread_val=20.0)
     assert len(_no_telegram) == 1
     assert 'Delivery-margin ramp' in _no_telegram[0]
     assert 'gamma' in _no_telegram[0]

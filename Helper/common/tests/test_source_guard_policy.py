@@ -292,7 +292,6 @@ BASELINE = {
     ('common/tests/test_layered_config.py', 'test_no_tracked_defaults_file_contains_a_secret'),
     ('common/tests/test_layered_config.py', 'test_defaults_and_overlay_do_not_both_claim_the_same_leaf'),
     # common/tests/test_nse_holidays.py
-    ('common/tests/test_nse_holidays.py', 'test_neither_engine_still_has_its_own_weekday_loop'),
 }
 
 
