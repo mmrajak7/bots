@@ -1391,7 +1391,8 @@ def sessions_to_expiry(trade: dict, today: Optional[date] = None) -> Optional[in
     return nse_holidays.sessions_between(d, expiry, warn=log)
 
 
-def time_stop_due(trade: dict, today: Optional[date] = None) -> bool:
+def time_stop_due(trade: dict, today: Optional[date] = None,
+                  spot: Optional[float] = None) -> bool:
     """Does this trade's TIME policy say close it today?
 
     Two policies, and which one applies is a property of the TRADE:
@@ -1414,7 +1415,13 @@ def time_stop_due(trade: dict, today: Optional[date] = None) -> bool:
     if trade.get('time_policy') != 'sessions_before_expiry':
         return is_expiry_day(trade, today)
     try:
-        n = int(trade.get('time_stop_sessions'))
+        # M10. `delivery_stop_sessions` is the record's own count with the
+        # moneyness FLOOR applied -- it can only ever raise it, and a larger
+        # count fires the stop EARLIER. Passing `spot=None` (no live price
+        # this cycle) leaves the stored count untouched rather than guessing.
+        n = int(delivery_stop_sessions(trade, spot))
+        if n <= 0:
+            n = int(trade.get('time_stop_sessions'))
     except (TypeError, ValueError):
         log(f"  WARNING: #{trade.get('id')} {trade.get('stock')} has "
             f"time_policy=sessions_before_expiry but "
@@ -1636,9 +1643,32 @@ def record_time_stop_result(state: dict, success, trade: dict, store,
     return state['state']
 
 
+def _arming_spot(kite, trade: dict) -> Optional[float]:
+    """Spot for the M10 moneyness floor, or None. Never raises.
+
+    A separate quote at the three arming sites rather than threading the poll
+    loop's `spot` down to them: two of the three arm a trade that has just
+    appeared mid-session, BEFORE the loop has fetched its price, and moving
+    the arming below that fetch would reorder the one call site the time-stop
+    policy is deliberately funnelled through.
+
+    None is safe by construction. Without a price the floor does not apply and
+    the record's stored session count stands -- and the floor can only ever
+    fire a close EARLIER, so losing it costs the head start and never the
+    close.
+    """
+    try:
+        return get_spot(kite, trade['spot_symbol'])
+    except Exception as e:
+        log(f"  WARNING: no spot for the delivery moneyness floor on "
+            f"#{trade.get('id')} {trade.get('stock')} ({e}) — the scheduled "
+            f"close stands")
+        return None
+
+
 def arm_time_stop(trade: dict, key, expiry_trades: dict, label: str,
                   note: str = '', today: Optional[date] = None,
-                  store=None) -> bool:
+                  store=None, spot: Optional[float] = None) -> bool:
     """Arm the force-close flag when this trade's TIME policy says today.
 
     ONE call site for `time_stop_due`, deliberately. There were three -- the
@@ -1655,7 +1685,7 @@ def arm_time_stop(trade: dict, key, expiry_trades: dict, label: str,
 
     Returns True when it armed this call (False if already armed, or not due).
     """
-    if key in expiry_trades or not time_stop_due(trade, today):
+    if key in expiry_trades or not time_stop_due(trade, today, spot=spot):
         return False
     stamp = (today or today_ist()).isoformat()
     state = new_time_stop_state(trade, stamp)
@@ -1717,6 +1747,217 @@ def delivery_exposure(trade: dict, spot: float) -> dict:
                      'type': kind, 'itm': itm})
     return {'legs': legs,
             'itm': None if not legs else [l['leg'] for l in legs if l['itm']]}
+
+
+# ── M10 remainders: moneyness, and the E-9 preflight ───────────────────────
+#
+# The 6-session close (`time_stop_sessions`) is sized to clear the delivery
+# ramp, which starts at E-4. Two things were designed with it and not built.
+#
+# **The session count is a FLOOR, never a ceiling.** The intuition runs
+# backwards, which is why it is written down: a far-OTM spread is worth pennies
+# at E-6, so holding it earns nothing and risks nothing; the DEEP-ITM one
+# converging on max value is the one with MAXIMUM delivery exposure, because
+# the margin base is the long ITM leg AT ITS STRIKE -- full contract value,
+# ~Rs 2.82L against a Rs 2L account. So moneyness may pull the close EARLIER
+# and may never push it later, and that is enforced with a `max()` rather than
+# left to whoever edits the arithmetic next.
+
+#: Extra trading sessions of head start when the LONG leg is ITM, i.e. when a
+#: delivery obligation actually exists. One session, not more: the ramp's first
+#: tranche lands at EOD of E-4 and the base close is already at E-6, so this
+#: buys a whole session of slack without materially shortening the trade.
+DELIVERY_MONEYNESS_BONUS_SESSIONS = 1
+
+#: When the preflight starts asking. Three sessions ahead of the base close,
+#: so a CLOSE_NOW verdict still has room to be acted on by a human before the
+#: automated stop would have fired anyway.
+DELIVERY_PREFLIGHT_SESSIONS = 9
+
+#: The whole verdict space. TWO members, and deliberately no DEFER and no HOLD.
+#:
+#: The exit vet's entire safety argument is that HOLDING IS BOUNDED -- the
+#: structure's max loss is the debit and it is already capped, so waiting for a
+#: verdict costs at most some of a known number. Past the delivery deadline
+#: that premise INVERTS: a long ITM put is a give-delivery obligation against
+#: an empty demat, and short delivery goes to auction with a 20% floor and NO
+#: CEILING. A gate whose safety argument has inverted must not have a state
+#: that means "wait", so this one does not, and `EXPIRY_FORCE_CLOSE` stays out
+#: of `bcs.exit_vet.VET_KIND`.
+CLOSE_NOW = 'CLOSE_NOW'
+CLOSE_ON_SCHEDULE = 'CLOSE_ON_SCHEDULE'
+DELIVERY_VERDICTS = (CLOSE_NOW, CLOSE_ON_SCHEDULE)
+
+#: Fraction of max spread value past which there is nothing left to wait for.
+#: At or above it a long-ITM position is holding full delivery exposure to
+#: collect the last few percent of a capped payoff.
+DELIVERY_CAPTURED_PCT = 90.0
+
+
+def _long_leg_itm(trade: dict, spot: float):
+    """Is the LONG leg ITM? None when it cannot be read.
+
+    The long leg, specifically, because that is what the margin is levied on:
+    the base is the long ITM leg AT ITS STRIKE. A short ITM leg is the
+    counterparty's delivery obligation, not ours, and the broker does not net
+    the two -- so "some leg is ITM" is the wrong question and would fire this
+    on a spread carrying no obligation at all.
+
+    None, not False, when the symbols cannot be parsed. Unknown is not clear.
+    """
+    exp = delivery_exposure(trade, spot)
+    if exp['itm'] is None:
+        return None
+    for leg in exp['legs']:
+        if leg['leg'] in ('long', 'long_put', 'long_call'):
+            return bool(leg['itm'])
+    return None
+
+
+def delivery_stop_sessions(trade: dict, spot: Optional[float] = None) -> int:
+    """This trade's time-stop session count, moneyness included.
+
+    `max()` of the record's own count and the moneyness-adjusted one, so the
+    stored value is a FLOOR that this can only raise -- and a larger session
+    count fires the stop EARLIER. Getting the direction wrong here would push
+    an ITM position further INTO the ramp, which is the one outcome the whole
+    6-session schedule exists to avoid, so the invariant is expressed as an
+    operation rather than as care.
+
+    Unknown moneyness (unreadable symbols, no spot) leaves the base count. It
+    does not guess ITM: firing every close a session early on a book whose
+    symbols simply did not parse is a real cost paid for no information.
+    """
+    try:
+        base = int(trade.get('time_stop_sessions') or 0)
+    except (TypeError, ValueError):
+        base = 0
+    if spot is None or base <= 0:
+        return base
+    return max(base, base + DELIVERY_MONEYNESS_BONUS_SESSIONS
+               if _long_leg_itm(trade, spot) else base)
+
+
+def delivery_preflight(trade: dict, spot: Optional[float],
+                       spread_val: Optional[float] = None,
+                       today: Optional[date] = None) -> Optional[dict]:
+    """Close now, or on schedule? Asked from E-9. Returns None before that.
+
+    `{'verdict', 'why', 'sessions'}`. MONOTONIC: once CLOSE_NOW, it stays
+    CLOSE_NOW for the life of the position. The delivery deadline only ever
+    gets nearer, so a verdict that could soften would be a verdict that lets a
+    quiet afternoon undo a decision the calendar already made.
+
+    Alert-only. It changes no stop and places no order; what it produces is a
+    named verdict on the record and a message, three sessions ahead of a close
+    that is going to happen anyway. That is the whole point of being early.
+
+    Two reasons to say CLOSE_NOW, both deterministic and both about the same
+    fact -- an obligation exists and waiting no longer buys anything:
+
+    * a PE spread whose long put is ITM. That is a GIVE-delivery obligation
+      against an empty demat: short delivery goes to auction at E+3 with a 20%
+      floor and no ceiling, and Do-Not-Exercise was permanently withdrawn in
+      Jan 2023, so there is no opt-out. This is the only exposure in the book
+      that can exceed the account, and it does not wait for a value threshold.
+    * any spread whose long leg is ITM and which has already captured
+      DELIVERY_CAPTURED_PCT of its max value. Full contract-value margin base,
+      and a capped payoff with almost nothing left in it.
+    """
+    left = sessions_to_expiry(trade, today)
+    if left is None or left > DELIVERY_PREFLIGHT_SESSIONS or left < 0:
+        return None
+    prior = (trade.get('delivery_preflight') or {}).get('verdict')
+    if prior == CLOSE_NOW:
+        return {'verdict': CLOSE_NOW, 'sessions': left,
+                'why': (trade.get('delivery_preflight') or {}).get('why', ''),
+                'monotonic': True}
+    itm = _long_leg_itm(trade, spot) if spot is not None else None
+    if itm:
+        if _is_put_spread(trade):
+            return {'verdict': CLOSE_NOW, 'sessions': left, 'monotonic': False,
+                    'why': 'the long PUT is ITM — a give-delivery obligation '
+                           'against an empty demat, auctioned at E+3 with a '
+                           '20% floor and no ceiling'}
+        pct = _captured_pct(trade, spread_val)
+        if pct is not None and pct >= DELIVERY_CAPTURED_PCT:
+            return {'verdict': CLOSE_NOW, 'sessions': left, 'monotonic': False,
+                    'why': 'the long leg is ITM and %.0f%% of max value is '
+                           'already captured — full contract-value margin '
+                           'base for the last %.0f%%' % (pct, 100 - pct)}
+    return {'verdict': CLOSE_ON_SCHEDULE, 'sessions': left, 'monotonic': False,
+            'why': ('the long leg is not ITM, so no delivery obligation exists'
+                    if itm is False else
+                    'moneyness could not be read — the scheduled close stands'
+                    if itm is None else
+                    'ITM but still worth holding to the scheduled close')}
+
+
+def _is_put_spread(trade: dict) -> bool:
+    """A structure whose LONG leg is a put. Reads the symbol, not a label.
+
+    `direction` is zebra's word and `_strategy` is this file's; neither is on
+    every record that reaches here, and the fact that matters is what the
+    contract actually is.
+    """
+    sym = str(trade.get('long_put_symbol') or trade.get('long_symbol') or '')
+    return sym.upper().endswith('PE')
+
+
+def _captured_pct(trade: dict, spread_val: Optional[float]) -> Optional[float]:
+    """How much of max value this spread has taken, or None if unknowable."""
+    if isinstance(spread_val, dict):
+        spread_val = spread_val.get('spread')
+    try:
+        width = float(trade.get('spread_width') or 0)
+        debit = float(trade.get('net_debit') or 0)
+        val = float(spread_val)
+    except (TypeError, ValueError):
+        return None
+    if width <= debit:
+        return None
+    return (val - debit) / (width - debit) * 100
+
+
+def record_delivery_preflight(store, trade: dict, verdict: dict,
+                              label: str) -> bool:
+    """Persist a preflight verdict and announce a CLOSE_NOW once. Never raises.
+
+    Announced ONCE per position, not once per day: unlike the expiry nag this
+    is not a recurring calendar fact but a one-way transition, and the daily
+    nag already runs alongside it in the same window.
+    """
+    if not verdict or verdict.get('monotonic'):
+        return False
+    prior = (trade.get('delivery_preflight') or {}).get('verdict')
+    if prior == verdict['verdict']:
+        return False
+    row = {'verdict': verdict['verdict'], 'why': verdict['why'],
+           'sessions': verdict['sessions'], 'at': now_ist().isoformat()}
+    try:
+        store.update_trade_fields(trade['id'], delivery_preflight=row)
+        trade['delivery_preflight'] = row
+    except Exception as e:
+        # The ALERT matters more than the record, so this never blocks it.
+        log('  WARNING: could not persist the delivery preflight for #%s: %s'
+            % (trade.get('id'), e))
+    if verdict['verdict'] != CLOSE_NOW:
+        log('  %s #%s %s: delivery preflight at E-%d — %s'
+            % (label, trade['id'], trade.get('stock', '?'),
+               verdict['sessions'], verdict['why']))
+        return False
+    log('  *** %s #%s %s: DELIVERY PREFLIGHT SAYS CLOSE NOW (E-%d) — %s ***'
+        % (label, trade['id'], trade.get('stock', '?'), verdict['sessions'],
+           verdict['why']))
+    send_telegram(
+        '\U000026A0 %s #%s %s: DELIVERY PREFLIGHT — CLOSE NOW\n'
+        '%d trading session(s) to expiry (%s).\n%s\n'
+        'This is ALERT-ONLY: no order was placed and the scheduled close still '
+        'stands. Closing by hand now is the cheaper of the two.'
+        % (label, trade['id'], trade.get('stock', '?'), verdict['sessions'],
+           trade.get('expiry', '?'), verdict['why']),
+        alert_class=alert_policy.SAFETY)
+    return True
 
 
 GAMMA_RULE_SESSIONS = 5          # playbook: "DTE < 5"
@@ -7426,7 +7667,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     for t in all_trades:
         _store = _get_store_for(t, bcs_store, fh_store, bps_store, zebra_store)
         if arm_time_stop(t, trade_key(t), expiry_trades, t['_strategy'],
-                         store=_store):
+                         store=_store, spot=_arming_spot(kite, t)):
             continue
         # Not expiry day, but close enough that physical-delivery margin is
         # about to build. Every strategy here is physically settled, so all of
@@ -7440,6 +7681,12 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             maybe_warn_expiry_proximity(
                 _store, t, _spot,
                 t.get('_strategy', '?'), spread_val=_sv)
+            # M10. Asked from E-9, three sessions ahead of the scheduled
+            # close, so a CLOSE_NOW verdict still has room to be acted on by a
+            # human. Alert-only and monotonic; it changes no stop.
+            record_delivery_preflight(
+                _store, t, delivery_preflight(t, _spot, _sv),
+                t.get('_strategy', '?'))
         except Exception as e:
             log(f"  WARNING: expiry-proximity check failed for "
                 f"#{t['id']} {t.get('stock')}: {e}")
@@ -7652,7 +7899,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         trail_state[close_key] = new_trail_state(trade)
                         arm_time_stop(trade, close_key, expiry_trades,
                                       strat, note='added mid-session',
-                                      store=trade_store)
+                                      store=trade_store,
+                                      spot=_arming_spot(kite, trade))
                     if close_key not in confirm_state:
                         confirm_state[close_key] = {'sl_spread': 0, 'sl_trail': 0}
                     if close_key not in blind_state:
@@ -7662,7 +7910,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 else:
                     # FH: check for new expiry-day trades added mid-session
                     arm_time_stop(trade, close_key, expiry_trades, 'FH',
-                                  note='added mid-session', store=trade_store)
+                                  note='added mid-session', store=trade_store,
+                                  spot=_arming_spot(kite, trade))
 
                 # B9 + B12 — two failure classes, opposite responses.
                 #

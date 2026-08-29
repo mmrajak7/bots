@@ -88,6 +88,55 @@ def covers(d: date) -> bool:
     return COVERAGE_START <= d <= COVERAGE_END
 
 
+#: How far ahead a lapse is announced. Two months, because the fix is not a
+#: code change: somebody has to find the NSE circular for the next year, and
+#: NSE publishes it in December. A warning that first appears on the day the
+#: window closes is a warning delivered too late to act on.
+COVERAGE_WARN_DAYS = 60
+
+
+def coverage_status(today: date) -> dict:
+    """How much calendar is left, as a decision rather than a fact.
+
+    `{'state', 'days_left', 'detail'}` where state is one of:
+
+      ok        more than COVERAGE_WARN_DAYS of coverage remain
+      expiring  inside the warning window; refresh it now
+      expired   past COVERAGE_END; every session count is weekday-only
+
+    This exists because the module's own honesty was passive. `sessions_between`
+    warns when it is ASKED to count past the window -- correct, and it only
+    fires once a position with a next-year expiry already exists, in a cron log,
+    on the day it starts mattering. The failure mode of stale data here is a
+    position held into the delivery ramp, which is not a thing to learn about
+    from a log line. [[feedback_a_stale_input_still_returns_a_number]]
+
+    Deliberately NOT auto-extending. A calendar that extrapolates is the same
+    shape as an option chain nobody checked the age of: it still parses, still
+    answers, still sizes the trade.
+    """
+    days = (COVERAGE_END - today).days
+    if days < 0:
+        return {'state': 'expired', 'days_left': days,
+                'detail': 'the NSE holiday calendar ran out on %s. Every '
+                          'session count is now WEEKDAYS-ONLY, which '
+                          'OVER-estimates the sessions remaining and fires '
+                          'every delivery close LATER, into the margin ramp. '
+                          'Refresh common/nse_holidays.py from the NSE '
+                          'circular.' % COVERAGE_END.isoformat()}
+    if days <= COVERAGE_WARN_DAYS:
+        return {'state': 'expiring', 'days_left': days,
+                'detail': 'the NSE holiday calendar covers only %d more '
+                          'day(s) (to %s). Refresh it from the NSE circular '
+                          'for the next year before it lapses — past coverage '
+                          'the session count silently degrades to '
+                          'weekdays-only and every delivery close fires '
+                          'LATER.' % (days, COVERAGE_END.isoformat())}
+    return {'state': 'ok', 'days_left': days,
+            'detail': 'covers to %s (%d days)'
+                      % (COVERAGE_END.isoformat(), days)}
+
+
 def is_holiday(d: date) -> bool:
     """A declared full closure. False for a date outside coverage — ask
     `covers()` first if the difference matters, which on a session count it

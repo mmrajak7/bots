@@ -582,6 +582,34 @@ into the other until the paper scorecard earns it.
 | TIME | `TIME_SL_DAYS` trading SESSIONS before expiry, unconditional | warns daily from E-5, force-closes on expiry day | Sessions, not calendar days: for an Aug-25 expiry the old calendar count's first weekday firing was ONE session out, because its earlier hits landed on a weekend when cron does not run. |
 | Delivery margin | — | daily warning from E-5 with sessions left + ITM legs | Stock options are PHYSICALLY settled and the exchange ramps a delivery margin over the last ~4 sessions. Alert-only. **Confirm with the broker:** exact ramp schedule, and whether both BCS legs net for delivery. |
 
+**M10, completed 2026-08-29.** Two rules were designed with the 6-session close
+and only now built:
+
+- **Moneyness may only ACCELERATE the close, never delay it.** The stored
+  `time_stop_sessions` is a FLOOR. When the LONG leg is ITM — the leg the
+  margin is actually levied on, at its STRIKE, full contract value — the close
+  comes forward one session (`delivery_stop_sessions`). The intuition runs
+  backwards, so the invariant is a `max()` rather than a convention: a far-OTM
+  spread is worth pennies at E-6 and risks nothing, while the deep-ITM one
+  converging on max value carries the whole exposure. Unknown moneyness leaves
+  the schedule alone.
+- **`delivery_preflight`, from E-9.** A SEPARATE gate with exactly two members,
+  `CLOSE_NOW | CLOSE_ON_SCHEDULE`, monotonic, alert-only. **Do NOT extend the
+  exit vet to cover it** — the vet's whole safety argument is that holding is
+  bounded, and past the delivery deadline that premise INVERTS (a long ITM put
+  is a give-delivery obligation auctioned at E+3 with a 20% floor and no
+  ceiling). A gate whose safety argument has inverted must not have a state
+  meaning "wait", so this one has no DEFER and no HOLD, and
+  `EXPIRY_FORCE_CLOSE` stays out of `VET_KIND`. CLOSE_NOW on a long ITM put
+  unconditionally, or a long ITM call with ≥90% of max value already captured.
+
+**The holiday calendar covers 2026 ONLY, and now says so BEFORE it lapses.**
+`nse_holidays.coverage_status()` reports `ok / expiring / expired`; zebra
+checks it every cycle and Telegrams weekly from 60 days out, daily once past.
+Refreshing it needs next year's NSE circular (published in December) — it is
+data, not logic, and past coverage the session count degrades to weekdays-only,
+which OVER-estimates the sessions left and fires every delivery close LATER.
+
 **A fired TRAIL is not proof of a profit.** The trigger is `mid <= level` and
 the booking price is `mid`; a gap straight through the level books wherever it
 landed, possibly below the entry debit. That is intended — a breached trail

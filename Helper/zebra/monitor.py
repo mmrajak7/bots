@@ -3232,6 +3232,60 @@ def _cohort_population(trades) -> set:
     return pop
 
 
+#: Dedup for the calendar-lapse alert, alongside the arming one and for the
+#: same reason: this process exits between cycles.
+CALENDAR_ALERT_STATE_NAME = 'calendar_alert_state.json'
+
+
+def _alert_calendar_coverage(dry_run: bool = False) -> Optional[str]:
+    """Say so BEFORE the NSE holiday list runs out. Never raises.
+
+    `sessions_between` already warns when it is asked to count past coverage.
+    That warning is passive twice over: it only fires once a position with an
+    expiry beyond the window already exists, and it lands in a cron log on the
+    day it starts mattering. Refreshing the list is not a code change --
+    somebody has to find next year's NSE circular, and NSE publishes it in
+    December -- so the notice has to arrive with time to act on it.
+
+    Stale data here means a position held INTO the delivery ramp: past
+    coverage the count degrades to weekdays-only, which OVER-estimates the
+    sessions remaining and fires every delivery close LATER.
+
+    Once a week while expiring, once a day once expired.
+    """
+    # IST, like every date in this module (M7). A naive `date.today()` would
+    # move the lapse warning by a day on a UTC box.
+    st = nse_holidays.coverage_status(datetime.now(IST).date())
+    if st['state'] == 'ok':
+        logger.debug('NSE holiday calendar %s', st['detail'])
+        return None
+    logger.warning('NSE HOLIDAY CALENDAR: %s', st['detail'])
+    every = 24 * 3600 if st['state'] == 'expired' else 7 * 24 * 3600
+    now = time.time()
+    try:
+        with open(cfg.LOG_DIR / CALENDAR_ALERT_STATE_NAME) as f:
+            prev = json.load(f)
+        prev = prev if isinstance(prev, dict) else {}
+    except Exception:
+        prev = {}
+    if prev.get('state') == st['state'] and             now - float(prev.get('alerted_at') or 0) < every:
+        return None
+    _send_telegram(
+        html.escape('\U0001F4C5 NSE HOLIDAY CALENDAR %s\n%s'
+                    % (st['state'].upper(), st['detail'])),
+        dry_run=dry_run)
+    try:
+        cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = cfg.LOG_DIR / CALENDAR_ALERT_STATE_NAME
+        tmp = path.with_name(path.name + '.tmp')
+        with open(tmp, 'w') as f:
+            json.dump({'state': st['state'], 'alerted_at': now}, f)
+        tmp.replace(path)
+    except Exception as e:
+        logger.warning('could not persist the calendar alert state: %s', e)
+    return st['state']
+
+
 def _arming_preflight(store, dry_run: bool = False) -> dict:
     """State the switch combination, every cycle. Never raises.
 
@@ -4096,6 +4150,14 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
         _arming_preflight(store, dry_run=dry_run)
     except Exception as e:
         logger.error("Arming preflight failed: %s", e, exc_info=True)
+    # The NSE holiday list is DATA and it runs out. Beside the other two
+    # input-freshness checks, because it fails the same way they do: the
+    # session count keeps answering, and the answer quietly moves every
+    # delivery close later, into the margin ramp.
+    try:
+        _alert_calendar_coverage(dry_run=dry_run)
+    except Exception as e:
+        logger.error("Calendar coverage check failed: %s", e)
     # Say which portfolio limits are ARMED, every cycle. An unset rupee cap
     # behaves exactly like a working one right up to the moment it should have
     # refused something, and this system has already shipped two controls that
