@@ -5574,13 +5574,67 @@ def trail_level_for(trade: dict, peak: float) -> float:
     return peak * TRAIL_PERCENT
 
 
+def restored_peak(trade: dict) -> float:
+    """The highest peak ANY engine has recorded for this position.
+
+    Two engines write a peak for a cohort record and they write it under
+    different names. This one persists `trail_peak`; `zebra/monitor.py`
+    persists `mfe_mid`, and it keeps persisting it while it is stood down --
+    measurement is not an exit decision, so the peak accrues whoever is
+    holding the trigger.
+
+    The arming plan explicitly contemplates ROLLBACK (`exits_managed_externally`
+    back to false, `--dry-run` back on, then forward again later). Across that
+    cycle the two names diverge: everything zebra saw while it held the exits
+    lives only in `mfe_mid`, so on the way back this engine would resume from
+    its own stale `trail_peak` -- a LOWER peak, which pushes the trail level
+    down and gives back more than the rule says. A supported toggle with an
+    unsupported state transfer.
+
+    MAX, not "prefer zebra's". Neither is authoritative: this engine polls
+    every 5 seconds and zebra every 5 minutes, so this one sees more; zebra's
+    jump gate needs `MFE_CONFIRM_POLLS` agreeing reads, so it accepts less. A
+    peak is a maximum, and the union of two partial observations of a maximum
+    is their maximum.
+
+    The three BCS-family books carry no `mfe_mid`, so this is `trail_peak`
+    unchanged for them.
+    """
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+    return max(_f(trade.get('trail_peak')), _f(trade.get('mfe_mid')))
+
+
 def new_trail_state(trade: dict) -> dict:
-    """Trail state dict, restored from persisted trade fields."""
+    """Trail state dict, restored from persisted trade fields.
+
+    The peak is reconciled across both engines' names (`restored_peak`), and
+    the ARMED flag and level are re-derived from it rather than read back.
+    Restoring a higher peak without them would be worse than not restoring it
+    at all: the trail would sit at a level computed for the old peak, or -- in
+    the give-back case the trail exists for -- stay disarmed at
+    `trail_active: False` with a peak that has long since passed the engage
+    level, because `update_trail` only arms on a LIVE reading above it.
+    """
+    peak = restored_peak(trade)
+    engage = trail_engage_level(trade)
+    active = bool(trade.get('trail_active', False))
+    trail = float(trade.get('trail_sl') or 0.0)
+    if not active and peak >= engage and peak > 0:
+        active = True
+    if active:
+        # Never DOWN. The stored level was computed from a peak this one is
+        # at least equal to, and a trail that loosens on a restart is a stop
+        # moving away from the position while it is open.
+        trail = max(trail, trail_level_for(trade, peak))
     return {
-        'peak': trade.get('trail_peak', 0.0),
-        'trail': trade.get('trail_sl', 0.0),
-        'active': trade.get('trail_active', False),
-        'engage_level': trail_engage_level(trade),
+        'peak': peak,
+        'trail': trail,
+        'active': active,
+        'engage_level': engage,
         # The trail RULE rides on the state dict, not just its engage level.
         # `update_trail` computes where the trail sits every time the peak
         # moves, and it is called from two places that have the state but not
@@ -7089,15 +7143,33 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
 
         if strat == 'BCS':
             trail_state[trade_key(t)] = new_trail_state(t)
-            if trail_state[trade_key(t)]['active']:
-                log(f"  BCS #{t['id']} {t['stock']}: Restored trail: peak={t.get('trail_peak', 0):.2f}, trail={t.get('trail_sl', 0):.2f}")
+            _ts = trail_state[trade_key(t)]
+            if _ts['active']:
+                # The RECONCILED values, not the record's own. For a cohort
+                # record the peak is the max of this engine's `trail_peak` and
+                # zebra's `mfe_mid` (`restored_peak`), so printing the stored
+                # field would report a lower peak than the one the trail is
+                # actually running on -- and the line exists to be checked
+                # against the record by hand.
+                log(f"  BCS #{t['id']} {t['stock']}: Restored trail: "
+                    f"peak={_ts['peak']:.2f}, trail={_ts['trail']:.2f}"
+                    f"{' (peak from the cohort book)' if _ts['peak'] > float(t.get('trail_peak') or 0) else ''}")
             log(f"  BCS #{t['id']} {t['stock']} {t['long_symbol']}/{t['short_symbol']} "
                 f"| Lots: {lots_str} "
                 f"| TP: {t['target_spot']} | SL: {t['sl_spot']} | SL Spread: {t['sl_spread']:.2f}")
         elif strat == 'BPS':
             trail_state[trade_key(t)] = new_trail_state(t)
-            if trail_state[trade_key(t)]['active']:
-                log(f"  BPS #{t['id']} {t['stock']}: Restored trail: peak={t.get('trail_peak', 0):.2f}, trail={t.get('trail_sl', 0):.2f}")
+            _ts = trail_state[trade_key(t)]
+            if _ts['active']:
+                # The RECONCILED values, not the record's own. For a cohort
+                # record the peak is the max of this engine's `trail_peak` and
+                # zebra's `mfe_mid` (`restored_peak`), so printing the stored
+                # field would report a lower peak than the one the trail is
+                # actually running on -- and the line exists to be checked
+                # against the record by hand.
+                log(f"  BPS #{t['id']} {t['stock']}: Restored trail: "
+                    f"peak={_ts['peak']:.2f}, trail={_ts['trail']:.2f}"
+                    f"{' (peak from the cohort book)' if _ts['peak'] > float(t.get('trail_peak') or 0) else ''}")
             log(f"  BPS #{t['id']} {t['stock']} {t['long_symbol']}/{t['short_symbol']} "
                 f"| Lots: {lots_str} "
                 f"| TP: spot<={t['target_spot']} | SL: spot>={t['sl_spot']} | SL Spread: {t['sl_spread']:.2f}")
