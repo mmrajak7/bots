@@ -307,19 +307,24 @@ def test_the_floors_margin_on_real_data_is_measured_not_assumed():
 
 
 def test_the_intrinsic_floor_is_inert_below_the_long_strike_by_construction():
-    """Worth stating, because the zebra twin needed a `max(0.0, ...)` fix here
-    and this copy does not have one — which reads like the same missing fix.
+    """Below the long strike the floor cannot reject anything, and that is fine.
 
-    It is not. zebra CLAMPS a negative structure value to 0 and keeps it, so a
-    floor allowed below zero made the guard inert in the loss region. This path
-    REFUSES a negative value earlier (`negative_spread`), so by the time the
-    floor is consulted the value is already >= 0 and a negative floor cannot
-    reject anything. Clamping it to 0 here would change no outcome.
+    This test earned its keep on 2026-08-30. The two engines' floors were being
+    merged into `common/spread_valuation`, and the merge was justified partly
+    by "zebra clamps the floor at zero and the money path does not, so the
+    guard is inert here in the loss region". This test said no: the VALUE is
+    clamped to >= 0 upstream, so a floor at or below zero rejects nothing
+    either way, and the clamp changes no outcome on this path.
 
-    Pinned so that a future reader who spots the difference finds the reason
-    instead of 'fixing' the live-money path to match the paper one.
+    The clamp is in the shared module because CLAUDE.md documents it and it
+    costs nothing. The claim that it FIXED something here was wrong, and this
+    is where that was caught.
+
+    (The docstring it replaced said the negative value was REFUSED upstream.
+    That was itself stale — the August bounds change made it a clamp to 0.
+    Same conclusion, different reason.)
     """
-    assert sm.spread_intrinsic_floor(TRADE, 1300.0) < 0
+    assert sm.spread_intrinsic_floor(TRADE, 1300.0) <= 0
     assert sm.spread_intrinsic_floor(TRADE, 1420.0) > 0
 
 

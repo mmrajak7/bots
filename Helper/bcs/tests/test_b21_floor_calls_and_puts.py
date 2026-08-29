@@ -211,8 +211,12 @@ def test_the_missing_price_disable_is_an_explicit_branch_not_a_caught_error():
     import inspect
     import textwrap
 
+    # The ladder moved to `common.spread_valuation._allowance` on 2026-08-30
+    # when the two engines' floors were merged. The property is unchanged and
+    # so is the reason for it; only the file moved.
+    from common import spread_valuation
     tree = ast.parse(textwrap.dedent(
-        inspect.getsource(sm.spread_intrinsic_floor)))
+        inspect.getsource(spread_valuation._allowance)))
     guarded = any(
         isinstance(n, ast.If)
         and isinstance(n.test, ast.Compare)
@@ -222,6 +226,6 @@ def test_the_missing_price_disable_is_an_explicit_branch_not_a_caught_error():
         and any(isinstance(st, ast.Return) for st in n.body)
         for n in ast.walk(tree))
     assert guarded, (
-        'spread_intrinsic_floor no longer returns early when '
-        'entry_short_price is missing. It still yields None today only '
-        'because float(None) raises into the catch-all.')
+        'the allowance ladder no longer returns early when the short entry '
+        'price is missing. It would still yield None today only because '
+        'float(None) raises into a catch-all.')

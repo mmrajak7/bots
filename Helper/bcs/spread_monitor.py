@@ -66,6 +66,7 @@ from common import option_symbols as _sym
 from common.option_symbols import check_leg_types
 from common import layered_config
 from common import kite_errors
+from common import spread_valuation
 from common import nse_holidays
 from bcs import alert_policy
 from bcs import exit_vet
@@ -825,86 +826,26 @@ def _spread_width(trade: dict):
 
 
 def spread_intrinsic_floor(trade: dict, spot: float):
-    """No-arbitrage floor for a vertical debit spread at `spot`, or None.
+    """No-arbitrage floor for a vertical at `spot`. See `common.spread_valuation`.
 
-    Ported from the zebra monitor's ABB #242 guard: in July 2026 a junk quote
-    on an illiquid ITM leg booked a -50% stop at a value of 335 when pure
-    intrinsic at the recorded spot was 1,020. A structure cannot be worth less
-    than it could be unwound for; a quote below this is proof of a broken book,
-    not an unlucky price.
+    A thin delegate since 2026-08-30. This function and
+    `zebra.monitor._intrinsic_floor` were one arithmetic implemented twice, and
+    each engine held HALF of the fix:
 
-    Deliberately generous — it subtracts 1.5x the short leg's entry-time
-    extrinsic, so it only ever fires on the impossible, never the merely
-    unfavourable. A too-tight floor would block a real stop, which is the
-    error that costs money.
+    * this one derived CE/PE from the leg SYMBOLS and built the short-leg
+      allowance from the entry price less its intrinsic at entry -- both
+      corrections zebra never got;
+    * zebra clamped the floor at zero and this one did not -- which changes no
+      outcome on either path, because both clamp the VALUE to >= 0 first, so a
+      floor at or below zero rejects nothing.
+      `test_the_intrinsic_floor_is_inert_below_the_long_strike_by_construction`
+      exists to stop a reader "fixing" the live-money path to match the paper
+      one on that difference, and it did its job during this merge.
 
-    **CALLS AND PUTS, since 2026-08-25.** It used to compute
-    `max(spot - k_l, 0) - max(spot - k_s, 0)` unconditionally, which is call
-    arithmetic. A bear put spread holds the HIGHER strike long, so that
-    expression returns 0 or a negative number for every spot — and since a
-    negative value is already refused upstream as `negative_spread`, the
-    comparison `value < floor` could never be true. The guard was not merely
-    approximate for BPS; it was INERT, and inert precisely where it matters:
-    at spot 1250 a 1400/1340 put spread is worth its full 60, the old floor
-    said -9.67, and a garbage quote of 1.00 passed straight through. That is
-    the ABB #242 scenario itself, unguarded, on one of the three live books.
-    `bcs/spread_monitor.py` monitors all three; the guard was written for the
-    first and silently skipped the second ([[feedback_copy_pasted_modules_fix_once]]).
-
-    The allowance was wrong for puts in the same way: a short put's intrinsic
-    at entry is `max(k_s - entry_spot, 0)`, not `max(entry_spot - k_s, 0)`.
-
-    Direction comes from the SYMBOL, not from `_store_type` — see
-    `option_type_from_symbol`. If the two legs disagree, or either is
-    unreadable, the floor does not apply.
+    Verticals only, so `long_multiplier` stays 1. The retired back-ratio's 2 is
+    zebra's business and this engine has never held one.
     """
-    try:
-        k_l = strike_from_symbol(trade.get('long_symbol'))
-        k_s = strike_from_symbol(trade.get('short_symbol'))
-        if k_l is None or k_s is None:
-            return None
-        opt_l = option_type_from_symbol(trade.get('long_symbol'))
-        opt_s = option_type_from_symbol(trade.get('short_symbol'))
-        if opt_l is None or opt_l != opt_s:
-            # A vertical has both legs in the same instrument. Anything else
-            # is not a shape this floor knows how to price.
-            return None
-
-        if opt_l == 'CE':
-            intrinsic = max(spot - k_l, 0.0) - max(spot - k_s, 0.0)
-            short_intrinsic_at_entry = lambda es: max(es - k_s, 0.0)
-        else:
-            intrinsic = max(k_l - spot, 0.0) - max(k_s - spot, 0.0)
-            short_intrinsic_at_entry = lambda es: max(k_s - es, 0.0)
-
-        # Short-leg extrinsic AT ENTRY. The short leg is sold OTM/NTM, so its
-        # entire premium is extrinsic unless spot was already past the strike.
-        short_px = trade.get('entry_short_price')
-        if short_px is None:
-            # No basis for an allowance at all. Disable rather than invent
-            # one: a floor built on a guessed allowance is not a no-arbitrage
-            # bound, and getting it too TIGHT blinds the monitor completely.
-            return None
-        entry_spot = trade.get('entry_spot')
-        if entry_spot is not None:
-            allowance = float(short_px) - short_intrinsic_at_entry(
-                float(entry_spot))
-        else:
-            # B17: the old fallback was `0.3 * net_debit`, which on the real
-            # ICICI record is 4.07 against a true 7.65 — a TIGHTER floor than
-            # the truth, so the healthy 09:16 book (38.95) fell below it and
-            # the monitor refused every valuation for the rest of the session.
-            # SL_SPREAD, SL_TRAIL and the trail all went dark, which is the
-            # exact opposite of what this guard is for.
-            #
-            # The whole premium is a strict UPPER bound on the extrinsic, so
-            # using it makes the floor generous when we are ignorant. Being
-            # ignorant should widen the benefit of the doubt, never narrow it.
-            allowance = float(short_px)
-        allowance = max(allowance, 0.0)
-        return round(intrinsic - 1.5 * allowance, 2)
-    except Exception:
-        return None
+    return spread_valuation.intrinsic_floor(trade, spot)
 
 
 def spot_corroborates(state: dict, spot: float, spread_val,

@@ -29,6 +29,7 @@ from typing import Optional
 import requests
 
 from common import arming as arming_mod
+from common import spread_valuation
 from common import kite_errors
 
 from . import capital
@@ -2478,46 +2479,28 @@ def _long_multiplier(trade: dict) -> int:
 
 
 def _intrinsic_floor(trade: dict, spot: float) -> Optional[float]:
-    """Arbitrage-floor for the structure value at the given spot, minus a
-    generous extrinsic allowance for the short leg.
+    """No-arbitrage floor for the structure value. See `common.spread_valuation`.
 
-    A quoted structure mid below this is a bad quote (stale/one-sided book on
-    the illiquid ITM leg), not a real price — July 2026: ABB #242 booked a
-    -50% debit-SL exit at mid 335 when pure intrinsic at the recorded spot
-    was 1,020. Returns None if the floor can't be computed.
+    A thin delegate since 2026-08-30. This and `bcs.spread_intrinsic_floor`
+    were one arithmetic implemented twice, and the money path's version was
+    the better one: it derives CE/PE from the leg SYMBOLS rather than from a
+    `direction` label (B21 -- call arithmetic makes the floor inert for a bear
+    put spread, which holds the higher strike long), and it builds the short
+    allowance from the entry price less its intrinsic at entry.
+
+    The allowance ladder no longer ends in `0.3 * debit`. B17 measured that
+    fallback as TIGHTER than the truth on the real ICICI record -- 4.07 against
+    7.65 -- so a healthy book fell below the floor and every valuation was
+    refused for the rest of the session, taking SL_SPREAD, SL_TRAIL and the
+    trail dark with it. With no basis for an allowance there is now NO FLOOR,
+    which is a known gap rather than a guard that refuses healthy books.
+
+    `_long_multiplier` is still consulted here: the back ratio's two long legs
+    are this book's history and the shared module must not have to know about
+    a structure that no longer trades.
     """
-    try:
-        k_l = float(trade['long_strike'])
-        k_s = float(trade['short_strike'])
-        mult = _long_multiplier(trade)
-        if trade['direction'] == 'CE':
-            intr = mult * max(spot - k_l, 0.0) - max(spot - k_s, 0.0)
-        else:
-            intr = mult * max(k_l - spot, 0.0) - max(k_s - spot, 0.0)
-
-        # Short-leg extrinsic allowance: the structure can legitimately trade
-        # below pure intrinsic by up to the short leg's time value. Use the
-        # entry-time value (extrinsic peaks ATM ≈ entry) with 1.5× headroom
-        # for IV spikes; fall back to the triggered alert pair, then to 30%
-        # of the entry debit for pre-guard trades.
-        allowance = trade.get('short_extrinsic_entry')
-        if allowance is None:
-            for p in trade.get('alert_strikes') or []:
-                if (abs(float(p.get('k_l', -1)) - k_l) < 1e-6
-                        and abs(float(p.get('k_s', -1)) - k_s) < 1e-6):
-                    allowance = p.get('short_extrinsic')
-                    break
-        if allowance is None:
-            allowance = 0.3 * trade.get('debit', 0)
-        # Never below zero. `intr - 1.5*allowance` goes negative the moment the
-        # spread is OTM (intr = 0), which made this guard inert in exactly the
-        # region it exists for: on a losing position it returned -0.83 against
-        # a stop of 0.705, so no collapsed book could ever fall below it. Zero
-        # is a real floor — a debit structure is never worth less, because you
-        # can always let it expire.
-        return max(0.0, round(intr - 1.5 * float(allowance), 2))
-    except Exception:
-        return None
+    return spread_valuation.intrinsic_floor(
+        trade, spot, long_multiplier=_long_multiplier(trade))
 
 
 def _structure_quote(kite, trade: dict, spot: Optional[float] = None) -> dict:

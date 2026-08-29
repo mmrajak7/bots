@@ -202,9 +202,14 @@ def test_the_negative_spread_guard_alone_would_also_have_refused_it():
     got = sm.get_spread_value.__doc__ is not None      # real function, not a stub
     assert got
     src = (HELPER / 'bcs' / 'spread_monitor.py').read_text(encoding='utf-8')
-    assert 'negative_spread' in src
+    # The CLAMP, not the word. This asserted `'negative_spread' in src` until
+    # 2026-08-30, and the only occurrence of that string was in a DOCSTRING
+    # explaining an older design — so the guard's own text moving broke a test
+    # about the guard's behaviour. A test that can be broken by a comment is
+    # testing the comment.
     assert 'if spread_val < 0:' in src, (
-        "the negative-spread refusal moved; this replay depends on it")
+        "the negative-spread clamp moved; this replay depends on it")
+    assert sm.get_spread_value is not None
 
 
 def test_the_open_buffer_covers_the_whole_incident():
