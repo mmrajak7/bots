@@ -34,6 +34,7 @@ from common import kite_errors
 
 from . import capital
 from . import config as cfg
+from . import depth as depth_mod
 from . import events as events_mod
 from . import health as health_mod
 from . import history
@@ -2645,6 +2646,14 @@ def _leg_book(symbol, q: dict) -> dict:
     return {'symbol': symbol, 'bid': bid, 'ask': ask, 'mid': mid_,
             'oi': q.get('oi'), 'last': q.get('last'),
             'spread_pct': spread_pct,
+            # SIZE AT THE TOUCH, carried since 2026-08-30. `_quote_option` has
+            # returned these all along and this function dropped them, so the
+            # forensic POLL line, the persisted `exit_legs` and the vetting
+            # agent's context all described a book without saying how much of
+            # it there was. Depth is the only limit on position size that is a
+            # fact about the market rather than a number we chose, and it is
+            # the one the book never kept.
+            'bid_qty': q.get('bid_qty'), 'ask_qty': q.get('ask_qty'),
             'reliable': q.get('reliable', True),
             'unreliable_reason': q.get('unreliable_reason')}
 
@@ -3751,6 +3760,17 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # that exits a trade is usually the poll that set its peak, and the
             # underlying is still worth recording on a cycle when the option book
             # is dark. Never gates or blocks anything — pure measurement.
+            # DEPTH, on the same footing as the peak and for the same
+            # reason: measurement, before any exit branch, folded into the one
+            # batched store write this cycle already makes. Never gates
+            # anything. An exit that cannot fill is the unbounded failure on
+            # this book, and until now nothing recorded whether the touch
+            # could have carried the position out.
+            dpatch = depth_mod.observe(trade, sq.get('legs'))
+            if dpatch:
+                pending_mfe.setdefault(tid, {}).update(dpatch)
+                trade.update(dpatch)
+
             patch = mfe_mod.compute(trade, spot, mid, sq['reliable'])
             if patch:
                 # MERGE, never assign. This dict may already hold the spot

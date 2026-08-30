@@ -519,6 +519,60 @@ After fills: save via `bcs.trade_store.add_trade()` immediately — no exception
 - **Phase 1 (Delta, Week 1-2):** Stock recovers, intrinsic spread widens. This is where most P&L comes from.
 - **Phase 2 (Theta, Week 3-4):** Both legs ITM, short leg's TV decays faster (closer to ATM = peak theta). Spread converges to max value passively.
 
+### Multi-pair entry — SPECIFIED, NOT BUILT
+
+Owner direction, 2026-08-30: *"if we cannot enter in a single go … then place
+multiple pairs meeting our price or width conditions"*, *"in long term we plan
+to trade with NEO — where orders does not matter"*, *"for initial days we trade
+in KITE — we will test with 1 lot"*, *"build with KITE in mind, in future we
+shall do migration"*.
+
+Full requirements: `docs/MULTI_PAIR_ENTRY.md` (untracked, Windows only).
+
+**The rule.** When one pair's touch cannot carry the size, spread it across
+several pairs that each independently pass EVERY entry gate — rather than
+walking the book, and rather than silently under-deploying. It is not a way to
+enter more: capital, slot and risk limits are unchanged.
+
+**Every pair is a whole trade.** No pair inherits approval from the pair beside
+it: OI ≥ 5,000 both legs, positive debit AND positive `debit_mid`, d/w ≤ 45% on
+the MID basis, entry cost ≤ 15%, reliable two-way book, short at least one
+strike beyond ATM. Candidates move the SHORT strike; the ATM long is the
+thesis and moves only if nothing else qualifies.
+
+**Legs intact, per pair.** One lot per order, long first within each round,
+each PAIR completed before the next starts — so stopping after pair *k* leaves
+*k* complete spreads and nothing else. Never unwind, never retry the whole
+thing. The long quantity must always equal the summed short quantity; a "pair"
+that becomes a ratio is a different structure.
+
+**The broker is a NUMBER, never a branch.** A second pair costs 4 more orders:
+Rs 94.40 on Kite, Rs 0 on Neo. `brokerage_per_order` is already in
+`cfg.FEE_RATES`, so the Neo migration must be a config change — any code that
+tests a broker NAME will rot, and it makes the Kite path the untested one the
+day it stops being used.
+
+Measured against the cohort, one tick per leg avoided: **break-even lot size on
+Kite is ~944 shares, and 6 of 13 records clear it.** So multi-pair is not a
+Neo-only feature; on Kite it is lot-size dependent and computable.
+
+**Nothing gets built until the evidence exists.** Collection shipped
+2026-08-30 and runs in paper — `long_ask_qty_entry` / `short_bid_qty_entry`
+(depth at entry), `exit_depth` (a 15-minute sampled histogram of lots the touch
+could absorb ON THE WAY OUT), and `entry_plan` (which limit decided the size,
+and what every other limit said). Read it with **`python -m zebra depth`**.
+
+Three questions it has to answer first: does the depth limit ever bind (at 1
+lot on Kite it should not, and that is the finding); is a second qualifying
+pair usually there; and what does walking the book actually cost — the
+one-tick figure above is an assumption, not a measurement.
+
+**The schema is the real work.** Every downstream reader — valuation, the
+intrinsic floor, the trail, `exit_legs`, the digest, fees — assumes ONE long
+symbol and ONE short symbol. Moving a record to a LIST of pairs is most of the
+change, and is a stronger argument for one pair while lots are small than any
+of the fee arithmetic.
+
 ### Execution
 
 ```

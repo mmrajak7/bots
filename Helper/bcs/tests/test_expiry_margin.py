@@ -188,10 +188,50 @@ def test_warning_is_wired_into_the_cron_startup():
 # and being restarted by the 5-minute cron all end with the monitor looking at
 # a book as unformed as at 09:15, while is_spread_settled() reports True.
 @pytest.fixture(autouse=True)
-def _clean_poll_state():
+def _clean_poll_state(monkeypatch):
+    """Poll state reset, AND the session clock pinned inside market hours.
+
+    `is_spread_settled` takes an injectable `now` for the resume buffer and
+    reads the REAL wall clock for the session buffer -- so with only `now`
+    supplied it returns False for every call made before 09:30 IST, whatever
+    the test injects. These tests passed all afternoon and failed at 06:33 the
+    next morning.
+
+    Third instance of this shape (`test_entry_executor` had two of them a day
+    earlier). A suite that only passes during Indian market hours is not a
+    suite anybody will trust at 07:00.
+    """
+    import datetime as _dt
+
+    class _DT(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = _dt.datetime(2026, 9, 15, 11, 0, 0)
+            return fixed.replace(tzinfo=tz) if tz else fixed
+    monkeypatch.setattr(sm, 'datetime', _DT)
     sm.reset_poll_state()
     yield
     sm.reset_poll_state()
+
+
+def test_the_suite_pins_the_session_clock():
+    """The pin above must actually reach the function it disarms.
+
+    Asserted structurally rather than by "it passes right now", which is the
+    property that was false: `is_spread_settled` mixes an injected `now` with
+    a hidden `now_ist()`, and only the second one decides before 09:30.
+
+    RETIRES WHEN: `is_spread_settled` takes ONE clock, so there is no hidden
+    second reading for a fixture to have to pin.
+    """
+    import inspect
+    src = inspect.getsource(sm.is_spread_settled)
+    assert 'now_ist()' in src, (
+        'is_spread_settled no longer reads the session clock; _clean_poll_state '
+        'pins sm.datetime and would now be pinning nothing')
+    assert sm.is_spread_settled(now=0.0) is True, (
+        'the pinned clock is outside the session buffer, so every value-trigger '
+        'test in this file is asserting against a disarmed engine')
 
 
 def test_a_blackout_rearms_the_spread_buffer(monkeypatch):

@@ -1218,6 +1218,64 @@ def _trade_cost(trade: dict):
         return 0.0, 'uncostable'
 
 
+def cmd_depth(args):
+    """Report the depth this book has actually observed at the touch.
+
+    The evidence half of the lot-scaling question (owner, 2026-08-30: *"let us
+    collect oi and depth in coming weeks and decide"*). Entry-side depth is
+    stamped on each record at entry; the exit side is sampled every
+    `depth.SAMPLE_SEC` while a position is open, because closing at size is
+    the constraint that has actually cost money here.
+
+    Open positions only by default. A closed record's histogram is still
+    valid evidence, but the question being asked is "how big can the NEXT
+    entry be", and the open book is the one whose books are current.
+    """
+    from zebra import depth as depth_mod
+    from .trade_store import get_store, in_cohort
+
+    store = get_store()
+    trades = [t for t in store.load_trades() if in_cohort(t)]
+    if not getattr(args, 'all', False):
+        trades = [t for t in trades if t.get('status') == 'entered']
+
+    print()
+    print(depth_mod.report(trades))
+    print()
+
+    # -- the entry side, straight off the records --------------------------
+    rows = []
+    for t in trades:
+        lot = t.get('lot_size')
+        aq, bq = t.get('long_ask_qty_entry'), t.get('short_bid_qty_entry')
+        if not lot or aq is None or bq is None:
+            continue
+        rows.append((t.get('stock'), int(min(int(aq), int(bq)) // int(lot)),
+                     t.get('long_oi_entry'), t.get('short_oi_entry')))
+    print('ENTRY DEPTH — lots the touch could absorb when the position opened')
+    print('-' * 66)
+    if not rows:
+        print('  none recorded yet. Depth has been persisted at entry since')
+        print('  2026-08-30; records opened before that carry OI but no size,')
+        print('  and OI is NOT a substitute — it counts open contracts, not')
+        print('  resting size at the touch.')
+    else:
+        print('%-14s %-8s %-12s %s' % ('stock', 'lots', 'long OI', 'short OI'))
+        for stock, lots, loi, soi in sorted(rows, key=lambda r: r[1]):
+            print('%-14s %-8d %-12s %s' % (stock, lots, loi, soi))
+        worst = min(r[1] for r in rows)
+        print()
+        print('  thinnest entry seen: %d lot(s). The ladder should not be'
+              % worst)
+        print('  raised past what the THINNEST book carries, because the')
+        print('  scanner picks the stock, not the size.')
+    print()
+    print('Decide from BOTH tables. Entry depth bounds how big a position can')
+    print('be opened; exit depth bounds whether it can be closed again, and')
+    print('only the second one is unbounded when it goes wrong.')
+    return 0
+
+
 def cmd_status(args):
     from .trade_store import get_store
     store = get_store()
@@ -1770,6 +1828,13 @@ def main():
     p_cnc.add_argument('id', type=int)
     p_cnc.add_argument('--reason', default=None)
     p_cnc.set_defaults(func=cmd_cancel)
+
+    p_dep = sub.add_parser(
+        'depth',
+        help='Depth actually seen at the touch — the lot-scaling evidence')
+    p_dep.add_argument('--all', action='store_true',
+                       help='include CLOSED positions (default: open only)')
+    p_dep.set_defaults(func=cmd_depth)
 
     p_sts = sub.add_parser('status', help='Dashboard')
     p_sts.set_defaults(func=cmd_status)

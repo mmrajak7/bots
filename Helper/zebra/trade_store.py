@@ -33,7 +33,11 @@ logger = logging.getLogger(__name__)
 # reference rides this write for the same reason the peaks do — it updates once
 # per open position per poll, and a write per trade per cycle is precisely what
 # the batching removed.
-_BATCHED_POLL_FIELDS = frozenset({'corrob_spot', 'corrob_value', 'corrob_t'})
+# `exit_depth` joined them on 2026-08-30: the same cadence (once per open
+# position per poll) and the same reason for riding this write rather than
+# taking one of its own.
+_BATCHED_POLL_FIELDS = frozenset({'corrob_spot', 'corrob_value', 'corrob_t',
+                                  'exit_depth'})
 
 #: Statuses that mean this thesis is ALREADY LIVE somewhere and a second
 #: signal on the same (stock, timeframe, direction) must be refused.
