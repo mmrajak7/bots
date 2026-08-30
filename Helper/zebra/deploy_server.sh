@@ -8,7 +8,7 @@
 # What this script does (no fetching — that's pull.sh):
 #   1. Sanity checks
 #   2. Verify zebra package imports + status
-#   3. Reset any in-flight signals (one-time hygiene)
+#   3. Reset in-flight signals — ONLY with --reset, and only on an EMPTY book
 #   4. Update crontab (add monitor + report lines, comment old)
 #   5. Stop old monitors + clear lock files
 #   6. Archive deprecated logs + stores (idempotent — only moves files that exist)
@@ -40,9 +40,35 @@ cd "$HELPER_DIR"
 "$VENV" -c "from zebra import config, scanner, strikes, monitor, trade_store, report; print('  imports OK')"
 "$VENV" -m zebra status
 
-# ── 3. Reset in-flight signals (one-time hygiene before paper-mode runs) ─
-step "3. Reset in-flight signals"
-"$VENV" -m zebra reset --confirm || true
+# ── 3. Reset in-flight signals — OPT-IN, NEVER ON A LIVE BOOK ────────────
+#
+# This was an unguarded `zebra reset --confirm` until 2026-08-30, described in
+# the header as "one-time hygiene". It is not one-time in any enforced sense:
+# re-running this script force-closed SIX open cohort positions at -100% under
+# `reset_force_close` and cancelled three signals. Paper records, so no money —
+# and three weeks of the evidence the arming gate is waiting on.
+#
+# A deploy script must be safe to re-run. That is the entire contract of one.
+# So the reset is now opt-in AND refuses a book that has anything in flight:
+# the operator has to ask for it twice, once with a flag and once by having an
+# empty book.
+step "3. Reset in-flight signals (skipped unless --reset)"
+if [ "${1:-}" = "--reset" ]; then
+    IN_FLIGHT=$("$VENV" -m zebra list 2>/dev/null \
+        | grep -cE '\b(watching|triggered|entered)\b' || true)
+    if [ "${IN_FLIGHT:-0}" -gt 0 ]; then
+        echo "  REFUSED: $IN_FLIGHT signal(s) are in flight."
+        echo "  A reset force-closes every one of them at -100%. If that is"
+        echo "  really what you want, close them deliberately first:"
+        echo "    $VENV -m zebra close <ID> --exit-debit X --reason ..."
+        echo "  Recover a book reset by accident with:"
+        echo "    $VENV -m zebra.restore_snapshot logs/archive/<date>/<snap>.json"
+        exit 1
+    fi
+    "$VENV" -m zebra reset --confirm || true
+else
+    echo "  skipped — pass --reset to run it (it force-closes the whole book)"
+fi
 
 # ── 4. Update crontab ────────────────────────────────────────────────────
 step "4. Update crontab"
