@@ -3,6 +3,14 @@
 # zebra BCS engine — Raspberry Pi deploy + readiness check
 # =========================================================
 #
+# SAFE-TO-RERUN: every write is gated on --apply, and each one is idempotent
+# on its own — the log-trim cron installs only if `grep -qF` finds it absent,
+# and the monitor line is replaced IN PLACE (backing the crontab up first) or
+# skipped when already correct. Without --apply this script only reports.
+# Declared because `common/tests/test_script_safety.py` requires a sentence
+# from anyone who ships a destructive verb; see incident 2026-08-30, where
+# "one-time hygiene" in a header enforced nothing and cost the whole book.
+#
 #   scp Helper/zebra/pi_setup.sh pi:~/
 #   ssh pi
 #   chmod +x ~/pi_setup.sh

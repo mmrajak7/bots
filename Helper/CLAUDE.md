@@ -1358,6 +1358,43 @@ python -m zebra cancel ID --reason "..."
 
 ---
 
+### Shell scripts — a destructive step must be opt-in or declared
+
+**Rule, from the 2026-08-30 incident:** a tracked `.sh` containing a
+destructive verb (`reset --confirm`, `rm -f`, `rm -rf`, a `crontab` write,
+`--force`, `git reset --hard`) must EITHER gate it behind an explicit flag, OR
+carry a line
+
+```
+# SAFE-TO-RERUN: <one sentence on why running it twice destroys nothing>
+```
+
+Enforced by `common/tests/test_script_safety.py`, which fails the commit rather
+than the box.
+
+**Why the rule is a sentence and not a marker:** the value is entirely in
+having thought about what a second run does. Same design as `RETIRES WHEN:` on
+the source guards.
+
+**What it cost to learn.** `zebra/deploy_server.sh` ran an unguarded
+`zebra reset --confirm` under a header calling it "one-time hygiene" — and,
+three lines above, "Idempotent: re-running is safe". Re-running it on
+2026-08-30 force-closed all six open cohort positions at −100% and cancelled
+three signals. Paper, so no money; three weeks of the evidence the arming gate
+is waiting on. Recovered with `python -m zebra.restore_snapshot` — **a file
+copy would NOT have worked**, because `ZebraStore._merge` resolves by version
+and the reset had already pushed higher versions to Drive.
+
+In the same chain: `restart_services.sh` contained
+`rm -f "$HELPER_DIR/restart_services.sh"` to "unblock git pull". The file was
+TRACKED, so deleting it left a permanent unstaged change — which is precisely
+what blocks `git pull --rebase`. Its own workaround caused the problem it
+claimed to solve, and that is why the pull failed that morning. Both scripts
+are deleted.
+
+**Prose is not a guard.** Both files were reviewed, both read as safe, and both
+said so in comments.
+
 ## Server Deployment (Cron Monitor)
 
 ### Server Paths
