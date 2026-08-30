@@ -400,6 +400,57 @@ python position_checker.py POWERGRID # Specific position
 
 Full playbook: `docs/BCS_PLAYBOOK.md`
 
+> ## ⚠ SCOPE: THE COHORT IS THE ONLY EVIDENCE (owner, 2026-08-31)
+>
+> *"The old records are not to be used any more. In early August we changed
+> significantly and all code rules shud stick to cohort BCS only. Forget old
+> trades and results."*
+>
+> The engine changed substantially in early August — the back ratio was
+> dropped for a Bull Call Spread, pricing moved from mid-mid to fill on
+> 2026-08-12, entry vetting was armed, and the cohort opened 2026-08-14. The
+> **448 records before that describe a DIFFERENT strategy.** Folding them into
+> a number about this one does not enlarge the sample, it voids the number —
+> and since every one of them is mid-priced, it voids it in a known,
+> optimistic direction.
+>
+> **The records stay on disk.** Nothing is deleted or archived; `zebra status`
+> still shows the whole book and the store still merges, allocates ids and
+> sweeps for residue across all of it. They simply stop being EVIDENCE.
+>
+> **Three populations, in `zebra/trade_store.py`. Use them; do not re-derive.**
+>
+> | Helper | Population | Use for |
+> |---|---|---|
+> | `scored()` | stamped cohort positions (**13**) | any P&L, win rate, scorecard, gate |
+> | `decided()` | + this engine's vetoes and cancels (**65**) | post-mortems, the vetting scorecard |
+> | `in_flight()` | what still needs work (**9**) | liveness |
+>
+> A veto never enters, so it never carries a cohort stamp — that is why
+> `decided()` exists, and why the post-mortem layer must not use `scored()`.
+>
+> **Enforced by `zebra/tests/test_cohort_scope_policy.py`**, which fails the
+> commit if a new reader takes the whole book without either scoping it or
+> writing `WHOLE BOOK: <why>` in the function. Same mechanism, and the same
+> reasoning, as `SAFE-TO-RERUN:` and `RETIRES WHEN:`. A reader that genuinely
+> needs everything — the store's own accessors, the recovery sweeps, dedup,
+> capital, the dashboard — says so and says why.
+>
+> **⚠ What this costs, stated plainly.** Several live thresholds were FITTED
+> on the data now out of scope: `debit/width ≤ 45%` (the 25-trade shadow
+> study), `spot_sl_enabled: False` (the 147-record MAE table), the
+> gain-anchored trail (42 records), and the fee-drag model. They stand as
+> **decisions already taken**, not as citeable evidence. Do not quote their
+> supporting numbers as a reason to keep or change them; re-derive on cohort
+> data when there is enough of it. Numbers of that kind still appearing below
+> are kept as the RECORD OF A DECISION and are marked where they matter.
+>
+> **And the honest consequence for go-live:** removing the old sample does not
+> make expectancy positive, it makes it **unmeasured**. The cohort's 7 closes
+> are all take-profits from two rallying weeks, with every potential loser
+> still open. A smaller, cleaner sample is the right sample — it is not yet a
+> sufficient one.
+
 > **TWO rule sets, deliberately.** The MANUAL playbook below governs spreads
 > you pick by hand off a crash/bounce thesis, where you choose the width. The
 > ST-magnet automation in `zebra/` runs a DIFFERENT, measured rule set — its

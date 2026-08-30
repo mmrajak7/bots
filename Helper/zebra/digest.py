@@ -438,10 +438,16 @@ def build(day: Optional[str] = None) -> dict:
     day = day or datetime.now(cfg.IST).strftime('%Y-%m-%d')
     rows = _read_log(day)
     try:
-        from .trade_store import ZebraStore
+        from .trade_store import ZebraStore, decided
         store = ZebraStore(config={})
         store._load_local()          # LOCAL ONLY: read-only, no Drive, no lock
-        store_rows = store.load_trades()
+        # SCOPED AT THE SOURCE. The digest is the paper run's dated record and
+        # the arming gate reads it, so every number below must describe THIS
+        # engine. `decided`, not `scored`, because the digest also counts
+        # cancellations -- those are decisions of this engine and have no
+        # cohort stamp, since the stamp lands at entry. `_cohort` narrows
+        # further to stamped positions on its own.
+        store_rows = decided(store.load_trades())
     except Exception as e:
         logger.warning('digest could not read the store: %s', e)
         store_rows = []

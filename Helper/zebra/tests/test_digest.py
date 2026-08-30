@@ -157,9 +157,14 @@ def test_it_is_wired_as_a_cli_verb():
 # was never exercised.
 
 def _opened_with_rate(logdir, rate, episodes):
+    # STAMPED, like every real entered record. Without it this is a LEGACY
+    # position by definition (`in_cohort`: absence is the answer), and since
+    # 2026-08-31 the digest scopes its rows to this engine — so an unstamped
+    # fixture silently produces an empty digest and the sibling
+    # `'None%' not in ...` assertion passes for the wrong reason.
     row = {'id': 1, 'stock': 'X', 'direction': 'CE', 'status': 'entered',
            'entry_date': DAY, 'dte_at_entry': 30, 'debit': 10.0,
-           'capital': 500000,
+           'capital': 500000, 'cohort': cfg.COHORT_START,
            'vet': {'context': {'st_attraction': {
                'overall': {'episodes': episodes, 'touch_rate_pct': rate},
                'median_days_to_touch': None}}}}

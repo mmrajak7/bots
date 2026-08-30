@@ -33,6 +33,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from . import config as cfg
+from .trade_store import decided
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,12 @@ def pending(store, limit: int = 20) -> list:
     lessons attached.
     """
     out = []
-    for t in store.load_trades():
+    # `decided`, not `scored`: this layer's whole point is that it covers the
+    # VETOES too, and a vetoed signal never enters, so it never carries a
+    # cohort stamp. Scoping this to stamped records alone would silently drop
+    # every veto -- rebuilding the exact bias the module docstring above
+    # exists to prevent. The retired engine's decisions are still excluded.
+    for t in decided(store.load_trades()):
         if isinstance(t.get('postmortem'), dict):
             continue
         if t.get('status') == 'exited' and t.get('pnl') is not None:
@@ -207,7 +213,7 @@ def precedents(store, stock: Optional[str] = None) -> list:
     point — see the module docstring.
     """
     by_tag: dict = {}
-    for t in store.load_trades():
+    for t in decided(store.load_trades()):
         pm = t.get('postmortem')
         if not isinstance(pm, dict):
             continue

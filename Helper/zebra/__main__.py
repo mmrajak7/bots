@@ -291,6 +291,8 @@ def cmd_vet_decide(args):
 
     verdict = vet_mod.ALLOWED if args.verdict == 'allow' else vet_mod.VETOED
     # One decision, both A/B arms — keeps the structure comparison clean.
+    # WHOLE BOOK: addressed by explicit id, and by the shadow arms of that
+    # id. The scope is the argument, not the era.
     trade_ids = [t['id']] + [s['id'] for s in store.load_trades()
                              if s.get('shadow_of') == t['id']]
     d = _journal(
@@ -1277,6 +1279,9 @@ def cmd_depth(args):
 
 
 def cmd_status(args):
+    # WHOLE BOOK: the dashboard is the one place that deliberately shows
+    # everything, including the retired engine, so the operator can see what
+    # is on disk. It reports counts; it does not compute a P&L or a gate.
     from .trade_store import get_store
     store = get_store()
     trades = store.load_trades()
@@ -1460,6 +1465,9 @@ def cmd_reset(args):
     from . import config as cfg
 
     store = get_store()
+    # WHOLE BOOK: reset cancels everything IN FLIGHT. A legacy signal left
+    # `triggered` is exactly what this verb is for, and scoping it out would
+    # leave the records it exists to clear.
     all_trades = store.load_trades()
     open_states = ('watching', 'triggered', 'entered')
     in_flight = [t for t in all_trades if t.get('status') in open_states]
@@ -1620,9 +1628,9 @@ def cmd_pm_run(args):
 def cmd_giveback(args):
     """Peak-vs-exit table for closed trades that carry a measured peak."""
     from . import mfe as mfe_mod
-    from .trade_store import get_store
+    from .trade_store import get_store, scored
     store = get_store()
-    trades = store.load_trades()
+    trades = scored(store.load_trades())
     g = mfe_mod.giveback(trades, min_progress=args.min_progress)
 
     print(f"\nGIVE-BACK  ({g['measured']} measured, "

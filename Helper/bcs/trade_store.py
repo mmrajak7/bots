@@ -361,7 +361,13 @@ def get_store() -> TradeStore:
 
 
 def load_trades() -> list:
-    """Load all trades (backward compat)."""
+    """Load all trades (backward compat).
+
+    WHOLE BOOK: this is the raw accessor, and the cohort rule does not apply
+    to this store at all — `logs/bcs_trades.json` holds hand-entered BCS
+    trades, not the zebra cohort. Scoping here would hide records from the
+    merge, the id allocator and the recovery sweeps.
+    """
     return get_store().load_trades()
 
 

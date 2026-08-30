@@ -358,7 +358,19 @@ def _write_alert_state(state: str, now: float) -> None:
         logger.warning("could not persist exit-engine alert state: %s", e)
 
 
-def _format_exit_engine_alert(hb: dict, n_positions: int, cohort_seen) -> str:
+#: Why THIS engine is not the one booking. Both are true statements about a
+#: cohort record the monitor alone can close; they differ in WHICH fact put it
+#: in sole charge, and the operator needs to know which -- one is a switch
+#: they set, the other is arithmetic they cannot change.
+WHY_STOOD_DOWN = ('This engine has STOOD DOWN from %d cohort position(s) '
+                  '(exits_managed_externally=true)')
+WHY_LIVE_RECORD = ('This engine CANNOT book %d LIVE cohort position(s) - it '
+                   'books at the structure mid, which is not a price a record '
+                   'with real legs could have transacted at')
+
+
+def _format_exit_engine_alert(hb: dict, n_positions: int, cohort_seen,
+                              why: str = WHY_STOOD_DOWN) -> str:
     fix = {
         'missing': 'START IT: the cron line for `bcs.spread_monitor --cron` '
                    'is not running, or it never reached its first poll.',
@@ -380,8 +392,7 @@ def _format_exit_engine_alert(hb: dict, n_positions: int, cohort_seen) -> str:
     }.get(hb['state'], 'Investigate.')
     return (
         f"\U0001F534 NO EXIT ENGINE\n"
-        f"This engine has STOOD DOWN from {n_positions} cohort position(s) "
-        f"(exits_managed_externally=true), but bcs/spread_monitor.py "
+        f"{why % n_positions}, but bcs/spread_monitor.py "
         f"{html.escape(str(hb['detail']))}.\n"
         f"Peer reports {cohort_seen} cohort position(s) loaded.\n"
         f"Nothing is holding their stops right now.\n"
@@ -390,8 +401,8 @@ def _format_exit_engine_alert(hb: dict, n_positions: int, cohort_seen) -> str:
 
 def alert_if_exit_engine_down(n_positions: int, dry_run: bool = False,
                               now: Optional[float] = None,
-                              market_open: Optional[bool] = None
-                              ) -> Optional[str]:
+                              market_open: Optional[bool] = None,
+                              why: str = WHY_STOOD_DOWN) -> Optional[str]:
     """Telegram when the engine we stood down for cannot close. Never raises.
 
     Returns the state alerted on, or None. Called ONCE per cycle from the
@@ -448,7 +459,8 @@ def alert_if_exit_engine_down(n_positions: int, dry_run: bool = False,
         since = HEARTBEAT_REPEAT_SEC + 1
     if same and since < HEARTBEAT_REPEAT_SEC:
         return None
-    _send_telegram(_format_exit_engine_alert(hb, n_positions, cohort_seen),
+    _send_telegram(_format_exit_engine_alert(hb, n_positions, cohort_seen,
+                                             why=why),
                    dry_run=dry_run)
     _write_alert_state(state, now)
     return state
@@ -720,6 +732,10 @@ def _capital_context(store, trade: dict, analysis: dict,
     plan can be checked afterwards against the position it was meant to size.
     """
     candidate, depth = _entry_candidate(trade, analysis, bcs)
+    # WHOLE BOOK: capital counts what is HOLDING, and a rupee committed by
+    # the retired engine would still be committed. No legacy record is open
+    # today, so this is identical either way — but a budget that could be
+    # widened by re-scoping is not a budget.
     book = store.load_trades()
     lim = capital.limits(book)
     held, n_open, unpriced = capital.deployed(book)
@@ -1103,6 +1119,55 @@ def _as_float(v):
         return None
 
 
+def _entry_already_in_flight(store: ZebraStore, trade: dict):
+    """Why this signal must NOT be sent to the order path, or None.
+
+    THE HOLE THIS CLOSES (found 2026-08-31). Every failure branch in
+    `_auto_enter_bcs` records an entry residue, and NOTHING read one back
+    before placing again. So a failure after the fills -- `mark_entered_bcs`
+    raising, or the debit coming back unpriceable -- left the signal at
+    `triggered` with its vet verdict still ALLOWED, and the next five-minute
+    cycle placed ANOTHER FULL SPREAD. One per cycle until the order cutoff or
+    the kill switch, none of them visible to `capital.check`, because none of
+    them was ever recorded as a position.
+
+    The same class covers a hard crash between the broker fill and the store
+    write: the order journal holds an intent with no result, and until now
+    nothing on the zebra entry path consulted it.
+
+    Two independent sources are checked, deliberately -- the failure being
+    guarded against is a STORE that would not write, so a guard reading only
+    the store would be blind in exactly the case it exists for:
+
+      * the record's own `entry_residue`, when the store did accept it;
+      * the order journal, which is written to disk BEFORE the broker call and
+        is therefore the only witness that survives the store failing.
+
+    Fails CLOSED: if neither source can be read, the entry is refused. An
+    entry not placed costs one signal; a duplicate costs a naked position.
+    """
+    try:
+        from bcs.spread_monitor import ENTRY_RESIDUE
+        residue = (trade.get(ENTRY_RESIDUE.field) or {})
+        if residue.get('state') == 'open':
+            return ('an entry residue is still OPEN on this signal (%s) -- '
+                    'legs from an earlier attempt may be at the broker'
+                    % str(residue.get('why'))[:120])
+    except Exception as e:
+        return 'the entry-residue field could not be read (%s)' % e
+
+    try:
+        from bcs import order_journal
+        unresolved = order_journal.unresolved_for_trade(trade['id'])
+        if unresolved:
+            return ('%d order intent(s) for this signal have no recorded '
+                    'result -- an order may be live at the broker (first: %s)'
+                    % (len(unresolved), unresolved[0].get('symbol')))
+    except Exception as e:
+        return 'the order journal could not be read (%s)' % e
+    return None
+
+
 def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
                     dry_run: bool = False):
     """LIVE auto-entry. Returns the fresh record, or None to fall back to the
@@ -1130,6 +1195,28 @@ def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
     if not allowed:
         return None
 
+    # BEFORE the book, before capital, before any quote: has this signal
+    # already been to the order path? Placed first in the sequence because
+    # every step below costs a Kite call, and because the answer does not
+    # depend on any of them.
+    in_flight = _entry_already_in_flight(store, trade)
+    if in_flight:
+        logger.error(
+            "AUTO-ENTRY #%d %s REFUSED: %s. NOT placing again -- resolve the "
+            "outstanding legs first.", trade['id'], trade['stock'], in_flight)
+        if store.set_alert_flag_daily(trade['id'], 'entry_in_flight'):
+            _send_telegram(
+                "\U0001F6A8 BCS %s: auto-entry REFUSED because %s.\n"
+                "No new order was placed. Check Kite, resolve the residue, "
+                "then re-arm this signal by hand."
+                % (html.escape(str(trade['stock'])), html.escape(in_flight)),
+                dry_run=dry_run)
+        return None
+
+    # WHOLE BOOK: capital counts what is HOLDING, and a rupee committed by
+    # the retired engine would still be committed. No legacy record is open
+    # today, so this is identical either way — but a budget that could be
+    # widened by re-scoping is not a budget.
     book = store.load_trades()
     lim = capital.limits(book)
     candidate = {'stock': trade.get('stock'), 'debit': bcs.get('debit'),
@@ -2272,12 +2359,14 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 "CAPITAL WOULD REFUSE #%d %s: %s — PAPER enters anyway and is "
                 "vetted normally, so the validation record stays unbiased. "
                 "%s", trade['id'], stock, capital_shadow,
+                # WHOLE BOOK: see `_capital_context`.
                 capital.describe(store.load_trades()))
             capital_refused = False
         elif capital_refused:
             logger.warning(
                 "CAPITAL REFUSES #%d %s: %s — no vet spent, no order ticket. "
                 "%s", trade['id'], stock, cap_plan['reason'],
+                # WHOLE BOOK: see `_capital_context`.
                 capital.describe(store.load_trades()))
 
         # ── Claude vetting gate ──────────────────────────────────────────
@@ -3210,8 +3299,16 @@ def _monitor_dry_run() -> Optional[bool]:
     hb = read_exit_engine_heartbeat()
     if hb['state'] == 'dry_run':
         return True
-    if hb['state'] in ('ok', 'no_cohort_book'):
+    if hb['state'] == 'ok':
         return False
+    # `no_cohort_book` used to answer False here, i.e. "armed" -- and it is
+    # armed, for the three books it CAN read. It is not armed for this one:
+    # the beat says its adapter onto the cohort store failed, so it cannot see
+    # a cohort record at all, let alone book one. Reporting it as the live
+    # records' engine on the strength of a beat that says it cannot reach them
+    # is the same error as reading a missing beat as healthy. UNKNOWN is the
+    # honest answer, and `classify` now turns unknown-plus-live-records into a
+    # fault rather than into silence.
     return None
 
 
@@ -3227,6 +3324,16 @@ def _cohort_population(trades) -> set:
     pop = set()
     for t in trades or ():
         if t.get('status') != 'entered' or not in_cohort(t):
+            continue
+        # The UNSTAMPED class is read from the RAW field, deliberately not
+        # through `is_paper_record` -- that helper answers "may zebra book
+        # this at mid", and its whole job is to resolve an absent flag to
+        # True. Asking it here would launder away the very ambiguity being
+        # detected, and the record would be counted as ordinary paper while
+        # `bcs/spread_monitor` counted the same record as live.
+        flag = t.get('paper')
+        if not isinstance(flag, bool):
+            pop.add(arming_mod.UNSTAMPED_RECORD)
             continue
         pop.add(arming_mod.PAPER_RECORD if is_paper_record(t)
                 else arming_mod.LIVE_RECORD)
@@ -3310,6 +3417,8 @@ def _arming_preflight(store, dry_run: bool = False) -> dict:
     check in a process.
     """
     try:
+        # WHOLE BOOK: `_cohort_population` does the scoping itself, and it
+        # must see unstamped records to classify them as UNSTAMPED.
         trades = store.load_trades()
     except Exception as e:
         logger.warning("arming preflight could not read the book: %s", e)
@@ -3612,6 +3721,9 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     pending_mfe: dict = {}
     # Once-per-cycle latch for the peer-engine heartbeat check below.
     stood_down = False
+    #: Same once-per-cycle discipline as `stood_down`: a fault common
+    #: to the whole book must not send one Telegram per row.
+    live_unmanaged_checked = False
 
     for trade in entered:
         # An earlier exit-check this cycle may have already auto-closed.
@@ -3943,6 +4055,29 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                             exc_info=True)
                 continue
 
+            # NOT stood down, and this record has REAL LEGS. zebra will
+            # decline to book it below (it can only book at mid), so the
+            # monitor is its only possible engine -- and until 2026-08-31
+            # nothing checked that the monitor was there, because the
+            # heartbeat alert fired ONLY from the stand-down branch above.
+            #
+            # That left the arming order's own first live step unguarded: a
+            # hand-placed live trade filed while `exits_managed_externally` is
+            # still false, against a monitor that is dead. The record is
+            # declined here, silently, every cycle.
+            if not is_paper_record(trade):
+                if not live_unmanaged_checked:
+                    live_unmanaged_checked = True
+                    try:
+                        alert_if_exit_engine_down(
+                            sum(1 for t in entered
+                                if not is_paper_record(t)),
+                            dry_run=dry_run, why=WHY_LIVE_RECORD)
+                    except Exception as e:
+                        logger.warning(
+                            "exit-engine heartbeat check failed: %s", e,
+                            exc_info=True)
+
             # ── TP ──────────────────────────────────────────────────────────
             # `latch` was decided ABOVE, before the dark-book defer and the
             # stand-down, because the touch is a fact about spot and several
@@ -4102,6 +4237,8 @@ def _reap_starved_vets(store: ZebraStore, dry_run: bool = False) -> list:
     re-added, re-triggered and vetted afresh. Nothing is lost but this attempt.
     """
     reaped = []
+    # WHOLE BOOK: reaping a starved vet marker is housekeeping on a marker.
+    # A legacy record holding one would keep it forever if scoped out.
     for t in list(store.load_trades()):
         if t.get('status') not in ('watching', 'triggered'):
             continue
@@ -4186,6 +4323,7 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
     # behaves exactly like a working one right up to the moment it should have
     # refused something, and this system has already shipped two controls that
     # were wired in, looked deployed and could never fire.
+    # WHOLE BOOK: see `_capital_context` — deployed capital is deployed.
     logger.info(capital.describe(store.load_trades()))
     # FIRST, before anything can read a vet state: fail open any vet that blew
     # its deadline. This is the guard that stops a Claude outage (crash, hung
@@ -4278,6 +4416,8 @@ def _run_vet_side_channels(store, kite, dry_run: bool = False) -> None:
     # signals whose shadow is still running. One batched call, as elsewhere.
     try:
         symbols = {t['stock'] for t in store.get_entered()}
+        # WHOLE BOOK: a symbol set for quoting. Over-fetching a quote is
+        # free; missing one blinds a position.
         symbols |= {t['stock'] for t in store.load_trades()
                     if isinstance(t.get('veto_shadow'), dict)
                     and t['veto_shadow'].get('status') == 'open'}
@@ -4321,6 +4461,7 @@ def _refresh_events_if_stale(store) -> bool:
     if not events_mod.is_stale():
         return False
     symbols = sorted({t['stock'] for t in store.get_entered()}
+                     # WHOLE BOOK: symbol set, as above.
                      | {t['stock'] for t in store.load_trades()
                         if t.get('status') == 'triggered'})
     logger.info("Event calendar stale — refreshing (%d symbols)", len(symbols))

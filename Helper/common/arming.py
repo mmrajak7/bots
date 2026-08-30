@@ -59,9 +59,21 @@ MONITOR = 'bcs/spread_monitor.py'
 #: always safe, and every illegal state below is about the other one.
 PAPER_RECORD = 'paper'      # `paper: True` -- its legs never reached a broker
 LIVE_RECORD = 'live'        # `paper: False` -- real legs at the broker
+#: `paper` MISSING or not a bool. Not a shade of the other two -- a record the
+#: two engines classify DIFFERENTLY, which is the one thing the invariant
+#: cannot survive. See `booking_engines`.
+UNSTAMPED_RECORD = 'unstamped'
 
 NO_ENGINE = 'no_engine'
 TWO_ENGINES = 'two_engines'
+#: The monitor's arming could not be read (no usable heartbeat) while LIVE
+#: cohort records are open. Not "no engine" -- we do not know -- and that is
+#: exactly why it must not be silence.
+UNVERIFIED = 'unverified_engine'
+#: Distinct from TWO_ENGINES because the fix is different: two engines is a
+#: switch problem, an unstamped record is a DATA problem and no switch closes
+#: it.
+UNSTAMPED = 'unstamped_record'
 
 
 def booking_engines(*, paper_mode: bool, exits_external: bool,
@@ -82,6 +94,40 @@ def booking_engines(*, paper_mode: bool, exits_external: bool,
     fault that turns on the unknown rather than certifying either verdict.
     """
     engines = []
+    if record_is_paper is None:
+        # THE UNSTAMPED RECORD, added 2026-08-31.
+        #
+        # The two engines read the flag with OPPOSITE defaults, each correctly
+        # and each pinned by `test_the_two_paper_predicates_default_in_
+        # opposite_directions`:
+        #
+        #   zebra/trade_store.is_paper_record   `trade.get('paper', True)`
+        #       -> absent means PAPER, because the BCS-family stores hold real
+        #          positions and carry no `paper` key at all;
+        #   bcs/spread_monitor._record_says_paper  `trade.get('paper') is True`
+        #       -> absent means LIVE, for the same reason read from the other
+        #          side.
+        #
+        # Individually right; jointly, on ONE zebra cohort record that has
+        # lost its key, zebra books it at mid AND the monitor places real
+        # orders for it. Worse, `_exits_external` requires
+        # `not is_paper_record`, so it reads the record as paper and the
+        # stand-down switch CANNOT close the hole -- there is no combination
+        # of the four switches that makes this record single-engine.
+        #
+        # It is modelled here rather than assumed away because the model's own
+        # record axis was a single bool, so the cross-product test could not
+        # express the state, and both preflights would have classified the
+        # same record into different populations while each reported OK.
+        #
+        # Reachable without any code defect: a Drive `_merge` against an old
+        # version, a snapshot restore, or a hand repair during an incident --
+        # and this fleet performed exactly that class of store surgery on
+        # 2026-08-30. Nothing validates the key on read.
+        engines.append(ZEBRA)
+        if dry_run is not True:
+            engines.append(MONITOR)
+        return tuple(engines)
     # zebra books at MID, and only a record whose legs never reached a broker
     # may be booked at a price nobody transacted. `paper_mode` does NOT appear
     # here: the mode says how NEW entries are made, the record says whether a
@@ -134,25 +180,102 @@ def classify(*, paper_mode: bool, exits_external: bool, auto_entry: bool,
          'engines': {PAPER_RECORD: (...), LIVE_RECORD: (...)},
          'summary': 'one line'}
     """
-    present = ({PAPER_RECORD, LIVE_RECORD} if population is None
-               else set(population))
+    # `None` = the caller does not know, and is read as EVERY class present,
+    # unstamped included. An unknown population must not be able to certify
+    # safety, and the unstamped class is the one a caller is least likely to
+    # have looked for.
+    present = ({PAPER_RECORD, LIVE_RECORD, UNSTAMPED_RECORD}
+               if population is None else set(population))
+    _flag = {PAPER_RECORD: True, LIVE_RECORD: False, UNSTAMPED_RECORD: None}
     engines = {
         cls: booking_engines(paper_mode=paper_mode,
                              exits_external=exits_external, dry_run=dry_run,
-                             record_is_paper=(cls == PAPER_RECORD))
-        for cls in (PAPER_RECORD, LIVE_RECORD)
+                             record_is_paper=_flag[cls])
+        for cls in (PAPER_RECORD, LIVE_RECORD, UNSTAMPED_RECORD)
     }
     faults, latent, warnings = [], [], []
 
-    for cls in (PAPER_RECORD, LIVE_RECORD):
+    if dry_run is None and LIVE_RECORD in present:
+        # THE STATE THAT LOOKED HEALTHY FROM EVERY LOG (found 2026-08-31).
+        #
+        # With `dry_run=None`, `booking_engines` lists the monitor as POSSIBLY
+        # booking, so a live record came back with exactly one engine and was
+        # certified `ARMING: OK` -- while the reason the heartbeat was
+        # unreadable may be that the monitor is dead. The `dry_run is None`
+        # branch further down never ran, because a one-engine class never
+        # reaches it, so the finding was not even recorded as latent.
+        #
+        # The scenario is not hypothetical: it is the arming order's own
+        # intermediate step. A hand-placed live trade is filed while
+        # `exits_managed_externally` is still false, and the monitor is
+        # crash-looping on a dead Kite token -- it `sys.exit`s in `load_kite`
+        # BEFORE writing its first beat, so there is no heartbeat at all.
+        # zebra then declines to book the live record (correctly, it can only
+        # book at mid) and, because `alert_if_exit_engine_down` fires only
+        # from the stood-down branch, says nothing. Nothing books, nothing
+        # alerts, every log reads OK.
+        #
+        # A present live record plus an unverifiable peer is therefore a
+        # FAULT. It is not the no-engine fault -- there may well be an engine
+        # -- so it names its own state and its own fix.
+        faults.append(_fault(
+            UNVERIFIED, LIVE_RECORD,
+            'LIVE cohort records are open and the arming of the monitor '
+            'could NOT be read (no usable exit-engine heartbeat), so '
+            'nothing here can confirm any engine is able to book them. '
+            'zebra cannot: it books at the structure mid.',
+            'Check that `bcs.spread_monitor --cron` is running and writing '
+            'its heartbeat — a dead Kite token makes it exit before the '
+            'first beat. Until it beats, treat these positions as UNWATCHED '
+            'and manage them by hand.'))
+
+    for cls in (PAPER_RECORD, LIVE_RECORD, UNSTAMPED_RECORD):
         eng = engines[cls]
+        if cls == UNSTAMPED_RECORD:
+            # ALWAYS a finding, even at one engine. Under `--dry-run` the
+            # monitor books nothing, so the count falls to one -- but that one
+            # is zebra, booking a record that MAY have real legs at the
+            # structure mid. The invariant is "exactly one engine", and the
+            # unstated half of it is "and it is the right one for what this
+            # record IS". An unstamped record makes that unanswerable, so
+            # counting engines cannot clear it.
+            found = _fault(
+                UNSTAMPED, cls,
+                'a cohort record has no usable `paper` flag, so the two '
+                'engines DISAGREE about what it is: zebra reads a missing '
+                'flag as paper (and would book it at the structure mid), the '
+                'monitor reads it as live (and would place real orders). '
+                'Engines that could act: %s. No switch closes this -- '
+                '`exits_managed_externally` also reads it as paper, so the '
+                'stand-down cannot fire.' % (' and '.join(eng) or 'none'),
+                'Find the record and restore its `paper` flag to the truth '
+                'about its legs: True if they never reached a broker, False '
+                'if they did. Check the broker before deciding — guessing '
+                'here books a real position at a fictional price, or leaves '
+                'a real one unwatched.')
+            # Reported ONLY when one is actually open, never as a latent.
+            # The other two classes have latents because a SWITCH decides
+            # them, so "what would happen if such a record appeared" is a
+            # real question about the current configuration. This one is
+            # decided by DATA: no switch makes it safe and no switch makes it
+            # unsafe, so a standing latent would say nothing except "a record
+            # could become corrupt", which is true of every record always and
+            # is exactly the line a reader learns to skim past.
+            if cls in present:
+                faults.append(found)
+            continue
         if len(eng) == 1:
             continue
         if not eng:
             if cls == LIVE_RECORD and dry_run is None:
-                # Not a finding at all: the caller could not see the monitor's
-                # arming, and an alarm raised on an unknown is one the reader
-                # learns to discount. It comes back as a warning instead.
+                # Unreachable: with `dry_run=None` the monitor is always
+                # listed, so a live record never has an empty engine list.
+                # Kept as a named no-op rather than deleted, because the
+                # ABSENT case is now handled above by the UNVERIFIED fault and
+                # a future change to `booking_engines` must land somewhere
+                # deliberate instead of falling into the no-engine text, which
+                # would tell the reader the monitor is in dry run when nobody
+                # knows what it is in.
                 continue
             found = _fault(
                 NO_ENGINE, cls,
@@ -226,6 +349,10 @@ def classify(*, paper_mode: bool, exits_external: bool, auto_entry: bool,
             who = eng[0] if len(eng) == 1 else ('NONE' if not eng
                                                 else ' and '.join(eng))
             return who if cls in present else who + ' (none open)'
+        # UNSTAMPED is deliberately absent from the healthy summary: when
+        # none are open it is not a state the book is in, and naming it every
+        # cycle is how the reader learns to skim the line that matters. It
+        # appears as a latent finding instead, which `describe` prints.
         summary = '; '.join('%s records -> %s' % (cls, _who(cls))
                             for cls in (PAPER_RECORD, LIVE_RECORD))
     return {'legal': not faults, 'faults': faults, 'latent': latent,

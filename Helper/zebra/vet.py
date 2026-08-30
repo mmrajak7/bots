@@ -1273,6 +1273,9 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
     # That made this module's own stated guarantee — "every drop sends a
     # Telegram, so a broken CLI announces itself within the hour" — FALSE on
     # the one path most likely to occur: a saturated agent budget.
+    # WHOLE BOOK: expiring a stale vet marker is housekeeping on a marker,
+    # not a judgement about a trade. A legacy record holding a pending marker
+    # would keep it forever if scoped out.
     for t in list(store.load_trades()):
         if not is_queued(t) or not queue_exhausted(t, now):
             continue
@@ -1292,6 +1295,9 @@ def expire_stale(store, now: Optional[datetime] = None) -> list:
                   '%s — gave up after %d min (attempts that actually ran: %d)'
                   % (why, cfg.ENTRY_QUEUE_DROP_AFTER_SEC // 60, tries)):
             starved.append(t['id'])
+    # WHOLE BOOK: expiring a stale vet marker is housekeeping on a marker,
+    # not a judgement about a trade. A legacy record holding a pending marker
+    # would keep it forever if scoped out.
     for t in list(store.load_trades()):
         if not is_expired(t, now):
             continue
@@ -1969,7 +1975,7 @@ def _request_exit_vet(store, trade_id: int, kind: str, context: dict,
         if existing.get('state') == PENDING and not _exit_expired(existing):
             fresh = False          # someone else already asked; keep their marker
         else:
-            ev[kind] = {
+            marker = {
                 'state': PENDING,
                 'requested_at': _now().isoformat(),
                 'deadline': (_now() + timedelta(
@@ -1978,6 +1984,40 @@ def _request_exit_vet(store, trade_id: int, kind: str, context: dict,
                 'context': context,
                 'decision_id': None,
             }
+            # THE HOLD CLOCK SURVIVES A RE-REQUEST.
+            #
+            # This assignment REPLACES the marker, and until 2026-08-31 the
+            # replacement dropped `held_since`/`held_date` -- so every defer
+            # episode re-requested a vet, `_apply_hold_budget` found no stamp,
+            # and restarted the budget from zero. A stop could therefore wait
+            # roughly TWICE `exit_vet_max_hold_sec` (and with EXIT_MAX_DEFERS
+            # defers ahead of it, longer still) before proceeding on the
+            # guards alone.
+            #
+            # That is the one thing this budget exists to prevent. The vet is
+            # additive, never load-bearing; the budget is the single control
+            # enforcing it, and a clock the waiting party can reset is not a
+            # bound. ASHOKLEY #390 went -50% -> -75% over three cycles on an
+            # agent that had died seconds after spawning, which is exactly the
+            # shape a restarting clock reopens.
+            #
+            # Carried ONLY on a continuation (`defers > 0`), never on a
+            # fresh episode. `defers` is non-zero exactly when the previous
+            # marker was in DEFER (see `_exit_gate_policy`), i.e. when the
+            # same stop is still waiting for a verdict nobody has given.
+            #
+            # The budget measures CONTINUOUS waiting, not wall-clock since
+            # the trade first held. A previous episode that resolved -- an
+            # `allow` whose TTL later expired, say -- was not spent waiting,
+            # so carrying its stamp would spend the budget on time the stop
+            # was free, and the very next re-vet would fail open. That is the
+            # opposite defect and `test_a_stale_allow_does_not_authorise_a_
+            # later_exit` pins it.
+            if defers > 0:
+                for key in (HELD_SINCE, HELD_DATE):
+                    if existing.get(key):
+                        marker[key] = existing[key]
+            ev[kind] = marker
             t['exit_vet'] = ev
             t['version'] = t.get('version', 0) + 1
     if not fresh:

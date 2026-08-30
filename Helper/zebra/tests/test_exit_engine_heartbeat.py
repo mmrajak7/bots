@@ -411,13 +411,62 @@ def test_a_healthy_peer_produces_no_alert_from_the_branch(
     assert not any('NO EXIT ENGINE' in m for m in telegrams)
 
 
-def test_nothing_is_checked_when_nothing_stood_down(
+def test_nothing_is_checked_for_PAPER_records_with_the_switch_off(
         store, logs, monkeypatch, telegrams):
-    """With the switch off, zebra books the exits itself. There is no peer to
-    be absent, and an alert here would be pure noise."""
+    """With the switch off and PAPER records, zebra books the exits itself.
+
+    There is no peer to be absent and an alert here would be pure noise. This
+    is the case the old `test_nothing_is_checked_when_nothing_stood_down`
+    meant, but it asserted over the fixture's LIVE records -- see the next
+    test for why that was pinning a defect.
+    """
     monkeypatch.setattr(cfg, 'EXITS_MANAGED_EXTERNALLY', False)
+    with store._mutate():
+        for t in store._trades:
+            if t.get('status') == 'entered':
+                t['paper'] = True
     _cycle(store, monkeypatch)
     assert not any('NO EXIT ENGINE' in m for m in telegrams)
+
+
+def test_a_LIVE_record_is_checked_even_with_the_switch_off(
+        store, logs, monkeypatch, telegrams):
+    """THE DEFECT (found 2026-08-31). The old test asserted SILENCE here.
+
+    Its premise -- "with the switch off, zebra books the exits itself" -- is
+    false for a record with real legs: `_paper_auto_close` declines those
+    regardless of `exits_managed_externally`, because zebra books at the
+    structure mid. So the monitor is the ONLY possible engine, and until now
+    nothing checked it was there: `alert_if_exit_engine_down` fired solely
+    from the stand-down branch.
+
+    That left the arming order's own first live step unguarded. Its step is a
+    hand-placed live trade filed while `exits_managed_externally` is still
+    false; if the monitor is crash-looping on a dead Kite token it exits in
+    `load_kite` BEFORE writing a first beat, so there is no heartbeat at all.
+    Every log read OK while nothing held the stops.
+    """
+    monkeypatch.setattr(cfg, 'EXITS_MANAGED_EXTERNALLY', False)
+    # The fixture's records are already `paper: False`, i.e. real legs.
+    _cycle(store, monkeypatch)
+    msgs = [m for m in telegrams if 'NO EXIT ENGINE' in m]
+    assert msgs, 'a live cohort record with no peer engine must alert'
+    assert 'CANNOT book' in msgs[0], (
+        'the alert must say WHY this engine is not booking — it has not '
+        'stood down here, it is unable'
+    )
+    assert 'exits_managed_externally=true' not in msgs[0], (
+        'that reason is false in this state and would send the operator to '
+        'the wrong switch'
+    )
+
+
+def test_the_live_record_alert_is_sent_once_per_cycle_not_once_per_row(
+        store, logs, monkeypatch, telegrams):
+    """Two live positions, one fault, one Telegram."""
+    monkeypatch.setattr(cfg, 'EXITS_MANAGED_EXTERNALLY', False)
+    _cycle(store, monkeypatch)
+    assert len([m for m in telegrams if 'NO EXIT ENGINE' in m]) == 1
 
 
 def test_a_broken_heartbeat_check_cannot_stop_exit_monitoring(

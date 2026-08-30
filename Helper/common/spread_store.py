@@ -267,7 +267,7 @@ class SpreadStoreBase(LockedStoreMixin):
                     data = json.load(f)
             if not isinstance(data, list):
                 raise ValueError(f"Expected list, got {type(data).__name__}")
-            return data
+            return self._quarantine_unreadable(data)
         except (json.JSONDecodeError, ValueError) as e:
             # File is corrupt — back it up so we can investigate, start fresh
             backup = M.LOCAL_TRADES_FILE.with_suffix(
@@ -287,6 +287,49 @@ class SpreadStoreBase(LockedStoreMixin):
             self._flag_corruption(str(e), backup)
             return []
 
+    def _statuses(self):
+        """This book's status vocabulary, for `store_contract`.
+
+        The BCS family says open/closed; zebra says entered/exited. Comparing
+        raw strings across the two would compare the wrong things, which is
+        why the contract is stated in ROLES.
+        """
+        return store_contract.BCS_FAMILY_STATUSES
+
+    def _quarantine_unreadable(self, data: list) -> list:
+        """Drop records the merge cannot survive, preserving and alerting.
+
+        `_merge_trades` indexes on `t['id']` and compares `version` before any
+        caller code runs, on EVERY write path. One record with a missing id or
+        a string version therefore made every write on this book raise --
+        exits included -- and nothing above quarantined it, because the file
+        parsed as JSON perfectly well. See `common.store_contract` for the
+        manufacture paths and for why repair is preferred to dropping.
+
+        The quarantined records are written beside the book rather than
+        discarded: a record this store cannot read may still be the only
+        evidence of a real position.
+        """
+        good, bad = store_contract.partition_readable(
+            data, log=lambda f, *a: self._logger.warning(f, *a))
+        if not bad:
+            return good
+        M = self._mod()
+        path = M.LOCAL_TRADES_FILE.with_suffix(
+            f'.unreadable.{int(time.time())}.json')
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(bad, f, indent=2, default=str)
+        except OSError:
+            path = None            # never let preservation break the read
+        self._logger.critical(
+            "%d unreadable record(s) held out of the book: %s. Preserved at "
+            "%s.", len(bad), '; '.join(b['why'] for b in bad), path)
+        self._flag_corruption(
+            '%d unreadable record(s): %s'
+            % (len(bad), '; '.join(b['why'] for b in bad)), path)
+        return good
+
     def _load_local(self):
         """Load trades from local JSON file into cache."""
         self._trades = self._read_local()
@@ -304,6 +347,7 @@ class SpreadStoreBase(LockedStoreMixin):
           - A trade was closed locally but Drive still shows it open
         """
         by_id: dict = {}
+        notes: list = []
 
         for t in base:
             by_id[t['id']] = t
@@ -313,10 +357,24 @@ class SpreadStoreBase(LockedStoreMixin):
             if tid not in by_id:
                 # New trade from the other side
                 by_id[tid] = t
-            elif t.get('version', 0) > by_id[tid].get('version', 0):
-                # Incoming has a newer version
-                by_id[tid] = t
-            # else: base version is equal or higher, keep it
+                continue
+            # Version alone used to decide this, and a version is a
+            # per-replica counter, not a conflict detector -- so a booked exit
+            # could be walked back by a replica that had merely bumped a
+            # couple of alert flags. See `store_contract.resolve_merge`.
+            winner, note = store_contract.resolve_merge(
+                by_id[tid], t, self._statuses())
+            by_id[tid] = winner
+            if note:
+                notes.append(note)
+
+        for note in notes:
+            self._logger.critical('MERGE: %s', note)
+        if notes:
+            # A log line is not an alert, and these are states no operator can
+            # infer from the book itself -- the two replicas simply differ.
+            self._flag_corruption('%d merge conflict(s): %s'
+                                  % (len(notes), ' | '.join(notes)), None)
 
         merged = sorted(by_id.values(), key=lambda t: t['id'])
 

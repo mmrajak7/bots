@@ -7381,6 +7381,16 @@ def _arming_preflight(dry_run: bool, all_trades) -> dict:
     for t in all_trades or ():
         if t.get('_store_type') != 'zebra':
             continue
+        # Read from the RAW field, not through `_record_says_paper`. That
+        # predicate resolves an absent flag to "live" on purpose, which is
+        # correct for deciding whether THIS engine may trade the record and
+        # wrong for deciding what the record IS -- zebra's twin resolves the
+        # same absence the opposite way. Classifying it here would have both
+        # preflights report OK on a record they disagree about.
+        flag = t.get('paper')
+        if not isinstance(flag, bool):
+            population.add(arming.UNSTAMPED_RECORD)
+            continue
         population.add(arming.PAPER_RECORD if _record_says_paper(t)
                        else arming.LIVE_RECORD)
     state = arming.check(

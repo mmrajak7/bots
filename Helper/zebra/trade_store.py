@@ -77,6 +77,103 @@ def in_cohort(trade: dict, cohort: Optional[str] = None) -> bool:
     return stamped == (cohort or cfg.COHORT_START)
 
 
+#: Statuses a signal passes through BEFORE it becomes a position. The cohort
+#: stamp is applied at ENTRY (`mark_entered_bcs`), deliberately -- moving
+#: `cohort_start` must not reclassify positions already open and already being
+#: measured -- so a signal cannot be in-cohort yet and must not be judged as
+#: out-of-cohort either. It is simply not a result.
+PRE_POSITION_STATUSES = ('watching', 'triggered')
+
+
+def scored(trades, cohort=None) -> list:
+    """The ONLY population a measurement, report, scorecard or gate may use.
+
+    OWNER DECISION, 2026-08-31: *"the old records are not to be used any more
+    ... all code rules shud stick to cohort bcs only ... forget old trades and
+    results."*
+
+    The engine changed substantially in early August: the back ratio was
+    dropped for a Bull Call Spread, pricing moved from mid-mid to fill on
+    2026-08-12, entry vetting was armed, and the cohort opened 2026-08-14. The
+    448 records before that describe a DIFFERENT strategy. Mixing them into a
+    number about this one does not make the sample bigger, it makes the number
+    meaningless -- and every one of them is mid-priced, so it also makes it
+    optimistic in a known direction.
+
+    UNCONDITIONAL, and not behind `alerts_cohort_only`. That switch governs
+    how CHATTY an alert is; this governs what is true. A measurement that a
+    config file can widen back over a retired engine is not a rule, it is a
+    default.
+
+    The records are NOT deleted, hidden from the store, or archived (owner
+    decision, same date): `zebra status` still shows the whole book, the store
+    still merges and ids against all of it, and the forensic history stays
+    readable. They simply stop being EVIDENCE.
+
+    Signals that have not entered yet are excluded too, and that is not a
+    judgement about them -- they carry no stamp because they carry no result.
+    Use `in_flight` for the population a liveness check needs.
+    """
+    return [t for t in trades if in_cohort(t, cohort)]
+
+
+def in_flight(trades) -> list:
+    """Signals and positions the CURRENT engine still has work to do on.
+
+    The complement of `scored` for the other question: not "what did we
+    achieve" but "what is live". An unstamped `watching`/`triggered` signal
+    belongs here -- it is a candidate of this engine that has not entered --
+    while an unstamped `entered` record would be a legacy position and does
+    not.
+    """
+    return [t for t in trades
+            if (t.get('status') in PRE_POSITION_STATUSES
+                or (t.get('status') == 'entered' and in_cohort(t)))]
+
+
+def from_current_engine(trade: dict, cohort: Optional[str] = None) -> bool:
+    """Did THIS engine make this decision, whether or not it became a trade?
+
+    Wider than `in_cohort`, and the difference is entirely about records that
+    never entered. The cohort stamp is applied at ENTRY, so a signal this
+    engine VETOED, drift-cancelled or stale-cancelled can never carry one --
+    52 records are in exactly that state. `scored` therefore cannot see them,
+    and it should not: they are not results.
+
+    They ARE decisions, and the post-mortem layer exists to learn from the
+    vetoes specifically. `zebra/postmortem.py` says why in its own docstring:
+    covering only the trades that HAPPENED "would build an evidence base made
+    entirely of decisions to trade, and the vetoes -- the layer's most
+    consequential calls -- would be the ones with no lessons attached."
+
+    WHY A DATE HERE, when `in_cohort` explicitly refuses to guess from one.
+    That refusal is about POSITIONS, where a stamp exists and its absence is
+    itself the answer ("made by an engine that no longer exists"). For a
+    record that never entered, no stamp could ever have been written, so
+    absence carries no information at all and the signal date is the only
+    thing that distinguishes a veto from last week from one in May. The rule
+    stays: never re-derive a stamped record's era from a date.
+    """
+    if trade.get('cohort'):
+        return in_cohort(trade, cohort)
+    if trade.get('status') not in ('watching', 'triggered', 'cancelled'):
+        # An `entered`/`exited` record with no stamp is a legacy POSITION.
+        # Absence is the answer there, exactly as `in_cohort` says.
+        return False
+    start = cohort or cfg.COHORT_START
+    return bool(start) and (trade.get('signal_date') or '')[:10] >= start
+
+
+def decided(trades, cohort=None) -> list:
+    """Every decision this engine made -- taken, vetoed or abandoned.
+
+    The population for the vetting scorecard and the post-mortem layer. Use
+    `scored` for anything that produces a P&L number; a veto has no P&L and
+    including it in one would be its own kind of nonsense.
+    """
+    return [t for t in trades if from_current_engine(t, cohort)]
+
+
 def is_paper_record(trade: dict) -> bool:
     """Did this record's legs NEVER reach a broker?
 
@@ -545,7 +642,8 @@ class ZebraStore:
         sync down before, upload after, never inside).
         """
         with exclusive(cfg.LOCK_FILE):
-            self._trades = self._merge(self._read_local(), self._trades)
+            self._trades = self._merge_announced(
+                self._read_local(), self._trades)
             # Rollback point. If the caller raises mid-mutation (e.g.
             # _apply_entry sets status='entered' and then a float() cast on a
             # later field blows up), the half-mutated trade must not linger in
@@ -1471,6 +1569,10 @@ class ZebraStore:
         non-cohort frozen records would hide the older generation's freezes
         from every reader that goes direct.
         """
+        # WHOLE BOOK: a frozen record has legs LIVE at the broker. Which
+        # engine opened it is irrelevant to whether it needs recovering, and
+        # scoping this would strand exactly the records that most need
+        # finding. A safety sweep, not a measurement.
         return [t for t in self.load_trades()
                 if t.get('status') == 'partial_close']
 
@@ -1495,10 +1597,12 @@ class ZebraStore:
         no stop to re-arm, and the residue may be a leg the owner is holding
         on purpose. Escalate, never act.
 
-        NOT cohort-filtered, for the same reason `get_frozen_trades` is not:
-        the adapter narrows, and a store method that hid the older
-        generation's residues from every direct reader would be answering a
-        different question than the one it is named for.
+        WHOLE BOOK: not cohort-filtered, for the same reason
+        `get_frozen_trades` is not — the adapter narrows, and a store method
+        that hid the older generation's residues from every direct reader
+        would be answering a different question than the one it is named for.
+        A residue is an unaccounted leg at a broker; which engine opened it
+        does not change that.
         """
         return [t for t in self.load_trades()
                 if t.get('status') == 'exited'
@@ -1524,12 +1628,12 @@ class ZebraStore:
 
         Read-only and escalate-only. No caller may place an order on the
         strength of this list.
+
+        WHOLE BOOK: as with the two sweeps above. An orphan leg is an orphan
+        leg whichever engine placed it.
         """
         return [t for t in self.load_trades()
                 if (t.get('entry_residue') or {}).get('state') == 'open']
-
-
-
 
     def set_trade_status(self, trade_id: int, status: str, **extra) -> dict:
         with self._mutate():
@@ -1867,8 +1971,9 @@ class ZebraStore:
                 # self._trades, which goes stale the moment the other process
                 # writes.
                 with exclusive(cfg.LOCK_FILE):
-                    base = self._merge(self._read_local(), self._trades)
-                    merged = self._merge(base, drive_data)
+                    base = self._merge_announced(
+                        self._read_local(), self._trades)
+                    merged = self._merge_announced(base, drive_data)
                     self._trades = merged
                     self._save_local()
                 self._last_sync_time = time.time()
@@ -1915,7 +2020,7 @@ class ZebraStore:
                 data = json.load(f)
             if not isinstance(data, list):
                 raise ValueError(f"Expected list, got {type(data).__name__}")
-            return data
+            return self._quarantine_unreadable(data)
         except (json.JSONDecodeError, ValueError) as e:
             backup = cfg.LOCAL_FILE.with_suffix(
                 f'.corrupt.{int(time.time())}.json'
@@ -1927,6 +2032,33 @@ class ZebraStore:
             logger.critical("File CORRUPT (%s). Backed up to %s.", e, backup)
             self._flag_corruption(str(e), backup)
             return []
+
+    def _quarantine_unreadable(self, data: list) -> list:
+        """Drop records the merge cannot survive, preserving and alerting.
+
+        The zebra twin of `common.spread_store._quarantine_unreadable`, and it
+        matters more here: this is the book holding the BCS cohort, and the
+        write path a bad record bricks includes `mark_exited`. See
+        `common.store_contract.partition_readable`.
+        """
+        good, bad = store_contract.partition_readable(
+            data, log=lambda f, *a: logger.warning(f, *a))
+        if not bad:
+            return good
+        path = cfg.LOCAL_FILE.with_suffix(
+            f'.unreadable.{int(time.time())}.json')
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(bad, f, indent=2, default=str)
+        except OSError:
+            path = None
+        logger.critical(
+            "%d unreadable record(s) held out of the book: %s. Preserved at "
+            "%s.", len(bad), '; '.join(b['why'] for b in bad), path)
+        self._flag_corruption(
+            '%d unreadable record(s): %s'
+            % (len(bad), '; '.join(b['why'] for b in bad)), path)
+        return good
 
     def _flag_corruption(self, err: str, backup) -> None:
         """Leave a marker the MONITOR turns into a Telegram.
@@ -1967,15 +2099,54 @@ class ZebraStore:
             logger.info("No local zebra file, starting empty")
 
     @staticmethod
-    def _merge(base: list, incoming: list) -> list:
+    def _merge_with_notes(base: list, incoming: list):
+        """Union by id, returning `(merged, notes)`. Pure -- logs nothing.
+
+        A booked exit is never walked back by a version. Version alone decided
+        this until 2026-08-31, and a version is a per-replica counter rather
+        than a conflict detector: local `exited` at version 7 against Drive
+        `entered` at version 8 erased the exit and REOPENED the trade. See
+        `common.store_contract.resolve_merge`.
+
+        Split from `_merge` rather than folded into it because the resolution
+        is worth testing without a store, a logger or a marker file -- and
+        because `_merge`'s two-argument unbound form is a spec several tests
+        already drive directly.
+        """
         by_id = {t['id']: t for t in base}
+        notes = []
         for t in incoming:
             tid = t['id']
             if tid not in by_id:
                 by_id[tid] = t
-            elif t.get('version', 0) > by_id[tid].get('version', 0):
-                by_id[tid] = t
-        return sorted(by_id.values(), key=lambda t: t['id'])
+                continue
+            winner, note = store_contract.resolve_merge(
+                by_id[tid], t, store_contract.ZEBRA_STATUSES)
+            by_id[tid] = winner
+            if note:
+                notes.append(note)
+        return sorted(by_id.values(), key=lambda t: t['id']), notes
+
+    @staticmethod
+    def _merge(base: list, incoming: list) -> list:
+        """The merged book. Unchanged signature; see `_merge_with_notes`."""
+        merged, _notes = ZebraStore._merge_with_notes(base, incoming)
+        return merged
+
+    def _merge_announced(self, base: list, incoming: list) -> list:
+        """`_merge`, with the conflicts said out loud.
+
+        The two states this reports are ones no operator can infer from the
+        book itself -- the replicas simply differ -- so a log line alone is not
+        enough and the corruption marker is raised too.
+        """
+        merged, notes = self._merge_with_notes(base, incoming)
+        for note in notes:
+            logger.critical('MERGE: %s', note)
+        if notes:
+            self._flag_corruption('%d merge conflict(s): %s'
+                                  % (len(notes), ' | '.join(notes)), None)
+        return merged
 
     def _save_local(self):
         cfg.LOG_DIR.mkdir(exist_ok=True)

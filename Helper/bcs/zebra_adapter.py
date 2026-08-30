@@ -291,6 +291,14 @@ class ZebraStoreAdapter:
         return None
 
     def load_trades(self) -> List[dict]:
+        """The raw zebra records, unscoped.
+
+        WHOLE BOOK: this is the raw accessor, same rule as the store it wraps
+        — scoping here would hide records from the merge, the id allocator and
+        the recovery sweeps. The cohort-scoped views are the `get_*_trades`
+        methods above, and `bcs/journal_report._load_zebra` scopes what it
+        reads through here.
+        """
         return self._store.load_trades()
 
     # -- writes --------------------------------------------------------------

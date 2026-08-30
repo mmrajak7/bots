@@ -19,7 +19,7 @@ from typing import Optional
 from . import config as cfg
 from . import outcomes
 from .trade_store import (TP_LATCH_EXPIRED, TP_TOUCHED_AT, ZebraStore,
-                          in_cohort)
+                          in_cohort, scored)
 
 logger = logging.getLogger(__name__)
 
@@ -541,17 +541,19 @@ def _open_sorted(report: dict) -> list:
 # ── Report builders ──────────────────────────────────────────────────────
 
 def _reportable(trades: list) -> list:
-    """Trades this report is allowed to talk about.
+    """Trades this report is allowed to talk about: this engine's only.
 
-    With `alerts_cohort_only` on, that is the current engine's trades only.
-    The legacy book is not deleted or hidden from the store — `zebra status`
-    still shows it under the whole-book block — it just stops being reported
-    daily, because 25 legacy positions were most of the message and a report
-    nobody reads to the bottom is worse than a shorter one.
+    UNCONDITIONAL since 2026-08-31 (owner decision). This used to defer to
+    `alerts_cohort_only`, so a config file could widen a P&L report back over
+    the retired back-ratio engine — 448 mid-priced records from a different
+    strategy, landing in the same total as the 13 that describe this one.
+
+    `alerts_cohort_only` still governs how CHATTY an alert is. It does not
+    govern what a number means. The legacy book is not deleted or hidden —
+    `zebra status` still shows the whole book — it just stops being evidence.
+    See `trade_store.scored`.
     """
-    if not cfg.ALERTS_COHORT_ONLY:
-        return trades
-    return [t for t in trades if in_cohort(t)]
+    return scored(trades)
 
 
 def daily_report(store: ZebraStore, kite=None,

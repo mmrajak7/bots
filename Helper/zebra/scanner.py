@@ -194,6 +194,9 @@ def validate_and_add(store: ZebraStore, kite=None,
         # Dedup against existing open signals (BCS shadows excluded — they
         # mirror zebra trades passively and must not block fresh signals)
         existing = next(
+            # WHOLE BOOK: dedup. A stock already carrying an open signal
+            # is a duplicate whichever engine created it, and re-adding it
+            # would put two live signals on one name.
             (t for t in store.load_trades()
              if t.get('stock') == stock
              and t.get('timeframe') == timeframe
@@ -211,6 +214,9 @@ def validate_and_add(store: ZebraStore, kite=None,
 
         # Cross-direction dedup: same stock can't be both CE-Zebra and PE-Zebra
         opposite = next(
+            # WHOLE BOOK: dedup. A stock already carrying an open signal
+            # is a duplicate whichever engine created it, and re-adding it
+            # would put two live signals on one name.
             (t for t in store.load_trades()
              if t.get('stock') == stock
              and t.get('direction') != direction

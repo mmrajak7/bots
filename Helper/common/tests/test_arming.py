@@ -299,7 +299,14 @@ def test_the_kill_switch_transition_re_states_the_arming():
 @pytest.mark.parametrize('state,expected', [
     ({'state': 'dry_run'}, True),
     ({'state': 'ok'}, False),
-    ({'state': 'no_cohort_book'}, False),
+    # CHANGED 2026-08-31, from False. `no_cohort_book` means the peer is
+    # polling and armed but its adapter onto the COHORT book failed -- so it
+    # cannot see a cohort record, let alone book one. Answering "armed" named
+    # it as the live records' engine on the strength of a beat that says it
+    # cannot reach them, which is the same error as reading a missing beat as
+    # healthy. UNKNOWN is the honest answer, and `classify` now turns
+    # unknown-plus-live-records into a fault rather than into silence.
+    ({'state': 'no_cohort_book'}, None),
     ({'state': 'missing'}, None),
     ({'state': 'stale'}, None),
     ({'state': 'unreadable'}, None),
@@ -312,3 +319,40 @@ def test_zebra_reads_the_peers_arming_from_the_heartbeat(monkeypatch, state,
     monkeypatch.setattr(monitor, 'read_exit_engine_heartbeat',
                         lambda *a, **k: state)
     assert monitor._monitor_dry_run() is expected
+
+
+def test_an_unverifiable_peer_with_LIVE_records_open_is_a_FAULT():
+    """THE STATE THAT LOOKED HEALTHY FROM EVERY LOG (found 2026-08-31).
+
+    With `dry_run=None` the monitor is listed as POSSIBLY booking, so a live
+    record came back with exactly one engine and was certified `ARMING: OK` --
+    while the reason its heartbeat is unreadable may be that it is dead. The
+    `dry_run is None` no-engine branch never ran, because a one-engine class
+    never reaches it, so the finding was not recorded even as latent.
+    """
+    st = arming.classify(paper_mode=True, exits_external=False,
+                         auto_entry=False, dry_run=None,
+                         population={arming.LIVE_RECORD})
+    assert st['legal'] is False
+    assert [f['state'] for f in st['faults']] == [arming.UNVERIFIED]
+    assert 'heartbeat' in st['faults'][0]['detail']
+
+
+def test_an_unverifiable_peer_with_only_PAPER_records_is_still_fine():
+    """Today's book. zebra books its own paper records, peer or no peer, so
+    an alarm here would be the noise that trains the reader to skim."""
+    st = arming.classify(paper_mode=True, exits_external=False,
+                         auto_entry=False, dry_run=None,
+                         population={arming.PAPER_RECORD})
+    assert st['legal'] is True
+    assert not any(f['state'] == arming.UNVERIFIED for f in st['faults'])
+
+
+def test_the_unverified_fault_does_not_send_the_operator_to_a_switch():
+    """There is no switch for "the peer might be dead". Say what to check."""
+    st = arming.classify(paper_mode=True, exits_external=False,
+                         auto_entry=False, dry_run=None,
+                         population={arming.LIVE_RECORD})
+    fix = st['faults'][0]['fix']
+    assert 'spread_monitor' in fix and 'heartbeat' in fix
+    assert 'UNWATCHED' in fix

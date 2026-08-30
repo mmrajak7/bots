@@ -216,3 +216,28 @@ def unresolved(day: Optional[str] = None):
     done = {r.get('intent_id') for r in records if r.get('kind') == 'result'}
     return [r for r in records
             if r.get('kind') == 'intent' and r.get('intent_id') not in done]
+
+
+def unresolved_for_trade(trade_id, day: Optional[str] = None):
+    """`unresolved`, narrowed to one signal, for the pre-placement check.
+
+    TODAY ONLY, and deliberately. Kite's regular orders are DAY orders: an
+    intent left unresolved by yesterday's crash names an order that no longer
+    exists, and blocking on it would strand the signal permanently -- turning
+    a duplicate-order guard into a silent, unbounded refusal to trade.
+
+    Dry-run intents are excluded: nothing was placed, so nothing can be live.
+
+    The trade id is read from the free-form `context` every call site stamps
+    (`entry_executor.ctx`), matched loosely because it has been written as
+    both an int and a str.
+    """
+    want = str(trade_id)
+    out = []
+    for r in unresolved(day):
+        if r.get('dry_run'):
+            continue
+        ctx = r.get('context') or {}
+        if str(ctx.get('trade_id')) == want:
+            out.append(r)
+    return out

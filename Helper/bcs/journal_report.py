@@ -44,27 +44,40 @@ from bcs import order_journal
 # side only" and the other three books went unlooked-at.
 
 def _load_bcs():
+    # WHOLE BOOK: a DIFFERENT book (hand-entered BCS trades). The cohort rule
+    # scopes the zebra book only; `_load_zebra` below is the one that scopes.
     from bcs.trade_store import get_store
     return get_store().load_trades()
 
 
 def _load_fh():
+    # WHOLE BOOK: a different book (Fallen Hero). See `_load_bcs`.
     from fallen_hero import get_store
     return get_store().load_trades()
 
 
 def _load_bps():
+    # WHOLE BOOK: a different book (bear put). See `_load_bcs`.
     from bear_put import get_store
     return get_store().load_trades()
 
 
 def _load_zebra():
     from bcs.zebra_adapter import get_adapter
+    from zebra.trade_store import decided
     adapter = get_adapter()
     # `load_trades` on the adapter is deliberately the RAW zebra records, not
     # `map_trade`d ones: the report reads `exit_date`, `status` and `cohort`
     # by zebra's own names, and a mapped copy would rename half of them.
-    return adapter.load_trades() if adapter is not None else []
+    #
+    # `decided`: the journal compares INTENDED orders against what the books
+    # record, and the retired engine placed none of the orders this journal
+    # holds -- it predates the journal entirely. Including its 399 records
+    # would report them all as "in the book, no matching intent", which is the
+    # shape of a real finding and would bury the real ones.
+    if adapter is None:
+        return []
+    return decided(adapter.load_trades())
 
 
 #: (tag, loader). The tag is stamped onto every record as `_strategy` and is

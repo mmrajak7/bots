@@ -337,6 +337,12 @@ COHORT_TRADE = {
     'sl_spread': 6.78, 'entry_spot': 1360.0, 'expiry': '2026-09-29',
     'spot_sl_enabled': False, 'trail_policy': 'gain_anchored',
     'time_policy': 'sessions_before_expiry',
+    # STAMPED, like every real cohort record. Omitted here until 2026-08-31,
+    # which the new UNSTAMPED arming check correctly flagged: a cohort record
+    # with no `paper` flag is read as paper by zebra and as live by this
+    # engine, so both would act on it. A fixture that leaves it out is
+    # exercising an illegal state without meaning to.
+    'paper': False,
 }
 
 _LONG_BOOK = {'bid': 40.00, 'bid_qty': 1400, 'ask': 40.20, 'ask_qty': 1400,

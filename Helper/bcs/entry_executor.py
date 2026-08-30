@@ -232,7 +232,51 @@ def open_leg(kite, exchange: str, symbol: str, is_buy: bool, qty: int,
             say(f"    PARTIAL FILL in the cancel race: "
                 f"{part['filled_quantity']}/{qty} {symbol}")
             return part
+
+        # THE ORDER MUST BE PROVEN DEAD BEFORE ANOTHER ONE IS PLACED.
+        #
+        # `cancel_order_safe` SWALLOWS a failed cancel (it logs and returns),
+        # and `_order_final_state` returns None when the order book cannot be
+        # read -- its own docstring says "callers must treat None as unknown,
+        # never as did not fill". Until 2026-08-31 this loop did exactly that:
+        # it fell through to the next attempt on None, and on a state that was
+        # still OPEN, and placed a SECOND live order against the same leg.
+        #
+        # The reachable path is not exotic. Kite rate-limits the quote family
+        # at 1/sec and this box has logged `Too many requests` for a whole
+        # session (2026-08-27); a burst there refuses the cancel AND the
+        # follow-up `orders()` read. The first order then fills minutes later,
+        # next to the retry's fill: two lots short against one lot long, i.e.
+        # a NET NAKED SHORT -- the precise exposure the long-first sequencing
+        # exists to make impossible, and the Feb-2026 shape at entry instead
+        # of exit.
+        #
+        # So: retry ONLY on a terminal status carrying no fill. Anything else
+        # stops the run and is reported as UNKNOWN, which the caller must not
+        # describe as "nothing extra held".
+        status = str((final or {}).get('status', '')).upper()
+        confirmed_dead = dry_run or (
+            status in sm._TERMINAL_ORDER_STATUS and status != 'COMPLETE')
+        if not confirmed_dead:
+            say(f"    {symbol}: order {order_id} could NOT be confirmed dead "
+                f"(status={status or 'unreadable'}). NOT placing another — "
+                f"it may still be working at the broker.")
+            return {'unknown': True, 'order_id': order_id, 'symbol': symbol,
+                    'status': status or 'unreadable', 'filled_quantity': 0}
+        say(f"    {symbol}: order {order_id} confirmed {status} with no fill "
+            f"— safe to retry")
     return None
+
+
+def _is_unknown(fill) -> bool:
+    """Did the order path lose track of an order it placed?
+
+    Distinct from None (nothing was placed, or it is proven dead with no
+    fill) and from a partial (a known quantity is held). UNKNOWN means an
+    order may be live at the broker RIGHT NOW, so the run must stop and the
+    operator must look -- never "nothing extra held".
+    """
+    return bool(fill) and bool(fill.get('unknown'))
 
 
 def _partial(result, qty: int):
@@ -281,7 +325,7 @@ def open_spread(kite, *, stock: str, long_symbol: str, short_symbol: str,
     tg = telegram or sm.send_telegram
     out = {'stock': stock, 'lots_requested': lots, 'lots_filled': 0,
            'long_fills': [], 'short_fills': [], 'orphan': None,
-           'partials': [], 'problems': []}
+           'partials': [], 'problems': [], 'unknown_orders': []}
 
     allowed, why = entries_allowed(log=say)
     if not allowed and not dry_run:
@@ -374,6 +418,22 @@ def _round(kite, out, i, lots, stock, long_symbol, short_symbol, exchange,
     # naked short.
     lfill = open_leg(kite, exchange, long_symbol, True, lot_size, dry_run,
                      context=ctx('long'), log=say)
+    if _is_unknown(lfill):
+        # NOT "nothing extra held". The order may be working at the broker and
+        # may fill after this function returns, so the run stops here and the
+        # operator is pointed at Kite. Recording a spread we cannot prove we
+        # hold is the one outcome worse than stopping short.
+        out['unknown_orders'] = out.get('unknown_orders', []) + [
+            {'round': i, 'leg': 'long', 'symbol': long_symbol,
+             'order_id': lfill.get('order_id'), 'status': lfill.get('status')}]
+        out['problems'].append(
+            'round %d: the LONG order %s could not be confirmed dead or '
+            'filled (status %s). It may be LIVE at the broker — check Kite '
+            'before entering %s again. %d complete spread(s) are recorded.'
+            % (i, lfill.get('order_id'), lfill.get('status'), long_symbol,
+               out['lots_filled']))
+        say(f"  Round {i}: LONG order state UNKNOWN. Stopping.")
+        return False
     if lfill and lfill.get('partial'):
         _note_partial(out, i, long_symbol, lfill, lot_size)
         say(f"  Round {i}: partial LONG. Stopping.")
@@ -387,6 +447,24 @@ def _round(kite, out, i, lots, stock, long_symbol, short_symbol, exchange,
 
     sfill = open_leg(kite, exchange, short_symbol, False, lot_size, dry_run,
                      context=ctx('short'), log=say)
+    if _is_unknown(sfill):
+        # The long IS held, and the short's fate is unknown, so this is at
+        # least an orphan long and possibly a complete spread. Report BOTH
+        # facts and stop; do not guess which, and never place the short again.
+        out['orphan'] = {'symbol': long_symbol, 'qty': lot_size,
+                         'fill': lfill.get('average_price')}
+        out['unknown_orders'] = out.get('unknown_orders', []) + [
+            {'round': i, 'leg': 'short', 'symbol': short_symbol,
+             'order_id': sfill.get('order_id'), 'status': sfill.get('status')}]
+        out['problems'].append(
+            'round %d: the LONG filled and the SHORT order %s could not be '
+            'confirmed dead or filled (status %s). Holding %d x %s, and the '
+            'short MAY also be live — check Kite before doing anything else.'
+            % (i, sfill.get('order_id'), sfill.get('status'), lot_size,
+               long_symbol))
+        say(f"  Round {i}: SHORT order state UNKNOWN against a filled long. "
+            f"Stopping.")
+        return False
     if sfill and sfill.get('partial'):
         # Worse than an orphan long: the round holds a FULL long and a PARTIAL
         # short, so it is neither a spread nor a clean single leg.
@@ -435,10 +513,16 @@ def _report(out: dict, stock: str, lots: int, dry_run: bool, say, tg) -> None:
     """
     n = out['lots_filled']
     tag = '[DRY RUN] ' if dry_run else ''
+    unknown = out.get('unknown_orders') or []
     # No `not out['partials']` clause: a partial always stops the run, so it
     # can never coexist with a full lots_filled. A mutation proved the extra
     # test was unreachable, and an unobservable guard is decorative.
-    if n == lots and not out['orphan']:
+    #
+    # `unknown` IS listed, because unlike a partial it does not imply an
+    # incomplete count: an order whose fate we never learned can leave the
+    # requested number of spreads filled AND an extra leg live at the broker.
+    # A run in that state must never print COMPLETE.
+    if n == lots and not out['orphan'] and not unknown:
         say(f"\n  {tag}ENTRY COMPLETE: {n}/{lots} lot(s) {stock}")
         return
     say(f"\n  *** {tag}ENTRY INCOMPLETE: {n}/{lots} lot(s) {stock} ***")
@@ -449,6 +533,13 @@ def _report(out: dict, stock: str, lots: int, dry_run: bool, say, tg) -> None:
     if out['orphan']:
         lines.append("An UNHEDGED LONG is open and was deliberately not "
                      "unwound. Decide manually.")
+    for u in unknown:
+        lines.append(
+            "ORDER STATE UNKNOWN: round %s %s leg %s, order %s (%s). It was "
+            "NOT retried and may be LIVE at the broker. Check Kite before "
+            "placing anything on this symbol."
+            % (u.get('round'), u.get('leg'), u.get('symbol'),
+               u.get('order_id'), u.get('status')))
     if n:
         lines.append(f"The {n} complete spread(s) ARE a valid position and "
                      f"will be recorded and monitored.")

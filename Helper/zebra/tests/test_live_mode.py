@@ -509,13 +509,23 @@ def test_eod_escapes_the_symbol_in_both_blocks(monkeypatch):
 
 
 def test_reports_are_scoped_to_the_cohort(monkeypatch):
+    """UNCONDITIONALLY, since 2026-08-31 (owner: "forget old trades and
+    results").
+
+    This used to assert that `alerts_cohort_only: false` WIDENED a report back
+    over the retired back-ratio engine — 448 mid-priced records from a
+    different strategy landing in the same total as the 13 that describe this
+    one. That switch governs how chatty an alert is; it does not govern what a
+    number means, and a scope a config file can widen is a default rather than
+    a rule.
+    """
     from zebra import report as rep
 
     trades = [_current(id=1), _legacy(id=2)]
-    monkeypatch.setattr(cfg, 'ALERTS_COHORT_ONLY', True)
-    assert [t['id'] for t in rep._reportable(trades)] == [1]
-    monkeypatch.setattr(cfg, 'ALERTS_COHORT_ONLY', False)
-    assert [t['id'] for t in rep._reportable(trades)] == [1, 2]
+    for switch in (True, False):
+        monkeypatch.setattr(cfg, 'ALERTS_COHORT_ONLY', switch)
+        assert [t['id'] for t in rep._reportable(trades)] == [1], (
+            'the legacy record came back with alerts_cohort_only=%s' % switch)
 
 
 @pytest.mark.parametrize('fmt,args', [

@@ -161,3 +161,236 @@ def refusal(method, status, trade_id, statuses=BCS_FAMILY_STATUSES) -> str:
                 "one." % (trade_id, status, method))
     return ("Trade #%s is %s (%s); the store contract does not allow %s from "
             "that state." % (trade_id, status, role, method))
+
+
+
+# -- What makes a record READABLE at all -------------------------------------
+#
+# Everything above says what may be done to a record in a given state. This
+# says whether the record can be looked at without taking the whole book down
+# with it, which is a strictly earlier question.
+#
+# THE DEFECT (found 2026-08-31). `_merge_trades` does `by_id[t['id']] = t` and
+# then compares `t.get('version', 0) > ...` -- before any caller code runs,
+# and on EVERY write path, because every write refreshes through the merge. So
+# ONE record with a missing `id`, or a string `version`, made every
+# `update_trade_fields` / `mark_exited` / `begin_close` on that book raise
+# TypeError or KeyError. Exits included. `_read_local` quarantines JSON-level
+# corruption but never looked inside the records, so the state survived every
+# restart and the corruption alert never fired.
+#
+# Two realistic manufacture paths, neither of them a coding error:
+#   * a hand edit during an incident -- this repo's history has several;
+#   * `json.dump(..., default=str)`, which both stores pass, silently
+#     stringifying any non-JSON-serialisable numeric (a numpy int, say) so the
+#     NEXT read sees `"id": "419"`.
+#
+# The response is deliberately asymmetric, because the two available mistakes
+# are not equally bad. Dropping a record from the working book stops it being
+# monitored, which for an open position is the worst outcome in the system. So:
+#
+#   COERCE when it is lossless -- an integer written as a decimal string is
+#   unambiguous, and repairing it is strictly safer than dropping a live
+#   position over a type. Logged as a WARNING so the cause stays visible.
+#
+#   QUARANTINE only what cannot be read at all -- not a dict, no usable `id`,
+#   or a duplicate id. Those are RETURNED to the caller rather than discarded,
+#   so the store preserves them and raises the corruption alert instead of
+#   going quietly on with a short book.
+#
+# `bool` is excluded explicitly: `isinstance(True, int)` is True in Python, so
+# a record whose id is `True` would otherwise collide with id 1.
+
+def _as_int(value):
+    """`value` as an int if that is lossless, else None.
+
+    Accepts an int (not a bool) and a string holding an exact integer literal.
+    Rejects floats outright -- 419.0 is almost certainly a real id that went
+    through a float, but 419.7 is not, and a rule that has to inspect the
+    fractional part to decide is one that will be got wrong later.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def partition_readable(trades, log=None):
+    """Split a raw trade list into (readable, unreadable), repairing in place.
+
+    Every `readable` record is guaranteed to have an int `id`, an int
+    `version` if it carries one, and an id no other readable record shares --
+    which is exactly what `_merge_trades` assumes and never checked.
+
+    `unreadable` is a list of `{'record', 'why'}`, returned rather than
+    dropped so the caller can preserve it and alert. Order is preserved, and
+    the first copy of a duplicated id wins so a re-read is deterministic.
+
+    Never raises: a validator that can itself fail on bad data is not one.
+    """
+    readable, unreadable, seen = [], [], {}
+    say = log or (lambda *a: None)
+    for t in trades or ():
+        if not isinstance(t, dict):
+            unreadable.append({'record': t, 'why': 'not an object'})
+            continue
+        tid = _as_int(t.get('id'))
+        if tid is None:
+            unreadable.append(
+                {'record': t,
+                 'why': 'id is %r, which is not an integer' % (t.get('id'),)})
+            continue
+        if t.get('id') != tid:
+            say('record id %r read as %d - repairing the type in memory; '
+                'something wrote this id as a non-integer', t.get('id'), tid)
+            t['id'] = tid
+        if 'version' in t:
+            ver = _as_int(t.get('version'))
+            if ver is None:
+                # Unlike a bad id, an uncomparable version has a safe reading:
+                # treat the record as the OLDEST possible, so a good copy on
+                # the other side of a merge wins and this one can never
+                # overwrite anything.
+                say('record #%d has version %r, which is not an integer - '
+                    'treating it as version 0 so it can never win a merge',
+                    tid, t.get('version'))
+                t['version'] = 0
+            elif t.get('version') != ver:
+                say('record #%d version %r read as %d - repairing the type',
+                    tid, t.get('version'), ver)
+                t['version'] = ver
+        if tid in seen:
+            # Two records with one id cannot both survive a merge keyed on it.
+            # Quarantining the later one makes the loss VISIBLE; letting the
+            # merge pick is what makes it silent.
+            unreadable.append(
+                {'record': t,
+                 'why': 'duplicate id %d - the first copy (version %s) was '
+                        'kept' % (tid, seen[tid].get('version'))})
+            continue
+        seen[tid] = t
+        readable.append(t)
+    return readable, unreadable
+
+
+
+# -- Resolving one id held by two replicas -----------------------------------
+#
+# THE DEFECT (found 2026-08-31). Both merges resolve by `version`, and a
+# version is a per-record counter each replica increments on its OWN writes.
+# It is not a conflict detector, and treating it as one produces two silent
+# failures:
+#
+#   1. A TIE with different content. `_merge_trades` keeps base on a tie and
+#      the divergence check compares VERSION MAPS only, so local and Drive
+#      disagree forever, no re-upload is triggered, and nothing is logged.
+#
+#   2. A BOOKED EXIT UN-BOOKED. Local `exited` at version 7, Drive `entered`
+#      at version 8 -- two alert-flag bumps on the other machine are enough to
+#      outrun a close. Higher version wins, the exit record is erased, and the
+#      trade REOPENS as a position nobody entered.
+#
+# (2) is the one that costs money, and it has a real invariant to appeal to
+# rather than a heuristic: closing is MONOTONIC. `CONTRACT` above already says
+# TERMINAL refuses every method, "because that is what idempotence IS -- the
+# guarantee that two processes racing to close cannot both book". A merge that
+# can walk a record back out of TERMINAL contradicts the table the same file
+# declares, so the rule here is not a new policy; it is the existing one
+# applied to the one code path that was not asking.
+#
+# (1) is left resolving as it always did -- base wins -- because changing
+# WHICH side wins is a bigger behavioural change than announcing that the
+# question was asked. What changes is that it is no longer silent.
+
+#: Stamped by `zebra.restore_snapshot.rebuild` on a record it deliberately
+#: reopens. A restore is the ONE authorised way a closed record goes back to
+#: open, and it is a human decision made in front of an incident -- so it is
+#: named explicitly here rather than inferred from a version counter, which is
+#: the mistake this whole function exists to stop making.
+RESTORE_MARKER = 'restored_from_snapshot_at'
+
+
+def resolve_merge(base_trade, incoming_trade, statuses=BCS_FAMILY_STATUSES):
+    """Which copy of one record survives, and what to say about it.
+
+    Returns `(winner, note)`. `note` is None on an ordinary resolution and a
+    human sentence on anything a reader needs to know about -- the caller logs
+    it and raises its corruption alert.
+
+    Never raises: a merge that can fail on odd data strands the whole book.
+    """
+    try:
+        b_ver = base_trade.get('version', 0)
+        i_ver = incoming_trade.get('version', 0)
+        b_role = role_of(base_trade.get('status'), statuses)
+        i_role = role_of(incoming_trade.get('status'), statuses)
+
+        # A BOOKED CLOSE IS NOT WALKED BACK BY A COUNTER.
+        #
+        # The case: local `exited` at version 7, the other replica `entered` at
+        # version 8. Two alert-flag bumps over there are enough to outrun a
+        # close, and higher-version-wins then ERASES the exit and reopens the
+        # trade as a position nobody entered.
+        #
+        # `CONTRACT` above already says TERMINAL refuses every method, "because
+        # that is what idempotence IS". A merge that can walk a record back out
+        # of TERMINAL contradicts the table in this same file; the rule here is
+        # that table applied to the one path that was not asking.
+        #
+        # The carve-out is `restore_snapshot`, and it is the reason this is
+        # keyed on an EXPLICIT marker rather than on the transition. A restore
+        # is exactly a deliberate un-booking of a wrongly-booked close -- the
+        # 2026-08-30 `deploy_server.sh` incident force-closed six live
+        # positions at -100%, and the recovery works by out-versioning those
+        # exits. Refusing it as "a stale replica reopening a closed trade"
+        # would break the only tool that has ever had to fix this book.
+        if b_role == TERMINAL and i_role != TERMINAL:
+            if incoming_trade.get(RESTORE_MARKER):
+                return incoming_trade, (
+                    'record #%s was %s locally and is being REOPENED by a '
+                    'snapshot restore (%s). Taking the restored copy.'
+                    % (base_trade.get('id'), base_trade.get('status'),
+                       incoming_trade.get(RESTORE_MARKER)))
+            if i_ver > b_ver:
+                return base_trade, (
+                    'record #%s is %s locally (version %s) and %s on the '
+                    'other replica at a HIGHER version %s. Keeping the CLOSED '
+                    'copy: a booked exit is not undone by a version counter, '
+                    'which is a per-replica write count and not a clock. The '
+                    'other replica is running against a stale book and the '
+                    'two will not converge on their own.'
+                    % (base_trade.get('id'), base_trade.get('status'), b_ver,
+                       incoming_trade.get('status'), i_ver))
+            return base_trade, None
+
+        # Ordinary version resolution, unchanged.
+        if i_ver > b_ver:
+            return incoming_trade, None
+        if i_ver == b_ver and incoming_trade != base_trade:
+            # A TIE WITH DIFFERENT CONTENT is a split brain, not a conflict
+            # either side can resolve: the counters are per-replica, so equal
+            # versions carry no information about which write came first. Base
+            # keeps winning, as it always has -- what changes is that the
+            # question is no longer asked silently. The divergence check that
+            # triggers a re-upload compares VERSION MAPS, so this state used to
+            # produce no log line, no alert and no re-upload.
+            return base_trade, (
+                'record #%s is at version %s on BOTH replicas with DIFFERENT '
+                'content. Versions are per-replica counters, so neither side '
+                'can resolve this. Keeping the local copy; the two books will '
+                'not converge on their own.' % (base_trade.get('id'), b_ver))
+        return base_trade, None
+    except Exception as e:                       # pragma: no cover - defensive
+        try:
+            tid = base_trade.get('id')
+        except Exception:
+            tid = '?'
+        return base_trade, ('record #%s could not be resolved against the '
+                            'other replica (%s); keeping the local copy'
+                            % (tid, e))

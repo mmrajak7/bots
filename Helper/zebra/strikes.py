@@ -324,7 +324,7 @@ def analyze(kite, stock: str, direction: str, spot: float,
         'stock': ..., 'direction': 'CE'|'PE', 'spot': ..., 'expiry': ...,
         'dte': ..., 'lot_size': ...,
         'atm_strike': ..., 'k_s_used': ...,
-        'atm_quote': {bid, ask, mid, oi},
+        'atm_quote': {bid, ask, mid, oi, bid_qty, ask_qty},
         'best': None,             # RETIRED — the back ratio is not priced
         'back_ratio': 'retired',
         'candidates': [],         # RETIRED — always empty
@@ -397,8 +397,23 @@ def analyze(kite, stock: str, direction: str, spot: float,
 
 
 def _atm_quote(q: dict) -> dict:
-    """The ATM leg's book, in the shape analyze_bcs expects."""
-    return {k: q.get(k) for k in ('bid', 'ask', 'mid', 'oi')}
+    """The ATM leg's book, in the shape analyze_bcs expects.
+
+    `bid_qty`/`ask_qty` are carried DELIBERATELY and must stay carried. This
+    projection is the only seam between `analyze()` and `analyze_bcs()`, and
+    until 2026-08-30 it dropped them: `analyze_bcs` read
+    `atm_quote.get('ask_qty')` and got None on EVERY production entry, so
+    `zebra/monitor.py`'s `if long_ask_qty is not None` never built a depth
+    dict, `capital.plan` never received one, and the liquidity bound — plus
+    the documented `liquidity_unknown -> 1 lot` fallback — was dead code. All
+    13 cohort records carry `long_ask_qty_entry: None` because of this line.
+
+    Every test hand-built an `atm_quote` WITH the size keys, so the suite
+    could not see it. `test_the_atm_projection_carries_size` pins the seam by
+    feeding `_quote_option`'s real output through this projection.
+    """
+    return {k: q.get(k)
+            for k in ('bid', 'ask', 'mid', 'oi', 'bid_qty', 'ask_qty')}
 
 
 def analyze_bcs(kite, stock: str, direction: str, spot: float,
@@ -420,8 +435,9 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     both structures share one snapshot) + SELL 1× the strike nearest the ST
     target, forced at least one strike beyond ATM in the trade direction.
 
-    `atm_quote` needs bid/ask/mid/oi keys (the zebra analyzer's short-leg
-    quote). Returns {'error': ...} when no viable target leg exists — the
+    `atm_quote` needs bid/ask/mid/oi keys, and SHOULD carry bid_qty/ask_qty
+    (the zebra analyzer's short-leg quote, as projected by `_atm_quote`).
+    Without the size keys the sizing plan silently loses its depth bound. Returns {'error': ...} when no viable target leg exists — the
     caller skips the shadow, never blocks the zebra flow.
 
     Two HARD gates (2026-08-10, from the 25-trade shadow study). Both return

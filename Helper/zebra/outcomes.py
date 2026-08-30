@@ -316,7 +316,12 @@ def track_shadows(store, ltps: dict, now: Optional[datetime] = None) -> list:
     """
     now = now or _now()
     resolved = []
-    for t in list(store.load_trades()):
+    # `decided`: a veto shadow is this engine's own counterfactual, and the
+    # retired engine has none (the feature postdates it). Scoped anyway rather
+    # than relying on that, because "no legacy record happens to carry this
+    # field" is a fact about today's data, not a rule.
+    from .trade_store import decided
+    for t in list(decided(store.load_trades())):
         shadow = t.get('veto_shadow')
         if not isinstance(shadow, dict) or shadow.get('status') != 'open':
             continue
@@ -378,6 +383,12 @@ def _entry_outcome(store, decision: dict) -> Optional[dict]:
     # the verdict, so it cannot exist when the decision is journalled and is
     # never in trade_ids. Trusting that list would silently score the zebra arm
     # alone while claiming to cover both.
+    # WHOLE BOOK: scoped by the ARGUMENT, not by the era. This only picks up
+    # records whose `shadow_of` points at an id already in `trades`, so the
+    # caller's scope decides the population and a second filter here could
+    # only drop an arm of a decision that is already in scope — scoring one
+    # arm while claiming to cover both, which is the defect the comment above
+    # describes.
     ids = {t['id'] for t in trades}
     trades = trades + [t for t in store.load_trades()
                        if t.get('shadow_of') in ids and t['id'] not in ids]
