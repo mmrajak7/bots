@@ -188,3 +188,54 @@ def test_a_reopened_exit_is_announced_even_on_the_refresh(store, tmp_path):
         'a stale copy reopening a closed trade must never be silent')
     assert store.find(tid)['status'] == 'exited', (
         'and the exit must survive — announcing it is not enough')
+
+
+# -- the batched poll write, against Drive ----------------------------------
+#
+# FOUND IN PRODUCTION on the Pi after the first fix deployed. The alert text
+# was now right and it was still arriving every cycle:
+#
+#   record #423 is at version 17 on BOTH replicas with DIFFERENT content
+#   (differs on: corrob_spot, corrob_t, corrob_value, exit_depth)
+#
+# `apply_mfe` writes exactly those fields with `drive=False` and NO version
+# bump, on purpose. So local disk and Drive sit at an equal version with
+# different content for every open position on every poll — the tie condition,
+# reached by design rather than by divergence.
+
+def test_the_batched_poll_write_does_not_look_like_a_split_brain(store,
+                                                                 tmp_path):
+    """THE SECOND DEFECT, reproduced through the real batched write path."""
+    tid = store.load_trades()[0]['id']
+    drive_copy = [dict(store.load_trades()[0])]      # Drive, before the poll
+
+    store.apply_mfe({tid: {'corrob_spot': 101.5, 'corrob_value': 4.2,
+                           'corrob_t': 1234.0, 'exit_depth': {'1': 3}}})
+
+    store._merge_announced(store.load_trades(), drive_copy)
+
+    assert not marker_path(tmp_path).exists(), (
+        'the per-poll local-only write raised a split-brain alert once per '
+        'open position per cycle')
+
+
+def test_apply_mfe_still_leaves_the_version_alone(store, tmp_path):
+    """Pins the PREMISE of the fix rather than only its effect.
+
+    If `apply_mfe` ever starts bumping the version, the exemption above stops
+    being needed and starts being a place a real conflict can hide.
+    """
+    tid = store.load_trades()[0]['id']
+    before = store.find(tid).get('version', 0)
+    store.apply_mfe({tid: {'corrob_spot': 1.0}})
+    assert store.find(tid).get('version', 0) == before
+
+
+def test_a_real_divergence_beside_the_poll_fields_still_alerts(store,
+                                                              tmp_path):
+    """Negative control: the exemption is for ties CONFINED to those fields."""
+    tid = store.load_trades()[0]['id']
+    drive_copy = [dict(store.load_trades()[0], notes='the other replica')]
+    store.apply_mfe({tid: {'corrob_spot': 101.5}})
+    store._merge_announced(store.load_trades(), drive_copy)
+    assert marker_path(tmp_path).exists()

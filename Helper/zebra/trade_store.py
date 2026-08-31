@@ -2142,9 +2142,16 @@ class ZebraStore:
             if tid not in by_id:
                 by_id[tid] = t
                 continue
+            # The unversioned set is `apply_mfe`'s OWN allowlist, not a second
+            # copy of it: those are exactly the fields it may write local-only
+            # without bumping the counter, so they are exactly the fields that
+            # may legitimately differ at an equal version. One source, so a
+            # field added to the batched write cannot start a false alarm.
             winner, note = store_contract.resolve_merge(
                 by_id[tid], t, store_contract.ZEBRA_STATUSES,
-                same_replica=same_replica)
+                same_replica=same_replica,
+                unversioned_fields=_BATCHED_POLL_FIELDS,
+                unversioned_prefixes=('mfe_',))
             by_id[tid] = winner
             if note:
                 notes.append(note)

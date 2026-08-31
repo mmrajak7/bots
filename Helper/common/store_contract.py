@@ -349,8 +349,41 @@ def diff_keys(a, b):
         return 'field-level difference could not be computed'
 
 
+def _only_unversioned(base_trade, incoming_trade, fields, prefixes):
+    """Do the two copies differ ONLY on fields written without a version bump?
+
+    Some writes are deliberately local-only and deliberately do NOT increment
+    the counter -- zebra's `apply_mfe` batches the per-poll peak, spot-
+    corroboration and depth fields this way, because pushing them to Drive
+    every five minutes would churn the network for data nobody reads until the
+    trade closes. They ride to Drive later on the next versioned write.
+
+    The consequence is structural, not accidental: for every open position, on
+    every poll, this replica's disk and Drive hold the SAME version with
+    DIFFERENT content. That is the tie condition exactly, so a detector that
+    does not know about these fields reports a split brain once per position
+    per cycle forever -- and drowns the real one it exists to catch.
+
+    Returns False when nothing differs, so a genuine identical pair is left to
+    the caller's own `!=` check rather than being classed as unversioned.
+    """
+    try:
+        differing = [k for k in set(base_trade) | set(incoming_trade)
+                     if base_trade.get(k) != incoming_trade.get(k)]
+        if not differing:
+            return False
+        # `startswith(())` is False for every string, so an empty prefix tuple
+        # correctly matches nothing. An accidental `('',)` would match ALL of
+        # them and silence every conflict in the system -- pinned by a test.
+        pre = tuple(prefixes)
+        return all(k in fields or str(k).startswith(pre) for k in differing)
+    except Exception:                            # pragma: no cover - defensive
+        return False
+
+
 def resolve_merge(base_trade, incoming_trade, statuses=BCS_FAMILY_STATUSES,
-                  same_replica=False):
+                  same_replica=False, unversioned_fields=frozenset(),
+                  unversioned_prefixes=()):
     """Which copy of one record survives, and what to say about it.
 
     Returns `(winner, note)`. `note` is None on an ordinary resolution and a
@@ -364,6 +397,12 @@ def resolve_merge(base_trade, incoming_trade, statuses=BCS_FAMILY_STATUSES,
     two writers as by-design) wrote the record while we held a cache, and
     absorbing that write is the entire purpose of the refresh. Resolution is
     unchanged either way; only whether the question is announced changes.
+
+    `unversioned_fields` / `unversioned_prefixes` name the fields a store
+    writes WITHOUT bumping the counter, so a tie confined to them is by design
+    rather than a divergence. Both default to empty: a store with no such write
+    -- the whole BCS family -- must not inherit the exemption. See
+    `_only_unversioned`.
 
     Never raises: a merge that can fail on odd data strands the whole book.
     """
@@ -430,6 +469,14 @@ def resolve_merge(base_trade, incoming_trade, statuses=BCS_FAMILY_STATUSES,
             # 11 CRITICAL lines and 4 false corruption alerts against a book
             # that was fully intact and reconverged on its own.
             if same_replica:
+                return base_trade, None
+            # Fields written local-only and deliberately without a version
+            # bump differ at an equal version BY DESIGN, once per open
+            # position per poll. Base wins, which is also correct: base is the
+            # local disk on the Drive merge, and it holds the fresher poll
+            # data that has not been pushed yet.
+            if _only_unversioned(base_trade, incoming_trade,
+                                 unversioned_fields, unversioned_prefixes):
                 return base_trade, None
             return base_trade, (
                 'record #%s is at version %s on BOTH replicas with DIFFERENT '

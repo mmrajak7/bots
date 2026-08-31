@@ -306,3 +306,101 @@ def test_a_real_quarantine_beside_a_conflict_still_reports_true(sm_spy):
     stores = [('ZEBRA', _FakeStore(_marker(sc.MARKER_MERGE_CONFLICT))),
               ('BCS', _FakeStore(_marker(sc.MARKER_QUARANTINE)))]
     assert sm.alert_store_corruption(stores) is True
+
+
+# -- writes that deliberately skip the version bump -------------------------
+#
+# FOUND IN PRODUCTION 2026-08-31, after the first fix went live: the alert was
+# now correct in its wording and still firing every cycle, on
+# `corrob_spot, corrob_t, corrob_value, exit_depth`.
+#
+# Those are `apply_mfe`'s batched poll fields. It writes them LOCAL ONLY and
+# deliberately does NOT bump the version — pushing a peak to Drive every five
+# minutes would churn the network for data nobody reads until the trade
+# closes, and they ride along on the next versioned write. So for every open
+# position, on every poll, local disk and Drive hold the SAME version with
+# DIFFERENT content. That is the tie condition exactly.
+#
+# The detector could not tell that from a split brain, so it reported one per
+# position per cycle — which is the same drowning problem the first fix was
+# about, arriving by a different route.
+
+_UNV = frozenset({'corrob_spot', 'corrob_value', 'corrob_t', 'exit_depth'})
+_PRE = ('mfe_',)
+
+
+def _tie(**incoming):
+    base = _rec(version=17, corrob_spot=100.0, mfe_peak=5.0, stock='X')
+    inc = dict(base)
+    inc.update(incoming)
+    return sc.resolve_merge(base, inc, Z, unversioned_fields=_UNV,
+                            unversioned_prefixes=_PRE)
+
+
+def test_a_tie_only_on_batched_poll_fields_is_not_a_conflict():
+    """THE DEFECT. Fired once per open position per cycle, forever."""
+    _, note = _tie(corrob_spot=101.5, corrob_t=123.0)
+    assert note is None
+
+
+def test_a_tie_only_on_mfe_fields_is_not_a_conflict():
+    """Same write, same reason — matched by prefix rather than by name."""
+    _, note = _tie(mfe_peak=6.0)
+    assert note is None
+
+
+def test_the_local_copy_wins_so_the_fresher_poll_data_survives():
+    """Base is the local disk on the Drive merge, and it holds the poll data
+    that has not been pushed yet. Silencing the note must not hand the record
+    to the stale side."""
+    base = _rec(version=17, corrob_spot=100.0)
+    winner, _ = sc.resolve_merge(base, _rec(version=17, corrob_spot=99.0), Z,
+                                 unversioned_fields=_UNV,
+                                 unversioned_prefixes=_PRE)
+    assert winner is base
+
+
+def test_a_real_field_differing_alongside_them_is_still_a_conflict():
+    """The exemption is for ties confined to the unversioned set. One real
+    field in the diff and it is a divergence again — otherwise a genuine split
+    brain hides behind a corroboration timestamp."""
+    _, note = _tie(corrob_spot=101.5, debit=99.9)
+    assert note is not None
+    assert 'debit' in note
+
+
+def test_the_exemption_is_off_by_default():
+    """A caller that passes no allowlist gets the loud behaviour. The BCS
+    family has no batched write and must not inherit this."""
+    _, note = sc.resolve_merge(_rec(version=17, corrob_spot=1.0),
+                               _rec(version=17, corrob_spot=2.0), Z)
+    assert note is not None
+
+
+def test_identical_records_are_not_classed_as_unversioned():
+    """`_only_unversioned` must answer False when nothing differs, or an
+    ordinary equal pair takes the wrong branch."""
+    assert sc._only_unversioned(_rec(), _rec(), _UNV, _PRE) is False
+
+
+def test_an_empty_prefix_tuple_does_not_match_everything():
+    """`str.startswith(())` is False for every string, but an accidental
+    `('',)` matches ALL of them and would silence every conflict."""
+    _, note = sc.resolve_merge(_rec(version=1, debit=1.0),
+                               _rec(version=1, debit=2.0), Z,
+                               unversioned_fields=frozenset(),
+                               unversioned_prefixes=())
+    assert note is not None
+
+
+def test_the_zebra_store_passes_its_own_batched_allowlist():
+    """One source of truth: the set the merge exempts must BE the set
+    `apply_mfe` permits, or a field added to the batched write starts a false
+    alarm the next time it is polled.
+
+    RETIRES WHEN: the batched-write allowlist and the merge exemption are the
+    same named constant by construction rather than by this assertion.
+    """
+    from zebra.trade_store import _BATCHED_POLL_FIELDS
+    assert {'corrob_spot', 'corrob_value', 'corrob_t',
+            'exit_depth'} <= _BATCHED_POLL_FIELDS
