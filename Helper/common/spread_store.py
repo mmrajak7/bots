@@ -373,8 +373,12 @@ class SpreadStoreBase(LockedStoreMixin):
         if notes:
             # A log line is not an alert, and these are states no operator can
             # infer from the book itself -- the two replicas simply differ.
-            self._flag_corruption('%d merge conflict(s): %s'
-                                  % (len(notes), ' | '.join(notes)), None)
+            # Flagged as MERGE_CONFLICT, not QUARANTINE: the book is intact and
+            # still readable here, so the alert must not claim it went empty
+            # and must not make the monitor treat an empty book as suspicious.
+            self._flag_corruption(
+                '%d merge conflict(s): %s' % (len(notes), ' | '.join(notes)),
+                None, kind=store_contract.MARKER_MERGE_CONFLICT)
 
         merged = sorted(by_id.values(), key=lambda t: t['id'])
 

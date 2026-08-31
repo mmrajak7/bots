@@ -642,8 +642,11 @@ class ZebraStore:
         sync down before, upload after, never inside).
         """
         with exclusive(cfg.LOCK_FILE):
+            # same_replica: disk vs THIS process's cache. A version tie here is
+            # the sibling writer this docstring already describes, not a split
+            # brain -- absorbing its write is what the refresh is for.
             self._trades = self._merge_announced(
-                self._read_local(), self._trades)
+                self._read_local(), self._trades, same_replica=True)
             # Rollback point. If the caller raises mid-mutation (e.g.
             # _apply_entry sets status='entered' and then a float() cast on a
             # later field blows up), the half-mutated trade must not linger in
@@ -1971,8 +1974,11 @@ class ZebraStore:
                 # self._trades, which goes stale the moment the other process
                 # writes.
                 with exclusive(cfg.LOCK_FILE):
+                    # First merge is disk vs our own cache (same replica, ties
+                    # are routine); only the second compares two REPLICAS and
+                    # can legitimately report a split brain.
                     base = self._merge_announced(
-                        self._read_local(), self._trades)
+                        self._read_local(), self._trades, same_replica=True)
                     merged = self._merge_announced(base, drive_data)
                     self._trades = merged
                     self._save_local()
@@ -2060,8 +2066,18 @@ class ZebraStore:
             % (len(bad), '; '.join(b['why'] for b in bad)), path)
         return good
 
-    def _flag_corruption(self, err: str, backup) -> None:
+    def _flag_corruption(self, err: str, backup,
+                         kind: str = store_contract.MARKER_QUARANTINE) -> None:
         """Leave a marker the MONITOR turns into a Telegram.
+
+        `kind` separates the two conditions that write this marker. A
+        QUARANTINE means the file failed to parse, the book went empty and open
+        positions stopped being monitored. A MERGE_CONFLICT means two writers
+        touched one record and the book is entirely intact. They were sharing
+        one alert until 2026-08-31, so a routine conflict shouted the
+        quarantine text -- "restarted EMPTY", "exit monitoring is off" -- at a
+        book with seven healthy positions. Defaults to QUARANTINE so existing
+        callers and previously-written markers keep their original meaning.
 
         Quarantine is the single highest-consequence event in this system and it
         was log-only. The store goes empty; `check_entered` hits
@@ -2079,6 +2095,7 @@ class ZebraStore:
             cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
             (cfg.LOG_DIR / 'zebra_store_corrupt.json').write_text(json.dumps({
                 'at': datetime.now().isoformat(timespec='seconds'),
+                'kind': kind,
                 'error': err,
                 'backup': str(backup),
             }))
@@ -2099,8 +2116,13 @@ class ZebraStore:
             logger.info("No local zebra file, starting empty")
 
     @staticmethod
-    def _merge_with_notes(base: list, incoming: list):
+    def _merge_with_notes(base: list, incoming: list, same_replica: bool = False):
         """Union by id, returning `(merged, notes)`. Pure -- logs nothing.
+
+        `same_replica=True` marks the refresh shape -- this replica's DISK
+        against this process's own CACHE -- where a version tie means a sibling
+        process wrote while we held a cache, not that two books have diverged.
+        See `store_contract.resolve_merge`. Resolution is identical either way.
 
         A booked exit is never walked back by a version. Version alone decided
         this until 2026-08-31, and a version is a per-replica counter rather
@@ -2121,31 +2143,41 @@ class ZebraStore:
                 by_id[tid] = t
                 continue
             winner, note = store_contract.resolve_merge(
-                by_id[tid], t, store_contract.ZEBRA_STATUSES)
+                by_id[tid], t, store_contract.ZEBRA_STATUSES,
+                same_replica=same_replica)
             by_id[tid] = winner
             if note:
                 notes.append(note)
         return sorted(by_id.values(), key=lambda t: t['id']), notes
 
     @staticmethod
-    def _merge(base: list, incoming: list) -> list:
+    def _merge(base: list, incoming: list, same_replica: bool = False) -> list:
         """The merged book. Unchanged signature; see `_merge_with_notes`."""
-        merged, _notes = ZebraStore._merge_with_notes(base, incoming)
+        merged, _notes = ZebraStore._merge_with_notes(
+            base, incoming, same_replica=same_replica)
         return merged
 
-    def _merge_announced(self, base: list, incoming: list) -> list:
+    def _merge_announced(self, base: list, incoming: list,
+                         same_replica: bool = False) -> list:
         """`_merge`, with the conflicts said out loud.
 
-        The two states this reports are ones no operator can infer from the
-        book itself -- the replicas simply differ -- so a log line alone is not
+        The states this reports are ones no operator can infer from the book
+        itself -- the replicas simply differ -- so a log line alone is not
         enough and the corruption marker is raised too.
+
+        MERGE_CONFLICT, never QUARANTINE: nothing here failed to parse and
+        nothing was held out of the book, so an alert claiming the store went
+        empty would be false in every clause. `same_replica=True` callers pass
+        the disk-vs-cache refresh, whose ties are routine and say nothing.
         """
-        merged, notes = self._merge_with_notes(base, incoming)
+        merged, notes = self._merge_with_notes(
+            base, incoming, same_replica=same_replica)
         for note in notes:
             logger.critical('MERGE: %s', note)
         if notes:
-            self._flag_corruption('%d merge conflict(s): %s'
-                                  % (len(notes), ' | '.join(notes)), None)
+            self._flag_corruption(
+                '%d merge conflict(s): %s' % (len(notes), ' | '.join(notes)),
+                None, kind=store_contract.MARKER_MERGE_CONFLICT)
         return merged
 
     def _save_local(self):

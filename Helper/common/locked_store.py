@@ -55,6 +55,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
+from common import store_contract
 from common.filelock import DEFAULT_TIMEOUT, LockTimeout, exclusive
 
 logger = logging.getLogger(__name__)
@@ -165,7 +166,8 @@ class LockedStoreMixin:
     def _corrupt_marker_path(self) -> Path:
         return self._data_path().with_suffix('.corrupt-flag.json')
 
-    def _flag_corruption(self, err: str, backup) -> None:
+    def _flag_corruption(self, err: str, backup,
+                         kind: str = store_contract.MARKER_QUARANTINE) -> None:
         """Leave a marker the MONITOR turns into a Telegram.
 
         Quarantine is the highest-consequence event this store has, and it was
@@ -177,6 +179,15 @@ class LockedStoreMixin:
         A marker file rather than a direct send: this module deliberately has
         no Telegram dependency, and the cron process exits between cycles, so
         an in-memory flag would not survive to reach the alerting layer.
+
+        `kind` exists because a second, far milder condition was later wired to
+        this same marker — a merge conflict, where the book is intact — and the
+        alerting layers went on reading out the quarantine story: "failed to
+        parse", "restarted EMPTY", "positions UNMONITORED". A CRITICAL alert
+        that is false in every clause is worse than no alert, because it trains
+        the reader to swipe past the one message that means the stops are dead.
+        Defaults to QUARANTINE so that markers written before this change, and
+        every caller that does not pass a kind, keep their original meaning.
         """
         try:
             path = self._corrupt_marker_path()
@@ -184,6 +195,7 @@ class LockedStoreMixin:
             path.write_text(json.dumps({
                 'at': datetime.now().isoformat(timespec='seconds'),
                 'store': self._data_path().name,
+                'kind': kind,
                 'error': err,
                 'backup': str(backup),
                 'alerted_at': None,

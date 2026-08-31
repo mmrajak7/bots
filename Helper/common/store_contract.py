@@ -315,13 +315,55 @@ def partition_readable(trades, log=None):
 #: the mistake this whole function exists to stop making.
 RESTORE_MARKER = 'restored_from_snapshot_at'
 
+#: The two things the corruption marker can mean. They are NOT the same event
+#: and must not share alert text: a QUARANTINE means the book failed to parse,
+#: went empty, and open positions stopped being monitored; a MERGE_CONFLICT
+#: means two writers touched one record and the book is entirely intact. The
+#: marker carried no kind until 2026-08-31, so the alerting layers read a
+#: missing kind as QUARANTINE -- that is what every marker written before this
+#: change actually was.
+MARKER_QUARANTINE = 'quarantine'
+MARKER_MERGE_CONFLICT = 'merge_conflict'
 
-def resolve_merge(base_trade, incoming_trade, statuses=BCS_FAMILY_STATUSES):
+#: How many differing field names a conflict note will list before giving up
+#: and saying how many more there were. A note is a Telegram line, not a diff.
+_MAX_DIFF_KEYS = 6
+
+
+def diff_keys(a, b):
+    """The field names on which two copies of one record disagree.
+
+    'different content' with no diff is unactionable -- diagnosing the first
+    real occurrence meant downloading the Drive copy by hand to discover the
+    argument was over a single `review` field. Returns a short human string.
+    """
+    try:
+        keys = sorted(set(a) | set(b))
+        differing = [k for k in keys if a.get(k) != b.get(k)]
+        if not differing:
+            return 'no field-level difference (ordering or type only)'
+        shown = ', '.join(differing[:_MAX_DIFF_KEYS])
+        extra = len(differing) - _MAX_DIFF_KEYS
+        return shown + (' and %d more' % extra if extra > 0 else '')
+    except Exception:                            # pragma: no cover - defensive
+        return 'field-level difference could not be computed'
+
+
+def resolve_merge(base_trade, incoming_trade, statuses=BCS_FAMILY_STATUSES,
+                  same_replica=False):
     """Which copy of one record survives, and what to say about it.
 
     Returns `(winner, note)`. `note` is None on an ordinary resolution and a
     human sentence on anything a reader needs to know about -- the caller logs
     it and raises its corruption alert.
+
+    `same_replica=True` says the two inputs are THIS replica's disk and THIS
+    process's own cache, not two replicas. A version tie is then routine rather
+    than alarming: another process on the same box (zebra's spawned vet /
+    review / postmortem CLIs -- see `ZebraStore._mutate`, which documents the
+    two writers as by-design) wrote the record while we held a cache, and
+    absorbing that write is the entire purpose of the refresh. Resolution is
+    unchanged either way; only whether the question is announced changes.
 
     Never raises: a merge that can fail on odd data strands the whole book.
     """
@@ -373,18 +415,29 @@ def resolve_merge(base_trade, incoming_trade, statuses=BCS_FAMILY_STATUSES):
         if i_ver > b_ver:
             return incoming_trade, None
         if i_ver == b_ver and incoming_trade != base_trade:
-            # A TIE WITH DIFFERENT CONTENT is a split brain, not a conflict
-            # either side can resolve: the counters are per-replica, so equal
-            # versions carry no information about which write came first. Base
-            # keeps winning, as it always has -- what changes is that the
-            # question is no longer asked silently. The divergence check that
-            # triggers a re-upload compares VERSION MAPS, so this state used to
-            # produce no log line, no alert and no re-upload.
+            # A TIE WITH DIFFERENT CONTENT between two REPLICAS is a split
+            # brain, not a conflict either side can resolve: the counters are
+            # per-replica, so equal versions carry no information about which
+            # write came first. Base keeps winning, as it always has -- what
+            # changes is that the question is no longer asked silently. The
+            # divergence check that triggers a re-upload compares VERSION MAPS,
+            # so this state used to produce no log line, no alert, no re-upload.
+            #
+            # Between this replica's DISK and this process's own CACHE it is
+            # none of those things -- it is a concurrent write by a sibling
+            # process on the same box, which the refresh exists to absorb. On
+            # 2026-08-31, the detector's first live session, that case produced
+            # 11 CRITICAL lines and 4 false corruption alerts against a book
+            # that was fully intact and reconverged on its own.
+            if same_replica:
+                return base_trade, None
             return base_trade, (
                 'record #%s is at version %s on BOTH replicas with DIFFERENT '
-                'content. Versions are per-replica counters, so neither side '
-                'can resolve this. Keeping the local copy; the two books will '
-                'not converge on their own.' % (base_trade.get('id'), b_ver))
+                'content (differs on: %s). Versions are per-replica counters, '
+                'so neither side can resolve this. Keeping the local copy; the '
+                'two books will not converge on their own.'
+                % (base_trade.get('id'), b_ver,
+                   diff_keys(base_trade, incoming_trade)))
         return base_trade, None
     except Exception as e:                       # pragma: no cover - defensive
         try:

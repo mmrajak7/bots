@@ -68,6 +68,7 @@ from common import layered_config
 from common import kite_errors
 from common import spread_valuation
 from common import nse_holidays
+from common import store_contract
 from bcs import alert_policy
 from bcs import exit_vet
 from bcs import order_journal
@@ -6924,26 +6925,47 @@ def alert_store_corruption(books) -> bool:
     `books` is [(label, store), ...]. Alerting is per book and re-armed hourly
     by `corruption_due_for_alert`, because the cron relaunches every 5 minutes
     and this path EXITS the monitor.
+
+    THE RETURN VALUE MEANS "this book may have gone empty underneath us", and
+    only a QUARANTINE means that. A merge conflict still alerts -- two writers
+    disagreeing is worth knowing -- but returns False, because the callers use
+    a True to refuse to exit on an empty book and to report that the emptiness
+    was caused by a quarantine. Saying that about an intact book would put a
+    false explanation on an ordinary quiet morning.
     """
     flagged = False
     for label, store in books:
         try:
             if not store.read_corruption_marker():
                 continue
-            flagged = True
             marker = store.corruption_due_for_alert()
+            kind = (store.read_corruption_marker().get('kind')
+                    or store_contract.MARKER_QUARANTINE)
+            quarantined = kind != store_contract.MARKER_MERGE_CONFLICT
+            flagged = flagged or quarantined
             if not marker:
                 continue            # already shouted within the hour
-            log(f"  *** {label} STORE QUARANTINED: {marker.get('error')} "
-                f"— backup {marker.get('backup')} ***")
-            send_telegram(
-                f"CRITICAL: the {label} trade store was QUARANTINED at "
-                f"{marker.get('at')}.\n"
-                f"Reason: {marker.get('error')}\n"
-                f"Backup: {marker.get('backup')}\n"
-                f"The book now reads EMPTY, so any open {label} position is "
-                f"UNMONITORED. Check the backup and restore before the next "
-                f"session. New trades will NOT reuse the old ids.")
+            if quarantined:
+                log(f"  *** {label} STORE QUARANTINED: {marker.get('error')} "
+                    f"— backup {marker.get('backup')} ***")
+                send_telegram(
+                    f"CRITICAL: the {label} trade store was QUARANTINED at "
+                    f"{marker.get('at')}.\n"
+                    f"Reason: {marker.get('error')}\n"
+                    f"Backup: {marker.get('backup')}\n"
+                    f"The book now reads EMPTY, so any open {label} position "
+                    f"is UNMONITORED. Check the backup and restore before the "
+                    f"next session. New trades will NOT reuse the old ids.")
+            else:
+                log(f"  *** {label} STORE MERGE CONFLICT: "
+                    f"{marker.get('error')} ***")
+                send_telegram(
+                    f"WARNING: the {label} trade store hit a merge conflict "
+                    f"at {marker.get('at')}.\n"
+                    f"Detail: {marker.get('error')}\n"
+                    f"The book is INTACT and still monitored — nothing was "
+                    f"quarantined and no backup is needed. The losing side's "
+                    f"edit was dropped; re-check those records if it mattered.")
             store.note_corruption_alerted()
         except Exception as e:
             # Never let the alerting path be the thing that stops the monitor.

@@ -31,6 +31,7 @@ import requests
 from common import arming as arming_mod
 from common import spread_valuation
 from common import kite_errors
+from common import store_contract
 
 from . import capital
 from . import config as cfg
@@ -3236,6 +3237,48 @@ def _alert_monitoring_blind(n_open: int, stocks: list,
         dry_run=dry_run)
 
 
+def _store_corruption_message(info: dict) -> str:
+    """The Telegram body for one marker, matched to what actually happened.
+
+    Two conditions write this marker and they need opposite responses, so they
+    get opposite words. A QUARANTINE is the catastrophe the original text
+    described. A MERGE_CONFLICT is two writers touching one record: the book
+    parsed, nothing was held out of it, no position stopped being monitored,
+    and there is no backup to restore because nothing was quarantined --
+    `backup: None` on such a marker is not a missing backup, it is the tell.
+
+    Emitting the quarantine text for a conflict is not a cosmetic bug. It is
+    the failure this repo has already paid for once: a CRITICAL that is false
+    in every clause trains the reader to swipe past the marker, and the next
+    one to be swiped past is the real one. A marker with no kind predates the
+    split and was, in fact, a quarantine.
+    """
+    stamp = html.escape(str(info.get('at') or ''))
+    err = html.escape(str(info.get('error'))[:400])
+    kind = info.get('kind') or store_contract.MARKER_QUARANTINE
+
+    if kind == store_contract.MARKER_MERGE_CONFLICT:
+        # Stated as what IS, not as a denial of the quarantine text. A reader
+        # scanning an alert during an incident takes the nouns out of it, and
+        # "nothing was quarantined" leaves the word "quarantined" on the page.
+        return (
+            f"⚠ <b>ZEBRA STORE MERGE CONFLICT</b>\n"
+            f"Two writers changed the same record(s) at {stamp}.\n"
+            f"Detail: <code>{err}</code>\n"
+            f"The book is INTACT, readable, and every open position is still "
+            f"being watched. This is a write race between two processes, not a "
+            f"damaged file, and no restore is needed. The losing side's edit "
+            f"was dropped — re-check those records if that write mattered.")
+    return (
+        f"🛑 <b>ZEBRA STORE CORRUPT</b>\n"
+        f"The trade file failed to parse and was quarantined at {stamp}.\n"
+        f"Error: <code>{err}</code>\n"
+        f"Backup: <code>{html.escape(str(info.get('backup')))}</code>\n"
+        f"The store may have restarted EMPTY — if so, exit monitoring is "
+        f"off on every open position and ids can be reissued. Restore from "
+        f"the backup or Drive before the next session.")
+
+
 def _alert_store_corruption(dry_run: bool = False) -> bool:
     """Telegram once per quarantine event, then disarm on the marker itself.
 
@@ -3258,19 +3301,11 @@ def _alert_store_corruption(dry_run: bool = False) -> bool:
         stamp = str(info.get('at') or '')
         if seen.exists() and seen.read_text().strip() == stamp:
             return False
-        _send_telegram(
-            f"🛑 <b>ZEBRA STORE CORRUPT</b>\n"
-            f"The trade file failed to parse and was quarantined at "
-            f"{html.escape(stamp)}.\n"
-            f"Error: <code>{html.escape(str(info.get('error'))[:200])}</code>\n"
-            f"Backup: <code>{html.escape(str(info.get('backup')))}</code>\n"
-            f"The store may have restarted EMPTY — if so, exit monitoring is "
-            f"off on every open position and ids can be reissued. Restore from "
-            f"the backup or Drive before the next session.",
-            dry_run=dry_run)
+        _send_telegram(_store_corruption_message(info), dry_run=dry_run)
         seen.write_text(stamp)
-        logger.critical("STORE CORRUPTION alerted (quarantined at %s, "
-                        "backup %s)", stamp, info.get('backup'))
+        kind = info.get('kind') or store_contract.MARKER_QUARANTINE
+        logger.critical("STORE %s alerted (at %s, backup %s)",
+                        kind.upper(), stamp, info.get('backup'))
         return True
     except Exception as e:
         logger.error("Could not process the store-corruption marker: %s", e)
