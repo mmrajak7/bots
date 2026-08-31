@@ -3654,8 +3654,23 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
         close_lock_acquired = True
 
     try:
-        return _close_spread_inner(kite, store, trade, spot, reason, dry_run, label,
-                                   urgent=urgent)
+        result = _close_spread_inner(kite, store, trade, spot, reason, dry_run,
+                                     label, urgent=urgent)
+        # THE ESCALATION BOUNDARY, and it belongs here rather than at each of
+        # the eight `return False` paths inside the inner close. Every one of
+        # those means "this close did not complete", which for a REAL position
+        # is an emergency the callers rightly Telegram about -- each of the
+        # four sites sends its own "close FAILED. Manual intervention needed!"
+        # on a falsy result. For a record this engine has already refused,
+        # that same signal is an instruction to trade a position that exists
+        # at no broker. Converting once, here, covers the paths that exist and
+        # the ones added later; `is False` so an 'ABORT' still aborts.
+        if paper_passthrough and result is False:
+            log(f"  PAPER #{trade.get('id')}: the rehearsal did not complete, "
+                f"which is not an emergency — no legs at any broker, and the "
+                f"owning engine books the exit. Journalled; no escalation.")
+            return True
+        return result
     except Exception as e:
         log(f"  EXCEPTION during close_spread: {e}")
         if paper_passthrough:
@@ -3683,7 +3698,10 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
             except Exception as inner_e:
                 log(f"  Could not set partial_close status: {inner_e}")
                 store._sync_locked = False  # Last resort: clear lock directly
-        return False
+        # Same boundary as the success path: the defect has already been
+        # reported above in its own words, and a falsy return here would add
+        # the callers' "Manual intervention needed!" on top of it.
+        return True if paper_passthrough else False
 
 
 #: M14 - the causes a close can freeze for. `rejected` is the one that CHANGES

@@ -180,3 +180,74 @@ def test_an_exception_on_a_real_record_still_says_manual_intervention(
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
     _close(REAL)
     assert 'Manual intervention needed' in '\n'.join(spy)
+
+
+# -- THE ESCALATION BOUNDARY ------------------------------------------------
+#
+# Found reviewing the first cut of this fix. Guarding the late-day guard and
+# the exception TEXT was not enough: the callers escalate on ANY falsy return,
+# and both the exception handler and `_close_spread_inner`'s eight `return
+# False` paths are falsy. So a paper record could still produce
+# "close FAILED. Manual intervention needed!" from the call site -- the same
+# instruction to trade, arriving by a different door.
+
+def test_an_exception_on_a_paper_record_does_not_report_failure(
+        spy, monkeypatch):
+    """`False` here makes each of the four call sites Telegram the owner.
+
+    The defect is already reported in its own words by the handler above; the
+    caller must not stack "Manual intervention needed!" on top of it.
+    """
+    monkeypatch.setattr(sm, 'now_ist',
+                        lambda: datetime.combine(date.today(), dtime(10, 0)))
+    monkeypatch.setattr(sm, '_close_spread_inner',
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
+    assert _close(PAPER) is True
+    assert 'CODE defect' in '\n'.join(spy), 'but it must still be reported'
+
+
+def test_an_exception_on_a_REAL_record_still_reports_failure(spy, monkeypatch):
+    """Negative control: a real close that threw IS an emergency."""
+    monkeypatch.setattr(sm, 'now_ist',
+                        lambda: datetime.combine(date.today(), dtime(10, 0)))
+    monkeypatch.setattr(sm, '_close_spread_inner',
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
+    assert _close(REAL) is False
+
+
+def test_an_inner_failure_on_a_paper_record_does_not_report_failure(
+        spy, monkeypatch):
+    """`_close_spread_inner` has eight `return False` paths — unfilled legs,
+    rejected orders, an unreadable book. Each means "this close did not
+    complete", which is an emergency for a REAL position and meaningless for a
+    record with no legs. Converted once at the boundary so the paths added
+    later are covered too."""
+    monkeypatch.setattr(sm, 'now_ist',
+                        lambda: datetime.combine(date.today(), dtime(10, 0)))
+    monkeypatch.setattr(sm, '_close_spread_inner', lambda *a, **k: False)
+    assert _close(PAPER) is True
+
+
+def test_an_inner_failure_on_a_REAL_record_still_reports_failure(
+        spy, monkeypatch):
+    monkeypatch.setattr(sm, 'now_ist',
+                        lambda: datetime.combine(date.today(), dtime(10, 0)))
+    monkeypatch.setattr(sm, '_close_spread_inner', lambda *a, **k: False)
+    assert _close(REAL) is False
+
+
+def test_an_abort_is_never_converted(spy, monkeypatch):
+    """`is False`, not falsy: 'ABORT' has its own caller branch (cooldown, no
+    `closed = True`) and turning it into True would silently retire a retry."""
+    monkeypatch.setattr(sm, 'now_ist',
+                        lambda: datetime.combine(date.today(), dtime(10, 0)))
+    monkeypatch.setattr(sm, '_close_spread_inner', lambda *a, **k: 'ABORT')
+    assert _close(PAPER) == 'ABORT'
+
+
+def test_a_successful_rehearsal_is_passed_through_unchanged(spy, monkeypatch):
+    """The conversion must not mask a result the inner close actually gave."""
+    monkeypatch.setattr(sm, 'now_ist',
+                        lambda: datetime.combine(date.today(), dtime(10, 0)))
+    monkeypatch.setattr(sm, '_close_spread_inner', lambda *a, **k: True)
+    assert _close(PAPER) is True
