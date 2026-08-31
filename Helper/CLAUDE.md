@@ -1480,8 +1480,20 @@ s.list_trades()
 # BCS Spread Monitor — long-lived process, polls every 5s internally
 # flock -n: skip if already running | 5-min retry as crash recovery
 # Runs Mon-Fri, 9:00-15:55 IST (monitor waits for 9:15, exits at 15:30)
-*/5 9-15 * * 1-5 cd /home/trustit/Desktop/BOTS/Helper && flock -n /tmp/bcs_monitor.lock ../CROCODILE/venv/bin/python -m bcs.spread_monitor --cron >> logs/cron_bcs.log 2>&1
+# The \% escaping is REQUIRED: an unescaped % ends the cron command and the
+# rest becomes stdin, so the job runs with no redirect and the log vanishes.
+*/5 9-15 * * 1-5 cd /home/trustit/Desktop/BOTS/Helper && flock -n /tmp/bcs_monitor.lock ../CROCODILE/venv/bin/python -m bcs.spread_monitor --cron >> logs/cron_bcs_$(date +\%Y\%m\%d).log 2>&1
+
+# Log cleanup — Sundays 07:00, outside market hours. Dry run without --apply.
+0 7 * * 0 cd /home/trustit/Desktop/BOTS/Helper && ../CROCODILE/venv/bin/python -m common.log_cleanup --apply >> logs/cron_log_cleanup_$(date +\%Y\%m\%d).log 2>&1
 ```
+
+**Date-stamp every cron redirect.** `cron_bcs.log` had none until 2026-08-31
+and reached **12.5 MB** in one ever-growing file, so "move today's log to the
+laptop" meant moving all of history each time — which is how logs stop being
+moved at all. zebra's line has been date-stamped since 2026-08-28; this one had
+simply been missed. The old `cron_bcs.log` stops growing the moment this lands
+and ages out on its own; nothing is lost.
 
 **How it works:**
 ```
@@ -1541,6 +1553,38 @@ Restarting is free while the crontab carries `--dry-run` and
 the paper cohort's exits, and the gap until the next tick costs nothing. **Once
 exits are armed, that stops being true** — restart in a market-closed window
 instead, or accept a <5-minute hole in exit monitoring.
+
+### Log retention — `python -m common.log_cleanup`
+
+```bash
+python -m common.log_cleanup            # DRY RUN, the default — always look first
+python -m common.log_cleanup --apply    # gzip >7d, delete .log.gz >90d
+```
+
+**`logs/` is not a log directory — it is the TRADE STORE directory that also
+holds logs.** `zebra_trades.json` is the book; the `.lock` files serialise two
+writer processes; `.nextid.json` stops a quarantine reissuing ids. So the
+cleaner works from an **ALLOWLIST**: `.log` may be compressed, `.log.gz` may be
+deleted, and **nothing else is reachable by any code path**. A denylist would
+be the wrong shape — it asks "is this file dangerous", which needs every
+dangerous name that will ever exist; the allowlist asks "is this file a log",
+which is a closed question.
+
+- **Compress before delete, because logs are EVIDENCE here.** An exit book
+  cannot be reconstructed after the fact, the POLL line is the only record of
+  what the engine saw at 14:35, and a real NSE holiday was identified from log
+  SIZES. gzip runs ~90-95% on these.
+- **The archive inherits the log's mtime**, so retention tracks the CONTENT's
+  age, not when the cleaner happened to run.
+- **A live log is never touched** — eligibility is by mtime, and a file being
+  appended has an mtime of now. The tool needs no knowledge of which processes
+  are running, and never rotates a file a process holds open.
+- **It refuses a directory that is not this one** (checked by marker files), so
+  a mistyped `--dir` is an error rather than damage.
+
+Covered by `common/tests/test_log_cleanup.py`, which is mostly about what the
+tool CANNOT do — the book is planted in the fixture at 400 days old, maximally
+eligible if the tool were age-driven rather than allowlist-driven.
 
 ### Verify It's Running
 ```bash
