@@ -3508,6 +3508,12 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
     log(f"  Initiating spread close sequence... ({'URGENT' if urgent else 'normal'})")
     log("=" * 70)
 
+    #: Set when a PAPER record is walked in dry run purely to journal the
+    #: orders it WOULD have placed. It marks "journalled, not owned", and every
+    #: human-escalation path in this function checks it: a record this engine
+    #: has refused must never produce an instruction to go and trade.
+    paper_passthrough = False
+
     # ── A PAPER RECORD NEVER REACHES THE ORDER PATH ──────────────────────
     #
     # `ZebraStoreAdapter.get_open_trades` already withholds these, so this is
@@ -3534,6 +3540,16 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
             log(f"  [DRY RUN] trade #{trade.get('id')} is a PAPER record — "
                 f"armed, this close would be REFUSED and nothing placed. "
                 f"Continuing so the intended orders are journalled.")
+            # JOURNALLING IS NOT OWNERSHIP. Walking on is right -- the compare
+            # study needs the intended orders -- but every human-escalation
+            # path below is now reachable for a record this engine has just
+            # said it does not own, and an escalation is an instruction to go
+            # and trade. On 2026-08-31 the late-day guard did exactly that:
+            # "TP TRIGGERED GMRAIRPORT ... Close manually in Kite!" for paper
+            # #455, which zebra closed correctly 53 seconds later. Nothing was
+            # placed, but a human who obeyed would have put real orders on a
+            # position that exists at no broker.
+            paper_passthrough = True
         else:
             log(f"  REFUSED: trade #{trade.get('id')} is a PAPER record. It "
                 f"has no legs at any broker, so a close here would either "
@@ -3556,6 +3572,17 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
     cutoff = HARD_ORDER_CUTOFF_TIME if urgent else LAST_ORDER_TIME
     if now_t > cutoff:
         log(f"  LATE-DAY GUARD: {now_t.strftime('%H:%M')} > {cutoff.strftime('%H:%M')}.")
+        if paper_passthrough:
+            # Journalled, not owned. Telling a human to "close manually in
+            # Kite" would send them to trade a position that exists at no
+            # broker; the engine that owns this record books it on its own
+            # cycle. True rather than False for the same reason the
+            # already-closing branch returns True: not an error, and not ours.
+            log(f"  PAPER #{trade.get('id')}: no escalation — this record has "
+                f"no legs at any broker and its own engine books the exit. "
+                f"The intended orders are journalled; nothing is owed to a "
+                f"human here.")
+            return True
         log(f"  Too close to market close. Not placing orders — manual intervention needed.")
         send_telegram(
             f"{label} {reason} TRIGGERED {stock} @ {spot}\n"
@@ -3631,7 +3658,21 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
                                    urgent=urgent)
     except Exception as e:
         log(f"  EXCEPTION during close_spread: {e}")
-        send_telegram(f"{label} {stock}: EXCEPTION during {reason} close! {e}\nManual intervention needed!", alert_class=alert_policy.SAFETY)
+        if paper_passthrough:
+            # Still reported -- an exception here is a CODE defect and hiding
+            # it would be worse. But it is not a position emergency: there are
+            # no legs at any broker, `close_lock_acquired` is False under dry
+            # run so nothing is frozen, and the owning engine books the exit
+            # regardless. Say which of those two things it is.
+            send_telegram(
+                f"{label} {stock}: EXCEPTION while journalling the intended "
+                f"{reason} close of PAPER trade #{trade.get('id')}: {e}\n"
+                f"No position at risk — this record has no legs at any broker "
+                f"and its own engine books the exit. This is a CODE defect to "
+                f"investigate, not a trade to place.",
+                alert_class=alert_policy.SAFETY)
+        else:
+            send_telegram(f"{label} {stock}: EXCEPTION during {reason} close! {e}\nManual intervention needed!", alert_class=alert_policy.SAFETY)
         if close_lock_acquired:
             try:
                 store.set_trade_status(
