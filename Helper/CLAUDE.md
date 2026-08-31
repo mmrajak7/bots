@@ -1457,6 +1457,11 @@ Credentials:  /home/trustit/Desktop/BOTS/data/secret.json
 Kite token:   /home/trustit/Desktop/BOTS/data/kite_access_token.json
 ```
 
+> **There is no bare `python` on the Pi** — `python: command not found`. Every
+> command in this section, and every crontab line, uses
+> `../CROCODILE/venv/bin/python` from `Helper/`. Commands elsewhere in this file
+> are written for Windows and need that substitution when run at the box.
+
 ### One-Time Setup
 ```bash
 # 1. Install Google Drive dependencies in shared venv
@@ -1557,8 +1562,12 @@ instead, or accept a <5-minute hole in exit monitoring.
 ### Log retention — `python -m common.log_cleanup`
 
 ```bash
-python -m common.log_cleanup            # DRY RUN, the default — always look first
-python -m common.log_cleanup --apply    # gzip >7d, delete .log.gz >90d
+# ON THE PI there is no bare `python` — use the shared venv, as the crontab does:
+../CROCODILE/venv/bin/python -m common.log_cleanup           # DRY RUN, the default
+../CROCODILE/venv/bin/python -m common.log_cleanup --apply   # gzip >7d, rm .log.gz >90d
+
+# On Windows:
+python -m common.log_cleanup
 ```
 
 **`logs/` is not a log directory — it is the TRADE STORE directory that also
