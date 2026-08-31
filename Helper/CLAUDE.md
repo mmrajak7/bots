@@ -1494,6 +1494,54 @@ s.list_trades()
 15:35 — Would start but exits immediately (market closed)
 ```
 
+### ⚠ AFTER EVERY `git pull`: restart the monitor if the diff left `bcs/`
+
+**The rule, one line:**
+
+```bash
+git pull --rebase && git diff --name-only HEAD@{1} HEAD | grep -qv '^Helper/bcs/' \
+  && pkill -f "bcs.spread_monitor --cron"   # next */5 tick restarts it
+```
+
+**Why only this one process.** `python -m zebra run` is ONE-SHOT — a cycle runs
+18-46s and exits — so zebra picks up new code on the next tick with no
+intervention, and killing it mid-cycle risks landing in a store write for no
+benefit. `bcs.spread_monitor --cron` is the only LONG-LIVED process: it starts
+once and polls internally until 15:30, so it holds whatever code was on disk
+when it started, for the whole session.
+
+**Why `bcs/` is not the boundary you'd guess.** The monitor opens a FOURTH
+book — `_open_zebra_store()` → `bcs.zebra_adapter.get_adapter()` → `ZebraStore`
+— and re-syncs it from Drive every 5 minutes. So it imports `zebra/` and
+`common/` too, and a stale copy keeps executing the OLD merge, the OLD store
+contract and the OLD alert text against the live cohort book.
+
+**What that costs, from 2026-08-31.** Two commits fixed the false
+MERGE-CONFLICT alert. The Pi pulled both. The alerts continued — because the
+monitor process predated the second pull and kept re-writing
+`logs/zebra_store_corrupt.json` with the pre-fix detector, which zebra's own
+cron then faithfully turned into a Telegram. The fix looked broken; the cause
+was a process nobody had restarted. **A stale long-lived process re-arms the
+very marker the pull was meant to stop.**
+
+**If the marker was already re-written by the stale process, clear it once**
+after the restart, or the next cycle alerts on a condition that no longer
+exists:
+```bash
+rm -f logs/zebra_store_corrupt.json logs/zebra_store_corrupt.alerted
+```
+
+Safe whenever the alert was a MERGE CONFLICT (`kind: merge_conflict`): the book
+is intact by definition in that state. **Do NOT blind-delete a `kind:
+quarantine` marker** — that one means the book failed to parse and the named
+backup is the only surviving copy.
+
+Restarting is free while the crontab carries `--dry-run` and
+`exits_managed_externally` is false: the monitor books nothing, zebra manages
+the paper cohort's exits, and the gap until the next tick costs nothing. **Once
+exits are armed, that stops being true** — restart in a market-closed window
+instead, or accept a <5-minute hole in exit monitoring.
+
 ### Verify It's Running
 ```bash
 # Check if monitor is active
@@ -1514,6 +1562,7 @@ tail -f /home/trustit/Desktop/BOTS/Helper/logs/spread_monitor_cron_$(date +%Y%m%
 | Drive sync failing | Monitor continues in local-only mode — check `cron_bcs.log` for Drive warnings |
 | Stale lock file after crash | `rm /tmp/bcs_monitor.lock` (flock auto-releases on process exit, rarely needed) |
 | Kite token expired | Check `data/kite_access_token.json` — `generated_at` must be today |
+| **A fix was pulled and the alert it fixes keeps arriving** | The monitor process predates the pull and is still running the old code. `pkill -f "bcs.spread_monitor --cron"`, then clear the marker it re-wrote. See "AFTER EVERY `git pull`" above — this is not a failed fix, it is a stale process. |
 
 ---
 
