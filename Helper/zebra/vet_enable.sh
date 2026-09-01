@@ -160,20 +160,27 @@ if missing:
     sys.exit(1)
 print(f'  \033[32m[ OK ]\033[0m VET_DENIED_TOOLS blocks all {len(need)} position verbs')
 print(f'  \033[32m[ OK ]\033[0m model={c.VET_MODEL}  timeout={c.VET_TIMEOUT_SEC}s')
-# THE REAL ARGV, not the template. This printed `c.VET_ALLOWED_TOOLS`, which
-# still carries {python} / {python_rel} placeholders -- so the line labelled
-# "allowed on argv" showed something that is NOT what goes on argv, and would
-# have looked IDENTICAL if the formatting ever broke. An unmatched grant fails
-# silently (the agent prints an approval request to a log nobody reads and
-# exits 0), so this display could not detect the one failure it exists for.
+# THE REAL ARGV, not the template. This printed VET_ALLOWED_TOOLS, which still
+# carries the python placeholders -- so the line labelled "allowed on argv"
+# showed something that is NOT what goes on argv, and would have looked
+# IDENTICAL if the formatting ever broke. An unmatched grant fails silently
+# (the agent prints an approval request to a log nobody reads and exits 0), so
+# the one display that exists to prove the grants work could not detect the
+# only way they fail.
+#
+# NO BACKTICKS ANYWHERE IN THIS BLOCK. The heredoc opens as <<EOF, unquoted,
+# so bash expands its whole body -- and a backtick quote inside a PYTHON
+# COMMENT is still command substitution to bash. The first version of this
+# fix quoted the constant name in backticks and shipped
+# "vet_enable.sh: line 152: c.VET_ALLOWED_TOOLS: command not found" to the Pi.
 from zebra import vet as _v
 _grants = _v._allowed_tools('vet')
 _unformatted = [g for g in _grants if '{' in g or '}' in g]
 if _unformatted:
-    print(f'  [31m[FAIL][0m grants still carry unformatted '
+    print(f'  \033[31m[FAIL]\033[0m grants still carry unformatted '
           f'placeholders and will match NOTHING: {_unformatted}')
     sys.exit(1)
-print(f'  [32m[ OK ][0m {len(_grants)} grants, all formatted')
+print(f'  \033[32m[ OK ]\033[0m {len(_grants)} grants, all formatted')
 for _g in _grants:
     print(f'           {_g}')
 print('         (a project settings.json ALLOW is IGNORED by claude -p —')
