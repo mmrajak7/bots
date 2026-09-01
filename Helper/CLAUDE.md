@@ -365,7 +365,7 @@ python -m zebra status                 # zebra/BCS cohort (paper mode)
 python -m bcs.spread_monitor --list    # manually-entered BCS trades
 python -c "from fallen_hero import get_store; get_store().list_trades()"  # Fallen Hero
 ```
-As of 2026-08-27: 8 open positions, all zebra-cohort BCS entries from
+As of 2026-09-01: 6 open positions, all zebra-cohort BCS entries from
 `cohort='2026-08-14'` (paper mode — no real money); no open manual BCS or
 Fallen Hero trades (the INFY Modified Fallen Hero listed as a live position
 in earlier versions of this file closed 2026-03-18 — see `logs/fallen_hero_trades.json`).
@@ -422,9 +422,12 @@ Full playbook: `docs/BCS_PLAYBOOK.md`
 >
 > | Helper | Population | Use for |
 > |---|---|---|
-> | `scored()` | stamped cohort positions (**13**) | any P&L, win rate, scorecard, gate |
-> | `decided()` | + this engine's vetoes and cancels (**65**) | post-mortems, the vetting scorecard |
-> | `in_flight()` | what still needs work (**9**) | liveness |
+> | `scored()` | stamped cohort positions (**18** on 2026-09-01) | any P&L, win rate, scorecard, gate |
+> | `decided()` | + this engine's vetoes and cancels (**82**) | post-mortems, the vetting scorecard |
+> | `in_flight()` | what still needs work (**10**) | liveness |
+>
+> These counts GROW. They are a snapshot for orientation — never quote one as
+> a sample size; call the helper.
 >
 > A veto never enters, so it never carries a cohort stamp — that is why
 > `decided()` exists, and why the post-mortem layer must not use `scored()`.
@@ -446,10 +449,19 @@ Full playbook: `docs/BCS_PLAYBOOK.md`
 > are kept as the RECORD OF A DECISION and are marked where they matter.
 >
 > **And the honest consequence for go-live:** removing the old sample does not
-> make expectancy positive, it makes it **unmeasured**. The cohort's 7 closes
-> are all take-profits from two rallying weeks, with every potential loser
-> still open. A smaller, cleaner sample is the right sample — it is not yet a
-> sufficient one.
+> make expectancy positive, it makes it **unmeasured**. A smaller, cleaner
+> sample is the right sample — it is not yet a sufficient one.
+>
+> **Updated 2026-09-01.** An earlier version of this paragraph read *"the
+> cohort's 7 closes are all take-profits, with every potential loser still
+> open."* That is NO LONGER TRUE and is corrected here rather than left to be
+> quoted back: the cohort has **12 closes — 10 `paper:tp` and 2
+> `paper:debit_sl`** (#453 HINDZINC −52.5% net, #454 SBICARD −53.9% net,
+> `exit_legs` stored for both). The censoring argument that paragraph was
+> making still stands — winners resolve in 1-4 sessions and losers take ~5 or
+> run to the TIME exit, so the closed book still flatters the open one — but
+> the FACT it rested on has changed. **Both stops were booked at MID by the
+> paper engine, so where a stop FILLS remains unmeasured.**
 
 > **TWO rule sets, deliberately.** The MANUAL playbook below governs spreads
 > you pick by hand off a crash/bounce thesis, where you choose the width. The
@@ -1491,7 +1503,24 @@ s.list_trades()
 
 # Log cleanup — Sundays 07:00, outside market hours. Dry run without --apply.
 0 7 * * 0 cd /home/trustit/Desktop/BOTS/Helper && ../CROCODILE/venv/bin/python -m common.log_cleanup --apply >> logs/cron_log_cleanup_$(date +\%Y\%m\%d).log 2>&1
+
+# EOD digest — 15:47, after the 15:30 close and the 15:40 EOD report.
+# Writes logs/eod/<date>.md + .json. THIS IS THE ARMING-GATE EVIDENCE RECORD.
+0,47 15 * * 1-5 cd /home/trustit/Desktop/BOTS/Helper && ../CROCODILE/venv/bin/python -m zebra digest >> logs/cron_digest_$(date +\%Y\%m\%d).log 2>&1
 ```
+
+> **The digest cron went uninstalled for 18 days and nobody noticed**, because
+> nothing fails when it is absent — `logs/eod/` simply stays empty. Found
+> 2026-09-01 and backfilled from the retained `cron_zebra_*.log` files; two
+> days (2026-08-19, 08-20) had already aged out of the logs and are gone for
+> good. `python -m zebra digest --date YYYY-MM-DD` rebuilds any day whose log
+> survives.
+>
+> **`logs/eod/` is never cleaned and must not be.** `common.log_cleanup` works
+> from an allowlist (`.log` → gzip, `.log.gz` → delete) and skips
+> subdirectories, so it cannot reach it. Digests run 1-9 KB, so the whole
+> directory costs ~2-3 MB a year — against being the only durable record of
+> what the engine saw, and the evidence the arming gate is waiting on.
 
 **Date-stamp every cron redirect.** `cron_bcs.log` had none until 2026-08-31
 and reached **12.5 MB** in one ever-growing file, so "move today's log to the
