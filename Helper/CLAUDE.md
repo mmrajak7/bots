@@ -675,7 +675,9 @@ Additional manual triggers:
 > guards had already cleared the exit before it was asked — and an unbounded
 > hold inverted that: one `defer` means a later timeout no longer fails open,
 > it escalates to a human and waits. ASHOKLEY #390 went −50% → −75% over three
-> cycles on an agent that had died on quota two seconds after spawning. The
+> cycles on an agent that had died on quota two seconds after spawning — a
+> PRE-COHORT record, cited for the MECHANISM and never as evidence about this
+> strategy's economics (see the cohort-scope box above). The
 > budget is PER SESSION, so a Friday hold cannot fire Monday's opening print.
 > `0` restores the unbounded behaviour without a code change.
 >
