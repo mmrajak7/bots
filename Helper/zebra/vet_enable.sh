@@ -29,7 +29,11 @@ HELPER="$BOTS/Helper"
 PY="$BOTS/CROCODILE/venv/bin/python"
 CFG="$HELPER/config/zebra_config.json"
 SETTINGS="$HELPER/.claude/settings.json"
-ACCOUNT="mail2raja18@gmail.com"
+# NOTE: the owner's Claude login used to be hardcoded here and printed in
+# two banners. This file is tracked in a PUBLIC repo, and an account
+# identifier attached to a repo that also describes a live trading system
+# is a targeting handle -- so the banners now say 'the owner account' and
+# the value lives nowhere in git.
 
 MODE=check
 case "${1:-}" in
@@ -84,7 +88,7 @@ $PY -c "import sys; sys.path.insert(0,'$HELPER'); import zebra.vet, zebra.health
   && ok "zebra.vet + zebra.health import" || bad "vetting modules do not import"
 
 # ── 2. The Claude CLI ─────────────────────────────────────────────────────
-head_ "2. Claude CLI  (account: $ACCOUNT)"
+head_ "2. Claude CLI"
 CLI="$($PY - <<EOF 2>/dev/null
 import sys; sys.path.insert(0, '$HELPER')
 from zebra import vet
@@ -114,7 +118,8 @@ if [ -n "$CLI" ]; then
     printf '%s\n' "$OUT" | head -c 300 | sed 's/^/           /'
     note ""
     note "If this mentions login/auth: run 'claude' interactively AS trustit,"
-    note "then /login with $ACCOUNT. Do NOT enable vetting until this passes —"
+    note "then /login as the owner account. Do NOT enable vetting until this"
+    note "passes -"
     note "an unauthenticated spawn exits 0 with the work undone, so the layer"
     note "would look enabled and silently vet nothing."
   fi
@@ -191,7 +196,7 @@ fi
 head_ "5. vet_enabled"
 $PY -c "import sys;sys.path.insert(0,'$HELPER');from zebra import config as c;print('         config resolves VET_ENABLED =', c.VET_ENABLED)"
 grep -q '"vet_enabled"' "$CFG" && note "key present in $CFG" \
-                               || note "key ABSENT from $CFG (falling back to the code default: false)"
+                               || note "key ABSENT from $CFG (falling back to the code default: TRUE)"
 
 if [ "$MODE" = apply ]; then
   if [ "$FAIL" -gt 0 ]; then

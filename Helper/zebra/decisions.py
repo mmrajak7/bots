@@ -444,12 +444,36 @@ class DecisionStore:
 
     @staticmethod
     def _merge(base: list, incoming: list) -> list:
-        by_id = {d['id']: d for d in base}
-        for d in incoming:
-            if d['id'] not in by_id or \
-                    d.get('version', 0) > by_id[d['id']].get('version', 0):
-                by_id[d['id']] = d
-        return sorted(by_id.values(), key=lambda d: d['id'])
+        """Higher version wins, per id.
+
+        ID-LESS ROWS ARE SKIPPED, NOT FATAL (fixed 2026-09-01). This indexed
+        `d['id']` directly, so ONE row without an id -- a hand edit during an
+        incident, and this repo's history has several -- made every subsequent
+        `_mutate` raise KeyError. Every verdict from then on would land
+        unaudited through `_journal`'s CRITICAL fallback and scoring would
+        freeze, until somebody found and repaired the file. `pending_outcome`
+        already tolerates id-less rows; the merge did not, which is the same
+        asymmetry `partition_readable` exists to remove on the trade stores.
+
+        Kept rather than dropped: an id-less row cannot be merged (there is
+        nothing to merge it ON), so it is passed through and reported. Losing
+        an audit row silently is the outcome to avoid.
+        """
+        by_id, orphans = {}, []
+        for d in list(base) + list(incoming):
+            try:
+                did = d['id']
+            except (TypeError, KeyError, IndexError):
+                orphans.append(d)
+                continue
+            prev = by_id.get(did)
+            if prev is None or d.get('version', 0) > prev.get('version', 0):
+                by_id[did] = d
+        if orphans:
+            logger.error('decision journal: %d row(s) have no id and cannot '
+                         'be merged; keeping them as-is. Repair the file.',
+                         len(orphans))
+        return sorted(by_id.values(), key=lambda d: d['id']) + orphans
 
     def _read(self) -> list:
         if not self._path.exists():

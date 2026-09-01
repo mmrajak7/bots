@@ -124,6 +124,10 @@ def _leg_reliable(q: dict) -> tuple:
 
 _OPTIONS_CACHE: dict = {}      # {stock: {expiry: {strike: {CE: {...}, PE: {...}}}}}
 _OPTIONS_CACHE_LOADED = False
+#: (mtime_ns, size) of the CSV this cache was built from, so a
+#: long-lived process can notice the 09:00 refresh. See
+#: `_load_options_csv`.
+_OPTIONS_CACHE_KEY = None
 
 
 def options_csv_age_days(now=None):
@@ -172,9 +176,33 @@ def options_csv_stale(now=None):
 
 def _load_options_csv() -> None:
     """Load nse_stocks_options.csv into the in-memory chain map."""
-    global _OPTIONS_CACHE, _OPTIONS_CACHE_LOADED
-    if _OPTIONS_CACHE_LOADED:
+    global _OPTIONS_CACHE, _OPTIONS_CACHE_LOADED, _OPTIONS_CACHE_KEY
+
+    # RELOAD WHEN THE FILE CHANGES (fixed 2026-08-31).
+    #
+    # The latch was `if _OPTIONS_CACHE_LOADED: return`, loaded once per
+    # PROCESS and never invalidated, while `options_csv_stale()` -- Gate 0,
+    # the hard gate that certifies this very file -- re-stats it on every
+    # call. In any long-lived process the two diverge: `zebra loop` started
+    # before the 09:00 refresh keeps yesterday's chain, and after the refresh
+    # lands the gate reads a fresh mtime and PASSES while symbols, lot sizes
+    # and expiries still flow from yesterday's rows. Gate 0's own docstring
+    # calls this the file "where LOT SIZES come from, and a lot size becomes
+    # an order QUANTITY at the broker".
+    #
+    # Benign under the one-shot `zebra run` cron (a fresh process each tick),
+    # which is why it has never bitten -- and exactly the kind of latent fault
+    # that surfaces the day somebody runs `zebra loop` instead.
+    try:
+        st = cfg.OPTIONS_CSV.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if _OPTIONS_CACHE_LOADED and key == _OPTIONS_CACHE_KEY:
         return
+    if _OPTIONS_CACHE_LOADED and key is not None:
+        logger.info("options CSV changed on disk — reloading the chain cache")
+    _OPTIONS_CACHE_KEY = key
 
     if not cfg.OPTIONS_CSV.exists():
         logger.error("Options CSV not found: %s. Run kite_nse_options.py first.",

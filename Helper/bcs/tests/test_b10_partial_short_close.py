@@ -82,7 +82,7 @@ class _ScriptedCloseLeg:
     # below pins the two together so the next kwarg cannot drift silently.
     def __call__(self, kite, exchange, symbol, txn, qty, is_buy=False,
                  dry_run=False, urgent=False, context=None, attempts=None,
-                 allow_pay_through=True):
+                 allow_pay_through=True, paper_passthrough=False):
         self.calls.append({'symbol': symbol, 'txn': txn, 'qty': qty,
                            'urgent': urgent, 'context': context})
         return self.results.pop(0) if self.results else None

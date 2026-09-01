@@ -315,6 +315,30 @@ def partition_readable(trades, log=None):
 #: the mistake this whole function exists to stop making.
 RESTORE_MARKER = 'restored_from_snapshot_at'
 
+#: Statuses that END a record's life without being TERMINAL in `CONTRACT`'s
+#: sense. zebra's `cancelled` is the whole list: a signal that never entered,
+#: so it has no exit to book and never appears in the table above -- which
+#: means `role_of` returns None for it and, before 2026-08-31, version
+#: resolution walked it straight back to `triggered`. A resurrected cancel
+#: re-occupies its dedup slot and can re-alert and re-enter.
+SETTLED_EXTRA = ('cancelled',)
+
+
+def is_settled(trade, statuses=BCS_FAMILY_STATUSES) -> bool:
+    """Is this record's life over, so that a COUNTER may not walk it back?
+
+    TERMINAL (a booked exit) plus `SETTLED_EXTRA` (a cancel). FROZEN is
+    deliberately NOT here: it is protected by its own rule below, because it
+    is protected in only ONE direction -- a completed recovery on the other
+    replica must still be able to land on top of it.
+    """
+    try:
+        if role_of(trade.get('status'), statuses) == TERMINAL:
+            return True
+        return trade.get('status') in SETTLED_EXTRA
+    except Exception:                            # pragma: no cover - defensive
+        return False
+
 #: The two things the corruption marker can mean. They are NOT the same event
 #: and must not share alert text: a QUARANTINE means the book failed to parse,
 #: went empty, and open positions stopped being monitored; a MERGE_CONFLICT
@@ -349,7 +373,8 @@ def diff_keys(a, b):
         return 'field-level difference could not be computed'
 
 
-def _only_unversioned(base_trade, incoming_trade, fields, prefixes):
+def _only_unversioned(base_trade, incoming_trade, fields, prefixes,
+                      suffixes=()):
     """Do the two copies differ ONLY on fields written without a version bump?
 
     Some writes are deliberately local-only and deliberately do NOT increment
@@ -375,15 +400,53 @@ def _only_unversioned(base_trade, incoming_trade, fields, prefixes):
         # `startswith(())` is False for every string, so an empty prefix tuple
         # correctly matches nothing. An accidental `('',)` would match ALL of
         # them and silence every conflict in the system -- pinned by a test.
-        pre = tuple(prefixes)
-        return all(k in fields or str(k).startswith(pre) for k in differing)
+        # `startswith(())` / `endswith(())` are False for every string, so an
+        # empty tuple correctly matches nothing.
+        pre, suf = tuple(prefixes), tuple(suffixes)
+        return all(k in fields or str(k).startswith(pre) or str(k).endswith(suf)
+                   for k in differing)
+    except Exception:                            # pragma: no cover - defensive
+        return False
+
+
+#: What makes two copies the SAME trade, beyond sharing an id. Deliberately
+#: only fields fixed at entry: a status, a version or a fill moves over a
+#: record's life, and comparing those would call every ordinary update a
+#: different trade. Legs are checked across BOTH vocabularies because one
+#: function serves all four books.
+_IDENTITY_FIELDS = ('stock', 'long_symbol', 'short_symbol', 'entry_date',
+                    'long_put_symbol', 'short_put_symbol', 'short_call_symbol')
+
+
+def _identity_str(t) -> str:
+    try:
+        parts = [str(t.get(f)) for f in _IDENTITY_FIELDS if t.get(f)]
+        return ' '.join(parts) or '(no identity fields)'
+    except Exception:                            # pragma: no cover - defensive
+        return '(unreadable)'
+
+
+def _identities_conflict(a, b) -> bool:
+    """Do these two copies name DIFFERENT trades?
+
+    True only when both sides state the same identity field and the values
+    differ. Absent on either side is "cannot tell", which resolves as no
+    conflict -- an older record missing `entry_date` must not be read as a
+    collision with its own newer copy.
+    """
+    try:
+        for f in _IDENTITY_FIELDS:
+            av, bv = a.get(f), b.get(f)
+            if av and bv and av != bv:
+                return True
+        return False
     except Exception:                            # pragma: no cover - defensive
         return False
 
 
 def resolve_merge(base_trade, incoming_trade, statuses=BCS_FAMILY_STATUSES,
                   same_replica=False, unversioned_fields=frozenset(),
-                  unversioned_prefixes=()):
+                  unversioned_prefixes=(), unversioned_suffixes=()):
     """Which copy of one record survives, and what to say about it.
 
     Returns `(winner, note)`. `note` is None on an ordinary resolution and a
@@ -431,7 +494,39 @@ def resolve_merge(base_trade, incoming_trade, statuses=BCS_FAMILY_STATUSES,
         # positions at -100%, and the recovery works by out-versioning those
         # exits. Refusing it as "a stale replica reopening a closed trade"
         # would break the only tool that has ever had to fix this book.
-        if b_role == TERMINAL and i_role != TERMINAL:
+        # TWO DIFFERENT TRADES WEARING ONE ID (found 2026-08-31).
+        #
+        # Id allocation is per-replica `max(live, sidecar) + 1`, so during a
+        # sync gap -- five minutes normally, arbitrarily long in Drive-down
+        # local-only mode -- two machines can both mint id 15 for DIFFERENT
+        # trades. The owner hand-captures BCS trades on Windows while the Pi
+        # writes the same books, so this topology is supported rather than
+        # hypothetical; the merge docstring says so.
+        #
+        # Everything below then resolves them as ONE record: version picks a
+        # winner and the other trade ceases to exist, with at most a note
+        # describing it as a field conflict. `partition_readable`'s duplicate-id
+        # quarantine cannot help -- it only looks WITHIN one file.
+        #
+        # Identity is the stock plus the legs. Where both sides name them and
+        # they DISAGREE, this is not one record at two versions, and no
+        # automatic resolution is right: keep base, say so loudly, and let a
+        # human re-id one of them. Announcing it is the whole point -- the
+        # silent version pick is what loses a trade.
+        if _identities_conflict(base_trade, incoming_trade):
+            return base_trade, (
+                'id #%s names DIFFERENT TRADES on the two replicas (%s vs %s). '
+                'Two machines allocated the same id during a sync gap, so this '
+                'is not one record at two versions -- the merge is keeping the '
+                'local copy and the other trade is NOT in this book. Re-id one '
+                'of them by hand before anything acts on either.'
+                % (base_trade.get('id'), _identity_str(base_trade),
+                   _identity_str(incoming_trade)))
+
+        b_settled = is_settled(base_trade, statuses)
+        i_settled = is_settled(incoming_trade, statuses)
+
+        if b_settled and not i_settled:
             if incoming_trade.get(RESTORE_MARKER):
                 return incoming_trade, (
                     'record #%s was %s locally and is being REOPENED by a '
@@ -449,6 +544,72 @@ def resolve_merge(base_trade, incoming_trade, statuses=BCS_FAMILY_STATUSES,
                     % (base_trade.get('id'), base_trade.get('status'), b_ver,
                        incoming_trade.get('status'), i_ver))
             return base_trade, None
+
+        # THE SAME RULE, THE OTHER WAY ROUND (found 2026-08-31, second review).
+        #
+        # The branch above reads `base` as the closed copy, because that is
+        # the direction the incident arrived from. But `base` is simply
+        # whichever side the caller passed first -- local disk on the Drive
+        # merge, the process cache on a sibling refresh -- and the stale
+        # replica is just as often the LOCAL one. Local `entered` at version
+        # 8 against Drive `exited` at version 7 is the identical fault with
+        # the arguments swapped, and it fell through to plain version
+        # resolution: base wins, the booked exit is DISCARDED, and the
+        # divergence check then re-uploads the reopened copy over the good
+        # one. Monotonic in one direction is not monotonic.
+        #
+        # Bounded to `i_ver <= b_ver`, which is the only region the ordinary
+        # resolution below gets wrong -- a settled copy at a HIGHER version
+        # already wins there, and leaving that case alone is what lets a
+        # completed close on the other replica land normally.
+        #
+        # The restore carve-out is mirrored too, and has to be: `rebuild`
+        # stamps the marker and sets version = max+1, so a restored record is
+        # exactly a non-settled BASE at a HIGHER version than the exit it is
+        # undoing. Without this check the mirror would re-book the very close
+        # the restore was run to reverse.
+        if i_settled and not b_settled and i_ver <= b_ver:
+            if base_trade.get(RESTORE_MARKER):
+                return base_trade, None
+            return incoming_trade, (
+                'record #%s is %s locally (version %s) and %s on the other '
+                'replica at a LOWER-or-equal version %s. Taking the CLOSED '
+                'copy: a booked exit is not undone by a version counter, '
+                'which is a per-replica write count and not a clock. This '
+                'replica is the stale one.'
+                % (base_trade.get('id'), base_trade.get('status'), b_ver,
+                   incoming_trade.get('status'), i_ver))
+
+        # A FREEZE IS NOT WALKED BACK BY A COUNTER EITHER.
+        #
+        # `partial_close` means legs are live at the broker and NOTHING is
+        # monitoring them; `CONTRACT` says FROZEN refuses every verb except
+        # `begin_recovery`. Version resolution undid that: two alert-flag
+        # bumps on a stale replica returned the record to `entered`, which
+        # re-arms every auto-exit trigger against a position whose legs are
+        # in an unknown state -- an order placed on top of live legs.
+        #
+        # One direction only. A recovery that RAN on the other replica ends
+        # settled, and a settled copy at a higher version still wins above,
+        # so a finished recovery propagates. What is refused here is a copy
+        # that is merely NEWER, and the refusal is always announced -- a
+        # frozen record is human-owned, and silence is what let this one sit.
+        if (b_role == FROZEN and i_role != FROZEN and not i_settled
+                and i_ver > b_ver):
+            if incoming_trade.get(RESTORE_MARKER):
+                return incoming_trade, (
+                    'record #%s was frozen at partial_close locally and is '
+                    'being REOPENED by a snapshot restore (%s).'
+                    % (base_trade.get('id'),
+                       incoming_trade.get(RESTORE_MARKER)))
+            return base_trade, (
+                'record #%s is FROZEN at partial_close locally (version %s) '
+                'and %s on the other replica at a HIGHER version %s. Keeping '
+                'the frozen copy: legs may be live at the broker with nothing '
+                'monitoring them, and a version counter is not evidence that '
+                'they were recovered. Resolve this record by hand.'
+                % (base_trade.get('id'), b_ver,
+                   incoming_trade.get('status'), i_ver))
 
         # Ordinary version resolution, unchanged.
         if i_ver > b_ver:
@@ -476,7 +637,8 @@ def resolve_merge(base_trade, incoming_trade, statuses=BCS_FAMILY_STATUSES,
             # local disk on the Drive merge, and it holds the fresher poll
             # data that has not been pushed yet.
             if _only_unversioned(base_trade, incoming_trade,
-                                 unversioned_fields, unversioned_prefixes):
+                                 unversioned_fields, unversioned_prefixes,
+                                 unversioned_suffixes):
                 return base_trade, None
             return base_trade, (
                 'record #%s is at version %s on BOTH replicas with DIFFERENT '

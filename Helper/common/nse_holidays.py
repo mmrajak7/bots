@@ -226,7 +226,34 @@ def coverage_status(today: date) -> dict:
                 'detail': '%s parsed but names no year. Session counts are '
                           'WEEKDAYS-ONLY.' % HOLIDAY_FILE}
     updated = c['updated']
-    if updated is not None and (today - updated).days > STALE_DAYS:
+    # AN UNKNOWN REFRESH DATE IS NOT A FRESH ONE (fixed 2026-08-31).
+    #
+    # `_read` swallows a `_last_updated` that `date.fromisoformat` rejects and
+    # leaves `updated=None`. The stale branch below was guarded on
+    # `updated is not None`, so a missing or reshaped timestamp — the scraper
+    # starting to write `2026-08-31T06:00:00`, or epoch millis, or the key
+    # being dropped — SKIPPED the staleness check entirely and fell through to
+    # `ok`, reporting "refreshed unknown" forever. The one detector that says
+    # the daily scrape has died was disarmed by the very field it reads.
+    #
+    # Degrades to `stale` rather than to its own state, because that is what
+    # it cannot be distinguished from: a calendar of unknown age is exactly a
+    # calendar that might not have been refreshed. And the direction matters —
+    # a holiday declared since the last real refresh is unknown here, which
+    # OVER-estimates the sessions remaining and fires every delivery close
+    # LATER, into the margin ramp. A timestamp is a value whose absence must
+    # degrade, which is the rule the rest of this module already honours.
+    if updated is None:
+        return {'state': 'stale', 'days_left': (end - today).days,
+                'detail': '%s parses, but its `_last_updated` is missing or '
+                          'unreadable, so this calendar has NO KNOWN AGE. It '
+                          'is scraped daily by SNAIL (holiday_scraper.py); a '
+                          'calendar that cannot say when it was refreshed is '
+                          'treated as one that was not. A holiday declared '
+                          'since then is unknown here, and an unknown holiday '
+                          'fires the delivery close LATER, into the ramp.'
+                          % HOLIDAY_FILE}
+    if (today - updated).days > STALE_DAYS:
         return {'state': 'stale', 'days_left': (end - today).days,
                 'detail': 'the NSE holiday calendar was last refreshed %s '
                           '(%d days ago). It is scraped daily, so this means '
@@ -253,7 +280,10 @@ def coverage_status(today: date) -> dict:
             'detail': 'covers %s (%d holidays, refreshed %s)'
                       % ('/'.join(str(y) for y in sorted(covered_years())),
                          len(c['holidays']),
-                         updated.isoformat() if updated else 'unknown')}
+                         # `updated` cannot be None here any more -- an unknown
+                         # age returns `stale` above -- so `ok` never claims a
+                         # freshness it does not have.
+                         updated.isoformat())}
 
 
 def is_holiday(d: date) -> bool:

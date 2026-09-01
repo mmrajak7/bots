@@ -702,7 +702,11 @@ def test_the_event_write_grant_matches_both_path_forms(monkeypatch):
     watchdog cried "AGENTS NOT REPORTING BACK". A test that encodes the wrong
     contract is worse than no test: it makes the bug look deliberate.
     """
-    grants = cfg.EVENT_EXTRA_TOOLS
+    # The FILE grants only. `EVENT_EXTRA_TOOLS` also carries the channel's
+    # finishing verb (`events replace`) since 2026-09-01 -- the allowlist
+    # narrowing took it off the blanket `-m zebra:*` prefix that used to
+    # supply it -- and this test is about the two PATH forms.
+    grants = [g for g in cfg.EVENT_EXTRA_TOOLS if not g.startswith('Bash(')]
     assert len(grants) == 2, 'both path forms must be granted'
     assert all(g.startswith('Edit(') for g in grants), (
         'path-scoped grants must use the Edit(path) family; Write(path) is '

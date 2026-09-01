@@ -15,7 +15,19 @@ import re
 from typing import Optional
 
 _SUFFIX = re.compile(r'(CE|PE)$')
-_STRIKE = re.compile(r'(\d+(?:\.\d+)?)(CE|PE)$')
+#: ANCHORED ON THE EXPIRY CODE, not on "the digits before CE/PE".
+#
+# It was `(\d+(?:\.\d+)?)(CE|PE)$`, which on a digit-coded WEEKLY index symbol
+# swallows the expiry as well as the strike: `NIFTY2560525000CE` returned
+# 2560525000.0 -- a confidently wrong number where the docstring promises
+# None, feeding intrinsic-floor arithmetic in the stores and the monitor.
+#
+# `\d{2}[A-Z]{3}` is the monthly expiry code (`26FEB`, `26AUG`), and it is
+# what separates symbol from strike. A weekly's `25605` has no alpha month, so
+# it no longer matches at all and the caller gets the None it was promised.
+# Verified against all 436 distinct option symbols in the four books: every
+# one is the monthly form, including the awkward `360ONE26AUG1140CE`.
+_STRIKE = re.compile(r'\d{2}[A-Z]{3}(\d+(?:\.\d+)?)(?:CE|PE)$')
 
 
 def option_type(symbol) -> Optional[str]:

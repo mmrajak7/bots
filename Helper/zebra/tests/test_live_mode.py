@@ -98,15 +98,16 @@ class _Store:
 def test_live_exit_claims_rearm_daily(monkeypatch, kind):
     """In LIVE the alert IS the exit, so its claim must not be once-ever.
 
-    `_paper_auto_close` returns at its first line when PAPER_MODE is off, so
-    nothing books the exit and the position stays `entered`. With a
-    one-time-EVER claim, a stop announced once while the owner was away could
-    never be announced again — the capped loss quietly becoming the maximum
-    loss, which is the shape of both real-money incidents.
+    `_paper_auto_close` declines a live record, so nothing books the exit and
+    the position stays `entered`. With a one-time-EVER claim, a stop announced
+    once while the owner was away could never be announced again — the capped
+    loss quietly becoming the maximum loss, which is the shape of both
+    real-money incidents.
     """
     monkeypatch.setattr(cfg, 'PAPER_MODE', False)
     store = _Store()
-    assert mon._claim_exit_alert(store, 42, kind) is True
+    trade = {'id': 42, 'paper': False}
+    assert mon._claim_exit_alert(store, trade, kind) is True
     assert store.daily == [(42, kind)], "live exit claim must re-arm daily"
     assert store.once == [], "live exit claim must not be one-time-ever"
 
@@ -117,9 +118,40 @@ def test_paper_exit_claims_stay_once_ever(monkeypatch, kind):
     alert would describe a trade that is already shut."""
     monkeypatch.setattr(cfg, 'PAPER_MODE', True)
     store = _Store()
-    assert mon._claim_exit_alert(store, 42, kind) is True
+    trade = {'id': 42, 'paper': True}
+    assert mon._claim_exit_alert(store, trade, kind) is True
     assert store.once == [(42, kind)]
     assert store.daily == []
+
+
+@pytest.mark.parametrize('kind', ['tp', 'trail', 'spot_sl', 'debit_sl'])
+def test_a_LIVE_record_in_a_PAPER_store_still_rearms_daily(monkeypatch, kind):
+    """THE RECORD DECIDES, NOT THE MODE (fixed 2026-08-31).
+
+    This is the arming order's first live-money action: a hand-placed live
+    trade filed with `zebra enter` while the store is still `paper_mode: true`.
+    Keying the claim on `cfg.PAPER_MODE` gave that record a once-EVER claim for
+    a close `_paper_auto_close` declines forever — its stop announced exactly
+    once, then silence, on the one record in the book with real legs.
+    """
+    monkeypatch.setattr(cfg, 'PAPER_MODE', True)
+    store = _Store()
+    trade = {'id': 42, 'paper': False}
+    assert mon._claim_exit_alert(store, trade, kind) is True
+    assert store.daily == [(42, kind)], (
+        "a record with real legs must keep re-arming, whatever the store's "
+        "mode says")
+    assert store.once == []
+
+
+@pytest.mark.parametrize('kind', ['tp', 'trail', 'spot_sl', 'debit_sl'])
+def test_an_unstamped_record_is_treated_as_paper(monkeypatch, kind):
+    """`is_paper_record` reads absence as paper, deliberately — the reading
+    that keeps a booking engine attached. The claim must agree with it."""
+    monkeypatch.setattr(cfg, 'PAPER_MODE', False)
+    store = _Store()
+    assert mon._claim_exit_alert(store, {'id': 42}, kind) is True
+    assert store.once == [(42, kind)] and store.daily == []
 
 
 class _BandStore:
@@ -289,13 +321,20 @@ def test_the_interpreter_is_granted_in_the_form_agents_actually_type(monkeypatch
     naming one spelling of something the agent can legitimately write two ways.
     """
     grants = _pi_grants(monkeypatch)
-    typed = '../CROCODILE/venv/bin/python -m zebra events replace --file x.json'
+    # `vet show` stands in for the class. The example used to be `events
+    # replace`, which the blanket `-m zebra:*` grant matched -- but that verb
+    # is in VET_DENIED_TOOLS and deny wins, so it was never actually runnable
+    # (see `test_the_events_finishing_verb_is_currently_denied` below). A
+    # grant test must use a command the agent can really run.
+    typed = '../CROCODILE/venv/bin/python -m zebra vet show 455'
     assert any(g.startswith('Bash(') and typed.startswith(g[5:-3])
                for g in grants if g.endswith(':*)')), \
         f'no grant prefix-matches what the agent typed: {grants}'
-    assert 'Bash(../CROCODILE/venv/bin/python -m zebra:*)' in grants
-    assert ('Bash(/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python '
-            '-m zebra:*)') in grants
+    rel = [g for g in grants if g.startswith('Bash(../CROCODILE/')]
+    absol = [g for g in grants
+             if g.startswith('Bash(/home/trustit/Desktop/BOTS/CROCODILE/')]
+    assert rel and absol, (
+        'both interpreter spellings must be granted: %s' % grants)
 
 
 def test_the_relative_grant_uses_forward_slashes_wherever_it_is_built(monkeypatch):
@@ -311,11 +350,55 @@ def test_the_dual_grant_does_not_reach_a_position_verb(monkeypatch):
     interpreter, same module, same `-m zebra` prefix, and the deny list matches
     anywhere in the string."""
     grants = _pi_grants(monkeypatch)
+    # Since 2026-08-31 the grants are a per-VERB allowlist rather than one
+    # `-m zebra:*` prefix, because deny-by-text is quotable and the blanket
+    # prefix also covered `-m zebra.restore_snapshot`. Every Bash grant must
+    # still be an `-m zebra <verb>` prefix and nothing wider.
     for g in grants:
         if g.startswith('Bash('):
-            assert g.endswith(' -m zebra:*)'), g
+            assert ' -m zebra ' in g and g.endswith(':*)'), g
+            assert not g.endswith(' -m zebra:*)'), (
+                'the blanket prefix is back: %s' % g)
     for verb in ('close', 'enter', 'cancel', 'reset', 'trigger', 'run', 'loop'):
         assert any(verb in d for d in cfg.VET_DENIED_TOOLS), verb
+
+
+def test_the_events_channel_CAN_run_its_finishing_verb(monkeypatch):
+    """The DENY side was always right -- `_denied_tools` strips this rule for
+    the events channel alone. What carried the ALLOW side was the blanket
+    `-m zebra:*` prefix, so narrowing that to a verb allowlist on 2026-08-31
+    silently took the verb from the one channel entitled to it. The failure
+    would have been the quiet kind: research done, candidate written, refused
+    at the last step, and `adjustment_today` left reading a stale calendar.
+    """
+    grants = _pi_grants(monkeypatch)
+    typed = ('../CROCODILE/venv/bin/python -m zebra events replace '
+             '--file logs/event_calendar.candidate.json')
+    assert any(g.startswith('Bash(') and typed.startswith(g[5:-3])
+               for g in grants if g.endswith(':*)')), grants
+    from zebra import vet as vet_mod
+    assert not any('events replace' in d
+                   for d in vet_mod._denied_tools('events')), (
+        'the per-channel deny carve-out is gone, so the grant is dead code')
+
+
+def test_only_the_events_channel_gets_it(monkeypatch):
+    """The vetting and review agents have no business installing a calendar."""
+    from zebra import vet as vet_mod
+    monkeypatch.setattr(
+        vet_mod.sys, 'executable',
+        '/home/trustit/Desktop/BOTS/CROCODILE/venv/bin/python')
+    assert not any('events replace' in g
+                   for g in vet_mod._allowed_tools('vet'))
+
+
+def test_no_events_grant_carries_an_unformatted_placeholder(monkeypatch):
+    """The extras were appended VERBATIM, which was harmless while they were
+    all literal `Edit(path)` rules and became a defect the moment one carried
+    `{python}`: an unformatted grant matches nothing the agent types, and that
+    is indistinguishable from a broken agent."""
+    for g in _pi_grants(monkeypatch):
+        assert '{' not in g and '}' not in g, g
 
 
 def test_a_pathological_relative_path_falls_back_to_absolute(monkeypatch):

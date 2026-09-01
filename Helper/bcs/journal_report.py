@@ -311,6 +311,20 @@ def report(day=None, only_unresolved=False) -> int:
     return len(dangling)
 
 
+def _today_ist_compact() -> str:
+    """Today in IST as YYYYMMDD, matching the journal's own day keys.
+
+    Delegates to the monitor rather than re-deriving a timezone: two
+    definitions of "today" in one fleet is how a report and the thing it
+    reports on start disagreeing.
+    """
+    try:
+        from .spread_monitor import today_ist
+        return today_ist().strftime('%Y%m%d')
+    except Exception:                     # pragma: no cover - import guard
+        return datetime.now().strftime('%Y%m%d')
+
+
 def compare_to_store(day=None) -> None:
     """What the journal says was placed, next to what the stores recorded.
 
@@ -332,7 +346,12 @@ def compare_to_store(day=None) -> None:
 
     trades = load_all_trades()
 
-    day_str = day or datetime.now().strftime('%Y%m%d')
+    # IST, not the box clock. The monitor had a deliberate IST sweep and this
+    # tool did not: on a non-IST box, between local midnight and IST midnight
+    # the compare labels the wrong day and reports "0 trades closed today"
+    # against a full journal -- the quiet wrong answer the EXIT_SCHEMA comment
+    # in this file warns about.
+    day_str = day or _today_ist_compact()
     closed_today = [t for t in trades if exit_day(t) == day_str]
     by_book = defaultdict(int)
     for t in closed_today:

@@ -136,7 +136,13 @@ from zebra import config as c
 checks = [
     ('PAPER_MODE',              c.PAPER_MODE,              True,  True),
     ('ENTRY_STRUCTURE',         c.ENTRY_STRUCTURE,        'bcs',  True),
-    ('VET_ENABLED',             c.VET_ENABLED,             False, True),
+    # Expected TRUE since 2026-08-27, when vet_enabled moved into the
+    # TRACKED defaults and the code default was raised to match. This
+    # line still demanded False, so the script that exists to VERIFY a
+    # deploy hard-failed on every correctly-armed box -- and its own
+    # failure text told the operator to disarm the vetting layer to make
+    # the check pass, which is the silent-dark state 08-27 closed.
+    ('VET_ENABLED',             c.VET_ENABLED,             True,  True),
     ('SPOT_SL_ENABLED',         c.SPOT_SL_ENABLED,         False, True),
     ('SPOT_VETO_ENABLED',       c.SPOT_VETO_ENABLED,       True,  True),
     ('TRAIL_ENABLED',           c.TRAIL_ENABLED,           True,  False),
@@ -439,7 +445,7 @@ cat <<'TXT'
 
   What is now live, and what is not:
     PAPER mode      — auto-enters and auto-closes, real money is NOT at risk
-    Claude vetting  — OFF. Enable only via zebra_config.json, never the env var
+    Claude vetting  — ON via zebra_config.json (never via the env var)
     spot stop       — OFF as a trigger, by measurement (it cuts 40% of winners)
     spot veto       — ON, and it can only ever REFUSE an exit, never cause one
     value triggers  — dark for the first 15 min after the open

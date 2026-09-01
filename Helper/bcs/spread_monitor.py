@@ -134,6 +134,13 @@ CONFIRM_STALE_SEC = 180
 # Set to 1 to restore the old behaviour.
 SL_SPOT_CONFIRM_POLLS = 2
 
+#: Pause before RE-READING `positions()` when a leg we hold is missing from
+#: the response entirely. Long enough for a degraded or mid-sync response to
+#: settle, short enough to sit inside one close without delaying it
+#: meaningfully. Only ever paid on the suspicious path -- a leg with a real
+#: row, flat or not, is believed on the first read.
+POSITION_RECHECK_SEC = 2.0
+
 # ── Spot corroboration (the NHPC signature) ───────────────────────────────
 # NHPC's book passed nothing, but the shape it exposed generalises: a vertical
 # spread's value is monotonic in spot, so a large collapse in the structure
@@ -1065,10 +1072,110 @@ def get_fh_position_value(kite: KiteConnect, trade: dict) -> dict:
 
 def get_net_position(kite: KiteConnect, symbol: str) -> int:
     """Get net quantity for a tradingsymbol from Kite positions."""
+    return get_net_position_detail(kite, symbol)[0]
+
+
+def get_net_position_detail(kite: KiteConnect, symbol: str):
+    """`(quantity, present)` — and `present` is the part that matters.
+
+    `get_net_position` returns 0 for a symbol that is ABSENT from the response
+    and 0 for a row that genuinely reads flat. Those are different facts and
+    this file already knows it: `resolve_residue` refuses to act on one read
+    precisely because "an empty list during the early-session sync window, a
+    degraded response, a row simply missing" all look like zero.
+
+    The close path had no such distinction, and one place needs it badly — see
+    `_short_is_confirmed_flat`. A leg we believe we are short of should HAVE a
+    row (intraday or carried forward), so its absence is evidence about the
+    RESPONSE, not about the position.
+    """
     for p in kite.positions()['net']:
         if p['tradingsymbol'] == symbol:
-            return p['quantity']
-    return 0
+            return p['quantity'], True
+    return 0, False
+
+
+def _record_says_short_already_closed(trade: dict) -> bool:
+    """Does THIS RECORD already carry evidence that the short leg filled?
+
+    A record frozen at `partial_close` after the short filled and the long did
+    not stores exactly that: `close_failed_leg='long'` and the short's own
+    `short_fill` price. That is a genuinely independent source -- it was
+    written from an order result, not from the position book -- so it
+    corroborates a positions response in which the short row is simply gone.
+
+    It is also the M14 recovery case, which is the common legitimate reason to
+    reach the skip-the-short branch at all: the sweep re-enters the close for
+    a naked long whose short is known closed.
+    """
+    if trade.get('short_fill') is not None:
+        return True
+    if trade.get('close_failed_leg') == 'long':
+        return True
+    cf = trade.get('close_failure') or {}
+    return isinstance(cf, dict) and cf.get('leg') == 'long'
+
+
+def _short_is_confirmed_flat(kite, short_sym: str, short_present: bool,
+                             trade: Optional[dict] = None,
+                             log_=None) -> bool:
+    """May we skip buying back the short and go on to SELL the long?
+
+    THE DEFECT (found 2026-08-31). Step 1 skipped the short whenever
+    `short_qty >= 0`, and Step 2 then sold the whole long. Both numbers come
+    from ONE `kite.positions()` read, and a row missing from a degraded
+    response reads as 0. So the asymmetric case -- SHORT row absent, LONG row
+    present -- produced:
+
+        "SHORT leg already flat/long (qty=0). Skipping BUY."
+        "STEP 2: Close LONG leg -> SELL ..."
+
+    ...leaving a LIVE SHORT with its hedge sold. A naked short, created by the
+    close path itself, in direct violation of the rule this whole file is
+    built around: buy the short back FIRST, always.
+
+    The both-legs-flat case (0/0) already gets refuse-and-escalate treatment.
+    This is the same reading, one leg at a time, and it had none.
+
+    `present` is the whole test. A leg we are short of has a row in `net` --
+    intraday or carried forward -- so ABSENCE is a statement about the
+    response, not about the position. When it is absent we take a SECOND read
+    a moment later, which is exactly what `resolve_residue` does and for
+    exactly this reason: one glitchy read must not decide anything.
+
+    Returns True only when the flatness is corroborated. Refusing costs one
+    poll; being wrong costs a naked short.
+    """
+    say = log_ or log
+    if short_present:
+        return True                      # a real row reading flat: believe it
+    if trade is not None and _record_says_short_already_closed(trade):
+        # A SECOND SOURCE, not a second look. The record's short fill was
+        # written from an order result; the positions book is a different
+        # system. Count sources, not checks.
+        say(f"    {short_sym}: absent from the positions response, but this "
+            f"record already carries the short's own fill — corroborated.")
+        return True
+    say(f"    {short_sym}: NOT in the positions response at all. A leg we are "
+        f"short of should have a row, so this is evidence about the RESPONSE. "
+        f"Re-reading before trusting 'flat'...")
+    try:
+        time.sleep(POSITION_RECHECK_SEC)
+        qty, present = get_net_position_detail(kite, short_sym)
+    except Exception as e:
+        say(f"    {short_sym}: the confirming read FAILED ({e}). Refusing to "
+            f"treat the short as flat.")
+        return False
+    if not present:
+        say(f"    {short_sym}: still absent on the second read. Refusing to "
+            f"sell the long against an unconfirmed flat short.")
+        return False
+    if qty < 0:
+        say(f"    {short_sym}: the second read shows {qty} — the first read "
+            f"was WRONG and this leg is still live.")
+        return False
+    say(f"    {short_sym}: confirmed flat on the second read (qty={qty}).")
+    return True
 
 
 def is_market_settled() -> bool:
@@ -2186,6 +2293,44 @@ STORE_TYPE_LABEL = {'bcs': 'BCS', 'bps': 'BPS', 'fh': 'FH', 'zebra': 'COHORT'}
 LABEL_STORE_TYPE = {v: k for k, v in STORE_TYPE_LABEL.items()}
 
 
+def _human_escalation(msg: str, paper_passthrough: bool = False,
+                      alert_class=None) -> bool:
+    """Send an escalation to a human -- unless this engine refused the record.
+
+    THE THIRD DOOR (found 2026-08-31). Commit 589a19b established the rule --
+    "a record this engine refuses must not tell a human to go and trade" --
+    and 5a39fdd closed two more. All three worked at the `close_spread`
+    BOUNDARY, converting its RETURN VALUE. But `_close_spread_inner` and
+    `close_leg` send their own Telegrams from deep inside the close, long
+    before that boundary is reached, and neither had ever heard of
+    `paper_passthrough`.
+
+    So a paper cohort record walked in dry run purely to journal its intended
+    orders could still emit, verbatim:
+
+        "WARNING: <stock> LONG LEG CLOSE FAILED! Short is closed. Naked long
+         remains. Close manually: SELL <qty>"
+
+    -- three false statements and one instruction, about a position that
+    exists at no broker. A human who obeyed would put real orders on somebody
+    else's book. Reachable without anything exotic: a rate-limit burst (70 in
+    one day on 2026-08-28) exhausts the depth loop, which runs `fresh=True`
+    REGARDLESS of dry_run, so the leg "fails" in a rehearsal.
+
+    Returns True if the message was actually sent.
+    """
+    if paper_passthrough:
+        log('  PAPER passthrough: escalation SUPPRESSED — this record has no '
+            'legs at any broker and its own engine books the exit. Would have '
+            'sent: %s' % ' '.join(str(msg).split())[:160])
+        return False
+    if alert_class is None:
+        send_telegram(msg)
+    else:
+        send_telegram(msg, alert_class=alert_class)
+    return True
+
+
 def _order_ctx(trade: dict, reason: str, leg: str, strategy: str,
                book: Optional[str] = None) -> dict:
     """Why this order exists, for the journal.
@@ -2455,7 +2600,8 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
               qty: int, is_buy: bool, dry_run: bool,
               urgent: bool = False, context: dict = None,
               attempts: int = None,
-              allow_pay_through: bool = True) -> Optional[dict]:
+              allow_pay_through: bool = True,
+              paper_passthrough: bool = False) -> Optional[dict]:
     """
     Close one leg with retry + escalating slippage.
 
@@ -2524,8 +2670,10 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
         if now_ist().time() > cutoff:
             log(f"    ORDER CUTOFF: {now_ist().strftime('%H:%M:%S')} > {cutoff.strftime('%H:%M')} "
                 f"({'urgent' if urgent else 'normal'}). No more orders for {symbol}.")
-            send_telegram(f"Order cutoff reached closing {symbol} — "
-                          f"{remaining_qty} qty NOT closed. Manual intervention needed!", alert_class=alert_policy.SAFETY)
+            _human_escalation(
+                f"Order cutoff reached closing {symbol} — "
+                f"{remaining_qty} qty NOT closed. Manual intervention needed!",
+                paper_passthrough, alert_class=alert_policy.SAFETY)
             break
         # ── Safety: Re-check position to compute actual remaining ─────
         if not dry_run:
@@ -3199,6 +3347,38 @@ def _recover_one(kite, label, store, orders_allowed, trade, net_by_symbol,
     rclass, why = classify_frozen(trade, net_by_symbol)
     _recovery_event('frozen_seen', store=label, id=tid, cls=rclass)
 
+    # ── A DRY RUN REHEARSES; IT DOES NOT RESOLVE ───────────────────────────
+    #
+    # THE DEFECT (found 2026-08-31). `recovery_gate` checks the kill switch and
+    # never checked `dry_run`, so under today's `--dry-run` crontab a REAL
+    # frozen record walked the whole action path: it burned and PERSISTED a
+    # recovery attempt, called `store.begin_recovery` (a real status write,
+    # partial_close -> closing), then ran `_close_spread_inner(dry_run=True)`
+    # whose preflight ASSUMES the legs are there and whose `wait_for_fill` stub
+    # reports COMPLETE -- returning True. The sweep then stamped
+    # `state='resolved'` and sent "frozen close FINISHED by recovery" for a
+    # position whose legs are all still live at the broker and still unbooked.
+    #
+    # Worse than a wrong message: the record is left at `closing`, and the next
+    # process start's crash-recovery sweep flips it to `open` and hands a
+    # HALF-CLOSED position back to the per-trade loop, which prices it as a
+    # whole spread. That is the state `_close_spread_inner` refuses to create
+    # deliberately, reached by a path that never asked.
+    #
+    # Classification and escalation stay ON: they place no orders and write no
+    # status, and a genuinely frozen real position is exactly what a human
+    # should hear about during the evidence week. What stops is ACTING.
+    # `orders_allowed` and RC_NO_ORDERS are the two alert-only shapes: they
+    # fall through to their escalations below, which is the behaviour a dry run
+    # should keep. Only the two paths that ACT are stopped here -- the RC_FLAT
+    # booking and, further down, the gated recovery attempt.
+    if dry_run and orders_allowed and rclass != RC_NO_ORDERS:
+        _recovery_event('recovery_rehearsed', store=label, id=tid, cls=rclass)
+        log('  %s #%s %s: frozen (%s) — DRY RUN, so no attempt is spent, no '
+            'status is written and nothing is booked. %s'
+            % (label, tid, trade.get('stock', '?'), rclass, why))
+        return 0
+
     # A record already booked or reopened by hand needs nothing.
     if rclass == RC_FLAT:
         if not orders_allowed:
@@ -3655,7 +3835,8 @@ def close_spread(kite: KiteConnect, trade: dict, spot: float,
 
     try:
         result = _close_spread_inner(kite, store, trade, spot, reason, dry_run,
-                                     label, urgent=urgent)
+                                     label, urgent=urgent,
+                                     paper_passthrough=paper_passthrough)
         # THE ESCALATION BOUNDARY, and it belongs here rather than at each of
         # the eight `return False` paths inside the inner close. Every one of
         # those means "this close did not complete", which for a REAL position
@@ -3803,7 +3984,7 @@ def _blend_fill(first_price, first_qty, retry_price, retry_qty):
 
 def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                         urgent=False, recovery=False, recovery_urgent=False,
-                        book=None):
+                        book=None, paper_passthrough=False):
     """Inner close logic, separated so close_spread() can wrap with try/except.
 
     **M14 recovery reuses this function rather than copying it.** It is already
@@ -3849,11 +4030,12 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
 
     # ── Pre-flight: Check actual position state ──────────────────────────
     if not dry_run:
-        short_qty = get_net_position(kite, short_sym)
-        long_qty = get_net_position(kite, long_sym)
+        short_qty, short_present = get_net_position_detail(kite, short_sym)
+        long_qty, long_present = get_net_position_detail(kite, long_sym)
     else:
         short_qty = -qty  # Assume normal state for dry run
         long_qty = qty
+        short_present = long_present = True
 
     log(f"  Position check: {short_sym} qty={short_qty} | {long_sym} qty={long_qty}")
 
@@ -3889,14 +4071,14 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                 close_failure=_close_failure(
                     cause='flipped', leg=None, reason=reason))
             reconcile_after_close(kite, trade, label, store=store)
-        send_telegram(
+        _human_escalation(
             f"🔴 {label} {stock}: FLIPPED POSITION\n"
             f"{reason} triggered, but the book is not what the trade says:\n"
             f"{detail}\n"
             f"No orders placed. The trade is frozen at "
             f"partial_close and will NOT be monitored further.\n"
             f"This is the Feb-2026 shape — audit the order history for this "
-            f"leg before doing anything else.", alert_class=alert_policy.SAFETY)
+            f"leg before doing anything else.", paper_passthrough, alert_class=alert_policy.SAFETY)
         return False
 
     # ── Guard: Both legs already flat — mark closed with recovered fills ──
@@ -3975,7 +4157,8 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             urgent=(recovery_urgent if recovery else urgent),
             context=_order_ctx(trade, reason, 'short', label, book=book),
             attempts=1 if recovery else None,
-            allow_pay_through=(recovery_urgent if recovery else True)
+            allow_pay_through=(recovery_urgent if recovery else True),
+            paper_passthrough=paper_passthrough,
         )
 
         if not short_result or short_result['status'] not in ('COMPLETE', 'PARTIAL'):
@@ -3986,8 +4169,9 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             if not recovery and not urgent and short_result is None:
                 log(f"\n  NORMAL close abort: short leg not tradeable/fillable, nothing filled.")
                 log(f"  Trade stays OPEN — trigger re-arms on the next reliable poll.")
-                send_telegram(f"{label} {stock}: {reason} close aborted — short-leg book not "
-                              f"tradeable. Trade still open, monitoring continues.")
+                _human_escalation(f"{label} {stock}: {reason} close aborted — short-leg book not "
+                                  f"tradeable. Trade still open, monitoring continues.",
+                                  paper_passthrough)
                 if not dry_run:
                     store.recover_closing_trade(trade['id'])
                 return 'ABORT'
@@ -3998,7 +4182,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             log("!!! DO NOT close long leg manually - margin spike! !!!")
             log("!!! Intervene manually in Kite terminal            !!!")
             log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            send_telegram(msg)
+            _human_escalation(msg, paper_passthrough)
             if not dry_run:
                 store.set_trade_status(
                     trade['id'], 'partial_close',
@@ -4013,7 +4197,8 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
         if short_result['status'] == 'PARTIAL':
             remaining = close_qty - short_result.get('filled_quantity', 0)
             log(f"  WARNING: Short leg partially filled. {remaining} qty still short!")
-            send_telegram(f"{label} {stock}: Short leg partial fill. {remaining} still short!", alert_class=alert_policy.SAFETY)
+            _human_escalation(f"{label} {stock}: Short leg partial fill. {remaining} still short!",
+                              paper_passthrough, alert_class=alert_policy.SAFETY)
 
             # ── B10 · the long leg is sold ONLY when the short is flat ──────
             #
@@ -4034,7 +4219,8 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                 log(f"  RETRY: closing the {remaining} qty residual (urgent)")
                 retry = close_leg(kite, exchange, short_sym, "BUY", remaining,
                                   is_buy=True, dry_run=dry_run, urgent=True,
-                                  context=_order_ctx(trade, reason, 'short-retry', label, book=book))
+                                  context=_order_ctx(trade, reason, 'short-retry', label, book=book),
+                                  paper_passthrough=paper_passthrough)
                 got = retry.get('filled_quantity', 0) if retry else 0
                 remaining -= got
                 log(f"  RETRY filled {got}; {remaining} still short")
@@ -4060,16 +4246,36 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                         close_failure=_close_failure(
                             cause='unfilled', leg='short', reason=reason))
                     reconcile_after_close(kite, trade, label, store=store)
-                send_telegram(
+                _human_escalation(
                     f"🔴 {label} {stock}: PARTIAL SHORT CLOSE\n"
                     f"{remaining} qty still SHORT on {short_sym} after a retry.\n"
                     f"The long leg was NOT sold — selling it would leave you "
                     f"naked short. You are over-hedged, which is the bounded "
                     f"side.\n"
                     f"Trade frozen at partial_close and NOT monitored further. "
-                    f"Close the residue by hand.", alert_class=alert_policy.SAFETY)
+                    f"Close the residue by hand.", paper_passthrough, alert_class=alert_policy.SAFETY)
                 return False
     else:
+        # SKIPPING THE SHORT IS ONLY SAFE IF THE SHORT IS REALLY FLAT.
+        # One `positions()` read decides this, and a missing row reads as 0 --
+        # so an unconfirmed skip here walks straight into Step 2 and sells the
+        # hedge off a live short. Corroborate before believing it.
+        if not dry_run and not _short_is_confirmed_flat(
+                kite, short_sym, short_present, trade):
+            log(f"\n  *** REFUSING TO CLOSE — the SHORT leg cannot be "
+                f"confirmed flat ***")
+            log(f"  {short_sym} is absent from the positions response. "
+                f"Selling the long now could leave a NAKED SHORT.")
+            if not dry_run:
+                store.recover_closing_trade(trade['id'])
+            _human_escalation(
+                f"{label} {stock}: {reason} close ABORTED — {short_sym} is "
+                f"missing from the broker's positions response, so this "
+                f"engine cannot prove the short leg is flat. Nothing was "
+                f"placed and the long was NOT sold; the trade stays open and "
+                f"monitoring continues. Check the position in Kite.",
+                paper_passthrough, alert_class=alert_policy.SAFETY)
+            return 'ABORT'
         log(f"\n  SHORT leg {short_sym} already flat/long (qty={short_qty}). Skipping BUY.")
 
     # ── Step 2: Close LONG leg (SELL) — only if still long ───────────────
@@ -4088,7 +4294,8 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             urgent=long_urgent,
             context=_order_ctx(trade, reason, 'long', label, book=book),
             attempts=1 if recovery else None,
-            allow_pay_through=(recovery_urgent if recovery else True)
+            allow_pay_through=(recovery_urgent if recovery else True),
+            paper_passthrough=paper_passthrough,
         )
 
         if not long_result or long_result['status'] not in ('COMPLETE', 'PARTIAL'):
@@ -4107,8 +4314,9 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                     and not short_closed_now):
                 log(f"\n  NORMAL close abort: long leg not tradeable/fillable, nothing filled.")
                 log(f"  Trade stays OPEN — trigger re-arms on the next reliable poll.")
-                send_telegram(f"{label} {stock}: {reason} close aborted — long-leg book not "
-                              f"tradeable. Trade still open, monitoring continues.")
+                _human_escalation(f"{label} {stock}: {reason} close aborted — long-leg book not "
+                                  f"tradeable. Trade still open, monitoring continues.",
+                                  paper_passthrough)
                 if not dry_run:
                     store.recover_closing_trade(trade['id'])
                 return 'ABORT'
@@ -4122,7 +4330,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
             log(f"!!! Short is closed - naked long remains           !!!")
             log(f"!!! Close {long_sym} manually (SELL {actual_close_qty}) !!!")
             log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            send_telegram(msg)
+            _human_escalation(msg, paper_passthrough)
             if not dry_run:
                 store.set_trade_status(
                     trade['id'], 'partial_close',
@@ -4152,7 +4360,8 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                 log(f"  RETRY: closing the {remaining} qty residual (urgent)")
                 retry = close_leg(kite, exchange, long_sym, "SELL", remaining,
                                   is_buy=False, dry_run=dry_run, urgent=True,
-                                  context=_order_ctx(trade, reason, 'long-retry', label, book=book))
+                                  context=_order_ctx(trade, reason, 'long-retry', label, book=book),
+                                  paper_passthrough=paper_passthrough)
                 got = retry.get('filled_quantity', 0) if retry else 0
                 remaining -= got
                 log(f"  RETRY filled {got}; {remaining} still long")
@@ -4175,7 +4384,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                         close_failure=_close_failure(
                             cause='unfilled', leg='long', reason=reason))
                     reconcile_after_close(kite, trade, label, store=store)
-                send_telegram(
+                _human_escalation(
                     f"🔴 {label} {stock}: PARTIAL LONG CLOSE\n"
                     f"{remaining} of {close_qty} qty still LONG on {long_sym} "
                     f"after an urgent retry.\n"
@@ -4183,7 +4392,7 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                     f"residue is a live option and NOTHING was booked: the "
                     f"P&L would have been computed on the full quantity.\n"
                     f"Trade frozen at partial_close and NOT monitored further. "
-                    f"Sell the residue by hand.", alert_class=alert_policy.SAFETY)
+                    f"Sell the residue by hand.", paper_passthrough, alert_class=alert_policy.SAFETY)
                 return False
     else:
         log(f"\n  LONG leg {long_sym} already flat/short (qty={long_qty}). Skipping SELL.")
@@ -6088,6 +6297,59 @@ def update_trail(ts: dict, spread_val: float) -> bool:
     return True
 
 
+def persist_trail(store, trade: dict, ts: dict, dry_run: bool,
+                  label: str = '') -> bool:
+    """Write the trail peak/level to the book -- unless this engine owns nothing.
+
+    THE DEFECT (found 2026-08-31). Both trail call sites persisted
+    unconditionally, so under today's `--dry-run` crontab this engine wrote
+    `trail_active` / `trail_peak` / `trail_sl` straight into `zebra_trades.json`
+    (and on to Drive) for every cohort record it watched. That is the exact
+    thing `tp_armed` refuses to do six thousand lines up, for the reason stated
+    there: "a dry run mutating the live cohort record would be this engine
+    arming a trigger it is not allowed to pull." The take-profit latch got the
+    guard; the trail -- which is a STOP level -- did not.
+
+    Two separate harms, both real:
+
+      * `--dry-run` is supposed to write nothing. The evidence week's whole
+        product is a comparison between what this engine WOULD have done and
+        what zebra did; an engine that edits the book it is being compared
+        against is not shadowing it.
+      * The values are on the WRONG BASIS. This engine measures a spread at the
+        fill (long bid - short ask); zebra's cohort book is mid-basis. Writing
+        a fill-basis peak into a mid-basis record moves that record's stop
+        level underneath it, and `pricing_basis` is stamped at entry precisely
+        because it must never change under an open position.
+
+    The in-memory `ts` is still updated by the caller either way -- this engine
+    keeps reasoning and logging normally, it just does not get to write.
+
+    Returns True if the values were actually persisted.
+    """
+    tid, stock = trade.get('id'), trade.get('stock')
+    if dry_run or _record_says_paper(trade):
+        log(f"  {label} #{tid} {stock}: trail peak={ts['peak']:.2f} "
+            f"level={ts['trail']:.2f} NOT written "
+            f"({'dry run' if dry_run else 'paper record'}); the engine that "
+            f"owns this record's exits keeps its own trail.")
+        return False
+    if store is None:
+        log(f"  {label} #{tid} {stock}: no store to persist the trail — the "
+            f"level is in memory only and dies with this process.")
+        return False
+    try:
+        store.update_trade_fields(tid, trail_active=True,
+                                  trail_peak=ts['peak'], trail_sl=ts['trail'])
+        return True
+    except Exception as e:
+        # Not fatal this poll: `ts` still holds the level, so the trail keeps
+        # working until the process restarts. What is lost is durability.
+        log(f"  {label} #{tid} {stock}: TRAIL WRITE FAILED ({e}) — the level "
+            f"is in memory only and will not survive a restart.")
+        return False
+
+
 def new_blind_state() -> dict:
     # 'alerted' is what makes recovery announceable. 'since' is set on the
     # FIRST failed poll, long before the escalation clock says anything, so
@@ -6392,6 +6654,8 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
 
     last_status_time = 0
     consecutive_errors = 0
+    #: One Telegram per session when the kill switch trips, not one per poll.
+    kill_switch_announced = False
 
     while True:
         try:
@@ -6406,6 +6670,29 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
                 log(f"Market not open yet ({now_t.strftime('%H:%M')}). Waiting...")
                 time.sleep(30)
                 continue
+
+            # ── THE KILL SWITCH, RE-READ EVERY POLL ─────────────────────
+            #
+            # `trading_enabled` had exactly two call sites -- `monitor_all`
+            # and `recovery_gate` -- so the single-trade CLI
+            # (`python -m bcs.spread_monitor ICICIBANK`, which is documented
+            # and used) went on placing real orders after the switch was
+            # tripped. Its own docstring promises the opposite: "Read on EVERY
+            # poll... what makes this an actual stop button." A stop button
+            # that works in one of the two entrypoints is not a stop button.
+            if not dry_run and not trading_enabled():
+                dry_run = True
+                log("KILL SWITCH: trading.enabled=false — forcing DRY RUN for "
+                    "the rest of this session. The position is still watched "
+                    "and alerted; no orders will be placed.")
+                if not kill_switch_announced:
+                    kill_switch_announced = True
+                    send_telegram(
+                        f"⛔ BCS MONITOR DISARMED ({stock})\n"
+                        "trading.enabled=false. The position is still watched "
+                        "and alerted, but NO EXIT ORDERS WILL BE PLACED — you "
+                        "must close by hand.\nRe-arm: set it back to true and "
+                        "restart the monitor.", alert_class=alert_policy.SAFETY)
 
             # Periodic Drive sync (picks up manual trade edits)
             store.maybe_sync()
@@ -6477,8 +6764,7 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
                         log(f"     Peak: {ts['peak']:.2f} | Trail level: {ts['trail']:.2f}")
                     else:
                         log(f"  ** TRAIL UPDATED ** Peak: {ts['peak']:.2f} | Trail: {ts['trail']:.2f}")
-                    store.update_trade_fields(trade['id'], trail_active=True,
-                                              trail_peak=ts['peak'], trail_sl=ts['trail'])
+                    persist_trail(store, trade, ts, dry_run, label='BCS')
                 elif ts['cand_count'] > 0:
                     log(f"  Trail peak candidate {spread_val:.2f} held "
                         f"(confirm {ts['cand_count']}/{SL_CONFIRM_POLLS})")
@@ -8041,8 +8327,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                         if update_trail(ts, spread_val):
                             verb = "TRAIL UPDATED" if was_active else "TRAIL ENGAGED"
                             log(f"  {strat} #{tid} {stock} ** {verb} ** peak={ts['peak']:.2f} | trail={ts['trail']:.2f}")
-                            trade_store.update_trade_fields(tid, trail_active=True,
-                                                            trail_peak=ts['peak'], trail_sl=ts['trail'])
+                            persist_trail(trade_store, trade, ts, dry_run,
+                                          label=strat)
                         elif ts['cand_count'] > 0:
                             log(f"  {strat} #{tid} {stock}: trail peak candidate {spread_val:.2f} "
                                 f"held (confirm {ts['cand_count']}/{SL_CONFIRM_POLLS})")
@@ -8199,6 +8485,20 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                                 f"{spot:.2f} {op} {sl_spot_val} "
                                 f"(confirm {n_sl}/{SL_SPOT_CONFIRM_POLLS})")
                             sl_spot_hit = False
+                    else:
+                        # SPOT RECOVERED: THE STREAK IS BROKEN.
+                        #
+                        # `monitor()` has had this since the debounce was
+                        # written (`else: confirm['sl_spot'] = 0`, "only
+                        # contiguous hits count") and `monitor_all` never got
+                        # it -- the copy nobody opened, in the entrypoint that
+                        # is the one actually running on the Pi. Without it the
+                        # counter only ever RISES, so two unrelated one-poll
+                        # dips within CONFIRM_STALE_SEC add up to a "confirmed"
+                        # stop: a debounce that certifies exactly the single
+                        # transient print it exists to reject. SL_SPREAD two
+                        # checks below already resets the same way.
+                        confirm_state[close_key]['sl_spot'] = 0
                     if sl_spot_hit:
                         op = '<=' if strat == 'BCS' else '>='
                         log(f"\n  {strat} #{tid} {stock} *** SL_SPOT HIT: {spot:.2f} {op} {sl_spot_val} "
@@ -8357,6 +8657,31 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     corrob_state.pop(close_key, None)
                     spot_blind_state.pop(close_key, None)
                     abort_until.pop(close_key, None)
+                    # A RECORD STILL `open` IS NOT CLOSING (fixed 2026-08-31).
+                    #
+                    # `closed = True` is set on every non-ABORT outcome,
+                    # including a close that FAILED. This block popped every
+                    # state dict except `closing_in_progress`, so a record the
+                    # close left untouched -- the late-day guard returns False
+                    # before taking any lock or freezing anything -- was then
+                    # skipped as "CLOSE IN PROGRESS" on every poll for the
+                    # rest of the session. Nothing was watching it, and the
+                    # log line said the opposite.
+                    #
+                    # The marker means "a close is in flight". `close_spread`
+                    # has returned, so nothing is; whether the position may be
+                    # closed again is the RECORD's business, and the store
+                    # contract already refuses `closing`, `partial_close` and
+                    # terminal states.
+                    try:
+                        still = trade_store.find(tid) if trade_store else None
+                    except Exception:
+                        still = None
+                    if still is not None and still.get('status') == 'open':
+                        closing_in_progress.pop(close_key, None)
+                        log(f"  {strat} #{tid} {stock}: the close did not move "
+                            f"the record (still open) — releasing the "
+                            f"in-progress marker so it stays monitored.")
 
             # ── M14 · frozen-close recovery ──────────────────────────
             #

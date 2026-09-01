@@ -95,9 +95,46 @@ VET_CLI = os.environ.get('ZEBRA_VET_CLI', 'claude')
 # spawn to discover.** This is not a widening: same interpreter, same module,
 # same `-m zebra` prefix, and the deny list still matches anywhere in the
 # string, so no position verb becomes reachable.
-VET_ALLOWED_TOOLS = ['WebSearch', 'WebFetch', 'Read', 'Glob', 'Grep',
-                     'Bash({python} -m zebra:*)',
-                     'Bash({python_rel} -m zebra:*)']
+#: The zebra verbs a spawned agent may run, and nothing else.
+#
+# THIS USED TO BE `-m zebra:*` — one prefix covering EVERY verb the package
+# has, with the deny list as the only thing standing between an agent and the
+# position verbs. Two problems with leaning on the deny list here, both found
+# 2026-08-31:
+#
+#   * DENY IS BY TEXT AND TEXT IS QUOTABLE. `Bash(*zebra close*)` is a glob
+#     over the literal command string, so `-m zebra "close" 455` matches none
+#     of the deny rules while still matching the allow prefix. The agent does
+#     live web research by design (WebSearch/WebFetch are granted), so the
+#     input that would type that is not hypothetical.
+#   * THE PREFIX ALSO COVERED THE MODULE FORM. `-m zebra.restore_snapshot`
+#     starts with `-m zebra`, and that module REWRITES THE BOOK. It appears in
+#     no deny rule at all.
+#
+# So the allow list is now the boundary, and it is an ALLOWLIST OF VERBS —
+# the same shape, and for the same reason, as `log_cleanup`'s allowlist and
+# `outcomes.STOP_KINDS`: "is this one of the things I do" is a closed
+# question, "is this dangerous" needs every dangerous spelling that will ever
+# exist. The deny list stays as defence in depth.
+#
+# EVERY VERB HERE IS EITHER READ-ONLY OR THE CHANNEL'S OWN FINISHING WRITE.
+# `test_the_agent_can_run_every_verb_its_prompts_ask_for` pins this list
+# against the prompts and VETTING.md, because an allow rule that does not
+# match is INDISTINGUISHABLE from a broken agent — it prints an approval
+# request into a log nobody reads live and exits 0 with the work undone. That
+# silent shape has already cost this grant three separate fixes; a missing
+# verb must fail in the suite, not on the Pi.
+_VET_VERBS = [
+    'vet show', 'vet decide', 'vet exit',      # the vetting channel itself
+    'quote',                                   # the live re-quote (read-only)
+    'review show', 'review record',            # position review
+    'postmortem show', 'postmortem record',    # post-mortems
+]
+VET_ALLOWED_TOOLS = (
+    ['WebSearch', 'WebFetch', 'Read', 'Glob', 'Grep']
+    + ['Bash({python} -m zebra %s:*)' % v for v in _VET_VERBS]
+    + ['Bash({python_rel} -m zebra %s:*)' % v for v in _VET_VERBS]
+)
 # The calendar agent builds a candidate JSON file before installing it — and
 # that is ALL it may write. An unscoped `Write` made vet.py's stated invariant
 # ("Claude NEVER writes the store directly ... the vetting layer physically
@@ -141,6 +178,24 @@ _EVENT_CANDIDATE_REL = EVENT_CANDIDATE_FILE.relative_to(PROJECT_ROOT).as_posix()
 EVENT_EXTRA_TOOLS = [
     'Edit({})'.format(_EVENT_CANDIDATE_REL),                 # cwd-relative
     'Edit(//{})'.format(EVENT_CANDIDATE_FILE.as_posix().lstrip('/')),  # absolute
+    # AND THE VERB THAT INSTALLS IT (added 2026-09-01).
+    #
+    # The DENY side of this was already correct: `_denied_tools` strips
+    # `events replace` for the events channel alone, which is the only way to
+    # say "everybody except the agent whose job this is" when deny beats
+    # allow. What carried the ALLOW side was the blanket `-m zebra:*` prefix,
+    # so narrowing that prefix to a verb allowlist on 2026-08-31 silently took
+    # this verb away from the one channel entitled to it -- and the failure
+    # would have been the quiet kind: the agent researches, writes its
+    # candidate, and is refused at the last step, leaving `adjustment_today`
+    # (the interlock that suspends automated exits on a bonus or split day)
+    # reading a calendar nobody refreshed.
+    #
+    # Scoped to the events channel, like the Edit rules above. The separate
+    # `--allow-empty` hazard is refused inside `cmd_events_replace` by
+    # channel: an agent may REFRESH the calendar and may not EMPTY it.
+    'Bash({python} -m zebra events replace:*)',
+    'Bash({python_rel} -m zebra events replace:*)',
 ]
 # The five position VERBS, plus the four verbs that CALL them. Denying only
 # the explicit verbs left the invariant above false: `zebra run` was granted by
@@ -165,12 +220,23 @@ EVENT_EXTRA_TOOLS = [
 #   channel could blank a safety input and re-stamp it "fresh". Denied for
 #   everyone here and granted back to the events channel alone via
 #   EVENT_EXTRA_TOOLS, which is how per-channel scoping already works.
+#
+# DEFENCE IN DEPTH ONLY, since 2026-08-31. These are globs over the literal
+# command text, so quoting evades every one of them (`zebra "close"`), and a
+# deny list can never be the boundary for that reason. `VET_ALLOWED_TOOLS`
+# above is the boundary; this stays because two independent refusals are
+# better than one, and because it documents the intent.
+#
+# `restore_snapshot` and the bare MODULE FORM are named explicitly: the old
+# `-m zebra:*` allow covered `-m zebra.restore_snapshot`, which rewrites the
+# trade book, and it appeared in no deny rule.
 VET_DENIED_TOOLS = ['Bash(*zebra close*)', 'Bash(*zebra enter*)',
                     'Bash(*zebra cancel*)', 'Bash(*zebra reset*)',
                     'Bash(*zebra trigger*)',
                     'Bash(*zebra run*)', 'Bash(*zebra loop*)',
                     'Bash(*zebra scan*)', 'Bash(*zebra report*)',
-                    'Bash(*postmortem run*)', 'Bash(*events replace*)']
+                    'Bash(*postmortem run*)', 'Bash(*events replace*)',
+                    'Bash(*restore_snapshot*)', 'Bash(*-m zebra.*)']
 
 # VET_MODEL, VET_TIMEOUT_SEC and CHILD_KILL_SEC are exported further down —
 # they read zebra_config.json, which is not loaded yet at this point.
@@ -195,10 +261,19 @@ VET_PROMPT_TEMPLATE = (
 )
 VETTING_DOC = SCRIPT_DIR / 'VETTING.md'
 # How many times Claude may defer one exit before the human is asked. Two
-# deferrals is ~10 min of re-checks with fresh quotes. Past that we do NOT fall
-# through to the deterministic trigger: every structure here is hedged with max
-# loss = debit known at entry, so HOLDING is bounded while exiting on a bad
-# print is not (NHPC). The conservative direction is to hold and escalate.
+# deferrals is ~10 min of re-checks with fresh quotes. Past that the exit does
+# not fire on the deferral alone: every structure here is hedged with max loss
+# = debit known at entry, so holding is bounded while exiting on a bad print is
+# not (NHPC). The conservative direction is to hold and escalate.
+#
+# CORRECTED 2026-09-01: this used to say "we do NOT fall through to the
+# deterministic trigger", full stop, which `exit_vet_max_hold_sec` has
+# contradicted since 2026-08-29. The escalation buys the HUMAN TIME; it is not
+# a veto over the guards. Past that budget (900s, per session) the exit
+# proceeds on the deterministic guards alone and says so loudly -- because the
+# guards had already cleared it before the agent was ever asked, and an
+# unbounded hold inverts that (ASHOKLEY #390: -50% to -75% over three cycles
+# on an agent that had died on quota).
 EXIT_MAX_DEFERS = 2
 EXIT_PROMPT_TEMPLATE = (
     "An EXIT trigger fired on open position {trade_id} ({exit_kind}) and the "
@@ -934,6 +1009,36 @@ def _int(key: str) -> int:
     return _positive_int(key, _runtime[key], _DEFAULTS[key])
 
 
+def _non_negative_int(key: str) -> int:
+    """`_int`, except that 0 is a MEANING here rather than a typo.
+
+    Two keys document 0 as their own disable switch -- `exit_vet_max_hold_sec`
+    ("0 disables the bound, restoring the old behaviour without a code change")
+    and `exit_vet_incycle_wait_sec` ("0 disables it"). Both CONSUMERS honour it:
+    `vet._apply_hold_budget` returns early on `if not budget` and the M12 wait
+    treats 0 as never-block.
+
+    Only the loader could not deliver it. `_positive_finite` rejects `val <= 0`
+    and substitutes the default, so an owner writing `"exit_vet_max_hold_sec":
+    0` got 900 back plus one WARNING in a cron log nobody tails -- and believed
+    every value stop now waits for a human, when in fact every one of them
+    proceeds after 15 minutes. A documented switch that silently does the
+    OPPOSITE of what it says is worse than no switch, and this one is on the
+    only loss-side exits the cohort has.
+
+    Everything else `_positive_int` refuses is still refused, for its reasons:
+    bool (an int subclass), non-numeric, NaN/inf (NaN compares False against
+    everything and would silently disarm the bound), negative, and fractional.
+    """
+    val = _runtime.get(key, _DEFAULTS[key])
+    if isinstance(val, bool) or not isinstance(val, (int, float)) \
+            or not math.isfinite(val) or val < 0 or val != int(val):
+        logger.warning("zebra_config.json: %s=%r is not a whole number >= 0 "
+                       "— using default %d", key, val, _DEFAULTS[key])
+        return int(_DEFAULTS[key])
+    return int(val)
+
+
 WATCH_GAP_MAX = _num('watch_gap_max')
 TRIGGER_GAP_MAX = _num('trigger_gap_max')
 STALE_GAP_MIN = _num('stale_gap_min')
@@ -1011,7 +1116,15 @@ assert SWING_PIVOT_BARS >= 1, "a swing needs at least one candle either side"
 assert SWING_LOOKBACK_CANDLES > SWING_PIVOT_BARS * 2, \
     "the lookback window cannot be shorter than one pivot window"
 assert ATTRACTION_HORIZON_BARS >= 1, "the return horizon must be at least 1 candle"
-SPOT_SL_ENABLED = _runtime['spot_sl_enabled']
+# `_strict_bool`, not a raw read. This switch took the value verbatim until
+# 2026-08-31, so `"spot_sl_enabled": "false"` -- or `0`, or `"no"` -- ARMED it:
+# every non-empty string is truthy. It is the one switch in this file whose OFF
+# state was decided by MEASUREMENT rather than by preference (147 records: a 3%
+# spot stop cuts 40% of winners and gives up Rs 8.9L to catch losses the debit
+# floor already caps), and it was the only money-deciding switch here still
+# reading raw while paper_mode, auto_entry and exits_managed_externally were
+# all validated. A typo must not be able to arm the money path.
+SPOT_SL_ENABLED = _strict_bool('spot_sl_enabled')
 SPOT_SL_PCT = _num('spot_sl_pct')
 DEBIT_SL_PCT = _num('debit_sl_pct')
 TIME_SL_DAYS = _int('time_sl_days_before_expiry')
@@ -1051,8 +1164,14 @@ ST_MULTIPLIER = _num('st_multiplier')
 # works without editing config; otherwise every process in the fleet reads the
 # SAME file and cannot disagree about whether the layer is on.
 _vet_env = os.environ.get('ZEBRA_VET_ENABLED', '').strip()
+# `_strict_bool` on the config side for the same reason as the switches above:
+# `bool()` reads `0`, `""` and a stray `null` as DISARM-THE-VETTING-LAYER, and
+# that is the unsafe direction here -- entry vetting fails closed only while it
+# is running at all, and with the layer off the exit gate returns `proceed`
+# unconditionally. The env override keeps its own parsing: it is a deliberate
+# one-off on a command line, not a file that a rebuild can half-write.
 VET_ENABLED = (_vet_env.lower() in ('1', 'true', 'yes') if _vet_env
-               else bool(_runtime['vet_enabled']))
+               else _strict_bool('vet_enabled'))
 
 
 #: Statuses that mean rupees and legs are live for a cohort record. `closing`
@@ -1134,8 +1253,8 @@ _log_vet_state()
 
 EXIT_VET_TTL_SEC = _int('exit_vet_ttl_sec')
 EXIT_HOLD_TTL_SEC = _int('exit_hold_ttl_sec')
-EXIT_VET_MAX_HOLD_SEC = _int('exit_vet_max_hold_sec')
-EXIT_VET_INCYCLE_WAIT_SEC = _int('exit_vet_incycle_wait_sec')
+EXIT_VET_MAX_HOLD_SEC = _non_negative_int('exit_vet_max_hold_sec')
+EXIT_VET_INCYCLE_WAIT_SEC = _non_negative_int('exit_vet_incycle_wait_sec')
 VETO_SHADOW_DAYS = _int('veto_shadow_days')
 EVENT_REFRESH_SEC = _int('event_refresh_sec')
 EVENT_HORIZON_DAYS = _int('event_horizon_days')

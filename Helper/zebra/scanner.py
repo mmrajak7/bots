@@ -246,6 +246,17 @@ def validate_and_add(store: ZebraStore, kite=None,
             'paper': True,
             'notes': f"Chartink {timeframe} {direction}-Zebra, gap={gap*100:.2f}%",
         }
+        # THE CAP IS RE-CHECKED PER ADD, not once per cycle.
+        #
+        # The guard above runs before the loop, so with `len(watching)` one
+        # short of the cap a cycle whose raw list has many qualifying
+        # candidates added ALL of them -- the limit could be exceeded by up to
+        # `len(raw) - 1` in a single scan. Watchlist-only, so no money, but
+        # `MAX_WATCHING_SIGNALS` exists to bound what the monitor re-prices
+        # every cycle and a cap that only holds between cycles is not one.
+        if len(watching) + len(added) >= cfg.MAX_WATCHING_SIGNALS:
+            skips['watch_capacity'] += 1
+            continue
         if dry_run:
             print(f"  [DRY] WATCH {stock} {timeframe} {direction} "
                   f"spot={price:.2f} ST={st_val:.2f} gap={gap*100:.2f}%")

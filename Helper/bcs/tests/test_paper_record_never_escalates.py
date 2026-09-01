@@ -251,3 +251,108 @@ def test_a_successful_rehearsal_is_passed_through_unchanged(spy, monkeypatch):
                         lambda: datetime.combine(date.today(), dtime(10, 0)))
     monkeypatch.setattr(sm, '_close_spread_inner', lambda *a, **k: True)
     assert _close(PAPER) is True
+
+
+# ── THE THIRD DOOR (found 2026-08-31, second review) ────────────────────────
+#
+# Everything above works at the `close_spread` BOUNDARY, converting its RETURN
+# VALUE. But `_close_spread_inner` and `close_leg` send their OWN Telegrams
+# from deep inside the close, long before that boundary is reached, and
+# neither had ever heard of `paper_passthrough`. So a paper record walked in
+# dry run purely to journal its intended orders could still emit, verbatim:
+#
+#   "WARNING: <stock> LONG LEG CLOSE FAILED! Short is closed. Naked long
+#    remains. Close manually: SELL <qty>"
+#
+# -- three false statements and one instruction, about a position that exists
+# at no broker. Reachable without anything exotic: the depth loop runs
+# `fresh=True` REGARDLESS of dry_run, so a rate-limit burst (70 in one day on
+# 2026-08-28) makes a leg "fail" inside a rehearsal.
+
+#: The inner close indexes `trade['exchange']`; without it the whole thing
+#: raises KeyError and every "this text is absent" assertion below passes
+#: vacuously. The REAL control is what catches that, which is its job.
+PAPER_X = dict(PAPER, exchange='NFO')
+REAL_X = dict(REAL, exchange='NFO')
+
+
+def test_a_failed_LONG_leg_on_a_paper_rehearsal_says_nothing_to_a_human(
+        spy, monkeypatch):
+    """THE DEFECT. The short 'fills' (dry stub), the long fails, and the old
+    code sent 'Close manually: SELL <qty>' for legs at no broker."""
+    monkeypatch.setattr(sm, 'now_ist',
+                        lambda: datetime.combine(date.today(), dtime(11, 0)))
+
+    def legs(kite, exchange, symbol, txn, qty, **kw):
+        if symbol == PAPER['short_symbol']:
+            return {'status': 'COMPLETE', 'filled_quantity': qty,
+                    'average_price': 1.0}
+        return None                      # the long leg cannot be closed
+    monkeypatch.setattr(sm, 'close_leg', legs)
+
+    _close(PAPER)
+
+    joined = '\n'.join(spy)
+    assert 'Close manually' not in joined, (
+        'a paper rehearsal told a human to SELL a leg that exists nowhere')
+    assert 'LONG LEG CLOSE FAILED' not in joined
+    assert 'Naked long' not in joined, (
+        'a paper rehearsal asserted a naked leg that cannot exist')
+
+
+def test_a_failed_LONG_leg_on_a_REAL_record_still_escalates(spy, monkeypatch):
+    """The negative control, and the one that matters most: suppressing the
+    paper case must not suppress the real emergency it was written for."""
+    monkeypatch.setattr(sm, 'now_ist',
+                        lambda: datetime.combine(date.today(), dtime(11, 0)))
+
+    def legs(kite, exchange, symbol, txn, qty, **kw):
+        if symbol == REAL['short_symbol']:
+            return {'status': 'COMPLETE', 'filled_quantity': qty,
+                    'average_price': 1.0}
+        return None
+    monkeypatch.setattr(sm, 'close_leg', legs)
+
+    _close(REAL_X, dry_run=True)
+
+    joined = '\n'.join(spy)
+    assert 'LONG LEG CLOSE FAILED' in joined, (
+        'a real record with a failed long leg went unannounced')
+
+
+def test_the_guard_suppresses_only_when_passthrough_is_set():
+    """`_human_escalation` in isolation, both directions."""
+    sent = []
+    import bcs.spread_monitor as m
+    real_send = m.send_telegram
+    try:
+        m.send_telegram = lambda msg, *a, **k: sent.append(msg)
+        assert m._human_escalation('go and trade', paper_passthrough=True) is False
+        assert sent == []
+        assert m._human_escalation('go and trade', paper_passthrough=False) is True
+        assert sent == ['go and trade']
+    finally:
+        m.send_telegram = real_send
+
+
+def test_every_escalation_inside_the_inner_close_is_routed_through_the_guard():
+    """The rule is at the SOURCE, but the inner close has its own sends and
+    they are the ones that were missed. Pins that none of them regressed to a
+    bare `send_telegram` that cannot know about the passthrough.
+
+    RETIRES WHEN: `_close_spread_inner` no longer sends Telegrams itself --
+    i.e. it returns a structured outcome and `close_spread` does all the
+    talking, which is the change that makes the boundary genuinely single.
+    """
+    import inspect
+    src = inspect.getsource(sm._close_spread_inner)
+    bare = [l.strip() for l in src.splitlines()
+            if 'send_telegram(' in l and '_human_escalation' not in l]
+    # The trigger and close alerts are allowed: they route through
+    # `alert_policy` and are already paper-aware.
+    allowed = ('trigger_alert_text', 'close_alert_text', 'already flat')
+    leaked = [l for l in bare if not any(a in l for a in allowed)]
+    assert not leaked, (
+        'these escalations bypass the paper-passthrough guard and can tell a '
+        'human to trade a position that exists at no broker:\n  '
+        + '\n  '.join(leaked))

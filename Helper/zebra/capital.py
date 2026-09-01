@@ -139,8 +139,15 @@ def limits(trades: List[dict]) -> Limits:
         max_open=cfg.MAX_OPEN_TRADES,
         max_per_stock=cfg.MAX_OPEN_PER_STOCK,
         max_lots=lots_for_capital(cap),
-        max_trade=(cap * cfg.MAX_TRADE_PCT / 100.0) if cap > 0 else None,
-        max_deployed=(cap * cfg.MAX_DEPLOYED_PCT / 100.0) if cap > 0 else None,
+        # A BANKRUPT BOOK IS LIMITED TO ZERO, NOT TO UNLIMITED. `check()`
+        # SKIPS any limit that is None, so resolving these to None on
+        # `cap <= 0` removed both rupee caps at exactly the moment they should
+        # bind hardest. Reachable with COMPOUND on once realised net losses
+        # (fees included) reach the base. `lots_for_capital` floors at 1 and
+        # its docstring assumes "a book below one unit of capital should be
+        # refused by the RUPEE limits" -- the limits that had just vanished.
+        max_trade=(cap * cfg.MAX_TRADE_PCT / 100.0) if cap > 0 else 0.0,
+        max_deployed=(cap * cfg.MAX_DEPLOYED_PCT / 100.0) if cap > 0 else 0.0,
     )
 
 
@@ -379,6 +386,13 @@ def plan(trades: List[dict], candidate: dict,
     # Depth absent is NOT depth unlimited. It is the same class as an
     # unpriceable candidate, and the same answer: take the smallest size that
     # is certainly executable rather than assume the book is deep.
+    #
+    # `depth is None` is a DIFFERENT case, kept deliberately: a caller that
+    # never had depth to give must not be capped at 1 lot by a limit it was
+    # never measured against (`test_no_depth_argument_at_all_leaves_liquidity_
+    # out_of_it`). The distinction only holds while callers honour it, which
+    # is why `zebra/monitor.py` now passes `{}` — "I looked and the book said
+    # nothing" — rather than None.
     elif depth is not None:
         bounds['liquidity_unknown'] = 1
 

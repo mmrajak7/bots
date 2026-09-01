@@ -99,6 +99,44 @@ def findings(path: Path):
     return hits
 
 
+def gated_lines(path: Path):
+    """Line numbers sitting inside an explicit opt-in gate.
+
+    THE DEFECT THIS CLOSES (found 2026-08-31). The exemption used to be
+    `DECLARATION in text or GUARDED.search(text)` -- both scoped to the whole
+    FILE. So one gate anywhere exempted every destructive verb in the script,
+    and `deploy_server.sh` passed this suite while rewriting the crontab,
+    pkill-ing processes and `rm -f`-ing lock files unconditionally, purely
+    because a `--reset` flag guarded something else entirely. The test
+    certified consideration that never happened, which is the exact failure
+    mode the module docstring above names.
+
+    Best-effort bash block tracking: `if`/`case` open a level, `fi`/`esac`
+    close one, `elif`/`else` do neither. When the line that OPENS a level
+    matches `GUARDED`, every line until that level closes counts as gated.
+
+    Deliberately biased toward STRICT: anything this cannot confidently place
+    inside a gate is reported as ungated, and the only cost of being wrong in
+    that direction is one sentence of documentation.
+    """
+    gated, depth, gate_depths = set(), 0, []
+    for i, raw in enumerate(path.read_text(encoding='utf-8',
+                                           errors='replace').splitlines(), 1):
+        code = raw.split('#', 1)[0]
+        stripped = code.strip()
+        if re.match(r'(?:if|case)\b', stripped):
+            depth += 1
+            if GUARDED.search(code):
+                gate_depths.append(depth)
+        if gate_depths:
+            gated.add(i)
+        if re.match(r'(?:fi|esac)\b', stripped):
+            if gate_depths and gate_depths[-1] == depth:
+                gate_depths.pop()
+            depth = max(0, depth - 1)
+    return gated
+
+
 SCRIPTS = tracked_scripts()
 
 
@@ -125,7 +163,12 @@ def test_a_destructive_script_is_guarded_or_declares_itself(script):
     if not hits:
         return
     text = script.read_text(encoding='utf-8', errors='replace')
-    if DECLARATION in text or GUARDED.search(text):
+    if DECLARATION in text:
+        return
+    # The gate must guard THIS verb, not merely exist somewhere in the file.
+    gated = gated_lines(script)
+    hits = [h for h in hits if h[1] not in gated]
+    if not hits:
         return
     listed = '\n'.join('    line %d: %s  (%s)' % (n, ln[:70], v)
                        for v, n, ln in hits[:5])
@@ -192,3 +235,66 @@ def test_the_rule_is_written_down_where_a_script_author_will_see_it():
     assert DECLARATION in claude_md, (
         'CLAUDE.md does not document the SAFE-TO-RERUN rule, so a script '
         'author meets it for the first time as a test failure')
+
+
+def test_an_unrelated_gate_does_not_exempt_the_whole_file(tmp_path):
+    """THE NEGATIVE CONTROL for the 2026-08-31 tightening.
+
+    The exemption was file-scoped: `GUARDED.search(text)` anywhere meant every
+    destructive verb in the script was excused. This is that shape exactly --
+    a flag gate around something harmless, and an ungated `rm -rf` well away
+    from it. It must FAIL, or the rule certifies consideration that never
+    happened.
+    """
+    script = tmp_path / 'unrelated_gate.sh'
+    script.write_text('\n'.join([
+        '#!/bin/bash',
+        'if [ "${1:-}" = "--verbose" ]; then',
+        '    echo "chatty"',
+        'fi',
+        'rm -rf /home/trustit/Desktop/BOTS/Helper/logs',
+    ]) + '\n', encoding='utf-8')
+    hits = findings(script)
+    assert hits, 'the rm -rf must be detected at all'
+    assert not (set(n for _, n, _ in hits) & gated_lines(script)), (
+        'the rm -rf sits outside the --verbose gate and must not count as '
+        'gated -- that is the whole defect')
+
+
+def test_a_verb_actually_inside_its_gate_is_still_exempt(tmp_path):
+    """The other direction: the tightening must not make the rule unusable.
+
+    A destructive step that really is behind its own opt-in flag needs no
+    declaration, exactly as before.
+    """
+    script = tmp_path / 'properly_gated.sh'
+    script.write_text('\n'.join([
+        '#!/bin/bash',
+        'if [ "${1:-}" = "--reset" ]; then',
+        '    rm -rf /tmp/scratch',
+        'fi',
+    ]) + '\n', encoding='utf-8')
+    hits = findings(script)
+    assert hits, 'the rm -rf must be detected at all'
+    assert all(n in gated_lines(script) for _, n, _ in hits), (
+        'a verb inside its own gate must still be exempt, or every gated '
+        'script now needs boilerplate'
+    )
+
+
+def test_the_deploy_script_declares_itself_rather_than_borrowing_a_gate():
+    """`deploy_server.sh` rewrites the crontab and `rm -f`s lock files at the
+    top level, nowhere near the `--reset` gate. Before the tightening it
+    passed on that gate alone. It must now carry the sentence.
+
+    RETIRES WHEN: `deploy_server.sh` no longer writes the crontab or clears
+    lock files itself -- i.e. provisioning moves out of the repo being pulled,
+    which is the same change that retires `test_no_tracked_script_deletes_itself`.
+    """
+    p = HELPER / 'zebra' / 'deploy_server.sh'
+    if not p.exists():
+        pytest.skip('deploy_server.sh is gone')
+    text = p.read_text(encoding='utf-8', errors='replace')
+    assert DECLARATION in text, (
+        'deploy_server.sh has ungated destructive steps and must say in one '
+        'sentence why a second run destroys nothing')

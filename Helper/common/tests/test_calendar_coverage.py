@@ -264,3 +264,67 @@ def test_a_broken_coverage_check_cannot_stop_the_cycle():
     src = inspect.getsource(monitor.run_cycle)
     i = src.index('_alert_calendar_coverage')
     assert 'except Exception' in src[i:i + 400]
+
+
+# ── an unknown refresh date is not a fresh one (found 2026-08-31) ──────────
+#
+# `_read` swallows a `_last_updated` that `date.fromisoformat` rejects and
+# leaves `updated=None`. The stale branch was guarded on `updated is not None`,
+# so a missing or reshaped timestamp -- the scraper starting to write
+# `2026-08-31T06:00:00`, or epoch millis, or the key being dropped -- SKIPPED
+# the staleness check entirely and fell through to `ok` with "refreshed
+# unknown", FOREVER. The one detector that says the daily scrape has died was
+# disarmed by the very field it reads.
+#
+# It degrades to `stale` because that is what it cannot be distinguished from,
+# and because the error points the money-losing way: a holiday declared since
+# the last real refresh is unknown here, which over-estimates the sessions
+# remaining and fires every delivery close LATER, into the margin ramp.
+
+def test_a_MISSING_last_updated_is_stale_not_ok(calendar):
+    calendar(_year(TODAY.year, updated=None,
+                   dates=('-10-02', '-12-25')))
+    st = h.coverage_status(today=TODAY)
+    assert st['state'] == 'stale', st
+    assert 'NO KNOWN AGE' in st['detail']
+
+
+def test_an_UNPARSEABLE_last_updated_is_stale_not_ok(calendar):
+    """The realistic shape: the scraper starts emitting a full timestamp."""
+    calendar(_year(TODAY.year, updated='2026-08-30T06:00:00',
+                   dates=('-10-02', '-12-25')))
+    st = h.coverage_status(today=TODAY)
+    assert st['state'] == 'stale', st
+
+
+def test_epoch_millis_are_also_stale(calendar):
+    calendar(_year(TODAY.year, updated=1756500000000,
+                   dates=('-10-02', '-12-25')))
+    assert h.coverage_status(today=TODAY)['state'] == 'stale'
+
+
+def test_a_GOOD_timestamp_still_reads_ok(calendar):
+    """The negative control. The real file on the box carries a plain
+    `YYYY-MM-DD`, so this must not start alarming on a healthy calendar."""
+    calendar(_year(TODAY.year, updated=TODAY.isoformat(),
+                   dates=('-10-02', '-12-25')))
+    st = h.coverage_status(today=TODAY)
+    assert st['state'] == 'ok', st
+    assert TODAY.isoformat() in st['detail']
+
+
+def test_the_ok_detail_never_says_unknown_again(calendar):
+    """`ok` used to be able to report `refreshed unknown`, which is a state it
+    has no business being in: freshness unknown is not freshness fine."""
+    calendar(_year(TODAY.year, updated=TODAY.isoformat(),
+                   dates=('-10-02', '-12-25')))
+    assert 'unknown' not in h.coverage_status(today=TODAY)['detail']
+
+
+def test_a_genuinely_old_timestamp_is_still_stale(calendar):
+    """The pre-existing behaviour must survive the new branch above it."""
+    old = (TODAY - timedelta(days=h.STALE_DAYS + 5)).isoformat()
+    calendar(_year(TODAY.year, updated=old, dates=('-10-02', '-12-25')))
+    st = h.coverage_status(today=TODAY)
+    assert st['state'] == 'stale'
+    assert old in st['detail'], 'the real refresh date must still be named'

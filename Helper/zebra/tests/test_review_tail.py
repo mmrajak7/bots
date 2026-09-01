@@ -96,7 +96,15 @@ def test_paper_retries_a_triggered_signal_that_never_entered():
     trigger band, never retried, released only by a drift/stale cancel."""
     import inspect
     from zebra import monitor
-    body = inspect.getsource(monitor.check_watching)
+    # Indentation-INSENSITIVE. A fixed character window over raw source
+    # measures whitespace as well as code: when `check_watching`'s loop body
+    # gained a fault-isolation `try` on 2026-08-31, four spaces a line pushed
+    # `RETRY` past the window and both of these went red without anything
+    # about the retry path having changed. Stripping per line keeps the order
+    # -- which is what these two actually assert about -- and drops the depth.
+    body = chr(10).join(
+        l.strip() for l
+        in inspect.getsource(monitor.check_watching).splitlines())
     at = body.index("if trade['status'] == 'triggered':")
     window = body[at:at + 1400]
     assert 'if not cfg.PAPER_MODE:' in window, \
@@ -109,7 +117,15 @@ def test_live_still_stops_at_the_ticket():
     re-alerting every 5 minutes is noise, not recovery."""
     import inspect
     from zebra import monitor
-    body = inspect.getsource(monitor.check_watching)
+    # Indentation-INSENSITIVE. A fixed character window over raw source
+    # measures whitespace as well as code: when `check_watching`'s loop body
+    # gained a fault-isolation `try` on 2026-08-31, four spaces a line pushed
+    # `RETRY` past the window and both of these went red without anything
+    # about the retry path having changed. Stripping per line keeps the order
+    # -- which is what these two actually assert about -- and drops the depth.
+    body = chr(10).join(
+        l.strip() for l
+        in inspect.getsource(monitor.check_watching).splitlines())
     at = body.index("if trade['status'] == 'triggered':")
     window = body[at:at + 1400]
     assert window.index('if not cfg.PAPER_MODE:') < window.index('RETRY'), \

@@ -15,6 +15,7 @@ Commands:
 
 import argparse
 import logging
+import os
 import sys
 
 
@@ -473,6 +474,25 @@ def cmd_events_replace(args):
         print(f"cannot read {args.file}: {e}")
         return 1
     rows = payload.get('events') if isinstance(payload, dict) else payload
+    # AN AGENT MAY REFRESH THE CALENDAR; IT MAY NOT EMPTY IT.
+    #
+    # `--allow-empty` refreshes `refreshed_at` while installing zero events,
+    # so the calendar reads HEALTHY to `is_stale()` while `adjustment_today`
+    # -- the corporate-action interlock that suspends automated exits on a
+    # bonus/split day -- sees nothing. That is the "a default that looks like
+    # a value" shape aimed at a safety input, and it is the whole reason this
+    # verb was globally denied. Denying it also made the calendar unwritable
+    # by its own channel, so the interlock read a file nobody maintained.
+    #
+    # The verb is now granted to the events channel and the DANGEROUS HALF is
+    # refused here instead: a genuinely empty window is a human's call.
+    if getattr(args, 'allow_empty', False) and os.environ.get(
+            'ZEBRA_AGENT_CHANNEL'):
+        print('refused: --allow-empty is not available to a spawned agent. '
+              'An empty calendar silences the corporate-action interlock '
+              'while reading as freshly refreshed. If the window genuinely '
+              'has no events, install it by hand.')
+        return 1
     try:
         # `replace()` refuses an empty install by default and tells the caller
         # to pass allow_empty — which the CLI did not expose, so the escape

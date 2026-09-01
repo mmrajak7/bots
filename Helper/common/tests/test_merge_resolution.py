@@ -167,3 +167,191 @@ def test_the_bcs_family_vocabulary_works_too():
     winner, note = sc.resolve_merge(local_closed, stale_open,
                                     sc.BCS_FAMILY_STATUSES)
     assert winner is local_closed and note
+
+
+# -- the same rule, the other way round (found 2026-08-31, second review) ----
+#
+# `base` is not "the local disk" and not "the closed one" -- it is whichever
+# side the caller passed first. The monotonic-close rule was written from the
+# incident, which arrived with the closed copy as base, and so it only ever
+# fired in that direction. Swap the arguments and the identical fault sailed
+# through plain version resolution with no note.
+
+def test_a_booked_exit_arriving_as_INCOMING_also_survives():
+    """The mirror of the money case. Pre-fix: base won, exit DISCARDED."""
+    stale_local_open = _rec(status='entered', version=8)
+    drive_closed = _rec(status='exited', version=7, exit_reason='paper:tp')
+    winner, note = sc.resolve_merge(stale_local_open, drive_closed, Z)
+    assert winner is drive_closed
+    assert note and 'not undone by a version counter' in note
+
+
+def test_the_mirror_holds_at_an_equal_version_too():
+    """A tie is the commonest shape: both replicas wrote once since the sync."""
+    winner, note = sc.resolve_merge(
+        _rec(status='entered', version=7),
+        _rec(status='exited', version=7), Z)
+    assert winner['status'] == 'exited' and note is not None
+
+
+def test_the_mirror_speaks_the_bcs_vocabulary_as_well():
+    """Three of the four books say open/closed. The rule is stated once."""
+    winner, note = sc.resolve_merge(
+        _rec(status='open', version=9), _rec(status='closed', version=8),
+        sc.BCS_FAMILY_STATUSES)
+    assert winner['status'] == 'closed' and note is not None
+
+
+def test_the_mirror_does_NOT_undo_a_snapshot_restore():
+    """`rebuild` sets version = max+1, so a restore is EXACTLY a non-settled
+    base at a higher version than the exit it is reversing -- which is the
+    mirror's own trigger shape. Without the marker check the mirror would
+    re-book the close the restore was run to undo."""
+    restored = _rec(status='entered', version=9,
+                    restored_from_snapshot_at='2026-08-30T09:00:00')
+    drive_closed = _rec(status='exited', version=7, exit_reason='reset')
+    winner, note = sc.resolve_merge(restored, drive_closed, Z)
+    assert winner is restored and note is None
+
+
+def test_a_restored_record_can_still_be_closed_for_real_afterwards():
+    """The marker is permanent, so it must not freeze the record forever.
+    A genuinely later close out-versions it and lands the ordinary way."""
+    restored = _rec(status='entered', version=9,
+                    restored_from_snapshot_at='2026-08-30T09:00:00')
+    real_close = _rec(status='exited', version=11, exit_reason='paper:tp')
+    winner, _ = sc.resolve_merge(restored, real_close, Z)
+    assert winner is real_close
+
+
+# -- a freeze is not walked back by a counter either -------------------------
+
+def test_partial_close_is_not_reopened_by_a_higher_version():
+    """FROZEN means legs may be live at the broker with NOTHING watching them.
+    Reopening it re-arms every auto-exit against an unknown position."""
+    frozen = _rec(status='partial_close', version=7)
+    stale_open = _rec(status='entered', version=8)
+    winner, note = sc.resolve_merge(frozen, stale_open, Z)
+    assert winner is frozen
+    assert note and 'FROZEN' in note and 'by hand' in note
+
+
+def test_a_COMPLETED_recovery_still_lands_on_a_frozen_record():
+    """The freeze is protected in ONE direction only. A recovery that ran to
+    completion on the other replica ends settled, and must propagate."""
+    frozen = _rec(status='partial_close', version=7)
+    recovered = _rec(status='exited', version=9, exit_reason='recovered')
+    winner, _ = sc.resolve_merge(frozen, recovered, Z)
+    assert winner is recovered
+
+
+# -- a cancel is settled, though the CONTRACT table has no word for it -------
+
+def test_a_cancelled_signal_is_not_resurrected_by_a_counter():
+    """`cancelled` names no role, so `role_of` returns None and version
+    resolution walked it back to `triggered` -- where it re-occupies its
+    dedup slot and can re-alert and re-enter."""
+    winner, note = sc.resolve_merge(
+        _rec(status='triggered', version=8),
+        _rec(status='cancelled', version=7), Z)
+    assert winner['status'] == 'cancelled' and note is not None
+
+
+def test_a_cancel_survives_from_the_base_side_too():
+    winner, note = sc.resolve_merge(
+        _rec(status='cancelled', version=7),
+        _rec(status='triggered', version=8), Z)
+    assert winner['status'] == 'cancelled' and note is not None
+
+
+def test_ordinary_forward_progress_is_still_silent():
+    """The guards must not turn every normal transition into an alert."""
+    winner, note = sc.resolve_merge(
+        _rec(status='watching', version=1),
+        _rec(status='triggered', version=2), Z)
+    assert winner['status'] == 'triggered' and note is None
+
+
+# -- two DIFFERENT trades wearing one id (found 2026-08-31) ------------------
+#
+# Id allocation is per-replica `max(live, sidecar) + 1`, so during a sync gap
+# -- five minutes normally, arbitrarily long in Drive-down local-only mode --
+# two machines can both mint id 15 for DIFFERENT trades. The owner
+# hand-captures BCS trades on Windows while the Pi writes the same books, so
+# the topology is supported rather than hypothetical.
+#
+# Everything else in this file then resolved them as ONE record: version
+# picked a winner and the other trade ceased to exist, described (at most) as
+# a field conflict. `partition_readable`'s duplicate-id quarantine cannot
+# help -- it only looks WITHIN one file.
+
+def _t(tid=15, **extra):
+    r = {'id': tid, 'status': 'entered', 'version': 1, 'stock': 'INFY',
+         'long_symbol': 'INFY26SEP1500CE', 'short_symbol': 'INFY26SEP1600CE'}
+    r.update(extra)
+    return r
+
+
+def test_two_different_stocks_on_one_id_are_reported():
+    """THE DEFECT. Pre-fix the higher version simply won and a real trade
+    vanished from the book with no alert."""
+    winner, note = sc.resolve_merge(
+        _t(stock='INFY'), _t(stock='TCS', version=9,
+                             long_symbol='TCS26SEP3000CE',
+                             short_symbol='TCS26SEP3200CE'), Z)
+    assert winner['stock'] == 'INFY', 'base must be kept, not out-versioned'
+    assert note and 'DIFFERENT TRADES' in note
+    assert 'Re-id one of them' in note, 'the note must say what to do'
+
+
+def test_the_same_stock_with_different_LEGS_is_a_collision_too():
+    """Same underlying, different spread. Version resolution would have picked
+    one silently."""
+    _, note = sc.resolve_merge(
+        _t(), _t(version=9, long_symbol='INFY26SEP1700CE'), Z)
+    assert note and 'DIFFERENT TRADES' in note
+
+
+def test_an_ordinary_version_bump_is_still_silent():
+    """The negative control, and the one that matters most: every normal
+    update shares an id by design."""
+    winner, note = sc.resolve_merge(_t(version=2), _t(version=5), Z)
+    assert winner['version'] == 5 and note is None
+
+
+def test_a_field_ABSENT_on_one_side_is_not_a_collision():
+    """"Cannot tell" must not read as "different". An older record missing
+    `entry_date` is not a collision with its own newer copy."""
+    winner, note = sc.resolve_merge(
+        _t(version=2), _t(version=5, entry_date='2026-08-14'), Z)
+    assert winner['version'] == 5 and note is None
+
+
+def test_identity_ignores_fields_that_MOVE():
+    """Status, version and fills change over a record's life; comparing them
+    would call every ordinary update a different trade."""
+    winner, note = sc.resolve_merge(
+        _t(version=2, status='entered'),
+        _t(version=5, status='exited', exit_debit=12.0), Z)
+    assert winner['status'] == 'exited' and note is None
+
+
+def test_the_fallen_hero_legs_are_checked_too():
+    """One function serves all four books, so identity spans both leg
+    vocabularies."""
+    a = {'id': 3, 'status': 'open', 'version': 1, 'stock': 'X',
+         'long_put_symbol': 'X26SEP100PE'}
+    b = {'id': 3, 'status': 'open', 'version': 8, 'stock': 'X',
+         'long_put_symbol': 'X26SEP200PE'}
+    _, note = sc.resolve_merge(a, b, sc.BCS_FAMILY_STATUSES)
+    assert note and 'DIFFERENT TRADES' in note
+
+
+def test_a_collision_is_reported_before_anything_else_resolves_it():
+    """The check runs FIRST, so a collision cannot be masked by the settled or
+    frozen rules deciding the record on other grounds."""
+    _, note = sc.resolve_merge(
+        _t(status='exited', version=7, stock='INFY'),
+        _t(status='entered', version=9, stock='TCS',
+           long_symbol='TCS26SEP3000CE'), Z)
+    assert note and 'DIFFERENT TRADES' in note

@@ -255,6 +255,26 @@ def open_leg(kite, exchange: str, symbol: str, is_buy: bool, qty: int,
         # stops the run and is reported as UNKNOWN, which the caller must not
         # describe as "nothing extra held".
         status = str((final or {}).get('status', '')).upper()
+        # A REJECTED ORDER IS RETRIED, AND THAT CONTRADICTS THE PROJECT'S
+        # OWN ERROR TABLE. Flagged 2026-09-01, deliberately NOT changed here.
+        #
+        # `status in _TERMINAL_ORDER_STATUS and status != 'COMPLETE'` admits
+        # REJECTED, so attempt 2 places a second order after an RMS,
+        # price-band or margin refusal. CLAUDE.md's error table says "Order
+        # rejected -> log error, do NOT retry automatically".
+        #
+        # BOTH readings are defensible and the choice is the owner's:
+        #   * retry -- `open_leg` RE-QUOTES and re-prices on each attempt, so a
+        #     price-band rejection at a stale limit is genuinely retryable, and
+        #     one-lot-at-a-time re-pricing is this path's whole design;
+        #   * refuse -- margin and RMS rejections are deterministic and the
+        #     second order fails identically, which is what the table assumes.
+        #
+        # `test_a_confirmed_rejected_order_IS_retried` pins the retry, by name
+        # and on purpose, so it is a decision already taken rather than an
+        # oversight. Left standing; latent either way while `auto_entry` is
+        # false. If it is ever changed, return None (nothing is held) -- a
+        # dict would be TRUTHY to `_round` and read as a FILL.
         confirmed_dead = dry_run or (
             status in sm._TERMINAL_ORDER_STATUS and status != 'COMPLETE')
         if not confirmed_dead:
@@ -360,16 +380,30 @@ def open_spread(kite, *, stock: str, long_symbol: str, short_symbol: str,
     # Whatever happens, this function RETURNS what actually filled.
     for i in range(1, lots + 1):
         try:
-            if not _round(kite, out, i, lots, stock, long_symbol, short_symbol,
-                          exchange, lot_size, dry_run, gated_debit, ctx, say):
+            cont = _round(kite, out, i, lots, stock, long_symbol, short_symbol,
+                          exchange, lot_size, dry_run, gated_debit, ctx, say)
+            # The round RETURNED, so its outcome is known and already recorded
+            # structurally (a complete spread, an orphan, a partial, or an
+            # unknown order). Only an exception leaves a leg unaccounted for.
+            out.pop('in_flight', None)
+            if not cont:
                 break
         except Exception as e:
+            # THE LEGS, not just the prose. `_round` stamps `in_flight` before
+            # each order and this is the only reader: whatever it still holds
+            # is a leg the order path may have put at the broker without
+            # anything recording it. Without this the entry residue was empty,
+            # so `_entry_already_in_flight` passed next cycle and the same
+            # signal bought ANOTHER long — every cycle, none of them in any
+            # store. Quantity 0 means ask the broker.
+            out['raised_legs'] = out.pop('in_flight', None) or {}
             out['problems'].append(
                 'round %d: the order path raised (%s). Anything it filled '
                 'before raising is at the broker and is NOT in this result -- '
                 'check Kite.' % (i, e))
             say(f"  Round {i}: EXCEPTION in the order path ({e}). Stopping "
-                f"with {out['lots_filled']} complete spread(s).")
+                f"with {out['lots_filled']} complete spread(s). Legs that may "
+                f"be live: {', '.join(out['raised_legs']) or 'none identified'}")
             break
 
     _report(out, stock, lots, dry_run, say, tg)
@@ -413,6 +447,25 @@ def _round(kite, out, i, lots, stock, long_symbol, short_symbol, exchange,
                 f"(gated at {gated_debit:.2f}). Stopping.")
             return False
 
+    # WHAT IS IN FLIGHT, so an EXCEPTION can still name the legs.
+    #
+    # THE GAP (found 2026-08-31). `place_limit_order` re-raises on a broker
+    # exception (deliberately — the journal keeps the record), and every one of
+    # the structured outputs below (`orphan`, `partials`, `unknown_orders`) is
+    # assigned AFTER the call that raised. So a round that bought its long and
+    # then hit a `TokenException` on the short reported PROSE only: `out` had
+    # no `orphan`, `_entry_residue_legs` returned `{}`, `_record_entry_residue`
+    # wrote nothing, and `_entry_already_in_flight` therefore found nothing
+    # next cycle and sent the SAME signal back to the order path — buying
+    # another long, every cycle, none of them in any store, invisible to
+    # `capital.check` and to every sweep.
+    #
+    # That is the amplification the 2026-08-31 `_entry_already_in_flight`
+    # guard was built to close, reopened by the one branch whose legs never
+    # reached the residue record. Quantity 0 means ASK THE BROKER — the same
+    # convention `_auto_enter_bcs`'s own raised-branch already uses.
+    out['in_flight'] = {long_symbol: 0}
+
     # LONG FIRST. The exchange must never see the short unhedged, and a round
     # that dies between the legs then leaves a capped-risk long rather than a
     # naked short.
@@ -444,6 +497,10 @@ def _round(kite, out, i, lots, stock, long_symbol, short_symbol, exchange,
             'spread(s), nothing extra held' % (i, out['lots_filled']))
         say(f"  Round {i}: long did not fill. Stopping.")
         return False
+
+    # The long is now HELD, at a known size. If the short raises, both facts
+    # have to survive: the long we can prove, and the short we cannot.
+    out['in_flight'] = {long_symbol: lot_size, short_symbol: 0}
 
     sfill = open_leg(kite, exchange, short_symbol, False, lot_size, dry_run,
                      context=ctx('short'), log=say)

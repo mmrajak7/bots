@@ -332,8 +332,15 @@ def test_overlapping_cycles_spawn_one_cli(store, monkeypatch):
     other — flock covers the STORE, not the cycle. Two CLIs answering one
     request would drive the defer counter to the cap in a single re-check."""
     spawns = []
-    monkeypatch.setattr(vet, '_spawn_cli',
-                        lambda tid, exit_kind=None: spawns.append(exit_kind))
+    # Returns a PID, as the real `_spawn_cli` does. `list.append`
+    # returns None, which production reads as SPAWN FAILED -- and
+    # since 2026-08-31 a failed exit spawn flips the marker to
+    # UNAVAILABLE rather than waiting out the deadline, so a double
+    # that fakes a failure no longer tests what this name says.
+    def _spawned(tid, exit_kind=None):
+        spawns.append(exit_kind)
+        return 4242
+    monkeypatch.setattr(vet, '_spawn_cli', _spawned)
     other = ZebraStore(config={})
     other._load_local()
     assert vet.exit_gate(store, store.find(1), 'debit_sl', BAD, 96.0,
@@ -374,7 +381,10 @@ def wired(store, monkeypatch):
     monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {'TESTCO': 101.0})
     monkeypatch.setattr(monitor, '_structure_quote', lambda *a, **k: dict(BAD))
     monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: True)
-    monkeypatch.setattr(vet, '_spawn_cli', lambda tid, exit_kind=None: None)
+    # A PID: this fixture is about a HELD exit on an unreliable book,
+    # not about a spawn that failed. Returning None would now short-
+    # circuit the wait to UNAVAILABLE and the gate would proceed.
+    monkeypatch.setattr(vet, '_spawn_cli', lambda tid, exit_kind=None: 4242)
     return store
 
 

@@ -158,8 +158,17 @@ def test_an_already_flat_short_leg_records_the_leg_as_UNKNOWN(bcs_env,
     script = _LegScript(**{B_LONG: [_complete(B_QTY, 40.00)]})
     monkeypatch.setattr(sm, 'close_leg', script)
     # Short already flat at the broker; only the long is live.
+    #
+    # The short's row is PRESENT and reads 0, which is how Kite reports a leg
+    # squared off during the session. Omitting the row entirely (as this
+    # fixture did until 2026-08-31) is a different fact: it is what a DEGRADED
+    # or mid-sync response looks like, and `_short_is_confirmed_flat` now
+    # refuses to sell the long against one -- because "row missing" read as
+    # "flat" is how this close path could create a naked short out of a
+    # glitchy read. See `test_naked_short_from_one_positions_read.py`.
     kite = FakeBroker(books=BCS_BOOKS,
-                      positions=[{'tradingsymbol': B_LONG,
+                      positions=[{'tradingsymbol': B_SHORT, 'quantity': 0},
+                                 {'tradingsymbol': B_LONG,
                                   'quantity': B_QTY}])
     ok = sm._close_spread_inner(kite, store, _bcs(), spot=1400.0,
                                 reason='SL_SPREAD', dry_run=False, label='BCS')

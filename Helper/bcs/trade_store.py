@@ -188,6 +188,100 @@ def _resolve_credentials_path(config: dict) -> Optional[Path]:
     return Path(path_str) if path_str else None
 
 
+#: Tolerance on a derived price, in rupees. Wide enough for the paisa rounding
+#: a hand-typed fill carries, tight enough that a transposed digit fails.
+_DERIVE_TOL = 0.02
+
+
+def _check_cross_fields(t: dict) -> None:
+    """Refuse a record whose derived fields contradict its own legs.
+
+    THE GAP (found 2026-08-31). The Fallen Hero store checks ten cross-field
+    invariants; this one — the LIVE-MONEY bull-call book — checked leg types
+    and lot arithmetic and nothing else. So a hand-captured trade with
+    `spread_width: 5` typo'd for 50 saved cleanly, and at close
+    `bound_bcs_exit` clamped a real `exit_spread` of 30 down to 5 and
+    re-derived `pnl_per_share` and `total_pnl` from the clamp. The result is
+    booked as "approximate" — a marker that says the number is imprecise, when
+    it is in fact wrong in an unknown direction. That is the opposite of the
+    guard's purpose.
+
+    STRICT: every mismatch RAISES. These trades are captured by hand from a
+    fill, so a disagreement between the strikes in the SYMBOLS and the numbers
+    typed beside them is a typo, and the cheapest moment to catch it is before
+    it becomes a position being managed with wrong levels. `add_trade`'s
+    contract is already "raises ValueError on bad input"; this extends the
+    same contract to the fields that decide money rather than only to the ones
+    that decide bookkeeping.
+
+    The SYMBOLS are the source of truth about the contract — that is
+    `option_symbols`' whole premise — so where a symbol can settle a question,
+    it does.
+    """
+    from common.option_symbols import strike as _strike
+
+    def _num(key):
+        v = t.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            raise ValueError('%s is %r, which is not a number' % (key, v))
+
+    long_k = _strike(t.get('long_symbol'))
+    short_k = _strike(t.get('short_symbol'))
+    width = _num('spread_width')
+    debit = _num('net_debit')
+    lp, sp = _num('entry_long_price'), _num('entry_short_price')
+
+    # 1. The spread's DIRECTION, from the symbols. A bull call spread is long
+    #    the lower strike; inverted, every stop and target runs backwards.
+    if long_k is not None and short_k is not None:
+        if long_k >= short_k:
+            raise ValueError(
+                'long strike %g is not below short strike %g — that is not a '
+                'bull call spread. Check which leg is which.'
+                % (long_k, short_k))
+        # 2. `spread_width` must BE the width, not a number beside it.
+        if width is not None and abs((short_k - long_k) - width) > _DERIVE_TOL:
+            raise ValueError(
+                'spread_width %g disagrees with the symbols (%g - %g = %g). '
+                'A wrong width silently clamps the exit value and books a '
+                'confidently wrong P&L.'
+                % (width, short_k, long_k, short_k - long_k))
+
+    # 3. `net_debit` must BE the difference of the fills.
+    if lp is not None and sp is not None and debit is not None:
+        if abs((lp - sp) - debit) > _DERIVE_TOL:
+            raise ValueError(
+                'net_debit %g disagrees with the fills (%g - %g = %g)'
+                % (debit, lp, sp, lp - sp))
+
+    # 4. A debit spread costs something, and it cannot cost more than it can
+    #    ever pay: debit >= width is a structure with no profitable outcome.
+    if debit is not None:
+        if debit <= 0:
+            raise ValueError('net_debit %g must be positive for a debit '
+                             'spread' % debit)
+        if width is not None and debit >= width:
+            raise ValueError(
+                'net_debit %g is not below spread_width %g — this structure '
+                'cannot make money at any price' % (debit, width))
+
+    # 5. The stops must be on the right side of entry. `sl_spot` above the
+    #    entry spot fires on the first poll of a healthy position.
+    entry_spot, sl_spot = _num('entry_spot'), _num('sl_spot')
+    if entry_spot is not None and sl_spot is not None and sl_spot >= entry_spot:
+        raise ValueError(
+            'sl_spot %g is at or above entry_spot %g — a bull call spread '
+            'stops out BELOW entry, so this fires immediately'
+            % (sl_spot, entry_spot))
+    target = _num('target_spot')
+    if entry_spot is not None and target is not None and target <= entry_spot:
+        raise ValueError(
+            'target_spot %g is at or below entry_spot %g — the take-profit is '
+            'already hit' % (target, entry_spot))
+
+
 class TradeStore(SpreadStoreBase):
     """Trade CRUD with local file + Google Drive sync.
 
@@ -243,7 +337,8 @@ class TradeStore(SpreadStoreBase):
         """Validate, assign ID, save local + Drive. Returns the trade.
 
         Raises:
-            ValueError: If required fields missing or lot_size validation fails.
+            ValueError: If required fields missing, lot_size validation fails,
+                or a cross-field derivation disagrees with the legs.
         """
         # Validate required fields
         missing = [f for f in REQUIRED_FIELDS if f not in trade_dict]
@@ -276,6 +371,8 @@ class TradeStore(SpreadStoreBase):
             # No lot_size provided — treat quantity as 1 lot
             trade_dict['lot_size'] = quantity
             trade_dict['lots'] = 1
+
+        _check_cross_fields(trade_dict)
 
         # ID allocation is a read-check-write, so it belongs INSIDE the lock:
         # two processes racing here hand the same id to two different trades,

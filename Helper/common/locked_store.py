@@ -192,6 +192,38 @@ class LockedStoreMixin:
         try:
             path = self._corrupt_marker_path()
             path.parent.mkdir(parents=True, exist_ok=True)
+            # A MILD EVENT MUST NOT ERASE A SEVERE ONE (fixed 2026-08-31).
+            #
+            # This is a single last-writer-wins slot, so a routine
+            # MERGE_CONFLICT overwrote a QUARANTINE that had not been alerted
+            # yet -- a cron gap, or Telegram briefly down, is all it takes.
+            # The operator then reads "two writers disagreed, the book is
+            # intact" about a book that actually went EMPTY, and the marker no
+            # longer names the `.corrupt.*.json` backup, which after a
+            # quarantine is the only surviving copy of anything Drive has not
+            # seen. Overwriting also reset `alerted_at`, so the severe event
+            # lost its place in the queue as well as its story.
+            #
+            # This is the exact INVERSE of the 2026-08-31 false-"EMPTY"
+            # incident: there a mild event wore the severe one's words; here
+            # the severe event is replaced by the mild one's.
+            if kind == store_contract.MARKER_MERGE_CONFLICT:
+                try:
+                    held = json.loads(path.read_text(encoding='utf-8'))
+                except Exception:
+                    held = None
+                if isinstance(held, dict) and not held.get('alerted_at') and (
+                        (held.get('kind')
+                         or store_contract.MARKER_QUARANTINE)
+                        == store_contract.MARKER_QUARANTINE):
+                    # A missing `kind` reads as QUARANTINE, deliberately --
+                    # every marker written before the field existed was one.
+                    logger.critical(
+                        'a merge conflict on %s was NOT recorded: an '
+                        'un-alerted QUARANTINE marker from %s is still '
+                        'standing and must not be overwritten. Conflict was: '
+                        '%s', self._data_path().name, held.get('at'), err)
+                    return
             path.write_text(json.dumps({
                 'at': datetime.now().isoformat(timespec='seconds'),
                 'store': self._data_path().name,
@@ -283,8 +315,13 @@ class LockedStoreMixin:
         with exclusive(self._lock_path(), timeout=self.LOCK_TIMEOUT):
             self._in_mutate = True
             try:
+                # DISK vs THIS PROCESS'S CACHE -- one replica, two writers on
+                # one box. An equal-version difference here is the sibling
+                # process's concurrent write that this refresh exists to
+                # absorb, not a split brain between machines.
                 self._trades = self._merge_trades(self._read_local(),
-                                                  self._trades)
+                                                  self._trades,
+                                                  same_replica=True)
                 self._note_ids_seen()
                 # Rollback point. If the caller raises half-way through a
                 # multi-field mutation, the partly-changed trade must not
@@ -305,7 +342,29 @@ class LockedStoreMixin:
                 # cross-process lock on a Pi that also runs the live monitor.
                 changed = self._trades != snapshot
                 if persist and changed:
-                    self._save_local()
+                    # THE SAVE ROLLS BACK TOO (fixed 2026-08-31).
+                    #
+                    # The rollback above covered only exceptions from `yield`.
+                    # If `_save_local` itself raised -- disk full, or the
+                    # Windows `os.replace` losing to a stray unlocked reader --
+                    # the caller got the exception and believed the write had
+                    # FAILED, while the cache kept the mutation at version N+1.
+                    # The next `_mutate` on any OTHER trade then refreshed
+                    # disk(vN) against cache(vN+1), the cache won, and the
+                    # "failed" write silently committed minutes later.
+                    #
+                    # Concretely: `begin_close` raises, the caller escalates to
+                    # a human believing no close-lock exists, and the `closing`
+                    # status materialises afterwards with nobody driving the
+                    # close -- a position stranded until the recovery sweep.
+                    #
+                    # Cache and disk now fail together, which is the only
+                    # state a caller can reason about.
+                    try:
+                        self._save_local()
+                    except BaseException:
+                        self._trades = snapshot
+                        raise
             finally:
                 self._in_mutate = False
 

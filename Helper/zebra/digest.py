@@ -46,7 +46,7 @@ import logging
 import re
 import statistics
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import List, Optional
 
@@ -456,6 +456,17 @@ def build(day: Optional[str] = None) -> dict:
         pp = cfg.LOG_DIR / 'eod' / f"{(datetime.strptime(day, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')}.json"
         if pp.exists():
             prev = json.loads(pp.read_text(encoding='utf-8'))
+            # A HALF-DAY IS NOT A BASELINE. `prev` is used for exactly one
+            # thing -- "NEW today: <warning>" -- and differencing against a
+            # digest that stopped at 13:00 marks every warning that first
+            # appeared in the AFTERNOON as new the following day. Refuse the
+            # comparison rather than publish a wrong one; the flag simply does
+            # not fire, which is the honest degradation.
+            if prev.get('partial'):
+                logger.info(
+                    'digest: %s was built mid-session, so it is not used as a '
+                    'baseline — "NEW today" is suppressed for %s', pp.name, day)
+                prev = None
     except Exception:
         pass
     cyc, fun = _cycles(rows), _funnel(rows)
@@ -481,12 +492,36 @@ def build(day: Optional[str] = None) -> dict:
                'mode': None,
                'problems': ['the order-engine log could not be analysed '
                             '(%s) — its failures are NOT covered today' % e]}
-    return {'date': day, 'cycles': cyc, 'funnel': fun, 'vetting': vet,
+    return {'date': day, 'partial': _is_partial(day),
+            'cycles': cyc, 'funnel': fun, 'vetting': vet,
             'trades': {k: (v if not isinstance(v, list) else len(v))
                        for k, v in tr.items()},
             'cohort': coh, 'warnings': warn, 'engines': eng, 'tp_latch': tpl,
             'flags': _flags(cyc, vet, tr, warn, coh, prev, eng, tpl),
             '_detail': tr}
+
+
+def _is_partial(day: str) -> bool:
+    """Is this digest being built while the session it describes is STILL OPEN?
+
+    A digest run at 13:00 reads a half-day log and a half-day store and then
+    renders exactly like an end-of-day one. "Cycles 45 (09:15-12:55)" reads as
+    a SHORT day, not as a partial read; the cohort running-net reads as the
+    day's answer; and — the part that outlives the moment — `write()` persists
+    it to `logs/eod/<date>.json`, which is tomorrow's `prev` baseline. Every
+    warning that first appears after 13:00 today is then mis-flagged "NEW
+    today" tomorrow.
+
+    Never raises: a digest that cannot decide this is not worth losing.
+    """
+    try:
+        now = datetime.now(cfg.IST)
+        if day != now.strftime('%Y-%m-%d'):
+            return False                     # a past day is complete by then
+        close = time(*cfg.MARKET_CLOSE)
+        return now.weekday() < 5 and now.time() < close
+    except Exception:                        # pragma: no cover - defensive
+        return False
 
 
 def _render_tp_latch(tpl: dict) -> List[str]:
@@ -580,6 +615,15 @@ def render(d: dict) -> str:
     A = L.append
     tr, coh, cyc, vet = d['_detail'], d['cohort'], d['cycles'], d['vetting']
     A(f"# Zebra digest — {d['date']}")
+    if d.get('partial'):
+        # SAY IT AT THE TOP, not in a footnote. Every number below describes
+        # a session that has not finished, and the rendered digest is the
+        # artefact that gets pasted into a chat and read on its own.
+        A('')
+        A(f"> ⚠ **PARTIAL — built at "
+          f"{datetime.now(cfg.IST).strftime('%H:%M')} IST with the session "
+          f"still open.** Every count below is a half-day. Re-run after "
+          f"{'%02d:%02d' % cfg.MARKET_CLOSE} for the day's real figures.")
     A('')
     A(f"**Cycles** {cyc['cycles']} ({cyc['first']}–{cyc['last']}), "
       f"median {cyc['median_sec']}s, max {cyc['max_sec']}s"

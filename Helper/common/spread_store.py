@@ -130,6 +130,29 @@ class SpreadStoreBase(LockedStoreMixin):
         # close operations. Set True by begin_close(), cleared by
         # update_trade_exit() or set_trade_status().
         self._sync_locked = False
+        #: Field names this process has written WITHOUT bumping `version`.
+        #:
+        #: `update_trade_fields` saves local-only and does not bump the
+        #: counter -- by design, since the trail state it carries "changes
+        #: every few seconds" and versioning it would churn Drive on every
+        #: poll. The consequence nobody wired up: local and Drive then hold
+        #: the SAME version with DIFFERENT content, which `resolve_merge`
+        #: reads as a split brain. That is a CRITICAL log line plus a
+        #: MERGE_CONFLICT marker plus an hourly Telegram, once per open
+        #: position per sync, for as long as the position is open.
+        #:
+        #: zebra solved this by handing `resolve_merge` the allowlist its
+        #: batched writer already owned. The BCS family has no such list --
+        #: `update_trade_fields` takes `**fields`, and three call sites pass
+        #: computed keys (`**{kind.field: res}`, `**latch['patch']`, `**gap`)
+        #: -- so a hand-maintained copy would drift on the next field added.
+        #: Recording what was actually written keeps ONE source.
+        #:
+        #: Process-local, and that is the honest scope: it names the fields
+        #: whose local value is knowingly ahead of Drive. A field written
+        #: unversioned by the OTHER replica still reports a conflict, which
+        #: is the safe direction -- it announces rather than hides.
+        self._unversioned_written: set = set()
 
     def _lock_path(self) -> Path:
         """Resolved at call time, not import time.
@@ -213,6 +236,39 @@ class SpreadStoreBase(LockedStoreMixin):
             drive_trades = self._mod().drive_store.download_json(
                 self._drive_service, self._drive_file_id
             )
+            # VALIDATE THE REMOTE SIDE TOO (fixed 2026-08-31).
+            #
+            # `partition_readable` guarded the LOCAL read and nothing guarded
+            # this one -- the input an outside writer can actually poison. One
+            # Drive record with a missing `id`, or a non-dict, made
+            # `_merge_trades` raise `KeyError`/`TypeError` inside the blanket
+            # `except` below, which falls back to `_load_local()`. Every sync,
+            # forever: Drive is silently no longer a second copy.
+            #
+            # Worse, local writes kept calling `_upload_to_drive`, which
+            # REPLACES the Drive file wholesale with a book that never absorbed
+            # the bad record. If that record was a real trade from another
+            # machine it is then gone from Drive with no quarantine, no
+            # sidecar and no alert -- only a "Drive download failed" warning
+            # that reads as transient.
+            #
+            # Unreadable remote records are held out of the merge and REPORTED
+            # rather than dropped, the same asymmetry the local path uses:
+            # never quietly go on with a short book.
+            drive_trades, unreadable = store_contract.partition_readable(
+                drive_trades, log=self._logger.warning)
+            if unreadable:
+                detail = '; '.join(str(u.get('why')) for u in unreadable[:4])
+                self._logger.critical(
+                    '%d unreadable record(s) on Drive were held OUT of the '
+                    'merge: %s', len(unreadable), detail)
+                self._flag_corruption(
+                    '%d unreadable record(s) in the Drive copy of %s (%s). '
+                    'They are not in the local book and a local write will '
+                    'overwrite them on Drive.'
+                    % (len(unreadable), self._data_path().name, detail),
+                    backup=None,
+                    kind=store_contract.MARKER_MERGE_CONFLICT)
             diverged = False
             with self._mutate(drive=False):
                 # _mutate has already refreshed self._trades from disk, so the
@@ -261,31 +317,56 @@ class SpreadStoreBase(LockedStoreMixin):
         M = self._mod()
         if not M.LOCAL_TRADES_FILE.exists():
             return []
+        # THE QUARANTINE RENAME IS INSIDE THE LOCK (fixed 2026-09-01).
+        #
+        # The `with self._read_lock()` used to close around the READ alone, so
+        # the decode error propagated out of it and the handler ran UNLOCKED.
+        # In that gap the live monitor's `_mutate` could take the lock, notice
+        # the same corruption, quarantine it, and rewrite a good book from its
+        # warm cache -- and then this handler renamed the GOOD file to
+        # `.corrupt.<ts>.json`. A healthy book quarantined, this reader
+        # continuing with `[]`, and the marker describing the OLD error while
+        # naming a backup that is actually the only good copy.
+        #
+        # `zebra/trade_store.py` never had this hole: its `_read_local` takes
+        # no lock of its own precisely because every caller already holds one
+        # across the read AND the handler. This is that property, restored to
+        # the shared base. `_read_lock` is re-entrant under `_mutate`, so the
+        # in-mutate path is unchanged.
         try:
             with self._read_lock():
-                with open(M.LOCAL_TRADES_FILE, encoding='utf-8') as f:
-                    data = json.load(f)
-            if not isinstance(data, list):
-                raise ValueError(f"Expected list, got {type(data).__name__}")
-            return self._quarantine_unreadable(data)
-        except (json.JSONDecodeError, ValueError) as e:
-            # File is corrupt — back it up so we can investigate, start fresh
-            backup = M.LOCAL_TRADES_FILE.with_suffix(
-                f'.corrupt.{int(time.time())}.json'
-            )
-            try:
-                M.LOCAL_TRADES_FILE.rename(backup)
-            except OSError:
-                pass  # Can't rename — at least don't crash
-            self._logger.critical(
-                "Trade file CORRUPT (%s). Backed up to %s. Starting empty!",
-                e, backup
-            )
-            # B7: a log line is not an alert. The monitor turns this marker
-            # into a Telegram BEFORE it concludes "all trades closed" and
-            # stops watching every open position.
-            self._flag_corruption(str(e), backup)
-            return []
+                try:
+                    with open(M.LOCAL_TRADES_FILE, encoding='utf-8') as f:
+                        data = json.load(f)
+                    if not isinstance(data, list):
+                        raise ValueError(
+                            f"Expected list, got {type(data).__name__}")
+                    return self._quarantine_unreadable(data)
+                except (json.JSONDecodeError, ValueError) as e:
+                    # File is corrupt — back it up so we can investigate,
+                    # start fresh. Still holding the lock, so no other writer
+                    # can repair the file between the diagnosis and the rename.
+                    backup = M.LOCAL_TRADES_FILE.with_suffix(
+                        f'.corrupt.{int(time.time())}.json'
+                    )
+                    try:
+                        M.LOCAL_TRADES_FILE.rename(backup)
+                    except OSError:
+                        pass  # Can't rename — at least don't crash
+                    self._logger.critical(
+                        "Trade file CORRUPT (%s). Backed up to %s. "
+                        "Starting empty!", e, backup)
+                    # B7: a log line is not an alert. The monitor turns this
+                    # marker into a Telegram BEFORE it concludes "all trades
+                    # closed" and stops watching every open position.
+                    self._flag_corruption(str(e), backup)
+                    return []
+        except LockTimeout:
+            # Could not take the lock at all. Returning [] here would look
+            # exactly like an empty book to every caller, so raise instead --
+            # `_mutate` and `_sync_from_drive` both already treat a
+            # LockTimeout as "do not write, retry next poll".
+            raise
 
     def _statuses(self):
         """This book's status vocabulary, for `store_contract`.
@@ -338,13 +419,24 @@ class SpreadStoreBase(LockedStoreMixin):
         else:
             self._logger.info("No local trades file found, starting empty")
 
-    def _merge_trades(self, base: list, incoming: list) -> list:
+    def _merge_trades(self, base: list, incoming: list,
+                      same_replica: bool = False) -> list:
         """Merge two trade lists. Per trade ID, higher version wins.
 
         This protects against data loss when:
           - A Drive upload failed (base has data incoming doesn't)
           - A new trade was added on another machine (incoming has data base doesn't)
           - A trade was closed locally but Drive still shows it open
+
+        `same_replica=True` means the two sides are this box's DISK and this
+        process's own CACHE, not two machines. An equal-version difference
+        there is a sibling process's concurrent write -- exactly what the
+        refresh exists to absorb -- and not a split brain. zebra was given
+        this on 2026-08-31 after the detector's first live session produced 11
+        CRITICAL lines and 4 false corruption alerts against a fully intact
+        book; the shared base under the two live-money books never got it, so
+        the same false alarm was still armed for `bcs_trades.json` the moment a
+        second writer touched it.
         """
         by_id: dict = {}
         notes: list = []
@@ -363,7 +455,9 @@ class SpreadStoreBase(LockedStoreMixin):
             # could be walked back by a replica that had merely bumped a
             # couple of alert flags. See `store_contract.resolve_merge`.
             winner, note = store_contract.resolve_merge(
-                by_id[tid], t, self._statuses())
+                by_id[tid], t, self._statuses(),
+                same_replica=same_replica,
+                unversioned_fields=self._unversioned_written)
             by_id[tid] = winner
             if note:
                 notes.append(note)
@@ -410,7 +504,23 @@ class SpreadStoreBase(LockedStoreMixin):
                 json.dump(self._trades, f, indent=2, default=str)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, str(M.LOCAL_TRADES_FILE))
+            # POSIX rename is indifferent to open handles, but on Windows a
+            # reader holding the destination open makes this fail OUTRIGHT.
+            # Every caller here is under the store lock, so a collision means a
+            # stray UNLOCKED reader -- an editor, a backup tool, an ad-hoc
+            # script using plain `open()`. Retry briefly rather than lose the
+            # write: the BCS and Fallen Hero books are hand-captured on
+            # Windows, so that reader is a realistic Tuesday afternoon.
+            # `zebra/trade_store.py` has had this since it was written; the
+            # shared base under the two live-money books never got the copy.
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_path, str(M.LOCAL_TRADES_FILE))
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05)
             tmp_path = None  # replaced successfully, don't clean up
         except Exception:
             # Clean up temp file on failure
@@ -483,7 +593,24 @@ class SpreadStoreBase(LockedStoreMixin):
         return self.allocate_id()
 
     def update_trade_exit(self, trade_id: int, exit_data: dict):
-        """Mark a trade as closed with exit details. Saves local + Drive."""
+        """Mark a trade as closed with exit details. Saves local + Drive.
+
+        THE SYNC LOCK IS RELEASED ON EVERY EXIT PATH (fixed 2026-08-31).
+        `begin_close` sets `_sync_locked` to stop a Drive pull overwriting the
+        close in flight, and the only release used to sit at the BOTTOM of the
+        loop below -- after the contract refusal `raise`, and after anything
+        `_mutate` itself can throw (`LockTimeout`). Either one left the flag
+        stuck True, which makes `maybe_sync` return early for the rest of the
+        process. On the long-lived monitor that is the whole session running
+        local-only, with no log line saying so: Drive silently stops being a
+        second copy of the money book at exactly the moment a close went wrong.
+        """
+        try:
+            return self._update_trade_exit(trade_id, exit_data)
+        finally:
+            self._sync_locked = False
+
+    def _update_trade_exit(self, trade_id: int, exit_data: dict):
         with self._mutate():
             found = False
             for t in self._trades:
@@ -673,9 +800,32 @@ class SpreadStoreBase(LockedStoreMixin):
 
         Used for state transitions: open → closing → closed / partial_close.
         """
+        # A TERMINAL RECORD IS NOT REOPENED BY A SETTER (added 2026-09-01).
+        #
+        # This accepted ANY transition, including `closed -> open`, and the
+        # merge's monotonic-close rule never sees it: an ordinary versioned
+        # local write is exactly what that rule treats as legitimate. So one
+        # call resurrects a booked trade with full version legitimacy, and the
+        # monitor then manages a position that is already flat at the broker.
+        #
+        # `partial_close` stays reachable -- it is how the close path freezes a
+        # half-done exit, and `store_contract` names it FROZEN rather than
+        # terminal. What is refused is leaving a TERMINAL state, which the
+        # contract in this same package already says nothing may do: "TERMINAL
+        # refuses everything because that is what idempotence IS."
         with self._mutate():
             for t in self._trades:
                 if t['id'] == trade_id:
+                    if (store_contract.role_of(t.get('status'),
+                                               self._statuses())
+                            == store_contract.TERMINAL
+                            and status != t.get('status')):
+                        raise ValueError(
+                            "Trade #%d is %s (terminal); set_trade_status may "
+                            "not move it to %r. A booked exit is undone by "
+                            "`restore_snapshot`, deliberately and visibly, "
+                            "never by a field setter."
+                            % (trade_id, t.get('status'), status))
                     t['status'] = status
                     t['version'] = t.get('version', 0) + 1
                     for k, v in extra_fields.items():
@@ -691,11 +841,26 @@ class SpreadStoreBase(LockedStoreMixin):
         Used for lightweight state updates like trailing SL that change every
         few seconds — Drive sync happens on the normal maybe_sync() cycle.
         """
+        # THE KEYS THIS MAY NOT WRITE. `zebra/trade_store.py` refuses `status`
+        # here and the shared base did not, so the money books had a second,
+        # unguarded door onto the state machine -- plus `id` and `version`,
+        # either of which silently breaks the merge that keys on them.
+        blocked = {'status', 'id', 'version', 'exit'} & set(fields)
+        if blocked:
+            raise ValueError(
+                "update_trade_fields may not write %s — use the verb that "
+                "owns that transition (set_trade_status / update_trade_exit). "
+                "This method exists for advisory state and does not consult "
+                "the store contract." % sorted(blocked))
         with self._mutate(drive=False):
             for t in self._trades:
                 if t['id'] == trade_id:
                     for k, v in fields.items():
                         t[k] = v
+                    # Declare what was written without a version bump, so the
+                    # merge can tell a deliberate local-only write from a
+                    # split brain. See `_unversioned_written`.
+                    self._unversioned_written.update(fields)
                     return True
             return False
 

@@ -504,8 +504,17 @@ never fires is not risk management.
 
 **defer** — the price cannot be reconciled with intrinsic value or with spot,
 or the book is too thin to transact. Deferring re-checks with a fresh quote next
-cycle. After the deferral cap the human is asked and the position HOLDS, which
-is safe precisely because the loss is already capped.
+cycle. After the deferral cap the human is asked and the position holds — but
+**that hold is BOUNDED, not indefinite.** Past `exit_vet_max_hold_sec` (900s by
+default, measured per SESSION) the exit proceeds on the deterministic guards
+alone and says so loudly.
+
+Budget your defers against that. The layer is ADDITIVE: the guards had already
+cleared this exit before you were asked, so an unbounded hold would turn an
+optional second opinion into a load-bearing precondition for a stop — and on
+this book the value stops are the ONLY loss-side exits, so it would invert the
+safety argument on every stop that can fire. ASHOKLEY #390 went -50% to -75%
+over three cycles waiting on an agent that had already died on quota.
 
 **Do not defer merely because the loss is unpleasant.** A real, executable,
 corroborated loss should be taken. Deferring a genuine stop is how a capped loss
@@ -519,9 +528,11 @@ quote in front of you and nothing further out. An `allow` is never a standing
 permission to exit this position later.
 
 One exception, and it runs the safe way: once deferrals reach the cap and the
-human has been asked, that HOLD persists for the day rather than expiring in 15
-minutes. It authorises nothing, and re-running the whole episode every quarter
-hour to re-reach an escalation the user already has is pure cost.
+human has been asked, that hold persists rather than expiring in 15 minutes. It
+authorises nothing, and re-running the whole episode every quarter hour to
+re-reach an escalation the user already has is pure cost. It is still bounded
+by `exit_vet_max_hold_sec` — the escalation buys the human TIME to act, not a
+veto over the deterministic guards.
 
 ```
 <python> -m zebra vet exit-decide 42 --kind debit_sl --verdict defer     --red-flag "structure mid 0.36 below intrinsic 1.10 — impossible"     --reason "spot moved -0.4%, cannot explain a -74% structure move"     --reason "ask side one-sided, no depth at touch"     --confidence 0.9

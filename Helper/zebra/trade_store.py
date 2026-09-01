@@ -39,6 +39,36 @@ logger = logging.getLogger(__name__)
 _BATCHED_POLL_FIELDS = frozenset({'corrob_spot', 'corrob_value', 'corrob_t',
                                   'exit_depth'})
 
+#: EVERY field this store writes LOCAL-ONLY and WITHOUT bumping `version`.
+#:
+#: `_BATCHED_POLL_FIELDS` above is `apply_mfe`'s own allowlist and covers only
+#: what THAT method writes. Three other advisory writers do the same thing and
+#: were never declared:
+#:
+#:   bump_confirm / reset_confirm  -> <kind>_confirm, <kind>_confirm_t
+#:   bump_blind / clear_blind / mark_blind_alerted
+#:                                 -> debit_blind_cycles, debit_blind_alerted
+#:
+#: All are `_mutate(drive=False)` with no version bump, deliberately: they
+#: change every poll and pushing them to Drive would churn the network for
+#: data nobody reads until the trade closes.
+#:
+#: THE COST OF THE OMISSION, observed live on 2026-09-01 12:10: record #454 at
+#: version 15 on both replicas, differing on `corrob_spot, corrob_t,
+#: corrob_value, debit_sl_confirm, debit_sl_confirm_t`. `_only_unversioned`
+#: requires EVERY differing key to be exempt, so the two undeclared
+#: `debit_sl_confirm*` fields dragged the three exempt `corrob_*` ones with
+#: them and the whole diff was reported as a split brain -- a CRITICAL log
+#: line and a Telegram, for a book that was working exactly as designed.
+#:
+#: The confirm keys are built as `f"{kind}_confirm"`, so they are matched by
+#: SUFFIX rather than listed: `bump_confirm` takes any kind, and a literal list
+#: would silently miss the next trigger added.
+_UNVERSIONED_FIELDS = _BATCHED_POLL_FIELDS | {'debit_blind_cycles',
+                                              'debit_blind_alerted'}
+_UNVERSIONED_PREFIXES = ('mfe_',)
+_UNVERSIONED_SUFFIXES = ('_confirm', '_confirm_t')
+
 #: Statuses that mean this thesis is ALREADY LIVE somewhere and a second
 #: signal on the same (stock, timeframe, direction) must be refused.
 #:
@@ -647,6 +677,21 @@ class ZebraStore:
             # brain -- absorbing its write is what the refresh is for.
             self._trades = self._merge_announced(
                 self._read_local(), self._trades, same_replica=True)
+            # RAISE THE ID MARK ON WHAT WE SEE, not only on what we allocate.
+            #
+            # `locked_store` has `_note_ids_seen` for a reason its own comment
+            # states: "every trade that already exists was written before this
+            # sidecar did... a quarantine would then empty a book holding ids
+            # 1..N against a mark of 0, and the allocator would hand out 1
+            # again". ZebraStore never had the call -- its mark advanced only
+            # inside `_next_id`, on allocation. So a fresh deployment (the
+            # sidecar is runtime-created and not in git) that syncs the book
+            # down from Drive and quarantines BEFORE its first allocation
+            # reissues id 1. When Drive returns, `_merge` keys on id and the
+            # higher version silently erases one of the two trades -- the
+            # exact loss the sidecar exists to prevent, on the book that holds
+            # the cohort.
+            self._note_ids_seen()
             # Rollback point. If the caller raises mid-mutation (e.g.
             # _apply_entry sets status='entered' and then a float() cast on a
             # later field blows up), the half-mutated trade must not linger in
@@ -669,7 +714,18 @@ class ZebraStore:
             # comparing against it is far cheaper than serialising to disk.
             changed = self._trades != snapshot
             if persist and changed:
-                self._save_local()
+                # THE SAVE ROLLS BACK TOO (fixed 2026-08-31). The rollback
+                # above covered only exceptions from `yield`; a `_save_local`
+                # that raised left the mutation live in the cache while the
+                # caller was told the write FAILED -- and the next `_mutate`
+                # on any other trade then committed it silently, because the
+                # refresh resolves cache-over-disk on a higher version.
+                # Cache and disk fail together or not at all.
+                try:
+                    self._save_local()
+                except BaseException:
+                    self._trades = snapshot
+                    raise
         if persist and changed and drive:
             self._upload_to_drive()
 
@@ -1912,6 +1968,29 @@ class ZebraStore:
         self._write_high_water(nid)
         return nid
 
+    def _note_ids_seen(self) -> None:
+        """Raise the high-water mark to cover every id currently in the book.
+
+        The twin of `locked_store.LockedStoreMixin._note_ids_seen`, which the
+        three BCS-family books have had all along. ZebraStore does not inherit
+        that mixin and never got the copy, so its mark advanced ONLY inside
+        `_next_id`, i.e. only on ids this process allocated.
+
+        The gap is not hypothetical. The sidecar is created at runtime and is
+        not in git, so on a fresh deployment it starts absent. A box that syncs
+        the book down from Drive and then quarantines BEFORE its first
+        allocation has ids 1..N in hand and a mark of 0 — and reissues id 1.
+        When Drive comes back, `_merge` keys on id, so the two distinct trades
+        become one record and the higher version silently erases the other.
+
+        Called from `_mutate` right after the refresh, so the mark tracks every
+        id ever SEEN rather than every id this process happened to hand out.
+        Best-effort throughout: `_write_high_water` never raises.
+        """
+        live = max((t.get('id', 0) for t in self._trades), default=0)
+        if live:
+            self._write_high_water(live)
+
     @staticmethod
     def _high_water_path():
         # Keyed to the STORE FILE, not to LOG_DIR: the sequence belongs to one
@@ -1966,6 +2045,27 @@ class ZebraStore:
             if self._drive_file_id:
                 # Network call OUTSIDE the lock (same rule as _mutate's upload).
                 drive_data = download_json(self._drive_service, self._drive_file_id)
+                # VALIDATE THE REMOTE SIDE TOO (fixed 2026-08-31). The local
+                # read is partitioned; this input -- the one an outside writer
+                # can actually poison -- was not. A single record with a
+                # missing `id` makes `_merge` raise inside the blanket handler
+                # below, which falls back to `_load_local()` EVERY sync while
+                # local writes keep replacing the Drive file wholesale. A real
+                # trade from another machine then disappears from Drive with
+                # no quarantine and no alert.
+                drive_data, unreadable = store_contract.partition_readable(
+                    drive_data, log=logger.warning)
+                if unreadable:
+                    detail = '; '.join(str(u.get('why')) for u in unreadable[:4])
+                    logger.critical('%d unreadable record(s) on Drive were '
+                                    'held OUT of the merge: %s',
+                                    len(unreadable), detail)
+                    self._flag_corruption(
+                        '%d unreadable record(s) in the Drive copy (%s). They '
+                        'are not in the local book, and a local write will '
+                        'overwrite them on Drive.' % (len(unreadable), detail),
+                        backup=None,
+                        kind=store_contract.MARKER_MERGE_CONFLICT)
                 # The merge+save is a read-modify-write on the shared file and
                 # MUST hold the store lock: unlocked, a trade the other cron
                 # writes between our read and our _save_local is clobbered —
@@ -2093,7 +2193,40 @@ class ZebraStore:
         """
         try:
             cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
-            (cfg.LOG_DIR / 'zebra_store_corrupt.json').write_text(json.dumps({
+            path = cfg.LOG_DIR / 'zebra_store_corrupt.json'
+            # A MILD EVENT MUST NOT ERASE A SEVERE ONE (fixed 2026-08-31).
+            # One last-writer-wins slot, so a routine MERGE_CONFLICT could
+            # overwrite a QUARANTINE that had not been alerted yet -- and the
+            # replacement loses the `.corrupt.*.json` backup path, which after
+            # a quarantine is the only surviving copy of anything Drive has
+            # not seen. The alerting layer dedups on the marker's OWN
+            # timestamp, so an un-alerted marker is one nobody has read.
+            if kind == store_contract.MARKER_MERGE_CONFLICT:
+                seen = cfg.LOG_DIR / 'zebra_store_corrupt.alerted'
+                try:
+                    held = json.loads(path.read_text())
+                except Exception:
+                    held = None
+                if isinstance(held, dict) and (
+                        (held.get('kind')
+                         or store_contract.MARKER_QUARANTINE)
+                        == store_contract.MARKER_QUARANTINE):
+                    # A missing `kind` reads as QUARANTINE deliberately: every
+                    # marker written before the field existed was one.
+                    try:
+                        alerted = (seen.exists()
+                                   and seen.read_text().strip()
+                                   == str(held.get('at') or ''))
+                    except Exception:
+                        alerted = False
+                    if not alerted:
+                        logger.critical(
+                            'a merge conflict was NOT recorded: an un-alerted '
+                            'QUARANTINE marker from %s is still standing and '
+                            'must not be overwritten. Conflict was: %s',
+                            held.get('at'), err)
+                        return
+            path.write_text(json.dumps({
                 'at': datetime.now().isoformat(timespec='seconds'),
                 'kind': kind,
                 'error': err,
@@ -2150,8 +2283,9 @@ class ZebraStore:
             winner, note = store_contract.resolve_merge(
                 by_id[tid], t, store_contract.ZEBRA_STATUSES,
                 same_replica=same_replica,
-                unversioned_fields=_BATCHED_POLL_FIELDS,
-                unversioned_prefixes=('mfe_',))
+                unversioned_fields=_UNVERSIONED_FIELDS,
+                unversioned_prefixes=_UNVERSIONED_PREFIXES,
+                unversioned_suffixes=_UNVERSIONED_SUFFIXES)
             by_id[tid] = winner
             if note:
                 notes.append(note)

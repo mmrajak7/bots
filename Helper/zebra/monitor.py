@@ -529,9 +529,17 @@ def _format_exit_escalation(trade: dict, kind: str, quote: dict,
         f"{('%.2f' % mid) if mid is not None else 'NA'} | entry debit "
         f"{trade.get('debit')}\n"
         f"reason: {html.escape(str(quote.get('reason') or 'unreliable book'))}\n"
-        f"<i>HOLDING — max loss is the debit and already capped. "
-        f"Close manually with <code>zebra close {trade.get('id')}</code> "
-        f"if you disagree.</i>"
+        # SAY THAT THE HOLD IS BOUNDED. This read "HOLDING" with no
+        # qualifier, which an owner reasonably takes as "the engine is
+        # waiting for me" -- and since 2026-08-29 it waits only
+        # `exit_vet_max_hold_sec`, then exits on the guards. Someone who
+        # started closing by hand on the strength of that word was racing the
+        # engine's own budget without knowing it.
+        f"<i>HOLDING for now — max loss is the debit and already capped. "
+        f"The engine proceeds on its deterministic guards in up to "
+        f"{max(0, int(getattr(cfg, 'EXIT_VET_MAX_HOLD_SEC', 0)) // 60)} min "
+        f"unless you close first. Close manually with "
+        f"<code>zebra close {trade.get('id')}</code> if you disagree.</i>"
     )
 
 
@@ -706,7 +714,15 @@ def _entry_candidate(trade: dict, analysis: dict,
         'debit': src.get('debit'),
         'lot_size': src.get('lot_size') or analysis.get('lot_size'),
     }
-    depth = None
+    # `{}`, NOT None. `capital.plan` distinguishes them deliberately: None
+    # means "this caller never had depth to give" and carries NO liquidity
+    # bound, while an empty mapping means "I looked and the book said
+    # nothing" and caps the size at one lot. This call site ALWAYS looks, so
+    # a missing `long_ask_qty` is the second case -- and Kite ships that key
+    # absent, which is the state that held on all 13 cohort records until the
+    # `_atm_quote` fix. Passing None sized those entries with no liquidity
+    # check at all; masked only because `lots_for_capital(2L)` is 1.
+    depth = {}
     if src.get('long_ask_qty') is not None:
         depth = {'long': {'ask_qty': src.get('long_ask_qty')},
                  'short': {'bid_qty': src.get('short_bid_qty')}}
@@ -938,7 +954,7 @@ def _band_cancel(store: ZebraStore, trade: dict, reason: str,
         pass
 
 
-def _claim_exit_alert(store: ZebraStore, trade_id: int, kind: str) -> bool:
+def _claim_exit_alert(store: ZebraStore, trade: dict, kind: str) -> bool:
     """Claim the consume-once exit alert. Daily in LIVE, once-ever in PAPER.
 
     In PAPER the position is booked in the SAME cycle the alert fires, so one
@@ -960,10 +976,86 @@ def _claim_exit_alert(store: ZebraStore, trade_id: int, kind: str) -> bool:
     alert fatigue the gates exist to cure (owner's call, 2026-08-10), and a
     stop that keeps asking once a day until the position is actually closed is
     the behaviour a human can act on.
+
+    THE RECORD DECIDES, NOT THE MODE (fixed 2026-08-31). This keyed on
+    `cfg.PAPER_MODE`, but the two arguments above are both about what happens
+    to THIS record: whether `_paper_auto_close` will book it in the same cycle,
+    which it decides per record via `is_paper_record`. The arming order's very
+    first live-money action is a hand-placed live trade filed with `zebra
+    enter` while the store is still `paper_mode: true` — and that record got a
+    once-EVER claim for a close zebra declines forever. Its stop was announced
+    exactly once and then never again, which is precisely the shape the LIVE
+    branch was written to prevent. Same `or`-versus-record defect that
+    `_paper_auto_close` was fixed for on 2026-08-29, one layer up.
     """
-    if cfg.PAPER_MODE:
-        return store.set_alert_flag(trade_id, kind)
-    return store.set_alert_flag_daily(trade_id, kind)
+    if is_paper_record(trade):
+        return store.set_alert_flag(trade['id'], kind)
+    return store.set_alert_flag_daily(trade['id'], kind)
+
+
+#: The price-driven exits whose claim is consume-once. TIME is deliberately
+#: absent: its flag is daily and its close is retried every cycle.
+_PRICE_EXIT_KINDS = ('tp', 'trail', 'spot_sl', 'debit_sl')
+
+
+def _release_stranded_claims(store: ZebraStore, trade: dict) -> None:
+    """Give back a consume-once exit claim that no process is still holding.
+
+    THE GAP (found 2026-08-31). `_claim_exit_alert` persists the claim, and the
+    booking happens AFTER it — with a Telegram POST of up to 10 seconds in
+    between. Every IN-PROCESS failure between the two already releases the flag
+    (`_paper_auto_close`'s defer paths, `_send_exit_alert`'s failed send). What
+    nothing covered is the process simply CEASING between them: a SIGKILL, an
+    OOM, power loss, or the 15:30 window closing mid-cycle. zebra's cron
+    process is one-shot and exits between cycles, so there is no in-memory
+    state to notice — the claim is durable and the release was not.
+
+    The consequence is worst exactly where it matters most. For `debit_sl` the
+    position's only loss-side stop is silently disarmed FOR THE LIFE OF THE
+    TRADE: every later cycle's `set_alert_flag` returns False and
+    short-circuits the branch, and the position rides to max loss or expiry
+    with nothing logged. That is "protection that looks armed and is not",
+    which is the shape of both real-money incidents.
+
+    The inference is sound rather than heuristic: a claim can only have been
+    made by a cycle that was about to book, a booking leaves the record
+    `exited`, and every in-process failure releases. So `entered` + a claim
+    older than a couple of cycles is, by construction, a claim whose holder is
+    gone. Two intervals of slack so a cycle that is merely SLOW is never robbed
+    of its claim mid-flight.
+
+    PAPER RECORDS ONLY. A live record's claim is daily, not once-ever, so it
+    re-arms tomorrow on its own — releasing it here would convert a deliberate
+    once-a-day nag into one every ten minutes, which is the alert fatigue the
+    daily throttle exists to cure.
+
+    Never raises: this is housekeeping, and it must not be able to stop the
+    exit checks that follow it.
+    """
+    if not is_paper_record(trade):
+        return
+    slack = max(2 * cfg.MONITOR_INTERVAL_SEC, 600)
+    now = datetime.now()
+    for kind in _PRICE_EXIT_KINDS:
+        stamp = trade.get('%s_alerted_at' % kind)
+        if not stamp:
+            continue
+        try:
+            age = (now - datetime.fromisoformat(str(stamp))).total_seconds()
+        except (TypeError, ValueError):
+            continue                     # unparseable: leave it alone, say so
+        if age < slack:
+            continue
+        try:
+            store.clear_alert_flag(trade['id'], kind)
+            logger.warning(
+                "STRANDED CLAIM #%d %s: the %s exit was claimed %.0fs ago and "
+                "the position is still `entered` — the cycle that claimed it "
+                "died before booking. Releasing so the trigger can fire again.",
+                trade['id'], trade.get('stock'), kind.upper(), age)
+        except Exception as e:
+            logger.error("could not release the stranded %s claim on #%d: %s",
+                         kind, trade['id'], e)
 
 
 def _send_exit_alert(store: ZebraStore, trade: dict, kind: str, msg: str,
@@ -1222,7 +1314,15 @@ def _auto_enter_bcs(store: ZebraStore, kite, trade: dict, bcs: dict,
     lim = capital.limits(book)
     candidate = {'stock': trade.get('stock'), 'debit': bcs.get('debit'),
                  'lot_size': bcs.get('lot_size')}
-    depth = None
+    # `{}`, NOT None. `capital.plan` distinguishes them deliberately: None
+    # means "this caller never had depth to give" and carries NO liquidity
+    # bound, while an empty mapping means "I looked and the book said
+    # nothing" and caps the size at one lot. This call site ALWAYS looks, so
+    # a missing `long_ask_qty` is the second case -- and Kite ships that key
+    # absent, which is the state that held on all 13 cohort records until the
+    # `_atm_quote` fix. Passing None sized those entries with no liquidity
+    # check at all; masked only because `lots_for_capital(2L)` is 1.
+    depth = {}
     if bcs.get('long_ask_qty') is not None:
         depth = {'long': {'ask_qty': bcs.get('long_ask_qty')},
                  'short': {'bid_qty': bcs.get('short_bid_qty')}}
@@ -1448,18 +1548,36 @@ def _filled_legs(bcs: dict, out: dict) -> dict:
 def _entry_residue_legs(out: dict, extra: Optional[dict] = None) -> dict:
     """Symbols an entry left at the broker that no record accounts for.
 
-    Three sources, all of them things `open_spread` reports and then declines
+    FIVE sources, all of them things `open_spread` reports and then declines
     to act on:
 
-      orphan    a round bought its long and could not sell its short;
-      partials  a leg filled odd-sized -- those shares are held;
-      extra     the caller's own case, for when COMPLETE spreads filled and
-                the RECORD could not be written (an uncomputable debit, a
-                store that refused). Both legs are then unaccounted for.
+      orphan        a round bought its long and could not sell its short;
+      partials      a leg filled odd-sized -- those shares are held;
+      unknown_orders an order that could NOT be confirmed dead: it may be
+                    working at the broker right now;
+      raised_legs   the legs in flight when the order path threw;
+      extra         the caller's own case, for when COMPLETE spreads filled
+                    and the RECORD could not be written (an uncomputable
+                    debit, a store that refused). Both legs are then
+                    unaccounted for.
 
-    Quantities are what the executor reported, i.e. what we believe we hold.
-    The sweep reads the BROKER for the live figure; these are only the
-    symbols to ask about and the size to print.
+    THE LAST TWO WERE MISSING (found 2026-08-31), and they are the two that
+    reopened the amplification `_entry_already_in_flight` exists to stop.
+    Both leave a leg possibly live at the broker while producing only PROSE in
+    `out['problems']` -- so `legs` came back empty, `_record_entry_residue`
+    returned False without writing anything, and the next cycle found no
+    residue and no unresolved journal intent. It therefore sent the SAME
+    signal back to the order path: another long, every cycle, none of them in
+    any store, invisible to `capital.check` and to every sweep.
+
+    `unknown_orders` is the sharper of the two. An unknown SHORT that fills
+    later, beside a new round's short, is two lots short against one long --
+    the net naked short the long-first sequencing exists to make impossible,
+    achieved across cycles instead of within a run.
+
+    Quantities are what the executor reported, i.e. what we believe we hold;
+    ZERO means "we do not know, ask the broker". The sweep reads the BROKER
+    for the live figure, so a zero is a symbol to chase rather than a claim.
     """
     legs = {}
     orphan = out.get('orphan') or {}
@@ -1468,6 +1586,14 @@ def _entry_residue_legs(out: dict, extra: Optional[dict] = None) -> dict:
     for pt in out.get('partials') or ():
         if pt.get('symbol'):
             legs[pt['symbol']] = legs.get(pt['symbol'], 0) + int(pt.get('qty') or 0)
+    for uo in out.get('unknown_orders') or ():
+        # `max`, not `+`: an unknown order carries no proven quantity, and
+        # adding a zero to a known orphan size must not overwrite it.
+        if uo.get('symbol'):
+            legs[uo['symbol']] = max(legs.get(uo['symbol'], 0), 0)
+    for sym, qty in (out.get('raised_legs') or {}).items():
+        if sym:
+            legs[sym] = max(legs.get(sym, 0), int(qty or 0))
     for sym, qty in (extra or {}).items():
         if sym:
             legs[sym] = legs.get(sym, 0) + int(qty or 0)
@@ -2107,468 +2233,490 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
     ltps = get_ltp(kite, stocks)
 
     for trade in watching:
-        stock = trade['stock']
-        price = ltps.get(stock, 0)
-        if price <= 0:
-            # No LTP, so the gap is never updated, so the drift and stale
-            # cancels below can never fire — a suspended, renamed or delisted
-            # symbol becomes an IMMORTAL row, holding a slot against
-            # MAX_WATCHING_SIGNALS (25) and blocking its own stock through
-            # dedup forever. Age is the only bound that still works when the
-            # price feed does not.
-            if _expire_if_ancient(store, trade):
-                continue
-            continue
-        st_val = trade['st_value']
-        gap = (price - st_val) / st_val if trade['direction'] == 'PE' \
-            else (st_val - price) / st_val
-        gap_pct = round(gap * 100, 2)
-        store.update_gap(trade['id'], gap_pct)
-
-        # Drift cancel: if gap blew past watch band by 20%
-        if gap > cfg.WATCH_GAP_MAX * 1.2:
-            _band_cancel(store, trade,
-                         f'drift: gap {gap_pct:.2f}% > watch+20%',
-                         dry_run=dry_run)
-            continue
-
-        # Stale (too close): gap fell below stale_min → past entry zone
-        if gap < 0:
-            # Crossed the line. For CE-Zebra (price < ST, gap = (ST-price)/ST),
-            # negative gap means price overshot above ST. Likely already moving
-            # toward target. Cancel as we missed the entry window.
-            _band_cancel(store, trade,
-                         f'crossed: gap {gap_pct:.2f}% (past ST)',
-                         dry_run=dry_run)
-            continue
-
-        if gap > cfg.TRIGGER_GAP_MAX:
-            # Not yet in trigger zone; just keep watching.
-            #
-            # EXCEPT for a signal already waiting on a vet. The queue is
-            # drained by the gate ~140 lines below, which this `continue` puts
-            # out of reach, so a queued signal that drifted back into the watch
-            # band could never be retried — `attempts` froze and the drop clock
-            # ran out underneath it. HAVELLS #404 on 2026-08-14 is the case:
-            # triggered at 3.92%, drifted to 4.46%, and was dropped 60 minutes
-            # later having had exactly one attempt across nine cycles, with the
-            # alert blaming an agent slot that was free the whole time.
-            #
-            # Vetting it here changes nothing about what may ENTER: entry lives
-            # past this `continue` and is still gated on the trigger band, so an
-            # ALLOWED verdict simply waits for price to come back. Costs one
-            # analyzer re-quote per queued signal per cycle, and only while one
-            # is queued — which is rare.
-            if cfg.VET_ENABLED and vet_mod.is_queued(store.find(trade['id'])
-                                                     or trade):
-                _drain_queued_out_of_band(store, trade, kite, price, gap_pct)
-            continue
-        if gap < cfg.STALE_GAP_MIN:
-            # In stale zone: too late
-            _band_cancel(
-                store, trade,
-                f'stale: gap {gap_pct:.2f}% < {cfg.STALE_GAP_MIN*100:.1f}%',
-                dry_run=dry_run)
-            continue
-
-        # Already triggered + still in zone.
-        # Vet OFF: the alert (and paper entry) happened in the trigger cycle —
-        #   nothing to do. (Saves Kite quote calls in the analyzer.)
-        # Vet ON: 'triggered' is the WAITING state. The entry was deliberately
-        #   deferred past the verdict and it happens HERE, on the first cycle
-        #   whose verdict permits it. Without this fall-through an allowed
-        #   signal would wait forever: this early `continue` runs long before
-        #   the gate below, so the gate alone can never re-admit it.
-        if trade['status'] == 'triggered':
-            if not cfg.VET_ENABLED:
-                # In PAPER a completed entry moves the row to `entered`, so a
-                # row still sitting in `triggered` means the entry did NOT
-                # complete — a suppressing gate, one bad quote, an IO blip.
-                # The old `continue` (justified as "saves Kite quote calls")
-                # therefore parked it forever: still inside its trigger band,
-                # never retried, and only ever released by a drift/stale
-                # cancel. Retry while it is still in the zone; the band is a
-                # window, and a book that was unquotable at 10:05 is routinely
-                # fine at 10:10.
-                #
-                # LIVE stops here ONLY once the ticket has actually gone out.
-                # Re-alerting every 5 minutes would be noise rather than a
-                # retry — but a ticket whose Telegram FAILED released its
-                # claim, and an unconditional `continue` then parked the
-                # signal forever with the human never told. Gate on the claim,
-                # not on the mode.
-                if not cfg.PAPER_MODE:
-                    if (store.find(trade['id']) or {}).get('vet_enter_alerted_at'):
-                        continue
-                    logger.warning(
-                        "TICKET RETRY #%d %s: live entry ticket was never "
-                        "delivered (claim not held) — re-running the analyzer",
-                        trade['id'], stock)
-                logger.info(
-                    "RETRY #%d %s: still triggered and in the zone "
-                    "(gap %.2f%%) — entry did not complete, re-running the "
-                    "analyzer", trade['id'], stock, gap_pct)
-            state = vet_mod.vet_state(store.find(trade['id']) or trade)
-            if state == vet_mod.VETOED:
-                # THE ONLY place a veto is ever observed. The verdict lands
-                # between cycles (the CLI is a separate process), so every
-                # post-veto cycle stops right here — anything downstream of
-                # this `continue` is unreachable for a vetoed signal. Opening
-                # the shadow anywhere below would look wired and never run,
-                # which is exactly the mistake the comment above describes and
-                # exactly how the veto scoring was dead on arrival.
-                try:
-                    outcomes_mod.open_shadow(store, trade['id'],
-                                             entry_spot=price)
-                except Exception as e:
-                    logger.error("Veto shadow failed for #%d: %s",
-                                 trade['id'], e)
-                continue
-            if state == vet_mod.PENDING:
-                continue    # still deciding; expire_stale bounds it
-            # QUEUED falls THROUGH deliberately: the analyzer below re-quotes
-            # the book, and the vetting gate then promotes the signal with that
-            # fresh context. A queued entry therefore never hands an agent a
-            # stale snapshot, and it costs no extra Kite call — this path runs
-            # the analyzer anyway. The band is re-checked above every cycle, so
-            # a queued signal whose price left the zone is drift-cancelled by
-            # the machinery that already exists.
-            # ALLOWED → enter now (re-running the analyzer for a fresh book;
-            # entry drift ≤ one tick is the accepted cost of vetting).
-            # None → the vet request never landed (crash after
-            # mark_triggered): fall through so the gate below re-requests it —
-            # recoverable instead of parked until drift-cancel.
-            #
-            # M6: UNAVAILABLE is NOT an entry state — see the gate below.
-            if state == vet_mod.ALLOWED \
-                    and not cfg.PAPER_MODE \
-                    and (store.find(trade['id']) or {}).get('vet_enter_alerted_at'):
-                continue    # LIVE: the order-ticket alert already went out
-
-        # In trigger zone — run analyzer + alert
+        # ── Per-signal fault isolation ───────────────────────────────
+        #
+        # `check_entered` got exactly this guard, with the note that the
+        # earlier fix 'guarded one CALL, this guards the CLASS'. This loop
+        # never got the copy, and it has the same three raising shapes: it
+        # indexes directly (`trade['st_value']`, `trade['direction']`),
+        # divides by `st_value` (a 0 or None from a half-merge or a hand
+        # edit is a ZeroDivisionError/TypeError), and calls a store that
+        # can raise `LockTimeout` or `ValueError` from `_must_find` when a
+        # sibling process has removed the row.
+        #
+        # Any of those propagated to run_cycle's PHASE-level catch, so
+        # every signal sorted after the bad one got no band check, no
+        # drift cancel and no entry -- and for a persistently bad row,
+        # never again. One malformed record silently stopped the scanner.
         try:
-            analysis = strikes_mod.analyze(kite, stock, trade['direction'],
-                                           price)
-        except Exception as e:
-            logger.error("Strike analysis failed for %s: %s", stock, e)
-            continue
-
-        if analysis.get('error'):
-            logger.warning("Strike analysis %s skipped: %s", stock, analysis['error'])
-            continue
-        # Require what the structure we ACTUALLY trade needs: the ATM book.
-        # This used to have a second arm gating on a tradeable back-ratio
-        # `best`, which let a retired structure's constraints (net-extrinsic,
-        # deep-ITM liquidity) veto a spread that shares none of them. The back
-        # ratio was decommissioned on 2026-08-27 and `analyze()` no longer
-        # produces a `best` at all.
-        atm_q = analysis.get('atm_quote') or {}
-        if not analysis.get('atm_strike') or not atm_q.get('mid'):
-            logger.info("No usable ATM book for %s, leaving in watching",
-                        stock)
-            continue
-
-        analysis['current_gap_pct'] = gap_pct
-        # `alert_strikes` recorded the back-ratio shortlist. There is no such
-        # shortlist any more, so the record carries an empty list rather than
-        # something that reads like a set of options the operator could pick
-        # from. Historical records keep whatever they were written with.
-        alert_strikes: list = []
-        if trade['status'] == 'watching':
-            try:
-                store.mark_triggered(trade['id'], price, gap_pct, alert_strikes)
-            except ValueError as e:
-                logger.warning("mark_triggered failed for #%d: %s", trade['id'], e)
-                continue
-
-        # ── Price the structure that would actually open, BEFORE the vet ──
-        # Everything below reasons about a position: the capital gate sizes
-        # it, the vet judges it, the ticket quotes it. Building it here means
-        # all three see ONE pair. Before 2026-08-27 it was built AFTER the
-        # vet, so the capital layer had nothing to price but the retired back
-        # ratio in `analysis['best']` (#449), and `analyze_bcs`'s own hard
-        # gates ran only after a Claude call had already been spent.
-        bcs = _build_bcs(kite, trade, analysis, price)
-        if bcs is None:
-            continue          # gated and logged; nothing to vet or alert
-
-        # ── Capital, BEFORE the vet ──────────────────────────────────────
-        # A deterministic check costing one store read decides the same thing
-        # a Claude spawn costs a slot and ~4 minutes to decide. #449 was
-        # refused for having no free slot AFTER the vet had already run on it,
-        # and the operator was then shown a full order ticket — click-copy
-        # symbols, "Vetted by Claude" — with "DO NOT ENTER" underneath it.
-        #
-        # This is a SHADOW in paper and stays one: `_refuse_if_over_budget`
-        # still records the position so the validation book keeps every
-        # signal. What changes is that the vet is not spent and the operator
-        # is not handed an order ticket for a trade the book cannot take.
-        cap_plan = None
-        try:
-            cap_plan = _capital_context(store, trade, analysis, bcs)['plan']
-        except Exception as e:
-            # A capital lookup that fails must not decide anything. Fall
-            # through exactly as before: the vet runs, the ticket renders, and
-            # `_refuse_if_over_budget` is still the backstop at entry.
-            logger.warning("capital pre-gate failed for #%d %s: %s — "
-                           "continuing unsized", trade['id'], stock, e)
-        capital_refused = bool(cap_plan) and not cap_plan['lots']
-        # THE SIZING DECISION RIDES ON THE RECORD, not just on a log line.
-        # `bcs` is the same dict `_bcs_entry_fields` reads at entry, so
-        # stamping it here needs no plumbing and covers the paper shadow too
-        # -- which is the only book there is to calibrate the lot ladder from.
-        if cap_plan:
-            bcs['entry_plan'] = {'lots': cap_plan['lots'],
-                                 'bound': cap_plan['bound'],
-                                 'bounds': cap_plan['bounds'],
-                                 'capital': cap_plan['capital']}
-        # ── PAPER SHADOW-LOGS WHAT IT WOULD HAVE REFUSED ────────────────
-        #
-        # `ZebraStore._refuse_if_over_budget` states the rule: "LIVE refuses.
-        # PAPER evaluates and LOGS what it WOULD have refused" — capping paper
-        # entries would bias which trades the validation record contains, and
-        # an unentered paper signal costs nothing. The STORE implements that.
-        # This pre-gate, the other place the cap is enforced, did not.
-        #
-        # What it cost, immediately: `max_open_trades` went 8 -> 4 on
-        # 2026-08-29 (M9, a LIVE decision) while the cohort held 6 open paper
-        # positions, so from the next session EVERY new signal was refused
-        # here — which skips the vet (below) and swaps the order ticket for a
-        # capital notice — while the store's paper exemption let the record
-        # enter anyway. A paper trade entered with NO VERDICT on it, and the
-        # vetting pipeline THE GOAL exists to validate going dark, from a
-        # config change that was supposed to be live-only.
-        # [[feedback_the_copy_you_did_not_open]], on the paper/live boundary.
-        #
-        # The log line stays either way: shadow evidence is how the rupee
-        # numbers get chosen from data instead of guessed.
-        capital_shadow = ''
-        if capital_refused and cfg.PAPER_MODE:
-            # THREE consequences were bundled behind one flag, and only two of
-            # them are right in paper:
-            #   * do not ENTER      — paper enters anyway (the store exempts
-            #                         it), so this one never applied here;
-            #   * spend no VET      — WRONG in paper: the record enters, so an
-            #                         unvetted entry is a hole in the very
-            #                         evidence the paper run exists to produce;
-            #   * send no TICKET    — RIGHT in both: an order ticket that says
-            #                         DO NOT ENTER underneath is #449.
-            # So the refusal stops binding, and the reason is carried forward
-            # to keep the ALERT honest instead of silently ticketing.
-            capital_shadow = cap_plan['reason']
-            logger.warning(
-                "CAPITAL WOULD REFUSE #%d %s: %s — PAPER enters anyway and is "
-                "vetted normally, so the validation record stays unbiased. "
-                "%s", trade['id'], stock, capital_shadow,
-                # WHOLE BOOK: see `_capital_context`.
-                capital.describe(store.load_trades()))
-            capital_refused = False
-        elif capital_refused:
-            logger.warning(
-                "CAPITAL REFUSES #%d %s: %s — no vet spent, no order ticket. "
-                "%s", trade['id'], stock, cap_plan['reason'],
-                # WHOLE BOOK: see `_capital_context`.
-                capital.describe(store.load_trades()))
-
-        # ── Claude vetting gate ──────────────────────────────────────────
-        # A triggered signal waits for a verdict before it enters. The vet is
-        # requested once; the spawned CLI is never waited on, so this cycle
-        # returns immediately and the entry happens on a later tick.
-        #
-        # INVERTED 2026-08-13. This used to read "every branch that is not an
-        # explicit ALLOW must still let the trade through eventually", and that
-        # is now false and dangerous as an instruction: entries QUEUE when no
-        # verdict is available, and only ALLOWED / UNAVAILABLE may proceed (see
-        # the explicit allowlist below). A missed entry costs nothing; an
-        # unqualified one costs capital. The halt is kept non-silent by
-        # `drop_after` plus the ENTRY DROPPED Telegram, not by entering.
-        #
-        # A signal the book cannot fund is not a judgement call, so it does not
-        # reach an agent — but ONLY when nothing is in flight for it yet. A
-        # verdict already being decided is still honoured: entering behind a
-        # PENDING vet would let a VETO land on a position that is already open.
-        # Nothing is dropped either way — the row stays where it is and every
-        # later cycle re-asks, so the moment a slot frees the vet is requested
-        # normally.
-        vet_skipped = (cfg.VET_ENABLED and capital_refused
-                       and vet_mod.vet_state(store.find(trade['id'])) is None)
-        if vet_skipped:
-            logger.info("VET NOT REQUESTED #%d %s — capital refuses the "
-                        "signal; no agent slot spent", trade['id'], stock)
-        if cfg.VET_ENABLED and not vet_skipped:
-            state = vet_mod.vet_state(store.find(trade['id']))
-            if state == vet_mod.QUEUED:
-                # Retry with the book we just re-quoted. promote_queued is a
-                # CAS, so overlapping drainers cannot double-spawn; a loser
-                # simply waits for the next cycle.
-                #
-                # Wrapped: this is the only vet call on this path that was
-                # bare, and `_mutate` can raise LockTimeout. Unwrapped it
-                # propagated out of check_watching and cost EVERY signal after
-                # this one its cycle — including their drift-cancel checks.
-                try:
-                    vet_mod.promote_queued(
-                        store, trade['id'],
-                        context=_vet_context(store, trade, analysis,
-                                             gap_pct, kite, bcs))
-                except Exception as e:
-                    logger.error("Queue drain failed for #%d: %s — stays "
-                                 "queued, retried next cycle", trade['id'], e)
-                continue
-            if state is None:
-                try:
-                    vet_mod.request_entry_vet(
-                        store, trade['id'],
-                        context=_vet_context(store, trade, analysis,
-                                             gap_pct, kite, bcs))
-                except ValueError as e:
-                    # The locked re-check saw a state this cache missed —
-                    # already requested or already SETTLED (possibly a veto).
-                    # Never enter on a guess; the next cycle reads the real
-                    # state (request_entry_vet's refresh updated the cache).
-                    logger.warning("VET request refused for #%d: %s — "
-                                   "re-reading next cycle", trade['id'], e)
+            stock = trade['stock']
+            price = ltps.get(stock, 0)
+            if price <= 0:
+                # No LTP, so the gap is never updated, so the drift and stale
+                # cancels below can never fire — a suspended, renamed or delisted
+                # symbol becomes an IMMORTAL row, holding a slot against
+                # MAX_WATCHING_SIGNALS (25) and blocking its own stock through
+                # dedup forever. Age is the only bound that still works when the
+                # price feed does not.
+                if _expire_if_ancient(store, trade):
                     continue
-                except Exception as e:
-                    # Infra failure (lock timeout, IO) while REQUESTING. This
-                    # handler predates the fail-closed inversion and used to
-                    # enter unvetted here — which re-opened the hole the queue
-                    # exists to close, and did it on the likeliest refusal
-                    # path: `request_entry_vet` calls `queue_entry_vet` when a
-                    # spawn is refused, so a LockTimeout in THAT write landed
-                    # right here and turned a refused slot into a live
-                    # position.
+                continue
+            st_val = trade['st_value']
+            gap = (price - st_val) / st_val if trade['direction'] == 'PE' \
+                else (st_val - price) / st_val
+            gap_pct = round(gap * 100, 2)
+            store.update_gap(trade['id'], gap_pct)
+
+            # Drift cancel: if gap blew past watch band by 20%
+            if gap > cfg.WATCH_GAP_MAX * 1.2:
+                _band_cancel(store, trade,
+                             f'drift: gap {gap_pct:.2f}% > watch+20%',
+                             dry_run=dry_run)
+                continue
+
+            # Stale (too close): gap fell below stale_min → past entry zone
+            if gap < 0:
+                # Crossed the line. For CE-Zebra (price < ST, gap = (ST-price)/ST),
+                # negative gap means price overshot above ST. Likely already moving
+                # toward target. Cancel as we missed the entry window.
+                _band_cancel(store, trade,
+                             f'crossed: gap {gap_pct:.2f}% (past ST)',
+                             dry_run=dry_run)
+                continue
+
+            if gap > cfg.TRIGGER_GAP_MAX:
+                # Not yet in trigger zone; just keep watching.
+                #
+                # EXCEPT for a signal already waiting on a vet. The queue is
+                # drained by the gate ~140 lines below, which this `continue` puts
+                # out of reach, so a queued signal that drifted back into the watch
+                # band could never be retried — `attempts` froze and the drop clock
+                # ran out underneath it. HAVELLS #404 on 2026-08-14 is the case:
+                # triggered at 3.92%, drifted to 4.46%, and was dropped 60 minutes
+                # later having had exactly one attempt across nine cycles, with the
+                # alert blaming an agent slot that was free the whole time.
+                #
+                # Vetting it here changes nothing about what may ENTER: entry lives
+                # past this `continue` and is still gated on the trigger band, so an
+                # ALLOWED verdict simply waits for price to come back. Costs one
+                # analyzer re-quote per queued signal per cycle, and only while one
+                # is queued — which is rare.
+                if cfg.VET_ENABLED and vet_mod.is_queued(store.find(trade['id'])
+                                                         or trade):
+                    _drain_queued_out_of_band(store, trade, kite, price, gap_pct)
+                continue
+            if gap < cfg.STALE_GAP_MIN:
+                # In stale zone: too late
+                _band_cancel(
+                    store, trade,
+                    f'stale: gap {gap_pct:.2f}% < {cfg.STALE_GAP_MIN*100:.1f}%',
+                    dry_run=dry_run)
+                continue
+
+            # Already triggered + still in zone.
+            # Vet OFF: the alert (and paper entry) happened in the trigger cycle —
+            #   nothing to do. (Saves Kite quote calls in the analyzer.)
+            # Vet ON: 'triggered' is the WAITING state. The entry was deliberately
+            #   deferred past the verdict and it happens HERE, on the first cycle
+            #   whose verdict permits it. Without this fall-through an allowed
+            #   signal would wait forever: this early `continue` runs long before
+            #   the gate below, so the gate alone can never re-admit it.
+            if trade['status'] == 'triggered':
+                if not cfg.VET_ENABLED:
+                    # In PAPER a completed entry moves the row to `entered`, so a
+                    # row still sitting in `triggered` means the entry did NOT
+                    # complete — a suppressing gate, one bad quote, an IO blip.
+                    # The old `continue` (justified as "saves Kite quote calls")
+                    # therefore parked it forever: still inside its trigger band,
+                    # never retried, and only ever released by a drift/stale
+                    # cancel. Retry while it is still in the zone; the band is a
+                    # window, and a book that was unquotable at 10:05 is routinely
+                    # fine at 10:10.
                     #
-                    # A missed entry costs nothing; an unqualified one costs
-                    # capital. So park it and try again next cycle. The queue's
-                    # own drop_after still bounds the wait, and the sweep still
-                    # announces a give-up, so this cannot become a silent halt.
-                    logger.error("VET request failed for #%d: %s — QUEUED, not "
-                                 "entered", trade['id'], e)
-                    try:
-                        vet_mod.queue_entry_vet(store, trade['id'],
-                                                'vet request failed: %s' % e)
-                    except Exception as e2:
-                        # Even the parking write failed. Leave it `triggered`
-                        # with no marker: the next cycle re-reads state None
-                        # and requests afresh. Entering is never the fallback.
+                    # LIVE stops here ONLY once the ticket has actually gone out.
+                    # Re-alerting every 5 minutes would be noise rather than a
+                    # retry — but a ticket whose Telegram FAILED released its
+                    # claim, and an unconditional `continue` then parked the
+                    # signal forever with the human never told. Gate on the claim,
+                    # not on the mode.
+                    if not cfg.PAPER_MODE:
+                        if (store.find(trade['id']) or {}).get('vet_enter_alerted_at'):
+                            continue
                         logger.warning(
-                            "could not queue #%d after a failed request: %s — "
-                            "left triggered, retried next cycle",
-                            trade['id'], e2)
+                            "TICKET RETRY #%d %s: live entry ticket was never "
+                            "delivered (claim not held) — re-running the analyzer",
+                            trade['id'], stock)
+                    logger.info(
+                        "RETRY #%d %s: still triggered and in the zone "
+                        "(gap %.2f%%) — entry did not complete, re-running the "
+                        "analyzer", trade['id'], stock, gap_pct)
+                state = vet_mod.vet_state(store.find(trade['id']) or trade)
+                if state == vet_mod.VETOED:
+                    # THE ONLY place a veto is ever observed. The verdict lands
+                    # between cycles (the CLI is a separate process), so every
+                    # post-veto cycle stops right here — anything downstream of
+                    # this `continue` is unreachable for a vetoed signal. Opening
+                    # the shadow anywhere below would look wired and never run,
+                    # which is exactly the mistake the comment above describes and
+                    # exactly how the veto scoring was dead on arrival.
+                    try:
+                        outcomes_mod.open_shadow(store, trade['id'],
+                                                 entry_spot=price)
+                    except Exception as e:
+                        logger.error("Veto shadow failed for #%d: %s",
+                                     trade['id'], e)
                     continue
-                else:
-                    continue          # wait for the verdict
-            elif state == vet_mod.PENDING:
-                continue              # still deciding; expire_stale bounds it
-            elif state == vet_mod.VETOED:
-                # DEFENCE IN DEPTH, and believed UNREACHABLE today: nothing
-                # between the fast-path read above and this one refreshes the
-                # store cache, and a verdict that settles mid-request comes
-                # back as request_entry_vet's ValueError instead. Kept because
-                # it is the safe duplicate of the fast-path (same action, same
-                # shadow) and any future cache refresh in between would make it
-                # live. Stated as a belief, not a fact: an over-confident
-                # reachability comment is what made the veto shadow dead code
-                # in the first place.
-                logger.info("VETOED #%d %s — no entry", trade['id'], stock)
-                try:
-                    outcomes_mod.open_shadow(store, trade['id'],
-                                             entry_spot=price)
-                except Exception as e:
-                    logger.error("Veto shadow failed for #%d: %s",
-                                 trade['id'], e)
-                continue
-            elif state != vet_mod.ALLOWED:
-                # EXPLICIT allowlist, not a bare fall-through. Entering was the
-                # DEFAULT for any state without an `elif` above, so adding a
-                # state to the machine silently meant "enter unvetted" — which
-                # is exactly what STARVED must never do.
+                if state == vet_mod.PENDING:
+                    continue    # still deciding; expire_stale bounds it
+                # QUEUED falls THROUGH deliberately: the analyzer below re-quotes
+                # the book, and the vetting gate then promotes the signal with that
+                # fresh context. A queued entry therefore never hands an agent a
+                # stale snapshot, and it costs no extra Kite call — this path runs
+                # the analyzer anyway. The band is re-checked above every cycle, so
+                # a queued signal whose price left the zone is drift-cancelled by
+                # the machinery that already exists.
+                # ALLOWED → enter now (re-running the analyzer for a fresh book;
+                # entry drift ≤ one tick is the accepted cost of vetting).
+                # None → the vet request never landed (crash after
+                # mark_triggered): fall through so the gate below re-requests it —
+                # recoverable instead of parked until drift-cancel.
                 #
-                # M6 (2026-08-29): UNAVAILABLE CAME OFF THIS ALLOWLIST.
-                #
-                # It means "the vet request could not even be made" — a lock
-                # timeout, an IO error, no agent slot. Letting it enter made an
-                # entry that was never reviewed indistinguishable from one that
-                # was reviewed and cleared, and that contradicts the standing
-                # rule this whole layer exists to serve: ENTRIES FAIL CLOSED.
-                # A missed entry costs nothing; an unqualified one costs
-                # capital (`feedback_no_rush_to_enter`).
-                #
-                # **EXITS ARE THE OPPOSITE and must stay that way.**
-                # `vet.exit_gate` returns 'proceed' on UNAVAILABLE, on purpose:
-                # there the bounded outcome is ACTING, and an exit deadline
-                # that depends on an LLM being reachable is how a stop stops
-                # working. Same word, opposite safe direction, because the two
-                # sides have opposite asymmetries. Do not "unify" them.
-                #
-                # This branch was unreachable before today — `mark_unavailable`
-                # (`zebra/vet.py`) has never had a caller, which is why the
-                # contradiction survived. It is now safe to wire in.
-                logger.info("NO ENTRY #%d %s — vet state %r is not an entry "
-                            "state", trade['id'], stock, state)
-                continue
-            # Only ALLOWED falls through and enters below.
+                # M6: UNAVAILABLE is NOT an entry state — see the gate below.
+                if state == vet_mod.ALLOWED \
+                        and not cfg.PAPER_MODE \
+                        and (store.find(trade['id']) or {}).get('vet_enter_alerted_at'):
+                    continue    # LIVE: the order-ticket alert already went out
 
-        # PAPER mode: auto-record the entry FIRST, then alert — so the ENTER
-        # alert only goes out for a position that actually opened. If the fill
-        # is rejected we leave the signal in 'triggered' (it self-heals via the
-        # drift/stale-cancel checks next cycle); we deliberately do NOT cancel
-        # here, because a 'cancelled' record isn't deduped by the scanner and
-        # would be re-added + re-alerted every scan (alert churn).
-        # ── The only entry path: one BCS record, no shadow ──────────────
-        # The `if cfg.ENTRY_STRUCTURE == 'bcs':` that used to wrap this, and
-        # the ~120-line back-ratio entry branch that followed it, were removed
-        # on 2026-08-27 when the owner decommissioned the back ratio. That
-        # branch is the one logged as F2: it ignored `capital_refused` and
-        # would still have rendered a full order ticket for a signal the book
-        # had already refused.
-        #
-        # The strike analyzer still runs because it owns expiry selection, lot
-        # size and the ATM book — but it no longer prices anything else.
-        built = _enter_as_bcs(store, kite, trade, analysis, price,
-                              bcs=bcs, dry_run=dry_run)
-        if built is None:
+            # In trigger zone — run analyzer + alert
+            try:
+                analysis = strikes_mod.analyze(kite, stock, trade['direction'],
+                                               price)
+            except Exception as e:
+                logger.error("Strike analysis failed for %s: %s", stock, e)
+                continue
+
+            if analysis.get('error'):
+                logger.warning("Strike analysis %s skipped: %s", stock, analysis['error'])
+                continue
+            # Require what the structure we ACTUALLY trade needs: the ATM book.
+            # This used to have a second arm gating on a tradeable back-ratio
+            # `best`, which let a retired structure's constraints (net-extrinsic,
+            # deep-ITM liquidity) veto a spread that shares none of them. The back
+            # ratio was decommissioned on 2026-08-27 and `analyze()` no longer
+            # produces a `best` at all.
+            atm_q = analysis.get('atm_quote') or {}
+            if not analysis.get('atm_strike') or not atm_q.get('mid'):
+                logger.info("No usable ATM book for %s, leaving in watching",
+                            stock)
+                continue
+
+            analysis['current_gap_pct'] = gap_pct
+            # `alert_strikes` recorded the back-ratio shortlist. There is no such
+            # shortlist any more, so the record carries an empty list rather than
+            # something that reads like a set of options the operator could pick
+            # from. Historical records keep whatever they were written with.
+            alert_strikes: list = []
+            if trade['status'] == 'watching':
+                try:
+                    store.mark_triggered(trade['id'], price, gap_pct, alert_strikes)
+                except ValueError as e:
+                    logger.warning("mark_triggered failed for #%d: %s", trade['id'], e)
+                    continue
+
+            # ── Price the structure that would actually open, BEFORE the vet ──
+            # Everything below reasons about a position: the capital gate sizes
+            # it, the vet judges it, the ticket quotes it. Building it here means
+            # all three see ONE pair. Before 2026-08-27 it was built AFTER the
+            # vet, so the capital layer had nothing to price but the retired back
+            # ratio in `analysis['best']` (#449), and `analyze_bcs`'s own hard
+            # gates ran only after a Claude call had already been spent.
+            bcs = _build_bcs(kite, trade, analysis, price)
+            if bcs is None:
+                continue          # gated and logged; nothing to vet or alert
+
+            # ── Capital, BEFORE the vet ──────────────────────────────────────
+            # A deterministic check costing one store read decides the same thing
+            # a Claude spawn costs a slot and ~4 minutes to decide. #449 was
+            # refused for having no free slot AFTER the vet had already run on it,
+            # and the operator was then shown a full order ticket — click-copy
+            # symbols, "Vetted by Claude" — with "DO NOT ENTER" underneath it.
+            #
+            # This is a SHADOW in paper and stays one: `_refuse_if_over_budget`
+            # still records the position so the validation book keeps every
+            # signal. What changes is that the vet is not spent and the operator
+            # is not handed an order ticket for a trade the book cannot take.
+            cap_plan = None
+            try:
+                cap_plan = _capital_context(store, trade, analysis, bcs)['plan']
+            except Exception as e:
+                # A capital lookup that fails must not decide anything. Fall
+                # through exactly as before: the vet runs, the ticket renders, and
+                # `_refuse_if_over_budget` is still the backstop at entry.
+                logger.warning("capital pre-gate failed for #%d %s: %s — "
+                               "continuing unsized", trade['id'], stock, e)
+            capital_refused = bool(cap_plan) and not cap_plan['lots']
+            # THE SIZING DECISION RIDES ON THE RECORD, not just on a log line.
+            # `bcs` is the same dict `_bcs_entry_fields` reads at entry, so
+            # stamping it here needs no plumbing and covers the paper shadow too
+            # -- which is the only book there is to calibrate the lot ladder from.
+            if cap_plan:
+                bcs['entry_plan'] = {'lots': cap_plan['lots'],
+                                     'bound': cap_plan['bound'],
+                                     'bounds': cap_plan['bounds'],
+                                     'capital': cap_plan['capital']}
+            # ── PAPER SHADOW-LOGS WHAT IT WOULD HAVE REFUSED ────────────────
+            #
+            # `ZebraStore._refuse_if_over_budget` states the rule: "LIVE refuses.
+            # PAPER evaluates and LOGS what it WOULD have refused" — capping paper
+            # entries would bias which trades the validation record contains, and
+            # an unentered paper signal costs nothing. The STORE implements that.
+            # This pre-gate, the other place the cap is enforced, did not.
+            #
+            # What it cost, immediately: `max_open_trades` went 8 -> 4 on
+            # 2026-08-29 (M9, a LIVE decision) while the cohort held 6 open paper
+            # positions, so from the next session EVERY new signal was refused
+            # here — which skips the vet (below) and swaps the order ticket for a
+            # capital notice — while the store's paper exemption let the record
+            # enter anyway. A paper trade entered with NO VERDICT on it, and the
+            # vetting pipeline THE GOAL exists to validate going dark, from a
+            # config change that was supposed to be live-only.
+            # [[feedback_the_copy_you_did_not_open]], on the paper/live boundary.
+            #
+            # The log line stays either way: shadow evidence is how the rupee
+            # numbers get chosen from data instead of guessed.
+            capital_shadow = ''
+            if capital_refused and cfg.PAPER_MODE:
+                # THREE consequences were bundled behind one flag, and only two of
+                # them are right in paper:
+                #   * do not ENTER      — paper enters anyway (the store exempts
+                #                         it), so this one never applied here;
+                #   * spend no VET      — WRONG in paper: the record enters, so an
+                #                         unvetted entry is a hole in the very
+                #                         evidence the paper run exists to produce;
+                #   * send no TICKET    — RIGHT in both: an order ticket that says
+                #                         DO NOT ENTER underneath is #449.
+                # So the refusal stops binding, and the reason is carried forward
+                # to keep the ALERT honest instead of silently ticketing.
+                capital_shadow = cap_plan['reason']
+                logger.warning(
+                    "CAPITAL WOULD REFUSE #%d %s: %s — PAPER enters anyway and is "
+                    "vetted normally, so the validation record stays unbiased. "
+                    "%s", trade['id'], stock, capital_shadow,
+                    # WHOLE BOOK: see `_capital_context`.
+                    capital.describe(store.load_trades()))
+                capital_refused = False
+            elif capital_refused:
+                logger.warning(
+                    "CAPITAL REFUSES #%d %s: %s — no vet spent, no order ticket. "
+                    "%s", trade['id'], stock, cap_plan['reason'],
+                    # WHOLE BOOK: see `_capital_context`.
+                    capital.describe(store.load_trades()))
+
+            # ── Claude vetting gate ──────────────────────────────────────────
+            # A triggered signal waits for a verdict before it enters. The vet is
+            # requested once; the spawned CLI is never waited on, so this cycle
+            # returns immediately and the entry happens on a later tick.
+            #
+            # INVERTED 2026-08-13. This used to read "every branch that is not an
+            # explicit ALLOW must still let the trade through eventually", and that
+            # is now false and dangerous as an instruction: entries QUEUE when no
+            # verdict is available, and only ALLOWED / UNAVAILABLE may proceed (see
+            # the explicit allowlist below). A missed entry costs nothing; an
+            # unqualified one costs capital. The halt is kept non-silent by
+            # `drop_after` plus the ENTRY DROPPED Telegram, not by entering.
+            #
+            # A signal the book cannot fund is not a judgement call, so it does not
+            # reach an agent — but ONLY when nothing is in flight for it yet. A
+            # verdict already being decided is still honoured: entering behind a
+            # PENDING vet would let a VETO land on a position that is already open.
+            # Nothing is dropped either way — the row stays where it is and every
+            # later cycle re-asks, so the moment a slot frees the vet is requested
+            # normally.
+            vet_skipped = (cfg.VET_ENABLED and capital_refused
+                           and vet_mod.vet_state(store.find(trade['id'])) is None)
+            if vet_skipped:
+                logger.info("VET NOT REQUESTED #%d %s — capital refuses the "
+                            "signal; no agent slot spent", trade['id'], stock)
+            if cfg.VET_ENABLED and not vet_skipped:
+                state = vet_mod.vet_state(store.find(trade['id']))
+                if state == vet_mod.QUEUED:
+                    # Retry with the book we just re-quoted. promote_queued is a
+                    # CAS, so overlapping drainers cannot double-spawn; a loser
+                    # simply waits for the next cycle.
+                    #
+                    # Wrapped: this is the only vet call on this path that was
+                    # bare, and `_mutate` can raise LockTimeout. Unwrapped it
+                    # propagated out of check_watching and cost EVERY signal after
+                    # this one its cycle — including their drift-cancel checks.
+                    try:
+                        vet_mod.promote_queued(
+                            store, trade['id'],
+                            context=_vet_context(store, trade, analysis,
+                                                 gap_pct, kite, bcs))
+                    except Exception as e:
+                        logger.error("Queue drain failed for #%d: %s — stays "
+                                     "queued, retried next cycle", trade['id'], e)
+                    continue
+                if state is None:
+                    try:
+                        vet_mod.request_entry_vet(
+                            store, trade['id'],
+                            context=_vet_context(store, trade, analysis,
+                                                 gap_pct, kite, bcs))
+                    except ValueError as e:
+                        # The locked re-check saw a state this cache missed —
+                        # already requested or already SETTLED (possibly a veto).
+                        # Never enter on a guess; the next cycle reads the real
+                        # state (request_entry_vet's refresh updated the cache).
+                        logger.warning("VET request refused for #%d: %s — "
+                                       "re-reading next cycle", trade['id'], e)
+                        continue
+                    except Exception as e:
+                        # Infra failure (lock timeout, IO) while REQUESTING. This
+                        # handler predates the fail-closed inversion and used to
+                        # enter unvetted here — which re-opened the hole the queue
+                        # exists to close, and did it on the likeliest refusal
+                        # path: `request_entry_vet` calls `queue_entry_vet` when a
+                        # spawn is refused, so a LockTimeout in THAT write landed
+                        # right here and turned a refused slot into a live
+                        # position.
+                        #
+                        # A missed entry costs nothing; an unqualified one costs
+                        # capital. So park it and try again next cycle. The queue's
+                        # own drop_after still bounds the wait, and the sweep still
+                        # announces a give-up, so this cannot become a silent halt.
+                        logger.error("VET request failed for #%d: %s — QUEUED, not "
+                                     "entered", trade['id'], e)
+                        try:
+                            vet_mod.queue_entry_vet(store, trade['id'],
+                                                    'vet request failed: %s' % e)
+                        except Exception as e2:
+                            # Even the parking write failed. Leave it `triggered`
+                            # with no marker: the next cycle re-reads state None
+                            # and requests afresh. Entering is never the fallback.
+                            logger.warning(
+                                "could not queue #%d after a failed request: %s — "
+                                "left triggered, retried next cycle",
+                                trade['id'], e2)
+                        continue
+                    else:
+                        continue          # wait for the verdict
+                elif state == vet_mod.PENDING:
+                    continue              # still deciding; expire_stale bounds it
+                elif state == vet_mod.VETOED:
+                    # DEFENCE IN DEPTH, and believed UNREACHABLE today: nothing
+                    # between the fast-path read above and this one refreshes the
+                    # store cache, and a verdict that settles mid-request comes
+                    # back as request_entry_vet's ValueError instead. Kept because
+                    # it is the safe duplicate of the fast-path (same action, same
+                    # shadow) and any future cache refresh in between would make it
+                    # live. Stated as a belief, not a fact: an over-confident
+                    # reachability comment is what made the veto shadow dead code
+                    # in the first place.
+                    logger.info("VETOED #%d %s — no entry", trade['id'], stock)
+                    try:
+                        outcomes_mod.open_shadow(store, trade['id'],
+                                                 entry_spot=price)
+                    except Exception as e:
+                        logger.error("Veto shadow failed for #%d: %s",
+                                     trade['id'], e)
+                    continue
+                elif state != vet_mod.ALLOWED:
+                    # EXPLICIT allowlist, not a bare fall-through. Entering was the
+                    # DEFAULT for any state without an `elif` above, so adding a
+                    # state to the machine silently meant "enter unvetted" — which
+                    # is exactly what STARVED must never do.
+                    #
+                    # M6 (2026-08-29): UNAVAILABLE CAME OFF THIS ALLOWLIST.
+                    #
+                    # It means "the vet request could not even be made" — a lock
+                    # timeout, an IO error, no agent slot. Letting it enter made an
+                    # entry that was never reviewed indistinguishable from one that
+                    # was reviewed and cleared, and that contradicts the standing
+                    # rule this whole layer exists to serve: ENTRIES FAIL CLOSED.
+                    # A missed entry costs nothing; an unqualified one costs
+                    # capital (`feedback_no_rush_to_enter`).
+                    #
+                    # **EXITS ARE THE OPPOSITE and must stay that way.**
+                    # `vet.exit_gate` returns 'proceed' on UNAVAILABLE, on purpose:
+                    # there the bounded outcome is ACTING, and an exit deadline
+                    # that depends on an LLM being reachable is how a stop stops
+                    # working. Same word, opposite safe direction, because the two
+                    # sides have opposite asymmetries. Do not "unify" them.
+                    #
+                    # This branch was unreachable before today — `mark_unavailable`
+                    # (`zebra/vet.py`) has never had a caller, which is why the
+                    # contradiction survived. It is now safe to wire in.
+                    logger.info("NO ENTRY #%d %s — vet state %r is not an entry "
+                                "state", trade['id'], stock, state)
+                    continue
+                # Only ALLOWED falls through and enters below.
+
+            # PAPER mode: auto-record the entry FIRST, then alert — so the ENTER
+            # alert only goes out for a position that actually opened. If the fill
+            # is rejected we leave the signal in 'triggered' (it self-heals via the
+            # drift/stale-cancel checks next cycle); we deliberately do NOT cancel
+            # here, because a 'cancelled' record isn't deduped by the scanner and
+            # would be re-added + re-alerted every scan (alert churn).
+            # ── The only entry path: one BCS record, no shadow ──────────────
+            # The `if cfg.ENTRY_STRUCTURE == 'bcs':` that used to wrap this, and
+            # the ~120-line back-ratio entry branch that followed it, were removed
+            # on 2026-08-27 when the owner decommissioned the back ratio. That
+            # branch is the one logged as F2: it ignored `capital_refused` and
+            # would still have rendered a full order ticket for a signal the book
+            # had already refused.
+            #
+            # The strike analyzer still runs because it owns expiry selection, lot
+            # size and the ATM book — but it no longer prices anything else.
+            built = _enter_as_bcs(store, kite, trade, analysis, price,
+                                  bcs=bcs, dry_run=dry_run)
+            if built is None:
+                continue
+            bcs, fresh = built
+            # `fresh` is None in LIVE mode when nothing auto-entered -- the
+            # default, since `auto_entry` is off; `_auto_enter_bcs` inside
+            # `_enter_as_bcs` can also fill it when auto-entry is armed and
+            # the fill succeeds. Either way the alert still goes out (as the
+            # order ticket, or as a record of what was just filled), and
+            # _alerts_enabled always returns True when paper mode is off for
+            # exactly that reason.
+            target = fresh or trade
+            if not _alerts_enabled(target):
+                logger.info("ENTER alert suppressed for #%d %s "
+                            "(alert_structures=%s)", trade['id'], stock,
+                            cfg.ALERT_STRUCTURES)
+                continue
+            if capital_refused:
+                # ONE signal, ONE alert -- and this one is not an order.
+                # Rendering the ticket and appending "DO NOT ENTER" is what
+                # #449 did: click-copy symbols, a debit, a lot size and a
+                # Claude tick, contradicted by its own last line. Whatever a
+                # reader acts on there, the message was wrong.
+                _send_capital_refused_alert(store, target, bcs, cap_plan,
+                                            stock, dry_run=dry_run)
+                continue
+            msg = _format_bcs_enter_alert(target, analysis, bcs)
+            if cfg.VET_ENABLED:
+                msg += _vet_line(store.find(trade['id']) or target)
+            # Funds LAST, closest to the click-copy symbols. Quantity from the
+            # BCS's own lot_size: the ticket and the margin must price the same
+            # order. (This used to sit BELOW the retired branch's `continue`, so
+            # under the BCS pipeline it ran exactly never — the wire-into-the-live-
+            # path shape, pinned by a test.)
+            # A refused plan must never render as a size. In PAPER the position
+            # HAS been opened at one lot while the plan says zero, so
+            # `_size_line`'s "DO NOT ENTER" would contradict the entry that just
+            # happened — #449's incoherence, arrived at from the other side.
+            msg += (_shadow_size_line(capital_shadow) if capital_shadow
+                    else _size_line(cap_plan))
+            msg += _funds_line(kite, bcs, bcs.get('lot_size') or 0)
+            _send_enter_alert(store, trade, msg, stock, dry_run=dry_run)
+        except Exception as e:
+            logger.error(
+                "WATCHING #%s %s raised (%s) — skipping this signal; the "
+                "rest of the watchlist is still checked this cycle.",
+                trade.get('id'), trade.get('stock'), e, exc_info=True)
             continue
-        bcs, fresh = built
-        # `fresh` is None in LIVE mode when nothing auto-entered -- the
-        # default, since `auto_entry` is off; `_auto_enter_bcs` inside
-        # `_enter_as_bcs` can also fill it when auto-entry is armed and
-        # the fill succeeds. Either way the alert still goes out (as the
-        # order ticket, or as a record of what was just filled), and
-        # _alerts_enabled always returns True when paper mode is off for
-        # exactly that reason.
-        target = fresh or trade
-        if not _alerts_enabled(target):
-            logger.info("ENTER alert suppressed for #%d %s "
-                        "(alert_structures=%s)", trade['id'], stock,
-                        cfg.ALERT_STRUCTURES)
-            continue
-        if capital_refused:
-            # ONE signal, ONE alert -- and this one is not an order.
-            # Rendering the ticket and appending "DO NOT ENTER" is what
-            # #449 did: click-copy symbols, a debit, a lot size and a
-            # Claude tick, contradicted by its own last line. Whatever a
-            # reader acts on there, the message was wrong.
-            _send_capital_refused_alert(store, target, bcs, cap_plan,
-                                        stock, dry_run=dry_run)
-            continue
-        msg = _format_bcs_enter_alert(target, analysis, bcs)
-        if cfg.VET_ENABLED:
-            msg += _vet_line(store.find(trade['id']) or target)
-        # Funds LAST, closest to the click-copy symbols. Quantity from the
-        # BCS's own lot_size: the ticket and the margin must price the same
-        # order. (This used to sit BELOW the retired branch's `continue`, so
-        # under the BCS pipeline it ran exactly never — the wire-into-the-live-
-        # path shape, pinned by a test.)
-        # A refused plan must never render as a size. In PAPER the position
-        # HAS been opened at one lot while the plan says zero, so
-        # `_size_line`'s "DO NOT ENTER" would contradict the entry that just
-        # happened — #449's incoherence, arrived at from the other side.
-        msg += (_shadow_size_line(capital_shadow) if capital_shadow
-                else _size_line(cap_plan))
-        msg += _funds_line(kite, bcs, bcs.get('lot_size') or 0)
-        _send_enter_alert(store, trade, msg, stock, dry_run=dry_run)
 
 
 # ── Entered → TP/SL/Time ─────────────────────────────────────────────────
@@ -3217,12 +3365,12 @@ def _alert_monitoring_blind(n_open: int, stocks: list,
         (diag['token'] or {}).get('summary', 'token not checked'))
     if seen == (today, cause):
         return
-    try:
-        marker.write_text(json.dumps({'date': today, 'cause': cause}))
-    except Exception as e:
-        logger.warning("Could not write the blind-alert marker: %s", e)
     tok = diag['token'] or {}
-    _send_telegram(
+    # MARKER AFTER THE SEND, not before. Written first, a failed send burned
+    # the whole day's alert for this cause -- and this alert says every exit
+    # trigger on every open position is dark. Same discipline as the exit
+    # claims: mark it done only once it IS done.
+    if not _send_telegram(
         f"🚨 <b>ZEBRA MONITORING BLIND</b>\n"
         f"No price for ANY of {n_open} open position(s).\n"
         f"TP, spot SL and the expiry nag are all dark.\n\n"
@@ -3234,7 +3382,14 @@ def _alert_monitoring_blind(n_open: int, stocks: list,
         f"<code>data/kite_access_token.json</code>: "
         f"{html.escape(str(tok.get('summary', 'not checked')))}\n\n"
         f"{html.escape(diag['advice'])}",
-        dry_run=dry_run)
+            dry_run=dry_run):
+        logger.warning("BLIND alert failed to send — not marking it seen, so "
+                       "the next cycle retries it.")
+        return
+    try:
+        marker.write_text(json.dumps({'date': today, 'cause': cause}))
+    except Exception as e:
+        logger.warning("Could not write the blind-alert marker: %s", e)
 
 
 def _store_corruption_message(info: dict) -> str:
@@ -3301,9 +3456,28 @@ def _alert_store_corruption(dry_run: bool = False) -> bool:
         stamp = str(info.get('at') or '')
         if seen.exists() and seen.read_text().strip() == stamp:
             return False
-        _send_telegram(_store_corruption_message(info), dry_run=dry_run)
-        seen.write_text(stamp)
+        # THE ALL-CLEAR IS GATED ON THE ALARM HAVING BEEN SENT.
+        #
+        # `seen.write_text(stamp)` ran unconditionally, discarding
+        # `_send_telegram`'s return value -- so a network blip or an HTML-400
+        # disarmed this event PERMANENTLY (the dedup is keyed on the marker's
+        # own timestamp, once per event EVER, deliberately). The message it
+        # loses is the highest-consequence one in the file: a quarantine means
+        # the book went empty and every open position stopped being monitored.
+        #
+        # Every claim-then-act path in this module already has this discipline
+        # -- `_send_exit_alert` releases its claim on a failed send, and so do
+        # the enter alert, the escalation and the review alert. The ALERT
+        # family was the one that never got it.
         kind = info.get('kind') or store_contract.MARKER_QUARANTINE
+        if not _send_telegram(_store_corruption_message(info), dry_run=dry_run):
+            logger.critical(
+                "STORE %s alert FAILED to send (at %s, backup %s) — NOT "
+                "marking it seen, so the next cycle retries. This is the "
+                "alert that says the book went empty.",
+                kind.upper(), stamp, info.get('backup'))
+            return False
+        seen.write_text(stamp)
         logger.critical("STORE %s alerted (at %s, backup %s)",
                         kind.upper(), stamp, info.get('backup'))
         return True
@@ -3778,6 +3952,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         try:
             stock = trade['stock']
             tid = trade['id']
+            _release_stranded_claims(store, trade)
             spot = ltps.get(stock, 0)
             if spot <= 0:
                 # A suspended, renamed or delisted underlying — `get_ltp`
@@ -4033,7 +4208,20 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                             "recorded: %s — the latch IS expired either way",
                             tid, stock, e)
 
-            if cfg.PAPER_MODE and mid is None:
+            # THE RECORD DECIDES, NOT THE MODE (fixed 2026-08-31).
+            #
+            # `_paper_auto_close` was moved off `cfg.PAPER_MODE` on 2026-08-29
+            # so a paper record keeps its booking engine after the mode flips
+            # -- and this branch, which is part of that same engine, was left
+            # keyed on the mode. So at arming step 6 (`paper_mode: false`)
+            # every still-open PAPER record silently loses its terminal
+            # expiry net: with the option book dead (delisting, symbol death,
+            # a chain that stops quoting) and spot still alive, neither call
+            # site of `_settle_if_expired` is reachable. The record then stays
+            # `entered` past expiry forever, holding a `max_open` slot and
+            # deployed rupees, banning its stock through scanner dedup, and
+            # nagging daily.
+            if is_paper_record(trade) and mid is None:
                 # Terminal net first: without it a position whose book has gone
                 # dark never reaches ANY exit and stays `entered` past expiry
                 # forever, which also bans its stock from the scanner for good.
@@ -4125,7 +4313,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # ride the position into settlement week unnoticed.
             if latch['armed'] and _exit_cleared(store, trade, 'tp', sq, spot,
                                                 dry_run=dry_run) \
-                    and _claim_exit_alert(store, tid, 'tp'):
+                    and _claim_exit_alert(store, trade, 'tp'):
                 _send_exit_alert(store, trade, 'tp',
                                  _format_tp_alert(trade, spot, mid,
                                                   on_latch=not tp_hit),
@@ -4161,7 +4349,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 if n >= cfg.DEBIT_SL_CONFIRM_POLLS:
                     if _exit_cleared(store, trade, 'trail', sq, spot,
                                      dry_run=dry_run) \
-                            and _claim_exit_alert(store, tid, 'trail'):
+                            and _claim_exit_alert(store, trade, 'trail'):
                         _send_exit_alert(store, trade, 'trail',
                                          _format_trail_alert(trade, mid, tl),
                                          dry_run=dry_run)
@@ -4190,7 +4378,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                      (direction == 'PE' and spot >= sl_spot))
             if sl_hit and _exit_cleared(store, trade, 'spot_sl', sq, spot,
                                         dry_run=dry_run) \
-                    and _claim_exit_alert(store, tid, 'spot_sl'):
+                    and _claim_exit_alert(store, trade, 'spot_sl'):
                 _send_exit_alert(store, trade, 'spot_sl',
                                  _format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
                 logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
@@ -4216,7 +4404,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     # claiming the consume-once flag.
                     if _exit_cleared(store, trade, 'debit_sl', sq, spot,
                                      dry_run=dry_run) \
-                            and _claim_exit_alert(store, tid, 'debit_sl'):
+                            and _claim_exit_alert(store, trade, 'debit_sl'):
                         _send_exit_alert(store, trade, 'debit_sl',
                                          _format_debit_sl_alert(trade, mid),
                                          dry_run=dry_run)

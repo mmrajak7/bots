@@ -14,13 +14,44 @@
 #   6. Archive deprecated logs + stores (idempotent — only moves files that exist)
 #   7. Summary + verify hint
 
+# SAFE-TO-RERUN: a second run re-installs the same two crontab lines (each
+# block now REPLACES rather than appends, so the crontab converges on exactly
+# one of each), re-kills processes that are already dead, re-deletes lock files
+# whose absence is the desired state, and moves only archive files that still
+# exist. The one step that can destroy anything -- `zebra reset --confirm` --
+# is opt-in behind `--reset` AND refuses a book with anything in flight AND
+# refuses a book it could not read.
+#
+# That sentence is the rule from CLAUDE.md, and this script is why the rule
+# exists: on 2026-08-30 it force-closed six open cohort positions at -100% on a
+# re-run, under a header that claimed "Idempotent: re-running is safe". Prose
+# is not a guard -- the guards are the flag, the in-flight refusal and the
+# unreadable-book refusal above, and this line only records that the question
+# was actually asked.
+
 set -euo pipefail
 
 BOTS_DIR=/home/trustit/Desktop/BOTS
 HELPER_DIR="$BOTS_DIR/Helper"
 VENV="$BOTS_DIR/CROCODILE/venv/bin/python"
-ZEBRA_CRON='*/5 9-15 * * 1-5 cd /home/trustit/Desktop/BOTS/Helper && flock -n /tmp/zebra_monitor.lock ../CROCODILE/venv/bin/python -m zebra run >> logs/cron_zebra.log 2>&1'
-ZEBRA_REPORT_CRON='30 15 * * 1-5 cd /home/trustit/Desktop/BOTS/Helper && ../CROCODILE/venv/bin/python -m zebra report --type auto --telegram >> logs/cron_zebra_report.log 2>&1'
+# DATE-STAMPED, and the % MUST be escaped as \%.
+#
+# Two separate defects lived in these two lines until 2026-08-31:
+#
+#   1. No date stamp. `cron_bcs.log` reached 12.5 MB as one ever-growing file,
+#      which is how logs stop being moved off the box at all -- and worse here,
+#      `zebra/digest.py` reads ONLY `cron_zebra_<YYYYMMDD>.log`, so on a box
+#      deployed by this script every digest reported zero cycles, no gaps and
+#      no vet events. A broken day rendered as a quiet one.
+#
+#   2. It disagreed with `pi_setup.sh`, whose CRON_LINE has been dated and
+#      escaped all along. Both scripts dedup on a substring of the command, so
+#      whichever ran LAST silently decided which line the box kept.
+#
+# cron reads a bare % as a newline in the command field, so an unescaped
+# $(date +%Y%m%d) truncates the entry and the redirect vanishes entirely.
+ZEBRA_CRON='*/5 9-15 * * 1-5 cd /home/trustit/Desktop/BOTS/Helper && flock -n /tmp/zebra_monitor.lock ../CROCODILE/venv/bin/python -m zebra run >> logs/cron_zebra_$(date +\%Y\%m\%d).log 2>&1'
+ZEBRA_REPORT_CRON='30 15 * * 1-5 cd /home/trustit/Desktop/BOTS/Helper && ../CROCODILE/venv/bin/python -m zebra report --type auto --telegram >> logs/cron_zebra_report_$(date +\%Y\%m\%d).log 2>&1'
 
 step() { echo; echo "=== $1 ==="; }
 
@@ -54,8 +85,27 @@ cd "$HELPER_DIR"
 # empty book.
 step "3. Reset in-flight signals (skipped unless --reset)"
 if [ "${1:-}" = "--reset" ]; then
-    IN_FLIGHT=$("$VENV" -m zebra list 2>/dev/null \
-        | grep -cE '\b(watching|triggered|entered)\b' || true)
+    # THE LISTING MUST SUCCEED BEFORE ITS COUNT MEANS ANYTHING.
+    #
+    # This read `zebra list 2>/dev/null | grep -c ... || true`, which turns
+    # EVERY failure of the listing -- Drive auth, a lock timeout, an import
+    # error, a quarantined book -- into empty stdout, a count of 0, and a
+    # cheerful walk into `zebra reset --confirm`. "I could not read the book"
+    # was rendered as "the book is empty", inside the guard that exists
+    # BECAUSE this script once force-closed six open positions at -100%.
+    set +e
+    LIST_OUT=$("$VENV" -m zebra list 2>&1)
+    LIST_RC=$?
+    set -e
+    if [ "$LIST_RC" -ne 0 ]; then
+        echo "  REFUSED: could not read the book ('zebra list' exited $LIST_RC)."
+        echo "  A reset force-closes every open position at -100%, so it runs"
+        echo "  only against a book this script has actually READ and found"
+        echo "  empty. Fix the listing first:"
+        echo "$LIST_OUT" | tail -n 15 | sed 's/^/      /'
+        exit 1
+    fi
+    IN_FLIGHT=$(echo "$LIST_OUT" | grep -cwE 'watching|triggered|entered' || true)
     if [ "${IN_FLIGHT:-0}" -gt 0 ]; then
         echo "  REFUSED: $IN_FLIGHT signal(s) are in flight."
         echo "  A reset force-closes every one of them at -100%. If that is"
@@ -79,21 +129,36 @@ crontab -l 2>/dev/null > "$TMP_CRON" || true
 sed -i -E 's|^([^#]*python -m playbook\.magnet)|# (zebra) \1|' "$TMP_CRON"
 sed -i -E 's|^([^#]*python -m flow run)|# (zebra) \1|' "$TMP_CRON"
 
-# Add zebra monitor cron if missing
-if grep -qF "python -m zebra run" "$TMP_CRON"; then
-    echo "  zebra monitor cron already present"
-else
-    echo "$ZEBRA_CRON" >> "$TMP_CRON"
-    echo "  zebra monitor cron added"
-fi
+# REPLACE, do not "add if missing".
+#
+# These two blocks used to skip whenever a matching line already existed, which
+# made the script unable to ever CORRECT one. That mattered the moment the two
+# deploy scripts disagreed: this one installed an undated `cron_zebra.log` while
+# `pi_setup.sh` installed the dated, %-escaped line the digest actually reads,
+# and "already present" meant whichever ran first won permanently. A box
+# deployed before 2026-08-31 keeps a log the digest cannot read, and re-running
+# the fixed script would have changed nothing.
+#
+# Dropping every existing line first also cleans up a commented-out or
+# hand-edited duplicate, so the crontab converges on exactly one of each.
+replace_cron_line() {
+    local pattern="$1" desired="$2" label="$3"
+    if grep -qF "$pattern" "$TMP_CRON"; then
+        if grep -qxF "$desired" "$TMP_CRON"; then
+            echo "  $label already correct"
+            return
+        fi
+        echo "  $label present but DIFFERENT — replacing it"
+    else
+        echo "  $label added"
+    fi
+    grep -vF "$pattern" "$TMP_CRON" > "$TMP_CRON.new" || true
+    mv "$TMP_CRON.new" "$TMP_CRON"
+    echo "$desired" >> "$TMP_CRON"
+}
 
-# Add zebra EOD report cron if missing
-if grep -qF "python -m zebra report" "$TMP_CRON"; then
-    echo "  zebra report cron already present"
-else
-    echo "$ZEBRA_REPORT_CRON" >> "$TMP_CRON"
-    echo "  zebra report cron added (15:30 Mon-Fri, auto daily/weekly)"
-fi
+replace_cron_line "python -m zebra run"    "$ZEBRA_CRON"        "zebra monitor cron"
+replace_cron_line "python -m zebra report" "$ZEBRA_REPORT_CRON" "zebra report cron"
 
 crontab "$TMP_CRON"
 rm "$TMP_CRON"

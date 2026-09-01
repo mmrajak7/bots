@@ -682,10 +682,17 @@ def _allowed_tools(channel: str) -> list:
     the agent to use: on the Pi that is the CROCODILE venv, and a pattern
     naming a different python would match nothing the agent actually types.
     """
-    tools = [t.format(python=sys.executable, python_rel=_interpreter_rel())
-             for t in cfg.VET_ALLOWED_TOOLS]
+    fmt = dict(python=sys.executable, python_rel=_interpreter_rel())
+    tools = [t.format(**fmt) for t in cfg.VET_ALLOWED_TOOLS]
     if channel == 'events':
-        tools += list(cfg.EVENT_EXTRA_TOOLS)
+        # FORMATTED TOO. The extras were appended verbatim, which was harmless
+        # while they were all `Edit(<literal path>)` and became a live defect
+        # the moment one carried `{python}`: an unformatted placeholder reaches
+        # argv and matches nothing the agent types, which is indistinguishable
+        # from a broken agent -- it prints an approval request to a log nobody
+        # reads and exits 0 with the work undone. `str.format` on a pattern
+        # with no placeholder is a no-op, so this is safe for the Edit rules.
+        tools += [t.format(**fmt) for t in cfg.EVENT_EXTRA_TOOLS]
     # De-dup: on a box where the interpreter lives INSIDE the project the two
     # spellings can collapse to the same string, and a duplicated grant is
     # noise in the argv and in every log that echoes it.
@@ -1123,8 +1130,26 @@ def _spawn_generic(prompt: str, model: str, tag: str,
                   f"{'=' * 78}\n")
         out.flush()
         try:
+            # THE CHILD KNOWS IT IS AN AGENT.
+            #
+            # Added 2026-09-01 so a CLI verb can refuse the destructive HALF
+            # of an otherwise legitimate command -- specifically
+            # `events replace --allow-empty`, which wipes the calendar the
+            # corporate-action interlock reads while refreshing its timestamp,
+            # so it reads healthy while every gate sees nothing.
+            #
+            # This is reliable BECAUSE of the grant shape, not in spite of it:
+            # every Bash grant is a prefix beginning with the interpreter path,
+            # so an agent cannot prepend `ZEBRA_AGENT_CHANNEL= ` to clear it
+            # without the command failing to match any grant at all. It is not
+            # a defence against a hostile agent with arbitrary Bash -- the
+            # tool grants are that boundary -- it is a guard against a
+            # confused one.
+            child_env = dict(os.environ)
+            child_env['ZEBRA_AGENT_CHANNEL'] = str(channel or 'vet')
             kwargs = {'stdout': out, 'stderr': subprocess.STDOUT,
                       'stdin': subprocess.DEVNULL,
+                      'env': child_env,
                       # Pin cwd: `-m zebra` must resolve regardless of where
                       # cron happened to start us.
                       'cwd': str(cfg.PROJECT_ROOT)}
@@ -2026,8 +2051,47 @@ def _request_exit_vet(store, trade_id: int, kind: str, context: dict,
         return False
     logger.info('EXIT VET REQUESTED #%d %s — %s', trade_id, kind,
                 context.get('reason_flagged'))
-    if spawn:
-        _spawn_cli(trade_id, exit_kind=kind)
+    if spawn and _spawn_cli(trade_id, exit_kind=kind) is None:
+        # NOTHING IS COMING, SO DO NOT WAIT FOR IT.
+        #
+        # `_spawn_cli`'s own docstring says the CALLER decides what a None
+        # means and that "exits fall back to the deterministic guards" — and
+        # this caller discarded it. The marker stayed PENDING with a full
+        # `VET_TIMEOUT_SEC` (600s) deadline, so a stop that has ALREADY fired
+        # sat waiting ten minutes for an agent that never started. With a
+        # missing or renamed CLI that repeats on EVERY value stop, for every
+        # position, indefinitely — a permanent +10-minute stop latency whose
+        # only trace is a log line.
+        #
+        # This is the same reasoning as the usage-limit short-circuit in
+        # `_exit_gate_policy`, applied to the other two ways a spawn fails
+        # (no CLI on PATH, agent budget refused). It changes only the TIMING
+        # of a decision the code already makes: the deadline branch reaches
+        # the same UNAVAILABLE / 'proceed'. The entry path has always handled
+        # this correctly — `request_entry_vet` queues rather than waits,
+        # because "waiting out the full deadline would be a lie".
+        #
+        # PRIOR DEFERS ARE EXCLUDED, exactly as the quota branch excludes
+        # them. A defer means Claude LOOKED and said it could not verify the
+        # quote; "the agent is offline" is no more consent than a timeout is,
+        # and that escalation must run its normal course.
+        if not defers:
+            if _set_exit_state(store, trade_id, kind, UNAVAILABLE,
+                               expect_state=PENDING):
+                logger.warning(
+                    'EXIT VET #%d %s — the agent could not be started (%s). '
+                    'Not waiting out the %ds deadline; the exit proceeds on '
+                    'the deterministic guards, which had already cleared it.',
+                    trade_id, kind,
+                    'no agent slot free' if resolve_cli()
+                    else 'vetting CLI not found',
+                    int(cfg.VET_TIMEOUT_SEC))
+        else:
+            logger.warning(
+                'EXIT VET #%d %s — the agent could not be started, but this '
+                'episode already has %d defer(s). Leaving the escalation to '
+                'run its course rather than converting a refusal to verify '
+                'into permission.', trade_id, kind, defers)
     return True
 
 

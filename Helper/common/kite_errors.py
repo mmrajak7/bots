@@ -105,10 +105,24 @@ def classify(exc) -> str:
         #    exists to stop.
         if any(t in text for t in _RATE_LIMIT_TEXT):
             return RATE_LIMIT
-        if any(t in text for t in _AUTH_TEXT):
-            return AUTH
+        # 4. CLASS BEFORE TEXT for the network fault (fixed 2026-08-31).
+        #
+        # The auth TEXT scan used to run first, so a genuine
+        # `NetworkException` whose message merely CONTAINS 'token' — or
+        # 'unauthor', or 'api_key' — was classified AUTH, and `monitor_all`
+        # then exits the session with "Kite token expired! Unmonitored:".
+        # That is the wrong-diagnosis shape this whole module exists to stop:
+        # it sends the owner to regenerate a healthy token while the real
+        # fault continues and positions go unwatched.
+        #
+        # The rate-limit text keeps its place above, and that ordering is
+        # argued three lines up. The auth text had no such justification: it
+        # is a fallback for exceptions whose CLASS says nothing, so it belongs
+        # after the classes that do.
         if name in ('NetworkException', 'DataException'):
             return NETWORK
+        if any(t in text for t in _AUTH_TEXT):
+            return AUTH
         if any(t in text for t in _NETWORK_TEXT):
             return NETWORK
         return UNKNOWN

@@ -433,3 +433,80 @@ def test_an_unknown_label_stamps_NOTHING_rather_than_guessing(spy, monkeypatch):
     trade.setdefault('_store_type', sm.LABEL_STORE_TYPE.get('NOSUCHBOOK'))
     assert trade['_store_type'] is None
     assert sm._order_ctx(trade, 'SL', 'short', 'BCS')['book'] is None
+
+
+# ══ a dry run rehearses; it does not resolve ════════════════════════════════
+#
+# THE DEFECT (found 2026-08-31). `recovery_gate` checks the kill switch and
+# never checked `dry_run`, so under the `--dry-run` crontab that has been live
+# all through the evidence week a REAL frozen record walked the entire action
+# path: it burned and persisted an attempt, called `begin_recovery` (a real
+# partial_close -> closing status write), ran the inner close whose dry stub
+# reports COMPLETE, and then stamped `resolved` and Telegrammed "frozen close
+# FINISHED by recovery" -- for a position whose legs were all still live and
+# unbooked at the broker.
+#
+# The record was then left at `closing`, where the next process start's
+# crash-recovery sweep flips it to `open` and hands a HALF-CLOSED position back
+# to the per-trade loop to price as a whole spread.
+
+def test_a_dry_run_places_no_order_and_resolves_nothing(spy, monkeypatch):
+    """THE DEFECT, on the shape that would have placed a real SELL."""
+    store = MemoryStore(trades=[_frozen()])
+    kite = _broker([{'tradingsymbol': B_LONG, 'quantity': B_QTY}])
+    script = _LegScript(**{B_LONG: [_complete(B_QTY, 40.00)]})
+
+    assert _run(store, kite, monkeypatch, script, dry_run=True) == 0
+
+    assert script.calls == [], 'a dry run reached the order path'
+    assert kite.placed == []
+    rec = store.trades[0]
+    assert rec['status'] == 'partial_close', (
+        'a dry run moved the record off partial_close; the next start would '
+        'reopen it as a whole spread')
+    assert rec['close_failure']['state'] == 'frozen'
+    assert rec['close_failure']['attempts'] == 0, 'a dry run spent an attempt'
+    assert not any('FINISHED by recovery' in m for m in spy.sent), (
+        'a dry run claimed a close it never made')
+
+
+def test_a_dry_run_does_not_book_a_flat_book_either(spy, monkeypatch):
+    """`_finish_flat` had the same hole: the inner close returns True under a
+    dry run, so it announced "the exit is booked" having booked nothing."""
+    store = MemoryStore(trades=[_frozen()])
+    kite = _broker([])
+    kite.order_book = [_tagged(B_SHORT, 'BUY', 10.00),
+                       _tagged(B_LONG, 'SELL', 40.00)]
+
+    assert _run(store, kite, monkeypatch, _LegScript(), dry_run=True) == 0
+
+    rec = store.trades[0]
+    assert rec['status'] == 'partial_close'
+    assert rec['close_failure']['state'] == 'frozen'
+    assert not any('the exit is booked' in m for m in spy.sent)
+
+
+def test_a_dry_run_still_says_what_it_SAW(spy, monkeypatch, capsys):
+    """The sweep must not go silent -- the whole point of the evidence week is
+    a record of what an armed engine would have done."""
+    store = MemoryStore(trades=[_frozen()])
+    kite = _broker([{'tradingsymbol': B_LONG, 'quantity': B_QTY}])
+
+    _run(store, kite, monkeypatch, _LegScript(), dry_run=True)
+
+    events = _events(capsys.readouterr().out)
+    assert 'frozen_seen' in events, 'a dry run stopped classifying'
+    assert 'recovery_rehearsed' in events, 'no rehearsal event was journalled'
+
+
+def test_a_dry_run_still_ESCALATES_a_hand_traded_book(spy, monkeypatch):
+    """Fallen Hero is alert-only in every mode. The dry-run guard must stop
+    ACTING, not stop warning -- a frozen real position is exactly what a human
+    should hear about during the evidence week."""
+    store = MemoryStore(trades=[_frozen()])
+    kite = _broker([{'tradingsymbol': B_LONG, 'quantity': B_QTY}])
+
+    _run(store, kite, monkeypatch, _LegScript(), orders_allowed=False,
+         dry_run=True, label='FH')
+
+    assert spy.sent, 'a hand-traded frozen record went unannounced in dry run'

@@ -39,7 +39,27 @@ from googleapiclient.http import MediaIoBaseDownload
 from pathlib import Path
 import json, io
 
-FOLDER_ID = '1gikSnfw7jI-KMB31SVjwGHTvDVcPpNX1'
+# THE FOLDER ID IS A SECRET AND THIS FILE IS TRACKED IN A PUBLIC REPO.
+#
+# It sat inline here as a literal until 2026-08-31. `common/layered_config.py`
+# counts "a Drive folder id" among the exact values the two-layer config split
+# exists to keep out of git, CLAUDE.md writes it as a POINTER ("Folder ID:
+# config/bcs_config.json -> not repeated here") rather than a value, and every
+# tracked config file omits it. This script republished it anyway, which is
+# the whole point of the rule being mechanical rather than remembered.
+#
+# Read it the way every other caller does. `config/bcs_config.json` is the
+# untracked overlay and is already on the box -- it is what `bcs.trade_store`
+# authenticates with, so if it were missing the monitor would be local-only
+# and this pull would be the second thing to notice.
+from common import layered_config
+_bcs_cfg = layered_config.load('bcs_config')
+FOLDER_ID = (_bcs_cfg.get('google_drive') or {}).get('folder_id')
+if not FOLDER_ID:
+    raise SystemExit(
+        '  FAIL: google_drive.folder_id missing from config/bcs_config.json.\n'
+        '  That overlay is untracked and does not arrive over git -- copy it\n'
+        '  to the box, or add the folder id to it, then re-run this script.')
 creds = Path('/home/trustit/Desktop/BOTS/data/secret.json')
 svc_ref = get_drive_service(creds)
 service = _extract_service(svc_ref)

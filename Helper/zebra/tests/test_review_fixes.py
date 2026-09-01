@@ -508,3 +508,125 @@ def test_a_missing_cli_is_recorded_as_a_spawn_failure(paths, real_spawn):
     health.check(send=lambda m, **k: sent.append(m) or True,
                  paths=[paths / 'none.json'])
     assert sent and 'NOT STARTING' in sent[0]
+
+
+# ── the 2026-09-01 12:10 false MERGE CONFLICT ──────────────────────────────
+#
+# Observed in production, not inferred. `logs/zebra_store_corrupt.json`:
+#
+#   record #454 is at version 15 on BOTH replicas with DIFFERENT content
+#   (differs on: corrob_spot, corrob_t, corrob_value, debit_sl_confirm,
+#    debit_sl_confirm_t)
+#
+# ...a CRITICAL log line and a Telegram, for a book that was working exactly as
+# designed. `_BATCHED_POLL_FIELDS` is `apply_mfe`'s OWN allowlist and covers
+# only what that method writes; `bump_confirm`/`reset_confirm` and the three
+# blind writers do the same local-only, no-version-bump write and were never
+# declared. `_only_unversioned` requires EVERY differing key to be exempt, so
+# the two undeclared `debit_sl_confirm*` fields dragged the three exempt
+# `corrob_*` ones with them.
+#
+# The confirm keys are built as `f"{kind}_confirm"`, so they are matched by
+# SUFFIX: `bump_confirm` takes any kind and a literal list would silently miss
+# the next trigger added.
+
+def _merged(base, incoming):
+    from common import store_contract as sc
+    from zebra import trade_store as zts
+    return sc.resolve_merge(
+        base, incoming, sc.ZEBRA_STATUSES,
+        unversioned_fields=zts._UNVERSIONED_FIELDS,
+        unversioned_prefixes=zts._UNVERSIONED_PREFIXES,
+        unversioned_suffixes=zts._UNVERSIONED_SUFFIXES)
+
+
+def _rec454(**extra):
+    r = {'id': 454, 'version': 15, 'status': 'entered', 'stock': 'X',
+         'corrob_spot': 100.0, 'corrob_t': 1.0, 'corrob_value': 2.0,
+         'debit_sl_confirm': 1, 'debit_sl_confirm_t': 10.0}
+    r.update(extra)
+    return r
+
+
+def test_the_live_20260901_merge_conflict_is_silent():
+    """THE PRODUCTION ALERT, reproduced field for field."""
+    _, note = _merged(_rec454(),
+                      _rec454(corrob_spot=101.0, corrob_t=2.0,
+                              corrob_value=2.5, debit_sl_confirm=2,
+                              debit_sl_confirm_t=20.0))
+    assert note is None, 'the false split-brain alert still fires: %s' % note
+
+
+@pytest.mark.parametrize('kind', ['tp', 'trail', 'spot_sl', 'debit_sl',
+                                  'some_future_trigger'])
+def test_every_triggers_confirm_counter_is_exempt(kind):
+    """Matched by SUFFIX, so a trigger added later cannot start a false alarm.
+    `bump_confirm` builds the key from its `kind` argument."""
+    a = _rec454(**{'%s_confirm' % kind: 1, '%s_confirm_t' % kind: 9.0})
+    b = _rec454(**{'%s_confirm' % kind: 3, '%s_confirm_t' % kind: 99.0})
+    assert _merged(a, b)[1] is None
+
+
+def test_the_blind_counters_are_exempt_too():
+    """`bump_blind` / `clear_blind` / `mark_blind_alerted` write local-only
+    without a version bump, exactly like the confirm counters."""
+    a = _rec454(debit_blind_cycles=1, debit_blind_alerted=False)
+    b = _rec454(debit_blind_cycles=4, debit_blind_alerted=True)
+    assert _merged(a, b)[1] is None
+
+
+def test_a_REAL_divergence_still_alerts():
+    """The negative control, and the whole point: widening the exemption must
+    not silence the split brain this detector exists to catch."""
+    _, note = _merged(_rec454(), _rec454(exit_reason='paper:tp', debit=9.9))
+    assert note is not None
+
+
+def test_a_confirm_field_MIXED_with_a_real_one_still_alerts():
+    """`all(...)` semantics: one undeclared field must still shout, which is
+    exactly how the false alarm arose in the first place."""
+    _, note = _merged(_rec454(),
+                      _rec454(debit_sl_confirm=2, sl_spot=95.0))
+    assert note is not None
+
+
+def test_the_exemption_is_not_a_wildcard():
+    """An empty or over-broad suffix would silence every conflict in the
+    system. `endswith(())` is False for every string; `('',)` matches all."""
+    from zebra import trade_store as zts
+    assert '' not in zts._UNVERSIONED_SUFFIXES
+    assert '' not in zts._UNVERSIONED_PREFIXES
+
+
+def test_every_unversioned_writer_is_declared():
+    """The list must be derived from the CODE, not remembered. Any `_mutate`
+    method that writes a field without bumping `version` has to be covered, or
+    it becomes the next 12:10 alert.
+
+    RETIRES WHEN: unversioned writes go through one helper that registers the
+    field it wrote, as `common/spread_store.py` now does.
+    """
+    import inspect
+    import re
+    from zebra import trade_store as zts
+
+    src = inspect.getsource(zts.ZebraStore)
+    covered = set(zts._UNVERSIONED_FIELDS)
+    for name in ('bump_confirm', 'reset_confirm', 'bump_blind', 'clear_blind',
+                 'mark_blind_alerted'):
+        body = inspect.getsource(getattr(zts.ZebraStore, name))
+        assert "['version']" not in body, (
+            '%s now bumps version — it no longer needs an exemption, so '
+            'remove it here rather than leaving a stale one' % name)
+        keys = set(re.findall(r"t\['([a-z_]+)'\]\s*=", body))
+        keys |= {'%s_confirm' % k for k in ('x',)
+                 if re.search(r'\{kind\}_confirm', body)}
+        undeclared = {
+            k for k in keys
+            if k not in covered
+            and not k.startswith(zts._UNVERSIONED_PREFIXES)
+            and not k.endswith(zts._UNVERSIONED_SUFFIXES)}
+        assert not undeclared, (
+            '%s writes %s without a version bump and without an exemption — '
+            'that is a false MERGE CONFLICT waiting to fire'
+            % (name, sorted(undeclared)))
