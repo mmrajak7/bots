@@ -173,9 +173,20 @@ def test_the_fix_changes_nothing_on_the_current_book():
     assert old == new, (
         'old and new disagree on the live book: gained %s, lost %s'
         % (sorted(new - old), sorted(old - new)))
-    assert len(new) == 70, (
-        'the 70 debit-SL exits behind bcs_debit_sl_saves_money; if this moved, '
-        'the finding it supports needs re-reading, not this assertion relaxing')
+    # SCOPED TO THE STUDY POPULATION, 2026-09-01.
+    #
+    # This pinned `len(new) == 70` against the WHOLE book, and on 2026-09-01
+    # the cohort produced its first two real `paper:debit_sl` exits, taking it
+    # to 72. That is the assertion firing for exactly the right reason -- and
+    # the fix is to scope it, not to relax it, because the 70 are PRE-COHORT
+    # records and the cohort-only rule says they are a different population
+    # (`bcs_cohort_only_scope_rule`). Mixing the two is what would corrupt the
+    # finding; separating them is what preserves it.
+    study = {t['id'] for t in _select(book) if not t.get('cohort')}
+    assert len(study) == 70, (
+        'the 70 PRE-COHORT debit-SL exits behind bcs_debit_sl_saves_money; if '
+        'this moved, the finding it supports needs re-reading, not this '
+        'assertion relaxing')
 
 
 def test_every_reason_in_the_live_book_is_recognised():

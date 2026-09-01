@@ -195,3 +195,96 @@ def test_the_refresh_declares_itself_same_replica():
     assert 'same_replica=True' in src, (
         'the in-lock refresh no longer says it is comparing one replica '
         'against itself; sibling writes will alarm again')
+
+
+# ── 5. the two REFUSALS, which shipped unpinned ────────────────────────────
+#
+# Called out by review on 2026-09-01: the commit that added them claimed
+# "every fix is pinned by tests that were checked by REVERTING the fix", and
+# for these two that was FALSE — reverting either guard left the whole suite
+# green. A guard nothing asserts is one a later simplification pass deletes.
+
+@pytest.mark.parametrize('modname,clsname', BOOKS, ids=IDS)
+def test_a_closed_trade_cannot_be_reopened_by_the_setter(modname, clsname):
+    """`closed -> open` in one call. The merge's monotonic-close rule never
+    sees it: an ordinary versioned local write is exactly what that rule
+    treats as legitimate."""
+    store = _store(modname, clsname)
+    store._trades = [{'id': 1, 'status': 'closed', 'version': 3}]
+    with pytest.raises(ValueError) as e:
+        store.set_trade_status(1, 'open')
+    assert 'terminal' in str(e.value)
+    assert store._trades[0]['status'] == 'closed'
+
+
+@pytest.mark.parametrize('modname,clsname', BOOKS, ids=IDS)
+def test_the_freeze_and_the_close_lock_still_work(modname, clsname):
+    """The negative control. `partial_close` is FROZEN, not terminal, and the
+    close path depends on reaching it — a guard that blocked the freeze would
+    break every half-done close."""
+    store = _store(modname, clsname)
+    store._trades = [{'id': 1, 'status': 'open', 'version': 1}]
+    store.set_trade_status(1, 'closing')
+    assert store._trades[0]['status'] == 'closing'
+    store.set_trade_status(1, 'partial_close', close_failed_leg='long')
+    assert store._trades[0]['status'] == 'partial_close'
+    assert store._trades[0]['close_failed_leg'] == 'long'
+
+
+@pytest.mark.parametrize('modname,clsname', BOOKS, ids=IDS)
+def test_reclosing_a_closed_trade_with_the_same_status_is_allowed(
+        modname, clsname):
+    """Idempotence: `closed -> closed` moves nothing and must not raise."""
+    store = _store(modname, clsname)
+    store._trades = [{'id': 1, 'status': 'closed', 'version': 3}]
+    store.set_trade_status(1, 'closed')
+
+
+@pytest.mark.parametrize('modname,clsname', BOOKS, ids=IDS)
+def test_update_trade_fields_refuses_the_merge_keys(modname, clsname):
+    """`status` was zebra-only; `id`/`version`/`exit` silently break the merge
+    that keys on them."""
+    store = _store(modname, clsname)
+    store._trades = [{'id': 1, 'status': 'open', 'version': 1}]
+    for bad in ({'status': 'closed'}, {'id': 9}, {'version': 99},
+                {'exit': {}}):
+        with pytest.raises(ValueError):
+            store.update_trade_fields(1, **bad)
+    assert store._trades[0] == {'id': 1, 'status': 'open', 'version': 1}
+
+
+@pytest.mark.parametrize('modname,clsname', BOOKS, ids=IDS)
+def test_update_trade_fields_still_writes_advisory_state(modname, clsname):
+    """The negative control: this method carries the trail and the nag
+    markers on every poll and must keep working."""
+    store = _store(modname, clsname)
+    store._trades = [{'id': 1, 'status': 'open', 'version': 1}]
+    assert store.update_trade_fields(1, trail_active=True, trail_peak=12.5)
+    assert store._trades[0]['trail_peak'] == 12.5
+
+
+@pytest.mark.parametrize('modname,clsname', BOOKS, ids=IDS)
+def test_set_trade_status_extra_fields_cannot_clobber_the_version(
+        modname, clsname):
+    """`extra_fields` writes AFTER the version bump, so it was an unguarded
+    sibling of the door `update_trade_fields` just closed."""
+    store = _store(modname, clsname)
+    store._trades = [{'id': 1, 'status': 'open', 'version': 1}]
+    with pytest.raises(ValueError):
+        store.set_trade_status(1, 'closing', version=99)
+    assert store._trades[0]['version'] == 1
+
+
+@pytest.mark.parametrize('modname,clsname', BOOKS, ids=IDS)
+def test_a_refused_status_change_releases_the_sync_lock(modname, clsname):
+    """`begin_close` sets `_sync_locked`; if a sibling books the record closed
+    in the race window this refusal fires, and leaving the flag set turns Drive
+    sync off for the rest of a long-lived monitor session. `update_trade_exit`
+    got a `try/finally` for exactly this; this method did not."""
+    store = _store(modname, clsname)
+    store._trades = [{'id': 1, 'status': 'closed', 'version': 3}]
+    store._sync_locked = True
+    with pytest.raises(ValueError):
+        store.set_trade_status(1, 'open')
+    assert store._sync_locked is False, (
+        'Drive sync is now off for the rest of this process')

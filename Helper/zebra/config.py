@@ -649,6 +649,32 @@ _DEFAULTS = {
                                  # spot that makes a position worth a fresh look.
     'auth_warn_days': 3,         # Telegram this many days before the Claude CLI
                                  # credential expires (user re-logs in manually).
+    'entry_vet_ttl_sec': 1800,   # How long an ALLOWED **ENTRY** verdict stays
+                                 # valid. Owner decision, 2026-09-01: *"vet has
+                                 # to be realtime"*.
+                                 #
+                                 # There was no bound at all, and it showed:
+                                 # signal #472 ANGELONE triggered 08-31 14:05,
+                                 # was vetted 14:07 (decision #109), sat at
+                                 # `triggered` overnight, and ENTERED on
+                                 # 09-01 at 13:50 -- on a verdict 23h45m old,
+                                 # whose own red flag was about a book that no
+                                 # longer existed ("only one lot sitting at the
+                                 # short leg's best bid RIGHT NOW").
+                                 #
+                                 # The mechanical gates are re-run at entry, so
+                                 # price drift was caught; what was stale is the
+                                 # AGENT's judgement. VETTING.md already tells
+                                 # the agent "your verdict covers this episode,
+                                 # not this trade" -- for EXITS. The entry side
+                                 # simply never enforced it.
+                                 #
+                                 # 30 min: the normal path is trigger -> answer
+                                 # in 2-5 min -> enter on the next 5-minute
+                                 # cycle, so ~10 min is typical and 30 leaves
+                                 # generous room. It cannot survive a session
+                                 # boundary, which is the case that matters.
+                                 # Expiry RE-REQUESTS; it never vetoes.
     'exit_vet_ttl_sec': 900,     # How long a terminal EXIT verdict stays valid.
                                  # A verdict is a judgement about the book AT
                                  # THAT MOMENT, so it must not authorise an exit
@@ -1251,6 +1277,7 @@ def _log_vet_state() -> None:
 
 _log_vet_state()
 
+ENTRY_VET_TTL_SEC = _int('entry_vet_ttl_sec')
 EXIT_VET_TTL_SEC = _int('exit_vet_ttl_sec')
 EXIT_HOLD_TTL_SEC = _int('exit_hold_ttl_sec')
 EXIT_VET_MAX_HOLD_SEC = _non_negative_int('exit_vet_max_hold_sec')

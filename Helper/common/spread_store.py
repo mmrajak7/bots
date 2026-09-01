@@ -813,6 +813,32 @@ class SpreadStoreBase(LockedStoreMixin):
         # terminal. What is refused is leaving a TERMINAL state, which the
         # contract in this same package already says nothing may do: "TERMINAL
         # refuses everything because that is what idempotence IS."
+        # THE SYNC LOCK IS RELEASED ON THE RAISE PATH TOO. `update_trade_exit`
+        # got a `try/finally` for exactly this a few lines up, and this method
+        # -- which the SAME commit taught to raise -- did not. `begin_close` /
+        # `begin_recovery` set `_sync_locked`; if a sibling process books the
+        # record `closed` in the race window, `_mutate`'s refresh absorbs that
+        # write and the refusal below fires. M14's `_return_to_partial_close`
+        # catches and only logs, so Drive sync on a live-money book would be
+        # silently off for the rest of the monitor session. Releasing on a
+        # refusal is safe: the record is terminal, so there is no close in
+        # flight left to protect.
+        #
+        # `extra_fields` is guarded like `update_trade_fields`, minus `status`,
+        # which this verb owns. It writes AFTER the version bump, so
+        # `set_trade_status(id, 'closing', version=99)` would have clobbered
+        # the counter the merge resolves on.
+        blocked = {'id', 'version', 'exit'} & set(extra_fields)
+        if blocked:
+            raise ValueError(
+                "set_trade_status may not write %s via extra_fields — those "
+                "are the keys the merge resolves on." % sorted(blocked))
+        try:
+            self._set_trade_status(trade_id, status, **extra_fields)
+        finally:
+            self._sync_locked = False
+
+    def _set_trade_status(self, trade_id: int, status: str, **extra_fields):
         with self._mutate():
             for t in self._trades:
                 if t['id'] == trade_id:
@@ -830,7 +856,6 @@ class SpreadStoreBase(LockedStoreMixin):
                     t['version'] = t.get('version', 0) + 1
                     for k, v in extra_fields.items():
                         t[k] = v
-                    self._sync_locked = False
                     self._logger.info("Trade #%d status -> %s", trade_id, status)
                     return
             self._logger.error("Trade #%d not found for set_trade_status", trade_id)

@@ -24,9 +24,13 @@ row (intraday, or carried forward), so absence is evidence about the RESPONSE
 rather than about the position. It is believed only when corroborated by:
 
   * the row being present and reading 0 -- an ordinary squared-off leg; or
-  * the RECORD's own `short_fill` / `close_failed_leg='long'`, written from an
-    order result rather than from the position book (this is the M14 recovery
-    case: a naked long whose short is known closed); or
+  * the RECORD naming the LONG as the failed leg (`close_failed_leg='long'` /
+    `close_failure.leg='long'`), which is evidence written from an order
+    result rather than from the position book -- the M14 recovery case, a
+    naked long whose short is known closed. NOT `short_fill` on its own: that
+    says some short quantity FILLED, not that the leg is flat, and the record
+    that most often carries it is the PARTIAL-SHORT freeze, whose defining
+    fact is that the short is still live; or
   * a second `positions()` read a moment later.
 
 Refusing costs one poll -- the trade stays open and monitoring continues.
@@ -68,6 +72,11 @@ def env(monkeypatch):
     monkeypatch.setattr(sm, 'reconcile_after_close', lambda *a, **k: True)
     # Never actually sleep in the confirming re-read.
     monkeypatch.setattr(sm.time, 'sleep', lambda *_: None)
+    # The abort escalation is deduped ONCE PER DAY per (kind, book, id) in a
+    # module-level dict -- correct in production, where the monitor is one
+    # long-lived process, and leaky across tests. Clearing it here keeps each
+    # test's assertions about what was SENT honest.
+    sm._unpriced_close_alerted.clear()
     return TelegramSpy().install(monkeypatch, sm)
 
 
@@ -237,3 +246,149 @@ def test_get_net_position_detail_separates_absent_from_flat():
     assert sm.get_net_position_detail(kite, B_LONG) == (0, False)
     # the old accessor still reads the same as it always did
     assert sm.get_net_position(kite, B_LONG) == 0
+
+
+# ══ THE DOORS THE FIRST FIX LEFT OPEN ═══════════════════════════════════════
+#
+# Found by an adversarial review of the fix itself, 2026-09-01, with running
+# reproductions. The preflight guard above was real but it was not the whole
+# hole: the same one-read decision lived one function down, and the record-based
+# corroboration accepted evidence from a record whose short is explicitly LIVE.
+
+def test_close_leg_refuses_an_absent_row_instead_of_calling_it_flat(env):
+    """CRITICAL 1. `close_leg`'s own per-attempt "Safety: Re-check position"
+    used bare `get_net_position`, so a degraded response missing the row gave
+    `actual_remaining == 0` and it returned COMPLETE/`position_verified` for a
+    leg it never traded. The caller then sets `short_closed_now = True`, which
+    makes the long URGENT and sells the hedge -- reached with the preflight
+    entirely healthy."""
+    kite = FakeBroker(books=BCS_BOOKS, positions=[])      # no row at all
+    out = sm.close_leg(kite, 'NFO', B_SHORT, 'BUY', B_QTY, is_buy=True,
+                       dry_run=False)
+    assert out is None, (
+        'an absent row was reported as a closed leg: %r' % (out,))
+    assert kite.placed == [], 'it also placed an order'
+
+
+def test_close_leg_still_believes_a_PRESENT_zero_row(env):
+    """The negative control: an ordinary intraday square-off keeps its row."""
+    kite = FakeBroker(books=BCS_BOOKS,
+                      positions=[{'tradingsymbol': B_SHORT, 'quantity': 0}])
+    out = sm.close_leg(kite, 'NFO', B_SHORT, 'BUY', B_QTY, is_buy=True,
+                       dry_run=False)
+    assert out and out['status'] == 'COMPLETE'
+    assert out['order_id'] == 'position_verified'
+
+
+def test_a_PARTIAL_SHORT_freeze_does_NOT_corroborate(env):
+    """CRITICAL 2, reproduced by the reviewer: the partial-short freeze stamps
+    `short_fill` (the filled tranche) AND `residual_short_qty` AND
+    `close_failure.leg='short'`. Its defining fact is that the short is still
+    LIVE, and the old check returned True on `short_fill is not None`."""
+    trade = _bcs(short_fill=11.43, residual_short_qty=200,
+                 close_failure={'leg': 'short', 'cause': 'unfilled'})
+    store = MemoryStore(trades=[trade])
+    kite = FakeBroker(books=BCS_BOOKS,
+                      positions=[{'tradingsymbol': B_LONG, 'quantity': B_QTY}])
+    script = _LegScript(**{B_LONG: [_complete(B_QTY, 40.00)]})
+
+    result = _close(kite, store, dict(trade), script)
+
+    assert result == 'ABORT', result
+    assert script.calls == [], 'the long was sold against a LIVE short residue'
+
+
+def test_a_stated_residue_vetoes_even_a_long_leg_failure(env):
+    """A residue on the record outranks the leg name: if any short quantity is
+    stated as still held, the short is not flat."""
+    trade = _bcs(close_failed_leg='long', residual_short_qty=100)
+    store = MemoryStore(trades=[trade])
+    kite = FakeBroker(books=BCS_BOOKS,
+                      positions=[{'tradingsymbol': B_LONG, 'quantity': B_QTY}])
+    assert _close(kite, store, dict(trade), _LegScript()) == 'ABORT'
+
+
+def test_short_fill_ALONE_no_longer_corroborates(env):
+    """It says some quantity filled, never that the leg is flat."""
+    trade = _bcs(short_fill=10.0)          # and nothing naming the failed leg
+    store = MemoryStore(trades=[trade])
+    kite = FakeBroker(books=BCS_BOOKS,
+                      positions=[{'tradingsymbol': B_LONG, 'quantity': B_QTY}])
+    assert _close(kite, store, dict(trade), _LegScript()) == 'ABORT'
+
+
+def test_a_second_read_showing_a_FLIPPED_long_refuses(env, monkeypatch):
+    """MEDIUM. `qty > 0` on a leg the record calls SHORT is the Feb-2026 flip.
+    Only `qty < 0` refused, so a flip was announced as "confirmed flat"."""
+    store = MemoryStore(trades=[_bcs()])
+    reads = {'n': 0}
+
+    def detail(kite, symbol):
+        if symbol != B_SHORT:
+            return B_QTY, True
+        reads['n'] += 1
+        return (0, False) if reads['n'] == 1 else (+B_QTY, True)
+
+    monkeypatch.setattr(sm, 'get_net_position_detail', detail)
+    kite = FakeBroker(books=BCS_BOOKS,
+                      positions=[{'tradingsymbol': B_LONG, 'quantity': B_QTY}])
+    script = _LegScript()
+
+    assert _close(kite, store, _bcs(), script) == 'ABORT'
+    assert script.calls == []
+
+
+def test_the_recovery_path_does_NOT_unfreeze_the_record(env):
+    """HIGH. `recover_closing_trade` moves closing -> open. On the M14 path the
+    record arrived from `partial_close` via `begin_recovery`, so flipping it to
+    `open` drops it out of `get_frozen_trades()` FOREVER -- and
+    `_refreeze_after_recovery` cannot undo it, because it only re-freezes a
+    record still at `closing`. The long-leg abort is gated `not recovery` for
+    exactly this reason; this one was not."""
+    import unittest.mock as _m
+    store = MemoryStore(trades=[_bcs(status='closing')])
+    kite = FakeBroker(books=BCS_BOOKS,
+                      positions=[{'tradingsymbol': B_LONG, 'quantity': B_QTY}])
+    with _m.patch.object(sm, 'close_leg', _LegScript()):
+        result = sm._close_spread_inner(
+            kite, store, _bcs(status='closing'), spot=1400.0,
+            reason='SL_SPREAD', dry_run=False, label='BCS', recovery=True)
+
+    assert result == 'ABORT'
+    assert not store.called('recover_closing_trade'), (
+        'the frozen record was un-frozen; the incident is now invisible')
+
+
+def test_the_abort_escalation_is_deduped_once_per_day(env):
+    """HIGH. A short squared off by hand on a PREVIOUS day has no row and no
+    corroboration that will ever arrive, so this abort is permanent for that
+    record. SL_SPOT is deliberately exempt from the abort cooldown, so without
+    a dedup a breached stop sends this every five seconds all session."""
+    store = MemoryStore(trades=[_bcs()])
+    kite = FakeBroker(books=BCS_BOOKS,
+                      positions=[{'tradingsymbol': B_LONG, 'quantity': B_QTY}])
+
+    for _ in range(4):
+        _close(kite, store, _bcs(), _LegScript())
+
+    aborts = [m for m in env.sent if 'close ABORTED' in m]
+    assert len(aborts) == 1, (
+        'the abort alert fired %d times; it floods a whole session' % len(aborts))
+
+
+def test_an_absent_LONG_row_does_not_book_the_trade_closed(env):
+    """MEDIUM. `long_present` was computed and never read, so a degraded
+    response missing the LONG row skipped Step 2 entirely and let the summary
+    book the trade CLOSED off the short fill alone -- abandoning a live long,
+    the leg carrying the value in a TP close, under a closed record."""
+    store = MemoryStore(trades=[_bcs()])
+    kite = FakeBroker(books=BCS_BOOKS,
+                      positions=[{'tradingsymbol': B_SHORT,
+                                  'quantity': -B_QTY}])
+    script = _LegScript(**{B_SHORT: [_complete(B_QTY, 10.00)]})
+
+    result = _close(kite, store, _bcs(), script)
+
+    assert result == 'ABORT', result
+    assert not store.called('update_trade_exit'), (
+        'the trade was booked closed over a long leg it could not see')

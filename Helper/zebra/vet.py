@@ -1492,6 +1492,81 @@ def _marker_fresh(marker: dict, now: Optional[datetime] = None) -> bool:
     return (now or _now()) - decided < timedelta(seconds=_marker_ttl(marker))
 
 
+def entry_allow_expired(trade, now: Optional[datetime] = None) -> bool:
+    """Is this record's ENTRY verdict too old to enter on?
+
+    THE GAP (found 2026-09-01, from production). `_marker_fresh` above guards
+    the EXIT side and there was no equivalent here, so an ALLOWED entry verdict
+    was a STANDING PERMISSION with no expiry. Signal #472 ANGELONE triggered
+    2026-08-31 14:05, was vetted at 14:07, sat at `triggered` overnight, and
+    entered 2026-09-01 at 13:50 — on a verdict 23h45m old, whose own recorded
+    red flag ("only one lot sitting at the short leg's best bid right now") was
+    a statement about a book that had long since gone.
+
+    VETTING.md already states the discipline: "Your verdict covers this
+    episode, not this trade... An `allow` is never a standing permission." It
+    said it about exits. Owner's ruling, 2026-09-01: *"vet has to be realtime"*
+    — it applies to entries too.
+
+    WHAT THIS IS AND IS NOT. The mechanical gates (d/w, entry cost, OI, DTE)
+    are re-run against a fresh book at entry, so this is not about price drift
+    — that was always caught. It is about the AGENT's judgement: its event
+    research ages slowly, its reading of the book ages in minutes.
+
+    Expiry RE-REQUESTS, never vetoes. A missed entry costs nothing and the
+    signal stays exactly where it is; what it must not do is enter on a stale
+    opinion.
+    """
+    if not isinstance(trade, dict):
+        return False
+    v = trade.get('vet')
+    if not isinstance(v, dict) or v.get('state') != ALLOWED:
+        return False
+    decided = _parse(v.get('decided_at')) or _parse(v.get('requested_at'))
+    if decided is None:
+        # An ALLOWED marker with no readable timestamp cannot be shown to be
+        # fresh, and "cannot be shown fresh" is stale on the entry path --
+        # entries fail closed.
+        return True
+    ttl = max(1, int(getattr(cfg, 'ENTRY_VET_TTL_SEC', 1800)))
+    return (now or _now()) - decided >= timedelta(seconds=ttl)
+
+
+def clear_entry_vet(store, trade_id: int, why: str) -> bool:
+    """Drop a stale ENTRY verdict so the next cycle re-vets from scratch.
+
+    Removing the marker rather than inventing an EXPIRED state, because
+    `state is None` is already the "never requested" path the gate handles:
+    it requests a fresh vet, and every bound (`drop_after`, the attempt cap,
+    the queue) applies again from the beginning. Self-healing, and it reuses
+    machinery instead of adding a state every reader would have to learn.
+
+    Never raises: this runs inside `check_watching`'s per-signal body.
+    """
+    try:
+        with store._mutate():
+            t = store._must_find(trade_id)
+            prior = t.get('vet') if isinstance(t.get('vet'), dict) else {}
+            t['vet_expired_history'] = (t.get('vet_expired_history') or [])[-4:] + [{
+                'at': _now().isoformat(timespec='seconds'),
+                'was': prior.get('state'),
+                'decided_at': prior.get('decided_at'),
+                'why': why,
+            }]
+            t['vet'] = None
+            t['version'] = t.get('version', 0) + 1
+        logger.warning('ENTRY VET EXPIRED #%s — %s. The verdict is discarded '
+                       'and a fresh one will be requested; nothing enters on '
+                       'a stale opinion.', trade_id, why)
+        return True
+    except Exception as e:
+        # Could not clear it. FAIL CLOSED is not available here (the caller
+        # decides), so say so loudly and let the caller skip the entry.
+        logger.error('ENTRY VET #%s is stale but could not be cleared (%s) — '
+                     'not entering on it', trade_id, e)
+        return False
+
+
 def _pending_recent(marker: dict, now: Optional[datetime] = None) -> bool:
     """Is an expired PENDING request still ABOUT the episode in front of us?
 

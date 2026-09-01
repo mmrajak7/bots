@@ -1043,8 +1043,27 @@ def _release_stranded_claims(store: ZebraStore, trade: dict) -> None:
         try:
             age = (now - datetime.fromisoformat(str(stamp))).total_seconds()
         except (TypeError, ValueError):
-            continue                     # unparseable: leave it alone, say so
-        if age < slack:
+            # SAY SO. The comment here used to promise this and the branch was
+            # a bare `continue`, so an unreadable stamp disarmed the sweep for
+            # that record silently and forever -- the same shape as the defect
+            # the sweep exists to fix.
+            logger.warning(
+                "STRANDED CLAIM #%d %s: the %s stamp is %r, which cannot be "
+                "read as a time — leaving the claim alone. That exit stays "
+                "disarmed until the record is repaired.",
+                trade['id'], trade.get('stock'), kind.upper(), stamp)
+            continue
+        if age < -slack:
+            # A stamp far in the FUTURE cannot belong to a live cycle. The Pi
+            # has no RTC, so a claim written while the clock was ahead and then
+            # stepped back by NTP would otherwise read as "young" for the whole
+            # skew — leaving the only loss-side stop disarmed, silently, which
+            # is precisely what this sweep is for.
+            logger.warning(
+                "STRANDED CLAIM #%d %s: the %s stamp is %.0fs in the FUTURE "
+                "(clock step?). Treating it as stranded.",
+                trade['id'], trade.get('stock'), kind.upper(), -age)
+        elif age < slack:
             continue
         try:
             store.clear_alert_flag(trade['id'], kind)
@@ -2538,6 +2557,20 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 logger.info("VET NOT REQUESTED #%d %s — capital refuses the "
                             "signal; no agent slot spent", trade['id'], stock)
             if cfg.VET_ENABLED and not vet_skipped:
+                # A VERDICT HAS A SHELF LIFE ON THIS SIDE TOO (2026-09-01).
+                #
+                # An ALLOWED entry verdict was a standing permission with no
+                # expiry: #472 ANGELONE entered on one 23h45m old. Dropping it
+                # here puts the record back on the `state is None` path a few
+                # lines down, which requests a fresh vet -- so a stale opinion
+                # costs a re-vet, never an entry and never a lost signal.
+                _fresh = store.find(trade['id'])
+                if vet_mod.entry_allow_expired(_fresh):
+                    if not vet_mod.clear_entry_vet(
+                            store, trade['id'],
+                            'the verdict is older than entry_vet_ttl_sec '
+                            '(%ds)' % cfg.ENTRY_VET_TTL_SEC):
+                        continue          # could not clear it: do NOT enter
                 state = vet_mod.vet_state(store.find(trade['id']))
                 if state == vet_mod.QUEUED:
                     # Retry with the book we just re-quoted. promote_queued is a

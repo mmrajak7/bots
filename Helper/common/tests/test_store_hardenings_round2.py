@@ -254,3 +254,4 @@ def test_a_clean_drive_copy_raises_nothing(bcs_store, monkeypatch):
 
     bcs_store._sync_from_drive()
     assert flagged == []
+

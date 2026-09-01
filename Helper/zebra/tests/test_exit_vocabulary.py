@@ -212,10 +212,33 @@ def test_the_real_cohort_leaves_the_gate_unmet():
     rows = json.loads(p.read_text(encoding='utf-8'))
     coh = digest._cohort(rows)
     assert coh['closed'] > 0, 'cohort has no closed trades to reason about'
-    assert coh['stop_exits'] == 0, coh['exit_reasons']
     assert not coh['unrecognised_exit_reasons'], \
         'a stored reason no reader understands: %s' % coh['unrecognised_exit_reasons']
-    assert any('ARMING GATE UNMET' in f for f in _flags(coh))
+    # Every counted stop must be a kind `outcomes` names. A COUNT is allowed to
+    # grow; a VOCABULARY is not.
+    known = {k for k in coh['exit_reasons']
+             if outcomes.is_stop_exit('paper:' + k)}
+    assert coh['stop_exits'] == sum(coh['exit_reasons'][k] for k in known), (
+        'the stop count does not reconcile with the recognised kinds: %s'
+        % coh['exit_reasons'])
+    assert 'already_flat_tp' not in coh['exit_reasons'], (
+        'an already-flat TP is being counted as cohort evidence — that is the '
+        'arm-against-paper-positions mistake manufacturing its own permission')
+    # THE GATE'S MECHANICAL CONDITION IS NOW MET (2026-09-01). This asserted
+    # the UNMET flag fires; with two `paper:debit_sl` closes it correctly does
+    # not. The flag's own wording says "transacted stop", and that is NOT what
+    # these are -- zebra books a paper close at MID, so they are evidence the
+    # stop PATH fires, books and labels correctly, and no evidence at all
+    # about where a stop FILLS. Both landed at ~-51%, i.e. exactly at the
+    # level, which is what mid-booking produces by construction and what a
+    # real fill would not guarantee.
+    flags = _flags(coh)
+    if coh['stop_exits']:
+        assert not any('ARMING GATE UNMET' in f for f in flags), (
+            'the cohort has %d stop exit(s) and the gate still reports UNMET'
+            % coh['stop_exits'])
+    else:
+        assert any('ARMING GATE UNMET' in f for f in flags)
 
 
 # ── the write boundary complains, but never interferes ─────────────────────

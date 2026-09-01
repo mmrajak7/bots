@@ -1108,11 +1108,31 @@ def _record_says_short_already_closed(trade: dict) -> bool:
     reach the skip-the-short branch at all: the sweep re-enters the close for
     a naked long whose short is known closed.
     """
-    if trade.get('short_fill') is not None:
-        return True
+    # `short_fill` ALONE IS NOT EVIDENCE (fixed 2026-09-01, second pass).
+    #
+    # It says SOME short quantity filled, never that the short is flat, and
+    # the record that most often carries it is the one whose defining fact is
+    # that the short is still LIVE: the PARTIAL-SHORT freeze stamps
+    # `short_fill=<the partial tranche>` alongside `residual_short_qty` and
+    # `close_failure.leg='short'`. The long-leg CRITICAL branch also stamps it,
+    # sometimes as 0.0, which `is not None` accepts.
+    #
+    # Reproduced: a partial-short freeze plus a degraded response sold the
+    # whole long and booked the trade closed with a naked short residue.
+    #
+    # So corroboration is the leg NAME -- "the close failed on the LONG,
+    # therefore the short completed" -- and a stated residue vetoes it
+    # outright.
+    try:
+        if float(trade.get('residual_short_qty') or 0) > 0:
+            return False
+    except (TypeError, ValueError):
+        return False                     # unreadable residue: refuse to guess
+    cf = trade.get('close_failure') or {}
+    if isinstance(cf, dict) and cf.get('leg') == 'short':
+        return False
     if trade.get('close_failed_leg') == 'long':
         return True
-    cf = trade.get('close_failure') or {}
     return isinstance(cf, dict) and cf.get('leg') == 'long'
 
 
@@ -1170,9 +1190,15 @@ def _short_is_confirmed_flat(kite, short_sym: str, short_present: bool,
         say(f"    {short_sym}: still absent on the second read. Refusing to "
             f"sell the long against an unconfirmed flat short.")
         return False
-    if qty < 0:
-        say(f"    {short_sym}: the second read shows {qty} — the first read "
-            f"was WRONG and this leg is still live.")
+    # ANY non-zero reading refuses, not just a negative one. `qty > 0` on a
+    # leg the record calls SHORT is the Feb-2026 flip — four 700-lot BUYs
+    # against -700 — and calling that "confirmed flat" would sell the long and
+    # book the trade closed while the flipped leg is live, walking straight
+    # past the B11 flip guard that exists for exactly this state.
+    if qty != 0:
+        say(f"    {short_sym}: the second read shows {qty:+d} — the first "
+            f"read was WRONG and this leg is %s."
+            % ('FLIPPED LONG (the Feb-2026 shape)' if qty > 0 else 'still live'))
         return False
     say(f"    {short_sym}: confirmed flat on the second read (qty={qty}).")
     return True
@@ -2677,13 +2703,43 @@ def close_leg(kite: KiteConnect, exchange: str, symbol: str, txn_type: str,
             break
         # ── Safety: Re-check position to compute actual remaining ─────
         if not dry_run:
-            current_qty = get_net_position(kite, symbol)
+            current_qty, qty_present = get_net_position_detail(kite, symbol)
             if is_buy:
                 # Buying back short: remaining = how much is still short
                 actual_remaining = abs(min(current_qty, 0))
             else:
                 # Selling long: remaining = how much is still long
                 actual_remaining = max(current_qty, 0)
+
+            # AN ABSENT ROW IS NOT A FLAT LEG (fixed 2026-09-01, second pass).
+            #
+            # `_short_is_confirmed_flat` closed this in the PREFLIGHT and the
+            # same one-read decision lived on down here, where it is worse:
+            # a degraded response missing the row gives `actual_remaining == 0`
+            # and this returns `COMPLETE / position_verified` for a leg it
+            # never traded. The caller then sets `short_closed_now = True`,
+            # which makes the long leg URGENT (`long_urgent = urgent or
+            # short_closed_now`) and sells the hedge off a live short. One
+            # function below the fix, reached with the preflight entirely
+            # healthy.
+            #
+            # REFUSE rather than proceed. Placing the order anyway is not the
+            # safe alternative: buying back a short that really is flat OPENS
+            # a long, and selling a long that is really gone opens a short.
+            # With no proof either way the only safe act is none, and `None`
+            # is this function's word for "the leg did not close" -- callers
+            # already freeze or abort on it, placing nothing.
+            #
+            # Our OWN tagged fills are the exception, and they are proof: if
+            # this run filled some of it, the leg went flat because WE closed
+            # it, whatever the position book is currently able to say.
+            if actual_remaining == 0 and not qty_present \
+                    and cumulative_fill_qty <= 0:
+                log(f"    {symbol}: NOT in the positions response, and no "
+                    f"{ORDER_TAG} fill of ours to explain it. Refusing to "
+                    f"call this leg flat — an absent row is a fact about the "
+                    f"RESPONSE, not about the position.")
+                return None
 
             if actual_remaining == 0:
                 log(f"    Position {symbol} already flat (qty={current_qty}). Nothing to close.")
@@ -4266,19 +4322,77 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
                 f"confirmed flat ***")
             log(f"  {short_sym} is absent from the positions response. "
                 f"Selling the long now could leave a NAKED SHORT.")
-            if not dry_run:
+            # NOT UNDER RECOVERY. `recover_closing_trade` moves closing -> open,
+            # and on the M14 path the record arrived here from `partial_close`
+            # via `begin_recovery`. Flipping it to `open` drops it out of
+            # `get_frozen_trades()` FOREVER, discards the attempt count, and
+            # hands a half-closed position to the per-trade loop to price as a
+            # whole spread -- and `_refreeze_after_recovery` cannot undo it,
+            # because it only re-freezes a record still at `closing`. The
+            # long-leg abort below is gated the same way, for the same reason.
+            if not dry_run and not recovery:
                 store.recover_closing_trade(trade['id'])
-            _human_escalation(
-                f"{label} {stock}: {reason} close ABORTED — {short_sym} is "
-                f"missing from the broker's positions response, so this "
-                f"engine cannot prove the short leg is flat. Nothing was "
-                f"placed and the long was NOT sold; the trade stays open and "
-                f"monitoring continues. Check the position in Kite.",
-                paper_passthrough, alert_class=alert_policy.SAFETY)
+            # ONCE PER DAY. A short squared off by hand on a PREVIOUS day has
+            # no row, no `close_failed_leg`, and no second read that will ever
+            # find one -- so this abort is permanent for that record. That is
+            # the safe answer, but SL_SPOT is deliberately exempt from the
+            # abort cooldown, so without a dedup a breached stop would send
+            # this alert every five seconds for the whole session and bury
+            # everything else. Same pattern as `_unpriced_close_alerted`.
+            key = ('SHORT_UNCONFIRMED', label, trade.get('id'))
+            today = now_ist().strftime('%Y-%m-%d')
+            if _unpriced_close_alerted.get(key) != today:
+                _unpriced_close_alerted[key] = today
+                _human_escalation(
+                    f"{label} {stock}: {reason} close ABORTED — {short_sym} is "
+                    f"missing from the broker's positions response, so this "
+                    f"engine cannot prove the short leg is flat. Nothing was "
+                    f"placed and the long was NOT sold; the trade stays open "
+                    f"and monitoring continues.\n"
+                    f"If that leg was closed by hand (on an earlier day it "
+                    f"drops out of Kite's positions entirely), book this trade "
+                    f"by hand — the engine cannot and will keep refusing. "
+                    f"Once per day.",
+                    paper_passthrough, alert_class=alert_policy.SAFETY)
             return 'ABORT'
         log(f"\n  SHORT leg {short_sym} already flat/long (qty={short_qty}). Skipping BUY.")
 
     # ── Step 2: Close LONG leg (SELL) — only if still long ───────────────
+    # THE MIRRORED HOLE (fixed 2026-09-01, second pass). `long_present` was
+    # computed in the preflight and never read, so a degraded response missing
+    # the LONG row gave `long_qty == 0`, skipped this whole step, and let the
+    # summary book the trade CLOSED off the short fill alone -- abandoning a
+    # live long, the leg carrying the value in a TP close, unmonitored under a
+    # closed record. `reconcile_after_close` usually catches it a moment later,
+    # but it re-reads the same source, so a burst spanning both reads reports
+    # "all legs flat OK".
+    #
+    # Same rule as the short: an absent row is a fact about the RESPONSE.
+    # Refuse the close rather than book a leg we cannot see. The record's own
+    # evidence corroborates the mirror case -- if the close failed on the
+    # SHORT, the long never sold.
+    if long_qty == 0 and not long_present and not dry_run \
+            and (trade.get('close_failed_leg') or
+                 (trade.get('close_failure') or {}).get('leg')) != 'short':
+        log(f"\n  *** REFUSING TO BOOK — the LONG leg cannot be confirmed "
+            f"flat ***")
+        log(f"  {long_sym} is absent from the positions response, so this "
+            f"close would book an exit for a leg it cannot see.")
+        if not recovery:
+            store.recover_closing_trade(trade['id'])
+        key = ('LONG_UNCONFIRMED', label, trade.get('id'))
+        today = now_ist().strftime('%Y-%m-%d')
+        if _unpriced_close_alerted.get(key) != today:
+            _unpriced_close_alerted[key] = today
+            _human_escalation(
+                f"{label} {stock}: {reason} close ABORTED — {long_sym} is "
+                f"missing from the broker's positions response. The short may "
+                f"already be closed; the long was NOT booked, because booking "
+                f"it would close the record over a leg this engine cannot "
+                f"see. Check the position in Kite. Once per day.",
+                paper_passthrough, alert_class=alert_policy.SAFETY)
+        return 'ABORT'
+
     if long_qty > 0:
         close_qty = min(long_qty, qty)
         log("")
