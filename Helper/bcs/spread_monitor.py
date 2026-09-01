@@ -8847,11 +8847,34 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     # closed again is the RECORD's business, and the store
                     # contract already refuses `closing`, `partial_close` and
                     # terminal states.
+                    # `find_open_trade`, NOT `find`, and no literal 'open'.
+                    #
+                    # The first cut of this used `trade_store.find(tid)` and
+                    # tested `status == 'open'`, and BOTH are wrong for the
+                    # cohort — which is the only book where the leak has
+                    # actually been observed. `ZebraStoreAdapter` has no
+                    # `find()` at all (the AttributeError was swallowed, so
+                    # the marker was never released), and `map_trade` does not
+                    # translate the status, so a cohort record arrives here
+                    # saying `entered`, not `open`. The guard was inert
+                    # precisely where it was needed.
+                    #
+                    # Seen in production 2026-09-01: the monitor logged
+                    # "CLOSE IN PROGRESS (SL_SPREAD). Skipping." 43 times for
+                    # #453 HINDZINC and 60 times for #454 SBICARD -- roughly
+                    # 4 and 5 minutes of not watching each, ending only when
+                    # zebra booked the exit and the record left the open book.
+                    # Free in dry run; not free once this engine books.
+                    #
+                    # `find_open_trade` is on BOTH stores and answers the
+                    # actual question -- "is this record still in the open
+                    # book?" -- without either side's status vocabulary.
                     try:
-                        still = trade_store.find(tid) if trade_store else None
+                        still = (trade_store.find_open_trade(stock, tid)
+                                 if trade_store else None)
                     except Exception:
                         still = None
-                    if still is not None and still.get('status') == 'open':
+                    if still is not None:
                         closing_in_progress.pop(close_key, None)
                         log(f"  {strat} #{tid} {stock}: the close did not move "
                             f"the record (still open) — releasing the "

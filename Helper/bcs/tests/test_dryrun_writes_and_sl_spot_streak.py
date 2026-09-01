@@ -160,3 +160,52 @@ def test_a_broken_streak_really_does_need_the_reset():
     sm.bump_confirm(confirm2, 'sl_spot')
     confirm2['sl_spot'] = 0
     assert sm.bump_confirm(confirm2, 'sl_spot') == 1
+
+
+# ── the closing_in_progress release must work on the COHORT book ───────────
+#
+# Observed in production 2026-09-01, in the monitor's own log:
+#
+#     BCS #453 HINDZINC: CLOSE IN PROGRESS (SL_SPREAD). Skipping.   x43
+#     BCS #454 SBICARD:  CLOSE IN PROGRESS (SL_SPREAD). Skipping.   x60
+#
+# ~4 and ~5 minutes of NOT WATCHING each, ending only when zebra booked the
+# exit and the record left the open book. The release added in 363fff8 was
+# supposed to prevent exactly that and was INERT for these records: it called
+# `trade_store.find(tid)` (which `ZebraStoreAdapter` does not implement -- the
+# AttributeError was swallowed) and tested `status == 'open'` (cohort records
+# say `entered`; `map_trade` does not translate it). Wrong on both counts, in
+# the only book where the leak has actually been seen.
+
+def test_the_release_uses_an_interface_BOTH_stores_implement():
+    """`find_open_trade` exists on the BCS family and on the cohort adapter.
+    `find` exists only on the former, which is why the guard was silent.
+
+    RETIRES WHEN: the adapter and the BCS-family stores share one declared
+    interface, so a method missing on one side is a type error rather than a
+    swallowed AttributeError.
+    """
+    from bcs.trade_store import TradeStore
+    from bcs.zebra_adapter import ZebraStoreAdapter
+    assert hasattr(ZebraStoreAdapter, 'find_open_trade')
+    assert hasattr(TradeStore, 'find_open_trade')
+    assert not hasattr(ZebraStoreAdapter, 'find'), (
+        'the adapter grew a find(); re-check the release still asks the right '
+        'question rather than silently working again for the wrong reason')
+
+
+def test_the_release_does_not_test_a_literal_status():
+    """A literal 'open' is wrong for half the book. The question is "is this
+    record still in the OPEN BOOK", which `find_open_trade` answers without
+    either vocabulary.
+
+    RETIRES WHEN: the two status vocabularies are unified.
+    """
+    import inspect
+    src = inspect.getsource(sm.monitor_all)
+    at = src.index('closing_in_progress.pop(close_key, None)\n                        log(')
+    window = src[max(0, at - 1200):at]
+    assert 'find_open_trade' in window, (
+        'the release no longer uses the interface both stores implement')
+    assert "still.get('status') == 'open'" not in window, (
+        "a literal 'open' is inert for cohort records, which say 'entered'")
