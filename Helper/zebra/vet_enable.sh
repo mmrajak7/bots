@@ -10,12 +10,17 @@
 # Run pi_setup.sh FIRST. This script assumes the engine is already deployed.
 #
 # Why the checks come before the switch: with vetting on, a signal waits for a
-# verdict before it enters. If the CLI cannot spawn, the layer fails OPEN --
-# signals enter UNVETTED rather than stalling, which is the right call for a
-# trading system but means a broken layer looks EXACTLY like a working one
-# from the outside. `claude -p` that lacks permission or a login does not hang
-# and does not error: it exits 0 with the work undone. So the only way to know
-# is to test the spawn before trusting it.
+# verdict before it enters, and ENTRIES FAIL CLOSED (M6, 2026-08-29). If the
+# CLI cannot spawn, nothing enters unvetted -- entries queue, retry, and are
+# eventually DROPPED. That is the right call for this account (a missed entry
+# costs nothing; an unqualified one costs capital), and it is also why a broken
+# layer is so hard to see from the outside: it looks exactly like a quiet
+# market. "Declined to start" and "started and failed" need opposite fixes and
+# produce identical silence.
+#
+# `claude -p` that lacks permission or a login does not hang and does not
+# error: it exits 0 with the work undone. So the only way to know is to test
+# the spawn before trusting it.
 #
 # Nothing here can open or close a position, and it never touches the
 # live-money bcs.spread_monitor.
@@ -155,7 +160,22 @@ if missing:
     sys.exit(1)
 print(f'  \033[32m[ OK ]\033[0m VET_DENIED_TOOLS blocks all {len(need)} position verbs')
 print(f'  \033[32m[ OK ]\033[0m model={c.VET_MODEL}  timeout={c.VET_TIMEOUT_SEC}s')
-print(f'         allowed on argv: {c.VET_ALLOWED_TOOLS}')
+# THE REAL ARGV, not the template. This printed `c.VET_ALLOWED_TOOLS`, which
+# still carries {python} / {python_rel} placeholders -- so the line labelled
+# "allowed on argv" showed something that is NOT what goes on argv, and would
+# have looked IDENTICAL if the formatting ever broke. An unmatched grant fails
+# silently (the agent prints an approval request to a log nobody reads and
+# exits 0), so this display could not detect the one failure it exists for.
+from zebra import vet as _v
+_grants = _v._allowed_tools('vet')
+_unformatted = [g for g in _grants if '{' in g or '}' in g]
+if _unformatted:
+    print(f'  [31m[FAIL][0m grants still carry unformatted '
+          f'placeholders and will match NOTHING: {_unformatted}')
+    sys.exit(1)
+print(f'  [32m[ OK ][0m {len(_grants)} grants, all formatted')
+for _g in _grants:
+    print(f'           {_g}')
 print('         (a project settings.json ALLOW is IGNORED by claude -p —')
 print('          grants MUST ride on argv; deny rules from the file DO apply)')
 EOF
@@ -265,8 +285,16 @@ cat <<'TXT'
     ALLOW  -> enters (one tick of drift is the accepted cost)
     VETO   -> does not enter; a paper "shadow" tracks what it would have done,
               which is the only way the veto ever gets scored
-    no verdict inside the timeout -> enters UNVETTED. Fail-open is deliberate:
-              a vetting outage must never become a silent trading halt.
+    no verdict inside the timeout -> QUEUED, retried, and DROPPED after
+              `vet_max_attempts` / `drop_after`. NOTHING ENTERS UNVETTED.
+              Entries fail CLOSED (M6, 2026-08-29): an entry nobody reviewed
+              must not be indistinguishable from one that was reviewed and
+              cleared. A missed entry costs nothing; an unqualified one costs
+              capital. The halt is kept non-silent by the ENTRY DROPPED
+              Telegram, not by entering.
+              (EXITS are the opposite and must stay that way: there the
+              deterministic guards have already cleared the exit, so the vet
+              is additive and fails OPEN.)
 
   Watch tomorrow:
     python -m zebra status                       # vet state per signal
