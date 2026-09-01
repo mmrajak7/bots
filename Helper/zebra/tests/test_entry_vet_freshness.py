@@ -214,3 +214,74 @@ def test_the_gate_actually_calls_it():
     assert any(calls_in_tests), (
         'the freshness check is short-circuited by a constant — it is wired '
         'in name only')
+
+
+# ── the TTL must not become a quota burn (review finding, 2026-09-01) ──────
+#
+# A signal can sit at `triggered` with an ALLOWED verdict and never enter --
+# and that is the DEFAULT state of live-ticket mode (`paper_mode: false`,
+# `auto_entry: false`), the very next arming step: the Telegram IS the order
+# ticket and the record waits for a human. Expiring on a timer alone meant
+# ~12 fresh CLI spawns per lingering signal per session, times N signals, on
+# the SAME shared quota whose exhaustion took the vetting layer offline for 40
+# minutes earlier that day. `_spawn_budget_ok` and `cli_blocked_until` bound
+# CONCURRENCY and OUTAGES, not spend.
+
+def _expired_marker():
+    return {'state': 'allowed',
+            'decided_at': (NOW - timedelta(hours=2)).isoformat()}
+
+
+def test_the_first_expiry_re_vets():
+    """Under the cap, a stale verdict is discarded and a fresh one asked for.
+    That is the whole point of the TTL and must keep working."""
+    t = _rec(120)
+    assert vet.clear_entry_vet(_Store(t), 472, 'stale') is True
+    assert t['vet'] is None, 'the first expiry must request a fresh verdict'
+
+
+def test_past_the_daily_cap_it_stops_spawning():
+    """THE FINDING. Past the cap the verdict is marked EXPIRED: it authorises
+    nothing AND requests nothing."""
+    t = _rec(120)
+    store = _Store(t)
+    for _ in range(vet.ENTRY_VET_MAX_REVETS_PER_DAY + 2):
+        t['vet'] = _expired_marker()
+        vet.clear_entry_vet(store, 472, 'stale')
+    assert isinstance(t['vet'], dict)
+    assert t['vet']['state'] == vet.EXPIRED
+    assert len([r for r in t['vet_expired_history']]) >= 1
+
+
+def test_an_EXPIRED_marker_refuses_the_entry():
+    """The gate's default arm is `elif state != ALLOWED: continue`, so EXPIRED
+    is fail-closed with no gate change at all."""
+    assert vet.vet_state({'vet': {'state': vet.EXPIRED}}) == vet.EXPIRED
+    assert vet.vet_state({'vet': {'state': vet.EXPIRED}}) != vet.ALLOWED
+
+
+def test_an_EXPIRED_marker_is_not_re_expired():
+    """Once EXPIRED it is not ALLOWED, so the freshness check ignores it and
+    the loop settles instead of writing every cycle."""
+    t = {'id': 1, 'vet': {'state': vet.EXPIRED}}
+    assert vet.entry_allow_expired(t, now=NOW) is False
+
+
+def test_the_cap_is_per_day():
+    """A signal still valid tomorrow gets a fresh look tomorrow -- the cap
+    bounds spend, it does not retire the signal."""
+    old = (NOW - timedelta(days=1)).isoformat(timespec='seconds')
+    t = _rec(120)
+    t['vet_expired_history'] = [{'at': old}, {'at': old}, {'at': old}]
+    vet.clear_entry_vet(_Store(t), 472, 'stale')
+    assert t['vet'] is None, "yesterday's expiries must not cap today"
+
+
+def test_the_counter_survives_the_clear():
+    """`vet_expired_history` is the counter, and it has to outlive the thing
+    it counts -- the marker it is counting is exactly what gets wiped."""
+    t = _rec(120)
+    store = _Store(t)
+    vet.clear_entry_vet(store, 472, 'stale')
+    assert t['vet'] is None
+    assert len(t['vet_expired_history']) == 1

@@ -63,6 +63,11 @@ PENDING = 'pending'
 ALLOWED = 'allowed'
 VETOED = 'vetoed'
 UNAVAILABLE = 'unavailable'
+#: An ENTRY verdict aged out past the daily re-vet cap. NOT in TERMINAL:
+#: it authorises nothing and requests nothing, which is exactly what the
+#: gate's default arm (`elif state != ALLOWED: continue`) already does
+#: with any state it does not recognise. See `clear_entry_vet`.
+EXPIRED = 'expired'
 # Waiting for an agent slot. NOT terminal and NOT an entry: the signal sits
 # here rather than entering unvetted. See the queue note below.
 QUEUED = 'queued'
@@ -1532,6 +1537,37 @@ def entry_allow_expired(trade, now: Optional[datetime] = None) -> bool:
     return (now or _now()) - decided >= timedelta(seconds=ttl)
 
 
+#: How many times ONE signal may have its entry verdict expired and re-vetted
+#: in a day. Past this the verdict is marked EXPIRED and simply stops
+#: authorising an entry: no agent is spawned and nothing enters.
+#:
+#: THE HAZARD THIS BOUNDS (found by review, 2026-09-01, the day the TTL was
+#: added). A signal can sit at `triggered` with an ALLOWED verdict and never
+#: enter — and that is the DEFAULT state of live-ticket mode (`paper_mode:
+#: false`, `auto_entry: false`), which is the very next arming step: the
+#: Telegram IS the order ticket and the record waits for a human. Expiring on
+#: a timer alone meant ~12 fresh CLI spawns per lingering signal per session,
+#: times N signals, on the SAME shared quota whose exhaustion took the vetting
+#: layer offline for 40 minutes earlier that day. `_spawn_budget_ok` and
+#: `cli_blocked_until` bound CONCURRENCY and OUTAGES, not spend.
+#:
+#: Two is enough to survive a transient bad book and far short of a loop.
+ENTRY_VET_MAX_REVETS_PER_DAY = 2
+
+
+def _revets_today(trade, now: Optional[datetime] = None) -> int:
+    """How many times this signal's entry verdict has already been expired."""
+    today = (now or _now()).date().isoformat()
+    n = 0
+    for row in (trade.get('vet_expired_history') or []):
+        try:
+            if str(row.get('at', ''))[:10] == today:
+                n += 1
+        except Exception:                    # pragma: no cover - defensive
+            continue
+    return n
+
+
 def clear_entry_vet(store, trade_id: int, why: str) -> bool:
     """Drop a stale ENTRY verdict so the next cycle re-vets from scratch.
 
@@ -1553,11 +1589,35 @@ def clear_entry_vet(store, trade_id: int, why: str) -> bool:
                 'decided_at': prior.get('decided_at'),
                 'why': why,
             }]
-            t['vet'] = None
+            # PAST THE DAILY CAP THE VERDICT DIES RATHER THAN RECYCLING.
+            #
+            # Under the cap: clear to None, which is the "never requested"
+            # path the gate already handles -- it asks for a fresh verdict.
+            # At the cap: mark it EXPIRED. The gate's default arm is
+            # `elif state != ALLOWED: continue`, so an EXPIRED marker refuses
+            # the entry AND requests nothing. Fail-closed and quota-safe at
+            # once, with no gate change. The cap is per DAY, so a signal that
+            # is still valid tomorrow gets a fresh look tomorrow.
+            capped = _revets_today(t) >= ENTRY_VET_MAX_REVETS_PER_DAY
+            if capped:
+                t['vet'] = {'state': EXPIRED,
+                            'expired_at': _now().isoformat(timespec='seconds'),
+                            'why': why}
+            else:
+                t['vet'] = None
             t['version'] = t.get('version', 0) + 1
-        logger.warning('ENTRY VET EXPIRED #%s — %s. The verdict is discarded '
-                       'and a fresh one will be requested; nothing enters on '
-                       'a stale opinion.', trade_id, why)
+        if capped:
+            logger.warning(
+                'ENTRY VET EXPIRED #%s — %s. This signal has already been '
+                're-vetted %d time(s) today, so the verdict is marked EXPIRED '
+                'and NO further agent is spawned for it: it will not enter, '
+                'and it stops costing quota. A fresh look comes tomorrow.',
+                trade_id, why, ENTRY_VET_MAX_REVETS_PER_DAY)
+        else:
+            logger.warning(
+                'ENTRY VET EXPIRED #%s — %s. The verdict is discarded and a '
+                'fresh one will be requested; nothing enters on a stale '
+                'opinion.', trade_id, why)
         return True
     except Exception as e:
         # Could not clear it. FAIL CLOSED is not available here (the caller

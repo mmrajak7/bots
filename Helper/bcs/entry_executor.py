@@ -543,6 +543,18 @@ def _round(kite, out, i, lots, stock, long_symbol, short_symbol, exchange,
             f"not unwound, not recorded. Manual decision needed.")
         return False
 
+    # NOTHING IS IN FLIGHT ANY MORE — cleared HERE, not only in the caller.
+    #
+    # `open_spread` pops it after `_round` returns, which covers every normal
+    # return. What it does not cover is a raise BETWEEN the round completing
+    # and the return: the trailing `say(...)` below is a log call, and a
+    # failing log handler would leave `in_flight` set on a round that has
+    # already been counted in `lots_filled` and recorded by
+    # `mark_entered_bcs`. The exception handler would then file those same
+    # legs as residue — an incident naming legs the record already accounts
+    # for, which can never self-resolve while the position is open, because
+    # the sweep tests for symbol-flat at the broker.
+    out.pop('in_flight', None)
     out['long_fills'].append(lfill.get('average_price'))
     out['short_fills'].append(sfill.get('average_price'))
     out['lots_filled'] += 1

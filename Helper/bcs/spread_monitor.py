@@ -4371,14 +4371,55 @@ def _close_spread_inner(kite, store, trade, spot, reason, dry_run, label='BCS',
     # Refuse the close rather than book a leg we cannot see. The record's own
     # evidence corroborates the mirror case -- if the close failed on the
     # SHORT, the long never sold.
-    if long_qty == 0 and not long_present and not dry_run \
+    # RE-READ AT STEP 2 TIME, not off the preflight.
+    #
+    # `long_qty` / `long_present` were read once, BEFORE Step 1 -- and Step 1
+    # can spend minutes buying the short back. A preflight that carried the
+    # short row but missed the long row (the partially-degraded shape this
+    # whole guard is about) would let the short close for real and then abort
+    # on a stale reading. One extra read, taken only when the preflight said
+    # the long was absent, i.e. on the suspicious path alone.
+    if long_qty == 0 and not long_present and not dry_run:
+        try:
+            long_qty, long_present = get_net_position_detail(kite, long_sym)
+        except Exception as e:
+            log(f"  {long_sym}: the Step-2 re-read failed ({e}); keeping the "
+                f"preflight reading.")
+
+    # NOT ON THE RECOVERY PATH. `classify_frozen` has already read the
+    # broker's positions and decided what is live -- RC_NAKED_SHORT means
+    # exactly "short live, long flat", so an absent long row there is the
+    # EXPECTED state and the sweep is entitled to act on it. Re-litigating it
+    # here duplicated that decision and got it wrong, aborting the naked-short
+    # recovery that must not wait. The guard is for the NORMAL close path,
+    # where nothing else has classified the book.
+    if long_qty == 0 and not long_present and not dry_run and not recovery \
             and (trade.get('close_failed_leg') or
                  (trade.get('close_failure') or {}).get('leg')) != 'short':
         log(f"\n  *** REFUSING TO BOOK — the LONG leg cannot be confirmed "
             f"flat ***")
         log(f"  {long_sym} is absent from the positions response, so this "
             f"close would book an exit for a leg it cannot see.")
-        if not recovery:
+        # ONCE THE SHORT HAS FILLED THIS RUN, ABORT-TO-OPEN IS WRONG.
+        #
+        # `recover_closing_trade` moves closing -> open, which hands a
+        # HALF-CLOSED position to the per-trade loop to price as a whole
+        # spread -- and discards this run's short fill, so the eventual
+        # re-close counts that leg at 0.00 and books `pnl_approximate`. The
+        # sibling long-leg failure branch below refuses exactly this
+        # (`... and not short_closed_now`); this guard did not. Freeze
+        # instead, which is what the record actually is: a real short close
+        # with a long nobody can see.
+        if short_closed_now:
+            log(f"  The short leg FILLED this run, so this is a half-closed "
+                f"position, not an untouched one. Freezing at partial_close.")
+            store.set_trade_status(
+                trade['id'], 'partial_close',
+                close_failed_leg='long', close_reason=reason,
+                short_fill=short_fill,
+                close_failure=_close_failure(
+                    cause='unreadable_book', leg='long', reason=reason))
+        elif not recovery:
             store.recover_closing_trade(trade['id'])
         key = ('LONG_UNCONFIRMED', label, trade.get('id'))
         today = now_ist().strftime('%Y-%m-%d')
@@ -4903,8 +4944,25 @@ def _resolve_residue(store, trade, label, nagged, kind=None):
     res = dict(trade.get(kind.field) or {})
     res['state'] = 'resolved'
     res['resolved_at'] = now_ist().isoformat()
+    # AND CLEAR THE RESIDUE QUANTITY IT WAS ABOUT (fixed 2026-09-01).
+    #
+    # `residual_short_qty` is stamped by the PARTIAL-SHORT freeze and was
+    # written in exactly one place and cleared in NONE. It vetoes the
+    # record-based corroboration in `_record_says_short_already_closed`, so
+    # once set it refused that corroboration FOREVER -- and the escalation
+    # that stamps it tells the owner "Close the residue by hand". They do; the
+    # residue settles off the positions book; and the M14 recovery this record
+    # exists for then dead-ends, frozen at `partial_close` with the long never
+    # sold and a daily escalation for company.
+    #
+    # This is the right place: the sweep resolves only on two DATED
+    # consecutive flat reads outside the opening window, which is live
+    # evidence that the residue is gone -- not a historical stamp.
+    patch = {kind.field: res}
+    if trade.get('residual_short_qty'):
+        patch['residual_short_qty'] = 0
     try:
-        store.update_trade_fields(trade['id'], **{kind.field: res})
+        store.update_trade_fields(trade['id'], **patch)
     except Exception as e:                     # pragma: no cover - store-level
         # The incident is NOT resolved if the record does not say so, and the
         # write is the only thing that makes it say so. Assigning first would
@@ -4914,6 +4972,8 @@ def _resolve_residue(store, trade, label, nagged, kind=None):
             % (kind.field, trade.get('id'), e))
         return
     trade[kind.field] = res
+    if 'residual_short_qty' in patch:
+        trade['residual_short_qty'] = 0
     _recovery_event(kind.resolved_event, store=label, id=trade.get('id'))
     log("  RESIDUE #%s (%s, %s) is FLAT at the broker - incident closed."
         % (trade.get('id'), label, kind.field))
