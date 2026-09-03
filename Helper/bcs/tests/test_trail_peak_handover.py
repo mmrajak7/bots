@@ -107,9 +107,24 @@ def test_a_restored_peak_past_the_engage_level_ARMS_the_trail():
 
 
 def test_a_restored_peak_BELOW_the_engage_level_does_not_arm():
-    """The negative control. Max gain 30 arms at 25.0; 21.0 is short of it,
-    and arming there would invent a stop the rule does not authorise."""
-    ts = sm.new_trail_state(cohort_trade(mfe_mid=21.0))
+    """The negative control: arming below the engage level would invent a stop
+    the rule does not authorise.
+
+    The peak is DERIVED from `cfg.TRAIL_ENGAGE_FRAC` rather than hardcoded. It
+    used to be the literal 21.0, chosen because max gain 30 armed at 25.0 under
+    engage 0.50; when that moved to 0.25 on 2026-09-03 the arm point dropped to
+    17.5 and this test started asserting that an ARMED trail was disarmed.
+    `zebra/tests/test_trail_study.py::test_the_trail_engage_cliff` owns the
+    number and the replay behind it — nothing else should restate it.
+
+    Note the engage level itself is NOT duplicated in this engine:
+    `_gain_anchored_levels` delegates to `zebra.mfe.trail_levels`, so the
+    cohort handover and zebra's own monitor cannot drift apart.
+    """
+    from zebra import config as cfg
+    max_gain = 40.0 - 10.0
+    below = 10.0 + cfg.TRAIL_ENGAGE_FRAC * max_gain * 0.8      # short of the level
+    ts = sm.new_trail_state(cohort_trade(mfe_mid=below))
     assert ts['active'] is False
     assert ts['trail'] == 0.0
 

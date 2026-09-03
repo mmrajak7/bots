@@ -132,6 +132,31 @@ the alignment flag on its own.
 The BCS debit/width ≤ 45% gate is **not** yet applied when you are called — it
 is evaluated at entry, one tick after your verdict.
 
+### NEVER veto on `would_block_on_gain_at_tp` — it is a MEASUREMENT, not a gate
+
+`zebra quote` hands you the whole BCS candidate, and since 2026-09-03 that
+includes four fields with alarming names:
+
+    proj_value_at_tp, proj_gain_at_tp_pct,
+    tp_value_frac_of_width_k, min_gain_at_tp_pct_at_entry,
+    would_block_on_gain_at_tp
+
+**`would_block_on_gain_at_tp: true` is not a finding, not a red flag, and not a
+reason.** It is an experiment running alongside you. The engine is recording
+what a *candidate* entry rule would have said, on every signal, precisely so
+that in ~30 closes someone can compare how the would-block signals actually
+performed against the would-pass ones. It blocks nothing today, deliberately —
+only 3 of 19 cohort entries clear it, and the threshold is reasoned rather than
+fitted.
+
+**If you veto would-block signals, that population stops entering and the
+comparison becomes impossible.** The measurement would destroy its own sample,
+and nobody would notice for a month.
+
+Same rule, same reason, as `trend_aligned` above: a field you can see is not a
+field you should act on. Two agents have already converted a stray field or a
+stale doc row into a live veto in this system — do not be the third.
+
 ## What only you can catch
 
 ### 1. Event risk inside the expiry window — the big one

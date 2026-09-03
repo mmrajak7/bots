@@ -90,9 +90,15 @@ def test_market_open_needs_a_vet_even_on_a_clean_book(store, monkeypatch):
     assert needed and 'first 15 minutes' in why
 
 
-def test_debit_sl_always_needs_a_vet(store, monkeypatch):
+def test_debit_sl_needs_a_vet_when_spot_does_not_corroborate(store, monkeypatch):
     """The value trigger is priced off the option book — the one that can be
-    faked. A spot trigger is corroborated by real trades."""
+    faked. A spot trigger is corroborated by real trades.
+
+    RENAMED 2026-09-03: this was `test_debit_sl_always_needs_a_vet`, and
+    "always" stopped being true when the spot-corroborated fast path landed.
+    The assertion still holds for the reason it always did — no `spot` is
+    passed, so there is nothing to clear it — but the NAME was making a claim
+    the code no longer honours, and a stale name becomes a stale belief."""
     _clock(monkeypatch, MIDDAY)
     needed, why = vet.needs_exit_vet(store.find(1), 'debit_sl', GOOD)
     assert needed and 'value-based' in why
@@ -475,3 +481,161 @@ def test_a_block_does_not_convert_an_explicit_defer_into_consent(
     _block(tmp_path, monkeypatch)
     assert _gate(store) != 'proceed', \
         "a usage limit was read as permission to fire a refused exit"
+
+
+# ── the spot-corroborated fast path (2026-09-03) ─────────────────────────
+#
+# WHAT IT IS FOR. The exit vet exists for ONE shape: the NHPC signature, value
+# collapsing while spot stands still. A stop whose loss the underlying has
+# already walked 3% to confirm is the opposite shape, and making it wait for an
+# agent is pure cost. On COALINDIA #440 that cost was real: a 900s hold that
+# produced no verdict at all (the CLI grant was broken) while the position
+# drifted 2.90 -> 2.40, Rs 540 of a Rs 4,703 loss.
+#
+# It may only ever REMOVE the 'value-based' reason. Every test below that
+# asserts `needed is True` is guarding that boundary, and matters more than the
+# one that asserts it works.
+
+def _sl_spot(store, value, direction='CE'):
+    t = store.find(1)
+    t['sl_spot'] = value
+    t['direction'] = direction
+    return t
+
+
+def test_spot_confirming_the_loss_skips_the_vet_on_a_clean_midday_book(store, monkeypatch):
+    """CE hurt by spot FALLING. 93.0 is through the 93.5 stop, so the option
+    book is not the only witness and there is nothing for an agent to add."""
+    _clock(monkeypatch, MIDDAY)
+    t = _sl_spot(store, 93.5, 'CE')
+    needed, why = vet.needs_exit_vet(t, 'debit_sl', GOOD, spot=93.0)
+    assert needed is False, why
+
+
+def test_spot_short_of_the_level_still_needs_the_vet(store, monkeypatch):
+    """One paisa the right side of the level is not corroboration."""
+    _clock(monkeypatch, MIDDAY)
+    t = _sl_spot(store, 93.5, 'CE')
+    needed, why = vet.needs_exit_vet(t, 'debit_sl', GOOD, spot=93.6)
+    assert needed and 'value-based' in why
+
+
+def test_the_direction_is_not_inverted_for_a_put_spread(store, monkeypatch):
+    """THE EASY BUG. A PE position is hurt by spot RISING, so its `sl_spot`
+    sits ABOVE entry. Getting this backwards would skip the vet on exactly the
+    positions where spot is moving favourably — i.e. where a collapsing value
+    IS the NHPC signature and most deserves a look."""
+    _clock(monkeypatch, MIDDAY)
+    t = _sl_spot(store, 103.0, 'PE')
+    needed, _ = vet.needs_exit_vet(t, 'debit_sl', GOOD, spot=104.0)
+    assert needed is False                      # spot rose through it: confirmed
+    needed, why = vet.needs_exit_vet(t, 'debit_sl', GOOD, spot=102.0)
+    assert needed and 'value-based' in why      # spot below it: NOT confirmed
+
+
+def test_the_fast_path_never_suppresses_an_unreliable_book(store, monkeypatch):
+    """Spot agreeing with a lying quote is not evidence the quote is honest.
+    The garbage-book reason must survive corroboration."""
+    _clock(monkeypatch, MIDDAY)
+    t = _sl_spot(store, 93.5, 'CE')
+    needed, why = vet.needs_exit_vet(t, 'debit_sl', BAD, spot=90.0)
+    assert needed and 'unreliable book' in why
+
+
+def test_the_fast_path_never_suppresses_the_opening_fifteen_minutes(store, monkeypatch):
+    """Both money-losing incidents were opening prints."""
+    _clock(monkeypatch, OPEN_)
+    t = _sl_spot(store, 93.5, 'CE')
+    needed, why = vet.needs_exit_vet(t, 'debit_sl', GOOD, spot=90.0)
+    assert needed and 'first 15 minutes' in why
+
+
+def test_the_fast_path_never_suppresses_blind_cycles(store, monkeypatch):
+    _clock(monkeypatch, MIDDAY)
+    store.bump_blind(1)
+    t = _sl_spot(store, 93.5, 'CE')
+    needed, why = vet.needs_exit_vet(t, 'debit_sl', GOOD, spot=90.0)
+    assert needed and 'blind' in why
+
+
+@pytest.mark.parametrize('sl,spot,direction', [
+    (None, 90.0, 'CE'),       # no stored level
+    (0, 90.0, 'CE'),          # falsy level
+    (93.5, None, 'CE'),       # no spot this cycle
+    ('bad', 90.0, 'CE'),      # unparseable level
+    # DIRECTION belongs in this list too. The name said "unknown
+    # corroboration" but only sl and spot were covered, while an unknown
+    # direction silently took the PE comparison — the one case that failed
+    # OPEN rather than closed.
+    (93.5, 90.0, None),
+    (93.5, 90.0, ''),
+    (93.5, 90.0, 'ce'),
+])
+def test_unknown_corroboration_fails_towards_vetting(store, monkeypatch, sl,
+                                                     spot, direction):
+    """It may only ever remove a reason to look, so the answer when we cannot
+    tell must be 'not corroborated'."""
+    _clock(monkeypatch, MIDDAY)
+    t = _sl_spot(store, sl, direction)
+    needed, why = vet.needs_exit_vet(t, 'debit_sl', GOOD, spot=spot)
+    assert needed and 'value-based' in why
+
+
+def test_the_gate_actually_threads_spot_into_the_prefilter(store, monkeypatch):
+    """WIRING, not logic. `exit_gate` takes spot as its own argument; if it is
+    not passed down, the fast path is dead code that every unit test above
+    still passes."""
+    _clock(monkeypatch, MIDDAY)
+    _sl_spot(store, 93.5, 'CE')
+    # spot 93.0 is through the level -> corroborated -> no agent, no wait
+    assert vet.exit_gate(store, store.find(1), 'debit_sl', GOOD, 93.0,
+                         spawn=False) == 'proceed'
+    assert store.find(1).get('exit_vet') in (None, {}), (
+        'a corroborated stop opened a vet episode anyway')
+
+
+def test_a_corroborated_spot_does_not_convert_an_explicit_defer_into_consent(
+        store, monkeypatch):
+    """THE H1 REGRESSION (found in review, 2026-09-03, before deploy).
+
+    Every marker state EXCEPT a fresh under-cap DEFER returns before the
+    `needs_exit_vet` call, so that one state falls through to the pre-filter.
+    Offering it the spot-corroboration shortcut discards the refusal it is
+    carrying: Claude LOOKED at 12:00 and said it could not verify this book;
+    at 12:05 the trigger re-fires with spot through `sl_spot`, and the exit
+    books at the very mid the agent declined to certify. The defer count is
+    dropped, so the at-cap escalation to a human never arrives.
+
+    Spot agreeing about the LOSS is not evidence about the PRICE, and the price
+    is what was refused. Same rule as the usage-limit branch and as
+    `test_a_block_does_not_convert_an_explicit_defer_into_consent`, one input
+    over.
+    """
+    _clock(monkeypatch, MIDDAY)
+    _sl_spot(store, 93.5, 'CE')
+    # Cycle 1: the value stop fires while spot is still ABOVE its level (94.0),
+    # so there is no corroboration and a vet is properly requested.
+    assert vet.exit_gate(store, store.find(1), 'debit_sl', GOOD, 94.0,
+                         spawn=False) == 'wait'
+    vet.record_exit_verdict(store, 1, 'debit_sl', 'defer', decision_id=1)
+    # Cycle 2: spot has since crossed 93.5. The loss is now corroborated — but
+    # the agent's refusal was about the PRICE, and that has not been answered.
+    _sl_spot(store, 93.5, 'CE')
+    assert vet.exit_gate(store, store.find(1), 'debit_sl', GOOD, 90.0,
+                         spawn=False) != 'proceed', (
+        'a corroborated spot fired an exit an agent had explicitly refused to '
+        'verify — the defer was silently discarded')
+
+
+def test_a_malformed_direction_never_reads_as_corroborated(store, monkeypatch):
+    """M1. The comparison used to be `... if direction == 'CE' else spot >= sl`,
+    so anything not exactly 'CE' took the PE branch. A CE-shaped record with a
+    FAVOURABLE spot then read as corroborated — skipping the vet on exactly the
+    value-collapse-while-spot-is-fine shape it exists for."""
+    _clock(monkeypatch, MIDDAY)
+    for bad in (None, '', 'ce', 'CALL', 0):
+        t = _sl_spot(store, 93.5, bad)
+        assert vet._spot_confirms_loss(t, 96.0) is False, (
+            'direction %r read as corroborated on a favourable spot' % bad)
+        needed, why = vet.needs_exit_vet(t, 'debit_sl', GOOD, spot=96.0)
+        assert needed and 'value-based' in why

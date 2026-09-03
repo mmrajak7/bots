@@ -551,8 +551,14 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     # The same spread at fair value. Kept, and gated on, because the d/w cap
     # below was CALIBRATED on this basis and cannot be re-derived: entry books
     # were never persisted, so all 42 historical records carry mid-basis d/w
-    # only. Moving the cap onto the fill basis would silently change
-    # selectivity by an unmeasurable amount.
+    # only.
+    #
+    # This used to end "moving the cap onto the fill basis would silently
+    # change selectivity by an unmeasurable amount". It was MEASURED on
+    # 2026-09-03: across all 19 cohort entries it changes exactly ONE
+    # (SAGILITY #469, mid 44.5% -> fill 46.5%). The fill basis is now ALSO
+    # capped, at HARD GATE 4 below -- the mid test is kept for the
+    # calibration reason above, and both use the same threshold.
     debit_mid = round(atm_quote['mid'] - tgt_q['mid'], 2)
     if debit <= 0:
         return {'error': f"non-positive BCS debit {debit} "
@@ -591,6 +597,8 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     # priced out — that band ran PF 0.24 while still winning 50% of the
     # time, i.e. it is a payoff problem, not a hit-rate problem.
     # Evaluated on the MID basis — the one it was fitted on. See debit_mid.
+    # The FILL basis is ALSO capped, but further down, after the entry-cost
+    # gate: see "HARD GATE 4" for why the order matters.
     if debit_to_width_pct_mid > cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT:
         return {'error': f"debit {debit_mid:g} (mid) is "
                          f"{debit_to_width_pct_mid:.1f}% of width {width:g} "
@@ -619,6 +627,62 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
                          f"of the {max_gain_mid:g} max gain "
                          f"(cap {cfg.BCS_MAX_ENTRY_COST_PCT:g}%) — the book "
                          f"takes too much of the payoff, signal suppressed"}
+
+    # ── HARD GATE 4: the same cap, on the price actually paid ────────────
+    # Added 2026-09-03. Gate 2 alone LEAKS: `debit_mid` is not a price anyone
+    # transacts at, and the gap between the bases is widest exactly where width
+    # is smallest — on a 2-point spread one tick is 2.5% of width. SAGILITY
+    # #469 passed gate 2 at mid 44.5% and FILLED at 46.5%, over the cap and
+    # live in the book. Across all 19 cohort entries this is the ONLY one it
+    # stops, so it closes a real hole without re-cutting the strategy.
+    #
+    # NOT a re-calibration: the SAME threshold, so the gate still means "45% of
+    # width". What changes is that it can no longer be passed on a price the
+    # trade will not get — which is only what the PRICING box already says: "a
+    # spread that reads 30% at mid and 38% at the touch is a 38% spread."
+    #
+    # ORDER MATTERS, AND THIS ONE GOES LAST OF THE THREE. A wide book inflates
+    # the fill debit, so on a badly-quoted spread this gate fires for a reason
+    # that is really the BOOK's, and would mask the entry-cost gate that is
+    # denominated for exactly that. `test_a_book_that_eats_the_payoff_is_blocked`
+    # pins the distinction: a 25%-wide book must report "entry cost", because
+    # that is the complaint that goes away on a better book, whereas a rich
+    # mid debit is the one that survives it. Placed here, this gate only ever
+    # fires on a spread whose book is already acceptable — i.e. on a genuine
+    # over-cap fill, which is the SAGILITY case.
+    if debit_to_width_pct > cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT:
+        return {'error': f"debit {debit:g} (fill) is "
+                         f"{debit_to_width_pct:.1f}% of width {width:g} "
+                         f"(cap {cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT:g}%) "
+                         f"— no payoff left at the touch, signal suppressed"}
+
+    # ── MEASURED, NOT ENFORCED: the payoff this exit actually pays ───────
+    # Every gate above is denominated in the EXPIRY payoff. This engine never
+    # collects that: the TP fires when spot reaches the target, the short strike
+    # sits AT the target, so exits book with 27-36 DTE left and the spread worth
+    # 42-66% of width (mean 55.2% over 12 cohort TPs). The realised gain is
+    # therefore an identity in d/w, and the win is capped BEFORE the order goes
+    # out. Recorded here so ~30 signals of evidence accrue; it blocks nothing.
+    # See cfg.BCS_MIN_GAIN_AT_TP_PCT for why enforcing it today would be
+    # premature (3 of 19 cohort entries clear it).
+    proj_value_at_tp = round(cfg.BCS_TP_VALUE_FRAC_OF_WIDTH * width, 2)
+    # No `else 999.0` sentinel. `debit <= 0` already returned an error ~100
+    # lines up, so that branch was unreachable -- and had code motion ever
+    # revived it, 999.0 reads as a +999% projected gain and sets
+    # would_block=False: the most permissive answer on the most broken
+    # input. That is the documented "a default that looks like a value"
+    # shape. If the guard above ever moves, this should raise, not invent.
+    proj_gain_at_tp_pct = round((proj_value_at_tp / debit - 1) * 100, 1)
+    would_block_on_gain_at_tp = proj_gain_at_tp_pct < cfg.BCS_MIN_GAIN_AT_TP_PCT
+    if would_block_on_gain_at_tp:
+        logger.info(
+            "GAIN-AT-TP would-block (MEASURED ONLY, not enforced) %s %s "
+            "%g/%g: debit %g (fill, d/w %.1f%%) projects %.1f%% at the TP "
+            "against a %.0f%% floor — value at TP assumed %g (k=%.2f x width "
+            "%g). Signal NOT suppressed.",
+            stock, direction, atm_strike, k_tgt, debit, debit_to_width_pct,
+            proj_gain_at_tp_pct, cfg.BCS_MIN_GAIN_AT_TP_PCT,
+            proj_value_at_tp, cfg.BCS_TP_VALUE_FRAC_OF_WIDTH, width)
 
     # `target_spread>2%` was dropped here on 2026-08-10. It fired on 17 of 25
     # closed shadows (68%) and carried no signal whatsoever — 58.8% WR flagged
@@ -661,6 +725,20 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
         'max_profit_per_share': round(width - debit, 2),
         'debit_to_width_pct': debit_to_width_pct,          # matches `debit`
         'debit_to_width_pct_mid': debit_to_width_pct_mid,  # matches `debit_mid`
+        # MEASURED, NOT ENFORCED. Stamped on the record so the would-block
+        # population can be scored against the would-pass one at ~30 closes.
+        # `k` travels with the numbers because it is provisional: re-deriving
+        # it later must not silently re-interpret rows written under the old
+        # value. See cfg.BCS_MIN_GAIN_AT_TP_PCT.
+        'proj_value_at_tp': proj_value_at_tp,
+        'proj_gain_at_tp_pct': proj_gain_at_tp_pct,
+        # BOTH inputs travel, not just k. The flag is a comparison of two
+        # numbers; stamping only one of them still lets a later threshold move
+        # re-label history, which is the exact failure the k stamp exists to
+        # prevent.
+        'tp_value_frac_of_width_k': cfg.BCS_TP_VALUE_FRAC_OF_WIDTH,
+        'min_gain_at_tp_pct_at_entry': cfg.BCS_MIN_GAIN_AT_TP_PCT,
+        'would_block_on_gain_at_tp': would_block_on_gain_at_tp,
         'lot_size': lot_size,
         'warnings': warnings,
     }

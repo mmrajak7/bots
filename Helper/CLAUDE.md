@@ -460,8 +460,20 @@ Full playbook: `docs/BCS_PLAYBOOK.md`
 > `exit_legs` stored for both). The censoring argument that paragraph was
 > making still stands — winners resolve in 1-4 sessions and losers take ~5 or
 > run to the TIME exit, so the closed book still flatters the open one — but
-> the FACT it rested on has changed. **Both stops were booked at MID by the
-> paper engine, so where a stop FILLS remains unmeasured.**
+> the FACT it rested on has changed.
+>
+> **CORRECTED 2026-09-03: the stops were NOT booked at mid.** An earlier
+> version of this paragraph said they were, and that "where a stop FILLS
+> remains unmeasured". Checked against the stored `exit_legs` on all 15 cohort
+> exits: every one books at the FILL basis, `bid(long) − ask(short)`, and
+> `pricing_basis` is `'fill'` on every record. COALINDIA #440 booked 2.40 where
+> mid was 2.45; ADANIGREEN #471 booked 22.90 where mid was 24.78. **The stop
+> losses already carry the full bid-ask cross of both legs and are not
+> flattered.** What is still unmeasured is narrower: impact BEYOND the touch —
+> queue position, and whether the quoted size is really there. `exit_depth`
+> and the `bid_qty`/`ask_qty` in `exit_legs` already measure part of it, and
+> say the touch covered 1 lot on 100% of known samples but 2 lots on 0 of 40
+> for WAAREEENER. **Do not quote the mid claim as a go-live blocker.**
 
 > **TWO rule sets, deliberately.** The MANUAL playbook below governs spreads
 > you pick by hand off a crash/bounce thesis, where you choose the width. The
@@ -665,9 +677,20 @@ Additional manual triggers:
 
 > **A value stop is REQUESTED at its level, not TAKEN at it.** SL_SPREAD and
 > SL_TRAIL are priced off the option book, so `needs_exit_vet` flags both — and
-> with `spot_sl_enabled: False` those are the cohort's ONLY loss-side exits, so
-> every stop this book can take waits on a Claude agent (~1m50s, plus a cycle
-> per `defer`). Do not read "50% of debit" as the price it fills at.
+> with `spot_sl_enabled: False` those are the cohort's ONLY loss-side exits.
+> Do not read "50% of debit" as the price it fills at.
+>
+> **CORRECTED 2026-09-03: it is no longer true that "every stop this book can
+> take waits on a Claude agent".** A value stop whose loss the UNDERLYING has
+> already confirmed — spot through the stored `sl_spot` — skips the agent and
+> proceeds on the deterministic guards. That shape is the opposite of the one
+> the vet exists for (NHPC: value collapsing while spot stands still), and all
+> three cohort stops qualified, so the corroborated case is now the COMMON one
+> and the vet on `debit_sl` is exception-only. It still fires for an unreliable
+> book, recent debit-blind cycles, the opening 15 minutes, or a trade already
+> carrying an agent's `defer` — none of which corroboration can clear. Source
+> of truth is `vet._spot_confirms_loss`; `sl_spot` remains a REPORTED number
+> and never a trigger.
 >
 > **That wait is now BOUNDED** (`exit_vet_max_hold_sec`, default 900s, owner
 > decision 2026-08-29). Past it the exit proceeds on the deterministic guards
@@ -692,6 +715,47 @@ Additional manual triggers:
 **The live monitor (`bcs/spread_monitor.py`) keeps rows 1-4 exactly as above.**
 The automated paper system uses a DIFFERENT trail — see below. Do not port one
 into the other until the paper scorecard earns it.
+
+### ⏳ REVISIT AT ~30 COHORT CLOSES (measured 2026-09-03, 15 closes)
+
+Findings from replaying every cohort position against its real 5-minute value
+path — **9,449 POLL observations** rebuilt from the complete Pi logs
+(`cron_zebra_2026*.log*`, 15 sessions, all 19 positions at full coverage).
+Validated: the extracted extremes reproduce the engine's own stored `mfe_spot`.
+
+**None of these is settled. Each names the observation that would change it.**
+
+| Finding | Number | Status | What settles it |
+|---|---|---|---|
+| **The win is capped at ENTRY.** TP fires when spot reaches the target and the short strike sits AT the target, so exits book with 27-36 DTE left and the spread worth 42-66% of width (mean 55.2%, n=12). Gain is then the identity `(V/w)/(d/w) − 1`, so d/w is the only lever. GMRAIRPORT in at 36.7% → +54.5%; MCX at 43.9% → +27.6%, same exit quality. | payoff 0.79:1, break-even WR **55.9%** vs observed 80% | `bcs_min_gain_at_tp_pct` MEASURED, **not enforced** — only 3 of 19 entries clear it | Realised WR of would-block vs would-pass signals. The confound: d/w is the market's own probability quote, so buying only cheap spreads bets against its odds — which IS the magnet claim, and is what 15 closes cannot show. |
+| **The trail was unreachable by construction.** At engage 0.50 it armed on **0 of 19**. Peak gain before the TP takes it is `(0.55 − d/w)/(1 − d/w)` ≈ 25% at d/w 40. | replay: 0.50/0.30 → Rs 0 · **0.25 → +Rs 1,080, clips none** · 0.20 → −Rs 4,400 · 0.15 → −Rs 7,537 | `trail_engage_frac` moved **0.50 → 0.25** | It sits ON a cliff and its whole benefit is ONE position. It also only arms below d/w 0.40, i.e. the cheap half of the band. Re-run the replay before touching it. |
+| **Overnight holding is +EV.** Measured close(≥15:20) → next open, n=59. | **mean +1.3% of debit, total +Rs 11,051**; only 4 of 59 nights worse than −20% | **EOD-harvest REJECTED** | Nothing pending — but note the measurement is basis-sensitive: using the FIRST print after 09:15 instead of after the 900s open buffer flips it to −12.1% and −Rs 61,708. Those are the VALUE BOUND clamps (CROMPTON 1.60→0.00), not prices. **The open buffer earns its keep.** |
+| **COALINDIA #440 was an overnight GAP, not a trail failure.** 7.85 at 15:30 → 3.15 at 09:20. | −81.0% in one night, worst by 2× | outlier, not a symptom | — |
+| **Cohort MAE separates cleanly.** Winners median 0.47% / **max 0.98%**; losers 3.65 / 4.29 / 4.46%. A 2% spot stop would cut 0 winners, catch all 3 losers, +Rs 4,640. | no overlap at all | **`spot_sl_enabled` stays False. Do NOT flip it.** | This points OPPOSITE to the live setting on 15 trades / 3 losses, and the cohort contains **no adverse-then-recovered winner** — the exact sample where a spot stop looks free. Pre-cohort measured 2.74% median winner MAE. **The observation that breaks it: one winner with MAE > 2%.** |
+| **Depth binds at 2 lots, not 1.** `exit_depth`: ge_1 = 100% of known samples on all 8 collected; ge_2 = **0 of 40** for WAAREEENER, 1 of 7 for ADANIGREEN. | — | informs multi-pair / lot sizing | Scaling size is a per-NAME liquidity question, not a uniform haircut. |
+
+**THE DATASET IS NOW PERSISTED — do not rebuild it from logs.**
+`logs/eod/paths_<date>.json`, written by `zebra/value_paths.py` and captured
+automatically on the **digest cron** (one line, two jobs — a second cron line
+is a second thing that can go quietly missing, and the digest line already did
+for 18 days). The evidence used to live only in `cron_zebra_*.log`, which is
+gzipped at 7 days and **deleted at 90** — so the August sessions would have
+aged out around early December, before the cohort reaches ~30 closes.
+
+```bash
+python -m zebra paths              # coverage; names anything still AT RISK
+python -m zebra paths --backfill   # capture every session log on disk
+```
+
+Backfilled 2026-09-03: **16 sessions, 9,477 observations, 1.6 MB**, nothing at
+risk. Forward cost ~12 MB/year at 173 bytes per observation. `logs/eod/` is
+never cleaned — `common.log_cleanup` runs from an allowlist and skips
+subdirectories — so this cannot be reached by it.
+
+Each file carries `basis: 'fill'` (value = `bid(long) − ask(short)`) and every
+observation keeps its quote `q`. **Keep the quality field when replaying.**
+Dropping it is what turns the overnight-gap answer from **+1.3%** of debit into
+**−12.1%**: the first prints after the open are VALUE BOUND clamps, not prices.
 
 ### Automated exits (zebra) — differences that are deliberate
 
@@ -1508,6 +1572,10 @@ s.list_trades()
 
 # EOD digest — 15:47, after the 15:30 close and the 15:40 EOD report.
 # Writes logs/eod/<date>.md + .json. THIS IS THE ARMING-GATE EVIDENCE RECORD.
+# It ALSO captures logs/eod/paths_<date>.json — the POLL value paths, which
+# would otherwise be deleted with the logs at 90 days. Deliberately on THIS
+# line rather than its own: a second cron entry is a second thing that can go
+# missing unnoticed, which this very line already did for 18 days.
 0,47 15 * * 1-5 cd /home/trustit/Desktop/BOTS/Helper && ../CROCODILE/venv/bin/python -m zebra digest >> logs/cron_digest_$(date +\%Y\%m\%d).log 2>&1
 ```
 

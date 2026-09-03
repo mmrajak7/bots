@@ -1668,8 +1668,51 @@ def _marker_ttl(marker: dict) -> int:
     return cfg.EXIT_VET_TTL_SEC
 
 
+def _spot_confirms_loss(trade: dict, spot: Optional[float]) -> bool:
+    """Has the UNDERLYING independently confirmed the loss this exit books?
+
+    `sl_spot` is stored on every position (entry_spot ± 3%) and PRINTED on
+    every POLL line, but it is not a trigger — `spot_sl_enabled` is False, and
+    the 147-record study behind that is not being re-argued here. This asks a
+    different question: not "should spot fire an exit" but "does spot AGREE
+    with the exit the option book has already asked for".
+
+    That distinction is the whole point of the exit vet. The vet exists for one
+    shape — the NHPC signature, value collapsing while spot stands still — and
+    a position whose spot has walked 3% the wrong way is the exact OPPOSITE of
+    that shape. Measured on the cohort's three stops, all three had crossed
+    `sl_spot` at the moment they fired (COALINDIA 420.70 vs 418.75; HINDZINC
+    594.80 vs 601.25; SBICARD 636.40 vs 645.29), and all three vet agents
+    independently concluded `allow` citing exactly this corroboration.
+
+    Direction matters and is easy to get backwards: a CE position is hurt by
+    spot FALLING, a PE position by spot RISING. Unknown spot or a missing
+    `sl_spot` returns False — this may only ever REMOVE a reason to vet, so
+    the safe answer when we cannot tell is "not corroborated, go and look".
+    """
+    direction = trade.get('direction')
+    # EXPLICIT, not an else-branch. `... if direction == 'CE' else spot >= sl`
+    # silently gave the PE comparison to anything that was not exactly 'CE' —
+    # None, '', 'ce', a half-merged row — so a CE record with a FAVOURABLE spot
+    # read as "corroborated" and skipped the vet on precisely the NHPC shape
+    # (value collapsing while spot is fine) the vet exists for. Every record in
+    # the store carries a clean direction today; `_exit_marker`'s own hardening
+    # exists because that has not always been true.
+    if direction not in ('CE', 'PE'):
+        return False
+    sl = trade.get('sl_spot')
+    if spot is None or sl in (None, 0):
+        return False
+    try:
+        spot, sl = float(spot), float(sl)
+    except (TypeError, ValueError):
+        return False
+    return spot <= sl if direction == 'CE' else spot >= sl
+
+
 def needs_exit_vet(trade: dict, kind: str, quote: dict,
-                   now: Optional[datetime] = None) -> tuple:
+                   now: Optional[datetime] = None,
+                   spot: Optional[float] = None) -> tuple:
     """Cheap deterministic pre-filter: is this exit worth an LLM call?
 
     Returns (needed, why). Market hours are ~75 cycles/day; a full agent run
@@ -1705,7 +1748,23 @@ def needs_exit_vet(trade: dict, kind: str, quote: dict,
     # to look unreliable, which is precisely the ABB case that looked fine.
     # Inverted, any exit kind added later is vetted by default and has to argue
     # its way out.
-    if kind not in SPOT_CORROBORATED_EXITS:
+    #
+    # THE FAST PATH (2026-09-03). A value trigger whose loss the UNDERLYING has
+    # independently confirmed is not the shape this vet was built for, so it
+    # does not earn a vet on the "value-based" ground alone.
+    #
+    # This removes a WAIT; it never adds a trigger and never skips a vet the
+    # other reasons still ask for. An unreliable book, debit-blind cycles or the
+    # opening 15 minutes each still force the agent call on their own — which is
+    # deliberate, because those describe a quote that might be lying, and spot
+    # agreeing with a lie is not evidence.
+    #
+    # What it is worth, measured on the cohort's three stops: +Rs 540 / +Rs 0 /
+    # -Rs 80 = +Rs 460. Small, and the reason it is worth doing anyway is
+    # COALINDIA #440, where a 900s hold produced NO verdict (the grant was
+    # broken) while the position drifted 2.90 -> 2.40. The hold is the risk;
+    # the vet was never load-bearing.
+    if kind not in SPOT_CORROBORATED_EXITS and not _spot_confirms_loss(trade, spot):
         reasons.append('value-based trigger (priced off the option book)')
     return (bool(reasons), '; '.join(reasons))
 
@@ -1927,7 +1986,25 @@ def _exit_gate_policy(store, trade: dict, kind: str, quote: dict, spot: float,
                        'deterministic guards alone', trade['id'], kind)
         return 'proceed'
 
-    needed, why = needs_exit_vet(trade, kind, quote)
+    # SPOT CORROBORATION IS OFFERED ONLY TO A TRADE THAT IS NOT ALREADY IN AN
+    # EPISODE. At this line `state` can only be None (no marker) or a FRESH
+    # DEFER under the cap — every other state returned above.
+    #
+    # That under-cap DEFER is the whole reason for the conditional. Claude
+    # LOOKED at this exit and said it could not verify the quote; before the
+    # fast path existed, the fall-through here always re-requested, carrying
+    # the defer count so the escalation reached a human on schedule. Handing
+    # that trade the corroboration shortcut discards the refusal: a stop
+    # deferred at 12:00 books at 12:05 at the very mid the agent declined to
+    # certify, and the at-cap 'hold' is never reached.
+    #
+    # Same rule as the usage-limit branch above ("'we don't know' after an
+    # explicit refusal is not consent"), and the same rule
+    # `test_a_block_does_not_convert_an_explicit_defer_into_consent` pins one
+    # input over. Spot agreeing about the LOSS is not evidence about the PRICE,
+    # which is what the agent refused to certify.
+    needed, why = needs_exit_vet(
+        trade, kind, quote, spot=None if state == DEFER else spot)
     if not needed:
         return 'proceed'
 

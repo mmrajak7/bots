@@ -27,7 +27,9 @@ suite, rather than discovered on the Pi.
 
 Run:  cd Helper && PURE_PYTHON=1 python -m pytest zebra/tests/test_vet_tool_grants.py -v
 """
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -65,7 +67,13 @@ def _covered(command: str, channel='vet') -> bool:
 INSTRUCTED = [
     '-m zebra vet show 455',
     '-m zebra vet decide 455 --verdict allow --reason x',
-    '-m zebra vet exit 455 --kind debit_sl --verdict allow',
+    # `exit-decide`, NOT `exit`. This line read `vet exit ...` until
+    # 2026-09-02 -- a command argparse rejects with "invalid choice" -- so the
+    # test proved a fiction granted while every real exit vet was refused at
+    # the permission layer and burned the full 900s hold. A hand-written
+    # command string is only as good as the hand; see
+    # `test_every_granted_verb_is_a_real_subcommand`.
+    '-m zebra vet exit-decide 455 --kind debit_sl --verdict allow',
     '-m zebra quote 455',
     '-m zebra review show 455',
     '-m zebra review record 455 --action hold --reason x',
@@ -94,7 +102,11 @@ def test_every_verb_in_the_prompt_templates_is_granted():
     blob = ' '.join([cfg.VET_PROMPT_TEMPLATE, cfg.EXIT_PROMPT_TEMPLATE,
                      cfg.REVIEW_PROMPT_TEMPLATE,
                      cfg.POSTMORTEM_PROMPT_TEMPLATE])
-    verbs = set(re.findall(r'-m zebra ([a-z]+(?: [a-z]+)?)', blob))
+    # `[a-z-]`, WITH THE HYPHEN. The class was `[a-z]` until 2026-09-02, which
+    # stops dead at a hyphen: `-m zebra vet exit-decide` yielded the verb
+    # `vet exit`, the grant list happened to contain that exact fiction, and
+    # this test passed for the one verb that was broken in production.
+    verbs = set(re.findall(r'-m zebra ([a-z][a-z-]*(?: [a-z][a-z-]*)?)', blob))
     verbs.discard('events replace')          # events channel, denied on purpose
     missing = [v for v in sorted(verbs)
                if not _covered('-m zebra %s x' % v)]
@@ -170,3 +182,51 @@ def test_web_research_is_still_granted():
     tools = vet._allowed_tools('vet')
     for t in ('WebSearch', 'WebFetch', 'Read', 'Glob', 'Grep'):
         assert t in tools
+
+
+# ── the grant must name a verb that EXISTS ────────────────────────────────
+
+@pytest.mark.parametrize('verb', cfg._VET_VERBS)
+def test_every_granted_verb_is_a_real_subcommand(verb):
+    """Ask the REAL CLI whether each granted verb parses.
+
+    THE DEFECT THIS EXISTS FOR (2026-09-02). `_VET_VERBS` carried `vet exit`
+    for weeks. There is no such subcommand -- argparse answers "invalid
+    choice: 'exit' (choose from 'show', 'exit-decide', 'decide', 'score')" --
+    so the grant matched nothing an agent could ever type, and every exit vet
+    silently burned its full 900s hold instead of recording a verdict.
+
+    Two other checks in this file were meant to catch that and both missed it,
+    because both compared one hand-written string against another: `INSTRUCTED`
+    listed the same non-existent command, and the template-derived test used a
+    regex that stopped at the hyphen. This test compares the grant against the
+    ONLY authority that cannot be mis-spelled twice -- the parser itself.
+
+    Subprocess rather than import because the parser is built inside `main()`
+    and there is no `build_parser()` to call. ~0.8s per verb.
+
+    RETIRES WHEN: parser construction moves out of `main()` into an importable
+    `build_parser()`, at which point assert against its choices directly.
+    """
+    env = dict(os.environ, PURE_PYTHON='1')
+    r = subprocess.run(
+        [sys.executable, '-m', 'zebra'] + verb.split() + ['--help'],
+        cwd=str(HELPER), env=env, capture_output=True, text=True, timeout=120)
+    blob = (r.stdout or '') + (r.stderr or '')
+    # FAIL-OPEN GUARD, added in review before deploy. Asserting only on
+    # 'invalid choice' passes when the CLI cannot even IMPORT: rc=1 with "No
+    # module named zebra" contains no such string, so all 8 cases go green
+    # while the parser is dead. A bad overlay on the Pi, a failed config
+    # assert (this same change added two) or a py3.8 slip all land there --
+    # and "the check cannot tell a broken CLI from a working one" is the exact
+    # defect class this whole test file exists for. `--help` exits 0; an
+    # invalid choice exits 2; an import crash exits 1.
+    assert r.returncode == 0, (
+        'the CLI did not start, so this test proves nothing about the grant. '
+        'rc=%s: %s' % (r.returncode, blob.strip()[-400:]))
+    assert 'invalid choice' not in blob, (
+        'VET_ALLOWED_TOOLS grants `%s`, but the CLI has no such subcommand, so '
+        'the allow rule can never match. An agent told to run it prints an '
+        'approval request into a log nobody reads and exits 0 with the work '
+        'undone. argparse said: %s'
+        % (verb, blob.strip().splitlines()[-1] if blob.strip() else '(no output)'))

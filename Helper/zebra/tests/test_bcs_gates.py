@@ -371,18 +371,56 @@ def test_a_tight_book_passes_the_entry_cost_gate(monkeypatch):
     assert r['entry_cost_pct'] < cfg.BCS_MAX_ENTRY_COST_PCT
 
 
-def test_the_d_w_gate_still_reads_the_mid_basis(monkeypatch):
-    """It was calibrated on mid-basis d/w across 42 records and cannot be
-    re-derived — none of them persisted an entry book. Moving it onto the fill
-    basis would change selectivity by an unmeasurable amount."""
+def test_the_d_w_gate_reads_BOTH_bases_and_a_fill_over_the_cap_is_blocked(monkeypatch):
+    """A spread that reads 44.5% at mid and fills at 46.5% is a 46.5% spread.
+
+    THIS TEST USED TO ASSERT THE OPPOSITE. It was called
+    `test_the_d_w_gate_still_reads_the_mid_basis` and its stated reason was
+    that moving onto the fill basis "would change selectivity by an
+    unmeasurable amount". That was measured on 2026-09-03 and is false: across
+    all 19 cohort entries it changes exactly ONE — SAGILITY #469, which passed
+    at mid 44.5% and filled at 46.5%, over the cap, and is open in the book
+    right now. The gap between the bases is widest where width is smallest (on
+    a 2-point spread one tick is 2.5% of width), which is precisely where the
+    mid test is least trustworthy.
+
+    The mid test is KEPT, and that part of the old rationale still stands: the
+    45% threshold was fitted on mid-basis d/w across records that persisted no
+    entry books, so it cannot be re-derived on the fill basis. Both tests use
+    the SAME number, so this is not a re-calibration — the gate still means
+    "45% of width", it just can no longer be passed on a price the trade will
+    not get.
+    """
     cap = cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT
-    # mid debit lands exactly on the cap; the fill debit is well past it.
+    # mid debit lands exactly on the cap; the fill debit is past it.
     r = _run(monkeypatch, tgt_mid=round(30.0 - 40.0 * cap / 100, 2),
              tgt_oi=20000, tgt_spread_pct=0.02,
              atm_quote=_quote(30.0, 20000, 0.02))
-    assert 'error' not in r, r
-    assert r['debit_to_width_pct_mid'] == pytest.approx(cap)
-    assert r['debit_to_width_pct'] > cap
+    assert 'error' in r, (
+        'a spread whose FILL debit is over the cap was admitted because its '
+        'mid reading was inside it — this is the SAGILITY #469 leak: %r' % r)
+    assert 'fill' in r['error'] and 'of width' in r['error'], r['error']
+
+    # AND IT FIRES ONLY ONCE THE BOOK IS ACCEPTABLE. A wide book inflates the
+    # fill debit, so without the ordering this gate would swallow the
+    # entry-cost complaint — the one that describes a problem which GOES AWAY
+    # on a better book. Same spread, same mid, only the quote widened:
+    wide = _run(monkeypatch, tgt_mid=16.0, tgt_oi=20000,
+                tgt_spread_pct=0.25, atm_quote=_quote(30.0, 20000, 0.25))
+    assert 'error' in wide and 'entry cost' in wide['error'], (
+        'a badly-quoted spread must report the BOOK problem, not be masked by '
+        'the fill-basis d/w gate: %r' % wide)
+
+
+def test_the_mid_basis_test_is_still_applied(monkeypatch):
+    """The other half of the same gate. A book can be tight enough that the
+    fill reading passes while the mid reading is over the cap; the fitted
+    calibration must still refuse it."""
+    cap = cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT
+    over = round(30.0 - 40.0 * (cap + 3) / 100, 2)   # mid d/w = cap + 3
+    r = _run(monkeypatch, tgt_mid=over, tgt_oi=20000, tgt_spread_pct=0.001,
+             atm_quote=_quote(30.0, 20000, 0.001))
+    assert 'error' in r and 'mid' in r['error'], r
 
 
 # ── depth SIZE, not just depth price ────────────────────────────────────────
@@ -431,3 +469,55 @@ def test_the_size_reaches_the_sizing_plan(monkeypatch):
                            max_deployed=None))
     assert pl['bounds']['liquidity'] == 3        # 1500 / 500
     assert pl['lots'] == 3 and pl['bound'] == 'liquidity'
+
+
+# ── the payoff measurement: recorded, ENFORCING NOTHING ─────────────────────
+#
+# The gates above are denominated in the EXPIRY payoff, which this engine never
+# collects: the TP fires when spot reaches the target, the short strike sits AT
+# the target, so exits book with 27-36 DTE left and the spread worth ~55% of
+# width. `proj_gain_at_tp_pct` records the payoff of the exit that actually
+# happens. It must stay non-blocking until ~30 cohort closes can score the
+# would-block population against the would-pass one.
+
+def test_the_gain_at_tp_projection_is_stamped_on_every_candidate(monkeypatch):
+    r = _run(monkeypatch, tgt_mid=16.0, tgt_oi=20000)          # debit 14, width 40
+    assert 'error' not in r, r
+    k = cfg.BCS_TP_VALUE_FRAC_OF_WIDTH
+    assert r['proj_value_at_tp'] == pytest.approx(k * r['width'], abs=0.01)
+    assert r['proj_gain_at_tp_pct'] == pytest.approx(
+        (k * r['width'] / r['debit'] - 1) * 100, abs=0.1)
+    assert r['tp_value_frac_of_width_k'] == k, (
+        'k must travel with the numbers — re-deriving it later must not '
+        'silently re-interpret rows written under the old value')
+
+
+def test_a_would_block_signal_is_still_returned_tradeable(monkeypatch):
+    """THE WHOLE POINT. A signal under the gain-at-TP floor must come back as a
+    normal candidate, not as {'error': ...}. If this ever starts failing,
+    someone has switched a measurement into a gate without the evidence."""
+    cap = cfg.BCS_MAX_DEBIT_TO_WIDTH_PCT
+    # d/w just inside the enforced cap, so it is comfortably under the
+    # gain-at-TP floor while still passing every hard gate.
+    r = _run(monkeypatch, tgt_mid=round(30.0 - 40.0 * (cap - 0.5) / 100, 2),
+             tgt_oi=20000)
+    assert 'error' not in r, r
+    assert r['would_block_on_gain_at_tp'] is True
+    assert r['proj_gain_at_tp_pct'] < cfg.BCS_MIN_GAIN_AT_TP_PCT
+
+
+def test_a_cheap_spread_clears_the_gain_at_tp_floor(monkeypatch):
+    """The other side of the same coin: the cheap tail is where the payoff is,
+    and it must NOT be flagged."""
+    r = _run(monkeypatch, tgt_mid=25.0, tgt_oi=20000)          # debit 5 = 12.5%
+    assert 'error' not in r, r
+    assert r['would_block_on_gain_at_tp'] is False
+    assert r['proj_gain_at_tp_pct'] > cfg.BCS_MIN_GAIN_AT_TP_PCT
+
+
+def test_the_floor_matches_the_documented_fill_basis_d_w(monkeypatch):
+    """cfg says the 50% floor at k=0.55 is d/w <= 36.7% on the FILL basis.
+    Pin the arithmetic so the comment and the code cannot drift."""
+    k, floor = cfg.BCS_TP_VALUE_FRAC_OF_WIDTH, cfg.BCS_MIN_GAIN_AT_TP_PCT
+    implied_dw = k / (1 + floor / 100) * 100
+    assert implied_dw == pytest.approx(36.7, abs=0.1), implied_dw

@@ -365,14 +365,28 @@ def _climb(store, *mids):
         bpoll(store, 106.0, m)
 
 
-def test_trail_arms_at_half_of_max_gain(bcs):
-    _climb(bcs, 14.0, 20.0)                     # gain 10 of max 30 = 33%
+# The fixture is width 40 / debit 10 / max gain 30. These tests derive their
+# mids from cfg.TRAIL_ENGAGE_FRAC rather than hardcoding it: the level moved
+# 0.50 -> 0.25 on 2026-09-03 (see `test_the_trail_engage_cliff`, which owns the
+# NUMBER and the replay behind it), and these tests own the MECHANISM. Pinning
+# the constant in two places is how one of them ends up asserting a rule the
+# engine no longer follows.
+def _mid_at_gain_frac(frac):
+    """Mid that puts the peak gain at `frac` of max gain, for the fixture."""
+    return 10.0 + frac * 30.0
+
+
+def test_trail_arms_at_the_configured_fraction_of_max_gain(bcs):
+    eng = cfg.TRAIL_ENGAGE_FRAC
+    _climb(bcs, 14.0, _mid_at_gain_frac(eng * 0.8))       # short of the level
     assert mfe.trail_levels(bcs.find(bcs._shadow_id))['armed'] is False
-    _climb(bcs, 25.0)                           # gain 15 of 30 = 50%
+    _climb(bcs, _mid_at_gain_frac(eng))                   # exactly on it
     tl = mfe.trail_levels(bcs.find(bcs._shadow_id))
     assert tl['armed'] is True
-    assert tl['peak_pct_of_max'] == 50.0
-    assert tl['level'] == 17.5                 # debit 10 + half of peak gain 15
+    assert tl['peak_pct_of_max'] == pytest.approx(eng * 100, abs=0.1)
+    # level = debit + retain x peak gain
+    assert tl['level'] == pytest.approx(
+        10.0 + cfg.TRAIL_RETAIN_FRAC * (eng * 30.0), abs=0.01)
 
 
 def test_trail_stays_armed_after_the_gain_evaporates(bcs):
@@ -397,12 +411,48 @@ def test_trail_level_sits_above_the_entry_debit(bcs):
             assert tl['level'] > bcs.find(bcs._shadow_id)['debit']
 
 
-def test_trail_is_not_the_live_monitors_2x_rule(bcs):
-    """A fixed 2x-debit engage would arm at mid 20 here — 33% of max gain — and
-    on a 45% d/w spread it would arm at 82%. Anchoring to max gain is what
-    keeps the trigger meaning the same thing across spreads."""
-    _climb(bcs, 14.0, 20.0)                     # exactly 2x the entry debit
-    assert mfe.trail_levels(bcs.find(bcs._shadow_id))['armed'] is False
+def test_trail_is_not_the_live_monitors_2x_rule():
+    """The invariant, exercised on two spreads instead of asserted on one mid.
+
+    A fixed 2x-debit engage arms at a fraction of max gain that DEPENDS on d/w
+    -- reaching 2x debit is a gain of `debit`, i.e. (d/w)/(1 - d/w) of max gain:
+    33.3% on a 25% d/w spread, 81.8% on a 45% one -- so the same rule means
+    something different on every spread, tightening exactly as the payoff
+    shrinks. The gain-anchored rule arms at the SAME fraction on both. That is
+    the reason it was chosen, and it holds at any engage level.
+
+    This used to assert `armed is False` at one specific mid, which was really
+    asserting engage == 0.50 a second time; it broke when the level moved to
+    0.25 on 2026-09-03. `test_the_trail_engage_cliff` owns the number now.
+    """
+    eng = cfg.TRAIL_ENGAGE_FRAC
+    cheap = {'width': 40.0, 'debit': 10.0}       # d/w 25%, max gain 30
+    rich = {'width': 40.0, 'debit': 18.0}        # d/w 45%, max gain 22
+
+    for spread in (cheap, rich):
+        max_gain = spread['width'] - spread['debit']
+        at_engage = dict(spread, mfe_mid=spread['debit'] + eng * max_gain)
+        tl = mfe.trail_levels(at_engage)
+        assert tl['armed'] is True
+        assert tl['peak_pct_of_max'] == pytest.approx(eng * 100, abs=0.1), (
+            'the engage point must be the same fraction of max gain on every '
+            'spread; on d/w %.0f%% it read %.1f%%'
+            % (spread['debit'] / spread['width'] * 100, tl['peak_pct_of_max']))
+
+    # ...whereas 2x debit does not, and this is driven through the same
+    # production function rather than asserted against the test's own algebra
+    # (an earlier version computed both sides itself and could not fail).
+    # At the 2x-debit point the gain-anchored rule gives DIFFERENT answers on
+    # the two spreads — which is exactly the inconsistency 2x-debit would bake
+    # into the trigger.
+    at_two_x = [mfe.trail_levels(dict(sp, mfe_mid=sp['debit'] * 2))
+                for sp in (cheap, rich)]
+    fracs = [tl['peak_pct_of_max'] for tl in at_two_x]
+    assert fracs[0] == pytest.approx(33.3, abs=0.5)      # 0.25 / 0.75
+    assert fracs[1] == pytest.approx(81.8, abs=0.5)      # 0.45 / 0.55
+    assert abs(fracs[1] - fracs[0]) > 10.0, (
+        'the 2x-debit rule must land at materially different fractions of max '
+        'gain on different spreads — that is why it was rejected')
 
 
 def test_degenerate_spread_has_no_trail():
@@ -469,10 +519,11 @@ def test_a_gap_through_the_trail_books_a_loss(bcs, monkeypatch):
 def test_trail_never_fires_before_it_arms(bcs, monkeypatch):
     """Mid below what would be a trail level, but the peak never reached half
     of max gain — there is nothing to protect yet."""
-    for m in (14.0, 20.0):
+    # Peak deliberately kept BELOW the engage level, whatever it is set to.
+    for m in (12.0, _mid_at_gain_frac(cfg.TRAIL_ENGAGE_FRAC * 0.8)):
         _wire(monkeypatch, 106.0, m)
         monitor.check_entered(bcs, kite=None, dry_run=True)
-    _wire(monkeypatch, 102.0, 12.0)
+    _wire(monkeypatch, 102.0, 11.0)
     for _ in range(3):
         monitor.check_entered(bcs, kite=None, dry_run=True)
     assert bcs.find(bcs._shadow_id)['status'] == 'entered'

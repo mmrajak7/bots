@@ -1153,6 +1153,30 @@ class ZebraStore:
             'short_extrinsic_entry': float(bcs.get('short_extrinsic', 0)
                                            or bcs.get('short_extrinsic_entry', 0)),
             'entry_warnings': bcs.get('warnings', []),
+            # ── MEASURED, NOT ENFORCED (2026-09-03) ──────────────────────
+            # THIS WHITELIST IS WHY THEY ARE HERE. `analyze_bcs` stamped all
+            # four of these on the candidate and `_swing_target_shadow` stamped
+            # the fifth, and every one was dropped on the store's doorstep —
+            # both instruments computed, logged, and thrown away. Found in
+            # review before deploy; it is the same shape as the exit-bridge
+            # write path, which stayed broken because no test drove the REAL
+            # store. `test_the_measurements_actually_reach_the_record` does.
+            #
+            # `tp_value_frac_of_width_k` is the point of the exercise, not
+            # decoration: the flag is recomputable from `debit`/`width`, but
+            # only under whatever `k` is in config AT THE TIME OF THE
+            # RECOMPUTE. Without the stamp, moving k before the ~30-close
+            # review silently re-labels every historical row.
+            'proj_value_at_tp': bcs.get('proj_value_at_tp'),
+            'proj_gain_at_tp_pct': bcs.get('proj_gain_at_tp_pct'),
+            'tp_value_frac_of_width_k': bcs.get('tp_value_frac_of_width_k'),
+            'min_gain_at_tp_pct_at_entry': bcs.get('min_gain_at_tp_pct_at_entry'),
+            'would_block_on_gain_at_tp': bcs.get('would_block_on_gain_at_tp'),
+            # The alternative pair a swing-shortened target would have picked.
+            # NOT recomputable later at any price — an option book cannot be
+            # reconstructed after the fact, which is the same reason `exit_legs`
+            # is persisted. None on the great majority of signals (no swing).
+            'swing_shadow': bcs.get('swing_shadow'),
         }
 
     def _build_bcs_shadow(self, zebra_trade, bcs, now, lot_size, lots, quantity,

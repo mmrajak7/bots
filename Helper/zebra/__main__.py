@@ -1543,6 +1543,40 @@ def cmd_report(args):
     )
 
 
+def cmd_paths(args):
+    """Capture / inspect the persisted value paths.
+
+    The POLL observations are the only record of what the engine saw, and they
+    live in logs the cleaner deletes at 90 days. `zebra digest` captures them
+    daily; this verb exists to backfill, to force a re-extract, and above all
+    to ANSWER WHETHER IT IS WORKING -- `at_risk` names sessions whose numbers
+    still exist only in a file scheduled for deletion.
+    """
+    from . import value_paths as vp_mod
+    if args.backfill or args.date:
+        if args.date:
+            p = vp_mod.write_day(args.date, force=args.force)
+            print('wrote %s' % p if p else
+                  'nothing written for %s (already captured, or no log)'
+                  % args.date)
+        else:
+            r = vp_mod.capture(force=args.force)
+            print('captured %d session(s): %s'
+                  % (len(r['written']), ', '.join(r['written']) or '-'))
+            print('already had %d' % len(r['already_had']))
+    cov = vp_mod.coverage()
+    print('')
+    print('captured sessions : %d (%d observations)'
+          % (len(cov['captured']), cov['observations']))
+    print('session logs found: %d' % len(cov['sessions_on_disk']))
+    if cov['at_risk']:
+        print('AT RISK (only in a log the cleaner will delete): %s'
+              % ', '.join(cov['at_risk']))
+    else:
+        print('AT RISK: none - every session on disk is captured')
+    return 0
+
+
 def cmd_digest(args):
     """One day reduced to something readable — the paper-run record.
 
@@ -1551,6 +1585,22 @@ def cmd_digest(args):
     look. Deterministic and offline, so it can never compete with the trading
     vets for the agent budget.
     """
+    # CAPTURE THE VALUE PATHS FIRST, and never let a failure here cost the
+    # digest. This rides on the digest cron rather than getting its own line
+    # for one reason: the digest cron ALREADY went uninstalled for 18 days
+    # without anyone noticing, and adding a second independent line doubles
+    # the number of things that can be quietly absent. One line, two jobs.
+    #
+    # It runs over every session log on disk, not just today's, so a missed
+    # day is picked up later — the log survives 90 days, the capture only has
+    # to happen once inside that window.
+    try:
+        from . import value_paths as vp_mod
+        vp_mod.capture()
+    except Exception as e:                       # a digest must still be written
+        logging.getLogger(__name__).warning(
+            'value-path capture failed (digest continues): %s', e)
+
     from . import digest as digest_mod
     path = digest_mod.write(args.date)
     text = path.read_text(encoding='utf-8')
@@ -1872,6 +1922,17 @@ def main():
     p_rst.add_argument('--confirm', action='store_true',
                        help='Actually apply; without this, prints what would happen')
     p_rst.set_defaults(func=cmd_reset)
+
+    p_vp = sub.add_parser(
+        'paths',
+        help='capture/inspect the persisted POLL value paths (evidence that '
+             'outlives the logs)')
+    p_vp.add_argument('--backfill', action='store_true',
+                      help='capture every session log on disk')
+    p_vp.add_argument('--date', default=None, help='capture one YYYY-MM-DD')
+    p_vp.add_argument('--force', action='store_true',
+                      help='re-extract a day already captured')
+    p_vp.set_defaults(func=cmd_paths)
 
     p_dig = sub.add_parser(
         'digest',

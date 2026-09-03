@@ -1765,6 +1765,101 @@ def _build_bcs(kite, trade: dict, analysis: dict,
     return bcs
 
 
+
+def _swing_target_shadow(kite, trade, analysis, price, traded, swing):
+    """SHADOW ONLY. What the pair would have been if the short strike had been
+    chosen against the SHORTENED target instead of the ST line.
+
+    THE MISMATCH THIS MEASURES (found 2026-09-02). `_build_bcs` calls
+    `analyze_bcs(target_spot=trade['st_value'])` — the ST line — and the swing
+    shortening runs AFTERWARDS, moving only the TP. So when a swing level
+    applies, the short strike sits at a price the position will never be
+    allowed to reach: WAAREEENER #449 bought 100 points of width out to 2500,
+    took its TP at the 2561 swing, and exited 63 points short of its own short
+    leg — 43.5% of width, +19.7%. LICHSGFIN #439 the same shape, +14.4%. The
+    nine `st_line` TPs, where target and strike agree, ran a median +44.5%.
+
+    NOT WIRED INTO THE TRADE. The alternative pair is quoted and stored, never
+    entered — the fix is only obviously right in arithmetic, and a narrower
+    spread reads a HIGHER d/w, so switching today would silently interact with
+    the gates and with `bcs_min_gain_at_tp_pct`. Three swing closes cannot
+    settle that. Stored so the two constructions can be compared at exit on
+    ~10 swing signals.
+
+    Costs one extra option quote per SWING-SHORTENED signal only — not per
+    poll, not per signal. Never raises: a shadow that fails is a shadow.
+    """
+    try:
+        tgt = float(swing.get('tp_spot'))
+        atm_strike, atm_quote = analysis.get('atm_strike'), analysis.get('atm_quote')
+        if not tgt or not atm_strike or not atm_quote:
+            return None
+        alt = strikes_mod.analyze_bcs(
+            kite, trade['stock'], trade['direction'], price,
+            target_spot=tgt,                      # THE SHORTENED TARGET
+            expiry=analysis['expiry'], atm_strike=atm_strike,
+            atm_quote=atm_quote, lot_size=analysis['lot_size'],
+        )
+    except Exception as e:
+        logger.warning("swing shadow failed for #%d %s: %s",
+                       trade['id'], trade['stock'], e)
+        return None
+    # EVERYTHING BELOW RUNS INSIDE THE try TOO. The two logger.info calls and
+    # `float(trade['st_value'])` sat OUTSIDE it, so a malformed record raised
+    # straight into `_enter_as_bcs` -- from a SHADOW, which by definition must
+    # not be able to affect the trade. The docstring said 'never raises';
+    # `test_a_broken_shadow_never_breaks_the_cycle` only covered analyze_bcs
+    # raising INSIDE the try, so the claim outran the test.
+    try:
+        return _swing_shadow_report(trade, traded, alt, tgt)
+    except Exception as e:
+        logger.warning("swing shadow report failed for #%s %s: %s",
+                       trade.get('id'), trade.get('stock'), e)
+        return None
+
+
+def _swing_shadow_report(trade, traded, alt, tgt):
+    """Format and package the shadow result.
+
+    Split out purely so the whole of it sits inside
+    `_swing_target_shadow`'s exception boundary.
+    """
+    if alt.get('error'):
+        logger.info("SWING SHADOW #%d %s: the shortened-target pair would be "
+                    "REJECTED (%s) — traded pair keeps short %g",
+                    trade['id'], trade['stock'], alt['error'],
+                    traded.get('short_strike', 0))
+        return {'error': alt['error'], 'target_spot': tgt}
+    same = alt.get('short_strike') == traded.get('short_strike')
+    logger.info(
+        "SWING SHADOW #%d %s: traded short %g (vs ST %.2f) d/w %.1f%% | "
+        "shortened-target short %g (vs swing %.2f) d/w %.1f%% | %s",
+        trade['id'], trade['stock'], traded.get('short_strike', 0),
+        float(trade['st_value']), traded.get('debit_to_width_pct', 0),
+        alt.get('short_strike', 0), tgt, alt.get('debit_to_width_pct', 0),
+        'SAME STRIKE' if same else 'DIFFERENT STRIKE')
+    return {
+        'target_spot': tgt,
+        'same_strike': same,
+        'short_strike': alt.get('short_strike'),
+        'width': alt.get('width'),
+        'debit': alt.get('debit'),
+        'debit_mid': alt.get('debit_mid'),
+        'debit_to_width_pct': alt.get('debit_to_width_pct'),
+        'debit_to_width_pct_mid': alt.get('debit_to_width_pct_mid'),
+        'entry_cost_pct': alt.get('entry_cost_pct'),
+        'proj_gain_at_tp_pct': alt.get('proj_gain_at_tp_pct'),
+        'would_block_on_gain_at_tp': alt.get('would_block_on_gain_at_tp'),
+        # The row most likely to be re-analysed later was the one that did not
+        # say which k and which floor it was computed under. Same rule as the
+        # traded record: both inputs travel with the flag.
+        'tp_value_frac_of_width_k': alt.get('tp_value_frac_of_width_k'),
+        'min_gain_at_tp_pct_at_entry': alt.get('min_gain_at_tp_pct_at_entry'),
+        'short_symbol': alt.get('short_symbol'),
+        'short_oi': alt.get('short_oi'),
+    }
+
+
 def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
                   price: float, bcs: Optional[dict] = None,
                   dry_run: bool = False):
@@ -1812,6 +1907,8 @@ def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
                     trade['id'], trade['stock'], s['kind'], s['tp_spot'],
                     s['timeframe'], s['bars_ago'], s['st_value'],
                     s['shortened_by_pct'], s['retained_pct'])
+        bcs['swing_shadow'] = _swing_target_shadow(kite, trade, analysis,
+                                                   price, bcs, s)
     elif s:
         # Found but NOT applied — the level is too close to spot to be worth
         # trading to. TP stays the ST line; the agent still gets told.

@@ -124,8 +124,26 @@ VET_CLI = os.environ.get('ZEBRA_VET_CLI', 'claude')
 # request into a log nobody reads live and exits 0 with the work undone. That
 # silent shape has already cost this grant three separate fixes; a missing
 # verb must fail in the suite, not on the Pi.
+# A VERB HERE MUST BE THE REAL SUBCOMMAND, SPELLED EXACTLY.
+#
+# 2026-09-02, the fourth cut at this grant. This list said `vet exit`; the
+# argparse subcommand is `exit-decide`, and `EXIT_PROMPT_TEMPLATE` instructs
+# `vet exit-decide`. Claude Code's prefix match does not cross the token
+# boundary, so the grant matched nothing the agent ever typed. All three of
+# that day's exit vets reached a verdict of `allow` and NONE could record it:
+# each held the full 900s `exit_vet_max_hold_sec` and fell through on EXIT VET
+# TIMED OUT. On COALINDIA #440 that hold cost 0.40 points -- Rs 540 of a
+# Rs 4,703 loss -- while the agent's own transcript said the write was refused.
+#
+# The suite did not catch it because BOTH its checks were blind in the same
+# place: `INSTRUCTED` hand-wrote a command that does not exist, and the
+# template-derived test matched verbs with `[a-z]+`, which stops at the hyphen
+# and extracted `vet exit` from `vet exit-decide` -- proving the fiction
+# granted. `test_every_granted_verb_is_a_real_subcommand` now parses each verb
+# against the real CLI, which is the check that does not depend on anyone
+# spelling the same thing twice.
 _VET_VERBS = [
-    'vet show', 'vet decide', 'vet exit',      # the vetting channel itself
+    'vet show', 'vet decide', 'vet exit-decide',   # the vetting channel itself
     'quote',                                   # the live re-quote (read-only)
     'review show', 'review record',            # position review
     'postmortem show', 'postmortem record',    # post-mortems
@@ -405,6 +423,69 @@ _DEFAULTS = {
                                  # admits (a garbage-print detector, never a
                                  # tradeability gate). Review once ~30
                                  # fill-basis records exist.
+    # ── the payoff gate, MEASURED BUT NOT ENFORCED (2026-09-03) ──────────
+    # A candidate replacement for bcs_max_debit_to_width_pct, recorded on every
+    # signal and blocking nothing, so ~30 signals of evidence accrue before
+    # anyone argues about the threshold.
+    #
+    # WHY. The TP fires when spot reaches the ST target, and the short strike
+    # sits AT that target, so every take-profit books with spot on the short
+    # leg and 27-36 DTE left. Measured on 12 cohort TP exits, the spread is
+    # then worth 42-66% of width, mean 55.2%. That makes the realised gain an
+    # identity -- (V/w)/(d/w) - 1 -- with V/w near-constant, so d/w is the only
+    # controllable input and the win is CAPPED AT ENTRY. At d/w 44 the ceiling
+    # is about +28% against a -50% stop: a 0.56:1 payoff, knowable before the
+    # order goes out. GMRAIRPORT entered at 36.7 and made +54.5%; MCX at 43.9
+    # made +27.6%, on the same exit quality.
+    #
+    # The existing 45% cap is denominated in the EXPIRY payoff -- a payoff this
+    # engine never collects, because it exits at the target. This one is
+    # denominated in the exit that actually happens.
+    'bcs_tp_value_frac_of_width': 0.55,
+                                 # k: assumed spread value at the TP, as a
+                                 # share of width. This is the MEAN of the
+                                 # 42.0-66.3% observed on the 12 cohort TP
+                                 # exits (mean 55.2, sd ~8).
+                                 # AN EARLIER VERSION OF THIS COMMENT CALLED IT
+                                 # "the conservative end ... NOT the mean" and
+                                 # claimed it errs towards refusing a trade.
+                                 # That was simply wrong -- 0.42 is the
+                                 # conservative end -- and it inverted the
+                                 # property: at the mean, half the observed
+                                 # exits fall BELOW k, so the projection is
+                                 # optimistic about half the time.
+                                 # Kept at the mean deliberately. This number
+                                 # classifies at ENTRY (is the payoff priced
+                                 # out?), and with sd ~8 it is a weak per-trade
+                                 # PREDICTOR either way; the honest use is the
+                                 # rank on d/w, which any k in the range gives.
+                                 # Note the boundary is k-sensitive: the 50%
+                                 # floor implies d/w <= 36.7% at k=0.55, 28% at
+                                 # 0.42 and 44% at 0.66 -- a span covering the
+                                 # whole cohort range, which is the real reason
+                                 # this must not be enforced yet.
+                                 # Re-derive per ~10 new exit books; every BCS
+                                 # record persists `exit_legs`, so unlike the
+                                 # 45% cap this one CAN be re-fitted.
+    'bcs_min_gain_at_tp_pct': 50.0,
+                                 # would-block threshold: modelled gain at the
+                                 # TP, (k*width)/debit_fill - 1. At k=0.55 this
+                                 # is d/w <= 36.7% on the FILL basis. 50% pairs
+                                 # the win ceiling to the -50% debit stop, i.e.
+                                 # payoff >= 1:1 by construction.
+                                 # NOT ENFORCED. Only 3 of 19 cohort entries
+                                 # clear it, so switching it on today would cut
+                                 # throughput by ~85% on the strength of an
+                                 # identity plus 15 trades. The identity is
+                                 # sound; what is unmeasured is whether the hit
+                                 # rate is flat across d/w bands -- d/w is the
+                                 # market's own probability quote, so buying
+                                 # only cheap spreads is a bet against its
+                                 # odds. That is exactly the ST-magnet claim,
+                                 # and exactly what 15 closes cannot show.
+                                 # REVISIT AT ~30 COHORT CLOSES: compare the
+                                 # realised win rate of would-block vs
+                                 # would-pass signals before enforcing.
     'bcs_max_debit_to_width_pct': 45.0,
                                  # HARD gate on the shadow BCS: reject when the
                                  # debit exceeds this share of the spread width.
@@ -857,13 +938,46 @@ _DEFAULTS = {
                                  # code alerts and closes nothing, because
                                  # _paper_auto_close no-ops. No new automated
                                  # close path in the real-order system.
-    'trail_engage_frac': 0.50,   # Arm once the PEAK gain reaches this share of
+    'trail_engage_frac': 0.25,   # Arm once the PEAK gain reaches this share of
                                  # max gain (width - debit). Deliberately NOT
                                  # the live monitor's 2x-debit rule: that lands
                                  # at 43% of max gain on a 30% d/w spread but
                                  # 82% on a 45% one, tightening exactly as the
                                  # payoff shrinks, and it would have engaged on
                                  # only 2 of 32 closed shadows.
+                                 #
+                                 # 0.50 -> 0.25 on 2026-09-03, REPLAYED not
+                                 # reasoned. At 0.50 the trail had armed on
+                                 # 0 of 19 cohort positions — decorative, and
+                                 # unreachable BY CONSTRUCTION: the TP fires at
+                                 # the short strike with 27-36 DTE left, where
+                                 # the spread holds ~55% of width, so the peak
+                                 # gain is (0.55w - d)/(w - d) ~ 25% at d/w 40.
+                                 # Arming at 50% needs V/w ~70%, which this TP
+                                 # rule never lets a position reach. Observed
+                                 # cohort peak: median ~25%, max 40.2%.
+                                 #
+                                 # Replayed over all 15 cohort closes on their
+                                 # real 5-minute value paths (9,449 POLL
+                                 # observations):
+                                 #     engage 0.50/0.30 -> Rs      0, arms never
+                                 #     engage 0.25      -> Rs +1,080, clips none
+                                 #     engage 0.20      -> Rs -4,400, clips 2
+                                 #     engage 0.15      -> Rs -7,537, clips 4
+                                 #
+                                 # ⚠ THIS SITS ON A CLIFF, one notch above a
+                                 # Rs -4,400 outcome, and its whole +Rs 1,080
+                                 # comes from ONE position (COALINDIA #440,
+                                 # which gapped 7.85 -> 3.15 overnight). It is
+                                 # retain-INSENSITIVE for the same reason —
+                                 # identical result at retain 0.40/0.50/0.60/
+                                 # 0.70 — because the only position that arms
+                                 # gaps straight through every level. So this
+                                 # is really a gap-detector, not a trail.
+                                 # `test_the_trail_engage_cliff` pins the
+                                 # neighbourhood. DO NOT LOWER IT without
+                                 # re-running the replay.
+                                 # REVISIT AT ~30 COHORT CLOSES.
     'trail_retain_frac': 0.50,   # Keep this share of the peak gain. Must stay
                                  # below 1: a trail sitting AT the peak fires
                                  # on the first tick down.
@@ -1094,6 +1208,14 @@ assert 0 < BCS_MAX_ENTRY_COST_PCT < 100, \
     "BCS_MAX_ENTRY_COST_PCT is a percentage of max gain; 0 blocks every trade"
 assert 0 < BCS_MAX_DEBIT_TO_WIDTH_PCT < 100, \
     "BCS_MAX_DEBIT_TO_WIDTH_PCT is a percentage of width"
+# Measured, not enforced — see the defaults block for the full rationale and
+# the REVISIT AT ~30 COHORT CLOSES note.
+BCS_TP_VALUE_FRAC_OF_WIDTH = _num('bcs_tp_value_frac_of_width')
+BCS_MIN_GAIN_AT_TP_PCT = _num('bcs_min_gain_at_tp_pct')
+assert 0 < BCS_TP_VALUE_FRAC_OF_WIDTH < 1, \
+    "BCS_TP_VALUE_FRAC_OF_WIDTH is a fraction of width, exclusive of 0 and 1"
+assert BCS_MIN_GAIN_AT_TP_PCT > 0, \
+    "BCS_MIN_GAIN_AT_TP_PCT is a percentage gain over the debit"
 TP_TARGET = _runtime['tp_target']
 
 
