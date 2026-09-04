@@ -1511,7 +1511,42 @@ def _log_vet_state() -> None:
     getattr(logger, level)('%s', msg)
 
 
-_log_vet_state()
+# ── Startup banners: emitted once, into a log that EXISTS ─────────────────
+# Both state lines (vetting, and the daily sweep further down) are emitted at
+# import so that no process in the fleet can be dark without saying so. But
+# `python -m zebra ...` imports this module through the package `__init__`
+# BEFORE `main()` has called `setup_logging()`, and an INFO record with no
+# handler is silently dropped (logging's last-resort handler only prints
+# WARNING and above). Verified 2026-09-04 against the Pi's cron log: the
+# vetting banner had NEVER appeared in it, and the sweep banner inherited the
+# same hole on its first day. So: emit at import only when a sink already
+# exists (the live monitor imports zebra lazily, after its own logging is up);
+# otherwise stay PENDING and let `main()` call `emit_state_banners()` once the
+# handler is there. Emitted at most once per process either way.
+_BANNERS_PENDING = True
+
+
+def _log_sink_exists() -> bool:
+    return bool(logging.getLogger().handlers)
+
+
+def emit_state_banners(force: bool = False) -> bool:
+    """Log the vetting and daily-sweep state lines once. True if emitted now.
+
+    Called at import (emits only if a log sink exists) and again from
+    `zebra.__main__.main()` after `setup_logging()`. `force` re-emits even
+    if already done — for a long-lived process that rotates its log.
+    """
+    global _BANNERS_PENDING
+    if not force and not _BANNERS_PENDING:
+        return False
+    if not force and not _log_sink_exists():
+        return False
+    _log_vet_state()
+    _eod_level, _eod_msg = eod_review_state_line()
+    getattr(logger, _eod_level)('%s', _eod_msg)
+    _BANNERS_PENDING = False
+    return True
 
 ENTRY_VET_TTL_SEC = _int('entry_vet_ttl_sec')
 EXIT_VET_TTL_SEC = _int('exit_vet_ttl_sec')
@@ -1774,8 +1809,9 @@ if EOD_REVIEW_START > EOD_REVIEW_LAST_REQUEST:
                  EOD_REVIEW_LAST_REQUEST[0], EOD_REVIEW_LAST_REQUEST[1])
     EOD_REVIEW_START = EOD_REVIEW_LAST_REQUEST
 
-_eod_level, _eod_msg = eod_review_state_line()
-getattr(logger, _eod_level)('%s', _eod_msg)
+# Both banners go out together here, now that every value they report is
+# final (the sweep window is clamped just above). See `emit_state_banners`.
+emit_state_banners()
 
 # ── Quote-reliability guards (2026-07-24 NHPC false DEBIT-SL incident) ──────
 # The DEBIT-SL is a VALUE trigger (structure mid <= 50% of entry debit); a

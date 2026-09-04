@@ -130,6 +130,14 @@ def _store(paths, n: int = 1):
             # Far enough out that the "last cheap window to adjust" reason
             # cannot fire and confuse a scan-only assertion.
             'expiry': (FRIDAY + timedelta(days=90)).strftime('%Y-%m-%d')})
+        # `mark_entered` stamps entry_date/entry_time from the REAL clock. The
+        # tests pin their day to FRIDAY, so once the suite runs after
+        # EOD_REVIEW_LAST_REQUEST on that very date the "entered after the
+        # window" exclusion hides every position from the INCOMPLETE alarm
+        # and the test flips. Bit us at 15:16 IST on 2026-09-04, the day the
+        # feature shipped. Pin the stamps to a mid-session entry on FRIDAY.
+        s.update_trade_fields(i + 1, entry_date=FRIDAY.date().isoformat(),
+                              entry_time='11:35:12')
     return s
 
 

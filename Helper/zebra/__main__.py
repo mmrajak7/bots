@@ -1995,6 +1995,11 @@ def main():
 
     args = p.parse_args()
     setup_logging(args.verbose)
+    # The package import above ran before this handler existed, so the
+    # startup banners (vetting state, daily-sweep window) were held back.
+    # Emit them now, into the log that will actually be read.
+    from . import config as _cfg
+    _cfg.emit_state_banners()
 
     if not args.command:
         p.print_help()
