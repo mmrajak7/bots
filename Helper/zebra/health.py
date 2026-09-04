@@ -75,6 +75,15 @@ CHANNEL_IMPACT = {
                "breached by ARITHMETIC, on a share that no longer exists."),
     'review': ("no macro/event judgement between triggers. Advisory only — no "
                "stop or target is affected."),
+    # Counted apart from `review` ON PURPOSE. The daily sweep lands ~8 times a
+    # session on the cheap model; `record_agent_landed` zeroes
+    # `spawns_since_landing` for a whole channel, so sharing one counter made
+    # the sweep's success an all-clear for the Opus price reviews — which could
+    # then fail on every spawn and never reach SILENT_SPAWN_LIMIT. A cheap
+    # frequent channel must never certify an expensive rare one.
+    'review_scan': ("open positions get no daily news sweep. The price and "
+                    "calendar triggers still fire; nothing that has not moved "
+                    "the tape yet is looked at."),
     'postmortem': ("no precedents accumulate for future vetting. Learning "
                    "only — nothing live is affected."),
 }

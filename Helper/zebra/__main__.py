@@ -554,11 +554,21 @@ def cmd_review_record(args):
     if not t:
         print(f"trade #{args.id} not found")
         return 1
+    # WHICH question was asked, and therefore which model answered. Both were
+    # hardcoded, so the journal recorded every routine Sonnet news sweep as an
+    # Opus price review — and the owner's plan is to judge the sweep's output
+    # after a week, which is impossible from a journal that cannot tell the two
+    # apart. The marker is the source of truth: `review.request` stamps `kind`
+    # when it spawns.
+    _m = t.get('review') if isinstance(t.get('review'), dict) else {}
+    _scan = _m.get('kind') == 'scan'
     d = _journal(
-        kind='review', verdict=args.action, trade_ids=[t['id']],
+        kind='scan' if _scan else 'review', verdict=args.action,
+        trade_ids=[t['id']],
         stock=t.get('stock'), direction=t.get('direction'),
         reasons=args.reason or [], red_flags=args.red_flag or [],
-        confidence=args.confidence, model=cfg.VET_MODEL,
+        confidence=args.confidence,
+        model=cfg.EOD_REVIEW_MODEL if _scan else cfg.VET_MODEL,
         notes=args.notes or '',
     )
     outcome = review_mod.record(store, args.id, args.action,
@@ -571,7 +581,9 @@ def cmd_review_record(args):
         logging.getLogger(__name__).warning(
             "review verdict for #%s was NOT applied: %s", args.id, outcome)
     from .health import record_agent_landed
-    record_agent_landed('review')   # proof of life for THIS channel
+    # Proof of life for THIS channel — and the sweep has its own, so a Sonnet
+    # scan landing can never clear the alarm for the Opus price reviews.
+    record_agent_landed(review_mod.CHANNELS['scan' if _scan else 'review'])
     print(f"decision #{d['id']} recorded; review {outcome}")
     return 0
 

@@ -52,7 +52,13 @@ VERDICTS = ('allow', 'veto', 'exit', 'defer', 'unavailable',
             # kind, and means the same thing in both: get out. It is still only
             # ever a RECOMMENDATION here — review.py cannot close a position.
             'hold', 'adjust')
-KINDS = ('entry', 'exit', 'review')
+# `scan` is the DAILY end-of-session news sweep — same verdict vocabulary as
+# `review` and the same inability to close anything, but a different question,
+# a different (cheaper) model, and ~8 rows a session against a handful. Rolled
+# into `review` it would swamp the price-triggered rows it must be judged
+# separately from, and the model column would say Opus on every one of them.
+# Additive: nothing selects `review` rows, so no existing reader changes.
+KINDS = ('entry', 'exit', 'review', 'scan')
 
 
 def _load_config() -> dict:

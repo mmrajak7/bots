@@ -1,9 +1,10 @@
 """Event calendar — the facts the mechanical rules cannot see.
 
-Results dates, ex-dividends, budget day, election results, RBI policy. None of
-these are in a price series, and all of them can invalidate a structure that
-every numeric gate just passed. A Sonnet agent refreshes this file every couple
-of hours; the entry checklist and the position-review pre-filter read it.
+Results dates, ex-dividends, monthly business updates, budget day, election
+results, RBI policy. None of these are in a price series, and all of them can
+invalidate a structure that every numeric gate just passed. A Sonnet agent
+refreshes this file every couple of hours; the entry checklist and the
+position-review pre-filter read it.
 
 Design notes
 ------------
@@ -37,10 +38,26 @@ logger = logging.getLogger(__name__)
 
 # Only these matter enough to act on. An open vocabulary would let the agent
 # invent categories nobody downstream handles.
+#
+# `monthly_update` was added 2026-09-04 at a cost of Rs 6,500. #472 ANGELONE
+# gapped -65.8% overnight on Angel One's monthly business update — a SCHEDULED,
+# researchable disclosure that is not a result, not a dividend and not a
+# corporate action, so it fell through every existing category and the events
+# agent never went looking for it. A closed vocabulary is only safe while it
+# covers the things that actually move a stock overnight.
 EVENT_TYPES = ('results', 'ex_dividend', 'bonus', 'split', 'rights',
+               'monthly_update',
                'budget', 'election', 'rbi_policy', 'expiry', 'other')
-# Events that move the whole market rather than one symbol.
+# Events that move the whole market rather than one symbol, always.
 MARKET_TYPES = ('budget', 'election', 'rbi_policy')
+# Types whose SCOPE is decided by the row, not by the type: a Nifty rebalance
+# or a Muhurat session is `other`/`expiry` with no symbol and bears on
+# everything; an OFS in one name is the same type WITH a symbol and bears only
+# on that name. VETTING.md has always documented them this way, while the
+# installer required a symbol on both — so the events agent reported the
+# contradiction four times and dropped real rows (Nifty rebalance, Diwali
+# Muhurat) to get its batch accepted.
+EITHER_SCOPE_TYPES = ('expiry', 'other')
 
 # Corporate actions that RE-PRICE the underlying and get the option strikes
 # adjusted with it. On the ex-date every spot level this bot has stored —
@@ -55,6 +72,25 @@ MARKET_TYPES = ('budget', 'election', 'rbi_policy')
 # "deferring a real, corroborated exit" error the vetting doc warns about — the
 # way a capped loss becomes a maximum loss.
 ADJUSTMENT_TYPES = ('bonus', 'split', 'rights')
+
+
+def is_market_scope(event) -> bool:
+    """Does this row bear on the whole market rather than one symbol?
+
+    THE single definition of scope. Validation ("may this row omit a symbol?")
+    and querying ("does this row reach a symbol it does not name?") are the
+    same question asked twice, and the answer must not be written down twice —
+    it was, in the code and in VETTING.md, and the two disagreed for months.
+    Anything that decides scope calls this rather than testing a type tuple.
+    """
+    if not isinstance(event, dict):
+        return False
+    etype = event.get('type')
+    if etype in MARKET_TYPES:
+        return True
+    # An either-scope row is market-wide exactly when it names no symbol.
+    named = (event.get('symbol') or '').strip()
+    return etype in EITHER_SCOPE_TYPES and not named
 
 
 def _today() -> date:
@@ -127,7 +163,10 @@ def validate(events) -> list:
             dropped.append((i, 'unknown type %r' % etype))
         elif not title:
             dropped.append((i, 'empty title'))
-        elif etype not in MARKET_TYPES and not symbol:
+        elif not symbol and not is_market_scope({'type': etype}):
+            # Asked of a symbol-less row: would this be market-scope without a
+            # symbol? If not, the symbol is mandatory. Same predicate the
+            # queries use, so a row that installs is a row that can be reached.
             dropped.append((i, 'per-stock event with no symbol'))
         else:
             clean.append({
@@ -208,7 +247,7 @@ def upcoming(symbol: Optional[str] = None, within_days: Optional[int] = None,
         d = _parse_date(e.get('date'))
         if d is None or d < today or (d - today).days > horizon:
             continue
-        if e.get('type') in MARKET_TYPES or sym is None or e.get('symbol') == sym:
+        if is_market_scope(e) or sym is None or e.get('symbol') == sym:
             out.append(dict(e, days_away=(d - today).days))
     return sorted(out, key=lambda e: e['days_away'])
 

@@ -599,6 +599,46 @@ Act only on something the mechanical rules genuinely cannot see:
   regulator, a guidance withdrawal, a promoter exit.
 - A macro shock that changes the distribution rather than the price.
 
+## Daily scan
+
+When `flagged_because` is **`daily EOD scan`**, nothing has happened yet. This
+is the routine end-of-session sweep that runs on every open position, and its
+job is to look where the mechanical rules cannot: at the wires.
+
+1. **News since the previous session** — on the stock, and on its sector.
+   Company announcements, exchange filings, regulator actions, an analyst
+   downgrade with a reason attached, a peer's result that reprices the whole
+   sector.
+2. **Scheduled events before expiry that the calendar does not carry.** The
+   calendar covers results, dividends, corporate actions and market-wide dates.
+   It does not know about the recurring operational prints, and those are what
+   gap a position overnight. If you find one, **name the class** so it can be
+   added: *monthly business update* (brokers, AMCs, exchanges — Angel One
+   around the 3rd-5th), *monthly sales* (autos, on the 1st), *quarterly
+   business update* (banks and NBFCs, in the first few sessions after a quarter
+   end), *monthly production* (Coal India, power), *index inclusion or
+   exclusion*.
+3. Say plainly whether either of those changes the reason for holding.
+
+**`hold` is the default and will be the answer almost every day.** A quiet
+session with no news is a `hold`, recorded in one line. Do not manufacture a
+concern to justify the run, and do not repeat the position's P&L back as a
+finding — a capped-loss structure being down is the strategy working.
+
+Recommend `exit` or `adjust` only on something **material**: a fact that, had
+it been known at entry, would have stopped the trade. When you do, the reason
+line is read on a phone, in a hurry, minutes before the close — one sentence,
+the fact first, no preamble.
+
+The boundary above is unchanged: **you cannot close anything.** A non-`hold`
+verdict is a message to a human who then decides.
+
+You are being asked late in the session so that a human can still act before
+the close, so answer and record promptly. A market-wide date the whole book
+already knows about — a monthly expiry, an index rebalance — is context, not a
+finding; it is in the `events` list for you to read, and it is deliberately not
+what flagged this position.
+
 ## Deciding
 
 **hold** — the default, and the right answer most of the time. Nothing the
@@ -637,11 +677,38 @@ judgement — record what is scheduled, and let the gates decide what it means.
 |---|---|---|
 | `results` | per stock | quarterly earnings date (estimate from the last 2 years' pattern + the SEBI 45-day ceiling if not yet filed; set `confidence` below 1.0) |
 | `ex_dividend` | per stock | ex-date, with the amount in the title — a mechanical spot drop |
+| `monthly_update` | per stock | scheduled OPERATING disclosures that are not results — see below |
 | `budget` | market | union budget |
 | `election` | market | national/state results with market impact |
 | `rbi_policy` | market | MPC decision dates |
-| `expiry` | market | unusual expiry-week effects worth flagging |
-| `other` | either | anything scheduled and material: OFS, QIP, lock-in expiry, bonus, split |
+| `expiry` | market when there is no `symbol`, per stock when there is | unusual expiry-week effects worth flagging (an expiry-calendar shift is market-wide; leave `symbol` out) |
+| `other` | market when there is no `symbol`, per stock when there is | anything scheduled and material: index rebalance or a Muhurat session (no `symbol`), OFS, QIP, lock-in expiry, bonus, split (with the `symbol`) |
+
+### `monthly_update` — look for this one EXPLICITLY, for every symbol
+
+**Go through the symbols in your prompt one at a time and ask whether that
+company publishes anything on a monthly or per-quarter operating cadence.** Do
+not wait for it to turn up in a news sweep; these are diarised disclosures and
+the whole point of the calendar is that they are knowable in advance.
+
+This class cost **Rs 6,500 on 2026-09-04**: ANGELONE gapped −65.8% overnight on
+Angel One's monthly business update. There was no type for it, so nobody looked
+for it, so the position was never reviewed before the print.
+
+What counts:
+
+- **Auto monthly sales** — dispatch/retail volumes, typically the 1st of the month.
+- **Broker / AMC / exchange monthly business updates** — Angel One around the
+  3rd–5th, CDSL, MCX, BSE volume disclosures.
+- **Bank and NBFC quarterly business updates** — provisional deposits/advances
+  or AUM, in roughly the first 5 sessions after a quarter end, weeks ahead of
+  the actual results.
+- **Coal India and power monthly production/generation numbers.**
+
+**Estimate the date from the last 2–3 months' own pattern** — the same company
+publishes on much the same day each month — and set `confidence` below 1.0 to
+say it is an estimate. It is a separate row from `results`: the business update
+lands well before the print and moves the stock on its own.
 
 ## Format
 
@@ -658,7 +725,10 @@ judgement — record what is scheduled, and let the gates decide what it means.
 Rules the installer enforces, so get them right or the row is dropped:
 - `date` must be `YYYY-MM-DD`.
 - `type` must be one of the types above.
-- Any non-market type needs a `symbol`.
+- A `symbol` is required unless the row is market-scope: `budget`, `election`
+  and `rbi_policy` always are, and `expiry`/`other` are whenever you leave
+  `symbol` out. A market-scope row reaches EVERY symbol, so use it only for
+  something that genuinely bears on all of them.
 - `title` must be non-empty.
 
 **Replace, do not append.** What you install becomes the whole calendar, so

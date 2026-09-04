@@ -728,6 +728,82 @@ _DEFAULTS = {
     'event_horizon_days': 10,    # How far ahead an event counts as relevant.
     'review_adverse_pct': 0.04,  # Position-review pre-filter: |move| from entry
                                  # spot that makes a position worth a fresh look.
+    'eod_review_enabled': True,  # DAILY end-of-session news sweep over EVERY
+                                 # open position, whatever price has done.
+                                 #
+                                 # Everything else in the review pre-filter is
+                                 # REACTIVE TO PRICE: a 4% adverse move, a
+                                 # give-back, an event the calendar already
+                                 # carries, the last cheap window before the
+                                 # time stop. News that has not moved the tape
+                                 # yet trips none of them, and neither does an
+                                 # event class the calendar has no type for.
+                                 #
+                                 # #472 ANGELONE lost 65.8% overnight on the
+                                 # August monthly business update. The calendar
+                                 # had no `monthly_update` class, so the events
+                                 # agent never looked for one; price had done
+                                 # nothing by the close, so no price trigger
+                                 # fired; and the review agent — which asks
+                                 # exactly the right question — was therefore
+                                 # never asked it. The gap was the PRE-FILTER,
+                                 # not the agent.
+    'eod_review_start': '15:00',  # IST wall clock, "HH:MM". Late enough that
+                                 # the session's news is out, early enough that
+                                 # a verdict can still be acted on before the
+                                 # 15:30 close — the alert asks a human to run
+                                 # `zebra close`, so a 15:35 verdict is a
+                                 # verdict about tomorrow's open. Owner
+                                 # decision, 2026-09-04.
+    'eod_review_last_request': '15:15',
+                                 # IST wall clock. NO scan is REQUESTED after
+                                 # this, because a verdict that lands after the
+                                 # session is over cannot be delivered.
+                                 #
+                                 # The alert is only sent by a LATER sweep —
+                                 # `run()` requests in one loop and delivers in
+                                 # the next — and `monitor._is_market_open`
+                                 # stops the cycle after 15:30. So a scan
+                                 # spawned at 15:25 whose agent lands at 15:31
+                                 # is not Telegrammed until ~09:15 the next
+                                 # morning, silently, having been asked
+                                 # precisely so a human could act before the
+                                 # close. 15:15 leaves ~3 cycles for the agent
+                                 # (measured round trip ~4m50s) and at least
+                                 # one delivering cycle after it.
+    'eod_review_model': 'sonnet',  # The routine daily sweep. Sonnet, like the
+                                 # calendar and the post-mortems: reading the
+                                 # day's news against a written checklist is
+                                 # fact-collection, and running Opus over every
+                                 # open position every session would spend the
+                                 # weekly limit on "nothing changed". Opus
+                                 # (VET_MODEL) stays on the price-triggered
+                                 # reviews, where something has already
+                                 # happened and the call is about money.
+    'eod_review_max_per_cycle': 2,  # Scan spawns per 5-minute sweep. The whole
+                                 # book qualifies the moment the clock passes
+                                 # `eod_review_start`, so without a stagger a
+                                 # full book starts N detached agents in one
+                                 # cycle on a Pi that also runs the live-money
+                                 # monitor.
+                                 #
+                                 # 2, not the deferrable cap of 3, and the
+                                 # missing slot is the point: at the full cap
+                                 # three quiet low-id scans take every
+                                 # deferrable slot and a genuine 6% adverse
+                                 # review on a higher id is REFUSED in the same
+                                 # cycle — the cheap sweep crowding out the
+                                 # expensive judgement it was never meant to
+                                 # compete with, with no alarm anywhere because
+                                 # the budget was working as designed. CLAMPED
+                                 # at import to DEFERRABLE_AGENT_CAP - 1, so
+                                 # raising this cannot reintroduce that.
+                                 #
+                                 # 8 positions at 2 a cycle is 4 cycles —
+                                 # 15:00, 15:05, 15:10, 15:15 — which is
+                                 # exactly the request window. Deferred
+                                 # positions re-qualify next cycle because
+                                 # nothing was stamped for them.
     'auth_warn_days': 3,         # Telegram this many days before the Claude CLI
                                  # credential expires (user re-logs in manually).
     'entry_vet_ttl_sec': 1800,   # How long an ALLOWED **ENTRY** verdict stays
@@ -1179,6 +1255,44 @@ def _non_negative_int(key: str) -> int:
     return int(val)
 
 
+def _parse_hhmm(raw):
+    """`"HH:MM"` -> `(hour, minute)`, or None if it is not a wall-clock time."""
+    if not isinstance(raw, str):
+        return None
+    parts = raw.strip().split(':')
+    if len(parts) != 2 or not all(p.strip().isdigit() for p in parts):
+        return None
+    hour, minute = int(parts[0]), int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return (hour, minute)
+
+
+def _hhmm(key: str) -> tuple:
+    """A wall-clock config value as an (hour, minute) tuple on the IST clock.
+
+    LOUD, then the tested default — the same shape as `_num`/`_int`, and for a
+    sharper version of the same reason. The alternative (return None and let
+    the consumer skip) means a typo'd `"3 PM"` DISABLES the daily sweep, on a
+    box where the switch still reads `eod_review_enabled: true` and nothing
+    ever fires. That is the exact failure the sweep was built to close: a layer
+    that looks armed and is dark. Falling back keeps it running at the known-
+    good time and says so at ERROR, which is a state an operator can see.
+
+    Turning the sweep OFF is `eod_review_enabled: false`, not a broken time.
+    """
+    raw = _runtime.get(key, _DEFAULTS[key])
+    parsed = _parse_hhmm(raw)
+    if parsed is None:
+        logger.error("zebra_config.json: %s=%r is not an \"HH:MM\" IST time "
+                     "— using default %r. The daily review sweep is STILL "
+                     "RUNNING, at the default time; set eod_review_enabled "
+                     "to false if you meant to stop it.",
+                     key, raw, _DEFAULTS[key])
+        parsed = _parse_hhmm(_DEFAULTS[key])
+    return parsed
+
+
 WATCH_GAP_MAX = _num('watch_gap_max')
 TRIGGER_GAP_MAX = _num('trigger_gap_max')
 STALE_GAP_MIN = _num('stale_gap_min')
@@ -1408,6 +1522,28 @@ VETO_SHADOW_DAYS = _int('veto_shadow_days')
 EVENT_REFRESH_SEC = _int('event_refresh_sec')
 EVENT_HORIZON_DAYS = _int('event_horizon_days')
 REVIEW_ADVERSE_PCT = _num('review_adverse_pct')
+# Env wins, same one-off-on-a-command-line shape as ZEBRA_VET_ENABLED. It is a
+# KILL switch as much as a switch: the sweep spawns an agent per open position
+# per session, so an operator watching the box burn its weekly limit needs a
+# way to stop it without editing a Drive-synced config file.
+_eod_env = os.environ.get('ZEBRA_EOD_REVIEW_ENABLED', '').strip()
+EOD_REVIEW_ENABLED = (_eod_env.lower() in ('1', 'true', 'yes') if _eod_env
+                      else bool(_runtime['eod_review_enabled']))
+EOD_REVIEW_START = _hhmm('eod_review_start')
+EOD_REVIEW_LAST_REQUEST = _hhmm('eod_review_last_request')
+if EOD_REVIEW_LAST_REQUEST < EOD_REVIEW_START:
+    # An empty window is a silently disabled sweep — the failure this feature
+    # exists to close, wearing the config that says it is on. Widened to a
+    # single instant rather than refused, so the sweep still runs and the log
+    # says exactly what was wrong.
+    logger.error('eod_review_last_request %02d:%02d is BEFORE '
+                 'eod_review_start %02d:%02d — that is an empty window and no '
+                 'scan could ever be requested. Using the start time; fix the '
+                 'config, or set eod_review_enabled false if you meant to stop '
+                 'the sweep.', EOD_REVIEW_LAST_REQUEST[0],
+                 EOD_REVIEW_LAST_REQUEST[1], EOD_REVIEW_START[0],
+                 EOD_REVIEW_START[1])
+    EOD_REVIEW_LAST_REQUEST = EOD_REVIEW_START
 AUTH_WARN_DAYS = _int('auth_warn_days')
 MFE_CONFIRM_POLLS = _int('mfe_confirm_polls')
 MFE_JUMP_MULT = _num('mfe_jump_mult')
@@ -1457,7 +1593,16 @@ MAX_CONCURRENT_AGENTS = int(os.environ.get('ZEBRA_MAX_CONCURRENT_AGENTS')
 # they are the NUMEROUS ones — under a single shared cap they win by weight and
 # starve the two channels that gate a trade. `entry`/`exit` are deliberately
 # absent: a signal that enters unvetted cannot be re-vetted afterwards.
-DEFERRABLE_CHANNELS = ('review', 'events', 'postmortem')
+# `review_scan` is the DAILY sweep, spawned on the cheap model. It is a
+# separate channel ONLY so the health watchdog counts it separately: ~8 Sonnet
+# sweeps land every session, and `record_agent_landed` zeroes
+# `spawns_since_landing` for its whole channel, so sharing 'review' meant the
+# sweep's success permanently cleared the alarm for the Opus price reviews —
+# a systematically failing price review could never reach SILENT_SPAWN_LIMIT.
+# Same lesson as the per-channel split itself, one level down. Everything else
+# about it is identical to `review`: same tool grants, same deny list, same
+# deferrable pool and cap.
+DEFERRABLE_CHANNELS = ('review', 'review_scan', 'events', 'postmortem')
 
 # Slots the deferrable channels may never take, so a decision channel always
 # has room. Must stay < MAX_CONCURRENT_AGENTS or the batch channels can never
@@ -1482,6 +1627,59 @@ if not 0 <= AGENT_RESERVE < MAX_CONCURRENT_AGENTS:
                    AGENT_RESERVE, MAX_CONCURRENT_AGENTS, _safe)
     AGENT_RESERVE = _safe
 VET_MODEL = os.environ.get('ZEBRA_VET_MODEL') or _runtime['vet_model']
+# The routine daily position sweep — Sonnet, not VET_MODEL. Same env-override
+# shape as every other model key so a one-off run can compare the two without
+# editing config on the box.
+EOD_REVIEW_MODEL = os.environ.get('ZEBRA_EOD_REVIEW_MODEL') \
+    or _runtime['eod_review_model']
+
+#: What ONE deferrable channel may hold at once. Derived, never written down
+#: twice: `_spawn_budget_ok` computes exactly this and a second hardcoded copy
+#: would drift the day AGENT_RESERVE moves.
+DEFERRABLE_AGENT_CAP = max(1, MAX_CONCURRENT_AGENTS - AGENT_RESERVE)
+EOD_REVIEW_MAX_PER_CYCLE = _int('eod_review_max_per_cycle')
+# LEAVE ONE SLOT. `run()` now spawns price-triggered reviews first, which is
+# the ordering half of the fix; this is the capacity half, and both are needed
+# because the sweep and the price review share one pool. At the full deferrable
+# cap a book of quiet positions takes every slot, and the adverse move that
+# actually needed an agent is refused — with `record_spawn_refused` correctly
+# NOT raising an alarm, because the budget was working as designed.
+_eod_cap_max = max(1, DEFERRABLE_AGENT_CAP - 1)
+if EOD_REVIEW_MAX_PER_CYCLE > _eod_cap_max:
+    logger.warning('eod_review_max_per_cycle=%d would take every deferrable '
+                   'agent slot (cap %d) and starve a price-triggered review '
+                   'in the same cycle — clamped to %d.',
+                   EOD_REVIEW_MAX_PER_CYCLE, DEFERRABLE_AGENT_CAP,
+                   _eod_cap_max)
+    EOD_REVIEW_MAX_PER_CYCLE = _eod_cap_max
+
+
+def eod_review_state_line() -> tuple:
+    """(log level, message) for where the daily sweep resolved.
+
+    A pure function, and a LINE AT STARTUP, for the same reason
+    `vet_state_line` is both: this switch decides whether every open position
+    gets looked at once a day, and the disabled state is indistinguishable from
+    a healthy quiet one in every log the box writes.
+    """
+    src = ('the ZEBRA_EOD_REVIEW_ENABLED env var' if _eod_env
+           else 'config (zebra_config.defaults.json <- zebra_config.json)')
+    if not EOD_REVIEW_ENABLED:
+        return 'warning', (
+            'Daily EOD position sweep DISABLED (resolved from %s). Open '
+            'positions get NO standing news check; only price and calendar '
+            'triggers can flag a review.' % src)
+    return 'info', (
+        'Daily EOD position sweep ENABLED (resolved from %s): %02d:%02d-'
+        '%02d:%02d IST, model=%s, max %d scan spawn(s)/cycle (deferrable cap '
+        '%d).' % (src, EOD_REVIEW_START[0], EOD_REVIEW_START[1],
+                  EOD_REVIEW_LAST_REQUEST[0], EOD_REVIEW_LAST_REQUEST[1],
+                  EOD_REVIEW_MODEL, EOD_REVIEW_MAX_PER_CYCLE,
+                  DEFERRABLE_AGENT_CAP))
+
+# The banner is LOGGED further down, after the market-hours block clamps the
+# request window to the close — a startup line that reports a window the code
+# has since narrowed is worse than no line at all.
 EVENT_FILE = LOG_DIR / 'event_calendar.json'
 EVENT_LOCK = LOG_DIR / 'event_calendar.lock'
 # Sonnet, not Fable: this is routine fact-collection, not a judgement call.
@@ -1545,6 +1743,39 @@ def is_trend_aligned(direction: str, st_direction: str) -> bool:
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
+
+# The daily sweep's request window must END INSIDE THE SESSION. Checked here
+# rather than beside the other EOD keys because this is where MARKET_CLOSE is
+# defined, and a second copy of 15:30 is exactly the drift this block exists to
+# prevent.
+#
+# `monitor._is_market_open` stops the cycle after MARKET_CLOSE, so a
+# `eod_review_last_request` of "15:40" arms a window no cycle ever reaches:
+# every scan after 15:30 is neither requested nor delivered, the config reads
+# healthy, and the only symptom is positions quietly going unscanned. Same
+# failure shape as the empty window above, one bound further out.
+if EOD_REVIEW_LAST_REQUEST > MARKET_CLOSE:
+    logger.error('eod_review_last_request %02d:%02d is after the %02d:%02d '
+                 'close — the monitor runs no cycle there, so scans requested '
+                 'in that window would never be requested OR delivered. '
+                 'Clamped to the close; pick a time that leaves at least one '
+                 'cycle for the agent to answer in.',
+                 EOD_REVIEW_LAST_REQUEST[0], EOD_REVIEW_LAST_REQUEST[1],
+                 MARKET_CLOSE[0], MARKET_CLOSE[1])
+    EOD_REVIEW_LAST_REQUEST = MARKET_CLOSE
+if EOD_REVIEW_START > EOD_REVIEW_LAST_REQUEST:
+    # Only reachable when the clamp above moved the end back past a start that
+    # was itself outside the session. Re-asserted rather than assumed: the
+    # empty-window guard ran earlier, on the values BEFORE this clamp, and a
+    # start after the close is the same silent no-op it exists to refuse.
+    logger.error('eod_review_start %02d:%02d is outside the session — the '
+                 'daily sweep would never fire. Clamped to %02d:%02d.',
+                 EOD_REVIEW_START[0], EOD_REVIEW_START[1],
+                 EOD_REVIEW_LAST_REQUEST[0], EOD_REVIEW_LAST_REQUEST[1])
+    EOD_REVIEW_START = EOD_REVIEW_LAST_REQUEST
+
+_eod_level, _eod_msg = eod_review_state_line()
+getattr(logger, _eod_level)('%s', _eod_msg)
 
 # ── Quote-reliability guards (2026-07-24 NHPC false DEBIT-SL incident) ──────
 # The DEBIT-SL is a VALUE trigger (structure mid <= 50% of entry debit); a

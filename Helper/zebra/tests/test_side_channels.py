@@ -40,6 +40,13 @@ def paths(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, 'EVENT_FILE', tmp_path / 'events.json')
     monkeypatch.setattr(cfg, 'EVENT_LOCK', tmp_path / 'events.lock')
     monkeypatch.setattr(cfg, 'VET_ENABLED', True)
+    # PIN THE REVIEW CLOCK. Same class as conftest's `_value_triggers_awake`:
+    # `review` now carries a time-of-day rule (the daily EOD sweep flags every
+    # open position once the IST clock passes 15:00), so a suite that reads the
+    # wall clock changes answer at 15:00 IST. TODAY is midnight, before the
+    # sweep window — the tests below are about the PRICE-triggered path, and
+    # `test_review_eod_scan.py` pins the sweep itself with explicit times.
+    monkeypatch.setattr(review, '_now', lambda: TODAY)
     return tmp_path
 
 
@@ -103,6 +110,67 @@ def test_upcoming_filters_by_symbol_but_keeps_market_events(paths):
 def test_past_events_are_not_upcoming(paths):
     events.replace([{'date': '2026-08-01', 'type': 'budget', 'title': 'past'}])
     assert events.upcoming(None, today=TODAY.date()) == []
+
+
+# ── monthly_update, and scope by row rather than by type (2026-09-04) ────
+# #472 ANGELONE gapped -65.8% overnight on a monthly business update. There was
+# no type for that class, so the events agent never looked for one.
+def test_a_monthly_update_validates_and_is_returned_by_upcoming(paths):
+    doc = events.replace([
+        {'date': '2026-08-13', 'type': 'monthly_update', 'symbol': 'ANGELONE',
+         'title': 'August business update (est. from Jun/Jul pattern)',
+         'confidence': 0.6},
+    ])
+    assert len(doc['events']) == 1
+    got = events.upcoming('ANGELONE', within_days=10, today=TODAY.date())
+    assert [(e['type'], e['days_away']) for e in got] == [('monthly_update', 2)]
+
+
+@pytest.mark.parametrize('etype', ['other', 'expiry'])
+def test_a_symbol_less_row_of_an_either_scope_type_reaches_every_symbol(paths,
+                                                                        etype):
+    """The installer used to drop these, and the agent said so four times."""
+    doc = events.replace([{'date': '2026-08-13', 'type': etype,
+                           'title': 'Nifty 50 reconstitution'}])
+    assert doc['events'][0]['symbol'] is None
+    assert events.is_market_scope(doc['events'][0]) is True
+    for sym in ('TESTCO', 'ANGELONE'):
+        got = events.upcoming(sym, within_days=10, today=TODAY.date())
+        assert [e['type'] for e in got] == [etype]
+
+
+@pytest.mark.parametrize('etype', ['other', 'expiry'])
+def test_the_same_type_WITH_a_symbol_reaches_only_that_symbol(paths, etype):
+    """Scope is a property of the ROW, not of the type: an OFS in one name
+    must not be broadcast to every open position."""
+    events.replace([{'date': '2026-08-13', 'type': etype, 'symbol': 'TESTCO',
+                     'title': 'OFS opens'}])
+    assert events.is_market_scope({'type': etype, 'symbol': 'TESTCO'}) is False
+    assert events.upcoming('TESTCO', within_days=10, today=TODAY.date())
+    assert events.upcoming('OTHER', within_days=10, today=TODAY.date()) == []
+
+
+def test_a_per_stock_row_with_no_symbol_is_still_dropped(paths):
+    """Widening scope must not widen it to types that name one company."""
+    events.replace([{'date': '2026-08-13', 'type': 'other', 'title': 'keeps'}])
+    with pytest.raises(ValueError):
+        events.replace([{'date': '2026-08-13', 'type': 'monthly_update',
+                         'title': 'no symbol'}])
+    assert len(events.load()['events']) == 1           # previous survives
+
+
+def test_a_monthly_update_two_days_out_flags_a_review(store):
+    """End to end on a pinned clock: installed row -> upcoming() -> the
+    pre-filter that decides whether an agent looks at the position at all."""
+    events.replace([
+        {'date': '2026-08-13', 'type': 'monthly_update', 'symbol': 'TESTCO',
+         'title': 'August business update', 'confidence': 0.6},
+    ])
+    evts = events.upcoming('TESTCO', today=TODAY.date())
+    needed, why = review.needs_review(store.find(1), 96.0, evts=evts,
+                                      now=TODAY)
+    assert needed
+    assert 'monthly_update in 2d' in why
 
 
 def test_staleness_drives_the_refresh(paths):
@@ -408,8 +476,12 @@ def test_a_dead_review_agent_does_not_respawn_all_day(store, monkeypatch,
     assert len(spawns) == 1
     # The agent dies. Its deadline lapses; the flagging condition still stands.
     with store._mutate():
+        # Lapsed against the PINNED clock, not the host's: the point of the
+        # test is the daily cap holding after the deadline passes, and reading
+        # a real `datetime.now()` here would put the deadline in the future
+        # and let the in-flight guard pass the test for the wrong reason.
         store.find(1)['review']['deadline'] = (
-            datetime.now() - timedelta(hours=1)).isoformat()
+            TODAY - timedelta(hours=1)).isoformat()
     for _ in range(3):
         review.run(store, {'TESTCO': 96.0})
     assert len(spawns) == 1, "dead review agent respawned %d times" % len(spawns)
