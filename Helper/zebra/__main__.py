@@ -1252,6 +1252,90 @@ def _trade_cost(trade: dict):
         return 0.0, 'uncostable'
 
 
+def cmd_spotstop(args):
+    """What an adverse-spot stop WOULD have done. It is armed by nothing.
+
+    `spot_sl_enabled` is False and this command does not change that. Its job
+    is to answer one question the cohort cannot yet answer: does the rule fire
+    correctly often enough to pay for itself?
+
+        one TRUE stop saves  ~25.6 points of debit
+        one FALSE stop costs ~60.5 (the forgone win plus the booked stop)
+        => it must be right ~70% of the time merely to break even
+
+    So the denominator is FIRINGS, not trades, and the number to watch is the
+    accuracy column against that bar. Five of five is not evidence: the 95%
+    lower bound on 5/5 is 54.9%, below the bar. Ten straight correct firings
+    with none false is the fastest a green light can arrive.
+
+    GAPS ARE COUNTED SEPARATELY and are not clean firings. A breach first seen
+    at a session's first poll is one the stop did not catch at its level — it
+    booked wherever the gap landed. Two of the cohort's five were gaps, and
+    folding them in is how a stop flatters itself.
+    """
+    from zebra import spot_shadow as ss
+    from .trade_store import get_store, in_cohort
+
+    store = get_store()
+    trades = [t for t in store.load_trades()
+              if in_cohort(t) and t.get(ss.FIELD)]
+    if not getattr(args, 'all', False):
+        trades = [t for t in trades if t.get('status') == 'exited']
+    if not trades:
+        print()
+        print('No shadowed positions yet. The shadow starts accruing on the '
+              'next poll after deploy; nothing before it can be back-filled, '
+              'because it needs the 5-minute spot path.')
+        print()
+        return
+
+    print()
+    print('ADVERSE-SPOT STOP — SHADOW ONLY. spot_sl_enabled is False.')
+    print()
+    hdr = (f"{'id':>4} {'stock':<12}{'d':<3}{'net%':>7}{'res':<5}{'MAE%':>7}"
+           + ''.join(f"{('b%g' % t):>18}" for t in ss.THRESHOLDS))
+    print(hdr)
+    print('-' * len(hdr))
+    fired = {t: {'true': 0, 'false': 0, 'gap': 0} for t in ss.THRESHOLDS}
+    for t in sorted(trades, key=lambda x: x['id']):
+        sh = t[ss.FIELD]
+        net = t.get('pnl_net')
+        win = None if net is None else net > 0
+        row = (f"{t['id']:>4} {t.get('stock', ''):<12}"
+               f"{t.get('direction', ''):<3}"
+               f"{(t.get('pnl_net_pct') or 0):>7.1f}"
+               f"{('WIN' if win else 'LOSS' if win is not None else 'OPEN'):<5}"
+               f"{sh.get('mae_pct', 0):>7.2f}")
+        for thr in ss.THRESHOLDS:
+            b = sh.get(ss._key(thr))
+            if not b:
+                row += f"{'-':>18}"
+                continue
+            tag = 'GAP' if b.get('gap') else ('ok' if b.get('q') == 'ok'
+                                              else 'dark')
+            row += f"{('%.2f%% %s' % (b['adverse_pct'], tag)):>18}"
+            if win is None:
+                continue
+            fired[thr]['gap'] += bool(b.get('gap'))
+            fired[thr]['false' if win else 'true'] += 1
+        print(row)
+
+    print()
+    print(f"{'threshold':>10}{'firings':>9}{'true':>6}{'FALSE':>7}"
+          f"{'accuracy':>10}{'of which gaps':>15}")
+    for thr in ss.THRESHOLDS:
+        f = fired[thr]
+        n = f['true'] + f['false']
+        acc = '-' if not n else f"{f['true'] / n * 100:.0f}%"
+        print(f"{thr:>10.1f}{n:>9}{f['true']:>6}{f['false']:>7}{acc:>10}"
+              f"{f['gap']:>15}")
+    print()
+    print('A firing must be right ~70% of the time to break even at 1.5% and')
+    print('~78% at 2.0%. Judge the accuracy column against THAT, not against')
+    print('the P&L — and treat a GAP as a firing the rule did not earn.')
+    print()
+
+
 def cmd_depth(args):
     """Report the depth this book has actually observed at the touch.
 
@@ -1925,6 +2009,14 @@ def main():
     p_dep.add_argument('--all', action='store_true',
                        help='include CLOSED positions (default: open only)')
     p_dep.set_defaults(func=cmd_depth)
+
+    p_ssh = sub.add_parser(
+        'spotstop',
+        help='Adverse-spot stop, SHADOWED — the firing count, not a switch')
+    p_ssh.add_argument('--all', action='store_true',
+                       help='include OPEN positions (default: closed only, '
+                            'because an open one has no outcome to score)')
+    p_ssh.set_defaults(func=cmd_spotstop)
 
     p_sts = sub.add_parser('status', help='Dashboard')
     p_sts.set_defaults(func=cmd_status)

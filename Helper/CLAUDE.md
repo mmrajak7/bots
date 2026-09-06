@@ -462,6 +462,38 @@ Full playbook: `docs/BCS_PLAYBOOK.md`
 > run to the TIME exit, so the closed book still flatters the open one — but
 > the FACT it rested on has changed.
 >
+> ## ⚠ RE-MARKED 2026-09-06: A THIRD OF THIS BOOK WAS PRICED AT THE CLOSE
+>
+> `monitor._is_market_open` tested `(h, m) <= MARKET_CLOSE`, so the 15:30 cron
+> cycle read as OPEN and polled the **closing auction print**. Three positions
+> booked `paper:tp` on it — TMPV #423 15:30:28, GMRAIRPORT #455 15:30:48,
+> ADANIGREEN #471 15:31:08, all 2026-08-31. That one print moved TMPV −3.01%,
+> SBICARD −3.13%, GMRAIRPORT −1.97%, JINDALSTEL +2.95% and ADANIGREEN −3.80%
+> while COALINDIA and SAGILITY sat flat, against a median 5-minute move of
+> **0.062%** across all 9,255 other polls on record. TMPV's book had not even
+> repriced: long 320 PE bid 8.90 against spot 308.85 is 2.25 BELOW intrinsic.
+> No live order fills there.
+>
+> `monitor._exits_executable` now refuses to BOOK at or after the close, while
+> measurement (POLL line, peak, depth, spot shadow) keeps accruing — the
+> closing observation is the session's close and it is the evidence record.
+> `python -m zebra.remark_close_print_exits` repaired the rows, using the
+> store's own `_apply_exit` rather than a second copy of the arithmetic.
+>
+> | | before | after |
+> |---|---|---|
+> | record | 12W / 5L | **11W / 6L** |
+> | gross | Rs 20,234 | **Rs 14,364** |
+> | net | Rs 17,481 | **Rs 11,631** |
+> | payoff | 0.70 | **0.79** |
+> | break-even WR | 58.7% | **55.8%** |
+>
+> The payoff reads BETTER only because TMPV flips from a Rs 24 win to a Rs 80
+> loss and drags the loser average toward zero. **Any number quoted from this
+> book before 2026-09-06 is overstated by ~Rs 5,850 and one win.** Run the
+> re-mark on every replica — it is idempotent, and a correction applied on one
+> box never reaches the other, because the store merges by VERSION.
+>
 > **CORRECTED 2026-09-03: the stops were NOT booked at mid.** An earlier
 > version of this paragraph said they were, and that "where a stop FILLS
 > remains unmeasured". Checked against the stored `exit_legs` on all 15 cohort
@@ -533,11 +565,12 @@ never alerted with a warning nobody reads.
 |------|-----------|-------|-----------------|
 | OI both legs | >= 5,000 | — | Was a soft warning. Now hard: on a thin book the stop does not fill where it is set. OI-flagged trades overshot the -50% trigger by -22.0 pts (realised -72.0%) vs -2.7 pts on clean books. COCHINSHIP collapsed 2.18 -> 0.18 in one session while spot moved the RIGHT way; NHPC cost real money the same way. Unknown OI fails CLOSED. |
 | debit / width | <= 45% | **MID** | Not the manual 30/35%: the ST-magnet pins width at ~3.8% of spot, so d/w is the market's own probability quote rather than a width you chose. Past ~45% the payoff is priced out — that band ran PF 0.24 while still winning 50% of the time, a payoff problem not a hit-rate one. Gates 1 & 2 together rejected 32% of the sample, and that third ran 37.5% WR / -22.9% RoC / PF 0.27. **Evaluated on the MID basis because that is what it was fitted on** — no historical record persisted its entry books, so it cannot be re-derived on the fill basis. |
+| gain at TP | MEASURED, not enforced | — | `pen * (k/(d/w) - 1)`, k=0.55. **Penetration-aware since 2026-09-06**: the old `k x width` was a pure function of d/w and blind to WHERE the TP sits, so it was optimistic on exactly the trades it exists to catch. `tp_penetration` is stamped on the record — without it a stored projection cannot be re-derived. |
 | entry cost / max gain | <= 15% | fill vs mid | Added 2026-08-12 with fill pricing. What the book charges just to open. **UNCALIBRATED — reasoned, not fitted.** Replaces the per-leg rupee bid-ask cap (below); denominated in the payoff, which is the same logic the d/w gate uses. Review once ~30 fill-basis records exist. |
 | Bid-ask per leg | **REMOVED** | — | Fired on 17 of 25 closed shadows (68%) and carried no signal at all: 58.8% WR flagged vs 62.5% clean. Its only real effect was training the reader to ignore the warning marker, which is how the OI flag on COCHINSHIP got waved through. The measurement still ships as `short_spread_pct`. |
 | debit floor | **NONE, ever** | — | Cheap spreads are the high-payoff tail (avg win +127%). Power-law rule: never cap the upside. |
 | DTE | first expiry 15-45 | — | Takes the first expiry >= 15 DTE, so entries routinely sit below the manual 20-30 band. **45 (owner decision, 2026-08-27; both sources now agree).** 55 had drifted into the tracked config — snapshotted from the live overlay by the config-split commit `7d1b107`, never chosen. No cohort trade ever entered above 41 DTE, so the two values never differed in effect. |
-| Short strike | nearest the ST target | — | Not a % band. At least one strike beyond ATM so the spread always has width. |
+| Short strike | nearest the **resolved TP** | — | Not a % band. At least one strike beyond ATM so the spread always has width. **Changed 2026-09-06:** it was the raw ST line, while the swing shortening moved only the TP — so on a swing signal the position could never reach its own short leg (WAAREEENER #449 exited 63 pts short of it, +19.7%; LICHSGFIN #439 +14.4%, the two smallest wins). `_rebuild_against_resolved_tp` re-picks against the target we will actually exit at and **SUPPRESSES the signal** if that pair fails any gate or its own breakeven — the ST-line pair is not a fallback, it is the construction this replaces. |
 
 `_leg_reliable` (leg width <= 25% of mid) is **not** a tradeability gate — it
 is a garbage-print detector shared with the live monitor's valuation path.
@@ -844,6 +877,56 @@ unreliable book, or a refused quote all defer. The deferred close RELEASES its
 consume-once flag so the exit can fire again — otherwise the exit is announced
 on Telegram, never booked, and that exit kind is disarmed for good. TIME is the
 exception: its alert is a nag about the calendar, not a claim about a price.
+
+### Nothing is executable at or after the close (2026-09-06)
+
+`_exits_executable` — the mirror of the open buffer, and there for the same
+reason: **a print the engine can see is not a price it can trade at.** At and
+after `MARKET_CLOSE` the whole exit cascade is skipped and the TP latch will
+not even arm, while the POLL line, the peak, the depth sample and the spot
+shadow all keep accruing. Measurement is not a decision, and the closing
+observation is the session's close — it is the evidence record.
+
+Read the incident in the cohort-scope box above: it cost a third of the paper
+book. It is NOT the same question as `_is_market_open`, which decides whether
+to run the cycle at all; the 15:30 cycle still has real work to do.
+
+### Spot stop — SHADOWED, still not armed (2026-09-06)
+
+`spot_sl_enabled` is **False and stays False.** `zebra/spot_shadow.py` records,
+per position, the adverse excursion and the first breach at **1.5 / 2.0 / 3.0%**
+— when, at what spot, at what value, and **whether it landed on the session's
+first poll**. Read it with **`python -m zebra spotstop`**.
+
+Why measure rather than flip. The replay is genuinely striking — on the cohort
+a 1.5% stop cut 0 of 12 winners, caught 5 of 5 losers and took the payoff from
+0.79 to 1.44 — but the arithmetic says that is not enough:
+
+```
+one TRUE  stop SAVES ~25.6 points of debit
+one FALSE stop COSTS ~60.5 (the forgone win plus the booked stop)
+=> the rule must be right ~70% of the time at 1.5%, ~78% at 2.0%, to break even
+```
+
+5 of 5 gives a 95% lower bound of **54.9%** — below the bar. **The denominator
+is FIRINGS, not trades**, and ten consecutive correct firings with none false
+is the fastest a green light can arrive.
+
+Three things that must not be forgotten when reading the count:
+
+- **A GAP is not a stop.** A breach first seen at a session's first poll is one
+  the rule did not catch at its level — it booked wherever the gap landed. Two
+  of the cohort's five were gaps. The shadow flags them separately.
+- **The 5-minute sampling UNDERSTATES true MAE** (median move 0.062%, p95
+  0.32%). Two winners sit within one p95 move of the 1.5% line, so "zero
+  overlap" is about 0.4% wide.
+- **#469 SAGILITY is the live refutation candidate** — MAE 2.73%, still open.
+  A winner with MAE > 2% is the observation that breaks this.
+
+The 147-record decision this appears to contradict was measured on **daily
+candle lows**, not 5-minute poll spot, and daily lows are systematically
+deeper. The two numbers are not comparable, so the contradiction is not yet
+established either. One instrument, measured forward, is the way out.
 
 ### Spot-based stops — VETO, never TRIGGER (measured 2026-08-12)
 
@@ -1469,6 +1552,9 @@ python -m zebra status        # dashboard
 python -m zebra list [--status STATUS]
 python -m zebra analyze SYMBOL --direction CE  # manual strike picker
 python -m zebra quote ID      # live re-quote of a signal/position (read-only, JSON)
+python -m zebra depth         # depth at the touch — the lot-scaling evidence
+python -m zebra spotstop      # adverse-spot stop, SHADOWED — the firing count
+python -m zebra.remark_close_print_exits [--apply]   # repair closing-print exits
 python -m zebra trigger ID    # force alert on a watching signal
 python -m zebra enter ID --pair K_L/K_S --debit X --lots N --expiry YYYY-MM-DD
 python -m zebra close ID --exit-debit X --reason tp

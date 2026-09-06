@@ -35,9 +35,20 @@ logger = logging.getLogger(__name__)
 # the batching removed.
 # `exit_depth` joined them on 2026-08-30: the same cadence (once per open
 # position per poll) and the same reason for riding this write rather than
-# taking one of its own.
+# taking one of its own. `spot_shadow` joined on 2026-09-06 on the same
+# footing — see zebra/spot_shadow.py.
+#
+# ADDING ONE MEANS ADDING IT TWICE. `_UNVERSIONED_FIELDS` below is the OTHER
+# list, the one `_only_unversioned` uses to decide whether two replicas
+# disagreeing on a field is a split brain or just advisory state. Omitting a
+# field there is what produced the false MERGE CONFLICT on 2026-09-01: record
+# #454 sat at version 15 on both replicas and the two undeclared
+# `debit_sl_confirm*` keys dragged the three exempt `corrob_*` ones into a
+# CRITICAL log line and a Telegram, for a book that was working correctly.
+# This one is derived from that set rather than repeated, so the mistake is
+# not available here.
 _BATCHED_POLL_FIELDS = frozenset({'corrob_spot', 'corrob_value', 'corrob_t',
-                                  'exit_depth'})
+                                  'exit_depth', 'spot_shadow'})
 
 #: EVERY field this store writes LOCAL-ONLY and WITHOUT bumping `version`.
 #:
@@ -1171,8 +1182,12 @@ class ZebraStore:
             'proj_gain_at_tp_pct': bcs.get('proj_gain_at_tp_pct'),
             'tp_value_frac_of_width_k': bcs.get('tp_value_frac_of_width_k'),
             'min_gain_at_tp_pct_at_entry': bcs.get('min_gain_at_tp_pct_at_entry'),
+            # The third input to the same flag, added 2026-09-06 with the
+            # penetration model. Same argument as k: without it, a row cannot
+            # be re-derived, because the term that SCALES k did not travel.
+            'tp_penetration': bcs.get('tp_penetration'),
             'would_block_on_gain_at_tp': bcs.get('would_block_on_gain_at_tp'),
-            # The alternative pair a swing-shortened target would have picked.
+            # The pair that was NOT traded, for comparison at exit.
             # NOT recomputable later at any price — an option book cannot be
             # reconstructed after the fact, which is the same reason `exit_legs`
             # is persisted. None on the great majority of signals (no swing).

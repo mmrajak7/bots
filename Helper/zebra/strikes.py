@@ -665,7 +665,48 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     # out. Recorded here so ~30 signals of evidence accrue; it blocks nothing.
     # See cfg.BCS_MIN_GAIN_AT_TP_PCT for why enforcing it today would be
     # premature (3 of 19 cohort entries clear it).
-    proj_value_at_tp = round(cfg.BCS_TP_VALUE_FRAC_OF_WIDTH * width, 2)
+    #
+    # PENETRATION-AWARE since 2026-09-06. `k * width` is a pure function of
+    # d/w and blind to WHERE the target sits in the spread, so it was
+    # systematically optimistic on exactly the trades the gate exists to
+    # catch. Model:
+    #
+    #     V/w = d/w + pen * (k - d/w),   pen = (target - K_long)/width, [0,1]
+    #
+    # i.e. at pen=0 the spread is worth what you paid (spot has gone nowhere)
+    # and at pen=1 it is worth the calibrated k. That makes the projected gain
+    # exactly `pen * (k/(d/w) - 1)` — the OLD formula scaled by penetration,
+    # and identical to it at pen=1, which is where k was fitted.
+    #
+    # Checked against the 12 cohort TPs (with the three post-close bookings
+    # re-marked at their last executable poll): mean abs error 0.068 of width
+    # against 0.082 for the flat model, bias -0.002 against +0.020. The
+    # overall gain is modest and the improvement is CONCENTRATED where the
+    # gate needs it — LICHSGFIN #439 (pen 0.59) err +0.032 vs flat +0.092,
+    # WAAREEENER #449 (pen 0.39) +0.002 vs flat +0.115. Those two are the
+    # smallest wins in the book.
+    #
+    # `_rebuild_against_resolved_tp` now pins the short strike to the resolved
+    # target, so pen should sit near 1 on new entries and this correction
+    # should rarely bite. It is kept because "should" is not "does": the
+    # nearest strike still lands either side of the target, and a projection
+    # that silently assumes its own fix worked is how the last one went wrong.
+    pen = None
+    try:
+        if target_spot is not None and width:
+            _sign = 1.0 if direction == 'CE' else -1.0
+            pen = _sign * (float(target_spot) - float(atm_strike)) / float(width)
+            pen = max(0.0, min(1.0, pen))
+    except (TypeError, ValueError, ZeroDivisionError):
+        pen = None
+    # Unknown penetration falls back to the flat model rather than to 0. A 0
+    # would read as "this projects a -100% gain" and would_block every signal
+    # whose target could not be parsed — the loudest possible answer to the
+    # least informative input.
+    _dw = debit / width
+    proj_value_at_tp = round(
+        width * (_dw + (1.0 if pen is None else pen)
+                 * (cfg.BCS_TP_VALUE_FRAC_OF_WIDTH - _dw)), 2)
     # No `else 999.0` sentinel. `debit <= 0` already returned an error ~100
     # lines up, so that branch was unreachable -- and had code motion ever
     # revived it, 999.0 reads as a +999% projected gain and sets
@@ -738,6 +779,13 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
         # prevent.
         'tp_value_frac_of_width_k': cfg.BCS_TP_VALUE_FRAC_OF_WIDTH,
         'min_gain_at_tp_pct_at_entry': cfg.BCS_MIN_GAIN_AT_TP_PCT,
+        # THE THIRD input, added with the penetration model. Without it a
+        # stored `proj_gain_at_tp_pct` cannot be re-derived at all: k and the
+        # floor travel, but the term that scales them did not, so every row
+        # written under the flat model reads as pen=1 whether it was or not.
+        # None means the target could not be parsed and the flat model was
+        # used — recorded as None rather than 1.0 so the two are not confused.
+        'tp_penetration': None if pen is None else round(pen, 3),
         'would_block_on_gain_at_tp': would_block_on_gain_at_tp,
         'lot_size': lot_size,
         'warnings': warnings,

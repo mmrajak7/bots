@@ -78,6 +78,11 @@ def _bcs(**over):
         'proj_gain_at_tp_pct': 120.0,
         'tp_value_frac_of_width_k': 0.55,
         'min_gain_at_tp_pct_at_entry': 50.0,
+        # The THIRD input to the flag, added 2026-09-06 with the penetration
+        # model. Without it a stored projection cannot be re-derived at all:
+        # k and the floor travel, but the term that SCALES them did not, so
+        # every row would read as pen=1 whether it was or not.
+        'tp_penetration': 0.85,
         'would_block_on_gain_at_tp': False,
         'swing_shadow': dict(SHADOW),
     }
@@ -87,6 +92,7 @@ def _bcs(**over):
 
 MEASUREMENT_KEYS = ('proj_value_at_tp', 'proj_gain_at_tp_pct',
                     'tp_value_frac_of_width_k', 'min_gain_at_tp_pct_at_entry',
+                    'tp_penetration',
                     'would_block_on_gain_at_tp', 'swing_shadow')
 
 
@@ -102,6 +108,7 @@ def test_the_measurements_actually_reach_the_record(store):
         'result away: %s' % missing)
     assert t['proj_gain_at_tp_pct'] == 120.0
     assert t['would_block_on_gain_at_tp'] is False
+    assert t['tp_penetration'] == 0.85
 
 
 def test_the_swing_shadow_survives_whole(store):

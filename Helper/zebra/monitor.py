@@ -44,6 +44,7 @@ from . import outcomes as outcomes_mod
 from . import postmortem as postmortem_mod
 from . import review as review_mod
 from common import nse_holidays
+from . import spot_shadow
 from . import strikes as strikes_mod
 from . import vet as vet_mod
 from .scanner import _get_kite, get_ltp, compute_st_for_stock, validate_and_add
@@ -1766,77 +1767,131 @@ def _build_bcs(kite, trade: dict, analysis: dict,
 
 
 
-def _swing_target_shadow(kite, trade, analysis, price, traded, swing):
-    """SHADOW ONLY. What the pair would have been if the short strike had been
-    chosen against the SHORTENED target instead of the ST line.
+def _rebuild_against_resolved_tp(kite, trade, analysis, price, bcs, swing):
+    """Re-pick the SHORT STRIKE against the target the position will actually
+    be exited at. Returns the pair to trade, or None to suppress the signal.
 
-    THE MISMATCH THIS MEASURES (found 2026-09-02). `_build_bcs` calls
-    `analyze_bcs(target_spot=trade['st_value'])` — the ST line — and the swing
-    shortening runs AFTERWARDS, moving only the TP. So when a swing level
-    applies, the short strike sits at a price the position will never be
-    allowed to reach: WAAREEENER #449 bought 100 points of width out to 2500,
-    took its TP at the 2561 swing, and exited 63 points short of its own short
-    leg — 43.5% of width, +19.7%. LICHSGFIN #439 the same shape, +14.4%. The
-    nine `st_line` TPs, where target and strike agree, ran a median +44.5%.
+    THE MISMATCH THIS CLOSES (measured 2026-09-02, fixed 2026-09-06).
+    `_build_bcs` called `analyze_bcs(target_spot=trade['st_value'])` — the ST
+    line — and the swing shortening ran AFTERWARDS, moving only the TP. So when
+    a swing level applied, the short strike sat at a price the position was
+    never allowed to reach. WAAREEENER #449 bought 100 points of width out to
+    2500, took its TP at the 2561 swing, and exited 63 points short of its own
+    short leg: 43.5% of width, +19.7%. LICHSGFIN #439 the same shape, +14.4%.
+    Those are the two smallest wins in the cohort, and the nine `st_line` TPs,
+    where target and strike agree, ran a median +44.5%.
 
-    NOT WIRED INTO THE TRADE. The alternative pair is quoted and stored, never
-    entered — the fix is only obviously right in arithmetic, and a narrower
-    spread reads a HIGHER d/w, so switching today would silently interact with
-    the gates and with `bcs_min_gain_at_tp_pct`. Three swing closes cannot
-    settle that. Stored so the two constructions can be compared at exit on
-    ~10 swing signals.
+    WHY IT SUPPRESSES RATHER THAN FALLING BACK. The narrower spread reads a
+    HIGHER d/w, so it faces the same gates on worse terms, and that is the
+    point rather than a side effect: d/w is the market's own quote for reaching
+    that strike, and a spread priced to the target we actually believe in is
+    the only one whose gates mean anything. Falling back to the ST-line pair
+    would re-enter the exact structure this exists to stop — a spread bought to
+    a level the exit rule forbids. Falling back to the ST-line TP instead would
+    keep a target the chart says has resistance standing in front of it.
+    So: if the honest pair does not qualify, nothing is entered
+    (`feedback_no_rush_to_enter` — a missed entry costs nothing).
 
-    Costs one extra option quote per SWING-SHORTENED signal only — not per
-    poll, not per signal. Never raises: a shadow that fails is a shadow.
+    Breakeven is re-checked against the NEW pair, not the old one. The narrower
+    spread has a smaller debit and therefore a NEARER breakeven, so this can
+    only ever rescue a swing level the wider pair rejected; it is re-run rather
+    than assumed because the direction of that inequality is exactly the kind
+    of thing that stops being true when someone changes the strike rule.
+
+    Never raises into the cycle.
     """
+    tid, stock = trade['id'], trade['stock']
     try:
         tgt = float(swing.get('tp_spot'))
-        atm_strike, atm_quote = analysis.get('atm_strike'), analysis.get('atm_quote')
-        if not tgt or not atm_strike or not atm_quote:
-            return None
+    except (TypeError, ValueError):
+        return bcs
+    try:
         alt = strikes_mod.analyze_bcs(
-            kite, trade['stock'], trade['direction'], price,
-            target_spot=tgt,                      # THE SHORTENED TARGET
-            expiry=analysis['expiry'], atm_strike=atm_strike,
-            atm_quote=atm_quote, lot_size=analysis['lot_size'],
+            kite, stock, trade['direction'], price,
+            target_spot=tgt,                       # THE TARGET WE WILL EXIT AT
+            expiry=analysis['expiry'],
+            atm_strike=analysis.get('atm_strike'),
+            atm_quote=analysis.get('atm_quote'),
+            lot_size=analysis['lot_size'],
         )
     except Exception as e:
-        logger.warning("swing shadow failed for #%d %s: %s",
-                       trade['id'], trade['stock'], e)
+        logger.error("resolved-TP rebuild FAILED for #%d %s: %s — signal "
+                     "suppressed rather than entered on the ST-line pair",
+                     tid, stock, e, exc_info=True)
+        _log_bcs_suppressed(trade, f'resolved-TP rebuild failed: {e}')
         return None
-    # EVERYTHING BELOW RUNS INSIDE THE try TOO. The two logger.info calls and
-    # `float(trade['st_value'])` sat OUTSIDE it, so a malformed record raised
-    # straight into `_enter_as_bcs` -- from a SHADOW, which by definition must
-    # not be able to affect the trade. The docstring said 'never raises';
-    # `test_a_broken_shadow_never_breaks_the_cycle` only covered analyze_bcs
-    # raising INSIDE the try, so the claim outran the test.
+    if alt.get('error'):
+        logger.info(
+            "RESOLVED-TP PAIR REJECTED #%d %s: short strike re-picked against "
+            "the swing target %.2f (was the ST line %.2f, short %g) does not "
+            "qualify — %s. Signal SUPPRESSED; the ST-line pair is not a "
+            "fallback, it is the construction this replaces.",
+            tid, stock, tgt, float(swing.get('st_value') or 0),
+            bcs.get('short_strike'), alt['error'])
+        _log_bcs_suppressed(trade, f'resolved-TP pair rejected: {alt["error"]}')
+        return None
+
+    alt['expiry'] = analysis['expiry']
+    alt['entry_spot'] = price
+    # Re-checked against the pair that will actually be entered.
+    alt['swing_tp'] = _swing_clears_breakeven(trade, alt, swing)
+    if not (alt.get('swing_tp') or {}).get('applied'):
+        # The narrower pair cannot make money at its own target. Suppress for
+        # the same reason as above: the ST-line pair is not a second chance.
+        logger.info(
+            "RESOLVED-TP PAIR BELOW BREAKEVEN #%d %s: swing %.2f does not "
+            "clear the rebuilt pair's breakeven. Signal SUPPRESSED.",
+            tid, stock, tgt)
+        _log_bcs_suppressed(trade, 'resolved-TP pair below its own breakeven')
+        return None
+
+    if alt.get('short_strike') != bcs.get('short_strike'):
+        logger.info(
+            "SHORT STRIKE MOVED #%d %s: %g -> %g (target %.2f, not the ST "
+            "line %.2f). width %g -> %g, debit %g -> %g, d/w %.1f%% -> %.1f%%",
+            tid, stock, bcs.get('short_strike'), alt.get('short_strike'), tgt,
+            float(swing.get('st_value') or 0), bcs.get('width'),
+            alt.get('width'), bcs.get('debit'), alt.get('debit'),
+            bcs.get('debit_to_width_pct') or 0, alt.get('debit_to_width_pct') or 0)
+    # The shadow points the OTHER way now: the retired ST-line construction is
+    # what gets stored, so the two can still be compared at exit. Wrapped
+    # because a shadow must never be able to stop a qualified entry.
     try:
-        return _swing_shadow_report(trade, traded, alt, tgt)
+        alt['swing_shadow'] = _swing_shadow_report(trade, alt, bcs, tgt)
     except Exception as e:
         logger.warning("swing shadow report failed for #%s %s: %s",
                        trade.get('id'), trade.get('stock'), e)
-        return None
+        alt['swing_shadow'] = None
+    return alt
 
 
 def _swing_shadow_report(trade, traded, alt, tgt):
-    """Format and package the shadow result.
+    """Package the pair that was NOT traded, for comparison at exit.
 
-    Split out purely so the whole of it sits inside
-    `_swing_target_shadow`'s exception boundary.
+    The polarity flipped on 2026-09-06. Until then the traded pair was built
+    against the ST line and this reported the shortened-target alternative;
+    now `_rebuild_against_resolved_tp` TRADES the shortened-target pair and
+    this reports the retired ST-line construction. `traded` is whichever pair
+    is going on, `alt` is the one that is not — the stored shape is unchanged
+    so the two constructions stay comparable across the switch.
+
+    Split out so the whole of it sits inside the caller's exception boundary:
+    a shadow that raises would break the cycle it is only supposed to observe.
     """
     if alt.get('error'):
-        logger.info("SWING SHADOW #%d %s: the shortened-target pair would be "
+        logger.info("SWING SHADOW #%d %s: the untraded pair would be "
                     "REJECTED (%s) — traded pair keeps short %g",
                     trade['id'], trade['stock'], alt['error'],
                     traded.get('short_strike', 0))
         return {'error': alt['error'], 'target_spot': tgt}
     same = alt.get('short_strike') == traded.get('short_strike')
     logger.info(
-        "SWING SHADOW #%d %s: traded short %g (vs ST %.2f) d/w %.1f%% | "
-        "shortened-target short %g (vs swing %.2f) d/w %.1f%% | %s",
-        trade['id'], trade['stock'], traded.get('short_strike', 0),
-        float(trade['st_value']), traded.get('debit_to_width_pct', 0),
-        alt.get('short_strike', 0), tgt, alt.get('debit_to_width_pct', 0),
+        "SWING SHADOW #%d %s: traded short %g (vs target %.2f) d/w %.1f%% | "
+        "untraded ST-line short %g (vs ST %.2f) d/w %.1f%% | %s",
+        trade['id'], trade['stock'], traded.get('short_strike', 0), tgt,
+        traded.get('debit_to_width_pct', 0),
+        alt.get('short_strike', 0), float(trade['st_value']),
+        alt.get('debit_to_width_pct', 0),
         'SAME STRIKE' if same else 'DIFFERENT STRIKE')
     return {
         'target_spot': tgt,
@@ -1907,8 +1962,12 @@ def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
                     trade['id'], trade['stock'], s['kind'], s['tp_spot'],
                     s['timeframe'], s['bars_ago'], s['st_value'],
                     s['shortened_by_pct'], s['retained_pct'])
-        bcs['swing_shadow'] = _swing_target_shadow(kite, trade, analysis,
-                                                   price, bcs, s)
+        rebuilt = _rebuild_against_resolved_tp(kite, trade, analysis, price,
+                                               bcs, s)
+        if rebuilt is None:
+            return None
+        bcs = rebuilt
+        s = bcs.get('swing_tp') or {}
     elif s:
         # Found but NOT applied — the level is too close to spot to be worth
         # trading to. TP stays the ST line; the agent still gets told.
@@ -3311,6 +3370,41 @@ def _value_triggers_live(now: Optional[datetime] = None) -> bool:
     return (now - open_dt).total_seconds() >= cfg.VALUE_TRIGGER_OPEN_BUFFER_SEC
 
 
+def _exits_executable(now=None) -> bool:
+    """Could an order actually be filled on this poll?
+
+    False at and after MARKET_CLOSE. The mirror image of the open buffer, and
+    it exists for the same reason: a print the engine can see is not a price
+    it can trade at.
+
+    THE INCIDENT. The cron line is `*/5 9-15`, and `_is_market_open` tests
+    `(h, m) <= MARKET_CLOSE`, so the 15:30 cycle read as open and polled the
+    CLOSING AUCTION print. Three cohort positions booked `paper:tp` on it —
+    TMPV #423 at 15:30:28, GMRAIRPORT #455 at 15:30:48, ADANIGREEN #471 at
+    15:31:08, all 2026-08-31. That print moved TMPV -3.01%, SBICARD -3.13%,
+    GMRAIRPORT -1.97%, JINDALSTEL +2.95% and ADANIGREEN -3.80% in ONE step
+    while COALINDIA and SAGILITY sat flat; the median 5-minute spot move over
+    all 9,255 other polls in the record is 0.062%. TMPV's book had not even
+    repriced — long 320 PE bid 8.90 against spot 308.85 is 2.25 BELOW
+    intrinsic. Re-marking those three at their last executable poll turns the
+    cohort from 12W/5L +Rs 17,481 into 11W/6L +Rs 11,610.
+
+    MEASUREMENT IS NOT GATED. The POLL line, the peak and the depth sample all
+    still accrue on the closing poll — that observation IS the session's close
+    and it is the evidence record (`logs/eod/paths_*.json`). What stops is
+    BOOKING, exactly as with the stand-down.
+
+    Not folded into `_is_market_open`, which answers a different question:
+    whether to run the cycle at all. The 15:30 cycle still has real work.
+
+    RETIRES WHEN: paper stops booking off a poll — i.e. exits are placed as
+    real orders and the fill is the record — at which point the broker refuses
+    the trade instead of this function.
+    """
+    now = now or datetime.now(IST)
+    return (now.hour, now.minute) < cfg.MARKET_CLOSE
+
+
 def _spot_corroborates(store: ZebraStore, trade: dict, spot: float,
                        value: Optional[float], reliable: bool,
                        now: Optional[float] = None) -> tuple:
@@ -4058,6 +4152,15 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     today = datetime.now(IST).date()
     # One store write for the whole cycle's peak tracking — see _flush_mfe.
     pending_mfe: dict = {}
+    # Read ONCE for the whole cycle, not per position: a cycle that straddles
+    # 15:30 must not book some rows and refuse others, which is exactly the
+    # kind of split verdict that makes a log unreadable afterwards.
+    exits_executable = _exits_executable()
+    if not exits_executable:
+        logger.info(
+            "CLOSING POLL: past %02d:%02d — this cycle MEASURES (POLL lines, "
+            "peaks, depth, spot-stop shadow) but books NOTHING",
+            cfg.MARKET_CLOSE[0], cfg.MARKET_CLOSE[1])
     # Once-per-cycle latch for the peer-engine heartbeat check below.
     stood_down = False
     #: Same once-per-cycle discipline as `stood_down`: a fault common
@@ -4201,6 +4304,12 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 ((sq.get('legs') or {}).get('short') or {}).get('bid'),
                 ((sq.get('legs') or {}).get('short') or {}).get('ask'))
 
+            if debit_usable and not exits_executable:
+                # Belt and braces: the cascade below is skipped wholesale, but
+                # a book read off the closing auction must not reach a
+                # valuation path either.
+                debit_usable = False
+
             if debit_usable and not _value_triggers_live():
                 logger.info(
                     "OPEN BUFFER #%d %s: value triggers dark until %ds after the "
@@ -4222,6 +4331,18 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             if dpatch:
                 pending_mfe.setdefault(tid, {}).update(dpatch)
                 trade.update(dpatch)
+
+            # SHADOW, on the same footing and for the same reason: measurement
+            # before any exit branch, folded into the same batched write, never
+            # gating anything. `spot_sl_enabled` is False and stays False until
+            # this count says otherwise — see zebra/spot_shadow.py for the
+            # break-even accuracy the rule has to clear.
+            spatch = spot_shadow.observe(
+                trade, spot, mid, sq['reliable'],
+                datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S'))
+            if spatch:
+                pending_mfe.setdefault(tid, {}).update(spatch)
+                trade.update(spatch)
 
             patch = mfe_mod.compute(trade, spot, mid, sq['reliable'])
             if patch:
@@ -4264,6 +4385,16 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # (`feedback_trigger_is_not_the_fill`).
             tp_hit = (direction == 'CE' and spot >= tp_spot) or \
                      (direction == 'PE' and spot <= tp_spot)
+            # A touch on the CLOSING PRINT is not a touch anyone could have
+            # traded, and the latch is what would carry it into the booking
+            # below. Nothing leaks past today either way: the latch is
+            # same-day, so refusing to arm here costs at most one cycle.
+            if tp_hit and not exits_executable:
+                logger.info(
+                    "TP touched #%d %s at %.2f on the closing print — NOT "
+                    "latched, nothing is executable at or after %02d:%02d",
+                    tid, stock, spot, cfg.MARKET_CLOSE[0], cfg.MARKET_CLOSE[1])
+                tp_hit = False
             latch = tp_latch(trade, tp_hit, spot)
             if latch['patch'] and _exits_external(trade):
                 # The peer engine owns this position's exits AND watches the
@@ -4406,6 +4537,19 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                         logger.warning(
                             "exit-engine heartbeat check failed: %s", e,
                             exc_info=True)
+                continue
+
+            # Nothing is executable at or after the close. Placed HERE, on
+            # the same seam as the stand-down and for the same reason: the
+            # POLL line, the peak, the depth sample and the spot-stop shadow
+            # above are the research record and must keep accruing; what stops
+            # is DECIDING. See `_exits_executable` for the three cohort exits
+            # this was found by.
+            if not exits_executable:
+                logger.info(
+                    "CLOSED-FOR-BOOKING #%d %s: past %02d:%02d, measured but "
+                    "not acted on", tid, stock,
+                    cfg.MARKET_CLOSE[0], cfg.MARKET_CLOSE[1])
                 continue
 
             # NOT stood down, and this record has REAL LEGS. zebra will
