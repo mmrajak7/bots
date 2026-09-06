@@ -280,14 +280,32 @@ def test_the_shortened_target_is_explained_on_the_ticket(tmp_path, monkeypatch):
 
 
 def test_the_swing_lookup_is_wired_into_the_entry_path():
-    """Grep the ENTRY function specifically. A whole-file grep passes on the
-    copy in _vet_context, so the TP could stop being shortened while the test
-    stayed green — the exact shape of every wiring failure in this fleet."""
+    """Grep the PAIR-BUILDING function specifically. A whole-file grep passes
+    on the copy in `_vet_context`, so the TP could stop being shortened while
+    the test stayed green — the exact shape of every wiring failure in this
+    fleet.
+
+    It moved from `_enter_as_bcs` to `_build_bcs` on 2026-09-06. That is the
+    point of the change, not an incidental relocation: the shortening can now
+    move the SHORT STRIKE, and `_enter_as_bcs` runs AFTER the capital gate has
+    sized the pair and after the vetting agent has been shown it under a note
+    reading "this is the pair that would open".
+
+    RETIRES WHEN: the swing target is resolved by the scanner and carried on
+    the record, so no entry-path function looks it up at all.
+    """
     import inspect
     from zebra import monitor
-    src = inspect.getsource(monitor._enter_as_bcs)
+    src = inspect.getsource(monitor._build_bcs)
     assert 'history.swing_tp(' in src, "the entry path no longer looks for a swing"
     assert "bcs['swing_tp']" in src
+    # And it must stay ABOVE capital and the vet, which is the whole reason it
+    # is in this function rather than the one below it.
+    caller = inspect.getsource(monitor.check_watching)
+    assert caller.index('_build_bcs(') < caller.index('_capital_context('), (
+        'the pair is now built after capital has sized it')
+    assert caller.index('_build_bcs(') < caller.index('request_entry_vet('), (
+        'the pair is now built after the vetting agent has been shown one')
 
 
 def test_attraction_is_wired_into_the_vet_context():

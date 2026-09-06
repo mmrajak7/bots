@@ -444,6 +444,63 @@ def _atm_quote(q: dict) -> dict:
             for k in ('bid', 'ask', 'mid', 'oi', 'bid_qty', 'ask_qty')}
 
 
+def tp_penetration(long_strike, short_or_width, target_spot, direction):
+    """How far through the spread does the target sit? [0, 1], or None.
+
+    `short_or_width` is the WIDTH. 1.0 means the target is at or beyond the
+    short strike (the spread fully ITM at the TP); 0 means it is at the long
+    strike, i.e. spot has gone nowhere.
+
+    None when it cannot be computed. Callers must treat None as "unknown" and
+    fall back to the flat model — never to 0, which reads as a -100% projected
+    gain and is the loudest possible answer to the least informative input
+    (`feedback_a_default_that_looks_like_a_value`).
+    """
+    try:
+        if target_spot is None or not short_or_width:
+            return None
+        sign = 1.0 if direction == 'CE' else -1.0
+        pen = sign * (float(target_spot) - float(long_strike)) / float(short_or_width)
+        return max(0.0, min(1.0, pen))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def project_at_tp(debit, width, long_strike, target_spot, direction, k=None):
+    """(value, gain_pct, penetration) this spread is projected to have AT its TP.
+
+    ONE definition, because there are now two callers that must not drift: the
+    measured `would_block_on_gain_at_tp` flag inside `analyze_bcs`, and
+    `monitor._pick_pair_for_resolved_tp`, which uses it to CHOOSE between two
+    candidate pairs. A second copy of this arithmetic is one that a change to k
+    would leave behind (`feedback_copy_pasted_modules_fix_once`).
+
+        V/w = d/w + pen * (k - d/w)   =>   gain = pen * (k/(d/w) - 1)
+
+    At pen=0 the spread is worth what you paid (spot has gone nowhere); at
+    pen=1 it is worth the calibrated k, which is where k was fitted, so this is
+    the OLD flat model scaled by penetration and identical to it there.
+
+    Checked against the 12 cohort TPs (with the three post-close bookings
+    re-marked at their last executable poll): mean abs error 0.068 of width
+    against 0.082 for the flat model, bias -0.002 against +0.020. The overall
+    gain is modest; the improvement is CONCENTRATED where it is needed —
+    LICHSGFIN #439 (pen 0.59) err +0.032 vs flat +0.092, WAAREEENER #449
+    (pen 0.39) +0.002 vs flat +0.115, the two smallest wins in the book.
+
+    IT IS AN ESTIMATE, not a price. It ranks two pairs on the same yardstick;
+    it does not say what either will fill at.
+    """
+    k = cfg.BCS_TP_VALUE_FRAC_OF_WIDTH if k is None else k
+    if not width or not debit:
+        return None, None, None
+    pen = tp_penetration(long_strike, width, target_spot, direction)
+    dw = float(debit) / float(width)
+    value = round(float(width) * (dw + (1.0 if pen is None else pen) * (k - dw)), 2)
+    gain = round((value / float(debit) - 1) * 100, 1)
+    return value, gain, pen
+
+
 def analyze_bcs(kite, stock: str, direction: str, spot: float,
                 target_spot: float, expiry: str,
                 atm_strike: float, atm_quote: dict,
@@ -691,22 +748,12 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     # should rarely bite. It is kept because "should" is not "does": the
     # nearest strike still lands either side of the target, and a projection
     # that silently assumes its own fix worked is how the last one went wrong.
-    pen = None
-    try:
-        if target_spot is not None and width:
-            _sign = 1.0 if direction == 'CE' else -1.0
-            pen = _sign * (float(target_spot) - float(atm_strike)) / float(width)
-            pen = max(0.0, min(1.0, pen))
-    except (TypeError, ValueError, ZeroDivisionError):
-        pen = None
-    # Unknown penetration falls back to the flat model rather than to 0. A 0
-    # would read as "this projects a -100% gain" and would_block every signal
-    # whose target could not be parsed — the loudest possible answer to the
-    # least informative input.
-    _dw = debit / width
-    proj_value_at_tp = round(
-        width * (_dw + (1.0 if pen is None else pen)
-                 * (cfg.BCS_TP_VALUE_FRAC_OF_WIDTH - _dw)), 2)
+    # `project_at_tp` is the single definition, shared with
+    # `monitor._pick_pair_for_resolved_tp`, which ranks two candidate pairs on
+    # exactly this yardstick. Unknown penetration falls back to the flat model
+    # there, never to 0.
+    proj_value_at_tp, _proj_gain, pen = project_at_tp(
+        debit, width, atm_strike, target_spot, direction)
     # No `else 999.0` sentinel. `debit <= 0` already returned an error ~100
     # lines up, so that branch was unreachable -- and had code motion ever
     # revived it, 999.0 reads as a +999% projected gain and sets

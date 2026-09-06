@@ -22,16 +22,33 @@ fitted on 147 pre-cohort records where a 3% stop cut 40% of winners). Those
 records are out of scope by the cohort rule, but they were also measured on
 DAILY CANDLE lows while this is 5-minute poll spot, and daily lows are
 systematically deeper. The two numbers are not comparable, so "the cohort
-contradicts the decision" is not yet established either. One instrument,
-measured forward, is the way out.
+contradicts the decision" is not established either. One instrument, measured
+forward, is the way out.
 
-## What it records
+## Three ways a shadow flatters itself, and what is done about each
 
-Per position, the adverse excursion (MAE) and, for each threshold, the FIRST
-breach: when, at what spot, at what structure value, and whether it landed on
-the session's first poll. That last flag matters more than it looks — a breach
-first seen at the open is a GAP, where the stop books wherever the gap landed
-and not at its level. Two of the five cohort firings were gaps.
+**A price the engine would not have acted on.** The value stored beside a
+breach is only as good as the book it came from. `reliable` off the raw quote
+is NOT enough: by the time the monitor calls this, four separate things may
+have already made that price unusable — the VALUE BOUND clamp (which returns
+0.0 or `width` with `reliable=True`, and is what turns the cohort's overnight
+measure from +1.3% into -12.1%), the 15-minute open buffer, the spot-corrob
+veto, and the closing print. So the caller passes the POST-GATE usability and
+the quality string says which, rather than a bare ok/unusable.
+
+**A gap counted as a stop.** A breach first SEEN at a session's first poll is
+one the rule did not catch at its level — it booked wherever the gap landed.
+Two of the cohort's five firings were gaps. `gap` is therefore derived from the
+CLOCK (inside the open buffer), not from "we have no earlier record", which
+would also fire on a mid-session entry, on the first poll after deploy, and
+after any dropped write — three things that are not gaps at all.
+
+**A one-print stop no armed rule would take.** Every value trigger in this
+engine is debounced (`DEBIT_SL_CONFIRM_POLLS`), and the standing rule is never
+to act on a single top-of-book quote. So a breach records `confirmed_at` on the
+next poll that still holds beyond the threshold, and the reader separates
+one-print firings from confirmed ones. Counting the former would authorise a
+rule nobody would ship.
 
 ## Contract
 
@@ -42,7 +59,7 @@ measurement sitting in the exit path, and a measurement that can throw is a new
 way to fail an exit (`feedback_guard_the_money_system_first`).
 
 SAFE-TO-RERUN: pure function of the record plus this poll; a breach is written
-once and never overwritten, so replaying a session re-derives the same fields.
+once and never re-priced, so replaying a session re-derives the same fields.
 
 RETIRES WHEN: `spot_sl_enabled` is armed on the strength of the count, or the
 count refuses it. Either way the shadow stops being the thing that decides.
@@ -50,7 +67,10 @@ count refuses it. Either way the shadow stops being the thing that decides.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Optional
+
+from . import config as cfg
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +82,10 @@ FIELD = 'spot_shadow'
 THRESHOLDS = (1.5, 2.0, 3.0)
 
 
-def _key(thr: float) -> str:
+def breach_key(thr: float) -> str:
+    """Field name for one threshold's first breach. Public: the reader needs
+    it, and a CLI reaching into a module's private helper is how two spellings
+    of the same key end up in the codebase."""
     return 'b%s' % ('%g' % thr).replace('.', '_')
 
 
@@ -83,14 +106,30 @@ def adverse_pct(trade: dict, spot: float) -> Optional[float]:
         return None
 
 
+def _within_open_buffer(ts: str) -> Optional[bool]:
+    """Is this poll inside the first `VALUE_TRIGGER_OPEN_BUFFER_SEC` of the
+    session? None when the stamp cannot be parsed.
+
+    The same window the value triggers are already dark for, reused rather than
+    re-chosen: a breach the engine could not have acted on and a breach that
+    arrived as a gap are the same fact seen from two sides.
+    """
+    try:
+        t = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+    except (TypeError, ValueError):
+        return None
+    open_h, open_m = cfg.MARKET_OPEN
+    since_open = (t.hour * 3600 + t.minute * 60 + t.second) - (open_h * 3600 + open_m * 60)
+    return 0 <= since_open < cfg.VALUE_TRIGGER_OPEN_BUFFER_SEC
+
+
 def observe(trade: dict, spot: Optional[float], value: Optional[float],
-            reliable: bool, ts: str) -> dict:
+            usable: bool, ts: str, quality: str = '') -> dict:
     """This poll's contribution to the shadow, or `{}` when nothing moved.
 
-    `value` is the structure's fill-basis value and may be None or unreliable —
-    a breach is still RECORDED then, with `q` saying so, because refusing to
-    record it would hide precisely the case where a real stop could not have
-    booked either.
+    `usable` is the caller's POST-GATE verdict on the price, not the raw book's
+    `reliable` flag — see the module docstring. `quality` names the reason when
+    it is False, so the count can be re-run excluding any one cause.
     """
     try:
         if spot is None:
@@ -102,13 +141,12 @@ def observe(trade: dict, spot: Optional[float], value: Optional[float],
         cur = dict(prev) if isinstance(prev, dict) else {}
         changed = False
 
-        # Derived here, not passed in: the caller would have to carry
-        # per-trade session state it has no other use for, and a position
-        # entered mid-session has a different "first poll" from the book's.
-        session = ts[:10]
-        first_poll_of_session = cur.get('last_date') != session
-        if first_poll_of_session:
-            cur['last_date'] = session
+        if 'since' not in cur:
+            # When this record STARTED being shadowed. Anything with a `since`
+            # after its own entry has an unobserved head, so its MAE is a lower
+            # bound and its first breach may already have happened — the reader
+            # marks those PARTIAL rather than counting them.
+            cur['since'] = ts
             changed = True
 
         if adv > float(cur.get('mae_pct', float('-inf'))):
@@ -118,25 +156,36 @@ def observe(trade: dict, spot: Optional[float], value: Optional[float],
             changed = True
 
         for thr in THRESHOLDS:
-            k = _key(thr)
-            if k in cur or adv < thr:
-                # FIRST breach only. A stop fires once; overwriting it with a
-                # later, deeper print would quietly re-price the counterfactual
-                # to something no stop would have got.
-                continue
-            cur[k] = {
-                'at': ts,
-                'spot': round(float(spot), 2),
-                'adverse_pct': round(adv, 3),
-                'value': None if value is None else round(float(value), 2),
-                'q': 'ok' if (value is not None and reliable) else 'unusable',
-                # A breach first SEEN at the session's first poll is a gap: the
-                # stop did not fire at its level, it fired wherever the gap
-                # landed. Counting those as clean firings is how a stop flatters
-                # itself.
-                'gap': bool(first_poll_of_session),
-            }
-            changed = True
+            k = breach_key(thr)
+            b = cur.get(k)
+            if b is None:
+                if adv < thr:
+                    continue
+                gap = _within_open_buffer(ts)
+                cur[k] = {
+                    'at': ts,
+                    'spot': round(float(spot), 2),
+                    'adverse_pct': round(adv, 3),
+                    'value': None if value is None else round(float(value), 2),
+                    'q': 'ok' if usable else (quality or 'unusable'),
+                    # None when the stamp could not be parsed: unknown, which
+                    # the reader must not read as "not a gap".
+                    'gap': gap,
+                    # Set on the NEXT poll that still holds beyond the
+                    # threshold. Absent means one print only — no armed rule
+                    # in this engine would have acted on that.
+                    'confirmed_at': None,
+                }
+                changed = True
+            elif b.get('confirmed_at') is None and adv >= thr \
+                    and b.get('at') != ts:
+                b = dict(b)
+                b['confirmed_at'] = ts
+                cur[k] = b
+                changed = True
+            # A recorded breach is NEVER re-priced. A stop fires once;
+            # overwriting it with a later, deeper print re-prices the
+            # counterfactual to something no stop would have got.
         return {FIELD: cur} if changed else {}
     except Exception as e:                              # never raise into a cycle
         logger.warning("spot shadow failed for #%s: %s", trade.get('id'), e,

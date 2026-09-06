@@ -258,8 +258,14 @@ def test_the_breakeven_guard_is_actually_wired_into_the_entry():
     invoking it."""
     import inspect
     from zebra import monitor
-    src = inspect.getsource(monitor._enter_as_bcs)
-    assert '_swing_clears_breakeven(' in src, \
-        "the breakeven guard is not called from the BCS entry path"
-    assert src.index('history.swing_tp(') < src.index('_swing_clears_breakeven('), \
-        "the guard must run AFTER the lookup it filters"
+    # Moved from `_enter_as_bcs` to `_build_bcs` on 2026-09-06, with the swing
+    # lookup itself — the shortening can now move the SHORT STRIKE, so it has
+    # to happen above the capital gate and above the vet.
+    src = inspect.getsource(monitor._build_bcs)
+    assert '_swing_clears_breakeven(' in src,         "the breakeven guard is not called from the BCS entry path"
+    assert src.index('history.swing_tp(') < src.index('_swing_clears_breakeven('),         "the guard must run AFTER the lookup it filters"
+    # And AGAIN on the pair that is actually entered. The re-picked pair is
+    # narrower and has its own, nearer breakeven; checking only the ST-line
+    # pair would enter a spread that cannot make money at its own target.
+    pick = inspect.getsource(monitor._pick_pair_for_resolved_tp)
+    assert '_swing_clears_breakeven(' in pick,         "the re-picked pair is entered without re-checking its own breakeven"

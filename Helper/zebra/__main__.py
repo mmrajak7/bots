@@ -1259,29 +1259,38 @@ def cmd_spotstop(args):
     is to answer one question the cohort cannot yet answer: does the rule fire
     correctly often enough to pay for itself?
 
-        one TRUE stop saves  ~25.6 points of debit
-        one FALSE stop costs ~60.5 (the forgone win plus the booked stop)
-        => it must be right ~70% of the time merely to break even
+    THE DENOMINATOR IS FIRINGS, NOT TRADES. Five of five is not evidence: the
+    95% lower bound on 5/5 is 54.9%, below the ~70% bar. Ten straight correct
+    firings with none false is the fastest a green light can arrive.
 
-    So the denominator is FIRINGS, not trades, and the number to watch is the
-    accuracy column against that bar. Five of five is not evidence: the 95%
-    lower bound on 5/5 is 54.9%, below the bar. Ten straight correct firings
-    with none false is the fastest a green light can arrive.
+    THREE COLUMNS EXIST TO STOP THE COUNT FLATTERING ITSELF:
 
-    GAPS ARE COUNTED SEPARATELY and are not clean firings. A breach first seen
-    at a session's first poll is one the stop did not catch at its level — it
-    booked wherever the gap landed. Two of the cohort's five were gaps, and
-    folding them in is how a stop flatters itself.
+    * **gaps** — a breach first seen inside the open buffer is one the stop did
+      not catch at its level; it booked wherever the gap landed. Two of the
+      cohort's five were gaps.
+    * **1-print** — every value trigger in this engine is debounced, so a
+      breach that did not survive to the next poll is a firing no armed rule
+      would have taken.
+    * **saved / cost** — measured from the stored breach value against the
+      trade's real exit, NOT from the replay's constants. A firing on a loser
+      is only a GOOD firing if stopping there would have booked better than
+      what actually happened, and outcome-labelling alone cannot see that.
+
+    `missed` is the other half nobody would otherwise print: losers the rule
+    never fired on at all. Without it "5 of 5 caught" has no place to be
+    contradicted.
     """
+    import statistics as st
+
     from zebra import spot_shadow as ss
     from .trade_store import get_store, in_cohort
 
     store = get_store()
-    trades = [t for t in store.load_trades()
-              if in_cohort(t) and t.get(ss.FIELD)]
+    trades = [t for t in store.load_trades() if in_cohort(t)]
     if not getattr(args, 'all', False):
         trades = [t for t in trades if t.get('status') == 'exited']
-    if not trades:
+    shadowed = [t for t in trades if t.get(ss.FIELD)]
+    if not shadowed:
         print()
         print('No shadowed positions yet. The shadow starts accruing on the '
               'next poll after deploy; nothing before it can be back-filled, '
@@ -1293,46 +1302,86 @@ def cmd_spotstop(args):
     print('ADVERSE-SPOT STOP — SHADOW ONLY. spot_sl_enabled is False.')
     print()
     hdr = (f"{'id':>4} {'stock':<12}{'d':<3}{'net%':>7}{'res':<5}{'MAE%':>7}"
-           + ''.join(f"{('b%g' % t):>18}" for t in ss.THRESHOLDS))
+           + ''.join(f"{('b%g' % t):>22}" for t in ss.THRESHOLDS))
     print(hdr)
     print('-' * len(hdr))
-    fired = {t: {'true': 0, 'false': 0, 'gap': 0} for t in ss.THRESHOLDS}
-    for t in sorted(trades, key=lambda x: x['id']):
+
+    stat = {t: {'true': 0, 'false': 0, 'gap': 0, 'oneprint': 0,
+                'saved': [], 'cost': []} for t in ss.THRESHOLDS}
+    missed = {t: 0 for t in ss.THRESHOLDS}
+    partial = 0
+    for t in sorted(shadowed, key=lambda x: x['id']):
         sh = t[ss.FIELD]
         net = t.get('pnl_net')
-        win = None if net is None else net > 0
+        win = None if (net is None or t.get('status') != 'exited') else net > 0
+        # A record the shadow started watching AFTER its own entry has an
+        # unobserved head: its MAE is a lower bound and a breach may already
+        # have happened before anyone was looking.
+        head = (sh.get('since') or '')[:10] > (t.get('entry_date') or '')
+        partial += bool(head)
         row = (f"{t['id']:>4} {t.get('stock', ''):<12}"
                f"{t.get('direction', ''):<3}"
                f"{(t.get('pnl_net_pct') or 0):>7.1f}"
                f"{('WIN' if win else 'LOSS' if win is not None else 'OPEN'):<5}"
                f"{sh.get('mae_pct', 0):>7.2f}")
         for thr in ss.THRESHOLDS:
-            b = sh.get(ss._key(thr))
+            b = sh.get(ss.breach_key(thr))
             if not b:
-                row += f"{'-':>18}"
+                row += f"{('-' + (' PARTIAL' if head else '')):>22}"
+                if win is False:
+                    missed[thr] += 1
                 continue
-            tag = 'GAP' if b.get('gap') else ('ok' if b.get('q') == 'ok'
-                                              else 'dark')
-            row += f"{('%.2f%% %s' % (b['adverse_pct'], tag)):>18}"
+            tags = []
+            if b.get('gap') is not False:
+                tags.append('GAP' if b.get('gap') else 'GAP?')
+            if not b.get('confirmed_at'):
+                tags.append('1-print')
+            if b.get('q') != 'ok':
+                tags.append(str(b.get('q'))[:9])
+            row += f"{('%.2f%% %s' % (b['adverse_pct'], ','.join(tags) or 'ok')):>22}"
             if win is None:
                 continue
-            fired[thr]['gap'] += bool(b.get('gap'))
-            fired[thr]['false' if win else 'true'] += 1
+            s = stat[thr]
+            s['gap'] += b.get('gap') is not False
+            s['oneprint'] += not b.get('confirmed_at')
+            s['false' if win else 'true'] += 1
+            # What the stop would have BOOKED against what actually happened.
+            # Only where the breach carries a price the engine would have
+            # acted on — an unusable one is exactly the case a real stop could
+            # not have filled at either.
+            if b.get('q') == 'ok' and b.get('value') is not None \
+                    and t.get('exit_debit') is not None:
+                delta = (float(b['value']) - float(t['exit_debit'])) \
+                    * int(t.get('quantity') or 0)
+                (s['saved'] if delta > 0 else s['cost']).append(delta)
         print(row)
 
     print()
-    print(f"{'threshold':>10}{'firings':>9}{'true':>6}{'FALSE':>7}"
-          f"{'accuracy':>10}{'of which gaps':>15}")
+    print(f"{'thr':>5}{'fire':>6}{'true':>6}{'FALSE':>7}{'acc':>6}"
+          f"{'ex-gap acc':>12}{'gaps':>6}{'1-print':>9}{'missed':>8}"
+          f"{'net Rs':>12}")
     for thr in ss.THRESHOLDS:
-        f = fired[thr]
-        n = f['true'] + f['false']
-        acc = '-' if not n else f"{f['true'] / n * 100:.0f}%"
-        print(f"{thr:>10.1f}{n:>9}{f['true']:>6}{f['false']:>7}{acc:>10}"
-              f"{f['gap']:>15}")
+        s = stat[thr]
+        n = s['true'] + s['false']
+        acc = '-' if not n else f"{s['true'] / n * 100:.0f}%"
+        clean = n - s['gap']
+        exgap = '-' if clean <= 0 else f"{(s['true'] - s['gap']) / clean * 100:.0f}%"
+        net = sum(s['saved']) + sum(s['cost'])
+        print(f"{thr:>5.1f}{n:>6}{s['true']:>6}{s['false']:>7}{acc:>6}"
+              f"{exgap:>12}{s['gap']:>6}{s['oneprint']:>9}{missed[thr]:>8}"
+              f"{net:>12,.0f}")
     print()
+    if partial:
+        print(f'{partial} row(s) marked PARTIAL: the shadow started after the '
+              f'entry, so their MAE is a LOWER BOUND and an earlier breach may '
+              f'have gone unseen.')
     print('A firing must be right ~70% of the time to break even at 1.5% and')
-    print('~78% at 2.0%. Judge the accuracy column against THAT, not against')
-    print('the P&L — and treat a GAP as a firing the rule did not earn.')
+    print('~78% at 2.0% (from the replay: one true stop saves ~25.6 points of')
+    print('debit, one false one costs ~60.5). Judge the accuracy column')
+    print('against THAT — and prefer the ex-gap column, because a GAP is a')
+    print('firing the rule did not earn. `net Rs` is measured from the stored')
+    print('breach prices against each trade\'s real exit, so it can disagree')
+    print('with the accuracy columns; when it does, believe it.')
     print()
 
 

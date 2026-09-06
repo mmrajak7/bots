@@ -203,7 +203,6 @@ BASELINE = {
     # zebra/tests/test_fees.py
     ('zebra/tests/test_fees.py', 'test_the_live_entry_path_hands_over_its_leg_book'),
     # zebra/tests/test_history.py
-    ('zebra/tests/test_history.py', 'test_the_swing_lookup_is_wired_into_the_entry_path'),
     ('zebra/tests/test_history.py', 'test_attraction_is_wired_into_the_vet_context'),
     ('zebra/tests/test_history.py', 'test_the_agent_is_told_the_rates_moved'),
     ('zebra/tests/test_history.py', 'test_the_agent_is_told_a_missing_monthly_section_is_deliberate'),

@@ -462,37 +462,57 @@ Full playbook: `docs/BCS_PLAYBOOK.md`
 > run to the TIME exit, so the closed book still flatters the open one — but
 > the FACT it rested on has changed.
 >
-> ## ⚠ RE-MARKED 2026-09-06: A THIRD OF THIS BOOK WAS PRICED AT THE CLOSE
+> ## ⚠ THREE OF THESE EXITS WERE PRICED AT THE CLOSING AUCTION (flagged 2026-09-06)
 >
 > `monitor._is_market_open` tested `(h, m) <= MARKET_CLOSE`, so the 15:30 cron
 > cycle read as OPEN and polled the **closing auction print**. Three positions
 > booked `paper:tp` on it — TMPV #423 15:30:28, GMRAIRPORT #455 15:30:48,
-> ADANIGREEN #471 15:31:08, all 2026-08-31. That one print moved TMPV −3.01%,
-> SBICARD −3.13%, GMRAIRPORT −1.97%, JINDALSTEL +2.95% and ADANIGREEN −3.80%
-> while COALINDIA and SAGILITY sat flat, against a median 5-minute move of
-> **0.062%** across all 9,255 other polls on record. TMPV's book had not even
-> repriced: long 320 PE bid 8.90 against spot 308.85 is 2.25 BELOW intrinsic.
-> No live order fills there.
+> ADANIGREEN #471 15:31:08, all 2026-08-31. TMPV's book had not even repriced:
+> long 320 PE bid 8.90 against spot 308.85 is 2.25 BELOW intrinsic. No live
+> order fills there.
 >
 > `monitor._exits_executable` now refuses to BOOK at or after the close, while
 > measurement (POLL line, peak, depth, spot shadow) keeps accruing — the
 > closing observation is the session's close and it is the evidence record.
-> `python -m zebra.remark_close_print_exits` repaired the rows, using the
-> store's own `_apply_exit` rather than a second copy of the arithmetic.
 >
-> | | before | after |
-> |---|---|---|
-> | record | 12W / 5L | **11W / 6L** |
-> | gross | Rs 20,234 | **Rs 14,364** |
-> | net | Rs 17,481 | **Rs 11,631** |
-> | payoff | 0.70 | **0.79** |
-> | break-even WR | 58.7% | **55.8%** |
+> **The rows are FLAGGED (`exit_closing_print`), not re-marked, and the numbers
+> stand as booked.** `python -m zebra.flag_close_print_exits --apply`. The
+> first attempt at this re-booked each exit at the last poll before the close
+> and kept `paper:tp` — at a moment when NONE of the three had touched its
+> target (TMPV 318.45 vs a TP of 309.29; GMRAIRPORT 95.51 vs 94.09; ADANIGREEN
+> 1262.90 vs 1247.43, all PE, all above target). That is a worse fiction than
+> the one it corrected: the original at least had a real trigger and a real if
+> unfillable price, while the re-mark had a real price and an invented trigger.
+> It also flipped TMPV from a Rs 24 win to a Rs 80 loss and moved the cohort
+> headline on that artefact.
 >
-> The payoff reads BETTER only because TMPV flips from a Rs 24 win to a Rs 80
-> loss and drags the loser average toward zero. **Any number quoted from this
-> book before 2026-09-06 is overstated by ~Rs 5,850 and one win.** Run the
-> re-mark on every replica — it is idempotent, and a correction applied on one
-> box never reaches the other, because the store merges by VERSION.
+> **The honest counterfactual does not exist.** Under the fixed rule the touch
+> is never latched, so these three would have carried into 09-01 — and because
+> the old engine closed them, no path was recorded for what happened next.
+>
+> **Exclude these three from anything about fill quality, exit slippage or TP
+> timing.** Trade counts and P&L may keep them, flagged.
+>
+> ### ⚠ AND THE SPOT FEED IS FROZEN FOR THE LAST 15 MINUTES OF EVERY SESSION
+>
+> Found in the same review. Across all 16 captured sessions, spot at 15:15,
+> 15:20 and 15:25 is **identical on 125 of 125 observations**, against 0 of 122
+> for the same triple at 12:15-12:25. Option books keep moving in that window;
+> spot does not. Consequences, none of them yet fixed:
+>
+> - There is no trustworthy pre-close spot mark. A "15:25 exit_spot" is the
+>   15:15 print.
+> - A TP genuinely touched between 15:15 and 15:30 is invisible until the
+>   closing print, and is now never booked that day.
+> - **`bcs/spread_monitor.py`, the LIVE order engine, is spot-blind for the
+>   same 15 minutes**, and it polls every 5 seconds.
+> - Any statistic derived from a 15:15-15:30 spot in `logs/eod/paths_*.json` is
+>   measuring a stale print. (The median 5-minute move survives it — 0.063%
+>   either way — but the "moved 3.8% in ONE print" framing did not.)
+>
+> Next step is diagnostic, not a fix: log the spot quote's `last_trade_time` on
+> every POLL line. One session says whether the exchange stops publishing or
+> the feed does.
 >
 > **CORRECTED 2026-09-03: the stops were NOT booked at mid.** An earlier
 > version of this paragraph said they were, and that "where a stop FILLS
@@ -565,12 +585,20 @@ never alerted with a warning nobody reads.
 |------|-----------|-------|-----------------|
 | OI both legs | >= 5,000 | — | Was a soft warning. Now hard: on a thin book the stop does not fill where it is set. OI-flagged trades overshot the -50% trigger by -22.0 pts (realised -72.0%) vs -2.7 pts on clean books. COCHINSHIP collapsed 2.18 -> 0.18 in one session while spot moved the RIGHT way; NHPC cost real money the same way. Unknown OI fails CLOSED. |
 | debit / width | <= 45% | **MID** | Not the manual 30/35%: the ST-magnet pins width at ~3.8% of spot, so d/w is the market's own probability quote rather than a width you chose. Past ~45% the payoff is priced out — that band ran PF 0.24 while still winning 50% of the time, a payoff problem not a hit-rate one. Gates 1 & 2 together rejected 32% of the sample, and that third ran 37.5% WR / -22.9% RoC / PF 0.27. **Evaluated on the MID basis because that is what it was fitted on** — no historical record persisted its entry books, so it cannot be re-derived on the fill basis. |
+> **Why the narrower pair does not simply win.** It reads a HIGHER d/w and
+> lands on the 45% cap by construction — on the three swing signals in the book
+> a suppress-on-fail rule would have killed two, both winners, carrying 39% of
+> the cohort's gross. And the TP fires on TOUCH with 27-36 DTE left, so a
+> nearer short leg carries MORE extrinsic at the exit: V/w rises less than d/w
+> does, and by the identity `(V/w)/(d/w) − 1` narrowing can LOSE. Hence a
+> ranked choice rather than a rule.
+
 | gain at TP | MEASURED, not enforced | — | `pen * (k/(d/w) - 1)`, k=0.55. **Penetration-aware since 2026-09-06**: the old `k x width` was a pure function of d/w and blind to WHERE the TP sits, so it was optimistic on exactly the trades it exists to catch. `tp_penetration` is stamped on the record — without it a stored projection cannot be re-derived. |
 | entry cost / max gain | <= 15% | fill vs mid | Added 2026-08-12 with fill pricing. What the book charges just to open. **UNCALIBRATED — reasoned, not fitted.** Replaces the per-leg rupee bid-ask cap (below); denominated in the payoff, which is the same logic the d/w gate uses. Review once ~30 fill-basis records exist. |
 | Bid-ask per leg | **REMOVED** | — | Fired on 17 of 25 closed shadows (68%) and carried no signal at all: 58.8% WR flagged vs 62.5% clean. Its only real effect was training the reader to ignore the warning marker, which is how the OI flag on COCHINSHIP got waved through. The measurement still ships as `short_spread_pct`. |
 | debit floor | **NONE, ever** | — | Cheap spreads are the high-payoff tail (avg win +127%). Power-law rule: never cap the upside. |
 | DTE | first expiry 15-45 | — | Takes the first expiry >= 15 DTE, so entries routinely sit below the manual 20-30 band. **45 (owner decision, 2026-08-27; both sources now agree).** 55 had drifted into the tracked config — snapshotted from the live overlay by the config-split commit `7d1b107`, never chosen. No cohort trade ever entered above 41 DTE, so the two values never differed in effect. |
-| Short strike | nearest the **resolved TP** | — | Not a % band. At least one strike beyond ATM so the spread always has width. **Changed 2026-09-06:** it was the raw ST line, while the swing shortening moved only the TP — so on a swing signal the position could never reach its own short leg (WAAREEENER #449 exited 63 pts short of it, +19.7%; LICHSGFIN #439 +14.4%, the two smallest wins). `_rebuild_against_resolved_tp` re-picks against the target we will actually exit at and **SUPPRESSES the signal** if that pair fails any gate or its own breakeven — the ST-line pair is not a fallback, it is the construction this replaces. |
+| Short strike | the BETTER of two | — | Not a % band. At least one strike beyond ATM so the spread always has width. **Changed 2026-09-06:** the strike was picked against the raw ST line while the swing shortening moved only the TP, so on a swing signal the position could never reach its own short leg (WAAREEENER #449 exited 63 pts short of it, +19.7%; LICHSGFIN #439 +14.4% — the two smallest wins). `_pick_pair_for_resolved_tp` now prices a second pair against the RESOLVED TP and enters whichever projects the higher gain AT THAT TARGET (`strikes.project_at_tp`). **It cannot suppress a signal**: the ST-line pair holds ties and holds whenever the alternative cannot be priced or gated. The pair that loses is stored as `swing_shadow` so the choice can be scored. |
 
 `_leg_reliable` (leg width <= 25% of mid) is **not** a tradeability gate — it
 is a garbage-print detector shared with the live monitor's valuation path.
@@ -1554,7 +1582,7 @@ python -m zebra analyze SYMBOL --direction CE  # manual strike picker
 python -m zebra quote ID      # live re-quote of a signal/position (read-only, JSON)
 python -m zebra depth         # depth at the touch — the lot-scaling evidence
 python -m zebra spotstop      # adverse-spot stop, SHADOWED — the firing count
-python -m zebra.remark_close_print_exits [--apply]   # repair closing-print exits
+python -m zebra.flag_close_print_exits [--apply]     # flag closing-print exits
 python -m zebra trigger ID    # force alert on a watching signal
 python -m zebra enter ID --pair K_L/K_S --debit X --lots N --expiry YYYY-MM-DD
 python -m zebra close ID --exit-debit X --reason tp
