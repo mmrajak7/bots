@@ -66,6 +66,7 @@ from common import option_symbols as _sym
 from common.option_symbols import check_leg_types
 from common import layered_config
 from common import kite_errors
+from common import market_session
 from common import spread_valuation
 from common import nse_holidays
 from common import store_contract
@@ -871,6 +872,17 @@ def spot_corroborates(state: dict, spot: float, spread_val,
     can never become the baseline that a later real move is judged against.
     """
     now = time.time() if now is None else now
+    # THE PREMISE INVERTS IN THE CLOSING AUCTION, and this engine places REAL
+    # ORDERS. The veto reads a still spot as evidence a collapse is not real.
+    # From 15:15 the cash market is in its closing auction and CANNOT print, so
+    # stillness is guaranteed by market design — while the option book, a
+    # different segment, trades on until 15:30 and can collapse genuinely.
+    # Vetoing there refuses a real exit and holds a collapsing position
+    # overnight. Same guard, same reasoning, same shared window as
+    # `zebra/monitor.py`: this function is a copy of that one and the pair have
+    # to move together (`feedback_copy_pasted_modules_fix_once`).
+    if market_session.cash_price_is_frozen():
+        return True, ''
     ref_spot, ref_spread = state.get('spot'), state.get('spread')
     ref_t = state.get('t', 0.0)
     ok, reason = True, ''

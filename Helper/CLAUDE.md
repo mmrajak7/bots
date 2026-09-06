@@ -462,70 +462,65 @@ Full playbook: `docs/BCS_PLAYBOOK.md`
 > run to the TIME exit, so the closed book still flatters the open one — but
 > the FACT it rested on has changed.
 >
-> ## ⚠ THREE OF THESE EXITS WERE PRICED AT THE CLOSING AUCTION (flagged 2026-09-06)
+> ## ⚠ THE CASH MARKET NOW CLOSES AT 15:15 — CLOSING AUCTION SESSION
 >
-> `monitor._is_market_open` tested `(h, m) <= MARKET_CLOSE`, so the 15:30 cron
-> cycle read as OPEN and polled the **closing auction print**. Three positions
-> booked `paper:tp` on it — TMPV #423 15:30:28, GMRAIRPORT #455 15:30:48,
-> ADANIGREEN #471 15:31:08, all 2026-08-31. TMPV's book had not even repriced:
-> long 320 PE bid 8.90 against spot 308.85 is 2.25 BELOW intrinsic. No live
-> order fills there.
+> **CAS went live 2026-08-03** (SEBI circular 2026-01-16, NSE SOP 2026-03-18)
+> for Category I — F&O-eligible — names, which is our whole universe. It
+> changed the session under this engine and nobody noticed for a month.
 >
-> `monitor._exits_executable` now refuses to BOOK at or after the close, while
-> measurement (POLL line, peak, depth, spot shadow) keeps accruing — the
-> closing observation is the session's close and it is the evidence record.
+> | segment | before | now |
+> |---|---|---|
+> | cash continuous | 09:15-15:30 | **09:15-15:15** |
+> | cash closing auction | — | **15:15-15:35**, uncrossing ~15:30 |
+> | closing price | VWAP of the last 30 min | **the auction uncrossing price** |
+> | **F&O continuous** | 09:15-15:30 | **09:15-15:40** |
+> | post-close | 15:40-16:00 | 15:50-16:00 |
 >
-> **The rows are FLAGGED (`exit_closing_print`), not re-marked, and the numbers
-> stand as booked.** `python -m zebra.flag_close_print_exits --apply`. The
-> first attempt at this re-booked each exit at the last poll before the close
-> and kept `paper:tp` — at a moment when NONE of the three had touched its
-> target (TMPV 318.45 vs a TP of 309.29; GMRAIRPORT 95.51 vs 94.09; ADANIGREEN
-> 1262.90 vs 1247.43, all PE, all above target). That is a worse fiction than
-> the one it corrected: the original at least had a real trigger and a real if
-> unfillable price, while the re-mark had a real price and an invented trigger.
-> It also flipped TMPV from a Rs 24 win to a Rs 80 loss and moved the cohort
-> headline on that artefact.
+> Measured on our own feed before any source was read: spot identical at
+> 15:15/15:20/15:25 on **125 of 125** position-sessions (0 of 122 at
+> 12:15-12:25); on 5-second polls a 12-14 minute frozen run starting
+> 15:15:02-15:15:32 every session, then one new print at ~15:29-15:31. In
+> February 2026 the same box saw spot moving at 15:14-15:20.
 >
-> **The honest counterfactual does not exist.** Under the fixed rule the touch
-> is never latched, so these three would have carried into 09-01 — and because
-> the old engine closed them, no path was recorded for what happened next.
+> **Only SPOT dies early. The OPTION book moved between the 15:25 and 15:30
+> polls on 125 of 125** — F&O trades on to 15:40 — so value triggers and exits
+> stay legitimate to the close and beyond.
 >
-> **Exclude these three from anything about fill quality, exit slippage or TP
-> timing.** Trade counts and P&L may keep them, flagged.
+> ### What was fixed
 >
-> ### ⚠ AND THE SPOT FEED IS FROZEN FOR THE LAST 15 MINUTES OF EVERY SESSION
+> `common/market_session.py` holds the window — ONE definition, imported by
+> both engines, pinned against both copies of `MARKET_CLOSE`.
 >
-> Found in the same review. Across all 16 captured sessions, spot at 15:15,
-> 15:20 and 15:25 is **identical on 125 of 125 observations**, against 0 of 122
-> for the same triple at 12:15-12:25. Option books keep moving in that window;
-> spot does not. Consequences, none of them yet fixed:
+> - **`_spot_corroborates` inverts in the window, in BOTH engines.** It vetoes
+>   an exit when value collapses ≥35% while spot moves <0.4%; in the auction
+>   spot moves exactly 0.00% BY DESIGN, so a genuine collapse — in the option
+>   book, which is still trading — would be refused as the NHPC signature.
+>   Both now stand down inside it. **Latent, never fired: 0 such collapses in
+>   9,549 observations.**
+> - POLL line marks spot `[STALE:auction]`.
+> - The `mfe` SPOT channel and the spot-stop shadow are HELD in the window;
+>   the MID channel is NOT, because it measures the option book.
+> - `window_looks_wrong()` logs if spot ever MOVES inside the window — the
+>   declaration checks itself. Never acted on.
 >
-> - There is no trustworthy pre-close spot mark. A "15:25 exit_spot" is the
->   15:15 print.
-> - A TP genuinely touched between 15:15 and 15:30 is invisible until the
->   closing print, and is now never booked that day.
-> - **`bcs/spread_monitor.py`, the LIVE order engine, is spot-blind for the
->   same 15 minutes**, and it polls every 5 seconds.
-> - Any statistic derived from a 15:15-15:30 spot in `logs/eod/paths_*.json` is
->   measuring a stale print. (The median 5-minute move survives it — 0.063%
->   either way — but the "moved 3.8% in ONE print" framing did not.)
+> ### ⚠ What was WRONG and is now reverted
 >
-> Next step is diagnostic, not a fix: log the spot quote's `last_trade_time` on
-> every POLL line. One session says whether the exchange stops publishing or
-> the feed does.
+> A first cut gated BOOKING at 15:30 (`_exits_executable`), on the theory that
+> three exits stamped 15:30:28-15:31:08 were priced where nothing fills. **That
+> was false.** Those three showed live, repriced two-way books (ADANIGREEN long
+> 48.00/48.80 → 63.55/65.95) and F&O was open until 15:40. The guard refused
+> genuine exits, which pushes a position overnight — how this book's worst loss
+> happened. Gate removed, rows un-flagged, **the cohort stands at 12W/5L, gross
+> Rs 20,234, net Rs 17,481**, unchanged throughout.
 >
-> **CORRECTED 2026-09-03: the stops were NOT booked at mid.** An earlier
-> version of this paragraph said they were, and that "where a stop FILLS
-> remains unmeasured". Checked against the stored `exit_legs` on all 15 cohort
-> exits: every one books at the FILL basis, `bid(long) − ask(short)`, and
-> `pricing_basis` is `'fill'` on every record. COALINDIA #440 booked 2.40 where
-> mid was 2.45; ADANIGREEN #471 booked 22.90 where mid was 24.78. **The stop
-> losses already carry the full bid-ask cross of both legs and are not
-> flattered.** What is still unmeasured is narrower: impact BEYOND the touch —
-> queue position, and whether the quoted size is really there. `exit_depth`
-> and the `bid_qty`/`ask_qty` in `exit_legs` already measure part of it, and
-> say the touch covered 1 lot on 100% of known samples but 2 lots on 0 of 40
-> for WAAREEENER. **Do not quote the mid claim as a go-live blocker.**
+> ### ⚠ STILL OPEN: both engines stop at 15:30, F&O trades to 15:40
+>
+> The fleet is blind to the last ten minutes of a tradeable options market,
+> every session. Closing that moves `MARKET_CLOSE`, which the EOD sweep window,
+> the digest and both loop exits are keyed to — a deliberate change, not a
+> one-liner. The CAS sub-windows (order entry 15:20-15:25, limit-only to a
+> randomised close 15:28-15:30, matching 15:30-15:35) are secondary-sourced and
+> **no code depends on them**; only the measured 15:15 boundary does.
 
 > **TWO rule sets, deliberately.** The MANUAL playbook below governs spreads
 > you pick by hand off a crash/bounce thesis, where you choose the width. The
@@ -906,25 +901,29 @@ consume-once flag so the exit can fire again — otherwise the exit is announced
 on Telegram, never booked, and that exit kind is disarmed for good. TIME is the
 exception: its alert is a nag about the calendar, not a claim about a price.
 
-### Nothing is executable at or after the close (2026-09-06)
+### Spot dies at 15:15; the option book does not (2026-09-06)
 
-`_exits_executable` — the mirror of the open buffer, and there for the same
-reason: **a print the engine can see is not a price it can trade at.** At and
-after `MARKET_CLOSE` the whole exit cascade is skipped and the TP latch will
-not even arm, while the POLL line, the peak, the depth sample and the spot
-shadow all keep accruing. Measurement is not a decision, and the closing
-observation is the session's close — it is the evidence record.
+`common/market_session.cash_price_is_frozen()`. See the CAS box in the Bull
+Call Spread section for the measurement and the full session table. In one
+line: **the cash market is in a closing auction from 15:15 and cannot print,
+while F&O trades on to 15:40** — so spot is a stale price beside a live book,
+and every guard that reads meaning into spot STILLNESS has to stand down.
 
-Read the incident in the cohort-scope box above: it cost a third of the paper
-book. It is NOT the same question as `_is_market_open`, which decides whether
-to run the cycle at all; the 15:30 cycle still has real work to do.
+There is deliberately **no booking gate at the close**. One was written and
+reverted the same day: the exits it refused were fillable in a live option
+market, and a guard that refuses a genuine exit pushes the position overnight,
+which is the expensive direction. Do not re-add it without first showing that
+the option book is dead, which the record says it is not.
 
 ### Spot stop — SHADOWED, still not armed (2026-09-06)
 
 `spot_sl_enabled` is **False and stays False.** `zebra/spot_shadow.py` records,
 per position, the adverse excursion and the first breach at **1.5 / 2.0 / 3.0%**
-— when, at what spot, at what value, and **whether it landed on the session's
-first poll**. Read it with **`python -m zebra spotstop`**.
+— when, at what spot, at what value, whether the price was one the engine
+would have ACTED on, and whether it landed in the opening buffer (a GAP the
+rule did not earn). Held entirely during the cash closing auction, because
+every field it records is a statement about spot. Read it with
+**`python -m zebra spotstop`**.
 
 Why measure rather than flip. The replay is genuinely striking — on the cohort
 a 1.5% stop cut 0 of 12 winners, caught 5 of 5 losers and took the payoff from
@@ -1582,7 +1581,6 @@ python -m zebra analyze SYMBOL --direction CE  # manual strike picker
 python -m zebra quote ID      # live re-quote of a signal/position (read-only, JSON)
 python -m zebra depth         # depth at the touch — the lot-scaling evidence
 python -m zebra spotstop      # adverse-spot stop, SHADOWED — the firing count
-python -m zebra.flag_close_print_exits [--apply]     # flag closing-print exits
 python -m zebra trigger ID    # force alert on a watching signal
 python -m zebra enter ID --pair K_L/K_S --debit X --lots N --expiry YYYY-MM-DD
 python -m zebra close ID --exit-debit X --reason tp

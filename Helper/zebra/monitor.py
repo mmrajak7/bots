@@ -43,6 +43,7 @@ from . import mfe as mfe_mod
 from . import outcomes as outcomes_mod
 from . import postmortem as postmortem_mod
 from . import review as review_mod
+from common import market_session
 from common import nse_holidays
 from . import spot_shadow
 from . import strikes as strikes_mod
@@ -2483,20 +2484,6 @@ def check_watching(store: ZebraStore, kite, dry_run: bool = False) -> None:
     if not watching:
         return
 
-    # Entries are gated at the close for the same reason exits are, and it is
-    # the same defect one door along: a signal paper-ENTERED on the closing
-    # auction print records a debit nobody could have filled. Late entries do
-    # happen — LICHSGFIN #439 entered at 15:20:24. The trigger-zone test is
-    # unreliable there too: measured across all 16 captured sessions, spot at
-    # 15:15, 15:20 and 15:25 is IDENTICAL on 125 of 125 observations, against 0
-    # of 122 for the same triple at 12:15-12:25, so the feed this loop reads is
-    # frozen for the last 15 minutes of every session.
-    if not _exits_executable():
-        logger.info("CLOSING POLL: %d watching signal(s) not evaluated for "
-                    "entry — nothing is executable at or after %02d:%02d",
-                    len(watching), cfg.MARKET_CLOSE[0], cfg.MARKET_CLOSE[1])
-        return
-
     stocks = list({t['stock'] for t in watching})
     ltps = get_ltp(kite, stocks)
 
@@ -3245,38 +3232,6 @@ def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
     `spot` is the live underlying LTP at exit — recorded for post-trade
     spot-movement analysis. P&L itself is driven by `mid`, not spot.
     """
-    if reason != 'expiry' and not _exits_executable():
-        # THE OTHER BACKSTOP, same shape and same reason as the one below:
-        # every close in this module funnels through here, so a branch that
-        # runs ABOVE the cascade's own gate — the NO-SPOT settle and the
-        # dark-book settle both do — cannot book on a print nobody could have
-        # transacted at. The cycle-level gate stays where it is, to save the
-        # wasted vet and to make the log say so once per position.
-        #
-        # `expiry` is exempt, and for the reason the set below is exempt from
-        # it: `_settle_if_expired` fires strictly PAST expiry, when the
-        # contracts no longer exist. There is no fill to be had at any hour,
-        # and refusing it would strand the record `entered` forever, holding a
-        # slot and banning its stock through scanner dedup.
-        logger.info(
-            "CLOSE REFUSED #%d %s (%s): nothing is executable at or after "
-            "%02d:%02d", trade.get('id'), trade.get('stock'), reason,
-            cfg.MARKET_CLOSE[0], cfg.MARKET_CLOSE[1])
-        if release_flag:
-            # RELEASE the consume-once flag, exactly as the deferred close
-            # below does, and swallow a failure to do so the same way: the
-            # alternative is an exit announced, never booked, and that kind
-            # disarmed for the position permanently — a capped loss quietly
-            # becoming a maximum one.
-            try:
-                store.clear_alert_flag(trade['id'], reason)
-            except Exception as e2:
-                logger.error("Could not release the %s flag on #%d after a "
-                             "close refused past the close: %s — that exit is "
-                             "disarmed until the flag is cleared",
-                             reason, trade['id'], e2)
-        return None
-
     if reason in EXTERNALLY_MANAGED_EXITS and _exits_external(trade):
         # THE BACKSTOP, and the reason it lives here rather than only at the
         # call sites: every close in this module funnels through this function,
@@ -3495,56 +3450,6 @@ def _value_triggers_live(now: Optional[datetime] = None) -> bool:
     return (now - open_dt).total_seconds() >= cfg.VALUE_TRIGGER_OPEN_BUFFER_SEC
 
 
-def _exits_executable(now=None) -> bool:
-    """Could an order actually be filled on this poll?
-
-    False at and after MARKET_CLOSE. The mirror image of the open buffer, and
-    it exists for the same reason: a print the engine can see is not a price
-    it can trade at.
-
-    THE INCIDENT. The cron line is `*/5 9-15`, and `_is_market_open` tests
-    `(h, m) <= MARKET_CLOSE`, so the 15:30 cycle read as open and polled the
-    CLOSING AUCTION print. Three cohort positions booked `paper:tp` on it —
-    TMPV #423 at 15:30:28, GMRAIRPORT #455 at 15:30:48, ADANIGREEN #471 at
-    15:31:08, all 2026-08-31. TMPV's book had not even repriced: long 320 PE
-    bid 8.90 against spot 308.85 is 2.25 BELOW intrinsic. No live order fills
-    there.
-
-    THE SIZE OF THAT MOVE IS NOT MEASURABLE FROM THIS DATA, and an earlier
-    version of this docstring claimed it was ("-3.80% in ONE step against a
-    0.062% median"). **The spot feed is frozen for the last 15 minutes of every
-    session**: across all 16 captured sessions, spot at 15:15, 15:20 and 15:25
-    is identical on 125 of 125 observations, against 0 of 122 for the same
-    triple at 12:15-12:25. So the 15:25 -> 15:30 delta is fifteen minutes of
-    invisible continuous trading plus the closing auction, not one 5-minute
-    print. (The median itself survives the correction — 0.063% with the frozen
-    window in or out — but the framing did not.)
-
-    Two consequences worth carrying: a TP genuinely touched between 15:15 and
-    15:30 is invisible until the closing print and is now never booked that
-    day, which is the right answer for a price nobody could trade at but is a
-    real behaviour change; and `bcs/spread_monitor.py`, the live order engine,
-    is spot-blind in the same window.
-
-    The three rows are FLAGGED, not re-marked — see
-    `zebra/flag_close_print_exits.py` for why re-booking them was worse.
-
-    MEASUREMENT IS NOT GATED. The POLL line, the peak and the depth sample all
-    still accrue on the closing poll — that observation IS the session's close
-    and it is the evidence record (`logs/eod/paths_*.json`). What stops is
-    BOOKING, exactly as with the stand-down.
-
-    Not folded into `_is_market_open`, which answers a different question:
-    whether to run the cycle at all. The 15:30 cycle still has real work.
-
-    RETIRES WHEN: paper stops booking off a poll — i.e. exits are placed as
-    real orders and the fill is the record — at which point the broker refuses
-    the trade instead of this function.
-    """
-    now = now or datetime.now(IST)
-    return (now.hour, now.minute) < cfg.MARKET_CLOSE
-
-
 def _spot_corroborates(store: ZebraStore, trade: dict, spot: float,
                        value: Optional[float], reliable: bool,
                        now: Optional[float] = None) -> tuple:
@@ -3570,6 +3475,16 @@ def _spot_corroborates(store: ZebraStore, trade: dict, spot: float,
     into a loop that was deliberately reduced to one batched write.
     """
     if not cfg.SPOT_VETO_ENABLED or value is None or not spot or spot <= 0:
+        return True, '', None
+    # THE PREMISE INVERTS IN THE CLOSING AUCTION. This veto reads a still spot
+    # as evidence that a collapse is not real. From 15:15 the cash market is in
+    # its closing auction and CANNOT print, so spot stillness is guaranteed by
+    # market design and carries no information at all — while the option book,
+    # a different segment, goes on trading until 15:30 and can collapse for
+    # entirely genuine reasons. Vetoing there refuses a real exit and holds a
+    # collapsing position overnight, which is how this book's worst loss
+    # happened. See `common/market_session`.
+    if market_session.cash_price_is_frozen():
         return True, '', None
     now = time.time() if now is None else now
     ref = store.corroboration_ref(trade['id'])
@@ -4292,15 +4207,6 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     today = datetime.now(IST).date()
     # One store write for the whole cycle's peak tracking — see _flush_mfe.
     pending_mfe: dict = {}
-    # Read ONCE for the whole cycle, not per position: a cycle that straddles
-    # 15:30 must not book some rows and refuse others, which is exactly the
-    # kind of split verdict that makes a log unreadable afterwards.
-    exits_executable = _exits_executable()
-    if not exits_executable:
-        logger.info(
-            "CLOSING POLL: past %02d:%02d — this cycle MEASURES (POLL lines, "
-            "peaks, depth, spot-stop shadow) but books NOTHING",
-            cfg.MARKET_CLOSE[0], cfg.MARKET_CLOSE[1])
     # Once-per-cycle latch for the peer-engine heartbeat check below.
     stood_down = False
     #: Same once-per-cycle discipline as `stood_down`: a fault common
@@ -4408,9 +4314,27 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # from. (Inert in practice: CORROBORATION_STALE_SEC ages it out
             # overnight. Ordered correctly anyway, because "must not reach a
             # valuation path" has to be true where it is written.)
-            usable_block = '' if exits_executable else 'closing_print'
-            if not exits_executable:
-                debit_usable = False
+            usable_block = ''
+            # Cash market in its closing auction: spot is frozen by design.
+            # Read ONCE per position per poll and threaded through, so the POLL
+            # line, the measurement channels and the record cannot disagree
+            # about whether this print was live.
+            spot_frozen = market_session.cash_price_is_frozen()
+            # The corroboration reference stops advancing once the window
+            # opens (the veto returns early), so it still holds the last
+            # PRE-auction price — which makes it the right thing to compare
+            # against, at no extra cost.
+            if market_session.window_looks_wrong(trade.get('corrob_spot'), spot):
+                # A difference here means the cash market IS printing when we
+                # believe it cannot — the declared window is stale. Log-only on
+                # purpose: a session-time assumption going out of date must not
+                # change what the engine does today.
+                logger.warning(
+                    "AUCTION WINDOW LOOKS WRONG #%d %s: spot moved %.2f -> "
+                    "%.2f inside %s. Re-measure the freeze before trusting any "
+                    "guard keyed to it (common/market_session.py).",
+                    tid, stock, trade.get('corrob_spot') or 0, spot,
+                    market_session.spot_staleness_note() or 'the window')
             _track_debit_blindness(store, trade, debit_usable, sq['reason'],
                                    dry_run=dry_run, spot=spot)
 
@@ -4439,9 +4363,13 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # forensic record, and a record of exits only is a record of the
             # cycles that were already interesting.
             logger.info(
-                "POLL #%d %s %s spot=%.2f tp=%.2f%s sl=%.2f | value=%s "
+                "POLL #%d %s %s spot=%.2f%s tp=%.2f%s sl=%.2f | value=%s "
                 "(%s) debit_sl=%.2f | long %s/%s short %s/%s",
-                tid, stock, direction, spot, tp_spot,
+                tid, stock, direction, spot,
+                # A price up to fifteen minutes old must not read as live. The
+                # option book beside it on this line IS live, which is exactly
+                # the confusion worth naming.
+                ' [STALE:auction]' if spot_frozen else '', tp_spot,
                 # The state the cycle STARTS in. An armed TP that is waiting on
                 # a vet or an unusable book looks identical to a quiet position
                 # otherwise, and this log is the whole forensic record in paper.
@@ -4490,7 +4418,14 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # which is precisely the price that turns the cohort's overnight
             # measure from +1.3% into -12.1%. A shadow scored on prices the
             # engine itself refuses to act on would flatter the stop.
-            spatch = spot_shadow.observe(
+            # SKIPPED while the cash market is in its closing auction. Every
+            # field this records is a statement about SPOT — the adverse
+            # excursion and the first breach of it — and spot cannot move in
+            # that window. Recording it would extend the MAE's observation
+            # window with fifteen minutes of guaranteed stillness on every
+            # session, and would let the uncrossing print land as a "breach"
+            # at a price no continuous order could have got.
+            spatch = {} if spot_frozen else spot_shadow.observe(
                 trade, spot, mid, debit_usable,
                 datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S'),
                 quality=usable_block or (sq.get('rejected') or sq['reason'] or ''))
@@ -4505,9 +4440,13 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # very print this change refuses to book at. So the MID channel is
             # held on a non-executable poll while the SPOT channel keeps
             # accruing, which is the same split the cascade already makes.
-            patch = mfe_mod.compute(trade, spot,
-                                    mid if exits_executable else None,
-                                    sq['reliable'])
+            patch = mfe_mod.compute(trade,
+                                    # The SPOT peak is a statement about spot,
+                                    # and spot cannot move in the auction. The
+                                    # frozen print is a REPEAT of the 15:15
+                                    # one, which the peak has already seen.
+                                    None if spot_frozen else spot,
+                                    mid, sq['reliable'])
             if patch:
                 # MERGE, never assign. This dict may already hold the spot
                 # corroboration reference for the same trade, and `pending_mfe[tid]
@@ -4548,16 +4487,6 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # (`feedback_trigger_is_not_the_fill`).
             tp_hit = (direction == 'CE' and spot >= tp_spot) or \
                      (direction == 'PE' and spot <= tp_spot)
-            # A touch on the CLOSING PRINT is not a touch anyone could have
-            # traded, and the latch is what would carry it into the booking
-            # below. Nothing leaks past today either way: the latch is
-            # same-day, so refusing to arm here costs at most one cycle.
-            if tp_hit and not exits_executable:
-                logger.info(
-                    "TP touched #%d %s at %.2f on the closing print — NOT "
-                    "latched, nothing is executable at or after %02d:%02d",
-                    tid, stock, spot, cfg.MARKET_CLOSE[0], cfg.MARKET_CLOSE[1])
-                tp_hit = False
             latch = tp_latch(trade, tp_hit, spot)
             if latch['patch'] and _exits_external(trade):
                 # The peer engine owns this position's exits AND watches the
@@ -4700,19 +4629,6 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                         logger.warning(
                             "exit-engine heartbeat check failed: %s", e,
                             exc_info=True)
-                continue
-
-            # Nothing is executable at or after the close. Placed HERE, on
-            # the same seam as the stand-down and for the same reason: the
-            # POLL line, the peak, the depth sample and the spot-stop shadow
-            # above are the research record and must keep accruing; what stops
-            # is DECIDING. See `_exits_executable` for the three cohort exits
-            # this was found by.
-            if not exits_executable:
-                logger.info(
-                    "CLOSED-FOR-BOOKING #%d %s: past %02d:%02d, measured but "
-                    "not acted on", tid, stock,
-                    cfg.MARKET_CLOSE[0], cfg.MARKET_CLOSE[1])
                 continue
 
             # NOT stood down, and this record has REAL LEGS. zebra will

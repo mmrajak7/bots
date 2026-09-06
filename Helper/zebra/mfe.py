@@ -105,7 +105,7 @@ def _peak_update(st: dict, value: float, floor: float, jump_limit,
     return st != before
 
 
-def compute(trade: dict, spot: float,
+def compute(trade: dict, spot: Optional[float],
             mid: Optional[float], reliable: bool) -> dict:
     """Advance a trade's peaks and return the patch to persist ({} if none).
 
@@ -128,16 +128,22 @@ def compute(trade: dict, spot: float,
     stamp = datetime.now(IST).isoformat(timespec='seconds')
     patch, advanced = {}, []
 
-    st = _peak_state(trade, 'spot')
-    was = st['peak']
-    entry_spot = float(trade.get('entry_spot') or trade.get('trigger_spot')
-                       or spot)
-    if _peak_update(st, float(spot), entry_spot,
-                    lambda p: p + sign * abs(p) * cfg.MFE_SPOT_JUMP_PCT,
-                    now, stamp, sign):
-        patch.update(_peak_fields(st, 'spot'))
-        if st['peak'] != was and was is not None:
-            advanced.append(f"spot={st['peak']:.2f}")
+    # `spot=None` HOLDS this channel, the same way `mid=None` holds the other.
+    # The caller passes it when the cash market is in its closing auction and
+    # spot is frozen by market design: the print is a repeat of the 15:15 one
+    # this peak has already seen, so advancing on it would be recording the
+    # same observation fifteen more times a session.
+    if spot is not None:
+        st = _peak_state(trade, 'spot')
+        was = st['peak']
+        entry_spot = float(trade.get('entry_spot') or trade.get('trigger_spot')
+                           or spot)
+        if _peak_update(st, float(spot), entry_spot,
+                        lambda p: p + sign * abs(p) * cfg.MFE_SPOT_JUMP_PCT,
+                        now, stamp, sign):
+            patch.update(_peak_fields(st, 'spot'))
+            if st['peak'] != was and was is not None:
+                advanced.append(f"spot={st['peak']:.2f}")
 
     # The mid channel is the one that measures MONEY, and it is gated on a
     # reliable book for the same reason the DEBIT-SL is: this fleet has twice
