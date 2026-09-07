@@ -190,3 +190,23 @@ def test_all_three_inputs_to_the_flag_travel_with_it(monkeypatch):
     assert r['tp_value_frac_of_width_k'] == K
     assert r['min_gain_at_tp_pct_at_entry'] == cfg.BCS_MIN_GAIN_AT_TP_PCT
     assert r['tp_penetration'] == 0.5
+
+
+def test_the_would_block_log_states_the_formula_it_actually_used(monkeypatch,
+                                                                 caplog):
+    """It used to read "(k=0.55 x width 30)", which was true only while the
+    projection WAS k*width. Once it became penetration-aware, that line stated
+    an identity which does not produce the number printed beside it — and the
+    first live emission after deploy was one of these. A reader checking one
+    against the other would conclude the code was broken."""
+    import logging
+    with caplog.at_level(logging.INFO, logger='zebra.strikes'):
+        r = _run(monkeypatch, target=1010.0)          # pen 0.25
+    assert r['would_block_on_gain_at_tp'] is True, 'fixture no longer blocks'
+    line = [m for m in caplog.messages if 'GAIN-AT-TP' in m]
+    assert line, caplog.text
+    assert 'pen 0.25' in line[0], line[0]
+    assert 'k=0.55 x width' not in line[0], (
+        'the message still claims k x width, which is not what it computed')
+    # And the number it prints must be the number the formula gives.
+    assert ('assumed %g ' % r['proj_value_at_tp']) in line[0], line[0]

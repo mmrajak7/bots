@@ -764,13 +764,22 @@ def analyze_bcs(kite, stock: str, direction: str, spot: float,
     would_block_on_gain_at_tp = proj_gain_at_tp_pct < cfg.BCS_MIN_GAIN_AT_TP_PCT
     if would_block_on_gain_at_tp:
         logger.info(
+            # The formula, not a slogan. This used to read "(k=0.55 x width
+            # 30)", which was true only while the projection WAS k*width; once
+            # it became penetration-aware that line stated an identity which
+            # does not produce the number printed beside it, and a reader
+            # checking one against the other would conclude the code was
+            # broken. `pen=1.00` still reduces to the old arithmetic, visibly.
             "GAIN-AT-TP would-block (MEASURED ONLY, not enforced) %s %s "
             "%g/%g: debit %g (fill, d/w %.1f%%) projects %.1f%% at the TP "
-            "against a %.0f%% floor — value at TP assumed %g (k=%.2f x width "
-            "%g). Signal NOT suppressed.",
+            "against a %.0f%% floor — value at TP assumed %g "
+            "(width %g x [d/w + pen %s x (k %.2f - d/w)]). "
+            "Signal NOT suppressed.",
             stock, direction, atm_strike, k_tgt, debit, debit_to_width_pct,
             proj_gain_at_tp_pct, cfg.BCS_MIN_GAIN_AT_TP_PCT,
-            proj_value_at_tp, cfg.BCS_TP_VALUE_FRAC_OF_WIDTH, width)
+            proj_value_at_tp, width,
+            'UNKNOWN->1' if pen is None else '%.2f' % pen,
+            cfg.BCS_TP_VALUE_FRAC_OF_WIDTH)
 
     # `target_spread>2%` was dropped here on 2026-08-10. It fired on 17 of 25
     # closed shadows (68%) and carried no signal whatsoever — 58.8% WR flagged
