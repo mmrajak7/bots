@@ -353,16 +353,79 @@ def _in_range(ts: Optional[str], start: date, end: date) -> bool:
 
 # ── Aggregations ──────────────────────────────────────────────────────────
 
+def _net(t: dict) -> float:
+    """Realised P&L AFTER costs, falling back to GROSS when uncosted.
+
+    Every aggregate below used `t['pnl']` — the gross — and stored it under a
+    key named `net_pnl`, printed as "net Rs ...". On 2026-09-07 the daily
+    report said `net Rs -6,142` for #487 HEROMOTOCO whose record reads
+    `pnl -6142.5, pnl_net -6277.44`; over the cohort the same line overstated
+    the book by **Rs 2,888 on Rs 11,203, 26%**. Fee drag is the term that
+    decides whether this strategy is profitable at all (+0.90% gross / -0.79%
+    net, `bcs_economics_fee_drag`), so a report that labels gross as net hides
+    precisely the number go-live turns on.
+
+    The fallback is unavoidable, not a preference: only 37 of 252 historical
+    exits carry `pnl_net` at all, and 179 of them can never be costed. So a sum
+    over an old population is a MIXED basis, and `_uncosted` exists to make any
+    caller say so rather than present it as clean. The cohort — the only
+    population that is evidence — is 18 of 18 costed, so for that one the
+    number is simply right.
+    """
+    v = t.get('pnl_net')
+    if v is None:
+        v = t.get('pnl')
+    try:
+        return float(v or 0.0)
+    except (TypeError, ValueError):
+        # `capital.realised_pnl` guards the same read the same way. A
+        # stray string used to raise straight out of the EOD report,
+        # taking the whole digest and its Telegram down for one record.
+        return 0.0
+
+
+def _net_pct(t: dict) -> float:
+    """Return % AFTER costs, falling back to gross. Pairs with `_net`."""
+    v = t.get('pnl_net_pct')
+    if v is None:
+        v = t.get('pnl_pct')
+    return v or 0.0
+
+
+def _uncosted(group: list) -> int:
+    """How many of these have no `pnl_net`, i.e. contribute GROSS to the sum."""
+    return sum(1 for t in group if t.get('pnl_net') is None)
+
+
+def _basis_note(uncosted: int, total: int) -> str:
+    """'' when the sum is clean, else a clause naming the contamination."""
+    if not uncosted or not total:
+        return ''
+    if uncosted == total:
+        return ' [GROSS — no trade in this set carries costs]'
+    return ' [MIXED — %d of %d uncosted, counted gross]' % (uncosted, total)
+
+
 def _summarize_exits(exits: list) -> dict:
     """Compute aggregate stats over a list of exited trades."""
     if not exits:
+        # ONE shape, both branches. A dict whose keys depend on whether
+        # the list was empty makes every consumer guess, and
+        # `format_text` survived the omission only by using `.get`.
         return {'count': 0, 'wins': 0, 'losses': 0,
-                'net_pnl': 0.0, 'win_rate': 0.0,
+                'net_pnl': 0.0, 'win_rate': 0.0, 'uncosted': 0,
+                'basis_note': '',
                 'avg_hold_days': 0.0, 'best': None, 'worst': None,
-                'by_reason': {}}
-    wins = [t for t in exits if (t.get('pnl') or 0) > 0]
-    losses = [t for t in exits if (t.get('pnl') or 0) <= 0]
-    net = sum(t.get('pnl') or 0 for t in exits)
+                'by_reason': {}, 'by_alignment': _alignment_split([]),
+                'by_structure': _structure_split([]),
+                'tp_touch': tp_touch_stats([])}
+    # Win/loss on the NET number too: a "win" that loses money after costs is
+    # not a win, and having the count and the rupee figure disagree is the
+    # inconsistency this fix exists to remove. Changes nothing historically —
+    # uncosted records fall back to gross, and the cohort is 12W on both.
+    wins = [t for t in exits if _net(t) > 0]
+    losses = [t for t in exits if _net(t) <= 0]
+    net = sum(_net(t) for t in exits)
     # Hold days
     holds = []
     for t in exits:
@@ -375,16 +438,18 @@ def _summarize_exits(exits: list) -> dict:
         r = _reason_label(t.get('exit_reason'))
         by_reason.setdefault(r, {'count': 0, 'pnl': 0.0})
         by_reason[r]['count'] += 1
-        by_reason[r]['pnl'] += t.get('pnl') or 0
+        by_reason[r]['pnl'] += _net(t)
     return {
         'count': len(exits),
         'wins': len(wins),
         'losses': len(losses),
         'net_pnl': round(net, 0),
+        'uncosted': _uncosted(exits),
+        'basis_note': _basis_note(_uncosted(exits), len(exits)),
         'win_rate': round(len(wins) / len(exits) * 100, 1),
         'avg_hold_days': round(sum(holds) / len(holds), 1) if holds else 0.0,
-        'best': max(exits, key=lambda t: t.get('pnl') or 0),
-        'worst': min(exits, key=lambda t: t.get('pnl') or 0),
+        'best': max(exits, key=_net),
+        'worst': min(exits, key=_net),
         'by_reason': by_reason,
         'by_alignment': _alignment_split(exits),
         'by_structure': _structure_split(exits),
@@ -399,11 +464,13 @@ def _structure_split(exits: list) -> dict:
     """Zebra vs shadow-BCS A/B stats (BCS paper comparison, July 2026)."""
     def _stat(group: list) -> dict:
         if not group:
-            return {'count': 0, 'net_pnl': 0.0, 'win_rate': 0.0, 'capital': 0.0}
-        wins = sum(1 for t in group if (t.get('pnl') or 0) > 0)
+            return {'count': 0, 'net_pnl': 0.0, 'win_rate': 0.0,
+                    'capital': 0.0, 'uncosted': 0}
+        wins = sum(1 for t in group if _net(t) > 0)
         return {
             'count': len(group),
-            'net_pnl': round(sum(t.get('pnl') or 0 for t in group), 0),
+            'net_pnl': round(sum(_net(t) for t in group), 0),
+            'uncosted': _uncosted(group),
             'win_rate': round(wins / len(group) * 100, 1),
             'capital': round(sum(t.get('capital') or 0 for t in group), 0),
         }
@@ -421,17 +488,18 @@ def _alignment_split(exits: list) -> dict:
     """
     def _stat(group: list) -> dict:
         if not group:
-            return {'count': 0, 'net_pnl': 0.0, 'win_rate': 0.0}
+            return {'count': 0, 'net_pnl': 0.0, 'win_rate': 0.0, 'uncosted': 0}
         wins = 0
         net = 0.0
         for t in group:
-            pnl = t.get('pnl') or 0
+            pnl = _net(t)
             net += pnl
             if pnl > 0:
                 wins += 1
         return {
             'count': len(group),
             'net_pnl': round(net, 0),
+            'uncosted': _uncosted(group),
             'win_rate': round(wins / len(group) * 100, 1),
         }
     aligned, counter = [], []
@@ -601,8 +669,8 @@ def weekly_report(store: ZebraStore, kite=None,
 
 def _fmt_trade_line(t: dict) -> str:
     """One-line summary for a closed trade."""
-    pnl = t.get('pnl') or 0
-    pct = t.get('pnl_pct') or 0
+    pnl = _net(t)
+    pct = _net_pct(t)
     kl = int(t['long_strike']) if t.get('long_strike') else '?'
     ks = int(t['short_strike']) if t.get('short_strike') else '?'
     reason = _reason_label(t.get('exit_reason'))
@@ -685,9 +753,9 @@ def format_text(report: dict) -> str:
             f"Closed: {s['count']} trade(s) ({s['wins']}W {s['losses']}L, "
             f"net Rs {s['net_pnl']:+,.0f}, win-rate {s['win_rate']:.0f}%, "
             f"avg hold {s['avg_hold_days']:.1f}d)"
+            f"{s.get('basis_note', '')}"
         )
-        for t in sorted(report['closed'], key=lambda x: x.get('pnl') or 0,
-                        reverse=True):
+        for t in sorted(report['closed'], key=_net, reverse=True):
             lines.append(_fmt_trade_line(t))
         if s['by_reason']:
             lines.append("")
@@ -778,14 +846,19 @@ def format_telegram(report: dict) -> str:
     else:
         net = s['net_pnl']
         sign = '✅' if net > 0 else '🔻' if net < 0 else '➖'
+        # The basis note goes HERE too, not only in `format_text`. This is
+        # the message the owner actually reads; disclosing a mixed-basis
+        # total in the file and not in the Telegram would be the same
+        # defect one level up. Escaped like every other interpolation here
+        # — a bare `<` 400-rejects the WHOLE alert, silently.
         parts.append(
             f"\n<b>Closed:</b> {s['count']} ({s['wins']}W/{s['losses']}L) "
             f"{sign} Rs {net:+,.0f} | WR {s['win_rate']:.0f}% | "
             f"hold {s['avg_hold_days']:.1f}d"
+            f"{html.escape(s.get('basis_note', ''))}"
         )
-        for t in sorted(report['closed'], key=lambda x: x.get('pnl') or 0,
-                        reverse=True):
-            pnl = t.get('pnl') or 0
+        for t in sorted(report['closed'], key=_net, reverse=True):
+            pnl = _net(t)
             tag = '🟢' if pnl > 0 else '🔴'
             kl = int(t['long_strike']) if t.get('long_strike') else '?'
             ks = int(t['short_strike']) if t.get('short_strike') else '?'

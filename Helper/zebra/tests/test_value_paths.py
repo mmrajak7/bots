@@ -22,6 +22,7 @@ So the tests that matter here are not "does it parse". They are:
 Run:  cd Helper && PURE_PYTHON=1 python -m pytest zebra/tests/test_value_paths.py -v
 """
 import gzip
+import io
 import json
 import sys
 from pathlib import Path
@@ -216,3 +217,112 @@ def test_a_plain_log_wins_over_its_own_gz_twin(logs):
     d = json.loads(vp.out_path('2026-09-02').read_text(encoding='utf-8'))
     assert d['observations'] == 2, 'the truncated gz copy won'
     assert not d['source'].endswith('.gz')
+
+
+# ── a capture must not freeze a HALF-FINISHED session ──────────────────────
+#
+# Found 2026-09-07 by an adversarial review, then confirmed on the real files.
+# `write_day` returned early on `dest.exists()`, so whichever run wrote a day
+# FIRST owned it permanently. Two live routes hit that:
+#
+#   * the digest crontab is `0,47 15 * * 1-5` -- 15:00 AND 15:47 -- so the
+#     15:00 run captured a half-day and the 15:47 run skipped it;
+#   * a `--backfill` run during market hours did the same.
+#
+# `logs/eod/paths_2026-09-03.json`: extracted 11:16:49, LAST OBSERVATION
+# 11:15:16, 100 observations against 307-623 on every neighbouring session.
+# Silently truncated, in the dataset the trail study, the overnight-gap result
+# and the cohort MAE table are all replayed from.
+
+def _payload(day='2026-09-02'):
+    """The captured JSON for a day.
+
+    Opened rather than read via the Path convenience reader, because
+    `common/tests/test_source_guard_policy.py` finds source-freezing guards by
+    scanning for that reader's name and these tests read DATA, not source.
+    """
+    with io.open(str(vp.out_path(day)), encoding='utf-8') as fh:
+        return json.load(fh)
+
+
+def test_a_capture_taken_MID_SESSION_is_refreshed_when_the_log_grows(logs):
+    """THE REGRESSION."""
+    src = _session(logs, lines=(LINE_BLIND,))
+    assert vp.write_day('2026-09-02') is not None
+    first = _payload()
+    assert first['observations'] == 1
+
+    # The session continues and the log grows, exactly as it does at 15:00.
+    src.write_text('\n'.join((LINE_BLIND, LINE_OK)) + '\n', encoding='utf-8')
+    _touch_after(src, first['extracted_at'])
+
+    assert vp.write_day('2026-09-02') is not None, 'the 15:47 run must refresh'
+    assert _payload()['observations'] == 2
+
+
+def test_a_FINISHED_session_is_not_rewritten(logs):
+    """The other half. Re-extracting every run would churn a directory that is
+    never cleaned, and `capture()` walks every session on disk each time."""
+    _session(logs)
+    assert vp.write_day('2026-09-02') is not None
+    assert vp.write_day('2026-09-02') is None
+    assert vp.capture()['written'] == []
+
+
+def test_a_capture_whose_LOG_IS_GONE_is_never_overwritten(logs):
+    """Past the 90-day deletion this file is the only surviving record of what
+    the engine saw. `capture_is_stale` must not invite a rewrite that would
+    replace it with nothing."""
+    _session(logs)
+    vp.write_day('2026-09-02')
+    before = _payload()
+    (logs / 'cron_zebra_20260902.log').unlink()
+    assert vp.capture_is_stale('2026-09-02') is False
+    assert vp.write_day('2026-09-02') is None
+    assert _payload() == before
+
+
+def test_an_UNREADABLE_capture_is_treated_as_stale(logs):
+    """The self-healing direction: it re-extracts once, which repairs the
+    truncated files already on disk rather than needing a human to find them."""
+    src = _session(logs)
+    vp.out_path('2026-09-02').write_text('{ not json', encoding='utf-8')
+    _touch_after(src, '1970-01-01T00:00:00')
+    assert vp.capture_is_stale('2026-09-02') is True
+    assert vp.write_day('2026-09-02') is not None
+
+
+def test_a_capture_with_no_extracted_at_is_treated_as_stale(logs):
+    src = _session(logs)
+    vp.out_path('2026-09-02').write_text('{"schema": 1}', encoding='utf-8')
+    _touch_after(src, '1970-01-01T00:00:00')
+    assert vp.capture_is_stale('2026-09-02') is True
+
+
+def test_GZIPPING_a_log_does_not_look_like_growth(logs):
+    """`log_cleanup` gzips at 7 days and the archive INHERITS the log's mtime,
+    so a compressed session must not re-extract for the rest of its life."""
+    _session(logs)
+    vp.write_day('2026-09-02')
+    stamp = _payload()['extracted_at']
+    (logs / 'cron_zebra_20260902.log').unlink()
+    gz = _session(logs, gz=True)
+    _touch_before(gz, stamp)
+    assert vp.capture_is_stale('2026-09-02') is False
+
+
+def _touch_after(path, stamp):
+    """Set mtime one minute AFTER `stamp` (an IST-naive isoformat string)."""
+    import os
+    from datetime import datetime, timedelta
+    t = datetime.fromisoformat(stamp) + timedelta(minutes=1)
+    epoch = t.replace(tzinfo=cfg.IST).timestamp()
+    os.utime(str(path), (epoch, epoch))
+
+
+def _touch_before(path, stamp):
+    import os
+    from datetime import datetime, timedelta
+    t = datetime.fromisoformat(stamp) - timedelta(minutes=1)
+    epoch = t.replace(tzinfo=cfg.IST).timestamp()
+    os.utime(str(path), (epoch, epoch))

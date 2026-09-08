@@ -176,34 +176,123 @@ def test_both_engines_consult_the_SAME_window():
 
 # -- the declaration checks itself -------------------------------------------
 
+#: Matches the pinned date in `at()` above — the clock is never the wall's.
+DAY = '2026-09-04'
+
+
+def _ref(spot, day=DAY, t='15:15:20'):
+    return {'spot': spot, 'day': day, 't': t}
+
+
+def _verdict(ref, spot, when):
+    """`auction_watch` returns (looks_wrong, patch, compared_to)."""
+    return ms.auction_watch(ref, spot, when)
+
+
+def test_the_first_reading_inside_the_window_becomes_the_reference():
+    """It cannot be a finding: there is nothing yet to have moved away from.
+
+    This is the whole fix. The first cut compared against `corrob_spot`, which
+    stops advancing at 15:15 and therefore holds the last PRE-auction price —
+    so it reported the ordinary 15:10->15:15 move as drift. Measured on
+    2026-09-07: spot differed between those two polls on 8 of 8 open positions,
+    so it fired on every position, three times each, in a session where the
+    window behaved perfectly.
+    """
+    wrong, patch, compared = _verdict(None, 100.0, at(15, 15))
+    assert wrong is False and compared is None
+    assert patch['spot'] == 100.0 and patch['day'] == DAY
+    assert patch['t'] == '15:15:00', 'the reference must record WHEN it was taken'
+
+
 def test_a_moving_price_inside_the_window_is_reported_as_drift():
     """The window is a DECLARATION, and a declaration nothing checks is the
     shape this codebase keeps paying for. If NSE moves the auction, every guard
     keyed to 15:15 silently starts answering the wrong question."""
-    assert ms.window_looks_wrong(100.0, 100.5, at(15, 20)) is True
-    assert ms.window_looks_wrong(100.0, 100.0, at(15, 20)) is False
+    wrong, patch, compared = _verdict(_ref(100.0), 100.5, at(15, 20))
+    assert wrong is True
+    assert patch is None
+    assert compared == 100.0, 'the log line needs the number actually compared'
+
+
+def test_a_still_price_inside_the_window_is_the_healthy_case():
+    assert _verdict(_ref(100.0), 100.0, at(15, 25)) == (False, None, 100.0)
+
+
+def test_a_pre_window_move_is_NOT_drift():
+    """THE REGRESSION. 2026-09-07: every one of 8 positions moved between the
+    15:10 and 15:15 polls — normal continuous trading right up to the auction —
+    and the old check called all 8 of them a broken window."""
+    # 15:10 price 667.65 (SBICARD), frozen 15:15 price 672.00.
+    wrong, patch, _ = _verdict(None, 672.00, at(15, 15))
+    assert wrong is False, 'the move INTO the freeze is not a move INSIDE it'
+    assert patch['spot'] == 672.00
+    # ...and the rest of the window is then silent, which is the point.
+    for hh, mm in ((15, 20), (15, 25)):
+        assert _verdict(patch, 672.00, at(hh, mm))[0] is False
+
+
+def test_a_reference_from_another_DAY_is_ignored():
+    """The old check read `corrob_spot` with no regard for `corrob_t` at all,
+    so a position whose book had been unreliable could be judged against a
+    price from an earlier session and report a fabricated move of any size."""
+    wrong, patch, _ = _verdict(_ref(100.0, '2026-09-01'), 140.0, at(15, 20))
+    assert wrong is False
+    assert patch['spot'] == 140.0 and patch['day'] == DAY
 
 
 def test_it_says_nothing_outside_the_window():
     """Spot moving at 12:00 is the market working."""
-    assert ms.window_looks_wrong(100.0, 100.5, at(12, 0)) is False
+    assert _verdict(_ref(100.0), 100.5, at(12, 0)) == (False, None, None)
+
+
+def test_it_takes_no_reference_outside_the_window():
+    """A reference stamped at 12:00 would be a pre-auction price wearing the
+    day stamp that makes it look in-window — the original bug, re-imported."""
+    assert _verdict(None, 100.0, at(14, 0)) == (False, None, None)
 
 
 def test_missing_or_garbage_prices_are_not_drift():
     """It runs once per open position per poll, in the exit path. A detector
     that can throw is a new way to fail an exit."""
-    for prev, cur in ((None, 100.0), (100.0, None), ('x', 100.0),
-                      (100.0, 'x'), (None, None)):
-        assert ms.window_looks_wrong(prev, cur, at(15, 20)) is False
+    for ref, cur in ((None, None), (_ref(100.0), None), (_ref(100.0), 'x'),
+                     (_ref(100.0), 0), (_ref(100.0), -1),
+                     (_ref(100.0), float('nan')), (_ref(100.0), float('inf')),
+                     ({'spot': 'x', 'day': DAY}, 100.0),
+                     ({'spot': float('nan'), 'day': DAY}, 100.0),
+                     ({'day': DAY}, 100.0), ('not a dict', 100.0)):
+        wrong = _verdict(ref, cur, at(15, 20))[0]
+        assert wrong is False, (ref, cur)
+
+
+def test_a_garbage_reference_is_REPLACED_not_merely_ignored():
+    """Otherwise the position spends the whole window unable to take a good
+    reference, and the check is silently dead for it."""
+    _, patch, _c = _verdict({'spot': 'x', 'day': DAY}, 100.0, at(15, 20))
+    assert patch['spot'] == 100.0 and patch['day'] == DAY
 
 
 def test_it_is_not_a_veto_and_not_a_trigger():
     """It returns a fact for a log line. A detector that could halt the engine
     would be a worse bug than the one it watches for."""
-    assert ms.window_looks_wrong(100.0, 105.0, at(15, 20)) in (True, False)
+    assert _verdict(_ref(100.0), 105.0, at(15, 20))[0] in (True, False)
 
 
-# -- what this is NOT: the market closing ------------------------------------
+def test_a_NaN_never_becomes_the_reference():
+    """`nan <= 0` is False, so NaN used to be accepted — and `nan != nan` is
+    True, so it then reported a finding on every remaining cycle of the day."""
+    wrong, patch, _c = _verdict(None, float('nan'), at(15, 15))
+    assert (wrong, patch) == (False, None)
+
+
+def test_the_compared_value_is_returned_as_a_NUMBER():
+    """The caller formats it with `%.2f`. A ref holding the STRING '100'
+    compares fine through float() and then blew up inside `logging`, which
+    swallows the error — so the warning was lost entirely."""
+    wrong, _p, compared = _verdict({'spot': '100', 'day': DAY}, 105.0,
+                                   at(15, 20))
+    assert wrong is True
+    assert isinstance(compared, float) and compared == 100.0
 
 def test_the_derivatives_close_is_LATER_than_the_cash_auction():
     """The fact a first cut of this work got wrong. It gated BOOKING at 15:30

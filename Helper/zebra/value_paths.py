@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import glob
 import gzip
+import io
 import json
 import logging
 import os
@@ -160,6 +161,51 @@ def out_path(day: str) -> Path:
     return cfg.LOG_DIR / 'eod' / ('paths_%s.json' % day)
 
 
+def capture_is_stale(day: str, dest=None, src=None) -> bool:
+    """Has the source log GROWN since this day's capture was taken?
+
+    THE BUG THIS EXISTS FOR, found 2026-09-07. `write_day` returned early on
+    `dest.exists()`, so the FIRST write of a day won permanently. The digest
+    crontab is `0,47 15 * * 1-5` — it runs at 15:00 AND 15:47 — so the 15:00
+    run captured a half-day and the 15:47 run skipped the file it had just
+    made partial. A backfill run mid-session did the same thing:
+    `paths_2026-09-03.json` was extracted at 11:16:49 that day and its LAST
+    observation is **11:15:16**, 100 observations against 307-623 on every
+    neighbouring session. Nothing anywhere said so.
+
+    That silently truncates the dataset every replay in this project is
+    measured on — the overnight-gap result, the trail study, the MAE table.
+    A stale input still returns a number
+    (`feedback_a_stale_input_still_returns_a_number`).
+
+    mtime, not a clock: the archive inherits the log's mtime when
+    `log_cleanup` gzips it at 7 days, so a compressed session does not look
+    freshly grown. Once a session ends its log stops changing and this goes
+    False for good, so the rewrite is bounded, not per-cycle.
+
+    Unreadable or missing `extracted_at` counts as STALE. That is the
+    self-healing direction: it re-extracts once, which repairs the truncated
+    files already on disk. A day whose log is gone is handled by the caller —
+    no source, no rewrite, and the existing capture is kept.
+    """
+    dest = dest if dest is not None else out_path(day)
+    src = src if src is not None else _session_logs().get(day)
+    if src is None:
+        return False
+    try:
+        with io.open(str(dest), encoding='utf-8') as f:
+            stamp = json.load(f).get('extracted_at')
+        taken = datetime.fromisoformat(stamp)
+    except Exception:
+        return True
+    try:
+        grown = datetime.fromtimestamp(src.stat().st_mtime,
+                                       cfg.IST).replace(tzinfo=None)
+    except Exception:                            # pragma: no cover - paranoia
+        return False
+    return grown > taken
+
+
 def write_day(day: str, force: bool = False) -> Optional[Path]:
     """Extract one session into `logs/eod/paths_<date>.json`.
 
@@ -169,10 +215,13 @@ def write_day(day: str, force: bool = False) -> Optional[Path]:
     smaller failure than a cron that dies and silently stops capturing.
     """
     dest = out_path(day)
-    if dest.exists() and not force:
-        return None
     src = _session_logs().get(day)
     if src is None:
+        # No log: nothing to extract, and an existing capture is all there is.
+        # Never overwrite it — for a day past the 90-day log deletion this file
+        # is the only surviving record of what the engine saw.
+        return None
+    if dest.exists() and not force and not capture_is_stale(day, dest, src):
         return None
     try:
         paths = parse_session(src)

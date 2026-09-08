@@ -69,6 +69,7 @@ inferred from the tick rather than declared here.
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime, time as dtime, timedelta, timezone
 
 #: Both engines define their own IST; this module must not become a third
@@ -142,8 +143,12 @@ def spot_staleness_note(now: datetime = None) -> str:
                                                    CASH_AUCTION_START.minute))
 
 
-def window_looks_wrong(prev_spot, spot, now: datetime = None) -> bool:
+def auction_watch(ref, spot, now: datetime = None) -> tuple:
     """Did the cash price MOVE while we believe it cannot? Log-only.
+
+    Returns ``(looks_wrong, patch, compared_to)``. `patch` is a new reference
+    to persist, or None when the stored one still stands; `compared_to` is the
+    numeric reference the verdict was reached against, for the log line.
 
     The window above is a declaration, and a declaration nothing checks is the
     shape this codebase keeps paying for (`feedback_stale_scripts_and_docs`:
@@ -152,23 +157,80 @@ def window_looks_wrong(prev_spot, spot, now: datetime = None) -> bool:
     answering the wrong question and nothing anywhere looks broken.
 
     So: inside the window, spot must not change. If it does, the window is
-    wrong. This is the cheap half of the check — the expensive half (spot
-    frozen for fifteen minutes BEFORE the declared start) needs per-position
-    history and is left to the offline path analysis, which already has it.
+    wrong.
+
+    THE REFERENCE MUST BE TAKEN INSIDE THE WINDOW, and this is the whole
+    subtlety. The first cut compared against `corrob_spot`, on the reasoning
+    that the corroboration veto stands down at 15:15 so its reference still
+    holds the last PRE-auction price. It does — and that is precisely why it is
+    the wrong thing to compare against. The market trades normally right up to
+    15:15, so the 15:10 price and the frozen 15:15 price differ for entirely
+    ordinary reasons. Measured on 2026-09-07: spot differed between the 15:10
+    and 15:15 polls on **8 of 8** open positions, so the check fired on all of
+    them, three times each, 24 warnings in a session where the window behaved
+    perfectly (identical at 15:15/15:20/15:25 on 8 of 8). A detector whose
+    false-positive rate is ~100% by construction is worse than none: it teaches
+    the reader to skip the line, which is how the OI flag on COCHINSHIP got
+    waved through.
+
+    Hence a dedicated reference, stamped with the DAY it was taken. The day
+    stamp rules out a CROSS-SESSION stale reference — the previous cut read
+    `corrob_spot` with no regard to `corrob_t` at all, so a position whose book
+    had been unreliable could be judged against a price from an earlier session
+    and report a fabricated move of any size. It does NOT rule out a
+    same-session one: see the note on `t` below.
+
+    This is the cheap half of the check. The expensive half — does the freeze
+    start EARLIER than 15:15 — needs per-position history, and was measured
+    offline on 2026-09-07: consecutive polls were identical on 0-2 of 7-8
+    positions everywhere from 14:30 to 15:10 (ordinary noise, including 2 of 8
+    at 15:05->15:10) and on 8 of 8 at both 15:15->15:20 and 15:20->15:25. The
+    declared start is right; nothing is hiding before it.
 
     Deliberately NOT a veto and NOT a trigger. It returns a fact for a log
     line; nothing about the day's trading should change because a session-time
     assumption is stale, and a detector that could halt the engine would be a
     worse bug than the one it watches for.
     """
+    now = now or datetime.now(IST)
     if not cash_price_is_frozen(now):
-        return False
+        return False, None, None
     try:
-        if prev_spot is None or spot is None:
-            return False
-        return float(prev_spot) != float(spot)
+        spot = float(spot)
+        # `nan <= 0` is False, so a NaN used to sail through and BECOME the
+        # reference — and `nan != nan` is True, so it then reported a finding
+        # on every remaining cycle of the day. `isfinite` also rejects inf.
+        if not math.isfinite(spot) or spot <= 0:
+            return False, None, None
     except (TypeError, ValueError):
-        return False
+        return False, None, None
+    day = now.date().isoformat()
+    stored = None
+    if isinstance(ref, dict) and ref.get('day') == day:
+        try:
+            stored = float(ref['spot'])
+            if not math.isfinite(stored):
+                stored = None
+        except (TypeError, ValueError, KeyError):
+            stored = None
+    if stored is None:
+        # First reading inside today's window: this IS the reference. It is
+        # never a finding — there is nothing yet to have moved away from.
+        #
+        # `t` is stamped because the reference can still, rarely, be a LIVE
+        # print: the freeze onset is measured at 15:15:02-15:15:32 and zebra's
+        # 15:15 cycle stamps its POLL lines at 15:15:15-15:15:41, so the two
+        # ranges overlap. On such a day the 15:20 comparison would differ for
+        # the ordinary reason and fire. It has not happened in ~140 measured
+        # position-sessions, but without the time on the record a firing could
+        # not be told from a real one — so the log line prints it and any
+        # future firing diagnoses itself.
+        return False, {'spot': spot, 'day': day, 't': now.strftime('%H:%M:%S')}, None
+    # The compared value comes BACK rather than the caller re-reading the
+    # stored dict: a ref holding `spot: "100"` compares fine through float()
+    # and then blew up `%.2f` inside logging, which swallows the error and
+    # LOSES the warning entirely.
+    return stored != spot, None, stored
 
 
 def assert_agrees_with(market_close) -> None:

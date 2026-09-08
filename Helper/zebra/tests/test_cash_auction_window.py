@@ -58,6 +58,11 @@ def drive(store, monkeypatch, spot=150.0, mid=30.0, frozen=False, vet=True):
     """One `check_entered` cycle, with the auction window pinned."""
     monkeypatch.setattr(monitor.market_session, 'cash_price_is_frozen',
                         lambda n=None: frozen)
+    # PIN THE CLOCK. The auction reference is stamped with the DAY it was
+    # taken, so two cycles either side of IST midnight would re-take it and
+    # this file would flake once a year at 00:00 — the wall-clock rule.
+    monkeypatch.setattr(monitor, '_now_ist',
+                        lambda: datetime(2026, 9, 7, 15, 20, tzinfo=monitor.IST))
     monkeypatch.setattr(monitor, '_send_telegram', lambda m, **k: True)
     monkeypatch.setattr(monitor, 'get_ltp', lambda kite, stocks: {'TESTCO': spot})
     monkeypatch.setattr(monitor, '_structure_quote',
@@ -146,17 +151,63 @@ def test_the_shadow_still_records_outside_the_window(store, monkeypatch):
 def test_a_moving_spot_inside_the_window_is_reported(store, monkeypatch, caplog):
     """If NSE moves the auction, every guard keyed to 15:15 silently starts
     answering the wrong question and nothing looks broken. Log-only: a stale
-    session-time assumption must not change what the engine does today."""
+    session-time assumption must not change what the engine does today.
+
+    BOTH cycles are inside the window. That is the fix: the reference has to be
+    taken in the window it is policing.
+    """
     # Below the TP of 100, or the position exits on the first cycle and there
     # is nothing left to observe on the second.
-    drive(store, monkeypatch, spot=97.0, frozen=False)    # sets the reference
+    drive(store, monkeypatch, spot=97.0, frozen=True)     # sets the reference
     with caplog.at_level(logging.WARNING, logger='zebra.monitor'):
         drive(store, monkeypatch, spot=98.0, frozen=True)
     assert 'AUCTION WINDOW LOOKS WRONG' in caplog.text
 
 
+def test_the_first_in_window_cycle_is_never_a_finding(store, monkeypatch,
+                                                      caplog):
+    """It is the reference. There is nothing yet to have moved away from."""
+    with caplog.at_level(logging.WARNING, logger='zebra.monitor'):
+        drive(store, monkeypatch, spot=97.0, frozen=True)
+    assert 'AUCTION WINDOW LOOKS WRONG' not in caplog.text
+    assert store.find(1)['auction_ref']['spot'] == 97.0
+
+
+def test_the_move_INTO_the_freeze_is_not_a_finding(store, monkeypatch, caplog):
+    """THE REGRESSION, from 2026-09-07.
+
+    The first cut compared the frozen spot against `corrob_spot`, which stops
+    advancing at 15:15 and so still holds the last PRE-auction price. The
+    market trades normally right up to 15:15, so those two differ for entirely
+    ordinary reasons — on that session, on 8 of 8 open positions, producing 24
+    warnings in a day when the window behaved perfectly (spot identical at
+    15:15/15:20/15:25 on 8 of 8, and moving again at the 15:30 uncrossing).
+
+    A detector whose false-positive rate is ~100% by construction is worse than
+    none: it teaches the reader to skip the line.
+    """
+    drive(store, monkeypatch, spot=97.0, frozen=False)    # 15:10, still live
+    with caplog.at_level(logging.WARNING, logger='zebra.monitor'):
+        drive(store, monkeypatch, spot=98.0, frozen=True)  # 15:15, frozen
+        drive(store, monkeypatch, spot=98.0, frozen=True)  # 15:20
+        drive(store, monkeypatch, spot=98.0, frozen=True)  # 15:25
+    assert 'AUCTION WINDOW LOOKS WRONG' not in caplog.text
+
+
+def test_the_reference_is_unversioned_and_local_only(store, monkeypatch):
+    """It changes once per position per session and nothing reads it after the
+    close, so pushing it to Drive would churn the network — and an undeclared
+    poll field is what produced the false MERGE CONFLICT on #454."""
+    from zebra.trade_store import _BATCHED_POLL_FIELDS, _UNVERSIONED_FIELDS
+    assert 'auction_ref' in _BATCHED_POLL_FIELDS
+    assert 'auction_ref' in _UNVERSIONED_FIELDS
+    before = store.find(1)['version']
+    drive(store, monkeypatch, spot=97.0, frozen=True)
+    assert store.find(1)['version'] == before
+
+
 def test_a_still_spot_inside_the_window_says_nothing(store, monkeypatch, caplog):
-    drive(store, monkeypatch, spot=97.0, frozen=False)
+    drive(store, monkeypatch, spot=97.0, frozen=True)
     with caplog.at_level(logging.WARNING, logger='zebra.monitor'):
         drive(store, monkeypatch, spot=97.0, frozen=True)
     assert 'AUCTION WINDOW LOOKS WRONG' not in caplog.text

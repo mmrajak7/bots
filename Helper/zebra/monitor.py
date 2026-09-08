@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import logging
 import time
 from datetime import datetime, timezone, timedelta
@@ -41,6 +42,7 @@ from . import health as health_mod
 from . import history
 from . import mfe as mfe_mod
 from . import outcomes as outcomes_mod
+from . import eod_coverage
 from . import postmortem as postmortem_mod
 from . import review as review_mod
 from common import market_session
@@ -2075,6 +2077,97 @@ def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
     return bcs, fresh
 
 
+#: One WARNING per (signal, gate) per day; the repeats go to INFO.
+#:
+#: #496 SHREECEM emitted the SAME suppression 58 times on 2026-09-07 — every
+#: cycle from 10:15 to 15:10 — and every one of them was true (the target leg
+#: ran 46-56% wide against a 25% cap) and re-quoting each cycle is correct,
+#: because a book can tighten. What is not correct is 58 WARNINGs for one
+#: condition: that is the path the OI flag took before COCHINSHIP was waved
+#: through, and this file already carries a second example from the same
+#: session (`AUCTION WINDOW LOOKS WRONG`, 24 a session, 100% false).
+#:
+#: Keyed on the reason with its NUMBERS STRIPPED, so a re-quote of the same
+#: gate collapses while a genuinely different rejection still speaks up. That
+#: DELIBERATELY collapses a target leg that moved to another strike
+#: (SHREECEM26SEP22750PE and ...23000PE both key as SHREECEM#SEP#PE): it is the
+#: same signal failing the same gate, and the full symbol is still on the INFO
+#: line for any post-mortem.
+#: Persisted, because `zebra run` is one-shot under cron and an in-memory
+#: counter would reset every five minutes — which is the whole failure.
+SUPPRESS_STATE_NAME = 'bcs_suppress_state.json'
+
+_SUPPRESS_NUM = re.compile(r'[0-9]+(?:\.[0-9]+)?')
+
+
+def _now_ist() -> datetime:
+    """The one wall-clock read in the poll loop, so tests can pin it.
+
+    A guard that reads `datetime.now()` directly cannot be tested at 02:00 on a
+    Sunday, and this project has already paid for that twice — a wall-clock
+    flake in the EOD sweep tests, and an auction test that would break across
+    IST midnight. One seam beats N patches.
+    """
+    return datetime.now(IST)
+
+
+def _suppression_seen(tid, reason: str) -> int:
+    """How many times this (signal, gate) has been logged today, incl. now.
+
+    Returns 1 the first time. NEVER raises and never blocks the caller: on any
+    I/O trouble it returns 1, which degrades to the old always-WARNING
+    behaviour — the safe direction for a log line.
+    """
+    try:
+        key = '%s|%s' % (tid, _SUPPRESS_NUM.sub('#', reason or ''))
+        day = _now_ist().date().isoformat()
+        path = cfg.LOG_DIR / SUPPRESS_STATE_NAME
+    except Exception as e:
+        # Including the path build itself: `LOG_DIR` is monkeypatched in tests
+        # and could be anything at all, and this runs in the ENTRY path. The
+        # first cut left these three lines outside the guard, which made a
+        # cosmetic log change into a new way to break an entry — found by the
+        # test that exists for exactly that.
+        logger.debug('suppression counter unavailable: %s', e)
+        return 1
+    try:
+        with open(path) as f:
+            state = json.load(f)
+        state = state if isinstance(state, dict) else {}
+    except Exception:
+        state = {}
+    if state.get('day') != day:
+        # A new session starts clean, so the first suppression of each morning
+        # is a WARNING again. Also bounds the file: it can never accumulate
+        # past one day of keys.
+        state = {'day': day, 'seen': {}}
+    # SHAPE-CHECK, not `setdefault`. A file holding `"seen": []` or
+    # `"seen": null` raised AttributeError, and `"seen": {"k": "abc"}` raised
+    # ValueError — out of `_log_bcs_suppressed`, out of `_build_bcs`, and past
+    # the per-trade `except` in `check_watching`, aborting the whole loop so
+    # every remaining signal in the cycle was skipped. Worse, the raise came
+    # BEFORE the rewrite, so the bad file was never repaired and it recurred
+    # every cycle until a human noticed. The docstring said "NEVER raises".
+    seen = state.get('seen')
+    if not isinstance(seen, dict):
+        seen = {}
+    state['seen'] = seen
+    try:
+        n = int(seen.get(key) or 0) + 1
+    except (TypeError, ValueError):
+        n = 1
+    seen[key] = n
+    try:
+        cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + '.tmp')
+        with open(tmp, 'w') as f:
+            json.dump(state, f)
+        tmp.replace(path)
+    except Exception as e:
+        logger.debug('could not persist the suppression counter: %s', e)
+    return n
+
+
 def _log_bcs_suppressed(trade: dict, reason: Optional[str]) -> None:
     """Record a gated shadow BCS — LOG ONLY, deliberately never Telegram.
 
@@ -2084,7 +2177,7 @@ def _log_bcs_suppressed(trade: dict, reason: Optional[str]) -> None:
 
     It is still recorded at WARNING with a fixed 'BCS SUPPRESSED' prefix so a
     gate that starts rejecting everything is one grep away:
-        grep 'BCS SUPPRESSED' logs/cron_zebra.log
+        grep 'BCS SUPPRESSED' logs/cron_zebra_$(date +%Y%m%d).log
     No html-escaping here — a log line is not parsed as markup.
     """
     # The tail of this line used to read "zebra entered silently for the A/B
@@ -2093,10 +2186,18 @@ def _log_bcs_suppressed(trade: dict, reason: Optional[str]) -> None:
     # and after the back ratio was decommissioned on 2026-08-27 — a suppressed
     # BCS means NOTHING entered at all, which is the opposite fact and the one
     # a reader needs.
-    logger.warning("BCS SUPPRESSED #%d %s (%s): %s — NO position opened "
-                   "(the BCS is the only structure; nothing enters behind it)",
-                   trade['id'], trade['stock'], trade['direction'],
-                   reason or "no viable BCS pair")
+    reason = reason or "no viable BCS pair"
+    n = _suppression_seen(trade.get('id'), reason)
+    msg = ("BCS SUPPRESSED #%d %s (%s): %s — NO position opened "
+           "(the BCS is the only structure; nothing enters behind it)")
+    args = (trade['id'], trade['stock'], trade['direction'], reason)
+    if n <= 1:
+        logger.warning(msg, *args)
+    else:
+        # SAME signal, SAME gate, a new quote. Still logged in full — the
+        # numbers move and the record of what the book looked like each cycle
+        # is the evidence — but at INFO, because the finding was the first one.
+        logger.info(msg + " [repeat %d today]", *(args + (n,)))
 
 
 def _swing_clears_breakeven(trade: dict, bcs: dict, swing):
@@ -3894,6 +3995,70 @@ def _alert_calendar_coverage(dry_run: bool = False) -> Optional[str]:
     return st['state']
 
 
+#: Dedup for the digest-coverage alert. Same reason as the two above: this
+#: process exits between cycles, so "have I already said this today" cannot
+#: live in memory.
+DIGEST_ALERT_STATE_NAME = 'digest_alert_state.json'
+
+
+def _alert_digest_coverage(dry_run: bool = False) -> Optional[str]:
+    """Say so when the EOD digest stops being written. Never raises.
+
+    The digest is a SEPARATE crontab line, and its failure mode is producing
+    nothing: `logs/eod/` stays empty and every other part of the system looks
+    perfectly healthy. It went uninstalled for 18 days that way, and it failed
+    again on 2026-09-07 — both times found by a human running `ls`, which is
+    not a monitoring strategy.
+
+    Why the engine has to be the one to notice: the digest is the arming-gate
+    evidence record and carries the value paths, and `common.log_cleanup`
+    deletes the raw logs at 90 days. A gap found inside that window costs one
+    `zebra digest --date`; a gap found outside it is permanent. So the alert
+    is not about today's file, it is about the clock that starts when today's
+    file does not appear.
+
+    Daily while broken, because there is nothing to do about it more often
+    than that and this fleet has already learnt what a per-cycle alarm does to
+    a reader (`AUCTION WINDOW LOOKS WRONG`, 24 a session, 100% false).
+    """
+    try:
+        st = eod_coverage.coverage_status()
+    except Exception as e:                       # pragma: no cover - paranoia
+        logger.warning('digest coverage check failed: %s', e)
+        return None
+    if st['state'] in ('ok', 'pending'):
+        # INFO on the healthy path for the same reason the calendar line is:
+        # a check that logs nothing when it passes is indistinguishable from a
+        # check that was never wired in.
+        logger.info('EOD digest coverage OK: %s', st['detail'])
+        return None
+    logger.warning('EOD DIGEST COVERAGE: %s', st['detail'])
+    now = time.time()
+    try:
+        with open(cfg.LOG_DIR / DIGEST_ALERT_STATE_NAME) as f:
+            prev = json.load(f)
+        prev = prev if isinstance(prev, dict) else {}
+    except Exception:
+        prev = {}
+    if (prev.get('state') == st['state']
+            and now - float(prev.get('alerted_at') or 0) < 24 * 3600):
+        return st['state']
+    _send_telegram(
+        html.escape('\U0001F4C1 EOD DIGEST %s\n%s'
+                    % (st['state'].upper(), st['detail'])),
+        dry_run=dry_run)
+    try:
+        cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = cfg.LOG_DIR / DIGEST_ALERT_STATE_NAME
+        tmp = path.with_name(path.name + '.tmp')
+        with open(tmp, 'w') as f:
+            json.dump({'state': st['state'], 'alerted_at': now}, f)
+        tmp.replace(path)
+    except Exception as e:
+        logger.warning('could not persist the digest alert state: %s', e)
+    return st['state']
+
+
 def _arming_preflight(store, dry_run: bool = False) -> dict:
     """State the switch combination, every cycle. Never raises.
 
@@ -4319,22 +4484,40 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # Read ONCE per position per poll and threaded through, so the POLL
             # line, the measurement channels and the record cannot disagree
             # about whether this print was live.
-            spot_frozen = market_session.cash_price_is_frozen()
-            # The corroboration reference stops advancing once the window
-            # opens (the veto returns early), so it still holds the last
-            # PRE-auction price — which makes it the right thing to compare
-            # against, at no extra cost.
-            if market_session.window_looks_wrong(trade.get('corrob_spot'), spot):
+            # ONE clock for this position, threaded through every reader.
+            # The comment below asserts the frozen state is read once and
+            # cannot disagree with the POLL line; `auction_watch` and
+            # `spot_staleness_note` used to read their own `now`, so a cycle
+            # crossing 15:15:00 or 15:30:00 could log `[STALE:auction]` absent
+            # while a reference was taken, or the reverse. The assertion is now
+            # true rather than aspirational.
+            poll_now = _now_ist()
+            spot_frozen = market_session.cash_price_is_frozen(poll_now)
+            # The reference is taken INSIDE the window and stamped with the
+            # day. It must not be `corrob_spot`: that one stops advancing at
+            # 15:15, so it holds the last PRE-auction price, and comparing it
+            # to the frozen one reports the ordinary 15:10->15:15 move as a
+            # finding — 8 of 8 positions, every session. See
+            # `market_session.auction_watch`.
+            auction_wrong, auction_patch, auction_ref_spot = (
+                market_session.auction_watch(trade.get('auction_ref'), spot,
+                                             now=poll_now))
+            if auction_patch:
+                pending_mfe.setdefault(tid, {})['auction_ref'] = auction_patch
+            if auction_wrong:
                 # A difference here means the cash market IS printing when we
                 # believe it cannot — the declared window is stale. Log-only on
                 # purpose: a session-time assumption going out of date must not
                 # change what the engine does today.
                 logger.warning(
-                    "AUCTION WINDOW LOOKS WRONG #%d %s: spot moved %.2f -> "
-                    "%.2f inside %s. Re-measure the freeze before trusting any "
-                    "guard keyed to it (common/market_session.py).",
-                    tid, stock, trade.get('corrob_spot') or 0, spot,
-                    market_session.spot_staleness_note() or 'the window')
+                    "AUCTION WINDOW LOOKS WRONG #%d %s: spot moved %.2f (ref "
+                    "taken %s) -> %.2f inside %s. Re-measure the freeze before "
+                    "trusting any guard keyed to it "
+                    "(common/market_session.py).",
+                    tid, stock, auction_ref_spot or 0.0,
+                    (trade.get('auction_ref') or {}).get('t') or '?', spot,
+                    market_session.spot_staleness_note(poll_now)
+                    or 'the window')
             _track_debit_blindness(store, trade, debit_usable, sq['reason'],
                                    dry_run=dry_run, spot=spot)
 
@@ -4895,6 +5078,14 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
         _alert_calendar_coverage(dry_run=dry_run)
     except Exception as e:
         logger.error("Calendar coverage check failed: %s", e)
+    # Its OWN try, not the calendar's. Two independent checks sharing one
+    # `except` means the first one raising silently disables the second, and
+    # the log line then names the wrong check — probes are independent `if`s
+    # (`feedback_all_clear_needs_the_alarm`).
+    try:
+        _alert_digest_coverage(dry_run=dry_run)
+    except Exception as e:
+        logger.error("EOD digest coverage check failed: %s", e)
     # Say which portfolio limits are ARMED, every cycle. An unset rupee cap
     # behaves exactly like a working one right up to the moment it should have
     # refused something, and this system has already shipped two controls that

@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 # This one is derived from that set rather than repeated, so the mistake is
 # not available here.
 _BATCHED_POLL_FIELDS = frozenset({'corrob_spot', 'corrob_value', 'corrob_t',
-                                  'exit_depth', 'spot_shadow'})
+                                  'exit_depth', 'spot_shadow', 'auction_ref'})
 
 #: EVERY field this store writes LOCAL-ONLY and WITHOUT bumping `version`.
 #:
