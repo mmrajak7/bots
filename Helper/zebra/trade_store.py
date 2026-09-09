@@ -800,6 +800,14 @@ class ZebraStore:
                 'paper': data.get('paper', True),
                 'notes': data.get('notes', ''),
             }
+            # Point-in-time speed reading (ATR20 and the distance to ST in
+            # ATRs). Optional: a symbol with too little daily history has none,
+            # and an ABSENT key is honest where a zero would read as "this
+            # stock does not move". Written once, at the signal, and never
+            # refreshed — a recomputed figure would contain bars from after
+            # the decision it is supposed to describe. MEASURED, NOT A GATE.
+            if isinstance(data.get('velocity'), dict):
+                trade['velocity'] = data['velocity']
             self._trades.append(trade)
         logger.info(
             "WATCHING #%d %s %s %s spot=%.2f ST=%.2f gap=%.2f%%",

@@ -566,3 +566,78 @@ def _attraction(kite, stock, timeframe, direction):
                  'its full horizon is NOT counted as a miss - see '
                  'in_progress.'),
     }
+
+
+# ── 3. how fast does this stock move, as of the signal? ───────────────────
+
+#: Bars of daily history the ATR is measured over. 20 sessions ~= one month,
+#: long enough to be a rate rather than a single gap, short enough to still
+#: describe the regime the signal fired in.
+ATR_BARS = 20
+
+
+def _atr(candles: List[dict], n: int = ATR_BARS) -> Optional[float]:
+    """Wilder true range, averaged over the last `n` COMPLETED bars.
+
+    True range rather than high-low: a stock that gaps and then trades quietly
+    has moved, and the gap is exactly the part that matters for whether the ST
+    line gets reached.
+    """
+    if len(candles) < n + 1:
+        return None
+    trs = []
+    for i in range(len(candles) - n, len(candles)):
+        h, l = candles[i]['high'], candles[i]['low']
+        pc = candles[i - 1]['close']
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return statistics.mean(trs) if trs else None
+
+
+def velocity_context(kite, stock: str, timeframe: str,
+                     st_value: float, price: float) -> Optional[dict]:
+    """How far the ST line is in units of this stock's own recent daily range.
+
+    MEASURED, NEVER A GATE — and the distinction is the whole point of this
+    function. Stamped on the signal so the question "does speed predict
+    arrival" can be answered later from records rather than by recomputing,
+    which is how a point-in-time statistic quietly becomes a look-ahead one.
+    The touch rate was measured the wrong way round exactly once and looked
+    decisive at p=0.0014 until it was clustered by symbol; see the caveats
+    below before anyone builds a filter on this.
+
+    WHAT IS AND IS NOT ESTABLISHED (measured 2026-09-09, 505 signals):
+      * `atrs_to_st` splits forward touch 67.2% vs 50.5% at 20 sessions, but
+        the permutation p is 0.0237 clustered by STOCK (0.0014 naive, which
+        was wrong — 132 stocks share 384 signals), and ~0.24 after correcting
+        for the number of splits tried. NOT significant.
+      * The DISTANCE term contributes nothing on its own (0.9pp, p=0.92).
+        `atr_pct` alone carries the whole effect. So this is a volatility
+        reading, not a time-to-target model, whatever its name suggests.
+      * Realised cohort P&L does NOT separate on it (p=0.63).
+      * ATR20 mean-reverts: the high bucket decays to ~0.89x over the next 20
+        sessions, so `atrs_to_st` is optimistic by roughly a tenth.
+
+    Free: the daily cache is already warm from `compute_st_for_stock`.
+    Returns None rather than a partial dict — a half-filled measurement reads
+    as a value later, which is the failure mode this codebase keeps hitting.
+    """
+    try:
+        daily = _daily_candles(kite, stock, timeframe)
+        if len(daily) < ATR_BARS + 1:
+            return None
+        a = _atr(daily)
+        if not a or a <= 0 or not price or price <= 0:
+            return None
+        return {
+            'atr': round(a, 4),
+            'atr_pct': round(100.0 * a / price, 3),
+            'atrs_to_st': round(abs(st_value - price) / a, 3),
+            'bars': ATR_BARS,
+            # The last COMPLETED bar this was measured on. Without it a stored
+            # figure cannot be told apart from one recomputed today, and that
+            # is the difference between evidence and look-ahead.
+            'as_of': str(daily[-1]['date'])[:10],
+        }
+    except Exception as e:                      # pragma: no cover - guard
+        logger.debug("velocity_context failed for %s: %s", stock, e)
+        return None

@@ -833,3 +833,131 @@ def test_the_agent_actually_receives_this_document():
     src = (HELPER / 'zebra' / 'vet.py').read_text(encoding='utf-8')
     assert 'vetting_doc=cfg.VETTING_DOC' in src, \
         "the entry prompt no longer hands VETTING.md to the agent"
+
+
+# ── velocity: measured at the signal, never a gate ────────────────────────
+
+def _atr_bars(n, rng, start=100.0, step=0.0):
+    """n daily bars, each with a `rng`-wide true range, on a flat or drifting
+    close. Dates ascend so the last bar is the most recent completed one."""
+    out = []
+    for i in range(n):
+        c = start + step * i
+        out.append({'date': '2026-01-%02d' % (i + 1), 'open': c,
+                    'high': c + rng / 2.0, 'low': c - rng / 2.0, 'close': c})
+    return out
+
+
+def _patch_cache(monkeypatch, bars):
+    monkeypatch.setattr(history, '_daily_candles', lambda k, s, t: bars)
+
+
+def test_velocity_is_absent_rather_than_zero_when_history_is_short(monkeypatch):
+    """A symbol with too few bars has NO reading. Returning zeros would read
+    later as 'this stock does not move', which is the opposite of unknown."""
+    _patch_cache(monkeypatch, _atr_bars(5, 2.0))
+    assert history.velocity_context(None, 'X', 'weekly', 105.0, 100.0) is None
+
+
+def test_velocity_measures_distance_in_units_of_daily_range(monkeypatch):
+    """ATR 2.0 on a Rs 100 stock is 2%/session; an ST line Rs 6 away is 3 ATRs.
+    That ratio is the whole point — distance means nothing without speed."""
+    _patch_cache(monkeypatch, _atr_bars(30, 2.0))
+    v = history.velocity_context(None, 'X', 'weekly', 106.0, 100.0)
+    assert v['atr'] == pytest.approx(2.0, abs=0.01)
+    assert v['atr_pct'] == pytest.approx(2.0, abs=0.01)
+    assert v['atrs_to_st'] == pytest.approx(3.0, abs=0.01)
+    assert v['bars'] == history.ATR_BARS
+
+
+def test_direction_does_not_matter_only_distance(monkeypatch):
+    """A PE signal sits ABOVE its line and a CE below. Both have to travel."""
+    _patch_cache(monkeypatch, _atr_bars(30, 2.0))
+    up = history.velocity_context(None, 'X', 'weekly', 106.0, 100.0)
+    dn = history.velocity_context(None, 'X', 'weekly', 94.0, 100.0)
+    assert up['atrs_to_st'] == dn['atrs_to_st']
+
+
+def test_the_reading_carries_the_bar_it_was_taken_on(monkeypatch):
+    """Without `as_of` a stored figure cannot be distinguished from one
+    recomputed today — which is the difference between a point-in-time
+    measurement and a look-ahead one. The touch rate was lost that way."""
+    bars = _atr_bars(30, 2.0)
+    _patch_cache(monkeypatch, bars)
+    v = history.velocity_context(None, 'X', 'weekly', 106.0, 100.0)
+    assert v['as_of'] == bars[-1]['date']
+
+
+def test_a_gap_counts_as_movement(monkeypatch):
+    """True range, not high-low: a stock that gaps then trades quietly HAS
+    moved, and the gap is exactly what carries price to the ST line."""
+    quiet = _atr_bars(30, 1.0)
+    gappy = _atr_bars(30, 1.0, step=3.0)      # same intraday range, big gaps
+    _patch_cache(monkeypatch, quiet)
+    a = history.velocity_context(None, 'X', 'weekly', 110.0, 100.0)['atr']
+    _patch_cache(monkeypatch, gappy)
+    b = history.velocity_context(None, 'X', 'weekly', 110.0, 100.0)['atr']
+    assert b > a, "gaps must register as movement or ATR understates speed"
+
+
+def test_a_broken_candle_series_yields_no_reading_and_does_not_raise(monkeypatch):
+    """This runs inside the scan loop. A costing or measurement error must
+    never be able to stop a signal being recorded."""
+    monkeypatch.setattr(history, '_daily_candles',
+                        lambda k, s, t: [{'date': 'x'}] * 30)
+    assert history.velocity_context(None, 'X', 'weekly', 106.0, 100.0) is None
+
+
+# ── the reading has to actually reach the record ──────────────────────────
+
+def _fresh_store(tmp_path, monkeypatch):
+    from zebra.trade_store import ZebraStore
+    monkeypatch.setattr(cfg, 'LOG_DIR', tmp_path)
+    monkeypatch.setattr(cfg, 'LOCAL_FILE', tmp_path / 'zebra_trades.json')
+    monkeypatch.setattr(cfg, 'LOCK_FILE', tmp_path / 'zebra_trades.lock')
+    return ZebraStore()
+
+
+BASE_SIGNAL = {'stock': 'TESTCO', 'timeframe': 'weekly', 'direction': 'CE',
+               'st_value': 1040.0, 'st_direction': 'UP',
+               'signal_price': 1000.0, 'signal_gap_pct': 4.0}
+
+
+def test_the_velocity_reading_is_persisted_on_the_signal(tmp_path, monkeypatch):
+    """A measurement that never reaches the record answers nothing later."""
+    s = _fresh_store(tmp_path, monkeypatch)
+    v = {'atr': 20.0, 'atr_pct': 2.0, 'atrs_to_st': 2.0, 'bars': 20,
+         'as_of': '2026-09-08'}
+    t = s.add_signal(dict(BASE_SIGNAL, velocity=v))
+    assert t['velocity'] == v
+    assert s.find(t['id'])['velocity']['as_of'] == '2026-09-08'
+
+
+def test_a_signal_without_a_reading_carries_no_key_at_all(tmp_path, monkeypatch):
+    """ABSENT, not zero. A symbol too new to have 21 daily bars has no speed
+    reading, and a stored 0.0 would later read as 'this stock does not move' —
+    the default-that-looks-like-a-value shape this codebase keeps hitting."""
+    s = _fresh_store(tmp_path, monkeypatch)
+    t = s.add_signal(dict(BASE_SIGNAL))
+    assert 'velocity' not in t
+    t2 = s.add_signal(dict(BASE_SIGNAL, stock='OTHERCO', velocity='nonsense'))
+    assert 'velocity' not in t2, "a malformed reading must be dropped, not stored"
+
+
+def test_the_scanner_asks_for_it_on_the_path_that_actually_runs():
+    """Wiring, not behaviour: a measurement wired into a function nobody calls
+    is the failure this project has hit repeatedly. `validate_and_add` is the
+    scan's real entrypoint, so the call must be inside it.
+
+    RETIRES WHEN: a scan-level test drives `validate_and_add` against a fake
+    Chartink + kite and asserts the stored signal carries `velocity` — then the
+    behaviour is covered end to end and reading the source proves nothing extra.
+    Not written now because the scan path needs both feeds stubbed, which is a
+    larger fixture than this one measurement justifies.
+    """
+    import inspect
+    from zebra import scanner
+    src = inspect.getsource(scanner.validate_and_add)
+    assert 'velocity_context' in src
+    assert "signal_data['velocity']" in src
+

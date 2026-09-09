@@ -30,6 +30,7 @@ from datetime import datetime
 from typing import List
 
 from . import config as cfg
+from . import history
 from .trade_store import ZebraStore
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,15 @@ def validate_and_add(store: ZebraStore, kite=None,
             'paper': True,
             'notes': f"Chartink {timeframe} {direction}-Zebra, gap={gap*100:.2f}%",
         }
+        # Speed, stamped AT THE SIGNAL and never recomputed. MEASURED ONLY —
+        # nothing reads it to decide anything, and `history.velocity_context`
+        # carries the reason (its own p-value does not survive clustering).
+        # It is stored now so the question can be answered from records in a
+        # few months instead of being re-derived against today's bars, which
+        # is precisely how the touch rate turned into a look-ahead statistic.
+        vc = history.velocity_context(kite, stock, timeframe, st_val, price)
+        if vc:
+            signal_data['velocity'] = vc
         # THE CAP IS RE-CHECKED PER ADD, not once per cycle.
         #
         # The guard above runs before the loop, so with `len(watching)` one
