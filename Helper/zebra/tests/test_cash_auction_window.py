@@ -211,3 +211,35 @@ def test_a_still_spot_inside_the_window_says_nothing(store, monkeypatch, caplog)
     with caplog.at_level(logging.WARNING, logger='zebra.monitor'):
         drive(store, monkeypatch, spot=97.0, frozen=True)
     assert 'AUCTION WINDOW LOOKS WRONG' not in caplog.text
+
+
+def test_the_suite_itself_does_not_run_inside_the_auction():
+    """The rail, not the feature.
+
+    On 2026-09-09 at 15:21 local, nine tests across four files failed on a
+    commit that had passed an hour earlier: `check_entered` correctly declined
+    to record a frozen spot, so `t['mfe_spot']` was never written and the
+    assertions read as a regression in the exit path. Nothing in the code had
+    moved. A suite that is red for twenty minutes of every trading day and
+    green either side cannot gate a deploy, and this shape is worse than a
+    plain flake — it arrives with no change and clears up on its own before
+    anyone finishes investigating.
+
+    `_outside_the_closing_auction` in conftest pins it. This asserts the pin is
+    actually in force, so deleting the fixture fails HERE rather than silently
+    handing the suite back its dependence on what time of day it runs.
+
+    The real boundary is asserted in `common/tests/test_market_session.py`,
+    which this rail does not reach; and the tests in this file that need the
+    window patch it themselves, in the test body, which wins over a fixture.
+    """
+    from datetime import datetime
+    from common import market_session as ms
+    assert ms.cash_price_is_frozen() is False
+    # Even asked about a moment squarely inside the window: the monitor passes
+    # an explicit `now` taken from the real clock, so a rail that honoured an
+    # explicit argument would delegate straight back to the wall clock and do
+    # nothing. That is exactly how the first version of this fixture failed.
+    inside = datetime(2026, 9, 9, 15, 21, tzinfo=ms.IST)
+    assert ms.cash_price_is_frozen(inside) is False, \
+        'the rail must not honour an explicit now — see conftest'

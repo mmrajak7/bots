@@ -47,6 +47,7 @@ import pytest
 HELPER = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HELPER))
 
+from common import market_session         # noqa: E402
 from zebra import config as cfg           # noqa: E402
 from zebra import monitor as monitor_mod  # noqa: E402
 from zebra import strikes as strikes_mod  # noqa: E402
@@ -212,6 +213,47 @@ def _value_triggers_awake(monkeypatch):
     monkeypatch.setattr(
         monitor_mod, '_value_triggers_live',
         lambda now=None: real(now) if now is not None else True)
+
+
+@pytest.fixture(autouse=True)
+def _outside_the_closing_auction(monkeypatch):
+    """The suite must not depend on WHAT TIME OF DAY it runs — second instance.
+
+    Same defect as `_value_triggers_awake` above, in the guard that shipped
+    after it. The cash market went to a closing auction on 2026-08-03: spot
+    cannot print between 15:15 and 15:35, so every guard that reads meaning
+    into spot STILLNESS stands down inside that window. `check_entered` holds
+    the `mfe` SPOT channel and the spot-stop shadow there, and
+    `_spot_corroborates` inverts.
+
+    None of which the tests driving `check_entered` pin. Found 2026-09-09 at
+    15:21 local, when nine tests across four files failed on a commit that had
+    passed an hour earlier — `t['mfe_spot']` simply never gets written, because
+    the code correctly declined to record a frozen price. The suite is red for
+    twenty minutes of every trading day and green either side of it, which is
+    the worst possible shape: it looks like a real regression in the exit path,
+    arrives without a code change, and clears up on its own before anyone
+    finishes investigating.
+
+    Pinned to NOT-frozen because that is the ordinary market the other 95% of
+    the suite is written against.
+
+    UNCONDITIONALLY, unlike `_value_triggers_awake` — and that difference is
+    the whole reason the first attempt at this fixture did nothing.
+    `monitor.py:4495` calls `cash_price_is_frozen(poll_now)` with an EXPLICIT
+    argument, but `poll_now` is itself taken from the real clock, so delegating
+    "when `now` is given, use the real function" delegates straight back to the
+    wall clock this rail exists to remove. An explicit argument only means the
+    caller is being tidy; it does not mean the value is pinned.
+
+    Safe to force here because the REAL boundary is asserted in
+    `common/tests/test_market_session.py`, a different package this conftest
+    does not reach. Inside `zebra/tests`, the one file that cares —
+    `test_cash_auction_window` — patches the attribute itself in the test body,
+    which runs after fixtures and wins.
+    """
+    monkeypatch.setattr(market_session, 'cash_price_is_frozen',
+                        lambda now=None: False)
 
 
 @pytest.fixture(autouse=True)
