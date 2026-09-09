@@ -175,3 +175,72 @@ def test_the_live_entry_path_hands_over_its_leg_book():
     mon = (HELPER / 'zebra' / 'monitor.py').read_text(encoding='utf-8')
     assert "best.get('long_ask')" not in mon, \
         'the retired back-ratio entry path is back'
+
+
+#: The shape `exit_legs` is ACTUALLY persisted in, copied from a live cohort
+#: record. There is no `price` key and there never has been — which is exactly
+#: how the v1 bug survived 24 passing tests: the fixture above invented a
+#: schema production does not write, so every assertion about the "full" path
+#: was made against a book that could not occur.
+REAL_EXIT_LEGS = {
+    'long': {'symbol': 'KOTAKBANK26SEP395CE', 'bid': 18.15, 'ask': 18.35,
+             'mid': 18.25, 'oi': 776000, 'last': 18.3, 'spread_pct': 1.1,
+             'reliable': True, 'unreliable_reason': ''},
+    'short': {'symbol': 'KOTAKBANK26SEP410CE', 'bid': 8.15, 'ask': 8.2,
+              'mid': 8.18, 'oi': 3560000, 'last': 8.2, 'spread_pct': 0.6,
+              'reliable': True, 'unreliable_reason': ''},
+}
+
+
+def _with_real_book(**over):
+    t = dict(FULL)
+    t['exit_legs'] = REAL_EXIT_LEGS
+    t.update(over)
+    return t
+
+
+def test_a_stored_exit_book_is_used_not_modelled():
+    """THE v1 BUG. `round_trip_for_trade` read `exit_legs['long']['price']`,
+    which is never written, so `approx` was permanently True and the modelled
+    fallback decided the answer for all 19 cohort records that HAD a real exit
+    book. `pnl_net` is what the arming gate reads, so an estimate was standing
+    in for evidence on the only trades that could supply it.
+    """
+    est = fees.round_trip_for_trade(_with_real_book(), exit_debit=9.95)
+    assert est['approx'] is False, "a record carrying a real book is not modelled"
+    assert est['basis'] == 'full'
+    assert est['orders'] == 4
+
+
+def test_the_exit_is_priced_at_the_side_actually_traded():
+    """Long is SOLD at the BID, short is BOUGHT BACK at the ASK — the same
+    convention as `exit_debit` and the CLAUDE.md pricing rule. Taking the mid
+    understates turnover on both legs, and STT lands on the sell side, i.e. on
+    the long leg the old code was guessing at."""
+    assert fees._exit_leg_price(REAL_EXIT_LEGS['long'], 'SELL') == 18.15
+    assert fees._exit_leg_price(REAL_EXIT_LEGS['short'], 'BUY') == 8.2
+
+
+def test_a_broken_quote_falls_through_rather_than_booking_a_free_exit():
+    """A zero bid is a broken book, not a costless sale. Booking it would put a
+    phantom zero-turnover order in the round trip and understate STT."""
+    assert fees._exit_leg_price({'bid': 0.0, 'ask': 0.0, 'mid': 4.2}, 'SELL') == 4.2
+    assert fees._exit_leg_price({'bid': None, 'ask': None, 'mid': None}, 'SELL') is None
+    assert fees._exit_leg_price({}, 'SELL') is None
+    assert fees._exit_leg_price(None, 'SELL') is None
+
+
+def test_a_real_fill_price_still_wins_if_one_is_ever_stamped():
+    """`price` is honoured FIRST, so a future writer that records an actual
+    fill overrides the book without another change in this module."""
+    assert fees._exit_leg_price({'price': 30.0, 'bid': 18.15}, 'SELL') == 30.0
+
+
+def test_modelled_and_full_are_not_comparable_so_the_version_moved():
+    """Every v1 figure on a record with an exit book was modelled when it did
+    not need to be. Mixing the two answers a question nobody asked — the same
+    reason `pnl` and `pnl_net` are kept side by side rather than one replacing
+    the other."""
+    assert fees.MODEL_VERSION >= 2
+    est = fees.round_trip_for_trade(_with_real_book(), exit_debit=9.95)
+    assert est['model'] == fees.MODEL_VERSION

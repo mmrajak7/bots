@@ -196,3 +196,43 @@ def test_a_non_numeric_pnl_does_not_take_the_whole_report_down():
 def test_the_empty_summary_has_the_SAME_SHAPE_as_a_populated_one():
     empty, full = R._summarize_exits([]), R._summarize_exits([_t(1, 1.0, 1.0)])
     assert set(empty) == set(full)
+
+
+# ── a sum that spans two fee models has to say so ─────────────────────────
+
+def _costed(model, pnl=100.0):
+    return {'id': 1, 'stock': 'X', 'pnl': pnl, 'pnl_net': pnl,
+            'fees': {'model': model, 'total': 10.0, 'basis': 'full'}}
+
+
+def test_one_fee_model_reads_clean():
+    from zebra import report
+    assert report._basis_note(0, 3, {2}) == ''
+
+
+def test_a_sum_spanning_two_fee_models_announces_itself():
+    """The books are deliberately NOT restamped (owner, 2026-09-09) — v2
+    applies forward only. That is cheap and safe, but `fees.py` says a figure
+    from one model must be recomputed, not compared, so the blend must be
+    visible rather than silently added up."""
+    from zebra import report
+    note = report._basis_note(0, 5, {1, 2})
+    assert 'MIXED FEE MODEL' in note and 'v1/v2' in note
+
+
+def test_the_two_contaminations_are_reported_independently():
+    """Uncosted trades and mixed fee models are different problems. A set can
+    have either, both or neither, and collapsing them would hide one."""
+    from zebra import report
+    both = report._basis_note(2, 5, {1, 2})
+    assert 'uncosted' in both and 'MIXED FEE MODEL' in both
+    assert report._basis_note(2, 5, {2}).count('MIXED') == 1
+    assert report._basis_note(5, 5, {2}) == ' [GROSS — no trade in this set carries costs]'
+
+
+def test_the_model_mix_is_read_off_the_stored_records():
+    from zebra import report
+    assert report._fee_models([_costed(1), _costed(2)]) == {1, 2}
+    assert report._fee_models([_costed(1), _costed(1)]) == {1}
+    # An uncosted record contributes no version — it is the OTHER contamination.
+    assert report._fee_models([{'pnl': 1.0}]) == set()

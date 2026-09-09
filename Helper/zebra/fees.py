@@ -51,7 +51,11 @@ logger = logging.getLogger(__name__)
 #: Bumped whenever the SHAPE of the calculation changes (not the rates — those
 #: live in config and are stamped separately). A stored figure whose model
 #: version differs from today's must be recomputed, never compared.
-MODEL_VERSION = 1
+#: v2 (2026-09-09): exit leg prices are read from the stored `exit_legs` BOOK at
+#: the traded side, instead of a `price` key that is never written. Every figure
+#: stamped under v1 on a record that HAS an exit book was modelled when it did
+#: not need to be, so v1 and v2 totals are not comparable — recompute, never mix.
+MODEL_VERSION = 2
 
 
 def _leg_orders(structure: str, debit: float, quantity: int,
@@ -130,6 +134,41 @@ def estimate(orders: List[dict]) -> dict:
             for k, v in out.items()}
 
 
+def _exit_leg_price(leg: Optional[dict], side: str) -> Optional[float]:
+    """What one leg actually transacted at on the way out.
+
+    `exit_legs` persists a BOOK — symbol/bid/ask/mid/oi/last — and never a key
+    called `price`. Reading `price` therefore returned None on every record ever
+    written (0 of 45 carried it), so `approx` was permanently True and the
+    modelled fallback decided the answer even for the 19 cohort trades whose
+    real exit book was sitting in the record. `pnl_net` is what the arming gate
+    and every scorecard read, so the estimate was standing in for evidence.
+
+    Priced at the side actually traded, the same convention as `exit_debit`
+    (`bid(long) - ask(short)`) and as the pricing rule in CLAUDE.md: the long is
+    SOLD at the BID, the short is BOUGHT BACK at the ASK. Taking the mid here
+    would understate turnover on both legs, and STT lands on the sell side —
+    which is precisely the leg the old code was guessing at.
+
+    `price` is still honoured first, so a future writer that stamps a real fill
+    overrides the book without another change here.
+    """
+    if not isinstance(leg, dict):
+        return None
+    for key in ('price', 'bid' if side == 'SELL' else 'ask', 'mid'):
+        v = leg.get(key)
+        if v is not None:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            # A zero or negative quote is a broken book, not a free exit; fall
+            # through to the next source rather than book a phantom order.
+            if f > 0:
+                return f
+    return None
+
+
 def round_trip_for_trade(t: dict, exit_debit: Optional[float]) -> dict:
     """Charges for one zebra/BCS trade, from what the record already stores.
 
@@ -142,8 +181,8 @@ def round_trip_for_trade(t: dict, exit_debit: Optional[float]) -> dict:
     # A zebra back-ratio holds TWO longs per short; BCS holds one of each.
     mult = 2 if str(t.get('structure') or 'zebra') == 'zebra' else 1
     legs = t.get('exit_legs') if isinstance(t.get('exit_legs'), dict) else {}
-    xl = (legs.get('long') or {}).get('price') if isinstance(legs.get('long'), dict) else None
-    xs = (legs.get('short') or {}).get('price') if isinstance(legs.get('short'), dict) else None
+    xl = _exit_leg_price(legs.get('long'), 'SELL')
+    xs = _exit_leg_price(legs.get('short'), 'BUY')
     approx = xl is None or xs is None
     entry_long = (t.get('long_ask_entry') if t.get('long_ask_entry') is not None
                   else t.get('long_mid_entry'))

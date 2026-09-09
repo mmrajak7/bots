@@ -397,13 +397,47 @@ def _uncosted(group: list) -> int:
     return sum(1 for t in group if t.get('pnl_net') is None)
 
 
-def _basis_note(uncosted: int, total: int) -> str:
-    """'' when the sum is clean, else a clause naming the contamination."""
-    if not uncosted or not total:
-        return ''
-    if uncosted == total:
-        return ' [GROSS — no trade in this set carries costs]'
-    return ' [MIXED — %d of %d uncosted, counted gross]' % (uncosted, total)
+def _fee_models(group: list) -> set:
+    """Which fee MODEL VERSIONS the costed trades in this set were priced by.
+
+    `fees.MODEL_VERSION` went 1 -> 2 on 2026-09-09, when the exit book started
+    being read from `exit_legs` instead of a `price` key that is never written.
+    v1 modelled the exit even on records that HAD a real book, and it
+    under-counted — by Rs 66.55 over the 19 cohort exits, concentrated in the
+    winners, where the real sale is bigger than the model assumed.
+
+    The stored figures are deliberately NOT being restamped (owner, 2026-09-09:
+    the book stays as it is, the new model applies forward). That is cheap and
+    safe, but it means the cohort will hold both versions at once, and
+    `fees.py` says in terms that a figure from one version must be recomputed
+    rather than compared with another. So the mix gets DISCLOSED, exactly like
+    the uncosted mix beside it, rather than being summed in silence.
+    """
+    out = set()
+    for t in group:
+        f = t.get('fees')
+        if isinstance(f, dict) and f.get('model') is not None:
+            out.add(f['model'])
+    return out
+
+
+def _basis_note(uncosted: int, total: int, models=()) -> str:
+    """'' when the sum is clean, else a clause naming the contamination.
+
+    Two independent contaminations, reported independently: some trades may
+    carry no costs at all (counted gross), and the costed ones may have been
+    priced by different fee models. A set can suffer either, both, or neither.
+    """
+    parts = []
+    if uncosted and total:
+        parts.append('GROSS — no trade in this set carries costs'
+                     if uncosted == total
+                     else 'MIXED — %d of %d uncosted, counted gross'
+                          % (uncosted, total))
+    if len(models or ()) > 1:
+        parts.append('MIXED FEE MODEL — v%s in one sum; recompute before '
+                     'comparing' % '/v'.join(str(m) for m in sorted(models)))
+    return (' [' + '; '.join(parts) + ']') if parts else ''
 
 
 def _summarize_exits(exits: list) -> dict:
@@ -445,7 +479,8 @@ def _summarize_exits(exits: list) -> dict:
         'losses': len(losses),
         'net_pnl': round(net, 0),
         'uncosted': _uncosted(exits),
-        'basis_note': _basis_note(_uncosted(exits), len(exits)),
+        'basis_note': _basis_note(_uncosted(exits), len(exits),
+                                  _fee_models(exits)),
         'win_rate': round(len(wins) / len(exits) * 100, 1),
         'avg_hold_days': round(sum(holds) / len(holds), 1) if holds else 0.0,
         'best': max(exits, key=_net),
