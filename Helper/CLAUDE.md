@@ -462,6 +462,13 @@ Full playbook: `docs/BCS_PLAYBOOK.md`
 > run to the TIME exit, so the closed book still flatters the open one — but
 > the FACT it rested on has changed.
 >
+> **Updated again 2026-09-09, and this is the reading that matters.** The
+> cohort is **23 closes, 14W/9L, gross −Rs 2,660, NET −Rs 6,230.** It has
+> turned negative. Net break-even win rate is 62.2% (avg win +33.9%, avg loss
+> −55.8%); realised is 60.9%. This is not a bad patch — it is the structure
+> arriving at its own arithmetic, and the censoring argument above resolving
+> exactly as it warned. Counts move: call `scored()`, never quote these.
+>
 > ## ⚠ THE CASH MARKET NOW CLOSES AT 15:15 — CLOSING AUCTION SESSION
 >
 > **CAS went live 2026-08-03** (SEBI circular 2026-01-16, NSE SOP 2026-03-18)
@@ -510,8 +517,10 @@ Full playbook: `docs/BCS_PLAYBOOK.md`
 > was false.** Those three showed live, repriced two-way books (ADANIGREEN long
 > 48.00/48.80 → 63.55/65.95) and F&O was open until 15:40. The guard refused
 > genuine exits, which pushes a position overnight — how this book's worst loss
-> happened. Gate removed, rows un-flagged, **the cohort stands at 12W/5L, gross
-> Rs 20,234, net Rs 17,481**, unchanged throughout.
+> happened. Gate removed, rows un-flagged, **the cohort stood at 12W/5L, gross
+> Rs 20,234, net Rs 17,481 on that date**, unchanged throughout. (That figure
+> is the RECORD OF A REVERT, not the current book — see the 2026-09-09 update
+> above: 14W/9L, net −Rs 6,230.)
 >
 > ### ⚠ STILL OPEN: both engines stop at 15:30, F&O trades to 15:40
 >
@@ -583,10 +592,25 @@ never alerted with a warning nobody reads.
 > **Why the narrower pair does not simply win.** It reads a HIGHER d/w and
 > lands on the 45% cap by construction — on the three swing signals in the book
 > a suppress-on-fail rule would have killed two, both winners, carrying 39% of
-> the cohort's gross. And the TP fires on TOUCH with 27-36 DTE left, so a
-> nearer short leg carries MORE extrinsic at the exit: V/w rises less than d/w
-> does, and by the identity `(V/w)/(d/w) − 1` narrowing can LOSE. Hence a
-> ranked choice rather than a rule.
+> the cohort's gross. Hence a ranked choice rather than a rule.
+>
+> ⚠ **CORRECTED 2026-09-09. This paragraph used to end "a nearer short leg
+> carries MORE extrinsic at the exit: V/w rises less than d/w does, and by the
+> identity `(V/w)/(d/w) − 1` narrowing can LOSE." Measured on the cohort's own
+> 14 TP exits, that is BACKWARDS.** Regressing realised V/w on entry d/w gives
+> `V/w = −0.100 + 1.608 × d/w` (r = +0.57, n = 14): V/w rises **faster** than
+> d/w, the intercept is negative, so the gain `(V/w)/(d/w) − 1` **increases**
+> with d/w. The book agrees — split at 39.1%, the cheap half ran 4W/4L for
+> −Rs 10,497 net and the expensive half 10W/5L for +Rs 4,267.
+>
+> The ranked-choice conclusion is unchanged and the reasoning it rested on is
+> not. **Do not use this to argue for a d/w FLOOR either**: n = 14, r = 0.57,
+> one four-week window, and d/w is the market's own probability quote, so
+> "expensive spreads pay more" may just be "the market prices the likely moves
+> higher". It is recorded here because a wrong direction stated as fact is how
+> a future session tightens the gate the wrong way — and a break-even formula
+> built on the old claim (`d/w < p × TPV`) recommended exactly that before the
+> book refuted it.
 
 | gain at TP | MEASURED, not enforced | — | `pen * (k/(d/w) - 1)`, k=0.55. **Penetration-aware since 2026-09-06**: the old `k x width` was a pure function of d/w and blind to WHERE the TP sits, so it was optimistic on exactly the trades it exists to catch. `tp_penetration` is stamped on the record — without it a stored projection cannot be re-derived. |
 | entry cost / max gain | <= 15% | fill vs mid | Added 2026-08-12 with fill pricing. What the book charges just to open. **UNCALIBRATED — reasoned, not fitted.** Replaces the per-leg rupee bid-ask cap (below); denominated in the payoff, which is the same logic the d/w gate uses. Review once ~30 fill-basis records exist. |
@@ -914,6 +938,65 @@ reverted the same day: the exits it refused were fillable in a live option
 market, and a guard that refuses a genuine exit pushes the position overnight,
 which is the expensive direction. Do not re-add it without first showing that
 the option book is dead, which the record says it is not.
+
+### The structure is the leak, not the signal — SHADOWED (2026-09-09)
+
+`zebra/structure_shadow.py`. Read it with **`python -m zebra shadow`**.
+
+Measured forward on the spot path of every triggered signal, the magnet is
+worth **+1.02% of notional** over 30 sessions with no stop (n=333). The spread
+built on it returns **−0.06%**:
+
+| per unit of notional | win | loss | EV |
+|---|---|---|---|
+| the signal (delta-1) | +4.55% | −8.38% | **+1.02%** |
+| the BCS on that signal | +0.55% | −1.55% | **−0.06%** |
+
+It surrenders **88% of the win to avoid 82% of the loss**, and the win was the
+bigger number. One line explains it: **the short strike sits AT the ST line**,
+so the structure sells away the exact move it is betting on. The owner's own
+framing is the same arithmetic — at d/w 40% the win caps at +37.5% and the loss
+floor is −100%, so it needs 2.67 wins per loss and the touch rate delivers 2.46.
+
+Replayed on the cohort's own value paths (real bid/ask, each arm on its OWN
+−50% stop), a naked ATM long ran **+14.8% RoC against the spread's +4.2%** over
+19 realised positions. **That is not a finding yet** — Rs 52,564 of the
+Rs 61,627 sits in seven positions too big for a Rs 25,000 slot, and inside the
+cap the sample is twelve. Three earlier reviews rejected naked-long on a MIXED
+population where it genuinely loses (the pre-cohort ITM-long records). The
+deciding variable turns out to be the **slot cap**, which is a choice.
+
+So it is measured forward rather than switched. Five arms, each differing from
+its neighbour in exactly ONE respect so a gap has one candidate cause:
+
+| arm | isolates |
+|---|---|
+| `naked_long` vs the real spread | does the SHORT LEG pay for itself? |
+| `naked_hold` vs `naked_long` | does the −50% STOP pay for itself? |
+| `naked_runner` vs `naked_hold` | **does the TP CAP at the ST line cost us?** |
+| `spread_hold` vs the real spread | the stop question, on the live structure |
+| `delta1` vs everything | how much of the signal any of them keeps |
+
+**It is a separate book (`logs/shadow_structures.json`) because a shadow
+OUTLIVES its parent.** That is the point: `naked_runner` gets interesting after
+the spread has stopped out, and the value paths stop there — so it is the one
+arm no replay of existing data can ever answer. Nothing here can place an
+order, send a Telegram, or write to `zebra_trades.json`, and a test asserts
+that structurally rather than trusting the docstring.
+
+Guards inherited from the live engine, not re-derived: prices at the side
+actually traded against, refuses an unreliable book instead of booking,
+value stops dark for the opening 15 minutes, spot triggers dark in the cash
+closing auction, a booked exit never re-priced, TIME fires even when nothing
+quotes. Arms carry their own `fills` count (2 for naked vs 4 for the spread)
+so a gross comparison cannot flatter the four-legged one.
+
+**Two columns stop the count flattering itself.** `partial` marks a shadow
+opened materially after its parent entered — its stop may already have fired
+where nothing was watching — and same-DAY is deliberately not treated as
+same-time. `--backfill` seeds OPEN positions from stored paths (exact: coverage
+runs from entry) and **refuses closed ones**, whose paths stop at their own
+exit and would bake in an unobserved tail.
 
 ### Spot stop — SHADOWED, still not armed (2026-09-06)
 
@@ -1581,6 +1664,8 @@ python -m zebra analyze SYMBOL --direction CE  # manual strike picker
 python -m zebra quote ID      # live re-quote of a signal/position (read-only, JSON)
 python -m zebra depth         # depth at the touch — the lot-scaling evidence
 python -m zebra spotstop      # adverse-spot stop, SHADOWED — the firing count
+python -m zebra shadow        # alternative STRUCTURES, SHADOWED — the arm scorecard
+python -m zebra shadow --backfill   # seed OPEN positions from stored value paths
 python -m zebra trigger ID    # force alert on a watching signal
 python -m zebra enter ID --pair K_L/K_S --debit X --lots N --expiry YYYY-MM-DD
 python -m zebra close ID --exit-debit X --reason tp

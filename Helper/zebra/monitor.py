@@ -48,6 +48,7 @@ from . import review as review_mod
 from common import market_session
 from common import nse_holidays
 from . import spot_shadow
+from . import structure_shadow
 from . import strikes as strikes_mod
 from . import vet as vet_mod
 from .scanner import _get_kite, get_ltp, compute_st_for_stock, validate_and_add
@@ -5171,6 +5172,20 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
             _refresh_events_if_stale(store)
         except Exception as e:
             logger.error("Event calendar refresh failed: %s", e, exc_info=True)
+    # Alternative structures on the same signal, measured forward. Books
+    # nothing, alerts nothing, and deliberately runs OUTSIDE the VET_ENABLED
+    # branch above: it answers a question about the STRUCTURE, not about
+    # vetting, and the corp-action guard already showed what it costs to hide a
+    # standing measurement behind an optional subsystem's switch.
+    #
+    # It fetches its own spot rather than borrowing `check_entered`'s, so the
+    # phase that manages open risk keeps exactly the contract it had. It is
+    # also the LAST thing in the cycle, so if it ever does run long, everything
+    # that trades has already finished.
+    try:
+        structure_shadow.poll(store, kite)
+    except Exception as e:
+        logger.error("Structure shadow failed: %s", e, exc_info=True)
 
 
 def _run_vet_side_channels(store, kite, dry_run: bool = False) -> None:

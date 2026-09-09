@@ -1252,6 +1252,102 @@ def _trade_cost(trade: dict):
         return 0.0, 'uncostable'
 
 
+def cmd_shadow(args):
+    """What OTHER structures on the same signal would have paid. Armed by nothing.
+
+    Each arm differs from its neighbour in exactly ONE respect, so a gap
+    between two of them has one candidate cause:
+
+        naked_long   vs the real spread  ->  does the SHORT LEG pay for itself?
+        naked_hold   vs naked_long       ->  does the -50% STOP pay for itself?
+        naked_runner vs naked_hold       ->  does the TP CAP at the ST line cost us?
+        spread_hold  vs the real spread  ->  the stop question, on the live structure
+        delta1       vs everything       ->  how much of the signal any of them keeps
+
+    TWO COLUMNS EXIST TO STOP THE COUNT FLATTERING ITSELF:
+
+    * **partial** -- a shadow opened after its parent entered has an unobserved
+      head, so a stop may already have fired where nothing was watching. Those
+      are reported and excluded from the totals.
+    * **fills** -- a naked arm is a 2-fill round trip against the spread's 4,
+      so the arms do not share a fee model and a gross comparison flatters the
+      4-fill ones. Net is shown per arm at the cohort's measured rate.
+    """
+    from zebra import structure_shadow as ss
+    from zebra.trade_store import get_store
+
+    store = get_store()
+    if getattr(args, 'backfill', False):
+        r = ss.backfill(store)
+        for tid, stock, n in r['seeded']:
+            print('  seeded #%s %-12s from %d stored observation(s)' % (tid, stock, n))
+        for tid, stock, why in r['skipped']:
+            print('  skipped #%s %-12s -- %s' % (tid, stock, why))
+        if not r['seeded'] and not r['skipped']:
+            print('  nothing to seed')
+        print('')
+    sc = ss.scorecard()
+    # WHOLE BOOK: a lookup table, not a population. The ids it is indexed
+    # by come from the shadow book, which `open_shadows` already scopes to
+    # the cohort, so the control set below is cohort-only by construction.
+    real = {str(t['id']): t for t in store.load_trades()}
+
+    print('STRUCTURE SHADOW -- measures only, books nothing, arms nothing')
+    print('  %d shadow(s) tracked, %d still open' % (sc['shadows'], sc['open']))
+    if not sc['shadows']:
+        print('\n  Nothing yet. A shadow opens when the next COHORT position enters.')
+        return
+    # The cohort's own measured fee, halved for a 2-fill arm. Approximate and
+    # said to be: the point is that a 4-fill arm must not be compared gross
+    # against a 2-fill one, not that this is the exact rupee.
+    FEE_PER_FILL = 155.0 / 4
+    print('\n  %-13s %4s %8s %8s %9s %10s %10s %8s' % (
+        'arm', 'n', 'win%', 'avg%', 'RoC', 'gross Rs', 'net Rs', 'partial'))
+    for key in ss.ARMS:
+        rows = [r for r in sc['arms'][key] if not r['partial']]
+        part = sum(1 for r in sc['arms'][key] if r['partial'])
+        if not rows:
+            print('  %-13s %4d %8s %8s %9s %10s %10s %8d'
+                  % (key, 0, '-', '-', '-', '-', '-', part))
+            continue
+        w = sum(1 for r in rows if r['pnl_pct'] > 0)
+        cap = sum(r['capital'] for r in rows) or 1.0
+        gross = sum(r['pnl'] for r in rows)
+        net = gross - sum(r['fills'] * FEE_PER_FILL for r in rows)
+        print('  %-13s %4d %7.1f%% %7.1f%% %8.1f%% %10.0f %10.0f %8d' % (
+            key, len(rows), 100.0 * w / len(rows),
+            sum(r['pnl_pct'] for r in rows) / len(rows),
+            100.0 * gross / cap, gross, net, part))
+
+    # The control: the real spread, on the SAME ids, so the comparison is not
+    # against a different set of trades.
+    ids = {r['id'] for k in ss.ARMS for r in sc['arms'][k] if not r['partial']}
+    ctrl = [real[i] for i in ids
+            if i in real and real[i].get('status') == 'exited'
+            and real[i].get('pnl') is not None]
+    if ctrl:
+        cap = sum((t.get('debit') or 0) * (t.get('quantity') or 0) for t in ctrl) or 1.0
+        g = sum(t['pnl'] for t in ctrl)
+        n = sum(t.get('pnl_net') or t['pnl'] for t in ctrl)
+        w = sum(1 for t in ctrl if t['pnl'] > 0)
+        print('  %-13s %4d %7.1f%% %7.1f%% %8.1f%% %10.0f %10.0f %8s' % (
+            'REAL spread', len(ctrl), 100.0 * w / len(ctrl),
+            sum(t['pnl_pct'] for t in ctrl) / len(ctrl),
+            100.0 * g / cap, g, n, '-'))
+    print('\n  RoC is on capital ACTUALLY DEPLOYED -- a naked arm costs ~2x the')
+    print('  spread per position, so comparing rupees alone favours it wrongly.')
+    if args.detail:
+        for key in ss.ARMS:
+            rows = sc['arms'][key]
+            if not rows:
+                continue
+            print('\n  %s' % key)
+            for r in sorted(rows, key=lambda x: -x['pnl_pct']):
+                print('    #%-5s %-13s %7.1f%%  %-6s %s' % (
+                    r['id'], r['stock'], r['pnl_pct'], r['reason'],
+                    '[PARTIAL]' if r['partial'] else ''))
+
+
 def cmd_spotstop(args):
     """What an adverse-spot stop WOULD have done. It is armed by nothing.
 
@@ -2066,6 +2162,16 @@ def main():
                        help='include OPEN positions (default: closed only, '
                             'because an open one has no outcome to score)')
     p_ssh.set_defaults(func=cmd_spotstop)
+
+    p_shd = sub.add_parser(
+        'shadow',
+        help='Alternative STRUCTURES on the same signal, SHADOWED — measures only')
+    p_shd.add_argument('--detail', action='store_true',
+                       help='list every shadowed position per arm')
+    p_shd.add_argument('--backfill', action='store_true',
+                       help='seed OPEN cohort positions from their stored '
+                            'value paths (exact: coverage runs from entry)')
+    p_shd.set_defaults(func=cmd_shadow)
 
     p_sts = sub.add_parser('status', help='Dashboard')
     p_sts.set_defaults(func=cmd_status)

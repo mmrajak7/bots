@@ -597,6 +597,9 @@ _DEFAULTS = {
                                   # sample size and flagged thin. 2 of 3 is not
                                   # a 67% hit rate.
     'spot_sl_enabled': False,     # master switch for the adverse-spot SL (off: debit floor only)
+    # SHADOW measurement only -- books nothing, places nothing. Off disables
+    # the extra quote calls without a deploy; see zebra/structure_shadow.py.
+    'structure_shadow_enabled': True,
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
     'time_sl_days_before_expiry': 6,
@@ -1387,6 +1390,13 @@ assert ATTRACTION_HORIZON_BARS >= 1, "the return horizon must be at least 1 cand
 # reading raw while paper_mode, auto_entry and exits_managed_externally were
 # all validated. A typo must not be able to arm the money path.
 SPOT_SL_ENABLED = _strict_bool('spot_sl_enabled')
+
+# SHADOW measurement, never a trading switch. `zebra/structure_shadow.py` runs
+# alternative structures on the same signal and books nothing; the flag exists
+# so the extra quote calls can be turned off in a rate-limit emergency without
+# a deploy. `_strict_bool` anyway -- a measurement that silently stops is worse
+# than one that never started, because the gap is invisible in the output.
+STRUCTURE_SHADOW_ENABLED = _strict_bool('structure_shadow_enabled')
 SPOT_SL_PCT = _num('spot_sl_pct')
 DEBIT_SL_PCT = _num('debit_sl_pct')
 TIME_SL_DAYS = _int('time_sl_days_before_expiry')
