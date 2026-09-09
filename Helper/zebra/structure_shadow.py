@@ -52,7 +52,7 @@ next). The write is atomic, so the failure mode is a lost MEASUREMENT, never a
 corrupt file and never a lost trade. A cycle runs 18-46s against a 5-minute
 interval, so it is unlikely as well as harmless.
 
-## Three ways a shadow flatters itself, and what is done about each
+## Five ways a shadow flatters itself, and what is done about each
 
 **Booking a price nobody could trade at.** Every arm prices at the side it
 would actually trade against -- sell the long at the BID, buy the short back at
@@ -60,7 +60,28 @@ the ASK -- and REFUSES to book on an unreliable book, deferring to the next
 poll exactly as the live engine does. `zebra.mfe` and `zebra.spot_shadow`
 already learned this one: the clamps that return 0.0 or `width` with
 `reliable=True` are what turn the cohort's overnight measure from +1.3% into
--12.1%.
+-12.1%. A spread arm is CLAMPED to [0, width] -- without the floor a wide book
+records a P&L past -100% on a -100%-capped structure, which is how PIIND #50
+read -112.4%.
+
+**Losing the observation instead of the trade.** TP fires on a spot level and
+TIME on the calendar, so either can arrive on a poll where the option book is
+unusable. Booking `value=None` there writes an exit with no P&L, and a reader
+that skips those loses the whole observation -- silently, and in the
+optimistic direction, because an unpriceable book correlates with a bad
+outcome. So a trigger LATCHES and the booking waits for a price, with expiry
+as the backstop; anything that reaches expiry unpriced is reported in its own
+column rather than dropped. `naked_runner` is the arm this protects: its ONLY
+exit is TIME, so one bad book on the deadline poll used to erase the very arm
+this module exists to measure.
+
+**Being compared on the wrong axis.** Arms do not hold for the same length of
+time -- `naked_runner` has no TP, so it runs ~28 days against the spread's ~5
+-- and they do not pay the same fees, because charges follow TURNOVER and a
+naked arm buys the whole ATM premium where the spread pays a net debit about
+half that. Holding period is surfaced per arm, fees come from the real model
+per leg, and an arm whose fee cannot be computed reports UNCOSTED rather than
+free.
 
 **Acting on a print the engine itself would not act on.** Value stops stand
 down for `VALUE_TRIGGER_OPEN_BUFFER_SEC` after the open -- both incidents that
@@ -112,12 +133,17 @@ STATE_FILE = cfg.LOG_DIR / 'shadow_structures.json'
 #: it gives up (None = no value stop). `fills` is the round-trip order count,
 #: carried so the reader can cost each arm honestly rather than assuming the
 #: spread's four.
+#: `reference` marks an arm that is NOT a proposal in this book. delta1 is a
+#: cash/futures position, so the option fee model does not describe it and
+#: netting it at option rates would invent a cost it would not pay. It is here
+#: to size the prize, not to be traded.
 ARMS = {
     'naked_long':   {'legs': ('long',),         'tp': True,  'stop_frac': 0.50, 'fills': 2},
     'naked_hold':   {'legs': ('long',),         'tp': True,  'stop_frac': None, 'fills': 2},
     'naked_runner': {'legs': ('long',),         'tp': False, 'stop_frac': None, 'fills': 2},
     'spread_hold':  {'legs': ('long', 'short'), 'tp': True,  'stop_frac': None, 'fills': 4},
-    'delta1':       {'legs': (),                'tp': True,  'stop_frac': None, 'fills': 2},
+    'delta1':       {'legs': (),                'tp': True,  'stop_frac': None, 'fills': 0,
+                     'reference': True},
 }
 
 
@@ -154,12 +180,26 @@ def _save(state: dict) -> None:
 
 # -- pricing -----------------------------------------------------------------
 
-def arm_value(arm: dict, lq: Optional[dict], sq: Optional[dict]) -> tuple:
+def arm_value(arm: dict, lq: Optional[dict], sq: Optional[dict],
+              width: Optional[float] = None) -> tuple:
     """(value, quality). Value is what CLOSING this arm would pay, per share.
 
     Priced at the side actually traded against: the long is sold at the BID,
     the short bought back at the ASK. A `None` value means DO NOT BOOK -- defer
     to the next poll, exactly as the live engine does on an unusable book.
+
+    CLAMPED to the structure's mathematical bounds, which is a different act
+    from refusing a quote and gets the opposite treatment (see the valuation
+    table in CLAUDE.md). A vertical cannot be worth less than 0 -- expiry is
+    always available and costs nothing -- nor more than its width. Without the
+    lower bound a wide book books a P&L past -100% on a -100%-capped structure,
+    which is exactly how PIIND #50 recorded -112.4%.
+
+    The INTRINSIC FLOOR is deliberately not replicated here. That one is a
+    heuristic estimate of fair value and its rule is REFUSE, not clamp;
+    clamping to it would invent a fill. The garbage-quote case it guards is
+    already caught upstream by each leg's `reliable` flag, and this arm defers
+    on an unreliable leg rather than valuing it.
     """
     legs = arm['legs']
     if not legs:                                    # delta1 is priced on spot
@@ -173,13 +213,19 @@ def arm_value(arm: dict, lq: Optional[dict], sq: Optional[dict]) -> tuple:
         # rather than book a total loss it cannot tell from a dead feed.
         return (None, 'long_no_bid')
     if 'short' not in legs:
+        # A long option's floor is 0 and it has no ceiling. `bid` is already
+        # non-negative here, so there is nothing to clamp.
         return (float(bid), 'ok')
     if sq is None or not sq.get('reliable', False):
         return (None, 'short_' + ((sq or {}).get('unreliable_reason') or 'no_quote'))
     ask = sq.get('ask') or 0
     if ask <= 0:
         return (None, 'short_no_ask')
-    return (float(bid) - float(ask), 'ok')
+    v = float(bid) - float(ask)
+    v = max(0.0, v)
+    if width and width > 0:
+        v = min(v, float(width))
+    return (v, 'ok')
 
 
 def delta1_mark(direction: str, entry_spot: float, spot: float) -> float:
@@ -276,6 +322,21 @@ def open_shadows(state: dict, entered: list, ts: str) -> int:
             continue
         if not (t.get('long_symbol') and t.get('tp_spot') and t.get('expiry')):
             continue
+        # `_tp_hit` and `delta1_mark` both treat "not CE" as PE, so an unknown
+        # direction would be silently shadowed as a bear position. Refuse it
+        # instead of measuring the wrong side of the market.
+        if t.get('direction') not in ('CE', 'PE'):
+            logger.warning('shadow: #%s has direction %r — not shadowed',
+                           tid, t.get('direction'))
+            continue
+        # TIME is the ONLY exit `naked_runner` has, and it is derived from the
+        # expiry. An unparseable expiry makes `_sessions_left` return None, so
+        # that arm would never terminate -- an immortal shadow reported as
+        # "still being measured" for ever. Refuse it at the door instead.
+        if _sessions_left(t.get('expiry'), date.today()) is None:
+            logger.warning('shadow: #%s has unusable expiry %r — not shadowed',
+                           tid, t.get('expiry'))
+            continue
         arms = {}
         for key, arm in ARMS.items():
             ev = entry_value(arm, t)
@@ -293,6 +354,13 @@ def open_shadows(state: dict, entered: list, ts: str) -> int:
             'target_spot': t.get('tp_spot'), 'expiry': str(t.get('expiry'))[:10],
             'quantity': t.get('quantity'), 'entry_spot': t.get('entry_spot'),
             'entry_date': str(t.get('entry_date'))[:10],
+            # The ENTRY book, per leg, so fees can be costed on the turnover
+            # each arm actually transacts. A naked arm buys the whole ATM
+            # premium where the spread buys a NET debit roughly half the size,
+            # so halving the spread's fee to model a 2-fill arm understates it
+            # -- STT and the percentage charges follow turnover, not fills.
+            'long_ask_entry': t.get('long_ask_entry'),
+            'short_bid_entry': t.get('short_bid_entry'),
             'width': t.get('width'),
             'debit_to_width_pct': t.get('debit_to_width_pct'),
             # A shadow opened after its parent entered has an UNOBSERVED HEAD:
@@ -307,18 +375,35 @@ def open_shadows(state: dict, entered: list, ts: str) -> int:
 
 
 def _close(sh: dict, key: str, reason: str, value: Optional[float],
-           spot: Optional[float], ts: str) -> None:
+           spot: Optional[float], ts: str, lq: Optional[dict] = None,
+           sq: Optional[dict] = None) -> None:
     a = sh['arms'][key]
     if a['status'] != 'open':
         return                        # a booked exit is NEVER re-priced
     ev = a['entry_value']
     a['status'] = 'exited'
+    a.pop('pending', None)
     a['exit'] = {
         'reason': reason, 'at': ts,
         'spot': None if spot is None else round(float(spot), 2),
         'value': None if value is None else round(float(value), 4),
         'pnl_pct': None if value is None else round(100.0 * (value - ev) / ev, 2),
+        # An exit that never found a price. It is NOT dropped -- an unpriceable
+        # book correlates with a bad outcome, so silently discarding these
+        # biases the very count this module exists to keep. The reader shows
+        # them in their own column.
+        'unpriced': value is None,
         'polls': sh.get('polls', 0),
+        # The exit BOOK, not just the scalar. `exit_debit` alone is what left
+        # the live engine unable to reconstruct the one direction that has
+        # twice cost real money; an option book cannot be rebuilt after the
+        # fact, and this is also what lets fees be costed exactly per leg.
+        'legs': {
+            'long': None if lq is None else {'bid': lq.get('bid'),
+                                             'ask': lq.get('ask')},
+            'short': None if sq is None else {'bid': sq.get('bid'),
+                                              'ask': sq.get('ask')},
+        },
     }
 
 
@@ -344,22 +429,60 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
         if not arm['legs'] and spot_live and entry_spot:
             v = delta1_mark(direction, entry_spot, spot)
         if arm['legs']:
-            v = arm_value(arm, lq, sq)[0]
+            v = arm_value(arm, lq, sq, sh.get('width'))[0]
         if v is not None and v > a.get('peak', 0):
             a['peak'] = round(float(v), 4)
+
+        expired = left is not None and left <= 0
+
+        # A TRIGGER THAT FIRED BUT COULD NOT BE PRICED IS NOT AN EXIT YET.
+        #
+        # TP and TIME both fire on something other than the option book -- a
+        # spot level and the calendar -- so either can arrive on a poll where
+        # the book is unusable. Booking `value=None` there records an exit with
+        # no P&L, and a reader that skips those silently loses the whole
+        # observation. That would have hit `naked_runner` hardest, whose ONLY
+        # exit is TIME: one bad book on the deadline poll and the arm this
+        # module exists to measure vanishes from its own scorecard.
+        #
+        # So the trigger LATCHES and the booking waits for a price, which is
+        # the same rule the live engine already runs on ("paper never books a
+        # price it could not have transacted at"). The latch is not released
+        # if the condition later stops holding: the trigger did fire, and
+        # re-deciding it on a later print would be a different rule.
+        pend = a.get('pending')
+        if pend:
+            if v is not None:
+                _close(sh, key, pend['reason'], v, spot, ts, lq, sq)
+            elif expired:
+                # Backstop. Past its own contract there is no future poll that
+                # can price it, so record it UNPRICED rather than leave an arm
+                # open for ever pretending it is still being measured.
+                _close(sh, key, pend['reason'], None, spot, ts, lq, sq)
+            continue
 
         # TIME first, because it is a statement about the CALENDAR rather than
         # about a price: it has to fire on a session where nothing quotes, or a
         # blind spell at expiry leaves an arm open past its own contract.
         if left is not None and left <= cfg.TIME_SL_DAYS:
-            _close(sh, key, 'time', v, spot, ts)
+            if v is not None:
+                _close(sh, key, 'time', v, spot, ts, lq, sq)
+            elif expired:
+                _close(sh, key, 'time', None, spot, ts, lq, sq)
+            else:
+                a['pending'] = {'reason': 'time', 'since': ts}
             continue
         if arm['tp'] and spot_live and _tp_hit(direction, spot, sh['target_spot']):
-            _close(sh, key, 'tp', v, spot, ts)
+            if v is not None:
+                _close(sh, key, 'tp', v, spot, ts, lq, sq)
+            else:
+                a['pending'] = {'reason': 'tp', 'since': ts}
             continue
+        # The stop is the one trigger that CANNOT arrive unpriced: it is
+        # defined on `v`, so reaching here at all means there was a price.
         if (arm['stop_frac'] is not None and value_armed and v is not None
                 and v <= a['entry_value'] * arm['stop_frac']):
-            _close(sh, key, 'stop', v, spot, ts)
+            _close(sh, key, 'stop', v, spot, ts, lq, sq)
 
 
 def poll(store, kite, ltps: Optional[dict] = None) -> dict:
@@ -370,7 +493,15 @@ def poll(store, kite, ltps: Optional[dict] = None) -> dict:
     """
     try:
         if not cfg.STRUCTURE_SHADOW_ENABLED:
-            return {}
+            # SAID OUT LOUD, every cycle. A measurement that stops silently is
+            # worse than one that never started: the gap is invisible in the
+            # output and the count simply reads short months later. The vetting
+            # banner in this engine was logged before its handler existed and
+            # so never reached the cron log at all -- state lines have to be
+            # greppable in production, not merely present in the source.
+            logger.info('SHADOW structures: DISABLED '
+                        '(structure_shadow_enabled=false) — nothing measured')
+            return {'disabled': True}
         state = _load()
         # WHOLE BOOK: a shadow outlives its parent, so the parent must be
         # findable whatever status it now carries. `open_shadows` is what
@@ -520,28 +651,138 @@ def backfill(store, paths_dir=None) -> dict:
 
 # -- reader ------------------------------------------------------------------
 
+def _days_held(sh: dict, exit_at: str) -> Optional[int]:
+    """Calendar days from the shadow opening to this arm's exit.
+
+    Surfaced because the arms do NOT hold for comparable periods and RoC alone
+    hides it: `naked_runner` has no TP, so it runs to its TIME stop -- roughly
+    28 days against the spread's ~5. A per-trade return that takes five times
+    as long to earn is not the same return, and this book's own measured edge
+    is VELOCITY (winners at +14.7% per slot-session), so an arm compared
+    without its duration is being flattered.
+    """
+    try:
+        a = datetime.strptime(sh['since'], '%Y-%m-%d %H:%M:%S')
+        b = datetime.strptime(exit_at, '%Y-%m-%d %H:%M:%S')
+        return max(0, (b - a).days)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def arm_fees(arm: dict, sh: dict, a: dict) -> Optional[float]:
+    """Round-trip charges for one arm, from the REAL fee model.
+
+    Built from the per-leg entry and exit books rather than scaled off the
+    spread's total, because charges follow TURNOVER, not fill count: a naked
+    arm buys the whole ATM premium where the spread pays a net debit about half
+    that, so a naked round trip is NOT simply half a spread's. `None` for a
+    reference arm, which is not an option position and would be given a cost it
+    would never pay.
+    """
+    if arm.get('reference'):
+        return None
+    try:
+        from . import fees as fees_mod
+        q = int(sh.get('quantity') or 0)
+        if q <= 0:
+            return None
+        ex = a.get('exit') or {}
+        legs = ex.get('legs') or {}
+        # Built here rather than through `fees._leg_orders`, whose signature
+        # takes a `structure` and a `debit` this arm does not have and whose
+        # body happens to ignore them. `estimate` is the public surface and the
+        # order shape is its documented input; depending on the private
+        # builder's argument order for a call that passes it dummies is a
+        # break waiting for the next edit of that file.
+        pairs = [('long', 'BUY', sh.get('long_ask_entry'), 'entry'),
+                 ('long', 'SELL', (legs.get('long') or {}).get('bid'), 'exit')]
+        if 'short' in arm['legs']:
+            pairs += [('short', 'SELL', sh.get('short_bid_entry'), 'entry'),
+                      ('short', 'BUY', (legs.get('short') or {}).get('ask'), 'exit')]
+        # ALL FOUR (or two) legs, or nothing. A partial order list costs a
+        # half round trip and returns a number that looks like a full one --
+        # and an understated fee reads as free money in the net column. An
+        # exit booked before `legs` was persisted, or an unpriced exit, has to
+        # come back UNKNOWN rather than cheap.
+        if any(px is None for _, _, px, _ in pairs):
+            return None
+        orders = [{'leg': leg, 'side': side, 'price': float(px), 'qty': q,
+                   'when': when} for leg, side, px, when in pairs]
+        return float(fees_mod.estimate(orders).get('total') or 0.0)
+    except Exception as e:
+        logger.debug('shadow fee estimate failed: %s', e)
+        return None
+
+
 def scorecard() -> dict:
-    """Per-arm results, for `python -m zebra shadow`. Read-only."""
+    """Per-arm results, for `python -m zebra shadow`. Read-only.
+
+    UNPRICED exits are returned in their own bucket, never dropped. An
+    unpriceable book correlates with a bad outcome, so quietly discarding those
+    rows would bias the count in the optimistic direction -- the same way
+    dropping the value-bound clamps turned the overnight measure from -12.1%
+    into +1.3%.
+    """
     state = _load()
-    out = {}
-    for key in ARMS:
-        rows = []
+    out, unpriced, pending, still_open = {}, {}, {}, {}
+    for key, arm in ARMS.items():
+        rows, un, pend, op = [], [], 0, 0
         for tid, sh in state['shadows'].items():
             a = sh['arms'].get(key)
-            if not a or a['status'] != 'exited' or not a['exit']:
+            if not a:
                 continue
-            if a['exit'].get('pnl_pct') is None:
+            if a['status'] == 'open':
+                pend += 1 if a.get('pending') else 0
+                op += 1
                 continue
+            ex = a.get('exit') or {}
+            if ex.get('pnl_pct') is None:
+                un.append({'id': tid, 'stock': sh['stock'],
+                           'reason': ex.get('reason'), 'at': ex.get('at')})
+                continue
+            fee = arm_fees(arm, sh, a)
+            gross = (ex['value'] - a['entry_value']) * (sh.get('quantity') or 0)
             rows.append({
                 'id': tid, 'stock': sh['stock'],
-                'pnl_pct': a['exit']['pnl_pct'], 'reason': a['exit']['reason'],
+                'pnl_pct': ex['pnl_pct'], 'reason': ex['reason'],
                 'capital': (a['entry_value'] or 0) * (sh.get('quantity') or 0),
-                'pnl': (a['exit']['value'] - a['entry_value']) * (sh.get('quantity') or 0),
+                'pnl': gross,
+                # None means UNCOSTED, never "cost nothing". A reference arm
+                # is genuinely uncosted by this model; an option arm with no
+                # exit book simply is not known, and the reader must not add
+                # its gross into a net total as though the fee were zero.
+                'net': (gross if arm.get('reference')
+                        else (None if fee is None else gross - fee)),
+                'fees': fee,
+                'days': _days_held(sh, ex.get('at')),
                 'partial': bool(sh.get('opened_late')),
                 'fills': a.get('fills'),
+                'reference': bool(arm.get('reference')),
             })
-        out[key] = rows
-    return {'arms': out,
+        out[key], unpriced[key], pending[key], still_open[key] = rows, un, pend, op
+    return {'arms': out, 'unpriced': unpriced, 'pending': pending,
+            'still_open': still_open,
             'open': sum(1 for sh in state['shadows'].values()
                         if any(a['status'] == 'open' for a in sh['arms'].values())),
             'shadows': len(state['shadows'])}
+
+
+def censored(sc: dict, key: str) -> bool:
+    """Is this arm's win rate still a statement about its FAST exits only?
+
+    THE ARMS DO NOT CENSOR ALIKE, and that difference manufactures a win rate.
+    An arm with a stop closes on both sides. An arm WITHOUT one closes only on
+    TP -- which arrives in about 4 days -- or on TIME, about 28. So at any
+    snapshot before the first TIME exits land, its closed set is nearly all
+    winners and its losers are still sitting open. Driving the 23 closed cohort
+    positions through this machinery showed exactly that: `naked_long` (with a
+    stop) 57.9% wins over 19, `naked_hold` (same arm, no stop) 91.7% over 12,
+    `spread_hold` 100% over 12 -- and `naked_runner`, whose only exit is TIME,
+    resolved NOTHING at all.
+
+    This engine has already been fooled by this once, on its own book: seven
+    wins from seven closes, read as a 100% strategy, when the losers were
+    simply still open. So the reader says CENSORED while any position of this
+    arm is unresolved, rather than printing a number that looks finished.
+    """
+    return (sc.get('still_open', {}).get(key) or 0) > 0

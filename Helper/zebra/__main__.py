@@ -1297,27 +1297,40 @@ def cmd_shadow(args):
     if not sc['shadows']:
         print('\n  Nothing yet. A shadow opens when the next COHORT position enters.')
         return
-    # The cohort's own measured fee, halved for a 2-fill arm. Approximate and
-    # said to be: the point is that a 4-fill arm must not be compared gross
-    # against a 2-fill one, not that this is the exact rupee.
-    FEE_PER_FILL = 155.0 / 4
-    print('\n  %-13s %4s %8s %8s %9s %10s %10s %8s' % (
-        'arm', 'n', 'win%', 'avg%', 'RoC', 'gross Rs', 'net Rs', 'partial'))
+    print('')
+    hdr = ('arm', 'n', 'open', 'win%', 'avg%', 'days', 'RoC', 'gross Rs',
+           'net Rs', 'part', 'unpr')
+    print('  %-13s %4s %5s %7s %7s %5s %8s %9s %9s %5s %5s' % hdr)
     for key in ss.ARMS:
         rows = [r for r in sc['arms'][key] if not r['partial']]
         part = sum(1 for r in sc['arms'][key] if r['partial'])
+        unpr = len(sc['unpriced'][key])
+        op = sc['still_open'][key]
         if not rows:
-            print('  %-13s %4d %8s %8s %9s %10s %10s %8d'
-                  % (key, 0, '-', '-', '-', '-', '-', part))
+            print('  %-13s %4d %5d %7s %7s %5s %8s %9s %9s %5d %5d'
+                  % (key, 0, op, '-', '-', '-', '-', '-', '-', part, unpr))
             continue
         w = sum(1 for r in rows if r['pnl_pct'] > 0)
         cap = sum(r['capital'] for r in rows) or 1.0
         gross = sum(r['pnl'] for r in rows)
-        net = gross - sum(r['fills'] * FEE_PER_FILL for r in rows)
-        print('  %-13s %4d %7.1f%% %7.1f%% %8.1f%% %10.0f %10.0f %8d' % (
-            key, len(rows), 100.0 * w / len(rows),
+        # An UNCOSTED row is not a free one. Summing `net` over only the rows
+        # that have it and marking the total '~' is the honest reading; adding
+        # their gross in would quietly report a fee of zero.
+        costed = [r for r in rows if r['net'] is not None]
+        net = sum(r['net'] for r in costed)
+        net_mark = '' if len(costed) == len(rows) else '~'
+        days = [r['days'] for r in rows if r['days'] is not None]
+        ref = rows[0]['reference']
+        # A reference arm's capital is NOTIONAL, not premium, so its RoC shares
+        # a column with the option arms while measuring something else
+        # entirely. Marked, not silently mixed: unmarked, delta1 reads as the
+        # worst arm on the board when it is in fact the size of the prize.
+        print('  %-13s %4d %5s %6.1f%% %6.1f%% %5s %7.1f%%%s %8.0f %9s %5d %5d' % (
+            key, len(rows), ('%d!' % op) if op else '0', 100.0 * w / len(rows),
             sum(r['pnl_pct'] for r in rows) / len(rows),
-            100.0 * gross / cap, gross, net, part))
+            ('%.0f' % (sum(days) / len(days))) if days else '-',
+            100.0 * gross / cap, '*' if ref else ' ', gross,
+            'n/a' if ref else ('%.0f%s' % (net, net_mark)), part, unpr))
 
     # The control: the real spread, on the SAME ids, so the comparison is not
     # against a different set of trades.
@@ -1330,12 +1343,36 @@ def cmd_shadow(args):
         g = sum(t['pnl'] for t in ctrl)
         n = sum(t.get('pnl_net') or t['pnl'] for t in ctrl)
         w = sum(1 for t in ctrl if t['pnl'] > 0)
-        print('  %-13s %4d %7.1f%% %7.1f%% %8.1f%% %10.0f %10.0f %8s' % (
-            'REAL spread', len(ctrl), 100.0 * w / len(ctrl),
-            sum(t['pnl_pct'] for t in ctrl) / len(ctrl),
-            100.0 * g / cap, g, n, '-'))
-    print('\n  RoC is on capital ACTUALLY DEPLOYED -- a naked arm costs ~2x the')
+        print('  %-13s %4d %5s %6.1f%% %6.1f%% %5s %7.1f%%  %8.0f %9.0f %5s %5s' % (
+            'REAL spread', len(ctrl), '-', 100.0 * w / len(ctrl),
+            sum(t['pnl_pct'] for t in ctrl) / len(ctrl), '-',
+            100.0 * g / cap, g, n, '-', '-'))
+    cens = [k for k in ss.ARMS if ss.censored(sc, k)]
+    if cens:
+        print('')
+        print('  !! CENSORED -- these arms have unresolved positions, so their')
+        print('     win rate is NOT yet a win rate: %s' % ', '.join(cens))
+        print('     The arms do not censor alike. One WITH a stop closes on both')
+        print('     sides; one WITHOUT closes on TP (~4 days) or TIME (~28), so')
+        print('     before the first TIME exits land its closed set is nearly all')
+        print('     winners and its losers are still open. This book has already')
+        print('     been fooled by exactly that -- 7 wins from 7 closes read as a')
+        print('     100% strategy while every loser was still running.')
+    print('')
+    print('  RoC is on capital ACTUALLY DEPLOYED -- a naked arm costs ~2x the')
     print('  spread per position, so comparing rupees alone favours it wrongly.')
+    print('  days matters as much: naked_runner has no TP, so it runs to its TIME')
+    print("  stop (~28d) against the spread's ~5. Same return over 5x the time is")
+    print("  not the same return, and this book's edge is measured in VELOCITY.")
+    print('  part = opened after entry (unobserved head, excluded from the row).')
+    print('  unpr = exit that never found a usable price. NOT dropped: an')
+    print('  unpriceable book correlates with a bad outcome, so hiding these')
+    print('  would bias the count optimistically. delta1 is a REFERENCE arm')
+    print('  (cash/futures), so the option fee model does not net it, and its')
+    print('  RoC* is on NOTIONAL where every other row is on PREMIUM -- it')
+    print('  sizes the prize, it does not compete for the same rupee.')
+    print('  A net marked ~ has rows this model could not cost (no exit book);')
+    print('  they are summed OUT of net, never in at a fee of zero.')
     if args.detail:
         for key in ss.ARMS:
             rows = sc['arms'][key]

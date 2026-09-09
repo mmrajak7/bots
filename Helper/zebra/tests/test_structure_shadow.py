@@ -21,7 +21,8 @@ def _trade(**kw):
         'long_symbol': 'ACME26SEP100CE', 'short_symbol': 'ACME26SEP104CE',
         'tp_spot': 104.0, 'expiry': '2026-09-24', 'quantity': 100,
         'entry_spot': 100.0, 'entry_date': '2026-09-01',
-        'long_ask_entry': 4.0, 'debit': 2.0, 'width': 4.0,
+        'long_ask_entry': 4.0, 'short_bid_entry': 2.0,
+        'entry_time': '09:30:00', 'debit': 2.0, 'width': 4.0,
     }
     t.update(kw)
     return t
@@ -113,11 +114,17 @@ def test_spot_triggers_stand_down_in_the_cash_closing_auction(monkeypatch):
 
 
 def test_the_time_stop_fires_even_when_nothing_quotes():
-    """TIME is a statement about the calendar, not about a price. Gated on a
-    quote, a blind spell at expiry leaves an arm open past its own contract."""
+    """TIME is a statement about the calendar, not about a price, so it must
+    FIRE without a quote -- gated on one, a blind spell at expiry leaves an arm
+    open past its own contract.
+
+    Firing is not the same as BOOKING. With no price the trigger latches and
+    the booking waits, which is why this asserts `pending` rather than an
+    exit; `test_naked_runner_survives_a_blind_time_deadline` covers the rest."""
     sh = _shadow(expiry='2026-09-11')
     ss.poll_one(sh, None, None, None, MID_SESSION, TODAY)
-    assert all(a['exit']['reason'] == 'time' for a in sh['arms'].values())
+    assert all(a['pending']['reason'] == 'time' for a in sh['arms'].values())
+    assert all(a['status'] == 'open' for a in sh['arms'].values())
 
 
 def test_only_cohort_positions_are_shadowed():
@@ -222,3 +229,182 @@ def test_backfilled_legs_inherit_the_engines_own_quality_verdict():
                        'long_ask': 1.2}, 'long')
     assert ok['reliable'] is True and bad['reliable'] is False
     assert ss._obs_leg({'q': 'ok'}, 'short') is None
+
+
+# -- a trigger that cannot be priced is not an exit yet -----------------------
+
+def test_a_tp_on_an_unusable_book_latches_and_books_at_the_next_price():
+    """TP fires on SPOT, so it can arrive on a poll where the option book is
+    unusable. Booking value=None there records an exit with no P&L, which a
+    reader then has to either drop (losing the observation) or count as zero."""
+    sh = _shadow()
+    dead = _q(5.0, 6.0, reliable=False)
+    ss.poll_one(sh, 104.0, dead, dead, MID_SESSION, TODAY)
+    a = sh['arms']['naked_long']
+    assert a['status'] == 'open' and a['pending']['reason'] == 'tp'
+
+    ss.poll_one(sh, 104.0, _q(7.0, 7.4), _q(3.0, 3.2), MID_SESSION, TODAY)
+    assert a['status'] == 'exited'
+    assert a['exit']['reason'] == 'tp' and a['exit']['value'] == 7.0
+    assert a['exit']['unpriced'] is False
+
+
+def test_a_latched_trigger_is_not_released_when_the_condition_stops_holding():
+    """The trigger DID fire. Re-deciding it on a later print is a different
+    rule, and it is the rule that would quietly never book a stop."""
+    sh = _shadow()
+    dead = _q(5.0, 6.0, reliable=False)
+    ss.poll_one(sh, 104.0, dead, dead, MID_SESSION, TODAY)      # TP fires, unpriced
+    assert sh['arms']['naked_long']['pending']['reason'] == 'tp'
+    ss.poll_one(sh, 90.0, _q(7.0, 7.4), _q(3.0, 3.2), MID_SESSION, TODAY)
+    assert sh['arms']['naked_long']['exit']['reason'] == 'tp'   # not 'stop', not open
+
+
+def test_naked_runner_survives_a_blind_time_deadline():
+    """`naked_runner`'s ONLY exit is TIME. One unusable book on the deadline
+    poll used to book it at value=None -- losing the arm this whole module
+    exists to measure, on exactly the position where it mattered."""
+    sh = _shadow(expiry='2026-09-11')                # inside TIME_SL_DAYS
+    ss.poll_one(sh, None, None, None, MID_SESSION, TODAY)
+    a = sh['arms']['naked_runner']
+    assert a['status'] == 'open' and a['pending']['reason'] == 'time'
+    ss.poll_one(sh, 100.0, _q(6.0, 6.4), _q(2.0, 2.2), MID_SESSION, TODAY)
+    assert a['exit']['reason'] == 'time' and a['exit']['value'] == 6.0
+
+
+def test_expiry_is_the_backstop_and_records_unpriced_rather_than_hanging():
+    """Past its own contract no future poll can price it. Leaving the arm open
+    would report it as still being measured when it never can be again."""
+    sh = _shadow(expiry='2026-09-10')
+    ss.poll_one(sh, None, None, None, MID_SESSION, date(2026, 9, 10))
+    a = sh['arms']['naked_runner']
+    assert a['status'] == 'exited'
+    assert a['exit']['unpriced'] is True and a['exit']['pnl_pct'] is None
+
+
+def test_unpriced_exits_are_reported_not_silently_dropped(tmp_path, monkeypatch):
+    """An unpriceable book correlates with a bad outcome, so discarding these
+    rows biases the count in the optimistic direction."""
+    monkeypatch.setattr(ss, 'STATE_FILE', tmp_path / 's.json')
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_trade(expiry='2026-09-10')], '2026-09-01 10:00:00')
+    ss.poll_one(state['shadows']['1'], None, None, None,
+                MID_SESSION, date(2026, 9, 10))
+    ss._save(state)
+    sc = ss.scorecard()
+    assert sc['arms']['naked_runner'] == []
+    assert [r['id'] for r in sc['unpriced']['naked_runner']] == ['1']
+
+
+# -- the count must not flatter an arm ---------------------------------------
+
+def test_the_exit_book_is_persisted_not_just_the_scalar():
+    """An option book cannot be reconstructed after the fact, and it is what
+    lets fees be costed per leg instead of scaled off the spread's total."""
+    sh = _shadow()
+    ss.poll_one(sh, 104.0, _q(7.0, 7.4), _q(3.0, 3.2), MID_SESSION, TODAY)
+    legs = sh['arms']['spread_hold']['exit']['legs']
+    assert legs['long']['bid'] == 7.0 and legs['short']['ask'] == 3.2
+
+
+def test_fees_follow_turnover_so_a_naked_arm_is_not_half_a_spread():
+    """Charges scale with turnover, not fill count. A naked arm buys the whole
+    ATM premium where the spread pays a net debit about half that, so halving
+    the spread's fee to model a 2-fill arm understates it."""
+    sh = _shadow()
+    ss.poll_one(sh, 104.0, _q(7.0, 7.4), _q(3.0, 3.2), MID_SESSION, TODAY)
+    naked = ss.arm_fees(ss.ARMS['naked_long'], sh, sh['arms']['naked_long'])
+    spread = ss.arm_fees(ss.ARMS['spread_hold'], sh, sh['arms']['spread_hold'])
+    assert naked and spread
+    assert naked > spread / 2.0, (naked, spread)
+
+
+def test_a_reference_arm_is_not_given_an_option_fee_it_would_never_pay():
+    sh = _shadow()
+    assert ss.arm_fees(ss.ARMS['delta1'], sh, sh['arms']['delta1']) is None
+
+
+def test_holding_period_is_surfaced_because_the_arms_do_not_hold_alike():
+    """`naked_runner` runs to its TIME stop (~28d) against the spread's ~5. A
+    per-trade return that takes five times as long is not the same return."""
+    sh = _shadow()
+    sh['since'] = '2026-09-01 10:00:00'
+    assert ss._days_held(sh, '2026-09-15 10:00:00') == 14
+    assert ss._days_held(sh, 'rubbish') is None
+
+
+def test_an_unknown_direction_is_refused_rather_than_shadowed_as_a_put():
+    """`_tp_hit` and `delta1_mark` both treat 'not CE' as PE, so an unknown
+    direction would be silently measured on the wrong side of the market."""
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    assert ss.open_shadows(state, [_trade(direction='XX')], 'x') == 0
+
+
+def test_an_uncosted_arm_reports_unknown_not_free():
+    """A missing exit book means the fee is UNKNOWN. Returning 0 there makes
+    an arm look cheaper than it is, in the net column, permanently."""
+    sh = _shadow()
+    sh.pop('short_bid_entry')                       # e.g. a pre-schema record
+    ss.poll_one(sh, 104.0, _q(7.0, 7.4), _q(3.0, 3.2), MID_SESSION, TODAY)
+    assert ss.arm_fees(ss.ARMS['spread_hold'], sh, sh['arms']['spread_hold']) is None
+    # and the scorecard must not fold it into net as a zero
+    a = sh['arms']['spread_hold']
+    gross = (a['exit']['value'] - a['entry_value']) * sh['quantity']
+    assert gross != 0
+
+
+def test_an_unpriced_exit_cannot_be_costed_either():
+    """No exit book, no round trip. This is the same hole as the one above,
+    reached from the other direction."""
+    sh = _shadow(expiry='2026-09-10')
+    ss.poll_one(sh, None, None, None, MID_SESSION, date(2026, 9, 10))
+    a = sh['arms']['naked_runner']
+    assert a['exit']['unpriced'] is True
+    assert ss.arm_fees(ss.ARMS['naked_runner'], sh, a) is None
+
+
+def test_a_spread_arm_is_clamped_to_its_mathematical_bounds():
+    """A vertical cannot be worth less than 0 (expiry is always available and
+    costs nothing) nor more than its width. Without the floor a wide book books
+    a P&L past -100% on a -100%-capped structure -- PIIND #50 read -112.4%."""
+    arm = ss.ARMS['spread_hold']
+    # long bid 0.55 / short ask 0.60 is an ORDINARY book for a worthless spread
+    assert ss.arm_value(arm, _q(0.55, 0.70), _q(0.50, 0.60), 4.0)[0] == 0.0
+    assert ss.arm_value(arm, _q(9.0, 9.5), _q(0.1, 0.2), 4.0)[0] == 4.0
+    # unknown width still floors at zero -- the bound that costs money
+    assert ss.arm_value(arm, _q(0.55, 0.70), _q(0.50, 0.60), None)[0] == 0.0
+
+
+def test_the_clamp_is_not_applied_to_a_naked_long():
+    """A long option has no upper bound. Clamping it to the spread's width
+    would truncate exactly the uncapped upside the arm exists to measure."""
+    v = ss.arm_value(ss.ARMS['naked_long'], _q(20.0, 20.5), None, 4.0)[0]
+    assert v == 20.0
+
+
+def test_an_arm_with_unresolved_positions_is_reported_CENSORED(tmp_path, monkeypatch):
+    """THE ARMS DO NOT CENSOR ALIKE, and that manufactures a win rate.
+
+    An arm with a stop closes on both sides; one without closes on TP (~4 days)
+    or TIME (~28), so before the first TIME exits land its closed set is nearly
+    all winners. Driving the 23 closed cohort positions through this machinery
+    showed naked_long (stop) at 57.9% over 19 against naked_hold (same arm, no
+    stop) at 91.7% over 12 -- a 34-point gap that is pure censoring. This book
+    has already been fooled by the same shape: 7 wins from 7 closes.
+    """
+    monkeypatch.setattr(ss, 'STATE_FILE', tmp_path / 's.json')
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_trade(id=1), _trade(id=2)], '2026-09-01 09:31:00')
+    # resolve ONE of the two, leaving the other running
+    ss.poll_one(state['shadows']['1'], 104.0, _q(7.0, 7.4), _q(3.0, 3.2),
+                MID_SESSION, TODAY)
+    ss._save(state)
+    sc = ss.scorecard()
+    assert sc['still_open']['naked_hold'] == 1
+    assert ss.censored(sc, 'naked_hold') is True
+
+    # and once nothing is left running, it stops being censored
+    ss.poll_one(state['shadows']['2'], 104.0, _q(7.0, 7.4), _q(3.0, 3.2),
+                MID_SESSION, TODAY)
+    ss._save(state)
+    assert ss.censored(ss.scorecard(), 'naked_hold') is False

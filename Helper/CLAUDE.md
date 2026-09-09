@@ -991,12 +991,43 @@ closing auction, a booked exit never re-priced, TIME fires even when nothing
 quotes. Arms carry their own `fills` count (2 for naked vs 4 for the spread)
 so a gross comparison cannot flatter the four-legged one.
 
-**Two columns stop the count flattering itself.** `partial` marks a shadow
+**Columns that stop the count flattering itself.** `partial` marks a shadow
 opened materially after its parent entered — its stop may already have fired
 where nothing was watching — and same-DAY is deliberately not treated as
-same-time. `--backfill` seeds OPEN positions from stored paths (exact: coverage
-runs from entry) and **refuses closed ones**, whose paths stop at their own
-exit and would bake in an unobserved tail.
+same-time. `unpr` marks an exit that never found a usable price: TP fires on
+spot and TIME on the calendar, so either can land on a poll with a dead book,
+and those rows are **reported, never dropped** (an unpriceable book correlates
+with a bad outcome, so dropping them biases the count optimistically). A
+trigger that cannot be priced LATCHES and books at the next usable price, with
+expiry as the backstop — without which `naked_runner`, whose only exit is TIME,
+would vanish from its own scorecard on one bad book. `--backfill` seeds OPEN
+positions from stored paths (exact: coverage runs from entry) and **refuses
+closed ones**, whose paths stop at their own exit and would bake in an
+unobserved tail.
+
+> ### ⚠ THE ARMS DO NOT CENSOR ALIKE — read `CENSORED` before any number
+>
+> An arm WITH a stop closes on both sides. An arm WITHOUT one closes only on
+> TP (~4 days) or TIME (~28), so **before the first TIME exits land, its closed
+> set is nearly all winners and its losers are still open.**
+>
+> Driving the 23 closed cohort positions through the real machinery makes the
+> size of it plain — same signal, same data, one difference per row:
+>
+> | arm | n | win% | why |
+> |---|---|---|---|
+> | `naked_long` (has a stop) | 19 | **57.9%** | closes on both sides |
+> | `naked_hold` (same arm, no stop) | 12 | **91.7%** | losers still open |
+> | `spread_hold` (no stop) | 12 | **100%** | losers still open |
+> | `naked_runner` (no TP, no stop) | **0** | — | resolves nothing until TIME |
+>
+> That 34-point gap between the first two rows is **entirely censoring** — it
+> is the same arm. This book has already been fooled by the identical shape
+> (7 wins from 7 closes read as a 100% strategy while every loser was still
+> running), so `python -m zebra shadow` prints **CENSORED** against any arm
+> with an unresolved position and the reader must not quote a win rate until
+> it clears. `naked_runner` — the arm the whole finding points at — is the
+> LAST one that can clear, by construction.
 
 ### Spot stop — SHADOWED, still not armed (2026-09-06)
 
