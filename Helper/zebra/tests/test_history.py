@@ -961,3 +961,40 @@ def test_the_scanner_asks_for_it_on_the_path_that_actually_runs():
     assert 'velocity_context' in src
     assert "signal_data['velocity']" in src
 
+
+
+def test_the_stored_ratio_is_reproducible_from_the_stored_fields(monkeypatch):
+    """`atrs_to_st` must be re-derivable from `st_value` and `signal_price` as
+    they sit on the record. Computing it from the unrounded scan values instead
+    leaves a figure that is ALMOST reproducible, which is worse than either
+    extreme: it invites a later analyst to conclude the two disagree."""
+    _patch_cache(monkeypatch, _atr_bars(30, 2.0))
+    st, px = 106.004, 100.002          # what the scan holds
+    v = history.velocity_context(None, 'X', 'weekly', round(st, 2), round(px, 2))
+    assert v['atrs_to_st'] == round(abs(round(st, 2) - round(px, 2)) / v['atr'], 3)
+
+
+def test_speed_is_measured_only_on_signals_the_scan_actually_keeps():
+    """The capacity gate `continue`s. Measuring before it burns work on rows
+    that are discarded, so the call must sit after it.
+
+    RETIRES WHEN: `validate_and_add` is covered by a scan-level test with both
+    feeds stubbed, which would assert the same ordering behaviourally.
+    """
+    import inspect
+    from zebra import scanner
+    src = inspect.getsource(scanner.validate_and_add)
+    cap = src.index("skips['watch_capacity']")
+    call = src.index('velocity_context')
+    assert cap < call, "velocity is computed before the capacity gate discards the row"
+
+
+def test_every_stored_ratio_derives_from_the_stored_atr(monkeypatch):
+    """Both ratios must be reproducible from the record alone. An ATR whose
+    full precision only lives inside the function makes `atrs_to_st` and
+    `atr_pct` un-checkable against the `atr` beside them."""
+    _patch_cache(monkeypatch, _atr_bars(30, 2.0 / 3.0))     # non-terminating
+    v = history.velocity_context(None, 'X', 'weekly', 106.0, 100.0)
+    assert v['atr'] == round(v['atr'], 4), 'stored atr is not the rounded one'
+    assert v['atr_pct'] == round(100.0 * v['atr'] / 100.0, 3)
+    assert v['atrs_to_st'] == round(6.0 / v['atr'], 3)

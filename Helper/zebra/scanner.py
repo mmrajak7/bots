@@ -247,15 +247,6 @@ def validate_and_add(store: ZebraStore, kite=None,
             'paper': True,
             'notes': f"Chartink {timeframe} {direction}-Zebra, gap={gap*100:.2f}%",
         }
-        # Speed, stamped AT THE SIGNAL and never recomputed. MEASURED ONLY —
-        # nothing reads it to decide anything, and `history.velocity_context`
-        # carries the reason (its own p-value does not survive clustering).
-        # It is stored now so the question can be answered from records in a
-        # few months instead of being re-derived against today's bars, which
-        # is precisely how the touch rate turned into a look-ahead statistic.
-        vc = history.velocity_context(kite, stock, timeframe, st_val, price)
-        if vc:
-            signal_data['velocity'] = vc
         # THE CAP IS RE-CHECKED PER ADD, not once per cycle.
         #
         # The guard above runs before the loop, so with `len(watching)` one
@@ -267,6 +258,22 @@ def validate_and_add(store: ZebraStore, kite=None,
         if len(watching) + len(added) >= cfg.MAX_WATCHING_SIGNALS:
             skips['watch_capacity'] += 1
             continue
+        # Speed, stamped AT THE SIGNAL and never recomputed. MEASURED ONLY —
+        # nothing reads it to decide anything, and `history.velocity_context`
+        # carries the reason (its own p-value does not survive clustering).
+        # Stored now so the question can be answered from records in a few
+        # months rather than re-derived against whatever bars exist by then,
+        # which is exactly how the touch rate became a look-ahead statistic.
+        #
+        # Computed AFTER the capacity gate, so a signal the scan is about to
+        # discard costs nothing; and from the ROUNDED values that actually get
+        # stored, so `atrs_to_st` is exactly reproducible from `st_value` and
+        # `signal_price` on the record instead of being almost-reproducible.
+        vc = history.velocity_context(kite, stock, timeframe,
+                                      signal_data['st_value'],
+                                      signal_data['signal_price'])
+        if vc:
+            signal_data['velocity'] = vc
         if dry_run:
             print(f"  [DRY] WATCH {stock} {timeframe} {direction} "
                   f"spot={price:.2f} ST={st_val:.2f} gap={gap*100:.2f}%")

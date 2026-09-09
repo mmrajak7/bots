@@ -221,11 +221,32 @@ def test_the_exit_is_priced_at_the_side_actually_traded():
     assert fees._exit_leg_price(REAL_EXIT_LEGS['short'], 'BUY') == 8.2
 
 
-def test_a_broken_quote_falls_through_rather_than_booking_a_free_exit():
-    """A zero bid is a broken book, not a costless sale. Booking it would put a
-    phantom zero-turnover order in the round trip and understate STT."""
-    assert fees._exit_leg_price({'bid': 0.0, 'ask': 0.0, 'mid': 4.2}, 'SELL') == 4.2
-    assert fees._exit_leg_price({'bid': None, 'ask': None, 'mid': None}, 'SELL') is None
+def test_a_zero_bid_is_a_price_not_a_failure():
+    """A long bid of 0 means the sale raises nothing: turnover, and the STT on
+    it, really are zero. `exit_debit` already reads the bid this way, and a fee
+    model that disagreed with the valuation layer about the same quote would be
+    the worse bug."""
+    assert fees._exit_leg_price({'bid': 0.0, 'ask': 0.0, 'mid': 0.0}, 'SELL') == 0.0
+
+
+def test_the_mid_is_never_used_to_cost_an_exit():
+    """Nobody trades at the mid. Accepting it would let `basis` say 'full' —
+    'costed from the real book' — off a price that never existed, which is the
+    same class of mistake as the bug this function replaces. A leg missing its
+    traded side must fall to the modelled path, which is labelled honestly."""
+    assert fees._exit_leg_price({'mid': 4.2}, 'SELL') is None
+    assert fees._exit_leg_price({'ask': 9.0, 'mid': 4.2}, 'SELL') is None, \
+        "took the WRONG side's quote"
+    est = fees.round_trip_for_trade(
+        dict(FULL, exit_legs={'long': {'mid': 4.2}, 'short': {'mid': 2.0}}),
+        exit_debit=7.0)
+    assert est['approx'] is True and est['basis'] == 'modelled'
+
+
+def test_a_missing_or_impossible_quote_is_refused():
+    assert fees._exit_leg_price({'bid': None, 'ask': None}, 'SELL') is None
+    assert fees._exit_leg_price({'bid': -1.0}, 'SELL') is None
+    assert fees._exit_leg_price({'bid': 'x'}, 'SELL') is None
     assert fees._exit_leg_price({}, 'SELL') is None
     assert fees._exit_leg_price(None, 'SELL') is None
 

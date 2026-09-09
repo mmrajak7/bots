@@ -628,8 +628,14 @@ def velocity_context(kite, stock: str, timeframe: str,
         a = _atr(daily)
         if not a or a <= 0 or not price or price <= 0:
             return None
+        # Derive the ratios from the ROUNDED atr, the one that is stored. Using
+        # the full-precision value would leave `atrs_to_st` almost — but not
+        # exactly — reproducible from the record's own fields, which is the
+        # worst of both: close enough to look right, different enough to make a
+        # later analyst think the two disagree.
+        a = round(a, 4)
         return {
-            'atr': round(a, 4),
+            'atr': a,
             'atr_pct': round(100.0 * a / price, 3),
             'atrs_to_st': round(abs(st_value - price) / a, 3),
             'bars': ATR_BARS,

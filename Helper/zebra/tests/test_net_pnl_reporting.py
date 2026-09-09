@@ -236,3 +236,27 @@ def test_the_model_mix_is_read_off_the_stored_records():
     assert report._fee_models([_costed(1), _costed(1)]) == {1}
     # An uncosted record contributes no version — it is the OTHER contamination.
     assert report._fee_models([{'pnl': 1.0}]) == set()
+
+
+def test_BOTH_formatters_disclose_a_mixed_FEE_MODEL():
+    """The same defect as the mixed-basis one above, one version later.
+
+    `format_text` and `format_telegram` render the summary separately, and a
+    previous review found the note reaching one and not the other. The book is
+    deliberately not restamped after `fees.MODEL_VERSION` went 1 -> 2, so this
+    blend is guaranteed to occur — it must be visible in the message that is
+    actually READ, not only in the one that is not.
+    """
+    a = _t(1, 1000.0, 900.0, fees={'model': 1, 'total': 100.0, 'basis': 'modelled'})
+    b = _t(2, 500.0, 450.0, fees={'model': 2, 'total': 50.0, 'basis': 'full'})
+    for out in (R.format_text(_report(a, b)), R.format_telegram(_report(a, b))):
+        assert 'MIXED FEE MODEL' in out and 'v1/v2' in out
+
+
+def test_one_fee_model_leaves_the_report_unmarked():
+    """The negative control. Every assertion above passes trivially if the note
+    were simply always present, and a permanent warning is one nobody reads."""
+    a = _t(1, 1000.0, 900.0, fees={'model': 2, 'total': 100.0, 'basis': 'full'})
+    b = _t(2, 500.0, 450.0, fees={'model': 2, 'total': 50.0, 'basis': 'full'})
+    for out in (R.format_text(_report(a, b)), R.format_telegram(_report(a, b))):
+        assert 'MIXED' not in out and 'GROSS' not in out

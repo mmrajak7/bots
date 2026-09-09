@@ -146,26 +146,39 @@ def _exit_leg_price(leg: Optional[dict], side: str) -> Optional[float]:
 
     Priced at the side actually traded, the same convention as `exit_debit`
     (`bid(long) - ask(short)`) and as the pricing rule in CLAUDE.md: the long is
-    SOLD at the BID, the short is BOUGHT BACK at the ASK. Taking the mid here
-    would understate turnover on both legs, and STT lands on the sell side —
-    which is precisely the leg the old code was guessing at.
+    SOLD at the BID, the short is BOUGHT BACK at the ASK. STT lands on the sell
+    side — precisely the leg the old code was guessing at.
 
-    `price` is still honoured first, so a future writer that stamps a real fill
+    THE MID IS NOT A FALLBACK. Nobody trades there, and accepting it would let
+    `basis` report 'full' — meaning "costed from the real book" — off a price
+    that never existed. A leg missing its traded side is a malformed book, and
+    the honest answer is to return None so the caller drops to the modelled
+    path, which is labelled as modelled. Costing the mid would be the same
+    class of mistake as the bug this function replaces: an estimate wearing the
+    label of evidence.
+
+    Zero is a PRICE, not a failure. A long bid of 0 means the sale raises
+    nothing, so turnover — and the STT on it — really is zero, while brokerage
+    is still charged. `exit_debit` already reads the bid this way, and a fee
+    model that disagreed with the valuation layer about the same quote would be
+    the worse bug. Only a missing or negative quote is refused. (Neither occurs
+    in the current book: 0 of 49 stored exit books have a non-positive bid.)
+
+    `price` is honoured first, so a future writer that stamps a real fill
     overrides the book without another change here.
     """
     if not isinstance(leg, dict):
         return None
-    for key in ('price', 'bid' if side == 'SELL' else 'ask', 'mid'):
+    for key in ('price', 'bid' if side == 'SELL' else 'ask'):
         v = leg.get(key)
-        if v is not None:
-            try:
-                f = float(v)
-            except (TypeError, ValueError):
-                continue
-            # A zero or negative quote is a broken book, not a free exit; fall
-            # through to the next source rather than book a phantom order.
-            if f > 0:
-                return f
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f >= 0:
+            return f
     return None
 
 
