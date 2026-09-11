@@ -552,8 +552,19 @@ def _guard_cooldown() -> None:
 
 
 def _note_rate_limit(exc) -> None:
-    """Start the local backoff if Kite said 429."""
+    """Start the local backoff if KITE said 429 — never on our own refusal.
+
+    `QuoteRateLimited` deliberately classifies as RATE_LIMIT (see its
+    docstring), so without the isinstance check a locally-refused call re-armed
+    the clock it was refused by. At a 5s poll against a 12s cooldown the
+    backoff then never lapsed: on 2026-09-11 one real 429 at 09:55:31 left the
+    monitor refusing every call for the rest of the session while zebra, on
+    the same key, priced all nine positions at 10:00. Only a response from the
+    broker can extend a window that lives on the broker.
+    """
     global _quote_cooldown_until
+    if isinstance(exc, QuoteRateLimited):
+        return
     if kite_errors.is_rate_limit(exc):
         _quote_cooldown_until = time.time() + QUOTE_COOLDOWN_SEC
 

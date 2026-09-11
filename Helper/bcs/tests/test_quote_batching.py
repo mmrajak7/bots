@@ -309,6 +309,55 @@ def test_the_cooldown_survives_a_cache_reset():
     assert sm.quote_cooldown_remaining() > 0
 
 
+def test_a_local_refusal_does_not_extend_the_local_cooldown(monkeypatch):
+    """`logs/spread_monitor_cron_20260911.log`: one real 429 at 09:55:31, then
+    `QUOTE ... 7s left` / `LTP ... 12s left` on EVERY poll to the close. The
+    refusal classifies as RATE_LIMIT by design, and was fed back into the
+    clock that raised it — so the backoff re-armed itself forever.
+
+    The clock is faked and ADVANCED between the two calls: on Windows
+    `time.time()` ticks at ~16ms, so two real reads back to back are equal and
+    a re-arm is invisible to `==` — this test passed on the pre-fix code until
+    it moved."""
+    now = [1_000_000.0]
+    monkeypatch.setattr(sm.time, 'time', lambda: now[0])
+    t = _cohort(1)[0]
+    k = _broker_for([t])
+    k.quote_raises = _429('Too many requests')
+    sm.prefetch_book(k, [t])
+    armed_until = sm._quote_cooldown_until
+    assert armed_until > 0
+    now[0] += 5.0
+    sm.reset_quote_cache()
+    sm.prefetch_book(k, [t])               # refused locally, both families
+    assert sm._quote_cooldown_until == armed_until, (
+        'a call we never made extended the backoff')
+
+
+def test_one_429_does_not_blind_the_monitor_for_the_session(monkeypatch):
+    """The whole incident, on a fake clock: one 429, the broker answers again
+    immediately, the poll runs every 5 seconds. Calls must resume once
+    QUOTE_COOLDOWN_SEC has passed since the BROKER's refusal."""
+    now = [1_000_000.0]
+    monkeypatch.setattr(sm.time, 'time', lambda: now[0])
+    t = _cohort(1)[0]
+    k = _broker_for([t])
+    k.quote_raises = _429('Too many requests')
+    sm.reset_quote_cache()
+    sm.prefetch_book(k, [t])
+    k.quote_raises = None                  # Kite's window is over; ours is not
+    served_at = None
+    for step in range(1, 13):              # one minute of 5-second polls
+        now[0] += 5.0
+        sm.reset_quote_cache()
+        sm.prefetch_book(k, [t])
+        if sm._quote_cache:
+            served_at = step * 5.0
+            break
+    assert served_at is not None, 'still refusing every call a minute later'
+    assert served_at <= sm.QUOTE_COOLDOWN_SEC + 5.0
+
+
 def test_a_missing_instrument_still_raises_rather_than_inventing_a_price():
     """Kite omits instruments it does not know. The old single-instrument
     `kite.quote([full])[full]` raised KeyError; the batched read must too,
