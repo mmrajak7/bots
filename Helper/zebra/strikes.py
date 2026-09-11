@@ -340,6 +340,17 @@ def _fresh(table: dict, key: str):
     return hit[1]
 
 
+def quotes_fresh(tradingsymbols) -> bool:
+    """True when EVERY symbol has a cached quote younger than the TTL.
+
+    The bound every valuation already trusts. `monitor._booking_quote` asks it
+    whether the book an exit triggered on is still the current book, or has
+    aged past the bound (an in-cycle vet wait) and must be read again.
+    """
+    keys = [f"NFO:{s}" for s in (tradingsymbols or []) if s]
+    return bool(keys) and all(_fresh(_quote_cache, k) is not None for k in keys)
+
+
 def _prune() -> None:
     """Forget entries past the TTL. Nothing reads them, and in `zebra loop` a
     kept exception would pin its traceback for the life of the process."""

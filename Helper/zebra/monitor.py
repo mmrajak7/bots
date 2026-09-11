@@ -2354,6 +2354,11 @@ def _format_bcs_enter_alert(trade: dict, analysis: dict, bcs: dict) -> str:
     )
 
 
+#: Default for `booked=` on the exit formatters: the close books the value
+#: that triggered it. A vetted paper exit passes what `_booking_quote` read.
+_SAME = object()
+
+
 def _paper_close_line(trade: dict, mid: Optional[float]) -> str:
     """Inline P&L estimate for paper-mode auto-close alerts."""
     if not cfg.PAPER_MODE:
@@ -2370,7 +2375,7 @@ def _paper_close_line(trade: dict, mid: Optional[float]) -> str:
 
 
 def _format_tp_alert(trade: dict, spot: float, mid: Optional[float] = None,
-                     on_latch: bool = False) -> str:
+                     on_latch: bool = False, booked=_SAME) -> str:
     """The TP ticket.
 
     `on_latch` says this exit is firing on a touch seen in an EARLIER cycle,
@@ -2379,7 +2384,7 @@ def _format_tp_alert(trade: dict, spot: float, mid: Optional[float] = None,
     Y" — is simply false when spot has since retreated, and the reader acts on
     this message. The touch is what fired; say so, and say where spot is now.
     """
-    paper = _paper_close_line(trade, mid)
+    paper = _paper_close_line(trade, mid if booked is _SAME else booked)
     if on_latch:
         touch = trade.get('tp_touch_spot')
         seen = f"{touch:,.2f}" if isinstance(touch, (int, float)) else 'NA'
@@ -2397,8 +2402,9 @@ def _format_tp_alert(trade: dict, spot: float, mid: Optional[float] = None,
     )
 
 
-def _format_spot_sl_alert(trade: dict, spot: float, mid: Optional[float] = None) -> str:
-    paper = _paper_close_line(trade, mid)
+def _format_spot_sl_alert(trade: dict, spot: float, mid: Optional[float] = None,
+                          booked=_SAME) -> str:
+    paper = _paper_close_line(trade, mid if booked is _SAME else booked)
     return (
         f"\U0001F6D1 <b>{_struct_label(trade)} SPOT SL</b>  "
         f"{html.escape(str(trade['stock']))} ({trade['direction']})\n"
@@ -2407,9 +2413,13 @@ def _format_spot_sl_alert(trade: dict, spot: float, mid: Optional[float] = None)
     )
 
 
-def _format_debit_sl_alert(trade: dict, mid: float) -> str:
-    paper = _paper_close_line(trade, mid)
-    pct_lost = (1 - mid / trade['debit']) * 100 if trade.get('debit') else 0
+def _format_debit_sl_alert(trade: dict, mid: float, booked=_SAME) -> str:
+    # `mid` is what TRIGGERED; the loss and the paper line are what BOOKED.
+    value = mid if booked is _SAME or booked is None else booked
+    # booked=None means the close did NOT book: the paper line says pending,
+    # as TP and SPOT SL already do, never the trigger's value as "auto-closed".
+    paper = _paper_close_line(trade, None if booked is None else value)
+    pct_lost = (1 - value / trade['debit']) * 100 if trade.get('debit') else 0
     return (
         f"\U0001F4C9 <b>{_struct_label(trade)} DEBIT SL</b>  "
         f"{html.escape(str(trade['stock']))} ({trade['direction']})\n"
@@ -2419,7 +2429,8 @@ def _format_debit_sl_alert(trade: dict, mid: float) -> str:
     )
 
 
-def _format_trail_alert(trade: dict, mid: float, tl: dict) -> str:
+def _format_trail_alert(trade: dict, mid: float, tl: dict,
+                        booked=_SAME) -> str:
     """Trail-stop exit. The LEVEL sits above the entry debit by construction;
     the FILL does not.
 
@@ -2430,9 +2441,13 @@ def _format_trail_alert(trade: dict, mid: float, tl: dict) -> str:
     and the alert is the layer the human actually reads, so a breached trail
     that lost money must not render as "Locking in ~Rs -12,000".
     """
-    paper = _paper_close_line(trade, mid)
+    # `mid` is what TRIGGERED; what is kept and the paper line are what BOOKED.
+    value = mid if booked is _SAME or booked is None else booked
+    # booked=None means the close did NOT book: the paper line says pending,
+    # as TP and SPOT SL already do, never the trigger's value as "auto-closed".
+    paper = _paper_close_line(trade, None if booked is None else value)
     qty = int(trade.get('quantity') or 0)
-    kept = (mid - trade['debit']) * qty
+    kept = (value - trade['debit']) * qty
     if kept >= 0:
         outcome = (f"Locking in ~Rs {kept:,.0f} of a peak Rs "
                    f"{tl['peak_gain'] * qty:,.0f}.")
@@ -3320,6 +3335,119 @@ def _flush_mfe(store: ZebraStore, pending: dict) -> None:
         # Measurement must never be able to block an exit.
         logger.warning("MFE flush failed (%d trades): %s", len(pending), e)
     pending.clear()
+
+
+def _booking_quote(kite, trade: dict, spot: float, trigger: dict,
+                   kind: str) -> tuple:
+    """The book a vetted PAPER exit is booked at — current at booking time.
+
+    Owner, 2026-09-11: "aft vet - book in real price bid-ask". Every vetted
+    exit (tp, trail, spot_sl, debit_sl) booked the quote this cycle took
+    BEFORE `_exit_cleared`, which can block for the M12 in-cycle vet wait.
+    #498 KEI's TP was quoted at 09:25:11, its vet answered at 09:27:11, and it
+    booked `mid=66.75` and its `exit_legs` from that 117-second-old book at
+    09:27:18. A close sent at 09:27:18 fills against the 09:27:18 book.
+
+    RE-READS ONLY WHEN THE TRIGGER'S BOOK HAS AGED past
+    `strikes.QUOTE_CACHE_TTL_SEC`. Inside that bound the trigger's quote IS the
+    current book — the bound every valuation in both engines already trusts —
+    and re-reading anyway would spend the quote budget `d8ef36e` protects on
+    every exit that never waited. Past it, spot and both legs are read again
+    and valued through `_structure_quote`: the trade's own basis (fill = long
+    BID minus short ASK), the bounds and the intrinsic-floor rejection apply
+    unchanged.
+
+    The vet and the spot-corroboration veto judged the TRIGGER book, not a
+    re-read, so the collapse shape the veto exists for — value down
+    >= SPREAD_COLLAPSE_PCT while spot moved < SPOT_MOVE_MIN_PCT — is applied
+    again here, trigger against re-read. Veto-only, nothing persisted, and it
+    stands down in the cash closing auction and without a fresh spot, exactly
+    as the veto itself does.
+
+    WHAT THAT BUYS IS BOUNDED, and differs by kind (second review, 2026-09-11).
+    TRAIL and DEBIT_SL stay protected: next cycle's own corroboration veto
+    judges the collapsed book against its persisted reference. TP and SPOT_SL
+    get ONE cycle: next cycle's quote is fresh, so there is no re-read here,
+    and the vet's earlier allow is still inside its shelf life, so a book that
+    STAYS collapsed books about five minutes later. TP was never spot-vetoed
+    before this helper existed; this narrows that window, it does not close it.
+
+    It never re-decides the exit: the trigger fired and was vetted, and this
+    only prices the close. An unusable result makes `_paper_auto_close` DEFER
+    and release the flag; the trigger's quote is never booked in its place.
+
+    A LIVE record books nothing here and its alert is the order ticket, so it
+    gets the trigger back untouched and no request is made.
+
+    Returns ``(quote, spot)``. Never raises.
+    """
+    if not is_paper_record(trade):
+        return trigger, spot
+    legs = [trade.get('long_symbol'), trade.get('short_symbol')]
+    if strikes_mod.quotes_fresh(legs):
+        return trigger, spot
+
+    def _f(v):
+        return '%.2f' % v if isinstance(v, (int, float)) else 'NA'
+
+    stock = trade.get('stock')
+    try:
+        fresh_spot = (get_ltp(kite, [stock]) or {}).get(stock) or 0
+    except Exception as e:
+        logger.warning("BOOKING QUOTE #%s %s: spot re-read failed (%s) — "
+                       "valuing against the cycle's spot", trade.get('id'),
+                       stock, e)
+        fresh_spot = 0
+    book_spot = fresh_spot if fresh_spot > 0 else spot
+    try:
+        strikes_mod.prefetch_quotes(kite, legs)
+        quote = _structure_quote(kite, trade, book_spot)
+    except Exception as e:
+        logger.error("BOOKING QUOTE #%s %s %s failed: %s — the close defers; "
+                     "the trigger's price is never booked in its place",
+                     trade.get('id'), stock, kind, e, exc_info=True)
+        quote = {'mid': None, 'reliable': False,
+                 'reason': 'booking_quote_error', 'legs': None,
+                 'floored': False}
+    trigger_mid = (trigger or {}).get('mid')
+    if (quote.get('mid') is not None and quote.get('reliable')
+            and fresh_spot > 0 and spot and spot > 0
+            and isinstance(trigger_mid, (int, float)) and trigger_mid > 0
+            and cfg.SPOT_VETO_ENABLED
+            and not market_session.cash_price_is_frozen()):
+        drop = (trigger_mid - quote['mid']) / trigger_mid
+        spot_move = abs(fresh_spot - spot) / spot
+        if drop >= cfg.SPREAD_COLLAPSE_PCT and spot_move < cfg.SPOT_MOVE_MIN_PCT:
+            why = ('uncorroborated collapse between trigger and booking: '
+                   'value %.2f -> %.2f (-%.0f%%) on a %.2f%% spot move'
+                   % (trigger_mid, quote['mid'], drop * 100, spot_move * 100))
+            logger.warning("BOOKING QUOTE REJECT #%s %s %s: %s — deferring, "
+                           "nothing booked", trade.get('id'), stock, kind, why)
+            quote = dict(quote, mid=None, reliable=False,
+                         reason='booking_uncorroborated_collapse',
+                         rejected=why)
+    usable = quote.get('mid') is not None and quote.get('reliable')
+    logger.info("BOOKING QUOTE #%s %s %s: trigger value %s -> booking value %s "
+                "(%s) | spot %s -> %s", trade.get('id'), stock, kind,
+                _f(trigger_mid), _f(quote.get('mid')),
+                'ok' if usable else (quote.get('reason') or 'unusable'),
+                _f(spot), _f(book_spot))
+    return quote, book_spot
+
+
+def _alert_with_booking(trade: dict, quote: dict) -> bool:
+    """Send a vetted exit's alert this cycle?
+
+    Always for a LIVE record: there the Telegram is the order ticket and must
+    go whatever the book is doing. For a PAPER record only when the close will
+    book. Its alert carries "[PAPER auto-closed] exit_mid ... P&L", so a close
+    that defers would announce a booking that never happened — and announce
+    it again every cycle it kept deferring (review 2026-09-11, H1). The
+    deferral itself is logged by `_paper_auto_close`.
+    """
+    if not is_paper_record(trade):
+        return True
+    return quote.get('mid') is not None and bool(quote.get('reliable'))
 
 
 def _paper_auto_close(store: ZebraStore, trade: dict, mid: Optional[float],
@@ -4861,19 +4989,31 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # that would also skip the DEBIT-SL and TIME checks below, so a TP held
             # on an untradeable book would suppress the T-3 expiry nag entirely and
             # ride the position into settlement week unnoticed.
+            # A vetted PAPER exit that was cleared and claimed but could not
+            # book this cycle. The rest of the price-driven cascade stands
+            # down for this position until the next cycle — it would re-read
+            # the same book, spend another vet, or book under the wrong
+            # label — while TIME below still runs.
+            booking_deferred = False
             if latch['armed'] and _exit_cleared(store, trade, 'tp', sq, spot,
                                                 dry_run=dry_run) \
                     and _claim_exit_alert(store, trade, 'tp'):
-                _send_exit_alert(store, trade, 'tp',
-                                 _format_tp_alert(trade, spot, mid,
-                                                  on_latch=not tp_hit),
-                                 dry_run=dry_run)
-                logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
-                _paper_auto_close(store, trade, mid, 'tp', spot,
-                                  pending_mfe=pending_mfe, reliable=sq['reliable'],
-                                  legs=sq.get('legs'))
+                # Priced at the book as it is at BOOKING time, and the alert
+                # states that price — see `_booking_quote`.
+                bq, bspot = _booking_quote(kite, trade, spot, sq, 'tp')
+                if _alert_with_booking(trade, bq):
+                    _send_exit_alert(store, trade, 'tp',
+                                     _format_tp_alert(trade, spot, mid,
+                                                      on_latch=not tp_hit,
+                                                      booked=bq['mid']),
+                                     dry_run=dry_run)
+                    logger.info("TP alert #%d %s spot=%.2f tp=%.2f", tid, stock, spot, tp_spot)
+                _paper_auto_close(store, trade, bq['mid'], 'tp', bspot,
+                                  pending_mfe=pending_mfe, reliable=bq['reliable'],
+                                  legs=bq.get('legs'))
                 if trade.get('status') == 'exited':
                     continue
+                booking_deferred = is_paper_record(trade)
 
             # ── TRAIL ───────────────────────────────────────────────────────
             # Profit-protection, so it sits with TP rather than with the stops: the
@@ -4889,7 +5029,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             if tl and tl['armed'] and store.set_alert_flag(tid, 'trail_armed'):
                 logger.info("TRAIL armed #%d %s peak=%.1f%% of max gain, level=%.2f",
                             tid, stock, tl['peak_pct_of_max'], tl['level'])
-            if not debit_usable or not tl or not tl['armed']:
+            if booking_deferred or not debit_usable or not tl or not tl['armed']:
                 # Unusable quote FREEZES the counter rather than resetting it —
                 # same rule as the DEBIT-SL, so a flickering book cannot
                 # indefinitely block a genuine exit.
@@ -4900,17 +5040,26 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     if _exit_cleared(store, trade, 'trail', sq, spot,
                                      dry_run=dry_run) \
                             and _claim_exit_alert(store, trade, 'trail'):
-                        _send_exit_alert(store, trade, 'trail',
-                                         _format_trail_alert(trade, mid, tl),
-                                         dry_run=dry_run)
-                        logger.info("TRAIL alert #%d %s mid=%.2f<=level=%.2f "
-                                    "peak_gain=%.2f (confirmed x%d)",
-                                    tid, stock, mid, tl['level'], tl['peak_gain'], n)
-                        _paper_auto_close(store, trade, mid, 'trail', spot,
+                        # Priced at the book as it is at BOOKING time; the
+                        # alert states that price. `reliable` is passed: the
+                        # trigger's book was usable by construction, a
+                        # re-read need not be.
+                        bq, bspot = _booking_quote(kite, trade, spot, sq, 'trail')
+                        if _alert_with_booking(trade, bq):
+                            _send_exit_alert(store, trade, 'trail',
+                                             _format_trail_alert(trade, mid, tl,
+                                                                 booked=bq['mid']),
+                                             dry_run=dry_run)
+                            logger.info("TRAIL alert #%d %s mid=%.2f<=level=%.2f "
+                                        "peak_gain=%.2f (confirmed x%d)",
+                                        tid, stock, mid, tl['level'], tl['peak_gain'], n)
+                        _paper_auto_close(store, trade, bq['mid'], 'trail', bspot,
                                           pending_mfe=pending_mfe,
-                                          legs=sq.get('legs'))
+                                          reliable=bq['reliable'],
+                                          legs=bq.get('legs'))
                         if trade.get('status') == 'exited':
                             continue
+                        booking_deferred = is_paper_record(trade)
                 else:
                     logger.info("TRAIL pending #%d %s mid=%.2f<=level=%.2f "
                                 "confirm %d/%d", tid, stock, mid, tl['level'],
@@ -4923,20 +5072,27 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # 3% adverse spot SL was force-exiting capped-risk trades near the
             # local bottom (biggest realized-loss bucket in paper). Flip
             # spot_sl_enabled=True in zebra_config.json to restore.
-            sl_hit = cfg.SPOT_SL_ENABLED and (
+            sl_hit = not booking_deferred and cfg.SPOT_SL_ENABLED and (
                      (direction == 'CE' and spot <= sl_spot) or
                      (direction == 'PE' and spot >= sl_spot))
             if sl_hit and _exit_cleared(store, trade, 'spot_sl', sq, spot,
                                         dry_run=dry_run) \
                     and _claim_exit_alert(store, trade, 'spot_sl'):
-                _send_exit_alert(store, trade, 'spot_sl',
-                                 _format_spot_sl_alert(trade, spot, mid), dry_run=dry_run)
-                logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
-                _paper_auto_close(store, trade, mid, 'spot_sl', spot,
-                                  pending_mfe=pending_mfe, reliable=sq['reliable'],
-                                  legs=sq.get('legs'))
+                # Priced at the book as it is at BOOKING time; the alert
+                # states that price.
+                bq, bspot = _booking_quote(kite, trade, spot, sq, 'spot_sl')
+                if _alert_with_booking(trade, bq):
+                    _send_exit_alert(store, trade, 'spot_sl',
+                                     _format_spot_sl_alert(trade, spot, mid,
+                                                           booked=bq['mid']),
+                                     dry_run=dry_run)
+                    logger.info("SPOT SL alert #%d %s spot=%.2f sl=%.2f", tid, stock, spot, sl_spot)
+                _paper_auto_close(store, trade, bq['mid'], 'spot_sl', bspot,
+                                  pending_mfe=pending_mfe, reliable=bq['reliable'],
+                                  legs=bq.get('legs'))
                 if trade.get('status') == 'exited':
                     continue
+                booking_deferred = is_paper_record(trade)
 
             # ── DEBIT SL ────────────────────────────────────────────────────
             # Value trigger: needs DEBIT_SL_CONFIRM_POLLS consecutive RELIABLE
@@ -4944,7 +5100,7 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
             # (never resets it — a flickering book must not block a genuine exit);
             # a reliable non-trigger read resets it. This is the direct fix for the
             # 2026-07-24 single-poll phantom SL.
-            if not debit_usable:
+            if booking_deferred or not debit_usable:
                 pass  # freeze confirm counter; blindness handled above
             elif mid <= trade['debit_sl_value']:
                 n = store.bump_confirm(tid, 'debit_sl')
@@ -4955,16 +5111,25 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                     if _exit_cleared(store, trade, 'debit_sl', sq, spot,
                                      dry_run=dry_run) \
                             and _claim_exit_alert(store, trade, 'debit_sl'):
-                        _send_exit_alert(store, trade, 'debit_sl',
-                                         _format_debit_sl_alert(trade, mid),
-                                         dry_run=dry_run)
-                        logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f (confirmed x%d)",
-                                    tid, stock, mid, trade['debit_sl_value'], n)
-                        _paper_auto_close(store, trade, mid, 'debit_sl', spot,
+                        # Priced at the book as it is at BOOKING time; the
+                        # alert states that price. `reliable` is passed: the
+                        # trigger's book was usable by construction, a
+                        # re-read need not be.
+                        bq, bspot = _booking_quote(kite, trade, spot, sq, 'debit_sl')
+                        if _alert_with_booking(trade, bq):
+                            _send_exit_alert(store, trade, 'debit_sl',
+                                             _format_debit_sl_alert(trade, mid,
+                                                                    booked=bq['mid']),
+                                             dry_run=dry_run)
+                            logger.info("DEBIT SL alert #%d %s mid=%.2f sl=%.2f (confirmed x%d)",
+                                        tid, stock, mid, trade['debit_sl_value'], n)
+                        _paper_auto_close(store, trade, bq['mid'], 'debit_sl', bspot,
                                           pending_mfe=pending_mfe,
-                                          legs=sq.get('legs'))
+                                          reliable=bq['reliable'],
+                                          legs=bq.get('legs'))
                         if trade.get('status') == 'exited':
                             continue
+                        booking_deferred = is_paper_record(trade)
                 else:
                     logger.info("DEBIT SL pending #%d %s mid=%.2f<=sl=%.2f confirm %d/%d",
                                 tid, stock, mid, trade['debit_sl_value'],

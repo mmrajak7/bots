@@ -547,7 +547,9 @@ def test_silencing_an_alert_does_not_silence_the_EXIT(monkeypatch):
     src = inspect.getsource(mon.check_entered)
     for kind in ('tp', 'spot_sl', 'debit_sl'):
         i_send = src.index(f"_send_exit_alert(store, trade, '{kind}'")
-        i_close = src.index(f"_paper_auto_close(store, trade, mid, '{kind}'")
+        # Books the re-read taken at booking time (`_booking_quote`, owner
+        # 2026-09-11), not the trigger's `mid`; the ordering it pins is unchanged.
+        i_close = src.index(f"_paper_auto_close(store, trade, bq['mid'], '{kind}'")
         assert i_close > i_send, f"{kind}: close must follow, not depend on, the send"
     assert booked == []
 
