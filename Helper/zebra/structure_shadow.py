@@ -532,6 +532,14 @@ def poll(store, kite, ltps: Optional[dict] = None) -> dict:
             except Exception as e:
                 logger.debug('shadow spot fetch failed for %s: %s', missing, e)
 
+        # Every leg the loop below reads, in ONE /quote. It was two single-leg
+        # calls per shadow at the tail of every cycle, and with ten shadows
+        # that burst ended within four seconds of all three 429s the BCS
+        # monitor took on 2026-09-11. Both legs of every live shadow go in: an
+        # instrument costs nothing, a request is the budget. Never raises.
+        strikes_mod.prefetch_quotes(kite, [
+            s for sh in live.values()
+            for s in (sh.get('long_symbol'), sh.get('short_symbol'))])
         today = now.date()
         closed = 0
         for tid, sh in live.items():

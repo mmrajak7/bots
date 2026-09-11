@@ -281,6 +281,24 @@ def _fresh_options_csv(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_quote_cache_between_tests():
+    """No test may be priced by another test's quotes.
+
+    `strikes.prefetch_quotes` (2026-09-11) keeps a module-level quote cache, a
+    miss table and a rate-limit cooldown. `check_entered` and
+    `structure_shadow.poll` prefetch on whatever broker object a test hands
+    them, so a test run with `kite=None` leaves AttributeError misses behind
+    for its fixture symbols, and a test that fakes a 429 arms a 12-second
+    cooldown. Either would be inherited by the NEXT test to read the same
+    symbol, which would then fail for a reason nothing in its own body shows.
+    Reset on both sides and package-wide, for the reason every rail above is.
+    """
+    strikes_mod.reset_quote_cache()
+    yield
+    strikes_mod.reset_quote_cache()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_telegram(monkeypatch, request):
     """Every Telegram send becomes a recording. Returns the list of messages."""
     sent = []

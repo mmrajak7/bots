@@ -4370,6 +4370,9 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
         _alert_monitoring_blind(len(entered), stocks, error=ltp_error,
                                 dry_run=dry_run)
         return
+    # Every open leg, batched by `strikes_mod.prefetch_quotes` inside the loop.
+    open_legs = [s for t in entered
+                 for s in (t.get('long_symbol'), t.get('short_symbol'))]
     today = datetime.now(IST).date()
     # One store write for the whole cycle's peak tracking — see _flush_mfe.
     pending_mfe: dict = {}
@@ -4468,6 +4471,16 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                                tid, stock, adj.get('type'))
                 continue
 
+            # ONE /quote for every open leg, not two per position: Kite's quote
+            # family is 1 req/s per API key, shared with the BCS monitor, and on
+            # 2026-09-11 zebra's per-leg burst took the monitor's calls down
+            # with it. Inside the loop rather than above it, because a position
+            # ahead of this one can outlast the cache TTL (a Drive write, the
+            # M12 in-cycle vet wait): here it costs nothing while the batch is
+            # fresh and ONE request once it has lapsed. Never raises; a refused
+            # batch reaches this position as its own quote error and defers it
+            # exactly as a failed single call did.
+            strikes_mod.prefetch_quotes(kite, open_legs)
             sq = _structure_quote(kite, trade, spot)
             mid = sq['mid']
             # DEBIT-SL valuation is usable only with a mid AND a reliable book —

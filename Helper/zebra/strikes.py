@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -268,6 +269,219 @@ def _list_strikes(stock: str, expiry: str, opt_type: str) -> list:
     return sorted([k for k, v in chain.items() if opt_type in v])
 
 
+# ── One /quote per cycle, not one per leg (2026-09-11) ─────────────────────
+# Kite's quote family (/quote, /quote/ltp, /quote/ohlc) allows ONE request per
+# second per API key, and zebra shares its key with `bcs.spread_monitor`.
+# `_quote_option` is one `kite.quote` per instrument, so every cycle valued
+# each open position with two calls and then each structure shadow with two
+# more: ~40 requests in ~20s with 9 positions and 10 shadows. zebra's own reads
+# got through; the monitor's did not — refused at 09:35:32, 09:55:31 and
+# 10:35:22, each within four seconds of the shadow pass, and the 09:55 refusal
+# blinded it for 25 minutes. The monitor batched itself on 2026-08-28
+# (`prefetch_book`); the engine beside it was left one call per leg —
+# [[feedback_the_copy_you_did_not_open]] once more.
+#
+# Only `prefetch_quotes` fills the cache. A plain `_quote_option` never writes
+# to it, so a caller that re-quotes a book to watch it change still gets the
+# broker's answer, and nothing is served older than QUOTE_CACHE_TTL_SEC.
+
+#: Kite documents 500 instruments per call; 200 keeps the query string short
+#: and still fits any realistic book in one request. The monitor's value.
+QUOTE_BATCH_MAX = 200
+
+#: The oldest a prefetched quote may be when a valuation guard reads it — the
+#: monitor's bound, for the monitor's reason. Older is re-asked, so a slow
+#: position (an in-cycle vet wait, a Drive write) costs a request, never a
+#: stale valuation.
+QUOTE_CACHE_TTL_SEC = 5.0
+
+#: After Kite answers a quote call with a 429, no quote call is made for this
+#: long. Kite's window is ~10s and SLIDING, so the first call back inside it
+#: extends it — and once the TTL above lapses, the per-leg fallback would be
+#: exactly that call. The monitor's value, for the monitor's reason.
+QUOTE_COOLDOWN_SEC = 12.0
+
+#: Indirected so tests can drive a fake clock without patching `time` itself.
+_clock = time.monotonic
+
+#: 'NFO:SYM' -> (fetched_at, the raw per-instrument dict Kite returned).
+_quote_cache: dict = {}
+#: 'NFO:SYM' -> (failed_at, exception) for an instrument a prefetch ASKED for
+#: and did not get — the batch was refused, or Kite left it out of the answer.
+_quote_misses: dict = {}
+#: Clock instant before which no quote call may be made.
+_cooldown_until: float = 0.0
+
+
+class QuoteCooldown(Exception):
+    """Refused locally: Kite rate-limited a quote call moments ago.
+
+    Deliberately NOT worded like Kite's refusal and carrying no `code = 429`.
+    The cooldown is armed by whatever the shared classifier reads as a rate
+    limit, and a refusal that re-arms its own clock never lapses — which is
+    how one 429 blinded `bcs.spread_monitor` for 25 minutes on 2026-09-11.
+    `_note_rate_limit` also refuses it by type; the wording is the second lock.
+    """
+
+
+def reset_quote_cache() -> None:
+    """Drop every prefetched quote, recorded miss and the cooldown."""
+    global _cooldown_until
+    _quote_cache.clear()
+    _quote_misses.clear()
+    _cooldown_until = 0.0
+
+
+def _fresh(table: dict, key: str):
+    """The stored value if younger than QUOTE_CACHE_TTL_SEC, else None."""
+    hit = table.get(key)
+    if hit is None or _clock() - hit[0] > QUOTE_CACHE_TTL_SEC:
+        return None
+    return hit[1]
+
+
+def _prune() -> None:
+    """Forget entries past the TTL. Nothing reads them, and in `zebra loop` a
+    kept exception would pin its traceback for the life of the process."""
+    now = _clock()
+    for table in (_quote_cache, _quote_misses):
+        for k in [k for k, (ts, _v) in table.items()
+                  if now - ts > QUOTE_CACHE_TTL_SEC]:
+            del table[k]
+
+
+def _cooldown_error() -> Optional[QuoteCooldown]:
+    """The refusal to raise while the cooldown runs, else None."""
+    left = _cooldown_until - _clock()
+    if left <= 0:
+        return None
+    return QuoteCooldown('local quote cooldown, %.0fs left: Kite refused a '
+                         'quote call moments ago' % left)
+
+
+def _note_rate_limit(exc) -> None:
+    """Start the cooldown if KITE said 429 — never on our own refusal."""
+    global _cooldown_until
+    if isinstance(exc, QuoteCooldown):
+        return
+    try:
+        from common import kite_errors
+        if kite_errors.is_rate_limit(exc):
+            _cooldown_until = _clock() + QUOTE_COOLDOWN_SEC
+    except Exception as e:                       # pragma: no cover
+        logger.debug("rate-limit classification failed: %s", e)
+
+
+def _rejected_input(exc) -> bool:
+    """True when Kite refused the REQUEST's input (InputException / HTTP 400).
+
+    That is the one batch failure that may be about a single instrument, so
+    the only one whose legs fall back to single calls. Everything else — a
+    rate limit, a dead token, a network fault, a malformed response — is about
+    the whole book, and asking once per leg would only send the same failure
+    eighteen times. Decided on class and status, never on text: a 400's message
+    can contain 'token', which the shared classifier would read as AUTH.
+    """
+    if type(exc).__name__ == 'InputException':
+        return True
+    code = getattr(exc, 'code', None)
+    return not isinstance(code, bool) and code == 400
+
+
+def prefetch_quotes(kite, tradingsymbols) -> int:
+    """Quote every NFO symbol given in as few `kite.quote` calls as possible.
+
+    Returns the number of requests made. NEVER raises: a refused batch is
+    recorded against every instrument it covered and replayed by
+    `_quote_option` as that leg's own quote error, so the caller's per-position
+    deferral runs exactly as it did when a single call failed. It is
+    deliberately NOT retried one instrument at a time — after a 429 that retry
+    is the burst that extends Kite's sliding cooldown.
+
+    Instruments already fresh in the cache are not asked for again, so a later
+    pass that shares legs with an earlier one (the shadows share their
+    parents') pays only for what it adds.
+    """
+    _prune()
+    wanted = sorted({f"NFO:{s}" for s in (tradingsymbols or []) if s})
+    # Skip what is fresh EITHER way. A fresh quote needs no request, and a
+    # fresh miss already has its answer: re-asking inside the TTL is how one
+    # refused batch becomes a refused batch per position in the exit loop.
+    wanted = [k for k in wanted if _fresh(_quote_cache, k) is None
+              and _fresh(_quote_misses, k) is None]
+    if not wanted or _cooldown_error() is not None:
+        # Nothing is recorded during the cooldown: `_quote_option` refuses
+        # each read itself, and a miss stamped now would outlive the cooldown.
+        return 0
+    made = 0
+    for i in range(0, len(wanted), QUOTE_BATCH_MAX):
+        chunk = wanted[i:i + QUOTE_BATCH_MAX]
+        try:
+            data = kite.quote(chunk) or {}
+            made += 1
+            stamp = _clock()
+            for k in chunk:
+                if k in data and data[k]:
+                    _quote_cache[k] = (stamp, data[k])
+                    _quote_misses.pop(k, None)
+                else:
+                    # Asked for and not returned: the same KeyError the single
+                    # `kite.quote([key])[key]` raised, recorded rather than
+                    # papered over with a second request.
+                    _quote_misses[k] = (stamp, KeyError(k))
+        except Exception as e:
+            _note_rate_limit(e)
+            if _rejected_input(e):
+                # Kite refused the REQUEST, not the book — most plausibly one
+                # leg whose symbol expired or was renamed by a corporate
+                # action. Recording that against every leg would blind the
+                # whole book every cycle for one bad instrument, where the old
+                # per-leg calls lost only that position. Leave these legs
+                # uncached: each falls back to its own single call, and the bad
+                # one fails alone. (Pre-deploy review 2026-09-11, M1.)
+                logger.warning("QUOTE PREFETCH REJECTED for %d instrument(s): "
+                               "%s — falling back to one call per leg",
+                               len(chunk), e)
+                continue
+            stamp = _clock()
+            for k in wanted[i:]:
+                _quote_misses[k] = (stamp, e)
+            logger.warning("QUOTE PREFETCH FAILED for %d instrument(s): %s — "
+                           "each leg reports it as its own quote error",
+                           len(wanted) - i, e)
+            break
+    return made
+
+
+def _parse_quote(q: dict) -> dict:
+    """Kite's per-instrument payload -> the leg dict every reader uses.
+
+    ONE parser for the single call and the batch, so the two cannot disagree
+    about a book. Kite's per-instrument payload does not depend on how many
+    instruments were requested beside it. Raises on a malformed payload;
+    `_quote_option` turns that into its error dict.
+    """
+    depth = q.get('depth', {})
+    buy = depth.get('buy', [])
+    sell = depth.get('sell', [])
+    bid = buy[0]['price'] if buy else 0.0
+    ask = sell[0]['price'] if sell else 0.0
+    bid_qty = buy[0].get('quantity', 0) if buy else 0
+    ask_qty = sell[0].get('quantity', 0) if sell else 0
+    oi = q.get('oi', 0)
+    last = q.get('last_price', 0)
+    mid = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else last
+    out = {
+        'bid': bid, 'ask': ask, 'mid': mid, 'oi': oi, 'last': last,
+        'bid_qty': bid_qty, 'ask_qty': ask_qty,
+        'ltp': last, 'ltp_fresh': _ltp_fresh(q.get('last_trade_time')),
+    }
+    ok, why = _leg_reliable(out)
+    out['reliable'] = ok
+    out['unreliable_reason'] = why
+    return out
+
+
 def _quote_option(kite, tradingsymbol: str) -> dict:
     """Get bid/ask/OI for an NFO option.
 
@@ -276,29 +490,33 @@ def _quote_option(kite, tradingsymbol: str) -> dict:
     top-of-book is unusable for valuation (one-sided, crossed, or wider than
     max(0.30, 25% of mid)) — a garbage opening book must never feed a DEBIT-SL
     trigger or an ENTER click-copy price (2026-07-24 NHPC incident).
+
+    Served from `prefetch_quotes` when that asked for the symbol within
+    QUOTE_CACHE_TTL_SEC — a refused batch included, which is replayed as the
+    error rather than asked again. Refused locally while a 429 cooldown runs.
+    Otherwise one `kite.quote`, as before.
     """
     key = f"NFO:{tradingsymbol}"
     try:
-        q = kite.quote([key])[key]
-        depth = q.get('depth', {})
-        buy = depth.get('buy', [])
-        sell = depth.get('sell', [])
-        bid = buy[0]['price'] if buy else 0.0
-        ask = sell[0]['price'] if sell else 0.0
-        bid_qty = buy[0].get('quantity', 0) if buy else 0
-        ask_qty = sell[0].get('quantity', 0) if sell else 0
-        oi = q.get('oi', 0)
-        last = q.get('last_price', 0)
-        mid = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else last
-        out = {
-            'bid': bid, 'ask': ask, 'mid': mid, 'oi': oi, 'last': last,
-            'bid_qty': bid_qty, 'ask_qty': ask_qty,
-            'ltp': last, 'ltp_fresh': _ltp_fresh(q.get('last_trade_time')),
-        }
-        ok, why = _leg_reliable(out)
-        out['reliable'] = ok
-        out['unreliable_reason'] = why
-        return out
+        q = _fresh(_quote_cache, key)
+        if q is None:
+            miss = _fresh(_quote_misses, key)
+            if miss is not None:
+                # Detached from its last raise, or every replay adds a frame
+                # to one object kept alive by the miss table.
+                raise miss.with_traceback(None)
+            refused = _cooldown_error()
+            if refused is not None:
+                raise refused
+            try:
+                q = kite.quote([key])[key]
+            except Exception as e:
+                # Only a response from the broker may arm the cooldown. A
+                # replayed miss above is deliberately NOT noted: it can be the
+                # original 429, and re-arming on it would never lapse.
+                _note_rate_limit(e)
+                raise
+        return _parse_quote(q)
     except Exception as e:
         return {'bid': 0, 'ask': 0, 'mid': 0, 'oi': 0, 'last': 0,
                 'bid_qty': 0, 'ask_qty': 0, 'ltp': 0, 'ltp_fresh': False,
