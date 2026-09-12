@@ -1697,6 +1697,7 @@ python -m zebra depth         # depth at the touch — the lot-scaling evidence
 python -m zebra spotstop      # adverse-spot stop, SHADOWED — the firing count
 python -m zebra shadow        # alternative STRUCTURES, SHADOWED — the arm scorecard
 python -m zebra shadow --backfill   # seed OPEN positions from stored value paths
+python -m zebra reentry      # same-stock re-entries vs first entries — TAGGED, never blocked
 python -m zebra trigger ID    # force alert on a watching signal
 python -m zebra enter ID --pair K_L/K_S --debit X --lots N --expiry YYYY-MM-DD
 python -m zebra close ID --exit-debit X --reason tp

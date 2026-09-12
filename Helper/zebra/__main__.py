@@ -148,6 +148,9 @@ def cmd_vet_show(args):
         # itself information ("we believe this pattern is bad but have only
         # ever vetoed it"), and a guard nobody can see is one nobody trusts.
         'precedents': _precedents_for(t),
+        # The name's recent positions, with how to read them. Tagged and
+        # measured, never a veto ground on its own (owner, 2026-09-11).
+        'recent_same_stock': _recent_same_stock_for(t),
         'context': v.get('context', {}),
         'checklist': 'Helper/CLAUDE.md — BCS pre-entry checklist (A-E)',
     }, indent=2, default=str))
@@ -168,6 +171,26 @@ def _precedents_for(trade: dict) -> dict:
     except Exception as e:
         logging.getLogger(__name__).warning("precedent lookup failed: %s", e)
         return {'shown': [], 'withheld': [], 'error': str(e)}
+
+
+def _recent_same_stock_for(trade: dict) -> dict:
+    """The name's recent positions for the entry context — never load-bearing.
+
+    Owner decision 2026-09-11 (`zebra/reentry.py`): re-entries are tagged and
+    measured, not blocked, and the agent is told so in the block itself. A
+    failure here must leave vetting exactly as it was before this existed.
+    """
+    from . import reentry as re_mod
+    from .trade_store import get_store
+    try:
+        # WHOLE BOOK: recent positions on this stock, whichever engine version traded them.
+        book = get_store().load_trades()
+        return {'note': re_mod.VET_NOTE, 'window_days': re_mod.WINDOW_DAYS,
+                'positions': re_mod.recent_on_stock(
+                    book, trade.get('stock'), exclude_id=trade.get('id'))}
+    except Exception as e:
+        logging.getLogger(__name__).warning("recent same-stock lookup failed: %s", e)
+        return {'positions': [], 'error': str(e)}
 
 
 def _stop_reason(trade: dict, state, expired: bool, exit_kind=None) -> tuple:
@@ -1385,6 +1408,80 @@ def cmd_shadow(args):
                     '[PARTIAL]' if r['partial'] else ''))
 
 
+def cmd_reentry(args):
+    """Same-stock re-entries against first entries. TAGGED, never blocked.
+
+    Owner, 2026-09-11, proposed blocking a stock traded in the last two weeks.
+    Measured first, the cohort's re-entries had done better than its first
+    entries, on a sample far too small to act on either way, so the decision
+    was to tag every entry (stamped at entry, `reentry.FIELD`) and score the two
+    populations here until the numbers can carry a rule. See
+    `zebra/reentry.py`.
+
+    Records entered before the tag existed are computed as of their own entry
+    from the book, which is the answer the stamp would have given.
+    """
+    from zebra import reentry as re_mod
+    from .trade_store import get_store, scored
+
+    store = get_store()
+    # WHOLE BOOK: a prior position on the same stock can pre-date the cohort; the population scored below is still scored().
+    book = store.load_trades()
+    window = getattr(args, 'days', None) or re_mod.WINDOW_DAYS
+    pop = sorted(scored(book), key=lambda t: (str(t.get('entry_date')),
+                                              str(t.get('entry_time') or '')))
+    if not pop:
+        print()
+        print('No cohort positions yet.')
+        print()
+        return 0
+
+    def _rs(v):
+        return '%9.0f' % v if isinstance(v, (int, float)) else '%9s' % '-'
+
+    print()
+    print('SAME-STOCK RE-ENTRIES — TAGGED, NEVER BLOCKED (window %d days)' % window)
+    print()
+    hdr = '%5s %-12s%-3s %-10s | %6s %5s %-17s %9s %-5s | %-13s %9s' % (
+        'id', 'stock', 'd', 'entered', 'prior', 'days', 'prior result',
+        'prior net', 'samST', 'outcome', 'net')
+    print(hdr)
+    print('-' * len(hdr))
+    again, first = [], []
+    for t in pop:
+        p = re_mod.prior_for(book, t)
+        if not re_mod.is_reentry(p, window):
+            first.append(t)
+            continue
+        again.append(t)
+        closed = t.get('status') == 'exited'
+        same = p.get('same_st')
+        print('%5s %-12s%-3s %-10s | %6s %5s %-17s %s %-5s | %-13s %s' % (
+            t.get('id'), str(t.get('stock'))[:12], str(t.get('direction'))[:2],
+            t.get('entry_date'), p.get('id'), p.get('days_since'),
+            str(p.get('exit_reason') or 'open at entry')[:17],
+            _rs(p.get('pnl_net')),
+            'yes' if same else ('no' if same is False else '?'),
+            str(t.get('exit_reason') if closed else 'OPEN')[:13],
+            _rs(re_mod._net(t) if closed else None)))
+    if not again:
+        print('  (none)')
+    print()
+    for label, group in (('re-entry <=%dd' % window, again),
+                         ('first entry', first)):
+        s = re_mod.summarise(group)
+        print('%-16s entries %3d | closed %3d  W/L %3d/%-3d | net Rs %9.0f | '
+              'open %d' % (label, s['entries'], s['closed'], s['wins'],
+                           s['losses'], s['net'], s['open']))
+    if any(t.get('status') != 'exited' for t in pop):
+        print()
+        print('CENSORED: positions are still open in these groups. Winners close '
+              'in days and losers run, so a closed-only win rate flatters '
+              'whichever group has more open — do not quote one as a rule.')
+    print()
+    return 0
+
+
 def cmd_spotstop(args):
     """What an adverse-spot stop WOULD have done. It is armed by nothing.
 
@@ -2199,6 +2296,13 @@ def main():
                        help='include OPEN positions (default: closed only, '
                             'because an open one has no outcome to score)')
     p_ssh.set_defaults(func=cmd_spotstop)
+
+    p_ree = sub.add_parser(
+        'reentry',
+        help='Same-stock re-entries vs first entries — TAGGED, never blocked')
+    p_ree.add_argument('--days', type=int, default=None,
+                       help='re-entry window in calendar days (default 14)')
+    p_ree.set_defaults(func=cmd_reentry)
 
     p_shd = sub.add_parser(
         'shadow',

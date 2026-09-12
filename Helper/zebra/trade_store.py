@@ -1375,6 +1375,17 @@ class ZebraStore:
                                  float(t.get('tp_spot', t['st_value'])),
                                  'st_line')))
             self._stamp_cohort(t)
+            # Re-entry TAG, never a gate (owner 2026-09-11, `zebra/reentry.py`).
+            # Taken here, inside the lock and against the refreshed book, so it
+            # records the book as it stood at the moment of entry. It is a
+            # measurement, so it must never be able to stop an entry.
+            try:
+                from . import reentry as reentry_mod
+                t[reentry_mod.FIELD] = reentry_mod.prior_position(self._trades, t)
+            except Exception as e:
+                logger.warning("re-entry tag failed for #%d: %s — entered "
+                               "untagged; the scorecard computes it instead",
+                               trade_id, e)
             t['version'] = t.get('version', 0) + 1
         logger.info(
             "ENTERED BCS #%d %s %g/%g debit=%.2f qty=%d cap=Rs%.0f d/w=%s%% "
