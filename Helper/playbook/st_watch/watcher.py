@@ -25,6 +25,7 @@ IST = pytz.timezone('Asia/Kolkata')
 
 BASKET_LABELS = {
     'core': 'Core',
+    'core_index': 'Core (index)',
     'tactical_etfs': 'Tactical ETF',
     'tactical_reits': 'Tactical REIT',
 }
@@ -375,10 +376,50 @@ def _send_telegram(msg: str, retries: int = 3) -> bool:
         return False
 
 
+def _ltp_symbols(symbols: list, all_st: dict) -> list:
+    """Symbols whose LTP this scan needs: the watchlist PLUS every proxy.
+
+    A proxy is QUOTED, not scanned, so it drops out of a filtered run unless
+    added back here — `scan(symbol_filter='NIFTY 50')` fetched no NIFTYBEES
+    price, `_index_proxy_level` correctly refused to invent one, and the single
+    alert this feature exists to produce went out without its buy level.
+    """
+    wanted = {s['symbol'] for s in symbols if any(
+        f"{s['symbol']}_{tf}" in all_st for tf in cfg.TIMEFRAMES
+    )}
+    wanted |= {cfg.INDEX_PROXY[s] for s in wanted if s in cfg.INDEX_PROXY}
+    return list(wanted)
+
+
+def _index_proxy_level(symbol: str, ltp: float, st_val: float, ltps: dict):
+    """(proxy symbol, ST level priced in that proxy) for an index, else None.
+
+    Converted at the LIVE ratio, never a stored one: NIFTYBEES/NIFTY drifts up
+    as the ETF reinvests dividends, so a constant would decay into a wrong buy
+    price — the shape of every "default that looks like a value" bug. Returns
+    None when either leg is missing, because a missing LTP must not become a
+    fabricated level; the alert then simply omits the line.
+    """
+    proxy_sym = cfg.INDEX_PROXY.get(symbol)
+    if not proxy_sym:
+        return None
+    proxy_ltp = ltps.get(proxy_sym)
+    if not proxy_ltp or not ltp:
+        logger.warning("%s: no LTP for proxy %s — alert will omit the buy level",
+                       symbol, proxy_sym)
+        return None
+    return (proxy_sym, st_val * proxy_ltp / ltp)
+
+
 def _format_alert(symbol: str, basket: str, timeframe: str,
                   ltp: float, st_val: float, gap_pct: float,
-                  direction: str, prev_gap: float = None) -> str:
-    """Format Telegram alert message with direction awareness."""
+                  direction: str, prev_gap: float = None,
+                  proxy: tuple = None) -> str:
+    """Format Telegram alert message with direction awareness.
+
+    `proxy` is (symbol, level) for an index that cannot itself be bought — the
+    same ST level expressed in the ETF actually traded. See cfg.INDEX_PROXY.
+    """
     abs_gap = abs(gap_pct)
 
     # Urgency based on proximity and direction
@@ -413,6 +454,20 @@ def _format_alert(symbol: str, basket: str, timeframe: str,
         f"LTP: Rs {ltp:,.2f} | {level_label}: Rs {st_val:,.2f}\n"
         f"Gap: {gap_pct:+.1f}%{trend}"
     )
+
+    # An index carries the signal but cannot be bought — quote the same level
+    # in the ETF that is. Omitted (rather than guessed) if its LTP was missing.
+    #
+    # UP only, and gated HERE rather than at the call site so no future caller
+    # can reintroduce it: on a DOWN line the ST is RESISTANCE, and "Buy
+    # NIFTYBEES at Rs 283" printed above "NOT a buy signal" is a contradiction
+    # the reader has to resolve at 09:20 on a falling open. Worse, that
+    # disclaimer only renders within 1%, so a 1.4% DOWN alert — inside the
+    # configured 1.5% threshold — would carry the buy instruction with nothing
+    # to contradict it. The index's own weekly line was DOWN on 2026-09-17.
+    if proxy and direction == 'UP':
+        proxy_sym, proxy_level = proxy
+        msg += f"\nBuy {proxy_sym} at Rs {proxy_level:,.2f}"
 
     # Action guidance based on direction and basket
     if abs_gap <= 1:
@@ -481,9 +536,7 @@ def scan(dry_run: bool = False, symbol_filter: str = None) -> list:
         return []
 
     # Step 2: Fetch LTP for all unique symbols with ST data
-    unique_symbols = list({s['symbol'] for s in symbols if any(
-        f"{s['symbol']}_{tf}" in all_st for tf in cfg.TIMEFRAMES
-    )})
+    unique_symbols = _ltp_symbols(symbols, all_st)
     ltps = _get_ltp(kite, unique_symbols)
 
     if not ltps:
@@ -542,7 +595,8 @@ def scan(dry_run: bool = False, symbol_filter: str = None) -> list:
             if alert_at is not None:
                 msg = _format_alert(
                     symbol, sym_info['basket'], tf,
-                    ltp, st_val, gap_pct, direction, prev_gap
+                    ltp, st_val, gap_pct, direction, prev_gap,
+                    proxy=_index_proxy_level(symbol, ltp, st_val, ltps)
                 )
                 if dry_run:
                     logger.info("DRY RUN alert:\n%s", msg)

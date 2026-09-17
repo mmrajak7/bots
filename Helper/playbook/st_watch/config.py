@@ -37,6 +37,16 @@ REGIME_DEFAULTS = {
     'alert_on_count_reset': True,
 }
 
+# ── Index → tradeable proxy ──────────────────────────────────────────────
+#: An index carries the clean signal but cannot be bought, and the ETF's own ST
+#: line is NOT the index's: NIFTYBEES prints freak highs/lows that inflate its
+#: monthly ATR, putting its line ~7% below NIFTY's (237 vs 22,268 on 2026-09-17).
+#: So alert on the index and quote the level in the ETF that is actually bought,
+#: converting at the LIVE price ratio — a stored ratio would drift (dividends).
+INDEX_PROXY = {
+    'NIFTY 50': 'NIFTYBEES',
+}
+
 # ── Supertrend parameters ────────────────────────────────────────────────
 ST_PERIOD = 10
 ST_MULTIPLIER = 3
