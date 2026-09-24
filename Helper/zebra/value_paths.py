@@ -64,7 +64,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -198,12 +198,32 @@ def capture_is_stale(day: str, dest=None, src=None) -> bool:
         taken = datetime.fromisoformat(stamp)
     except Exception:
         return True
+    if taken >= _session_complete_at(day):
+        # A capture taken after the session closed already holds every POLL
+        # the engine wrote. The log keeps GROWING after that: the zebra cron
+        # fires at 15:50 and 15:55 and logs "Market closed, skipping cycle",
+        # which moves the mtime past the 15:47 capture. Without this, every
+        # finished session read as stale and `eod_coverage` sent a false
+        # "value paths MISSING" alert every morning (found 2026-09-24).
+        return False
     try:
         grown = datetime.fromtimestamp(src.stat().st_mtime,
                                        cfg.IST).replace(tzinfo=None)
     except Exception:                            # pragma: no cover - paranoia
         return False
     return grown > taken
+
+
+#: A cycle that starts at MARKET_CLOSE can still be writing POLL lines for up
+#: to ~46s. One cron interval of slack covers it with room to spare.
+_LAST_POLL_GRACE = timedelta(minutes=5)
+
+
+def _session_complete_at(day: str) -> datetime:
+    """When session `day` can no longer write a POLL line (IST-naive)."""
+    h, m = cfg.MARKET_CLOSE
+    return (datetime.combine(date.fromisoformat(day), dtime(h, m))
+            + _LAST_POLL_GRACE)
 
 
 def write_day(day: str, force: bool = False) -> Optional[Path]:

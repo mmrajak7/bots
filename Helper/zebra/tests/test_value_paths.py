@@ -251,6 +251,10 @@ def test_a_capture_taken_MID_SESSION_is_refreshed_when_the_log_grows(logs):
     assert vp.write_day('2026-09-02') is not None
     first = _payload()
     assert first['observations'] == 1
+    # Pin the capture to the 15:00 run: the real clock would put it days
+    # after the session closed, where a capture is complete by definition.
+    first['extracted_at'] = '2026-09-02T15:00:05'
+    vp.out_path('2026-09-02').write_text(json.dumps(first), encoding='utf-8')
 
     # The session continues and the log grows, exactly as it does at 15:00.
     src.write_text('\n'.join((LINE_BLIND, LINE_OK)) + '\n', encoding='utf-8')
@@ -258,6 +262,33 @@ def test_a_capture_taken_MID_SESSION_is_refreshed_when_the_log_grows(logs):
 
     assert vp.write_day('2026-09-02') is not None, 'the 15:47 run must refresh'
     assert _payload()['observations'] == 2
+
+
+def test_POST_CLOSE_log_noise_does_not_make_a_capture_stale(logs):
+    """The false "value paths MISSING" alert, every morning until 2026-09-24.
+
+    The digest captures at 15:47; the zebra cron fires again at 15:50 and
+    15:55 and logs "Market closed, skipping cycle". The log's mtime passes
+    the capture, but no POLL can land after the close, so the capture is
+    complete."""
+    src = _session(logs)
+    vp.write_day('2026-09-02')
+    d = _payload()
+    d['extracted_at'] = '2026-09-02T15:47:02'
+    vp.out_path('2026-09-02').write_text(json.dumps(d), encoding='utf-8')
+    _touch_after(src, '2026-09-02T15:54:05')          # the 15:55 cycle
+    assert vp.capture_is_stale('2026-09-02') is False
+
+
+def test_a_capture_just_BEFORE_the_last_poll_grace_is_still_stale(logs):
+    """The boundary: a cycle starting at 15:30 can still be polling."""
+    src = _session(logs)
+    vp.write_day('2026-09-02')
+    d = _payload()
+    d['extracted_at'] = '2026-09-02T15:34:59'
+    vp.out_path('2026-09-02').write_text(json.dumps(d), encoding='utf-8')
+    _touch_after(src, d['extracted_at'])
+    assert vp.capture_is_stale('2026-09-02') is True
 
 
 def test_a_FINISHED_session_is_not_rewritten(logs):
