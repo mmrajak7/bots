@@ -33,7 +33,24 @@ outcome has one candidate cause rather than three:
     naked_hold   vs naked_long        ->  does the -50% STOP earn its keep?
     naked_runner vs naked_hold        ->  does the TP CAP at the ST line cost us?
     spread_hold  vs the real spread   ->  the stop question again, on the live structure
+    spread_wide  vs the real spread   ->  is it the short leg's PLACEMENT that costs us?
     delta1       vs everything        ->  how much of the signal any of them keeps
+
+`spread_wide` (added 2026-09-24) is the real spread with ONE change: its short
+strike sits past the target instead of at it. The first 12 resolved shadows
+said the target is right (`naked_runner` peaked +105-166% and gave it all back
+by TIME: the move ENDS at the ST line) and that the naked long out-earned the
+spread on the win side (+79% avg against +40%) at the same stop. The spread's
+win is small because at TP the short leg is at-the-money with ~30 days left --
+peak extrinsic. This arm asks whether moving that leg past the target keeps
+the spread's lower cost and recovers most of the naked win.
+
+Its short strike is picked from the option chain at shadow open, and BOTH its
+legs are priced live at that instant (long ask, wide short bid) rather than
+borrowing the parent's long price from ~5 minutes earlier. Its entry is
+therefore offset from the parent's by that lag; the other arms' are not.
+Shadows opened before this arm existed do not get it -- adding it mid-flight
+would be an unobserved head.
 
 `naked_runner` is the arm today's arithmetic points at, and it is the only one
 that cannot be derived from the existing value paths -- because it is still
@@ -142,9 +159,18 @@ ARMS = {
     'naked_hold':   {'legs': ('long',),         'tp': True,  'stop_frac': None, 'fills': 2},
     'naked_runner': {'legs': ('long',),         'tp': False, 'stop_frac': None, 'fills': 2},
     'spread_hold':  {'legs': ('long', 'short'), 'tp': True,  'stop_frac': None, 'fills': 4},
+    'spread_wide':  {'legs': ('long', 'wide'),  'tp': True,  'stop_frac': 0.50, 'fills': 4},
     'delta1':       {'legs': (),                'tp': True,  'stop_frac': None, 'fills': 0,
                      'reference': True},
 }
+
+#: The legs that are SOLD. `wide` is a short leg at a different strike, carried
+#: on the arm itself (symbol, entry bid, width) rather than on the shadow.
+SHORT_LEGS = ('short', 'wide')
+
+
+def _has_short(arm: dict) -> bool:
+    return any(leg in SHORT_LEGS for leg in arm['legs'])
 
 
 # -- state -------------------------------------------------------------------
@@ -212,7 +238,7 @@ def arm_value(arm: dict, lq: Optional[dict], sq: Optional[dict],
         # one is not, and `_quote_option` returns 0 for both. This arm defers
         # rather than book a total loss it cannot tell from a dead feed.
         return (None, 'long_no_bid')
-    if 'short' not in legs:
+    if not _has_short(arm):
         # A long option's floor is 0 and it has no ceiling. `bid` is already
         # non-negative here, so there is nothing to clamp.
         return (float(bid), 'ok')
@@ -272,8 +298,10 @@ def entry_value(arm: dict, trade: dict) -> Optional[float]:
     la = trade.get('long_ask_entry')
     if not la or la <= 0:
         return None
-    if 'short' not in arm['legs']:
+    if not _has_short(arm):
         return float(la)
+    if 'wide' in arm['legs']:
+        return None           # priced live at open -- see `_open_wide`
     d = trade.get('debit')
     return float(d) if d and d > 0 else None
 
@@ -308,7 +336,152 @@ def opened_late(trade: dict, ts: str) -> bool:
     return (seen_at - entered_at).total_seconds() > MAX_OPEN_LAG_SEC
 
 
-def open_shadows(state: dict, entered: list, ts: str) -> int:
+def _wide_strike(trade: dict) -> Optional[tuple]:
+    """(strike, tradingsymbol) for `spread_wide`'s short leg, or None.
+
+    None covers two different facts -- the expiry is not in the chain (a stale
+    options CSV) or nothing lies beyond the real short. `_open_wide` tells
+    them apart for the skip reason; a stale CSV reported as "no strike" sent
+    the first live probe looking at the strike logic instead of the file.
+
+    The listed strike nearest `target + WIDE_EXT x (target - entry)`, and
+    strictly further out of the money than the real short -- otherwise the arm
+    is the real spread under another name and measures nothing. Read from the
+    options CSV, never constructed.
+    """
+    try:
+        direction = trade['direction']
+        entry, tgt = float(trade['entry_spot']), float(trade['tp_spot'])
+        real_short = float(trade['short_strike'])
+        expiry = str(trade['expiry'])[:10]
+        strikes_mod._load_options_csv()
+        chain = strikes_mod._OPTIONS_CACHE.get(trade['stock'], {}).get(expiry, {})
+    except (KeyError, TypeError, ValueError):
+        return None
+    level = tgt + cfg.STRUCTURE_SHADOW_WIDE_EXT * (tgt - entry)
+    beyond = [k for k, v in chain.items() if direction in v
+              and (k > real_short if direction == 'CE' else k < real_short)]
+    if not beyond:
+        return None
+    k = min(beyond, key=lambda x: (abs(x - level), abs(x - real_short)))
+    return (k, chain[k][direction]['tradingsymbol'])
+
+
+def _open_wide(trade: dict, kite, ts: str = '') -> tuple:
+    """(`spread_wide` arm, None) priced live, or (None, reason). NEVER raises.
+
+    Both legs are quoted NOW, so the debit is one instant's book. Refuses an
+    unreliable leg or a non-positive debit rather than opening on a price
+    nobody could fill -- the same rule every other arm is held to.
+
+    It must not raise because it runs inside `open_shadows`, BEFORE the state
+    is saved: one malformed record would otherwise fail the whole shadow pass
+    on every cycle and stop every arm being measured, silently.
+
+    The live entry gate on OI is RECORDED, not enforced. The wide short sits
+    further out of the money than any leg the engine trades, so it can be a
+    strike the engine would never have entered. Refusing it would hide how
+    often that happens; booking it unmarked would flatter the arm. The reader
+    reports the arm with and without the rows that fail it.
+    """
+    if kite is None:
+        return (None, 'no_broker')
+    try:
+        long_strike = float(trade['long_strike'])
+        pick = _wide_strike(trade)
+        if not pick:
+            strikes_mod._load_options_csv()
+            known = strikes_mod._OPTIONS_CACHE.get(trade.get('stock'), {})
+            return (None, 'no_strike_beyond_short'
+                    if str(trade.get('expiry'))[:10] in known
+                    else 'expiry_not_in_chain')
+        k, sym = pick
+        strikes_mod.prefetch_quotes(kite, [trade['long_symbol'], sym])
+        lq = strikes_mod._quote_option(kite, trade['long_symbol'])
+        wq = strikes_mod._quote_option(kite, sym)
+        for leg, q in (('long', lq), ('wide', wq)):
+            if not (q and q.get('reliable')):
+                return (None, '%s_%s' % (leg, (q or {}).get('unreliable_reason')
+                                         or 'no_quote'))
+        la, wb = float(lq.get('ask') or 0), float(wq.get('bid') or 0)
+        debit = la - wb
+        if la <= 0 or wb <= 0 or debit <= 0:
+            return (None, 'non_positive_debit')
+        width = abs(k - long_strike)
+        l_oi, w_oi = lq.get('oi') or 0, wq.get('oi') or 0
+        return ({'status': 'open', 'entry_value': round(debit, 4),
+                 'fills': ARMS['spread_wide']['fills'], 'peak': round(debit, 4),
+                 'exit': None, 'since': ts,
+                 'short_symbol': sym, 'short_strike': k, 'width': width,
+                 'long_ask_entry': la, 'short_bid_entry': wb,
+                 'debit_to_width_pct': (round(100.0 * debit / width, 1)
+                                        if width > 0 else None),
+                 'long_oi_entry': l_oi, 'short_oi_entry': w_oi,
+                 'oi_gate_ok': (l_oi >= cfg.MIN_LEG_OI
+                                and w_oi >= cfg.MIN_LEG_OI)}, None)
+    except Exception as e:                       # never raise into open_shadows
+        return (None, 'error: %s' % e)
+
+
+def _note_wide_skip(sh: dict, tid: str, reason: str, ts: str) -> None:
+    """Stamp WHY `spread_wide` did not open, and say it in the log.
+
+    An absent arm with no reason reads the same as one that was never tried;
+    the reader counts these so the arm's n is not mistaken for complete.
+    """
+    first = 'wide_skip' not in sh
+    sh['wide_skip'] = {'reason': reason, 'at': ts,
+                       'since': (sh.get('wide_skip') or {}).get('since', ts),
+                       'final': False}
+    if first:
+        logger.info('SHADOW spread_wide: #%s not opened (%s) -- retrying for '
+                    'up to %ds', tid, reason, MAX_OPEN_LAG_SEC)
+
+
+def retry_wide(state: dict, by_id: dict, kite, now: datetime) -> tuple:
+    """Re-try `spread_wide` where it failed to open. -> (opened, touched).
+
+    `touched` counts every shadow this changed, so the caller saves only when
+    something did -- not on every cycle for as long as a skip exists.
+
+    A transient refusal -- a 429 cooldown, a one-sided book on the first
+    poll -- would otherwise lose the arm for that position for good. The retry
+    is bounded by the same `MAX_OPEN_LAG_SEC` that defines a complete
+    observation, so a late open cannot sneak in an unobserved head; past it the
+    skip is marked final. Only shadows STAMPED with a skip are retried, so
+    shadows opened before this arm existed are never given it mid-flight.
+    """
+    ts = now.strftime('%Y-%m-%d %H:%M:%S')
+    opened = touched = 0
+    for tid, sh in state['shadows'].items():
+        sk = sh.get('wide_skip')
+        if not sk or sk.get('final') or 'spread_wide' in sh['arms']:
+            continue
+        parent = by_id.get(tid) or {}
+        try:
+            age = (datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+                   - datetime.strptime(sh['since'], '%Y-%m-%d %H:%M:%S')
+                   ).total_seconds()
+        except (KeyError, TypeError, ValueError):
+            age = MAX_OPEN_LAG_SEC + 1
+        if age > MAX_OPEN_LAG_SEC or parent.get('status') != 'entered':
+            sk['final'] = True
+            touched += 1
+            logger.info('SHADOW spread_wide: #%s not measured (last reason: %s)',
+                        tid, sk.get('reason'))
+            continue
+        touched += 1
+        arm, why = _open_wide(parent, kite, ts)
+        if arm:
+            sh['arms']['spread_wide'] = arm
+            sh.pop('wide_skip', None)
+            opened += 1
+        else:
+            _note_wide_skip(sh, tid, why, ts)
+    return (opened, touched)
+
+
+def open_shadows(state: dict, entered: list, ts: str, kite=None) -> int:
     """Open a shadow for every entered COHORT position that has none.
 
     Cohort only: the pre-cohort book is a different strategy, and mixing the
@@ -338,7 +511,13 @@ def open_shadows(state: dict, entered: list, ts: str) -> int:
                            tid, t.get('expiry'))
             continue
         arms = {}
+        wide_why = None
         for key, arm in ARMS.items():
+            if 'wide' in arm['legs']:
+                w, wide_why = _open_wide(t, kite, ts)
+                if w:
+                    arms[key] = w
+                continue
             ev = entry_value(arm, t)
             if not ev or ev <= 0:
                 continue
@@ -370,6 +549,10 @@ def open_shadows(state: dict, entered: list, ts: str) -> int:
             'opened_late': opened_late(t, ts),
             'polls': 0, 'arms': arms,
         }
+        # `no_broker` is backfill, which cannot price the wide leg at all;
+        # nothing to retry and nothing to report.
+        if 'spread_wide' not in arms and wide_why and wide_why != 'no_broker':
+            _note_wide_skip(state['shadows'][tid], tid, wide_why, ts)
         n += 1
     return n
 
@@ -408,7 +591,8 @@ def _close(sh: dict, key: str, reason: str, value: Optional[float],
 
 
 def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
-             sq: Optional[dict], now: datetime, today: date) -> None:
+             sq: Optional[dict], now: datetime, today: date,
+             wq: Optional[dict] = None) -> None:
     """Advance one shadow by one poll. Mutates `sh`; touches nothing else."""
     ts = now.strftime('%Y-%m-%d %H:%M:%S')
     sh['polls'] = sh.get('polls', 0) + 1
@@ -425,11 +609,13 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
         if not a or a['status'] != 'open':
             continue
         entry_spot = sh.get('entry_spot')
+        # The short quote THIS arm holds: `spread_wide` sells a different strike.
+        asq = wq if 'wide' in arm['legs'] else sq
         v = None
         if not arm['legs'] and spot_live and entry_spot:
             v = delta1_mark(direction, entry_spot, spot)
         if arm['legs']:
-            v = arm_value(arm, lq, sq, sh.get('width'))[0]
+            v = arm_value(arm, lq, asq, a.get('width') or sh.get('width'))[0]
         if v is not None and v > a.get('peak', 0):
             a['peak'] = round(float(v), 4)
 
@@ -453,12 +639,12 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
         pend = a.get('pending')
         if pend:
             if v is not None:
-                _close(sh, key, pend['reason'], v, spot, ts, lq, sq)
+                _close(sh, key, pend['reason'], v, spot, ts, lq, asq)
             elif expired:
                 # Backstop. Past its own contract there is no future poll that
                 # can price it, so record it UNPRICED rather than leave an arm
                 # open for ever pretending it is still being measured.
-                _close(sh, key, pend['reason'], None, spot, ts, lq, sq)
+                _close(sh, key, pend['reason'], None, spot, ts, lq, asq)
             continue
 
         # TIME first, because it is a statement about the CALENDAR rather than
@@ -466,15 +652,15 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
         # blind spell at expiry leaves an arm open past its own contract.
         if left is not None and left <= cfg.TIME_SL_DAYS:
             if v is not None:
-                _close(sh, key, 'time', v, spot, ts, lq, sq)
+                _close(sh, key, 'time', v, spot, ts, lq, asq)
             elif expired:
-                _close(sh, key, 'time', None, spot, ts, lq, sq)
+                _close(sh, key, 'time', None, spot, ts, lq, asq)
             else:
                 a['pending'] = {'reason': 'time', 'since': ts}
             continue
         if arm['tp'] and spot_live and _tp_hit(direction, spot, sh['target_spot']):
             if v is not None:
-                _close(sh, key, 'tp', v, spot, ts, lq, sq)
+                _close(sh, key, 'tp', v, spot, ts, lq, asq)
             else:
                 a['pending'] = {'reason': 'tp', 'since': ts}
             continue
@@ -482,7 +668,7 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
         # defined on `v`, so reaching here at all means there was a price.
         if (arm['stop_frac'] is not None and value_armed and v is not None
                 and v <= a['entry_value'] * arm['stop_frac']):
-            _close(sh, key, 'stop', v, spot, ts, lq, sq)
+            _close(sh, key, 'stop', v, spot, ts, lq, asq)
 
 
 def poll(store, kite, ltps: Optional[dict] = None) -> dict:
@@ -511,12 +697,13 @@ def poll(store, kite, ltps: Optional[dict] = None) -> dict:
         entered = [t for t in trades if t.get('status') == 'entered']
         now = datetime.now(cfg.IST)
         ts = now.strftime('%Y-%m-%d %H:%M:%S')
-        opened = open_shadows(state, entered, ts)
+        opened = open_shadows(state, entered, ts, kite)
+        opened_wide, wide_touched = retry_wide(state, by_id, kite, now)
 
         live = {k: v for k, v in state['shadows'].items()
                 if any(a['status'] == 'open' for a in v['arms'].values())}
         if not live:
-            if opened:
+            if opened or wide_touched:
                 _save(state)
             return {'opened': opened, 'live': 0}
 
@@ -539,7 +726,9 @@ def poll(store, kite, ltps: Optional[dict] = None) -> dict:
         # instrument costs nothing, a request is the budget. Never raises.
         strikes_mod.prefetch_quotes(kite, [
             s for sh in live.values()
-            for s in (sh.get('long_symbol'), sh.get('short_symbol'))])
+            for s in ([sh.get('long_symbol'), sh.get('short_symbol')]
+                      + [a.get('short_symbol') for a in sh['arms'].values()
+                         if a.get('status') == 'open' and a.get('short_symbol')])])
         today = now.date()
         closed = 0
         for tid, sh in live.items():
@@ -552,8 +741,12 @@ def poll(store, kite, ltps: Optional[dict] = None) -> dict:
                     for k, a in sh['arms'].items() if k in ARMS)
                 if sh.get('short_symbol') and needs_short:
                     sq = strikes_mod._quote_option(kite, sh['short_symbol'])
+                wa = sh['arms'].get('spread_wide') or {}
+                wq = None
+                if wa.get('status') == 'open' and wa.get('short_symbol'):
+                    wq = strikes_mod._quote_option(kite, wa['short_symbol'])
                 before = sum(1 for a in sh['arms'].values() if a['status'] == 'open')
-                poll_one(sh, ltps.get(sh['stock']), lq, sq, now, today)
+                poll_one(sh, ltps.get(sh['stock']), lq, sq, now, today, wq)
                 closed += before - sum(1 for a in sh['arms'].values()
                                        if a['status'] == 'open')
                 # The parent is gone and this shadow is still running -- the
@@ -562,11 +755,13 @@ def poll(store, kite, ltps: Optional[dict] = None) -> dict:
             except Exception as e:
                 logger.debug('shadow poll failed for #%s: %s', tid, e)
         _save(state)
-        summary = {'opened': opened, 'live': len(live), 'closed_arms': closed,
+        summary = {'opened': opened, 'opened_wide': opened_wide,
+                   'live': len(live), 'closed_arms': closed,
                    'orphans': sum(1 for v in live.values() if v.get('orphan'))}
         logger.info('SHADOW structures: %d live (%d orphaned), %d opened, '
-                    '%d arm(s) closed this cycle',
-                    summary['live'], summary['orphans'], opened, closed)
+                    '%d arm(s) closed this cycle, %d spread_wide late-opened',
+                    summary['live'], summary['orphans'], opened, closed,
+                    opened_wide)
         return summary
     except Exception as e:                          # never raise into a cycle
         logger.warning('structure shadow failed: %s', e, exc_info=True)
@@ -702,10 +897,12 @@ def arm_fees(arm: dict, sh: dict, a: dict) -> Optional[float]:
         # order shape is its documented input; depending on the private
         # builder's argument order for a call that passes it dummies is a
         # break waiting for the next edit of that file.
-        pairs = [('long', 'BUY', sh.get('long_ask_entry'), 'entry'),
+        # An arm that priced its own entry (`spread_wide`) carries its own
+        # entry book; the rest share the parent's.
+        pairs = [('long', 'BUY', a.get('long_ask_entry', sh.get('long_ask_entry')), 'entry'),
                  ('long', 'SELL', (legs.get('long') or {}).get('bid'), 'exit')]
-        if 'short' in arm['legs']:
-            pairs += [('short', 'SELL', sh.get('short_bid_entry'), 'entry'),
+        if _has_short(arm):
+            pairs += [('short', 'SELL', a.get('short_bid_entry', sh.get('short_bid_entry')), 'entry'),
                       ('short', 'BUY', (legs.get('short') or {}).get('ask'), 'exit')]
         # ALL FOUR (or two) legs, or nothing. A partial order list costs a
         # half round trip and returns a number that looks like a full one --
@@ -766,10 +963,19 @@ def scorecard() -> dict:
                 'partial': bool(sh.get('opened_late')),
                 'fills': a.get('fills'),
                 'reference': bool(arm.get('reference')),
+                # Only `spread_wide` can fail the live OI gate -- every other
+                # arm trades strikes the engine already vetted.
+                'oi_gate_ok': a.get('oi_gate_ok', True),
             })
         out[key], unpriced[key], pending[key], still_open[key] = rows, un, pend, op
+    wide_skips = {}
+    for sh in state['shadows'].values():
+        sk = sh.get('wide_skip')
+        if sk:
+            r = str(sk.get('reason')).split(':')[0]
+            wide_skips[r] = wide_skips.get(r, 0) + 1
     return {'arms': out, 'unpriced': unpriced, 'pending': pending,
-            'still_open': still_open,
+            'still_open': still_open, 'wide_skips': wide_skips,
             'open': sum(1 for sh in state['shadows'].values()
                         if any(a['status'] == 'open' for a in sh['arms'].values())),
             'shadows': len(state['shadows'])}

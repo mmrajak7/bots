@@ -600,6 +600,11 @@ _DEFAULTS = {
     # SHADOW measurement only -- books nothing, places nothing. Off disables
     # the extra quote calls without a deploy; see zebra/structure_shadow.py.
     'structure_shadow_enabled': True,
+    # Where the `spread_wide` shadow arm puts its short strike: this fraction of
+    # the entry->target distance PAST the target (0.5 = 1.5x the distance from
+    # entry). Measures whether moving the short leg off the target gives back
+    # the win the real spread surrenders. Shadow only; see structure_shadow.py.
+    'structure_shadow_wide_ext': 0.5,
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
     'time_sl_days_before_expiry': 6,
@@ -1397,6 +1402,7 @@ SPOT_SL_ENABLED = _strict_bool('spot_sl_enabled')
 # a deploy. `_strict_bool` anyway -- a measurement that silently stops is worse
 # than one that never started, because the gap is invisible in the output.
 STRUCTURE_SHADOW_ENABLED = _strict_bool('structure_shadow_enabled')
+STRUCTURE_SHADOW_WIDE_EXT = _num('structure_shadow_wide_ext')
 SPOT_SL_PCT = _num('spot_sl_pct')
 DEBIT_SL_PCT = _num('debit_sl_pct')
 TIME_SL_DAYS = _int('time_sl_days_before_expiry')

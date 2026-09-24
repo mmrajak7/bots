@@ -33,7 +33,7 @@ SIGNAL = {
 }
 ENTRY = {'long_strike': 90.0, 'short_strike': 100.0,
          'long_symbol': 'TESTCO26SEP90CE', 'short_symbol': 'TESTCO26SEP100CE',
-         'debit': 10.0, 'lot_size': 100, 'lots': 1, 'expiry': '2026-09-30'}
+         'debit': 10.0, 'lot_size': 100, 'lots': 1, 'expiry': '2027-12-30'}
 
 
 @pytest.fixture
@@ -322,7 +322,7 @@ def test_exit_above_the_recorded_peak_never_reports_negative_giveback():
 # ── gain-anchored trail ──────────────────────────────────────────────────
 SHADOW = {'long_strike': 100.0, 'short_strike': 140.0, 'width': 40.0,
           'long_symbol': 'TESTCO26SEP100CE', 'short_symbol': 'TESTCO26SEP140CE',
-          'debit': 10.0, 'lot_size': 100, 'expiry': '2026-09-30',
+          'debit': 10.0, 'lot_size': 100, 'expiry': '2027-12-30',
           'entry_spot': 100.0, 'debit_to_width_pct': 25.0,
           'short_extrinsic': 1.0, 'warnings': []}
 

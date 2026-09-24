@@ -1275,6 +1275,11 @@ def _trade_cost(trade: dict):
         return 0.0, 'uncostable'
 
 
+def cfg_min_oi() -> int:
+    from zebra import config as _cfg
+    return _cfg.MIN_LEG_OI
+
+
 def cmd_shadow(args):
     """What OTHER structures on the same signal would have paid. Armed by nothing.
 
@@ -1285,6 +1290,7 @@ def cmd_shadow(args):
         naked_hold   vs naked_long       ->  does the -50% STOP pay for itself?
         naked_runner vs naked_hold       ->  does the TP CAP at the ST line cost us?
         spread_hold  vs the real spread  ->  the stop question, on the live structure
+        spread_wide  vs the real spread  ->  does moving the short PAST the target pay?
         delta1       vs everything       ->  how much of the signal any of them keeps
 
     TWO COLUMNS EXIST TO STOP THE COUNT FLATTERING ITSELF:
@@ -1370,6 +1376,37 @@ def cmd_shadow(args):
             'REAL spread', len(ctrl), '-', 100.0 * w / len(ctrl),
             sum(t['pnl_pct'] for t in ctrl) / len(ctrl), '-',
             100.0 * g / cap, g, n, '-', '-'))
+    # spread_wide exists only on shadows opened from 2026-09-24, so the REAL
+    # row above is a DIFFERENT set of trades. Its fair control is the real
+    # spread on the wide arm's own ids -- and, separately, the arm without the
+    # rows whose wide short would have failed the live OI gate.
+    wide = [r for r in sc['arms'].get('spread_wide', []) if not r['partial']]
+    if wide:
+        wids = {r['id'] for r in wide}
+        wctrl = [real[i] for i in wids
+                 if i in real and real[i].get('status') == 'exited'
+                 and real[i].get('pnl') is not None]
+        if wctrl:
+            cap = sum((t.get('debit') or 0) * (t.get('quantity') or 0)
+                      for t in wctrl) or 1.0
+            g = sum(t['pnl'] for t in wctrl)
+            print('  %-13s %4d %5s %6.1f%% %6.1f%% %5s %7.1f%%  %8.0f %9.0f' % (
+                'REAL (wide ids)', len(wctrl), '-',
+                100.0 * sum(1 for t in wctrl if t['pnl'] > 0) / len(wctrl),
+                sum(t['pnl_pct'] for t in wctrl) / len(wctrl), '-',
+                100.0 * g / cap, g,
+                sum(t.get('pnl_net') or t['pnl'] for t in wctrl)))
+        fail = [r for r in wide if not r.get('oi_gate_ok', True)]
+        if fail:
+            ok = [r for r in wide if r.get('oi_gate_ok', True)]
+            cap = sum(r['capital'] for r in ok) or 1.0
+            print('  spread_wide: %d row(s) FAIL the live OI gate (<%d); '
+                  'without them n=%d, RoC %.1f%%' % (
+                      len(fail), cfg_min_oi(), len(ok),
+                      100.0 * sum(r['pnl'] for r in ok) / cap))
+    if sc.get('wide_skips'):
+        print('  spread_wide NOT opened on: %s' % ', '.join(
+            '%s x%d' % kv for kv in sorted(sc['wide_skips'].items())))
     cens = [k for k in ss.ARMS if ss.censored(sc, k)]
     if cens:
         print('')
@@ -1387,6 +1424,9 @@ def cmd_shadow(args):
     print('  days matters as much: naked_runner has no TP, so it runs to its TIME')
     print("  stop (~28d) against the spread's ~5. Same return over 5x the time is")
     print("  not the same return, and this book's edge is measured in VELOCITY.")
+    print('  spread_wide = the live spread with its short strike moved past the')
+    print('  target; priced live at shadow open, so it only exists on shadows')
+    print('  opened from 2026-09-24 on.')
     print('  part = opened after entry (unobserved head, excluded from the row).')
     print('  unpr = exit that never found a usable price. NOT dropped: an')
     print('  unpriceable book correlates with a bad outcome, so hiding these')

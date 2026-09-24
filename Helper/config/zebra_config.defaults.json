@@ -49,5 +49,6 @@
     "file_name": "zebra_trades.json",
     "sync_interval_sec": 300
   },
-  "structure_shadow_enabled": true
+  "structure_shadow_enabled": true,
+  "structure_shadow_wide_ext": 0.5
 }

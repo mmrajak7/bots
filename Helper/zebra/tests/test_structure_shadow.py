@@ -5,7 +5,7 @@ test; the rest pin the four ways a shadow quietly turns into either a trading
 path or an optimistic one.
 """
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -408,3 +408,266 @@ def test_an_arm_with_unresolved_positions_is_reported_CENSORED(tmp_path, monkeyp
                 MID_SESSION, TODAY)
     ss._save(state)
     assert ss.censored(ss.scorecard(), 'naked_hold') is False
+
+
+# -- spread_wide: the short leg moved PAST the target (2026-09-24) -----------
+
+#: ACME CE chain, long 100, real short 104, target 104 from entry 100. With
+#: WIDE_EXT 0.5 the wide level is 106 -> strike 106.
+_CHAIN = {'ACME': {'2026-09-24': {
+    k: {'CE': {'tradingsymbol': 'ACME26SEP%gCE' % k},
+        'PE': {'tradingsymbol': 'ACME26SEP%gPE' % k}}
+    for k in (94.0, 96.0, 98.0, 100.0, 102.0, 104.0, 106.0, 108.0, 110.0)}}}
+
+
+@pytest.fixture
+def chain(monkeypatch):
+    monkeypatch.setattr(ss.strikes_mod, '_OPTIONS_CACHE', _CHAIN)
+    monkeypatch.setattr(ss.strikes_mod, '_load_options_csv', lambda: None)
+    monkeypatch.setattr(ss.cfg, 'STRUCTURE_SHADOW_WIDE_EXT', 0.5)
+    monkeypatch.setattr(ss.strikes_mod, 'prefetch_quotes', lambda kite, syms: 0)
+
+
+def _quotes(monkeypatch, book):
+    monkeypatch.setattr(ss.strikes_mod, '_quote_option',
+                        lambda kite, sym: book.get(sym))
+
+
+def _wide_trade(**kw):
+    base = dict(long_strike=100.0, short_strike=104.0)
+    base.update(kw)
+    return _trade(**base)
+
+
+def test_the_wide_short_sits_past_the_target_and_beyond_the_real_short(chain):
+    assert ss._wide_strike(_wide_trade()) == (106.0, 'ACME26SEP106CE')
+    # PE mirrors it: entry 100, target 96, level 94, real short 96.
+    pe = _wide_trade(direction='PE', tp_spot=96.0, long_strike=100.0,
+                     short_strike=96.0)
+    assert ss._wide_strike(pe) == (94.0, 'ACME26SEP94PE')
+
+
+def test_the_wide_short_is_never_the_real_short_under_another_name(chain):
+    """If the only strike near the level IS the real short, the arm would
+    measure the live structure twice. Refuse rather than duplicate it."""
+    assert ss._wide_strike(_wide_trade(short_strike=110.0)) is None
+
+
+def test_without_a_broker_the_wide_arm_is_not_opened_and_the_rest_are(chain):
+    """Backfill has no kite and no stored quotes for the wide strike, so it
+    must not invent one -- and must not lose the other arms either."""
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_wide_trade()], '2026-09-01 10:00:00')
+    arms = state['shadows']['1']['arms']
+    assert 'spread_wide' not in arms and 'naked_long' in arms
+
+
+def test_the_wide_arm_is_priced_live_at_the_side_it_would_trade(chain, monkeypatch):
+    _quotes(monkeypatch, {'ACME26SEP100CE': _q(3.9, 4.1),
+                          'ACME26SEP106CE': _q(0.9, 1.1)})
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_wide_trade()], '2026-09-01 10:00:00', kite=object())
+    w = state['shadows']['1']['arms']['spread_wide']
+    assert w['entry_value'] == pytest.approx(4.1 - 0.9)   # long ASK - wide BID
+    assert w['width'] == 6.0 and w['short_symbol'] == 'ACME26SEP106CE'
+    assert w['long_ask_entry'] == 4.1 and w['short_bid_entry'] == 0.9
+
+
+@pytest.mark.parametrize('book', [
+    {'ACME26SEP100CE': _q(3.9, 4.1), 'ACME26SEP106CE': _q(0.9, 1.1, reliable=False)},
+    {'ACME26SEP100CE': _q(3.9, 4.1)},                              # no quote
+    {'ACME26SEP100CE': _q(0.5, 0.6), 'ACME26SEP106CE': _q(0.9, 1.1)},  # debit <= 0
+])
+def test_the_wide_arm_refuses_to_open_on_a_price_nobody_could_fill(chain, monkeypatch, book):
+    _quotes(monkeypatch, book)
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_wide_trade()], '2026-09-01 10:00:00', kite=object())
+    assert 'spread_wide' not in state['shadows']['1']['arms']
+
+
+def _wide_shadow(chain_fixture, monkeypatch):
+    _quotes(monkeypatch, {'ACME26SEP100CE': _q(3.9, 4.0),
+                          'ACME26SEP106CE': _q(1.0, 1.1)})
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_wide_trade()], '2026-09-01 10:00:00', kite=object())
+    return state['shadows']['1']          # wide debit 3.0, width 6
+
+
+def test_the_wide_arm_is_valued_off_its_own_short_not_the_real_one(chain, monkeypatch):
+    """At TP the real short (104) is ATM and expensive; the wide one (106) is
+    not. Valuing the wide arm off the real short's ask would report the very
+    surrender this arm exists to measure."""
+    sh = _wide_shadow(chain, monkeypatch)
+    ss.poll_one(sh, 104.0, _q(6.0, 6.2), _q(3.0, 3.2), MID_SESSION, TODAY,
+                wq=_q(1.4, 1.5))
+    w, real = sh['arms']['spread_wide'], sh['arms']['spread_hold']
+    assert w['exit']['reason'] == 'tp' and w['exit']['value'] == pytest.approx(6.0 - 1.5)
+    assert w['exit']['legs']['short']['ask'] == 1.5          # ITS book, persisted
+    assert real['exit']['value'] == pytest.approx(6.0 - 3.2)
+
+
+def test_the_wide_arm_carries_the_live_stop(chain, monkeypatch):
+    """One change from the real spread -- the strike -- so it keeps the -50%
+    stop. Otherwise a gap would have two candidate causes."""
+    sh = _wide_shadow(chain, monkeypatch)
+    ss.poll_one(sh, 100.0, _q(2.4, 2.5), _q(1.0, 1.1), MID_SESSION, TODAY,
+                wq=_q(0.9, 1.0))                          # 2.4 - 1.0 = 1.4 < 1.5
+    assert sh['arms']['spread_wide']['exit']['reason'] == 'stop'
+
+
+def test_a_wide_arm_without_its_quote_defers_rather_than_booking(chain, monkeypatch):
+    sh = _wide_shadow(chain, monkeypatch)
+    ss.poll_one(sh, 100.0, _q(0.2, 0.3), _q(0.1, 0.2), MID_SESSION, TODAY)
+    assert sh['arms']['spread_wide']['status'] == 'open'
+
+
+def test_the_wide_arm_is_costed_on_its_own_entry_book(chain, monkeypatch):
+    sh = _wide_shadow(chain, monkeypatch)
+    ss.poll_one(sh, 104.0, _q(6.0, 6.2), _q(3.0, 3.2), MID_SESSION, TODAY,
+                wq=_q(1.4, 1.5))
+    seen = {}
+    from zebra import fees as fees_mod
+    monkeypatch.setattr(fees_mod, 'estimate',
+                        lambda orders: seen.setdefault('o', orders) and {'total': 1.0})
+    assert ss.arm_fees(ss.ARMS['spread_wide'], sh, sh['arms']['spread_wide']) == 1.0
+    px = {(o['leg'], o['when']): o['price'] for o in seen['o']}
+    assert px == {('long', 'entry'): 4.0, ('long', 'exit'): 6.0,
+                  ('short', 'entry'): 1.0, ('short', 'exit'): 1.5}
+
+
+# -- review fixes, 2026-09-24 ------------------------------------------------
+
+def test_a_malformed_record_cannot_stop_the_whole_shadow_pass(chain, monkeypatch):
+    """`_open_wide` runs inside `open_shadows` BEFORE the save. A record with
+    no `long_strike` used to raise there, failing every cycle's pass and
+    silently stopping every arm on every position."""
+    _quotes(monkeypatch, {'ACME26SEP100CE': _q(3.9, 4.1),
+                          'ACME26SEP106CE': _q(0.9, 1.1)})
+    t = _wide_trade()
+    del t['long_strike']
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    assert ss.open_shadows(state, [t], '2026-09-01 10:00:00', kite=object()) == 1
+    sh = state['shadows']['1']
+    assert 'naked_long' in sh['arms'] and 'spread_wide' not in sh['arms']
+    assert sh['wide_skip']['reason'].startswith('error')
+
+
+def test_a_refused_wide_arm_says_why_instead_of_vanishing(chain, monkeypatch):
+    _quotes(monkeypatch, {'ACME26SEP100CE': _q(3.9, 4.1),
+                          'ACME26SEP106CE': _q(0.9, 1.1, reliable=False)})
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_wide_trade()], '2026-09-01 10:00:00', kite=object())
+    assert state['shadows']['1']['wide_skip']['reason'] == 'wide_wide_book'
+
+
+def test_backfill_is_not_reported_as_a_skip(chain):
+    """No broker is backfill -- there is no wide quote to have, and nothing
+    to retry. Stamping it would inflate the skip count with non-events."""
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_wide_trade()], '2026-09-01 10:00:00')
+    assert 'wide_skip' not in state['shadows']['1']
+
+
+def _skipped_state(monkeypatch):
+    _quotes(monkeypatch, {'ACME26SEP100CE': _q(3.9, 4.1)})        # wide missing
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_wide_trade()], '2026-09-01 10:00:00', kite=object())
+    assert 'wide_skip' in state['shadows']['1']
+    return state
+
+
+def test_a_transient_refusal_is_retried_inside_the_complete_window(chain, monkeypatch):
+    state = _skipped_state(monkeypatch)
+    _quotes(monkeypatch, {'ACME26SEP100CE': _q(3.9, 4.1),
+                          'ACME26SEP106CE': _q(0.9, 1.1)})
+    by_id = {'1': _wide_trade()}
+    opened, touched = ss.retry_wide(state, by_id, object(),
+                                    datetime(2026, 9, 1, 10, 5, 0))
+    sh = state['shadows']['1']
+    assert opened == 1 and touched == 1
+    assert 'spread_wide' in sh['arms'] and 'wide_skip' not in sh
+    assert sh['arms']['spread_wide']['since'] == '2026-09-01 10:05:00'
+
+
+def test_the_retry_stops_where_an_observation_stops_being_complete(chain, monkeypatch):
+    """Past MAX_OPEN_LAG_SEC a late open would carry an unobserved head, so
+    the skip is marked final rather than opened."""
+    state = _skipped_state(monkeypatch)
+    _quotes(monkeypatch, {'ACME26SEP100CE': _q(3.9, 4.1),
+                          'ACME26SEP106CE': _q(0.9, 1.1)})
+    late = datetime(2026, 9, 1, 10, 0, 0) + timedelta(seconds=ss.MAX_OPEN_LAG_SEC + 60)
+    opened, touched = ss.retry_wide(state, {'1': _wide_trade()}, object(), late)
+    sh = state['shadows']['1']
+    assert opened == 0 and 'spread_wide' not in sh['arms']
+    assert sh['wide_skip']['final'] is True
+    # and a final skip is left alone thereafter -- no save churn
+    assert ss.retry_wide(state, {'1': _wide_trade()}, object(), late) == (0, 0)
+
+
+def test_the_retry_stops_once_the_parent_has_closed(chain, monkeypatch):
+    state = _skipped_state(monkeypatch)
+    ss.retry_wide(state, {'1': _wide_trade(status='exited')}, object(),
+                  datetime(2026, 9, 1, 10, 5, 0))
+    assert state['shadows']['1']['wide_skip']['final'] is True
+
+
+def test_shadows_from_before_the_arm_existed_are_never_given_it(chain, monkeypatch):
+    """No stamp, no retry: adding the arm mid-flight is an unobserved head."""
+    _quotes(monkeypatch, {'ACME26SEP100CE': _q(3.9, 4.1),
+                          'ACME26SEP106CE': _q(0.9, 1.1)})
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_wide_trade()], '2026-09-01 10:00:00')   # backfill-like
+    assert ss.retry_wide(state, {'1': _wide_trade()}, object(),
+                         datetime(2026, 9, 1, 10, 5, 0)) == (0, 0)
+
+
+@pytest.mark.parametrize('w_oi,ok', [(4999, False), (5000, True)])
+def test_the_live_oi_gate_is_recorded_not_enforced(chain, monkeypatch, w_oi, ok):
+    """The wide short can be a strike the engine would never have entered.
+    Refusing it hides how often; booking it unmarked flatters the arm."""
+    monkeypatch.setattr(ss.cfg, 'MIN_LEG_OI', 5000)
+    lq, wq = _q(3.9, 4.1), _q(0.9, 1.1)
+    lq['oi'], wq['oi'] = 20000, w_oi
+    _quotes(monkeypatch, {'ACME26SEP100CE': lq, 'ACME26SEP106CE': wq})
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_wide_trade()], '2026-09-01 10:00:00', kite=object())
+    w = state['shadows']['1']['arms']['spread_wide']
+    assert w['oi_gate_ok'] is ok and w['short_oi_entry'] == w_oi
+    assert w['debit_to_width_pct'] == pytest.approx(100 * 3.2 / 6.0, abs=0.1)
+
+
+def test_poll_opens_prices_and_persists_the_wide_arm_end_to_end(chain, monkeypatch, tmp_path):
+    """The production path: `poll()` opens the arm, quotes its OWN short in
+    the same cycle, and the book on disk carries it."""
+    monkeypatch.setattr(ss, 'STATE_FILE', tmp_path / 's.json')
+    monkeypatch.setattr(ss.cfg, 'STRUCTURE_SHADOW_ENABLED', True)
+    # poll() reads the REAL date; the fixture expiry is fixed, so pin the
+    # session count or this test goes red by itself once the wall clock
+    # passes it (as four other files here did on 2026-09-22).
+    monkeypatch.setattr(ss, '_sessions_left', lambda expiry, today: 20)
+    asked = []
+
+    def quote(kite, sym):
+        asked.append(sym)
+        return {'ACME26SEP100CE': _q(3.9, 4.1), 'ACME26SEP104CE': _q(1.9, 2.1),
+                'ACME26SEP106CE': _q(0.9, 1.1)}.get(sym)
+    monkeypatch.setattr(ss.strikes_mod, '_quote_option', quote)
+
+    class Store:
+        def load_trades(self):
+            return [_wide_trade(entry_date=date.today().isoformat())]
+    out = ss.poll(Store(), object(), ltps={'ACME': 101.0})
+    assert out.get('live') == 1, out
+    with open(tmp_path / 's.json', encoding='utf-8') as f:
+        saved = json.load(f)
+    w = saved['shadows']['1']['arms']['spread_wide']
+    assert w['status'] == 'open' and w['short_symbol'] == 'ACME26SEP106CE'
+    assert asked.count('ACME26SEP106CE') >= 2        # at open AND in the poll
+
+
+def test_a_stale_chain_is_named_as_such_not_as_a_missing_strike(chain, monkeypatch):
+    _quotes(monkeypatch, {})
+    arm, why = ss._open_wide(_wide_trade(expiry='2026-10-27'), object())
+    assert arm is None and why == 'expiry_not_in_chain'
+    arm, why = ss._open_wide(_wide_trade(short_strike=110.0), object())
+    assert why == 'no_strike_beyond_short'

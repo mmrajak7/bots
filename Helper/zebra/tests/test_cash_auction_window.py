@@ -49,7 +49,12 @@ def store(tmp_path, monkeypatch):
                   'signal_price': 96.0, 'signal_gap_pct': 4.0})
     s.mark_entered(1, {'long_strike': 100.0, 'short_strike': 140.0,
                        'long_symbol': 'L', 'short_symbol': 'S', 'debit': 10.0,
-                       'lot_size': 100, 'lots': 1, 'expiry': '2026-09-30',
+                       # FAR expiry. `_now_ist` is pinned below, but the TIME
+                       # stop counts sessions from the REAL date, so a near
+                       # expiry turned every exit here into `paper:time` once
+                       # the wall clock reached 2026-09-22 (the file went red
+                       # by itself, not by any code change).
+                       'lot_size': 100, 'lots': 1, 'expiry': '2027-12-30',
                        'structure': 'bcs'})
     return s
 

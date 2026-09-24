@@ -975,7 +975,22 @@ its neighbour in exactly ONE respect so a gap has one candidate cause:
 | `naked_hold` vs `naked_long` | does the −50% STOP pay for itself? |
 | `naked_runner` vs `naked_hold` | **does the TP CAP at the ST line cost us?** |
 | `spread_hold` vs the real spread | the stop question, on the live structure |
+| `spread_wide` vs the real spread | does moving the short strike PAST the target pay? (added 2026-09-24) |
 | `delta1` vs everything | how much of the signal any of them keeps |
+
+**Read at 2026-09-24 (12 fully resolved, 5 of them partial — NOT a verdict).**
+`naked_runner` lost −Rs 97,644: every winner peaked +105-166% and gave it all
+back by TIME. **The move ENDS at the ST line, so the TP there is right** and
+"never cap the upside" does not apply to this signal. `naked_long` (same TP,
+same −50% stop) paid ~1.5:1 against the spread's ~0.8:1, break-even WR ~40%
+vs ~54-58%, with RoC roughly level on the clean rows. Owner's stated
+preference is naked buying (judged on RoC, and one leg each way instead of two
+means less slippage and cost); the decision is to **revisit at 25-30 resolved
+shadows** and let the data confirm or refute it. `spread_wide` was added the
+same day as the middle ground: the live spread with its short strike at
+`target + structure_shadow_wide_ext x (target − entry)` (default 0.5), priced
+live at shadow open, −50% stop. It exists only on shadows opened from
+2026-09-24.
 
 **It is a separate book (`logs/shadow_structures.json`) because a shadow
 OUTLIVES its parent.** That is the point: `naked_runner` gets interesting after
