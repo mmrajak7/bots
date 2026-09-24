@@ -17,6 +17,11 @@
         "exchange": "NSE"
       }
     },
+    "core_index": {
+      "NIFTY 50": {
+        "exchange": "NSE"
+      }
+    },
     "tactical_etfs": {
       "JUNIORBEES": {
         "exchange": "NSE"
@@ -52,6 +57,12 @@
         "exchange": "NSE"
       },
       "INFRABEES": {
+        "exchange": "NSE"
+      },
+      "MOM30IETF": {
+        "exchange": "NSE"
+      },
+      "EBBETF0431": {
         "exchange": "NSE"
       }
     },
