@@ -110,6 +110,23 @@ has missed part of the path, so its stop may already have fired unseen.
 `since` and `opened_late` are stamped and the reader marks those PARTIAL
 rather than counting them.
 
+## What else is stamped, for the go-live decision (2026-09-24)
+
+Owner, 2026-09-24: at go-live we must choose the structure, the capital, the
+maximum number of positions, whether the stop changes, and whether a trade can
+be too expensive to take. The arms answer the first; these answer the rest,
+and are read by `zebra/golive.py` (`python -m zebra golive`):
+
+* `context` on every shadow at open -- India VIX, the long's implied
+  volatility, premium as % of spot, DTE, and the capital each structure ties
+  up. Capital needed rises with VIX, so the plan has to be sized on it.
+* `ladder` on the `naked_hold` arm -- the FIRST poll at which value fell to
+  each loss fraction in `shadow_stop_ladder`, under the same opening-buffer
+  rule the live stop obeys. That arm has no stop and runs to TP or TIME, so
+  its path passes every level, and any stop can be scored after the fact
+  without an arm per level. A breach found on the first ARMED poll of a
+  session is flagged: that one is a GAP, booked wherever it opened.
+
 ## Contract
 
 `poll()` is called once per cycle from the OBSERVATION block of `run_cycle`,
@@ -137,6 +154,7 @@ from common import market_session
 from common.nse_holidays import sessions_between
 
 from . import config as cfg
+from . import ivcalc
 from . import strikes as strikes_mod
 from .trade_store import in_cohort
 
@@ -167,6 +185,72 @@ ARMS = {
 #: The legs that are SOLD. `wide` is a short leg at a different strike, carried
 #: on the arm itself (symbol, entry bid, width) rather than on the shadow.
 SHORT_LEGS = ('short', 'wide')
+
+#: The arm that carries the stop ladder: no stop of its own, so its path is
+#: observed through every loss level until TP or TIME.
+LADDER_ARM = 'naked_hold'
+
+VIX_SYMBOL = 'NSE:INDIA VIX'
+
+
+def ladder_key(frac: float) -> str:
+    return 'l%02d' % int(round(frac * 100))
+
+
+def fetch_vix(kite) -> tuple:
+    """(India VIX, None) or (None, reason). Never raises.
+
+    One LTP call, made only on a cycle that opens a shadow. It shares the
+    broker's quote budget with both engines, so it stands down while the
+    429 cooldown runs rather than extending it.
+    """
+    if kite is None:
+        return (None, 'no_broker')
+    try:
+        refused = strikes_mod._cooldown_error()
+        if refused is not None:
+            return (None, 'quote_cooldown')
+        try:
+            v = (kite.ltp([VIX_SYMBOL]) or {}).get(VIX_SYMBOL, {}).get('last_price')
+        except Exception as e:
+            strikes_mod._note_rate_limit(e)
+            return (None, 'error: %s' % e)
+        return (float(v), None) if v and v > 0 else (None, 'no_price')
+    except Exception as e:
+        return (None, 'error: %s' % e)
+
+
+def entry_context(trade: dict, vix: Optional[float] = None,
+                  vix_why: Optional[str] = None) -> dict:
+    """What the go-live decision needs to know about this ENTRY. Never raises.
+
+    Built from the parent's own entry book, so it can also be derived after
+    the fact for shadows opened before it existed -- except VIX, which is a
+    market reading and can only be taken live.
+    """
+    ctx = {'vix': vix, 'vix_why': vix_why}
+    try:
+        q = int(trade.get('quantity') or 0)
+        la = float(trade.get('long_ask_entry') or 0)
+        spot = float(trade.get('entry_spot') or 0)
+        debit = float(trade.get('debit') or 0)
+        ctx['capital_naked'] = round(la * q, 2) if la > 0 and q > 0 else None
+        ctx['capital_spread'] = round(debit * q, 2) if debit > 0 and q > 0 else None
+        ctx['premium_pct_spot'] = round(100.0 * la / spot, 3) if la > 0 and spot > 0 else None
+        days = (date.fromisoformat(str(trade.get('expiry'))[:10])
+                - date.fromisoformat(str(trade.get('entry_date'))[:10])).days
+        ctx['dte'] = days
+        # IV off the MID where the book gave one: the ask carries half the
+        # bid-ask, which on a thin name reads as volatility that is not there.
+        px = trade.get('long_mid_entry') or la
+        ctx['iv_basis'] = 'mid' if trade.get('long_mid_entry') else 'ask'
+        iv = ivcalc.implied_vol(trade.get('direction'), px, spot,
+                                trade.get('long_strike'), max(days, 0.5) / 365.0,
+                                cfg.IV_RISK_FREE_RATE)
+        ctx['iv_long'] = None if iv is None else round(100.0 * iv, 1)
+    except Exception as e:
+        ctx['error'] = str(e)
+    return ctx
 
 
 def _has_short(arm: dict) -> bool:
@@ -489,6 +573,7 @@ def open_shadows(state: dict, entered: list, ts: str, kite=None) -> int:
     (it wins on cohort records, loses badly on the older ITM-long ones).
     """
     n = 0
+    vix = None                 # read once, lazily, only if something opens
     for t in entered:
         tid = str(t.get('id'))
         if tid in state['shadows'] or not in_cohort(t):
@@ -524,12 +609,17 @@ def open_shadows(state: dict, entered: list, ts: str, kite=None) -> int:
             arms[key] = {'status': 'open', 'entry_value': round(float(ev), 4),
                          'fills': arm['fills'], 'peak': round(float(ev), 4),
                          'exit': None}
+            if key == LADDER_ARM:
+                # Present-and-empty means "measured, nothing breached yet";
+                # absent means the shadow predates the ladder.
+                arms[key]['ladder'] = {}
         if not arms:
             continue
         state['shadows'][tid] = {
             'stock': t.get('stock'), 'direction': t.get('direction'),
             'long_symbol': t.get('long_symbol'),
             'short_symbol': t.get('short_symbol'),
+            'long_strike': t.get('long_strike'),
             'target_spot': t.get('tp_spot'), 'expiry': str(t.get('expiry'))[:10],
             'quantity': t.get('quantity'), 'entry_spot': t.get('entry_spot'),
             'entry_date': str(t.get('entry_date'))[:10],
@@ -549,6 +639,9 @@ def open_shadows(state: dict, entered: list, ts: str, kite=None) -> int:
             'opened_late': opened_late(t, ts),
             'polls': 0, 'arms': arms,
         }
+        if vix is None:
+            vix = fetch_vix(kite)
+        state['shadows'][tid]['context'] = entry_context(t, *vix)
         # `no_broker` is backfill, which cannot price the wide leg at all;
         # nothing to retry and nothing to report.
         if 'spread_wide' not in arms and wide_why and wide_why != 'no_broker':
@@ -603,6 +696,10 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
                  and not market_session.cash_price_is_frozen(now))
     value_armed = not _within_open_buffer(now)
     left = _sessions_left(sh.get('expiry'), today)
+    # The first poll of a session at which a value stop may act. A breach
+    # seen there happened OVERNIGHT: a stop would have filled at the open,
+    # wherever the gap put it, not at its level.
+    first_armed = value_armed and sh.get('armed_day') != today.isoformat()
 
     for key, arm in ARMS.items():
         a = sh['arms'].get(key)
@@ -618,6 +715,13 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
             v = arm_value(arm, lq, asq, a.get('width') or sh.get('width'))[0]
         if v is not None and v > a.get('peak', 0):
             a['peak'] = round(float(v), 4)
+        if 'ladder' in a and v is not None and value_armed:
+            for frac in cfg.SHADOW_STOP_LADDER:
+                k = ladder_key(frac)
+                if k not in a['ladder'] and v <= a['entry_value'] * (1.0 - frac):
+                    a['ladder'][k] = {'at': ts, 'value': round(float(v), 4),
+                                      'spot': None if spot is None else round(float(spot), 2),
+                                      'gap': bool(first_armed)}
 
         expired = left is not None and left <= 0
 
@@ -669,6 +773,8 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
         if (arm['stop_frac'] is not None and value_armed and v is not None
                 and v <= a['entry_value'] * arm['stop_frac']):
             _close(sh, key, 'stop', v, spot, ts, lq, asq)
+    if value_armed:
+        sh['armed_day'] = today.isoformat()
 
 
 def poll(store, kite, ltps: Optional[dict] = None) -> dict:

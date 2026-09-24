@@ -1448,6 +1448,16 @@ def cmd_shadow(args):
                     '[PARTIAL]' if r['partial'] else ''))
 
 
+def cmd_golive(args):
+    """The go-live decision pack: structure, capital, positions, stop, per-trade
+    capital and IV/VIX bands -- from the structure shadow. Read-only."""
+    from zebra import golive
+    from zebra.trade_store import get_store
+    caps = tuple(int(x) for x in args.caps.split(',')) if args.caps else golive.DEFAULT_CAPS
+    cuts = tuple(int(x) for x in args.cuts.split(',')) if args.cuts else golive.DEFAULT_CUTS
+    print(golive.report(get_store(), caps=caps, cuts=cuts))
+
+
 def cmd_reentry(args):
     """Same-stock re-entries against first entries. TAGGED, never blocked.
 
@@ -2321,6 +2331,15 @@ def main():
     p_cnc.add_argument('id', type=int)
     p_cnc.add_argument('--reason', default=None)
     p_cnc.set_defaults(func=cmd_cancel)
+
+    p_gl = sub.add_parser(
+        'golive',
+        help='Go-live decision pack: structure, capital, positions, stop, IV')
+    p_gl.add_argument('--caps', default=None,
+                      help='position caps to simulate, e.g. 6,8,10,12')
+    p_gl.add_argument('--cuts', default=None,
+                      help='per-trade capital ceilings, e.g. 15000,25000,40000')
+    p_gl.set_defaults(func=cmd_golive)
 
     p_dep = sub.add_parser(
         'depth',

@@ -605,6 +605,13 @@ _DEFAULTS = {
     # entry). Measures whether moving the short leg off the target gives back
     # the win the real spread surrenders. Shadow only; see structure_shadow.py.
     'structure_shadow_wide_ext': 0.5,
+    # Loss fractions at which the no-stop naked arm records its FIRST breach
+    # (value <= entry x (1 - f)), so any stop level can be scored after the
+    # fact without an arm per level. Measurement only.
+    'shadow_stop_ladder': [0.30, 0.40, 0.50, 0.60, 0.70],
+    # Annual risk-free rate for the implied-volatility stamp at shadow open.
+    # Measurement only; ~ the 91-day T-bill. A 1-pt error moves IV ~0.1 pt.
+    'iv_risk_free_rate': 0.065,
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
     'time_sl_days_before_expiry': 6,
@@ -1403,6 +1410,30 @@ SPOT_SL_ENABLED = _strict_bool('spot_sl_enabled')
 # than one that never started, because the gap is invisible in the output.
 STRUCTURE_SHADOW_ENABLED = _strict_bool('structure_shadow_enabled')
 STRUCTURE_SHADOW_WIDE_EXT = _num('structure_shadow_wide_ext')
+IV_RISK_FREE_RATE = _num('iv_risk_free_rate')
+
+
+def _stop_ladder() -> tuple:
+    """`shadow_stop_ladder` as a sorted tuple of fractions in (0, 1).
+
+    A malformed entry falls back to the default WITH a warning: this only
+    decides what gets measured, so a typo must not stop the measurement, and
+    must not pass silently either.
+    """
+    raw = _runtime.get('shadow_stop_ladder', _DEFAULTS['shadow_stop_ladder'])
+    try:
+        vals = sorted({float(x) for x in raw})
+        if not vals or any(not (0.0 < v < 1.0) for v in vals):
+            raise ValueError(raw)
+        return tuple(vals)
+    except (TypeError, ValueError):
+        logger.warning("zebra_config.json: shadow_stop_ladder=%r is not a list "
+                       "of fractions in (0, 1) — using default %r",
+                       raw, _DEFAULTS['shadow_stop_ladder'])
+        return tuple(_DEFAULTS['shadow_stop_ladder'])
+
+
+SHADOW_STOP_LADDER = _stop_ladder()
 SPOT_SL_PCT = _num('spot_sl_pct')
 DEBIT_SL_PCT = _num('debit_sl_pct')
 TIME_SL_DAYS = _int('time_sl_days_before_expiry')

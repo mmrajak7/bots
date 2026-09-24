@@ -992,6 +992,30 @@ same day as the middle ground: the live spread with its short strike at
 live at shadow open, −50% stop. It exists only on shadows opened from
 2026-09-24.
 
+### Go-live decision pack — `python -m zebra golive` (2026-09-24)
+
+Owner: at go-live we choose **the structure (naked or spread), the capital,
+the max positions, any change to the stop, and whether a trade can be too
+expensive (high IV) to take** — measured over the next 30-50 trades. The pack
+answers each from the forward shadow, read-only:
+
+| section | answers | built from |
+|---|---|---|
+| 1 structure | naked vs REAL spread vs `spread_wide` | RoC on **peak concurrent capital**, net of all charges, plus a +1-tick-per-order stress |
+| 2 capital | capital needed; owner plans **1.5x peak** | intervals of every shadow, open ones included; VIX of positions open at the peak |
+| 3 positions | a cap on open positions (6/8/10/12) | signals taken in entry order, skipped while full |
+| 4 stop | any stop level | `ladder` on the no-stop `naked_hold` arm: first breach at each of `shadow_stop_ladder` (30-70%), under the live opening blindness; overnight breaches flagged as GAPS |
+| 5 per-trade capital | a ceiling on one trade's capital | skip trades above it |
+| 6 bands | avoid high-IV / high-VIX / expensive names? | `context` stamped at shadow open: India VIX, the long's IV (Black-Scholes off the mid, `zebra/ivcalc.py`), premium % spot, DTE, capital |
+
+**Capital means what is tied up AT ONCE**, never the sum of premiums (owner's
+correction 2026-09-24 — the sum charged the same rupee several times over).
+Whole-cohort replay that day: naked peak Rs 1.77L with 10 open, net
++Rs 81,472 = +46% on peak (+43% under the stress); the spread +8% and **−3%
+under the stress**. VIX is only captured from 2026-09-24 on; the stop ladder
+likewise. Every group under 10 rows prints `(thin)`, and the pack says NOT
+YET DECIDABLE until 30 resolved `naked_long` rows exist.
+
 **It is a separate book (`logs/shadow_structures.json`) because a shadow
 OUTLIVES its parent.** That is the point: `naked_runner` gets interesting after
 the spread has stopped out, and the value paths stop there — so it is the one
@@ -1712,6 +1736,7 @@ python -m zebra depth         # depth at the touch — the lot-scaling evidence
 python -m zebra spotstop      # adverse-spot stop, SHADOWED — the firing count
 python -m zebra shadow        # alternative STRUCTURES, SHADOWED — the arm scorecard
 python -m zebra shadow --backfill   # seed OPEN positions from stored value paths
+python -m zebra golive        # go-live DECISION PACK: structure, capital, positions, stop, IV/VIX
 python -m zebra reentry      # same-stock re-entries vs first entries — TAGGED, never blocked
 python -m zebra trigger ID    # force alert on a watching signal
 python -m zebra enter ID --pair K_L/K_S --debit X --lots N --expiry YYYY-MM-DD
