@@ -241,3 +241,58 @@ def test_the_ladders_50_level_books_what_the_live_50_stop_books():
     stop = sh['arms']['naked_long']['exit']
     assert stop['reason'] == 'stop'
     assert sh['arms'][ss.LADDER_ARM]['ladder']['l50']['value'] == stop['value'] == 1.9
+
+
+# -- review fixes 2026-09-24 -------------------------------------------------
+
+def test_a_mid_session_first_poll_is_not_an_overnight_gap():
+    """A shadow opened at 11:00 whose FIRST armed poll already sits past a
+    level was watched from entry -- nothing overnight happened to it."""
+    sh = _shadow()
+    ss.poll_one(sh, 95.0, _q(1.5, 1.6), _q(1, 1.1), datetime(2026, 9, 10, 11, 0), TODAY)
+    assert sh['arms'][ss.LADDER_ARM]['ladder']['l50']['gap'] is False
+
+
+def test_capital_counts_partial_positions_but_outcomes_do_not():
+    """A partial shadow's parent tied up real money: leaving it out of the
+    capital plan understates what the plan needs."""
+    rows = [dict(_row('2026-09-01 10:00', '2026-09-03 10:00', 100, 50, 50), partial=True),
+            dict(_row('2026-09-02 10:00', '2026-09-04 10:00', 200, -20, -20), partial=False)]
+    s = golive.cap_simulation(rows, 10)
+    assert s['peak'] == 300              # both occupy capital
+    assert s['n'] == 1 and s['net'] == -20   # only the watched one is scored
+    assert golive.cap_simulation(rows, 1)['taken'] == 1   # the partial one held the slot
+
+
+def test_the_ladder_says_what_it_could_not_score():
+    sh_open = _shadow()
+    sh_unpriced = _shadow()
+    a = sh_unpriced['arms'][ss.LADDER_ARM]
+    a['status'], a['exit'] = 'exited', {'value': None, 'pnl_pct': None, 'at': 'x'}
+    res = golive.ladder_outcomes({'shadows': {'1': sh_open, '2': sh_unpriced}}, MID)
+    assert res['_skipped'] == {'open': 1, 'unpriced': 1, 'partial': 0}
+
+
+def test_context_capture_is_logged_with_the_reason_vix_is_missing(monkeypatch, caplog):
+    import logging
+    monkeypatch.setattr(ss.strikes_mod, '_cooldown_error', lambda: object())
+    monkeypatch.setattr(ss, '_open_wide', lambda t, kite, ts='': (None, 'test'))
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    with caplog.at_level(logging.INFO, logger=ss.logger.name):
+        ss.open_shadows(state, [_trade()], '2026-09-01 09:35:00', kite=_Kite())
+    assert 'SHADOW context #1 ACME: VIX MISSING (quote_cooldown)' in caplog.text
+
+
+def test_backfill_does_not_log_a_context_it_cannot_have(caplog):
+    import logging
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    with caplog.at_level(logging.INFO, logger=ss.logger.name):
+        ss.open_shadows(state, [_trade()], '2026-09-01 09:35:00')
+    assert 'SHADOW context' not in caplog.text
+
+
+def test_bad_cli_numbers_are_refused_cleanly(capsys):
+    from types import SimpleNamespace
+    from zebra.__main__ import cmd_golive
+    assert cmd_golive(SimpleNamespace(caps='6,x', cuts=None)) == 2
+    assert 'whole numbers' in capsys.readouterr().out

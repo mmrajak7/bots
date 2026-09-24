@@ -186,12 +186,16 @@ def peak_concurrent(rows: list) -> dict:
 
 def cap_simulation(rows: list, cap: int) -> dict:
     """Take signals in entry order; skip one when `cap` positions are already
-    open. What the book would have been under a live position limit."""
+    open. What the book would have been under a live position limit.
+
+    Every row OCCUPIES a slot; only non-partial rows are SCORED -- a partial
+    shadow's outcome may have missed its own stop, but its capital was real.
+    """
     taken = []
     for r in sorted((x for x in rows if x['start']), key=lambda x: x['start']):
         if sum(1 for t in taken if t['end'] > r['start']) < cap:
             taken.append(r)
-    s = summary(taken)
+    s = summary([t for t in taken if not t.get('partial')])
     s['taken'], s['skipped'] = len(taken), len([x for x in rows if x['start']]) - len(taken)
     s['peak'] = peak_concurrent(taken)['peak']
     return s
@@ -204,15 +208,25 @@ def ladder_outcomes(state: dict, now: datetime) -> dict:
     breach print; otherwise at the arm's own TP/TIME exit. Only shadows whose
     arm carries a ladder, is resolved and priced, and is not partial.
     """
-    arm = ss.ARMS[ss.LADDER_ARM]
     levels = [ss.ladder_key(f) for f in cfg.SHADOW_STOP_LADDER]
     res = {k: {'n': 0, 'stopped': 0, 'gaps': 0, 'net': 0.0, 'pcts': [], 'uncosted': 0}
            for k in levels + ['none']}
+    # Not scored, and SAID: an open arm has no outcome yet, and an unpriced
+    # exit has no price -- dropping either silently would read as complete.
+    res['_skipped'] = {'open': 0, 'unpriced': 0, 'partial': 0}
     for sh in state['shadows'].values():
         a = sh['arms'].get(ss.LADDER_ARM) or {}
         ex = a.get('exit') or {}
-        if ('ladder' not in a or a.get('status') != 'exited' or ex.get('value') is None
-                or sh.get('opened_late')):
+        if 'ladder' not in a:
+            continue
+        if sh.get('opened_late'):
+            res['_skipped']['partial'] += 1
+            continue
+        if a.get('status') != 'exited':
+            res['_skipped']['open'] += 1
+            continue
+        if ex.get('value') is None:
+            res['_skipped']['unpriced'] += 1
             continue
         q = int(sh.get('quantity') or 0)
         ev = a['entry_value']
@@ -260,8 +274,14 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
     by_id = {str(t.get('id')): t for t in store.load_trades()}
     L = []
     p = L.append
-    rows = {k: [r for r in arm_rows(state, by_id, k, now) if not r['partial']] for k in ARM_KEYS}
-    rows['REAL spread'] = [r for r in real_rows(state, by_id, now) if not r['partial']]
+    # Two populations, deliberately. OUTCOMES (returns, win rates, the stop)
+    # use only fully watched shadows -- a partial one may have missed its own
+    # stop. CAPITAL uses every position: a partial shadow's parent tied up
+    # real money whether or not the shadow saw its first minutes, and leaving
+    # it out understates the capital and the position count the plan needs.
+    every = {k: arm_rows(state, by_id, k, now) for k in ARM_KEYS}
+    every['REAL spread'] = real_rows(state, by_id, now)
+    rows = {k: [r for r in v if not r['partial']] for k, v in every.items()}
     nl = summary(rows['naked_long'])['n']
 
     p('GO-LIVE DECISION PACK -- measures only, from the structure shadow')
@@ -291,9 +311,9 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
             _thin(s['n']) + (' uncosted %d' % s['uncosted'] if s['uncosted'] else '')))
     p('  spread_wide exists only on shadows opened from 2026-09-24; compare it on its own ids.')
 
-    p('\n2 CAPITAL -- what is tied up AT ONCE (open positions included)')
+    p('\n2 CAPITAL -- what is tied up AT ONCE (every position: open and partial included)')
     for k in ('naked_long', 'REAL spread'):
-        c = peak_concurrent(rows[k])
+        c = peak_concurrent(every[k])
         vix = [r['ctx'].get('vix') for r in c['open_at_peak'] if r['ctx'].get('vix')]
         p('  %-12s peak Rs %s at %s, max %d open at once, time-weighted avg Rs %s'
           % (k, '{:,.0f}'.format(c['peak']), c['at'].strftime('%Y-%m-%d %H:%M') if c['at'] else '-',
@@ -302,10 +322,11 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
           % ('', PLAN_MULT, '{:,.0f}'.format(PLAN_MULT * c['peak']),
              ('%.1f-%.1f' % (min(vix), max(vix))) if vix else 'not captured (pre-09-24)'))
 
-    p('\n3 POSITIONS -- naked_long under a cap on open positions (signals taken in entry order)')
+    p('\n3 POSITIONS -- naked_long under a cap on open positions (signals taken in entry order;')
+    p('  every position occupies a slot, outcomes counted on fully watched ones only)')
     p('  %-6s %6s %7s %4s %6s %9s %9s %7s' % ('cap', 'taken', 'skipped', 'n', 'win%', 'net Rs', 'peak cap', 'RoC'))
     for cap in list(caps) + [10 ** 6]:
-        s = cap_simulation(rows['naked_long'], cap)
+        s = cap_simulation(every['naked_long'], cap)
         p('  %-6s %6d %7d %4d %6s %9.0f %9.0f %7s%s' % (
             'none' if cap >= 10 ** 6 else cap, s['taken'], s['skipped'], s['n'],
             _f(s['win_pct'], '%.0f%%'), s['net'], s['peak'],
@@ -313,6 +334,7 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
 
     p('\n4 STOP -- every level scored on the no-stop arm\'s path (only shadows with a ladder)')
     lad = ladder_outcomes(state, now)
+    skipped = lad.pop('_skipped')
     if not any(g['n'] for g in lad.values()):
         p('  no resolved shadow carries a ladder yet -- it starts with shadows opened 2026-09-24.')
     else:
@@ -323,6 +345,9 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
                     ('-%s%%' % k[1:]) if k != 'none' else 'none', g['n'], g['stopped'],
                     g['gaps'], sum(g['pcts']) / g['n'], g['net'], _thin(g['n'])))
         p('  gaps = breached overnight; a real stop fills at the open, not at its level.')
+    if any(skipped.values()):
+        p('  not scored: %d still open, %d unpriced exit, %d partial'
+          % (skipped['open'], skipped['unpriced'], skipped['partial']))
 
     p('\n5 PER-TRADE CAPITAL -- naked_long if trades above a ceiling were skipped')
     p('  %-9s %4s %6s %9s %9s %7s' % ('ceiling', 'n', 'win%', 'net Rs', 'peak cap', 'RoC'))

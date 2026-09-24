@@ -641,7 +641,18 @@ def open_shadows(state: dict, entered: list, ts: str, kite=None) -> int:
         }
         if vix is None:
             vix = fetch_vix(kite)
-        state['shadows'][tid]['context'] = entry_context(t, *vix)
+        ctx = entry_context(t, *vix)
+        state['shadows'][tid]['context'] = ctx
+        # Greppable proof the go-live inputs are being captured. A missing VIX
+        # says WHY; `no_broker` is backfill, which cannot read a live index.
+        if vix[1] != 'no_broker':
+            logger.info('SHADOW context #%s %s: VIX %s, IV %s%%, premium %s%% of spot, '
+                        'DTE %s, capital naked Rs %s / spread Rs %s',
+                        tid, t.get('stock'),
+                        ctx.get('vix') if ctx.get('vix') is not None
+                        else 'MISSING (%s)' % ctx.get('vix_why'),
+                        ctx.get('iv_long'), ctx.get('premium_pct_spot'), ctx.get('dte'),
+                        ctx.get('capital_naked'), ctx.get('capital_spread'))
         # `no_broker` is backfill, which cannot price the wide leg at all;
         # nothing to retry and nothing to report.
         if 'spread_wide' not in arms and wide_why and wide_why != 'no_broker':
@@ -696,10 +707,13 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
                  and not market_session.cash_price_is_frozen(now))
     value_armed = not _within_open_buffer(now)
     left = _sessions_left(sh.get('expiry'), today)
-    # The first poll of a session at which a value stop may act. A breach
-    # seen there happened OVERNIGHT: a stop would have filled at the open,
-    # wherever the gap put it, not at its level.
-    first_armed = value_armed and sh.get('armed_day') != today.isoformat()
+    # The first poll of a session at which a value stop may act, on a shadow
+    # already watched on an EARLIER day. A breach seen there happened
+    # OVERNIGHT: a stop would have filled at the open, wherever the gap put
+    # it, not at its level. A shadow's very first armed poll (opened mid-
+    # session) is not a gap -- nothing was unwatched between it and entry.
+    prev_day = sh.get('armed_day')
+    first_armed = value_armed and prev_day is not None and prev_day != today.isoformat()
 
     for key, arm in ARMS.items():
         a = sh['arms'].get(key)

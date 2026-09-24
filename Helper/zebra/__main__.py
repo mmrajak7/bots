@@ -1453,8 +1453,15 @@ def cmd_golive(args):
     capital and IV/VIX bands -- from the structure shadow. Read-only."""
     from zebra import golive
     from zebra.trade_store import get_store
-    caps = tuple(int(x) for x in args.caps.split(',')) if args.caps else golive.DEFAULT_CAPS
-    cuts = tuple(int(x) for x in args.cuts.split(',')) if args.cuts else golive.DEFAULT_CUTS
+    try:
+        caps = tuple(int(x) for x in args.caps.split(',')) if args.caps else golive.DEFAULT_CAPS
+        cuts = tuple(int(x) for x in args.cuts.split(',')) if args.cuts else golive.DEFAULT_CUTS
+    except ValueError:
+        print('--caps / --cuts take whole numbers separated by commas, e.g. --caps 6,8,10')
+        return 2
+    if any(c <= 0 for c in caps + cuts):
+        print('--caps / --cuts must be positive')
+        return 2
     print(golive.report(get_store(), caps=caps, cuts=cuts))
 
 
