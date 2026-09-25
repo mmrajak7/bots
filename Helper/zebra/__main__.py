@@ -1463,11 +1463,22 @@ def cmd_golive(args):
         print('--caps / --cuts must be positive')
         return 2
     if getattr(args, 'refresh', False):
-        # The replay behind sections 7-8 reads the candle cache; on a box that
+        # The replay behind sections 7-10 reads the candle cache; on a box that
         # does not scan every stock daily that cache goes stale. A failed
         # refresh is reported and the pack still runs on what is cached --
         # the header prints how far the cache reaches.
+        #
+        # Never during market hours: ~420 historical requests would compete
+        # with the live scanner for Kite's 3 req/s limit -- the limit whose
+        # burn on 2026-08-27 blinded the scanner.
+        from datetime import datetime
+        from zebra import config as cfg
         from zebra import replay
+        now = datetime.now(cfg.IST)
+        if now.weekday() < 5 and '09:00' <= now.strftime('%H:%M') < '15:45':
+            print('candle refresh SKIPPED: market hours (09:00-15:45 IST) -- run it after the close')
+            print(golive.report(get_store(), caps=caps, cuts=cuts))
+            return
         try:
             from zebra.scanner import _get_kite
             res = replay.refresh(_get_kite())

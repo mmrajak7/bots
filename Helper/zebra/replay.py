@@ -16,8 +16,12 @@ and a naked ATM option priced by Black-Scholes off the stock's own realised
 volatility: target at the ST line, the live debit stop, TIME a fixed number
 of sessions before expiry, one position per stock.
 
-How far to trust it -- measured 2026-09-25, not assumed. On the 14 closed
-naked shadows it matched the live result's SIGN 14/14 and the exit type 13/14;
+How far to trust it -- measured 2026-09-25, not assumed. SIGNALS: it
+reproduces 90 of 103 live triggers on the same day (101 within 3 days), and
+148 of 157 of its own signals have a live record -- after a review found the
+first version reproduced only 31 of 80 (it lacked the same-day path). PRICING:
+on the 14 closed naked shadows it matched the live result's SIGN 14/14 and the
+exit type 13/14;
 on the 9 fully watched ones it averaged +23.3% against the shadow's real
 +23.4%. It reproduces the live `st_value` to within 0.1%. On single trades the
 SIZE can differ by 20-50 points (GMRAIRPORT +107% live, +79% here): it is a
@@ -57,20 +61,26 @@ COST_PCT = 2.0
 #: Implied vol as a multiple of 20-session realised vol, with a floor. Not
 #: fitted -- the value the 14/14 calibration was run with.
 IV_MULT, IV_FLOOR, RV_DAYS = 1.1, 0.18, 20
-#: A watch the replay has not triggered within this many sessions is dropped.
-#: A REPLAY assumption -- live keeps a watch until drift/stale/trigger -- kept
-#: because it is what the calibration ran with.
-WATCH_LIFE = 20
-#: Live cancels a watch that drifts past watch_gap_max x this (monitor.py,
-#: `gap > cfg.WATCH_GAP_MAX * 1.2`). Pinned by a test against that source.
-DRIFT_MULT = 1.2
 #: A close-to-close move larger than this is a split or bonus, not a price.
 CORP_ACTION_MOVE = 0.25
 #: NSE moved monthly stock-option expiry from the last Thursday to the last
 #: Tuesday of the month from September 2025.
 TUESDAY_EXPIRY_FROM = date(2025, 9, 1)
-#: How much history `refresh()` re-fetches, in calendar days.
+#: How much history `refresh()` re-fetches for a file that is already
+#: current, in calendar days.
 REFRESH_DAYS = 120
+#: A file that is missing, shorter than this many candles, or older than the
+#: REFRESH_DAYS window gets its FULL history instead -- the span the scanner
+#: itself fetches (6 years), so the shared cache never holds a 120-day stub the
+#: scanner would then trust as fresh and compute ST from (review 2026-09-25:
+#: ten such stubs left SAGILITY's weekly ST 25% off and its monthly ST empty).
+FULL_HISTORY_DAYS = 365 * 6
+MIN_ROWS = 300
+#: Kite caps a daily-candle request at 2,000 days.
+CHUNK_DAYS = 1900
+#: Seconds between historical requests: under Kite's 3 req/s limit with room
+#: to spare for the live scanner, which shares it.
+REFRESH_PAUSE = 0.5
 
 
 def _cache_dir():
@@ -97,18 +107,34 @@ def universe() -> list:
     return sorted(out.items())
 
 
-def load_daily(symbol: str) -> Optional[list]:
-    """Daily candles for one stock, dates normalised to YYYY-MM-DD, or None."""
+def _read_raw(symbol: str) -> list:
+    """The cache file exactly as stored -- every field, the original date
+    format -- or [] when missing or unreadable."""
     p = _cache_dir() / ('%s.json' % symbol)
     if not p.exists():
-        return None
+        return []
     try:
         raw = json.load(open(p))
     except (OSError, ValueError) as e:
         logger.warning('REPLAY cache unreadable for %s: %s', symbol, e)
-        return None
-    return [{'date': str(c['date'])[:10], 'open': float(c['open']), 'high': float(c['high']),
-             'low': float(c['low']), 'close': float(c['close'])} for c in raw]
+        return []
+    return raw if isinstance(raw, list) else []
+
+
+def load_daily(symbol: str) -> Optional[list]:
+    """Daily candles for one stock, dates normalised to YYYY-MM-DD, or None.
+    A malformed candle is skipped and logged, never allowed to crash a reader."""
+    out, bad = [], 0
+    for c in _read_raw(symbol):
+        try:
+            out.append({'date': str(c['date'])[:10], 'open': float(c['open']),
+                        'high': float(c['high']), 'low': float(c['low']),
+                        'close': float(c['close'])})
+        except (KeyError, TypeError, ValueError):
+            bad += 1
+    if bad:
+        logger.warning('REPLAY %s: %d malformed candle(s) skipped', symbol, bad)
+    return out or None
 
 
 def cache_last_date(symbols) -> Optional[str]:
@@ -118,37 +144,62 @@ def cache_last_date(symbols) -> Optional[str]:
     return ends[len(ends) // 2] if ends else None
 
 
-def refresh(kite, symbols=None, days: int = REFRESH_DAYS, pause: float = 0.35) -> dict:
-    """Top up the candle cache from Kite. Fetched candles win on overlap; older
-    history is never dropped; today's incomplete bar is never written (the
-    scanner's own writer enforces that). Returns {'updated', 'failed'}.
+def _chunks(start: date, end: date):
+    a = start
+    while a <= end:
+        b = min(end, a + timedelta(days=CHUNK_DAYS))
+        yield a, b
+        a = b + timedelta(days=1)
 
-    `pause` keeps under Kite's 3 req/s historical limit -- the limit whose
-    burn on 2026-08-27 is why the writer exists."""
+
+def refresh(kite, symbols=None, days: int = REFRESH_DAYS, pause: float = REFRESH_PAUSE,
+            since: Optional[str] = None) -> dict:
+    """Top up the shared candle cache from Kite. Returns {'updated', 'full', 'failed'}.
+
+    - The stored rows are kept AS STORED -- every field (volume included) and
+      the original date format. Fetched candles replace only their own dates,
+      in the format the scanner writes (the Kite timestamp's isoformat).
+    - A missing, short or stale file gets the full scanner span, so no stub
+      is ever written. `since` forces a fetch back to that date (repair).
+    - Today's incomplete bar is never written (the scanner's writer drops it).
+    - One symbol failing never stops the rest; a failed symbol's file is left
+      untouched."""
     from playbook.magnet.scanner import _write_daily_cache
     symbols = symbols if symbols is not None else universe()
-    start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    end = datetime.now().strftime('%Y-%m-%d')
-    updated, failed = 0, []
+    today = date.today()
+    window_start = today - timedelta(days=days)
+    updated, full, failed = 0, 0, []
     for sym, token in symbols:
+        raw = _read_raw(sym)
+        last = str(raw[-1].get('date', ''))[:10] if raw else ''
+        if since:
+            start = date.fromisoformat(since)
+        elif not raw or len(raw) < MIN_ROWS or last < window_start.isoformat():
+            start = today - timedelta(days=FULL_HISTORY_DAYS)
+            full += 1
+        else:
+            start = window_start
+        fetched = []
         try:
-            fresh = kite.historical_data(token, start, end, 'day')
+            for a, b in _chunks(start, today):
+                fetched += kite.historical_data(token, a.isoformat(), b.isoformat(), 'day')
+                time.sleep(pause)
         except Exception as e:                     # one bad symbol must not stop the rest
             failed.append(sym)
-            logger.warning('REPLAY refresh %s failed: %s', sym, e)
+            logger.warning('REPLAY refresh %s failed, file left untouched: %s', sym, e)
             time.sleep(pause)
             continue
-        merged = {c['date']: c for c in (load_daily(sym) or [])}
-        for c in fresh:
-            d = c['date'].isoformat() if hasattr(c['date'], 'isoformat') else str(c['date'])
-            merged[d[:10]] = {'date': d[:10], 'open': c['open'], 'high': c['high'],
-                              'low': c['low'], 'close': c['close'], 'volume': c.get('volume', 0)}
+        merged = {str(c.get('date', ''))[:10]: c for c in raw if c.get('date')}
+        for c in fetched:
+            row = dict(c)
+            row['date'] = c['date'].isoformat() if hasattr(c['date'], 'isoformat') else str(c['date'])
+            merged[row['date'][:10]] = row
         _write_daily_cache(_cache_dir() / ('%s.json' % sym), sym,
                            [merged[k] for k in sorted(merged)])
         updated += 1
-        time.sleep(pause)
-    logger.info('REPLAY refresh: %d updated, %d failed %s', updated, len(failed), failed[:10])
-    return {'updated': updated, 'failed': failed}
+    logger.info('REPLAY refresh: %d updated (%d full history), %d failed %s',
+                updated, full, len(failed), failed[:10])
+    return {'updated': updated, 'full': full, 'failed': failed}
 
 
 # -- the signal --------------------------------------------------------------
@@ -193,53 +244,58 @@ def st_as_of(daily: list, timeframe: str) -> list:
 def signals(symbol: str, daily: list, since: str, until: str) -> list:
     """Every trigger the live rules would have produced in [since, until].
 
-    Watch: a close whose gap to ST sits in [fresh_entry_gap, watch_gap_max]
-    with no touch of the line (within the magnet touch threshold) in the last
-    freshness_days sessions. Trigger: a later session trades to the
-    trigger_gap_max level -- filled there, or at the open if it opened inside
-    the band; skipped as stale if it opened past stale_gap_min or through the
-    line. Drift past watch_gap_max x DRIFT_MULT cancels the watch, as live."""
+    Modelled on the LIVE path, which watches and triggers from the intraday
+    price in the same 5-minute cycle (`zebra/scanner.py validate_and_add`,
+    then `zebra/monitor.py check_watching`). On a daily bar that becomes, for
+    session i with the ST line of the last COMPLETED period:
+
+      - the previous close sits at least fresh_entry_gap from the line
+        (`check_freshness`: closer than that is a missed approach),
+      - no close/high/low within the touch threshold of the line in the
+        freshness_days sessions before i (a bounce, not a fresh approach),
+      - session i trades to the trigger_gap_max level: filled there, or at the
+        open if it opened inside the band; skipped as stale if it opened past
+        stale_gap_min or through the line.
+
+    The first version required an END-OF-DAY close inside the watch band and a
+    trigger on a LATER session. It reproduced only 31 of 80 live triggers,
+    and the ones it missed were the fast approaches (MCX, HINDZINC, KAYNES:
+    previous close 6-8% away, watched and triggered the same day) -- exactly
+    the population the approach hypothesis is about (review 2026-09-25).
+
+    Known remaining difference: live keeps a watch's stored ST across a
+    week/month rollover; this uses each session's line."""
     touch = _touch_threshold()
     closes = [c['close'] for c in daily]
     out = []
     for tf in cfg.ENABLED_TIMEFRAMES:
         sts = st_as_of(daily, tf)
-        watch = None
-        for i in range(1, len(daily)):
+        for i in range(cfg.FRESHNESS_DAYS + 1, len(daily)):
             d = daily[i]['date']
             if d < since or d > until:
                 continue
             st = sts[i]
-            if not st:
-                watch = None
+            prev = closes[i - 1]
+            if not st or prev == st:
                 continue
-            if abs(closes[i] / closes[i - 1] - 1) > CORP_ACTION_MOVE:
-                watch = None
+            if abs(closes[i] / prev - 1) > CORP_ACTION_MOVE:
                 continue
-            if watch and (abs(watch['st'] - st) > 1e-9 or i - watch['i'] > WATCH_LIFE):
-                watch = None
-            if watch and abs(closes[i] - st) / st > cfg.WATCH_GAP_MAX * DRIFT_MULT:
-                watch = None
-            if watch:
-                call = watch['dir'] == 'CE'
-                lvl = st * (1 - cfg.TRIGGER_GAP_MAX) if call else st * (1 + cfg.TRIGGER_GAP_MAX)
-                op = daily[i]['open']
-                og = abs(op - st) / st
-                if (daily[i]['high'] >= lvl) if call else (daily[i]['low'] <= lvl):
-                    through = (call and op > st) or (not call and op < st)
-                    if not (through or og < cfg.STALE_GAP_MIN):
-                        out.append({'sym': symbol, 'tf': tf, 'dir': watch['dir'], 'i': i,
-                                    'date': d, 'entry': op if og <= cfg.TRIGGER_GAP_MAX else lvl,
-                                    'target': st})
-                    watch = None
-                    continue
-            g = abs(closes[i] - st) / st
-            if (watch is None and cfg.FRESH_ENTRY_GAP <= g <= cfg.WATCH_GAP_MAX
-                    and closes[i] != st and cfg_direction_enabled(closes[i], st)):
-                fresh = all(min(abs(daily[k][x] - st) / st for x in ('close', 'high', 'low')) >= touch
-                            for k in range(max(0, i - cfg.FRESHNESS_DAYS + 1), i + 1))
-                if fresh:
-                    watch = {'i': i, 'st': st, 'dir': 'CE' if closes[i] < st else 'PE'}
+            if abs(prev - st) / st < cfg.FRESH_ENTRY_GAP or not cfg_direction_enabled(prev, st):
+                continue
+            if any(min(abs(daily[k][x] - st) / st for x in ('close', 'high', 'low')) < touch
+                   for k in range(i - cfg.FRESHNESS_DAYS, i)):
+                continue
+            call = prev < st
+            lvl = st * (1 - cfg.TRIGGER_GAP_MAX) if call else st * (1 + cfg.TRIGGER_GAP_MAX)
+            if not ((daily[i]['high'] >= lvl) if call else (daily[i]['low'] <= lvl)):
+                continue
+            op = daily[i]['open']
+            og = abs(op - st) / st
+            if (call and op >= st) or (not call and op <= st) or og < cfg.STALE_GAP_MIN:
+                continue
+            out.append({'sym': symbol, 'tf': tf, 'dir': 'CE' if call else 'PE', 'i': i,
+                        'date': d, 'entry': op if og <= cfg.TRIGGER_GAP_MAX else lvl,
+                        'target': st})
     return out
 
 
@@ -326,6 +382,9 @@ def simulate(daily: list, i: int, direction: str, entry: float, target: float,
     stop_v = v0 * (1 - cfg.DEBIT_SL_PCT)
     t_exit = time_exit_date(expiry)
     reason, xv, xdate = 'open', None, None
+    # Gross % at each session CLOSE the trade survived (index 0 = the entry
+    # session): what a time exit at the close of session n would have booked.
+    closes = []
     for k in range(i, len(daily)):
         c = daily[k]
         dk = date.fromisoformat(c['date'])
@@ -348,8 +407,10 @@ def simulate(daily: list, i: int, direction: str, entry: float, target: float,
         if dk >= t_exit:
             reason, xv, xdate = 'time', value(c['close'], dk), c['date']
             break
+        closes.append(100.0 * (value(c['close'], dk) - v0) / v0)
     out = {'entry_date': daily[i]['date'], 'exit_date': xdate, 'reason': reason,
-           'expiry': expiry.isoformat(), 'premium_pct_spot': 100.0 * v0 / entry}
+           'expiry': expiry.isoformat(), 'premium_pct_spot': 100.0 * v0 / entry,
+           'closes': closes}
     if xv is not None:
         gross = 100.0 * (xv - v0) / v0
         out.update(gross_pct=gross, net_pct=gross - COST_PCT)
@@ -387,10 +448,11 @@ def approach_move(daily: list, day: str, entry: float, direction: str,
     the entry session, ending at the entry price: known at entry, nothing
     after it. Positive = travelling toward the target.
 
-    The one precursor that survived the wrong-way control (2026-09-25, 3,446
-    replayed triggers): the fastest fifth reached the line within 3 sessions
-    40% of the time against 22% for the rest, and ran +5.1% vs -2.9% a trade
-    as a naked ATM option. ONE definition, used by the research and the pack.
+    DESCRIPTIVE since 2026-09-25. It looked like a precursor on the first
+    replay (+5.1% vs -2.9% a trade); on the live-faithful replay the fastest
+    fifth ran -7.1% vs -3.1% for the rest and hit the WRONG-way level more
+    often (81% vs 70%): speed tracked volatility, not direction. ONE
+    definition, used by the research and by golive section 10.
     """
     idx = next((k for k, c in enumerate(daily) if c['date'] == day), None)
     if idx is None or idx < sessions or entry <= 0:

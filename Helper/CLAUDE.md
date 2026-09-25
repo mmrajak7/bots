@@ -995,56 +995,56 @@ live at shadow open, −50% stop. It exists only on shadows opened from
 ### THE 100-TRADE TEST — the only go-live gate (owner, 2026-09-25)
 
 Full plan, results log and monthly review checklist:
-`docs/NAKED_100_TRADE_TEST.md` (Windows). **First review: 2026-10-25.**
+`docs/NAKED_100_TRADE_TEST.md` (Windows). **First review: 2026-10-25**, on the
+Pi, after 15:45: `../CROCODILE/venv/bin/python -m zebra golive --refresh`.
 
-**The question.** Replayed on 6.7 years of history (2,541 trades, every
-signal taken, `zebra/replay.py`), the naked-long rule set has **no edge on its
-own**: +0.8% per trade before costs, about −1.2% after, 2020 the only clearly
-good year. The replay is trustworthy — on the 14 closed naked shadows it got
-the win/loss right 14/14. So the one open question is whether **live's
-filters** (intraday trigger, entry gates, vetting, drift cancel) pick better
-trades than the raw signal. Two windows so far point that way (live about +12%
-in both while every signal swung from +20% to −30%) — two windows is a
-hypothesis, not evidence.
+**The question.** `zebra/replay.py` rebuilds the live rules on daily candles
+and reproduces **90 of 103** live triggers on the same day (148 of 157 replay
+signals have a live record); re-pricing the naked shadow's closed trades it gets
+win/loss right 14 of 14. Over 2020-01..2026-09 the rules alone **lose**: 6,187
+trades, −3.9% a trade after costs (−1.9% before), 2020 the only positive year,
+PE −6.7% vs CE −0.2%. So the one open question is whether **live's filters**
+(intraday trigger, entry gates, vetting, drift cancel) pick trades good enough
+to turn that around. First window (09-10..09-18): live +23.4% vs the replay
+−4.7% — nine trades, a hypothesis, not evidence.
 
-**The gate, fixed IN ADVANCE** (`golive.TEST_N`, `PASS_PCT`, ...), on fully
-watched, closed, costed `naked_long` shadows:
+**The signal carries no direction.** On 11,063 replayed signals the line is
+touched within 30 sessions 69.9% of the time and the same distance the WRONG
+way 71.2%. Never quote the touch rate as evidence of an edge.
+
+**The population is fixed by ENTRY:** the first 100 fully watched
+`naked_long` shadows in entry order, open or closed (`golive.population`). An
+exit with no price counts as −100%; priced but uncosted as gross − 2%.
+
+**The gate, fixed IN ADVANCE** (`golive.TEST_N`, `PASS_PCT`, ...):
 
 | at | PASS needs ALL of | FAIL | otherwise |
 |---|---|---|---|
-| 100 trades | mean net >= +12% · beats the replay of every signal over the same dates · still positive without the best 3 | mean < +5% | extend ONCE to 150 |
+| 100 trades | mean net >= +12% · beats the replay of every signal over the same entry dates · still positive without the best 3 | mean < +5% | extend ONCE to the first 150 |
 | 150 trades | mean net >= +10% · same two conditions | anything else | — |
 
-**Second hypothesis, also fixed in advance: a TIME EXIT** — close at the end
-of session 3 after entry unless the target was hit. Winners resolve fast
-(live median 2 sessions) and losers drag (median 3-4); in the replay a trade
-still open after N sessions reached the target only ~35% of the time, and the
-3-session exit lifted the book from −1.2% to +1.5% a trade (paired +2.7,
-SE 0.7; 3 chosen by a walk-forward on 2020-22). Scored in section 9 on the
-SAME test trades from the `naked_long` arm's session-close `marks` (value
-paths for older trades) — the live exit rules do not change. SUPPORTED at 100
-if the paired gain is positive and >= 2 SE; it can never rescue a failed main
-test.
+The verdict reads IN PROGRESS until 100 have entered, WAITING until all of them
+have closed and the replay of their window is complete, and BLOCKED (never
+FAIL) when the replay cannot run. +12% is two standard errors at n=100 when one
+trade swings ~59%. **No early stop, no rule changes mid-test** (a change to
+entry, exit or vetting is logged in the plan with its date and reported
+before/after).
 
-**Third hypothesis, also fixed in advance: a FAST APPROACH** — the stock
-moved more than 4.2% toward its line in the 3 sessions before entry
-(`replay.approach_move`, `golive.FAST_APPROACH_PCT`). On 3,446 replayed
-triggers the fastest fifth reached the line within 3 sessions 40% of the time
-against 22%, and ran +5.1% vs −2.9% a trade as a naked ATM option — the one
-precursor that beat the wrong-way control (4.2 = the 2020-22 cut; 2023-26 held).
-About 1 trade in 5 is fast, so live cannot prove it; at 100 it must not
-CONTRADICT the replay (fast mean >= rest mean). A fast-only filter is a go-live
-candidate only if the main test passes. Section 10. The FIRST signal on a line
-touches faster but earns no more — not a filter.
+**Second hypothesis: a TIME EXIT** — close at the end of session 3 after entry
+unless the target was hit. Winners resolve fast (live median 2 sessions),
+losers drag (3-4). On the replay it lifts the book from −3.9% to −2.1% a trade
+(paired +1.7, SE 0.37; a walk-forward on 2020-22 chose 3) — it shrinks the
+loss, it does not create a profit. Scored in section 9 on the SAME fixed trades
+from the `naked_long` arm's session-close `marks` (polls at or after 15:00;
+value paths for older trades); a latched exit is judged by `triggered_at`, when
+it fired. The live exit rules do not change. SUPPORTED at 100 if the paired
+gain is positive and >= 2 SE; it can never rescue a failed main test.
 
-**The plain touch rate carries NO directional information** (independent
-review 2026-09-25): the line is touched within 30 sessions 66.7% of the time,
-but the same distance the WRONG way is hit 64.9% of the time and a driftless
-random walk predicts 63.6%. Never quote the touch rate as evidence of an edge.
-
-+12% is two standard errors at n=100 when one trade swings ~59%. **No early
-stop, no verdict before 100, no rule changes mid-test** (a change to entry,
-exit or vetting is logged in the plan with its date and reported before/after).
+**Fast approach: WITHDRAWN, descriptive only (section 10).** Registered as a
+third hypothesis on a first replay that missed most same-day triggers; on the
+corrected replay the fastest fifth ran −7.1% a trade vs −3.1% for the rest
+and hit the wrong-way level more often (81% vs 70%) — speed was volatility, not
+direction. The FIRST signal on a line reaches it faster but earns no more.
 
 **Nothing about capital or limits is decided before the gate.** A capital
 figure, position limit, per-trade size and monthly loss cap were proposed on
@@ -1052,10 +1052,18 @@ figure, position limit, per-trade size and monthly loss cap were proposed on
 trade, and one naked lot costs Rs 7.5K-36K (median ~Rs 18K), so none of them
 applied. Size for the book that passes, after it passes.
 
-**Vetting quality** is read in section 8, descriptively: proving a 5-point
-vetting edge would take ~800 signals per group. The one pre-set trigger: with
->= 50 vetoed setups replayed, vetoed averaging >= 10 points ABOVE allowed means
-the agent turns away better trades than it takes — review it.
+**Vetting quality** is read in section 8, descriptively, one row per setup
+(re-vetoes of the same stock/direction/ST line are repeats, never re-scored):
+proving a 5-point vetting edge would take ~800 signals per group. The one
+pre-set trigger: with >= 50 vetoed setups replayed, vetoed averaging >= 10
+points ABOVE allowed means the agent turns away better trades than it takes —
+review it.
+
+**`--refresh` refuses to run 09:00-15:45 IST on weekdays**: ~420 historical
+requests would compete with the live scanner for Kite's 3 req/s limit. It keeps
+every stored field of the shared cache (`playbook/backtest_cache`) and never
+writes a short stub — a first version stripped `volume` and wrote 120-day files
+the scanner then trusted (Windows only; repaired 2026-09-25).
 
 ### Go-live decision pack — `python -m zebra golive` (2026-09-24)
 
@@ -1076,10 +1084,11 @@ measurements for after it, not inputs to it. Read-only:
 | 7 selection | do live's filters pick better trades? | the test trades vs `replay.replay_window` over the same entry dates |
 | 8 vetting | are the vetoes turning away worse trades? | every allowed / vetoed setup replayed naked from its trigger (`replay.replay_record`), ONE row per setup (stock, direction, ST line); `veto_shadow` labels alongside |
 | 9 time exit | would "exit at the close of session 3 unless the target was hit" have done better on the same trades? | `naked_long` session-close `marks` (value paths before 2026-09-25); paired gain ± SE, trades cut, cut-then-TP; N=1,2 shown only |
-| 10 approach | do trades that RAN at the line before entry do better? | test trades split at `FAST_APPROACH_PCT` by `replay.approach_move` from the candle cache; unknown when candles are missing |
+| 10 approach | DESCRIPTIVE ONLY (hypothesis withdrawn): trades that ran at the line before entry vs the rest | test trades split at `FAST_APPROACH_PCT` (7.6) by `replay.approach_move`; unknown when candles are missing |
 
 `--refresh` tops up the daily candle cache (`playbook/backtest_cache`) from
-Kite before the replay; the header prints how far the cache reaches. The
+Kite before the replay (after 15:45 only); the header prints how far the cache
+reaches. The
 replay is a yardstick for AVERAGES — on a single trade its size can be 20-50
 points off the live price.
 

@@ -222,7 +222,11 @@ def test_a_partial_shadow_is_kept_out_of_the_ladder():
 def test_the_report_leads_with_the_100_trade_test(monkeypatch):
     sh = _shadow()
     monkeypatch.setattr(ss, '_load', lambda: {'schema': ss.SCHEMA, 'shadows': {'1': sh}})
+    # Nothing may reach the real candle cache or the real value paths.
     monkeypatch.setattr(golive.replay, 'universe', lambda: [])
+    monkeypatch.setattr(golive.replay, 'load_daily', lambda s: None)
+    monkeypatch.setattr(golive.replay, 'replay_record', lambda t: None)
+    monkeypatch.setattr(golive, '_paths_marks', lambda paths_dir=None: {})
 
     class Store:
         def load_trades(self):
@@ -304,52 +308,109 @@ def test_bad_cli_numbers_are_refused_cleanly(capsys):
 
 # -- the 100-trade test ------------------------------------------------------
 
-def test_the_test_counts_only_fully_watched_closed_and_costed_trades():
-    rows = [dict(_row('2026-09-01 10:00', '2026-09-02 10:00', 1000, 100, 10), partial=False),
-            dict(_row('2026-09-01 10:00', '2026-09-02 10:00', 1000, 100, 10), partial=True),
-            dict(_row('2026-09-01 10:00', '2026-09-02 10:00', 1000, None, 10), partial=False),
-            dict(_row('2026-09-01 10:00', '2026-09-02 10:00', 1000, None, None), partial=False)]
-    t = golive.test_rows(rows)
-    assert len(t) == 1 and t[0]['net_pct'] == pytest.approx(10.0)
+def _prow(k, net_pct=None, resolved=True, partial=False, priced=True, costed=True):
+    """Test row k (entered k hours after a fixed start), capital 100, so
+    net rupees == net %."""
+    from datetime import timedelta
+    start = datetime(2026, 9, 1, 9, 30) + timedelta(hours=k)
+    return {'id': str(k), 'start': start, 'end': start + timedelta(days=2), 'capital': 100.0,
+            'resolved': resolved, 'priced': priced and resolved, 'partial': partial,
+            'pct': net_pct, 'net': net_pct if costed else None, 'gross': net_pct, 'fees': 0.0,
+            'stress': 0.0, 'ctx': {}}
 
 
-def test_no_verdict_before_100_however_good_the_run():
-    """Stopping on a good early run is how a lucky patch becomes an 'edge'."""
-    v = golive.verdict([80.0] * 99, -10.0)
+def _sel(mean, open_=0):
+    return lambda tests: {'replay': mean, 'open': open_, 'n': 50}
+
+
+def test_the_population_is_fixed_by_ENTRY_not_by_first_close():
+    """A slow early loser still open must stay in; the fast later winners
+    must not stand in for it."""
+    rows = [_prow(0, resolved=False)] + [_prow(k, 50.0) for k in range(1, 5)]
+    pop = golive.population(rows, 3)
+    assert [r['id'] for r in pop] == ['0', '1', '2']
+    assert [r['booked'] for r in pop] == ['open', 'net', 'net']
+    assert [r['id'] for r in golive.test_rows(rows, 3)] == ['1', '2']
+
+
+def test_partial_shadows_never_enter_the_population():
+    rows = [_prow(0, 10.0, partial=True), _prow(1, 20.0)]
+    assert [r['id'] for r in golive.population(rows, 5)] == ['1']
+
+
+def test_unpriced_books_the_whole_premium_and_uncosted_books_gross_less_cost():
+    rows = [_prow(0, None, priced=False), _prow(1, 30.0, costed=False)]
+    pop = golive.population(rows, 5)
+    assert pop[0]['booked'] == 'unpriced' and pop[0]['net_pct'] == golive.UNPRICED_NET_PCT
+    assert pop[1]['booked'] == 'uncosted' and pop[1]['net_pct'] == 30.0 - golive.replay.COST_PCT
+
+
+def test_no_verdict_before_100_have_entered_however_good_the_run():
+    v = golive.verdict([_prow(k, 80.0) for k in range(99)], _sel(-10.0))
     assert v['state'] == 'IN PROGRESS'
 
 
-def _hundred(mean, n=100):
-    """n nets averaging `mean`, spread so the top 3 do not carry it."""
-    return [mean + (20.0 if k % 2 else -20.0) for k in range(n)]
+def test_the_verdict_waits_while_any_of_the_100_is_open():
+    rows = [_prow(k, 80.0) for k in range(99)] + [_prow(99, resolved=False)]
+    assert golive.verdict(rows, _sel(-10.0))['state'] == 'WAITING'
+
+
+def test_the_verdict_waits_while_the_replay_of_the_window_is_incomplete():
+    rows = [_prow(k, 80.0) for k in range(100)]
+    assert golive.verdict(rows, _sel(-10.0, open_=4))['state'] == 'WAITING'
+
+
+def test_a_missing_replay_is_BLOCKED_never_a_fail():
+    rows = [_prow(k, 20.0) for k in range(150)]
+    assert golive.verdict(rows, lambda t: None)['state'] == 'BLOCKED'
+
+
+def _hundred(mean, n=100, start=0):
+    """n rows averaging `mean`, spread so the top 3 do not carry it."""
+    return [_prow(start + k, mean + (20.0 if k % 2 else -20.0)) for k in range(n)]
 
 
 def test_pass_needs_all_three_conditions():
-    assert golive.verdict(_hundred(15.0), 0.0)['state'] == 'PASS'
-    assert golive.verdict(_hundred(15.0), 20.0)['state'] != 'PASS'     # does not beat the replay
-    carried = [600.0, 600.0, 600.0] + [-5.0] * 97                      # mean +13.2%, all of it 3 trades
-    assert golive.verdict(carried, 0.0)['state'] != 'PASS'
+    assert golive.verdict(_hundred(15.0), _sel(0.0))['state'] == 'PASS'
+    assert golive.verdict(_hundred(15.0), _sel(20.0))['state'] != 'PASS'    # does not beat the replay
+    carried = [_prow(k, 600.0) for k in range(3)] + [_prow(k, -5.0) for k in range(3, 100)]
+    assert golive.verdict(carried, _sel(0.0))['state'] != 'PASS'           # all of it 3 trades
 
 
-def test_below_the_fail_line_fails_and_between_extends():
-    assert golive.verdict(_hundred(3.0), 0.0)['state'] == 'FAIL'
-    assert golive.verdict(_hundred(8.0), 0.0)['state'] == 'INCONCLUSIVE'
+def test_below_the_fail_line_fails():
+    assert golive.verdict(_hundred(3.0), _sel(0.0))['state'] == 'FAIL'
 
 
-def test_at_the_extension_the_bar_is_lower_and_there_is_no_third_chance():
-    assert golive.verdict(_hundred(11.0, 150), 0.0)['state'] == 'PASS'
-    assert golive.verdict(_hundred(8.0, 150), 0.0)['state'] == 'FAIL'
+def test_between_the_lines_extends_to_150_and_waits_for_it():
+    v = golive.verdict(_hundred(8.0), _sel(0.0))
+    assert v['state'] == 'INCONCLUSIVE -> IN PROGRESS'
+    # 100 at +8% then 50 at +16%: the 150 average is +10.7%, over the extension bar
+    assert golive.verdict(_hundred(8.0) + _hundred(16.0, 50, 100), _sel(0.0))['state'] == 'PASS'
+    assert golive.verdict(_hundred(8.0) + _hundred(8.0, 50, 100), _sel(0.0))['state'] == 'FAIL'
+
+
+def test_a_late_winner_cannot_flip_a_verdict_already_reached():
+    """The review's case: 100 at +4% FAILS; five +200% trades that ENTERED
+    later must not turn it into a PASS."""
+    rows = _hundred(4.0)
+    assert golive.verdict(rows, _sel(0.0))['state'] == 'FAIL'
+    rows += [_prow(100 + k, 200.0) for k in range(5)]
+    assert golive.verdict(rows, _sel(0.0))['state'] == 'FAIL'
 
 
 def test_selection_compares_against_the_replay_of_the_same_dates():
-    tests = golive.test_rows([
-        dict(_row('2026-09-10 10:00', '2026-09-12 10:00', 1000, 200, 20), partial=False),
-        dict(_row('2026-09-15 10:00', '2026-09-16 10:00', 1000, -500, -50), partial=False)])
+    tests = [dict(_prow(0, 20.0), net_pct=20.0), dict(_prow(30, -50.0), net_pct=-50.0)]
     replayed = [{'net_pct': -10.0}, {'net_pct': 30.0}, {'reason': 'open'}]
     s = golive.selection(tests, replayed)
-    assert (s['since'], s['until']) == ('2026-09-10', '2026-09-15')
+    assert (s['since'], s['until']) == ('2026-09-01', '2026-09-02')
     assert s['live'] == pytest.approx(-15.0) and s['replay'] == pytest.approx(10.0)
     assert s['n'] == 2 and s['open'] == 1
+
+
+def test_selection_is_blocked_when_the_cache_does_not_reach_the_window():
+    tests = [dict(_prow(0, 20.0), net_pct=20.0)]
+    s = golive.selection(tests, cache_end='2026-08-20')
+    assert s['replay'] is None and 'run --refresh' in s['blocked']
 
 
 def _vet(i, state, stock='ACME', st=100.0, day='2026-09-10'):
@@ -423,7 +484,7 @@ def test_an_exit_before_the_cutoff_stands_unchanged(weekdays):
 
 def test_a_trade_still_open_at_the_cutoff_books_that_sessions_close_mark(weekdays):
     sh = _shadow()                                    # naked entry 4.0 x 100
-    sh['arms'][ss.MARKS_ARM]['marks'] = {'2026-09-04': {'at': 'x', 'value': 3.0}}
+    sh['arms'][ss.MARKS_ARM]['marks'] = {'2026-09-04': {'at': '2026-09-04 15:20:00', 'value': 3.0}}
     r = _te_row('2026-09-01 09:35', '2026-09-09 10:00', -52.0)
     o = golive.time_exit_outcome(r, sh, 3)            # Tue + 3 sessions = Fri 09-04
     assert o['cut'] is True
@@ -487,30 +548,26 @@ def test_the_approach_is_the_move_toward_the_line_before_entry():
 
 
 def test_test_trades_split_fast_and_rest_and_missing_candles_are_unknown():
-    d = _daily([90, 91, 92, 95, 99, 99])
+    d = _daily([90, 90, 90, 90, 99, 99])              # +10% in 3 sessions: fast (> 7.6)
     rows = [dict(_te_row('%s 10:00' % d[4]['date'], '%s 15:00' % d[5]['date'], 30.0), id='1'),
             dict(_te_row('%s 10:00' % d[4]['date'], '%s 15:00' % d[5]['date'], -50.0), id='2'),
             dict(_te_row('%s 10:00' % d[4]['date'], '%s 15:00' % d[5]['date'], 10.0), id='3')]
     state = {'shadows': {'1': {'stock': 'FAST', 'entry_spot': 99.0, 'direction': 'CE'},
-                         '2': {'stock': 'SLOW', 'entry_spot': 92.5, 'direction': 'CE'},
+                         '2': {'stock': 'SLOW', 'entry_spot': 92.0, 'direction': 'CE'},
                          '3': {'stock': 'NOCANDLES', 'entry_spot': 99.0, 'direction': 'CE'}}}
     load = lambda s: None if s == 'NOCANDLES' else d
     ap = golive.approach(rows, state, load)
-    assert (ap['fast_n'], ap['rest_n'], ap['unknown']) == (1, 1, 1)
-    assert ap['fast_mean'] == 30.0 and ap['rest_mean'] == -50.0
-    assert ap['state'] == 'IN PROGRESS'
+    assert (ap['fast']['n'], ap['rest']['n'], ap['unknown']) == (1, 1, 1)
+    assert ap['fast']['mean'] == 30.0 and ap['rest']['mean'] == -50.0
 
 
-def test_at_100_live_must_not_contradict_the_replay():
-    d = _daily([90, 91, 92, 95, 99, 99])
-    rows, shadows = [], {}
-    for k in range(golive.TEST_N):
-        fast = k % 5 == 0
-        rows.append(dict(_te_row('%s 10:00' % d[4]['date'], '%s 15:00' % d[5]['date'],
-                                 -10.0 if fast else 5.0), id=str(k)))
-        shadows[str(k)] = {'stock': 'X', 'entry_spot': 99.0 if fast else 92.5, 'direction': 'CE'}
-    ap = golive.approach(rows, {'shadows': shadows}, lambda s: d)
-    assert ap['state'] == 'CONTRADICTS the replay'
+def test_a_broken_candle_file_does_not_stop_the_approach_split():
+    rows = [dict(_te_row('2026-09-01 10:00', '2026-09-02 15:00', 5.0), id='1')]
+    state = {'shadows': {'1': {'stock': 'X', 'entry_spot': 99.0, 'direction': 'CE'}}}
+
+    def load(s):
+        raise ValueError('corrupt')
+    assert golive.approach(rows, state, load)['unknown'] == 1
 
 
 def test_a_future_trade_is_captured_end_to_end(weekdays):
@@ -526,7 +583,7 @@ def test_a_future_trade_is_captured_end_to_end(weekdays):
     ss.poll_one(sh, 99.0, _q(1.9, 2.0), _q(0.5, 0.6), datetime(2026, 9, 8, 12, 0), date(2026, 9, 8))
     a = sh['arms'][ss.MARKS_ARM]
     assert a['status'] == 'exited' and a['exit']['reason'] == 'stop'
-    assert sorted(a['marks']) == days + ['2026-09-08']
+    assert sorted(a['marks']) == days          # the 12:00 stop poll is not a close
     state = {'schema': ss.SCHEMA, 'shadows': {'1': sh}}
     rows = golive.arm_rows(state, {'1': _trade()}, 'naked_long', datetime(2026, 9, 9, 10, 0))
     tests = golive.test_rows(rows)
@@ -534,3 +591,48 @@ def test_a_future_trade_is_captured_end_to_end(weekdays):
     te = golive.time_exit(tests, state, golive.TIME_EXIT_N, {})
     assert te['n'] == 1 and te['cut'] == 1 and te['unpriced'] == 0
     assert te['variant'] > tests[0]['net_pct']            # cut at the 3.6 session-3 mark, not the stop
+
+
+def test_a_morning_mark_is_not_a_close(weekdays):
+    sh = _shadow()
+    sh['arms'][ss.MARKS_ARM]['marks'] = {'2026-09-04': {'at': '2026-09-04 10:05:00', 'value': 3.0}}
+    r = _te_row('2026-09-01 09:35', '2026-09-09 10:00', -52.0)
+    assert golive.time_exit_outcome(r, sh, 3, {}) == {'unpriced': True}
+
+
+def test_a_tp_that_FIRED_on_the_cutoff_is_not_cut_though_booked_later(weekdays):
+    """A trigger latched on an unpriceable poll books at the next priced one;
+    the time-exit test must read when it fired."""
+    sh = _shadow()
+    a = sh['arms'][ss.MARKS_ARM]
+    a['status'] = 'exited'
+    a['exit'] = {'reason': 'tp', 'at': '2026-09-07 09:40:00', 'triggered_at': '2026-09-04 15:10:00',
+                 'value': 6.0, 'pnl_pct': 50.0}
+    r = _te_row('2026-09-01 09:35', '2026-09-07 09:40', 49.0, 'tp')
+    assert golive.time_exit_outcome(r, sh, 3, {}) == {'net_pct': 49.0, 'cut': False}
+
+
+def test_a_latched_exit_records_when_it_fired():
+    sh = _shadow()
+    a = sh['arms']['naked_long']
+    a['pending'] = {'reason': 'tp', 'since': '2026-09-04 15:10:00'}
+    ss._close(sh, 'naked_long', 'tp', 6.0, 104.0, '2026-09-07 09:40:00')
+    assert a['exit']['triggered_at'] == '2026-09-04 15:10:00' and a['exit']['at'] == '2026-09-07 09:40:00'
+
+
+def test_the_pack_survives_a_replay_that_cannot_run(monkeypatch):
+    """No options CSV / no candles on the box: sections 1-6 still print and
+    the replay sections say UNAVAILABLE instead of killing the pack."""
+    sh = _shadow()
+    monkeypatch.setattr(ss, '_load', lambda: {'schema': ss.SCHEMA, 'shadows': {'1': sh}})
+
+    def boom():
+        raise FileNotFoundError('nse_stocks_options.csv')
+    monkeypatch.setattr(golive.replay, 'universe', boom)
+    monkeypatch.setattr(golive, '_paths_marks', lambda paths_dir=None: {})
+
+    class Store:
+        def load_trades(self):
+            return [_trade()]
+    out = golive.report(Store(), now=MID)
+    assert '6 BANDS' in out and 'replay UNAVAILABLE' in out and '8 VETTING' in out

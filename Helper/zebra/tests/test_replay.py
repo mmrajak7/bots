@@ -71,12 +71,22 @@ def test_an_open_past_the_stale_floor_is_skipped(flat_st):
     assert replay.signals('X', _sig_bars([(97.5, 98.0, 97.4, 97.8)]), '2000-01-01', '2100-01-01') == []
 
 
-def test_a_drift_past_the_live_multiple_cancels_the_watch(flat_st):
-    """7% away is past watch_gap_max x 1.2 = 6%: the watch dies, so a later
-    return to the band is a NEW approach that must re-qualify."""
-    s = replay.signals('X', _sig_bars([(93.0, 93.1, 92.9, 93.0), (95.9, 96.3, 95.8, 96.1)]),
+def test_a_close_far_from_the_line_still_triggers_the_SAME_day(flat_st):
+    """The live path: watched and triggered in one intraday move. A previous
+    close 7% away that trades to the 4% level is a signal -- the first replay
+    required a close inside the band first and missed MCX, HINDZINC, KAYNES."""
+    s = replay.signals('X', _sig_bars([(93.0, 93.1, 92.9, 93.0), (93.2, 96.3, 93.1, 96.1)]),
                        '2000-01-01', '2100-01-01')
-    assert s == []
+    assert len(s) == 1 and s[0]['entry'] == pytest.approx(96.0)
+
+
+def test_a_previous_close_already_inside_the_band_is_a_missed_approach(flat_st):
+    """check_freshness: a last close nearer than fresh_entry_gap = too late."""
+    inside = [{'date': d, 'open': 96.5, 'high': 96.6, 'low': 96.4, 'close': 96.5} for d in _days(8)]
+    assert replay.signals('X', inside, '2000-01-01', '2100-01-01') == []
+    control = [dict(c) for c in inside]
+    control[6].update(close=95.5, low=95.4)                  # the close before the last is 4.5% away
+    assert [g['date'] for g in replay.signals('X', control, '2000-01-01', '2100-01-01')] == [_days(8)[7]]
 
 
 def test_a_recent_touch_of_the_line_is_not_fresh(flat_st):
@@ -87,16 +97,6 @@ def test_a_recent_touch_of_the_line_is_not_fresh(flat_st):
     assert replay.signals('X', bars, '2000-01-01', '2100-01-01') == []
     bars[1]['high'] = 95.6                  # control: the same bars without the touch
     assert len(replay.signals('X', bars, '2000-01-01', '2100-01-01')) == 1
-
-
-def test_the_drift_multiple_is_the_live_monitors():
-    """DRIFT_MULT is a copy of a literal in monitor.py; if that literal moves,
-    this fails rather than the replay quietly measuring a different rule.
-
-    RETIRES WHEN: the drift multiple becomes a config value that both
-    monitor.py and replay.py read, so there is one definition to pin."""
-    src = (Path(replay.__file__).parent / 'monitor.py').read_text(encoding='utf-8')
-    assert 'gap > cfg.WATCH_GAP_MAX * %s' % replay.DRIFT_MULT in src
 
 
 def test_st_uses_only_COMPLETED_periods():
@@ -215,25 +215,80 @@ def test_one_open_position_per_stock(monkeypatch):
 
 class _Kite:
     def __init__(self, bars, fail=()):
-        self.bars, self.fail = bars, set(fail)
+        self.bars, self.fail, self.calls = bars, set(fail), []
 
     def historical_data(self, token, start, end, interval):
+        self.calls.append((token, start, end))
         if token in self.fail:
             raise RuntimeError('Too many requests')
         return self.bars
 
 
-def test_refresh_merges_keeps_old_history_and_never_writes_today(tmp_path, monkeypatch):
+def _old_rows(n=400):
+    """A stored file as the scanner writes it: Kite timestamps, with volume."""
+    out, d = [], date(2019, 1, 1)
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append({'date': d.isoformat() + 'T00:00:00+05:30', 'open': 1, 'high': 1,
+                        'low': 1, 'close': 1, 'volume': 1234})
+        d += timedelta(days=1)
+    return out
+
+
+def test_refresh_keeps_every_stored_field_and_never_writes_today(tmp_path, monkeypatch):
+    """The review's data loss: stored rows lost `volume` and their timestamp
+    format. They are now kept AS STORED; only fetched dates are replaced."""
     monkeypatch.setattr(replay, '_cache_dir', lambda: tmp_path)
-    old = [{'date': '2020-01-%02d' % d, 'open': 1, 'high': 1, 'low': 1, 'close': 1} for d in range(1, 29)]
-    (tmp_path / 'X.json').write_text(json.dumps(old))
     from datetime import datetime
-    today = datetime.now().strftime('%Y-%m-%d')
-    fresh = [{'date': date(2020, 1, 28), 'open': 2, 'high': 2, 'low': 2, 'close': 2},
-             {'date': date.fromisoformat(today), 'open': 3, 'high': 3, 'low': 3, 'close': 3}]
-    res = replay.refresh(_Kite(fresh, fail={2}), [('X', 1), ('Y', 2)], pause=0)
-    assert res == {'updated': 1, 'failed': ['Y']}
-    got = {c['date']: c['close'] for c in json.load(open(tmp_path / 'X.json'))}
-    assert got['2020-01-01'] == 1            # old history kept
-    assert got['2020-01-28'] == 2            # the fetched candle wins the overlap
-    assert today not in got                  # the forming bar is never cached
+    old = _old_rows()
+    old[-1]['date'] = (date.today() - timedelta(days=2)).isoformat() + 'T00:00:00+05:30'
+    (tmp_path / 'X.json').write_text(json.dumps(old))
+    last_day = date.fromisoformat(old[-1]['date'][:10])
+    fresh = [{'date': datetime(last_day.year, last_day.month, last_day.day), 'open': 2, 'high': 2,
+              'low': 2, 'close': 2, 'volume': 99},
+             {'date': datetime.now(), 'open': 3, 'high': 3, 'low': 3, 'close': 3, 'volume': 5}]
+    res = replay.refresh(_Kite(fresh), [('X', 1)], pause=0)
+    assert res['updated'] == 1 and res['full'] == 0
+    got = json.load(open(tmp_path / 'X.json'))
+    assert got[0] == old[0]                                   # untouched, volume and format intact
+    assert all('volume' in c for c in got)
+    assert got[-1]['close'] == 2 and got[-1]['volume'] == 99  # the fetched candle wins its date
+    assert all(c['date'][:10] < date.today().isoformat() for c in got)   # no forming bar
+
+
+def test_refresh_never_writes_a_stub_for_a_missing_or_short_file(tmp_path, monkeypatch):
+    """A missing file gets the scanner's full span, in Kite-sized chunks, so
+    the scanner never finds a 120-day file it trusts as fresh."""
+    monkeypatch.setattr(replay, '_cache_dir', lambda: tmp_path)
+    k = _Kite([])
+    res = replay.refresh(k, [('NEW', 7)], pause=0)
+    assert res['full'] == 1
+    first = date.fromisoformat(k.calls[0][1])
+    assert (date.today() - first).days >= replay.FULL_HISTORY_DAYS - 1
+    assert len(k.calls) >= 2                                 # chunked under Kite's 2,000-day cap
+    for _, a, b in k.calls:
+        assert (date.fromisoformat(b) - date.fromisoformat(a)).days <= replay.CHUNK_DAYS
+
+
+def test_a_failed_symbol_leaves_its_file_untouched_and_the_rest_continue(tmp_path, monkeypatch):
+    monkeypatch.setattr(replay, '_cache_dir', lambda: tmp_path)
+    old = _old_rows()
+    (tmp_path / 'Y.json').write_text(json.dumps(old))
+    res = replay.refresh(_Kite([], fail={2}), [('Y', 2), ('Z', 3)], pause=0)
+    assert res['failed'] == ['Y'] and res['updated'] == 1
+    assert json.load(open(tmp_path / 'Y.json')) == old
+
+
+def test_a_malformed_candle_is_skipped_not_fatal(tmp_path, monkeypatch):
+    monkeypatch.setattr(replay, '_cache_dir', lambda: tmp_path)
+    rows = _old_rows(3)
+    rows[1] = {'date': rows[1]['date'], 'open': None}
+    (tmp_path / 'B.json').write_text(json.dumps(rows))
+    assert len(replay.load_daily('B')) == 2
+
+
+def test_simulate_reports_each_surviving_session_close(monkeypatch):
+    monkeypatch.setattr(replay, '_is_session', lambda d: d.weekday() < 5)
+    bars = _trade_bars([(96.0, 96.3, 95.8, 96.0)] * 3)
+    r = replay.simulate(bars, 24, 'CE', 96.0, 100.0, EXP)
+    assert r['reason'] == 'open' and len(r['closes']) == 4    # the entry session + 3

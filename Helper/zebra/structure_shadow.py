@@ -192,6 +192,10 @@ LADDER_ARM = 'naked_hold'
 #: The arm that records a session close mark (`marks`): the one the 100-trade
 #: test scores, so its time-exit variant differs from it in one respect only.
 MARKS_ARM = 'naked_long'
+#: Only a poll at or after this time can be a session CLOSE mark: a day whose
+#: last good poll was mid-morning leaves no mark (scored unpriced), rather
+#: than a morning price standing in for the close.
+MARKS_FROM = '15:00'
 
 VIX_SYMBOL = 'NSE:INDIA VIX'
 
@@ -672,9 +676,12 @@ def _close(sh: dict, key: str, reason: str, value: Optional[float],
         return                        # a booked exit is NEVER re-priced
     ev = a['entry_value']
     a['status'] = 'exited'
-    a.pop('pending', None)
+    # When the trigger FIRED. A latched exit books at a later priced poll;
+    # without this the time-exit test would score a TP that fired on time as
+    # one that came too late.
+    fired = (a.pop('pending', None) or {}).get('since') or ts
     a['exit'] = {
-        'reason': reason, 'at': ts,
+        'reason': reason, 'at': ts, 'triggered_at': fired,
         'spot': None if spot is None else round(float(spot), 2),
         'value': None if value is None else round(float(value), 4),
         'pnl_pct': None if value is None else round(100.0 * (value - ev) / ev, 2),
@@ -737,7 +744,7 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
         # session, overwritten through the day, so "exit at the close of
         # session N" can be scored on a price this arm could have sold at. A
         # measurement only -- nothing here reads it to decide an exit.
-        if key == MARKS_ARM and v is not None:
+        if key == MARKS_ARM and v is not None and now.strftime('%H:%M') >= MARKS_FROM:
             a.setdefault('marks', {})[today.isoformat()] = {'at': ts, 'value': round(float(v), 4)}
         if 'ladder' in a and v is not None and value_armed:
             for frac in cfg.SHADOW_STOP_LADDER:
