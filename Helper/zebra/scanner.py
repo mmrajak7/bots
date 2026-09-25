@@ -86,6 +86,49 @@ def run_all_scanners() -> List[dict]:
     return all_signals
 
 
+#: Two ST values within this fraction of each other are the SAME line. The
+#: scanner recomputes the line from the same completed candles all week (all
+#: month), so a real repeat matches to the paisa; this only absorbs float noise.
+SAME_LINE_TOL = 0.0005
+
+
+def vetoed_today(trades: list, stock: str, timeframe: str, direction: str,
+                 st_val: float, today: str = None):
+    """The record that VETOED this exact setup today, or None.
+
+    ONE SETUP, ONE VERDICT A DAY (2026-09-25). A veto holds the dedup slot only
+    while its record stays `triggered`; once price slips under stale_gap_min
+    the record is cancelled, the slot frees, and the next scan re-adds the SAME
+    setup as a new signal -- which triggers and is vetted again. ICICIBANK PE
+    weekly on 2026-09-25, hovering at the 3% stale line against one ST line:
+    vetoed at 14:17, 14:37, 14:57 and 15:17, four agent runs for one question.
+    Beyond the quota, re-asking until a run says ALLOW would let one agent's
+    disagreement buy an entry the others refused.
+
+    A setup is (stock, timeframe, direction, ST line). Same day only: tomorrow
+    the agent gets a fresh look, because news and events move. A new line is a
+    new setup. An ALLOWED or entered setup is untouched.
+
+    `trades` should be `decided()`: a veto never enters, so it never carries
+    the cohort stamp `scored()` looks for.
+    """
+    from .vet import VETOED
+    today = today or datetime.now(cfg.IST).date().isoformat()
+    for t in trades:
+        v = t.get('vet')
+        if not (isinstance(v, dict) and v.get('state') == VETOED):
+            continue
+        if str(v.get('decided_at') or v.get('requested_at') or '')[:10] != today:
+            continue
+        if (t.get('stock') != stock or t.get('timeframe') != timeframe
+                or t.get('direction') != direction or t.get('shadow_of') is not None):
+            continue
+        line = t.get('st_value')
+        if line and st_val and abs(float(line) - float(st_val)) <= SAME_LINE_TOL * float(st_val):
+            return t
+    return None
+
+
 def validate_and_add(store: ZebraStore, kite=None,
                      dry_run: bool = False) -> List[dict]:
     """Run scanners, validate each candidate, add to store as WATCHING.
@@ -211,6 +254,19 @@ def validate_and_add(store: ZebraStore, kite=None,
             logger.debug("SKIP %s %s %s: already open as #%d (%s)",
                          stock, timeframe, direction, existing['id'],
                          existing['status'])
+            continue
+
+        # One setup, one verdict a day: a setup vetoed today is not re-added
+        # after its record went stale (see `vetoed_today`).
+        from .trade_store import decided
+        prior = vetoed_today(decided(store.load_trades()), stock, timeframe,
+                             direction, st_val)
+        if prior:
+            skips['vetoed_today'] += 1
+            logger.info("SKIP %s %s %s: this setup (ST %.2f) was VETOED today as "
+                        "#%d -- one setup, one verdict a day; no new signal, no "
+                        "new agent run", stock, timeframe, direction, st_val,
+                        prior['id'])
             continue
 
         # Cross-direction dedup: same stock can't be both CE-Zebra and PE-Zebra

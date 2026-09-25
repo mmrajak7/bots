@@ -1054,7 +1054,12 @@ applied. Size for the book that passes, after it passes.
 
 **Vetting quality** is read in section 8, descriptively, one row per setup
 (re-vetoes of the same stock/direction/ST line are repeats, never re-scored):
-proving a 5-point vetting edge would take ~800 signals per group. The one
+proving a 5-point vetting edge would take ~800 signals per group. The live
+scanner applies the same idea since 2026-09-25 (`scanner.vetoed_today`): a
+setup vetoed TODAY is not re-added after its record goes stale -- ICICIBANK
+was vetoed four times in one afternoon on one ST line, each as a new record,
+which spends agent quota and lets a later run's ALLOW overturn the earlier
+NOs. Same day only; a new line is a new setup. The one
 pre-set trigger: with >= 50 vetoed setups replayed, vetoed averaging >= 10
 points ABOVE allowed means the agent turns away better trades than it takes —
 review it.
