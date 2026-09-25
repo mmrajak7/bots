@@ -61,7 +61,8 @@ def test_the_scan_does_not_re_add_a_setup_vetoed_today(tmp_path, monkeypatch, ca
     t = store.add_signal({'stock': 'ICICIBANK', 'timeframe': 'weekly', 'direction': 'PE',
                           'st_value': LINE, 'st_direction': 'UP', 'signal_price': 1325.0,
                           'signal_gap_pct': 3.07})
-    today = datetime.now(cfg.IST).date().isoformat()
+    from zebra.vet import _now
+    today = _now().date().isoformat()          # the vet module's own clock
     with store._mutate():
         r = store._must_find(t['id'])
         r['status'] = 'cancelled'
@@ -77,10 +78,11 @@ def test_the_scan_does_not_re_add_a_setup_vetoed_today(tmp_path, monkeypatch, ca
     monkeypatch.setattr(scanner, 'check_freshness', lambda *a, **k: (True, 'fresh'))
     import logging
     before = len(store.load_trades())
-    with caplog.at_level(logging.INFO, logger=scanner.logger.name):
+    with caplog.at_level(logging.DEBUG, logger=scanner.logger.name):
         added = scanner.validate_and_add(store, kite=object())
     assert added == [] and len(store.load_trades()) == before
     assert 'was VETOED today as #%d' % t['id'] in caplog.text     # skipped for THIS reason
+    assert 'vetoed_today=1' in caplog.text                          # and counted on the summary
 
     # Control: the same scan on a DIFFERENT line is a new setup and is added.
     monkeypatch.setattr(scanner, 'compute_st_for_stock',

@@ -112,8 +112,10 @@ def vetoed_today(trades: list, stock: str, timeframe: str, direction: str,
     `trades` should be `decided()`: a veto never enters, so it never carries
     the cohort stamp `scored()` looks for.
     """
-    from .vet import VETOED
-    today = today or datetime.now(cfg.IST).date().isoformat()
+    from .vet import VETOED, _now
+    # The vet module stamps `decided_at` with ITS clock (naive local); asking
+    # "was it today" on any other clock is two definitions of one day.
+    today = today or _now().date().isoformat()
     for t in trades:
         v = t.get('vet')
         if not (isinstance(v, dict) and v.get('state') == VETOED):
@@ -263,7 +265,10 @@ def validate_and_add(store: ZebraStore, kite=None,
                              direction, st_val)
         if prior:
             skips['vetoed_today'] += 1
-            logger.info("SKIP %s %s %s: this setup (ST %.2f) was VETOED today as "
+            # DEBUG like every per-symbol skip: a vetoed setup hovering in the
+            # band would otherwise log every 5-minute cycle. The count is on
+            # the INFO summary line as `vetoed_today=N`.
+            logger.debug("SKIP %s %s %s: this setup (ST %.2f) was VETOED today as "
                         "#%d -- one setup, one verdict a day; no new signal, no "
                         "new agent run", stock, timeframe, direction, st_val,
                         prior['id'])
