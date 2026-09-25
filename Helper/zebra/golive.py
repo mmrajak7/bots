@@ -16,6 +16,20 @@ measured over the next 30-50 trades. Each section answers one of those:
     4 STOP         every stop level on the ladder, scored after the fact
     5 PER-TRADE    what a ceiling on one trade's capital would have done
     6 BANDS        outcome by implied vol, VIX, premium % of spot, capital
+    7 SELECTION    the trades live took vs the REPLAY of every signal, same dates
+    8 VETTING      allowed vs vetoed signals, both replayed the same way
+    9 TIME EXIT    the test's second hypothesis: exit at the close of session N
+                   unless the target was hit, priced on the arm's real marks
+   10 APPROACH     the third: trades whose price RAN at the line before entry
+                   (fast approach) vs the rest, on the same test trades
+
+Above all of them sits THE 100-TRADE TEST (owner, 2026-09-25): real money is
+decided on 100 fully watched, closed naked_long shadows against criteria
+fixed IN ADVANCE (`docs/NAKED_100_TRADE_TEST.md`, summary in CLAUDE.md).
+Until then nothing here chooses a capital, a position limit or a loss cap --
+the earlier quick conclusions of that kind were withdrawn as built on too
+little data. Sections 2-6 are measurements for AFTER the test, not inputs to
+it.
 
 Why PEAK concurrent capital, not the sum of premiums: the owner's correction,
 2026-09-24 -- capital is what is tied up AT ONCE. Summing every premium
@@ -35,11 +49,13 @@ engine -- then this is rebuilt around the new control.
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Optional
 
 from . import config as cfg
 from . import fees as fees_mod
+from . import replay
 from . import structure_shadow as ss
 
 #: One tick, the smallest price step on NSE stock options. The stress line
@@ -47,8 +63,45 @@ from . import structure_shadow as ss
 TICK = 0.05
 #: Below this many rows a group is printed but marked thin.
 THIN_N = 10
-#: The owner's decision point: revisit at 25-30 resolved, measure to 50.
-DECIDE_AT, MEASURE_TO = 30, 50
+#: The 100-trade test, fixed IN ADVANCE on 2026-09-25 so the result cannot
+#: move the bar. Population: fully watched (not partial), closed, priced and
+#: costed naked_long shadows. PASS needs all three of: mean net >= PASS_PCT,
+#: mean net above the replay of every signal over the same dates, and the
+#: mean still positive with the TOP_K best trades removed. FAIL below
+#: FAIL_PCT. In between: extend once to EXTEND_N, where PASS needs
+#: EXTEND_PASS_PCT with the same two conditions, and anything else FAILS.
+#: Why 12: two standard errors at n=100 when one trade's net swings ~59%
+#: (the replay's measured spread) -- 2 x 59 / sqrt(100).
+TEST_N, PASS_PCT, FAIL_PCT = 100, 12.0, 5.0
+EXTEND_N, EXTEND_PASS_PCT, TOP_K = 150, 10.0, 3
+#: Vetting review trigger, also fixed in advance: with at least this many
+#: vetoes replayed, vetoed signals averaging this many points ABOVE allowed
+#: ones means the agent is turning away better trades than it lets in.
+VET_REVIEW_MIN_N, VET_REVIEW_GAP = 50, 10.0
+#: Where the test's evidence starts: vetting armed and the cohort opened.
+TEST_SINCE = '2026-08-14'
+#: The test's SECOND hypothesis, fixed IN ADVANCE on 2026-09-25: exit at the
+#: close of session TIME_EXIT_N after entry unless the target was hit. N=3 is
+#: the value a walk-forward chose on 2020-2022 alone (2023-2026 then went
+#: -2.9% -> -0.1% a trade in the replay); 1 and 2 did better on the full
+#: sample and are SHOWN, not tested -- picking the best of three on the same
+#: data is how a fitted number passes for a finding. SUPPORTED at TEST_N rows
+#: when the paired gain is positive and at least 2 paired standard errors.
+#: It cannot rescue a failed main test: that would be a new hypothesis and a
+#: new test.
+TIME_EXIT_N = 3
+TIME_EXIT_SHOWN = (1, 2)
+#: The test's THIRD hypothesis, fixed IN ADVANCE on 2026-09-25: a trade is
+#: FAST when the stock moved more than FAST_APPROACH_PCT toward its line over
+#: the 3 sessions before entry (`replay.approach_move`). 4.2 is the top-fifth
+#: cut of 2020-2022 ALONE -- 2023-2026 then ran fast +5.0% vs rest -2.9% a
+#: trade in the replay -- not the full-sample 3.7%. Only ~1 in 5 trades is
+#: fast, so 100 test trades hold ~20: too few to prove it live. The evidence
+#: is the replay; the live test only has to NOT CONTRADICT it (fast mean >=
+#: rest mean at the verdict). A fast-only filter becomes a go-live candidate
+#: only if the main test PASSES; after a FAIL it is a new hypothesis and a
+#: new test.
+FAST_APPROACH_PCT = 4.2
 DEFAULT_CAPS = (6, 8, 10, 12)
 DEFAULT_CUTS = (15000, 20000, 25000, 30000, 40000)
 PLAN_MULT = 1.5          # owner, 2026-09-24: "plan 1.5x peak capital needed"
@@ -256,6 +309,250 @@ def bands(rows: list, field: str) -> list:
     return [(g[0]['ctx'][field], g[-1]['ctx'][field], summary(g)) for g in cuts if g]
 
 
+# -- the 100-trade test ----------------------------------------------------------
+
+def test_rows(rows: list) -> list:
+    """The test population: fully watched, closed, priced AND costed rows, each
+    with `net_pct` = net rupees / capital. An uncosted row is left out rather
+    than counted at zero fees, which would flatter the mean."""
+    out = []
+    for r in rows:
+        if r.get('partial') or not r['priced'] or r.get('net') is None or not r['capital']:
+            continue
+        out.append(dict(r, net_pct=100.0 * r['net'] / r['capital']))
+    return sorted(out, key=lambda r: r['start'])
+
+
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else None
+
+
+def _sd(xs):
+    if len(xs) < 2:
+        return None
+    m = _mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+def verdict(nets: list, replay_mean: Optional[float]) -> dict:
+    """The pre-registered verdict. Before TEST_N it is IN PROGRESS whatever the
+    numbers say -- stopping early on a good run is how a lucky patch gets
+    mistaken for an edge."""
+    n = len(nets)
+    mean = _mean(nets)
+    sd = _sd(nets)
+    ex_top = _mean(sorted(nets)[:-TOP_K]) if n > TOP_K else None
+    beats = (mean is not None and replay_mean is not None and mean > replay_mean)
+    out = {'n': n, 'mean': mean, 'sd': sd, 'se': (sd / math.sqrt(n)) if sd else None,
+           'ex_top': ex_top, 'beats_replay': beats if replay_mean is not None else None}
+    if n < TEST_N:
+        out['state'], out['why'] = 'IN PROGRESS', '%d of %d trades' % (n, TEST_N)
+        return out
+    bar = PASS_PCT if n < EXTEND_N else EXTEND_PASS_PCT
+    passed = mean >= bar and beats and (ex_top or 0) > 0
+    if passed:
+        out['state'], out['why'] = 'PASS', 'mean %+.1f%% >= %.0f%%, beats replay, holds without top %d' % (mean, bar, TOP_K)
+    elif n < EXTEND_N and mean >= FAIL_PCT:
+        out['state'], out['why'] = 'INCONCLUSIVE', 'between %.0f%% and the bar -- extend once to %d' % (FAIL_PCT, EXTEND_N)
+    else:
+        out['state'], out['why'] = 'FAIL', 'mean %+.1f%% (bar %.0f%%), beats replay: %s, without top %d: %s' % (
+            mean, bar, beats, TOP_K, _f(ex_top, '%+.1f%%'))
+    return out
+
+
+def selection(tests: list, replayed: Optional[list] = None) -> dict:
+    """The trades live took against the replay of EVERY signal entered over the
+    same dates. `replayed` is injectable for tests; by default the replay runs
+    over the candle cache."""
+    if not tests:
+        return {'since': None, 'until': None, 'live': None, 'replay': None, 'open': 0, 'n': 0}
+    since = tests[0]['start'].strftime('%Y-%m-%d')
+    until = max(r['start'] for r in tests).strftime('%Y-%m-%d')
+    if replayed is None:
+        replayed = replay.replay_window(since, until)
+    closed = [t['net_pct'] for t in replayed if t.get('net_pct') is not None]
+    return {'since': since, 'until': until, 'live': _mean([r['net_pct'] for r in tests]),
+            'live_win': 100.0 * sum(r['net_pct'] > 0 for r in tests) / len(tests),
+            'replay': _mean(closed), 'n': len(closed),
+            'replay_win': (100.0 * sum(x > 0 for x in closed) / len(closed)) if closed else None,
+            'open': len(replayed) - len(closed)}
+
+
+def vetting(trades: list, replay_fn=None) -> dict:
+    """Allowed vs vetoed, each replayed as a naked trade from its trigger.
+
+    `trades` must already be `decided()` -- vetoes never enter, so they never
+    carry the cohort stamp `scored()` looks for. The live `veto_shadow` label
+    (hit/miss/flat against spot barriers) is reported beside the replay, as a
+    second, independent reading of the same vetoes.
+
+    ONE SETUP, ONE ROW. A vetoed signal can re-trigger and be vetoed again on
+    the same ST line -- ADANIGREEN was vetoed six times against 1,247.43 in
+    September -- and counting each repeat as a new trade multiplies one
+    outcome. Measured 2026-09-25: with repeats, vetoed signals read +11.9%;
+    one row per setup, about -2%. A setup is (stock, direction, ST line); the
+    first record of it that the replay can price stands for it, and the
+    repeats are counted, never scored."""
+    replay_fn = replay_fn or replay.replay_record
+    groups, seen = {}, set()
+    for t in sorted(trades, key=lambda x: str(x.get('triggered_at') or '')):
+        v = t.get('vet')
+        if not isinstance(v, dict) or str(t.get('triggered_at') or '')[:10] < TEST_SINCE:
+            continue
+        state = v.get('state') or 'unknown'
+        g = groups.setdefault(state, {'n': 0, 'nets': [], 'open': 0, 'unpriced': 0,
+                                      'repeats': 0, 'labels': {}})
+        key = (state, t.get('stock'), t.get('direction'), round(float(t.get('st_value') or 0), 2))
+        if key in seen:
+            g['repeats'] += 1
+            continue
+        r = replay_fn(t)
+        if r is None:
+            g['unpriced'] += 1          # a later repeat may still price this setup
+            continue
+        seen.add(key)
+        g['n'] += 1
+        lab = (t.get('veto_shadow') or {}).get('label') if isinstance(t.get('veto_shadow'), dict) else None
+        if lab:
+            g['labels'][lab] = g['labels'].get(lab, 0) + 1
+        if r.get('net_pct') is None:
+            g['open'] += 1
+        else:
+            g['nets'].append(r['net_pct'])
+    a = _mean(groups.get('allowed', {}).get('nets', []))
+    vet_nets = groups.get('vetoed', {}).get('nets', [])
+    v = _mean(vet_nets)
+    review = (len(vet_nets) >= VET_REVIEW_MIN_N and a is not None and v is not None
+              and v - a >= VET_REVIEW_GAP)
+    return {'groups': groups, 'allowed_mean': a, 'vetoed_mean': v, 'review': review}
+
+
+def _session_after(day, n: int):
+    """The n-th trading session after `day` (calendar-aware)."""
+    from datetime import timedelta
+    from common import nse_holidays
+    d, k = day, 0
+    while k < n:
+        d += timedelta(days=1)
+        if nse_holidays.is_session(d):
+            k += 1
+    return d
+
+
+def _paths_marks(paths_dir=None) -> dict:
+    """{trade id: {date: long-leg bid at the last reliable poll of that day}}
+    from the persisted value paths -- the fallback for shadows opened before
+    the arm recorded its own `marks` (2026-09-25). Same basis: the long leg at
+    its BID, only on a poll the engine judged reliable."""
+    import glob
+    import json as _json
+    d = paths_dir or (cfg.LOG_DIR / 'eod')
+    out = {}
+    for f in sorted(glob.glob(str(d / 'paths_*.json'))):
+        try:
+            with open(f, encoding='utf-8') as fh:
+                day = _json.load(fh)
+        except (OSError, ValueError):
+            continue
+        for tid, t in (day.get('trades') or {}).items():
+            for o in t.get('obs') or []:
+                if o.get('q') == 'ok' and (o.get('long_bid') or 0) > 0 and o.get('ts'):
+                    out.setdefault(str(tid), {})[o['ts'][:10]] = (o['ts'], float(o['long_bid']))
+    return {tid: {day: v[1] for day, v in days.items()} for tid, days in out.items()}
+
+
+def time_exit_outcome(row: dict, sh: dict, n: int, fallback: Optional[dict] = None) -> dict:
+    """The test row re-scored under "exit at the close of session n unless the
+    target was hit". Its own exit stands if it came on or before that session
+    (TP or stop earlier, or the same trade either way). Otherwise it books the
+    session-n close mark, net of the fees that sale would have cost.
+    Returns {'net_pct', 'cut'} or {'unpriced': True} -- never a guess."""
+    a = sh['arms'][ss.MARKS_ARM]
+    start = row['start'].date()
+    cutoff = _session_after(start, n)
+    if row['end'].date() <= cutoff:
+        return {'net_pct': row['net_pct'], 'cut': False}
+    day = cutoff.isoformat()
+    m = (a.get('marks') or {}).get(day)
+    val = m['value'] if m else (fallback or {}).get(day)
+    if val is None:
+        return {'unpriced': True}
+    q = int(sh.get('quantity') or 0)
+    ev = float(a['entry_value'])
+    f = fees_mod.estimate([
+        {'leg': 'long', 'side': 'BUY', 'price': ev, 'qty': q, 'when': 'entry'},
+        {'leg': 'long', 'side': 'SELL', 'price': float(val), 'qty': q, 'when': 'exit'}])
+    net = (float(val) - ev) * q - float(f.get('total') or 0.0)
+    return {'net_pct': 100.0 * net / (ev * q), 'cut': True, 'value': val}
+
+
+def time_exit(tests: list, state: dict, n: int, paths_marks: Optional[dict] = None) -> dict:
+    """Paired comparison on the test rows: the time-exit variant vs the rule
+    actually run, over the rows the variant can price. Unpriced rows are
+    counted, not dropped."""
+    pm = paths_marks if paths_marks is not None else _paths_marks()
+    pairs, unpriced, cut, cut_later_tp = [], 0, 0, 0
+    for r in tests:
+        sh = state['shadows'].get(str(r['id']))
+        if not sh:
+            unpriced += 1
+            continue
+        o = time_exit_outcome(r, sh, n, pm.get(str(r['id'])))
+        if o.get('unpriced'):
+            unpriced += 1
+            continue
+        pairs.append((r['net_pct'], o['net_pct']))
+        if o['cut']:
+            cut += 1
+            cut_later_tp += 1 if r.get('reason') == 'tp' else 0
+    diffs = [b - a for a, b in pairs]
+    sd = _sd(diffs)
+    out = {'n': len(pairs), 'unpriced': unpriced, 'cut': cut, 'cut_later_tp': cut_later_tp,
+           'base': _mean([a for a, _ in pairs]), 'variant': _mean([b for _, b in pairs]),
+           'gain': _mean(diffs), 'se': (sd / math.sqrt(len(diffs))) if sd is not None else None}
+    if len(pairs) < TEST_N:
+        out['state'] = 'IN PROGRESS'
+    elif out['gain'] > 0 and out['se'] is not None and out['gain'] >= 2 * out['se']:
+        out['state'] = 'SUPPORTED'
+    else:
+        out['state'] = 'NOT SUPPORTED'
+    return out
+
+
+def approach(tests: list, state: dict, load=None) -> dict:
+    """The test trades split by their approach into entry. Rows whose candles
+    are missing are counted as unknown, never guessed into a group."""
+    load = load or replay.load_daily
+    groups = {'fast': [], 'rest': [], 'unknown': 0}
+    cache = {}
+    for r in tests:
+        sh = state['shadows'].get(str(r['id'])) or {}
+        stock, spot = sh.get('stock') or r.get('stock'), sh.get('entry_spot')
+        if stock not in cache:
+            cache[stock] = load(stock) if stock else None
+        mv = (replay.approach_move(cache[stock], r['start'].strftime('%Y-%m-%d'),
+                                   float(spot), sh.get('direction') or r.get('dir'))
+              if cache[stock] and spot else None)
+        if mv is None:
+            groups['unknown'] += 1
+        else:
+            groups['fast' if mv > FAST_APPROACH_PCT else 'rest'].append(r['net_pct'])
+    f, rest = groups['fast'], groups['rest']
+    out = {'fast_n': len(f), 'rest_n': len(rest), 'unknown': groups['unknown'],
+           'fast_mean': _mean(f), 'rest_mean': _mean(rest),
+           'fast_win': (100.0 * sum(x > 0 for x in f) / len(f)) if f else None,
+           'rest_win': (100.0 * sum(x > 0 for x in rest) / len(rest)) if rest else None}
+    n = len(f) + len(rest)
+    if n < TEST_N:
+        out['state'] = 'IN PROGRESS'
+    elif out['fast_mean'] is not None and out['rest_mean'] is not None \
+            and out['fast_mean'] >= out['rest_mean']:
+        out['state'] = 'CONSISTENT with the replay'
+    else:
+        out['state'] = 'CONTRADICTS the replay'
+    return out
+
+
 # -- report --------------------------------------------------------------------
 
 def _f(x, fmt='%.0f', dash='-'):
@@ -282,15 +579,27 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
     every = {k: arm_rows(state, by_id, k, now) for k in ARM_KEYS}
     every['REAL spread'] = real_rows(state, by_id, now)
     rows = {k: [r for r in v if not r['partial']] for k, v in every.items()}
-    nl = summary(rows['naked_long'])['n']
+    tests = test_rows(rows['naked_long'])
+    sel = selection(tests)
+    vd = verdict([r['net_pct'] for r in tests], sel['replay'])
+    cache_end = replay.cache_last_date([s for s, _ in replay.universe()])
 
     p('GO-LIVE DECISION PACK -- measures only, from the structure shadow')
-    p('  FORWARD shadows only (live-priced from 2026-09-09). The earlier cohort was')
-    p('  replayed once from stored value paths on 2026-09-24 and is not re-run here.')
-    p('  %d shadows, partial ones excluded. naked_long resolved: %d  (decide at %d, measure to %d)'
-      % (len(state['shadows']), nl, DECIDE_AT, MEASURE_TO))
-    if nl < DECIDE_AT:
-        p('  !! NOT YET DECIDABLE -- %d more resolved naked_long rows before the revisit.' % (DECIDE_AT - nl))
+    p('  FORWARD shadows only (live-priced from 2026-09-09). %d shadows.' % len(state['shadows']))
+    p('\nTHE 100-TRADE TEST -- naked_long, fully watched, closed, net of fees')
+    p('  (criteria fixed in advance: docs/NAKED_100_TRADE_TEST.md, summary in CLAUDE.md)')
+    p('  progress %d / %d   mean net %s   SE %s   win %s   without top %d: %s' % (
+        vd['n'], TEST_N, _f(vd['mean'], '%+.1f%%'), _f(vd['se'], '%.1f'),
+        _f(sel.get('live_win'), '%.0f%%'), TOP_K, _f(vd['ex_top'], '%+.1f%%')))
+    p('  vs replay of every signal, same dates: live %s vs replay %s (%d replayed)' % (
+        _f(sel['live'], '%+.1f%%'), _f(sel['replay'], '%+.1f%%'), sel['n']))
+    p('  VERDICT: %s -- %s' % (vd['state'], vd['why']))
+    p('  PASS at %d: mean >= %.0f%% AND beats the replay AND positive without the top %d.'
+      % (TEST_N, PASS_PCT, TOP_K))
+    p('  FAIL below %.0f%%. In between: extend once to %d (bar %.0f%%). No early stop.'
+      % (FAIL_PCT, EXTEND_N, EXTEND_PASS_PCT))
+    p('  candle cache ends %s -- `python -m zebra golive --refresh` fetches from Kite first.'
+      % (cache_end or 'MISSING'))
     sc = ss.scorecard()
     cens = [k for k in ARM_KEYS if ss.censored(sc, k)]
     if cens:
@@ -371,6 +680,75 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
                 _f(hi, '%.1f' if field != 'capital_naked' else '%.0f'), s['n'],
                 _f(s['win_pct'], '%.0f%%'), s['avg_pct'], s['net'], _thin(s['n'])))
             label = ''
+    p('\n7 SELECTION -- the trades live took vs the replay of EVERY signal, same dates')
+    if not tests:
+        p('  no fully watched, closed naked_long shadow yet.')
+    else:
+        p('  window %s .. %s (entry dates of the test trades)' % (sel['since'], sel['until']))
+        p('  live    n=%-4d win %4s  mean net %s' % (vd['n'], _f(sel['live_win'], '%.0f%%'),
+                                                   _f(sel['live'], '%+.1f%%')))
+        p('  replay  n=%-4d win %4s  mean net %s  (%d still open in the replay)' % (
+            sel['n'], _f(sel['replay_win'], '%.0f%%'), _f(sel['replay'], '%+.1f%%'), sel['open']))
+        if sel['live'] is not None and sel['replay'] is not None:
+            p("  difference %+.1f points -- positive means live's filters picked better trades"
+              % (sel['live'] - sel['replay']))
+        if cache_end and cache_end < sel['until']:
+            p('  !! the candle cache ends %s, before the window does -- run with --refresh' % cache_end)
+    p('  The replay has no edge on its own over 2020-2026 (+0.8% before costs, n=2,541);')
+    p('  this gap is the thing under test.')
+
+    p('\n8 VETTING -- allowed vs vetoed, each replayed as a naked trade from its trigger')
+    # `decided`: vetoes never enter, so they never carry the cohort stamp.
+    from .trade_store import decided
+    vt = vetting(decided(store.load_trades()))
+    p('  %-11s %6s %8s %5s %8s %7s %5s %9s  %s' % ('verdict', 'setups', 'replayed', 'open', 'unpriced',
+                                                   'repeats', 'win%', 'mean net', 'veto_shadow (spot barriers)'))
+    for state_, g in sorted(vt['groups'].items(), key=lambda kv: -kv[1]['n']):
+        nets = g['nets']
+        p('  %-11s %6d %8d %5d %8d %7d %5s %9s  %s' % (
+            state_, g['n'], len(nets), g['open'], g['unpriced'], g['repeats'],
+            _f(100.0 * sum(x > 0 for x in nets) / len(nets) if nets else None, '%.0f%%'),
+            _f(_mean(nets), '%+.1f%%'),
+            ', '.join('%s %d' % kv for kv in sorted(g['labels'].items())) or '-'))
+    if vt['allowed_mean'] is not None and vt['vetoed_mean'] is not None:
+        p('  allowed minus vetoed: %+.1f points (positive = the vetoes avoided worse trades)'
+          % (vt['allowed_mean'] - vt['vetoed_mean']))
+    p('  One row per setup (stock, direction, ST line); re-vetoes of it are counted as repeats.')
+    p('  Descriptive only: proving a 5-point vetting edge needs ~800 signals per group.')
+    p('  REVIEW TRIGGER (fixed in advance): >= %d vetoes replayed and vetoed averaging >= %.0f'
+      % (VET_REVIEW_MIN_N, VET_REVIEW_GAP))
+    p('  points ABOVE allowed.  Now: %s' % ('!! TRIPPED -- review the vetting' if vt['review'] else 'not tripped'))
+
+    p('\n9 TIME EXIT -- second hypothesis: exit at the close of session N unless the target')
+    p('  was hit, on the SAME test trades, priced on the arm\'s real session-close marks')
+    p('  %-9s %4s %8s %5s %11s %9s %9s %14s  %s' % ('N', 'n', 'unpriced', 'cut', 'cut then TP',
+                                                  'as run', 'variant', 'gain +- SE', 'verdict'))
+    pm = _paths_marks()
+    for n in (TIME_EXIT_N,) + TIME_EXIT_SHOWN:
+        te = time_exit(tests, state, n, pm)
+        p('  %-9s %4d %8d %5d %11d %9s %9s %14s  %s' % (
+            ('%d TESTED' % n) if n == TIME_EXIT_N else ('%d shown' % n), te['n'], te['unpriced'],
+            te['cut'], te['cut_later_tp'], _f(te['base'], '%+.1f%%'), _f(te['variant'], '%+.1f%%'),
+            ('%+.1f +- %.1f' % (te['gain'], te['se'])) if te['se'] else _f(te['gain'], '%+.1f'),
+            te['state'] if n == TIME_EXIT_N else '(not tested)'))
+    p('  SUPPORTED at %d trades if the gain is positive and >= 2 SE. "cut then TP" = trades the'
+      % TEST_N)
+    p('  time exit closed that went on to hit the target -- the late winners it costs.')
+    p('  Replay 2020-2026 said +2.7 pts a trade at N=3 (SE 0.7); this is the real-price check.')
+
+    p('\n10 APPROACH -- third hypothesis: FAST = the stock moved > %.1f%% toward its line in the'
+      % FAST_APPROACH_PCT)
+    p('  3 sessions before entry (`replay.approach_move`), on the same test trades')
+    ap = approach(tests, state)
+    p('  %-8s %4s %6s %9s' % ('group', 'n', 'win%', 'mean net'))
+    p('  %-8s %4d %6s %9s' % ('fast', ap['fast_n'], _f(ap['fast_win'], '%.0f%%'), _f(ap['fast_mean'], '%+.1f%%')))
+    p('  %-8s %4d %6s %9s' % ('rest', ap['rest_n'], _f(ap['rest_win'], '%.0f%%'), _f(ap['rest_mean'], '%+.1f%%')))
+    if ap['unknown']:
+        p('  %d trade(s) without candles for the approach -- run with --refresh' % ap['unknown'])
+    p('  Replay 2020-2026: fast +5.1% vs rest -2.9% a trade (fast reached the line in 3 sessions')
+    p('  40% of the time vs 22%). Live holds only ~1 in 5 fast trades, so it cannot prove this;')
+    p('  at 100 it must NOT CONTRADICT it (fast >= rest).  Now: %s' % ap['state'])
+
     p('\n  Every number here is PAPER: fills at the touch, fees modelled. Impact beyond the')
     p('  touch is unmeasured until real orders go in -- read the stress column, not just net.')
     return '\n'.join(L)

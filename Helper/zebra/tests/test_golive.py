@@ -219,15 +219,19 @@ def test_a_partial_shadow_is_kept_out_of_the_ladder():
     assert golive.ladder_outcomes({'shadows': {'1': sh}}, MID)['none']['n'] == 0
 
 
-def test_the_report_says_when_it_cannot_decide_yet(monkeypatch):
+def test_the_report_leads_with_the_100_trade_test(monkeypatch):
     sh = _shadow()
     monkeypatch.setattr(ss, '_load', lambda: {'schema': ss.SCHEMA, 'shadows': {'1': sh}})
+    monkeypatch.setattr(golive.replay, 'universe', lambda: [])
 
     class Store:
         def load_trades(self):
             return [_trade()]
     out = golive.report(Store(), now=MID)
-    assert 'NOT YET DECIDABLE' in out and '1 STRUCTURE' in out and '6 BANDS' in out
+    assert 'THE 100-TRADE TEST' in out and 'VERDICT: IN PROGRESS' in out
+    assert '1 STRUCTURE' in out and '6 BANDS' in out
+    assert '7 SELECTION' in out and '8 VETTING' in out
+    assert out.index('THE 100-TRADE TEST') < out.index('1 STRUCTURE')
 
 
 def test_the_ladders_50_level_books_what_the_live_50_stop_books():
@@ -296,3 +300,237 @@ def test_bad_cli_numbers_are_refused_cleanly(capsys):
     from zebra.__main__ import cmd_golive
     assert cmd_golive(SimpleNamespace(caps='6,x', cuts=None)) == 2
     assert 'whole numbers' in capsys.readouterr().out
+
+
+# -- the 100-trade test ------------------------------------------------------
+
+def test_the_test_counts_only_fully_watched_closed_and_costed_trades():
+    rows = [dict(_row('2026-09-01 10:00', '2026-09-02 10:00', 1000, 100, 10), partial=False),
+            dict(_row('2026-09-01 10:00', '2026-09-02 10:00', 1000, 100, 10), partial=True),
+            dict(_row('2026-09-01 10:00', '2026-09-02 10:00', 1000, None, 10), partial=False),
+            dict(_row('2026-09-01 10:00', '2026-09-02 10:00', 1000, None, None), partial=False)]
+    t = golive.test_rows(rows)
+    assert len(t) == 1 and t[0]['net_pct'] == pytest.approx(10.0)
+
+
+def test_no_verdict_before_100_however_good_the_run():
+    """Stopping on a good early run is how a lucky patch becomes an 'edge'."""
+    v = golive.verdict([80.0] * 99, -10.0)
+    assert v['state'] == 'IN PROGRESS'
+
+
+def _hundred(mean, n=100):
+    """n nets averaging `mean`, spread so the top 3 do not carry it."""
+    return [mean + (20.0 if k % 2 else -20.0) for k in range(n)]
+
+
+def test_pass_needs_all_three_conditions():
+    assert golive.verdict(_hundred(15.0), 0.0)['state'] == 'PASS'
+    assert golive.verdict(_hundred(15.0), 20.0)['state'] != 'PASS'     # does not beat the replay
+    carried = [600.0, 600.0, 600.0] + [-5.0] * 97                      # mean +13.2%, all of it 3 trades
+    assert golive.verdict(carried, 0.0)['state'] != 'PASS'
+
+
+def test_below_the_fail_line_fails_and_between_extends():
+    assert golive.verdict(_hundred(3.0), 0.0)['state'] == 'FAIL'
+    assert golive.verdict(_hundred(8.0), 0.0)['state'] == 'INCONCLUSIVE'
+
+
+def test_at_the_extension_the_bar_is_lower_and_there_is_no_third_chance():
+    assert golive.verdict(_hundred(11.0, 150), 0.0)['state'] == 'PASS'
+    assert golive.verdict(_hundred(8.0, 150), 0.0)['state'] == 'FAIL'
+
+
+def test_selection_compares_against_the_replay_of_the_same_dates():
+    tests = golive.test_rows([
+        dict(_row('2026-09-10 10:00', '2026-09-12 10:00', 1000, 200, 20), partial=False),
+        dict(_row('2026-09-15 10:00', '2026-09-16 10:00', 1000, -500, -50), partial=False)])
+    replayed = [{'net_pct': -10.0}, {'net_pct': 30.0}, {'reason': 'open'}]
+    s = golive.selection(tests, replayed)
+    assert (s['since'], s['until']) == ('2026-09-10', '2026-09-15')
+    assert s['live'] == pytest.approx(-15.0) and s['replay'] == pytest.approx(10.0)
+    assert s['n'] == 2 and s['open'] == 1
+
+
+def _vet(i, state, stock='ACME', st=100.0, day='2026-09-10'):
+    return {'id': i, 'stock': stock, 'direction': 'CE', 'st_value': st,
+            'triggered_at': day + 'T10:00:00', 'vet': {'state': state}}
+
+
+def test_a_re_vetoed_setup_is_one_row_not_many():
+    """ADANIGREEN was vetoed six times on one ST line: one outcome, not six."""
+    trades = [_vet(1, 'vetoed'), _vet(2, 'vetoed'), _vet(3, 'vetoed'),
+              _vet(4, 'vetoed', stock='OTHER'), _vet(5, 'allowed', stock='THIRD')]
+    v = golive.vetting(trades, replay_fn=lambda t: {'net_pct': 40.0 if t['stock'] == 'ACME' else -50.0})
+    g = v['groups']['vetoed']
+    assert g['n'] == 2 and g['repeats'] == 2 and g['nets'] == [40.0, -50.0]
+    assert v['allowed_mean'] == -50.0
+
+
+def test_an_unpriceable_record_does_not_hide_a_later_repeat():
+    trades = [_vet(1, 'vetoed'), _vet(2, 'vetoed', day='2026-09-11')]
+    v = golive.vetting(trades, replay_fn=lambda t: None if t['id'] == 1 else {'net_pct': 5.0})
+    g = v['groups']['vetoed']
+    assert g['n'] == 1 and g['unpriced'] == 1 and g['nets'] == [5.0]
+
+
+def test_signals_before_the_test_window_are_left_out():
+    v = golive.vetting([_vet(1, 'vetoed', day='2026-08-01')], replay_fn=lambda t: {'net_pct': 1.0})
+    assert v['groups'] == {}
+
+
+def test_the_vetting_review_trigger_needs_both_the_sample_and_the_gap():
+    few = [_vet(i, 'vetoed', stock='V%d' % i) for i in range(10)] + [_vet(99, 'allowed', stock='A')]
+    fn = lambda t: {'net_pct': 30.0 if t['vet']['state'] == 'vetoed' else 0.0}
+    assert golive.vetting(few, fn)['review'] is False                 # gap, but too few
+    many = [_vet(i, 'vetoed', stock='V%d' % i) for i in range(golive.VET_REVIEW_MIN_N)] + few[-1:]
+    assert golive.vetting(many, fn)['review'] is True
+
+
+# -- the time-exit hypothesis ------------------------------------------------
+
+def test_the_arm_records_the_LAST_priced_poll_of_each_session():
+    sh = _shadow()
+    for h, bid in ((11, 4.4), (15, 4.6)):
+        ss.poll_one(sh, 100.5, _q(bid, bid + 0.1), _q(1, 1.1), datetime(2026, 9, 10, h, 0), TODAY)
+    ss.poll_one(sh, 100.5, _q(9.9, 10.0, reliable=False), _q(1, 1.1),
+                datetime(2026, 9, 10, 15, 25), TODAY)            # unusable book: no mark
+    marks = sh['arms'][ss.MARKS_ARM]['marks']
+    assert marks == {'2026-09-10': {'at': '2026-09-10 15:00:00', 'value': 4.6}}
+    assert all('marks' not in a for k, a in sh['arms'].items() if k != ss.MARKS_ARM)
+
+
+@pytest.fixture
+def weekdays(monkeypatch):
+    from common import nse_holidays
+    monkeypatch.setattr(nse_holidays, 'is_session', lambda d: d.weekday() < 5)
+
+
+def _te_row(start, end, net_pct, reason='stop'):
+    r = _row(start, end, 400.0, net_pct * 4, net_pct)
+    return dict(r, id='1', net_pct=net_pct, reason=reason, partial=False)
+
+
+def test_session_counting_skips_the_weekend(weekdays):
+    assert golive._session_after(date(2026, 9, 11), 1) == date(2026, 9, 14)   # Fri -> Mon
+
+
+def test_an_exit_before_the_cutoff_stands_unchanged(weekdays):
+    sh = _shadow()
+    r = _te_row('2026-09-01 09:35', '2026-09-02 11:00', 50.0, 'tp')
+    assert golive.time_exit_outcome(r, sh, 3) == {'net_pct': 50.0, 'cut': False}
+
+
+def test_a_trade_still_open_at_the_cutoff_books_that_sessions_close_mark(weekdays):
+    sh = _shadow()                                    # naked entry 4.0 x 100
+    sh['arms'][ss.MARKS_ARM]['marks'] = {'2026-09-04': {'at': 'x', 'value': 3.0}}
+    r = _te_row('2026-09-01 09:35', '2026-09-09 10:00', -52.0)
+    o = golive.time_exit_outcome(r, sh, 3)            # Tue + 3 sessions = Fri 09-04
+    assert o['cut'] is True
+    # -25% gross, less the real (flat, so large on a Rs 400 test lot) fees
+    assert -50.0 < o['net_pct'] < -25.0
+
+
+def test_the_value_paths_fill_in_for_a_shadow_without_marks(weekdays):
+    sh = _shadow()
+    r = _te_row('2026-09-01 09:35', '2026-09-09 10:00', -52.0)
+    o = golive.time_exit_outcome(r, sh, 3, {'2026-09-04': 5.0})     # +25% gross
+    assert o['cut'] is True and 0.0 < o['net_pct'] < 25.0
+
+
+def test_no_mark_anywhere_is_unpriced_never_guessed(weekdays):
+    sh = _shadow()
+    r = _te_row('2026-09-01 09:35', '2026-09-09 10:00', -52.0)
+    assert golive.time_exit_outcome(r, sh, 3, {}) == {'unpriced': True}
+    te = golive.time_exit([r], {'shadows': {'1': sh}}, 3, {})
+    assert te['n'] == 0 and te['unpriced'] == 1
+
+
+def test_the_time_exit_verdict_waits_for_100_and_needs_two_standard_errors(weekdays, monkeypatch):
+    rows = [dict(_te_row('2026-09-01 09:35', '2026-09-09 10:00', -52.0), id=str(k))
+            for k in range(golive.TEST_N)]
+    state = {'shadows': {str(k): _shadow() for k in range(golive.TEST_N)}}
+    few = golive.time_exit(rows[:10], state, 3, {str(k): {'2026-09-04': 3.0} for k in range(100)})
+    assert few['state'] == 'IN PROGRESS' and few['gain'] > 0
+    # every stopped trade (-52%) cut at a 3.0 mark instead: a consistent gain
+    clean = golive.time_exit(rows, state, 3, {str(k): {'2026-09-04': 3.0} for k in range(100)})
+    assert clean['state'] == 'SUPPORTED' and clean['gain'] > 0
+    # against a -20% baseline, marks alternating 4.0 / 1.0 lose on average
+    for k in range(100):
+        rows[k]['net_pct'] = -20.0
+    pm = {str(k): {'2026-09-04': (4.0 if k % 2 else 1.0)} for k in range(100)}
+    noisy = golive.time_exit(rows, state, 3, pm)
+    assert noisy['gain'] < 0 and noisy['state'] == 'NOT SUPPORTED'
+
+
+# -- the approach hypothesis -------------------------------------------------
+
+def _daily(closes, start='2026-08-24'):
+    from datetime import timedelta
+    d, out = date.fromisoformat(start), []
+    for c in closes:
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        out.append({'date': d.isoformat(), 'open': c, 'high': c, 'low': c, 'close': c})
+        d += timedelta(days=1)
+    return out
+
+
+def test_the_approach_is_the_move_toward_the_line_before_entry():
+    from zebra import replay
+    d = _daily([90, 91, 92, 95, 99])                  # entry session = the 5th
+    # 3 sessions before the entry session closed at 91: 99 / 91 - 1
+    assert replay.approach_move(d, d[4]['date'], 99.0, 'CE') == pytest.approx(100 * (99 / 91 - 1))
+    assert replay.approach_move(d, d[4]['date'], 99.0, 'PE') == pytest.approx(-100 * (99 / 91 - 1))
+    assert replay.approach_move(d, d[1]['date'], 91.0, 'CE') is None    # not 3 sessions of history
+    assert replay.approach_move(d, '2030-01-01', 91.0, 'CE') is None    # entry day not in candles
+
+
+def test_test_trades_split_fast_and_rest_and_missing_candles_are_unknown():
+    d = _daily([90, 91, 92, 95, 99, 99])
+    rows = [dict(_te_row('%s 10:00' % d[4]['date'], '%s 15:00' % d[5]['date'], 30.0), id='1'),
+            dict(_te_row('%s 10:00' % d[4]['date'], '%s 15:00' % d[5]['date'], -50.0), id='2'),
+            dict(_te_row('%s 10:00' % d[4]['date'], '%s 15:00' % d[5]['date'], 10.0), id='3')]
+    state = {'shadows': {'1': {'stock': 'FAST', 'entry_spot': 99.0, 'direction': 'CE'},
+                         '2': {'stock': 'SLOW', 'entry_spot': 92.5, 'direction': 'CE'},
+                         '3': {'stock': 'NOCANDLES', 'entry_spot': 99.0, 'direction': 'CE'}}}
+    load = lambda s: None if s == 'NOCANDLES' else d
+    ap = golive.approach(rows, state, load)
+    assert (ap['fast_n'], ap['rest_n'], ap['unknown']) == (1, 1, 1)
+    assert ap['fast_mean'] == 30.0 and ap['rest_mean'] == -50.0
+    assert ap['state'] == 'IN PROGRESS'
+
+
+def test_at_100_live_must_not_contradict_the_replay():
+    d = _daily([90, 91, 92, 95, 99, 99])
+    rows, shadows = [], {}
+    for k in range(golive.TEST_N):
+        fast = k % 5 == 0
+        rows.append(dict(_te_row('%s 10:00' % d[4]['date'], '%s 15:00' % d[5]['date'],
+                                 -10.0 if fast else 5.0), id=str(k)))
+        shadows[str(k)] = {'stock': 'X', 'entry_spot': 99.0 if fast else 92.5, 'direction': 'CE'}
+    ap = golive.approach(rows, {'shadows': shadows}, lambda s: d)
+    assert ap['state'] == 'CONTRADICTS the replay'
+
+
+def test_a_future_trade_is_captured_end_to_end(weekdays):
+    """Open -> live polls over several sessions -> stop -> the pack: the time
+    exit is priced from the marks the polls recorded (no value-path
+    fallback), and the trade counts in the test population."""
+    sh = _shadow()                                        # entered Tue 2026-09-01, naked entry 4.0
+    days = ['2026-09-01', '2026-09-02', '2026-09-03', '2026-09-04', '2026-09-07']
+    for day in days:
+        d = date.fromisoformat(day)
+        for h, m in ((12, 30), (15, 20)):
+            ss.poll_one(sh, 100.2, _q(3.6, 3.7), _q(1, 1.1), datetime(d.year, d.month, d.day, h, m), d)
+    ss.poll_one(sh, 99.0, _q(1.9, 2.0), _q(0.5, 0.6), datetime(2026, 9, 8, 12, 0), date(2026, 9, 8))
+    a = sh['arms'][ss.MARKS_ARM]
+    assert a['status'] == 'exited' and a['exit']['reason'] == 'stop'
+    assert sorted(a['marks']) == days + ['2026-09-08']
+    state = {'schema': ss.SCHEMA, 'shadows': {'1': sh}}
+    rows = golive.arm_rows(state, {'1': _trade()}, 'naked_long', datetime(2026, 9, 9, 10, 0))
+    tests = golive.test_rows(rows)
+    assert len(tests) == 1 and tests[0]['net_pct'] < -50.0
+    te = golive.time_exit(tests, state, golive.TIME_EXIT_N, {})
+    assert te['n'] == 1 and te['cut'] == 1 and te['unpriced'] == 0
+    assert te['variant'] > tests[0]['net_pct']            # cut at the 3.6 session-3 mark, not the stop

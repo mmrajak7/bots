@@ -1462,6 +1462,19 @@ def cmd_golive(args):
     if any(c <= 0 for c in caps + cuts):
         print('--caps / --cuts must be positive')
         return 2
+    if getattr(args, 'refresh', False):
+        # The replay behind sections 7-8 reads the candle cache; on a box that
+        # does not scan every stock daily that cache goes stale. A failed
+        # refresh is reported and the pack still runs on what is cached --
+        # the header prints how far the cache reaches.
+        from zebra import replay
+        try:
+            from zebra.scanner import _get_kite
+            res = replay.refresh(_get_kite())
+            print('candles refreshed from Kite: %d updated, %d failed %s'
+                  % (res['updated'], len(res['failed']), res['failed'][:10]))
+        except Exception as e:
+            print('candle refresh FAILED (%s) -- running on the cached candles' % e)
     print(golive.report(get_store(), caps=caps, cuts=cuts))
 
 
@@ -2346,6 +2359,8 @@ def main():
                       help='position caps to simulate, e.g. 6,8,10,12')
     p_gl.add_argument('--cuts', default=None,
                       help='per-trade capital ceilings, e.g. 15000,25000,40000')
+    p_gl.add_argument('--refresh', action='store_true',
+                      help='top up the daily candle cache from Kite before the replay')
     p_gl.set_defaults(func=cmd_golive)
 
     p_dep = sub.add_parser(

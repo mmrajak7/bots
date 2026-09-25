@@ -985,19 +985,85 @@ back by TIME. **The move ENDS at the ST line, so the TP there is right** and
 same −50% stop) paid ~1.5:1 against the spread's ~0.8:1, break-even WR ~40%
 vs ~54-58%, with RoC roughly level on the clean rows. Owner's stated
 preference is naked buying (judged on RoC, and one leg each way instead of two
-means less slippage and cost); the decision is to **revisit at 25-30 resolved
-shadows** and let the data confirm or refute it. `spread_wide` was added the
+means less slippage and cost). The "revisit at 25-30 resolved shadows" plan
+is **superseded by THE 100-TRADE TEST (2026-09-25)** below. `spread_wide` was added the
 same day as the middle ground: the live spread with its short strike at
 `target + structure_shadow_wide_ext x (target − entry)` (default 0.5), priced
 live at shadow open, −50% stop. It exists only on shadows opened from
 2026-09-24.
 
+### THE 100-TRADE TEST — the only go-live gate (owner, 2026-09-25)
+
+Full plan, results log and monthly review checklist:
+`docs/NAKED_100_TRADE_TEST.md` (Windows). **First review: 2026-10-25.**
+
+**The question.** Replayed on 6.7 years of history (2,541 trades, every
+signal taken, `zebra/replay.py`), the naked-long rule set has **no edge on its
+own**: +0.8% per trade before costs, about −1.2% after, 2020 the only clearly
+good year. The replay is trustworthy — on the 14 closed naked shadows it got
+the win/loss right 14/14. So the one open question is whether **live's
+filters** (intraday trigger, entry gates, vetting, drift cancel) pick better
+trades than the raw signal. Two windows so far point that way (live about +12%
+in both while every signal swung from +20% to −30%) — two windows is a
+hypothesis, not evidence.
+
+**The gate, fixed IN ADVANCE** (`golive.TEST_N`, `PASS_PCT`, ...), on fully
+watched, closed, costed `naked_long` shadows:
+
+| at | PASS needs ALL of | FAIL | otherwise |
+|---|---|---|---|
+| 100 trades | mean net >= +12% · beats the replay of every signal over the same dates · still positive without the best 3 | mean < +5% | extend ONCE to 150 |
+| 150 trades | mean net >= +10% · same two conditions | anything else | — |
+
+**Second hypothesis, also fixed in advance: a TIME EXIT** — close at the end
+of session 3 after entry unless the target was hit. Winners resolve fast
+(live median 2 sessions) and losers drag (median 3-4); in the replay a trade
+still open after N sessions reached the target only ~35% of the time, and the
+3-session exit lifted the book from −1.2% to +1.5% a trade (paired +2.7,
+SE 0.7; 3 chosen by a walk-forward on 2020-22). Scored in section 9 on the
+SAME test trades from the `naked_long` arm's session-close `marks` (value
+paths for older trades) — the live exit rules do not change. SUPPORTED at 100
+if the paired gain is positive and >= 2 SE; it can never rescue a failed main
+test.
+
+**Third hypothesis, also fixed in advance: a FAST APPROACH** — the stock
+moved more than 4.2% toward its line in the 3 sessions before entry
+(`replay.approach_move`, `golive.FAST_APPROACH_PCT`). On 3,446 replayed
+triggers the fastest fifth reached the line within 3 sessions 40% of the time
+against 22%, and ran +5.1% vs −2.9% a trade as a naked ATM option — the one
+precursor that beat the wrong-way control (4.2 = the 2020-22 cut; 2023-26 held).
+About 1 trade in 5 is fast, so live cannot prove it; at 100 it must not
+CONTRADICT the replay (fast mean >= rest mean). A fast-only filter is a go-live
+candidate only if the main test passes. Section 10. The FIRST signal on a line
+touches faster but earns no more — not a filter.
+
+**The plain touch rate carries NO directional information** (independent
+review 2026-09-25): the line is touched within 30 sessions 66.7% of the time,
+but the same distance the WRONG way is hit 64.9% of the time and a driftless
+random walk predicts 63.6%. Never quote the touch rate as evidence of an edge.
+
++12% is two standard errors at n=100 when one trade swings ~59%. **No early
+stop, no verdict before 100, no rule changes mid-test** (a change to entry,
+exit or vetting is logged in the plan with its date and reported before/after).
+
+**Nothing about capital or limits is decided before the gate.** A capital
+figure, position limit, per-trade size and monthly loss cap were proposed on
+2026-09-24 and **withdrawn** on 2026-09-25: they were computed at Rs 5K per
+trade, and one naked lot costs Rs 7.5K-36K (median ~Rs 18K), so none of them
+applied. Size for the book that passes, after it passes.
+
+**Vetting quality** is read in section 8, descriptively: proving a 5-point
+vetting edge would take ~800 signals per group. The one pre-set trigger: with
+>= 50 vetoed setups replayed, vetoed averaging >= 10 points ABOVE allowed means
+the agent turns away better trades than it takes — review it.
+
 ### Go-live decision pack — `python -m zebra golive` (2026-09-24)
 
-Owner: at go-live we choose **the structure (naked or spread), the capital,
-the max positions, any change to the stop, and whether a trade can be too
-expensive (high IV) to take** — measured over the next 30-50 trades. The pack
-answers each from the forward shadow, read-only:
+Owner (2026-09-24): at go-live we choose **the structure (naked or spread),
+the capital, the max positions, any change to the stop, and whether a trade can
+be too expensive (high IV) to take**. Since 2026-09-25 those choices wait for
+THE 100-TRADE TEST above, which the pack prints FIRST; sections 2-6 are
+measurements for after it, not inputs to it. Read-only:
 
 | section | answers | built from |
 |---|---|---|
@@ -1007,14 +1073,23 @@ answers each from the forward shadow, read-only:
 | 4 stop | any stop level | `ladder` on the no-stop `naked_hold` arm: first breach at each of `shadow_stop_ladder` (30-70%), under the live opening blindness; overnight breaches flagged as GAPS |
 | 5 per-trade capital | a ceiling on one trade's capital | skip trades above it |
 | 6 bands | avoid high-IV / high-VIX / expensive names? | `context` stamped at shadow open: India VIX, the long's IV (Black-Scholes off the mid, `zebra/ivcalc.py`), premium % spot, DTE, capital |
+| 7 selection | do live's filters pick better trades? | the test trades vs `replay.replay_window` over the same entry dates |
+| 8 vetting | are the vetoes turning away worse trades? | every allowed / vetoed setup replayed naked from its trigger (`replay.replay_record`), ONE row per setup (stock, direction, ST line); `veto_shadow` labels alongside |
+| 9 time exit | would "exit at the close of session 3 unless the target was hit" have done better on the same trades? | `naked_long` session-close `marks` (value paths before 2026-09-25); paired gain ± SE, trades cut, cut-then-TP; N=1,2 shown only |
+| 10 approach | do trades that RAN at the line before entry do better? | test trades split at `FAST_APPROACH_PCT` by `replay.approach_move` from the candle cache; unknown when candles are missing |
+
+`--refresh` tops up the daily candle cache (`playbook/backtest_cache`) from
+Kite before the replay; the header prints how far the cache reaches. The
+replay is a yardstick for AVERAGES — on a single trade its size can be 20-50
+points off the live price.
 
 **Capital means what is tied up AT ONCE**, never the sum of premiums (owner's
 correction 2026-09-24 — the sum charged the same rupee several times over).
 Whole-cohort replay that day: naked peak Rs 1.77L with 10 open, net
 +Rs 81,472 = +46% on peak (+43% under the stress); the spread +8% and **−3%
 under the stress**. VIX is only captured from 2026-09-24 on; the stop ladder
-likewise. Every group under 10 rows prints `(thin)`, and the pack says NOT
-YET DECIDABLE until 30 resolved `naked_long` rows exist.
+likewise. Every group under 10 rows prints `(thin)`, and the verdict line
+reads IN PROGRESS until the test reaches 100.
 
 **It is a separate book (`logs/shadow_structures.json`) because a shadow
 OUTLIVES its parent.** That is the point: `naked_runner` gets interesting after
@@ -1736,7 +1811,8 @@ python -m zebra depth         # depth at the touch — the lot-scaling evidence
 python -m zebra spotstop      # adverse-spot stop, SHADOWED — the firing count
 python -m zebra shadow        # alternative STRUCTURES, SHADOWED — the arm scorecard
 python -m zebra shadow --backfill   # seed OPEN positions from stored value paths
-python -m zebra golive        # go-live DECISION PACK: structure, capital, positions, stop, IV/VIX
+python -m zebra golive        # go-live DECISION PACK: the 100-trade test first, then structure, capital, ...
+python -m zebra golive --refresh   # same, after topping up the candle cache from Kite
 python -m zebra reentry      # same-stock re-entries vs first entries — TAGGED, never blocked
 python -m zebra trigger ID    # force alert on a watching signal
 python -m zebra enter ID --pair K_L/K_S --debit X --lots N --expiry YYYY-MM-DD

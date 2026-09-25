@@ -189,6 +189,9 @@ SHORT_LEGS = ('short', 'wide')
 #: The arm that carries the stop ladder: no stop of its own, so its path is
 #: observed through every loss level until TP or TIME.
 LADDER_ARM = 'naked_hold'
+#: The arm that records a session close mark (`marks`): the one the 100-trade
+#: test scores, so its time-exit variant differs from it in one respect only.
+MARKS_ARM = 'naked_long'
 
 VIX_SYMBOL = 'NSE:INDIA VIX'
 
@@ -729,6 +732,13 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
             v = arm_value(arm, lq, asq, a.get('width') or sh.get('width'))[0]
         if v is not None and v > a.get('peak', 0):
             a['peak'] = round(float(v), 4)
+        # The SESSION CLOSE MARK for the time-exit hypothesis of the 100-trade
+        # test (docs/NAKED_100_TRADE_TEST.md): the last priced poll of each
+        # session, overwritten through the day, so "exit at the close of
+        # session N" can be scored on a price this arm could have sold at. A
+        # measurement only -- nothing here reads it to decide an exit.
+        if key == MARKS_ARM and v is not None:
+            a.setdefault('marks', {})[today.isoformat()] = {'at': ts, 'value': round(float(v), 4)}
         if 'ladder' in a and v is not None and value_armed:
             for frac in cfg.SHADOW_STOP_LADDER:
                 k = ladder_key(frac)
