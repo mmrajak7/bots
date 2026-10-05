@@ -1112,12 +1112,22 @@ arm no replay of existing data can ever answer. Nothing here can place an
 order, send a Telegram, or write to `zebra_trades.json`, and a test asserts
 that structurally rather than trusting the docstring.
 
-Guards inherited from the live engine, not re-derived: prices at the side
-actually traded against, refuses an unreliable book instead of booking,
-value stops dark for the opening 15 minutes, spot triggers dark in the cash
-closing auction, a booked exit never re-priced, TIME fires even when nothing
-quotes. Arms carry their own `fills` count (2 for naked vs 4 for the spread)
-so a gross comparison cannot flatter the four-legged one.
+**The shadow closes the way live closes (owner, 2026-10-05: "shadow should
+close same as live - then there is no purpose").** Every arm runs the live
+cascade in the live order — TP, TRAIL, STOP, TIME — with the live guards:
+prices at the side actually traded against, refuses an unreliable book,
+value exits dark for the opening 15 minutes AND confirmed over 2 consecutive
+polls (`DEBIT_SL_CONFIRM_POLLS`), TIME held through the opening buffer, the TP
+read on spot INCLUDING inside the cash closing auction (live reads it there),
+an unpriced TP latch lapsing at the end of its session, the live trail on the
+vertical arms (`spread_hold`, `spread_wide`), a booked exit never re-priced.
+The stop ladder books each level on the confirming poll too. **Not
+replicated:** the exit vet (an agent) and the `_spot_corroborates` veto. Naked
+arms have no trail — the live trail is a fraction of MAX GAIN, which a naked
+long does not have. Before 2026-10-05 the shadow stopped on the first breach,
+booked TIME on the 09:15 prints and had no trail; rows closed before that date
+ran the older rules. Arms carry their own `fills` count (2 for naked vs 4 for
+the spread) so a gross comparison cannot flatter the four-legged one.
 
 **Columns that stop the count flattering itself.** `partial` marks a shadow
 opened materially after its parent entered — its stop may already have fired

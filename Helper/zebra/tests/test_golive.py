@@ -120,16 +120,20 @@ def test_only_the_no_stop_arm_carries_a_ladder():
     assert all('ladder' not in a for k, a in sh['arms'].items() if k != ss.LADDER_ARM)
 
 
-def test_the_ladder_keeps_the_FIRST_breach_of_each_level():
+def test_the_ladder_books_each_level_where_the_live_stop_would():
+    """The CONFIRMING poll of the live debounce (2 consecutive breaches), not
+    the first touch -- so l50 is exactly what naked_long's stop books."""
     sh = _shadow()                                    # naked entry 4.0
     ss.poll_one(sh, 99.0, _q(2.7, 2.8), _q(1, 1.1), MID, TODAY)           # -32.5%
     ss.poll_one(sh, 98.0, _q(2.3, 2.4), _q(1, 1.1),
                 datetime(2026, 9, 10, 12, 35), TODAY)                     # -42.5%
     ss.poll_one(sh, 97.0, _q(1.0, 1.1), _q(1, 1.1),
                 datetime(2026, 9, 10, 12, 40), TODAY)                     # -75%
+    ss.poll_one(sh, 97.0, _q(0.9, 1.0), _q(1, 1.1),
+                datetime(2026, 9, 10, 12, 45), TODAY)                     # -77.5%
     lad = sh['arms'][ss.LADDER_ARM]['ladder']
-    assert lad['l30']['value'] == 2.7 and lad['l40']['value'] == 2.3
-    assert lad['l50']['value'] == lad['l70']['value'] == 1.0
+    assert lad['l30']['value'] == 2.3 and lad['l40']['value'] == 1.0
+    assert lad['l50']['value'] == lad['l70']['value'] == 0.9
     assert sh['arms'][ss.LADDER_ARM]['status'] == 'open'   # it has no stop
 
 
@@ -144,6 +148,7 @@ def test_a_breach_on_the_first_armed_poll_of_a_session_is_a_gap():
     ss.poll_one(sh, 100.0, _q(3.9, 4.0), _q(1, 1.1), datetime(2026, 9, 9, 14, 0), date(2026, 9, 9))
     ss.poll_one(sh, 95.0, _q(1.5, 1.6), _q(1, 1.1), datetime(2026, 9, 10, 9, 31), TODAY)
     ss.poll_one(sh, 94.0, _q(1.1, 1.2), _q(1, 1.1), datetime(2026, 9, 10, 9, 36), TODAY)
+    ss.poll_one(sh, 94.0, _q(1.1, 1.2), _q(1, 1.1), datetime(2026, 9, 10, 9, 41), TODAY)
     lad = sh['arms'][ss.LADDER_ARM]['ladder']
     assert lad['l50']['gap'] is True           # overnight: first armed poll
     assert lad['l70']['gap'] is False          # reached during the session
@@ -248,7 +253,7 @@ def test_the_ladders_50_level_books_what_the_live_50_stop_books():
                     datetime(2026, 9, 10, h, m), TODAY)
     stop = sh['arms']['naked_long']['exit']
     assert stop['reason'] == 'stop'
-    assert sh['arms'][ss.LADDER_ARM]['ladder']['l50']['value'] == stop['value'] == 1.9
+    assert sh['arms'][ss.LADDER_ARM]['ladder']['l50']['value'] == stop['value'] == 1.2
 
 
 # -- review fixes 2026-09-24 -------------------------------------------------
@@ -258,6 +263,7 @@ def test_a_mid_session_first_poll_is_not_an_overnight_gap():
     level was watched from entry -- nothing overnight happened to it."""
     sh = _shadow()
     ss.poll_one(sh, 95.0, _q(1.5, 1.6), _q(1, 1.1), datetime(2026, 9, 10, 11, 0), TODAY)
+    ss.poll_one(sh, 95.0, _q(1.5, 1.6), _q(1, 1.1), datetime(2026, 9, 10, 11, 5), TODAY)
     assert sh['arms'][ss.LADDER_ARM]['ladder']['l50']['gap'] is False
 
 
@@ -580,7 +586,8 @@ def test_a_future_trade_is_captured_end_to_end(weekdays):
         d = date.fromisoformat(day)
         for h, m in ((12, 30), (15, 20)):
             ss.poll_one(sh, 100.2, _q(3.6, 3.7), _q(1, 1.1), datetime(d.year, d.month, d.day, h, m), d)
-    ss.poll_one(sh, 99.0, _q(1.9, 2.0), _q(0.5, 0.6), datetime(2026, 9, 8, 12, 0), date(2026, 9, 8))
+    for m in (0, 5):                                       # the live debounce
+        ss.poll_one(sh, 99.0, _q(1.9, 2.0), _q(0.5, 0.6), datetime(2026, 9, 8, 12, m), date(2026, 9, 8))
     a = sh['arms'][ss.MARKS_ARM]
     assert a['status'] == 'exited' and a['exit']['reason'] == 'stop'
     assert sorted(a['marks']) == days          # the 12:00 stop poll is not a close

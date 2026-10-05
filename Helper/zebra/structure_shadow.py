@@ -100,10 +100,19 @@ half that. Holding period is surfaced per arm, fees come from the real model
 per leg, and an arm whose fee cannot be computed reports UNCOSTED rather than
 free.
 
-**Acting on a print the engine itself would not act on.** Value stops stand
-down for `VALUE_TRIGGER_OPEN_BUFFER_SEC` after the open -- both incidents that
-cost real money were on the first prints of a session. Spot triggers stand
-down inside the cash closing auction, where spot is frozen by design.
+**Exiting by a different rule than live.** Owner, 2026-10-05: *"shadow should
+close same as live - then there is no purpose"* otherwise. An arm that exits
+differently measures the exit rule, not the structure. So every arm runs the
+live cascade in the live order (TP, TRAIL, STOP, TIME), with the live guards:
+value exits dark for `VALUE_TRIGGER_OPEN_BUFFER_SEC` after the open (both
+incidents that cost real money were on first prints) and confirmed over
+`DEBIT_SL_CONFIRM_POLLS` consecutive polls; TIME held through that buffer; the
+TP read on spot INCLUDING inside the cash closing auction, because live reads
+it there; an unpriced TP latch lapsing at the end of its session; and the live
+trail on the vertical arms. Two live guards are NOT replicated and are the
+known residual difference: the exit vet (a Claude agent, not replayable) and
+the `_spot_corroborates` veto. Naked arms have no trail because the live trail
+is defined on MAX GAIN, which a naked long does not have.
 
 **A head that was never observed.** A shadow opened after its parent entered
 has missed part of the path, so its stop may already have fired unseen.
@@ -155,6 +164,7 @@ from common.nse_holidays import sessions_between
 
 from . import config as cfg
 from . import ivcalc
+from . import mfe as mfe_mod
 from . import strikes as strikes_mod
 from .trade_store import in_cohort
 
@@ -172,12 +182,18 @@ STATE_FILE = cfg.LOG_DIR / 'shadow_structures.json'
 #: cash/futures position, so the option fee model does not describe it and
 #: netting it at option rates would invent a cost it would not pay. It is here
 #: to size the prize, not to be traded.
+#: `trail` gives a vertical arm the live engine's trail (`mfe.trail_levels`
+#: arithmetic). Only verticals carry it: the trail is defined as a fraction of
+#: MAX GAIN, which a naked long does not have, so no naked arm can run the live
+#: rule -- that difference is structural, not an omission.
 ARMS = {
     'naked_long':   {'legs': ('long',),         'tp': True,  'stop_frac': 0.50, 'fills': 2},
     'naked_hold':   {'legs': ('long',),         'tp': True,  'stop_frac': None, 'fills': 2},
     'naked_runner': {'legs': ('long',),         'tp': False, 'stop_frac': None, 'fills': 2},
-    'spread_hold':  {'legs': ('long', 'short'), 'tp': True,  'stop_frac': None, 'fills': 4},
-    'spread_wide':  {'legs': ('long', 'wide'),  'tp': True,  'stop_frac': 0.50, 'fills': 4},
+    'spread_hold':  {'legs': ('long', 'short'), 'tp': True,  'stop_frac': None, 'fills': 4,
+                     'trail': True},
+    'spread_wide':  {'legs': ('long', 'wide'),  'tp': True,  'stop_frac': 0.50, 'fills': 4,
+                     'trail': True},
     'delta1':       {'legs': (),                'tp': True,  'stop_frac': None, 'fills': 0,
                      'reference': True},
 }
@@ -367,6 +383,68 @@ def _within_open_buffer(now: datetime) -> bool:
     since = (now.hour * 3600 + now.minute * 60 + now.second) \
         - (open_h * 3600 + open_m * 60)
     return 0 <= since < cfg.VALUE_TRIGGER_OPEN_BUFFER_SEC
+
+
+def _trail_level(a: dict, width: Optional[float]) -> Optional[float]:
+    """The live trail's exit level for a vertical arm, or None while unarmed.
+
+    Same arithmetic as `mfe.trail_levels`, on the arm's own entry value, width
+    and TRAIL peak: armed once the peak gain reaches TRAIL_ENGAGE_FRAC of max
+    gain, exits at entry + TRAIL_RETAIN_FRAC of the peak gain. The peak is the
+    jump-gated one (`_advance_trail_peak`), never the raw `peak`: one garbage-
+    high print would otherwise arm a trail the position never earned.
+    """
+    if not cfg.TRAIL_ENABLED:
+        return None
+    ev, peak = a.get('entry_value'), (a.get('trail_peak') or {}).get('peak')
+    if not (ev and width and peak is not None):
+        return None
+    max_gain = float(width) - float(ev)
+    peak_gain = float(peak) - float(ev)
+    if max_gain <= 0 or peak_gain < max_gain * cfg.TRAIL_ENGAGE_FRAC:
+        return None
+    return float(ev) + peak_gain * cfg.TRAIL_RETAIN_FRAC
+
+
+def _advance_trail_peak(a: dict, v: float, now: datetime) -> None:
+    """Advance the arm's trail peak with the live engine's own gate
+    (`mfe._peak_update`): a rise beyond MFE_JUMP_MULT must repeat over
+    MFE_CONFIRM_POLLS, and the most conservative reading of that window is the
+    one stored. The poll's own clock is used, so a backfill replay judges
+    staleness on the observation times rather than on wall time."""
+    st = a.setdefault('trail_peak', {'peak': None, 'at': None, 'cand_n': 0,
+                                     'cand_v': None, 'cand_t': 0.0})
+    mfe_mod._peak_update(st, float(v), float(a['entry_value']),
+                         lambda p: p + abs(p) * (cfg.MFE_JUMP_MULT - 1.0),
+                         now.timestamp(), now.strftime('%Y-%m-%d %H:%M:%S'))
+
+
+def _bump(c: dict, kind: str, now: datetime) -> int:
+    """`ZebraStore.bump_confirm` on a plain dict: a streak whose last hit is
+    older than CONFIRM_STALE_SEC restarts, so a breach at 15:25 cannot pair
+    with one at 09:30 the next morning. The poll's own clock, so a backfill
+    replay judges the gap on observation times."""
+    t = now.timestamp()
+    n = c.get(kind) or {}
+    if t - float(n.get('t', 0.0)) > cfg.CONFIRM_STALE_SEC:
+        n = {}
+    c[kind] = {'n': int(n.get('n', 0)) + 1, 't': t}
+    return c[kind]['n']
+
+
+def _confirmed(a: dict, kind: str, breached: Optional[bool], now: datetime) -> bool:
+    """The live engine's debounce: a value exit needs DEBIT_SL_CONFIRM_POLLS
+    breaching polls. `breached=None` (no usable price, or the opening buffer)
+    FREEZES the count rather than resetting it -- the live rule, so a
+    flickering book cannot block a genuine exit for ever; a non-breaching
+    usable poll resets it."""
+    c = a.setdefault('confirm', {})
+    if breached is None:
+        return False
+    if not breached:
+        c.pop(kind, None)
+        return False
+    return _bump(c, kind, now) >= cfg.DEBIT_SL_CONFIRM_POLLS
 
 
 def _sessions_left(expiry, today: date) -> Optional[int]:
@@ -679,7 +757,8 @@ def _close(sh: dict, key: str, reason: str, value: Optional[float],
     # When the trigger FIRED. A latched exit books at a later priced poll;
     # without this the time-exit test would score a TP that fired on time as
     # one that came too late.
-    fired = (a.pop('pending', None) or {}).get('since') or ts
+    pend = a.pop('pending', None) or {}
+    fired = (pend.get('since') if pend.get('reason') == reason else None) or ts
     a['exit'] = {
         'reason': reason, 'at': ts, 'triggered_at': fired,
         'spot': None if spot is None else round(float(spot), 2),
@@ -711,10 +790,14 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
     ts = now.strftime('%Y-%m-%d %H:%M:%S')
     sh['polls'] = sh.get('polls', 0) + 1
     direction = sh.get('direction')
-    # Spot is frozen BY DESIGN inside the cash closing auction, so a spot
-    # trigger read there is a statement about a price that cannot print.
-    spot_live = (spot is not None and spot > 0
-                 and not market_session.cash_price_is_frozen(now))
+    # The TP reads spot exactly as the live engine does -- INCLUDING inside the
+    # cash closing auction, where spot is frozen. Owner, 2026-10-05: "shadow
+    # should close same as live - then there is no purpose" otherwise; an arm
+    # that exits by a different rule measures the rule, not the structure.
+    # Only delta1's VALUATION still stands down there: it marks a cash position
+    # at spot, and a frozen print is not a price that position could trade at.
+    spot_ok = spot is not None and spot > 0
+    spot_live = spot_ok and not market_session.cash_price_is_frozen(now)
     value_armed = not _within_open_buffer(now)
     left = _sessions_left(sh.get('expiry'), today)
     # The first poll of a session at which a value stop may act, on a shadow
@@ -739,6 +822,8 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
             v = arm_value(arm, lq, asq, a.get('width') or sh.get('width'))[0]
         if v is not None and v > a.get('peak', 0):
             a['peak'] = round(float(v), 4)
+        if arm.get('trail') and v is not None:
+            _advance_trail_peak(a, v, now)
         # The SESSION CLOSE MARK for the time-exit hypothesis of the 100-trade
         # test (docs/NAKED_100_TRADE_TEST.md): the last priced poll of each
         # session, overwritten through the day, so "exit at the close of
@@ -747,12 +832,29 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
         if key == MARKS_ARM and v is not None and now.strftime('%H:%M') >= MARKS_FROM:
             a.setdefault('marks', {})[today.isoformat()] = {'at': ts, 'value': round(float(v), 4)}
         if 'ladder' in a and v is not None and value_armed:
+            # Each level books where the LIVE stop would: on the confirming
+            # poll of the debounce, not the first breach. `gap` is about the
+            # first breach -- an overnight one is a gap however it confirms.
+            pend_l = a.setdefault('ladder_confirm', {})
             for frac in cfg.SHADOW_STOP_LADDER:
                 k = ladder_key(frac)
-                if k not in a['ladder'] and v <= a['entry_value'] * (1.0 - frac):
+                if k in a['ladder']:
+                    continue
+                if v > a['entry_value'] * (1.0 - frac):
+                    pend_l.pop(k, None)
+                    continue
+                # `gap` belongs to the breach that STARTS the streak; a stale
+                # streak restarts, and so does its gap flag.
+                prev = pend_l.get(k) or {}
+                if _bump(pend_l, k, now) == 1:
+                    pend_l[k]['gap'] = bool(first_armed)
+                else:
+                    pend_l[k]['gap'] = prev.get('gap', bool(first_armed))
+                if pend_l[k]['n'] >= cfg.DEBIT_SL_CONFIRM_POLLS:
                     a['ladder'][k] = {'at': ts, 'value': round(float(v), 4),
                                       'spot': None if spot is None else round(float(spot), 2),
-                                      'gap': bool(first_armed)}
+                                      'gap': pend_l[k]['gap']}
+                    pend_l.pop(k, None)
 
         expired = left is not None and left <= 0
 
@@ -768,10 +870,20 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
         #
         # So the trigger LATCHES and the booking waits for a price, which is
         # the same rule the live engine already runs on ("paper never books a
-        # price it could not have transacted at"). The latch is not released
-        # if the condition later stops holding: the trigger did fire, and
-        # re-deciding it on a later print would be a different rule.
+        # price it could not have transacted at").
         pend = a.get('pending')
+        if pend and pend['reason'] == 'tp' and str(pend.get('since'))[:10] != today.isoformat():
+            # The live TP latch arms for its OWN SESSION only (owner,
+            # 2026-08-28). A touch that never found a price lapses overnight
+            # and the exit goes back to the live spot comparison below.
+            a.setdefault('tp_latch_expired', []).append(pend.get('since'))
+            a.pop('pending', None)
+            pend = None
+        if pend and pend['reason'] == 'time':
+            # TIME is re-evaluated by the cascade every poll, AFTER TP and the
+            # value exits, exactly where live evaluates it. Kept only as the
+            # record of when it first fired; it never blocks a TP.
+            pend = None
         if pend:
             if v is not None:
                 _close(sh, key, pend['reason'], v, spot, ts, lq, asq)
@@ -782,28 +894,39 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
                 _close(sh, key, pend['reason'], None, spot, ts, lq, asq)
             continue
 
-        # TIME first, because it is a statement about the CALENDAR rather than
-        # about a price: it has to fire on a session where nothing quotes, or a
-        # blind spell at expiry leaves an arm open past its own contract.
-        if left is not None and left <= cfg.TIME_SL_DAYS:
-            if v is not None:
-                _close(sh, key, 'time', v, spot, ts, lq, asq)
-            elif expired:
-                _close(sh, key, 'time', None, spot, ts, lq, asq)
-            else:
-                a['pending'] = {'reason': 'time', 'since': ts}
-            continue
-        if arm['tp'] and spot_live and _tp_hit(direction, spot, sh['target_spot']):
+        # The live cascade, in the live ORDER: TP, TRAIL, STOP, then TIME.
+        if arm['tp'] and spot_ok and _tp_hit(direction, spot, sh['target_spot']):
             if v is not None:
                 _close(sh, key, 'tp', v, spot, ts, lq, asq)
             else:
                 a['pending'] = {'reason': 'tp', 'since': ts}
             continue
-        # The stop is the one trigger that CANNOT arrive unpriced: it is
-        # defined on `v`, so reaching here at all means there was a price.
-        if (arm['stop_frac'] is not None and value_armed and v is not None
-                and v <= a['entry_value'] * arm['stop_frac']):
-            _close(sh, key, 'stop', v, spot, ts, lq, asq)
+        # Value exits use the live debounce and stand down in the opening
+        # buffer; no usable price freezes the count (`_confirmed`).
+        usable = v is not None and value_armed
+        if arm.get('trail'):
+            lvl = _trail_level(a, a.get('width') or sh.get('width'))
+            if _confirmed(a, 'trail', (v <= lvl) if (usable and lvl is not None) else
+                          (False if usable else None), now):
+                _close(sh, key, 'trail', v, spot, ts, lq, asq)
+                continue
+        if arm['stop_frac'] is not None:
+            if _confirmed(a, 'stop', (v <= a['entry_value'] * arm['stop_frac'])
+                          if usable else None, now):
+                _close(sh, key, 'stop', v, spot, ts, lq, asq)
+                continue
+        # TIME is a statement about the CALENDAR rather than about a price: it
+        # FIRES on a session where nothing quotes, so a blind spell at expiry
+        # cannot leave an arm open past its own contract. Like live, the close
+        # is held until the opening buffer has passed -- every `paper:time`
+        # exit used to price on the 09:15 auction prints.
+        if left is not None and left <= cfg.TIME_SL_DAYS:
+            if v is not None and value_armed:
+                _close(sh, key, 'time', v, spot, ts, lq, asq)
+            elif expired and v is None:
+                _close(sh, key, 'time', None, spot, ts, lq, asq)
+            elif not a.get('pending'):
+                a['pending'] = {'reason': 'time', 'since': ts}
     if value_armed:
         sh['armed_day'] = today.isoformat()
 

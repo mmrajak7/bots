@@ -219,8 +219,11 @@ def test_the_real_book_narrows_to_the_cohort():
     book = json.loads(book_path.read_text())
     s, d = scored(book), decided(book)
     assert len(book) > 400, 'the legacy records are still on disk, as intended'
-    assert len(s) < 50, 'scored() is not narrowing — %d of %d' % (len(s),
-                                                                 len(book))
+    # Measured as what is EXCLUDED, not as a ceiling on the cohort: the cohort
+    # grows every week and passed the old `< 50` on 2026-10-05, while the
+    # legacy book it must leave out stays fixed at 400+.
+    assert len(book) - len(s) > 400, 'scored() is not narrowing — %d of %d' % (
+        len(s), len(book))
     assert all(t.get('cohort') for t in s)
     assert len(d) >= len(s), 'decisions are a superset of results'
     assert all(t.get('status') != 'exited' or t.get('cohort') for t in d), (

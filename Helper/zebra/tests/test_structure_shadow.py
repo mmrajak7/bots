@@ -84,7 +84,8 @@ def test_a_booked_exit_is_never_repriced():
     """A stop fires once. Re-pricing it on a later, deeper print re-prices the
     counterfactual to something no stop would ever have got."""
     sh = _shadow()
-    ss.poll_one(sh, 100.0, _q(1.0, 1.2), _q(0.4, 0.5), MID_SESSION, TODAY)
+    for _ in range(2):                                  # the live debounce
+        ss.poll_one(sh, 100.0, _q(1.0, 1.2), _q(0.4, 0.5), MID_SESSION, TODAY)
     first = dict(sh['arms']['naked_long']['exit'])
     assert first['reason'] == 'stop'
     ss.poll_one(sh, 100.0, _q(0.1, 0.2), _q(0.05, 0.1), MID_SESSION, TODAY)
@@ -99,18 +100,26 @@ def test_value_stops_stand_down_in_the_opening_buffer():
     at_open = datetime(2026, 9, 10, 9, 20, 0)          # inside the 900s buffer
     ss.poll_one(sh, 100.0, _q(1.0, 1.2), _q(0.4, 0.5), at_open, TODAY)
     assert sh['arms']['naked_long']['status'] == 'open'
-    ss.poll_one(sh, 100.0, _q(1.0, 1.2), _q(0.4, 0.5), MID_SESSION, TODAY)
+    assert 'stop' not in sh['arms']['naked_long'].get('confirm', {})   # not counted
+    for _ in range(2):
+        ss.poll_one(sh, 100.0, _q(1.0, 1.2), _q(0.4, 0.5), MID_SESSION, TODAY)
     assert sh['arms']['naked_long']['status'] == 'exited'
 
 
-def test_spot_triggers_stand_down_in_the_cash_closing_auction(monkeypatch):
-    """Spot cannot print between 15:15 and 15:35, so a TP read there is a claim
-    about a price that does not exist."""
+def test_the_tp_fires_in_the_cash_closing_auction_exactly_as_live(monkeypatch):
+    """Owner, 2026-10-05: the shadow closes the way live closes, or it measures
+    the rule instead of the structure. Live reads spot for its TP inside the
+    auction, so the option arms take the TP there too. Only delta1, which is
+    VALUED at spot, cannot be priced on a frozen print -- it latches and books
+    on the next live one."""
     monkeypatch.setattr(ss.market_session, 'cash_price_is_frozen',
                         lambda now=None: True)
     sh = _shadow()
     ss.poll_one(sh, 999.0, _q(5.0, 6.0), _q(1.0, 1.2), MID_SESSION, TODAY)
-    assert all(a['status'] == 'open' for a in sh['arms'].values())
+    assert sh['arms']['naked_long']['exit']['reason'] == 'tp'
+    assert sh['arms']['spread_hold']['exit']['reason'] == 'tp'
+    assert sh['arms']['delta1']['status'] == 'open'
+    assert sh['arms']['delta1']['pending']['reason'] == 'tp'
 
 
 def test_the_time_stop_fires_even_when_nothing_quotes():
@@ -510,8 +519,9 @@ def test_the_wide_arm_carries_the_live_stop(chain, monkeypatch):
     """One change from the real spread -- the strike -- so it keeps the -50%
     stop. Otherwise a gap would have two candidate causes."""
     sh = _wide_shadow(chain, monkeypatch)
-    ss.poll_one(sh, 100.0, _q(2.4, 2.5), _q(1.0, 1.1), MID_SESSION, TODAY,
-                wq=_q(0.9, 1.0))                          # 2.4 - 1.0 = 1.4 < 1.5
+    for _ in range(2):                                    # the live debounce
+        ss.poll_one(sh, 100.0, _q(2.4, 2.5), _q(1.0, 1.1), MID_SESSION, TODAY,
+                    wq=_q(0.9, 1.0))                      # 2.4 - 1.0 = 1.4 < 1.5
     assert sh['arms']['spread_wide']['exit']['reason'] == 'stop'
 
 
@@ -671,3 +681,101 @@ def test_a_stale_chain_is_named_as_such_not_as_a_missing_strike(chain, monkeypat
     assert arm is None and why == 'expiry_not_in_chain'
     arm, why = ss._open_wide(_wide_trade(short_strike=110.0), object())
     assert why == 'no_strike_beyond_short'
+
+
+# -- the shadow closes the way live closes (owner, 2026-10-05) ---------------
+
+def test_a_stop_needs_the_live_confirmations_and_a_recovery_resets_them():
+    sh = _shadow()
+    ss.poll_one(sh, 100.0, _q(1.0, 1.2), _q(0.4, 0.5), MID_SESSION, TODAY)
+    assert sh['arms']['naked_long']['status'] == 'open'          # 1 of 2
+    ss.poll_one(sh, 100.0, _q(3.0, 3.2), _q(0.4, 0.5), MID_SESSION, TODAY)
+    assert 'stop' not in sh['arms']['naked_long']['confirm']    # recovered: reset
+    ss.poll_one(sh, 100.0, _q(1.0, 1.2), _q(0.4, 0.5), MID_SESSION, TODAY)
+    assert sh['arms']['naked_long']['status'] == 'open'          # 1 of 2 again
+    ss.poll_one(sh, 100.0, None, None, MID_SESSION, TODAY)       # no book: FREEZE
+    assert sh['arms']['naked_long']['confirm']['stop']['n'] == 1
+    ss.poll_one(sh, 100.0, _q(1.0, 1.2), _q(0.4, 0.5), MID_SESSION, TODAY)
+    assert sh['arms']['naked_long']['exit']['reason'] == 'stop'
+
+
+def test_time_is_held_through_the_opening_buffer_like_live():
+    """Every `paper:time` exit once priced on the 09:15 auction prints; live
+    now holds the close until the buffer passes, and so must the shadow."""
+    sh = _shadow(expiry='2026-09-14')                  # inside TIME_SL_DAYS
+    at_open = datetime(2026, 9, 10, 9, 15, 40)
+    ss.poll_one(sh, 100.0, _q(3.0, 3.2), _q(1.0, 1.1), at_open, TODAY)
+    assert sh['arms']['naked_runner']['status'] == 'open'
+    assert sh['arms']['naked_runner']['pending']['reason'] == 'time'
+    ss.poll_one(sh, 100.0, _q(3.0, 3.2), _q(1.0, 1.1), MID_SESSION, TODAY)
+    assert sh['arms']['naked_runner']['exit']['reason'] == 'time'
+
+
+def test_an_unpriced_tp_latch_lapses_overnight_like_live():
+    """Live's latch arms for its own session only. Next day the exit goes back
+    to the live spot comparison instead of booking a stale touch."""
+    sh = _shadow()
+    ss.poll_one(sh, 104.5, None, None, MID_SESSION, TODAY)          # touch, no book
+    assert sh['arms']['naked_long']['pending']['reason'] == 'tp'
+    tomorrow = MID_SESSION + timedelta(days=1)
+    ss.poll_one(sh, 101.0, _q(4.5, 4.6), _q(2.0, 2.1), tomorrow, tomorrow.date())
+    a = sh['arms']['naked_long']
+    assert a['status'] == 'open' and 'pending' not in a
+    assert a['tp_latch_expired']
+
+
+def test_a_vertical_arm_runs_the_live_trail():
+    """`spread_hold` is the live spread minus the stop, so it keeps the trail;
+    entry 2.0, width 4.0, max gain 2.0, engage at 25% = peak 2.5, level =
+    2.0 + 0.5 * peak gain."""
+    from zebra import config as cfg
+    sh = _shadow()
+    ss.poll_one(sh, 101.0, _q(4.0, 4.1), _q(0.9, 1.0), MID_SESSION, TODAY)   # 3.0 peak
+    lvl = 2.0 + (3.0 - 2.0) * cfg.TRAIL_RETAIN_FRAC
+    for _ in range(cfg.DEBIT_SL_CONFIRM_POLLS):
+        ss.poll_one(sh, 101.0, _q(3.4, 3.5), _q(1.0, 1.1), MID_SESSION, TODAY)  # 2.3
+    a = sh['arms']['spread_hold']
+    assert 2.3 <= lvl and a['exit']['reason'] == 'trail'
+    assert 'trail' not in ss.ARMS['naked_long'] and 'trail' not in ss.ARMS['naked_hold']
+
+
+def test_a_stop_streak_does_not_pair_across_the_night():
+    """Live restarts a confirmation streak older than CONFIRM_STALE_SEC, so a
+    breach at 15:25 and one at the next open are two first breaches."""
+    sh = _shadow()
+    late = datetime(2026, 9, 10, 15, 25)
+    ss.poll_one(sh, 100.0, _q(1.0, 1.2), _q(0.4, 0.5), late, TODAY)
+    nxt = datetime(2026, 9, 11, 9, 35)
+    ss.poll_one(sh, 100.0, _q(1.0, 1.2), _q(0.4, 0.5), nxt, nxt.date())
+    a = sh['arms']['naked_long']
+    assert a['status'] == 'open' and a['confirm']['stop']['n'] == 1
+    ss.poll_one(sh, 100.0, _q(1.0, 1.2), _q(0.4, 0.5), nxt + timedelta(minutes=5), nxt.date())
+    assert a['exit']['reason'] == 'stop'
+
+
+def test_a_pending_time_never_blocks_a_tp():
+    """Live evaluates TP before TIME every cycle. A TIME that fired on a dark
+    book must not swallow a target touched later -- and its first-fire stamp
+    must not be rewritten on every poll."""
+    sh = _shadow(expiry='2026-09-14')                  # inside TIME_SL_DAYS
+    ss.poll_one(sh, 100.0, None, None, MID_SESSION, TODAY)
+    first = sh['arms']['naked_long']['pending']['since']
+    ss.poll_one(sh, 100.0, None, None, MID_SESSION + timedelta(minutes=5), TODAY)
+    assert sh['arms']['naked_long']['pending']['since'] == first
+    ss.poll_one(sh, 104.5, _q(6.0, 6.2), _q(2.0, 2.1),
+                MID_SESSION + timedelta(minutes=10), TODAY)
+    ex = sh['arms']['naked_long']['exit']
+    assert ex['reason'] == 'tp'
+    assert ex['triggered_at'] == ex['at']          # TIME's stamp is not TP's
+
+
+def test_one_garbage_high_print_cannot_arm_the_trail():
+    """The live peak is jump-gated (`mfe._peak_update`): a rise past
+    MFE_JUMP_MULT must repeat. One impossible print followed by a fall must
+    not book a `trail` off a peak that never traded."""
+    sh = _shadow()                                   # spread entry 2.0, width 4.0
+    ss.poll_one(sh, 101.0, _q(3.9, 4.0), _q(0.0, 0.05), MID_SESSION, TODAY)   # 3.85: > 1.5x
+    for m in (5, 10):
+        ss.poll_one(sh, 101.0, _q(3.3, 3.4), _q(1.2, 1.3),
+                    MID_SESSION + timedelta(minutes=m), TODAY)             # 2.0
+    assert sh['arms']['spread_hold']['status'] == 'open'
