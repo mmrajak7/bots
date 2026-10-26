@@ -1020,8 +1020,17 @@ exit with no price counts as −100%; priced but uncosted as gross − 2%.
 
 | at | PASS needs ALL of | FAIL | otherwise |
 |---|---|---|---|
-| 100 trades | mean net >= +12% · beats the replay of every signal over the same entry dates · still positive without the best 3 | mean < +5% | extend ONCE to the first 150 |
-| 150 trades | mean net >= +10% · same two conditions | anything else | — |
+| 100 trades | mean net >= +12% · beats the replay by >= 2 SE of the gap · still positive without the best 3 · regime conditions | mean < +5% | extend ONCE to the first 150 |
+| 150 trades | mean net >= +10% · same three conditions | below +10% or not beating the replay | regime unmet → INCONCLUSIVE, paper continues |
+
+**Regime conditions (added 2026-10-26, at 62 of 100 — they can only stop a
+PASS):** >= 25 closed test trades entered in a NIFTY-up week OR >= 25 CE; and
+the replay over the test's dates at or below the 75th percentile of all
+same-length replay windows since 2020. Why: at 57 paired trades live's +22.9%
+split into replay of every signal +12.6, selection +4.1, pricing +6.2 (mostly
+the replay's own crudeness), and the window was in the top 2.7% of 294 since
+2020 — a falling market, 55 of 58 closes PE. `golive` does not compute these
+yet; read them by hand until the build adds them.
 
 The verdict reads IN PROGRESS until 100 have entered, WAITING until all of them
 have closed and the replay of their window is complete, and BLOCKED (never
@@ -1046,13 +1055,16 @@ corrected replay the fastest fifth ran −7.1% a trade vs −3.1% for the rest
 and hit the wrong-way level more often (81% vs 70%) — speed was volatility, not
 direction. The FIRST signal on a line reaches it faster but earns no more.
 
-**Live limits for the naked build — FROZEN 2026-10-26 (owner).** Cap 8 open
-from day one (shared CE/PE), 1 lot, premium ≤ Rs 25K per trade (skip, never
-resize), no total premium cap, Rs 2.5L capital (a full reversal ≈ 48% of it,
-accepted knowingly). Pause is automatic (4 stops in 3 sessions → 2 sessions
-without entries). Kill (5 straight stops, −25% from peak, fills > 3% worse
-than paper, or the test FAILs) stops NEW entries only, and **only the owner
-restarts it** — no auto-resume. Full table and the replay behind it:
+**Live limits for the naked build — amended 2026-10-26 (owner, after Fable's
+drawdown review).** Cap 8 open, **at most 4 CE and 4 PE**, 1 lot, premium ≤
+Rs 25K per trade (skip, never resize), **Rs 5L capital** (one side gapping
+−85% at the cap ≈ 17% of it). Pause is automatic (4 stops in 3 sessions → 2
+sessions without entries). Kill (−25% from peak equity INCLUDING open marks,
+fills > 3% worse than paper, or the test FAILs) stops NEW entries only, and
+**only the owner restarts it** — the peak resets to equity at the restart.
+The 5-straight-stops kill is DROPPED: a 5-stop streak occurs on 96-100% of
+bootstrap paths at any edge. No regime gate on entry survived out-of-sample
+(Fable, 2024-26) — do not build one. Full table and the replay behind it:
 `docs/NAKED_100_TRADE_TEST.md` §11. The naked live path is NOT built yet
 (design frozen 2026-10-26, `docs/NAKED_LIVE_DESIGN.md`, Windows only). The
 nightly digest carries a "NIFTY ±3% on the open book" section
