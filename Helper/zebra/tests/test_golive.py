@@ -463,8 +463,15 @@ def test_the_arm_records_the_LAST_priced_poll_of_each_session():
     ss.poll_one(sh, 100.5, _q(9.9, 10.0, reliable=False), _q(1, 1.1),
                 datetime(2026, 9, 10, 15, 25), TODAY)            # unusable book: no mark
     marks = sh['arms'][ss.MARKS_ARM]['marks']
-    assert marks == {'2026-09-10': {'at': '2026-09-10 15:00:00', 'value': 4.6}}
+    assert marks == {'2026-09-10': {'at': '2026-09-10 15:00:00', 'value': 4.6, 'spot': 100.5}}
     assert all('marks' not in a for k, a in sh['arms'].items() if k != ss.MARKS_ARM)
+
+
+def test_a_close_mark_without_a_spot_carries_no_spot_rather_than_a_guess():
+    sh = _shadow()
+    ss.poll_one(sh, None, _q(4.6, 4.7), _q(1, 1.1), datetime(2026, 9, 10, 15, 0), TODAY)
+    assert sh['arms'][ss.MARKS_ARM]['marks'] == {
+        '2026-09-10': {'at': '2026-09-10 15:00:00', 'value': 4.6}}
 
 
 @pytest.fixture

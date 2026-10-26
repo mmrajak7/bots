@@ -1337,6 +1337,7 @@ def heartbeat_path() -> Path:
 def write_heartbeat(state: str, dry_run: bool, *, open_trades: int = 0,
                     cohort_trades: int = 0, cohort_store: bool = False,
                     kill_switch: bool = False,
+                    cohort_bookable: Optional[int] = None,
                     now: Optional[float] = None) -> bool:
     """Stamp one poll of the exit engine. Best-effort; never raises.
 
@@ -1367,6 +1368,14 @@ def write_heartbeat(state: str, dry_run: bool, *, open_trades: int = 0,
         # False = the fourth book could not be opened, so cohort positions are
         # not being watched even though this process is alive and armed.
         'cohort_store': bool(cohort_store),
+        # F7 (naked-live design, 2026-10-26). `cohort_trades` counts records
+        # LOADED, and a record `_malformed_reason` quarantines is loaded and
+        # never polled -- so a peer could read "healthy, watching 2" while one
+        # of the two had no stop at all. This counts only the LIVE cohort
+        # records the loop can actually book. None = a writer that predates
+        # the field; the reader then falls back to the old check.
+        'cohort_bookable': (None if cohort_bookable is None
+                            else int(cohort_bookable)),
         'pid': os.getpid(),
     }
     try:
@@ -1399,7 +1408,14 @@ def _beat_all(state: str, dry_run: bool, trades: list, zebra_store,
         cohort_trades=sum(1 for t in trades
                           if t.get('_store_type') == 'zebra'),
         cohort_store=zebra_store is not None,
-        kill_switch=kill_switch)
+        kill_switch=kill_switch,
+        # Same screen the poll loop applies before it touches a record, and
+        # the same paper predicate `close_spread` refuses on: a record counts
+        # only if this engine would actually place its closing orders.
+        cohort_bookable=sum(1 for t in trades
+                            if t.get('_store_type') == 'zebra'
+                            and not _record_says_paper(t)
+                            and _malformed_reason(t) is None))
 
 
 def is_expiry_day(trade: dict, today: Optional[date] = None) -> bool:
@@ -8098,7 +8114,22 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     spot_blind_state = {}  # B12: {(strategy, id): blind dict} — spot, not spread
     abort_until = {}     # {(strategy, id): time.time() before which no valuation/TP closes}
     kill_switch_announced = False   # Telegram the disarm ONCE, not every poll
+    # F6 (naked-live design, 2026-10-26). The poll loop has always skipped a
+    # record `_malformed_reason` names; this startup block did not, and read
+    # `t['short_symbol']` / `t['sl_spread']` with no per-record guard. One
+    # record without a short leg raised here, `monitor_all` exited, cron
+    # restarted it into the same crash every 5 minutes, and EVERY book went
+    # unmonitored. Same screen, same once-only alert set the loop uses, so the
+    # owner hears about the record exactly once per process.
+    malformed_alerted = set()  # (strategy, id) already shouted about
+    readable = []
     for t in all_trades:
+        bad = _malformed_reason(t)
+        if bad:
+            _alert_malformed_record(t, bad, malformed_alerted)
+        else:
+            readable.append(t)
+    for t in readable:
         strat = t['_strategy']
         lots_str = f"{t.get('lots', '?')}x{t.get('lot_size', '?')}"
 
@@ -8151,7 +8182,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     try:
         positions = kite.positions()['net']
     except Exception as e:
-        stocks = ', '.join(f"{t['_strategy']}:{t['stock']}" for t in all_trades)
+        stocks = ', '.join(f"{t.get('_strategy')}:{t.get('stock', '?')}"
+                           for t in all_trades)
         if _is_auth_error(e):
             log(f"FATAL: Kite auth failed at startup: {e}")
             send_telegram(f"🔴 BCS MONITOR CANNOT START\nKite auth failed "
@@ -8166,7 +8198,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
         send_telegram(f"⚠️ BCS MONITOR: startup position check failed ({e}). "
                       f"Monitoring continues for: {stocks}")
         positions = []
-    for t in all_trades:
+    for t in readable:
         strat = t['_strategy']
         warn, msg = position_check_line(t, strat, positions)
         log(("  WARNING: " if warn else "  ") + msg)
@@ -8179,8 +8211,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     # Same F7 batching as the poll loop. This runs at 09:00 alongside the
     # positions fetch and the store syncs, so an unbatched burst here is the
     # one most likely to open the session already inside a 429 cooldown.
-    prefetch_book(kite, all_trades)
-    for t in all_trades:
+    prefetch_book(kite, readable)
+    for t in readable:
         _store = _get_store_for(t, bcs_store, fh_store, bps_store, zebra_store)
         if arm_time_stop(t, trade_key(t), expiry_trades, t['_strategy'],
                          store=_store, spot=_arming_spot(kite, t)):
@@ -8214,7 +8246,6 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
 
     last_status_time = 0
     closing_in_progress = {}  # {(strategy, trade_id): reason}
-    malformed_alerted = set()  # (strategy, id) already shouted about
     consecutive_errors = 0
 
     while True:

@@ -276,6 +276,21 @@ HEARTBEAT_NAME = 'exit_engine_heartbeat.json'      # written by the peer
 ALERT_STATE_NAME = 'exit_engine_alert_state.json'  # this file's own dedup
 HEARTBEAT_STALE_SEC = 15 * 60      # ~3 missed cron restarts of a 5-min line
 HEARTBEAT_REPEAT_SEC = 30 * 60     # re-arm, so a standing fault is not forgotten
+# F7 counts what the peer can BOOK against what this engine handed it, and the
+# two books are read at different moments. The monitor learns of a new record
+# only on its Drive re-sync (`sync_interval_sec`, 300s), so a position younger
+# than one re-sync plus one zebra cycle is not yet expected to be there --
+# without this grace every live entry would raise "nothing is holding their
+# stops" for up to ten minutes.
+EXIT_ENGINE_PICKUP_GRACE_SEC = 10 * 60
+# ...and the reverse: a position the monitor closes during a zebra cycle is
+# gone from its count while this cycle's copy of the book still says entered.
+# The next cycle reads the exit, so a shortfall is believed only once it has
+# held this long -- just under one 5-minute cycle, i.e. two consecutive
+# checks. A gap longer than RESET means cycles were missed: start again.
+EXIT_ENGINE_SHORTFALL_CONFIRM_SEC = 4 * 60
+EXIT_ENGINE_SHORTFALL_RESET_SEC = 15 * 60
+SHORTFALL_STATE_NAME = 'exit_engine_shortfall.json'
 
 
 def _heartbeat_path():
@@ -390,10 +405,12 @@ def _format_exit_engine_alert(hb: dict, n_positions: int, cohort_seen,
         'no_cohort_book': 'Its adapter onto the cohort book failed. Check the '
                           'cohort store, then restart it.',
         'unreadable': 'Treat as DOWN until proven otherwise.',
-        'not_watching': 'It is alive and armed but reports 0 cohort positions '
-                        'while this engine has %d stood down. One of the two '
-                        'is reading the book wrong — the same shape as '
-                        '"--list answered Open: 0 with eight positions live".'
+        'not_watching': 'It is alive and armed but is not booking all %d '
+                        'live cohort position(s) this engine left to it. '
+                        'Either one of the two is reading the book wrong — '
+                        'the same shape as "--list answered Open: 0 with '
+                        'eight positions live" — or a record is malformed to '
+                        'it (its log names it MALFORMED RECORD).'
                         % n_positions,
     }.get(hb['state'], 'Investigate.')
     return (
@@ -405,10 +422,65 @@ def _format_exit_engine_alert(hb: dict, n_positions: int, cohort_seen,
         f"{html.escape(fix)}")
 
 
+def settled_count(trades: list, now: Optional[datetime] = None) -> int:
+    """How many of `trades` are old enough that the peer must already see
+    them (`EXIT_ENGINE_PICKUP_GRACE_SEC`). Never raises.
+
+    Entry time is stamped with naive local `datetime.now()` on this same box,
+    so it is compared against the same clock. A record whose entry time cannot
+    be read counts as SETTLED: the cost of that is a possible early alert, the
+    cost of the opposite is a position with no engine that nothing reports.
+    """
+    now = now or datetime.now()
+    n = 0
+    for t in trades:
+        try:
+            at = datetime.strptime('%s %s' % (t['entry_date'], t['entry_time']),
+                                   '%Y-%m-%d %H:%M:%S')
+            young = (now - at).total_seconds() < EXIT_ENGINE_PICKUP_GRACE_SEC
+        except Exception:
+            young = False
+        n += 0 if young else 1
+    return n
+
+
+def _shortfall_confirmed(short: bool, now: float) -> bool:
+    """True once a bookable shortfall has held for
+    `EXIT_ENGINE_SHORTFALL_CONFIRM_SEC`. Persisted (the cron process exits
+    between cycles). Losing the file makes the alert one cycle LATER, never
+    silent: the next check starts the clock again."""
+    path = cfg.LOG_DIR / SHORTFALL_STATE_NAME
+    if not short:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning("could not clear %s: %s", path.name, e)
+        return False
+    try:
+        with open(path) as f:
+            first = float(json.load(f)['first_seen'])
+    except Exception:
+        first = None
+    if first is None or not (0 <= now - first <= EXIT_ENGINE_SHORTFALL_RESET_SEC):
+        try:
+            cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + '.tmp')
+            with open(tmp, 'w') as f:
+                json.dump({'first_seen': now}, f)
+            tmp.replace(path)
+        except Exception as e:
+            logger.warning("could not persist %s: %s", path.name, e)
+        return False
+    return now - first >= EXIT_ENGINE_SHORTFALL_CONFIRM_SEC
+
+
 def alert_if_exit_engine_down(n_positions: int, dry_run: bool = False,
                               now: Optional[float] = None,
                               market_open: Optional[bool] = None,
-                              why: str = WHY_STOOD_DOWN) -> Optional[str]:
+                              why: str = WHY_STOOD_DOWN,
+                              n_settled: Optional[int] = None) -> Optional[str]:
     """Telegram when the engine we stood down for cannot close. Never raises.
 
     Returns the state alerted on, or None. Called ONCE per cycle from the
@@ -424,8 +496,13 @@ def alert_if_exit_engine_down(n_positions: int, dry_run: bool = False,
     tests: outside market hours the peer exits on purpose and its heartbeat
     goes stale by design, so alerting then would cry wolf every evening
     (`feedback_pin_the_wall_clock_in_tests` — this must pass at 02:00 Sunday).
+
+    `n_settled` is how many of the `n_positions` are past the peer's pick-up
+    grace (`settled_count`); the count checks compare against it, never
+    against positions the peer cannot have synced yet. None = all settled.
     """
     now = time.time() if now is None else now
+    n_settled = n_positions if n_settled is None else n_settled
     if market_open is None:
         market_open = _is_market_open()
     hb = read_exit_engine_heartbeat(now=now)
@@ -433,13 +510,27 @@ def alert_if_exit_engine_down(n_positions: int, dry_run: bool = False,
     beat = hb.get('beat') or {}
     cohort_seen = beat.get('cohort_trades', '?')
     if state == 'ok' and isinstance(cohort_seen, int) and cohort_seen == 0 \
-            and n_positions > 0:
+            and n_settled > 0:
         # Alive, armed, and watching NONE of them. `--list answered Open: 0
         # with eight positions live` was this exact disagreement, and a
         # heartbeat that only reported liveness would have called it healthy.
         state = 'not_watching'
         hb = dict(hb, state=state,
                   detail=f'{hb["detail"]} but reports 0 cohort positions')
+    bookable = beat.get('cohort_bookable')
+    short = (state == 'ok' and isinstance(bookable, int)
+             and bookable < n_settled)
+    if _shortfall_confirmed(short, now):
+        # F7 (naked-live design, 2026-10-26). Loaded is not bookable: a record
+        # the peer quarantines as malformed is counted in `cohort_trades` and
+        # never polled. Fewer bookable live records than this engine has left
+        # to it -- settled ones, on two consecutive checks -- means at least
+        # one position has no engine at all.
+        state = 'not_watching'
+        hb = dict(hb, state=state,
+                  detail=f'{hb["detail"]} but can book only {bookable} of '
+                         f'the {n_settled} live cohort position(s) it should '
+                         f'have by now - the rest are unreadable to it')
     prev = _read_alert_state()
     if state == 'ok':
         if prev.get('state') not in (None, 'ok'):
@@ -4947,9 +5038,10 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 if not stood_down:
                     stood_down = True
                     try:
+                        handed = [t for t in entered if _exits_external(t)]
                         alert_if_exit_engine_down(
-                            sum(1 for t in entered if _exits_external(t)),
-                            dry_run=dry_run)
+                            len(handed), dry_run=dry_run,
+                            n_settled=settled_count(handed))
                     except Exception as e:
                         logger.warning(
                             "exit-engine heartbeat check failed: %s", e,
@@ -4970,10 +5062,10 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
                 if not live_unmanaged_checked:
                     live_unmanaged_checked = True
                     try:
+                        live = [t for t in entered if not is_paper_record(t)]
                         alert_if_exit_engine_down(
-                            sum(1 for t in entered
-                                if not is_paper_record(t)),
-                            dry_run=dry_run, why=WHY_LIVE_RECORD)
+                            len(live), dry_run=dry_run, why=WHY_LIVE_RECORD,
+                            n_settled=settled_count(live))
                     except Exception as e:
                         logger.warning(
                             "exit-engine heartbeat check failed: %s", e,

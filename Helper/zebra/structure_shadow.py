@@ -830,7 +830,13 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
         # session N" can be scored on a price this arm could have sold at. A
         # measurement only -- nothing here reads it to decide an exit.
         if key == MARKS_ARM and v is not None and now.strftime('%H:%M') >= MARKS_FROM:
-            a.setdefault('marks', {})[today.isoformat()] = {'at': ts, 'value': round(float(v), 4)}
+            # `spot` beside the value so the nightly NIFTY-shock line can
+            # reprice the position offline (zebra/book_shock.py): a value
+            # without the spot of the same moment cannot carry an IV.
+            mark = {'at': ts, 'value': round(float(v), 4)}
+            if spot_ok:
+                mark['spot'] = round(float(spot), 2)
+            a.setdefault('marks', {})[today.isoformat()] = mark
         if 'ladder' in a and v is not None and value_armed:
             # Each level books where the LIVE stop would: on the confirming
             # poll of the debounce, not the first breach. `gap` is about the

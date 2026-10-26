@@ -1046,11 +1046,21 @@ corrected replay the fastest fifth ran −7.1% a trade vs −3.1% for the rest
 and hit the wrong-way level more often (81% vs 70%) — speed was volatility, not
 direction. The FIRST signal on a line reaches it faster but earns no more.
 
-**Nothing about capital or limits is decided before the gate.** A capital
-figure, position limit, per-trade size and monthly loss cap were proposed on
-2026-09-24 and **withdrawn** on 2026-09-25: they were computed at Rs 5K per
-trade, and one naked lot costs Rs 7.5K-36K (median ~Rs 18K), so none of them
-applied. Size for the book that passes, after it passes.
+**Live limits for the naked build — FROZEN 2026-10-26 (owner).** Cap 8 open
+from day one (shared CE/PE), 1 lot, premium ≤ Rs 25K per trade (skip, never
+resize), no total premium cap, Rs 2.5L capital (a full reversal ≈ 48% of it,
+accepted knowingly). Pause is automatic (4 stops in 3 sessions → 2 sessions
+without entries). Kill (5 straight stops, −25% from peak, fills > 3% worse
+than paper, or the test FAILs) stops NEW entries only, and **only the owner
+restarts it** — no auto-resume. Full table and the replay behind it:
+`docs/NAKED_100_TRADE_TEST.md` §11. The naked live path is NOT built yet
+(design frozen 2026-10-26, `docs/NAKED_LIVE_DESIGN.md`, Windows only). The
+nightly digest carries a "NIFTY ±3% on the open book" section
+(`zebra/book_shock.py`) — the rupee figure that judges the accepted
+reversal exposure, measured on the uncapped paper book until live records
+exist. These limits govern real money only and
+change nothing in the test's own population or rules. (The 2026-09-24 sizing
+proposal, computed at Rs 5K per trade, stays withdrawn.)
 
 **Vetting quality** is read in section 8, descriptively, one row per setup
 (re-vetoes of the same stock/direction/ST line are repeats, never re-scored):

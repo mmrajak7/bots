@@ -52,5 +52,8 @@
   "structure_shadow_enabled": true,
   "structure_shadow_wide_ext": 0.5,
   "shadow_stop_ladder": [0.30, 0.40, 0.50, 0.60, 0.70],
-  "iv_risk_free_rate": 0.065
+  "iv_risk_free_rate": 0.065,
+  "book_shock_pct": 3.0,
+  "book_shock_beta_sessions": 60,
+  "book_shock_beta_min": 30
 }

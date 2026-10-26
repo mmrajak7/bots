@@ -481,3 +481,110 @@ def test_a_broken_heartbeat_check_cannot_stop_exit_monitoring(
     monkeypatch.setattr(monitor, 'alert_if_exit_engine_down', boom)
     _cycle(store, monkeypatch)          # must not raise
     assert all(t['status'] == 'entered' for t in store.get_entered())
+
+
+# ── F7 (naked-live design, 2026-10-26): loaded is not bookable ─────────────
+
+_LIVE = {'_store_type': 'zebra', '_strategy': 'BCS', 'paper': False,
+         'id': 1, 'stock': 'TESTCO', 'sl_spot': 90.0,
+         'spot_symbol': 'NSE:TESTCO', 'quantity': 100, 'target_spot': 110.0,
+         'sl_spread': 1.0, 'net_debit': 2.0,
+         'long_symbol': 'TESTCO26SEP100CE', 'short_symbol': 'TESTCO26SEP105CE'}
+
+
+def test_a_quarantined_live_record_is_not_counted_as_bookable(logs):
+    """The record a naked long would be today: loaded, then skipped by the
+    loop as malformed. It must not count as a position the peer can close."""
+    no_short = {k: v for k, v in _LIVE.items() if k != 'short_symbol'}
+    paper = dict(_LIVE, id=3, paper=True)
+    sm._beat_all('polling', False, [dict(_LIVE), dict(no_short, id=2), paper],
+                 object())
+    with open(logs / sm.HEARTBEAT_NAME) as f:   # a data file, not source
+        b = json.load(f)
+    assert b['cohort_trades'] == 3, 'loaded count is unchanged'
+    assert b['cohort_bookable'] == 1, (
+        'only the readable LIVE record can be booked by the peer; the '
+        'malformed one and the paper one cannot')
+
+
+def _short_beat(now, bookable=1):
+    sm.write_heartbeat('polling', False, open_trades=2, cohort_trades=2,
+                       cohort_store=True, cohort_bookable=bookable, now=now)
+
+
+def test_fewer_bookable_than_handed_over_is_not_watching(logs, telegrams):
+    """Two live positions left to the peer, one of them unreadable to it.
+    Before F7 this read 'ok' because 2 records were LOADED. Believed on the
+    SECOND consecutive check, one zebra cycle later."""
+    _short_beat(NOW)
+    assert check(n=2) is None, 'one sighting may be a position closed mid-cycle'
+    assert telegrams == []
+    _short_beat(NOW + 300)
+    assert check(n=2, now=NOW + 300) == 'not_watching'
+    assert 'can book only 1 of the 2' in telegrams[-1]
+
+
+def test_a_shortfall_that_clears_on_the_next_cycle_never_alerts(logs, telegrams):
+    """The monitor closed a position during zebra's cycle: zebra's copy still
+    says entered, the next cycle reads the exit and the counts agree."""
+    _short_beat(NOW)
+    assert check(n=2) is None
+    _short_beat(NOW + 300, bookable=1)
+    assert check(n=1, now=NOW + 300) is None
+    _short_beat(NOW + 600)
+    assert check(n=2, now=NOW + 600) is None, 'the clock restarted after clearing'
+    assert telegrams == []
+
+
+def test_a_sighting_from_a_missed_cycle_long_ago_does_not_confirm(logs, telegrams):
+    _short_beat(NOW)
+    check(n=2)
+    later = NOW + monitor.EXIT_ENGINE_SHORTFALL_RESET_SEC + 60
+    _short_beat(later)
+    assert check(n=2, now=later) is None
+    assert telegrams == []
+
+
+def test_a_position_the_peer_cannot_have_synced_yet_is_not_counted(logs, telegrams):
+    """Entered three minutes ago: the monitor learns of it on its next Drive
+    re-sync. Two checks in a row must not call that a fault."""
+    for k in (0, 300):
+        _short_beat(NOW + k)
+        assert monitor.alert_if_exit_engine_down(
+            2, dry_run=False, now=NOW + k, market_open=True, n_settled=1) is None
+    assert telegrams == []
+
+
+def test_zero_seen_with_only_young_positions_is_not_a_fault(logs, telegrams):
+    beat(logs, cohort_trades=0)
+    assert monitor.alert_if_exit_engine_down(
+        1, dry_run=False, now=NOW, market_open=True, n_settled=0) is None
+    assert telegrams == []
+
+
+def test_settled_count_uses_the_entry_stamp_and_fails_toward_alerting():
+    from datetime import datetime, timedelta
+    now = datetime(2027, 3, 10, 11, 0, 0)
+    g = monitor.EXIT_ENGINE_PICKUP_GRACE_SEC
+
+    def at(sec_ago):
+        t = now - timedelta(seconds=sec_ago)
+        return {'entry_date': t.strftime('%Y-%m-%d'),
+                'entry_time': t.strftime('%H:%M:%S')}
+    trades = [at(g + 1), at(g - 1), at(30), {'entry_date': 'x'}, {}]
+    # old one + the two unreadable ones count; the two young ones do not
+    assert monitor.settled_count(trades, now=now) == 3
+
+
+def test_all_bookable_is_still_ok(logs, telegrams):
+    sm.write_heartbeat('polling', False, open_trades=2, cohort_trades=5,
+                       cohort_store=True, cohort_bookable=2, now=NOW)
+    assert check(n=2) is None
+    assert telegrams == []
+
+
+def test_an_old_beat_without_the_field_keeps_the_old_check(logs, telegrams):
+    """A heartbeat written before F7 carries no `cohort_bookable`; the reader
+    must not invent a fault from its absence."""
+    beat(logs, cohort_trades=8)
+    assert check(n=8) is None

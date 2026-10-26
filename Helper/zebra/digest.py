@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import config as cfg
+from . import book_shock
 from . import engine_log
 # `reason_label` is the report's wording, imported rather than re-derived: the
 # Closed table below did its own `paper:` strip and printed a bridged
@@ -492,11 +493,14 @@ def build(day: Optional[str] = None) -> dict:
                'mode': None,
                'problems': ['the order-engine log could not be analysed '
                             '(%s) — its failures are NOT covered today' % e]}
+    # Report only, and guarded inside: a failed estimate renders as MISSING.
+    shock = book_shock.analyse(day)
     return {'date': day, 'partial': _is_partial(day),
             'cycles': cyc, 'funnel': fun, 'vetting': vet,
             'trades': {k: (v if not isinstance(v, list) else len(v))
                        for k, v in tr.items()},
             'cohort': coh, 'warnings': warn, 'engines': eng, 'tp_latch': tpl,
+            'book_shock': shock,
             'flags': _flags(cyc, vet, tr, warn, coh, prev, eng, tpl),
             '_detail': tr}
 
@@ -702,6 +706,9 @@ def render(d: dict) -> str:
     # was blind to the process that places orders.
     if d.get('engines'):
         L.extend(engine_log.render(d['engines']))
+        A('')
+    if d.get('book_shock'):
+        L.extend(book_shock.render(d['book_shock']))
         A('')
     if d['flags']:
         A('## ⚑ Earns a look')

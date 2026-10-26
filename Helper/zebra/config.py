@@ -612,6 +612,13 @@ _DEFAULTS = {
     # Annual risk-free rate for the implied-volatility stamp at shadow open.
     # Measurement only; ~ the 91-day T-bill. A 1-pt error moves IV ~0.1 pt.
     'iv_risk_free_rate': 0.065,
+    # The nightly "NIFTY +N% -> Rs on the open book" line (zebra/book_shock.py,
+    # docs/NAKED_100_TRADE_TEST.md section 11). Report only. pct is the NIFTY
+    # move; beta is measured over `sessions` daily closes and falls back to 1.0
+    # (said so in the digest) with fewer than `min` common returns.
+    'book_shock_pct': 3.0,
+    'book_shock_beta_sessions': 60,
+    'book_shock_beta_min': 30,
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
     'time_sl_days_before_expiry': 6,
@@ -1411,6 +1418,9 @@ SPOT_SL_ENABLED = _strict_bool('spot_sl_enabled')
 STRUCTURE_SHADOW_ENABLED = _strict_bool('structure_shadow_enabled')
 STRUCTURE_SHADOW_WIDE_EXT = _num('structure_shadow_wide_ext')
 IV_RISK_FREE_RATE = _num('iv_risk_free_rate')
+BOOK_SHOCK_PCT = _num('book_shock_pct')
+BOOK_SHOCK_BETA_SESSIONS = _int('book_shock_beta_sessions')
+BOOK_SHOCK_BETA_MIN = _int('book_shock_beta_min')
 
 
 def _stop_ladder() -> tuple:
