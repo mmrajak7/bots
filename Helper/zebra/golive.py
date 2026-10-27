@@ -50,6 +50,7 @@ engine -- then this is rebuilt around the new control.
 from __future__ import annotations
 
 import math
+import statistics
 from datetime import datetime
 from typing import Optional
 
@@ -110,7 +111,7 @@ UNPRICED_NET_PCT = -100.0
 DEFAULT_CAPS = (6, 8, 10, 12)
 DEFAULT_CUTS = (15000, 20000, 25000, 30000, 40000)
 PLAN_MULT = 1.5          # owner, 2026-09-24: "plan 1.5x peak capital needed"
-ARM_KEYS = ('naked_long', 'naked_hold', 'spread_hold', 'spread_wide')
+ARM_KEYS = ('naked_long', 'naked_hold', 'spread_hold', 'spread_wide', 'naked_run1')
 
 
 def _dt(s: Optional[str]) -> Optional[datetime]:
@@ -157,6 +158,19 @@ def arm_rows(state: dict, by_id: dict, key: str, now: datetime) -> list:
                 r['net'] = None if r['fees'] is None else r['gross'] - r['fees']
         out.append(r)
     return out
+
+
+def run_vs_twin(run: list, twin: list) -> dict:
+    """`naked_run1` against `naked_long` on the ids where BOTH are priced.
+    Paired on % of premium, because the two differ only after the target:
+    every id that never reached it carries an identical result on both sides."""
+    t = {r['id']: r for r in twin if r.get('priced')}
+    g = [(r['pct'] - t[r['id']]['pct'], r) for r in run if r.get('priced') and r['id'] in t]
+    d = [x for x, _ in g]
+    se = (statistics.stdev(d) / len(d) ** 0.5) if len(d) > 1 else None
+    return {'n': len(d), 'ran': sum(1 for _, r in g if str(r.get('reason')).startswith('run_')),
+            'gain': statistics.mean(d) if d else 0.0, 'se': se,
+            'better': sum(1 for x in d if x > 0.5), 'worse': sum(1 for x in d if x < -0.5)}
 
 
 def real_rows(state: dict, by_id: dict, now: datetime) -> list:
@@ -696,7 +710,7 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
     p('  %-12s %4s %4s %6s %7s %7s %6s %5s %9s %8s %9s %9s %7s %7s' % (
         'arm', 'n', 'open', 'win%', 'avgWin', 'avgLoss', 'payoff', 'BEWR', 'net Rs', 'fees',
         'stress', 'peak cap', 'RoC', 'RoC/str'))
-    for k in ('naked_long', 'REAL spread', 'spread_wide', 'naked_hold', 'spread_hold'):
+    for k in ('naked_long', 'REAL spread', 'spread_wide', 'naked_hold', 'spread_hold', 'naked_run1'):
         s, pk = summary(rows[k]), peak_concurrent(rows[k])['peak']
         p('  %-12s %4d %4d %6s %7s %7s %6s %5s %9.0f %8.0f %9.0f %9.0f %7s %7s%s' % (
             k, s['n'], s['open'], _f(s['win_pct'], '%.0f%%'), _f(s['avg_win'], '%+.1f'),
@@ -706,6 +720,13 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
             _f(100 * (s['net'] - s['stress']) / pk if pk else None, '%+.1f%%'),
             _thin(s['n']) + (' uncosted %d' % s['uncosted'] if s['uncosted'] else '')))
     p('  spread_wide exists only on shadows opened from 2026-09-24; compare it on its own ids.')
+    run = run_vs_twin(rows['naked_run1'], rows['naked_long'])
+    p('  naked_run1 (hold past the target, floor %.1f%%, %d session) vs naked_long, same ids: %s'
+      % (cfg.SHADOW_RUN_FLOOR_PCT, cfg.SHADOW_RUN_HOLD_SESSIONS,
+         'none resolved yet' if not run['n'] else
+         'n %d, %d reached the target, gain %+.1f pts (SE %s), better %d / worse %d%s'
+         % (run['n'], run['ran'], run['gain'], _f(run['se'], '%.1f'), run['better'],
+            run['worse'], _thin(run['n']))))
 
     p('\n2 CAPITAL -- what is tied up AT ONCE (every position: open and partial included)')
     for k in ('naked_long', 'REAL spread'):

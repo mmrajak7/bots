@@ -976,6 +976,7 @@ its neighbour in exactly ONE respect so a gap has one candidate cause:
 | `naked_runner` vs `naked_hold` | **does the TP CAP at the ST line cost us?** |
 | `spread_hold` vs the real spread | the stop question, on the live structure |
 | `spread_wide` vs the real spread | does moving the short strike PAST the target pay? (added 2026-09-24) |
+| `naked_run1` vs `naked_long` | does LETTING IT RUN past the target pay? (added 2026-10-27: holds one session past the target, floor 1% back from it; `run.path` keeps every poll) |
 | `delta1` vs everything | how much of the signal any of them keeps |
 
 **Read at 2026-09-24 (12 fully resolved, 5 of them partial — NOT a verdict).**
@@ -1111,6 +1112,7 @@ measurements for after it, not inputs to it. Read-only:
 | 7 selection | do live's filters pick better trades? | the test trades vs `replay.replay_window` over the same entry dates |
 | 8 vetting | are the vetoes turning away worse trades? | every allowed / vetoed setup replayed naked from its trigger (`replay.replay_record`), ONE row per setup (stock, direction, ST line); `veto_shadow` labels alongside |
 | 9 time exit | would "exit at the close of session 3 unless the target was hit" have done better on the same trades? | `naked_long` session-close `marks` (value paths before 2026-09-25); paired gain ± SE, trades cut, cut-then-TP; N=1,2 shown only |
+| 1b let it run | third hypothesis (2026-10-27): `naked_run1` vs `naked_long` paired on the same ids. Replay 2024-26 +5.3 (SE 0.6) but daily bars overstate it; 30 real shadow TPs on 5-min option prices +8.8 (SE 10.5), median −4.9. SUPPORTED needs ≥ 2 SE at 50 test trades | `naked_run1` arm |
 | 10 approach | DESCRIPTIVE ONLY (hypothesis withdrawn): trades that ran at the line before entry vs the rest | test trades split at `FAST_APPROACH_PCT` (7.6) by `replay.approach_move`; unknown when candles are missing |
 
 `--refresh` tops up the daily candle cache (`playbook/backtest_cache`) from

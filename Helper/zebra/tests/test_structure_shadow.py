@@ -779,3 +779,114 @@ def test_one_garbage_high_print_cannot_arm_the_trail():
         ss.poll_one(sh, 101.0, _q(3.3, 3.4), _q(1.2, 1.3),
                     MID_SESSION + timedelta(minutes=m), TODAY)             # 2.0
     assert sh['arms']['spread_hold']['status'] == 'open'
+
+
+# -- naked_run1: let it run past the target -----------------------------------
+# Fixture: CE, entry 100, target 104, long ask 4.0. Floor at 1% = 102.96.
+
+NEXT_DAY = date(2026, 9, 11)
+
+
+def _at(day, hh, mm):
+    return datetime(day.year, day.month, day.day, hh, mm, 0)
+
+
+def _ran(sh):
+    """Touch the target on MID_SESSION: naked_long books, naked_run1 runs."""
+    ss.poll_one(sh, 104.2, _q(7.0, 7.4), _q(3.0, 3.2), MID_SESSION, TODAY)
+    return sh['arms']['naked_run1']
+
+
+def test_at_the_target_the_run_arm_holds_while_its_twin_books():
+    sh = _shadow()
+    a = _ran(sh)
+    assert sh['arms']['naked_long']['exit']['reason'] == 'tp'
+    assert a['status'] == 'open' and a['run']['tp_value'] == 7.0
+    assert a['run']['path'][0][1:] == [104.2, 7.0]
+
+
+def test_spot_between_the_target_and_the_floor_keeps_it_running():
+    sh = _shadow()
+    a = _ran(sh)
+    ss.poll_one(sh, 103.2, _q(6.0, 6.4), None, MID_SESSION + timedelta(minutes=5), TODAY)
+    assert a['status'] == 'open'
+
+
+def test_spot_back_through_the_floor_books_at_the_bid():
+    sh = _shadow()
+    a = _ran(sh)
+    ss.poll_one(sh, 102.9, _q(5.5, 5.9), None, MID_SESSION + timedelta(minutes=5), TODAY)
+    assert a['exit']['reason'] == 'run_floor' and a['exit']['value'] == 5.5
+
+
+def test_the_floor_is_read_on_spot_even_in_the_opening_buffer():
+    """A spot exit like the TP: an overnight gap through the floor books at the
+    first poll, not 15 minutes later."""
+    sh = _shadow()
+    a = _ran(sh)
+    ss.poll_one(sh, 101.0, _q(4.5, 4.9), None, _at(NEXT_DAY, 9, 16), NEXT_DAY)
+    assert a['exit']['reason'] == 'run_floor'
+
+
+def test_the_hold_ends_at_the_close_of_the_next_session():
+    sh = _shadow()
+    a = _ran(sh)
+    ss.poll_one(sh, 106.0, _q(9.0, 9.4), None, _at(NEXT_DAY, 15, 15), NEXT_DAY)
+    assert a['status'] == 'open'
+    ss.poll_one(sh, 106.5, _q(9.5, 9.9), None, _at(NEXT_DAY, 15, 20), NEXT_DAY)
+    assert a['exit']['reason'] == 'run_close' and a['exit']['value'] == 9.5
+    assert not a['run'].get('late')
+
+
+def test_a_missed_close_books_at_the_next_poll_and_says_late():
+    sh = _shadow()
+    a = _ran(sh)
+    ss.poll_one(sh, 106.0, _q(9.0, 9.4), None, _at(NEXT_DAY, 11, 0), NEXT_DAY)
+    later = date(2026, 9, 14)
+    ss.poll_one(sh, 106.0, _q(8.8, 9.2), None, _at(later, 9, 40), later)
+    assert a['exit']['reason'] == 'run_close' and a['run']['late'] is True
+
+
+def test_an_unpriced_floor_latches_and_books_at_the_next_price():
+    """The floor fired; a later recovery above it must not release it."""
+    sh = _shadow()
+    a = _ran(sh)
+    ss.poll_one(sh, 102.5, _q(5.0, 6.0, reliable=False), None,
+                MID_SESSION + timedelta(minutes=5), TODAY)
+    assert a['status'] == 'open' and a['pending']['reason'] == 'run_floor'
+    ss.poll_one(sh, 104.5, _q(7.2, 7.5), None, MID_SESSION + timedelta(minutes=10), TODAY)
+    assert a['exit']['reason'] == 'run_floor' and a['exit']['value'] == 7.2
+
+
+def test_before_the_target_the_run_arm_is_its_twin():
+    """Same entry, same -50% stop: a loser books identically on both."""
+    sh = _shadow()
+    for m in (0, 5):
+        ss.poll_one(sh, 99.0, _q(1.9, 2.0), None, MID_SESSION + timedelta(minutes=m), TODAY)
+    run, twin = sh['arms']['naked_run1']['exit'], sh['arms']['naked_long']['exit']
+    assert run['reason'] == twin['reason'] == 'stop' and run['value'] == twin['value']
+
+
+def test_seeding_copies_an_open_twin_and_skips_a_closed_one():
+    state = {'schema': ss.SCHEMA, 'shadows': {}}
+    ss.open_shadows(state, [_trade(id=1), _trade(id=2)], '2026-09-01 10:00:00')
+    for tid in ('1', '2'):
+        del state['shadows'][tid]['arms']['naked_run1']      # shadows from before the arm
+    ss.poll_one(state['shadows']['2'], 104.2, _q(7.0, 7.4), _q(3.0, 3.2), MID_SESSION, TODAY)
+    assert ss._seed_run_arm(state) == 1
+    a = state['shadows']['1']['arms']['naked_run1']
+    assert a['seeded_from'] == 'naked_long' and a['status'] == 'open'
+    assert 'marks' not in a
+    assert 'naked_run1' not in state['shadows']['2']['arms']   # its path past TP was never seen
+    assert ss._seed_run_arm(state) == 0                         # safe to rerun
+
+
+def test_the_run_reports_against_its_twin_on_the_same_ids():
+    from zebra import golive
+    twin = [{'id': '1', 'priced': True, 'pct': 75.0}, {'id': '2', 'priced': True, 'pct': -50.0}]
+    run = [{'id': '1', 'priced': True, 'pct': 95.0, 'reason': 'run_close'},
+           {'id': '2', 'priced': True, 'pct': -50.0, 'reason': 'stop'},
+           {'id': '3', 'priced': True, 'pct': 10.0, 'reason': 'run_floor'}]   # no twin: excluded
+    r = golive.run_vs_twin(run, twin)
+    assert r['n'] == 2 and r['ran'] == 1 and r['gain'] == 10.0
+    assert r['better'] == 1 and r['worse'] == 0

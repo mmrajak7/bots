@@ -190,6 +190,10 @@ ARMS = {
     'naked_long':   {'legs': ('long',),         'tp': True,  'stop_frac': 0.50, 'fills': 2},
     'naked_hold':   {'legs': ('long',),         'tp': True,  'stop_frac': None, 'fills': 2},
     'naked_runner': {'legs': ('long',),         'tp': False, 'stop_frac': None, 'fills': 2},
+    # `naked_long` until the target; AT the target it holds instead of exiting
+    # (see `_poll_run`). Differs from `naked_long` in that one respect only.
+    'naked_run1':   {'legs': ('long',),         'tp': True,  'stop_frac': 0.50, 'fills': 2,
+                     'run': True},
     'spread_hold':  {'legs': ('long', 'short'), 'tp': True,  'stop_frac': None, 'fills': 4,
                      'trail': True},
     'spread_wide':  {'legs': ('long', 'wide'),  'tp': True,  'stop_frac': 0.50, 'fills': 4,
@@ -212,6 +216,17 @@ MARKS_ARM = 'naked_long'
 #: last good poll was mid-morning leaves no mark (scored unpriced), rather
 #: than a morning price standing in for the close.
 MARKS_FROM = '15:00'
+
+#: The arm `naked_run1` is cloned from while both are still before the target
+#: (`_seed_run_arm`): identical rules up to there, so the copy is exact.
+RUN_ARM, RUN_TWIN = 'naked_run1', 'naked_long'
+#: On its last holding session the run arm books at the first poll at or after
+#: this time. The engines stop at 15:30, so a later time could find no poll.
+RUN_EXIT_AT = '15:20'
+#: Polls kept per run (`path`): spot and long bid on every poll while running,
+#: so any other floor or holding period can be re-scored from the arm's own
+#: observations. ~75 polls a session; the cap only bounds a pathological case.
+RUN_PATH_MAX = 600
 
 VIX_SYMBOL = 'NSE:INDIA VIX'
 
@@ -900,8 +915,21 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
                 _close(sh, key, pend['reason'], None, spot, ts, lq, asq)
             continue
 
+        if arm.get('run') and a.get('run') is not None:
+            _poll_run(sh, key, a, v, spot, spot_ok, now, today, ts, lq, asq, left,
+                      expired, value_armed)
+            continue
+
         # The live cascade, in the live ORDER: TP, TRAIL, STOP, then TIME.
         if arm['tp'] and spot_ok and _tp_hit(direction, spot, sh['target_spot']):
+            if arm.get('run'):
+                # Let it run: the target STARTS the hold. Nothing is booked
+                # here, so an unpriced book at the touch costs nothing.
+                a['run'] = {'since': ts, 'tp_spot': round(float(spot), 2),
+                            'tp_value': None if v is None else round(float(v), 4),
+                            'days': [], 'path': []}
+                _run_observe(a['run'], ts, spot, v)
+                continue
             if v is not None:
                 _close(sh, key, 'tp', v, spot, ts, lq, asq)
             else:
@@ -937,6 +965,85 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
         sh['armed_day'] = today.isoformat()
 
 
+def _run_observe(r: dict, ts: str, spot: Optional[float], v: Optional[float]) -> None:
+    if len(r['path']) < RUN_PATH_MAX:
+        r['path'].append([ts, None if spot is None else round(float(spot), 2),
+                          None if v is None else round(float(v), 4)])
+
+
+def _run_floor(direction: str, target: float) -> float:
+    """The spot level that ends a run: the target, moved back by
+    SHADOW_RUN_FLOOR_PCT. At 0% a run ends on the first wiggle -- on the real
+    5-minute paths spot hovers around the target right after the touch."""
+    buf = cfg.SHADOW_RUN_FLOOR_PCT / 100.0
+    return target * (1.0 - buf) if direction == 'CE' else target * (1.0 + buf)
+
+
+def _book_or_latch(sh: dict, key: str, a: dict, reason: str, v: Optional[float],
+                   spot: Optional[float], ts: str, lq, asq) -> None:
+    if v is not None:
+        _close(sh, key, reason, v, spot, ts, lq, asq)
+    elif not a.get('pending'):
+        a['pending'] = {'reason': reason, 'since': ts}
+
+
+def _poll_run(sh: dict, key: str, a: dict, v: Optional[float], spot: Optional[float],
+              spot_ok: bool, now: datetime, today: date, ts: str, lq, asq,
+              left: Optional[int], expired: bool, value_armed: bool) -> None:
+    """One poll of an arm that has passed its target and is holding.
+
+    Exits, in order: the FLOOR (spot back through `_run_floor`, read on spot
+    like the TP, so not held by the opening buffer); the HOLD end (the
+    SHADOW_RUN_HOLD_SESSIONS-th session after the target day, at RUN_EXIT_AT,
+    or the first poll after it if that close was never polled -- flagged
+    `late`); TIME, exactly as the cascade. The -50% stop cannot be reached from
+    above the target and is not evaluated. An exit with no price latches.
+    """
+    r = a['run']
+    _run_observe(r, ts, spot, v)
+    day = today.isoformat()
+    if day > r['since'][:10] and day not in r['days']:
+        r['days'].append(day)
+    direction = sh.get('direction')
+    if spot_ok:
+        floor = _run_floor(direction, float(sh['target_spot']))
+        if (spot <= floor) if direction == 'CE' else (spot >= floor):
+            _book_or_latch(sh, key, a, 'run_floor', v, spot, ts, lq, asq)
+            return
+    n, hold = len(r['days']), cfg.SHADOW_RUN_HOLD_SESSIONS
+    if n > hold or (n == hold and now.strftime('%H:%M') >= RUN_EXIT_AT):
+        if n > hold:
+            r['late'] = True
+        _book_or_latch(sh, key, a, 'run_close', v, spot, ts, lq, asq)
+        return
+    if left is not None and left <= cfg.TIME_SL_DAYS:
+        if v is not None and value_armed:
+            _close(sh, key, 'time', v, spot, ts, lq, asq)
+        elif expired and v is None:
+            _close(sh, key, 'time', None, spot, ts, lq, asq)
+
+
+def _seed_run_arm(state: dict) -> int:
+    """Give `naked_run1` to every shadow whose `naked_long` is still open and
+    has not reached its target: the two arms run identical rules up to the
+    target, so a copy of the twin's state IS the run arm's state. Shadows
+    whose twin already exited are left without it -- their path past the
+    target was never observed."""
+    n = 0
+    for sh in state['shadows'].values():
+        twin = sh['arms'].get(RUN_TWIN)
+        if RUN_ARM in sh['arms'] or not twin or twin.get('status') != 'open':
+            continue
+        if twin.get('pending'):
+            continue                   # a latched exit: the twin is AT its exit
+        a = json.loads(json.dumps(twin))
+        a.pop('marks', None)           # the test's marks belong to the twin
+        a['seeded_from'] = RUN_TWIN
+        sh['arms'][RUN_ARM] = a
+        n += 1
+    return n
+
+
 def poll(store, kite, ltps: Optional[dict] = None) -> dict:
     """One cycle of shadow measurement. Never raises.
 
@@ -965,11 +1072,15 @@ def poll(store, kite, ltps: Optional[dict] = None) -> dict:
         ts = now.strftime('%Y-%m-%d %H:%M:%S')
         opened = open_shadows(state, entered, ts, kite)
         opened_wide, wide_touched = retry_wide(state, by_id, kite, now)
+        seeded = _seed_run_arm(state)
+        if seeded:
+            logger.info('SHADOW %s: seeded on %d open shadow(s) from %s',
+                        RUN_ARM, seeded, RUN_TWIN)
 
         live = {k: v for k, v in state['shadows'].items()
                 if any(a['status'] == 'open' for a in v['arms'].values())}
         if not live:
-            if opened or wide_touched:
+            if opened or wide_touched or seeded:
                 _save(state)
             return {'opened': opened, 'live': 0}
 

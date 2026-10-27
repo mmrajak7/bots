@@ -609,6 +609,12 @@ _DEFAULTS = {
     # (value <= entry x (1 - f)), so any stop level can be scored after the
     # fact without an arm per level. Measurement only.
     'shadow_stop_ladder': [0.30, 0.40, 0.50, 0.60, 0.70],
+    # The `naked_run1` shadow arm: at the target it does NOT exit -- it holds
+    # through this many further sessions (exiting at RUN_EXIT_AT on the last),
+    # unless spot comes back this % of the target past the target (the floor).
+    # Owner 2026-10-27: "let profits run". Measurement only.
+    'shadow_run_floor_pct': 1.0,
+    'shadow_run_hold_sessions': 1,
     # Annual risk-free rate for the implied-volatility stamp at shadow open.
     # Measurement only; ~ the 91-day T-bill. A 1-pt error moves IV ~0.1 pt.
     'iv_risk_free_rate': 0.065,
@@ -1417,6 +1423,8 @@ SPOT_SL_ENABLED = _strict_bool('spot_sl_enabled')
 # than one that never started, because the gap is invisible in the output.
 STRUCTURE_SHADOW_ENABLED = _strict_bool('structure_shadow_enabled')
 STRUCTURE_SHADOW_WIDE_EXT = _num('structure_shadow_wide_ext')
+SHADOW_RUN_FLOOR_PCT = _num('shadow_run_floor_pct')
+SHADOW_RUN_HOLD_SESSIONS = _int('shadow_run_hold_sessions')
 IV_RISK_FREE_RATE = _num('iv_risk_free_rate')
 BOOK_SHOCK_PCT = _num('book_shock_pct')
 BOOK_SHOCK_BETA_SESSIONS = _int('book_shock_beta_sessions')

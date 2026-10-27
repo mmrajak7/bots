@@ -52,6 +52,32 @@ def test_prod_rail_covers_every_log_path():
     )
 
 
+def _zebra_module_log_paths():
+    """{module.NAME: Path} for every module-level Path under the real logs/
+    in the zebra package, read NOW (i.e. after the rail has run)."""
+    import importlib
+    import pkgutil
+    import zebra
+    found = {}
+    for m in pkgutil.iter_modules(zebra.__path__):
+        if m.name in ('__main__', 'tests'):
+            continue
+        mod = importlib.import_module('zebra.' + m.name)
+        for name, value in vars(mod).items():
+            if isinstance(value, Path) and _REAL_LOG_DIR in value.parents:
+                found['%s.%s' % (m.name, name)] = value
+    return found
+
+
+def test_no_zebra_module_points_at_production_logs():
+    """The cfg-only check above missed `structure_shadow.STATE_FILE`, built at
+    import from the real LOG_DIR: every suite run that drove a monitor cycle
+    polled and SAVED the production shadow book (2026-10-27). Scan every
+    module, so the next one fails here."""
+    leaks = _zebra_module_log_paths()
+    assert not leaks, 'still pointing at production logs/ during tests: ' + ', '.join(sorted(leaks))
+
+
 def test_drive_is_unreachable_from_the_suite():
     """The Drive rail must raise something `except Exception` cannot eat.
 
