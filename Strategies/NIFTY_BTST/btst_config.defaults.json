@@ -1,0 +1,41 @@
+{
+  "underlying": "NIFTY",
+  "index_quote_symbol": "NSE:NIFTY 50",
+  "index_token": 256265,
+  "option_exchange": "NFO",
+
+  "target_premium": 100.0,
+  "trigger_mult": 1.5,
+  "stop_frac": 0.5,
+  "lots": 1,
+  "strike_band_points": 1500,
+
+  "market_open": "09:15:00",
+  "mark_time": "09:20:00",
+  "late_mark_after": "09:21:00",
+  "entry_start": "09:21:00",
+  "entry_end": "15:25:00",
+  "next_day_exit": "09:25:00",
+  "next_day_exit_grace_sec": 120,
+  "market_close": "15:40:00",
+
+  "poll_seconds": 3,
+  "poll_log_every_sec": 60,
+  "quote_retries": 3,
+  "quote_fail_alert_after": 10,
+
+  "max_spread_abs": 2.0,
+  "max_spread_pct": 10.0,
+
+  "fee_rates": {
+    "brokerage_per_order": 20.0,
+    "stt_sell_pct": 0.10,
+    "exchange_pct": 0.03503,
+    "sebi_pct": 0.0001,
+    "stamp_buy_pct": 0.003,
+    "gst_pct": 18.0
+  },
+
+  "telegram_enabled": true,
+  "telegram_prefix": "NIFTY-BTST (paper)"
+}

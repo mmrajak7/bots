@@ -1,0 +1,5 @@
+state/
+logs/
+btst_config.json
+.pytest_cache/
+.coverage
