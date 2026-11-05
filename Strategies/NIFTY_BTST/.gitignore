@@ -1,5 +1,8 @@
 state/
 logs/
+state_live/
+state_rehearsal/
 btst_config.json
+btst_live_config.json
 .pytest_cache/
 .coverage

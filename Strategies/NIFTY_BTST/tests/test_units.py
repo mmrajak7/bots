@@ -1,5 +1,5 @@
 import json
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -114,7 +114,7 @@ def test_overlay_merges_fee_rates_one_level(tmp_path):
     ov.write_text(json.dumps({'fee_rates': {'brokerage_per_order': 0.0}, 'lots': 2}))
     cfg = config_mod.load(APP / 'btst_config.defaults.json', ov)
     assert cfg.fee_rates['brokerage_per_order'] == 0.0
-    assert cfg.fee_rates['stt_sell_pct'] == 0.10
+    assert cfg.fee_rates['stt_sell_pct'] == 0.15
     assert cfg.lots == 2
 
 
@@ -149,6 +149,110 @@ def test_compare_pairs_by_date_and_side(tmp_path):
     pairs, p_only, v_only = compare.pair(paper, vol)
     assert len(pairs) == 1 and not p_only and len(v_only) == 1
     assert 'gap' in compare.render(pairs, p_only, v_only).lower()
+
+
+def _pair_rows(n, paper_exit=170.0, volrix_exit=170.0):
+    """n matched CE trades on consecutive days from the gate's first day."""
+    paper, vol = [], []
+    for i in range(n):
+        d = compare.GATE_START + timedelta(days=i)
+        paper.append({'entry_date': d.isoformat(), 'side': 'CE', 'strike': 23000.0,
+                      'entry_price': 150.0, 'exit_price': paper_exit})
+        vol.append({'entry_date': d, 'side': 'CE', 'instrument': 'NIFTY 23,000 CE',
+                    'entry_price': 150.0, 'exit_price': volrix_exit, 'pnl': 1300.0,
+                    'remarks': 'Next day 09:25 exit'})
+    return paper, vol
+
+
+def test_gate_in_progress_below_30_pairs():
+    g = compare.gate(*_pair_rows(29))
+    assert g['verdict'] == 'IN PROGRESS' and g['pairs'] == 29
+
+
+def test_gate_passes_exactly_at_the_cost_limit():
+    g = compare.gate(*_pair_rows(30, paper_exit=168.0))
+    assert g['mean_cost'] == 2.0 and g['verdict'] == 'PASS'
+
+
+def test_gate_fails_just_above_the_cost_limit():
+    assert compare.gate(*_pair_rows(30, paper_exit=167.99))['verdict'] == 'FAIL'
+
+
+def test_gate_population_is_frozen_at_the_first_30():
+    """A bad 31st trade cannot fail a finished test, and a good one cannot rescue it."""
+    paper, vol = _pair_rows(31)
+    paper[30]['exit_price'] = 100.0
+    g = compare.gate(paper, vol)
+    assert g['pairs'] == 30 and g['verdict'] == 'PASS'
+
+
+def test_gate_ignores_trades_before_it_started():
+    paper, vol = _pair_rows(1)
+    early = compare.GATE_START - timedelta(days=1)
+    vol.append(dict(vol[0], entry_date=early, pnl=50000.0))
+    g = compare.gate(paper, vol)
+    assert g['pairs'] == 1 and not g['missed']
+
+
+def test_gate_one_missed_big_win_fails_immediately():
+    paper, vol = _pair_rows(3)
+    vol.append(dict(vol[0], side='PE', pnl=10000.0))
+    g = compare.gate(paper, vol)
+    assert g['verdict'] == 'FAIL' and len(g['missed']) == 1
+
+
+def test_gate_a_win_just_under_the_line_is_not_a_miss():
+    paper, vol = _pair_rows(3)
+    vol.append(dict(vol[0], side='PE', pnl=9999.0))
+    assert compare.gate(paper, vol)['verdict'] == 'IN PROGRESS'
+
+
+def test_gate_a_big_win_after_the_window_closed_is_not_a_miss():
+    paper, vol = _pair_rows(30)
+    late = compare.GATE_START + timedelta(days=45)
+    vol.append(dict(vol[0], entry_date=late, pnl=20000.0))
+    assert compare.gate(paper, vol)['verdict'] == 'PASS'
+
+
+def test_gate_excludes_the_end_of_backtest_row():
+    """That row's exit is a mark on a still-open trade, never a fill."""
+    paper, vol = _pair_rows(1)
+    vol[0]['remarks'] = 'IN x OUT End of backtest'
+    vol[0]['exit_price'] = 10.0
+    g = compare.gate(paper, vol)
+    assert g['pairs'] == 0 and len(g['excluded']) == 1
+
+
+def test_gate_waits_for_an_open_paper_position():
+    paper, vol = _pair_rows(1)
+    paper[0]['exit_price'] = None
+    assert compare.gate(paper, vol)['pairs'] == 0
+
+
+def test_gate_keeps_a_different_strike_and_reports_it():
+    paper, vol = _pair_rows(1)
+    vol[0]['instrument'] = 'NIFTY 23,050 CE'
+    g = compare.gate(paper, vol)
+    assert g['pairs'] == 1 and len(g['strike_diff']) == 1
+
+
+def test_gate_with_no_data_is_in_progress():
+    g = compare.gate([], [])
+    assert g['verdict'] == 'IN PROGRESS' and g['mean_cost'] is None
+    assert 'IN PROGRESS' in compare.render_gate(g)
+
+
+def test_volrix_reads_sept_dates_and_multiline_cells(tmp_path):
+    """The page writes 28 Sept 2026 and stacks a time under the price."""
+    csv = tmp_path / 'v.csv'
+    csv.write_text('Entry Date,Instrument,Entry Price,Exit Price,PnL,Remarks\n'
+                   '"28 Sept 2026\nMonday","NIFTY 23,000 PE","155.12\n13:00:00",'
+                   '"113.13\n15:38:59","-₹2,748\nMax ₹572",End of backtest\n',
+                   encoding='utf-8')
+    v = compare.load_volrix(csv)[0]
+    assert v['entry_date'] == date(2026, 9, 28)
+    assert v['entry_price'] == 155.12 and v['exit_price'] == 113.13 and v['pnl'] == -2748.0
+    assert v['remarks'] == 'End of backtest'
 
 
 def test_compare_refuses_unknown_headers(tmp_path):

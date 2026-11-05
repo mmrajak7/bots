@@ -19,6 +19,9 @@ class Notifier:
         self.enabled = enabled
         self.prefix = prefix
         self.sent: List[str] = []          # kept for tests and the EOD log
+        #: strings never to send or log (the live path sets the account id here;
+        #: empty for paper, which changes nothing)
+        self.redactions: List[str] = []
         self._cfg = None
         if enabled:
             try:
@@ -32,6 +35,9 @@ class Notifier:
                 self._cfg = None
 
     def send(self, text: str) -> bool:
+        for secret in self.redactions:
+            if secret:
+                text = text.replace(secret, '<redacted>')
         msg = '%s\n%s' % (self.prefix, text)
         self.sent.append(msg)
         logger.info('ALERT %s', text.replace('\n', ' | '))
@@ -49,7 +55,10 @@ class Notifier:
                 return False
             return True
         except Exception as exc:
-            logger.error('Telegram send failed: %s | message: %s', exc, msg[:300])
+            # The exception text carries the request URL, which holds the bot
+            # token: log the type only.
+            logger.error('Telegram send failed: %s | message: %s',
+                         type(exc).__name__, msg[:300])
             return False
 
 
@@ -58,4 +67,5 @@ class NullNotifier(Notifier):
         self.enabled = False
         self.prefix = ''
         self.sent = []
+        self.redactions = []
         self._cfg = None

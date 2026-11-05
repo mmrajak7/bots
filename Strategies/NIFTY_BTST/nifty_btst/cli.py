@@ -34,6 +34,11 @@ logger = logging.getLogger('nifty_btst')
 #: consecutive unexpected step errors before a Telegram alert
 STEP_ERROR_ALERT_AFTER = 5
 
+#: the live commands, by name only: `live_cli` is imported ONLY when one of
+#: these is asked for, so a broken live module can never stop a paper command
+LIVE_COMMANDS = ('live-run', 'live-status', 'live-report', 'live-resume', 'live-digest',
+                 'live-confirm-held', 'live-book-external', 'neo-probe', 'neo-order-probe')
+
 
 def _logging() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
@@ -58,7 +63,19 @@ class _Lock:
             fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined,unused-ignore]
             return True
         except OSError:
+            self.fh.close()
+            self.fh = None
             return False
+
+    def release(self) -> None:
+        """Explicit release: the OS frees the lock when the fd closes, but a
+        logged exception can keep the frame (and the fd) alive longer than
+        the function that took it (seen under pytest on Linux)."""
+        if self.fh is not None:
+            try:
+                self.fh.close()
+            finally:
+                self.fh = None
 
 
 def _send_digest(engine: Engine, store: Store, notifier: Notifier, today) -> None:
@@ -216,6 +233,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     since = date.fromisoformat(args.since) if args.since else None
     vol = cmp.load_volrix(Path(args.csv))
     print(cmp.render(*cmp.pair(store.data['positions'], vol, since)))
+    print(cmp.render_gate(cmp.gate(store.data['positions'], vol)))
     return 0
 
 
@@ -245,6 +263,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     c.add_argument('csv')
     c.add_argument('--since', help='YYYY-MM-DD; default = first paper trade')
     sub.add_parser('digest')
+    handlers = {'run': cmd_run, 'status': cmd_status, 'report': cmd_report,
+                'compare': cmd_compare, 'digest': cmd_digest}
+    # Live/rehearsal commands live in their own module and are imported ONLY
+    # when one is requested: a syntax error in the live code must not stop
+    # the paper trader under its frozen test (R2-27).
+    first = next((a for a in (argv if argv is not None else sys.argv[1:])
+                  if not a.startswith('-')), None)
+    if first in LIVE_COMMANDS:
+        from . import live_cli
+        handlers.update(live_cli.register(sub))
+    else:
+        for name in LIVE_COMMANDS:
+            sub.add_parser(name, add_help=False)
     args = ap.parse_args(argv)
-    return {'run': cmd_run, 'status': cmd_status, 'report': cmd_report,
-            'compare': cmd_compare, 'digest': cmd_digest}[args.cmd](args)
+    return handlers[args.cmd](args)
