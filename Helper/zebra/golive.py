@@ -58,6 +58,7 @@ from . import config as cfg
 from . import fees as fees_mod
 from . import replay
 from . import structure_shadow as ss
+from . import veto_naked
 
 #: One tick, the smallest price step on NSE stock options. The stress line
 #: prices every order one tick worse than the touch it was measured at.
@@ -343,17 +344,18 @@ def population(rows: list, n: int) -> list:
       open      still running"""
     first = sorted((r for r in rows if not r.get('partial') and r.get('start')),
                    key=lambda r: r['start'])[:n]
-    out = []
-    for r in first:
-        if not r['resolved']:
-            out.append(dict(r, net_pct=None, booked='open'))
-        elif not r['priced']:
-            out.append(dict(r, net_pct=UNPRICED_NET_PCT, booked='unpriced'))
-        elif r.get('net') is None or not r['capital']:
-            out.append(dict(r, net_pct=r['pct'] - replay.COST_PCT, booked='uncosted'))
-        else:
-            out.append(dict(r, net_pct=100.0 * r['net'] / r['capital'], booked='net'))
-    return out
+    return [_booked(r) for r in first]
+
+
+def _booked(r: dict) -> dict:
+    """The row with `net_pct` and `booked`, scored the way the test scores it."""
+    if not r['resolved']:
+        return dict(r, net_pct=None, booked='open')
+    if not r['priced']:
+        return dict(r, net_pct=UNPRICED_NET_PCT, booked='unpriced')
+    if r.get('net') is None or not r['capital']:
+        return dict(r, net_pct=r['pct'] - replay.COST_PCT, booked='uncosted')
+    return dict(r, net_pct=100.0 * r['net'] / r['capital'], booked='net')
 
 
 def test_rows(rows: list, n: int = TEST_N) -> list:
@@ -629,6 +631,77 @@ def approach(tests: list, state: dict, load=None) -> dict:
 
 # -- report --------------------------------------------------------------------
 
+def veto_naked_read(allowed_rows: list, now: datetime, trades: list = (),
+                    state: Optional[dict] = None) -> dict:
+    """Vetoed setups as real naked options, against the allowed `naked_long`
+    rows that entered over the same dates. Read-only.
+
+    Same dates because a comparison across different markets is the exact flaw
+    this book exists to remove from section 8. Naked trades track the market and
+    its direction, so the `matched` pair keeps only the weeks and sides BOTH
+    groups traded: that is the row to read. Every row is scored as the test
+    scores it (`_booked`), so a dead book cannot flatter either side. PARTIAL
+    rows are left out of both. `flipped` counts vetoed setups that also ENTERED
+    on the same line, before or after: real veto outcomes, so they stay in, but
+    the reader should know the two groups overlap by that much."""
+    st = state if state is not None else veto_naked.load_state()
+    rows = [r for r in arm_rows(st, {}, veto_naked.ARM, now) if r['start']]
+    out = {'rows': len(rows), 'partial': sum(r['partial'] for r in rows),
+           'repeats': sum(len(sh.get('repeat_ids') or []) for sh in st['shadows'].values()),
+           'unopened': {}, 'vetoed': None, 'allowed': None, 'flipped': 0, 'since': None}
+    for u in st.get('unopened', {}).values():
+        why = str(u.get('reason'))
+        out['unopened'][why] = out['unopened'].get(why, 0) + 1
+    if not rows:
+        return out
+    out['since'], out['until'] = min(r['start'] for r in rows), max(r['start'] for r in rows)
+    entered_keys = {veto_naked.setup_key(t) for t in trades
+                    if isinstance(t.get('vet'), dict) and t['vet'].get('state') == 'allowed'
+                    and t.get('status') in ('entered', 'exited')}
+    out['flipped'] = sum(k in entered_keys for k in st.get('setups', {}))
+
+    def side(xs):
+        booked = [_booked(r) for r in xs if not r['partial']]
+        nets = [r['net_pct'] for r in booked if r['net_pct'] is not None]
+        return {'n': len(nets), 'open': len(booked) - len(nets),
+                'unpriced': sum(r['booked'] == 'unpriced' for r in booked),
+                'uncosted': sum(r['booked'] == 'uncosted' for r in booked),
+                'win': 100.0 * sum(x > 0 for x in nets) / len(nets) if nets else None,
+                'mean': _mean(nets), 'se': _sd(nets) / len(nets) ** 0.5 if len(nets) > 1 else None}
+
+    def cell(r):
+        return (tuple(r['start'].isocalendar()[:2]), r.get('dir'))
+    allowed = [r for r in allowed_rows if r['start'] and out['since'] <= r['start'] <= out['until']]
+    both = {cell(r) for r in rows} & {cell(r) for r in allowed}
+    out['vetoed'], out['allowed'] = side(rows), side(allowed)
+    out['vetoed_matched'] = side([r for r in rows if cell(r) in both])
+    out['allowed_matched'] = side([r for r in allowed if cell(r) in both])
+    return out
+
+
+def _veto_naked_lines(state: dict, by_id: dict, now: datetime) -> list:
+    vn = veto_naked_read(arm_rows(state, by_id, 'naked_long', now), now, list(by_id.values()))
+    if not vn['rows']:
+        lines = ['  Nothing yet: rows open only on vetoes decided after this shipped (never backfilled).']
+    else:
+        lines = ['  %s to %s; %d partial left out; %d re-vetoes not scored; %d vetoed setups also entered'
+                 % (vn['since'].strftime('%Y-%m-%d'), vn['until'].strftime('%Y-%m-%d'), vn['partial'],
+                    vn['repeats'], vn['flipped']),
+                 '  %-22s %4s %5s %5s %6s %9s %6s' % ('group', 'n', 'open', 'unpr', 'win%', 'mean net', 'SE')]
+        for label, key in (('vetoed', 'vetoed'), ('allowed', 'allowed'),
+                           ('vetoed, same wk+side', 'vetoed_matched'),
+                           ('allowed, same wk+side', 'allowed_matched')):
+            g = vn[key]
+            lines.append('  %-22s %4d %5d %5d %6s %9s %6s%s' % (
+                label, g['n'], g['open'], g['unpriced'], _f(g['win'], '%.0f%%'),
+                _f(g['mean'], '%+.1f%%'), _f(g['se'], '%.1f'), _thin(g['n'])))
+        lines.append('  Read the same wk+side rows: the market and its direction drive most of the rest.')
+        lines.append('  !! CENSORED while any row is open: closed rows are the fast ones, on both sides.')
+    if vn['unopened']:
+        lines.append('  never opened: %s' % ', '.join('%s %d' % kv for kv in sorted(vn['unopened'].items())))
+    return lines
+
+
 def _f(x, fmt='%.0f', dash='-'):
     return dash if x is None else fmt % x
 
@@ -832,6 +905,15 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
     p('  REVIEW TRIGGER (fixed in advance): >= %d vetoes replayed and vetoed averaging >= %.0f'
       % (VET_REVIEW_MIN_N, VET_REVIEW_GAP))
     p('  points ABOVE allowed.  Now: %s' % ('!! TRIPPED -- review the vetting' if vt['review'] else 'not tripped'))
+
+    p('\n8b VETO_NAKED -- every veto as a real naked option, same exits as naked_long, own book')
+    # This report returns its text at the end, so a crash here would also lose
+    # the 100-trade verdict printed above it.
+    try:
+        for line in _veto_naked_lines(state, by_id, now):
+            p(line)
+    except Exception as e:
+        p('  UNAVAILABLE -- %r' % e)
 
     p('\n9 TIME EXIT -- second hypothesis: exit at the close of session N unless the target')
     p('  was hit, on the SAME fixed test trades, priced on the arm\'s real session-close marks')

@@ -297,9 +297,12 @@ def _has_short(arm: dict) -> bool:
 
 # -- state -------------------------------------------------------------------
 
-def _load() -> dict:
+def _load(path=None) -> dict:
+    # `path`: `veto_naked` keeps its own book with the same failure behaviour.
+    # The default is read at CALL time so tests can repoint STATE_FILE.
+    path = path or STATE_FILE
     try:
-        with open(STATE_FILE, encoding='utf-8') as f:
+        with open(path, encoding='utf-8') as f:
             d = json.load(f)
         if not isinstance(d, dict) or not isinstance(d.get('shadows'), dict):
             raise ValueError('unexpected shape')
@@ -312,18 +315,19 @@ def _load() -> dict:
         # than lose every future observation to a parse error on the old one.
         logger.warning('shadow state unreadable (%s) -- starting a new one', e)
         try:
-            os.replace(str(STATE_FILE), str(STATE_FILE) + '.unreadable')
+            os.replace(str(path), str(path) + '.unreadable')
         except OSError:
             pass
         return {'schema': SCHEMA, 'shadows': {}}
 
 
-def _save(state: dict) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = str(STATE_FILE) + '.tmp'
+def _save(state: dict, path=None) -> None:
+    path = path or STATE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(path) + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(state, f, indent=1, sort_keys=True)
-    os.replace(tmp, str(STATE_FILE))
+    os.replace(tmp, str(path))
 
 
 # -- pricing -----------------------------------------------------------------

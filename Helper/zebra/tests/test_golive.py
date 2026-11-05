@@ -227,6 +227,7 @@ def test_a_partial_shadow_is_kept_out_of_the_ladder():
 def test_the_report_leads_with_the_100_trade_test(monkeypatch):
     sh = _shadow()
     monkeypatch.setattr(ss, '_load', lambda: {'schema': ss.SCHEMA, 'shadows': {'1': sh}})
+    monkeypatch.setattr(golive.veto_naked, 'load_state', lambda: {'shadows': {}})
     # Nothing may reach the real candle cache or the real value paths.
     monkeypatch.setattr(golive.replay, 'universe', lambda: [])
     monkeypatch.setattr(golive.replay, 'load_daily', lambda s: None)
@@ -639,6 +640,7 @@ def test_the_pack_survives_a_replay_that_cannot_run(monkeypatch):
     the replay sections say UNAVAILABLE instead of killing the pack."""
     sh = _shadow()
     monkeypatch.setattr(ss, '_load', lambda: {'schema': ss.SCHEMA, 'shadows': {'1': sh}})
+    monkeypatch.setattr(golive.veto_naked, 'load_state', lambda: {'shadows': {}})
 
     def boom():
         raise FileNotFoundError('nse_stocks_options.csv')

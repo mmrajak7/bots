@@ -1110,6 +1110,7 @@ measurements for after it, not inputs to it. Read-only:
 | 5 per-trade capital | a ceiling on one trade's capital | skip trades above it |
 | 6 bands | avoid high-IV / high-VIX / expensive names? | `context` stamped at shadow open: India VIX, the long's IV (Black-Scholes off the mid, `zebra/ivcalc.py`), premium % spot, DTE, capital |
 | 7 selection | do live's filters pick better trades? | the test trades vs `replay.replay_window` over the same entry dates |
+| 8b veto_naked | the same question on real option prices, forward only, vetoed against allowed over the same dates | `logs/shadow_veto_naked.json` |
 | 8 vetting | are the vetoes turning away worse trades? | every allowed / vetoed setup replayed naked from its trigger (`replay.replay_record`), ONE row per setup (stock, direction, ST line); `veto_shadow` labels alongside |
 | 9 time exit | would "exit at the close of session 3 unless the target was hit" have done better on the same trades? | `naked_long` session-close `marks` (value paths before 2026-09-25); paired gain ± SE, trades cut, cut-then-TP; N=1,2 shown only |
 | 1b let it run | third hypothesis (2026-10-27): `naked_run1` vs `naked_long` paired on the same ids. Replay 2024-26 +5.3 (SE 0.6) but daily bars overstate it; 30 real shadow TPs on 5-min option prices +8.8 (SE 10.5), median −4.9. SUPPORTED needs ≥ 2 SE at 50 test trades | `naked_run1` arm |
@@ -1135,6 +1136,14 @@ the spread has stopped out, and the value paths stop there — so it is the one
 arm no replay of existing data can ever answer. Nothing here can place an
 order, send a Telegram, or write to `zebra_trades.json`, and a test asserts
 that structurally rather than trusting the docstring.
+
+**Vetoes get their own naked book (`zebra/veto_naked.py`, 2026-11-05).** Every
+vetoed setup opens one forward-only row at the live ask on the first cycle after
+its verdict, in `logs/shadow_veto_naked.json`, driven by the same `poll_one` as
+`naked_long`. Read it in `zebra golive` section 8b. It is a separate file so it
+cannot enter the test's population or block a real shadow on the same id, and
+it changes no veto or trading rule. It exists because 13 extra setups moved the
+replayed veto mean by 8.6 points: a daily-candle replay cannot settle this.
 
 **The shadow closes the way live closes (owner, 2026-10-05: "shadow should
 close same as live - then there is no purpose").** Every arm runs the live

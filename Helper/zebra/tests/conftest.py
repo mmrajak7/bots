@@ -110,8 +110,9 @@ def _no_production_paths(tmp_path_factory, monkeypatch):
     # shadow book with fake quotes and saved it (the laptop copy's mtime moved
     # on each suite run). `test_no_zebra_module_points_at_production_logs`
     # now scans every zebra module, not only cfg.
-    from zebra import debit_sl_study, structure_shadow, trail_study
+    from zebra import debit_sl_study, structure_shadow, trail_study, veto_naked
     monkeypatch.setattr(structure_shadow, 'STATE_FILE', tmp / 'shadow_structures.json')
+    monkeypatch.setattr(veto_naked, 'STATE_FILE', tmp / 'shadow_veto_naked.json')
     # Read-only studies, but a test reading the real book depends on prod data.
     monkeypatch.setattr(debit_sl_study, 'TRADES', tmp / 'zebra_trades.json')
     monkeypatch.setattr(trail_study, 'TRADES', tmp / 'zebra_trades.json')
