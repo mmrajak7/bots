@@ -36,7 +36,8 @@ def _show(out: Out, title: str, data: Any, limit: int = 1500) -> None:
 
 
 def run_probe(reader: NeoReader, underlying: str, today: date,
-              kite_row: Optional[Dict[str, Any]] = None, out: Out = print) -> int:
+              kite_row: Optional[Dict[str, Any]] = None, out: Out = print,
+              net_field: str = 'Net') -> int:
     """Returns 0 when every read answered, 1 when something could not be read.
     Never raises on a NEO failure: each section reports its own."""
     rc = 0
@@ -112,6 +113,11 @@ def run_probe(reader: NeoReader, underlying: str, today: date,
             if isinstance(data, dict):
                 keys += ['data.' + k for k in sorted(data.keys())]
             out('limits keys: %s' % ', '.join(keys))
+            # The envelope print is truncated and the field sits past the cut, so
+            # say its value outright: the owner compares it with the NEO app.
+            net = data.get(net_field) if isinstance(data, dict) else None
+            out('limits %s = %s  (must equal AVAILABLE rupees in the NEO app)'
+                % (net_field, raw.get(net_field, net)))
             out('neo.limits_net_field must name the AVAILABLE rupees above.')
     out('PROBE %s' % ('OK' if rc == 0 else 'INCOMPLETE'))
     return rc

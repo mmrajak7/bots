@@ -272,3 +272,10 @@ def test_order_probe_hold_then_sell_next_morning(tmp_path):
     r4.fb.set_external_position(NEO, LOT, day=T('2026-10-27', '00:00:00').date())
     rc = r4.run(step='sell')                                          # row PRESENT: sells via the guard
     assert rc == 0 and any('PRESENT' in s for s in r4.out)
+
+
+def test_run_probe_states_the_funds_value_outright():
+    # The real limits envelope runs past the print limit, so `Net` was never visible.
+    lines = []
+    neo_probe.run_probe(FakeReader(), 'NIFTY', T('2026-10-26', '10:00:00').date(), out=lines.append)
+    assert any(line.startswith('limits Net = 12345') for line in lines)

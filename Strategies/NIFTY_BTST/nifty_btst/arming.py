@@ -138,7 +138,8 @@ def check(cfg: Config, execution: str, neo: NeoConfig, state_dir: Path, today: d
     rep.lines.append(gate_line)
     if execution == 'rehearsal':
         rep.armed_until = today          # entries go to the fake; nothing real
-        rep.lines.append('ARMED: rehearsal — orders go to the in-process fake broker')
+        rep.lines.append('ARMED: rehearsal — orders go to the in-process fake broker '
+                         '(a pass-mark block above applies to real orders only)')
     else:
         until = read_arm(state_dir, today, neo.arm_max_days)
         if until and verdict == 'PASS':

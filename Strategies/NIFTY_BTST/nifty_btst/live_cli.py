@@ -813,7 +813,8 @@ def cmd_neo_probe(args: argparse.Namespace) -> int:
         return EXIT_REFUSED
     try:
         pin_ipv4()
-        return run_probe(reader, cfg.underlying, today, kite_row=row)
+        return run_probe(reader, cfg.underlying, today, kite_row=row,
+                         net_field=neo.limits_net_field)
     finally:
         lock.release()
 

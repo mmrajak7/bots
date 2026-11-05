@@ -496,7 +496,7 @@ def test_order_probe_cli_hold_and_sell_steps(wired):
 def test_neo_probe_cli_uses_the_reader_only(wired, monkeypatch, capsys):
     seen = {}
 
-    def fake_probe(reader, underlying, today, kite_row=None, out=print):
+    def fake_probe(reader, underlying, today, kite_row=None, out=print, net_field='Net'):
         seen['reader'] = type(reader).__name__
         seen['row'] = kite_row
         return 0
