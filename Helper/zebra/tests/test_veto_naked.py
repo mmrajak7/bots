@@ -64,6 +64,11 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(vn.strikes_mod, 'prefetch_quotes', lambda k, s: 0)
     monkeypatch.setattr(vn.strikes_mod, '_quote_option', lambda k, s: box['q'])
     monkeypatch.setattr(vn, '_spots', lambda k, n: {x: box['spot'] for x in n})
+    # Never the production decision journal (its store syncs from Drive), the
+    # live event calendar, or the shared candle cache.
+    monkeypatch.setattr(vn, '_decision', lambda i: box.get('decision', {}))
+    monkeypatch.setattr(vn, 'results_in_window', lambda s, a, b: list(box.get('results', [])))
+    monkeypatch.setattr(vn.entry_tags.replay, 'load_daily', lambda s: box.get('daily'))
     return box
 
 

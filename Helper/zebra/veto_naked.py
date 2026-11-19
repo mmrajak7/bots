@@ -50,6 +50,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
 from . import config as cfg
+from . import entry_tags
 from . import strikes as strikes_mod
 from . import structure_shadow as ss
 from .trade_store import decided
@@ -106,6 +107,106 @@ def contract(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not (out['symbol'] and out['expiry'] and out['target'] and out['lot']):
         return None
     return out
+
+
+#: Veto reason categories, checked IN THIS ORDER against each reason line
+#: until one matches (Fable review 2026-11-19, shadow item 3). EVENT first:
+#: an earnings veto often also says "spread" or "in three weeks", and it is
+#: the category that may matter MORE for a naked long (IV crush). SPREAD is an
+#: argument that exists only for a vertical (debit/width cap, capped payoff),
+#: so it says nothing about the naked trade this book measures.
+#: Descriptive only -- nothing reads it to decide a veto or a trade. The
+#: first two reason lines are stored beside it so the review can re-label.
+VETO_CATEGORIES = (
+    ('EVENT', ('result', 'earning', 'print', ' q1', ' q2', ' q3', ' q4', 'quarter',
+               'dividend', 'ex-date', 'record date', 'board ', 'agm', 'bonus', 'split',
+               'catalyst')),
+    ('SPREAD', ('width', 'debit', 'priced out', 'past the cap', 'own cap', 'expensive',
+                'rich', 'best case', 'payoff')),
+    ('TREND', ('already fallen', 'already rallied', 'already run', 'bad news', 'weak',
+               'resistance', 'overhead')),
+    ('PACE', ('clock', 'arrives', 'arrive', 'runs out', 'in under', 'weeks', 'sessions',
+              ' days', 'slow')),
+    ('LIQ', ('liquid', 'tradeable', 'tradable', 'open interest', 'bid-ask', 'depth')),
+    ('MAGNET', ('come back', 'comes back', 'returned', 'magnet')),
+)
+#: Event types that count as a results print inside the trade's window.
+RESULTS_TYPES = ('results',)
+
+
+def veto_category(reasons: Iterable[Any]) -> str:
+    """The primary category of a veto: the first reason line that matches."""
+    for ln in reasons or ():
+        low = ' ' + str(ln).lower()
+        for cat, kws in VETO_CATEGORIES:
+            if any(k in low for k in kws):
+                return cat
+    return 'OTHER'
+
+
+def _decision(decision_id: Any) -> Dict[str, Any]:
+    """The vet's decision record, or {}. Never raises."""
+    if decision_id is None:
+        return {}
+    try:
+        from . import decisions
+        st = decisions.get_store()
+        d = st.find(decision_id)
+        if d is None:
+            # The verdict is written by a spawned CLI agent, another process:
+            # this process's snapshot may predate it.
+            st.refresh()
+            d = st.find(decision_id)
+        return d or {}
+    except Exception as e:
+        logger.debug('veto_naked: decision %s unreadable: %s', decision_id, e)
+    return {}
+
+
+def stamp_category(sh: Dict[str, Any]) -> bool:
+    """Fill `veto_category` / `veto_reasons` from the decision, once. A row
+    whose decision is not readable yet stays None and is retried next cycle."""
+    if sh.get('veto_category') is not None:
+        return False
+    reasons = [str(x) for x in (_decision(sh.get('decision_id')).get('reasons') or [])]
+    if not reasons:
+        return False
+    sh['veto_category'] = veto_category(reasons)
+    sh['veto_reasons'] = [x[:200] for x in reasons[:2]]
+    return True
+
+
+def results_in_window(stock: Any, start: str, expiry: str) -> List[str]:
+    """Results dates the event calendar holds for this stock inside
+    [start, expiry]. Taken AT OPEN only: the calendar is forward-looking, so a
+    past row may since have been pruned. Never raises."""
+    try:
+        from . import events
+        out = []
+        for e in events.load().get('events') or []:
+            if e.get('type') in RESULTS_TYPES and e.get('symbol') == stock                     and start <= str(e.get('date'))[:10] <= expiry:
+                out.append(str(e['date'])[:10])
+        return sorted(set(out))
+    except Exception as e:
+        logger.debug('veto_naked: event calendar unreadable: %s', e)
+        return []
+
+
+def stamp_results_iv(sh: Dict[str, Any]) -> bool:
+    """IV at the first session-close mark AFTER the first results date, once.
+
+    With entry IV in `context.iv_long`, that pair is the earnings crush on the
+    option this veto would have bought. True if it was stamped this call."""
+    if sh.get('iv_after_results') is not None or not sh.get('results_dates'):
+        return False
+    first = sh['results_dates'][0]
+    marks = ((sh.get('arms') or {}).get(ARM) or {}).get('marks') or {}
+    after = sorted(d for d in marks if d > first and marks[d].get('iv') is not None)
+    if not after:
+        return False
+    sh['iv_after_results'] = {'date': after[0], 'iv': marks[after[0]]['iv'],
+                              'results_date': first}
+    return True
 
 
 def _spots(kite: Any, names: Iterable[str]) -> Dict[str, float]:
@@ -215,10 +316,14 @@ def _open_one(state: Dict[str, Any], t: Dict[str, Any], c: Dict[str, Any], lq: O
         'opened_late': (vet_now - made).total_seconds() > ss.MAX_OPEN_LAG_SEC,
         'polls': 0, 'repeat_ids': [],
         'context': ss.entry_context(book, None, 'not_read'),
+        'veto_category': None, 'veto_reasons': [],
+        'results_dates': results_in_window(t.get('stock'), day, str(c['expiry'])[:10]),
+        'iv_after_results': None,
         'arms': {ARM: {'status': 'open', 'entry_value': round(float(ask), 4),
                        'fills': ss.ARMS[ARM]['fills'], 'peak': round(float(ask), 4),
                        'exit': None}},
     }
+    stamp_category(state['shadows'][tid])
     key = setup_key(t)
     if key:
         state['setups'][key] = tid
@@ -290,9 +395,16 @@ def poll(store: Any, kite: Any) -> Dict[str, Any]:
                 try:
                     lq = strikes_mod._quote_option(kite, sh['long_symbol'])
                     ss.poll_one(sh, ltps.get(sh['stock']), lq, None, now, now.date())
+                    stamp_results_iv(sh)
+                    stamp_category(sh)
                     closed += sh['arms'][ARM]['status'] != 'open'
                 except Exception as e:
                     logger.warning('veto_naked: poll failed for #%s: %s', tid, e)
+        # Entry tags (zebra/entry_tags.py): every row, the same definitions as
+        # the structure shadow, so allowed and vetoed read on one yardstick.
+        tagged = entry_tags.stamp_missing(state['shadows'])
+        if tagged:
+            logger.info('SHADOW veto_naked: entry tags stamped on %d row(s)', tagged)
         if new_book or state['shadows'] or state['unopened']:
             ss._save(state, STATE_FILE)
         # Today's only: an older one can no longer open, so it is not waiting.

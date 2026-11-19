@@ -163,6 +163,7 @@ from common import market_session
 from common.nse_holidays import sessions_between
 
 from . import config as cfg
+from . import entry_tags
 from . import ivcalc
 from . import mfe as mfe_mod
 from . import strikes as strikes_mod
@@ -289,6 +290,25 @@ def entry_context(trade: dict, vix: Optional[float] = None,
     except Exception as e:
         ctx['error'] = str(e)
     return ctx
+
+
+def mark_iv(sh: dict, lq: Optional[dict], spot: float, today: date) -> Optional[float]:
+    """IV % of the long leg off its mid, or None. Never raises.
+
+    The mid, not the bid the mark is valued at: the bid carries half the
+    bid-ask, which on a thin book reads as volatility that is not there --
+    the same reason `entry_context` prices entry IV off the mid."""
+    try:
+        bid, ask = float((lq or {}).get('bid') or 0), float((lq or {}).get('ask') or 0)
+        if bid <= 0 or ask <= 0 or spot <= 0 or not sh.get('long_strike'):
+            return None
+        days = (date.fromisoformat(str(sh.get('expiry'))[:10]) - today).days
+        iv = ivcalc.implied_vol(sh.get('direction'), (bid + ask) / 2.0, spot,
+                                float(sh['long_strike']), max(days, 0.5) / 365.0,
+                                cfg.IV_RISK_FREE_RATE)
+        return None if iv is None else round(100.0 * iv, 1)
+    except Exception:
+        return None
 
 
 def _has_short(arm: dict) -> bool:
@@ -855,6 +875,13 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
             mark = {'at': ts, 'value': round(float(v), 4)}
             if spot_ok:
                 mark['spot'] = round(float(spot), 2)
+                # IV of the long at the close, off the MID as at entry, so a
+                # move in implied vol during the trade (the earnings crush in
+                # particular) can be read from the shadow's own marks
+                # (Fable review 2026-11-19, shadow item 4). Measurement only.
+                iv = mark_iv(sh, lq, float(spot), today)
+                if iv is not None:
+                    mark['iv'] = iv
             a.setdefault('marks', {})[today.isoformat()] = mark
         if 'ladder' in a and v is not None and value_armed:
             # Each level books where the LIVE stop would: on the confirming
@@ -1080,11 +1107,17 @@ def poll(store, kite, ltps: Optional[dict] = None) -> dict:
         if seeded:
             logger.info('SHADOW %s: seeded on %d open shadow(s) from %s',
                         RUN_ARM, seeded, RUN_TWIN)
+        # Entry tags for the 100/150-trade review (zebra/entry_tags.py). A
+        # stamp needs only pre-entry candles, so the first cycle after deploy
+        # backfills every older shadow with the number it would have had.
+        tagged = entry_tags.stamp_missing(state['shadows'])
+        if tagged:
+            logger.info('SHADOW entry tags stamped on %d shadow(s)', tagged)
 
         live = {k: v for k, v in state['shadows'].items()
                 if any(a['status'] == 'open' for a in v['arms'].values())}
         if not live:
-            if opened or wide_touched or seeded:
+            if opened or wide_touched or seeded or tagged:
                 _save(state)
             return {'opened': opened, 'live': 0}
 

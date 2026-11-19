@@ -655,6 +655,7 @@ def test_poll_opens_prices_and_persists_the_wide_arm_end_to_end(chain, monkeypat
     # session count or this test goes red by itself once the wall clock
     # passes it (as four other files here did on 2026-09-22).
     monkeypatch.setattr(ss, '_sessions_left', lambda expiry, today: 20)
+    monkeypatch.setattr(ss.entry_tags.replay, 'load_daily', lambda s: None)   # not the shared cache
     asked = []
 
     def quote(kite, sym):

@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import math
 import statistics
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from . import config as cfg
@@ -374,6 +374,58 @@ def _sd(xs):
     return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
 
 
+def week_of(d) -> str:
+    """ISO entry week, 'YYYY-WW': the cluster outcomes move together in."""
+    y, w, _ = (d if isinstance(d, date) else date.fromisoformat(str(d)[:10])).isocalendar()
+    return '%d-%02d' % (y, w)
+
+
+def clustered(vals: list, clusters: list) -> dict:
+    """Mean and a cluster-robust SE (clusters = entry weeks).
+
+    Why (Fable review 2026-11-19): trades entered the same week share one
+    market move -- entry week x side explained 38% of outcome variance -- so
+    the naive SE treats ~10 weekly draws as 80-odd independent ones and
+    roughly halves the true uncertainty. With few clusters this SE is itself
+    noisy and probably LOW; read it against t(g-1), not 1.96. Reported beside
+    the naive SE, never instead of it: the pre-registered gate is unchanged."""
+    n = len(vals)
+    if n == 0:
+        return {'mean': None, 'se': None, 'n': 0, 'g': 0}
+    m = sum(vals) / n
+    acc = {}
+    for v, c in zip(vals, clusters):
+        acc[c] = acc.get(c, 0.0) + (v - m)
+    g = len(acc)
+    se = math.sqrt(sum(x * x for x in acc.values()) / (n * n) * g / (g - 1)) if g > 1 else None
+    return {'mean': m, 'se': se, 'n': n, 'g': g}
+
+
+def within_week_side(tests: list, replayed: list, key: str = 'net_pct') -> dict:
+    """Each test trade's `key` minus the mean replay result of EVERY signal
+    entered the same ISO week on the same side, clustered by week.
+
+    The selection question with the market taken out: CE trades in a rally
+    week are compared with every CE signal of that week, so a gap here is
+    picking, not direction. Trades whose week x side has no closed replay
+    signal are dropped and counted."""
+    cell = {}
+    for t in replayed:
+        if t.get('net_pct') is None or not t.get('entry_date'):
+            continue
+        cell.setdefault((week_of(t['entry_date']), t.get('dir')), []).append(t['net_pct'])
+    res, wk, dropped = [], [], 0
+    for r in tests:
+        v = r.get(key)
+        k = (week_of(r['start'].date()), r.get('dir'))
+        if v is None or k not in cell:
+            dropped += 1
+            continue
+        res.append(v - sum(cell[k]) / len(cell[k]))
+        wk.append(k[0])
+    return dict(clustered(res, wk), dropped=dropped)
+
+
 def _stats(nets: list) -> dict:
     sd = _sd(nets)
     return {'n': len(nets), 'mean': _mean(nets), 'se': (sd / math.sqrt(len(nets))) if sd else None,
@@ -433,7 +485,7 @@ def verdict(rows: list, sel_fn) -> dict:
 
 
 def selection(tests: list, replayed: Optional[list] = None,
-              cache_end: Optional[str] = None) -> dict:
+              cache_end: Optional[str] = None, self_nets: Optional[dict] = None) -> dict:
     """The trades live took against the replay of EVERY signal entered over the
     same dates. BLOCKED (replay None) when the candle cache does not reach the
     window's last entry -- a stale cache would silently turn late replay
@@ -455,6 +507,13 @@ def selection(tests: list, replayed: Optional[list] = None,
     closed = [t['net_pct'] for t in replayed if t.get('net_pct') is not None]
     out.update(replay=_mean(closed), n=len(closed), open=len(replayed) - len(closed),
                replay_win=(100.0 * sum(x > 0 for x in closed) / len(closed)) if closed else None)
+    # Descriptive (Fable review 2026-11-19): the gap with week x side removed,
+    # in total (live price) and as SELECTION only (the live trade's own replay
+    # against its cell, so pricing is held on one yardstick). Never gated.
+    out['within'] = within_week_side(tests, replayed)
+    if self_nets is not None:
+        rows = [dict(r, self_net=self_nets.get(r['id'])) for r in tests]
+        out['within_sel'] = within_week_side(rows, replayed, key='self_net')
     return out
 
 
@@ -738,7 +797,16 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
         if replay_err:
             return None
         try:
-            return selection(t, cache_end=cache_end)
+            # Each test trade replayed on its own, so selection can be read
+            # on one yardstick (within_sel). Only when the replay can run.
+            own = None
+            if cache_end and t and cache_end >= max(r['start'] for r in t).strftime('%Y-%m-%d'):
+                own = {}
+                for r in t:
+                    rec = by_id.get(r['id'])
+                    rp = replay.replay_record(rec) if rec else None
+                    own[r['id']] = rp.get('net_pct') if rp else None
+            return selection(t, cache_end=cache_end, self_nets=own)
         except Exception as e:
             return {'replay': None, 'blocked': 'replay failed: %s' % e}
 
@@ -761,6 +829,10 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
     p('  closed so far: mean net %s   SE %s   win %s   without top %d: %s' % (
         _f(st_now['mean'], '%+.1f%%'), _f(st_now['se'], '%.1f'), _f(st_now['win'], '%.0f%%'),
         TOP_K, _f(st_now['ex_top'], '%+.1f%%')))
+    cl_now = clustered([r['net_pct'] for r in tests], [week_of(r['start'].date()) for r in tests])
+    p('  week-clustered SE %s over %d entry weeks (descriptive; trades in one week share a market '
+      'move -- read against t(%d), the gate itself is unchanged)'
+      % (_f(cl_now['se'], '%.1f'), cl_now['g'], max(cl_now['g'] - 1, 1)))
     p('  vs replay of every signal, same dates: live %s vs replay %s (%d replayed, %d open)%s' % (
         _f(sel['live'], '%+.1f%%'), _f(sel['replay'], '%+.1f%%'), sel['n'], sel['open'],
         ('  !! ' + sel['blocked']) if sel.get('blocked') else ''))
@@ -873,6 +945,12 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
         if sel['live'] is not None and sel['replay'] is not None:
             p("  difference %+.1f points -- positive means live's filters picked better trades"
               % (sel['live'] - sel['replay']))
+        for lab, k in (('within week x side, live price', 'within'),
+                       ('within week x side, SELECTION only (own replay)', 'within_sel')):
+            w = sel.get(k)
+            if w and w.get('n'):
+                p('  %-48s %s  SE %s (week-clustered, %d weeks, n %d, %d without a cell)'
+                  % (lab, _f(w['mean'], '%+.1f pts'), _f(w['se'], '%.1f'), w['g'], w['n'], w['dropped']))
         if sel.get('blocked'):
             p('  !! %s' % sel['blocked'])
     p('  The replay alone over 2020-2026: -3.9% a trade (n=6,187, one position per stock);')
