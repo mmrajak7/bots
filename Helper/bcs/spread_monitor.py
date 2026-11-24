@@ -418,10 +418,45 @@ def ist_epoch(stamp: str) -> float:
 
 # ── Market & Price ───────────────────────────────────────────────────────────
 
+def holiday_standdown() -> bool:
+    """True on a declared NSE holiday: log it, Telegram it ONCE per day.
+
+    WHY loud: the calendar can now switch this exit engine off for a whole
+    session, and that file was wrong for most of 2026. A wrong weekday entry
+    must be visible the day it bites, not inferred from silence. cron
+    relaunches this process every 5 minutes, so the once-per-day dedup lives
+    on disk, not in memory.
+    """
+    today = now_ist().date()
+    if nse_holidays.is_session(today) or today.weekday() >= 5:
+        return False
+    marker = LOG_DIR / f'holiday_standdown_{today:%Y%m%d}.alerted'
+    log(f"NSE holiday per {nse_holidays.HOLIDAY_FILE.name} ({today}) -- "
+        f"not a session, monitor standing down.")
+    if not marker.exists():
+        send_telegram(f"BCS monitor: {today} is an NSE holiday per the calendar "
+                      f"-- standing down for the day. If the market IS open, "
+                      f"the calendar is wrong: exits are NOT being watched.")
+        try:
+            marker.touch()
+        except OSError as e:
+            log(f"  WARNING: could not write {marker.name}: {e}")
+    return True
+
+
 def is_market_open() -> bool:
-    """Check if within NSE trading hours."""
-    now = now_ist().time()
-    return MARKET_OPEN <= now < MARKET_CLOSE
+    """Check if within NSE trading hours ON A TRADING DAY.
+
+    WHY the calendar check (2026-11-24): this used to test the clock only, so
+    on a weekday holiday the monitor polled a dead market all session and
+    alerted "spread quotes unreliable" on every open position. An unreadable
+    calendar degrades `is_session` to weekday-only -- i.e. back to the old
+    behaviour -- so a broken file can make the monitor noisy, never blind.
+    """
+    now = now_ist()
+    if not nse_holidays.is_session(now.date()):
+        return False
+    return MARKET_OPEN <= now.time() < MARKET_CLOSE
 
 
 # ── Batched quotes (F7) ─────────────────────────────────────────────────────
@@ -6879,6 +6914,8 @@ def monitor(kite: KiteConnect, trade: dict, target: float,
                     if ts['active']:
                         log(f"  Trailing SL state: peak={ts['peak']:.2f}, trail={ts['trail']:.2f}")
                     return
+                if holiday_standdown():
+                    return
                 # Before market open - wait
                 log(f"Market not open yet ({now_t.strftime('%H:%M')}). Waiting...")
                 time.sleep(30)
@@ -8264,6 +8301,13 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     _beat_all('closed', dry_run, all_trades, zebra_store,
                               kill_switch=kill_switch_announced)
                     return
+                if holiday_standdown():
+                    # Same stamp as a finished session: the peer must read
+                    # 'closed', not a crash, and zebra's heartbeat check is
+                    # itself gated off on a holiday.
+                    _beat_all('closed', dry_run, all_trades, zebra_store,
+                              kill_switch=kill_switch_announced)
+                    return
                 log(f"Market not open yet ({now_t.strftime('%H:%M')}). Waiting...")
                 # The cron line starts this process at 09:00; without a beat
                 # here the only stamp for the whole pre-open wait is the
@@ -9122,6 +9166,11 @@ def main():
 
     # ── --cron mode ──────────────────────────────────────────────────────
     if args.cron:
+        # A holiday is decided BEFORE startup: cron relaunches this every 5
+        # minutes, and the startup path (Drive sync, Kite auth, preflight)
+        # has no business running 75 times into a closed market.
+        if holiday_standdown():
+            return
         # Log file is set inside monitor_all()
         kite = load_kite()
         log("Kite authenticated.")

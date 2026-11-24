@@ -124,7 +124,10 @@ def _send_telegram(msg: str, dry_run: bool = False) -> bool:
 
 def _is_market_open() -> bool:
     now = datetime.now(IST)
-    if now.weekday() >= 5:
+    # Weekday holidays too (2026-11-24): the weekend test alone ran full
+    # cycles into closed markets on 09-14, 10-20, 11-10 and 11-24. Unreadable
+    # calendar -> weekday-only, the previous behaviour.
+    if not nse_holidays.is_session(now.date()):
         return False
     h, m = now.hour, now.minute
     open_h, open_m = cfg.MARKET_OPEN

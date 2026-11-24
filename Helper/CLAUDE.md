@@ -872,15 +872,36 @@ reads it at call time, cached on the file's mtime, so a refresh lands without
 restarting either engine. It is NOT in git — a `git pull` does not deliver it;
 SNAIL's daily startup has to produce it on the box.
 
-> ⚠ **The static list this replaced was mostly WRONG.** It shipped 2026-08-29
-> claiming three independent publications of the NSE calendar agreed on it.
-> Checked against 160 FIFTY daemon logs — a real holiday leaves a ~20-35 line
-> log (daemon started, found the market closed, exited) against ~5,700 on a
-> trading day — it scored **2 of 6** evidenced holidays and listed **6 dates
-> that were full trading days** (2026-03-03, 03-26, 03-31, 04-14, 05-01,
-> 05-28, 06-26). The three it MISSED (2026-02-19, 03-19, 04-01) are the half
-> that costs money: a missing holiday makes the session count over-estimate,
-> so the delivery close fires LATER, into the ramp.
+> ⚠ **CORRECTED 2026-11-24 — the SCRAPER was wrong, not the static list.**
+> Zerodha's trading-holiday table is `Date | Day | Holiday | Exchanges`; the
+> scraper read column 1 as the date, got the weekday, and its header filter
+> skipped the row. **Every real NSE closure was dropped**; the file held only
+> SETTLEMENT holidays (02-19, 03-19, 04-01, 08-26 — the market TRADES) and
+> MCX/weekend rows. Guru Nanak Jayanti (11-24) was missed and both engines
+> alerted every 5 minutes into a closed market; 09-14, 10-20 and 11-10 were
+> polled the same way (zebra logs: `no_two_way_book` all session).
+>
+> The "160 FIFTY daemon logs" evidence that condemned the old static list was
+> **circular**: a daemon reading this same file writes a full-size log into a
+> dead market, so log SIZE cannot tell open from closed. Kite's daily NIFTY 50
+> bars can: 03-03, 03-26, 03-31, 04-14, 05-01, 05-28, 06-26 have NO bar
+> (closed); 02-19, 03-19, 04-01, 06-23, 08-26 do (traded). **Evidence for a
+> closure is the exchange's own bars, never a log line count.**
+>
+> The parser now finds the date cell by content and keeps only rows whose
+> exchanges cell names `nse`; it refuses to overwrite the file if the current
+> year parses to fewer than 8 weekday closures. Pinned by
+> `SNAIL/tests/unit/test_holiday_parse.py`.
+
+**Both engines now consult it for TODAY (2026-11-24).** `bcs.spread_monitor`
+(`is_market_open`, and `holiday_standdown()` before cron startup) and zebra
+(`_is_market_open`) return closed on a listed weekday holiday. The monitor
+sends ONE Telegram per day saying it stood down — because a wrong weekday
+entry now blinds an exit engine for a session. Harmless while paper and
+`--dry-run`; **an arming blocker to revisit before exits go live.** An
+unreadable calendar degrades to weekday-only, i.e. noisy, never blind. BTST
+computes `session_expected` once at startup: restart `live-run` after a
+calendar refresh.
 
 `coverage_status()` reports `ok / expiring / expired / stale / missing /
 unreadable`. zebra checks it every cycle: **daily** Telegram for anything that
@@ -888,13 +909,9 @@ means the calendar is not working now (missing, unreadable, stale, expired),
 weekly for `expiring`, which is only a diary note about December. Every bad
 state degrades the count to weekday-only and says which way the error points.
 
-**The file is taken AS-IS** (owner decision, 2026-08-30) — no hand-patching and
-no reconciliation against observed sessions. Two divergences are therefore live
-and deliberate, both pinned in
-`test_the_known_imperfections_are_still_the_known_ones`: 2026-06-23 is an
-evidenced closure the file omits (count over-estimates, close fires later), and
-2026-08-26 is listed while `logs/cron_zebra_20260826.log` shows a full 347-poll
-session (count under-estimates, close fires earlier).
+**The file is taken AS-IS** (owner decision, 2026-08-30) — no hand-patching.
+The two "known imperfections" that decision pinned (06-23 omitted, 08-26
+listed) were both the scraper bug and are now simply correct.
 
 **A fired TRAIL is not proof of a profit.** The trigger is `mid <= level` and
 the booking price is `mid`; a gap straight through the level books wherever it

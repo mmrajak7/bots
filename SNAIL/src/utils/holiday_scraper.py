@@ -12,6 +12,7 @@ Automated scraping of NSE trading holidays from Zerodha marketintel.
 """
 
 import json
+import re
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple
 from loguru import logger
@@ -43,6 +44,14 @@ def get_holiday_file_path():
 
 
 HOLIDAY_FILE_PATH = get_holiday_file_path()
+
+_WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday",
+             "saturday", "sunday"}
+
+# A real NSE year has ~14-16 weekday closures. A current-year parse below this
+# floor means the page layout changed under the parser (the 2026 file held 6,
+# none of them real closures) -- refuse to overwrite rather than save garbage.
+MIN_WEEKDAY_HOLIDAYS_CURRENT_YEAR = 8
 
 # Date formats to try when parsing
 DATE_FORMATS = [
@@ -99,13 +108,24 @@ def fetch_holiday_page() -> Optional[str]:
 
 def parse_holidays(html_content: str) -> List[Dict[str, str]]:
     """
-    Parse holidays from HTML content.
+    Parse NSE TRADING holidays from Zerodha's holiday page.
 
-    Args:
-        html_content: HTML from Zerodha holiday page
+    The page carries several tables with DIFFERENT column orders:
+      - trading holidays   : Date | Day | Holiday | Exchanges ("nse bse")
+      - settlement holidays: Day | Date | Holiday | "settlement"  (market OPEN)
+      - MCX-only holidays  : Day | Date | Holiday | "mcx"         (NSE OPEN)
+      - weekend holidays   : Day | Date | Holiday | "nse bse"
+
+    WHY content-based, not position-based: until 2026-11-24 this read
+    cells[1] as the date. On the trading table cells[1] is the weekday, which
+    the header filter ("day" in text) skipped -- so EVERY real NSE closure was
+    dropped and the file held only settlement/MCX days. Guru Nanak Jayanti
+    2026-11-24 was missed and both engines alerted every 5 minutes into a
+    closed market. So: the date is whichever cell parses as a date, and a row
+    counts only if its exchanges cell names NSE.
 
     Returns:
-        List of holiday dicts with date, name, day
+        List of holiday dicts with date, name, day (NSE closures only)
     """
     if BeautifulSoup is None:
         logger.error("BeautifulSoup not available")
@@ -116,54 +136,52 @@ def parse_holidays(html_content: str) -> List[Dict[str, str]]:
         tables = soup.find_all('table')
 
         if not tables:
-            logger.warning("No tables found in holiday page")
-            return parse_holidays_alternative(soup)
+            logger.error("No tables found in holiday page -- layout changed?")
+            return []
 
         holidays = []
+        skipped_non_nse = 0
         current_year = datetime.now().year
 
         for table in tables:
-            rows = table.find_all('tr')
+            for row in table.find_all('tr'):
+                cells = [c.get_text(" ", strip=True) for c in row.find_all(['td', 'th'])]
+                if len(cells) < 3:
+                    continue
 
-            for row in rows:
-                cells = row.find_all(['td', 'th'])
+                # Find the date cell by CONTENT ("26 Jan 2026 Long weekend"
+                # carries a badge suffix, so strip it before parsing).
+                date_idx, parsed_date = None, None
+                for i, text in enumerate(cells):
+                    candidate = re.sub(r'\s*long weekend\s*$', '', text, flags=re.I)
+                    parsed_date = try_parse_date(candidate, current_year)
+                    if parsed_date:
+                        date_idx = i
+                        break
+                if parsed_date is None:
+                    continue  # header row or unrelated row
 
-                if len(cells) >= 2:
-                    # Zerodha table structure: Day | Date | Holiday | Exchanges
-                    date_text = None
-                    description = None
+                exchanges = cells[-1].lower().split() if len(cells) >= 4 else []
+                if 'nse' not in exchanges:
+                    skipped_non_nse += 1  # settlement-only or MCX-only: NSE trades
+                    continue
 
-                    # Try different column layouts
-                    if len(cells) >= 3:
-                        # Layout: Day | Date | Holiday (Zerodha format)
-                        date_text = cells[1].get_text(strip=True)
-                        description = cells[2].get_text(strip=True)
-                    else:
-                        # Layout: Date | Holiday
-                        date_text = cells[0].get_text(strip=True)
-                        description = cells[1].get_text(strip=True)
+                # Holiday name: the first non-date, non-weekday cell.
+                name = next((c for j, c in enumerate(cells[:-1])
+                             if j != date_idx and c.lower() not in _WEEKDAYS), None)
+                if not name:
+                    logger.warning(f"Holiday row without a name: {cells}")
+                    continue
 
-                    # Skip header rows
-                    if not date_text or 'date' in date_text.lower() or 'day' in date_text.lower():
-                        continue
+                holidays.append({
+                    "date": parsed_date.isoformat(),
+                    "name": name,
+                    "day": parsed_date.strftime("%A")
+                })
 
-                    # Parse date
-                    parsed_date = try_parse_date(date_text, current_year)
-
-                    if parsed_date and description:
-                        holidays.append({
-                            "date": parsed_date.isoformat(),
-                            "name": description,
-                            "day": parsed_date.strftime("%A")
-                        })
-
-        if not holidays:
-            holidays = parse_holidays_alternative(soup)
-
-        # Remove duplicates and sort
         holidays = deduplicate_holidays(holidays)
-
-        logger.info(f"Parsed {len(holidays)} holidays")
+        logger.info(f"Parsed {len(holidays)} NSE holidays "
+                    f"(skipped {skipped_non_nse} settlement/MCX-only rows)")
         return holidays
 
     except Exception as e:
@@ -193,39 +211,6 @@ def try_parse_date(date_text: str, default_year: int) -> Optional[date]:
     return None
 
 
-def parse_holidays_alternative(soup) -> List[Dict[str, str]]:
-    """
-    Alternative parsing method for different page structures.
-
-    Args:
-        soup: BeautifulSoup parsed content
-
-    Returns:
-        List of holiday dicts
-    """
-    holidays = []
-    current_year = datetime.now().year
-    text_content = soup.get_text()
-
-    # Known holidays with fixed dates
-    known_holidays = {
-        "Republic Day": (1, 26),
-        "Dr Ambedkar Jayanti": (4, 14),
-        "Independence Day": (8, 15),
-        "Mahatma Gandhi Jayanti": (10, 2),
-        "Christmas": (12, 25),
-    }
-
-    for holiday_name, (month, day) in known_holidays.items():
-        if holiday_name.lower() in text_content.lower():
-            holiday_date = date(current_year, month, day)
-            holidays.append({
-                "date": holiday_date.isoformat(),
-                "name": holiday_name,
-                "day": holiday_date.strftime("%A")
-            })
-
-    return holidays
 
 
 def deduplicate_holidays(holidays: List[Dict]) -> List[Dict]:
@@ -289,6 +274,17 @@ def scrape_and_save_holidays(force: bool = False) -> Tuple[bool, str]:
     holidays = parse_holidays(html_content)
     if not holidays:
         return False, "No holidays parsed from page"
+
+    this_year = str(datetime.now().year)
+    weekday_count = sum(1 for h in holidays
+                        if h["date"].startswith(this_year)
+                        and date.fromisoformat(h["date"]).weekday() < 5)
+    if weekday_count < MIN_WEEKDAY_HOLIDAYS_CURRENT_YEAR:
+        msg = (f"Only {weekday_count} weekday NSE holidays parsed for {this_year} "
+               f"(floor {MIN_WEEKDAY_HOLIDAYS_CURRENT_YEAR}) -- page layout changed? "
+               f"NOT overwriting {HOLIDAY_FILE_PATH.name}")
+        logger.error(msg)
+        return False, msg
 
     # Group by year
     holidays_by_year = {}

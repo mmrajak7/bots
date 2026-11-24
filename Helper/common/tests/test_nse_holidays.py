@@ -39,15 +39,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from common import nse_holidays as h            # noqa: E402
 
-#: Evidenced against the FIFTY daemon logs: a ~20-35 line log means the daemon
-#: started, found the market closed and exited; a trading day leaves ~5,700.
-EVIDENCED_CLOSED = [date(2026, 1, 26), date(2026, 2, 19), date(2026, 3, 19),
-                    date(2026, 4, 1), date(2026, 4, 3)]
-#: Same source, the other way: these are dates the OLD static list called
-#: holidays and the daemon logged a full session on.
-EVIDENCED_TRADED = [date(2026, 3, 3), date(2026, 3, 26), date(2026, 3, 31),
+#: CORRECTED 2026-11-24. Evidence is now Kite's own daily NIFTY 50 bars
+#: (`FIFTY/data/backtest_px/_NIFTY_50.json`): no bar = the exchange was shut.
+#: The previous lists came from FIFTY daemon log SIZES, and were wrong in BOTH
+#: directions -- a daemon writes a full-size log into a closed market (zebra
+#: polled no_two_way_book all day on 09-14, 10-20 and 11-10), and the dates it
+#: "evidenced" closed (02-19, 03-19, 04-01) are Zerodha SETTLEMENT holidays,
+#: on which the market trades. The scraper read only those tables because it
+#: mis-parsed the real one -- see SNAIL/src/utils/holiday_scraper.py.
+EVIDENCED_CLOSED = [date(2026, 1, 15), date(2026, 1, 26), date(2026, 3, 3),
+                    date(2026, 3, 26), date(2026, 3, 31), date(2026, 4, 3),
                     date(2026, 4, 14), date(2026, 5, 1), date(2026, 5, 28),
-                    date(2026, 6, 26)]
+                    date(2026, 6, 26), date(2026, 9, 14), date(2026, 10, 20),
+                    date(2026, 11, 10), date(2026, 11, 24)]
+#: The bars end 2026-10-26, so 11-10 and 11-24 above rest on other evidence:
+#: zebra polled `no_two_way_book` all session on 11-10, and 11-24 is on
+#: Zerodha's NSE table (and the incident that found this bug).
+#: Kite has a NIFTY bar on each of these: settlement-only holidays, plus 06-23.
+EVIDENCED_TRADED = [date(2026, 2, 19), date(2026, 3, 19), date(2026, 4, 1),
+                    date(2026, 6, 23), date(2026, 8, 26)]
 
 
 @pytest.fixture(autouse=True)
@@ -83,20 +93,17 @@ def test_the_calendar_is_not_empty():
 
 @pytest.mark.parametrize('d', EVIDENCED_CLOSED, ids=lambda d: d.isoformat())
 def test_every_evidenced_closure_is_in_the_calendar(d):
-    """The measurement that condemned the old static list, kept as a test.
-
-    Three of these (02-19, 03-19, 04-01) were MISSING from it, and a missing
-    holiday is the direction that holds a position into the delivery ramp.
-    """
+    """A missing holiday is the direction that holds a position into the
+    delivery ramp -- and, on the day itself, alerts every 5 minutes into a
+    closed market (2026-11-24, Guru Nanak Jayanti)."""
     assert h.is_holiday(d), '%s was evidenced closed and is not in the file' % d
     assert not h.is_session(d)
 
 
 @pytest.mark.parametrize('d', EVIDENCED_TRADED, ids=lambda d: d.isoformat())
 def test_no_evidenced_trading_day_is_called_a_holiday(d):
-    """The other half. The old list carried all seven of these, which makes a
-    session count UNDER-estimate — safe direction, still wrong, and it was the
-    sign the list was a generic festival calendar rather than NSE's."""
+    """The other half: a settlement holiday is a TRADING day. Calling it a
+    holiday under-counts sessions and silences the engines on an open market."""
     assert not h.is_holiday(d)
     assert h.is_session(d)
 
@@ -130,21 +137,12 @@ def test_the_muhurat_session_changes_no_count():
     assert not h.is_session(muhurat)
 
 
-def test_the_known_imperfections_are_still_the_known_ones():
-    """Owner decision, 2026-08-30: trust the file as-is, no hand-patching.
-
-    Two divergences from observed sessions are therefore live and deliberate,
-    and both are recorded here so that a future reader finds the decision
-    rather than a bug. If either flips, the file changed and that is worth
-    knowing.
-    """
-    # Evidenced closed (FIFTY log, 25 lines) and NOT in the file: the count
-    # over-estimates by one session across it, firing the close LATER.
+def test_settlement_and_mcx_only_holidays_are_not_closures():
+    """Replaces `test_the_known_imperfections_are_still_the_known_ones`
+    (2026-11-24). Both of its "deliberate divergences" were the scraper bug:
+    06-23 traded (it was never a closure) and 08-26 is a settlement holiday."""
     assert not h.is_holiday(date(2026, 6, 23))
-    # In the file, but `logs/cron_zebra_20260826.log` shows a full session
-    # (347 polls, 265 distinct spot prints): the count under-estimates by one,
-    # firing the close EARLIER. The safe direction.
-    assert h.is_holiday(date(2026, 8, 26))
+    assert not h.is_holiday(date(2026, 8, 26))
 
 
 # -- sessions ----------------------------------------------------------------
