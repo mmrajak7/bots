@@ -1162,10 +1162,23 @@ class LiveEngine(Engine):
     def _closed_day_watch(self, now: datetime) -> None:
         """The mark found the market closed, but a position is open: the
         calendar has been wrong before (NEO-26). Keep quoting the holdings
-        and running the exits; say so every ten minutes."""
-        self._throttled('closed_watch', now, 600,
-                        'Day marked CLOSED but %d position(s) are open. Still quoting and '
-                        'watching them.' % len(self.store.holding()))
+        and running the exits.
+
+        How often to SAY so depends on whether anything disagrees. When the
+        calendar also calls the day closed, books and calendar agree: one
+        alert a day is the whole message (a holiday sent ~35 identical ones,
+        2026-11-24). Only when the calendar expected a session is the closure
+        itself suspect, and that keeps the ten-minute nag."""
+        n = len(self.store.holding())
+        if self.session_expected:
+            self._throttled('closed_watch', now, 600,
+                            'Day marked CLOSED but %d position(s) are open. Still quoting and '
+                            'watching them.' % n)
+        else:
+            self._throttled('closed_watch_' + now.date().isoformat(), now, float('inf'),
+                            'Day marked CLOSED (holiday calendar agrees) and %d position(s) '
+                            'are open. Still quoting and watching them all session; this is '
+                            'the only reminder today.' % n)
         keys = [self.key(p['symbol']) for p in self.store.holding()
                 if p['expiry'] >= now.date().isoformat()]
         try:

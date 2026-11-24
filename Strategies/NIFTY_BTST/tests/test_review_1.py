@@ -329,6 +329,33 @@ def test_neo26_closed_day_with_a_holding_keeps_watching_and_exits(cfg, tmp_path,
     assert sells(rig) and any('marked CLOSED' in s for s in rig.sent)
 
 
+def test_closed_day_watch_alerts_once_when_the_calendar_agrees(cfg, tmp_path, market):
+    # 2026-11-24 (a real holiday): the 10-minute repeat sent ~35 identical
+    # alerts. Calendar and books agree, so say it once; still watch.
+    rig = marked(cfg, tmp_path, market)
+    holding(rig)
+    default_premiums(market, '2026-11-03')
+    rig.restart()
+    rig.engine.session_expected = False
+    rig.start(T(TUE, '09:00:00'))
+    market.stale = set(market.books)
+    for hhmm in ('09:20:01', '09:31:00', '09:42:00', '10:30:00', '15:20:00'):
+        rig.go(T(TUE, hhmm))
+    assert rig.engine.closed_today == T(TUE, '09:20:01').date()
+    assert sum('marked CLOSED' in s for s in rig.sent) == 1
+    assert rig.store.holding()
+
+
+def test_closed_day_watch_keeps_nagging_when_the_calendar_disagrees(cfg, tmp_path, market):
+    rig = marked(cfg, tmp_path, market)
+    holding(rig)
+    rig.engine.session_expected = True
+    rig.engine.closed_today = T(TUE, '09:20:01').date()
+    for hhmm in ('09:20:01', '09:31:00', '09:42:00'):
+        rig.engine._closed_day_watch(T(TUE, hhmm))
+    assert sum('marked CLOSED' in s for s in rig.sent) == 3
+
+
 # ---------------------------------------------------------------- NEO-27
 def test_neo27_reconcile_sums_by_symbol(cfg, tmp_path, market):
     rig = marked(cfg, tmp_path, market)
