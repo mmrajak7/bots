@@ -37,10 +37,24 @@ REQUEST_TIMEOUT = 10
 MAX_CACHE_AGE_HOURS = 24  # Only re-scrape if older than this
 
 
+DEFAULT_HOLIDAY_FILE = '../data/holiday_calendar.json'
+
+
 def get_holiday_file_path():
-    """Get holiday file path from config."""
-    paths = get_paths_config()
-    return PROJECT_ROOT / paths.get('holidays', '../data/holiday_calendar.json')
+    """Get holiday file path from config, or the default if config won't load.
+
+    WHY the fallback (2026-11-24): SNAIL's config refuses to load without its
+    Kite/Telegram env vars, which the Pi's cron environment does not carry.
+    The scraper needs only this one path, so a daily refresh from cron must
+    not depend on credentials it never uses. Same default as config.yaml.
+    """
+    try:
+        paths = get_paths_config()
+    except ValueError as e:
+        logger.warning(f"SNAIL config unavailable ({e}); using default "
+                       f"holiday path {DEFAULT_HOLIDAY_FILE}")
+        paths = {}
+    return PROJECT_ROOT / paths.get('holidays', DEFAULT_HOLIDAY_FILE)
 
 
 HOLIDAY_FILE_PATH = get_holiday_file_path()
@@ -537,14 +551,19 @@ if __name__ == '__main__':
     print("SNAIL NSE Holiday Scraper")
     print("=" * 60 + "\n")
 
-    # Scrape and save
-    print("Scraping holidays from Zerodha...")
-    success, message = scrape_and_save_holidays()
+    import sys
+
+    # Scrape and save. --force bypasses the 24h cache: a daily cron at a fixed
+    # time sees a file ~24h old and would skip on alternate days without it.
+    force = '--force' in sys.argv
+    print(f"Scraping holidays from Zerodha (force={force})...")
+    success, message = scrape_and_save_holidays(force=force)
 
     if success:
         print(f"[OK] {message}")
     else:
         print(f"[FAIL] {message}")
+        sys.exit(1)  # non-zero so the cron log shows a failed refresh
 
     # Show upcoming holidays
     print("\nUpcoming holidays (next 30 days):")
