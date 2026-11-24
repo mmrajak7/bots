@@ -1996,6 +1996,14 @@ s.list_trades()
 # line rather than its own: a second cron entry is a second thing that can go
 # missing unnoticed, which this very line already did for 18 days.
 0,47 15 * * 1-5 cd /home/trustit/Desktop/BOTS/Helper && ../CROCODILE/venv/bin/python -m zebra digest >> logs/cron_digest_$(date +\%Y\%m\%d).log 2>&1
+
+# NSE holiday calendar — 08:30, before the 08:45 token and the 09:00 monitor
+# start. Writes BOTS/data/holiday_calendar.json, which both engines now read
+# to decide whether TODAY is a session (added 2026-11-24, after the file had
+# missed every real 2026 closure). --force: a fixed-time daily run sees a
+# ~24h-old file and would skip alternate days. Exits 1 and leaves the file
+# untouched on a bad parse; zebra's coverage check Telegrams if it goes stale.
+30 8 * * 1-5 cd /home/trustit/Desktop/BOTS/SNAIL && ../CROCODILE/venv/bin/python -m src.utils.holiday_scraper --force >> ../Helper/logs/cron_holidays_$(date +\%Y\%m\%d).log 2>&1
 ```
 
 > **The digest cron went uninstalled for 18 days and nobody noticed**, because
