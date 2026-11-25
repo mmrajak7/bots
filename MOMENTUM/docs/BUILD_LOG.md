@@ -86,3 +86,7 @@
   top-up then). Own kill only (FIFTY kill-switch check removed from preflight). Reason found: QSK814's API has NO
   market-data permission (quote() raises PermissionException, memory project_accounts) - the engine needs quote()
   at 14:45/15:10 and historical() in the evening. April needs market data on QSK or a two-token design. 89/89.
+- Owner 2026-11-25 "go" (review answers all as recommended; D45): no 2-share TEST buy; band reject -> hold; manual
+  repair-journal; probe 3 x 1 s; no circuit -> no order; backup by 18 Dec; vet inputs audit_flags + freshness before Jan.
+  **April company switch: data reading ALWAYS from YL6478 (quote/historical/instruments/sessions/audit); QSK814 only for
+  its own orders/order book/trades/holdings/margins (two tokens, two roles).**
