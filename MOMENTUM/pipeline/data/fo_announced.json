@@ -1,0 +1,1569 @@
+[
+ {
+  "symbol": "BANDHANBNK",
+  "announced": "2020-02-24",
+  "member_month": "2020-03",
+  "first_contracts": "2020-02-28",
+  "circular": "14/2020",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP43635.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "HDFCLIFE",
+  "announced": "2020-02-24",
+  "member_month": "2020-03",
+  "first_contracts": "2020-02-28",
+  "circular": "14/2020",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP43635.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "NAUKRI",
+  "announced": "2020-02-24",
+  "member_month": "2020-03",
+  "first_contracts": "2020-02-28",
+  "circular": "14/2020",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP43635.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "GODREJPROP",
+  "announced": "2020-03-03",
+  "member_month": "2020-04",
+  "first_contracts": "2020-03-27",
+  "circular": "21/2020",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP43744.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SBILIFE",
+  "announced": "2020-04-21",
+  "member_month": "2020-05",
+  "first_contracts": "2020-05-04",
+  "circular": "41/2020",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP44196.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ICICIGI",
+  "announced": "2020-10-28",
+  "member_month": "2020-11",
+  "first_contracts": "2020-10-30",
+  "circular": "94/2020",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP46182.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "AARTIIND",
+  "announced": "2020-12-17",
+  "member_month": "2021-01",
+  "first_contracts": "2021-01-01",
+  "circular": "112/2020",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP46705.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "HDFCAMC",
+  "announced": "2020-12-17",
+  "member_month": "2021-01",
+  "first_contracts": "2021-01-01",
+  "circular": "112/2020",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP46705.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "LALPATHLAB",
+  "announced": "2020-12-17",
+  "member_month": "2021-01",
+  "first_contracts": "2021-01-01",
+  "circular": "112/2020",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP46705.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ALKEM",
+  "announced": "2021-01-29",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "08/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47161.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "AUBANK",
+  "announced": "2021-01-29",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "08/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47161.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "DEEPAKNTR",
+  "announced": "2021-01-29",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "08/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47161.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "IRCTC",
+  "announced": "2021-01-29",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "08/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47161.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "NAM-INDIA",
+  "announced": "2021-01-29",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "08/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47161.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "LTI",
+  "announced": "2021-02-01",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "NSE/FAOP/47182",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47182.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "NAVINFLUOR",
+  "announced": "2021-02-01",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "NSE/FAOP/47182",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47182.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "PFIZER",
+  "announced": "2021-02-01",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "NSE/FAOP/47182",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47182.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "PIIND",
+  "announced": "2021-02-01",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "NSE/FAOP/47182",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47182.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "TRENT",
+  "announced": "2021-02-01",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "NSE/FAOP/47182",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47182.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "APLLTD",
+  "announced": "2021-02-09",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "14/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47286.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "CUB",
+  "announced": "2021-02-09",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "14/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47286.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "GRANULES",
+  "announced": "2021-02-09",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "14/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47286.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "GUJGASLTD",
+  "announced": "2021-02-09",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "14/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47286.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "LTTS",
+  "announced": "2021-02-09",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "14/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47286.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "MPHASIS",
+  "announced": "2021-02-09",
+  "member_month": "2021-03",
+  "first_contracts": "2021-02-26",
+  "circular": "14/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP47286.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ABFRL",
+  "announced": "2021-06-03",
+  "member_month": "2021-07",
+  "first_contracts": "2021-06-25",
+  "circular": "38/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP48495.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "COROMANDEL",
+  "announced": "2021-06-03",
+  "member_month": "2021-07",
+  "first_contracts": "2021-06-25",
+  "circular": "38/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP48495.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "INDHOTEL",
+  "announced": "2021-06-03",
+  "member_month": "2021-07",
+  "first_contracts": "2021-06-25",
+  "circular": "38/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP48495.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "METROPOLIS",
+  "announced": "2021-06-03",
+  "member_month": "2021-07",
+  "first_contracts": "2021-06-25",
+  "circular": "38/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP48495.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ASTRAL",
+  "announced": "2021-07-12",
+  "member_month": "2021-08",
+  "first_contracts": "2021-07-30",
+  "circular": "49/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP48907.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "STAR",
+  "announced": "2021-07-12",
+  "member_month": "2021-08",
+  "first_contracts": "2021-07-30",
+  "circular": "49/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP48907.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "CANFINHOME",
+  "announced": "2021-08-09",
+  "member_month": "2021-09",
+  "first_contracts": "2021-08-27",
+  "circular": "57/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49224.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "DIXON",
+  "announced": "2021-08-09",
+  "member_month": "2021-09",
+  "first_contracts": "2021-08-27",
+  "circular": "57/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49224.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "HAL",
+  "announced": "2021-08-09",
+  "member_month": "2021-09",
+  "first_contracts": "2021-08-27",
+  "circular": "57/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49224.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "IEX",
+  "announced": "2021-08-09",
+  "member_month": "2021-09",
+  "first_contracts": "2021-08-27",
+  "circular": "57/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49224.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "INDIAMART",
+  "announced": "2021-08-09",
+  "member_month": "2021-09",
+  "first_contracts": "2021-08-27",
+  "circular": "57/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49224.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "IPCALAB",
+  "announced": "2021-08-09",
+  "member_month": "2021-09",
+  "first_contracts": "2021-08-27",
+  "circular": "57/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49224.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "MCX",
+  "announced": "2021-08-09",
+  "member_month": "2021-09",
+  "first_contracts": "2021-08-27",
+  "circular": "57/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49224.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "OFSS",
+  "announced": "2021-08-09",
+  "member_month": "2021-09",
+  "first_contracts": "2021-08-27",
+  "circular": "57/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49224.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "POLYCAB",
+  "announced": "2021-08-09",
+  "member_month": "2021-09",
+  "first_contracts": "2021-08-27",
+  "circular": "57/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49224.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SYNGENE",
+  "announced": "2021-08-09",
+  "member_month": "2021-09",
+  "first_contracts": "2021-08-27",
+  "circular": "57/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49224.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ABBOTINDIA",
+  "announced": "2021-08-31",
+  "member_month": "2021-10",
+  "first_contracts": "2021-10-01",
+  "circular": "63/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "CROMPTON",
+  "announced": "2021-08-31",
+  "member_month": "2021-10",
+  "first_contracts": "2021-10-01",
+  "circular": "63/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "DALBHARAT",
+  "announced": "2021-08-31",
+  "member_month": "2021-10",
+  "first_contracts": "2021-10-01",
+  "circular": "63/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "DELTACORP",
+  "announced": "2021-08-31",
+  "member_month": "2021-10",
+  "first_contracts": "2021-10-01",
+  "circular": "63/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "INDIACEM",
+  "announced": "2021-08-31",
+  "member_month": "2021-10",
+  "first_contracts": "2021-10-01",
+  "circular": "63/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "JKCEMENT",
+  "announced": "2021-08-31",
+  "member_month": "2021-10",
+  "first_contracts": "2021-10-01",
+  "circular": "63/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "OBEROIRLTY",
+  "announced": "2021-08-31",
+  "member_month": "2021-10",
+  "first_contracts": "2021-10-01",
+  "circular": "63/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "PERSISTENT",
+  "announced": "2021-08-31",
+  "member_month": "2021-10",
+  "first_contracts": "2021-10-01",
+  "circular": "63/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ATUL",
+  "announced": "2021-10-06",
+  "member_month": "2021-11",
+  "first_contracts": "2021-10-29",
+  "circular": "79/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49858.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "BSOFT",
+  "announced": "2021-10-06",
+  "member_month": "2021-11",
+  "first_contracts": "2021-10-29",
+  "circular": "79/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49858.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "CHAMBLFERT",
+  "announced": "2021-10-06",
+  "member_month": "2021-11",
+  "first_contracts": "2021-10-29",
+  "circular": "79/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49858.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "FSL",
+  "announced": "2021-10-06",
+  "member_month": "2021-11",
+  "first_contracts": "2021-10-29",
+  "circular": "79/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49858.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "GSPL",
+  "announced": "2021-10-06",
+  "member_month": "2021-11",
+  "first_contracts": "2021-10-29",
+  "circular": "79/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49858.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "LAURUSLABS",
+  "announced": "2021-10-06",
+  "member_month": "2021-11",
+  "first_contracts": "2021-10-29",
+  "circular": "79/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49858.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SBICARD",
+  "announced": "2021-10-06",
+  "member_month": "2021-11",
+  "first_contracts": "2021-10-29",
+  "circular": "79/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49858.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "WHIRLPOOL",
+  "announced": "2021-10-06",
+  "member_month": "2021-11",
+  "first_contracts": "2021-10-29",
+  "circular": "79/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP49858.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ABCAPITAL",
+  "announced": "2021-11-25",
+  "member_month": "2022-01",
+  "first_contracts": "2021-12-31",
+  "circular": "92/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP50414.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "HONAUT",
+  "announced": "2021-11-25",
+  "member_month": "2022-01",
+  "first_contracts": "2021-12-31",
+  "circular": "92/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP50414.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "IDFC",
+  "announced": "2021-11-26",
+  "member_month": "2022-01",
+  "first_contracts": "2021-12-31",
+  "circular": "93/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP50429.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "BALRAMCHIN",
+  "announced": "2021-11-30",
+  "member_month": "2022-01",
+  "first_contracts": "2021-12-31",
+  "circular": "94/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP50456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "GNFC",
+  "announced": "2021-11-30",
+  "member_month": "2022-01",
+  "first_contracts": "2021-12-31",
+  "circular": "94/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP50456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "HINDCOPPER",
+  "announced": "2021-11-30",
+  "member_month": "2022-01",
+  "first_contracts": "2021-12-31",
+  "circular": "94/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP50456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "NBCC",
+  "announced": "2021-11-30",
+  "member_month": "2022-01",
+  "first_contracts": "2021-12-31",
+  "circular": "94/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP50456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "RAIN",
+  "announced": "2021-11-30",
+  "member_month": "2022-01",
+  "first_contracts": "2021-12-31",
+  "circular": "94/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP50456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SUPREMEIND",
+  "announced": "2021-11-30",
+  "member_month": "2022-01",
+  "withdrawn": "2021-12-29",
+  "circular": "NSE/FAOP/50456",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP50456.pdf",
+  "withdrawal_source": "https://nsearchives.nseindia.com/content/circulars/FAOP50812.pdf",
+  "confidence": "verified",
+  "notes": "withdrawn by 107/2021 (failed one eligibility criterion)"
+ },
+ {
+  "symbol": "TATACOMM",
+  "announced": "2021-11-30",
+  "member_month": "2022-01",
+  "first_contracts": "2021-12-31",
+  "circular": "94/2021",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP50456.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ABB",
+  "announced": "2022-01-25",
+  "member_month": "2022-02",
+  "first_contracts": "2022-01-28",
+  "circular": "11/2022",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP51128.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "INTELLECT",
+  "announced": "2022-01-25",
+  "member_month": "2022-02",
+  "first_contracts": "2022-01-28",
+  "circular": "11/2022",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP51128.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ADANIENSOL",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ADANIGREEN",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ANGELONE",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "APLAPOLLO",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ATGL",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "BANKINDIA",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "BSE",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "CAMS",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "CDSL",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "CESC",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "CGPOWER",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "CYIENT",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "DELHIVERY",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "DMART",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "HFCL",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "HUDCO",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "INDIANB",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "IRB",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "IRFC",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "JIOFIN",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "JSL",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "JSWENERGY",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "KALYANKJIL",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "KEI",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "KPITTECH",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "LICI",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "LODHA",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "MAXHEALTH",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "NCC",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "NHPC",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "NYKAA",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "OIL",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "PAYTM",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "POLICYBZR",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "POONAWALLA",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "PRESTIGE",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SJVN",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SONACOMS",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SUPREMEIND",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "TATAELXSI",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "TIINDIA",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "UNIONBANK",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "VBL",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "YESBANK",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ZOMATO",
+  "announced": "2024-11-13",
+  "member_month": "2024-12",
+  "first_contracts": "2024-11-29",
+  "circular": "146/2024",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP65064.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "CASTROLIND",
+  "announced": "2025-01-07",
+  "member_month": "2025-02",
+  "withdrawn": "2025-01-24",
+  "circular": "NSE/FAOP/66015",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66015.pdf",
+  "withdrawal_source": "https://www.angelone.in/news/f-and-o-revision-nse-excludes-two-stocks-from-january-31",
+  "confidence": "press",
+  "notes": "withdrawn per press (Angel One / NSE decision 2025-01-24); withdrawal circular not found; never in the F&O bhavcopy"
+ },
+ {
+  "symbol": "GLAND",
+  "announced": "2025-01-07",
+  "member_month": "2025-02",
+  "withdrawn": "2025-01-24",
+  "circular": "NSE/FAOP/66015",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66015.pdf",
+  "withdrawal_source": "https://www.angelone.in/news/f-and-o-revision-nse-excludes-two-stocks-from-january-31",
+  "confidence": "press",
+  "notes": "withdrawn per press (Angel One / NSE decision 2025-01-24); withdrawal circular not found; never in the F&O bhavcopy"
+ },
+ {
+  "symbol": "NBCC",
+  "announced": "2025-01-07",
+  "member_month": "2025-02",
+  "first_contracts": "2025-01-31",
+  "circular": "03/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66015.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "PHOENIXLTD",
+  "announced": "2025-01-07",
+  "member_month": "2025-02",
+  "first_contracts": "2025-01-31",
+  "circular": "03/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66015.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SOLARINDS",
+  "announced": "2025-01-07",
+  "member_month": "2025-02",
+  "first_contracts": "2025-01-31",
+  "circular": "03/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66015.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "TORNTPOWER",
+  "announced": "2025-01-07",
+  "member_month": "2025-02",
+  "first_contracts": "2025-01-31",
+  "circular": "03/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66015.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ARE&M",
+  "announced": "2025-01-31",
+  "member_month": "2025-03",
+  "withdrawn": "2025-02-20",
+  "circular": "NSE/FAOP/66426",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66426.pdf",
+  "withdrawal_source": "https://nsearchives.nseindia.com/content/circulars/FAOP66760.pdf",
+  "confidence": "verified",
+  "notes": "withdrawn by 28/2025"
+ },
+ {
+  "symbol": "IIFL",
+  "announced": "2025-01-31",
+  "member_month": "2025-03",
+  "first_contracts": "2025-02-28",
+  "circular": "17/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66426.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "PATANJALI",
+  "announced": "2025-01-31",
+  "member_month": "2025-03",
+  "first_contracts": "2025-02-28",
+  "circular": "17/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66426.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "TITAGARH",
+  "announced": "2025-01-31",
+  "member_month": "2025-03",
+  "first_contracts": "2025-02-28",
+  "circular": "17/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66426.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "IREDA",
+  "announced": "2025-02-19",
+  "member_month": "2025-03",
+  "first_contracts": "2025-02-28",
+  "circular": "26/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66750.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "TATATECH",
+  "announced": "2025-02-19",
+  "member_month": "2025-03",
+  "first_contracts": "2025-02-28",
+  "circular": "26/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66750.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "HINDZINC",
+  "announced": "2025-03-05",
+  "member_month": "2025-04",
+  "first_contracts": "2025-03-28",
+  "circular": "34/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66981.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "INOXWIND",
+  "announced": "2025-03-05",
+  "member_month": "2025-04",
+  "first_contracts": "2025-03-28",
+  "circular": "34/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66981.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "PNBHOUSING",
+  "announced": "2025-03-05",
+  "member_month": "2025-04",
+  "first_contracts": "2025-03-28",
+  "circular": "34/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP66981.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "FORTIS",
+  "announced": "2025-05-07",
+  "member_month": "2025-06",
+  "first_contracts": "2025-05-30",
+  "circular": "69/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP67892.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "PPLPHARMA",
+  "announced": "2025-05-07",
+  "member_month": "2025-06",
+  "first_contracts": "2025-05-30",
+  "circular": "69/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP67892.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "UNOMINDA",
+  "announced": "2025-05-07",
+  "member_month": "2025-06",
+  "first_contracts": "2025-05-30",
+  "circular": "69/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP67892.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "BDL",
+  "announced": "2025-05-09",
+  "member_month": "2025-06",
+  "first_contracts": "2025-05-30",
+  "circular": "72/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP67937.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "KAYNES",
+  "announced": "2025-05-09",
+  "member_month": "2025-06",
+  "first_contracts": "2025-05-30",
+  "circular": "72/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP67937.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "MANKIND",
+  "announced": "2025-05-09",
+  "member_month": "2025-06",
+  "first_contracts": "2025-05-30",
+  "circular": "72/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP67937.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "MAZDOCK",
+  "announced": "2025-05-09",
+  "member_month": "2025-06",
+  "first_contracts": "2025-05-30",
+  "circular": "72/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP67937.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "RVNL",
+  "announced": "2025-05-09",
+  "member_month": "2025-06",
+  "first_contracts": "2025-05-30",
+  "circular": "72/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP67937.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "BLUESTARCO",
+  "announced": "2025-05-20",
+  "member_month": "2025-06",
+  "first_contracts": "2025-05-30",
+  "circular": "78/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP68080.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "FSL",
+  "announced": "2025-05-20",
+  "member_month": "2025-06",
+  "withdrawn": "2025-05-22",
+  "circular": "NSE/FAOP/68080",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP68080.pdf",
+  "withdrawal_source": "https://nsearchives.nseindia.com/content/circulars/FAOP68129.pdf",
+  "confidence": "verified",
+  "notes": "withdrawn by 84/2025 (re-entry attempt)"
+ },
+ {
+  "symbol": "360ONE",
+  "announced": "2025-05-26",
+  "member_month": "2025-07",
+  "first_contracts": "2025-06-27",
+  "circular": "86/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP68181.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "AMBER",
+  "announced": "2025-05-26",
+  "member_month": "2025-07",
+  "first_contracts": "2025-06-27",
+  "circular": "86/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP68181.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "KFINTECH",
+  "announced": "2025-05-26",
+  "member_month": "2025-07",
+  "first_contracts": "2025-06-27",
+  "circular": "86/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP68181.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "PGEL",
+  "announced": "2025-05-26",
+  "member_month": "2025-07",
+  "first_contracts": "2025-06-27",
+  "circular": "86/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP68181.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "NUVAMA",
+  "announced": "2025-07-24",
+  "member_month": "2025-08",
+  "first_contracts": "2025-08-01",
+  "circular": "131/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP69278.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SUZLON",
+  "announced": "2025-07-24",
+  "member_month": "2025-08",
+  "first_contracts": "2025-08-01",
+  "circular": "131/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP69278.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SAMMAANCAP",
+  "announced": "2025-07-30",
+  "member_month": "2025-09",
+  "first_contracts": "2025-08-29",
+  "circular": "136/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP69384.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "POWERINDIA",
+  "announced": "2025-09-22",
+  "member_month": "2025-10",
+  "first_contracts": "2025-10-01",
+  "circular": "166/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP70336.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "BAJAJHLDNG",
+  "announced": "2025-12-18",
+  "member_month": "2026-01",
+  "first_contracts": "2025-12-31",
+  "circular": "218/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP71880.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "PREMIERENE",
+  "announced": "2025-12-18",
+  "member_month": "2026-01",
+  "first_contracts": "2025-12-31",
+  "circular": "218/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP71880.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SWIGGY",
+  "announced": "2025-12-18",
+  "member_month": "2026-01",
+  "first_contracts": "2025-12-31",
+  "circular": "218/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP71880.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "WAAREEENER",
+  "announced": "2025-12-18",
+  "member_month": "2026-01",
+  "first_contracts": "2025-12-31",
+  "circular": "218/2025",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP71880.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ADANIPOWER",
+  "announced": "2026-03-09",
+  "member_month": "2026-04",
+  "first_contracts": "2026-04-01",
+  "circular": "34/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP73205.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "COCHINSHIP",
+  "announced": "2026-03-09",
+  "member_month": "2026-04",
+  "first_contracts": "2026-04-01",
+  "circular": "34/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP73205.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "HYUNDAI",
+  "announced": "2026-03-09",
+  "member_month": "2026-04",
+  "first_contracts": "2026-04-01",
+  "circular": "34/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP73205.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "MOTILALOFS",
+  "announced": "2026-03-09",
+  "member_month": "2026-04",
+  "first_contracts": "2026-04-01",
+  "circular": "34/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP73205.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "NAM-INDIA",
+  "announced": "2026-03-09",
+  "member_month": "2026-04",
+  "first_contracts": "2026-04-01",
+  "circular": "34/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP73205.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "VMM",
+  "announced": "2026-03-09",
+  "member_month": "2026-04",
+  "first_contracts": "2026-04-01",
+  "circular": "34/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP73205.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "FORCEMOT",
+  "announced": "2026-03-20",
+  "member_month": "2026-04",
+  "first_contracts": "2026-04-01",
+  "circular": "38/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP73400.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "GODFRYPHLP",
+  "announced": "2026-03-20",
+  "member_month": "2026-04",
+  "first_contracts": "2026-04-01",
+  "circular": "38/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP73400.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "GVT&D",
+  "announced": "2026-05-11",
+  "member_month": "2026-06",
+  "first_contracts": "2026-05-27",
+  "circular": "60/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP74151.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "RADICO",
+  "announced": "2026-05-11",
+  "member_month": "2026-06",
+  "first_contracts": "2026-05-27",
+  "circular": "60/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP74151.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ATHERENERG",
+  "announced": "2026-07-23",
+  "member_month": "2026-09",
+  "first_contracts": "2026-08-26",
+  "circular": "106/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP75371.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "MAHABANK",
+  "announced": "2026-07-23",
+  "member_month": "2026-09",
+  "first_contracts": "2026-08-26",
+  "circular": "106/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP75371.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SAGILITY",
+  "announced": "2026-07-23",
+  "member_month": "2026-09",
+  "first_contracts": "2026-08-26",
+  "circular": "106/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP75371.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ANANDRATHI",
+  "announced": "2026-09-09",
+  "member_month": "2026-10",
+  "first_contracts": "2026-09-30",
+  "circular": "124/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP76257.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "ENRIN",
+  "announced": "2026-09-09",
+  "member_month": "2026-10",
+  "first_contracts": "2026-09-30",
+  "circular": "124/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP76257.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "UJJIVANSFB",
+  "announced": "2026-09-09",
+  "member_month": "2026-10",
+  "first_contracts": "2026-09-30",
+  "circular": "124/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP76257.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "COROMANDEL",
+  "announced": "2026-10-14",
+  "member_month": "2026-11",
+  "first_contracts": "2026-10-28",
+  "circular": "140/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP76899.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "CUB",
+  "announced": "2026-10-14",
+  "member_month": "2026-11",
+  "first_contracts": "2026-10-28",
+  "circular": "140/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP76899.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "DATAPATTNS",
+  "announced": "2026-10-14",
+  "member_month": "2026-11",
+  "first_contracts": "2026-10-28",
+  "circular": "140/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP76899.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "KARURVYSYA",
+  "announced": "2026-10-14",
+  "member_month": "2026-11",
+  "first_contracts": "2026-10-28",
+  "circular": "140/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP76899.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "NAVINFLUOR",
+  "announced": "2026-10-14",
+  "member_month": "2026-11",
+  "first_contracts": "2026-10-28",
+  "circular": "140/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP76899.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ },
+ {
+  "symbol": "SYRMA",
+  "announced": "2026-10-14",
+  "member_month": "2026-11",
+  "first_contracts": "2026-10-28",
+  "circular": "140/2026",
+  "source": "https://nsearchives.nseindia.com/content/circulars/FAOP76899.pdf",
+  "confidence": "verified (NSE circular PDF read)"
+ }
+]

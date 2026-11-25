@@ -1,0 +1,98 @@
+{
+ "INE974H01013": {
+  "symbol": "MEGH",
+  "type": "scheme",
+  "verified": "NSE CA file + NSE CM",
+  "notes": "Meghmani Organics. NSE CA: 'Merger/Demerger' ex 2021-05-18. NSE CM: last MEGH row 2021-05-17 close 138.25; successors MOL (INE0CT101020, first row 2021-08-18 89.25) and MFL (INE071N01016, now EPIGRAL, first row 2021-08-18 406.45). Scheme ratio not verified, so no swap: exit at the last traded close (design: scheme = exit at last close), same treatment as HEXAWARE."
+ },
+ "INE141A01014": {
+  "symbol": "ORIENTBANK",
+  "type": "scheme",
+  "verified": "NSE CM last-day close ratio + recall/press; ratio not used (no swap): exit at last traded close",
+  "notes": "Amalgamated into PNB 2020-04-01 (recall 1150 PNB per 1000). Last row 2020-03-20 43.45; PNB 38.05 same day, ratio 1.142 vs 1.150."
+ },
+ "INE722A01011": {
+  "symbol": "SHRIRAMCIT",
+  "type": "scheme",
+  "verified": "NSE CM last-day close ratio + recall/press; ratio not used (no swap): exit at last traded close",
+  "notes": "Amalgamated into Shriram Transport (now Shriram Finance) Dec 2022 (recall 155:100). Last row 2022-11-28 1921.80; ratio 1.520 vs 1.55."
+ },
+ "INE988K01017": {
+  "symbol": "EQUITAS",
+  "type": "scheme",
+  "verified": "NSE CM last-day close ratio + recall/press; ratio not used (no swap): exit at last traded close",
+  "notes": "Equitas Holdings amalgamated into Equitas SFB 2023 (recall 231:100). Last row 2023-02-02 120.30; ratio 2.191 vs 2.31."
+ },
+ "INE455T01018": {
+  "symbol": "JSLHISAR",
+  "type": "scheme",
+  "verified": "NSE CM last-day close ratio + recall/press; ratio not used (no swap): exit at last traded close",
+  "notes": "Jindal Stainless (Hisar) amalgamated into Jindal Stainless 2023 (recall 195:100). Last row 2023-03-08 562.80; ratio 1.813 vs 1.95."
+ },
+ "INE493A01027": {
+  "symbol": "TATACOFFEE",
+  "type": "scheme",
+  "verified": "NSE CM last-day close ratio + recall/press; ratio not used (no swap): exit at last traded close",
+  "notes": "Tata Coffee scheme into Tata Consumer 2024 (recall 3:10 plus plantations). Last row 2024-01-12 344.80; ratio 0.2975 vs 0.30."
+ },
+ "INE422C01014": {
+  "symbol": "TINPLATE",
+  "type": "scheme",
+  "verified": "NSE CM last-day close ratio + recall/press; ratio not used (no swap): exit at last traded close",
+  "notes": "Tinplate amalgamated into Tata Steel 2024 (recall 33:10). Last row 2024-01-18 430.50; ratio 3.286 vs 3.30."
+ },
+ "INE056C01010": {
+  "symbol": "TATAMETALI",
+  "type": "scheme",
+  "verified": "NSE CM last-day close ratio + recall/press; ratio not used (no swap): exit at last traded close",
+  "notes": "Tata Metaliks amalgamated into Tata Steel 2024 (recall 79:10). Last row 2024-02-05 1110.55; ratio 7.846 vs 7.90."
+ },
+ "INE274G01010": {
+  "symbol": "DHANI",
+  "type": "scheme",
+  "verified": "press (record date 2025-10-28, 294 Yaari per 100 DSL) + NSE CM",
+  "notes": "Dhani Services amalgamated into Yaari Digital (now Indiabulls Ltd, IBULLSLTD). Last row 2025-10-27 51.06; YAARI 18.38, ratio 2.78 vs 2.94."
+ },
+ "INE152B01027": {
+  "symbol": "ACLGATI",
+  "type": "scheme",
+  "verified": "press (63 ALLCARGO per 10, record date 2025-11-12) + NSE CM",
+  "notes": "Allcargo Gati amalgamated into Allcargo Logistics alongside Allcargo's own demerger (NSE CA ALLCARGO Demerger 2025-11-12), so the price ratio does not test the swap. Last row 2025-11-11 66.05."
+ },
+ "INE246F01010": {
+  "symbol": "GSPL",
+  "type": "scheme",
+  "verified": "NSE CM last-day close ratio + recall/press; ratio not used (no swap): exit at last traded close",
+  "notes": "GSPL amalgamated into Gujarat Gas 2026 (recall 10 GUJGASLTD per 13). Last row 2026-05-11 268.35; ratio 0.704 vs 0.769."
+ },
+ "INE451A01017": {
+  "symbol": "FORCEMOT",
+  "type": "last_close",
+  "verified": "NSE CM",
+  "notes": "Panel gap 2023-10-25..2024-02-14 (77 sessions, same ISIN, resumes). Joiner rule: >=20-session gap = stop; exit at last close 3352.35 (resumed 4422.65)."
+ },
+ "INE425B01027": {
+  "symbol": "BCG",
+  "type": "last_close",
+  "verified": "NSE CM + recall (NSE suspension, revoked 2025)",
+  "notes": "Brightcom: no rows 2024-12-30..2025-07-14 (134 sessions), resumes. Exit at last close 10.25 (resumed 20.71)."
+ },
+ "INE974C01022": {
+  "symbol": "WINPRO",
+  "type": "last_close",
+  "verified": "NSE CM + press (BSE trading continued until 2025 suspensions)",
+  "notes": "NSE rows stop 2023-04-28 at 2.60; shares stayed tradable on BSE, so exit at last close."
+ },
+ "INE752P01024": {
+  "symbol": "FRETAIL",
+  "type": "write_off",
+  "verified": "press (NCLT liquidation order, commencement 2024-07-29)",
+  "notes": "Future Retail: liquidation, trading suspended; last row 2024-08-01 2.28. Equity unpaid in liquidation: -100%."
+ },
+ "INE455F01025": {
+  "symbol": "JPASSOCIAT",
+  "type": "write_off",
+  "verified": "press (NCLT plan approved 2026-03-17; delisted 2026-06-18, nil to equity)",
+  "notes": "Jaiprakash Associates: Adani resolution plan, pre-CIRP equity extinguished for zero. Last row 2026-03-17 2.42: -100%."
+ }
+}

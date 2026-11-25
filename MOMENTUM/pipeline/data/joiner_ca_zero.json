@@ -1,0 +1,3107 @@
+[
+{
+"isin": "INE201J01017",
+"date": "2019-01-14",
+"kind": "rights",
+"symbol": "LGBFORGE",
+"ca_symbol": "LGBFORGE",
+"ca_exdate": "2019-01-03",
+"subject": "Rights 588:1000@ Premium Rs 2/-"
+},
+{
+"isin": "INE268B01013",
+"date": "2019-01-31",
+"kind": "rights",
+"symbol": "KREBSBIO",
+"ca_symbol": "KREBSBIO",
+"ca_exdate": "2019-01-31",
+"subject": "Rights 21:100 @ Premium Rs 76 Per Share"
+},
+{
+"isin": "INE669E01016",
+"date": "2019-03-29",
+"kind": "rights",
+"symbol": "IDEA",
+"ca_symbol": "IDEA",
+"ca_exdate": "2019-03-29",
+"subject": "Rights 87:38 @ Premium Of Rs 2.50 Per Share"
+},
+{
+"isin": "INE561C01019",
+"date": "2019-04-02",
+"kind": "rights",
+"symbol": "BHARATGEAR",
+"ca_symbol": "BHARATGEAR",
+"ca_exdate": "2019-04-02",
+"subject": "Rights 1:7 @ Premium Rs 95 Per Share"
+},
+{
+"isin": "INE501G01024",
+"date": "2019-04-09",
+"kind": "demerger",
+"symbol": "HTMEDIA",
+"ca_symbol": "HTMEDIA",
+"ca_exdate": "2019-04-09",
+"subject": "Demerger"
+},
+{
+"isin": "INE397D01024",
+"date": "2019-04-23",
+"kind": "rights",
+"symbol": "BHARTIARTL",
+"ca_symbol": "BHARTIARTL",
+"ca_exdate": "2019-04-23",
+"subject": "Rights 19:67 @ Premium Rs 215 Per Share"
+},
+{
+"isin": "INE603A01013",
+"date": "2019-04-23",
+"kind": "demerger",
+"symbol": "PRAKASH",
+"ca_symbol": "PRAKASH",
+"ca_exdate": "2019-04-23",
+"subject": "Demerger"
+},
+{
+"isin": "INE618L01018",
+"date": "2019-05-28",
+"kind": "rights",
+"symbol": "5PAISA",
+"ca_symbol": "5PAISA",
+"ca_exdate": "2019-05-28",
+"subject": "Rights 1:1 @ Premium Rs 70 Per Share"
+},
+{
+"isin": "INE498A01018",
+"date": "2019-05-30",
+"kind": "demerger",
+"symbol": "DCM",
+"ca_symbol": "DCM",
+"ca_exdate": "2019-05-30",
+"subject": "Demerger"
+},
+{
+"isin": "INE674A01014",
+"date": "2019-06-24",
+"kind": "rights",
+"symbol": "TATASPONGE",
+"ca_symbol": "TATASTLLP",
+"ca_exdate": "2019-06-24",
+"subject": "Rights 15:7@ Premium Rs 490 Per Share"
+},
+{
+"isin": "INE769A01020",
+"date": "2019-07-03",
+"kind": "demerger",
+"symbol": "AARTIIND",
+"ca_symbol": "AARTIIND",
+"ca_exdate": "2019-07-03",
+"subject": "Scheme Of Demerger"
+},
+{
+"isin": "INE517B01013",
+"date": "2019-07-11",
+"kind": "demerger",
+"symbol": "TTML",
+"ca_symbol": "TTML",
+"ca_exdate": "2019-07-11",
+"subject": "De-Merger"
+},
+{
+"isin": "INE461C01038",
+"date": "2019-07-12",
+"kind": "demerger",
+"symbol": "GREENPLY",
+"ca_symbol": "GREENPLY",
+"ca_exdate": "2019-07-12",
+"subject": "Demerger"
+},
+{
+"isin": "INE538A01037",
+"date": "2019-08-06",
+"kind": "demerger",
+"symbol": "GFLLIMITED",
+"ca_symbol": "GFLLIMITED",
+"ca_exdate": "2019-08-06",
+"subject": "Demerger"
+},
+{
+"isin": "INE415A01038",
+"date": "2019-08-19",
+"kind": "demerger",
+"symbol": "HSIL",
+"ca_symbol": "AGI",
+"ca_exdate": "2019-08-19",
+"subject": "Demerger"
+},
+{
+"isin": "INE426A01027",
+"date": "2019-08-26",
+"kind": "demerger",
+"symbol": "ALEMBICLTD",
+"ca_symbol": "ALEMBICLTD",
+"ca_exdate": "2019-08-26",
+"subject": "Demerger"
+},
+{
+"isin": "INE840M01016",
+"date": "2019-09-13",
+"kind": "rights",
+"symbol": "ZUARI",
+"ca_symbol": "ZUARI",
+"ca_exdate": "2019-09-13",
+"subject": "Rights:14 Compulosry Convertible Debentures For Every 15 Equity Shares"
+},
+{
+"isin": "INE151A01013",
+"date": "2019-09-17",
+"kind": "demerger",
+"symbol": "TATACOMM",
+"ca_symbol": "TATACOMM",
+"ca_exdate": "2019-09-17",
+"subject": "Demerger"
+},
+{
+"isin": "INE244B01030",
+"date": "2019-09-17",
+"kind": "rights",
+"symbol": "PATELENG",
+"ca_symbol": "PATELENG",
+"ca_exdate": "2019-09-17",
+"subject": "Rights 7:5 @ Premium Rs 8/- Per Share"
+},
+{
+"isin": "INE621L01012",
+"date": "2019-09-24",
+"kind": "rights",
+"symbol": "TEXRAIL",
+"ca_symbol": "TEXRAIL",
+"ca_exdate": "2019-09-24",
+"subject": "Rights 19:100 @ Premium Rs 45.70/-"
+},
+{
+"isin": "INE055A01016",
+"date": "2019-10-11",
+"kind": "demerger",
+"symbol": "CENTURYTEX",
+"ca_symbol": "ABREL",
+"ca_exdate": "2019-10-11",
+"subject": "Demerger"
+},
+{
+"isin": "INE332A01027",
+"date": "2019-12-05",
+"kind": "demerger",
+"symbol": "THOMASCOOK",
+"ca_symbol": "THOMASCOOK",
+"ca_exdate": "2019-12-05",
+"subject": "Demerger"
+},
+{
+"isin": "INE117A01022",
+"date": "2019-12-20",
+"kind": "demerger",
+"symbol": "ABB",
+"ca_symbol": "ABB",
+"ca_exdate": "2019-12-20",
+"subject": "Demerger"
+},
+{
+"isin": "INE087A01019",
+"date": "2019-12-24",
+"kind": "demerger",
+"symbol": "KESORAMIND",
+"ca_symbol": "KESORAMIND",
+"ca_exdate": "2019-12-24",
+"subject": "Demerger"
+},
+{
+"isin": "INE140A01024",
+"date": "2019-12-30",
+"kind": "rights",
+"symbol": "PEL",
+"ca_symbol": "PEL",
+"ca_exdate": "2019-12-30",
+"subject": "Rights 11:83 @ Premium Rs 1298/-"
+},
+{
+"isin": "INE197D01010",
+"date": "2019-12-30",
+"kind": "demerger",
+"symbol": "JINDALPOLY",
+"ca_symbol": "JINDALPOLY",
+"ca_exdate": "2019-12-30",
+"subject": "Demerger"
+},
+{
+"isin": "INE495B01038",
+"date": "2020-01-21",
+"kind": "demerger",
+"symbol": "SUVEN",
+"ca_symbol": "SUVEN",
+"ca_exdate": "2020-01-21",
+"subject": "Demerger"
+},
+{
+"isin": "INE193E01025",
+"date": "2020-02-05",
+"kind": "rights",
+"symbol": "BAJAJELEC",
+"ca_symbol": "BAJAJELEC",
+"ca_exdate": "2020-02-05",
+"subject": "Rights 13:118 @ Premium Rs 308/-"
+},
+{
+"isin": "INE650L01011",
+"date": "2020-02-11",
+"kind": "rights",
+"symbol": "BROOKS",
+"ca_symbol": "BROOKS",
+"ca_exdate": "2020-02-11",
+"subject": "Rights 9:20 @ Premium Rs 10/-"
+},
+{
+"isin": "INE570D01018",
+"date": "2020-02-12",
+"kind": "rights",
+"symbol": "ARROWGREEN",
+"ca_symbol": "ARROWGREEN",
+"ca_exdate": "2020-02-12",
+"subject": "Rights 1:5 @ Premium Rs 26/-"
+},
+{
+"isin": "INE877I01016",
+"date": "2020-02-13",
+"kind": "demerger",
+"symbol": "ARCHIDPLY",
+"ca_symbol": "ARCHIDPLY",
+"ca_exdate": "2020-02-13",
+"subject": "Demerger"
+},
+{
+"isin": "INE092A01019",
+"date": "2020-03-04",
+"kind": "demerger",
+"symbol": "TATACHEM",
+"ca_symbol": "TATACHEM",
+"ca_exdate": "2020-03-04",
+"subject": "Demerger"
+},
+{
+"isin": "INE666D01022",
+"date": "2020-03-06",
+"kind": "demerger",
+"symbol": "BORORENEW",
+"ca_symbol": "BORORENEW",
+"ca_exdate": "2020-03-06",
+"subject": "Demerger"
+},
+{
+"isin": "INE955V01021",
+"date": "2020-03-17",
+"kind": "rights",
+"symbol": "ARVINDFASN",
+"ca_symbol": "ARVINDFASN",
+"ca_exdate": "2020-03-17",
+"subject": "Rights 16:47 @ Premium Rs 146/-"
+},
+{
+"isin": "INE597I01010",
+"date": "2020-03-26",
+"kind": "demerger",
+"symbol": "SHARDAMOTR",
+"ca_symbol": "SHARDAMOTR",
+"ca_exdate": "2020-03-26",
+"subject": "Demerger"
+},
+{
+"isin": "INE002A01018",
+"date": "2020-05-13",
+"kind": "rights",
+"symbol": "RELIANCE",
+"ca_symbol": "RELIANCE",
+"ca_exdate": "2020-05-13",
+"subject": "Rights 1:15 @ Premium Rs 1247"
+},
+{
+"isin": "INE056I01017",
+"date": "2020-06-16",
+"kind": "rights",
+"symbol": "REFEX",
+"ca_symbol": "REFEX",
+"ca_exdate": "2020-06-16",
+"subject": "Rights 5:14@ Premium Rs 35/-"
+},
+{
+"isin": "INE647O01011",
+"date": "2020-06-30",
+"kind": "rights",
+"symbol": "ABFRL",
+"ca_symbol": "ABFRL",
+"ca_exdate": "2020-06-30",
+"subject": "Rights 9:77 Partly Paid @ Premium Rs 100/-"
+},
+{
+"isin": "INE191H01014",
+"date": "2020-07-09",
+"kind": "rights",
+"symbol": "PVR",
+"ca_symbol": "PVRINOX",
+"ca_exdate": "2020-07-09",
+"subject": "Rights 7:94 @ Premium Rs 774/-"
+},
+{
+"isin": "INE721A01013",
+"date": "2020-07-09",
+"kind": "rights",
+"symbol": "SRTRANSFIN",
+"ca_symbol": "SHRIRAMFIN",
+"ca_exdate": "2020-07-09",
+"subject": "Rights 3:26 @ Premium Rs 560/-"
+},
+{
+"isin": "INE774D01024",
+"date": "2020-07-22",
+"kind": "rights",
+"symbol": "M&MFIN",
+"ca_symbol": "M&MFIN",
+"ca_exdate": "2020-07-22",
+"subject": "Rights 1:1 @ Premium Rs 48/-"
+},
+{
+"isin": "INE852F01015",
+"date": "2020-07-23",
+"kind": "rights",
+"symbol": "GDL",
+"ca_symbol": "GDL",
+"ca_exdate": "2020-07-23",
+"subject": "Rights 4:27 @ Premium Rs 62/-"
+},
+{
+"isin": "INE020801028",
+"date": "2020-07-28",
+"kind": "rights",
+"symbol": "SPENCERS",
+"ca_symbol": "SPENCERS",
+"ca_exdate": "2020-07-28",
+"subject": "Rights 2:15 @ Premium Rs 70/-"
+},
+{
+"isin": "INE836B01017",
+"date": "2020-08-04",
+"kind": "rights",
+"symbol": "SATIN",
+"ca_symbol": "SATIN",
+"ca_exdate": "2020-08-04",
+"subject": "Rights 48:125 @ Premium Rs 50/-"
+},
+{
+"isin": "INE405E01023",
+"date": "2020-08-14",
+"kind": "rights",
+"symbol": "MINDAIND",
+"ca_symbol": "UNOMINDA",
+"ca_exdate": "2020-08-14",
+"subject": "Rights 1:27 @ Premium Rs 248/-"
+},
+{
+"isin": "INE959A01019",
+"date": "2020-08-21",
+"kind": "demerger",
+"symbol": "FAIRCHEM",
+"ca_symbol": "PRIVISCL",
+"ca_exdate": "2020-08-21",
+"subject": "Demerger"
+},
+{
+"isin": "INE573K01017",
+"date": "2020-09-10",
+"kind": "rights",
+"symbol": "RUSHIL",
+"ca_symbol": "RUSHIL",
+"ca_exdate": "2020-09-10",
+"subject": "Rights 1:3 @ Premium Rs 40/-"
+},
+{
+"isin": "INE501A01019",
+"date": "2020-09-16",
+"kind": "rights",
+"symbol": "DEEPAKFERT",
+"ca_symbol": "DEEPAKFERT",
+"ca_exdate": "2020-09-16",
+"subject": "Rights 3:20 @ Premium Rs 123/-"
+},
+{
+"isin": "INE922B01023",
+"date": "2020-09-21",
+"kind": "demerger",
+"symbol": "PANACEABIO",
+"ca_symbol": "PANACEABIO",
+"ca_exdate": "2020-09-21",
+"subject": "Demerger"
+},
+{
+"isin": "INE230A01023",
+"date": "2020-09-22",
+"kind": "rights",
+"symbol": "EIHOTEL",
+"ca_symbol": "EIHOTEL",
+"ca_exdate": "2020-09-22",
+"subject": "Rights 8:85 @ Premium Rs 63/-"
+},
+{
+"isin": "INE993A01026",
+"date": "2020-09-24",
+"kind": "demerger",
+"symbol": "MANINDS",
+"ca_symbol": "MANINDS",
+"ca_exdate": "2020-09-24",
+"subject": "Demerger"
+},
+{
+"isin": "INE242C01024",
+"date": "2020-10-06",
+"kind": "demerger",
+"symbol": "ANANTRAJ",
+"ca_symbol": "ANANTRAJ",
+"ca_exdate": "2020-10-06",
+"subject": "Demerger"
+},
+{
+"isin": "INE893J01029",
+"date": "2020-10-21",
+"kind": "rights",
+"symbol": "MOLDTKPAC",
+"ca_symbol": "MOLDTKPAC",
+"ca_exdate": "2020-10-21",
+"subject": "Rights 1:50 @ Premium Rs 175 With 6 Warrants For 50 Equity Shares"
+},
+{
+"isin": "INE677H01012",
+"date": "2020-11-10",
+"kind": "demerger",
+"symbol": "DEEPENR",
+"ca_symbol": "DEEPENR",
+"ca_exdate": "2020-11-10",
+"subject": "Demerger"
+},
+{
+"isin": "INE498B01024",
+"date": "2020-11-19",
+"kind": "rights",
+"symbol": "SHOPERSTOP",
+"ca_symbol": "SHOPERSTOP",
+"ca_exdate": "2020-11-19",
+"subject": "Rights 17:70 @ Premium Rs 135/-"
+},
+{
+"isin": "INE726V01018",
+"date": "2020-11-24",
+"kind": "rights",
+"symbol": "PRICOLLTD",
+"ca_symbol": "PRICOLLTD",
+"ca_exdate": "2020-11-24",
+"subject": "Rights 2:7 @ Premium Rs 29/-"
+},
+{
+"isin": "INE483S01020",
+"date": "2020-12-10",
+"kind": "demerger",
+"symbol": "INFIBEAM",
+"ca_symbol": "CCAVENUE",
+"ca_exdate": "2020-12-10",
+"subject": "Demerger"
+},
+{
+"isin": "INE550C01020",
+"date": "2021-01-14",
+"kind": "rights",
+"symbol": "URJA",
+"ca_symbol": "URJA",
+"ca_exdate": "2021-01-14",
+"subject": "Rights 7:71 @ Premium Rs 4/-"
+},
+{
+"isin": "INE498L01015",
+"date": "2021-01-21",
+"kind": "rights",
+"symbol": "L&TFH",
+"ca_symbol": "LTF",
+"ca_exdate": "2021-01-21",
+"subject": "Rights 17:74@ Premium Rs 55 Per Share"
+},
+{
+"isin": "INE700A01033",
+"date": "2021-02-04",
+"kind": "demerger",
+"symbol": "JUBILANT",
+"ca_symbol": "JUBLPHARMA",
+"ca_exdate": "2021-02-04",
+"subject": "Demerger"
+},
+{
+"isin": "INE529D01014",
+"date": "2021-02-17",
+"kind": "rights",
+"symbol": "PATINTLOG",
+"ca_symbol": "PATINTLOG",
+"ca_exdate": "2021-02-17",
+"subject": "Rights 27:47"
+},
+{
+"isin": "INE955V01021",
+"date": "2021-02-23",
+"kind": "rights",
+"symbol": "ARVINDFASN",
+"ca_symbol": "ARVINDFASN",
+"ca_exdate": "2021-02-23",
+"subject": "Rights 3:20 @ Premium Rs 131/-"
+},
+{
+"isin": "INE538A01037",
+"date": "2021-03-26",
+"kind": "demerger",
+"symbol": "GFLLIMITED",
+"ca_symbol": "GFLLIMITED",
+"ca_exdate": "2021-03-26",
+"subject": "Demerger"
+},
+{
+"isin": "INE291D01011",
+"date": "2021-03-30",
+"kind": "rights",
+"symbol": "KDDL",
+"ca_symbol": "KDDL",
+"ca_exdate": "2021-03-30",
+"subject": "Rights 7:75 @ Premium Rs 220/-"
+},
+{
+"isin": "INE202Z01029",
+"date": "2021-04-26",
+"kind": "rights",
+"symbol": "SUNDARMHLD",
+"ca_symbol": "TSFINV",
+"ca_exdate": "2021-04-26",
+"subject": "Rights 23:49 @ Premium Rs 45/-"
+},
+{
+"isin": "INE161L01027",
+"date": "2021-05-20",
+"kind": "rights",
+"symbol": "VIKASLIFE",
+"ca_symbol": "VIKASLIFE",
+"ca_exdate": "2021-05-20",
+"subject": "Rights 2:5 @ Premium Re 0.85/-"
+},
+{
+"isin": "INE806A01020",
+"date": "2021-06-09",
+"kind": "rights",
+"symbol": "VIKASECO",
+"ca_symbol": "VIKASECO",
+"ca_exdate": "2021-06-09",
+"subject": "Rights 13:10 @ Premium Rs 0.35/-"
+},
+{
+"isin": "INE933B01012",
+"date": "2021-07-12",
+"kind": "rights",
+"symbol": "MEGASOFT",
+"ca_symbol": "SIGMAADV",
+"ca_exdate": "2021-07-12",
+"subject": "Rights 2:3"
+},
+{
+"isin": "INE546Y01022",
+"date": "2021-09-07",
+"kind": "rights",
+"symbol": "PRAXIS",
+"ca_symbol": "PRAXIS",
+"ca_exdate": "2021-09-07",
+"subject": "Rights 11:8 @ Premium Rs 6.35/-"
+},
+{
+"isin": "INE022I01019",
+"date": "2021-09-08",
+"kind": "rights",
+"symbol": "ASIANTILES",
+"ca_symbol": "ASIANTILES",
+"ca_exdate": "2021-09-08",
+"subject": "Rights 19:29 @ Premium Rs 90/-"
+},
+{
+"isin": "INE186H01022",
+"date": "2021-09-08",
+"kind": "rights",
+"symbol": "BASML",
+"ca_symbol": "BASML",
+"ca_exdate": "2021-09-08",
+"subject": "Rights 21:20@ Premium Rs 25/-"
+},
+{
+"isin": "INE087A01019",
+"date": "2021-09-16",
+"kind": "rights",
+"symbol": "KESORAMIND",
+"ca_symbol": "KESORAMIND",
+"ca_exdate": "2021-09-16",
+"subject": "Rights 133:274 @ Premium Rs 40/-"
+},
+{
+"isin": "INE324L01013",
+"date": "2021-09-17",
+"kind": "rights",
+"symbol": "RPPINFRA",
+"ca_symbol": "RPPINFRA",
+"ca_exdate": "2021-09-17",
+"subject": "Rights 3:5 @ Premium Rs 20/-"
+},
+{
+"isin": "INE397D01024",
+"date": "2021-09-27",
+"kind": "rights",
+"symbol": "BHARTIARTL",
+"ca_symbol": "BHARTIARTL",
+"ca_exdate": "2021-09-27",
+"subject": "Rights 1:14 @ Premium Rs 530/-"
+},
+{
+"isin": "INE621L01012",
+"date": "2021-10-21",
+"kind": "rights",
+"symbol": "TEXRAIL",
+"ca_symbol": "TEXRAIL",
+"ca_exdate": "2021-10-21",
+"subject": "Rights 2:7 @ Premium Rs 22/-"
+},
+{
+"isin": "INE353A01023",
+"date": "2021-10-22",
+"kind": "rights",
+"symbol": "NXTDIGITAL",
+"ca_symbol": "NDLVENTURE",
+"ca_exdate": "2021-10-22",
+"subject": "Rights 2:5 @ Premium Rs 290/-"
+},
+{
+"isin": "INE529D01014",
+"date": "2021-10-28",
+"kind": "rights",
+"symbol": "PATINTLOG",
+"ca_symbol": "PATINTLOG",
+"ca_exdate": "2021-10-28",
+"subject": "Rights 613:399"
+},
+{
+"isin": "INE561C01019",
+"date": "2021-10-28",
+"kind": "rights",
+"symbol": "BHARATGEAR",
+"ca_symbol": "BHARATGEAR",
+"ca_exdate": "2021-10-28",
+"subject": "Rights 1:10 @ Premium Rs 95/-"
+},
+{
+"isin": "INE161L01027",
+"date": "2021-10-29",
+"kind": "rights",
+"symbol": "VIKASLIFE",
+"ca_symbol": "VIKASLIFE",
+"ca_exdate": "2021-10-29",
+"subject": "Rights 4:21 @ Premium Rs 1.80/-"
+},
+{
+"isin": "INE053A01029",
+"date": "2021-11-11",
+"kind": "rights",
+"symbol": "INDHOTEL",
+"ca_symbol": "INDHOTEL",
+"ca_exdate": "2021-11-11",
+"subject": "Rights 1:9 @ Premium Rs 149/-"
+},
+{
+"isin": "INE806A01020",
+"date": "2021-11-24",
+"kind": "rights",
+"symbol": "VIKASECO",
+"ca_symbol": "VIKASECO",
+"ca_exdate": "2021-11-24",
+"subject": "Rights 12:25@ Premium Rs 0.60/-"
+},
+{
+"isin": "INE637H01024",
+"date": "2021-12-09",
+"kind": "rights",
+"symbol": "SHIVAMAUTO",
+"ca_symbol": "SHIVAMAUTO",
+"ca_exdate": "2021-12-09",
+"subject": "Rights 2:9 @ Premium Rs 16/-"
+},
+{
+"isin": "INE520H01022",
+"date": "2021-12-16",
+"kind": "rights",
+"symbol": "BEARDSELL",
+"ca_symbol": "BEARDSELL",
+"ca_exdate": "2021-12-16",
+"subject": "Rights 1:3 @ Premium Rs 8/-"
+},
+{
+"isin": "INE480C01020",
+"date": "2021-12-31",
+"kind": "rights",
+"symbol": "SDBL",
+"ca_symbol": "SDBL",
+"ca_exdate": "2021-12-31",
+"subject": "Rights 1:13@ Premium Rs 30/-"
+},
+{
+"isin": "INE776C01039",
+"date": "2022-01-11",
+"kind": "demerger",
+"symbol": "GMRINFRA",
+"ca_symbol": "GMRAIRPORT",
+"ca_exdate": "2022-01-11",
+"subject": "Demerger"
+},
+{
+"isin": "INE775A01035",
+"date": "2022-01-14",
+"kind": "demerger",
+"symbol": "MOTHERSUMI",
+"ca_symbol": "MOTHERSON",
+"ca_exdate": "2022-01-14",
+"subject": "Demerger"
+},
+{
+"isin": "INE968D01022",
+"date": "2022-03-03",
+"kind": "demerger",
+"symbol": "ARSHIYA",
+"ca_symbol": "ARSHIYA",
+"ca_exdate": "2022-03-03",
+"subject": "Demerger"
+},
+{
+"isin": "INE049B01025",
+"date": "2022-03-08",
+"kind": "rights",
+"symbol": "WOCKPHARMA",
+"ca_symbol": "WOCKPHARMA",
+"ca_exdate": "2022-03-08",
+"subject": "Rights 3:10@ Premium Rs 220 Per Share"
+},
+{
+"isin": "INE236Y01012",
+"date": "2022-03-30",
+"kind": "rights",
+"symbol": "NGIL",
+"ca_symbol": "NGIL",
+"ca_exdate": "2022-03-30",
+"subject": "Rights 1:4@ Premium Rs 110/-"
+},
+{
+"isin": "INE414D01019",
+"date": "2022-04-07",
+"kind": "rights",
+"symbol": "BHAGCHEM",
+"ca_symbol": "BHAGCHEM",
+"ca_exdate": "2022-04-07",
+"subject": "Rights Issue 4:17@ Premium Rs 390/-"
+},
+{
+"isin": "INE022I01019",
+"date": "2022-04-11",
+"kind": "rights",
+"symbol": "ASIANTILES",
+"ca_symbol": "ASIANTILES",
+"ca_exdate": "2022-04-11",
+"subject": "Rights Issue 30:37@ Premium Rs 53/-"
+},
+{
+"isin": "INE898S01029",
+"date": "2022-04-12",
+"kind": "rights",
+"symbol": "AURUM",
+"ca_symbol": "AURUM",
+"ca_exdate": "2022-04-12",
+"subject": "Rights 3:2 @ Premium Rs 75/-"
+},
+{
+"isin": "INE418N01035",
+"date": "2022-05-09",
+"kind": "rights",
+"symbol": "ESSENTIA",
+"ca_symbol": "ESSENTIA",
+"ca_exdate": "2022-05-04",
+"subject": "Rights 33:13@ Premium Rs 0.80/-"
+},
+{
+"isin": "INE256H01015",
+"date": "2022-05-12",
+"kind": "rights",
+"symbol": "DYNPRO",
+"ca_symbol": "DYNPRO",
+"ca_exdate": "2022-05-12",
+"subject": "Rights 1:20 @ Premium Rs. 440/-"
+},
+{
+"isin": "INE041A01016",
+"date": "2022-05-13",
+"kind": "demerger",
+"symbol": "DHAMPURSUG",
+"ca_symbol": "DHAMPURSUG",
+"ca_exdate": "2022-05-13",
+"subject": "Demerger"
+},
+{
+"isin": "INE716B01011",
+"date": "2022-05-19",
+"kind": "demerger",
+"symbol": "TIPSINDLTD",
+"ca_symbol": "TIPSINDLTD",
+"ca_exdate": "2022-05-19",
+"subject": "Demerger"
+},
+{
+"isin": "INE869Y01010",
+"date": "2022-08-08",
+"kind": "rights",
+"symbol": "TEMBO",
+"ca_symbol": "TEMBO",
+"ca_exdate": "2022-08-08",
+"subject": "Rights 9:25 @ Premium Rs 90/-"
+},
+{
+"isin": "INE377E01016",
+"date": "2022-08-25",
+"kind": "rights",
+"symbol": "COASTCORP",
+"ca_symbol": "COASTCORP",
+"ca_exdate": "2022-08-25",
+"subject": "Rights 1:6 @ Premium Rs 215/-"
+},
+{
+"isin": "INE140A01024",
+"date": "2022-08-30",
+"kind": "demerger",
+"symbol": "PEL",
+"ca_symbol": "PEL",
+"ca_exdate": "2022-08-30",
+"subject": "Demerger"
+},
+{
+"isin": "INE126M01010",
+"date": "2022-09-01",
+"kind": "demerger",
+"symbol": "YAARI",
+"ca_symbol": "IBULLSLTD",
+"ca_exdate": "2022-09-01",
+"subject": "Demerger"
+},
+{
+"isin": "INE390H01012",
+"date": "2022-09-06",
+"kind": "demerger",
+"symbol": "KAMDHENU",
+"ca_symbol": "KAMDHENU",
+"ca_exdate": "2022-09-06",
+"subject": "Demerger"
+},
+{
+"isin": "INE258A01016",
+"date": "2022-09-08",
+"kind": "demerger",
+"symbol": "BEML",
+"ca_symbol": "BEML",
+"ca_exdate": "2022-09-08",
+"subject": "Demerger"
+},
+{
+"isin": "INE908V01012",
+"date": "2022-09-15",
+"kind": "rights",
+"symbol": "LIBAS",
+"ca_symbol": "LIBAS",
+"ca_exdate": "2022-09-15",
+"subject": "Rights 1:2 @ Premium Rs 11/-"
+},
+{
+"isin": "INE040H01021",
+"date": "2022-10-03",
+"kind": "rights",
+"symbol": "SUZLON",
+"ca_symbol": "SUZLON",
+"ca_exdate": "2022-10-03",
+"subject": "Rights 5:21 @ Premium Rs 3/-"
+},
+{
+"isin": "INE926K01017",
+"date": "2022-10-06",
+"kind": "demerger",
+"symbol": "AHLEAST",
+"ca_symbol": "AHLEAST",
+"ca_exdate": "2022-10-06",
+"subject": "Bonus 1:2 | Demerger"
+},
+{
+"isin": "INE495B01038",
+"date": "2022-10-17",
+"kind": "rights",
+"symbol": "SUVEN",
+"ca_symbol": "SUVEN",
+"ca_exdate": "2022-10-17",
+"subject": "Rights 1:2 @ Premium Rs 54/-"
+},
+{
+"isin": "INE769A01020",
+"date": "2022-10-19",
+"kind": "demerger",
+"symbol": "AARTIIND",
+"ca_symbol": "AARTIIND",
+"ca_exdate": "2022-10-19",
+"subject": "Demerger"
+},
+{
+"isin": "INE788H01017",
+"date": "2022-10-20",
+"kind": "rights",
+"symbol": "HILTON",
+"ca_symbol": "HILTON",
+"ca_exdate": "2022-10-20",
+"subject": "Rights 2:5 @ Premium Rs 45/-"
+},
+{
+"isin": "INE584A01023",
+"date": "2022-10-27",
+"kind": "demerger",
+"symbol": "NMDC",
+"ca_symbol": "NMDC",
+"ca_exdate": "2022-10-27",
+"subject": "Demerger"
+},
+{
+"isin": "INE804H01012",
+"date": "2022-11-04",
+"kind": "rights",
+"symbol": "TFL",
+"ca_symbol": "TFL",
+"ca_exdate": "2022-11-04",
+"subject": "Rights 1:1"
+},
+{
+"isin": "INE070C01037",
+"date": "2022-11-14",
+"kind": "rights",
+"symbol": "COMPINFO",
+"ca_symbol": "COMPINFO",
+"ca_exdate": "2022-11-14",
+"subject": "Rights 8:25 @ Premium Rs 18/-"
+},
+{
+"isin": "INE418N01035",
+"date": "2022-11-17",
+"kind": "rights",
+"symbol": "ESSENTIA",
+"ca_symbol": "ESSENTIA",
+"ca_exdate": "2022-11-17",
+"subject": "Rights 37:200 @ Premium Rs 6/-"
+},
+{
+"isin": "INE353A01023",
+"date": "2022-11-22",
+"kind": "demerger",
+"symbol": "NXTDIGITAL",
+"ca_symbol": "NDLVENTURE",
+"ca_exdate": "2022-11-22",
+"subject": "Demerger"
+},
+{
+"isin": "INE820Y01021",
+"date": "2022-11-25",
+"kind": "rights",
+"symbol": "AJOONI",
+"ca_symbol": "AJOONI",
+"ca_exdate": "2022-11-25",
+"subject": "Rights 29:30 @ Premium Rs 4/-"
+},
+{
+"isin": "INE473B01035",
+"date": "2022-12-07",
+"kind": "rights",
+"symbol": "HATSUN",
+"ca_symbol": "HATSUN",
+"ca_exdate": "2022-12-07",
+"subject": "Rights 1:30 @ Premium Rs 418/-"
+},
+{
+"isin": "INE00Y801016",
+"date": "2022-12-16",
+"kind": "rights",
+"symbol": "AKG",
+"ca_symbol": "AKG",
+"ca_exdate": "2022-12-16",
+"subject": "Rights 2:1 @ Premium Rs 2/-"
+},
+{
+"isin": "INE071F01012",
+"date": "2022-12-16",
+"kind": "rights",
+"symbol": "APCL",
+"ca_symbol": "APCL",
+"ca_exdate": "2022-12-16",
+"subject": "Rights 1:2 @ Premium Rs 187/-"
+},
+{
+"isin": "INE611A01016",
+"date": "2022-12-16",
+"kind": "rights",
+"symbol": "RSWM",
+"ca_symbol": "RSWM",
+"ca_exdate": "2022-12-16",
+"subject": "Rights 1:1 @ Premium Rs 90/-"
+},
+{
+"isin": "INE482J01021",
+"date": "2022-12-23",
+"kind": "rights",
+"symbol": "GAL",
+"ca_symbol": "SHAH",
+"ca_exdate": "2022-12-23",
+"subject": "Rights 110:100 @ Premium Rs 1.75/-"
+},
+{
+"isin": "INE982V01025",
+"date": "2023-01-11",
+"kind": "rights",
+"symbol": "JETFREIGHT",
+"ca_symbol": "JETFREIGHT",
+"ca_exdate": "2023-01-11",
+"subject": "Rights 1:1 @ Premium Rs 11.25/-"
+},
+{
+"isin": "INE227G01018",
+"date": "2023-01-13",
+"kind": "rights",
+"symbol": "INDOWIND",
+"ca_symbol": "INDOWIND",
+"ca_exdate": "2023-01-13",
+"subject": "Rights 2:5@ Premium Rs 2/-"
+},
+{
+"isin": "INE09EO01013",
+"date": "2023-01-17",
+"kind": "rights",
+"symbol": "AARTISURF",
+"ca_symbol": "AARTISURF",
+"ca_exdate": "2023-01-17",
+"subject": "Rights 2:17 @ Premium Rs 545/-"
+},
+{
+"isin": "INE978A01027",
+"date": "2023-01-20",
+"kind": "rights",
+"symbol": "HERITGFOOD",
+"ca_symbol": "HERITGFOOD",
+"ca_exdate": "2023-01-20",
+"subject": "Rights 1:1 @ Premium Rs 0/-"
+},
+{
+"isin": "INE244B01030",
+"date": "2023-02-06",
+"kind": "rights",
+"symbol": "PATELENG",
+"ca_symbol": "PATELENG",
+"ca_exdate": "2023-02-06",
+"subject": "Rights 1:2@ Premium Rs 11.60/-"
+},
+{
+"isin": "INE294G01026",
+"date": "2023-02-09",
+"kind": "rights",
+"symbol": "ROML",
+"ca_symbol": "ROML",
+"ca_exdate": "2023-02-09",
+"subject": "Rights 1:1 @ Premium Rs 20/-"
+},
+{
+"isin": "INE180C01026",
+"date": "2023-02-17",
+"kind": "rights",
+"symbol": "CGCL",
+"ca_symbol": "CGCL",
+"ca_exdate": "2023-02-17",
+"subject": "Rights 11:64 @ Premium Rs 473/-"
+},
+{
+"isin": "INE932X01018",
+"date": "2023-02-28",
+"kind": "rights",
+"symbol": "SHAREINDIA",
+"ca_symbol": "SHAREINDIA",
+"ca_exdate": "2023-02-28",
+"subject": "Rights 1:50 @ Premium Rs 690/- With 17 Warrants For 50 Equity Shares"
+},
+{
+"isin": "INE314T01025",
+"date": "2023-03-08",
+"kind": "rights",
+"symbol": "GOKULAGRO",
+"ca_symbol": "GOKULAGRO",
+"ca_exdate": "2023-03-08",
+"subject": "Rights 1:32 @ Premium Rs 90/-"
+},
+{
+"isin": "INE771A01026",
+"date": "2023-03-29",
+"kind": "demerger",
+"symbol": "MIRZAINT",
+"ca_symbol": "MIRZAINT",
+"ca_exdate": "2023-03-29",
+"subject": "Demerger"
+},
+{
+"isin": "INE964H01014",
+"date": "2023-03-29",
+"kind": "rights",
+"symbol": "SEPC",
+"ca_symbol": "SEPC",
+"ca_exdate": "2023-03-29",
+"subject": "Rights 2:53 @ Premium Rs 0/-"
+},
+{
+"isin": "INE109A01011",
+"date": "2023-03-31",
+"kind": "demerger",
+"symbol": "SCI",
+"ca_symbol": "SCI",
+"ca_exdate": "2023-03-31",
+"subject": "Demerger"
+},
+{
+"isin": "INE572E01012",
+"date": "2023-04-05",
+"kind": "rights",
+"symbol": "PNBHOUSING",
+"ca_symbol": "PNBHOUSING",
+"ca_exdate": "2023-04-05",
+"subject": "Rights 29:54@ Premium Rs 265/-"
+},
+{
+"isin": "INE539A01019",
+"date": "2023-04-06",
+"kind": "demerger",
+"symbol": "GHCL",
+"ca_symbol": "GHCL",
+"ca_exdate": "2023-04-06",
+"subject": "Demerger"
+},
+{
+"isin": "INE480C01020",
+"date": "2023-04-13",
+"kind": "rights",
+"symbol": "SDBL",
+"ca_symbol": "SDBL",
+"ca_exdate": "2023-04-13",
+"subject": "Rights 10:211@ Premium Rs 135/-"
+},
+{
+"isin": "INE573K01017",
+"date": "2023-04-13",
+"kind": "rights",
+"symbol": "RUSHIL",
+"ca_symbol": "RUSHIL",
+"ca_exdate": "2023-04-13",
+"subject": "Rights 1:3 @ Premium Rs 152/-"
+},
+{
+"isin": "INE065J01016",
+"date": "2023-04-18",
+"kind": "rights",
+"symbol": "GISOLUTION",
+"ca_symbol": "TPHQ",
+"ca_exdate": "2023-04-18",
+"subject": "Rights 11:8 @ Premium Rs 0/-"
+},
+{
+"isin": "INE418H01029",
+"date": "2023-04-18",
+"kind": "demerger",
+"symbol": "ALLCARGO",
+"ca_symbol": "ALLCARGO",
+"ca_exdate": "2023-04-18",
+"subject": "Demerger"
+},
+{
+"isin": "INE925Y01036",
+"date": "2023-05-12",
+"kind": "rights",
+"symbol": "GODHA",
+"ca_symbol": "AURIGROW",
+"ca_exdate": "2023-05-12",
+"subject": "Rights 2:1 @ Premium Rs 0/-"
+},
+{
+"isin": "INE546Y01022",
+"date": "2023-05-30",
+"kind": "rights",
+"symbol": "PRAXIS",
+"ca_symbol": "PRAXIS",
+"ca_exdate": "2023-05-30",
+"subject": "Rights 13:20 @ Premium Rs 5/-"
+},
+{
+"isin": "INE879A01019",
+"date": "2023-05-30",
+"kind": "rights",
+"symbol": "SHREERAMA",
+"ca_symbol": "SHREERAMA",
+"ca_exdate": "2023-05-30",
+"subject": "Rights 11:10@ Premium Rs 4/-"
+},
+{
+"isin": "INE411Y01011",
+"date": "2023-06-01",
+"kind": "rights",
+"symbol": "DIL",
+"ca_symbol": "DIL",
+"ca_exdate": "2023-06-01",
+"subject": "Rights 3:7 @ Premium Rs 5/-"
+},
+{
+"isin": "INE532F01054",
+"date": "2023-06-02",
+"kind": "demerger",
+"symbol": "EDELWEISS",
+"ca_symbol": "EDELWEISS",
+"ca_exdate": "2023-06-02",
+"subject": "Demerger"
+},
+{
+"isin": "INE553C01016",
+"date": "2023-06-02",
+"kind": "rights",
+"symbol": "NECCLTD",
+"ca_symbol": "NECCLTD",
+"ca_exdate": "2023-06-02",
+"subject": "Rights 9:10 @ Premium Rs 8/-"
+},
+{
+"isin": "INE161A01038",
+"date": "2023-06-08",
+"kind": "demerger",
+"symbol": "NIITLTD",
+"ca_symbol": "NIITLTD",
+"ca_exdate": "2023-06-08",
+"subject": "Demerger"
+},
+{
+"isin": "INE225C01029",
+"date": "2023-06-14",
+"kind": "rights",
+"symbol": "UDAICEMENT",
+"ca_symbol": "UDAICEMENT",
+"ca_exdate": "2023-06-14",
+"subject": "Rights 4:5 @ Premium Rs 14/-"
+},
+{
+"isin": "INE051B01021",
+"date": "2023-06-15",
+"kind": "demerger",
+"symbol": "VAKRANGEE",
+"ca_symbol": "VAKRANGEE",
+"ca_exdate": "2023-06-15",
+"subject": "Demerger"
+},
+{
+"isin": "INE008Z01020",
+"date": "2023-07-06",
+"kind": "rights",
+"symbol": "SRPL",
+"ca_symbol": "SRPL",
+"ca_exdate": "2023-07-06",
+"subject": "Rights 1:1 @ Premium Rs 1.30/-"
+},
+{
+"isin": "INE002A01018",
+"date": "2023-07-20",
+"kind": "demerger",
+"symbol": "RELIANCE",
+"ca_symbol": "RELIANCE",
+"ca_exdate": "2023-07-20",
+"subject": "Demerger"
+},
+{
+"isin": "INE098201036",
+"date": "2023-07-24",
+"kind": "rights",
+"symbol": "VCL",
+"ca_symbol": "VCL",
+"ca_exdate": "2023-07-24",
+"subject": "Rights 1:2 @ Premium Re 1.50/-"
+},
+{
+"isin": "INE979A01025",
+"date": "2023-07-27",
+"kind": "demerger",
+"symbol": "SAREGAMA",
+"ca_symbol": "SAREGAMA",
+"ca_exdate": "2023-07-27",
+"subject": "Demerger"
+},
+{
+"isin": "INE650L01011",
+"date": "2023-07-28",
+"kind": "rights",
+"symbol": "BROOKS",
+"ca_symbol": "BROOKS",
+"ca_exdate": "2023-07-28",
+"subject": "Rights 1:16 @ Premium Rs 65/-"
+},
+{
+"isin": "INE0DK501011",
+"date": "2023-08-02",
+"kind": "rights",
+"symbol": "PPLPHARMA",
+"ca_symbol": "PPLPHARMA",
+"ca_exdate": "2023-08-02",
+"subject": "Rights 5:46 @ Premium Rs 71/-"
+},
+{
+"isin": "INE999K01014",
+"date": "2023-08-18",
+"kind": "rights",
+"symbol": "GREENPOWER",
+"ca_symbol": "GREENPOWER",
+"ca_exdate": "2023-08-18",
+"subject": "Rights 19:62 @ Premium Rs 0/-"
+},
+{
+"isin": "INE105A01035",
+"date": "2023-08-24",
+"kind": "demerger",
+"symbol": "TVSHLTD",
+"ca_symbol": "TVSHLTD",
+"ca_exdate": "2023-08-24",
+"subject": "Demerger"
+},
+{
+"isin": "INE236Y01012",
+"date": "2023-09-05",
+"kind": "rights",
+"symbol": "NGIL",
+"ca_symbol": "NGIL",
+"ca_exdate": "2023-09-05",
+"subject": "Rights 1:7 @ Premium Rs 30/-"
+},
+{
+"isin": "INE544H01014",
+"date": "2023-09-11",
+"kind": "demerger",
+"symbol": "JHS",
+"ca_symbol": "JHS",
+"ca_exdate": "2023-09-11",
+"subject": "Demerger"
+},
+{
+"isin": "INE193E01025",
+"date": "2023-09-14",
+"kind": "demerger",
+"symbol": "BAJAJELEC",
+"ca_symbol": "BAJAJELEC",
+"ca_exdate": "2023-09-14",
+"subject": "Demerger"
+},
+{
+"isin": "INE474E01029",
+"date": "2023-09-22",
+"kind": "rights",
+"symbol": "BHANDARI",
+"ca_symbol": "BHANDARI",
+"ca_exdate": "2023-09-22",
+"subject": "Rights 3:26 @ Premium Rs 3.50/-"
+},
+{
+"isin": "INE00SZ01018",
+"date": "2023-09-28",
+"kind": "rights",
+"symbol": "MARSHALL",
+"ca_symbol": "MARSHALL",
+"ca_exdate": "2023-09-28",
+"subject": "Rights 7:10 @ Premium Rs 34.80/-"
+},
+{
+"isin": "INE964H01014",
+"date": "2023-11-28",
+"kind": "rights",
+"symbol": "SEPC",
+"ca_symbol": "SEPC",
+"ca_exdate": "2023-11-28",
+"subject": "Rights 1:36 @ Premium Rs 3/-"
+},
+{
+"isin": "INE02PY01013",
+"date": "2023-12-05",
+"kind": "demerger",
+"symbol": "BOROLTD",
+"ca_symbol": "BOROLTD",
+"ca_exdate": "2023-12-05",
+"subject": "Demerger"
+},
+{
+"isin": "INE093R01011",
+"date": "2023-12-14",
+"kind": "rights",
+"symbol": "LLOYDSENGG",
+"ca_symbol": "LLOYDSENGG",
+"ca_exdate": "2023-12-14",
+"subject": "Rights 1:17 @ Premium Rs 14.50/-"
+},
+{
+"isin": "INE047A01021",
+"date": "2024-01-10",
+"kind": "rights",
+"symbol": "GRASIM",
+"ca_symbol": "GRASIM",
+"ca_exdate": "2024-01-10",
+"subject": "Rights 6:179 @ Premium Rs 1810/-"
+},
+{
+"isin": "INE439E01022",
+"date": "2024-01-12",
+"kind": "rights",
+"symbol": "SKIPPER",
+"ca_symbol": "SKIPPER",
+"ca_exdate": "2024-01-12",
+"subject": "Rights 1:10 @ Premium Rs 193/-"
+},
+{
+"isin": "INE737B01033",
+"date": "2024-01-19",
+"kind": "rights",
+"symbol": "ADROITINFO",
+"ca_symbol": "ADROITINFO",
+"ca_exdate": "2024-01-19",
+"subject": "Rights 3:2 @ Premium Rs 5/-"
+},
+{
+"isin": "INE387I01016",
+"date": "2024-01-25",
+"kind": "rights",
+"symbol": "MAGNUM",
+"ca_symbol": "MAGNUM",
+"ca_exdate": "2024-01-25",
+"subject": "Rights 2:11 @ Premium Rs 44/-"
+},
+{
+"isin": "INE123B01028",
+"date": "2024-01-30",
+"kind": "rights",
+"symbol": "NAGREEKEXP",
+"ca_symbol": "NAGREEKEXP",
+"ca_exdate": "2024-01-30",
+"subject": "Rights 3:2 @ Premium Rs 15/-"
+},
+{
+"isin": "INE148I01020",
+"date": "2024-02-01",
+"kind": "rights",
+"symbol": "IBULHSGFIN",
+"ca_symbol": "SAMMAANCAP",
+"ca_exdate": "2024-02-01",
+"subject": "Rights 1:2 @ Premium Rs 148/-"
+},
+{
+"isin": "INE01II01013",
+"date": "2024-02-22",
+"kind": "rights",
+"symbol": "SILGO",
+"ca_symbol": "SILGO",
+"ca_exdate": "2024-02-22",
+"subject": "Rights 1:1 @ Premium Rs 15/-"
+},
+{
+"isin": "INE581X01021",
+"date": "2024-02-23",
+"kind": "rights",
+"symbol": "GLOBE",
+"ca_symbol": "GLOBE",
+"ca_exdate": "2024-02-23",
+"subject": "Rights 1:1 @ Premium Rs 1/-"
+},
+{
+"isin": "INE683A01023",
+"date": "2024-02-27",
+"kind": "rights",
+"symbol": "SOUTHBANK",
+"ca_symbol": "SOUTHBANK",
+"ca_exdate": "2024-02-27",
+"subject": "Rights 1:4 @ Premium Rs 21/-"
+},
+{
+"isin": "INE549A01026",
+"date": "2024-03-15",
+"kind": "rights",
+"symbol": "HCC",
+"ca_symbol": "HCC",
+"ca_exdate": "2024-03-15",
+"subject": "Rights 13:118 @ Premium Rs 20/-"
+},
+{
+"isin": "INE875R01011",
+"date": "2024-03-15",
+"kind": "rights",
+"symbol": "BALKRISHNA",
+"ca_symbol": "BALKRISHNA",
+"ca_exdate": "2024-03-15",
+"subject": "Rights 2:1 @ Premium Rs 11/-"
+},
+{
+"isin": "INE197A01024",
+"date": "2024-03-21",
+"kind": "rights",
+"symbol": "JYOTISTRUC",
+"ca_symbol": "JYOTISTRUC",
+"ca_exdate": "2024-03-21",
+"subject": "Rights 6:37 @ Premium Rs 13/-"
+},
+{
+"isin": "INE806C01018",
+"date": "2024-03-26",
+"kind": "rights",
+"symbol": "TIL",
+"ca_symbol": "TIL",
+"ca_exdate": "2024-03-22",
+"subject": "Rights 28:10 @ Premium Rs 0/-"
+},
+{
+"isin": "INE190H01024",
+"date": "2024-04-15",
+"kind": "rights",
+"symbol": "SAKUMA",
+"ca_symbol": "SAKUMA",
+"ca_exdate": "2024-04-15",
+"subject": "Rights 33:98 @ Premium Rs 24.30/-"
+},
+{
+"isin": "INE112D01035",
+"date": "2024-04-19",
+"kind": "demerger",
+"symbol": "MHLXMIRU",
+"ca_symbol": "MHLXMIRU",
+"ca_exdate": "2024-04-19",
+"subject": "Demerger"
+},
+{
+"isin": "INE530B01024",
+"date": "2024-04-23",
+"kind": "rights",
+"symbol": "IIFL",
+"ca_symbol": "IIFL",
+"ca_exdate": "2024-04-23",
+"subject": "Rights 1:9 @ Premium Rs 298/-"
+},
+{
+"isin": "INE617A01013",
+"date": "2024-05-03",
+"kind": "demerger",
+"symbol": "SEMAC",
+"ca_symbol": "SEMAC",
+"ca_exdate": "2024-05-03",
+"subject": "Demerger"
+},
+{
+"isin": "INE753W01010",
+"date": "2024-05-07",
+"kind": "rights",
+"symbol": "SANGINITA",
+"ca_symbol": "AGASTYAEN",
+"ca_exdate": "2024-05-07",
+"subject": "Rights 1:2 @ Premium Rs 8/-"
+},
+{
+"isin": "INE820Y01021",
+"date": "2024-05-07",
+"kind": "rights",
+"symbol": "AJOONI",
+"ca_symbol": "AJOONI",
+"ca_exdate": "2024-05-07",
+"subject": "Rights 1:1 @ Premium Rs 3/-"
+},
+{
+"isin": "INE055C01020",
+"date": "2024-05-15",
+"kind": "rights",
+"symbol": "KEEPLEARN",
+"ca_symbol": "KEEPLEARN",
+"ca_exdate": "2024-05-14",
+"subject": "Rights 7:9 @ Premium Rs 0/-"
+},
+{
+"isin": "INE159N01027",
+"date": "2024-05-15",
+"kind": "rights",
+"symbol": "VIJIFIN",
+"ca_symbol": "VIJIFIN",
+"ca_exdate": "2024-05-15",
+"subject": "Rights 8:11 @ Premium Re 0.50/-"
+},
+{
+"isin": "INE624Z01016",
+"date": "2024-05-15",
+"kind": "rights",
+"symbol": "SOLARA",
+"ca_symbol": "SOLARA",
+"ca_exdate": "2024-05-15",
+"subject": "Rights 1:3 @ Premium Rs 365/-"
+},
+{
+"isin": "INE0APB01024",
+"date": "2024-05-24",
+"kind": "rights",
+"symbol": "MGEL",
+"ca_symbol": "MGEL",
+"ca_exdate": "2024-05-24",
+"subject": "Rights 1:7 @ Premium Rs 18/-"
+},
+{
+"isin": "INE899L01030",
+"date": "2024-05-27",
+"kind": "demerger",
+"symbol": "UEL",
+"ca_symbol": "UEL",
+"ca_exdate": "2024-05-22",
+"subject": "Demerger"
+},
+{
+"isin": "INE236Y01012",
+"date": "2024-05-30",
+"kind": "rights",
+"symbol": "NGIL",
+"ca_symbol": "NGIL",
+"ca_exdate": "2024-05-30",
+"subject": "Rights 4:10 @ Premium Rs 15/-"
+},
+{
+"isin": "INE418N01035",
+"date": "2024-05-31",
+"kind": "rights",
+"symbol": "ESSENTIA",
+"ca_symbol": "ESSENTIA",
+"ca_exdate": "2024-05-31",
+"subject": "Rights 20:119 @ Premium Rs 2.25/-"
+},
+{
+"isin": "INE058A01010",
+"date": "2024-06-13",
+"kind": "demerger",
+"symbol": "SANOFI",
+"ca_symbol": "SANOFI",
+"ca_exdate": "2024-06-13",
+"subject": "Demerger"
+},
+{
+"isin": "INE013801027",
+"date": "2024-06-18",
+"kind": "rights",
+"symbol": "KSHITIJPOL",
+"ca_symbol": "KSHITIJPOL",
+"ca_exdate": "2024-06-18",
+"subject": "Rights 4:5 @ Premium Rs 4.40/-"
+},
+{
+"isin": "INE474E01029",
+"date": "2024-06-19",
+"kind": "rights",
+"symbol": "BHANDARI",
+"ca_symbol": "BHANDARI",
+"ca_exdate": "2024-06-19",
+"subject": "Rights 15:32 @ Premium Rs 5.26/-"
+},
+{
+"isin": "INE671H01015",
+"date": "2024-06-19",
+"kind": "rights",
+"symbol": "SOBHA",
+"ca_symbol": "SOBHA",
+"ca_exdate": "2024-06-19",
+"subject": "Rights 6:47 @ Premium Rs 1641/-"
+},
+{
+"isin": "INE828O01033",
+"date": "2024-06-20",
+"kind": "rights",
+"symbol": "MITCON",
+"ca_symbol": "MITCON",
+"ca_exdate": "2024-06-20",
+"subject": "Rights 6:19 @ Premium Rs 66/-"
+},
+{
+"isin": "INE964H01014",
+"date": "2024-06-25",
+"kind": "rights",
+"symbol": "SEPC",
+"ca_symbol": "SEPC",
+"ca_exdate": "2024-06-25",
+"subject": "Rights 6:55 @ Premium Rs 3"
+},
+{
+"isin": "INE321D01016",
+"date": "2024-07-01",
+"kind": "demerger",
+"symbol": "OCCL",
+"ca_symbol": "OCCL",
+"ca_exdate": "2024-07-01",
+"subject": "Demerger"
+},
+{
+"isin": "INE696V01013",
+"date": "2024-07-04",
+"kind": "rights",
+"symbol": "JAIPURKURT",
+"ca_symbol": "JAIPURKURT",
+"ca_exdate": "2024-07-04",
+"subject": "Rights 100:224 @ Premium Rs 20/-"
+},
+{
+"isin": "INE878H01024",
+"date": "2024-07-05",
+"kind": "rights",
+"symbol": "INVENTURE",
+"ca_symbol": "INVENTURE",
+"ca_exdate": "2024-07-05",
+"subject": "Rights 1:4 @ Premium Rs 1.33/-"
+},
+{
+"isin": "INE301A01014",
+"date": "2024-07-11",
+"kind": "demerger",
+"symbol": "RAYMOND",
+"ca_symbol": "RAYMOND",
+"ca_exdate": "2024-07-11",
+"subject": "Demerger"
+},
+{
+"isin": "INE224E01028",
+"date": "2024-07-16",
+"kind": "rights",
+"symbol": "GATECH",
+"ca_symbol": "GATECH",
+"ca_exdate": "2024-07-16",
+"subject": "Rights 1:1 @ Premium Rs 0/-"
+},
+{
+"isin": "INE224E01036",
+"date": "2024-07-16",
+"kind": "rights",
+"symbol": "GATECHDVR",
+"ca_symbol": "GATECHDVR",
+"ca_exdate": "2024-07-16",
+"subject": "Rights 1:1 @ Premium Rs 0/-"
+},
+{
+"isin": "INE227G01018",
+"date": "2024-07-16",
+"kind": "rights",
+"symbol": "INDOWIND",
+"ca_symbol": "INDOWIND",
+"ca_exdate": "2024-07-16",
+"subject": "Rights 1:5 @ Premium Rs 12.50/-"
+},
+{
+"isin": "INE192A01025",
+"date": "2024-07-26",
+"kind": "rights",
+"symbol": "TATACONSUM",
+"ca_symbol": "TATACONSUM",
+"ca_exdate": "2024-07-26",
+"subject": "Rights 1:26 @ Premium Rs 817/-"
+},
+{
+"isin": "INE298G01027",
+"date": "2024-08-02",
+"kind": "demerger",
+"symbol": "AJMERA",
+"ca_symbol": "AJMERA",
+"ca_exdate": "2024-08-02",
+"subject": "Demerger"
+},
+{
+"isin": "INE999K01014",
+"date": "2024-08-13",
+"kind": "rights",
+"symbol": "GREENPOWER",
+"ca_symbol": "GREENPOWER",
+"ca_exdate": "2024-08-13",
+"subject": "Rights 10:51 @ Premium Rs 3/-"
+},
+{
+"isin": "INE01KI01027",
+"date": "2024-08-14",
+"kind": "rights",
+"symbol": "VINNY",
+"ca_symbol": "VINNY",
+"ca_exdate": "2024-08-14",
+"subject": "Rights 1:1 @ Premium Rs 1/-"
+},
+{
+"isin": "INE0ALR01029",
+"date": "2024-08-22",
+"kind": "rights",
+"symbol": "ATALREAL",
+"ca_symbol": "ATALREAL",
+"ca_exdate": "2024-08-22",
+"subject": "Rights 1:2 @ Premium Rs 5/-"
+},
+{
+"isin": "INE256Z01025",
+"date": "2024-08-23",
+"kind": "rights",
+"symbol": "AKSHAR",
+"ca_symbol": "AKSHAR",
+"ca_exdate": "2024-08-23",
+"subject": "Rights 13:8 @ Premium Rs 0/-"
+},
+{
+"isin": "INE835A01029",
+"date": "2024-08-28",
+"kind": "rights",
+"symbol": "VARDMNPOLY",
+"ca_symbol": "VARDMNPOLY",
+"ca_exdate": "2024-08-28",
+"subject": "Rights 7:23 @ Premium Rs 5/-"
+},
+{
+"isin": "INE741L01018",
+"date": "2024-08-30",
+"kind": "rights",
+"symbol": "DUCON",
+"ca_symbol": "DUCON",
+"ca_exdate": "2024-08-30",
+"subject": "Rights 1:4 @ Premium Rs 6/-"
+},
+{
+"isin": "INE998H01012",
+"date": "2024-09-05",
+"kind": "rights",
+"symbol": "ORIENTALTL",
+"ca_symbol": "ORIENTALTL",
+"ca_exdate": "2024-09-05",
+"subject": "Rights 3:2 @ Premium Re 1/-"
+},
+{
+"isin": "INE529D01014",
+"date": "2024-09-06",
+"kind": "rights",
+"symbol": "PATINTLOG",
+"ca_symbol": "PATINTLOG",
+"ca_exdate": "2024-09-06",
+"subject": "Rights 8:103 @ Premium Rs 8/-"
+},
+{
+"isin": "INE00QT01015",
+"date": "2024-09-11",
+"kind": "rights",
+"symbol": "SGIL",
+"ca_symbol": "SGIL",
+"ca_exdate": "2024-09-11",
+"subject": "Rights 1:10 @ Premium Rs 315/-"
+},
+{
+"isin": "INE483S01020",
+"date": "2024-09-11",
+"kind": "demerger",
+"symbol": "INFIBEAM",
+"ca_symbol": "CCAVENUE",
+"ca_exdate": "2024-09-11",
+"subject": "Demerger"
+},
+{
+"isin": "INE117Z01011",
+"date": "2024-09-13",
+"kind": "rights",
+"symbol": "NARMADA",
+"ca_symbol": "NARMADA",
+"ca_exdate": "2024-09-13",
+"subject": "Rights 9:5 @ Premium Rs 5/-"
+},
+{
+"isin": "INE888C01040",
+"date": "2024-09-13",
+"kind": "rights",
+"symbol": "SADHNANIQ",
+"ca_symbol": "SADHNANIQ",
+"ca_exdate": "2024-09-13",
+"subject": "Rights 1:3 @ Premium Rs 5.06/-"
+},
+{
+"isin": "INE847C01020",
+"date": "2024-09-20",
+"kind": "demerger",
+"symbol": "ROSSELLIND",
+"ca_symbol": "ROSSELLIND",
+"ca_exdate": "2024-09-20",
+"subject": "Demerger"
+},
+{
+"isin": "INE997Y01027",
+"date": "2024-10-03",
+"kind": "rights",
+"symbol": "MITTAL",
+"ca_symbol": "MITTAL",
+"ca_exdate": "2024-10-03",
+"subject": "Rights 1:2 @ Premium Re 1/-"
+},
+{
+"isin": "INE007B01023",
+"date": "2024-10-07",
+"kind": "rights",
+"symbol": "GEOJITFSL",
+"ca_symbol": "GEOJITFSL",
+"ca_exdate": "2024-10-07",
+"subject": "Rights 1:6 @ Premium Rs 49/-"
+},
+{
+"isin": "INE688E01024",
+"date": "2024-10-11",
+"kind": "demerger",
+"symbol": "HERCULES",
+"ca_symbol": "HERCULES",
+"ca_exdate": "2024-10-11",
+"subject": "Demerger"
+},
+{
+"isin": "INE05AN01011",
+"date": "2024-10-25",
+"kind": "rights",
+"symbol": "HINDWAREAP",
+"ca_symbol": "HINDWAREAP",
+"ca_exdate": "2024-10-25",
+"subject": "Rights 119:758 @ Premium Rs 218/-"
+},
+{
+"isin": "INE628A01036",
+"date": "2024-11-26",
+"kind": "rights",
+"symbol": "UPL",
+"ca_symbol": "UPL",
+"ca_exdate": "2024-11-26",
+"subject": "Rights 1:8 @ Premium Rs 358/-"
+},
+{
+"isin": "INE048C01025",
+"date": "2024-11-29",
+"kind": "rights",
+"symbol": "VHLTD",
+"ca_symbol": "VHLTD",
+"ca_exdate": "2024-11-29",
+"subject": "Rights 7:10 @ Prm Rs 102/-"
+},
+{
+"isin": "INE112X01017",
+"date": "2024-12-06",
+"kind": "rights",
+"symbol": "SIKKO",
+"ca_symbol": "SIKKO",
+"ca_exdate": "2024-12-06",
+"subject": "Rights 3:10 @ Premium Rs 88/-"
+},
+{
+"isin": "INE939A01011",
+"date": "2024-12-06",
+"kind": "demerger",
+"symbol": "STAR",
+"ca_symbol": "STAR",
+"ca_exdate": "2024-12-06",
+"subject": "Demerger"
+},
+{
+"isin": "INE323B01024",
+"date": "2024-12-12",
+"kind": "rights",
+"symbol": "AVONMORE",
+"ca_symbol": "AVONMORE",
+"ca_exdate": "2024-12-12",
+"subject": "Rights 5:24 @ Premium Rs 9/-"
+},
+{
+"isin": "INE514Y01020",
+"date": "2024-12-20",
+"kind": "rights",
+"symbol": "MOKSH",
+"ca_symbol": "MOKSH",
+"ca_exdate": "2024-12-20",
+"subject": "Rights 14:23 @ Premium Rs 13/-"
+},
+{
+"isin": "INE680A01011",
+"date": "2024-12-27",
+"kind": "rights",
+"symbol": "DHANBANK",
+"ca_symbol": "DHANBANK",
+"ca_exdate": "2024-12-27",
+"subject": "Rights 14:25 @ Premium Rs 11/-"
+},
+{
+"isin": "INE154A01025",
+"date": "2025-01-06",
+"kind": "demerger",
+"symbol": "ITC",
+"ca_symbol": "ITC",
+"ca_exdate": "2025-01-06",
+"subject": "Demerger"
+},
+{
+"isin": "INE052I01032",
+"date": "2025-01-08",
+"kind": "rights",
+"symbol": "CAMLINFINE",
+"ca_symbol": "CAMLINFINE",
+"ca_exdate": "2025-01-08",
+"subject": "Rights 5:41 @ Premium Rs 109/-"
+},
+{
+"isin": "INE526B01014",
+"date": "2025-01-15",
+"kind": "rights",
+"symbol": "CALSOFT",
+"ca_symbol": "CALSOFT",
+"ca_exdate": "2025-01-15",
+"subject": "Rights 3:1 @ Premium Rs 0/-"
+},
+{
+"isin": "INE581X01021",
+"date": "2025-01-17",
+"kind": "rights",
+"symbol": "GLOBE",
+"ca_symbol": "GLOBE",
+"ca_exdate": "2025-01-17",
+"subject": "Rights 1:2 @ Premium Rs 1/-"
+},
+{
+"isin": "INE197A01024",
+"date": "2025-02-10",
+"kind": "rights",
+"symbol": "JYOTISTRUC",
+"ca_symbol": "JYOTISTRUC",
+"ca_exdate": "2025-02-10",
+"subject": "Rights 9:26 @ Premium Rs 14/-"
+},
+{
+"isin": "INE085J01014",
+"date": "2025-02-11",
+"kind": "rights",
+"symbol": "THANGAMAYL",
+"ca_symbol": "THANGAMAYL",
+"ca_exdate": "2025-02-11",
+"subject": "Rights 2:15 @ Premium Rs 1390/-"
+},
+{
+"isin": "INE00YB01017",
+"date": "2025-03-10",
+"kind": "rights",
+"symbol": "ABINFRA",
+"ca_symbol": "ABINFRA",
+"ca_exdate": "2025-03-10",
+"subject": "Rights 1:5 @ Premium Rs 27.50/-"
+},
+{
+"isin": "INE087A01019",
+"date": "2025-03-10",
+"kind": "demerger",
+"symbol": "KESORAMIND",
+"ca_symbol": "KESORAMIND",
+"ca_exdate": "2025-03-10",
+"subject": "Demerger"
+},
+{
+"isin": "INE01GN01025",
+"date": "2025-03-13",
+"kind": "rights",
+"symbol": "IRISDOREME",
+"ca_symbol": "IRISDOREME",
+"ca_exdate": "2025-03-13",
+"subject": "Rights 1:6 @ Premium Rs 33/-"
+},
+{
+"isin": "INE546Y01022",
+"date": "2025-03-20",
+"kind": "rights",
+"symbol": "PRAXIS",
+"ca_symbol": "PRAXIS",
+"ca_exdate": "2025-03-20",
+"subject": "Rights 11:30 @ Premium Rs 5/-"
+},
+{
+"isin": "INE0EEJ01023",
+"date": "2025-03-24",
+"kind": "rights",
+"symbol": "BTML",
+"ca_symbol": "BTML",
+"ca_exdate": "2025-03-24",
+"subject": "Rights 4:9 @ Premium Rs 7/-"
+},
+{
+"isin": "INE139R01012",
+"date": "2025-04-04",
+"kind": "rights",
+"symbol": "FUSION",
+"ca_symbol": "FUSION",
+"ca_exdate": "2025-04-04",
+"subject": "Rights 55:91 @ Premium Rs 121/-"
+},
+{
+"isin": "INE003A01024",
+"date": "2025-04-07",
+"kind": "demerger",
+"symbol": "SIEMENS",
+"ca_symbol": "SIEMENS",
+"ca_exdate": "2025-04-07",
+"subject": "Demerger"
+},
+{
+"isin": "INE615P01015",
+"date": "2025-04-15",
+"kind": "demerger",
+"symbol": "QUESS",
+"ca_symbol": "QUESS",
+"ca_exdate": "2025-04-15",
+"subject": "Demerger"
+},
+{
+"isin": "INE089C01029",
+"date": "2025-04-24",
+"kind": "demerger",
+"symbol": "STLTECH",
+"ca_symbol": "STLTECH",
+"ca_exdate": "2025-04-24",
+"subject": "Demerger"
+},
+{
+"isin": "INE093R01011",
+"date": "2025-04-28",
+"kind": "rights",
+"symbol": "LLOYDSENGG",
+"ca_symbol": "LLOYDSENGG",
+"ca_exdate": "2025-04-28",
+"subject": "Rights 9:34 @ Premium Rs 31/-"
+},
+{
+"isin": "INE224E01028",
+"date": "2025-04-28",
+"kind": "rights",
+"symbol": "GATECH",
+"ca_symbol": "GATECH",
+"ca_exdate": "2025-04-28",
+"subject": "Rights 51:82 @ Premium Rs 0/-"
+},
+{
+"isin": "INE224E01036",
+"date": "2025-04-28",
+"kind": "rights",
+"symbol": "GATECHDVR",
+"ca_symbol": "GATECHDVR",
+"ca_exdate": "2025-04-28",
+"subject": "Rights 51:82 @ Premium Rs 0/-"
+},
+{
+"isin": "INE0CG601016",
+"date": "2025-04-29",
+"kind": "rights",
+"symbol": "MAXIND",
+"ca_symbol": "MAXIND",
+"ca_exdate": "2025-04-29",
+"subject": "Rights 19:100 @ Premium Rs 140/-"
+},
+{
+"isin": "INE186H01022",
+"date": "2025-04-30",
+"kind": "rights",
+"symbol": "BASML",
+"ca_symbol": "BASML",
+"ca_exdate": "2025-04-30",
+"subject": "Rights 10:43 @ Premium Rs 22/-"
+},
+{
+"isin": "INE005B01027",
+"date": "2025-05-07",
+"kind": "rights",
+"symbol": "AVANTEL",
+"ca_symbol": "AVANTEL",
+"ca_exdate": "2025-05-07",
+"subject": "Rights 10:121@ Premium Rs 38/-"
+},
+{
+"isin": "INE521J01018",
+"date": "2025-05-09",
+"kind": "demerger",
+"symbol": "CPCAP",
+"ca_symbol": "CPCAP",
+"ca_exdate": "2025-05-09",
+"subject": "Demerger"
+},
+{
+"isin": "INE995D01025",
+"date": "2025-05-09",
+"kind": "demerger",
+"symbol": "CHEMBOND",
+"ca_symbol": "CHEMBOND",
+"ca_exdate": "2025-05-09",
+"subject": "Demerger"
+},
+{
+"isin": "INE301A01014",
+"date": "2025-05-14",
+"kind": "demerger",
+"symbol": "RAYMOND",
+"ca_symbol": "RAYMOND",
+"ca_exdate": "2025-05-14",
+"subject": "Demerger"
+},
+{
+"isin": "INE774D01024",
+"date": "2025-05-14",
+"kind": "rights",
+"symbol": "M&MFIN",
+"ca_symbol": "M&MFIN",
+"ca_exdate": "2025-05-14",
+"subject": "Rights 1:8 @ Premium Rs 192/-"
+},
+{
+"isin": "INE647O01011",
+"date": "2025-05-22",
+"kind": "demerger",
+"symbol": "ABFRL",
+"ca_symbol": "ABFRL",
+"ca_exdate": "2025-05-22",
+"subject": "Demerger"
+},
+{
+"isin": "INE813A01018",
+"date": "2025-05-23",
+"kind": "rights",
+"symbol": "MAHLIFE",
+"ca_symbol": "MAHLIFE",
+"ca_exdate": "2025-05-23",
+"subject": "Rights 3:8 @ Premium Rs 247/-"
+},
+{
+"isin": "INE964H01014",
+"date": "2025-05-23",
+"kind": "rights",
+"symbol": "SEPC",
+"ca_symbol": "SEPC",
+"ca_exdate": "2025-05-23",
+"subject": "Rights 11: 50 @ Premium Rs 0/-"
+},
+{
+"isin": "INE583D01011",
+"date": "2025-06-05",
+"kind": "rights",
+"symbol": "UGROCAP",
+"ca_symbol": "UGROCAP",
+"ca_exdate": "2025-06-05",
+"subject": "Rights 50:189 @ Premium Rs 152/-"
+},
+{
+"isin": "INE834I01025",
+"date": "2025-06-06",
+"kind": "demerger",
+"symbol": "KHADIM",
+"ca_symbol": "KHADIM",
+"ca_exdate": "2025-06-06",
+"subject": "Demerger"
+},
+{
+"isin": "INE04TZ01018",
+"date": "2025-06-12",
+"kind": "rights",
+"symbol": "ETHOSLTD",
+"ca_symbol": "ETHOSLTD",
+"ca_exdate": "2025-06-12",
+"subject": "Rights 4:43@ Premium Rs 1790/-"
+},
+{
+"isin": "INE707C01018",
+"date": "2025-06-18",
+"kind": "rights",
+"symbol": "CAPTRUST",
+"ca_symbol": "CAPTRUST",
+"ca_exdate": "2025-06-18",
+"subject": "Rights 5:14 @ Premium Rs 72/-"
+},
+{
+"isin": "INE483S01020",
+"date": "2025-06-26",
+"kind": "rights",
+"symbol": "INFIBEAM",
+"ca_symbol": "CCAVENUE",
+"ca_exdate": "2025-06-26",
+"subject": "Rights 67:267 @ Premium Rs 9/-"
+},
+{
+"isin": "INE382T01030",
+"date": "2025-06-30",
+"kind": "rights",
+"symbol": "GVPTECH",
+"ca_symbol": "GVPTECH",
+"ca_exdate": "2025-06-30",
+"subject": "Rights 13:100 @ Premium Rs 8/-"
+},
+{
+"isin": "INE831A01028",
+"date": "2025-06-30",
+"kind": "rights",
+"symbol": "MIRCELECTR",
+"ca_symbol": "ONIDA",
+"ca_exdate": "2025-06-30",
+"subject": "Rights 3:14 @ Premium Rs 9/-"
+},
+{
+"isin": "INE563J01010",
+"date": "2025-07-04",
+"kind": "rights",
+"symbol": "ASTEC",
+"ca_symbol": "ASTEC",
+"ca_exdate": "2025-07-04",
+"subject": "Rights 1:7 @ Premium Rs 880/-"
+},
+{
+"isin": "INE592B01024",
+"date": "2025-07-04",
+"kind": "rights",
+"symbol": "TTL",
+"ca_symbol": "TTL",
+"ca_exdate": "2025-07-04",
+"subject": "Rights 4:27 @ Premium Rs 11/-"
+},
+{
+"isin": "INE777F01014",
+"date": "2025-07-07",
+"kind": "rights",
+"symbol": "EXICOM",
+"ca_symbol": "EXICOM",
+"ca_exdate": "2025-07-07",
+"subject": "Rights 3:20 @ Premium Rs 133/-"
+},
+{
+"isin": "INE729D01010",
+"date": "2025-07-15",
+"kind": "rights",
+"symbol": "KILITCH",
+"ca_symbol": "KILITCH",
+"ca_exdate": "2025-07-15",
+"subject": "Rights 2:23 @ Premium Rs 347/-"
+},
+{
+"isin": "INE0JWS01017",
+"date": "2025-07-18",
+"kind": "rights",
+"symbol": "VALIANTLAB",
+"ca_symbol": "VALIANTLAB",
+"ca_exdate": "2025-07-18",
+"subject": "Rights 1:4 @ Premium Rs 65/-"
+},
+{
+"isin": "INE879I01012",
+"date": "2025-07-18",
+"kind": "demerger",
+"symbol": "DBREALTY",
+"ca_symbol": "DBREALTY",
+"ca_exdate": "2025-07-18",
+"subject": "Demerger"
+},
+{
+"isin": "INE766P01016",
+"date": "2025-07-23",
+"kind": "rights",
+"symbol": "MAHLOG",
+"ca_symbol": "MAHLOG",
+"ca_exdate": "2025-07-23",
+"subject": "Rights 3:8 @ Premium Rs 267/-"
+},
+{
+"isin": "INE572J01011",
+"date": "2025-07-24",
+"kind": "rights",
+"symbol": "SPANDANA",
+"ca_symbol": "SPANDANA",
+"ca_exdate": "2025-07-24",
+"subject": "Rights 10:41 @ Premium Rs 220/-"
+},
+{
+"isin": "INE643A01035",
+"date": "2025-07-25",
+"kind": "rights",
+"symbol": "JTEKTINDIA",
+"ca_symbol": "JTEKTINDIA",
+"ca_exdate": "2025-07-25",
+"subject": "Rights 1:11 @ Premium Rs 107.10/-"
+},
+{
+"isin": "INE066P01011",
+"date": "2025-07-29",
+"kind": "rights",
+"symbol": "INOXWIND",
+"ca_symbol": "INOXWIND",
+"ca_exdate": "2025-07-29",
+"subject": "Rights 5:78 @ Premium Rs 110/-"
+},
+{
+"isin": "INE278G01037",
+"date": "2025-08-01",
+"kind": "rights",
+"symbol": "CYBERMEDIA",
+"ca_symbol": "CYBERMEDIA",
+"ca_exdate": "2025-08-01",
+"subject": "Rights 2:5 @ Premium Rs 5.80/-"
+},
+{
+"isin": "INE179G01029",
+"date": "2025-08-06",
+"kind": "rights",
+"symbol": "DAVANGERE",
+"ca_symbol": "DAVANGERE",
+"ca_exdate": "2025-08-06",
+"subject": "Rights 13:25 @ Premium Rs 2.05/-"
+},
+{
+"isin": "INE080I01025",
+"date": "2025-08-14",
+"kind": "rights",
+"symbol": "LLOYDSENT",
+"ca_symbol": "LLOYDSENT",
+"ca_exdate": "2025-08-14",
+"subject": "Rights 1:5 @ Premium Rs 38/-"
+},
+{
+"isin": "INE324X01026",
+"date": "2025-08-22",
+"kind": "rights",
+"symbol": "SARVESHWAR",
+"ca_symbol": "SARVESHWAR",
+"ca_exdate": "2025-08-22",
+"subject": "Rights 12:47 @ Premium Rs 5/-"
+},
+{
+"isin": "INE155G01029",
+"date": "2025-09-12",
+"kind": "rights",
+"symbol": "NDTV",
+"ca_symbol": "NDTV",
+"ca_exdate": "2025-09-12",
+"subject": "Rights 3:4 @ Premium Rs 78/-"
+},
+{
+"isin": "INE715Y01031",
+"date": "2025-09-16",
+"kind": "rights",
+"symbol": "SHRADHA",
+"ca_symbol": "SHRADHA",
+"ca_exdate": "2025-09-16",
+"subject": "Rights 3:5 @ Premium Rs 38/-"
+},
+{
+"isin": "INE274V01019",
+"date": "2025-09-24",
+"kind": "demerger",
+"symbol": "SHANKARA",
+"ca_symbol": "SHANKARA",
+"ca_exdate": "2025-09-24",
+"subject": "Demerger"
+},
+{
+"isin": "INE748C01038",
+"date": "2025-09-26",
+"kind": "rights",
+"symbol": "3IINFOLTD",
+"ca_symbol": "3IINFOLTD",
+"ca_exdate": "2025-09-26",
+"subject": "Rights 2:9 @ Premium Rs 7/-"
+},
+{
+"isin": "INE707C01018",
+"date": "2025-10-10",
+"kind": "rights",
+"symbol": "CAPTRUST",
+"ca_symbol": "CAPTRUST",
+"ca_exdate": "2025-10-10",
+"subject": "Rights 1:1 @ Premium Rs 4/-"
+},
+{
+"isin": "INE155A01022",
+"date": "2025-10-14",
+"kind": "demerger",
+"symbol": "TATAMOTORS",
+"ca_symbol": "TMPV",
+"ca_exdate": "2025-10-14",
+"subject": "Demerger"
+},
+{
+"isin": "INE726L01019",
+"date": "2025-10-14",
+"kind": "rights",
+"symbol": "DELPHIFX",
+"ca_symbol": "DELPHIFX",
+"ca_exdate": "2025-10-14",
+"subject": "Rights 23:49 @ Premium Rs 181/-"
+},
+{
+"isin": "INE735W01017",
+"date": "2025-10-14",
+"kind": "rights",
+"symbol": "UTKARSHBNK",
+"ca_symbol": "UTKARSHBNK",
+"ca_exdate": "2025-10-14",
+"subject": "Rights 8:13 @ Premium Rs 4/-"
+},
+{
+"isin": "INE640A01023",
+"date": "2025-10-15",
+"kind": "demerger",
+"symbol": "SKFINDIA",
+"ca_symbol": "SKFINDIA",
+"ca_exdate": "2025-10-15",
+"subject": "Demerger"
+},
+{
+"isin": "INE495A01022",
+"date": "2025-10-31",
+"kind": "demerger",
+"symbol": "DALMIASUG",
+"ca_symbol": "DALMIASUG",
+"ca_exdate": "2025-10-31",
+"subject": "Demerger"
+},
+{
+"isin": "INE418H01029",
+"date": "2025-11-12",
+"kind": "demerger",
+"symbol": "ALLCARGO",
+"ca_symbol": "ALLCARGO",
+"ca_exdate": "2025-11-12",
+"subject": "Demerger"
+},
+{
+"isin": "INE0NN701020",
+"date": "2025-11-14",
+"kind": "rights",
+"symbol": "ATL",
+"ca_symbol": "ATL",
+"ca_exdate": "2025-11-14",
+"subject": "Rights 3:19 @ Premium Rs 18/-"
+},
+{
+"isin": "INE020D01022",
+"date": "2025-11-17",
+"kind": "rights",
+"symbol": "BAIDFIN",
+"ca_symbol": "BAIDFIN",
+"ca_exdate": "2025-11-17",
+"subject": "Rights 1:4 @ Premium Rs 8/-"
+},
+{
+"isin": "INE423A01024",
+"date": "2025-11-17",
+"kind": "rights",
+"symbol": "ADANIENT",
+"ca_symbol": "ADANIENT",
+"ca_exdate": "2025-11-17",
+"subject": "Rights 3:25 @ Premium Rs 1799/-"
+},
+{
+"isin": "INE227G01018",
+"date": "2025-11-19",
+"kind": "rights",
+"symbol": "INDOWIND",
+"ca_symbol": "INDOWIND",
+"ca_exdate": "2025-11-19",
+"subject": "Rights 1:4 @ Premium Rs 5.35/-"
+},
+{
+"isin": "INE244B01030",
+"date": "2025-12-04",
+"kind": "rights",
+"symbol": "PATELENG",
+"ca_symbol": "PATELENG",
+"ca_exdate": "2025-12-04",
+"subject": "Rights 7:40 @ Premium Rs 26/-"
+},
+{
+"isin": "INE030A01027",
+"date": "2025-12-05",
+"kind": "demerger",
+"symbol": "HINDUNILVR",
+"ca_symbol": "HINDUNILVR",
+"ca_exdate": "2025-12-05",
+"subject": "Demerger"
+},
+{
+"isin": "INE549A01026",
+"date": "2025-12-05",
+"kind": "rights",
+"symbol": "HCC",
+"ca_symbol": "HCC",
+"ca_exdate": "2025-12-05",
+"subject": "Rights 277:630 @ Premium Rs 11.50/-"
+},
+{
+"isin": "INE295D01020",
+"date": "2025-12-12",
+"kind": "rights",
+"symbol": "NACLIND",
+"ca_symbol": "NACLIND",
+"ca_exdate": "2025-12-12",
+"subject": "Rights 5:31 @ Premium Rs 75.70/-"
+},
+{
+"isin": "INE0GGO01015",
+"date": "2025-12-17",
+"kind": "rights",
+"symbol": "KRISHIVAL",
+"ca_symbol": "KRISHIVAL",
+"ca_exdate": "2025-12-17",
+"subject": "Rights 45:301 @ Premium Rs 290/-"
+},
+{
+"isin": "INE505Y01010",
+"date": "2025-12-23",
+"kind": "rights",
+"symbol": "VINEETLAB",
+"ca_symbol": "VINEETLAB",
+"ca_exdate": "2025-12-23",
+"subject": "Rights 13:12 @ Premium Rs 20/-"
+},
+{
+"isin": "INE788H01017",
+"date": "2025-12-26",
+"kind": "rights",
+"symbol": "HILTON",
+"ca_symbol": "HILTON",
+"ca_exdate": "2025-12-26",
+"subject": "Rights 14:29 @ Premium Rs 18.32/-"
+},
+{
+"isin": "INE843D01027",
+"date": "2025-12-26",
+"kind": "demerger",
+"symbol": "DCMSRIND",
+"ca_symbol": "DCMSRIND",
+"ca_exdate": "2025-12-26",
+"subject": "Demerger"
+},
+{
+"isin": "INE01II01013",
+"date": "2026-01-05",
+"kind": "rights",
+"symbol": "SILGO",
+"ca_symbol": "SILGO",
+"ca_exdate": "2026-01-05",
+"subject": "Rights 3:10 @ Premium Rs 50/-"
+},
+{
+"isin": "INE955D01029",
+"date": "2026-02-06",
+"kind": "demerger",
+"symbol": "GENUSPOWER",
+"ca_symbol": "GENUSPOWER",
+"ca_exdate": "2026-02-06",
+"subject": "Demerger"
+},
+{
+"isin": "INE0RYC01010",
+"date": "2026-02-11",
+"kind": "rights",
+"symbol": "STALLION",
+"ca_symbol": "STALLION",
+"ca_exdate": "2026-02-11",
+"subject": "Rights 19:41 @ Premium Rs 89/-"
+},
+{
+"isin": "INE912L01015",
+"date": "2026-02-16",
+"kind": "rights",
+"symbol": "ONELIFECAP",
+"ca_symbol": "ONELIFECAP",
+"ca_exdate": "2026-02-16",
+"subject": "Rights 300:167 @ Premium Rs 5/-"
+},
+{
+"isin": "INE075B01020",
+"date": "2026-02-18",
+"kind": "rights",
+"symbol": "SICALLOG",
+"ca_symbol": "SICALLOG",
+"ca_exdate": "2026-02-18",
+"subject": "Rights 11:5 @ Premium Rs 54/-"
+},
+{
+"isin": "INE888C01040",
+"date": "2026-02-18",
+"kind": "rights",
+"symbol": "SADHNANIQ",
+"ca_symbol": "SADHNANIQ",
+"ca_exdate": "2026-02-18",
+"subject": "Rights 8:1 @ Premium Rs 0/-"
+},
+{
+"isin": "INE788H01017",
+"date": "2026-02-24",
+"kind": "rights",
+"symbol": "HILTON",
+"ca_symbol": "HILTON",
+"ca_exdate": "2026-02-24",
+"subject": "Rights 29:60 @ Premium Rs 6.68/-"
+},
+{
+"isin": "INE474E01029",
+"date": "2026-02-25",
+"kind": "rights",
+"symbol": "BHANDARI",
+"ca_symbol": "BHANDARI",
+"ca_exdate": "2026-02-25",
+"subject": "Rights 4:5 @ Premium Rs 1.56/-"
+},
+{
+"isin": "INE075I01017",
+"date": "2026-03-02",
+"kind": "rights",
+"symbol": "HCG",
+"ca_symbol": "HCG",
+"ca_exdate": "2026-03-02",
+"subject": "Rights 1:17 @ Premium Rs 502/-"
+},
+{
+"isin": "INE0I0M01023",
+"date": "2026-03-11",
+"kind": "rights",
+"symbol": "PRABHA",
+"ca_symbol": "PRABHA",
+"ca_exdate": "2026-03-11",
+"subject": "Rights 5:14 @ Premium Rs 143/-"
+},
+{
+"isin": "INE618L01018",
+"date": "2026-03-17",
+"kind": "rights",
+"symbol": "5PAISA",
+"ca_symbol": "5PAISA",
+"ca_exdate": "2026-03-17",
+"subject": "Rights 1:2 @ Premium Rs 290/-"
+},
+{
+"isin": "INE843B01013",
+"date": "2026-03-20",
+"kind": "rights",
+"symbol": "MAHAPEXLTD",
+"ca_symbol": "MAHAPEXLTD",
+"ca_exdate": "2026-03-20",
+"subject": "Rights 1:1 @ Premium Rs 0/-"
+},
+{
+"isin": "INE806C01018",
+"date": "2026-03-23",
+"kind": "rights",
+"symbol": "TIL",
+"ca_symbol": "TIL",
+"ca_exdate": "2026-03-23",
+"subject": "Rights 11:64 @ Premium Rs 155/-"
+},
+{
+"isin": "INE205A01025",
+"date": "2026-04-30",
+"kind": "demerger",
+"symbol": "VEDL",
+"ca_symbol": "VEDL",
+"ca_exdate": "2026-04-30",
+"subject": "Demerger"
+},
+{
+"isin": "INE886D01026",
+"date": "2026-05-07",
+"kind": "rights",
+"symbol": "EFCIL",
+"ca_symbol": "EFCIL",
+"ca_exdate": "2026-05-07",
+"subject": "Rights 8:103 @ Premium Rs 148/-"
+},
+{
+"isin": "INE418N01035",
+"date": "2026-05-20",
+"kind": "rights",
+"symbol": "ESSENTIA",
+"ca_symbol": "ESSENTIA",
+"ca_exdate": "2026-05-20",
+"subject": "Rights 161:250 @ Premium Re 0.45 /-"
+},
+{
+"isin": "INE680Z01018",
+"date": "2026-05-21",
+"kind": "rights",
+"symbol": "AVG",
+"ca_symbol": "AVG",
+"ca_exdate": "2026-05-21",
+"subject": "Rights 8:33 @ Premium Rs 135/-"
+},
+{
+"isin": "INE482J01021",
+"date": "2026-05-27",
+"kind": "rights",
+"symbol": "SHAH",
+"ca_symbol": "SHAH",
+"ca_exdate": "2026-05-27",
+"subject": "Rights 36:311 @ Premium Rs 3.86"
+},
+{
+"isin": "INE206N01018",
+"date": "2026-06-08",
+"kind": "rights",
+"symbol": "RELTD",
+"ca_symbol": "RELTD",
+"ca_exdate": "2026-06-08",
+"subject": "Rights 1:9 @ Premium 91"
+},
+{
+"isin": "INE235C01036",
+"date": "2026-06-12",
+"kind": "rights",
+"symbol": "SUMEETINDS",
+"ca_symbol": "SUMEETINDS",
+"ca_exdate": "2026-06-12",
+"subject": "Rights 8:25 @ Premium Rs 9.86/-"
+},
+{
+"isin": "INE691Z01023",
+"date": "2026-07-02",
+"kind": "rights",
+"symbol": "GANGAFORGE",
+"ca_symbol": "GANGAFORGE",
+"ca_exdate": "2026-07-02",
+"subject": "Rights 3:2 @ Premium Re. 0.63/-"
+},
+{
+"isin": "INE844O01030",
+"date": "2026-07-02",
+"kind": "demerger",
+"symbol": "GUJENERGY",
+"ca_symbol": "GUJENERGY",
+"ca_exdate": "2026-07-02",
+"subject": "Demerger"
+},
+{
+"isin": "INE256C01024",
+"date": "2026-07-22",
+"kind": "demerger",
+"symbol": "TRIVENI",
+"ca_symbol": "TRIVENI",
+"ca_exdate": "2026-07-22",
+"subject": "Demerger"
+},
+{
+"isin": "INE510W01014",
+"date": "2026-07-31",
+"kind": "demerger",
+"symbol": "INOXGREEN",
+"ca_symbol": "INOXGREEN",
+"ca_exdate": "2026-07-31",
+"subject": "Demerger"
+},
+{
+"isin": "INE06ZD01017",
+"date": "2026-08-06",
+"kind": "rights",
+"symbol": "SHANTIGOLD",
+"ca_symbol": "SHANTIGOLD",
+"ca_exdate": "2026-08-06",
+"subject": "Rights 19:295 @ Premium Rs 205/-"
+},
+{
+"isin": "INE727B01026",
+"date": "2026-08-06",
+"kind": "rights",
+"symbol": "GENESYS",
+"ca_symbol": "GENESYS",
+"ca_exdate": "2026-08-06",
+"subject": "Rights 3:5 @ Premium Rs 45/-"
+},
+{
+"isin": "INE013801027",
+"date": "2026-08-19",
+"kind": "rights",
+"symbol": "KSHITIJPOL",
+"ca_symbol": "KSHITIJPOL",
+"ca_exdate": "2026-08-19",
+"subject": "Rights 2:5 @ Premium Rs 1.17/-"
+},
+{
+"isin": "INE048C01025",
+"date": "2026-08-20",
+"kind": "rights",
+"symbol": "VHLTD",
+"ca_symbol": "VHLTD",
+"ca_exdate": "2026-08-20",
+"subject": "Rights 6:7 @ Premium Rs 105/-"
+},
+{
+"isin": "INE05CZ01011",
+"date": "2026-08-25",
+"kind": "rights",
+"symbol": "RATNAVEER",
+"ca_symbol": "RATNAVEER",
+"ca_exdate": "2026-08-25",
+"subject": "Rights 7:40 @ Premium Rs 254/-"
+},
+{
+"isin": "INE641R01017",
+"date": "2026-08-25",
+"kind": "rights",
+"symbol": "QUINT",
+"ca_symbol": "QUINT",
+"ca_exdate": "2026-08-25",
+"subject": "Rights - 7 Ccps And 7 Warrants:40"
+},
+{
+"isin": "INE741L01018",
+"date": "2026-08-25",
+"kind": "rights",
+"symbol": "DUCON",
+"ca_symbol": "DUCON",
+"ca_exdate": "2026-08-25",
+"subject": "Rights 10:13 @ Premium Rs 0/-"
+},
+{
+"isin": "INE903A01025",
+"date": "2026-08-28",
+"kind": "rights",
+"symbol": "JAYKAY",
+"ca_symbol": "JAYKAY",
+"ca_exdate": "2026-08-28",
+"subject": "Rights 3:19 @ Premium Rs 74/-"
+},
+{
+"isin": "INE560A01023",
+"date": "2026-09-02",
+"kind": "demerger",
+"symbol": "INDIAGLYCO",
+"ca_symbol": "INDIAGLYCO",
+"ca_exdate": "2026-09-02",
+"subject": "Demerger"
+},
+{
+"isin": "INE545A01024",
+"date": "2026-09-07",
+"kind": "demerger",
+"symbol": "HEG",
+"ca_symbol": "HEGAM",
+"ca_exdate": "2026-09-07",
+"subject": "Demerger"
+},
+{
+"isin": "INE281A01026",
+"date": "2026-09-15",
+"kind": "rights",
+"symbol": "CENTEXT",
+"ca_symbol": "CENTEXT",
+"ca_exdate": "2026-09-15",
+"subject": "Rights 3:8 @ Premium Rs 14/-"
+},
+{
+"isin": "INE157H01023",
+"date": "2026-10-01",
+"kind": "demerger",
+"symbol": "KMSUGAR",
+"ca_symbol": "KMSUGAR",
+"ca_exdate": "2026-10-01",
+"subject": "Demerger"
+},
+{
+"isin": "INE987B01026",
+"date": "2026-10-01",
+"kind": "rights",
+"symbol": "NATCOPHARM",
+"ca_symbol": "NATCOPHARM",
+"ca_exdate": "2026-10-01",
+"subject": "Rights 2:21 @ Premium Rs 748/-"
+},
+{
+"isin": "INE0IQ001011",
+"date": "2026-10-06",
+"kind": "demerger",
+"symbol": "VERANDA",
+"ca_symbol": "VERANDA",
+"ca_exdate": "2026-10-06",
+"subject": "Demerger"
+},
+{
+"isin": "INE458B01036",
+"date": "2026-10-08",
+"kind": "demerger",
+"symbol": "BHAGYANGR",
+"ca_symbol": "BHAGYANGR",
+"ca_exdate": "2026-10-08",
+"subject": "Demerger"
+},
+{
+"isin": "INE0LXG01040",
+"date": "2026-10-13",
+"kind": "rights",
+"symbol": "OLAELEC",
+"ca_symbol": "OLAELEC",
+"ca_exdate": "2026-10-13",
+"subject": "Rights 2:25 @ Premium Rs 17/-"
+},
+{
+"isin": "INE311M01018",
+"date": "2026-10-15",
+"kind": "rights",
+"symbol": "SHRADDHA",
+"ca_symbol": "SHRADDHA",
+"ca_exdate": "2026-10-15",
+"subject": "Rights 3:20 @ Premium Rs 150/-"
+},
+{
+"isin": "INE637H01024",
+"date": "2026-10-15",
+"kind": "rights",
+"symbol": "SHIVAMAUTO",
+"ca_symbol": "SHIVAMAUTO",
+"ca_exdate": "2026-10-15",
+"subject": "Rights 19:25 @ Premium Rs 10/-"
+},
+{
+"isin": "INE018401013",
+"date": "2026-11-04",
+"kind": "rights",
+"symbol": "SUVIDHAA",
+"ca_symbol": "SUVIDHAA",
+"ca_exdate": "2026-11-04",
+"subject": "Rights 3:8 @ Premium Re 0.50/-"
+},
+{
+"isin": "INE234A01025",
+"date": "2026-11-11",
+"kind": "rights",
+"symbol": "EVONILE",
+"ca_symbol": "EVONILE",
+"ca_exdate": "2026-11-11",
+"subject": "Rights 5:12 @ Premium Rs 855/-"
+},
+{
+"isin": "INE546Y01022",
+"date": "2026-11-18",
+"kind": "rights",
+"symbol": "PRAXIS",
+"ca_symbol": "PRAXIS",
+"ca_exdate": "2026-11-18",
+"subject": "Rights 5:9"
+},
+{
+"isin": "INE294B01019",
+"date": "2026-11-20",
+"kind": "rights",
+"symbol": "SMLMAH",
+"ca_symbol": "SMLMAH",
+"ca_exdate": "2026-11-20",
+"subject": "Rights 2:7 @ Premium Rs 3496/-"
+}
+]

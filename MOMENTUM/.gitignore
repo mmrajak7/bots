@@ -1,0 +1,10 @@
+# runtime state, secrets and owner controls never leave the Pi
+state/
+state_dryrun/
+logs/
+secrets/
+control/
+config/momentum.json
+.venv/
+__pycache__/
+*.pyc

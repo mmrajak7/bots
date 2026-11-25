@@ -1,0 +1,11 @@
+# MOMENTUM book (IST; system TZ must be Asia/Kolkata). Installed by deploy/setup.sh between the BEGIN/END markers.
+# M = the momentum command wrapper (venv + MOMENTUM_HOME). Every command takes its own flock.
+*/30 20-23 * * *  $M evening        # signal-day evening (no-op on other days; re-runs a pending signal day; resumes)
+30 20 * * *       $M check-arm
+30 8 * * 1-5      $M canary
+35 8 * * 1-5      $M morning        # alive, token wait, preflight, holdings snapshot, shared-name holds
+30 14 * * 1-5     $M canary
+40 14 * * 1-5     $M afternoon      # 14:45 plan + vet, 15:10 place, ladder, 15:28 cancel, 15:35 reconcile
+*/5 15 * * 1-5    $M afternoon      # resume after a crash/reboot (never a new buy after 15:15)
+0 16 * * 1-5      $M watch
+*/5 * * * *       $M-poller-keepalive

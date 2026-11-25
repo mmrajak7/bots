@@ -1,0 +1,115 @@
+{
+ "INE264A01014": {
+  "symbol": "GSKCONS",
+  "type": "merger",
+  "into_isin": "INE030A01027",
+  "ratio": "4.39 HINDUNILVR per 1 GSKCONS",
+  "verified": "NSE data + recall",
+  "notes": "Amalgamated into Hindustan Unilever (2020-04). NSE CM: last GSKCONS row 2020-04-15 (EQ); HINDUNILVR trades on with ISIN INE030A01027 on that date; last-day close ratio GSKCONS/HINDUNILVR = 4.3145 vs the scheme's 4.39 (1.7% arbitrage gap). Ratio from recall, consistent with the prices."
+ },
+ "INE093A01033": {
+  "symbol": "HEXAWARE",
+  "type": "voluntary_delisting",
+  "exit_price": 475.0,
+  "verified": "NSE data + press (Business Standard 2020-09-23)",
+  "notes": "Voluntary delisting by Baring PE Asia; reverse book building discovered price Rs 475 accepted 2020-09-23; exit window 2020-11-09..2021-11-08. NSE CM: last row 2020-10-30 close 470.80. The code exits at the last traded close (design \u00c2\u00a74.3), 0.9% below the Rs 475 offer: conservative."
+ },
+ "INE694C01018": {
+  "symbol": "LAKSHVILAS",
+  "type": "write_off",
+  "verified": "press (RBI draft scheme 2020-11-17, Govt sanction 2020-11-25)",
+  "notes": "Lakshmi Vilas Bank amalgamated into DBS Bank India effective 2020-11-27; the entire paid-up equity capital was written off, shareholders received nothing. NSE CM: last row 2020-11-25. Genuine -100%."
+ },
+ "INE824B01021": {
+  "symbol": "TATASTLBSL",
+  "type": "merger",
+  "into_isin": "INE081A01012",
+  "ratio": "1 TATASTEEL per 15 TATASTLBSL",
+  "verified": "NSE data + recall",
+  "notes": "Tata Steel BSL (ex Bhushan Steel) amalgamated into Tata Steel (Nov 2021). NSE CM: last row 2021-11-12 (series BE); TATASTEEL carried ISIN INE081A01012 then (INE081A01020 only after its 2022 1:10 split; the panel chain links both). Last-day close ratio 0.0663 vs 1/15 = 0.0667. The FOODSIN 'possible successor' is a price coincidence, not a link."
+ },
+ "INE312H01016": {
+  "symbol": "INOXLEISUR",
+  "type": "merger",
+  "into_isin": "INE191H01014",
+  "ratio": "3 PVR per 10 INOXLEISUR",
+  "verified": "NSE data + recall",
+  "notes": "INOX Leisure amalgamated into PVR (effective Feb 2023; PVR renamed PVRINOX 2023-05-12 per NSE symbolchange.csv). NSE CM: last row 2023-02-16; PVR ISIN INE191H01014 on that date; last-day close ratio 0.2974 vs 0.3."
+ },
+ "INE334L01012": {
+  "symbol": "UJJIVAN",
+  "type": "merger",
+  "into_isin": "INE551W01018",
+  "ratio": "116 UJJIVANSFB per 10 UJJIVAN",
+  "verified": "NSE data + press (record date 2024-05-03, ratio 116:10)",
+  "notes": "Ujjivan Financial Services reverse-merged into Ujjivan Small Finance Bank. NSE CM: last row 2024-05-02; UJJIVANSFB ISIN INE551W01018 then; last-day close ratio 10.67 vs 11.6 (8% below the scheme ratio). The code continues the value from the last UJJIVAN close, so the gap is not booked as a gain: conservative."
+ },
+ "INE886H01027": {
+  "symbol": "TV18BRDCST",
+  "type": "merger",
+  "into_isin": "INE870H01013",
+  "ratio": "100 NETWORK18 per 172 TV18BRDCST",
+  "verified": "NSE data + press (record date 2024-10-16, ratio 100:172)",
+  "notes": "TV18 Broadcast amalgamated into Network18 Media & Investments (composite scheme). NSE CM: last row 2024-10-15; NETWORK18 ISIN INE870H01013 then; last-day close ratio 0.5198 vs 100/172 = 0.5814 (11% below). The code continues from the last TV18 close (conservative)."
+ },
+ "INE763G01038": {
+  "symbol": "ISEC",
+  "type": "scheme",
+  "into_isin": "INE090A01021",
+  "ratio": "67 ICICIBANK per 100 ISEC",
+  "verified": "NSE data + recall",
+  "notes": "ICICI Securities delisted by a scheme of arrangement with ICICI Bank (Mar 2025). NSE CM: last row 2025-03-21; ICICIBANK ISIN INE090A01021 then; last-day close ratio 0.6673 vs 0.67."
+ },
+ "INE140A01024": {
+  "symbol": "PEL",
+  "type": "merger",
+  "into_isin": "INE202B01038",
+  "ratio": "1 PIRAMALFIN per 1 PEL",
+  "verified": "NSE data",
+  "notes": "Piramal Enterprises amalgamated into Piramal Finance. NSE CM: last PEL row 2025-09-22 close 1124.20; PIRAMALFIN (ISIN INE202B01038) first row 2025-11-07 (series BE) with previous close 1124.20 = PEL's last close, i.e. NSE treats it as 1:1. The acquirer lists 6 weeks AFTER the target's last date, so into_isin does not resolve at that date and the code exits at the last PEL close (design \u00c2\u00a74.3 'last traded close'). OWNER: bridging the 6-week unlisted gap into PIRAMALFIN would need a code change."
+ },
+ "INE572A01036": {
+  "symbol": "JBCHEPHARM",
+  "type": "merger",
+  "into_isin": "INE685A01028",
+  "ratio": "51 TORNTPHARM per 100 JBCHEPHARM",
+  "verified": "NSE data + press (NCLT sanction 2026-07-06, record date 2026-07-17, ratio 51:100)",
+  "notes": "J.B. Chemicals amalgamated into Torrent Pharmaceuticals. NSE CM: last row 2026-07-16; TORNTPHARM ISIN INE685A01028 then; last-day close ratio 0.4830 vs 0.51 (5% below)."
+ },
+ "INE018I01017": {
+  "symbol": "MINDTREE",
+  "type": "merger",
+  "into_isin": "INE214T01019",
+  "ratio": "73 LTIM per 100 MINDTREE",
+  "verified": "NSE data + recall",
+  "notes": "Never entered in B (no row at the 2022-12 entry); listed for completeness. Mindtree merged into L&T Infotech (LTIM). Last row 2022-11-22; last-day close ratio 0.722 vs 0.73."
+ },
+ "INE001A01036": {
+  "symbol": "HDFC",
+  "type": "merger",
+  "into_isin": "INE040A01034",
+  "ratio": "42 HDFCBANK per 25 HDFC",
+  "verified": "NSE data + recall",
+  "notes": "Never entered in B (no row at the 2023-08 entry); listed for completeness. HDFC Ltd merged into HDFC Bank 2023-07-01. Last row 2023-07-12; last-day close ratio 1.668 vs 1.68."
+ },
+ "INE043D01016": {
+  "symbol": "IDFC",
+  "type": "merger",
+  "into_isin": "INE092T01019",
+  "ratio": "155 IDFCFIRSTB per 100 IDFC",
+  "verified": "NSE data + recall",
+  "notes": "Never entered in B (no row at the 2024-11 entry); listed for completeness. IDFC Ltd merged into IDFC First Bank (Oct 2024). Last row 2024-10-09; last-day close ratio 1.49 vs 1.55."
+ },
+ "INE285B01017": {
+  "symbol": "SPICEJET",
+  "type": "last_close",
+  "verified": "owner decision D3 2026-11-23",
+  "notes": "NSE CM: last row 2023-04-28; no mapped corporate event. The equity kept trading elsewhere (BSE-listed; on NSE it traded as a permitted security; the exact reason for the NSE stop is not verified). Owner D3: exit at the last NSE close, not -100%."
+ },
+ "INE052T01013": {
+  "symbol": "BESTAGRO",
+  "type": "last_close",
+  "verified": "owner decision D3 2026-11-23",
+  "notes": "NSE CM: last row 2023-07-26; no mapped corporate event. Review 2026-11-23: the SAME chain and ISIN have NSE rows again from 2024-04-10 (a 175-session gap, then trading to the panel end); reason for the gap not verified. The 2026-01-16 corporate action (new ISIN INE052T01021) is adjusted by the CA path (factor 0.0667). Owner D3: exit at the last NSE close, not -100%."
+ }
+}

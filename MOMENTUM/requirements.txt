@@ -1,0 +1,4 @@
+# pinned = the PC versions the tests and the KA checks ran on (live decision must equal the backtest bit for bit)
+numpy==2.1.0
+kiteconnect==5.1.0
+requests>=2.31,<3

@@ -1,0 +1,31 @@
+[
+ {
+  "ca_symbol": "DVL",
+  "ex": "2021-08-05",
+  "action": "reassign",
+  "to_symbol": "DTIL",
+  "notes": "NSE CA file lists 'Bonus 1:2' (record date 2021-08-06) under DVL (Dhunseri Ventures, ISIN INE477B01010). The 1:2 bonus was Dhunseri Tea & Industries' (DTIL): BSE filing 2021-06-23 and Business Standard 2021-06-29 report DTIL's board approving it; Trendlyne / Upstox list no DVL bonus since 2000. NSE CM: the DVL chain has no single-day step below 0.75 anywhere 2018-12..2026-11, while DTIL steps by the 1:2-bonus factor on exactly 2021-08-05. The CA file also carries DTIL dividend records under INE477B01010, so its ISIN field is not trusted here: located by symbol."
+ },
+ {
+  "ca_symbol": "DHARAN",
+  "ex": "2020-07-02",
+  "action": "reassign",
+  "to_symbol": "KARDA",
+  "notes": "CA file names the company by its later symbol / ISIN (DHARAN, INE278R01034); on 2020-07-02 the panel chain was KARDA with ISIN INE278R01018 (one chain KARDA..KBCGLOBAL..DHARAN). NSE CM: that chain steps by the 1:5 split factor on exactly 2020-07-02, and nowhere else in 2018-12..2026-11."
+ },
+ {
+  "ca_symbol": "AURIGROW",
+  "ex": "2022-01-20",
+  "action": "reassign",
+  "to_symbol": "GODHA",
+  "notes": "CA file names the company by its later symbol / ISIN (AURIGROW, INE925Y01036); on 2022-01-20 the panel chain was GODHA (one chain GODHA..AURIGROW). NSE CM: that chain steps by the 1:1-bonus factor on exactly 2022-01-20."
+ },
+ {
+  "ca_symbol": "TIPSMUSIC",
+  "ex": "2022-05-19",
+  "action": "reassign",
+  "to_symbol": "TIPSINDLTD",
+  "applies_to": "zero",
+  "notes": "Demerger record under the later symbol / ISIN (TIPSMUSIC, INE716B01029); on 2022-05-19 the panel chain was TIPSINDLTD (one chain TIPSINDLTD..TIPSMUSIC). Ex-date return set to 0 per design 4.2."
+ }
+]
