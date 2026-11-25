@@ -192,6 +192,12 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
                       f"AUDIT FLAG {f['symbol']} {f['check']}: {f['value']} (tol {f['threshold']}) {f['detail']}"
                       f"{' Kite ' + f['kite_value'] if f.get('kite_value') else ''}", position_id=b["position_id"],
                       other_open_flags=others)
+    for h in holds:                             # a name held at the plan (BE/BZ series, G14) gets its Buy / Skip
+        if h["overlay"] == "OWNER_HOLD":
+            b = next(x for x in buys if x["position_id"] == h["position_id"])
+            open_approval(env, "leg", b["position_id"], {"buy": "Buy", "skip": "Skip"},
+                          f"HOLD {b['symbol']} (OWNER_HOLD): {h.get('reason') or 'held at the plan'}",
+                          position_id=b["position_id"])
     em = buys[0]["earmark_paise"] // 100 if buys else 0
     env.notify(f"PLAN {m} r{plan_id['data_rev']} FINAL: {len(buys)} buys x Rs {em:,}; holds {len(holds)}; "
                f"signal day {plan_id['signal_day']} verified on Kite")

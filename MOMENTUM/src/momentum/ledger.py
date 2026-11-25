@@ -21,7 +21,7 @@ LEG_MOVES = {
     "PENDING_BUY": {"NONE", "SKIPPED", "EXPIRED"},
 }
 TERMINAL_INTENT = frozenset({"COMPLETE", "CANCELLED", "ABSENT", "REJECTED_BAND", "REJECTED_CLOSED", "REJECTED_RMS",
-                             "REJECTED_OTHER", "REJECTED"})
+                             "REJECTED_OTHER", "REJECTED_AUTH", "REJECTED"})
 LIVE_INTENT = frozenset({"INTENT_WRITTEN", "SENT", "ACK", "OPEN", "PARTIAL", "TIMEOUT", "FOUND"})
 
 

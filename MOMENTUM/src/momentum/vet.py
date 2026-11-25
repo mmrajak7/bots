@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -62,6 +64,35 @@ def cli_args(cfg: Dict[str, Any], schema: Dict[str, Any]) -> List[str]:
         "--setting-sources", "", "--no-session-persistence", "--permission-mode", "dontAsk",
     ]
     return [cfg["claude_bin"], *base, "--system-prompt", SYSTEM_PROMPT, "--json-schema", json.dumps(schema)]
+
+
+KILL_GRACE_S = 5                # spec §C8 `timeout -k 5`: wait this long for the killed CLI to let go of its pipes
+
+
+def run_cli(args: List[str], stdin_text: str, timeout_s: int, cwd: str) -> "subprocess.CompletedProcess[str]":
+    """subprocess.run with a timeout that also ends the CLI's CHILD processes. Plain subprocess.run kills only the
+    direct child and then waits for the pipes without a limit: a helper process the CLI started would keep them open
+    and hang the 14:45 step for the whole session with no alert. Here the CLI runs in its own process group (Pi),
+    the whole group is killed on timeout, and the wait for the pipes is bounded."""
+    posix = os.name == "posix"
+    pr = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                          cwd=cwd, encoding="utf-8", start_new_session=posix)
+    try:
+        out, err = pr.communicate(stdin_text, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        try:
+            if posix:
+                os.killpg(pr.pid, signal.SIGKILL)
+            else:
+                pr.kill()
+        except OSError:
+            pass
+        try:
+            pr.communicate(timeout=KILL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            log.error("vet CLI pipes still open %s s after the kill; abandoned", KILL_GRACE_S)
+        raise
+    return subprocess.CompletedProcess(args, pr.returncode, out, err)
 
 
 @dataclass
@@ -140,8 +171,7 @@ def run(cfg: Dict[str, Any], vet_dir: Path, step: str, vet_input: Dict[str, Any]
     t = int(timeout_s if timeout_s is not None else cfg["vet_timeout_s"])
     try:
         with tempfile.TemporaryDirectory(prefix="momvet_") as cwd:   # empty cwd: nothing to read even if a tool ran
-            pr = subprocess.run(args, input=in_text, capture_output=True, text=True, timeout=t, cwd=cwd,
-                                encoding="utf-8")
+            pr = run_cli(args, in_text, t, cwd)
     except (OSError, subprocess.TimeoutExpired) as e:
         return Verdict(False, f"vet call failed: {type(e).__name__}: {e}", {}, "")
     raw = pr.stdout or ""
@@ -166,8 +196,7 @@ def canary(cfg: Dict[str, Any], timeout_s: int = 60) -> Tuple[bool, str]:
     args = cli_args(cfg, schema)
     try:
         with tempfile.TemporaryDirectory(prefix="momvet_") as cwd:
-            pr = subprocess.run(args, input='Reply {"ok": true}', capture_output=True, text=True,
-                                timeout=timeout_s, cwd=cwd, encoding="utf-8")
+            pr = run_cli(args, 'Reply {"ok": true}', timeout_s, cwd)
         ans = parse_cli_output(pr.stdout)
         return (ans.get("ok") is True, "" if ans.get("ok") is True else f"answer {ans}")
     except Exception as e:  # noqa: BLE001

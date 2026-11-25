@@ -33,6 +33,9 @@ class PipelineError(Exception):
     pass
 
 
+MIN_STOCK_FUTURES = 100         # same floor as the research build (pipeline/fo_membership.py build): fewer = a parse problem
+
+
 def month_add(m: str, k: int) -> str:
     y, mo = int(m[:4]), int(m[5:7]) + k
     y += (mo - 1) // 12
@@ -85,8 +88,14 @@ def fo_url_fetch(M: Modules, d: str, dest: Path) -> Set[str]:
         tmp = dest.with_suffix(".tmp")
         tmp.write_bytes(data)
         os.replace(tmp, dest)
-    syms = M.FM.stock_futures(dest)
-    if len(syms) < 100:
+    try:
+        syms = M.FM.stock_futures(dest)
+    except Exception as e:  # noqa: BLE001 - an error page or a cut download was saved: never keep it as the cache
+        dest.unlink(missing_ok=True)
+        raise PipelineError(f"F&O bhavcopy {d}: unreadable download removed, fetched again on the next run "
+                            f"({type(e).__name__}: {e})") from e
+    if len(syms) < MIN_STOCK_FUTURES:
+        dest.unlink(missing_ok=True)
         raise PipelineError(f"F&O bhavcopy {d}: only {len(syms)} stock futures (expected ~200): refused")
     return set(syms)
 

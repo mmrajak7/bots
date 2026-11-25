@@ -2,6 +2,7 @@
 state/
 state_dryrun/
 logs/
+backup/
 secrets/
 control/
 config/momentum.json

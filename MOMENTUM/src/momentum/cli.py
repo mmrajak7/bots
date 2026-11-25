@@ -6,6 +6,7 @@
     python -m momentum.cli poller            # long-running Telegram poller (kept alive like FIFTY's watchdog)
     python -m momentum.cli manifest          # (PC) write manifests/code.sha256 for the commit being deployed
     python -m momentum.cli isolation-test    # (Pi) T5: the vet path has no tools
+    python -m momentum.cli repair-journal    # (Pi, owner) after a power cut: move a torn LAST journal line aside
 Global: --dry (no broker writes, state_dryrun/ root), --home DIR.
 """
 from __future__ import annotations
@@ -27,9 +28,12 @@ from . import engine as E
 from . import ledger as L
 from . import util
 from . import vet as V
-from .journal import Journal, LockBusy, process_lock
+from .journal import Journal, LockBusy, process_lock, repair_torn_tail
 
 log = logging.getLogger("momentum")
+
+ARM_EXPIRY_WARN_DAYS = 3        # spec §I: "ARM expires in 3 days"
+POLLER_ERROR_SLEEP_S = 10
 
 SRS_MODULES = ("compounding", "de_kill", "fetch_indices", "fo_membership", "full_asrs", "htf_orb", "joiner_free",
                "joiner_positional", "joiner_profile", "liq_side", "monthly_orb", "nonfo_momentum", "nonfo_srs",
@@ -81,7 +85,7 @@ def holiday_year_ok(cfg: Dict[str, Any], home: Path, day: dt.date) -> bool:
 
 
 class Ctx:
-    def __init__(self, a: argparse.Namespace) -> None:
+    def __init__(self, a: argparse.Namespace, open_journal: bool = True) -> None:
         self.home = Path(a.home).resolve() if a.home else CF.HOME
         self.cfg = CF.load(self.home)
         self.dry = bool(a.dry) or self.cfg["mode"] != "live"
@@ -93,7 +97,10 @@ class Ctx:
         logs.mkdir(exist_ok=True)
         logging.basicConfig(filename=logs / f"momentum_{util.today().isoformat()}.log", level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(name)s %(message)s")
-        self.journal = Journal(self.paths.journal, dry=False)   # the dry ROOT is separate; records stay plain there
+        man = self.home / "manifests" / "code.sha256.json"
+        self.cfg["_code_manifest_sha"] = util.sha256_file(man) if man.exists() else None
+        # the dry ROOT is separate; records stay plain there. repair-journal opens the journal itself.
+        self.journal: Journal = Journal(self.paths.journal, dry=False) if open_journal else None  # type: ignore
         self.arm, self.arm_problem = C.read_arm(self.paths.arm_file)
         self._bot: Any = None
         self._api: Any = None
@@ -116,7 +123,7 @@ class Ctx:
 
     # kite
     def token(self) -> Optional[C.Token]:
-        tok, why = C.read_token(resolve(self.home, self.cfg["fifty_token_file"]), self.cfg["account_user_id"])
+        tok, why = C.read_token(resolve(self.home, self.cfg["token_file"]), self.cfg["account_user_id"])
         if tok is None:
             log.warning("token: %s", why)
         return tok
@@ -135,9 +142,12 @@ class Ctx:
         return self._api
 
     def env(self, api: Any) -> E.Env:
-        plan_month = current_plan_month(self.journal)
-        gate = B.Gate(live=not self.dry, killed=lambda: C.killed(self.paths.kill_file),
-                      armed=lambda: bool(self.arm and plan_month and self.arm.covers(plan_month, util.today())))
+        def armed() -> bool:
+            """Read again before every broker write: an ARM the owner removed or changed mid-session stops orders."""
+            arm, _why = C.read_arm(self.paths.arm_file)
+            month = current_plan_month(self.journal)
+            return bool(arm and month and arm.covers(month, util.today()))
+        gate = B.Gate(live=not self.dry, killed=lambda: C.killed(self.paths.kill_file), armed=armed)
         return E.Env(self.cfg, self.paths, self.journal, api, B.Broker(api, self.journal, gate), self.notify,
                      lambda step, vin, sk: V.run(self.cfg, self.paths.vet, step, vin, sk), sleep_until,
                      arm=self.arm, dry=self.dry)
@@ -163,12 +173,16 @@ def preflight(x: Ctx, api: Any, full: bool) -> List[str]:
     day = util.today()
     if C.killed(x.paths.kill_file):
         p.append("KILL present")
-    active, why = C.fifty_kill_switch(resolve(x.home, x.cfg["fifty_db_file"]))
-    if active:
-        p.append(f"FIFTY kill switch on ({why or 'active'})")
+    recs = x.journal.read()
+    lg = L.replay(recs)
+    plan = E.current_plan(lg)
     if not x.dry:
         if x.arm is None:
             p.append(f"no ARM ({x.arm_problem})")
+        elif plan is not None and not x.arm.covers(plan["plan_id"]["month"], day):
+            p.append(f"ARM does not cover plan month {plan['plan_id']['month']} on {day}")
+        elif x.arm.mode != "automatic":
+            p.append(f"ARM mode {x.arm.mode} is not built in this slice (only automatic)")
         p += check_manifest(x.home, x.cfg)
     ok, why = C.clock_ok()
     if not ok:
@@ -185,11 +199,15 @@ def preflight(x: Ctx, api: Any, full: bool) -> List[str]:
             p.append(f"profile user {prof.get('user_id')}")
     except Exception as e:  # noqa: BLE001
         p.append(f"Kite profile failed: {type(e).__name__}")
-    recs = x.journal.read()
-    lg = L.replay(recs)
-    if x.paths.ledger.exists():
-        if json.loads(x.paths.ledger.read_text(encoding="utf-8")) != lg.to_json():
-            p.append("ledger.json != journal replay")
+    why_ledger = ledger_cache_problem(x, recs)
+    if why_ledger:
+        p.append(why_ledger)
+    snap = [r for r in recs if r["type"] == "HOLDINGS_SNAPSHOT" and r["ts"][:10] == day.isoformat()]
+    if snap:                                   # frozen design §7.4: opening Kite holdings >= the book's quantity
+        short = E.holdings_short(lg, {k: int(v) for k, v in snap[0]["holdings"].items()})
+        if short and not any(r["type"] == "OWNER_CMD" and r["cmd"] == "ack" and r["seq"] > snap[0]["seq"]
+                             for r in recs):
+            p.append("opening holdings below the book: " + "; ".join(short) + " (owner: check Kite, then send 'ack')")
     if lg.unresolved:
         p.append(f"unresolved intents {lg.unresolved}")
     tw = [r for r in recs if r["type"] == "NOTE" and "three_way" in r]
@@ -197,13 +215,55 @@ def preflight(x: Ctx, api: Any, full: bool) -> List[str]:
         acked = any(r["type"] == "OWNER_CMD" and r["cmd"] == "ack" and r["seq"] > tw[-1]["seq"] for r in recs)
         if not acked:
             p.append(f"16:00 three-way check of {tw[-1]['three_way']} found problems (owner: check, then send 'ack')")
-    if full and E.current_plan(lg) is None:
+    if full and plan is None:
         p.append("no FINAL plan")
     return p
 
 
 def write_ledger(x: Ctx) -> None:
-    util.write_json_atomic(x.paths.ledger, L.replay(x.journal.read()).to_json())
+    """ledger.json = the replay of the journal up to `journal_seq` (a cache for people and for the tamper check)."""
+    recs = x.journal.read()
+    d = L.replay(recs).to_json()
+    d["journal_seq"] = int(recs[-1]["seq"]) if recs else 0
+    util.write_json_atomic(x.paths.ledger, d)
+
+
+def ledger_cache_problem(x: Ctx, recs: List[Dict[str, Any]]) -> Optional[str]:
+    """Spec §E 'journal replay == ledger'. The file must equal the replay of the journal UP TO THE SEQ IT WAS WRITTEN
+    AT: a file that is merely older than the journal (a crash before the last write) is not a fault and must not
+    stop a session; an edited / damaged file, or a journal shorter than the file knows, is."""
+    if not x.paths.ledger.exists():
+        return None
+    last = int(recs[-1]["seq"]) if recs else 0
+    try:
+        stored = json.loads(x.paths.ledger.read_text(encoding="utf-8"))
+        n = stored.pop("journal_seq", last)     # a file from before journal_seq existed: compared with the full replay
+    except (ValueError, AttributeError):
+        return "ledger.json unreadable"
+    if not isinstance(n, int) or n > last:
+        return f"ledger.json was written at journal seq {n} but the journal ends at {last} (journal lost records?)"
+    if stored != L.replay([r for r in recs if r["seq"] <= n]).to_json():
+        return f"ledger.json != journal replay at seq {n} (file edited or damaged?)"
+    return None
+
+
+def backup_state(x: Ctx) -> bool:
+    """Spec §C13 / §L3 fallback: copy the journal and the ledger to a second local folder and send the journal to
+    the owner's Telegram chat as a document (the Pi's SD card is otherwise the only copy of the book).
+    -> True when the Telegram document was delivered. Never raises: a failed backup must not fail the step."""
+    try:
+        dst = resolve(x.home, x.cfg["backup_dir"]) / ("dry" if x.dry else "live") / util.today().isoformat()
+        dst.mkdir(parents=True, exist_ok=True)
+        for f in (x.paths.journal, x.paths.ledger):
+            if f.exists():
+                shutil.copy2(f, dst / f.name)
+        if not x.paths.journal.exists():
+            return False
+        return bool(x.bot().send_document(x.paths.journal, f"{'[DRY] ' if x.dry else ''}MOM journal "
+                                          f"{util.today().isoformat()} (backup)"))
+    except Exception as e:  # noqa: BLE001 - reported by the caller's heartbeat text
+        log.error("backup failed: %s: %s", type(e).__name__, e)
+        return False
 
 
 def holdings_snapshot(x: Ctx, api: Any) -> Dict[str, int]:
@@ -232,6 +292,11 @@ def cmd_evening(x: Ctx, a: argparse.Namespace) -> int:
         return 0
     util.write_json_atomic(pending_f, {"signal_day": day.isoformat(), "since": util.now().isoformat()})
     m = P.month_add(day.isoformat()[:7], 1)
+    if not x.dry:                              # manifests are recomputed before every live step (spec §C1)
+        bad = check_manifest(x.home, x.cfg)
+        if bad:
+            x.notify(f"ALERT MANIFEST: {'; '.join(bad)}: no {m} plan is made by untested code")
+            return 6
     tok = x.token()
     if tok is None:
         x.notify(f"ALERT TOKEN: no valid Kite token this evening: no {m} plan tonight (re-run next evening)")
@@ -252,34 +317,53 @@ def cmd_evening(x: Ctx, a: argparse.Namespace) -> int:
     if res["status"] in ("FINAL", "already final"):
         pending_f.unlink(missing_ok=True)
     write_ledger(x)
+    if res["status"] == "FINAL":
+        backup_state(x)
     log.info("evening %s: %s", m, res)
     print(json.dumps(res))
     return 0
+
+
+def missing_plan_month(x: Ctx, lg: L.Ledger) -> Optional[str]:
+    """The 08:40 plan check (spec §C7, §J 'no FINAL at 08:40'): the ARM says this month is to be traded but the
+    journal holds no FINAL plan for it (the signal evening never ran or never finished). -> the month, or None."""
+    m = util.today().isoformat()[:7]
+    if x.dry or x.arm is None or m not in x.arm.plan_months or any(k.startswith(m + "|") for k in lg.plans):
+        return None
+    return m
 
 
 def cmd_morning(x: Ctx, a: argparse.Namespace) -> int:
     lg = L.replay(x.journal.read())
     plan = E.current_plan(lg)
     pend = [p for p in lg.positions.values() if p.leg == "PENDING_BUY"]
-    x.notify(f"ALIVE plan {L.plan_key(plan['plan_id']) if plan else 'none'}; pending buys {len(pend)}")
-    if not pend:
+    held = [p for p in lg.positions.values() if p.filled_qty > 0]
+    x.notify(f"ALIVE plan {L.plan_key(plan['plan_id']) if plan else 'none'}; " + E.status_text(lg))
+    no_plan = missing_plan_month(x, lg)
+    if no_plan:
+        x.journal.append("ALERT", code="NO_PLAN", text=f"no FINAL plan for {no_plan}")
+        x.notify(f"ALERT NO_PLAN: the ARM covers {no_plan} but there is no FINAL plan for it (signal evening missed "
+                 "or failed). Nothing is bought. The evening job re-runs a pending signal day by itself; if it never "
+                 "started: ./momentum evening --as-of-signal <last session of last month>")
+    if not pend and not held:
         return 0
-    tok = x.wait_token(util.at_today("09:05"))
+    tok = x.wait_token(util.at_today(x.cfg["token_alert_at"]))
     if tok is None:
-        x.notify("ALERT TOKEN: no FIFTY token by 09:05 (deadline 14:15)")
+        x.notify(f"ALERT TOKEN: no Kite token by {x.cfg['token_alert_at']} (deadline {x.cfg['token_deadline']})")
         return 2
     api = x.api(tok)
     env = x.env(api)
-    probs = preflight(x, api, full=True)
-    if probs:
-        env.alert("PREFLIGHT_AM", "; ".join(probs))
     h = holdings_snapshot(x, api)
+    if pend:
+        probs = preflight(x, api, full=True)
+        if probs:
+            env.alert("PREFLIGHT_AM", "; ".join(probs))
+    else:
+        short = E.holdings_short(lg, h)
+        if short:
+            env.alert("HOLDINGS_SHORT", "; ".join(short))
     E.ingest_inbox(env)
-    lg = L.replay(x.journal.read())
-    for p in lg.positions.values():                       # D38: a plan ISIN with non-book quantity in the account
-        book_qty = p.filled_qty
-        if p.leg == "PENDING_BUY" and h.get(p.isin, 0) > book_qty and "SHARED_NAME_HOLD" not in p.overlays:
-            E.hold_leg(env, p, "SHARED_NAME_HOLD", f"account holds {h[p.isin]} shares outside the book")
+    E.shared_name_holds(env, h)                # D38: a plan ISIN with non-book quantity in the account
     write_ledger(x)
     return 0
 
@@ -290,7 +374,12 @@ def cmd_afternoon(x: Ctx, a: argparse.Namespace) -> int:
         return 0
     tok = x.wait_token(util.at_today(x.cfg["token_deadline"]))
     if tok is None:
-        x.notify(f"ALERT TOKEN: no FIFTY token by {x.cfg['token_deadline']}: buys move one session")
+        day = util.today().isoformat()
+        if not any(r["type"] == "ALERT" and r.get("code") == "TOKEN" and r["ts"][:10] == day
+                   for r in x.journal.read()):          # once a day: this command re-runs every 5 minutes
+            x.journal.append("ALERT", code="TOKEN", text="no Kite token for the afternoon step")
+            x.notify(f"ALERT TOKEN: no Kite token by {x.cfg['token_deadline']}: buys move one session unless it "
+                     f"appears before {x.cfg['last_place_at']}")
         return 2
     api = x.api(tok)
     env = x.env(api)
@@ -305,14 +394,22 @@ def cmd_watch(x: Ctx, a: argparse.Namespace) -> int:
     write_ledger(x)
     day = util.today().isoformat()
     probs: List[str] = []
+    checked = False
     snap = [r for r in x.journal.read() if r["type"] == "HOLDINGS_SNAPSHOT" and r["ts"][:10] == day]
     if snap and any(p.filled_qty or p.leg == "PENDING_BUY" for p in lg.positions.values()):
         tok = x.token()
         if tok is None:
             probs.append("no token for the 16:00 check")
         else:
-            probs = E.three_way(x.env(x.api(tok)), {k: int(v) for k, v in snap[-1]["holdings"].items()}, day)
-    x.notify("HEARTBEAT " + E.status_text(lg) + (f"; THREE-WAY PROBLEMS {len(probs)}" if probs else "; three-way OK"))
+            probs = E.three_way(x.env(x.api(tok)), {k: int(v) for k, v in snap[0]["holdings"].items()}, day)
+            checked = True
+    lg = L.replay(x.journal.read())
+    write_ledger(x)
+    backed_up = backup_state(x)
+    x.notify("HEARTBEAT " + E.status_text(lg) + (f"; THREE-WAY PROBLEMS {len(probs)}" if probs else
+                                                 ("; three-way OK" if checked else "; three-way not run (no "
+                                                  "opening snapshot today or nothing in the book)"))
+             + ("" if backed_up else "; BACKUP NOT SENT"))
     return 0
 
 
@@ -324,11 +421,25 @@ def cmd_canary(x: Ctx, a: argparse.Namespace) -> int:
 
 
 def cmd_check_arm(x: Ctx, a: argparse.Namespace) -> int:
+    """20:30: ARM present, covering the months that are about to trade, and not about to expire (spec §I)."""
     if x.arm is None:
         x.notify(f"ALERT NO ARM: {x.arm_problem} -> dry run only")
         return 0
-    left = (x.arm.valid_to - util.today()).days
-    if 0 <= left <= 3:
+    from . import evening as EV
+    from . import pipeline as P
+    today = util.today()
+    lg = L.replay(x.journal.read())
+    months = {p.plan_id["month"] for p in lg.positions.values() if p.leg == "PENDING_BUY"}
+    if (x.paths.refresh / "pending_signal.json").exists() or EV.is_signal_day(today, holidays(x.cfg, x.home)):
+        months.add(P.month_add(today.isoformat()[:7], 1))
+    for m in sorted(months):
+        if m not in x.arm.plan_months or x.arm.valid_to < today:
+            x.notify(f"ALERT NO ARM {m}: the ARM covers {list(x.arm.plan_months)} until {x.arm.valid_to} -> the "
+                     f"{m} buys will not be placed")
+        elif x.arm.mode != "automatic":
+            x.notify(f"ALERT ARM MODE: {x.arm.mode} is not built in this slice -> the {m} buys will not be placed")
+    left = (x.arm.valid_to - today).days
+    if 0 <= left <= ARM_EXPIRY_WARN_DAYS:
         x.notify(f"ARM {x.arm.phase} expires in {left} days ({x.arm.valid_to})")
     return 0
 
@@ -349,14 +460,41 @@ def cmd_status(x: Ctx, a: argparse.Namespace) -> int:
 
 
 def cmd_poller(x: Ctx, a: argparse.Namespace) -> int:
+    """Long-running. Exits when config mode flips dry <-> live, because the inbox it writes to lives under the state
+    root of the mode it started in (state_dryrun/ vs state/); the 5-minute keep-alive starts it again on the right
+    root. Without this, taps sent after arming would land in the dry inbox and never reach the live book."""
     from .telegram import poll_once
     off = x.paths.state / "tg_offset"
+
+    def status() -> str:
+        try:
+            return ("[DRY] " if x.dry else "") + E.status_text(L.replay(Journal(x.paths.journal).read()))
+        except Exception as e:  # noqa: BLE001 - a damaged journal must still answer, with the reason
+            return f"status unavailable: {type(e).__name__}: {str(e)[:200]}"
     while True:
         try:
-            poll_once(x.bot(), x.paths.inbox, off, x.paths.kill_file)
+            if (CF.load(x.home)["mode"] == "live") != (x.cfg["mode"] == "live"):
+                log.info("poller: config mode changed; exiting so the keep-alive restarts it on the new state root")
+                return 0
+            poll_once(x.bot(), x.paths.inbox, off, x.paths.kill_file, status_fn=status)
         except Exception as e:  # noqa: BLE001 - keep polling; logged
             log.error("poller: %s", e)
-            time.sleep(10)
+            time.sleep(POLLER_ERROR_SLEEP_S)
+
+
+def cmd_repair_journal(x: Ctx, a: argparse.Namespace) -> int:
+    """Owner, at the Pi, after 'torn write' alerts: moves an unfinished LAST journal line to a side file."""
+    frag = repair_torn_tail(x.paths.journal)
+    if frag is None:
+        print("journal is whole: nothing to repair")
+        Journal(x.paths.journal).read()         # raises if the damage is elsewhere (never auto-repaired)
+        return 0
+    j = Journal(x.paths.journal)
+    j.append("NOTE", text="torn last journal line moved aside by repair-journal", fragment=frag[:500])
+    x.notify(f"journal repaired: one unfinished last line removed ({len(frag)} chars); the reconcile settles any "
+             "order it described by tag")
+    print("repaired; fragment saved beside the journal")
+    return 0
 
 
 def cmd_manifest(x: Ctx, a: argparse.Namespace) -> int:
@@ -387,7 +525,7 @@ COMMANDS = {"evening": (cmd_evening, "order"), "morning": (cmd_morning, "order")
             "afternoon": (cmd_afternoon, "order"), "watch": (cmd_watch, "watch"), "canary": (cmd_canary, "canary"),
             "check-arm": (cmd_check_arm, "arm"), "kill-cancel": (cmd_kill_cancel, "kill"),
             "status": (cmd_status, None), "poller": (cmd_poller, "poller"), "manifest": (cmd_manifest, None),
-            "isolation-test": (cmd_isolation, None)}
+            "isolation-test": (cmd_isolation, None), "repair-journal": (cmd_repair_journal, "order")}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -399,13 +537,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--as-of-signal")
     ap.add_argument("--skip-fetch", action="store_true")
     a = ap.parse_args(argv)
-    x = Ctx(a)
+    try:
+        x = Ctx(a, open_journal=a.command != "repair-journal")
+    except Exception as e:  # noqa: BLE001 - config / journal damage: every command would die silently in cron
+        return startup_failure(a, e)
     fn, lock = COMMANDS[a.command]
     if lock is None:
         return fn(x, a)
     try:
         with process_lock(x.paths.locks, lock):
-            return fn(x, a)
+            try:
+                return fn(x, a)
+            finally:
+                if lock == "order" and x.journal is not None:
+                    try:                        # keep the ledger cache current on every exit path, crash included
+                        write_ledger(x)
+                    except Exception:  # noqa: BLE001 - the original error is the one to report
+                        log.exception("ledger cache not written")
     except LockBusy:
         log.info("%s: another run holds the %s lock; exiting", a.command, lock)
         return 0
@@ -413,6 +561,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.exception("%s crashed", a.command)
         x.notify(f"ALERT CRASH {a.command}: {type(e).__name__}: {str(e)[:300]}")
         return 9
+
+
+def startup_failure(a: argparse.Namespace, e: BaseException) -> int:
+    """Ctx could not be built (config invalid, journal torn / seq gap). Report on stderr and, once per day per
+    command, on Telegram straight from the secrets file (the normal notify path needs the Ctx that failed)."""
+    home = Path(a.home).resolve() if a.home else CF.HOME
+    text = f"MOM ALERT STARTUP {a.command}: {type(e).__name__}: {str(e)[:300]}"
+    if "torn" in str(e):
+        text += " | at the Pi: ./momentum repair-journal"
+    print(text, file=sys.stderr)
+    try:
+        logs = home / "logs"
+        logs.mkdir(exist_ok=True)
+        mark = logs / f"startup_alert_{util.today().isoformat()}_{a.command}"
+        if not mark.exists():
+            from .telegram import Bot, load_secrets
+            tok, chat = load_secrets(home / "secrets")
+            if Bot(tok, chat, 1, 0).send(text):
+                mark.write_text(text, encoding="utf-8")
+    except Exception as e2:  # noqa: BLE001 - nothing more can be done from here; stderr has it
+        print(f"startup alert not sent: {type(e2).__name__}", file=sys.stderr)
+    return 8
 
 
 if __name__ == "__main__":

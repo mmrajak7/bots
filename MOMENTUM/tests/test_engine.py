@@ -188,7 +188,7 @@ class TestThreeWay(Harness):
         self.run_day(fill=fill)
         self.assertEqual(E.three_way(self.env(), {}, "2026-12-01"), [])
         self.k.holdings_qty["INE000000001"] -= 5                 # someone sold book shares by hand
-        self.assertEqual(len(E.three_way(self.env(), {}, "2026-12-01")), 2)
+        self.assertEqual(len(E.three_way(self.env(), {}, "2026-12-01")), 1)
 
 
 class TestCAToday(Harness):
@@ -305,6 +305,25 @@ class TestFailures(Harness):
         self.assertNotIn("OWNER_HOLD", lg.positions["2612-01"].overlays)
         self.assertEqual(lg.positions["2612-01"].leg, "PENDING_BUY")      # second tap ignored ("already done")
         self.assertTrue(any("already done" in t for t, _ in self.sent))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestTradesLag(Harness):
+    def test_standin_fill_then_real_trade_not_double_counted(self) -> None:
+        def fill_no_trade(o):  # noqa: ANN001  - order book says filled, trades() lags
+            o.status, o.filled_quantity, o.average_price = "COMPLETE", o.quantity, o.price
+        self.run_day(fill=fill_no_trade)
+        lg = L.replay(self.j.read())
+        q1 = lg.positions["2612-01"].filled_qty
+        self.assertGreater(q1, 0)
+        o = self.k.orders_[0]                                   # the real trade shows up later the same day
+        self.k.trades_.append({"trade_id": "late1", "order_id": o.order_id, "quantity": o.quantity,
+                               "average_price": o.price, "exchange_timestamp": "x"})
+        E.reconcile(self.env(), "2026-12-01")
+        self.assertEqual(L.replay(self.j.read()).positions["2612-01"].filled_qty, q1)
 
 
 if __name__ == "__main__":

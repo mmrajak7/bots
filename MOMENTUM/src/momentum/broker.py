@@ -29,7 +29,25 @@ log = logging.getLogger("momentum.broker")
 TAG_RE = re.compile(r"^M\d{4}[SBURPX]\d{2}A\d$")
 LEG_LETTER = {"sell": "S", "buy": "B", "topup": "U", "residual": "R", "piece": "P", "test": "X"}
 
+# Kite order states that can never trade again. Every other state (OPEN, OPEN PENDING, MODIFY PENDING, VALIDATION
+# PENDING, PUT ORDER REQ RECEIVED, TRIGGER PENDING, ...) is treated as LIVE: it is cancelled at 15:28 / on KILL and it
+# blocks a second order on the same (position, leg).
+DEAD_ORDER_STATES = frozenset({"COMPLETE", "CANCELLED", "REJECTED"})
+
 _ipv4_patched = False
+
+
+def order_state(o: Dict[str, Any]) -> str:
+    return str(o.get("status") or "").upper()
+
+
+def order_is_live(o: Dict[str, Any]) -> bool:
+    return order_state(o) not in DEAD_ORDER_STATES
+
+
+def reject_text(o: Dict[str, Any]) -> str:
+    """The exchange / RMS reason of a REJECTED order-book row (Kite: status_message, status_message_raw)."""
+    return f"{o.get('status_message') or ''} {o.get('status_message_raw') or ''}".strip()
 
 
 def patch_ipv4() -> None:
@@ -209,6 +227,8 @@ class Broker:
             raise BrokerRefused(f"qty {qty}")
         if qty * limit > max_rupees + 1e-6:
             raise BrokerRefused(f"qty x limit {qty * limit:.2f} > max rupees {max_rupees}")
+        if limit <= 0 or limit > cap_price + 1e-6 or qty * cap_price > max_rupees + 1e-6:
+            raise BrokerRefused(f"limit {limit} / cap {cap_price} x qty {qty} outside the envelope ({max_rupees})")
         # step 1: the journal
         lg = L.replay(self.j.read())
         if intent_id in lg.intents:
@@ -228,8 +248,7 @@ class Broker:
         # step 2: the broker's own order book (a tag with this (position, leg) prefix placed today)
         pre = tag_prefix(tag)
         # A REJECTED order never lived, so it does not block the one corrected retry (E12); any other status does.
-        clash = [t for t, o in self._today_tags().items()
-                 if t.startswith(pre) and str(o.get("status", "")).upper() != "REJECTED"]
+        clash = [t for t, o in self._today_tags().items() if t.startswith(pre) and order_state(o) != "REJECTED"]
         if clash:
             raise BrokerRefused(f"order book already has {clash} for {pre}")
         # steps 3-6
@@ -253,8 +272,13 @@ class Broker:
 
     def modify_price(self, intent_id: str, order_id: str, step_no: int, new_limit: float) -> bool:
         why = self._refuse_reason()
-        if why == "KILL":
-            raise BrokerRefused("KILL")
+        if why:                                  # KILL, dry mode or no ARM: a re-price is a broker write like any other
+            raise BrokerRefused(why)
+        caps = [r["cap_price_paise"] for r in self.j.read() if r["type"] == "INTENT" and r["intent_id"] == intent_id
+                and "cap_price_paise" in r]
+        if not caps or L.paise(new_limit) > int(caps[-1]) or new_limit <= 0:
+            raise BrokerRefused(f"re-price {new_limit} above the 15:10 cap of {intent_id} "
+                                f"({caps[-1] / 100 if caps else 'no INTENT'})")
         self.j.append("MODIFY_INTENT", intent_id=intent_id, order_id=order_id, step_no=step_no,
                       new_limit_paise=L.paise(new_limit))
         self.j.append("MODIFY_SENT", intent_id=intent_id, order_id=order_id, step_no=step_no)
@@ -286,9 +310,11 @@ def classify_reject(msg: str) -> str:
     """Map a Kite rejection text to the spec's classes. Texts are UNVERIFIED (U5, U27): unknown -> REJECTED_OTHER,
     which goes to the owner (the safe default)."""
     m = msg.lower()
-    if "circuit" in m or "price band" in m or "outside" in m and "range" in m:
+    if "tokenexception" in m or "permissionexception" in m or "api_key" in m or "access_token" in m:
+        return "REJECTED_AUTH"          # the session died (FIFTY re-login?): nothing was sent; next session, no hold
+    if "circuit" in m or "price band" in m or ("outside" in m and "range" in m):
         return "REJECTED_BAND"
-    if "market" in m and ("closed" in m or "not open" in m):
+    if ("market" in m and ("closed" in m or "not open" in m)) or "after market order" in m or "amo" in m.split():
         return "REJECTED_CLOSED"
     if "margin" in m or "insufficient" in m or "funds" in m or "rms" in m:
         return "REJECTED_RMS"

@@ -14,7 +14,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import util
 
@@ -92,8 +92,16 @@ def new_approval_id() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(8))
 
 
-def poll_once(bot: Bot, inbox: Path, offset_file: Path, kill_file: Path) -> int:
-    """One getUpdates round. -> number of inbox items written."""
+HELP = ("kill | hold <isin> | release <isin> | resolve <intent> found|absent | filled <intent> <qty> <avg_price> | "
+        "ack | status")
+
+
+def poll_once(bot: Bot, inbox: Path, offset_file: Path, kill_file: Path,
+              status_fn: Optional[Callable[[], str]] = None) -> int:
+    """One getUpdates round. -> number of inbox items written.
+    `status` is read-only, so it is answered here at once (status_fn); every other command and every tap waits in
+    the inbox for the order process. One inbox file per update id: an update Telegram hands out twice (crash before
+    the offset was saved) is written once."""
     try:
         offset = int(offset_file.read_text().strip())
     except (FileNotFoundError, ValueError):
@@ -120,18 +128,22 @@ def poll_once(bot: Bot, inbox: Path, offset_file: Path, kill_file: Path) -> int:
                 log.warning("ignored message from chat %s", chat)
                 continue
             if not mt:
-                bot.send(f"unknown command: {text[:60]} (kill | hold <isin> | release <isin> | "
-                         "resolve <intent> found|absent | status)")
+                bot.send(f"unknown command: {text[:60]} ({HELP})")
                 continue
             cmd, args = mt.group(1).lower(), (mt.group(2) or "").strip()
             if cmd == "kill":
                 util.write_atomic(kill_file, json.dumps({"by": "telegram", "chat_id": chat,
                                                          "at": util.now().isoformat()}) + "\n")
                 bot.send("KILL set: no new momentum orders; open book orders will be cancelled by tag.")
+            if cmd == "status" and status_fn is not None:
+                bot.send("MOM " + status_fn())
+                continue
             item = {"kind": "cmd", "cmd": cmd, "args": args, "update_id": u["update_id"]}
         if item:
             item["received_at"] = util.now().isoformat(timespec="seconds")
-            name = f"{util.now().strftime('%Y%m%dT%H%M%S')}_{u['update_id']}.json"
+            name = f"{int(u['update_id']):015d}.json"      # sorts in arrival order; the same update = the same file
+            if (inbox / name).exists() or (inbox / "done" / name).exists():
+                continue
             util.write_json_atomic(inbox / name, item)
             n += 1
     util.write_atomic(offset_file, f"{offset}\n")

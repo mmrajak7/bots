@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -17,9 +18,17 @@ REQUIRED_KEYS = (
     "mode", "account_user_id", "book_cash_open", "n_hold", "charges_reserve", "buy_ltp_mult", "buy_cap_mult",
     "ladder", "cancel_at", "last_place_at", "lock_tries", "vet_timeout_s", "kite_rps", "kite_retry_s",
     "token_poll_s", "token_first_poll", "token_deadline", "plan_final", "audit_ret", "audit_factor", "audit_kite_pp",
-    "price_freeze", "tg_retries", "tg_retry_s", "min_free_gb", "rms_max", "defer_max", "fifty_token_file",
-    "fifty_db_file", "holiday_file", "nse_data", "claude_bin", "claude_version", "units_open", "nav_open",
+    "price_freeze", "tg_retries", "tg_retry_s", "min_free_gb", "rms_max", "defer_max", "token_file",
+    "holiday_file", "nse_data", "claude_bin", "claude_version", "units_open", "nav_open",
+    "step_plan_at", "place_at", "reconcile_at", "token_alert_at", "ladder_grace_min", "band_max",
+    "arm_cap_rupees_default", "charges_rates", "srs_dir", "audit_top_n", "sell_rank", "backup_dir",
+    "probe_reads", "probe_wait_s",
 )
+TIME_KEYS = ("step_plan_at", "place_at", "last_place_at", "cancel_at", "reconcile_at", "token_first_poll",
+             "token_alert_at", "token_deadline", "plan_final")
+CHARGE_KEYS = ("brokerage", "stt_buy", "exchange_txn", "sebi", "stamp_buy", "gst_on")
+# Hard ceiling on the buy price multipliers: a config typo (1.10 for 1.010) must never become a 10% chase.
+MAX_BUY_MULT = Decimal("1.03")
 
 
 class ConfigError(Exception):
@@ -129,10 +138,41 @@ def load(home: Optional[Path] = None, overrides: Optional[Dict[str, Any]] = None
     for k in ("book_cash_open", "n_hold", "lock_tries", "rms_max", "defer_max", "units_open"):
         if not isinstance(cfg[k], int) or cfg[k] <= 0:
             raise ConfigError(f"{k} must be a positive int")
+    for k in ("band_max", "probe_reads", "probe_wait_s", "ladder_grace_min", "arm_cap_rupees_default", "vet_timeout_s", "kite_rps", "tg_retries",
+              "audit_top_n"):
+        if not isinstance(cfg[k], int) or isinstance(cfg[k], bool) or cfg[k] <= 0:
+            raise ConfigError(f"{k} must be a positive int")
     ladder: List[str] = cfg["ladder"]
-    if ladder != sorted(ladder) or not ladder:
+    if not isinstance(ladder, list) or not ladder:
         raise ConfigError("ladder times must be a non-empty ascending list")
+    for k, v in [(k, cfg[k]) for k in TIME_KEYS] + [("ladder", x) for x in ladder]:
+        if not _is_hhmm(v):
+            raise ConfigError(f"{k}: {v!r} is not a HH:MM time")
+    if ladder != sorted(ladder):
+        raise ConfigError("ladder times must be a non-empty ascending list")
+    # the session's order of events; equal times are allowed only where the engine defines them (place cut-off =
+    # first ladder slot)
+    if not (cfg["step_plan_at"] < cfg["place_at"] < cfg["last_place_at"] <= ladder[0]
+            and ladder[-1] < cfg["cancel_at"] < cfg["reconcile_at"]):
+        raise ConfigError("times must run step_plan_at < place_at < last_place_at <= ladder < cancel_at < "
+                          "reconcile_at")
+    try:
+        ltp_m, cap_m = Decimal(str(cfg["buy_ltp_mult"])), Decimal(str(cfg["buy_cap_mult"]))
+        reserve = Decimal(str(cfg["charges_reserve"]))
+        rates = {k: Decimal(str(cfg["charges_rates"][k])) for k in CHARGE_KEYS}
+    except (InvalidOperation, KeyError, TypeError) as e:
+        raise ConfigError(f"buy multipliers / charges are not decimal numbers: {e!r}") from e
+    if not (Decimal(1) <= ltp_m <= cap_m <= MAX_BUY_MULT):
+        raise ConfigError(f"need 1 <= buy_ltp_mult <= buy_cap_mult <= {MAX_BUY_MULT}, got {ltp_m}, {cap_m}")
+    if not (Decimal(0) <= reserve < Decimal("0.05")) or any(v < 0 or v >= 1 for v in rates.values()):
+        raise ConfigError("charges_reserve / charges_rates out of range")
     return cfg
+
+
+def _is_hhmm(v: Any) -> bool:
+    if not isinstance(v, str) or len(v) != 5 or v[2] != ":" or not (v[:2] + v[3:]).isdigit():
+        return False
+    return int(v[:2]) < 24 and int(v[3:]) < 60
 
 
 def paths(home: Optional[Path] = None, state: Optional[Path] = None) -> Paths:

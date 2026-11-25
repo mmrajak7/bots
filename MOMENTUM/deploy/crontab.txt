@@ -8,4 +8,5 @@
 40 14 * * 1-5     $M afternoon      # 14:45 plan + vet, 15:10 place, ladder, 15:28 cancel, 15:35 reconcile
 */5 15 * * 1-5    $M afternoon      # resume after a crash/reboot (never a new buy after 15:15)
 0 16 * * 1-5      $M watch
+10,40 16 * * 1-5  $M afternoon      # late resume: a reboot after 15:55 still reconciles from today's order book
 */5 * * * *       $M-poller-keepalive

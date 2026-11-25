@@ -185,6 +185,14 @@ class TestControl(Base):
         p.write_text('{"api_key": "k", "access_')                                         # torn write
         self.assertIsNone(C.read_token(p, "QSK814")[0])
 
+    def test_yl6478_naive_timestamp_is_ist(self) -> None:
+        """The personal account's token file (Helper bots) writes generated_at without a zone: read as IST."""
+        p = self.tmp / "tok.json"
+        p.write_text(json.dumps({"api_key": "k", "access_token": "a", "user_id": "YL6478", "valid_until": "x",
+                                 "generated_at": "2026-12-01T08:45:05.239900"}))
+        self.assertIsNotNone(C.read_token(p, "YL6478")[0])
+        self.assertIsNone(C.read_token(p, "QSK814")[0])
+
     def test_fifty_kill_unreadable_is_active(self) -> None:
         self.assertTrue(C.fifty_kill_switch(self.tmp / "nope.db")[0])
 

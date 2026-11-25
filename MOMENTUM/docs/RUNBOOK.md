@@ -1,5 +1,11 @@
 # MOMENTUM — Pi runbook (December 2026 slice: buys only, 5L)
 
+**Account (owner 2026-11-25): the PERSONAL account YL6478, December 2026 to March 2027.** The book reads the token
+the Helper bots refresh at ~08:45 (`BOTS/data/kite_access_token.json`), never logs in. Keep the 5L as FREE cash on
+top of the option bots' margin: the 15:10 cash guard stops the buys otherwise. DDPI must be active on the personal
+demat before the first sell (1 Jan). Only the book's own kill (`kill` / `control/KILL`) stops it. The company account
+(QSK814, 50L) starts fresh from the April 2027 rebalance; it has no market-data permission, so that needs work first.
+
 Design: `SRS/MOMENTUM_FROZEN_DESIGN.md` · Build spec: `SRS/MOMENTUM_BUILD_SPEC_DEC1.md` · Log: `docs/BUILD_LOG.md`.
 
 ## 1. Install (owner at the Pi)
@@ -9,7 +15,8 @@ Design: `SRS/MOMENTUM_FROZEN_DESIGN.md` · Build spec: `SRS/MOMENTUM_BUILD_SPEC_
 2. `cd ~/Desktop/BOTS/MOMENTUM && bash deploy/setup.sh` → venv, wrappers, crontab block. Prints the manifest check.
 3. `./momentum isolation-test` → must print `"pass": true` (the vet has no tools on this CLI version).
 4. `./momentum canary` → Telegram silent = OK; an ALERT means the vet path is broken.
-5. Send `status` to the new bot in Telegram → the book status comes back (poller works).
+5. Send `status` to the new bot in Telegram → the book status comes back within ~30 s (the poller answers `status`
+   itself; every other command and every button waits for the next order step: 08:35, 14:45, evening).
 
 Nothing trades until BOTH: `config/momentum.json` has `"mode": "live"` AND `control/ARM.json` covers the month.
 
@@ -18,6 +25,10 @@ Nothing trades until BOTH: `config/momentum.json` has `"mode": "live"` AND `cont
 - DRY-2 afternoon (Mon 30 Nov 14:40): `./momentum afternoon --dry` → real quotes, vet call, limits, quantities; no order.
 
 ## 3. Arm December (owner, by hand, after the dry runs pass)
+After writing `"mode": "live"`: the poller restarts itself onto the live state within 5 minutes (or run
+`./momentum-poller-keepalive` after `pkill -f "momentum.cli poller"`). Send `status`: the reply must NOT start with
+`[DRY]`. Until then taps and commands would land in the dry-run inbox. Only `mode: automatic` ARMs trade in this
+slice; an `approve_each` ARM places nothing (ALERT ARM_MODE).
 `config/momentum.json`:
 ```json
 {"mode": "live"}
@@ -42,4 +53,17 @@ Nothing trades until BOTH: `config/momentum.json` has `"mode": "live"` AND `cont
 | 16:00 | HEARTBEAT |
 
 Commands to the bot: `kill` (stops everything; cancels open book orders by tag), `hold <ISIN>`, `release <ISIN>`,
-`resolve <intent_id> found|absent`, `status`. Un-kill: delete `control/KILL` at the Pi.
+`resolve <intent_id> found|absent`, `filled <intent_id> <qty> <avg_price>`, `ack`, `status`. Un-kill: delete
+`control/KILL` at the Pi.
+
+## 5. Alerts that need you (review 2026-11-25)
+| Alert | Meaning | What to do |
+|---|---|---|
+| `STARTUP ... torn write` | power cut while a journal line was being written; every command stops | at the Pi: `./momentum repair-journal` (moves the unfinished last line aside), then nothing else |
+| `NO_PLAN` (08:35) | the ARM covers this month but no FINAL plan exists | `./momentum evening --as-of-signal <last session of last month>` |
+| `PROBE_FAILED` | the first order was rejected / not seen in the order book; the other buys wait a session | read the reason in the alert before the next session |
+| `HOLD <sym> ... rejected (REJECTED_RMS, 3 in a row)` | no cash for the book three sessions running | fund the account, tap Buy |
+| `NO_CIRCUIT` | the quote had no upper circuit limit, so the limit could not be clamped | nothing; it retries next session (no lock try); if it hits every name, the Kite field changed |
+| `THREE_WAY` (16:00) / `opening holdings below the book` (preflight) | Kite and the book disagree | check Kite, then send `ack` |
+| `STALE_INTENT` / `ORPHAN` / `ORDER_MISSING` | an order was never reconciled | contract note → `filled ...` or `resolve ... absent` |
+| `CANCEL_FAILED` | the 15:28 cancel was not confirmed | look at Kite's order book; DAY orders end at the close |

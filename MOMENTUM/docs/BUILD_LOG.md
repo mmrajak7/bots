@@ -69,3 +69,20 @@
   easy"); YES to all five: P0 ARM (automatic, 2026-11-30..2026-12-31, cap 5.5L/session); December gate = buy-path
   tests (full replay = January gate); BE/BZ buy -> OWNER_HOLD; first-order probe; 2-share TEST buy on Mon 30 Nov
   (to build: P0-T ARM, approve-each, tag M2611X01A1).
+- Independent review 2026-11-25 (docs/REVIEW_2026-11-25.md): 36 fixes (tests/test_review.py, 46 tests); 87/87.
+  Main ones: order-book REJECTED rows now classified (RMS x3 / band x1 / other -> OWNER_HOLD; the probe passes only
+  on a first order settled OPEN / COMPLETE); cash guard read at 15:10; journal append safe with two processes + `repair-journal`;
+  every non-dead order state is cancelled at 15:28 / on KILL; a crash-time order is found by tag before the ladder
+  and the cancel; ledger.json check no longer blocks on a stale cache (journal_seq); approve_each ARM places nothing;
+  three-way check tolerant of U6; startup failures alert; poller follows the mode; vet timeout kills the process group.
+  New config keys: reconcile_at, ladder_grace_min, token_alert_at, band_max, probe_reads, probe_wait_s, backup_dir.
+  Cron: afternoon also at 16:10 / 16:40. NOT yet run on the Pi (fcntl lock, killpg): run the unit suite there first.
+- Fable independent review 11-25 (docs/REVIEW_2026-11-25.md): 46 findings, 36 fixed (1 Critical: approve_each ARM
+  traded as automatic -> now places nothing; 7 High fixed), tests 41 -> 87. My line review of the order path:
+  broker/place_all/probe/after_reject OK; found + fixed a double count in the reviewer's new stand-in fill (trades()
+  lag -> stand-in at the order average, then the real trade booked again). Test added: 88/88. Manifest regenerated.
+- Owner 2026-11-25: Dec 2026-Mar 2027 in the PERSONAL account YL6478 (token ../data/kite_access_token.json, ~08:45,
+  naive generated_at read as IST - test), company QSK814 fresh at 50L from the 1 Apr 2027 rebalance (no scale-up /
+  top-up then). Own kill only (FIFTY kill-switch check removed from preflight). Reason found: QSK814's API has NO
+  market-data permission (quote() raises PermissionException, memory project_accounts) - the engine needs quote()
+  at 14:45/15:10 and historical() in the evening. April needs market data on QSK or a two-token design. 89/89.

@@ -10,6 +10,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any, Dict, Iterator, List, Optional
 
 from . import util
@@ -28,6 +29,10 @@ class JournalError(Exception):
 
 class LockBusy(Exception):
     pass
+
+
+TAIL_BYTES = 1 << 16            # the last record is found in the file's tail; a longer record falls back to a full read
+APPEND_LOCK_WAIT_S = 30         # how long one append waits for another process's append before failing loudly
 
 
 class Journal:
@@ -61,25 +66,108 @@ class Journal:
             out.append(rec)
         return out
 
+    def _tail_seq(self) -> int:
+        """seq of the last record ON DISK (another process may have appended since this object was built).
+        A torn last line raises: nothing is appended behind a damaged record."""
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            return 0
+        if size == 0:
+            return 0
+        with open(self.path, "rb") as f:
+            start = max(0, size - TAIL_BYTES)
+            f.seek(start)
+            chunk = f.read()
+        if not chunk.endswith(b"\n"):
+            raise JournalError(f"{self.path}: the last line has no line end (torn write?)")
+        lines = chunk[:-1].split(b"\n")
+        if start > 0 and len(lines) < 2:          # the tail holds only part of one very long record
+            recs = self.read()
+            return int(recs[-1]["seq"]) if recs else 0
+        try:
+            return int(json.loads(lines[-1].decode("utf-8"))["seq"])
+        except (ValueError, KeyError, TypeError) as e:
+            raise JournalError(f"{self.path}: the last line is not a journal record (torn write?): {e}") from e
+
     def append(self, type_: str, **fields: Any) -> Dict[str, Any]:
+        """One record, flushed and fsynced. Safe with more than one process (the 16:00 watch or a hand-run
+        kill-cancel beside the order process): the append takes a short file lock and numbers the record from the
+        file's real tail, so two writers can never produce the same seq (which would brick every later read)."""
         t = ("DRY_" + type_) if self.dry and not type_.startswith("DRY_") else type_
         base = t[4:] if t.startswith("DRY_") else t
         if base not in RECORD_TYPES:
             raise JournalError(f"unknown record type {type_}")
-        rec = {"seq": self._seq + 1, "ts": util.now().isoformat(timespec="seconds"), "type": t}
         for k in fields:
-            if k in rec:
+            if k in ("seq", "ts", "type"):
                 raise JournalError(f"field {k} is reserved")
-        rec.update(fields)
-        line = json.dumps(rec, sort_keys=True, ensure_ascii=False)
-        if "\n" in line:
-            raise JournalError("record serialises with a newline")
-        with open(self.path, "a", encoding="utf-8", newline="\n") as f:
-            f.write(line + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        self._seq += 1
+        with _append_lock(self.path):
+            rec = {"seq": self._tail_seq() + 1, "ts": util.now().isoformat(timespec="seconds"), "type": t}
+            rec.update(fields)
+            line = json.dumps(rec, sort_keys=True, ensure_ascii=False)
+            if "\n" in line:
+                raise JournalError("record serialises with a newline")
+            with open(self.path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            self._seq = rec["seq"]
         return rec
+
+
+def repair_torn_tail(path: Path) -> Optional[str]:
+    """Owner-run repair (cli `repair-journal`) after a power cut: if the LAST line is not a complete record, move
+    that fragment to <journal>.torn.<time> and cut it off. -> the fragment, or None when the journal is whole.
+    Safe by the journal-before-call order: an unfinished INTENT or SENT means the broker call was never made; an
+    unfinished RESULT leaves the intent SENT, which the reconcile settles by tag. Never touches a complete line."""
+    if not path.exists():
+        return None
+    raw = path.read_bytes()
+    if not raw:
+        return None
+    cut = raw.rfind(b"\n") + 1                   # start of the last (possibly unfinished) line
+    tail = raw[cut:]
+    if not tail:                                  # ends with a line end: check that the last full line parses
+        prev = raw[:-1].rfind(b"\n") + 1
+        try:
+            rec = json.loads(raw[prev:-1].decode("utf-8"))
+            if isinstance(rec, dict) and "seq" in rec and "type" in rec:
+                return None
+        except ValueError:
+            pass
+        cut, tail = prev, raw[prev:]
+    side = path.with_name(f"{path.name}.torn.{util.now().strftime('%Y%m%dT%H%M%S')}")
+    side.write_bytes(tail)
+    with open(path, "r+b") as f:
+        f.truncate(cut)
+        f.flush()
+        os.fsync(f.fileno())
+    return tail.decode("utf-8", errors="replace")
+
+
+@contextlib.contextmanager
+def _append_lock(journal_path: Path) -> Iterator[None]:
+    """Blocking exclusive lock on a side file (never on the journal itself: a Windows byte lock would stop readers)."""
+    f = open(journal_path.with_name(journal_path.name + ".lock"), "a+")
+    try:
+        deadline = time.monotonic() + APPEND_LOCK_WAIT_S
+        while True:
+            try:
+                if os.name == "posix":
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:  # Windows dev PC
+                    import msvcrt
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as e:
+                if time.monotonic() >= deadline:
+                    raise JournalError(f"journal append lock busy for {APPEND_LOCK_WAIT_S} s") from e
+                time.sleep(0.05)
+        yield
+    finally:
+        f.close()
 
 
 @contextlib.contextmanager
