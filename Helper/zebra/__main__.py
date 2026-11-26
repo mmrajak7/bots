@@ -1754,6 +1754,64 @@ def cmd_depth(args):
     return 0
 
 
+def _naked_mode(args) -> str:
+    """`--mode`, else the armed mode, else live (the file that matters)."""
+    from . import config as cfg
+    m = getattr(args, 'mode', None)
+    if m:
+        return m
+    return cfg.NAKED_LIVE if cfg.NAKED_LIVE in ('rehearsal', 'live') else 'live'
+
+
+def _cli_sender() -> str:
+    import getpass
+    try:
+        return 'cli:%s' % getpass.getuser()
+    except Exception:
+        return 'cli'
+
+
+def cmd_halt(args):
+    """Trip the naked entry kill by hand, or show the halt state.
+
+    G13: the owner trips it when a review reads FAIL. Stops NEW naked entries
+    only; exits keep running. Prints the one-time restart code.
+    """
+    from datetime import datetime as _dt
+    from . import naked_halt
+    mode = _naked_mode(args)
+    if args.status or not args.reason:
+        print(naked_halt.summary(mode))
+        if not args.status:
+            print()
+            print('(to halt: python -m zebra halt --reason "..." [--mode %s])' % mode)
+        return
+    try:
+        ev = naked_halt.halt(mode, args.reason, _dt.now(), _cli_sender())
+    except ValueError as e:
+        print('NOT HALTED: %s' % e)
+        sys.exit(1)
+    print('naked %s entries KILLED at %s: %s' % (mode, ev['at'], ev['reason']))
+    print('restart code: %s   ->   python -m zebra resume %s --mode %s'
+          % (ev['code'], ev['code'], mode))
+
+
+def cmd_resume(args):
+    """Clear a naked kill with its one-time code (Q7 backup channel). The peak
+    resets to equity on the next cycle. Never clears a pause or a limit."""
+    from datetime import datetime as _dt
+    from . import naked_halt
+    mode = _naked_mode(args)
+    try:
+        naked_halt.resume(mode, args.code, _dt.now(), _cli_sender())
+    except (ValueError, naked_halt.HaltUnreadable) as e:
+        print('NOT RESUMED: %s' % e)
+        sys.exit(1)
+    print('naked %s entries RESUMED; the peak resets to equity on the next cycle'
+          % mode)
+    print(naked_halt.summary(mode))
+
+
 def cmd_status(args):
     # WHOLE BOOK: the dashboard is the one place that deliberately shows
     # everything, including the retired engine, so the operator can see what
@@ -2420,6 +2478,19 @@ def main():
                        help='seed OPEN cohort positions from their stored '
                             'value paths (exact: coverage runs from entry)')
     p_shd.set_defaults(func=cmd_shadow)
+
+    p_hlt = sub.add_parser(
+        'halt', help='Naked live: trip the entry kill by hand, or --status')
+    p_hlt.add_argument('--reason', default=None, help='why (required to halt)')
+    p_hlt.add_argument('--status', action='store_true', help='show the halt state only')
+    p_hlt.add_argument('--mode', choices=('rehearsal', 'live'), default=None)
+    p_hlt.set_defaults(func=cmd_halt)
+
+    p_rsm = sub.add_parser(
+        'resume', help='Naked live: clear a kill with its one-time code')
+    p_rsm.add_argument('code')
+    p_rsm.add_argument('--mode', choices=('rehearsal', 'live'), default=None)
+    p_rsm.set_defaults(func=cmd_resume)
 
     p_sts = sub.add_parser('status', help='Dashboard')
     p_sts.set_defaults(func=cmd_status)
