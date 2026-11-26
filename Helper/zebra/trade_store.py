@@ -100,8 +100,194 @@ _UNVERSIONED_SUFFIXES = ('_confirm', '_confirm_t')
 OPEN_STATUSES = ('watching', 'triggered', 'entered', 'closing', 'partial_close')
 
 
-def in_cohort(trade: dict, cohort: Optional[str] = None) -> bool:
-    """Was this position opened by the CURRENT engine?
+#: Structures a record in this store can carry. `back_ratio` is the dropped
+#: structure; its records predate the `structure` key, so absence means it.
+#: `naked_long` is the LIVE one-leg record (`docs/NAKED_LIVE_DESIGN.md` Q4):
+#: one long option bought on a cohort signal whose paper BCS twin entered.
+STRUCTURE_BCS = 'bcs'
+STRUCTURE_NAKED = 'naked_long'
+STRUCTURE_BACK_RATIO = 'back_ratio'
+KNOWN_STRUCTURES = (STRUCTURE_BCS, STRUCTURE_NAKED, STRUCTURE_BACK_RATIO)
+#: Pass as `structure=` to mean "every structure". Only readers that must SEE
+#: every position -- the money path, arming, liveness -- may use it.
+ANY_STRUCTURE = '*'
+
+
+def structure_of(trade: dict) -> str:
+    """The record's structure. RAISES on a value this code does not know.
+
+    Never defaults an unknown string to a known one: a reader that guesses
+    `back_ratio` values a one-leg record as two longs (design F11), and a
+    reader that guesses `bcs` reads a short leg that is not there.
+    """
+    s = trade.get('structure')
+    if s is None:
+        # Absence is read by ERA. The cohort engine only ever entered a BCS
+        # (127 of 127 stamped records on disk carry 'bcs'), so a stamped record
+        # without the key is a BCS written by a path that forgot it. An
+        # unstamped one predates the key and is the retired back ratio.
+        # A live naked record is never inferred: it is always written with
+        # its structure by `build_naked_record`.
+        return STRUCTURE_BCS if trade.get('cohort') else STRUCTURE_BACK_RATIO
+    if s not in KNOWN_STRUCTURES:
+        raise ValueError('trade #%s has unknown structure %r' % (trade.get('id'), s))
+    return s
+
+
+def is_naked(trade: dict) -> bool:
+    """A live one-leg naked record. Never raises (absent/odd = not naked)."""
+    return trade.get('structure') == STRUCTURE_NAKED
+
+
+#: The −50% stop of the tested arm: exit when the long's value is at or below
+#: this fraction of its entry value. MUST equal
+#: `structure_shadow.ARMS['naked_long']['stop_frac']` -- pinned by a test --
+#: because live has to run the rule the 100-trade test measured (design Q1).
+NAKED_STOP_FRAC = 0.50
+
+#: Fields a naked record must carry. Validated BEFORE any order (design F4):
+#: the BCS entry write raised AFTER real fills, which is how a live position
+#: ends up with no record.
+NAKED_REQUIRED = ('structure', 'status', 'paper', 'rehearsal', 'override',
+                  'parent_id', 'cohort', 'stock', 'direction', 'expiry',
+                  'tp_spot', 'entry_spot', 'exchange', 'spot_symbol',
+                  'long_symbol', 'long_strike', 'lot_size', 'lots', 'quantity',
+                  'entry_long_price', 'debit', 'capital', 'stop_frac',
+                  'stop_value', 'entry_date', 'entry_time')
+
+#: Keys that would make a reader treat a one-leg record as a spread. OMITTED,
+#: never None and never 0 (design Q4): a reader that sees `short_symbol: None`
+#: still goes down the two-leg path and fails there instead of here.
+NAKED_FORBIDDEN_PREFIXES = ('short_',)
+NAKED_FORBIDDEN_KEYS = ('width', 'debit_to_width_pct', 'debit_to_width_pct_mid',
+                        'shadow_of')
+
+
+def build_naked_record(parent: dict, *, long_symbol: str, long_strike: float,
+                       lot_size: int, fill_price: float, now: datetime,
+                       quote: Optional[dict] = None, rehearsal: bool = False,
+                       override: bool = False,
+                       order_ids: Optional[list] = None) -> dict:
+    """The live naked record for one filled long, built from its paper parent.
+
+    PURE: no store, no clock (``now`` is an argument), no config writes beyond
+    reading the stop fraction. Same signal fields as the parent (target,
+    expiry, direction) because live trades the parent's signal (design Q2);
+    its OWN entry price, the fill. ``id`` and ``version`` are assigned by
+    `ZebraStore.add_naked_live`.
+
+    Call it with the quoted ask as ``fill_price`` to DRY-CONSTRUCT the record
+    before any order: `validate_naked_record` then proves the write will
+    succeed while nothing has been bought yet.
+    """
+    q = quote or {}
+    lots = 1                      # 1 lot, start and stay (owner 2026-10-26)
+    qty = int(lot_size) * lots
+    fill = float(fill_price)
+    rec = {
+        'structure': STRUCTURE_NAKED,
+        'status': 'entered',
+        'paper': False,
+        'rehearsal': bool(rehearsal),
+        'override': bool(override),
+        'parent_id': parent.get('id'),
+        'cohort': parent.get('cohort'),
+        'stock': parent.get('stock'),
+        'direction': parent.get('direction'),
+        'timeframe': parent.get('timeframe'),
+        'st_value': parent.get('st_value'),
+        'expiry': parent.get('expiry'),
+        'tp_spot': parent.get('tp_spot'),
+        'entry_spot': parent.get('entry_spot'),
+        'exchange': 'NFO',
+        'spot_symbol': 'NSE:%s' % parent.get('stock'),
+        'long_symbol': long_symbol,
+        'long_strike': float(long_strike),
+        'lot_size': int(lot_size),
+        'lots': lots,
+        'quantity': qty,
+        # `debit` is kept as the per-share entry price so the generic readers
+        # (P&L, fees, the store's exit arithmetic) need no naked branch for it.
+        'entry_long_price': fill,
+        'debit': fill,
+        'capital': round(fill * qty, 2),
+        'stop_frac': NAKED_STOP_FRAC,
+        'stop_value': round(fill * NAKED_STOP_FRAC, 2),
+        'long_ask_entry': q.get('ask'),
+        'long_bid_entry': q.get('bid'),
+        'long_ask_qty_entry': q.get('ask_qty'),
+        'long_oi_entry': q.get('oi'),
+        'entry_date': now.strftime('%Y-%m-%d'),
+        'entry_time': now.strftime('%H:%M:%S'),
+        'entry_order_ids': list(order_ids or []),
+    }
+    return rec
+
+
+def validate_naked_record(rec: dict) -> list:
+    """Every reason this record must not be written. Empty list = valid.
+
+    Returns problems rather than raising so the entry path can log ALL of them
+    in one line before refusing; `add_naked_live` raises on any.
+    """
+    probs = []
+    for k in NAKED_REQUIRED:
+        if k not in rec or rec[k] is None:
+            probs.append('missing %s' % k)
+    for k in rec:
+        if k.startswith(NAKED_FORBIDDEN_PREFIXES) or k in NAKED_FORBIDDEN_KEYS:
+            probs.append('forbidden key %s (one-leg record)' % k)
+    if probs:
+        return probs
+    if rec['structure'] != STRUCTURE_NAKED:
+        probs.append('structure %r' % rec['structure'])
+    if rec['status'] != 'entered':
+        probs.append('status %r' % rec['status'])
+    if rec['paper'] is not False:
+        probs.append('paper must be False (a live record), got %r' % rec['paper'])
+    for k in ('rehearsal', 'override'):
+        if not isinstance(rec[k], bool):
+            probs.append('%s must be a bool' % k)
+    if isinstance(rec['parent_id'], bool) or not isinstance(rec['parent_id'], int):
+        probs.append('parent_id must be an int id')
+    if rec['direction'] not in ('CE', 'PE'):
+        probs.append('direction %r' % rec['direction'])
+    sym = rec['long_symbol']
+    if not isinstance(sym, str) or not sym.endswith(str(rec['direction'])):
+        probs.append('long_symbol %r does not match direction %r'
+                     % (sym, rec['direction']))
+    for k in ('long_strike', 'entry_long_price', 'tp_spot', 'entry_spot',
+              'debit', 'capital', 'stop_value'):
+        try:
+            v = float(rec[k])
+        except (TypeError, ValueError):
+            probs.append('%s not a number' % k)
+            continue
+        if not (v > 0) or v == float('inf'):
+            probs.append('%s must be a finite number > 0, got %r' % (k, rec[k]))
+    try:
+        lot, lots, qty = int(rec['lot_size']), int(rec['lots']), int(rec['quantity'])
+        if lot <= 0 or lots != 1 or qty != lot * lots:
+            probs.append('quantity %r must be exactly 1 lot of %r'
+                         % (rec['quantity'], rec['lot_size']))
+    except (TypeError, ValueError):
+        probs.append('lot_size/lots/quantity not integers')
+    try:
+        exp = datetime.strptime(str(rec['expiry'])[:10], '%Y-%m-%d').date()
+        ent = datetime.strptime(str(rec['entry_date']), '%Y-%m-%d').date()
+        if exp < ent:
+            probs.append('expiry %s before entry %s' % (exp, ent))
+        datetime.strptime(str(rec['entry_time']), '%H:%M:%S')
+    except ValueError:
+        probs.append('expiry/entry_date/entry_time not ISO')
+    if not rec['cohort']:
+        probs.append('cohort stamp empty')
+    return probs
+
+
+def in_cohort(trade: dict, cohort: Optional[str] = None,
+              structure: str = STRUCTURE_BCS) -> bool:
+    """Was this position opened by the CURRENT engine -- as `structure`?
 
     ONE definition, imported by every reader, because the alternative is each
     report inventing its own date test and them quietly disagreeing about what
@@ -111,11 +297,25 @@ def in_cohort(trade: dict, cohort: Optional[str] = None) -> bool:
     that predate the stamp were priced mid-mid, ran unvetted, and were made by
     an engine that no longer exists. Absence is the answer, not a reason to
     guess from `entry_date`.
+
+    **Structure defaults to `bcs`, deliberately (2026-11-26).** A live
+    `naked_long` record carries the cohort stamp (the exit adapter selects by
+    it), so without this every cohort reader -- ~a dozen of them call this
+    directly -- would pool real-money naked results into the paper BCS cohort,
+    shadow the live record into the 100-trade test as a second copy of its own
+    parent, and let it block the scanner. The default makes forgetting SAFE for
+    every number; the few readers that must see a naked record (the exit
+    engine, arming, liveness) opt in with `structure=STRUCTURE_NAKED` or
+    `ANY_STRUCTURE`, and each is pinned by a test.
     """
     stamped = trade.get('cohort')
     if not stamped:
         return False
-    return stamped == (cohort or cfg.COHORT_START)
+    if stamped != (cohort or cfg.COHORT_START):
+        return False
+    if structure == ANY_STRUCTURE:
+        return True
+    return structure_of(trade) == structure
 
 
 #: Statuses a signal passes through BEFORE it becomes a position. The cohort
@@ -126,7 +326,7 @@ def in_cohort(trade: dict, cohort: Optional[str] = None) -> bool:
 PRE_POSITION_STATUSES = ('watching', 'triggered')
 
 
-def scored(trades, cohort=None) -> list:
+def scored(trades, cohort=None, structure: str = STRUCTURE_BCS) -> list:
     """The ONLY population a measurement, report, scorecard or gate may use.
 
     OWNER DECISION, 2026-08-31: *"the old records are not to be used any more
@@ -154,11 +354,14 @@ def scored(trades, cohort=None) -> list:
     Signals that have not entered yet are excluded too, and that is not a
     judgement about them -- they carry no stamp because they carry no result.
     Use `in_flight` for the population a liveness check needs.
+
+    `structure` defaults to `bcs`: live naked results are their own book and
+    are read with `scored(trades, structure=STRUCTURE_NAKED)`, never pooled.
     """
-    return [t for t in trades if in_cohort(t, cohort)]
+    return [t for t in trades if in_cohort(t, cohort, structure)]
 
 
-def in_flight(trades) -> list:
+def in_flight(trades, structure: str = STRUCTURE_BCS) -> list:
     """Signals and positions the CURRENT engine still has work to do on.
 
     The complement of `scored` for the other question: not "what did we
@@ -169,10 +372,11 @@ def in_flight(trades) -> list:
     """
     return [t for t in trades
             if (t.get('status') in PRE_POSITION_STATUSES
-                or (t.get('status') == 'entered' and in_cohort(t)))]
+                or (t.get('status') == 'entered' and in_cohort(t, None, structure)))]
 
 
-def from_current_engine(trade: dict, cohort: Optional[str] = None) -> bool:
+def from_current_engine(trade: dict, cohort: Optional[str] = None,
+                        structure: str = STRUCTURE_BCS) -> bool:
     """Did THIS engine make this decision, whether or not it became a trade?
 
     Wider than `in_cohort`, and the difference is entirely about records that
@@ -196,7 +400,7 @@ def from_current_engine(trade: dict, cohort: Optional[str] = None) -> bool:
     stays: never re-derive a stamped record's era from a date.
     """
     if trade.get('cohort'):
-        return in_cohort(trade, cohort)
+        return in_cohort(trade, cohort, structure)
     if trade.get('status') not in ('watching', 'triggered', 'cancelled'):
         # An `entered`/`exited` record with no stamp is a legacy POSITION.
         # Absence is the answer there, exactly as `in_cohort` says.
@@ -205,14 +409,17 @@ def from_current_engine(trade: dict, cohort: Optional[str] = None) -> bool:
     return bool(start) and (trade.get('signal_date') or '')[:10] >= start
 
 
-def decided(trades, cohort=None) -> list:
+def decided(trades, cohort=None, structure: str = STRUCTURE_BCS) -> list:
     """Every decision this engine made -- taken, vetoed or abandoned.
 
     The population for the vetting scorecard and the post-mortem layer. Use
     `scored` for anything that produces a P&L number; a veto has no P&L and
     including it in one would be its own kind of nonsense.
+
+    A live naked record is not a separate DECISION (its paper BCS parent is
+    the decision), so the `bcs` default leaves it out of every vetting count.
     """
-    return [t for t in trades if from_current_engine(t, cohort)]
+    return [t for t in trades if from_current_engine(t, cohort, structure)]
 
 
 def is_paper_record(trade: dict) -> bool:
@@ -542,7 +749,9 @@ def cohort_split(trades: list, cohort: Optional[str] = None) -> tuple:
     because it is the one anybody is actually asking about."""
     want = cohort or cfg.COHORT_START
     current = [t for t in trades if in_cohort(t, want)]
-    legacy = [t for t in trades if not in_cohort(t, want)]
+    # Legacy = not this engine at ALL. A live naked record is this engine's
+    # (just not the BCS book), so it belongs in neither list.
+    legacy = [t for t in trades if not in_cohort(t, want, ANY_STRUCTURE)]
     return current, legacy
 
 
@@ -633,8 +842,16 @@ class ZebraStore:
     def get_triggered(self) -> list:
         return self.get_by_status('triggered')
 
-    def get_entered(self) -> list:
-        return self.get_by_status('entered')
+    def get_entered(self, include_naked: bool = False) -> list:
+        """Open positions of the zebra/BCS book.
+
+        Live `naked_long` records are EXCLUDED by default: every caller here
+        values, reviews, alerts on or auto-closes a two-leg paper position, and
+        a one-leg live record is booked only by `bcs/spread_monitor.py`. The
+        exit adapter asks for them explicitly with `include_naked=True`.
+        """
+        rows = self.get_by_status('entered')
+        return rows if include_naked else [t for t in rows if not is_naked(t)]
 
     def find(self, trade_id: int) -> Optional[dict]:
         for t in self._trades:
@@ -769,12 +986,18 @@ class ZebraStore:
         # from dedup and let duplicates open on one thesis. "Is this a shadow
         # of something else" is the property that actually matters, and it does
         # not change meaning when the structure does.
+        #
+        # A live `naked_long` record is the same kind of thing as a shadow
+        # here: a TWIN of a paper position (its `parent_id`), never a signal
+        # of its own. Letting it block would let a real-money position decide
+        # the paper population the 100-trade test measures (design Q5).
         with self._mutate():
             for t in self._trades:
                 if (t.get('stock') == stock
                         and t.get('timeframe') == timeframe
                         and t.get('direction') == direction
                         and t.get('shadow_of') is None
+                        and not is_naked(t)
                         and t.get('status') in OPEN_STATUSES):
                     raise ValueError(
                         f"{stock} {timeframe} {direction} already open as #{t['id']}"
@@ -1336,6 +1559,49 @@ class ZebraStore:
             return
         raise ValueError(f"#{trade_id} refused: {why}. Close something or "
                          f"raise the limit deliberately.")
+
+    def add_naked_live(self, record: dict) -> dict:
+        """Write a LIVE naked record built by `build_naked_record`.
+
+        Validated twice: by the caller BEFORE the order (dry-construct), and
+        here, inside the lock, against the book as it now stands. The parent
+        must be this engine's BCS position on the same stock and direction, and
+        a parent may have at most ONE live naked twin -- a retried cycle must
+        not be able to file the same fill twice.
+
+        Raises ValueError on any problem; never writes a partial record.
+        Returns a copy of the stored record (with its new id).
+        """
+        probs = validate_naked_record(record)
+        if probs:
+            raise ValueError('naked record refused: ' + '; '.join(probs))
+        with self._mutate():
+            parent = self._must_find(record['parent_id'])
+            if not in_cohort(parent):          # a cohort BCS position only
+                raise ValueError('#%s is not a cohort BCS position'
+                                 % record['parent_id'])
+            if (parent.get('stock'), parent.get('direction')) != \
+                    (record['stock'], record['direction']):
+                raise ValueError('#%s is %s %s, record is %s %s' % (
+                    parent['id'], parent.get('stock'), parent.get('direction'),
+                    record['stock'], record['direction']))
+            twin = next((t for t in self._trades if is_naked(t)
+                         and t.get('parent_id') == record['parent_id']), None)
+            if twin is not None:
+                raise ValueError('#%s already has live naked twin #%s'
+                                 % (record['parent_id'], twin['id']))
+            t = dict(record)
+            t['id'] = self._next_id()
+            t['version'] = 1
+            self._trades.append(t)
+            stored = copy.deepcopy(t)
+        logger.info("NAKED LIVE #%d %s %s %s @ %.2f x %d (parent #%d)%s%s",
+                    stored['id'], stored['stock'], stored['direction'],
+                    stored['long_symbol'], stored['entry_long_price'],
+                    stored['quantity'], stored['parent_id'],
+                    ' [rehearsal]' if stored['rehearsal'] else '',
+                    ' [override]' if stored['override'] else '')
+        return stored
 
     def mark_entered_bcs(self, trade_id: int, bcs: dict) -> dict:
         """Promote a signal straight into a BCS position — ONE record.

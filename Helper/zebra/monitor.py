@@ -54,8 +54,8 @@ from . import strikes as strikes_mod
 from . import vet as vet_mod
 from .scanner import _get_kite, get_ltp, compute_st_for_stock, validate_and_add
 from playbook.magnet import scanner as scanner_mod
-from .trade_store import (ZebraStore, get_store, in_cohort,
-                          is_paper_record, tp_latch, tp_latched,
+from .trade_store import (ANY_STRUCTURE, ZebraStore, get_store, in_cohort,
+                          is_naked, is_paper_record, tp_latch, tp_latched,
                           tp_touch_to_fill)
 
 logger = logging.getLogger(__name__)
@@ -4136,7 +4136,9 @@ def _cohort_population(trades) -> set:
     """
     pop = set()
     for t in trades or ():
-        if t.get('status') != 'entered' or not in_cohort(t):
+        # ANY structure: a live naked record is exactly the LIVE cohort record
+        # whose missing engine this verdict exists to announce (design Q9).
+        if t.get('status') != 'entered' or not in_cohort(t, None, ANY_STRUCTURE):
             continue
         # The UNSTAMPED class is read from the RAW field, deliberately not
         # through `is_paper_record` -- that helper answers "may zebra book
@@ -4564,7 +4566,12 @@ def check_entered(store: ZebraStore, kite, dry_run: bool = False) -> None:
     Dedup via persistent <kind>_alerted_at flags on each trade (survives
     cron restarts).
     """
-    entered = store.get_entered()
+    # A live `naked_long` record is booked by `bcs/spread_monitor.py` and by
+    # nothing else (design Q3/Q9). zebra skips it ENTIRELY -- it must not
+    # value it (no short leg), alert on it, auto-close it, or count it as an
+    # unmanaged live record for the heartbeat; the exit engine's own
+    # heartbeat and `common/arming` cover it.
+    entered = store.get_entered()  # excludes naked_long by default
     if not entered:
         return
 

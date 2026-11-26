@@ -248,6 +248,10 @@ def validate_and_add(store: ZebraStore, kite=None,
              and t.get('timeframe') == timeframe
              and t.get('direction') == direction
              and t.get('shadow_of') is None
+             # A live naked record is the real-money TWIN of a paper
+             # position; it must not block a paper signal (design Q5 --
+             # the 100-trade population is the paper book's).
+             and t.get('structure') != 'naked_long'
              and t.get('status') in ('watching', 'triggered', 'entered')),
             None
         )
@@ -283,6 +287,10 @@ def validate_and_add(store: ZebraStore, kite=None,
              if t.get('stock') == stock
              and t.get('direction') != direction
              and t.get('shadow_of') is None
+             # A live naked record is the real-money TWIN of a paper
+             # position; it must not block a paper signal (design Q5 --
+             # the 100-trade population is the paper book's).
+             and t.get('structure') != 'naked_long'
              and t.get('status') in ('watching', 'triggered', 'entered')),
             None
         )

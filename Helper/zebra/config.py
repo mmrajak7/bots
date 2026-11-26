@@ -625,6 +625,30 @@ _DEFAULTS = {
     'book_shock_pct': 3.0,
     'book_shock_beta_sessions': 60,
     'book_shock_beta_min': 30,
+    # ── LIVE NAKED LONG (docs/NAKED_LIVE_DESIGN.md, limits in
+    # docs/NAKED_100_TRADE_TEST.md section 11). `naked_live` is the ONLY arming
+    # switch for the one-leg real-money path: 'off' (nothing), 'rehearsal'
+    # (full path, fake journalled fills, records tagged rehearsal), 'live'
+    # (real orders; also needs the monitor crontab without --dry-run).
+    # Anything else is refused and read as 'off'.
+    'naked_live': 'off',
+    'naked_capital': 500000,           # Rs; the kill's equity starts here
+    'naked_max_open': 8,               # live naked positions at once, either side
+    'naked_max_premium': 25000,        # Rs per trade (ask x lot); skip, never resize.
+                                       # 25-30K is chosen by the owner at go-live.
+    'naked_pause_stops': 4,            # this many -50% stops ...
+    'naked_pause_window_sessions': 3,  # ... within this many sessions ...
+    'naked_pause_sessions': 2,         # ... pause new entries for this many
+    'naked_kill_drawdown_pct': 25.0,   # -% from peak equity INCL. open marks -> kill
+    'naked_slippage_kill_pct': 3.0,    # mean fill slippage, % of entry premium ...
+    'naked_slippage_window': 20,       # ... over the last N live fills -> kill
+    # Owner-override pilot (docs/NAKED_100_TRADE_TEST.md section 4): a hard
+    # rupee loss budget (realised + open marks) that kills new entries; 0 = off.
+    # The pilot is CONFIG ONLY: naked_max_open 4 + naked_loss_budget 75000 +
+    # naked_override true. `naked_override` labels every record it opens so no
+    # reader can mistake a pilot trade for evidence.
+    'naked_loss_budget': 0,
+    'naked_override': False,
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
     'time_sl_days_before_expiry': 6,
@@ -1429,6 +1453,49 @@ IV_RISK_FREE_RATE = _num('iv_risk_free_rate')
 BOOK_SHOCK_PCT = _num('book_shock_pct')
 BOOK_SHOCK_BETA_SESSIONS = _int('book_shock_beta_sessions')
 BOOK_SHOCK_BETA_MIN = _int('book_shock_beta_min')
+
+#: Values `naked_live` may take. Order matters only for readability.
+NAKED_LIVE_MODES = ('off', 'rehearsal', 'live')
+
+
+def _naked_live_mode() -> str:
+    """`naked_live`, strictly. Only an exact known string arms anything.
+
+    Same reasoning as `_strict_bool`: this decides whether real orders are
+    placed, so a typo (`"Live "`, `true`, `1`, `null`) must not be able to
+    arm the money path. Unknown -> 'off', loudly.
+    """
+    val = _runtime.get('naked_live', _DEFAULTS['naked_live'])
+    if isinstance(val, str) and val in NAKED_LIVE_MODES:
+        return val
+    logger.error("zebra_config.json: naked_live=%r is not one of %s -- read as "
+                 "'off'. The live naked path is never armed by inference.",
+                 val, NAKED_LIVE_MODES)
+    return 'off'
+
+
+def _non_negative_num(key: str) -> float:
+    """A finite number >= 0, where 0 is a documented MEANING ('off')."""
+    val, default = _runtime.get(key, _DEFAULTS[key]), _DEFAULTS[key]
+    if isinstance(val, bool) or not isinstance(val, (int, float))             or val != val or val in (float('inf'), float('-inf')) or val < 0:
+        logger.warning("zebra_config.json: %s=%r is not a finite number >= 0 "
+                       "-- using the default %r", key, val, default)
+        return float(default)
+    return float(val)
+
+
+NAKED_LIVE = _naked_live_mode()
+NAKED_CAPITAL = _num('naked_capital')
+NAKED_MAX_OPEN = _int('naked_max_open')
+NAKED_MAX_PREMIUM = _num('naked_max_premium')
+NAKED_PAUSE_STOPS = _int('naked_pause_stops')
+NAKED_PAUSE_WINDOW_SESSIONS = _int('naked_pause_window_sessions')
+NAKED_PAUSE_SESSIONS = _int('naked_pause_sessions')
+NAKED_KILL_DRAWDOWN_PCT = _num('naked_kill_drawdown_pct')
+NAKED_SLIPPAGE_KILL_PCT = _num('naked_slippage_kill_pct')
+NAKED_SLIPPAGE_WINDOW = _int('naked_slippage_window')
+NAKED_LOSS_BUDGET = _non_negative_num('naked_loss_budget')
+NAKED_OVERRIDE = _strict_bool('naked_override')
 
 
 def _stop_ladder() -> tuple:

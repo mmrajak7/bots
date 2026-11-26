@@ -97,6 +97,17 @@ def realised_pnl(trades: List[dict]) -> tuple:
     return total, costed, uncosted
 
 
+def _bcs_book(trades: List[dict]) -> List[dict]:
+    """The book THIS module budgets: everything except live `naked_long`.
+
+    A live naked record has its own capital, cap and kill
+    (`docs/NAKED_LIVE_DESIGN.md` Q5, `naked_*` config); counting it here would
+    let real-money positions use up paper slots and compound paper capital
+    with real P&L. Odd/absent structure stays IN -- fails toward counting.
+    """
+    return [t for t in (trades or []) if t.get('structure') != 'naked_long']
+
+
 def effective_capital(trades: List[dict]) -> tuple:
     """(rupees, basis). The base figure, plus realised P&L when compounding.
 
@@ -109,7 +120,7 @@ def effective_capital(trades: List[dict]) -> tuple:
     base = float(cfg.CAPITAL_RUPEES or 0)
     if not cfg.COMPOUND:
         return base, 'base'
-    realised, _costed, _uncosted = realised_pnl(trades)
+    realised, _costed, _uncosted = realised_pnl(_bcs_book(trades))
     return base + realised, 'compounded (base + realised)'
 
 
@@ -201,7 +212,7 @@ def deployed(trades: List[dict]) -> tuple:
     """
     total = 0.0
     n = unpriced = 0
-    for t in trades:
+    for t in _bcs_book(trades):
         if t.get('status') not in HOLDING:
             continue
         n += 1
@@ -247,7 +258,7 @@ def check(trades: List[dict], candidate: dict,
 
     if lim.max_per_stock:
         stock = candidate.get('stock')
-        same = sum(1 for t in trades
+        same = sum(1 for t in _bcs_book(trades)
                    if t.get('status') in HOLDING and t.get('stock') == stock)
         if same >= lim.max_per_stock:
             return False, ('%s already has %d open position(s), cap is %d '

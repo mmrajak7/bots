@@ -97,9 +97,13 @@ def prior_position(book, trade: dict) -> Optional[dict]:
     entered = _key(trade, 'entry')
     if not stock or not entered[0]:
         return None
+    # A live `naked_long` record is a real-money TWIN of a paper position
+    # already in this book, not a separate position on the stock: counting it
+    # would report the parent's own twin as "the prior trade".
     candidates = [p for p in (book or [])
                   if p is not trade
                   and p.get('id') != trade.get('id')
+                  and p.get('structure') != 'naked_long'
                   and p.get('stock') == stock
                   and p.get('status') in ('entered', 'exited')
                   and p.get('entry_date')
@@ -163,6 +167,8 @@ def recent_on_stock(book, stock: str, today: Optional[date] = None,
     for p in book or []:
         if p.get('stock') != stock or p.get('id') == exclude_id:
             continue
+        if p.get('structure') == 'naked_long':
+            continue  # a live twin of a paper position already listed
         if p.get('status') == 'entered':
             pass
         elif p.get('status') == 'exited':

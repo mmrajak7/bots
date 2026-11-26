@@ -1775,6 +1775,17 @@ def cmd_status(args):
         from . import config as cfg
         print(f"\n  --- Open Trades ---")
         for t in entered:
+            if t.get('structure') == 'naked_long':
+                # One long leg: no short strike, no debit/width. Printed on
+                # its own line shape so the dashboard cannot KeyError on it.
+                tags = ' [NAKED LIVE%s%s]' % (
+                    ' rehearsal' if t.get('rehearsal') else '',
+                    ' override' if t.get('override') else '')
+                print(f"  #{t['id']} {t['stock']:<12} {t['direction']:<3} "
+                      f"{t.get('long_symbol')} entry={t.get('entry_long_price')} "
+                      f"TP={t.get('tp_spot')} exp={t.get('expiry')} "
+                      f"parent=#{t.get('parent_id')}{tags}")
+                continue
             sl_txt = f"SL={t['sl_spot']:.2f} " if cfg.SPOT_SL_ENABLED else ""
             st_tag = ' [BCS]' if t.get('structure') == 'bcs' else ''
             print(f"  #{t['id']} {t['stock']:<12} {t['direction']:<3} "
@@ -1839,8 +1850,12 @@ def cmd_status(args):
         _print_cohort_scoreboard(exited, entered)
         print(f"\n  --- Performance (WHOLE BOOK, all engines) ---")
         for label, group in (
-                ('Zebra', [t for t in exited if t.get('structure') != 'bcs']),
-                ('BCS  ', [t for t in exited if t.get('structure') == 'bcs'])):
+                ('Zebra', [t for t in exited
+                           if t.get('structure') not in ('bcs', 'naked_long')]),
+                ('BCS  ', [t for t in exited if t.get('structure') == 'bcs']),
+                # Real money, its own book -- never pooled with paper.
+                ('Naked', [t for t in exited if t.get('structure') == 'naked_long'
+                           and not t.get('rehearsal')])):
             if not group:
                 continue
             wins = sum(1 for t in group if t.get('pnl', 0) > 0)

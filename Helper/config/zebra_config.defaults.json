@@ -57,5 +57,17 @@
   "iv_risk_free_rate": 0.065,
   "book_shock_pct": 3.0,
   "book_shock_beta_sessions": 60,
-  "book_shock_beta_min": 30
+  "book_shock_beta_min": 30,
+  "naked_live": "off",
+  "naked_capital": 500000,
+  "naked_max_open": 8,
+  "naked_max_premium": 25000,
+  "naked_pause_stops": 4,
+  "naked_pause_window_sessions": 3,
+  "naked_pause_sessions": 2,
+  "naked_kill_drawdown_pct": 25.0,
+  "naked_slippage_kill_pct": 3.0,
+  "naked_slippage_window": 20,
+  "naked_loss_budget": 0,
+  "naked_override": false
 }
