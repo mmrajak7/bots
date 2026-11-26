@@ -23,7 +23,9 @@ Steps (`--step`):
           refuses unless BOTH `--allow-missing-row --owner-confirms-held` are
           given AND the journal shows the hold filled with no filled probe
           SELL since. A completed SELL on the symbol today refuses every run
-          (R3-13): re-running cannot sell twice.
+          (R3-13): re-running cannot sell twice. A probe SELL whose outcome was
+          never read (an unclear send, UNRESOLVED in the journal) refuses every
+          SELL on the symbol that day, and `all` before it buys (R5-10).
 
 Every send goes through the engine's journal with position id 0 and a
 per-run attempt base, so two probes in a day never share a tag (NEO-33).
@@ -76,7 +78,9 @@ class OrderProbe:
         self.report: List[str] = []
         #: identity strings never printed or reported (the UCC; R3 part A)
         self.redactions: List[str] = []
-        base = self.journal.sends_today(self.clock().date(), include_probe=True)
+        # every intent of the day, refused or not: the tag base must only grow
+        base = self.journal.sends_today(self.clock().date(), include_probe=True,
+                                        include_refused=True)
         self._seq = {'ENTRY': base, 'EXIT': base}
 
     # -- helpers -----------------------------------------------------------
@@ -262,6 +266,12 @@ class OrderProbe:
             if sold:
                 raise ProbeRefused('a SELL with a fill already exists today on %s (%s): not buying '
                                    'again' % (row.trading_symbol, ', '.join(o.order_no for o in sold)))
+            open_sells = self._unresolved_sells(row, any_day=False)
+            if open_sells:
+                # `all` would buy and then refuse to sell (R5-10): refuse first
+                raise ProbeRefused('an earlier probe SELL on %s is UNRESOLVED in the journal (%s): '
+                                   'it may be working or filled. Not buying; check the app'
+                                   % (row.trading_symbol, ', '.join(open_sells)))
         rc = 1
         try:
             if step == 'all':
@@ -300,6 +310,17 @@ class OrderProbe:
             if t is None or t.date() == today:
                 out.append(o)
         return out
+
+    def _unresolved_sells(self, row: ScripRow, any_day: bool) -> List[str]:
+        """Tags of probe SELL intents on the symbol with no PLACED /
+        NOT_PLACED / BOUND line (R5-10): a SELL that may be resting or filled
+        though the book does not show it yet. Today's only, unless `any_day`
+        (the no-row path, which has no row to check against)."""
+        prefix = self.clock().date().strftime('%Y%m%d') + '-'
+        return [str(u.get('tag')) for u in self.journal.unresolved()
+                if u.get('probe') and u.get('side') == 'S'
+                and u.get('symbol') == row.trading_symbol
+                and (any_day or str(u.get('tag', '')).startswith(prefix))]
 
     def _verify_flat(self, row: ScripRow) -> bool:
         try:
@@ -417,6 +438,15 @@ class OrderProbe:
 
     def _sell(self, row: ScripRow, quote: QuoteFn, allow_missing: bool = False) -> None:
         self._say('C) sell %d with the selling guard' % self.held)
+        open_sells = self._unresolved_sells(row, any_day=allow_missing)
+        if open_sells:
+            # an unclear SELL of an earlier run may still be resting or have
+            # filled while the book lags: a second SELL could go short (R5-10)
+            self._say('  guard REFUSED: probe SELL %s on %s is UNRESOLVED in the journal (sent, '
+                      'outcome never read). Nothing sent.' % (', '.join(open_sells),
+                                                             row.trading_symbol))
+            self._stop('an earlier probe SELL on %s is unresolved' % row.trading_symbol)
+            return
         sold = 0
         for n in range(SELL_CHASES):
             want = self.held - sold

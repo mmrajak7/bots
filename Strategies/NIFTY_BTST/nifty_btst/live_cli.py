@@ -32,7 +32,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import arming, config as config_mod, live_config, report
+from . import arming, config as config_mod, live_config, report, twin
 from .broker import Broker, FakeBroker, NeoBroker
 from .cli import STEP_ERROR_ALERT_AFTER, _Lock
 from .journal import Journal
@@ -593,6 +593,9 @@ def cmd_live_report(args: argparse.Namespace) -> int:
     if nf:
         print('never filled: %d (%s)' % (len(nf), ', '.join(
             '#%d %s' % (p['id'], p.get('exit_reason')) for p in nf)))
+    # the implementation check that replaced the Volrix gate (owner 2026-11-26):
+    # every trade both books took, live fill vs the paper twin's fill
+    print(twin.report(store.path, config_mod.STATE_DIR / 'book.json', execution.upper()))
     return 0
 
 

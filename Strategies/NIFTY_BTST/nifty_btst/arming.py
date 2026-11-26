@@ -9,7 +9,10 @@ Three different questions, deliberately separate (review NEO-07):
               and the date at most `arm_max_days` ahead;
             * the pass mark: `compare.gate` reads PASS on `neo.volrix_csv`
               against the PAPER book. No CSV, an unreadable CSV, IN PROGRESS
-              or FAIL all mean NOT ARMED (fail closed).
+              or FAIL all mean NOT ARMED (fail closed) -- UNLESS the owner
+              has waived it with `neo.pass_mark_waived` (a date; owner
+              decision 2026-11-26), when the verdict reads WAIVED and the
+              computed verdict is printed as a report only.
           The file is re-read every minute by the running engine, so removing
           it disarms a running process (NEO-18). Unarmed = exits, reconcile
           and alerts still run; nothing new opens.
@@ -83,18 +86,38 @@ def read_probe_arm(state_dir: Path, today: date) -> bool:
     return d == today
 
 
-def gate_verdict(neo: NeoConfig, paper_positions: List[Dict[str, Any]]) -> Tuple[str, str]:
+def _computed_verdict(neo: NeoConfig, paper_positions: List[Dict[str, Any]]) -> Tuple[str, str]:
     """(verdict, line). Anything but a readable CSV with a PASS is not PASS."""
     if not neo.volrix_csv:
-        return 'NOT EVALUATED', 'PASS MARK: not evaluated (neo.volrix_csv not set) -> entries blocked'
+        return 'NOT EVALUATED', 'PASS MARK: not evaluated (neo.volrix_csv not set)'
     if not neo.volrix_csv.exists():
-        return 'NOT EVALUATED', 'PASS MARK: not evaluated (%s missing) -> entries blocked' % neo.volrix_csv
+        return 'NOT EVALUATED', 'PASS MARK: not evaluated (%s missing)' % neo.volrix_csv
     try:
         g = compare.gate(paper_positions, compare.load_volrix(neo.volrix_csv))
     except Exception as exc:                        # noqa: BLE001 - any CSV defect fails closed
-        return 'ERROR', 'PASS MARK: not evaluated (%s: %s) -> entries blocked' % (
-            type(exc).__name__, exc)
+        return 'ERROR', 'PASS MARK: not evaluated (%s: %s)' % (type(exc).__name__, exc)
     return str(g['verdict']), compare.render_gate(g).splitlines()[0]
+
+
+def gate_verdict(neo: NeoConfig, paper_positions: List[Dict[str, Any]]) -> Tuple[str, str]:
+    """(verdict, line). PASS and WAIVED are the only verdicts that allow
+    entries. WAIVED needs `neo.pass_mark_waived` (a date): the owner decided
+    on 2026-11-26 that a trade-by-trade Volrix sync is not a go-live
+    condition. The computed verdict is still printed, as a report."""
+    verdict, line = _computed_verdict(neo, paper_positions)
+    if neo.pass_mark_waiver_problem:
+        line += ' | ' + neo.pass_mark_waiver_problem
+    if neo.pass_mark_waived is not None and verdict != 'PASS':
+        return 'WAIVED', ('PASS MARK: WAIVED by the owner on %s (neo.pass_mark_waived); report only: '
+                          '%s' % (neo.pass_mark_waived, line[len('PASS MARK: '):]
+                                  if line.startswith('PASS MARK: ') else line))
+    if verdict != 'PASS':
+        line += ' -> entries blocked'
+    return verdict, line
+
+
+#: the verdicts that let strategy entries through
+ENTRY_VERDICTS = ('PASS', 'WAIVED')
 
 
 def read_paper_positions(paper_book: Optional[Path]) -> List[Dict[str, Any]]:
@@ -142,10 +165,10 @@ def check(cfg: Config, execution: str, neo: NeoConfig, state_dir: Path, today: d
                          '(a pass-mark block above applies to real orders only)')
     else:
         until = read_arm(state_dir, today, neo.arm_max_days)
-        if until and verdict == 'PASS':
+        if until and verdict in ENTRY_VERDICTS:
             rep.armed_until = until
-            rep.lines.append('ARMED for entries through %s (%s) and the pass mark reads PASS'
-                             % (until, Path(state_dir) / ARM_FILE))
+            rep.lines.append('ARMED for entries through %s (%s) and the pass mark reads %s'
+                             % (until, Path(state_dir) / ARM_FILE, verdict))
         elif until:
             rep.lines.append('NOT ARMED: ARM is set through %s but the pass mark reads %s, not '
                              'PASS. No strategy entries. Exits, reconcile and alerts still run.'
@@ -182,7 +205,7 @@ def make_arm_reader(neo: NeoConfig, state_dir: Path, paper_book: Optional[Path]
         if until is None:
             return None
         verdict, _ = gate_verdict(neo, read_paper_positions(paper_book))
-        return until if verdict == 'PASS' else None
+        return until if verdict in ENTRY_VERDICTS else None
     return read
 
 

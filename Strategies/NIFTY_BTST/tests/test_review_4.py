@@ -395,13 +395,14 @@ def test_r4_10_definite_refusals_are_not_attempts(cfg, tmp_path, market):
     rig.broker.place_faults = [('reject', '429', 'slow down')] * 6
     t0 = T(MON, '10:00:00')
     rig.market.set(CE_MON, 153.5, bid=153.3, ask=153.8)
-    for i in range(0, 18, 3):                         # six refusals, more than max_entry_attempts
-        rig.go(t0 + timedelta(seconds=i))
+    for i in range(0, 94):                            # six refusals, more than max_entry_attempts,
+        rig.go(t0 + timedelta(seconds=i))             # at 0/3/9/21/45/93 s under the R5-03 backoff
     p = state(rig)
+    assert len(buys(rig)) == 6
     assert p['status'] == 'pending' and p['live']['entry_attempts'] == 0
     assert not any('entry attempts without a fill' in s for s in rig.sent)
-    rig.go(t0 + timedelta(seconds=18))                # the gateway relents
-    rig.go(t0 + timedelta(seconds=19))
+    for i in range(94, 155):                          # the gateway relents: sent after the 60 s wait
+        rig.go(t0 + timedelta(seconds=i))
     assert state(rig)['status'] == 'open'
 
 
@@ -411,12 +412,14 @@ def test_r4_10b_refusals_do_not_push_the_chase_into_slow_mode(cfg, tmp_path, mar
     rig.broker.place_faults = [('reject', '100008', 'unauthorized')] * 10
     rig.market.set(CE_MON, 70.0, bid=69.8, ask=70.2)
     t0 = T(MON, '11:00:00')
-    for i in range(0, 30, 3):                         # ten refusals, the whole fast budget
-        rig.go(t0 + timedelta(seconds=i))
+    for i in range(0, 334):                           # ten refusals, the whole fast budget, at
+        rig.go(t0 + timedelta(seconds=i))             # 0/3/9/21/45/93/153/213/273/333 s (R5-03)
+    assert len(sells(rig)) == 10
     assert state(rig)['live']['exit_attempts'] == 0 and state(rig)['status'] == 'open'
-    rig.go(t0 + timedelta(seconds=30))                # the IP is fixed: sent at once, not in 60 s
-    rig.go(t0 + timedelta(seconds=31))
+    for i in range(334, 395):                         # the IP is fixed: sent at the first send after
+        rig.go(t0 + timedelta(seconds=i))             # the backoff (<= 60 s), still in FAST mode
     assert state(rig)['status'] == 'closed'
+    assert state(rig)['live']['exit_attempts'] == 1
 
 
 # ---------------------------------------------------------------- R4-11

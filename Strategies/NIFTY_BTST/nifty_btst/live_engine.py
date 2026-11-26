@@ -83,6 +83,13 @@ CRITERIA_WINDOW_BEFORE = timedelta(seconds=60)
 CRITERIA_WINDOW_AFTER = timedelta(seconds=180)
 #: the owner's resume request, written by `live-resume`, applied by the loop
 RESUME_FILE = 'RESUME'
+#: the wait after a definite gateway refusal (`neo.retry_stcodes`, R5-03):
+#: 3 s, doubling per refusal in a row, never more than 60 s, cleared by the
+#: first send that is not refused. Code constants, NOT config, on purpose:
+#: the 60 s cap is a safety bound on how long a due EXIT can be held back by
+#: refusals, and an overlay must not be able to raise it.
+REFUSAL_BACKOFF_START_SEC = 3.0
+REFUSAL_BACKOFF_MAX_SEC = 60.0
 
 ZERO_PNL = {'gross_pnl': 0.0, 'net_pnl': 0.0, 'net_ex_brokerage': 0.0, 'exit_price': None,
             'charges': {'total': 0.0}, 'held_sessions': 0, 'never_filled': True}
@@ -333,6 +340,10 @@ class LiveEngine(Engine):
             for h in lv.get('leg_history', []):
                 if h.get('order_no'):
                     nos.add(str(h['order_no']))
+            # the owner's sale reconcile adopted as this record's close is
+            # claimed: it must not block (or close) a later lot (R5-02)
+            for no in lv.get('closed_by_orders') or []:
+                nos.add(str(no))
         for line in self.journal.lines():
             if line.get('ev') in ('PLACED', 'BOUND') and line.get('order_no'):
                 nos.add(str(line['order_no']))
@@ -341,11 +352,24 @@ class LiveEngine(Engine):
     def _trip(self, now: datetime, reason: str, loud: bool = False) -> None:
         k = self.store.kill()
         if k.get('tripped'):
-            if loud and not k.get('loud'):
+            # An already tripped kill still RECORDS and ALERTS every new
+            # distinct reason (R6-03): a real SHORT after a loud quarantine
+            # kill must never be swallowed. The same reason read again (every
+            # reconcile while it lasts) is not repeated.
+            reasons = k.setdefault('reasons', [k.get('reason')])
+            if reason in reasons:
+                return
+            reasons.append(reason)
+            k['reason'] = '%s; %s' % (k.get('reason'), reason)
+            k['latest'] = reason
+            if loud:
                 k['loud'] = True
-                k['reason'] = '%s; %s' % (k.get('reason'), reason)
+            self.store.event(now, 'KILL_ALSO', reason=reason, loud=loud)
+            self.notify.send('KILL (already tripped) ALSO: %s\nNo new entries. Exits still run.%s'
+                             % (reason, ' Check the app NOW.' if loud else ''))
             return
-        k.update({'tripped': True, 'reason': reason, 'at': _iso(now), 'loud': loud})
+        k.update({'tripped': True, 'reason': reason, 'at': _iso(now), 'loud': loud,
+                  'reasons': [reason], 'latest': reason})
         self.store.event(now, 'KILL', reason=reason, loud=loud)
         self.notify.send('KILL TRIPPED: %s\nNo new entries. Exits still run. Clear with '
                          '`python -m nifty_btst live-resume --yes` when you have looked.' % reason)
@@ -356,7 +380,7 @@ class LiveEngine(Engine):
                                            'peak_before': k.get('peak'),
                                            'equity': k.get('equity')})
         k.update({'tripped': False, 'reason': None, 'at': None, 'peak': k.get('equity'),
-                  'loud': False})
+                  'loud': False, 'reasons': [], 'latest': None})
         self.store.event(now, 'KILL_RESET', by=who)
         self._rejection_streak = 0
         self.store.save()
@@ -470,7 +494,10 @@ class LiveEngine(Engine):
         if k.get('tripped') and k.get('loud'):
             self._throttled('kill_loud', now, 60,
                             'KILL (LOUD): %s. Check the app NOW. Nothing is traded to repair '
-                            'it.' % k.get('reason'))
+                            'it.%s' % (k.get('latest') or k.get('reason'),
+                                       ' All reasons: %s' % k.get('reason')
+                                       if k.get('latest') and k.get('latest') != k.get('reason')
+                                       else ''))
         if not self._ensure_session(now):
             return
         for p in self.store.in_flight():
@@ -538,12 +565,50 @@ class LiveEngine(Engine):
         if not leg.get('order_no'):
             self._resolve_unknown(p, leg, now)
             return
-        o = self.broker.order(leg['order_no'])
-        if o is not None:
-            leg.pop('absent_since', None)
-            self._apply_order(p, leg, o, now)
+        if leg['kind'] != 'EXIT':
+            o = self.broker.order(leg['order_no'])
+            if o is not None:
+                leg.pop('absent_since', None)
+                self._apply_order(p, leg, o, now)
+                return
+            self._known_order_absent(p, leg, now)
             return
-        self._known_order_absent(p, leg, now)
+        # An EXIT leg reads the whole book (the same single read `order()`
+        # makes) so a SELL this book did not send can be seen while ours
+        # rests (R5-06).
+        book = self.broker.order_book()
+        o = next((x for x in book if x.order_no == str(leg['order_no'])), None)
+        if o is None:
+            self._known_order_absent(p, leg, now)
+            return
+        leg.pop('absent_since', None)
+        foreign: List[OrderView] = []
+        working: List[OrderView] = []
+        unexplained = 0
+        if o.live and not leg.get('quarantined'):
+            # the owner (or anyone) sold on this symbol while our SELL works:
+            # if ours fills too the account is short. Pull ours NOW, not at
+            # its chase timer; the selling guard then refuses a new one until
+            # the sale is explained (R5-06). A foreign SELL still WORKING is
+            # the same danger one fill earlier: pulled too (R6-05).
+            sym = lv['neo_symbol']
+            foreign, unexplained = self._foreign_sells(sym, now, book)
+            others = [x for x in book if x.symbol == sym and x.side == 'S' and x.live
+                      and x.order_no != o.order_no]
+            if others:
+                known = self._known_order_nos()
+                working = [x for x in others if x.order_no not in known]
+        pull = unexplained > 0 or bool(working)
+        self._apply_order(p, leg, o, now, pull=pull)
+        # the alert only when a cancel really went out this tick, and AFTER it (R3-06, R6-05)
+        if pull and leg.get('cancel_requested_at') == _iso(now):
+            self._throttled('pull_%d' % p['id'], now, 60,
+                            '#%d %s: a SELL this book did not send is %s (%s) while our SELL %s '
+                            'was working: CANCELLING OURS NOW so the account cannot go short. '
+                            'Check the app.' % (p['id'], lv['neo_symbol'],
+                                                'FILLED' if unexplained > 0 else 'WORKING',
+                                                ', '.join(o2.order_no for o2 in foreign + working),
+                                                o.order_no))
 
     # -- an order we have a NUMBER for, that the book does not show --------
     def _known_order_absent(self, p: Dict[str, Any], leg: Dict[str, Any], now: datetime) -> None:
@@ -645,16 +710,177 @@ class LiveEngine(Engine):
         t = _parse_neo_time(o.placed_at, now.tzinfo)
         return t is None or t.date() == now.date()
 
-    def _filled_sells_today(self, sym: str, now: datetime) -> Dict[str, int]:
+    def _filled_today(self, sym: str, now: datetime, book: List[OrderView],
+                      side: str) -> Dict[str, OrderView]:
+        """Orders of `side` with a fill on `sym` today in `book`, by order
+        number (the largest fill seen for a number). A row dated another day
+        is not today's; an undated one counts (R4-22)."""
+        out: Dict[str, OrderView] = {}
+        for o in book:
+            if o.symbol == sym and o.side == side and o.filled > 0 and self._is_today(o, now):
+                if o.order_no not in out or o.filled > out[o.order_no].filled:
+                    out[o.order_no] = o
+        return out
+
+    def _filled_sells_today(self, sym: str, now: datetime, book: List[OrderView]) -> Dict[str, int]:
         """Every SELL with a fill on `sym` today, OURS OR FOREIGN, by order
         number (R4-02/03): the positive evidence a short is read from. The
         ORDER BOOK alone: it carries the fill quantity, and a trade-book
-        outage must not block a stop (R2-05)."""
-        out: Dict[str, int] = {}
-        for o in self.broker.order_book():
-            if o.symbol == sym and o.side == 'S' and o.filled > 0 and self._is_today(o, now):
-                out[o.order_no] = max(out.get(o.order_no, 0), o.filled)
+        outage must not block a stop (R2-05). `book` is the order book the
+        caller already read: one snapshot, no read of its own (R5-04)."""
+        return {no: o.filled for no, o in self._filled_today(sym, now, book, 'S').items()}
+
+    def _probe_order_nos(self) -> Set[str]:
+        """Order numbers the Stage 3 order probe journalled (R5-01): its own
+        lot, never this book's."""
+        lines = self.journal.lines()
+        tags = {str(ln['tag']) for ln in lines
+                if ln.get('ev') == 'INTENT' and ln.get('probe') and ln.get('tag')}
+        return {str(ln['order_no']) for ln in lines
+                if ln.get('ev') in ('PLACED', 'BOUND') and ln.get('order_no')
+                and (str(ln.get('tag')) in tags or self._is_probe_tag(str(ln.get('tag') or '')))}
+
+    def _claimed_order_nos(self) -> Set[str]:
+        """SELL order numbers already accounted for as a sale of some record:
+        its own exit fills, or the owner's sale its close was tied to."""
+        out: Set[str] = set()
+        for p in self.store.data['positions']:
+            lv = p.get('live') or {}
+            out.update(str(f['order_no']) for f in lv.get('exit_fills', []) if f.get('order_no'))
+            out.update(str(no) for no in lv.get('closed_by_orders') or [])
         return out
+
+    def _bind_external_sale(self, p: Dict[str, Any], now: datetime, book: List[OrderView]) -> None:
+        """Tie a close booked by `live-book-external` to the sale(s) in
+        TODAY's order book that it describes (R6-02), as reconcile's adoption
+        does: this record's own quarantined SELL if it shows a fill, else the
+        newest unclaimed foreign SELLs filled today and placed no later than
+        the booking, covering the lot, each claimed once. An undated row is
+        never bound. With no such sale the record stays `sale_unmatched`: no
+        allowance at all (not a quantity budget), retried at each reconcile."""
+        lv = self._live(p)
+        sym, qty = lv['neo_symbol'], int(p.get('qty') or 0)
+        try:
+            cut = datetime.fromisoformat(str(lv.get('booked_outside_at')))
+        except ValueError:
+            return
+        claimed = self._claimed_order_nos()
+        known = self._known_order_nos()
+        probe = self._probe_order_nos()
+        own = {str(h['order_no']) for h in lv.get('leg_history') or []
+               if h.get('kind') == 'EXIT' and h.get('quarantined') and h.get('order_no')}
+        sells = [o for o in self._filled_today(sym, now, book, 'S').values()
+                 if o.order_no not in claimed and o.order_no not in probe
+                 and not self._is_probe_tag(o.tag)]
+        mine = [o for o in sells if o.order_no in own]
+        if mine:
+            chosen = mine                       # its unit is unreliable: the owner priced it
+        else:
+            foreign = []
+            for o in sells:
+                t = _parse_neo_time(o.placed_at, now.tzinfo)
+                if o.order_no not in known and t is not None and t <= cut:
+                    foreign.append(o)
+            if sum(o.filled for o in foreign) < qty:
+                return
+            chosen = self._newest_covering(foreign, qty, now)
+        lv['closed_by_orders'] = [o.order_no for o in chosen]
+        lv.pop('sale_unmatched', None)
+        self.store.event(now, 'EXTERNAL_SALE_BOUND', id=p['id'],
+                         orders=lv['closed_by_orders'])
+
+    def _book_external_close(self, p: Dict[str, Any], now: datetime) -> None:
+        """After `live-book-external` closed `p` at the owner's price: mark it
+        unmatched and try to bind it to today's sale now (R6-02)."""
+        lv = self._live(p)
+        lv['sale_unmatched'] = True
+        lv['booked_outside_at'] = _iso(now)
+        if self.offline:
+            return                              # no broker read offline: reconcile binds it
+        try:
+            book = self.broker.order_book()
+        except (BrokerUnavailable, BrokerAuth):
+            return
+        self._bind_external_sale(p, now, book)
+        if lv.get('sale_unmatched'):
+            self.notify.send('#%d booked closed outside the engine, but no SELL in today\'s order '
+                             'book matches it yet: it excuses NO other sale on %s (a sale of '
+                             'yours that appears later, placed before now, is tied to it at '
+                             'reconcile).' % (p['id'], lv['neo_symbol']))
+
+    def _foreign_sells(self, sym: str, now: datetime, book: List[OrderView]
+                       ) -> Tuple[List[OrderView], int]:
+        """(SELLs with a fill today on `sym` that this book did not send,
+        shares of them NOT explained). Explained: a filled BUY today in this
+        book's product that this book did not send either (an owner round
+        trip, R5-02). A sale tied to a record's close (`closed_by_orders`,
+        by reconcile or `live-book-external`) is known, so it is not foreign;
+        there is no quantity allowance (R6-02). Unexplained
+        > 0 means someone sold what this book may be about to sell: the
+        selling guard refuses, a working SELL is pulled (R4-03, R5-06), and
+        reconcile may book it as the owner's close. The journal is read only
+        when the book shows a candidate."""
+        sells = self._filled_today(sym, now, book, 'S')
+        if not sells:
+            return [], 0
+        known = self._known_order_nos()
+        foreign = [o for no, o in sells.items() if no not in known]
+        if not foreign:
+            return [], 0
+        buys = sum(o.filled for no, o in self._filled_today(sym, now, book, 'B').items()
+                   if no not in known and not parse_tag(o.tag) and self._nets_a_sale(o, now))
+        unexplained = sum(o.filled for o in foreign) - buys
+        return foreign, max(0, unexplained)
+
+    @staticmethod
+    def _newest_covering(orders: List[OrderView], qty: int, now: datetime) -> List[OrderView]:
+        """The newest orders whose fills reach `qty` (an undated row counts
+        as the oldest)."""
+        floor = datetime.min.replace(tzinfo=now.tzinfo)
+        ranked = sorted(orders, key=lambda o: _parse_neo_time(o.placed_at, now.tzinfo) or floor,
+                        reverse=True)
+        out: List[OrderView] = []
+        got = 0
+        for o in ranked:
+            out.append(o)
+            got += o.filled
+            if got >= qty:
+                break
+        return out
+
+    def _net_sold_today(self, sym: str, now: datetime, book: List[OrderView]) -> int:
+        """Shares of `sym` sold today net, for the SHORT sum (R4-02, R5-01):
+        every SELL with a fill, ours or foreign, minus every filled BUY this
+        book did not send (an owner buy-back or round trip). The probe's
+        orders count on NEITHER side: its lot is its own (R5-01). A BUY with
+        one of our tags is never subtracted (it is this book's, or untracked
+        and tripped loud elsewhere)."""
+        sells = self._filled_today(sym, now, book, 'S')
+        buys = self._filled_today(sym, now, book, 'B')
+        if not sells:
+            return 0
+        known = self._known_order_nos()
+        probe = self._probe_order_nos()
+
+        def is_probe(no: str, o: OrderView) -> bool:
+            return no in probe or self._is_probe_tag(o.tag)
+        sold = sum(o.filled for no, o in sells.items() if not is_probe(no, o))
+        bought = sum(o.filled for no, o in buys.items()
+                     if not is_probe(no, o) and no not in known and not parse_tag(o.tag)
+                     and self._nets_a_sale(o, now))
+        return sold - bought
+
+    def _nets_a_sale(self, o: OrderView, now: datetime) -> bool:
+        """A BUY this book did not send nets a sale only when the row STATES
+        this book's product (an MIS buy is not an NRML lot) AND a date that
+        parses as today. The SELL side's defaults (undated = today) fail
+        closed for a SELL but would fail OPEN here, so a BUY with no `prod`
+        or no parsable `ordDtTm` is never netted: the sale stays unexplained
+        (R6-04)."""
+        if o.product != self.neo.product:
+            return False
+        t = _parse_neo_time(o.placed_at, now.tzinfo)
+        return t is not None and t.date() == now.date()
 
     def _ours_sold_today(self, sym: str, now: datetime) -> int:
         """Shares of `sym` this book records as sold today: its own exit fills,
@@ -671,7 +897,9 @@ class LiveEngine(Engine):
             if fills:
                 total += sum(fills)
             elif (p.get('exit_date') == today and p['status'] == 'closed'
-                  and not p.get('never_filled')):
+                  and not p.get('never_filled') and not lv.get('sale_unmatched')):
+                # a close on the owner's word that no sale in today's book
+                # matches is not a sale today (R6-02)
                 total += int(p.get('qty') or 0)
         return total
 
@@ -804,7 +1032,7 @@ class LiveEngine(Engine):
             self._set_state(p, EXIT_DUE, now)
 
     def _apply_order(self, p: Dict[str, Any], leg: Dict[str, Any], o: OrderView,
-                     now: datetime) -> None:
+                     now: datetime, pull: bool = False) -> None:
         leg['last_status'] = o.status
         if not o.known_status:
             self._throttled('status_' + o.order_no, now, 600,
@@ -827,7 +1055,7 @@ class LiveEngine(Engine):
                                  order_no=o.order_no, filled=0)
                 self._leg_done(p, leg, now)
         else:
-            self._maybe_cancel(p, leg, now)
+            self._maybe_cancel(p, leg, now, pull=pull)
 
     def _fill_qty_sane(self, p: Dict[str, Any], leg: Dict[str, Any], o: OrderView,
                        now: datetime, filled: Optional[int] = None) -> bool:
@@ -847,6 +1075,21 @@ class LiveEngine(Engine):
                        'order (lot %d). Not booked. The order/trade book may report in LOTS '
                        '(unmeasured: the Stage 3 probe prints it). Check the app.'
                        % (o.order_no, qty, int(leg['qty']), lot), loud=True)
+        if leg['kind'] == 'EXIT':
+            # the record holds the lot; `--not-filled` (a pending entry's
+            # word) does not apply and is refused before anything changes
+            # (R5-05). "It never filled" is the owner's confirmation that the
+            # lot is still held.
+            self._throttled('quarantine_' + leg['tag'], now, 60,
+                            '#%d: SELL %s QUARANTINED (fill %d vs sent %d). No order goes out on '
+                            'this position; its stop is watched and alerted only. The broker '
+                            'REPORTS A FILL: if the lot is gone, `live-book-external %d --price X '
+                            '--yes`; if the lot is still held, sell it in the app, then the same '
+                            'command. `live-confirm-held %d --yes` clears the quarantine ONLY '
+                            'once the broker reads this SELL terminal with NO fill (order and '
+                            'trade book); while it shows any fill it is refused (R6-01).'
+                            % (p['id'], o.order_no, qty, int(leg['qty']), p['id'], p['id']))
+            return False
         self._throttled('quarantine_' + leg['tag'], now, 60,
                         '#%d: order %s QUARANTINED (fill %d vs sent %d). No order goes out on this '
                         'position; its stop is watched and alerted only. In the app: if the lot '
@@ -855,7 +1098,11 @@ class LiveEngine(Engine):
                         % (p['id'], o.order_no, qty, int(leg['qty']), p['id'], p['id']))
         return False
 
-    def _maybe_cancel(self, p: Dict[str, Any], leg: Dict[str, Any], now: datetime) -> None:
+    def _maybe_cancel(self, p: Dict[str, Any], leg: Dict[str, Any], now: datetime,
+                      pull: bool = False) -> None:
+        """`pull`: cancel now, whatever the chase timer says (R5-06). The
+        repeat throttle below still applies, so a pull is never a cancel a
+        tick."""
         sent = datetime.fromisoformat(leg['sent_at'])
         age = (now - sent).total_seconds()
         lv = self._live(p)
@@ -866,7 +1113,7 @@ class LiveEngine(Engine):
             # so an order is working almost all the time (R2-10).
             slow = int(lv.get('exit_attempts', 0)) >= self.neo.exit_chase_fast_max
             due = age >= (self.neo.exit_retry_slow_sec if slow else self.neo.exit_chase_sec)
-        if not due:
+        if not due and not pull:
             return
         last = leg.get('cancel_requested_at')
         n = int(leg.get('cancel_attempts', 0))
@@ -958,20 +1205,29 @@ class LiveEngine(Engine):
         lv = self._live(p)
         lv['leg'] = None
         lv.setdefault('leg_history', []).append(dict(leg, rejected=reason))
-        try:
-            retryable = int(code) in self.neo.retry_stcodes
-        except (TypeError, ValueError):
-            retryable = False
-        if retryable:
-            # a wrong-IP refusal or a throttle: definitely NOT placed, retried
-            # at the next poll with an alert, no streak, no side lost (R3-09)
-            self.store.event(now, 'REFUSED', id=p['id'], tag=leg['tag'], reason=reason)
+        if self._retryable(code):
+            # a wrong-IP refusal or a throttle: definitely NOT placed, no
+            # streak, no side lost (R3-09), not an attempt (R4-10) and not a
+            # send for the ceilings (R5-03, journal `refused`). Retried after
+            # a backoff of 3 s doubling to 60 s, so a gateway that refuses
+            # all day is asked ~once a minute, not once a poll (R5-03).
+            if str(lv.get('refused_at') or '')[:10] != now.date().isoformat():
+                lv['refusal_step'] = 0          # a new day starts at 3 s again (R6-07)
+            step = min(int(lv.get('refusal_step', 0) or 0), 16)
+            wait = min(REFUSAL_BACKOFF_MAX_SEC, REFUSAL_BACKOFF_START_SEC * (2 ** step))
+            lv['refusal_step'] = step + 1
+            lv['refused_at'] = _iso(now)
+            lv['refusal_wait_sec'] = wait
+            self.store.event(now, 'REFUSED', id=p['id'], tag=leg['tag'], reason=reason,
+                             retry_in_sec=wait)
             key = 'entry_attempts' if leg['kind'] == 'ENTRY' else 'exit_attempts'
             lv[key] = max(0, int(lv.get(key, 0)) - 1)     # not an attempt (R4-10)
             self._throttled('refused_code_%d' % p['id'], now, 60,
-                            '#%d %s %s REFUSED by the gateway (%s). Retrying at the next poll. '
-                            'If this is 100008, the box IP is not whitelisted.'
-                            % (p['id'], leg['kind'], leg['tag'], reason))
+                            '#%d %s %s REFUSED by the gateway (%s). Retrying in %.0fs (the wait '
+                            'doubles per refusal, at most %.0fs). If this is 100008, the box IP '
+                            'is not whitelisted.'
+                            % (p['id'], leg['kind'], leg['tag'], reason, wait,
+                               REFUSAL_BACKOFF_MAX_SEC))
             self._leg_done(p, leg, now)
             return
         self._rejection_streak += 1
@@ -1011,39 +1267,48 @@ class LiveEngine(Engine):
         attempts_key = 'entry_attempts' if kind == 'ENTRY' else 'exit_attempts'
         attempt = int(lv.get(attempts_key, 0)) + 1
         lv[attempts_key] = attempt
-        tag = make_tag(now.date(), int(p['id']), kind, attempt)
+        # the TAG numbers sends, not attempts: a refusal refunds the attempt
+        # but must never hand its tag to the next send (R5-08)
+        send_no = self._next_send_no(p, kind, now)
+        tag = make_tag(now.date(), int(p['id']), kind, send_no)
         pstr = price_str(price, lv['tick'], 'up' if side == 'B' else 'down')
-        leg = {'kind': kind, 'tag': tag, 'attempt': attempt, 'order_no': None, 'limit': pstr,
-               'qty': int(qty), 'sent_at': _iso(now), 'cancel_requested_at': None,
-               'valid_reads': 0}
+        leg = {'kind': kind, 'tag': tag, 'attempt': attempt, 'send_no': send_no,
+               'order_no': None, 'limit': pstr, 'qty': int(qty), 'sent_at': _iso(now),
+               'cancel_requested_at': None, 'valid_reads': 0}
         lv['leg'] = leg
         lv['last_send_at'] = _iso(now)
         self._set_state(p, ENTRY_SENT if kind == 'ENTRY' else EXIT_SENT, now)
         self.store.save()                       # the book knows BEFORE the wire
         self.journal.intent(now, tag, kind, int(p['id']), lv['neo_symbol'], side, int(qty),
-                            pstr, attempt=attempt)
+                            pstr, attempt=attempt, send=send_no)
         req = OrderRequest(symbol=lv['neo_symbol'], token=lv['neo_token'], side=side,
                            qty=int(qty), price=pstr, tag=tag)
         try:
             order_no = self.broker.place(req)
         except BrokerRejected as exc:
-            self.journal.not_placed(now, tag, '%s %s' % (exc.code, exc.msg))
+            refused = self._retryable(exc.code)
+            self.journal.not_placed(now, tag, '%s %s' % (exc.code, exc.msg), refused=refused)
+            if not refused:
+                self._clear_refusal_backoff(lv)
             self._on_rejected(p, leg, now, 'stCode %s: %s' % (exc.code, exc.msg), placed=False,
                               code=exc.code)
             self.store.save()
             return False
         except BrokerUnclear as exc:
+            self._clear_refusal_backoff(lv)
             self.store.event(now, 'UNCLEAR', id=p['id'], tag=tag, error=str(exc))
             self.notify.send('#%d: %s send UNCLEAR (%s). Searching the book before anything '
                              'else.' % (p['id'], tag, exc))
             self.store.save()
             return False
         except BrokerAuth as exc:
+            self._clear_refusal_backoff(lv)
             self.session_ok, self.session_error = False, str(exc)
             self.store.event(now, 'UNCLEAR', id=p['id'], tag=tag, error=str(exc))
             self.notify.send('#%d: %s send UNCLEAR, session dead (%s).' % (p['id'], tag, exc))
             self.store.save()
             return False
+        self._clear_refusal_backoff(lv)
         leg['order_no'] = order_no
         self.journal.placed(now, tag, order_no)
         self._set_state(p, ENTRY_OPEN if kind == 'ENTRY' else EXIT_OPEN, now)
@@ -1051,6 +1316,59 @@ class LiveEngine(Engine):
                          side=side, qty=int(qty), limit=pstr)
         self.store.save()
         return True
+
+    def _retryable(self, code: Any) -> bool:
+        """A definite gateway refusal (`neo.retry_stcodes`): not placed."""
+        try:
+            return int(code) in self.neo.retry_stcodes
+        except (TypeError, ValueError):
+            return False
+
+    def _next_send_no(self, p: Dict[str, Any], kind: str, now: datetime) -> int:
+        """The next send number of `kind` for this record: never refunded,
+        and never below a number already used in a tag of the record's legs
+        or in today's journal (a book older than its journal after a power
+        cut must not reuse a tag either, R2-25)."""
+        lv = self._live(p)
+        key = 'entry_sends' if kind == 'ENTRY' else 'exit_sends'
+        used = int(lv.get(key, 0) or 0)
+        legs = list(lv.get('leg_history') or []) + ([lv['leg']] if lv.get('leg') else [])
+        for h in legs:
+            t = parse_tag(str(h.get('tag') or ''))
+            if t is not None and t['kind'] == kind:
+                used = max(used, int(t['attempt']))
+        prefix = make_tag(now.date(), int(p['id']), kind, 0)[:-1]
+        for line in self.journal.lines():
+            tag = str(line.get('tag') or '')
+            if line.get('ev') == 'INTENT' and tag.startswith(prefix):
+                t = parse_tag(tag)
+                if t is not None:
+                    used = max(used, int(t['attempt']))
+        lv[key] = used + 1
+        return used + 1
+
+    @staticmethod
+    def _clear_refusal_backoff(lv: Dict[str, Any]) -> None:
+        for k in ('refusal_step', 'refused_at', 'refusal_wait_sec'):
+            lv.pop(k, None)
+
+    def _refusal_wait_left(self, lv: Dict[str, Any], now: datetime) -> float:
+        """Seconds still to wait after a gateway refusal (R5-03). Clamped on
+        READ to [0, REFUSAL_BACKOFF_MAX_SEC], and a stamp that cannot be read
+        or lies in the future waits nothing: no stored value can hold a due
+        exit back for more than a minute."""
+        at_ = lv.get('refused_at')
+        if not at_:
+            return 0.0
+        try:
+            t = datetime.fromisoformat(str(at_))
+            wait = float(lv.get('refusal_wait_sec') or 0.0)
+            elapsed = (now - t).total_seconds()
+        except (TypeError, ValueError):
+            return 0.0
+        if elapsed < 0 or not math.isfinite(wait):
+            return 0.0
+        return max(0.0, min(REFUSAL_BACKOFF_MAX_SEC, wait) - elapsed)
 
     # ------------------------------------------------------------- step
     def step(self, now: datetime) -> None:
@@ -1412,6 +1730,8 @@ class LiveEngine(Engine):
             self._trip(now, 'entry order ceiling %d' % neo.max_entry_orders_per_day)
             self._abandon(p, now, 'entry_abandoned', 'entry order ceiling reached')
             return
+        if self._refusal_wait_left(lv, now) > 0:
+            return                      # a gateway refusal's backoff (R5-03); no read, no send
         allowed, why = self._buy_allowed(p, qty, now)
         if not allowed:
             self.store.event(now, 'BUY_REFUSED', id=p['id'], why=why)
@@ -1583,10 +1903,16 @@ class LiveEngine(Engine):
             since = (now - datetime.fromisoformat(last)).total_seconds()
             self._throttled('exit_slow_%d' % p['id'], now, 60,
                             'EXIT #%d %s STILL OPEN after %d attempts (%s). Retrying once a '
-                            'minute. Consider exiting in the app.'
-                            % (p['id'], p['symbol'], attempts, lv.get('exit_reason')))
+                            'minute; each SELL of ours WORKS for up to %.0fs. Consider exiting '
+                            'in the app: CANCEL OUR WORKING SELL THERE FIRST, or both can fill '
+                            'and the account goes short (the engine also pulls its SELL the '
+                            'moment it sees your sale fill).'
+                            % (p['id'], p['symbol'], attempts, lv.get('exit_reason'),
+                               neo.exit_retry_slow_sec))
             if since < neo.exit_retry_slow_sec:
                 return
+        if self._refusal_wait_left(lv, now) > 0:
+            return                      # a gateway refusal's backoff, <= 60 s (R5-03)
         # A live SELL needs a bid that exists today, nothing more: a wide book
         # is what a fall looks like, and refusing it strands the stop (NEO-14).
         if b is None or b.bid <= 0:
@@ -1640,19 +1966,30 @@ class LiveEngine(Engine):
         if live_sells:
             return False, 'another SELL is live on %s: %s' % (
                 sym, ', '.join('%s(%s)' % (o.order_no, o.status) for o in live_sells))
-        try:
-            known = self._known_order_nos()
-            foreign = [no for no in self._filled_sells_today(sym, now) if no not in known]
-        except (BrokerUnavailable, BrokerAuth) as exc:
-            if isinstance(exc, BrokerAuth):
-                self.session_ok = False
-            return False, 'broker unreadable: %s' % exc
-        if foreign:
-            # a SELL this book did not send FILLED today: whatever the row says
-            # (it may lag), selling again could go SHORT (R4-03)
-            return False, ('a SELL this book did not send FILLED today on %s (%s). Not selling: '
-                           'check the app for a SHORT; if you sold it, `live-book-external %d '
-                           '--price X --yes`' % (sym, ', '.join(foreign), p['id']))
+        own_filled = [h.get('order_no') for h in lv.get('leg_history') or []
+                      if h.get('kind') == 'EXIT' and h.get('cleared_by_owner') and h.get('order_no')
+                      and any(o.order_no == str(h['order_no']) and o.filled > 0 for o in book)]
+        if own_filled:
+            # a SELL of this record whose quarantine the owner cleared shows
+            # a fill: whatever the source says, selling again could go short
+            # (R6-01, defence in depth behind confirm-held's own read)
+            return False, ('SELL %s of #%d, quarantined and cleared, shows a FILL in the order '
+                           'book: not selling again. Check the app; if the lot is gone, '
+                           '`live-book-external %d --price X --yes`'
+                           % (', '.join(str(x) for x in own_filled), p['id'], p['id']))
+        foreign, unexplained = self._foreign_sells(sym, now, book)     # the same snapshot (R5-04)
+        if unexplained > 0:
+            # a SELL this book did not send FILLED today and nothing explains
+            # it: whatever the row says (it may lag), selling again could go
+            # SHORT (R4-03). A sale already booked as an earlier lot's close,
+            # or netted by an owner BUY, does not block this lot (R5-02).
+            return False, ('a SELL this book did not send FILLED today on %s (%s): %d share(s) '
+                           'not explained by a lot this book already booked as closed outside '
+                           'the engine. Not selling #%d (%d held, entered %s): check the app for '
+                           'a SHORT; if you sold THIS lot (#%d) in the app, `live-book-external '
+                           '%d --price X --yes`'
+                           % (sym, ', '.join(o.order_no for o in foreign), unexplained, p['id'],
+                              qty, p.get('entry_date'), p['id'], p['id']))
         try:
             net, source = self._positive_long(sym, p, now)
         except (BrokerUnavailable, BrokerAuth) as exc:
@@ -1726,11 +2063,17 @@ class LiveEngine(Engine):
         a previous-day holding is UNKNOWN (R2-03), not a mismatch: alert and
         wait for positive evidence or the owner. A shortfall newer than the
         positions lag, or seen only once, or before the open, is deferred
-        (R2-08, R2-20). Nothing is flattened."""
+        (R2-08, R2-20). Nothing is flattened.
+
+        ONE read of positions and ONE of the order book; every check below
+        works on that snapshot (R5-04). Any broker error, from those reads or
+        from anything below, leaves reconcile NOT clean with an alert; it
+        never escapes to crash `start` or abort the service tick."""
         self._last_reconcile = now
         try:
             positions = self.broker.positions()
             book = self.broker.order_book()
+            self._reconcile_snapshot(now, startup, positions, book)
         except (BrokerUnavailable, BrokerAuth) as exc:
             if isinstance(exc, BrokerAuth):
                 self.session_ok = False
@@ -1738,7 +2081,13 @@ class LiveEngine(Engine):
             self._throttled('reconcile', now, 300,
                             'RECONCILE could not read the broker (%s). No new entries until it '
                             'can.' % exc)
-            return
+
+    def _reconcile_snapshot(self, now: datetime, startup: bool, positions: List[Any],
+                            book: List[OrderView]) -> None:
+        today_iso = now.date().isoformat()
+        for p in self.store.data['positions']:
+            if (p.get('live') or {}).get('sale_unmatched') and p.get('exit_date') == today_iso:
+                self._bind_external_sale(p, now, book)      # a sale that showed up late (R6-02)
         pre_open = now.time() < self.cfg.market_open
         net: Dict[str, int] = {}
         for pos in positions:
@@ -1803,11 +2152,25 @@ class LiveEngine(Engine):
             if legs:
                 self.store.event(now, 'RECONCILE_DEFER', symbol=sym, have=have, expected=exp)
                 continue
-            ext = [o for o in book if o.symbol == sym and o.side == 'S' and o.filled > 0
-                   and o.order_no not in self._known_order_nos()]
-            if have == 0 and ext and sum(o.filled for o in ext) >= exp:
+            # the positions lag of a FRESH entry first: a row that has not yet
+            # caught up with today's BUY must not be read as the owner's sale
+            # of the lot (R5-02)
+            newest = max((str(p.get('entry_time') or '') for p in holders), default='')
+            fresh = False
+            if newest:
+                try:
+                    fresh = (now - datetime.fromisoformat(newest)).total_seconds() < self.neo.positions_lag_sec
+                except ValueError:
+                    fresh = False
+            # only today's SELLs, not claimed by an earlier close, and beyond
+            # what is already explained (R5-02)
+            ext, unexplained = self._foreign_sells(sym, now, book)
+            if have == 0 and ext and not fresh and unexplained >= exp:
                 # The owner sold it in the app: book what the broker shows,
                 # never a price we invent. The books agree again afterwards.
+                # The NEWEST sales cover this lot; older ones belong to a lot
+                # already booked outside (R5-02).
+                ext = self._newest_covering(ext, exp, now)
                 price = sum(o.avg_price * o.filled for o in ext) / sum(o.filled for o in ext)
                 for p in holders:
                     self._close(p, now, price, 'closed_externally',
@@ -1819,13 +2182,6 @@ class LiveEngine(Engine):
                                                            price))
                 continue
             clean = False
-            newest = max((str(p.get('entry_time') or '') for p in holders), default='')
-            fresh = False
-            if newest:
-                try:
-                    fresh = (now - datetime.fromisoformat(newest)).total_seconds() < self.neo.positions_lag_sec
-                except ValueError:
-                    fresh = False
             seen = self._mismatch_seen.get(sym, 0) + 1
             self._mismatch_seen[sym] = seen
             if fresh or seen < 2 or pre_open:
@@ -1846,12 +2202,13 @@ class LiveEngine(Engine):
         for sym in set(net) | set(expected) | closed_syms:
             if not self._looks_like_ours(sym) and sym not in expected:
                 continue
-            total = sum(self._filled_sells_today(sym, now).values())
+            total = self._net_sold_today(sym, now, book)
             held = self._ours_sold_today(sym, now) + expected.get(sym, 0)
             if total > held:
                 clean = False
                 self._trip(now, 'SHORT: %d sold today on %s (every SELL with a fill, ours or '
-                           'not) against %d this book held' % (total, sym, held), loud=True)
+                           'not, less BUYs this book did not send; probe orders excluded) '
+                           'against %d this book held' % (total, sym, held), loud=True)
         for sym, q in net.items():
             seen_syms.add(sym)
             if q < 0:
@@ -1860,7 +2217,7 @@ class LiveEngine(Engine):
                 # a row that shows ONLY today's SELL of a lot this book sold is
                 # an unmeasured row shape, not a short (R3-20): resolved by the
                 # book record plus today's filled SELL, and never on one read.
-                if self._row_explained_by_sales(sym, q, now, expected.get(sym, 0)):
+                if self._row_explained_by_sales(sym, q, now, expected.get(sym, 0), book):
                     self._throttled('rowshape_' + sym, now, 3600,
                                     'NOTE: %s reads net %d and equals the SELLs filled today on a '
                                     'lot this book held: the row carries no carried quantity '
@@ -1967,13 +2324,16 @@ class LiveEngine(Engine):
         self._surplus_seen[sym] = n
         return 'confirmed' if n >= 2 else 'first'
 
-    def _row_explained_by_sales(self, sym: str, net: int, now: datetime, expected: int) -> bool:
+    def _row_explained_by_sales(self, sym: str, net: int, now: datetime, expected: int,
+                                book: List[OrderView]) -> bool:
         """A negative row is the row shape without carried quantities, not a
         short, only when it equals every SELL filled today on the symbol
-        (ours or foreign) AND those sales do not exceed what this book held
-        today (R4-02): the sum matches exactly what we held. More sold than
-        held is a short and is tripped from the positive evidence."""
-        total = sum(self._filled_sells_today(sym, now).values())
+        (ours or foreign, net of BUYs this book did not send, probe orders
+        out: the same sum as the SHORT check, R5-01) AND those sales do not
+        exceed what this book held today (R4-02): the sum matches exactly
+        what we held. More sold than held is a short and is tripped from the
+        positive evidence. `book` is reconcile's snapshot (R5-04)."""
+        total = self._net_sold_today(sym, now, book)
         held = self._ours_sold_today(sym, now) + expected
         return total > 0 and -net == total and total <= held
 
@@ -2025,11 +2385,63 @@ class LiveEngine(Engine):
                 self._confirm_pending(p, leg, now)
         elif p['status'] != 'open':
             raise ValueError('#%d is %s, not an open holding' % (pos_id, p['status']))
+        else:
+            leg = lv.get('leg')
+            if leg and leg.get('quarantined') and leg.get('kind') == 'EXIT':
+                # the owner states the lot is held: the quarantined SELL did
+                # not fill (R5-05). His word never overrides the broker
+                # (R6-01): the order and the trade book are read FIRST, and
+                # any fill (partial included), a live order or an unreadable
+                # one refuses with nothing changed. Only an order read
+                # terminal with ZERO fill clears the quarantine; the next
+                # SELL still goes through the selling guard.
+                self._quarantine_unfilled_or_refuse(p, leg)
+                self.journal.owner(now, pos_id, 'clear_quarantine', order_no=leg.get('order_no'),
+                                   why='owner: lot held, the SELL did not fill')
+                lv.setdefault('leg_history', []).append(dict(leg, cleared_by_owner=_iso(now),
+                                                             owner_says='not filled, held'))
+                lv['leg'] = None
+                self._set_state(p, EXIT_DUE, now)
+                self.notify.send('#%d: quarantine of SELL %s CLEARED on your word (lot held, the '
+                                 'SELL did not fill). The exit resumes through the selling guard.'
+                                 % (pos_id, leg.get('order_no')))
         self.store.confirm_held(pos_id, now.date(), by)
         self.journal.owner(now, pos_id, 'confirm_held', symbol=lv['neo_symbol'])
         self.store.event(now, 'OWNER', id=pos_id, action='confirm_held', by=by)
         self.store.save()
         return p
+
+    def _quarantine_unfilled_or_refuse(self, p: Dict[str, Any], leg: Dict[str, Any]) -> None:
+        """Raise ValueError unless the quarantined SELL reads, in the order
+        book AND the trade book, terminal with no fill (R6-01)."""
+        pid, no = int(p['id']), leg.get('order_no')
+        way_out = ('sell in the app if the lot is still held, then `live-book-external %d '
+                   '--price X --yes`' % pid)
+        if self.offline:
+            raise ValueError('#%d: SELL %s must be read at the broker first and NO ENGINE IS '
+                             'RUNNING: nothing was read or changed. The request is kept for the '
+                             'loop (next cron tick)' % (pid, no))
+        if not no:
+            raise ValueError('#%d: the quarantined SELL has no order number to read: nothing '
+                             'changed; %s' % (pid, way_out))
+        try:
+            o = self.broker.order(no)
+            trades = self.broker.trades()
+        except (BrokerUnavailable, BrokerAuth) as exc:
+            raise ValueError('#%d: SELL %s cannot be read (%s): nothing changed; retry, or %s'
+                             % (pid, no, exc, way_out))
+        traded = sum(t.filled for t in trades if t.order_no == str(no) and t.filled > 0)
+        if o is None:
+            raise ValueError('#%d: SELL %s is not in the order book: nothing changed; %s'
+                             % (pid, no, way_out))
+        if not o.terminal:
+            raise ValueError('#%d: SELL %s is %s at the broker: nothing changed; cancel it in the '
+                             'app first' % (pid, no, o.status))
+        if o.filled > 0 or traded > 0:
+            raise ValueError('#%d: the broker reports SELL %s FILLED (order book %d, trade book %d; '
+                             'a partial fill counts): your confirmation cannot override it and '
+                             'nothing was changed. If the lot is really still held, %s'
+                             % (pid, no, o.filled, traded, way_out))
 
     def _confirm_pending(self, p: Dict[str, Any], leg: Dict[str, Any], now: datetime) -> None:
         """The owner says the entry filled and the lot is held (R3-04): book
@@ -2075,6 +2487,21 @@ class LiveEngine(Engine):
                 raise ValueError('price %.2f is not sensible against entry/trigger %.2f'
                                  % (price, ref))
         leg = lv.get('leg')
+        if p['status'] == 'open' and price is None:
+            # a HELD lot can only be booked closed at a price. Refused BEFORE
+            # anything changes: a refused command must never release a
+            # quarantine or cancel an order (R5-05)
+            if leg and leg.get('quarantined'):
+                raise ValueError('#%d holds the lot; its SELL %s is QUARANTINED and nothing was '
+                                 'changed (--not-filled is for a pending entry). If the lot is '
+                                 'gone: `live-book-external %d --price X --yes`; if it is still '
+                                 'held, sell it in the app, then the same command. '
+                                 '`live-confirm-held %d --yes` clears the quarantine only once '
+                                 'the broker reads that SELL terminal with NO fill'
+                                 % (pos_id, leg.get('order_no'), pos_id, pos_id))
+            raise ValueError('a sale price is required to book an external close (#%d holds the '
+                             'lot; --not-filled is for a pending entry): nothing was changed'
+                             % pos_id)
         dead_leg: Optional[Dict[str, Any]] = None
         if leg and leg.get('quarantined'):
             # the owner states the outcome of a fill the engine could not read
@@ -2118,6 +2545,7 @@ class LiveEngine(Engine):
             self._close(p, now, float(price), 'closed_externally',
                         book=self._books.get(self.key(p['symbol'])), orders=2)
             lv['state'] = 'CLOSED'
+            self._book_external_close(p, now)
         elif p['status'] == 'pending':
             if price is None:
                 if dead_leg:
@@ -2140,6 +2568,7 @@ class LiveEngine(Engine):
                 self._close(p, now, float(price), 'closed_externally',
                             book=self._books.get(self.key(p['symbol'])), orders=2)
                 lv['state'] = 'CLOSED'
+                self._book_external_close(p, now)
         else:
             raise ValueError('#%d is already %s (%s). If you ALSO sold in the app the broker may '
                              'be SHORT: check the app; reconcile trips the kill on its next read'

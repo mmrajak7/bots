@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import date
 from datetime import time as dtime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,7 +41,7 @@ KNOWN_NEO_KEYS = frozenset((
     'empty_report_order_book', 'empty_report_positions', 'empty_report_trade_book',
     'empty_report_holdings', 'auth_stcodes', 'transient_stcodes', 'rejected_stcodes',
     'holdings_source_enabled', 'position_qty_unit', 'positions_lag_sec', 'telegram_enabled',
-    'retry_stcodes'))
+    'retry_stcodes', 'pass_mark_waived'))
 #: paper rule keys that must not drift between the paper overlay and the
 #: tracked defaults without the owner knowing (R3-07)
 RULE_KEYS = ('target_premium', 'trigger_mult', 'stop_frac', 'lots', 'market_open', 'mark_time',
@@ -89,6 +90,12 @@ class NeoConfig:
     telegram_prefix_live: str
     telegram_prefix_rehearsal: str
     volrix_csv: Optional[Path]
+    #: the date the OWNER waived the Volrix pass mark (2026-11-26), or None.
+    #: None (the tracked default) keeps the gate fail-closed; a date makes the
+    #: gate a report only. A date, not a bool, so the arming line can say who
+    #: decided what and when.
+    pass_mark_waived: Optional[date]
+    pass_mark_waiver_problem: str
     arm_max_days: int
     empty_report_stcode: Optional[int]
     empty_report_emsg: str
@@ -145,6 +152,20 @@ def _path(raw: Dict[str, Any], key: str) -> Optional[Path]:
         return None
     p = Path(str(v))
     return p if p.is_absolute() else BOTS_ROOT / p
+
+
+def _waiver(raw: Dict[str, Any]) -> Tuple[Optional[date], str]:
+    """(date, problem). A bad value is NOT a ConfigError: that would stop the
+    whole live run, exits included (R6-06). It reads as no waiver (entries
+    fail closed) and the arming line names the problem."""
+    v = raw.get('pass_mark_waived')
+    if v is None:
+        return None, ''
+    try:
+        return date.fromisoformat(str(v)), ''
+    except ValueError:
+        return None, ('neo.pass_mark_waived unreadable (%r, want null or YYYY-MM-DD): NOT waived'
+                      % (v,))
 
 
 def build_neo(raw: Any) -> NeoConfig:
@@ -209,6 +230,8 @@ def build_neo(raw: Any) -> NeoConfig:
         telegram_prefix_rehearsal=str(raw.get('telegram_prefix_rehearsal',
                                               'NIFTY-BTST (REHEARSAL)')),
         volrix_csv=_path(raw, 'volrix_csv'),
+        pass_mark_waived=_waiver(raw)[0],
+        pass_mark_waiver_problem=_waiver(raw)[1],
         arm_max_days=_int(raw, 'arm_max_days'),
         empty_report_stcode=empty_code,
         empty_report_emsg=str(raw.get('empty_report_emsg', 'No Data')),

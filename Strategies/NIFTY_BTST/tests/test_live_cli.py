@@ -195,6 +195,42 @@ def test_check_live_needs_arm_and_pass_and_rehearsal_is_always_armed(tmp_path):
     assert reader(TODAY) == date(2026, 10, 30)
 
 
+def test_owner_waiver_arms_without_a_pass_and_says_so(tmp_path):
+    """Owner 2026-11-26: Volrix trade-by-trade sync is not a go-live condition.
+    The waiver is a DATE in the live overlay; the tracked default (null) keeps
+    the gate fail-closed; ARM is still required; the computed verdict stays
+    printed as a report."""
+    creds = tmp_path / 'c.json'
+    creds.write_text('{}')
+    cfg = config_mod.build(_raw())
+    assert build_neo(neo_raw(credentials_file=str(creds))).pass_mark_waived is None
+    neo = build_neo(neo_raw(credentials_file=str(creds), pass_mark_waived='2026-11-26'))
+    assert neo.pass_mark_waived == date(2026, 11, 26) and not neo.unknown_keys
+    rep = arming.check(cfg, 'live', neo, tmp_path, TODAY, [])
+    assert not rep.armed and rep.gate_verdict == 'WAIVED'           # waiver alone never arms
+    assert 'WAIVED by the owner on 2026-11-26' in rep.text()
+    assert 'not evaluated (neo.volrix_csv not set)' in rep.text()   # report kept
+    assert 'entries blocked' not in rep.text()
+    (tmp_path / arming.ARM_FILE).write_text('2026-10-30')
+    rep = arming.check(cfg, 'live', neo, tmp_path, TODAY, [])
+    assert rep.armed_until == date(2026, 10, 30) and 'reads WAIVED' in rep.text()
+    reader = arming.make_arm_reader(neo, tmp_path, None)
+    assert reader(TODAY) == date(2026, 10, 30)
+    (tmp_path / arming.ARM_FILE).unlink()
+    assert reader(TODAY) is None                                     # deleting ARM still disarms
+    book, csv = pass_fixture(tmp_path)                               # a real PASS reads PASS
+    neo = build_neo(neo_raw(credentials_file=str(creds), volrix_csv=str(csv),
+                            pass_mark_waived='2026-11-26'))
+    assert arming.gate_verdict(neo, arming.read_paper_positions(book))[0] == 'PASS'
+    for bad in ('yes', True, '26-11-2026', 7):        # never stops the run (R6-06)
+        neo = build_neo(neo_raw(credentials_file=str(creds), pass_mark_waived=bad))
+        assert neo.pass_mark_waived is None and 'unreadable' in neo.pass_mark_waiver_problem
+        (tmp_path / arming.ARM_FILE).write_text('2026-10-30')
+        rep = arming.check(cfg, 'live', neo, tmp_path, TODAY, [])
+        assert rep.may_run and not rep.armed and 'NOT waived' in rep.text()
+        assert 'entries blocked' in rep.text()
+
+
 # ------------------------------------------------------------------- CLI
 @pytest.fixture
 def wired(tmp_path, monkeypatch):
@@ -310,7 +346,9 @@ def test_live_run_once_in_rehearsal_marks_maps_and_keeps_paper_untouched(wired, 
     assert cli.main(['live-status']) == 0
     out = capsys.readouterr().out
     assert 'REHEARSAL' in out and 'kill: ok' in out and 'NEO-' in out
+    capsys.readouterr()
     assert cli.main(['live-report']) == 0
+    assert 'REHEARSAL vs PAPER: 0 pairs' in capsys.readouterr().out   # twin line, empty books
     wired['clock']['now'] = T('2026-10-26', '15:45:00')
     assert cli.main(['live-digest']) == 0
     assert _book(wired)['days']['2026-10-26']['eod_sent']

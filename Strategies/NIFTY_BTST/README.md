@@ -53,6 +53,20 @@ Fixed in advance. Read it with `python -m nifty_btst compare FILE`. Do not tune 
 whether the edge is real. A losing window does not fail it, and 30 trades cannot prove an edge.
 No real order until it reads PASS, the NEO design is approved, and the owner says so.
 
+**WAIVED by the owner on 2026-11-26** ("we cannot get 100% sync; the concept is clear and matches
+the direction and P&L; what matters now is razor-sharp execution"). Go-live 2026-12-01 after the
+Stage 3 real 1-lot test. The waiver is `neo.pass_mark_waived: "2026-11-26"` in the Pi's LIVE overlay
+only; the tracked default `null` keeps the gate fail-closed. The arming line then reads
+`PASS MARK: WAIVED by the owner on 2026-11-26 ...` and still prints the computed verdict, as a
+report (a computed FAIL is waived too: the owner waived the comparison itself). ARM is still
+required and still re-read every minute; the waiver is read once per `live-run` start (removing
+it takes effect at the next start). An unreadable waiver value never stops the run: it reads as
+NOT waived (entries blocked, exits run) and the arming line says so. What replaces the gate as the implementation check is the twin
+report in `live-report`: every trade both books took, live fill against the paper twin's fill,
+`extra cost/share = (paper exit - paper entry) - (live exit - live entry)`, split into its entry
+and exit parts (`nifty_btst/twin.py`). Added risk, said to the owner: real fills are measured only
+from the first live trades; the Rs 10 probe proves mechanics, not slippage on a Rs 150 option.
+
 ## Layout
 ```
 NIFTY_BTST/
@@ -155,7 +169,9 @@ to send again.
   that side on the symbol, and the broker holds exactly what the book expects (BUY) / at least the
   quantity sold (SELL). A read failure is a refusal.
 - A **short** on any symbol, an **extra lot**, an own-tag order the book does not know, or a tag
-  once written off that later appears: the kill trips, LOUD (every minute), and nothing is ever
+  once written off that later appears: the kill trips, LOUD (every minute; an already tripped kill
+  still records and alerts each new distinct reason, and the minute reminder leads with the
+  newest, R6-03), and nothing is ever
   traded to repair it. The owner looks in the app.
 - **A missing position row is evidence of nothing.** A holding or leg from an earlier day with no
   row is UNKNOWN: never sold, never adopted, never abandoned on absence. Positive sources only: a
@@ -171,7 +187,20 @@ to send again.
 - **Every SELL with a fill on the symbol today counts, ours or not (R4-02/03).** A filled SELL
   this book did not send blocks our SELL on every source, naming it; more sold today than this
   book held is a real short and a loud kill at once; a negative row is the row shape without
-  carried quantities only when it equals exactly the SELLs filled on a lot this book held. Sold it in the app? `python -m
+  carried quantities only when it equals exactly the SELLs filled on a lot this book held. That
+  sum leaves out the Stage 3 probe's own orders and nets filled BUYs this book did not send (an
+  owner buy-back or round trip), so a clean probe sale or a repaired short does not keep the kill
+  tripped (R5-01). A BUY is netted only when its row states this book's product AND today's
+  date; a row with no `prod` or no parsable `ordDtTm` is never netted (R6-04). A foreign SELL
+  already accounted for (adopted as an earlier lot's close, tied to a `live-book-external` close,
+  or netted by an owner BUY) does not block a later lot on the same strike; reconcile books an
+  owner's sale only for today's unclaimed SELLs and never inside a fresh entry's positions lag
+  (R5-02). `live-book-external` ties the close to the sale itself: the record's own quarantined
+  SELL, else the newest unclaimed foreign SELLs filled today and placed before the booking, each
+  claimed once (one that shows up late is tied at the next reconcile). With no such sale the
+  close excuses NOTHING (no quantity allowance) and is not counted as a sale today (R6-02).
+  While our SELL is working, a foreign SELL on the symbol, filled OR still working, makes the
+  engine cancel ours at once, not at its chase timer (R5-06, R6-05). Sold it in the app? `python -m
   nifty_btst live-book-external ID --price X --yes` (a pending entry that never filled:
   `--not-filled`; a pending one you sold: `--price X` books the real round trip). While an order of
   that record is LIVE at the broker, book-external cancels it and completes itself once the order
@@ -207,12 +236,20 @@ to send again.
   (`neo.entry_cap_pct`); above the cap no order, keep watching until 15:25. Not filled in 5 s:
   cancel, read back, re-price (up to `max_entry_attempts`). A rejection ends the side for the day;
   two in a row trip the kill — except the gateway refusals in `neo.retry_stcodes` (100008 = wrong
-  IP, HTTP 429 = throttled): definitely NOT placed, retried at the next poll with an alert, no
-  streak. A leg whose fill is unknown is never abandoned. Order-book quantities get the unit check
+  IP, HTTP 429 = throttled): definitely NOT placed, no streak, not an attempt, not counted by the
+  order ceilings, and retried after a backoff of 3 s doubling to at most 60 s (code constants,
+  reset by the first send that is not refused and at the first refusal of a new day, R6-07), with
+  an alert (R5-03). Each send has its own tag,
+  a refused one included (R5-08). A leg whose fill is unknown is never abandoned. Order-book quantities get the unit check
   too: a fill that is not a whole lot multiple, or larger than what was sent, is never booked and
   never becomes a SELL quantity — the leg is quarantined and the kill trips loud; the stop is
   still watched and alerted; the owner's way out is `live-book-external ID --price X --yes` or
-  `--not-filled`, which clears the quarantine on his word (R4-05). The trade book gets the same
+  `--not-filled`, which clears the quarantine on his word (R4-05). On a quarantined EXIT (the
+  record holds the lot) `--not-filled` is refused with nothing changed (R5-05). The broker has
+  REPORTED a fill, so the way out is to sell in the app if the lot is still held, then `--price X`.
+  `live-confirm-held ID --yes` clears an exit quarantine only when the order and the trade book read
+  that SELL terminal with NO fill (a partial fill counts); otherwise it is refused, and the selling
+  guard also refuses while a cleared SELL of the record shows a fill (R6-01). The trade book gets the same
   check. A definite gateway refusal (100008, 429, on any HTTP status) is not an attempt and never
   pushes an exit into slow mode (R4-10/20).
 - Stop: **50% of the REAL fill**, watched by the bot only (no resting order, Q1). It fires when the
@@ -231,7 +268,8 @@ to send again.
   with a 3 s timeout, always after the order (R4-01/19). Live has its OWN switch,
   `neo.telegram_enabled`.
 - The order ceiling (`max_orders_per_day`) never stops an exit: past it the kill trips (no new
-  entries) and exits keep their minimum interval. Probe sends do not count.
+  entries) and exits keep their minimum interval. Probe sends and definite gateway refusals do
+  not count.
 - Kill: **Rs 75,000 drawdown from peak equity, open marks included** — stops NEW entries only, exits
   always run. A non-finite equity (a NaN price in the book) trips it loud rather than disabling it;
   `live-book-external` refuses a price that is not finite, positive and within 1/50..20x of the
@@ -295,10 +333,11 @@ entries), `arm_max_days` 35, `empty_report_stcode` 5203, `empty_report_emsg` "No
 `empty_ok_without_data` false, `empty_report_order_book|positions|trade_book|holdings` (per-report
 `{"stcode": .., "emsg": ..}`, null = the default shape), `auth_stcodes` [1003],
 `transient_stcodes` [1005], `rejected_stcodes` [1004, 1006, 1007, 1009, 100008] (any other
-`Not_Ok` on a send is UNCLEAR), `retry_stcodes` [100008, 429] (definite refusals retried at the
-next poll), `telegram_enabled` true (LIVE's own switch), `holdings_source_enabled` false,
+`Not_Ok` on a send is UNCLEAR), `retry_stcodes` [100008, 429] (definite refusals, retried after a
+3 s doubling to 60 s backoff), `telegram_enabled` true (LIVE's own switch), `holdings_source_enabled` false,
 `position_qty_unit` shares|lots, `positions_lag_sec` 60. In code, not config: `MAX_LIVE_LOTS = 1`,
-order-probe premium ceiling Rs 1,000, product NRML. A key in the `neo` block that the code does not
+order-probe premium ceiling Rs 1,000, the refusal backoff 3 s doubling to 60 s (R5-03; the cap is a
+safety bound an overlay must not raise), product NRML. A key in the `neo` block that the code does not
 know is named in the arming line (`UNKNOWN neo keys ignored`). The rule values live shares with
 paper (`stop_frac`, `next_day_exit`, `trigger_mult`, `entry_start`/`entry_end`, `market_close`,
 `lots`) are compared with PAPER's effective values at every start: a difference is printed as
@@ -310,8 +349,9 @@ nothing.
    exists. Without these the live process refuses to start (exit 6).
 2. **Strategy entries** need BOTH: `state_live/ARM` holding a date `YYYY-MM-DD` (today <= date, at
    most 35 days ahead) AND the pass mark reading **PASS** (`neo.volrix_csv` set to the Volrix export,
-   `compare.gate` against the paper book). No CSV, an unreadable CSV, IN PROGRESS or FAIL = **NOT
-   ARMED**. Both are re-read every minute: deleting ARM disarms a running process. Unarmed, the
+   `compare.gate` against the paper book) or **WAIVED** (`neo.pass_mark_waived` set to a date, the
+   owner's decision of 2026-11-26). No CSV, an unreadable CSV, IN PROGRESS or FAIL without a
+   waiver = **NOT ARMED**. Both are re-read every minute: deleting ARM disarms a running process. Unarmed, the
    process still runs every exit, reconciles and alerts — it opens nothing new.
 3. **The order probe** needs `state_live/PROBE_ARM` holding TODAY's date, `--confirm-real-order`,
    market hours, 1 lot, premium under the ceiling. The strategy ARM never arms the probe, and
@@ -367,7 +407,9 @@ refuses unless BOTH `--allow-missing-row --owner-confirms-held` are given AND th
 hold filled with no FILLED probe SELL since (a placed-then-cancelled SELL is not a sale). A SELL
 with a fill on the symbol today refuses every `sell` run, whatever the positions report says, a
 live SELL refuses it whatever the flags say, and a second `all` on the symbol refuses before
-buying (R4-06/22); rows are read by date. A positions read that fails prints `row UNKNOWN` and sends nothing. The NOT FLAT
+buying (R4-06/22); rows are read by date. A probe SELL whose outcome was never read (an unclear
+send, still UNRESOLVED in the journal) refuses every probe SELL on the symbol that day, and `all`
+before it buys (R5-10). A positions read that fails prints `row UNKNOWN` and sends nothing. The NOT FLAT
 report at the end means the reports may be lagging: do NOT re-run; check the app. Every step journals to
 `state_live/intents.jsonl`, always reports what is held, and always sends a Telegram.
 

@@ -11,6 +11,9 @@ crash. One JSONL file, append-only, one line per event:
                                                                      searched twice and absent
   BOUND       tag, order_no, how (tag|criteria)                    - found in the book later
 
+A NOT_PLACED with `refused: true` is a definite gateway refusal: its INTENT
+is not counted as a send by the ceilings (R5-03).
+
 An INTENT with no PLACED / NOT_PLACED / BOUND after it is UNRESOLVED: a send
 whose fate is unknown. On start the engine resolves every one of those against
 the broker's book before it sends anything. The file is also the per-day order
@@ -78,9 +81,14 @@ class Journal:
         self._write({'t': when.isoformat(timespec='seconds'), 'ev': 'PLACED',
                      'tag': tag, 'order_no': str(order_no)})
 
-    def not_placed(self, when: datetime, tag: str, why: str) -> None:
-        self._write({'t': when.isoformat(timespec='seconds'), 'ev': 'NOT_PLACED',
-                     'tag': tag, 'why': why})
+    def not_placed(self, when: datetime, tag: str, why: str, refused: bool = False) -> None:
+        """`refused`: a definite gateway refusal (`neo.retry_stcodes`). Its
+        INTENT is not a send for the ceilings (R5-03); the tag still counts as
+        written off, so a late arrival still trips the kill."""
+        line = {'t': when.isoformat(timespec='seconds'), 'ev': 'NOT_PLACED', 'tag': tag, 'why': why}
+        if refused:
+            line['refused'] = True
+        self._write(line)
 
     def bound(self, when: datetime, tag: str, order_no: str, how: str) -> None:
         self._write({'t': when.isoformat(timespec='seconds'), 'ev': 'BOUND',
@@ -117,16 +125,23 @@ class Journal:
         return [v for k, v in intents.items() if k not in resolved]
 
     def sends_today(self, day: date, kind: Optional[str] = None,
-                    include_probe: bool = False) -> int:
+                    include_probe: bool = False, include_refused: bool = False) -> int:
         """Orders SENT today (intents, resolved or not): the ceiling counter.
         Probe sends (`probe: true`) are excluded unless asked for, so a Stage-3
-        probe never eats the strategy's budget (NEO-21)."""
+        probe never eats the strategy's budget (NEO-21). A definite gateway
+        refusal (NOT_PLACED `refused`) never reached the exchange and is not
+        counted unless asked for (R5-03): ten 429s must not trip a ceiling."""
         prefix = day.strftime('%Y%m%d') + '-'
+        lines = self.lines()
+        refused = set() if include_refused else {
+            str(ln.get('tag')) for ln in lines if ln.get('ev') == 'NOT_PLACED' and ln.get('refused')}
         n = 0
-        for line in self.lines():
+        for line in lines:
             if line.get('ev') != 'INTENT' or not str(line.get('tag', '')).startswith(prefix):
                 continue
             if line.get('probe') and not include_probe:
+                continue
+            if str(line.get('tag')) in refused:
                 continue
             if kind is None or line.get('kind') == kind:
                 n += 1
