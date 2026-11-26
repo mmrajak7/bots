@@ -368,6 +368,10 @@ class Engine:
     def manage_open(self, now: datetime, books: Dict[str, Book]) -> None:
         cfg, today, t = self.cfg, now.date(), now.time()
         exit_dt = at(today, cfg.next_day_exit)
+        # Positive evidence that today is a session, as live's R3-10: today's
+        # mark completed, or an option book polled now traded today.
+        proven = bool(self.store.day(today).get('mark_done')) or any(
+            traded_on(x, today) for k, x in books.items() if k != cfg.index_quote_symbol)
         for p in self.store.open_positions():
             if p['expiry'] < today.isoformat():
                 continue                        # settle_expired owns it
@@ -384,13 +388,12 @@ class Engine:
                 p['next_open_at'] = now.isoformat(timespec='seconds')
             reason = p.get('exit_pending')
             if reason is None:
-                # The 09:25 exit belongs to the next TRADING session. Without a
-                # book traded today this may be a closed day (the calendar has
-                # missed closures, e.g. 2026-11-24); latching here once carried
-                # the exit into the following session's 09:15 open instead of
-                # its 09:25. Re-evaluated every poll, so a real session whose
-                # quotes come back late still exits (as next_day_late).
-                if overnight and t >= cfg.next_day_exit and b is not None:
+                # The 09:25 exit belongs to the next TRADING session. On a day
+                # not shown to trade (the calendar has missed closures, e.g.
+                # 2026-11-24) latching once carried the exit into the following
+                # session's 09:15 open instead of its 09:25. Same test as live
+                # (R3-10), so the two books label the same exit the same way.
+                if overnight and t >= cfg.next_day_exit and (b is not None or proven):
                     late = (now - exit_dt).total_seconds() > cfg.next_day_exit_grace_sec
                     reason = 'next_day_late' if late else 'next_day_0925'
                 elif b is not None and 0 < b.ltp <= p['stop_level']:

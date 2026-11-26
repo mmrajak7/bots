@@ -587,5 +587,7 @@ def test_make_scrip_loader_downloads_then_caches(tmp_path):
 
 def test_open_settle_is_bounded_to_seconds():
     with pytest.raises(config_mod.ConfigError, match='open_settle_sec'):
-        build_neo(neo_raw(open_settle_sec=121))
+        build_neo(neo_raw(open_settle_sec=61))
+    with pytest.raises(config_mod.ConfigError, match='open_settle_max'):
+        build_neo(neo_raw(open_settle_max_abs=0, open_settle_max_pct=0))
     assert build_neo(neo_raw(open_settle_sec=0)).open_settle_sec == 0

@@ -413,3 +413,20 @@ def test_opening_minute_logs_every_poll_then_once_a_minute(cfg, store, market):
     polls = [ev['t'][11:19] for ev in map(json.loads, lines) if ev['kind'] == 'POLL']
     assert polls[:5] == ['09:15:00', '09:15:03', '09:15:06', '09:15:57', '09:16:00']
     assert '09:16:03' not in polls and '09:16:30' not in polls
+
+
+def test_real_session_held_option_trades_late_keeps_the_0925_label(cfg, store, market):
+    # independent review M1: the day is SHOWN trading (today's mark), only the
+    # held option is quiet at 09:25. Live latches at 09:25; paper must too.
+    e = held_from_tuesday(cfg, store, market)
+    market.stale = {CE_TUE}
+    go(e, T(WED, '09:15:05'))
+    go(e, T(WED, '09:20:01'))
+    assert store.day(T(WED, '09:20:01').date()).get('mark_done')
+    go(e, T(WED, '09:25:01'))
+    assert store.open_positions()[0]['exit_pending'] == 'next_day_0925'
+    market.stale = set()
+    market.set(CE_TUE, 160.0, bid=159.9, ask=160.1)
+    go(e, T(WED, '09:28:00'))
+    [c] = store.closed_positions()
+    assert c['exit_reason'] == 'next_day_0925' and c['exit_price'] == 159.9

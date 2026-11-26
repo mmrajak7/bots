@@ -198,7 +198,9 @@ to send again.
   (Rs 0.50) OR <= `open_settle_max_pct` (1%) of mid. Paper's entry gate (Rs 2 OR 10%) is too loose
   for this: it would have passed 5 of the 11 opening books. Inside the window a bid under the stop
   counts as a stop only on a settled book (an LTP under it always does). After the window: any
-  bid, as below (NEO-14 / NEO-30), so a stop is never stranded. `0` turns it off; max 120 s.
+  bid, as below (NEO-14 / NEO-30), so a stop is never stranded. `0` turns it off; max 60 s (the opening-minute log covers the whole wait).
+  Not covered: a single stray opening TRADE under the stop still triggers it (as paper and the
+  backtest do); only the bid trigger is gated.
   Paper is NOT changed (it is the Volrix twin), so the rehearsal-vs-paper gap on 09:15 stops now
   measures the settle (still simulated: the fake broker fills at its own limit).
 - Entry: LIMIT BUY at the ask (rounded UP to the tick), **capped at trigger +5%**

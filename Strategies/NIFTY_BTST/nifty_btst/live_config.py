@@ -47,7 +47,7 @@ RULE_KEYS = ('target_premium', 'trigger_mult', 'stop_frac', 'lots', 'market_open
              'late_mark_after', 'entry_start', 'entry_end', 'next_day_exit',
              'next_day_exit_grace_sec', 'market_close', 'max_spread_abs', 'max_spread_pct')
 MAX_LIVE_LOTS = 1
-MAX_OPEN_SETTLE_SEC = 120
+MAX_OPEN_SETTLE_SEC = 60     # = paper's open_log_sec default: every poll of the wait is logged
 LIVE_OVERLAY_FILE = APP_DIR / 'btst_live_config.json'
 QTY_UNITS = ('shares', 'lots')
 
@@ -232,6 +232,8 @@ def build_neo(raw: Any) -> NeoConfig:
     if cfg.open_settle_sec > MAX_OPEN_SETTLE_SEC:
         # the wait delays a STOP; it must stay a matter of seconds
         raise ConfigError('neo.open_settle_sec must be <= %d' % MAX_OPEN_SETTLE_SEC)
+    if cfg.open_settle_sec > 0 and cfg.open_settle_max_abs <= 0 and cfg.open_settle_max_pct <= 0:
+        raise ConfigError('neo.open_settle_max_abs / open_settle_max_pct: at least one must be > 0')
     if cfg.exit_retry_slow_sec < cfg.exit_chase_sec:
         raise ConfigError('neo.exit_retry_slow_sec must be >= exit_chase_sec')
     if cfg.unknown_grace_sec < cfg.unknown_recheck_sec:
