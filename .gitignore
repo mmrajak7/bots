@@ -219,3 +219,7 @@ FIFTY/data/breadth/*.tmp
 
 # derived: expiry closes fetched by zebra/debit_sl_study.py (re-fetchable)
 Helper/zebra/_expiry_close_cache.json
+
+# Neo credentials + session cache: MPIN/TOTP/session token, never tracked (2026-11-26)
+**/neo_credentials.yaml
+**/neo/data/session.json
