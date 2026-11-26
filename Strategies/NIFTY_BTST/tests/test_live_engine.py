@@ -840,3 +840,49 @@ def test_live_digest_mentions_kill_and_sends(cfg, tmp_path, market):
     rig.go(T(MON, '10:00:01'))
     text = rig.engine.eod_digest(T(MON, '15:45:00').date())
     assert 'LIVE (live)' in text and 'sends today 1 (entries 1)' in text and 'BOUGHT' in text
+
+
+# ------------------------------------------------ opening settle (2026-11-26)
+def _held_into_a_gap(cfg, tmp_path, market, **kw):
+    rig = marked(cfg, tmp_path, market, **kw)
+    rig.broker.fill_price_override = 152.3
+    trigger_ce(rig)
+    rig.go(T(MON, '10:00:01'))
+    rig.broker.fill_price_override = None
+    return rig
+
+
+def test_opening_settle_does_not_sell_into_the_0915_wide_book(cfg, tmp_path, market):
+    # the 2026-11-18 shape: 09:15:00 ltp 69.00 bid 60.15 ask 67.50; 3 s later
+    # the book was tight with a bid of 72.35
+    rig = _held_into_a_gap(cfg, tmp_path, market)
+    sent = len(rig.broker.sent)
+    rig.market.set(CE_MON, 69.0, bid=60.15, ask=67.5)
+    rig.go(T(TUE, '09:15:00'))
+    assert state(rig)['live']['exit_reason'] == 'stop_next_morning'
+    assert len(rig.broker.sent) == sent                     # nothing at 60.15
+    assert state(rig)['exit_defers'] >= 1
+    rig.market.set(CE_MON, 72.5, bid=72.35, ask=72.6)
+    rig.go(T(TUE, '09:15:03'))
+    assert rig.broker.sent[-1].side == 'S' and rig.broker.sent[-1].price == '72.35'
+    rig.go(T(TUE, '09:15:04'))
+    p = state(rig)
+    assert p['status'] == 'closed' and p['exit_price'] == 72.35
+
+
+def test_opening_settle_is_bounded_then_sells_at_any_bid(cfg, tmp_path, market):
+    rig = _held_into_a_gap(cfg, tmp_path, market)
+    sent = len(rig.broker.sent)
+    rig.market.set(CE_MON, 69.0, bid=60.15, ask=67.5)       # stays wide
+    for s in ('00', '10', '20', '29'):
+        rig.go(T(TUE, '09:15:' + s))
+    assert len(rig.broker.sent) == sent
+    rig.go(T(TUE, '09:15:30'))                               # wait over: NEO-14
+    assert rig.broker.sent[-1].side == 'S' and rig.broker.sent[-1].price == '60.15'
+
+
+def test_opening_settle_off_when_zero(cfg, tmp_path, market):
+    rig = _held_into_a_gap(cfg, tmp_path, market, neo_overrides={'open_settle_sec': 0})
+    rig.market.set(CE_MON, 69.0, bid=60.15, ask=67.5)
+    rig.go(T(TUE, '09:15:00'))
+    assert rig.broker.sent[-1].side == 'S' and rig.broker.sent[-1].price == '60.15'

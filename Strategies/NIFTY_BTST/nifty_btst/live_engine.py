@@ -65,7 +65,7 @@ from .kite_io import Market, QuoteError
 from .live_config import MAX_LIVE_LOTS, NeoConfig
 from .neo_symbols import ScripMap, ScripMasterError
 from .notify import Notifier
-from .pricing import Book, traded_on
+from .pricing import Book, reliable, traded_on
 from .sessions import at
 from .store import CorruptBook, Store
 from .ticks import price_str, round_tick
@@ -1579,6 +1579,22 @@ class LiveEngine(Engine):
                             'EXIT #%d %s due but no usable bid (%s). Waiting.'
                             % (p['id'], p['symbol'], why))
             return
+        # Opening settle (owner 2026-11-26): options have no pre-open, and the
+        # 09:15:00 book was wide or one-sided on all 11 overnight mornings
+        # logged, tight on all 11 by 09:16. For the first `open_settle_sec`
+        # a SELL waits for paper's reliable book; after it, any bid (NEO-14),
+        # so the wait is bounded and a stop is never stranded.
+        settle_end = at(now.date(), self.cfg.market_open) + timedelta(
+            seconds=neo.open_settle_sec)
+        if now < settle_end:
+            ok, why = reliable(b, self.cfg.max_spread_abs, self.cfg.max_spread_pct)
+            if not ok:
+                p['exit_defers'] = int(p.get('exit_defers', 0)) + 1
+                self.store.event(now, 'DEFER', what='exit', id=p['id'],
+                                 reason=lv.get('exit_reason'),
+                                 why='opening settle until %s: %s'
+                                 % (settle_end.time().isoformat(), why))
+                return
         if b.ask > 0 and b.ask - b.bid > self.cfg.max_spread_abs:
             self.store.event(now, 'WIDE_BOOK', id=p['id'], bid=b.bid, ask=b.ask)
         qty = self._remaining(p)

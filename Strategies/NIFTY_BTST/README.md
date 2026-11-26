@@ -191,6 +191,11 @@ to send again.
   expected, trips the kill loud rather than being read as flat.
 
 ### What live does differently from paper
+- **Opening settle (owner, 2026-11-26; `neo.open_settle_sec`, 30).** NIFTY options have no
+  pre-open (NSE's F&O pre-open, from 2025-12-08, is futures only). The 09:15:00 book was wide or
+  one-sided on all 11 overnight mornings logged and tight on all 11 by 09:16:00. For the first 30 s
+  after 09:15:00 a live SELL waits for paper's reliable book (`max_spread_abs` / `max_spread_pct`);
+  after that it sells at any bid as below (NEO-14), so a stop is never stranded. `0` turns it off.
 - Entry: LIMIT BUY at the ask (rounded UP to the tick), **capped at trigger +5%**
   (`neo.entry_cap_pct`); above the cap no order, keep watching until 15:25. Not filled in 5 s:
   cancel, read back, re-price (up to `max_entry_attempts`). A rejection ends the side for the day;
@@ -340,7 +345,8 @@ while `state_live/run.lock` is held.
 echo 2026-MM-DD > state_live/PROBE_ARM                   # today's date; expires tonight
 ../../CROCODILE/venv/bin/python -m nifty_btst neo-order-probe --symbol <sym> --confirm-real-order
 ../../CROCODILE/venv/bin/python -m nifty_btst neo-order-probe --symbol <sym> --confirm-real-order --step hold
-# next morning after 09:15, PROBE_ARM re-dated:
+# next morning, PROBE_ARM re-dated. Run the sell AT 09:15:00 (owner, 2026-11-26): it is the one
+# real measure of an opening fill; the fake broker fills at its own limit.
 ../../CROCODILE/venv/bin/python -m nifty_btst neo-order-probe --symbol <sym> --confirm-real-order --step sell
 ```
 `all` measures: order visibility delay after a send, `GuiOrdId` echo, cancel latency. Any order the
@@ -385,6 +391,10 @@ watching plus a reconcile that must find the book exactly as the broker has it. 
 that touches this folder, both loops need the restart; the paper one is harmless any time.
 
 ### Logged changes to the paper configuration
+- 2026-11-26: the 09:25 exit is no longer set due on a day the option has not traded (an
+  unlisted closure, 2026-11-24, carried it to the next session's 09:15 open: trade #11 sold 09:15:03
+  at 119.20, rehearsal 09:25 at 100.40; #11 is left as booked). New `open_log_sec` (60): every poll
+  of the opening minute is logged as POLL (evidence only, no trading change).
 - 2026-11-02: `fee_rates.stt_sell_pct` 0.10 -> 0.15 (STT on option premium sold is 0.15% since
   2026-04-01, per the NEO audit). Stored paper `net_pnl` / `net_ex_brokerage` change at the next
   paper restart; the pass mark (`compare.gate`) uses prices only, so it is unaffected.

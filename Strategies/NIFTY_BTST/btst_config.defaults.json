@@ -21,6 +21,7 @@
 
   "poll_seconds": 3,
   "poll_log_every_sec": 60,
+  "open_log_sec": 60,
   "quote_retries": 3,
   "quote_fail_alert_after": 10,
 
@@ -52,6 +53,7 @@
     "entry_timeout_sec": 5,
     "max_entry_attempts": 5,
     "exit_chase_sec": 3,
+    "open_settle_sec": 30,
     "exit_chase_fast_max": 10,
     "exit_retry_slow_sec": 60,
     "unknown_recheck_sec": 3,

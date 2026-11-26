@@ -278,6 +278,69 @@ def test_holiday_with_stale_books_closes_the_day_and_books_nothing(cfg, store, m
     assert not h.notify.sent                 # an expected holiday is not an alert
 
 
+THU = '2026-10-29'
+CE_TUE = sym('2026-11-03', 22850, 'CE')     # TUE is expiry day: marks the next weekly
+
+
+def held_from_tuesday(cfg, store, market):
+    """Bought Tuesday, held into an UNLISTED closure on Wednesday: the
+    calendar expects a session, every book is Tuesday's."""
+    default_premiums(market, '2026-11-03')
+    e = eng(cfg, store, market)
+    go(e, T(TUE, '09:15:30'))
+    go(e, T(TUE, '09:20:01'))
+    market.set(CE_TUE, 154.0)
+    go(e, T(TUE, '11:00:00'))
+    assert store.open_positions()[0]['symbol'] == CE_TUE
+    market.stale = set(market.books)
+    return e
+
+
+def test_unlisted_closure_does_not_move_the_next_sessions_exit_to_0915(cfg, store, market):
+    # 2026-11-23 entry, 11-24 closed (calendar missed it), 11-25 paper sold
+    # at 09:15:03 instead of 09:25. The exit belongs to 09:25 of the next
+    # session that TRADES.
+    e = held_from_tuesday(cfg, store, market)
+    for hms in ('09:15:05', '09:25:01', '09:25:31', '12:00:00', '15:39:00'):
+        go(e, T(WED, hms))
+    [p] = store.open_positions()
+    assert p.get('exit_pending') is None and not store.closed_positions()
+    market.stale = set()                     # Thursday trades
+    market.set(CE_TUE, 120.0, bid=119.9, ask=120.1)
+    go(e, T(THU, '09:15:03'))
+    go(e, T(THU, '09:24:59'))
+    assert store.open_positions()            # no 09:15 exit
+    market.set(CE_TUE, 100.0, bid=99.9, ask=100.1)
+    go(e, T(THU, '09:25:02'))
+    [c] = store.closed_positions()
+    assert c['exit_reason'] == 'next_day_0925' and c['exit_price'] == 99.9
+    assert c['exit_time'].startswith('%sT09:25' % THU)
+
+
+def test_unlisted_closure_still_watches_the_stop_at_the_next_open(cfg, store, market):
+    e = held_from_tuesday(cfg, store, market)
+    stop = store.open_positions()[0]['stop_level']
+    go(e, T(WED, '09:25:01'))
+    market.stale = set()
+    market.set(CE_TUE, stop - 5, bid=stop - 5.1, ask=stop - 4.9)
+    go(e, T(THU, '09:15:03'))
+    [c] = store.closed_positions()
+    assert c['exit_reason'] == 'stop_next_morning'
+
+
+def test_quotes_out_at_0925_on_a_real_session_exit_late_when_back(cfg, store, market):
+    e = marked_monday(cfg, store, market)
+    market.set(CE_MON, 154.0)
+    go(e, T(MON, '11:00:00'))
+    market.set(CE_MON, 170.0, bid=169.8, ask=170.2)
+    market.stale = {CE_MON}
+    go(e, T(TUE, '09:25:01'))
+    market.stale = set()
+    go(e, T(TUE, '09:40:00'))
+    [c] = store.closed_positions()
+    assert c['exit_reason'] == 'next_day_late' and c['exit_price'] == 169.8
+
+
 def test_late_start_on_a_holiday_closes_quietly(cfg, store, market):
     default_premiums(market, '2026-10-27')
     market.stale = set(market.books)         # and no candles exist for today
@@ -294,7 +357,9 @@ def test_exit_due_on_a_stale_book_waits_for_a_trade_today(cfg, store, market):
     market.set(CE_MON, 170.0, bid=169.8, ask=170.2)
     market.stale = {CE_MON}                  # not traded yet this morning
     go(e, T(TUE, '09:25:01'))
-    assert store.open_positions()[0]['exit_pending'] == 'next_day_0925'
+    # nothing latched on a book not traded today (2026-11-24 bug): the exit
+    # is re-evaluated each poll and fires on the first book traded today
+    assert store.open_positions()[0].get('exit_pending') is None
     market.stale = set()
     go(e, T(TUE, '09:25:04'))
     [c] = store.closed_positions()
@@ -334,3 +399,17 @@ def test_stale_book_never_triggers_a_stop_or_entry(cfg, store, market):
     market.stale = {CE_MON}
     go(e, T(MON, '11:10:00'))
     assert store.open_positions()            # a stale print below the stop is not a stop
+
+
+def test_opening_minute_logs_every_poll_then_once_a_minute(cfg, store, market):
+    e = marked_monday(cfg, store, market)
+    market.set(CE_MON, 154.0)
+    go(e, T(MON, '11:00:00'))
+    for hms in ('09:15:00', '09:15:03', '09:15:06', '09:15:57', '09:16:00', '09:16:03',
+                '09:16:30'):
+        go(e, T(TUE, hms))
+    import json
+    lines = (store.dir / ('events_%s.jsonl' % TUE.replace('-', ''))).read_text().splitlines()
+    polls = [ev['t'][11:19] for ev in map(json.loads, lines) if ev['kind'] == 'POLL']
+    assert polls[:5] == ['09:15:00', '09:15:03', '09:15:06', '09:15:57', '09:16:00']
+    assert '09:16:03' not in polls and '09:16:30' not in polls

@@ -85,6 +85,7 @@ class Config:
     market_close: dtime
     poll_seconds: float
     poll_log_every_sec: int
+    open_log_sec: int
     quote_retries: int
     quote_fail_alert_after: int
     max_spread_abs: float
@@ -139,6 +140,7 @@ def build(raw: Dict[str, Any]) -> Config:
         market_close=_hms(raw['market_close'], 'market_close'),
         poll_seconds=_pos(raw, 'poll_seconds'),
         poll_log_every_sec=int(_pos(raw, 'poll_log_every_sec')),
+        open_log_sec=int(_pos(raw, 'open_log_sec')),
         quote_retries=int(_pos(raw, 'quote_retries')),
         quote_fail_alert_after=int(_pos(raw, 'quote_fail_alert_after')),
         max_spread_abs=_pos(raw, 'max_spread_abs'),

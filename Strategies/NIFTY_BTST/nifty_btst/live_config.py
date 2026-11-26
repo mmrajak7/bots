@@ -29,7 +29,7 @@ EXECUTION_MODES = ('paper', 'rehearsal', 'live')
 KNOWN_NEO_KEYS = frozenset((
     'credentials_file', 'login_url', 'exchange_segment', 'product', 'http_timeout_sec',
     'login_timeout_sec', 'poll_seconds', 'entry_cap_pct', 'entry_timeout_sec',
-    'max_entry_attempts', 'exit_chase_sec', 'exit_chase_fast_max', 'exit_retry_slow_sec',
+    'max_entry_attempts', 'exit_chase_sec', 'open_settle_sec', 'exit_chase_fast_max', 'exit_retry_slow_sec',
     'unknown_recheck_sec', 'unknown_grace_sec', 'kill_drawdown_rs', 'max_premium_rs',
     'max_entry_orders_per_day', 'max_orders_per_day', 'funds_margin_pct', 'limits_net_field',
     'reconcile_sec', 'order_poll_sec', 'expiry_backstop_time', 'sell_refused_alert_sec',
@@ -63,6 +63,7 @@ class NeoConfig:
     entry_timeout_sec: float
     max_entry_attempts: int
     exit_chase_sec: float
+    open_settle_sec: float
     exit_chase_fast_max: int
     exit_retry_slow_sec: float
     unknown_recheck_sec: float
@@ -178,6 +179,7 @@ def build_neo(raw: Any) -> NeoConfig:
         entry_timeout_sec=_pos(raw, 'entry_timeout_sec'),
         max_entry_attempts=_int(raw, 'max_entry_attempts'),
         exit_chase_sec=_pos(raw, 'exit_chase_sec'),
+        open_settle_sec=_nonneg(raw, 'open_settle_sec'),
         exit_chase_fast_max=_int(raw, 'exit_chase_fast_max'),
         exit_retry_slow_sec=_pos(raw, 'exit_retry_slow_sec'),
         unknown_recheck_sec=_pos(raw, 'unknown_recheck_sec'),

@@ -384,7 +384,13 @@ class Engine:
                 p['next_open_at'] = now.isoformat(timespec='seconds')
             reason = p.get('exit_pending')
             if reason is None:
-                if overnight and t >= cfg.next_day_exit:
+                # The 09:25 exit belongs to the next TRADING session. Without a
+                # book traded today this may be a closed day (the calendar has
+                # missed closures, e.g. 2026-11-24); latching here once carried
+                # the exit into the following session's 09:15 open instead of
+                # its 09:25. Re-evaluated every poll, so a real session whose
+                # quotes come back late still exits (as next_day_late).
+                if overnight and t >= cfg.next_day_exit and b is not None:
                     late = (now - exit_dt).total_seconds() > cfg.next_day_exit_grace_sec
                     reason = 'next_day_late' if late else 'next_day_0925'
                 elif b is not None and 0 < b.ltp <= p['stop_level']:
@@ -467,10 +473,17 @@ class Engine:
     # ------------------------------------------------------------ evidence
     def _poll_log(self, now: datetime, day: Dict[str, Any],
                   books: Dict[str, Book]) -> None:
-        if (self._last_poll_log is not None and
+        # Every poll of the opening minute is kept: the 09:15:00 book is wide
+        # or empty on every overnight morning seen (2026-11-26 study) and the
+        # book that later fills a stop was seconds after it, unlogged.
+        opening = now < at(now.date(), self.cfg.market_open) + timedelta(
+            seconds=self.cfg.open_log_sec)
+        if (not opening and self._last_poll_log is not None and
                 (now - self._last_poll_log).total_seconds() < self.cfg.poll_log_every_sec):
             return
-        self._last_poll_log = now
+        # inside the opening minute the cadence is not anchored, so the first
+        # poll after it (09:16:00) is kept too, then once a minute as before
+        self._last_poll_log = None if opening else now
         snap = {k: [b.ltp, b.bid, b.ask] for k, b in books.items()}
         self.store.event(now, 'POLL', books=snap)
 
