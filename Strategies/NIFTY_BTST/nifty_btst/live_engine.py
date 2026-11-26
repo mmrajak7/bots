@@ -1506,7 +1506,8 @@ class LiveEngine(Engine):
             if leg:
                 if leg.get('quarantined') and b is not None and (
                         (0 < b.ltp <= float(p['stop_level']))
-                        or (0 < b.bid <= float(p['stop_level']) and b.ask > 0)):
+                        or (0 < b.bid <= float(p['stop_level']) and b.ask > 0
+                            and self._settled(b, now)[0])):
                     # watched, never traded, while the owner decides (R4-05)
                     self._throttled('qstop_%d' % p['id'], now, 60,
                                     'STOP HIT #%d %s (ltp %.2f, stop %.2f) while order %s is '
@@ -1536,7 +1537,9 @@ class LiveEngine(Engine):
                         (0 < b.ltp <= stop)
                         # the owner's wording: "sells when the bid hits 50% of
                         # the fill" — a two-sided bid at the level fires too
-                        or (0 < b.bid <= stop and b.ask > 0)):
+                        # ... but not a lowball bid in the empty opening book:
+                        # inside the settle window it counts only on a tight book
+                        or (0 < b.bid <= stop and b.ask > 0 and self._settled(b, now)[0])):
                     reason = 'stop_next_morning' if overnight else 'stop'
                 if reason is None:
                     continue
@@ -1555,6 +1558,22 @@ class LiveEngine(Engine):
                 continue
             self._try_exit(p, now, b)
         self._update_kill(now)
+
+    def _settled(self, b: Optional[Book], now: datetime) -> Tuple[bool, str]:
+        """Opening settle (owner, 2026-11-26). Options have no pre-open (NSE's
+        F&O pre-open is futures only), and the 09:15:00 book was wide or
+        one-sided on all 11 overnight mornings logged, within 0.7% on all 11 by
+        09:16. For `open_settle_sec` after the open a book counts only when its
+        spread is within `open_settle_max_abs` OR `open_settle_max_pct` of mid:
+        tighter than paper's entry gate, which would have passed 5 of those
+        09:15:00 books. After the window: True (any bid, NEO-14), so a stop is
+        never stranded."""
+        start = at(now.date(), self.cfg.market_open)
+        end = start + timedelta(seconds=self.neo.open_settle_sec)
+        if not start <= now < end:
+            return True, ''
+        ok, why = reliable(b, self.neo.open_settle_max_abs, self.neo.open_settle_max_pct)
+        return ok, '' if ok else 'opening settle until %s: %s' % (end.time().isoformat(), why)
 
     def _try_exit(self, p: Dict[str, Any], now: datetime, b: Optional[Book]) -> None:
         neo, lv = self.neo, self._live(p)
@@ -1579,22 +1598,12 @@ class LiveEngine(Engine):
                             'EXIT #%d %s due but no usable bid (%s). Waiting.'
                             % (p['id'], p['symbol'], why))
             return
-        # Opening settle (owner 2026-11-26): options have no pre-open, and the
-        # 09:15:00 book was wide or one-sided on all 11 overnight mornings
-        # logged, tight on all 11 by 09:16. For the first `open_settle_sec`
-        # a SELL waits for paper's reliable book; after it, any bid (NEO-14),
-        # so the wait is bounded and a stop is never stranded.
-        settle_end = at(now.date(), self.cfg.market_open) + timedelta(
-            seconds=neo.open_settle_sec)
-        if now < settle_end:
-            ok, why = reliable(b, self.cfg.max_spread_abs, self.cfg.max_spread_pct)
-            if not ok:
-                p['exit_defers'] = int(p.get('exit_defers', 0)) + 1
-                self.store.event(now, 'DEFER', what='exit', id=p['id'],
-                                 reason=lv.get('exit_reason'),
-                                 why='opening settle until %s: %s'
-                                 % (settle_end.time().isoformat(), why))
-                return
+        ok, why = self._settled(b, now)
+        if not ok:
+            p['exit_defers'] = int(p.get('exit_defers', 0)) + 1
+            self.store.event(now, 'DEFER', what='exit', id=p['id'],
+                             reason=lv.get('exit_reason'), why=why)
+            return
         if b.ask > 0 and b.ask - b.bid > self.cfg.max_spread_abs:
             self.store.event(now, 'WIDE_BOOK', id=p['id'], bid=b.bid, ask=b.ask)
         qty = self._remaining(p)

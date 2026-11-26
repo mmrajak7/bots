@@ -886,3 +886,35 @@ def test_opening_settle_off_when_zero(cfg, tmp_path, market):
     rig.market.set(CE_MON, 69.0, bid=60.15, ask=67.5)
     rig.go(T(TUE, '09:15:00'))
     assert rig.broker.sent[-1].side == 'S' and rig.broker.sent[-1].price == '60.15'
+
+
+def test_opening_settle_is_tighter_than_paper_gate(cfg, tmp_path, market):
+    # the 2026-11-18 #8 shape: a 09:15:00 spread of ~5% passes paper's entry
+    # gate (Rs 2 OR 10%) but is not a settled book
+    rig = _held_into_a_gap(cfg, tmp_path, market)
+    sent = len(rig.broker.sent)
+    rig.market.set(CE_MON, 75.0, bid=70.0, ask=74.0)         # ltp under the 76.15 stop
+    rig.go(T(TUE, '09:15:00'))
+    assert state(rig)['live']['exit_reason'] == 'stop_next_morning'
+    assert len(rig.broker.sent) == sent
+    rig.market.set(CE_MON, 74.0, bid=73.9, ask=74.1)
+    rig.go(T(TUE, '09:15:06'))
+    assert rig.broker.sent[-1].price == '73.90'
+
+
+def test_lowball_opening_bid_is_not_a_stop(cfg, tmp_path, market):
+    # ltp above the stop; only the empty opening book's bid is under it
+    rig = _held_into_a_gap(cfg, tmp_path, market)
+    rig.market.set(CE_MON, 85.0, bid=60.0, ask=90.0)
+    rig.go(T(TUE, '09:15:00'))
+    assert state(rig)['live'].get('exit_reason') is None
+    rig.market.set(CE_MON, 85.0, bid=84.9, ask=85.1)
+    rig.go(T(TUE, '09:15:03'))
+    assert state(rig)['live'].get('exit_reason') is None and state(rig)['status'] == 'open'
+
+
+def test_bid_stop_still_fires_after_the_window(cfg, tmp_path, market):
+    rig = _held_into_a_gap(cfg, tmp_path, market)
+    rig.market.set(CE_MON, 85.0, bid=60.0, ask=90.0)
+    rig.go(T(TUE, '09:15:31'))                               # NEO-30 unchanged
+    assert state(rig)['live']['exit_reason'] == 'stop_next_morning'

@@ -29,7 +29,8 @@ EXECUTION_MODES = ('paper', 'rehearsal', 'live')
 KNOWN_NEO_KEYS = frozenset((
     'credentials_file', 'login_url', 'exchange_segment', 'product', 'http_timeout_sec',
     'login_timeout_sec', 'poll_seconds', 'entry_cap_pct', 'entry_timeout_sec',
-    'max_entry_attempts', 'exit_chase_sec', 'open_settle_sec', 'exit_chase_fast_max', 'exit_retry_slow_sec',
+    'max_entry_attempts', 'exit_chase_sec', 'open_settle_sec',
+    'open_settle_max_abs', 'open_settle_max_pct', 'exit_chase_fast_max', 'exit_retry_slow_sec',
     'unknown_recheck_sec', 'unknown_grace_sec', 'kill_drawdown_rs', 'max_premium_rs',
     'max_entry_orders_per_day', 'max_orders_per_day', 'funds_margin_pct', 'limits_net_field',
     'reconcile_sec', 'order_poll_sec', 'expiry_backstop_time', 'sell_refused_alert_sec',
@@ -46,6 +47,7 @@ RULE_KEYS = ('target_premium', 'trigger_mult', 'stop_frac', 'lots', 'market_open
              'late_mark_after', 'entry_start', 'entry_end', 'next_day_exit',
              'next_day_exit_grace_sec', 'market_close', 'max_spread_abs', 'max_spread_pct')
 MAX_LIVE_LOTS = 1
+MAX_OPEN_SETTLE_SEC = 120
 LIVE_OVERLAY_FILE = APP_DIR / 'btst_live_config.json'
 QTY_UNITS = ('shares', 'lots')
 
@@ -64,6 +66,8 @@ class NeoConfig:
     max_entry_attempts: int
     exit_chase_sec: float
     open_settle_sec: float
+    open_settle_max_abs: float
+    open_settle_max_pct: float
     exit_chase_fast_max: int
     exit_retry_slow_sec: float
     unknown_recheck_sec: float
@@ -180,6 +184,8 @@ def build_neo(raw: Any) -> NeoConfig:
         max_entry_attempts=_int(raw, 'max_entry_attempts'),
         exit_chase_sec=_pos(raw, 'exit_chase_sec'),
         open_settle_sec=_nonneg(raw, 'open_settle_sec'),
+        open_settle_max_abs=_nonneg(raw, 'open_settle_max_abs'),
+        open_settle_max_pct=_nonneg(raw, 'open_settle_max_pct'),
         exit_chase_fast_max=_int(raw, 'exit_chase_fast_max'),
         exit_retry_slow_sec=_pos(raw, 'exit_retry_slow_sec'),
         unknown_recheck_sec=_pos(raw, 'unknown_recheck_sec'),
@@ -223,6 +229,9 @@ def build_neo(raw: Any) -> NeoConfig:
         raise ConfigError('neo.product must be NRML for an overnight hold')
     if cfg.max_orders_per_day < cfg.max_entry_orders_per_day:
         raise ConfigError('neo.max_orders_per_day must be >= max_entry_orders_per_day')
+    if cfg.open_settle_sec > MAX_OPEN_SETTLE_SEC:
+        # the wait delays a STOP; it must stay a matter of seconds
+        raise ConfigError('neo.open_settle_sec must be <= %d' % MAX_OPEN_SETTLE_SEC)
     if cfg.exit_retry_slow_sec < cfg.exit_chase_sec:
         raise ConfigError('neo.exit_retry_slow_sec must be >= exit_chase_sec')
     if cfg.unknown_grace_sec < cfg.unknown_recheck_sec:

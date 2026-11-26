@@ -476,8 +476,8 @@ class Engine:
         # Every poll of the opening minute is kept: the 09:15:00 book is wide
         # or empty on every overnight morning seen (2026-11-26 study) and the
         # book that later fills a stop was seconds after it, unlogged.
-        opening = now < at(now.date(), self.cfg.market_open) + timedelta(
-            seconds=self.cfg.open_log_sec)
+        start = at(now.date(), self.cfg.market_open)
+        opening = start <= now < start + timedelta(seconds=self.cfg.open_log_sec)
         if (not opening and self._last_poll_log is not None and
                 (now - self._last_poll_log).total_seconds() < self.cfg.poll_log_every_sec):
             return

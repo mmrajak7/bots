@@ -54,6 +54,8 @@
     "max_entry_attempts": 5,
     "exit_chase_sec": 3,
     "open_settle_sec": 30,
+    "open_settle_max_abs": 0.5,
+    "open_settle_max_pct": 1.0,
     "exit_chase_fast_max": 10,
     "exit_retry_slow_sec": 60,
     "unknown_recheck_sec": 3,

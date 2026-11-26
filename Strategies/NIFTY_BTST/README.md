@@ -193,9 +193,14 @@ to send again.
 ### What live does differently from paper
 - **Opening settle (owner, 2026-11-26; `neo.open_settle_sec`, 30).** NIFTY options have no
   pre-open (NSE's F&O pre-open, from 2025-12-08, is futures only). The 09:15:00 book was wide or
-  one-sided on all 11 overnight mornings logged and tight on all 11 by 09:16:00. For the first 30 s
-  after 09:15:00 a live SELL waits for paper's reliable book (`max_spread_abs` / `max_spread_pct`);
-  after that it sells at any bid as below (NEO-14), so a stop is never stranded. `0` turns it off.
+  one-sided on all 11 overnight mornings logged and within 0.7% on all 11 by 09:16:00. For the
+  first 30 s after 09:15:00 a live SELL waits for a SETTLED book: spread <= `open_settle_max_abs`
+  (Rs 0.50) OR <= `open_settle_max_pct` (1%) of mid. Paper's entry gate (Rs 2 OR 10%) is too loose
+  for this: it would have passed 5 of the 11 opening books. Inside the window a bid under the stop
+  counts as a stop only on a settled book (an LTP under it always does). After the window: any
+  bid, as below (NEO-14 / NEO-30), so a stop is never stranded. `0` turns it off; max 120 s.
+  Paper is NOT changed (it is the Volrix twin), so the rehearsal-vs-paper gap on 09:15 stops now
+  measures the settle (still simulated: the fake broker fills at its own limit).
 - Entry: LIMIT BUY at the ask (rounded UP to the tick), **capped at trigger +5%**
   (`neo.entry_cap_pct`); above the cap no order, keep watching until 15:25. Not filled in 5 s:
   cancel, read back, re-price (up to `max_entry_attempts`). A rejection ends the side for the day;

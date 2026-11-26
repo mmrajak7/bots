@@ -583,3 +583,9 @@ def test_make_scrip_loader_downloads_then_caches(tmp_path):
     nofo.login()
     with pytest.raises(Exception, match='nse_fo'):
         live_cli.make_scrip_loader(nofo, neo, tmp_path / 'x', TODAY, 'NIFTY')()
+
+
+def test_open_settle_is_bounded_to_seconds():
+    with pytest.raises(config_mod.ConfigError, match='open_settle_sec'):
+        build_neo(neo_raw(open_settle_sec=121))
+    assert build_neo(neo_raw(open_settle_sec=0)).open_settle_sec == 0
