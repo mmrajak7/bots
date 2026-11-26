@@ -85,8 +85,8 @@ pull_token() {
 }
 
 echo "=== tokens (newer-only) ==="
-pull_token "$R_BOTS/data/kite_access_token.json"      "data/kite_access_token.json"        # YL6478
-pull_token "$R_BOTS/FIFTY/data/kite_access_token.json" "FIFTY/data/kite_access_token.json"  # QSK814
+pull_token "$R_BOTS/data/kite_access_token.json"      "data/kite_access_token.json"        # personal account
+pull_token "$R_BOTS/FIFTY/data/kite_access_token.json" "FIFTY/data/kite_access_token.json"  # company account (FIFTY)
 pull_token "$R_BOTS/CROCODILE/data/kite_access_token.json" "CROCODILE/data/kite_access_token.json"
 pull_token "$R_ETF/neo/data/session.json"             "ETF_PI/neo/data/session.json"       # Neo (absent while trade_enabled=false)
 
