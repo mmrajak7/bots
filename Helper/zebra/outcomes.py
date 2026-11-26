@@ -94,6 +94,10 @@ _EXIT_KIND = {
     'sl_spread': DEBIT_SL,
     'sl_trail': TRAIL,
     'expiry_force_close': EXPIRY,
+    # zebra/naked_rules.py -- the naked long's -50% value stop, written by the
+    # structure shadow and by the live naked engine. Same fact as debit_sl
+    # (the position's value fell to its stop fraction), one leg instead of two.
+    'stop': DEBIT_SL,
     # `zebra close ID` with no --reason
     'manual': MANUAL,
     'manual close': MANUAL,
@@ -179,6 +183,21 @@ def is_stop_exit(reason) -> bool:
     """
     c = classify(reason)
     return c['kind'] in STOP_KINDS and not c['recovered']
+
+
+def is_value_stop(reason) -> bool:
+    """Did a VALUE stop close this position (the -50% debit stop)?
+
+    The naked pause (`docs/NAKED_100_TRADE_TEST.md` section 11: 4 stops in 3
+    sessions -> 2 sessions without entries) counts exactly these. Narrower
+    than `is_stop_exit` on purpose: that one is the arming gate's "evidence
+    about the stop path" and includes TIME and EXPIRY, which fire on the
+    calendar -- a cluster of time exits says the signals were slow, not that
+    the market is running over the book. Fails closed like `is_stop_exit`:
+    unknown and recovered reasons are not stops.
+    """
+    c = classify(reason)
+    return c['kind'] == DEBIT_SL and not c['recovered']
 
 
 # Canonical kinds mapped onto signal-quality labels. TIME (and EXPIRY, which

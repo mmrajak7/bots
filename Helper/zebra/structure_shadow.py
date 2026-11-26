@@ -160,12 +160,13 @@ from datetime import date, datetime
 from typing import Optional
 
 from common import market_session
-from common.nse_holidays import sessions_between
+from common.nse_holidays import sessions_between  # noqa: F401 (re-exported)
 
 from . import config as cfg
 from . import entry_tags
 from . import ivcalc
 from . import mfe as mfe_mod
+from . import naked_rules
 from . import strikes as strikes_mod
 from .trade_store import in_cohort
 
@@ -202,6 +203,13 @@ ARMS = {
     'delta1':       {'legs': (),                'tp': True,  'stop_frac': None, 'fills': 0,
                      'reference': True},
 }
+
+#: Arms that run the shared naked rules (`naked_rules.step`): one long leg,
+#: no trail, no let-it-run hold. `naked_run1` keeps its own path because AT the
+#: target it holds instead of exiting -- a rule live does not run.
+NAKED_RULE_ARMS = tuple(k for k, a in ARMS.items()
+                        if a['legs'] == ('long',) and not a.get('trail')
+                        and not a.get('run'))
 
 #: The legs that are SOLD. `wide` is a short leg at a different strike, carried
 #: on the arm itself (symbol, entry bid, width) rather than on the shadow.
@@ -413,15 +421,11 @@ def delta1_mark(direction: str, entry_spot: float, spot: float) -> float:
     return float(spot) if direction == 'CE' else 2.0 * float(entry_spot) - float(spot)
 
 
-def _tp_hit(direction: str, spot: float, target: float) -> bool:
-    return spot >= target if direction == 'CE' else spot <= target
-
-
-def _within_open_buffer(now: datetime) -> bool:
-    open_h, open_m = cfg.MARKET_OPEN
-    since = (now.hour * 3600 + now.minute * 60 + now.second) \
-        - (open_h * 3600 + open_m * 60)
-    return 0 <= since < cfg.VALUE_TRIGGER_OPEN_BUFFER_SEC
+# The naked exit rules live in ONE place, `zebra/naked_rules.py`, which the
+# live engine runs too (design Q1). These names are kept because the vertical
+# arms, the ladder, `veto_naked` and the tests use them.
+_tp_hit = naked_rules.tp_hit
+_within_open_buffer = naked_rules.within_open_buffer
 
 
 def _trail_level(a: dict, width: Optional[float]) -> Optional[float]:
@@ -458,39 +462,9 @@ def _advance_trail_peak(a: dict, v: float, now: datetime) -> None:
                          now.timestamp(), now.strftime('%Y-%m-%d %H:%M:%S'))
 
 
-def _bump(c: dict, kind: str, now: datetime) -> int:
-    """`ZebraStore.bump_confirm` on a plain dict: a streak whose last hit is
-    older than CONFIRM_STALE_SEC restarts, so a breach at 15:25 cannot pair
-    with one at 09:30 the next morning. The poll's own clock, so a backfill
-    replay judges the gap on observation times."""
-    t = now.timestamp()
-    n = c.get(kind) or {}
-    if t - float(n.get('t', 0.0)) > cfg.CONFIRM_STALE_SEC:
-        n = {}
-    c[kind] = {'n': int(n.get('n', 0)) + 1, 't': t}
-    return c[kind]['n']
-
-
-def _confirmed(a: dict, kind: str, breached: Optional[bool], now: datetime) -> bool:
-    """The live engine's debounce: a value exit needs DEBIT_SL_CONFIRM_POLLS
-    breaching polls. `breached=None` (no usable price, or the opening buffer)
-    FREEZES the count rather than resetting it -- the live rule, so a
-    flickering book cannot block a genuine exit for ever; a non-breaching
-    usable poll resets it."""
-    c = a.setdefault('confirm', {})
-    if breached is None:
-        return False
-    if not breached:
-        c.pop(kind, None)
-        return False
-    return _bump(c, kind, now) >= cfg.DEBIT_SL_CONFIRM_POLLS
-
-
-def _sessions_left(expiry, today: date) -> Optional[int]:
-    try:
-        return sessions_between(today, date.fromisoformat(str(expiry)[:10]))
-    except Exception:
-        return None
+_bump = naked_rules.bump
+_confirmed = naked_rules.confirmed
+_sessions_left = naked_rules.sessions_left
 
 
 # -- lifecycle ---------------------------------------------------------------
@@ -907,6 +881,18 @@ def poll_one(sh: dict, spot: Optional[float], lq: Optional[dict],
                                       'spot': None if spot is None else round(float(spot), 2),
                                       'gap': pend_l[k]['gap']}
                     pend_l.pop(k, None)
+
+        if key in NAKED_RULE_ARMS:
+            # The naked cascade is the SHARED one (`zebra/naked_rules.py`):
+            # the live naked engine runs this same function, so the arm the
+            # 100-trade test scores and the position live holds cannot drift.
+            res = naked_rules.step(
+                a, take_tp=arm['tp'], stop_frac=arm['stop_frac'], v=v,
+                spot=spot, direction=direction, target=sh['target_spot'],
+                now=now, today=today, left=left, value_armed=value_armed)
+            if res is not None:
+                _close(sh, key, res[0], res[1], spot, ts, lq, asq)
+            continue
 
         expired = left is not None and left <= 0
 
