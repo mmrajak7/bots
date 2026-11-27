@@ -22,9 +22,9 @@ sys.path.insert(0, str(ROOT))
 
 from kotak_neo import session as S          # noqa: E402
 
-CREDS = {'consumer_key': 'CK', 'mobile_number': '+911234567890', 'ucc': 'UCC1',
+CREDS = {'consumer_key': 'CONSUMERKEY9', 'mobile_number': '+911234567890', 'ucc': 'UCC1',
          'mpin': '654321', 'totp_secret': 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'}
-SECRETS = ('TOKEN-', 'SID-', '654321', 'GEZDGNBV', 'UCC1')
+SECRETS = ('TOKEN-', 'SID-', '654321', 'GEZDGNBV', 'UCC1', '1234567890', 'CONSUMERKEY9')
 
 
 def fake_creds(path):
@@ -45,12 +45,26 @@ class Login:
             if kind:
                 raise S.LoginFailed(kind, 'scripted %s failure' % kind)
         return {'token': 'TOKEN-%d' % self.calls, 'sid': 'SID-%d' % self.calls,
-                'base_url': 'https://cis.example', 'server_id': 'H1'}
+                'base_url': 'https://cis.kotaksecurities.com', 'server_id': 'H1'}
 
 
 def verify_by_gen(dead_upto):
     """DEAD for generations <= dead_upto, ALIVE above."""
     return lambda s: S.DEAD if s.generation <= dead_upto else S.ALIVE
+
+
+@pytest.fixture(autouse=True)
+def _no_cache():
+    S._alive_cache.clear()
+    yield
+    S._alive_cache.clear()
+
+
+@pytest.fixture
+def fast(monkeypatch):
+    """Floors off, cooldown 0: for tests about something other than timing."""
+    monkeypatch.setattr(S, 'FLOORS', {})
+    monkeypatch.setattr(S, 'DEFAULTS', dict(S.DEFAULTS, cooldown_sec=0.0))
 
 
 @pytest.fixture
@@ -67,7 +81,7 @@ def publish(gen, day=None):
     st = S.read_state()
     st['last_generation'] = gen - 1
     now = S._now() if day is None else S._now() - timedelta(days=day)
-    S._publish(st, None, {'token': 'TOKEN-x', 'sid': 'SID-x', 'base_url': 'https://cis.example',
+    S._publish(st, None, {'token': 'TOKEN-x', 'sid': 'SID-x', 'base_url': 'https://cis.kotaksecurities.com',
                           'server_id': None}, dict(CREDS), now)
     st = S.read_state()
     st['next_allowed_at'] = 0.0
@@ -76,6 +90,7 @@ def publish(gen, day=None):
 
 def R(failed, **kw):
     kw.setdefault('_creds', fake_creds)
+    kw.setdefault('_sleep', lambda sec: None)
     return S.refresh(failed, 'test', **kw)
 
 
@@ -155,13 +170,30 @@ def test_generation_survives_a_corrupt_session_file(home):
     assert res.outcome == S.LOGGED_IN and S.current().generation == 6   # never back to 1
 
 
-def test_a_corrupt_state_file_keeps_the_floor_and_imposes_a_cooldown(home):
+def test_a_corrupt_state_file_is_rebuilt_once_then_logins_work(home, monkeypatch):
+    """Review F1: it used to re-arm a cooldown on EVERY read, forever."""
+    monkeypatch.setattr(S, 'FLOORS', {})
+    monkeypatch.setattr(S, 'DEFAULTS', dict(S.DEFAULTS, cooldown_sec=0.5))
     publish(7)
-    (home / 'state.json').write_text('garbage', encoding='utf-8')
+    (home / 'state.json').write_text('', encoding='utf-8')         # the power-cut shape
     lg = Login()
     res = R(7, _verify=verify_by_gen(7), _login=lg)
     assert res.outcome == S.COOLDOWN and lg.calls == 0
-    assert S.read_state()['last_generation'] == 7
+    st = json.loads((home / 'state.json').read_text(encoding='utf-8'))   # written back, valid
+    assert st['last_generation'] == 7
+    assert 'state_rebuilt' in (home / 'alerts.jsonl').read_text(encoding='utf-8')
+    time.sleep(0.6)
+    res = R(7, _verify=verify_by_gen(7), _login=lg)
+    assert res.outcome == S.LOGGED_IN and S.current().generation == 8
+
+
+@pytest.mark.parametrize('bad', ['{"next_allowed_at": "x"}', '{"latched": 5}', '[]'])
+def test_a_wrong_typed_state_is_rebuilt_not_raised(home, bad):
+    publish(3)
+    (home / 'state.json').write_text(bad, encoding='utf-8')
+    res = R(3, _verify=verify_by_gen(3), _login=Login())
+    assert res.outcome == S.COOLDOWN          # one rebuild cooldown, not ERROR forever
+    assert S.read_state().get('_corrupt') is None
 
 
 # ── the brakes ───────────────────────────────────────────────────────────────
@@ -174,24 +206,44 @@ def test_cooldown_between_two_logins(home):
     assert res.outcome == S.COOLDOWN and lg.calls == 1
 
 
-def test_daily_cap_is_a_long_cooldown_and_an_alert_never_a_latch(home, monkeypatch):
-    monkeypatch.setattr(S, 'DEFAULTS', dict(S.DEFAULTS, max_logins_per_day=1, cooldown_sec=0.0))
+def test_daily_cap_cools_down_then_allows_one_login_per_period(home, monkeypatch):
+    """Review F2: the cap used to re-arm itself until midnight."""
+    monkeypatch.setattr(S, 'FLOORS', {})
+    monkeypatch.setattr(S, 'DEFAULTS', dict(S.DEFAULTS, max_logins_per_day=1, cooldown_sec=0.0,
+                                            cap_cooldown_sec=0.5))
     publish(1)
     lg = Login()
-    assert R(1, _verify=verify_by_gen(10), _login=lg).outcome == S.LOGGED_IN
-    res = R(2, _verify=verify_by_gen(10), _login=lg)
-    assert res.outcome == S.COOLDOWN and 'cap' in res.detail and lg.calls == 1
-    st = S.read_state()
-    assert st['latched'] is None
-    assert st['next_allowed_at'] - time.time() > 1700
+    assert R(1, _verify=verify_by_gen(99), _login=lg).outcome == S.LOGGED_IN
+    res = R(2, _verify=verify_by_gen(99), _login=lg)
+    assert res.outcome == S.COOLDOWN and 'cap' in res.detail and res.retry_after > 0
+    assert S.read_state()['latched'] is None
     assert 'daily_cap' in (home / 'alerts.jsonl').read_text(encoding='utf-8')
+    time.sleep(0.6)
+    assert R(2, _verify=verify_by_gen(99), _login=lg).outcome == S.LOGGED_IN   # one per period
+    assert R(3, _verify=verify_by_gen(99), _login=lg).outcome == S.COOLDOWN    # re-armed
+    S.unblock('test')
+    assert S.read_state()['logins_today'] == 0
+    assert R(3, _verify=verify_by_gen(99), _login=lg).outcome == S.LOGGED_IN
 
 
-def test_a_refused_mpin_latches_and_nothing_logs_in_until_unblock(home, monkeypatch):
-    monkeypatch.setattr(S, 'DEFAULTS', dict(S.DEFAULTS, cooldown_sec=0.0))
+def test_network_failures_never_reached_neo_and_do_not_count(home, fast):
+    publish(1)
+    R(1, _verify=verify_by_gen(9), _login=Login('network'))
+    assert S.read_state()['logins_today'] == 0
+
+
+def test_day_rollover_resets_the_count(home, fast):
+    publish(1)
+    st = S.read_state(); st.update(day='2000-01-01', logins_today=99, cap_until=0.0)
+    S._write_state(st)
+    assert R(1, _verify=verify_by_gen(9), _login=Login()).outcome == S.LOGGED_IN
+    assert S.read_state()['logins_today'] == 1
+
+
+def test_a_refused_mpin_latches_and_nothing_logs_in_until_unblock(home, fast):
     publish(1)
     lg = Login('mpin')
-    assert R(1, _verify=verify_by_gen(10), _login=lg).outcome == S.FAILED
+    assert R(1, _verify=verify_by_gen(10), _login=lg).outcome == S.BLOCKED
     assert S.read_state()['latched'].startswith('mpin')
     res = R(1, _verify=verify_by_gen(10), _login=lg)
     assert res.outcome == S.BLOCKED and lg.calls == 1          # no second network login
@@ -265,13 +317,25 @@ def test_scheduled_replaces_yesterdays_session_even_if_alive(home):
 
 # ── nothing secret anywhere ─────────────────────────────────────────────────
 
-def test_no_secret_in_logs_files_or_status(home, caplog, monkeypatch):
-    monkeypatch.setattr(S, 'DEFAULTS', dict(S.DEFAULTS, cooldown_sec=0.0))
+def test_no_secret_in_logs_files_or_status(home, caplog, fast):
+    """Review F7: the fakes never echoed a secret, so the old test proved nothing.
+    Here NEO's reply ECHOES every credential value, through the real
+    `_network_login`, and none may come out anywhere but the 0600 session file."""
     caplog.set_level('DEBUG')
     publish(1)
+    echo = 'bad request for %s %s %s pin %s' % (CREDS['mobile_number'], CREDS['ucc'],
+                                              CREDS['consumer_key'], CREDS['mpin'])
+
+    def echoing_login(creds, cfg):
+        return S._network_login(creds, cfg, http=_HTTP(
+            _R(200, {'data': {'token': 'v', 'sid': 's'}}), _R(400, {'errMsg': echo})))
+    R(1, _verify=verify_by_gen(10), _login=echoing_login)
+    S.unblock('t')
     R(1, _verify=verify_by_gen(10), _login=Login('network'))
+    S.unblock('t')
     R(1, _verify=verify_by_gen(10), _login=Login())
-    texts = [caplog.text, json.dumps(S.status())]
+    texts = [caplog.text, json.dumps(S.status()),
+             (home / 'state.json').read_text(encoding='utf-8')]
     for name in ('refresh_log.jsonl', 'alerts.jsonl'):
         if (home / name).exists():
             texts.append((home / name).read_text(encoding='utf-8'))
@@ -284,14 +348,17 @@ def test_no_secret_in_logs_files_or_status(home, caplog, monkeypatch):
 
 def _race_worker(home, counter):
     S.HOME = Path(home)
+    while not os.path.exists(counter + '.go'):            # start barrier: all at once
+        time.sleep(0.01)
 
     def login(creds, cfg):
         with open(counter, 'a') as f:
             f.write('login\n')
         time.sleep(0.5)
-        return {'token': 'TOKEN-r', 'sid': 'SID-r', 'base_url': 'https://cis.example',
+        return {'token': 'TOKEN-r', 'sid': 'SID-r', 'base_url': 'https://cis.kotaksecurities.com',
                 'server_id': None}
-    res = S.refresh(1, 'racer', _verify=verify_by_gen(1), _login=login, _creds=fake_creds)
+    res = S.refresh(1, 'racer', _verify=verify_by_gen(1), _login=login, _creds=fake_creds,
+                    _sleep=lambda sec: None)
     with open(counter + '.out', 'a') as f:
         f.write(res.outcome + '\n')
 
@@ -303,6 +370,8 @@ def test_eight_processes_that_see_one_death_log_in_once(home, tmp_path):
     ps = [ctx.Process(target=_race_worker, args=(str(home), counter)) for _ in range(8)]
     for p in ps:
         p.start()
+    time.sleep(3)                                         # every worker reaches the barrier
+    open(counter + '.go', 'w').close()
     for p in ps:
         p.join(60)
     assert all(p.exitcode == 0 for p in ps)
@@ -319,7 +388,8 @@ def _hang_worker(home, started):
     def login(creds, cfg):
         open(started, 'w').close()
         time.sleep(60)
-    S.refresh(1, 'hanger', _verify=verify_by_gen(1), _login=login, _creds=fake_creds)
+    S.refresh(1, 'hanger', _verify=verify_by_gen(1), _login=login, _creds=fake_creds,
+              _sleep=lambda sec: None)
 
 
 def test_a_process_killed_mid_login_leaves_its_cooldown_no_storm(home, tmp_path):
@@ -372,16 +442,17 @@ CFG = dict(S.DEFAULTS)
 
 def test_network_login_two_steps_ok():
     h = _HTTP(_R(200, {'data': {'token': 'v', 'sid': 's'}}),
-              _R(200, {'data': {'token': 'T', 'sid': 'S', 'baseUrl': 'https://x/',
+              _R(200, {'data': {'token': 'T', 'sid': 'S', 'baseUrl': 'https://x.kotaksecurities.com/',
                                 'hsServerId': 'H'}}))
     out = S._network_login(CREDS, CFG, http=h)
-    assert out == {'token': 'T', 'sid': 'S', 'base_url': 'https://x', 'server_id': 'H'}
+    assert out == {'token': 'T', 'sid': 'S', 'base_url': 'https://x.kotaksecurities.com', 'server_id': 'H'}
     assert h.calls[0].endswith(S.LOGIN_PATH) and h.calls[1].endswith(S.VALIDATE_PATH)
 
 
 @pytest.mark.parametrize('answers,kind', [
     ((_R(503, None),), 'network'),
-    ((_R(401, {'message': 'Invalid TOTP'}),), 'totp'),
+    ((_R(401, {'message': 'Invalid TOTP'}),), 'refused'),
+    ((_R(200, {'data': {'token': 'v', 'sid': 's'}}), _R(403, None)), 'refused'),
     ((_R(200, {'data': {'token': 'v', 'sid': 's'}}), _R(401, {'message': 'Invalid MPIN'})), 'mpin'),
 ])
 def test_network_login_classifies_failures(answers, kind):
@@ -397,7 +468,7 @@ def test_network_login_timeout_is_network():
     assert ei.value.kind == 'network'
 
 
-SESS = S.Session(1, 'd', 'c', 'https://x', 'T', 'S', None, 'CK', 'U')
+SESS = S.Session(1, 'd', 'c', 'https://x.kotaksecurities.com', 'T', 'S', None, 'CK', 'U')
 
 
 @pytest.mark.parametrize('answer,want', [
@@ -414,3 +485,120 @@ def test_verify_classifies(answer, want):
 
 def test_totp_rfc_vector():
     assert S.totp_now('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', at=59) == '287082'
+
+
+# -- review F3/F4/F5/F6/F9/F10 ---------------------------------------------------
+
+def test_an_unexpected_exception_in_login_is_a_failure_with_backoff(home):
+    publish(1)
+
+    def boom(creds, cfg):
+        raise RuntimeError('library bug')
+    res = R(1, _verify=verify_by_gen(9), _login=boom)
+    assert res.outcome == S.FAILED and res.retry_after > 0
+    st = S.read_state()
+    assert st['last_attempt']['outcome'] == 'failed:error' and st['latched'] is None
+
+
+def test_a_bad_totp_secret_inside_login_latches_as_credentials(home):
+    publish(1)
+
+    def bad(creds, cfg):
+        raise S.CredentialsError('totp_secret is not valid base32')
+    assert R(1, _verify=verify_by_gen(9), _login=bad).outcome == S.BLOCKED
+    assert S.read_state()['latched'].startswith('credentials')
+
+
+def test_a_publish_failure_after_login_is_recorded_and_backs_off(home, monkeypatch):
+    publish(1)
+    real = S._write_private
+
+    def flaky(path, obj):
+        if path.name == 'session.json':
+            raise OSError(28, 'No space left on device')
+        return real(path, obj)
+    monkeypatch.setattr(S, '_write_private', flaky)
+    res = R(1, _verify=verify_by_gen(9), _login=Login())
+    assert res.outcome == S.FAILED and 'error' in res.detail
+    assert S.read_state()['last_attempt']['outcome'] == 'failed:error'
+
+
+def test_a_failed_write_leaves_no_tmp(home, monkeypatch):
+    def boom(fd):
+        raise OSError(28, 'No space left on device')
+    monkeypatch.setattr(S.os, 'fsync', boom)
+    with pytest.raises(OSError):
+        S._write_private(home / 'x.json', {'a': 1})
+    assert not (home / 'x.json.tmp').exists()
+
+
+def test_a_session_from_another_schema_is_never_replaced(home):
+    (home / 'session.json').write_text(json.dumps({'schema': 2, 'generation': 9}),
+                                       encoding='utf-8')
+    lg = Login()
+    res = R(9, _verify=lambda s: pytest.fail('no verify'), _login=lg)
+    assert res.outcome == S.ERROR and 'upgrade this clone' in res.detail and lg.calls == 0
+
+
+def test_three_refusals_latch_but_one_does_not(home, fast):
+    publish(1)
+    lg = Login('refused', 'refused', 'refused')
+    assert R(1, _verify=verify_by_gen(9), _login=lg).outcome == S.FAILED
+    st = S.read_state(); st['next_allowed_at'] = 0; S._write_state(st)
+    assert R(1, _verify=verify_by_gen(9), _login=lg).outcome == S.FAILED
+    assert S.read_state()['latched'] is None
+    st = S.read_state(); st['next_allowed_at'] = 0; S._write_state(st)
+    assert R(1, _verify=verify_by_gen(9), _login=lg).outcome == S.BLOCKED
+
+
+def test_a_single_dead_read_not_confirmed_does_not_log_in(home):
+    publish(4)
+    answers = [S.DEAD, S.ALIVE]
+    lg = Login()
+    res = R(4, _verify=lambda s: answers.pop(0), _login=lg)
+    assert res.outcome == S.STILL_ALIVE and lg.calls == 0
+
+
+def test_an_alive_verdict_is_cached_briefly(home):
+    publish(4)
+    calls = []
+    R(4, _verify=lambda s: calls.append(1) or S.ALIVE, _login=Login())
+    R(4, _verify=lambda s: calls.append(1) or S.ALIVE, _login=Login())
+    assert len(calls) == 1
+
+
+def test_scheduled_does_not_log_in_blind_when_neo_is_unreachable(home):
+    publish(3)
+    lg = Login()
+    res = S.scheduled_login(_verify=lambda s: S.UNAVAILABLE, _login=lg, _creds=fake_creds,
+                            _sleep=lambda x: None)
+    assert res.outcome == S.UNAVAILABLE and lg.calls == 0
+
+
+def test_config_is_clamped_and_login_url_pinned(home):
+    (home / 'config.json').write_text(json.dumps({
+        'cooldown_sec': 0, 'max_logins_per_day': 500, 'login_url': 'http://evil.example',
+        'cap_cooldown_sec': 'x'}), encoding='utf-8')
+    c = S.config()
+    assert c['cooldown_sec'] == S.FLOORS['cooldown_sec']
+    assert c['max_logins_per_day'] == S.CEILINGS['max_logins_per_day']
+    assert c['login_url'] == S.DEFAULTS['login_url']
+    assert c['cap_cooldown_sec'] == S.DEFAULTS['cap_cooldown_sec']
+
+
+def test_a_session_pointing_off_kotak_fails_closed(home):
+    publish(2)
+    raw = json.loads((home / 'session.json').read_text(encoding='utf-8'))
+    raw['base_url'] = 'https://evil.example'
+    (home / 'session.json').write_text(json.dumps(raw), encoding='utf-8')
+    with pytest.raises(S.SessionUnavailable, match='base_url'):
+        S.current()
+
+
+def test_a_login_returning_an_off_kotak_base_url_is_not_published(home, fast):
+    publish(1)
+
+    def evil(creds, cfg):
+        return {'token': 'T', 'sid': 'S', 'base_url': 'https://evil.example', 'server_id': None}
+    res = R(1, _verify=verify_by_gen(9), _login=evil)
+    assert res.outcome == S.FAILED and S.current().generation == 1

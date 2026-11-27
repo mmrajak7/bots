@@ -8,13 +8,15 @@ Legacy holders are listed with what retires them. A NEW file containing an
 endpoint fails this test; so does a listed file once its retirement has
 happened and someone forgot to take it off the list (the list may only shrink).
 """
+import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-ENDPOINTS = ('tradeApiLogin', 'tradeApiValidate', 'totp_login', 'totp_validate')
+ENDPOINTS = ('tradeApiLogin', 'tradeApiValidate', 'totp_login', 'totp_validate',
+             'neo_api_client', 'session_2fa')
 OWNER = 'kotak_neo/session.py'
 
 #: path -> RETIRES WHEN
@@ -30,12 +32,26 @@ LEGACY = {
 SKIP_DIRS = {'.git', '__pycache__', 'venv', '.venv', 'node_modules', 'Archive'}
 
 
+def _files(root: Path):
+    """TRACKED .py/.sh files: the same answer on the laptop and the Pi, where
+    untracked research folders differ. A tree that is not a git repo (the
+    negative control's tmp dir) is walked instead."""
+    try:
+        out = subprocess.run(['git', 'ls-files', '*.py', '*.sh'], cwd=str(root),
+                             capture_output=True, text=True, check=True).stdout.split()
+        if out:
+            return [root / f for f in out]
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return list(root.rglob('*.py')) + list(root.rglob('*.sh'))
+
+
 def holders(root: Path):
     out = set()
-    for p in root.rglob('*.py'):
+    for p in _files(root):
         rel = p.relative_to(root).as_posix()
         parts = set(rel.split('/'))
-        if parts & SKIP_DIRS or '/tests/' in '/' + rel or rel.startswith('kotak_neo/tests/'):
+        if parts & SKIP_DIRS or rel.startswith('kotak_neo/tests/'):
             continue
         try:
             text = p.read_text(encoding='utf-8', errors='ignore')
