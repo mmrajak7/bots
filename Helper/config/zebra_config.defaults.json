@@ -69,5 +69,7 @@
   "naked_slippage_kill_pct": 3.0,
   "naked_slippage_window": 20,
   "naked_loss_budget": 0,
-  "naked_override": false
+  "naked_override": false,
+  "naked_entry_cutoff": "15:20",
+  "naked_max_orders_per_signal": 2
 }

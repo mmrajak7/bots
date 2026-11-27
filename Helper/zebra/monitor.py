@@ -41,6 +41,7 @@ from . import events as events_mod
 from . import health as health_mod
 from . import history
 from . import mfe as mfe_mod
+from . import naked_entry
 from . import outcomes as outcomes_mod
 from . import eod_coverage
 from . import postmortem as postmortem_mod
@@ -2170,6 +2171,15 @@ def _enter_as_bcs(store: ZebraStore, kite, trade: dict, analysis: dict,
                      "(will drift-cancel), no alert sent",
                      trade['id'], trade['stock'], e)
         return None
+    # The LIVE naked twin (P3, design G4): only AFTER the paper parent is on
+    # disk, so the test's population is decided before any money moves and a
+    # live failure can never un-enter the paper position. `after_paper_entry`
+    # never raises; the guard is for an import failure.
+    try:
+        naked_entry.after_paper_entry(store, kite, fresh, dry_run=dry_run)
+    except Exception as e:
+        logger.error("NAKED entry hook failed for #%d %s: %s",
+                     trade['id'], trade['stock'], e, exc_info=True)
     return bcs, fresh
 
 
@@ -5428,12 +5438,17 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
     # EXITS-FIRST ordering above fixed the within-cycle half of that; this
     # bounds the across-cycle half.
     start_entry_phase()
+    # The live naked halt is evaluated ONCE per cycle, here, before any entry
+    # can ask it (the `naked_halt` caller contract). `end_cycle` drops the
+    # verdict so no later cycle can read a stale one. Never raises.
+    naked_entry.begin_cycle(store, kite, dry_run=dry_run)
     try:
         check_watching(store, kite, dry_run=dry_run)
     except Exception as e:
         logger.error("Watching cycle failed: %s", e, exc_info=True)
     finally:
         end_entry_phase()
+        naked_entry.end_cycle()
     # Everything below is OBSERVATION, never trading. It runs last and each
     # piece is independently caught, so a failure in the learning/monitoring
     # half can never stop the half that trades.

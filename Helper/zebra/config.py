@@ -649,6 +649,13 @@ _DEFAULTS = {
     # reader can mistake a pilot trade for evidence.
     'naked_loss_budget': 0,
     'naked_override': False,
+    # Last minute (IST, "HH:MM") a live naked ENTRY may start (design G1):
+    # past it a fill leaves too little session to manage the position on its
+    # first day. A signal past it is stamped `skipped: late`, never queued.
+    'naked_entry_cutoff': '15:20',
+    # Orders one signal may send: the first, plus ONE re-quoted retry after a
+    # price/band/stale reject (design Q8). Anything else stops the signal.
+    'naked_max_orders_per_signal': 2,
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
     'time_sl_days_before_expiry': 6,
@@ -1496,6 +1503,8 @@ NAKED_SLIPPAGE_KILL_PCT = _num('naked_slippage_kill_pct')
 NAKED_SLIPPAGE_WINDOW = _int('naked_slippage_window')
 NAKED_LOSS_BUDGET = _non_negative_num('naked_loss_budget')
 NAKED_OVERRIDE = _strict_bool('naked_override')
+NAKED_ENTRY_CUTOFF = _hhmm('naked_entry_cutoff')
+NAKED_MAX_ORDERS_PER_SIGNAL = _int('naked_max_orders_per_signal')
 
 
 def _stop_ladder() -> tuple:
