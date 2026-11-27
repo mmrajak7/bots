@@ -6,6 +6,7 @@
   refresh    a manual refresh request: --reason is required and logged
   unblock    clear a latch (credentials/MPIN) and the cooldown -- owner only
   owners     list which bot holds which contract; --assign SYM BOT / --clear SYM
+  alerts     deliver any queued alert to Telegram now (also runs after every login)
   measure-second-login   after hours, no bot trading: does a 2nd login kill the 1st?
   probe      REAL 1-lot order probe through this package (armed by PROBE_ARM):
              probe --underlying RELIANCE --expiry 2026-12-29 --strike 1540 --type CE
@@ -38,6 +39,7 @@ def main(argv=None) -> int:
     o = sub.add_parser('owners', help='contract ownership')
     o.add_argument('--assign', nargs=2, metavar=('SYMBOL', 'BOT'))
     o.add_argument('--clear', metavar='SYMBOL')
+    sub.add_parser('alerts', help='deliver queued alerts to Telegram')
     sub.add_parser('measure-second-login', help='after hours only (DESIGN section 10)')
     pr = sub.add_parser('probe', help='REAL 1-lot order probe (armed by PROBE_ARM)')
     pr.add_argument('--underlying', required=True)
@@ -60,6 +62,10 @@ def main(argv=None) -> int:
         elif a.clear:
             C.assign(a.clear, None)
         print(json.dumps(C.owners(), indent=1, sort_keys=True))
+        return 0
+    if a.cmd == 'alerts':
+        from . import alerts
+        print('delivered %d' % alerts.flush())
         return 0
     if a.cmd == 'measure-second-login':
         out = S.measure_second_login()

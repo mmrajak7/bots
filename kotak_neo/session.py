@@ -808,7 +808,17 @@ def _run(requester: str, failed_generation: Optional[int], scheduled: bool,
     lvl = logging.INFO if res.outcome in (LOGGED_IN, ADOPTED, STILL_ALIVE, NOOP) \
         else logging.WARNING
     logger.log(lvl, 'NEO session %s for %s (%s)', res.outcome, requester, res.detail)
+    _flush_alerts()
     return res
+
+
+def _flush_alerts() -> None:
+    """Deliver queued alerts to Telegram, OUTSIDE the lock. Tests replace it."""
+    try:
+        from . import alerts
+        alerts.flush()
+    except Exception as e:                           # never into a trading loop
+        logger.error('kotak_neo alert flush failed: %s', e)
 
 
 def refresh(failed_generation: int, requester: str, *, wait_s: Optional[float] = None,
@@ -930,4 +940,5 @@ def measure_second_login(*, _verify: Optional[Callable] = None, _login: Optional
         else:
             out['verdict'] = 'MIXED -- inconclusive, re-measure'
     _log('measure-second-login', 'MEASURED', out['verdict'], now, None, out.get('published'))
+    _flush_alerts()
     return out

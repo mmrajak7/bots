@@ -5,10 +5,16 @@
 # It never pulls code, restarts anything, sends Telegram, or writes on the Pi.
 #
 # WHAT LANDS WHERE
-#   tokens  -> their REAL local paths (BOTS/data, FIFTY/data, CROCODILE/data,
-#              ETF_PI/neo/data), replaced only when the Pi's copy is NEWER.
-#              All four paths are gitignored; the script refuses to write one
+#   tokens  -> their REAL local paths (BOTS/data, FIFTY/data, CROCODILE/data),
+#              replaced only when the Pi's copy is NEWER.
+#              All three paths are gitignored; the script refuses to write one
 #              that is not.  Token VALUES are never printed.
+#   NEO     -> NEVER by default (owner, 2026-11-27: the laptop never logs in and
+#              imports the Pi's session only when it needs one):
+#                bash pull_pi.sh --neo-session
+#              copies the Pi's ~/.kotak_neo/session.json to the laptop's
+#              ~/.kotak_neo/ -- OUTSIDE Documents, so the Drive backup never
+#              carries it. The laptop has no LOGIN_HOST, so it can never log in.
 #   evidence-> Helper/logs/pi_mirror/{helper,etf_pi,btst,momentum}/ (gitignored)
 #              NOT over Helper/logs/: the laptop's *_trades.json are Drive-synced
 #              store copies, and a file copy over a version-merged store is how
@@ -33,6 +39,20 @@
 set -euo pipefail
 
 PI_HOST="${PI_HOST:-pi-ts}"
+
+if [ "${1:-}" = "--neo-session" ]; then
+  # On demand only. Never prints a value; refuses a destination inside a
+  # Drive-backed or git tree.
+  DEST="$HOME/.kotak_neo"
+  case "$DEST" in */Documents/*|*/OneDrive/*) echo "FAIL: $DEST is inside a synced tree"; exit 1;; esac
+  mkdir -p "$DEST" && chmod 700 "$DEST" 2>/dev/null || true
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$PI_HOST" 'cat ~/.kotak_neo/session.json' > "$DEST/session.json.tmp"     && [ -s "$DEST/session.json.tmp" ] && mv -f "$DEST/session.json.tmp" "$DEST/session.json"     && chmod 600 "$DEST/session.json" 2>/dev/null || { rm -f "$DEST/session.json.tmp"; echo "FAIL: no session pulled"; exit 1; }
+  gen=$(grep -oE '"generation": *[0-9]+' "$DEST/session.json" | grep -oE '[0-9]+$' || true)
+  day=$(grep -oE '"trading_day": *"[0-9-]+"' "$DEST/session.json" | grep -oE '[0-9-]{10}' || true)
+  echo "  <- NEO session generation ${gen:-?} (trading day ${day:-?}) -> $DEST/session.json"
+  exit 0
+fi
+
 DAYS="${1:-1}"
 STATS="${2:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"          # Helper/
@@ -88,7 +108,7 @@ echo "=== tokens (newer-only) ==="
 pull_token "$R_BOTS/data/kite_access_token.json"      "data/kite_access_token.json"        # personal account
 pull_token "$R_BOTS/FIFTY/data/kite_access_token.json" "FIFTY/data/kite_access_token.json"  # company account (FIFTY)
 pull_token "$R_BOTS/CROCODILE/data/kite_access_token.json" "CROCODILE/data/kite_access_token.json"
-pull_token "$R_ETF/neo/data/session.json"             "ETF_PI/neo/data/session.json"       # Neo (absent while trade_enabled=false)
+# NEO: not here. One session lives on the Pi (~/.kotak_neo); see --neo-session.
 
 echo "=== evidence (logs: last $DAYS day(s); books/journals: all) ==="
 M="-mtime -$DAYS"

@@ -54,6 +54,11 @@ def verify_by_gen(dead_upto):
 
 
 @pytest.fixture(autouse=True)
+def _no_telegram(monkeypatch):
+    monkeypatch.setattr(S, '_flush_alerts', lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_cache():
     S._alive_cache.clear()
     yield
