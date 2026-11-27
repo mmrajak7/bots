@@ -21,7 +21,7 @@
  "kite_rps": 2,
  "kite_retry_s": [1, 2, 4],
  "token_poll_s": 20,
- "token_first_poll": "08:45",
+ "token_first_poll": "08:30",
  "token_deadline": "14:15",
  "refresh_retry_min": 30,
  "refresh_last": "22:00",
@@ -53,7 +53,7 @@
   "dp_per_sell_scrip": "15.93"
  },
  "token_file": "../data/kite_access_token.json",
- "_token_doc": "Dec 2026-Mar 2027: personal account YL6478 (owner 2026-11-25), token refreshed ~08:45 by the Helper bots, read only. The book has ONLY its own kill (control/KILL); no other bot's kill switch is read (owner 2026-11-25). From Apr 2027 the company account needs market data (QSK814 has no quote permission) - redesign then.",
+ "_token_doc": "Dec 2026-Mar 2027: personal account YL6478 (owner 2026-11-25), token made at 08:30 by kite_login (from 30 Nov 2026), read only. The book has ONLY its own kill (control/KILL); no other bot's kill switch is read (owner 2026-11-25). From Apr 2027 the company account needs market data (QSK814 has no quote permission) - redesign then.",
  "holiday_file": "../data/holiday_calendar.json",
  "nse_data": "../../NSE_DATA",
  "srs_dir": "pipeline",

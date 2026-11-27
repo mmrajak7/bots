@@ -9,8 +9,10 @@ demat before the first sell (1 Jan). Only the book's own kill (`kill` / `control
 **Test size (owner 2026-11-27): 2L** (`book_cash_open: 200000` in the Pi overlay; ₹9,970 per name; ARM cap 2.2L).
 Test rebalances 1 Dec, 1 Jan, 1 Feb, 1 Mar in YL6478; the 20 stocks STAY in YL6478 after the test (not sold).
 YL6478 has no option trading on Kite any more (options moved to NEO), so the book's cash sits beside positional
-holdings only. **Token dependency:** the YL6478 token is written at 08:45 by SNAIL's `main.py startup` cron line;
-that line must stay, or the book fails closed every day (no token = no orders + ALERT).
+holdings only. **Token dependency:** from 30 Nov 2026 both Kite tokens are made at 08:30 (retry + alert 08:36) by
+`python -m kite_login morning` (BOTS root; see kite_login/README). The book only READS `BOTS/data/kite_access_token.json`
+and never logs in. No token = no orders + ALERT (fail closed). It also needs `BOTS/data/holiday_calendar.json`,
+which kite_login refreshes. No dependency on SNAIL, FIFTY or CROCODILE processes, cron lines or Telegram bots.
 
 Design: `SRS/MOMENTUM_FROZEN_DESIGN.md` · Build spec: `SRS/MOMENTUM_BUILD_SPEC_DEC1.md` · Log: `docs/BUILD_LOG.md`.
 
