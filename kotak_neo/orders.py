@@ -105,7 +105,7 @@ def resolve(c: NeoClient, tag: str, wait_s: float = 10.0, poll_s: float = 0.5,
                 last = _summarise(views, expect_qty)
                 if last.terminal or not until_terminal:
                     return last
-        except Unavailable as e:
+        except (Unavailable, Auth) as e:              # N5: Auth = unreadable, never escapes
             readable = False
             logger.warning('resolve %s: book unreadable: %s', tag, e)
         if clock() >= deadline:
@@ -127,7 +127,7 @@ def cancel_and_confirm(c: NeoClient, order_no: str, tag: str, wait_s: float = 10
         c.cancel(order_no)
     except Rejected as e:
         logger.info('cancel %s rejected (%s) -- reading the book', order_no, e)
-    except Unclear as e:
+    except (Unclear, Auth) as e:
         logger.warning('cancel %s unclear (%s) -- reading the book', order_no, e)
     return resolve(c, tag, wait_s=wait_s, poll_s=poll_s, expect_qty=expect_qty,
                    sleep=sleep, clock=clock)
@@ -138,15 +138,18 @@ def cancel_and_confirm(c: NeoClient, order_no: str, tag: str, wait_s: float = 10
 class ChasePolicy:
     reprice_after_s: float = 10.0   # a working sell older than this is cancelled + re-priced
     step_ticks: int = 1             # each re-price goes this many ticks below the bid
-    max_reprices: int = 12          # then NEEDS_HUMAN (alert: exit in the app)
+    max_reprices: Optional[int] = 12  # then NEEDS_HUMAN (alert: exit in the app).
+                                    # None = never: the chase keeps going and the
+                                    # CALLER alerts (ETF_PI, owner: no manual step)
     confirm_wait_s: float = 0.0     # 0 for a 5-s monitor: settle the cancel on the next poll
     unclear_grace_s: float = 60.0   # an UNCLEAR sell may surface late; settle it after this.
                                     # RESIDUAL RISK, stated: an unclear sell that stays
                                     # INVISIBLE in the book and UNFILLED for longer than
                                     # this is re-sent. (Filled-but-invisible is caught by the
                                     # position check.) Measured visibility: immediate.
-    max_troubles: int = 12          # consecutive unreadable/unsettled steps -> NEEDS_HUMAN
-                                    # (12 x a 5-s poll = 1 min: positions can lag a fill)
+    max_troubles: Optional[int] = 12  # consecutive unreadable/unsettled steps -> NEEDS_HUMAN
+                                    # (12 x a 5-s poll = 1 min: positions can lag a fill).
+                                    # None = never (the caller alerts on `troubles`)
     reject_backoff_s: float = 15.0  # after a definite refusal, wait before the next try
 
 
@@ -169,6 +172,8 @@ class ChaseState:
     troubles: int = 0
     next_try_at: float = 0.0
     status: str = 'active'          # active | done | needs_human
+    rejects: int = 0                # N3: definite refusals in a row (reset by a fill)
+    unclears: int = 0               # N4: unclear sends in a row (reset by a fill)
     note: str = ''
     fills: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -191,6 +196,7 @@ def _round_down(px: float, tick: float) -> float:
 
 def _apply(st: ChaseState, res: Resolution) -> None:
     if res.filled:
+        st.rejects = st.unclears = 0
         st.sold += res.filled
         st.proceeds += res.filled * res.avg_price
         st.remaining -= res.filled
@@ -204,13 +210,14 @@ def _apply(st: ChaseState, res: Resolution) -> None:
 def _trouble(st: ChaseState, p: ChasePolicy, why: str) -> ChaseState:
     st.troubles += 1
     st.note = why
-    if st.troubles >= p.max_troubles:
+    if p.max_troubles is not None and st.troubles >= p.max_troubles:
         st.status = 'needs_human'
         st.note = '%s (%d steps in a row)' % (why, st.troubles)
     return st
 
 
-def _settle_working(c: NeoClient, st: ChaseState, p: ChasePolicy, sleep, clock) -> bool:
+def _settle_working(c: NeoClient, st: ChaseState, p: ChasePolicy, sleep, clock,
+                    held_fn: Callable[[], int]) -> bool:
     """Settle the working sell. True = no sell is working any more (the step
     may place); False = leave the step (still working, or trouble noted)."""
     res = resolve(c, st.working_tag, wait_s=0, until_terminal=False,
@@ -228,13 +235,19 @@ def _settle_working(c: NeoClient, st: ChaseState, p: ChasePolicy, sleep, clock) 
         if clock() - st.working_since < p.unclear_grace_s:
             return False                                # may still surface: never resend early
         # F1: after the grace, re-send ONLY if no sell is live on the symbol
-        # (any tag) and the position still holds the lots.
+        # (any tag; a NON-exclusive bot: any of ITS tags -- another bot's sell
+        # on a shared strike is not ours to wait for) and the lots are held.
         try:
-            if c.live_orders(st.symbol, 'S'):
+            if getattr(c, 'exclusive', True):
+                live = c.live_orders(st.symbol, 'S')
+            else:
+                live = [o for o in c.own_orders()
+                        if o.symbol == st.symbol and o.side == 'S' and not o.terminal]
+            if live:
                 _trouble(st, p, 'unclear sell absent but a live sell exists on %s' % st.symbol)
                 return False
-            held = c.net_held(st.symbol)
-        except Unavailable as e:
+            held = held_fn()
+        except (Unavailable, Auth) as e:
             _trouble(st, p, 'cannot settle unclear sell: %s' % e)
             return False
         if held < st.remaining:
@@ -262,11 +275,21 @@ def _settle_working(c: NeoClient, st: ChaseState, p: ChasePolicy, sleep, clock) 
 
 def chase_exit(c: NeoClient, st: ChaseState, quote: Callable[[], Optional[Dict[str, float]]],
                policy: Optional[ChasePolicy] = None, persist: Optional[Callable] = None,
-               sleep: Callable = time.sleep, clock: Callable = time.time) -> ChaseState:
+               sleep: Callable = time.sleep, clock: Callable = time.time,
+               held_fn: Optional[Callable[[], int]] = None,
+               price_fn: Optional[Callable[[float, int, float], float]] = None) -> ChaseState:
     """ONE step. Mutates and returns `st`; calls `persist(st)` after every
-    change that matters, and BEFORE any order is sent."""
+    change that matters, and BEFORE any order is sent.
+
+    `held_fn()` -> shares this chase may sell at most (default: the ACCOUNT's
+    net position). A non-exclusive bot passes min(own tagged net, account
+    net) so a shared strike's other lots are never sold. Raises Unavailable
+    when unreadable (nothing is sent).
+    `price_fn(bid, reprices, tick)` -> the limit (default: bid minus
+    `reprices * step_ticks` ticks). Always rounded DOWN to the tick here."""
     p = policy or ChasePolicy()
     save = persist or (lambda s: None)
+    held_of = held_fn or (lambda: c.net_held(st.symbol))
     if st.status != 'active':
         return st
     with S.file_lock('chase_%s_%s.lock' % (st.bot, st.symbol), 0.0) as got:
@@ -274,21 +297,22 @@ def chase_exit(c: NeoClient, st: ChaseState, quote: Callable[[], Optional[Dict[s
             st.note = 'another process is stepping this chase'
             return st
         if st.working_tag:
-            if not _settle_working(c, st, p, sleep, clock):
+            if not _settle_working(c, st, p, sleep, clock, held_of):
                 save(st)
                 return st
             st.troubles = 0                             # the working sell is settled
         try:
-            held = c.net_held(st.symbol)
-        except Unavailable as e:
+            held = held_of()
+        except (Unavailable, Auth) as e:
             save(_trouble(st, p, 'positions unreadable: %s -- nothing sent' % e))
             return st
         if st.remaining <= 0:
             st.status = 'done'
-            try:
-                c.release_if_flat(st.symbol)
-            except Unavailable as e:
-                logger.warning('release %s after exit: %s', st.symbol, e)
+            if getattr(c, 'exclusive', True):
+                try:
+                    c.release_if_flat(st.symbol)
+                except Unavailable as e:
+                    logger.warning('release %s after exit: %s', st.symbol, e)
             save(st)
             return st
         qty = min(st.remaining, held)                   # F4: never more than the account holds
@@ -297,7 +321,7 @@ def chase_exit(c: NeoClient, st: ChaseState, quote: Callable[[], Optional[Dict[s
                           % (st.remaining, held)))
             return st
         st.troubles = 0                                 # the book and the account agree
-        if st.reprices >= p.max_reprices:
+        if p.max_reprices is not None and st.reprices >= p.max_reprices:
             st.status, st.note = 'needs_human', '%d re-prices without getting flat' % st.reprices
             save(st)
             return st
@@ -309,7 +333,22 @@ def chase_exit(c: NeoClient, st: ChaseState, quote: Callable[[], Optional[Dict[s
             st.note = 'no bid -- waiting'
             save(st)
             return st
-        px = _round_down(bid - st.reprices * p.step_ticks * st.tick, st.tick)
+        try:                                            # N2: a resting stop / stray sell
+            if getattr(c, 'exclusive', True):
+                others = c.live_orders(st.symbol, 'S')
+            else:
+                others = [o for o in c.own_orders()
+                          if o.symbol == st.symbol and o.side == 'S' and not o.terminal]
+        except (Unavailable, Auth) as e:
+            save(_trouble(st, p, 'order book unreadable before a sell: %s -- nothing sent' % e))
+            return st
+        if others:
+            save(_trouble(st, p, 'another live sell on %s (%s) -- nothing sent' % (
+                st.symbol, ', '.join(o.order_no for o in others))))
+            return st
+        raw = (price_fn(bid, st.reprices, st.tick) if price_fn
+               else bid - st.reprices * p.step_ticks * st.tick)
+        px = _round_down(raw, st.tick)
         tag = c.new_tag()
         st.working_tag, st.working_qty, st.working_since = tag, qty, clock()
         st.working_no, st.note = '', 'selling %d @ %.2f' % (qty, px)
@@ -320,11 +359,13 @@ def chase_exit(c: NeoClient, st: ChaseState, quote: Callable[[], Optional[Dict[s
         except Rejected as e:
             _apply(st, Resolution(REJECTED, 0, 0.0, '', str(e), True))
             st.next_try_at = clock() + p.reject_backoff_s
-            st.note = 'sell rejected: %s' % e
+            st.rejects += 1                             # N3: the caller escalates on this
+            st.note = 'sell rejected (%d in a row): %s' % (st.rejects, e)
         except (NotOwner, Auth, Unavailable, ValueError) as e:
             _apply(st, Resolution(CANCELLED, 0, 0.0, '', str(e), True))   # nothing was sent
             _trouble(st, p, 'sell not sent: %s' % e)
         except Unclear as e:
-            st.note = 'sell unclear: %s' % e            # keep the tag; settle from the book
+            st.unclears += 1                            # N4: the caller escalates on this
+            st.note = 'sell unclear (%d in a row): %s' % (st.unclears, e)   # settle from the book
         save(st)
         return st

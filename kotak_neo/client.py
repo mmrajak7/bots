@@ -11,9 +11,13 @@ contract measured on 2026-11-27 and the review's rules:
     body logged scrubbed, and NO login (a refused order is not evidence of a
     dead session -- the 13:32 401 that a re-login did not fix). The caller
     resolves the order from the book by its TAG.
-  * Every order carries the bot's tag prefix (`zbr-`, `btst-`, `etf-`) and
-    CLAIMS its contract in `owners.json`: one bot per contract, so one bot's
-    reconcile can never adopt, sell or kill on another bot's position.
+  * Every order carries the bot's tag prefix (`zbr-`, `btst-`, `etf-`). An
+    EXCLUSIVE client (the default) CLAIMS its contract in `owners.json`: one bot
+    per contract, so its reconcile can never adopt, sell or kill on another
+    bot's position. A NON-exclusive client (`exclusive=False`, ETF_PI, owner
+    2026-11-27: "BTST may trade the same strike in parallel -- do not
+    interfere") claims nothing and must size every sell by `own_net()` -- its
+    OWN tagged fills -- never by the account position alone.
   * SL-M is refused here, before NEO: RMS rejects it for options (measured).
 """
 from __future__ import annotations
@@ -299,7 +303,7 @@ class NeoClient:
     """One per bot process. Cheap: it re-reads the published session per call."""
 
     def __init__(self, bot: str, *, segment: str = 'nse_fo', product: str = 'NRML',
-                 timeout: float = 10.0, http: Any = None,
+                 exclusive: bool = True, timeout: float = 10.0, http: Any = None,
                  current_fn: Callable[[], S.Session] = None,
                  refresh_fn: Callable[..., S.Result] = None,
                  clock: Callable[[], datetime] = None):
@@ -308,6 +312,7 @@ class NeoClient:
         self.bot = bot
         self.segment = segment
         self.product = product
+        self.exclusive = bool(exclusive)
         self.timeout = timeout
         self._http = http
         self._current = current_fn or S.current
@@ -416,6 +421,15 @@ class NeoClient:
         """This account's net quantity in `symbol` (shares). Raises Unavailable."""
         return sum(p.net_qty for p in self.positions() if p.symbol == symbol)
 
+    def own_net(self, symbol: str, fills: Optional[List[FillView]] = None) -> int:
+        """Shares THIS bot holds in `symbol` from TODAY's trade book: its own
+        tagged buys minus its own tagged sells (one row per fill). Raises
+        Unavailable when the trade book cannot be read. A lot carried from an
+        earlier day is not in today's book: the bot's journal adds it."""
+        rows = self.trades() if fills is None else fills
+        return sum((f.qty if f.side == 'B' else -f.qty) for f in rows
+                   if f.symbol == symbol and f.bot() == self.bot and f.side in ('B', 'S'))
+
     def live_orders(self, symbol: str, side: Optional[str] = None) -> List[OrderView]:
         return [o for o in self.order_book() if o.symbol == symbol and not o.terminal
                 and (side is None or o.side == side)]
@@ -440,8 +454,38 @@ class NeoClient:
         except (TypeError, ValueError):
             raise Unavailable('limits has no usable %r' % field_name)
 
+    def _views_where(self, keep: Callable[[Dict[str, Any]], bool], what: str) -> List[OrderView]:
+        """Order-book rows that `keep` selects, parsed STRICTLY; rows it does
+        not select are never parsed (review F11, 2026-11-27: one unparsable row
+        of ANOTHER bot or a manual order must not blind this bot's own reads)."""
+        out = []
+        for r in self._rows(self._read('GET', PATH_ORDER_BOOK), 'order book'):
+            if not keep(r):
+                continue
+            try:
+                out.append(OrderView.from_neo(r))
+            except RowError as e:
+                raise Unavailable('%s: %s' % (what, e))
+        return out
+
     def orders_tagged(self, tag: str) -> List[OrderView]:
-        return [o for o in self.order_book() if o.tag == tag]
+        return self._views_where(lambda r: str(r.get('GuiOrdId') or '') == tag,
+                                 'order book (tag %s)' % tag)
+
+    def own_orders(self) -> List[OrderView]:
+        """Today's order-book rows carrying THIS bot's tag prefix."""
+        pre = self.bot + '-'
+        return self._views_where(lambda r: str(r.get('GuiOrdId') or '').startswith(pre),
+                                 'order book (%s)' % self.bot)
+
+    def own_order_net(self, symbol: str, views: Optional[List[OrderView]] = None) -> int:
+        """Shares this bot holds in `symbol` per TODAY's ORDER BOOK: filled
+        quantity of its own tagged buys minus sells. The order book is the
+        fastest and the measured-tagged source (GuiOrdId echoes the tag,
+        2026-11-27); the trade book's tag was never measured (review F5)."""
+        rows = self.own_orders() if views is None else views
+        return sum((o.filled if o.side == 'B' else -o.filled) for o in rows
+                   if o.symbol == symbol and o.side in ('B', 'S'))
 
     def scrip_master_paths(self) -> List[str]:
         """Links to the per-segment scrip-master CSVs (consumer key auth, as
@@ -543,13 +587,19 @@ class NeoClient:
             raise ValueError('qty must be positive')
         if req.kind == 'SL' and _f(req.trigger) <= 0:
             raise ValueError('an SL order needs a trigger')
-        if reduce_only:
+        new_claim = False
+        if reduce_only and not self.exclusive:
+            # A non-exclusive bot's exit: the owners file is the EXCLUSIVE bots'
+            # registry and says nothing about this bot's own lots on a shared
+            # strike. The caller caps the qty at its own tagged net.
+            if req.side != 'S':
+                raise ValueError('reduce_only is for sells of a long')
+        elif reduce_only:
             # An EXIT. Never blocked by an unreadable owners file (review F7):
             # the chase caps it at what the account holds. Still refused if the
             # file is readable and names another bot.
             if req.side != 'S':
                 raise ValueError('reduce_only is for sells of a long')
-            new_claim = False
             try:
                 holder = owner_of(req.symbol)
             except Unavailable as e:
@@ -557,7 +607,7 @@ class NeoClient:
                 logger.warning('owners.json unreadable for an exit sell (%s) -- proceeding', e)
             if holder and holder != self.bot:
                 raise NotOwner('%s is held by %s' % (req.symbol, holder))
-        else:
+        elif self.exclusive:
             new_claim = self.claim(req.symbol)
         jdata = {'am': 'NO', 'dq': '0', 'es': self.segment, 'mp': '0', 'pc': self.product,
                  'pf': 'N', 'pr': req.price, 'pt': req.kind, 'qt': str(int(req.qty)),

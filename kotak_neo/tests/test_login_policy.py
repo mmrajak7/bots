@@ -23,8 +23,6 @@ OWNER = 'kotak_neo/session.py'
 LEGACY = {
     'Strategies/NIFTY_BTST/nifty_btst/neo_client.py':
         'K5: BTST reads the shared session; its login code is deleted',
-    'ETF_PI/neo/session.py':
-        'K6: ETF_PI adopts kotak_neo (its 08:45 login cron is already off, 2026-11-27)',
     'Scalper/core/session_manager.py': 'Scalper retired or moved onto kotak_neo',
     'Scalper/test_api.py': 'Scalper retired or moved onto kotak_neo',
 }

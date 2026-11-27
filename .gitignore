@@ -241,3 +241,5 @@ ETF_PI/harness/replay_work/
 ETF_PI/harness/test_*/
 ETF_PI/.nifty_only
 ETF_PI/state/
+ETF_PI/executor_local.yaml
+ETF_PI/credentials.json

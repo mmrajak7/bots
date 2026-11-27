@@ -1,0 +1,65 @@
+# ETF_PI executor -- tracked defaults (docs/EXECUTOR_SPEC.md). The Pi overrides
+# per box in the UNTRACKED `executor_local.yaml` beside the ETF_PI scripts
+# (mode, lots, live_until). Unknown keys in either file are an ERROR.
+
+mode: "off"                 # off | paper | live   (O9). off = intents are read and SKIPPED.
+lots: 1                     # lots per entry; must be <= floor(capital / capital_per_lot)
+live_until: ""              # YYYY-MM-DD: last day mode=live may trade (empty = live refused)
+capital: 500000             # Rs, for the lot ceiling (owner 2026-11-26)
+capital_per_lot: 50000      # ceiling = floor(capital / this)
+max_open: 2                 # open + working positions at once (one CE + one PE)
+
+# entry (spec §4)
+intent_max_age_s: 20        # I1
+last_entry: "15:00"         # E1 (paper: MIN_MINUTES_TO_EOD=25 before 15:25)
+entry_cap_ticks: 3          # E2: cap = signal_ltp + max(3 ticks, 0.3%)
+entry_cap_pct: 0.3
+entry_reprice_s: 2.0        # E5
+entry_attempts: 3           # E5: places in all
+funds_margin: 1.10          # E1 live: funds >= ask * qty * this
+
+# exit (spec §5/§6)
+floor_persist_s: 5.0        # X3
+floor_instant_pct: 0.5      # X3
+adv_backstop_pct: 12.0      # X5
+minute_sample_second: 4     # X1
+exit_step_s: 2.0            # X11
+exit_steps_pct: [0.3, 0.6, 1.0]   # X11 re-price 1..3: bid x (1 - pct%)
+exit_tail_pct: 2.0          # X11 every later re-price
+exit_alert_every_s: 60      # X12
+unclear_grace_s: 60         # E6 entries
+unclear_grace_sell_s: 10    # X13 sells (Fable F4; Monday M3 measures visibility)
+positions_lag_s: 10         # F6: account net may trail our own fill this long
+reject_backoff_s: 5         # F15
+exit_fault_s: 60            # F22: an exit chasing longer than this is a fault
+trouble_alert_after: 3      # X12: consecutive troubled steps before an alert
+stop_placing: "15:29:50"    # F16: no order placed after this; open lots -> CARRY
+carry_resume: "09:15:05"    # F16: a carried lot is exited from this time
+neo_timeout_s: 3            # F10
+
+# prices (spec §8)
+price_stale_s: 5.0          # P2: older tick -> REST
+rest_poll_s: 2.0            # P2
+no_price_alert_s: 30        # X8
+no_price_flatten_s: 120     # X8 / Q15
+
+# risk (spec §7)
+daily_loss_per_lot: 3000    # R1
+max_fault_streak: 2         # R2
+cover_window_s: 300         # R4 / Q7
+reconcile_s: 15             # R5 periodic reconcile while anything is active
+after_close_alert_s: 600    # R6
+
+# ops (spec §9)
+loop_s: 0.5
+status_every_s: 5
+deadman_every_s: 30
+watchdog_stale_s: 90
+watchdog_restart_cmd: "sudo systemctl restart etf-executor"
+neo_bot: "etf"
+skip_foreign_strikes: true  # never enter a strike where the account holds lots that are not ours
+product: "MIS"             # owner 2026-11-27 (via BTST session): MIS segregates ETF from BTST's NRML rows.
+                            # Kotak MIS F&O auto square-off: 15:20 (FAQ) or 15:25 (MIS T&C / bulletin),
+                            # Rs50+GST per order -> our EOD must come first (eod_time).
+eod_time: "15:15"           # live EOD exit; "" = paper's U.eod_close (15:25). Used as min(this, paper).
+bots_root: ""               # empty = the BOTS clone this ETF_PI sits in, else the Pi default

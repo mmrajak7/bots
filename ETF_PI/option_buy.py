@@ -873,20 +873,17 @@ def _init_bridge():
     try:
         with open(config_path) as f:
             cfg = yaml.safe_load(f)
-        TRADE_ENABLED = cfg.get('trade_enabled', False)
         TF_TIME_SL = cfg.get('time_sl', {})
-        # Paper-only underlyings can never reach Neo, whatever config_trade.yaml says: the
-        # file is shared by every process, so switching NIFTY live must not arm the others.
-        if TRADE_ENABLED and not U.orders_allowed:
-            log.warning(f"ORDER PATH DISABLED for {U.name} (paper only) — trade_enabled ignored")
-            TRADE_ENABLED = False
-        if TRADE_ENABLED:
-            from neo import NeoTrader
-            _NEO_BRIDGE = NeoTrader(config_path)
-            log.info(f"Neo trader active: log_only={_NEO_BRIDGE.log_only}")
-        else:
-            # Still load TIME_SL even without trade execution
-            log.info(f"Trade disabled. TIME_SL loaded: {TF_TIME_SL}")
+        # D17 (2026-11-27, owner): the old in-process Neo bridge (neo/) is RETIRED. It could not
+        # log in, could not map weekly symbols, booked fills that never happened and never
+        # retried a failed exit. `trade_enabled` can no longer arm anything: live orders belong
+        # to the executor daemon alone (docs/EXECUTOR_SPEC.md), fed by _emit_intent below.
+        TRADE_ENABLED = False
+        _NEO_BRIDGE = None
+        if cfg.get('trade_enabled'):
+            log.error("config_trade.yaml trade_enabled=true is IGNORED: the neo/ bridge is retired; "
+                      "the executor daemon places live orders (docs/EXECUTOR_SPEC.md)")
+        log.info(f"Paper only (orders = executor daemon). TIME_SL loaded: {TF_TIME_SL}")
     except Exception as e:
         log.error(f"Bridge init failed: {e}", exc_info=True)
         TRADE_ENABLED = False
@@ -1760,14 +1757,50 @@ def _open_pos(opt_type, tf, strike, expiry, opt_sym, opt_ltp, st_val, gap, spot,
         'TIME_SL_CAP': (TF_TIME_SL or {}).get(tf, (TF_TIME_SL or {}).get('default', 120)),
     })
 
-    # Neo bridge: place entry + TP orders
-    if TRADE_ENABLED and _NEO_BRIDGE:
-        try:
-            _NEO_BRIDGE.on_entry(key, positions[key])
-        except Exception as e:
-            log.error(f"Bridge on_entry failed: {e}")
+    # LIVE: hand a NIFTY 10M paper entry to the executor daemon (EXECUTOR_SPEC §2). The paper
+    # row above is unchanged and stays the paper book; the executor keeps its own live book.
+    _emit_intent(key, positions[key])
 
     return key
+
+#: Executor hand-off (EXECUTOR_SPEC §2). Only NIFTY 10M goes live (owner 2026-11-26: 15M keeps
+#: running as signal / T2 source; the live filter is HERE, SIGNAL_TIMEFRAMES is unchanged).
+EXEC_INTENT_DIR = os.path.join(CURRENT_DIR, 'state', 'executor', 'intents')
+EXEC_INTENT_UNDERLYING = 'NIFTY'
+EXEC_INTENT_TF = '10minute'
+
+def _emit_intent(key, pos):
+    """Write one atomic intent file for the executor. Never raises, never gates the paper trade:
+    a failed write costs the LIVE trade only, and says so loudly."""
+    try:
+        if U.name != EXEC_INTENT_UNDERLYING or pos.get('signal_tf') != EXEC_INTENT_TF:
+            return
+        rec = {
+            'key': key, 'created_at': datetime.datetime.now(IST).isoformat(),
+            'underlying': U.name, 'kite_symbol': pos['option_symbol'],
+            'kite_token': _token_for_symbol(pos['option_symbol']),
+            'exchange': pos.get('exchange', U.exchange), 'strike': pos['strike'],
+            'expiry': pos['expiry'], 'opt_type': pos['opt_type'], 'signal_tf': pos['signal_tf'],
+            'signal_ltp': pos['entry_premium'], 'st_value': pos['st_value'],
+            't2_value': pos.get('t2_value', 0) or 0, 't2_tf': pos.get('t2_tf', ''),
+            'lot_size': pos['lot_size'], 'tick_size': pos['tick_size'],
+            'entry_bid': pos.get('entry_bid'), 'entry_ask': pos.get('entry_ask'),
+        }
+        os.makedirs(EXEC_INTENT_DIR, exist_ok=True)
+        path = os.path.join(EXEC_INTENT_DIR, key + '.json')
+        tmp = path + '.%d.tmp' % os.getpid()
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(rec, f, cls=_Enc)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        log.info(f"INTENT: {key} -> executor ({pos['option_symbol']} ST={pos['st_value']:.2f})")
+    except Exception as e:
+        log.error(f"INTENT write FAILED for {key} (no live trade for this signal): {e}")
+        try:
+            common.sendMsgTelegram(f"⚠️ INTENT write failed {key}: {e} -- no live trade", 'E')
+        except Exception:
+            pass
 
 def _close_pos(key, pos, exit_prem, exit_type):
     pos['status'] = 'closed'; pos['exit_type'] = exit_type
@@ -1811,12 +1844,8 @@ def _close_pos(key, pos, exit_prem, exit_type):
     # peak/drift/hold but never compares the exit price to its own trigger.
     trade_observer.on_exit(key, pos, exit_prem, exit_type)
 
-    # Neo trader: cancel TP + place exit order (pass exit_prem for C1 fix)
-    if TRADE_ENABLED and _NEO_BRIDGE:
-        try:
-            _NEO_BRIDGE.on_exit(key, exit_type, exit_prem)
-        except Exception as e:
-            log.error(f"Neo on_exit failed: {e}")
+    # (The neo/ bridge's on_exit hook was removed 2026-11-27 -- D17. Live exits are the
+    #  executor's own, on its own book and ticks.)
 
     # SHADOW (non-NIFTY only): what longer / no TIME_SL caps and holding through an event would
     # have done. Never raises, never gates.
@@ -3560,31 +3589,8 @@ def main():
     if should_update(): run_level_update(kite, df_instruments)
     run_ltp_scan()
 
-    # Sync TP fills from Neo exchange (if bridge active)
-    # CRITICAL: must update st_opt_positions.json to prevent double-sell
-    if TRADE_ENABLED and _NEO_BRIDGE:
-        try:
-            fills = _NEO_BRIDGE.sync_tp_fills()
-            if fills:
-                positions = _load(_pos_path())
-                for key, fill_price in fills:
-                    log.info(f"TP filled on Neo: {key} @ {fill_price}")
-                    if key in positions and positions[key].get('status') == 'open':
-                        _close_pos(key, positions[key], fill_price, 'TP')
-                _save(positions, _pos_path())
-
-            # Also sync entry rejections — mark them closed in our state
-            rejections = _NEO_BRIDGE.get_rejected_entries()
-            if rejections:
-                positions = _load(_pos_path())
-                for key in rejections:
-                    if key in positions and positions[key].get('status') == 'open':
-                        positions[key]['status'] = 'closed'
-                        positions[key]['exit_type'] = 'ENTRY_REJECTED'
-                        log.warning(f"Entry rejected on exchange: {key}")
-                _save(positions, _pos_path())
-        except Exception as e:
-            log.error(f"TP sync failed: {e}")
+    # (The neo/ bridge's TP-fill / rejection sync was removed 2026-11-27 -- D17: the paper
+    #  ledger is never written from broker events; the executor keeps the live book.)
 
     _kite_stats_close()
     log.info("=" * 60); log.info("COMPLETE"); log.info("=" * 60)

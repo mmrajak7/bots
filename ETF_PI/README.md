@@ -11,11 +11,15 @@ Sections: `telegram_main`, `telegram_error`, `extract_data_kite`, `extract_data_
 `tracker_kite`, `tracker_telegram`, `backtest_kite`. Also never committed: `secret.json`,
 `neo_credentials.yaml`, `neo/data/session.json`, `logs/`.
 
-## NEO (Kotak) — moving to the shared `kotak_neo` login
-ETF_PI's own NEO login (`neo/session.py`, the 08:45 `neo_login.py` cron) is being retired:
-the cron line is commented out on the Pi (2026-11-27) and ETF_PI will use the ONE shared
-session published by `BOTS/kotak_neo` (see `kotak_neo/README.md`), importing it from
-`~/Desktop/BOTS`. Until that lands, `trade_enabled: false` keeps the order path off.
+## Live orders — the executor daemon (2026-11-27)
+`option_buy.py` stays the signal generator + PAPER ledger. For each NIFTY 10M paper entry it
+writes an intent file (`state/executor/intents/`); the `executor/` daemon (systemd
+`etf-executor`) alone places live orders through the shared `BOTS/kotak_neo` session, keeps
+its own journal-backed live book and runs the exit ladder on Kite ticks.
+Spec `docs/EXECUTOR_SPEC.md` · ops `docs/EXECUTOR_RUNBOOK.md` · tests `executor/tests/`.
+The old in-process `neo/` bridge is RETIRED (D17): importing `neo` raises, `trade_enabled` is
+ignored, `neo_login.py` exits 2. ETF works by its `etf-` order tag only and trades MIS, so BTST
+(NRML) on the same strike is never touched.
 
 ## Runs (Pi crontab, system `/usr/bin/python3`)
 `option_buy.py` every minute (flock), `get_instruments.py` 08:50, `get_op_instruments.py`
