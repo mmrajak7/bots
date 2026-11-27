@@ -20,7 +20,16 @@ product: "MIS"                 # MIS for intraday, NRML for positional
 # Order execution
 entry_tick_buffer: 0.15        # Add to ask for entry LIMIT BUY (3 ticks, was 0.05)
 exit_tick_buffer: 0.10         # Subtract from bid for exit LIMIT SELL (2 ticks)
-tp_order_enabled: true         # Place TP LIMIT SELL at ST value on exchange
+# Exchange-side TP LIMIT SELL.
+# DISABLED 2026-08-09. A resting sell truncates exactly the TRAIL runners that carry
+# the edge. Replay on the 137-trade post-EOD-gate ledger:
+#   tp_order_enabled: false (software-only)  ->  all-time Rs17,553 | P3+P4 Rs13,864
+#   TP at T2 (neo/orders.py now anchors here) ->  all-time Rs 6,217 | P3+P4 Rs 9,549
+#   TP at T1 (pre-2026-08-09 behavior)        ->  all-time Rs-1,121 | P3+P4 Rs 2,108
+# It also provides no crash protection: a TP is a sell ABOVE market, so it never fires
+# when the bot dies holding a loser. If exchange-side protection is wanted, add an
+# SL-M, not a TP. Exits are handled by monitor_positions() in software.
+tp_order_enabled: false
 
 # Time-based SL (in minutes)
 # Hard cap: TP or cut. Apr 2026 backtest:
@@ -28,10 +37,11 @@ tp_order_enabled: true         # Place TP LIMIT SELL at ST value on exchange
 #   Sacrifices 11 slow TPs (+46%) but saves 29 losers (-209%)
 #   1H gets 60m since all 1H TPs are 60-120m
 time_sl:
+  10minute: 30                 # hard cap 30m (3 candles)
   15minute: 45                 # hard cap 45m
-  30minute: 45                 # hard cap 45m
   60minute: 60                 # 1 candle grace (2/3 TPs at 60m)
   default: 45                  # hard cap
+  # 30minute: removed 2026-05-12 (disabled in ALL_TIMEFRAMES — see option_buy.py)
 
 # Risk management (H4 circuit breaker)
 max_loss_per_day: 10000        # INR — block new entries if daily loss exceeds this

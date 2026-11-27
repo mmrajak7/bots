@@ -1,0 +1,32 @@
+{
+  "json_new_keys": [
+    "candles_today",
+    "dte",
+    "entry_ask",
+    "entry_bid",
+    "exit_ask",
+    "exit_bid",
+    "last_candle",
+    "last_ltp",
+    "last_ltp_time",
+    "pnl_pct",
+    "session_half",
+    "slot_n",
+    "spread_pct",
+    "t1_dist_ticks",
+    "t1_time",
+    "underlying",
+    "vol_candles_today"
+  ],
+  "log_new_patterns": [
+    "^WARNING \\| Kite (quote|hist) retry \\d/\\d: ",
+    "^INFO    \\| Kite calls: \\d+ retries: \\d+ failures: \\d+ wait: [\\d.]+s$"
+  ],
+  "_why": "json_new_keys: additive ledger fields approved in spec \u00a79 (H7 friction, B12 slot tags, M13 last-known-good, t1_time for the winners-come-fast study). log_new_patterns: Kite retry/counter lines (spec \u00a713). candles_today/vol_candles_today/last_candle: H9 metadata (recorded, not gated). kite_failures_<date>: \u00a713 daily counter (review-3 R3-2). telegram_new_patterns: the >10-failures/day KITE alert (review-4 R4-8).",
+  "json_new_key_patterns": [
+    "^kite_failures_\\d{8}$"
+  ],
+  "telegram_new_patterns": [
+    "^<b>\\u26a0\\ufe0f KITE</b> "
+  ]
+}

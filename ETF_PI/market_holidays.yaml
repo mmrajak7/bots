@@ -1,0 +1,71 @@
+# Exchange trading holidays read by market_calendar.py (spec SPEC_multi_instrument_2026-10-06 §8, §9c).
+#
+# WHY this file exists: on 2026-10-02 (NSE closed) the bot ran 375 scans on a frozen tape. main()
+# must not run on a closed session; the liquidity freshness gate is only the backstop.
+#
+# Layout:  <EXCHANGE>: <YEAR>: {source, note?, holidays: [{date, type, name}, ...]}
+#   EXCHANGE  NSE (equity derivatives / F&O: NIFTY, BANKNIFTY) | MCX (commodity derivatives)
+#   type      closed        - no trading at all
+#             evening_only  - MCX only: morning session closed, evening session trades from 17:00
+#             morning_only  - MCX only: morning session trades, closed from 17:00
+# Weekdays only: weekends are closed by rule in market_calendar.day_type(), so the official lists'
+# weekend holidays (2026: Feb 15, Mar 21, Aug 15, Nov 8) are omitted.
+# A year with an empty holidays list counts as NOT covered -> coverage_problem() raises the alarm.
+#
+# Muhurat trading (Sunday 2026-11-08, timings announced separately) is a special session the bot
+# does not trade; it is deliberately not modelled.
+#
+# Reviewed against local 1-min futures bars 2026-08-10..2026-10-06 (backtest_multi_2026-10-06/data):
+# NSE no bars on 09-14 and 10-02; MCX bars only 17:00-23:29 on 09-14 and none on 10-02.
+
+NSE:
+  2026:
+    source: "https://www.nseindia.com/resources/exchange-communication-holidays (segment FO, read via https://www.nseindia.com/api/holiday-master?type=trading on 2026-10-06)"
+    holidays:
+      - {date: 2026-01-15, type: closed, name: "Municipal Corporation Election - Maharashtra"}
+      - {date: 2026-01-26, type: closed, name: "Republic Day"}
+      - {date: 2026-03-03, type: closed, name: "Holi"}
+      - {date: 2026-03-26, type: closed, name: "Shri Ram Navami"}
+      - {date: 2026-03-31, type: closed, name: "Shri Mahavir Jayanti"}
+      - {date: 2026-04-03, type: closed, name: "Good Friday"}
+      - {date: 2026-04-14, type: closed, name: "Dr. Baba Saheb Ambedkar Jayanti"}
+      - {date: 2026-05-01, type: closed, name: "Maharashtra Day"}
+      - {date: 2026-05-28, type: closed, name: "Bakri Id"}
+      - {date: 2026-06-26, type: closed, name: "Muharram"}
+      - {date: 2026-09-14, type: closed, name: "Ganesh Chaturthi"}
+      - {date: 2026-10-02, type: closed, name: "Mahatma Gandhi Jayanti"}
+      - {date: 2026-10-20, type: closed, name: "Dussehra"}
+      - {date: 2026-11-10, type: closed, name: "Diwali-Balipratipada"}
+      - {date: 2026-11-24, type: closed, name: "Prakash Gurpurb Sri Guru Nanak Dev"}
+      - {date: 2026-12-25, type: closed, name: "Christmas"}
+  2027:
+    source: null
+    note: "Not published as of 2026-10-06 (NSE holiday-master API has no 2027 FO rows). NSE usually issues the list in December; add it then."
+    holidays: []
+
+MCX:
+  2026:
+    source: "MCX circular MCX/TRD/636/2025 dated 2025-12-15, https://www.mcxindia.com/market-operations/trading-survelliance/trading-holidays (site blocks scripted access; session statuses transcribed identically by https://www.hdfcsec.com/mcx-holidays-list, https://www.kotakneo.com/share-market-holidays/mcx-holidays/, https://upstox.com/stocks-market/mcx-holidays/)"
+    note: "2026-01-15 was added after the circular (Maharashtra municipal election): morning closed, evening open from 17:00 - https://fyers.in/notice-board/trading-holiday-on-january-15-2026-on-account-of-municipal-elections-in-maharashtra/"
+    holidays:
+      - {date: 2026-01-01, type: morning_only, name: "New Year Day"}
+      - {date: 2026-01-15, type: evening_only, name: "Municipal Corporation Election - Maharashtra"}
+      - {date: 2026-01-26, type: closed, name: "Republic Day"}
+      - {date: 2026-03-03, type: evening_only, name: "Holi (2nd day)"}
+      - {date: 2026-03-26, type: evening_only, name: "Shri Ram Navmi"}
+      - {date: 2026-03-31, type: evening_only, name: "Shri Mahavir Jayanti"}
+      - {date: 2026-04-03, type: closed, name: "Good Friday"}
+      - {date: 2026-04-14, type: evening_only, name: "Dr. Baba Saheb Ambedkar Jayanti"}
+      - {date: 2026-05-01, type: evening_only, name: "Maharashtra Day"}
+      - {date: 2026-05-28, type: evening_only, name: "Bakri Id"}
+      - {date: 2026-06-26, type: evening_only, name: "Moharram"}
+      - {date: 2026-09-14, type: evening_only, name: "Ganesh Chaturthi"}
+      - {date: 2026-10-02, type: closed, name: "Mahatma Gandhi Jayanti"}
+      - {date: 2026-10-20, type: evening_only, name: "Dassera"}
+      - {date: 2026-11-10, type: evening_only, name: "Diwali-Balipratipada"}
+      - {date: 2026-11-24, type: evening_only, name: "Guru Nanak Jayanti"}
+      - {date: 2026-12-25, type: closed, name: "Christmas"}
+  2027:
+    source: null
+    note: "Not published as of 2026-10-06. MCX issued the 2026 list on 2025-12-15; expect the 2027 circular in December 2026."
+    holidays: []

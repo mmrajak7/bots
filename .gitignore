@@ -220,6 +220,24 @@ FIFTY/data/breadth/*.tmp
 # derived: expiry closes fetched by zebra/debit_sl_study.py (re-fetchable)
 Helper/zebra/_expiry_close_cache.json
 
+# derived: full-universe daily bars for the ST-hold study (re-fetchable, large)
+FIFTY/data/backtest_px_universe/
+FIFTY/data/st_swing_cache/
+FIFTY/_research/st_swing/out/
+
 # Neo credentials + session cache: MPIN/TOTP/session token, never tracked (2026-11-26)
 **/neo_credentials.yaml
 **/neo/data/session.json
+
+# ETF_PI runtime (2026-11-27): state, ledgers, logs, generated harness copies (they hold old code WITH secrets)
+ETF_PI/st_opt_*.json
+ETF_PI/neo_bridge_state.json
+ETF_PI/logs/
+ETF_PI/data/
+ETF_PI/backups_multi/
+ETF_PI/deploy_multi/
+ETF_PI/harness/baseline/
+ETF_PI/harness/replay_work/
+ETF_PI/harness/test_*/
+ETF_PI/.nifty_only
+ETF_PI/state/

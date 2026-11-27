@@ -1,10 +1,22 @@
 """
-Fetch Option Instruments for all indices
-Downloads instruments from Kite API and filters for index options
-Run daily before market opens (e.g., 8:30 AM)
+Fetch option (and MCX futures) instruments for the option magnet.
+Downloads the Kite instrument dump ONCE and writes:
+  op_instruments.csv   - index options (NFO/BFO) + MCX options + MCX futures (FUT rows are the
+                         ATM reference for MCX: an MCX option settles into a futures contract)
+  mcx_instruments.csv  - MCX futures only (kept for backward compatibility)
+Run daily before market opens (Pi cron 08:52).
+
+2026-10-06 (spec SPEC_multi_instrument_2026-10-06 step 3):
+  * one download instead of two (the MCX futures pass used to re-download the whole dump)
+  * MCX names extended to the mini contracts the bot signals on (CRUDEOILM, NATGASMINI, GOLDM,
+    SILVERM) and NATURALGAS, which the old filter silently dropped
+  * a partial download can no longer overwrite a good file: NIFTY missing -> keep yesterday's
+    file; MCX fetch failed -> carry yesterday's still-valid MCX rows forward. Either case exits
+    non-zero so the cron log and preflight see it instead of every MCX process failing quietly.
 """
 import pandas as pd
 import os
+import sys
 import json
 import platform
 from datetime import datetime
@@ -18,11 +30,20 @@ if platform.system() == 'Windows':
 else:
     TOKEN_PATH = '/home/trustit/Desktop/BOTS/data/kite_access_token.json'
 
-# All indices to fetch (must match option_buy.py)
+# All indices to fetch (other scripts still read FINNIFTY/MIDCPNIFTY/SENSEX rows)
 ALLOWED_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'SENSEX']
 
-# MCX commodities for options
-ALLOWED_MCX = ['GOLD', 'SILVER', 'CRUDEOIL']
+# MCX commodities. Minis are the signal chains; CRUDEOIL/NATURALGAS full chains are quoted by the
+# liquidity probe; GOLD/SILVER kept for other readers.
+ALLOWED_MCX = ['CRUDEOILM', 'NATGASMINI', 'GOLDM', 'SILVERM',
+               'CRUDEOIL', 'NATURALGAS', 'GOLD', 'SILVER']
+
+# Names the bot cannot run without. Missing NFO -> the file is not written at all.
+REQUIRED_NFO = ['NIFTY', 'BANKNIFTY']
+REQUIRED_MCX = ['CRUDEOILM', 'NATGASMINI', 'GOLDM', 'SILVERM']
+
+OP_PATH = os.path.join(CURRENT_DIR, 'op_instruments.csv')
+MCX_FUT_PATH = os.path.join(CURRENT_DIR, 'mcx_instruments.csv')
 
 pd.set_option('display.max_rows', 5000)
 pd.set_option('display.max_columns', 500)
@@ -30,7 +51,7 @@ pd.set_option('display.width', 1000)
 
 
 def fetch_instruments_from_api():
-    """Fetch instruments using Kite Connect API"""
+    """Fetch instruments using Kite Connect API. Returns (df, mcx_ok) or (None, False)."""
     try:
         from kiteconnect import KiteConnect
 
@@ -42,161 +63,132 @@ def fetch_instruments_from_api():
 
         if not api_key or not access_token:
             print("Invalid token file, falling back to public URL")
-            return None
+            return None, False
 
         kite = KiteConnect(api_key=api_key)
         kite.set_access_token(access_token)
 
-        # Fetch NFO (NSE F&O) and BFO (BSE F&O) instruments
         print("Fetching NFO instruments...")
         nfo_instruments = kite.instruments("NFO")
 
         print("Fetching BFO instruments...")
         try:
             bfo_instruments = kite.instruments("BFO")
-        except:
+        except Exception as e:
             bfo_instruments = []
-            print("BFO fetch failed, continuing with NFO only")
+            print(f"BFO fetch failed ({e}), continuing with NFO only")
 
         print("Fetching MCX instruments...")
+        mcx_ok = True
         try:
             mcx_instruments = kite.instruments("MCX")
-        except:
+        except Exception as e:
             mcx_instruments = []
-            print("MCX fetch failed, continuing without MCX")
+            mcx_ok = False
+            print(f"ERROR: MCX fetch failed ({e})")
 
-        # Combine into DataFrame
-        all_instruments = nfo_instruments + bfo_instruments + mcx_instruments
-        df = pd.DataFrame(all_instruments)
-
+        df = pd.DataFrame(nfo_instruments + bfo_instruments + mcx_instruments)
         print(f"Fetched {len(df)} instruments via Kite API")
-        return df
+        return df, mcx_ok
 
     except Exception as e:
         print(f"Kite API fetch failed: {e}")
-        return None
+        return None, False
 
 
 def fetch_instruments_from_url():
-    """Fallback: Fetch instruments from public Kite URL"""
+    """Fallback: Fetch instruments from public Kite URL (all exchanges in one dump)."""
     print("Fetching instruments from public URL...")
     url = 'https://api.kite.trade/instruments'
     df = pd.read_csv(url)
     print(f"Fetched {len(df)} instruments from URL")
-    return df
+    return df, True
 
 
-def process_option_instruments():
-    """Main function to fetch and process option instruments"""
+def select_rows(df, today):
+    """Option rows for the allowed names + MCX futures rows, unexpired, sorted."""
+    nfo_bfo = df[(df['segment'].isin(['NFO-OPT', 'BFO-OPT'])) & (df['name'].isin(ALLOWED_INDICES))]
+    mcx_opt = df[(df['segment'] == 'MCX-OPT') & (df['name'].isin(ALLOWED_MCX))]
+    mcx_fut = df[(df['segment'] == 'MCX-FUT') & (df['name'].isin(ALLOWED_MCX))]
+    out = pd.concat([nfo_bfo, mcx_opt, mcx_fut], ignore_index=True).copy()
+    out['expiry'] = pd.to_datetime(out['expiry'])
+    out = out[out['expiry'] >= today]
+    return out.sort_values(['name', 'expiry', 'strike']).reset_index(drop=True)
 
-    # Try Kite API first, fallback to URL
-    df = fetch_instruments_from_api()
+
+def carry_forward_mcx(today):
+    """Yesterday's MCX rows that have not expired, used when today's MCX fetch failed."""
+    if not os.path.exists(OP_PATH):
+        return pd.DataFrame()
+    old = pd.read_csv(OP_PATH)
+    old['expiry'] = pd.to_datetime(old['expiry'])
+    return old[(old['exchange'] == 'MCX') & (old['expiry'] >= today)]
+
+
+def sanity(df):
+    """Per-name counts. Returns (missing_nfo, missing_mcx)."""
+    print("\nInstruments per underlying (options / futures):")
+    for name in ALLOWED_INDICES + ALLOWED_MCX:
+        sub = df[df['name'] == name]
+        if sub.empty:
+            continue
+        n_opt = int(sub['instrument_type'].isin(['CE', 'PE']).sum())
+        n_fut = int((sub['instrument_type'] == 'FUT').sum())
+        exps = sorted(sub[sub['instrument_type'].isin(['CE', 'PE'])]['expiry'].unique())[:3]
+        print(f"  {name:11s} {n_opt:5d} / {n_fut:2d}   next expiries: "
+              f"{', '.join(pd.Timestamp(e).strftime('%d-%b-%Y') for e in exps)}")
+    opts = df[df['instrument_type'].isin(['CE', 'PE'])]
+    futs = df[df['instrument_type'] == 'FUT']
+    missing_nfo = [n for n in REQUIRED_NFO if opts[opts['name'] == n].empty]
+    missing_mcx = [n for n in REQUIRED_MCX if opts[opts['name'] == n].empty or futs[futs['name'] == n].empty]
+    return missing_nfo, missing_mcx
+
+
+def write_csv(df, path):
+    tmp = path + '.tmp'
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def main():
+    print("=" * 50)
+    print(f"Instrument Fetcher - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 50)
+
+    df, mcx_ok = fetch_instruments_from_api()
     if df is None or df.empty:
-        df = fetch_instruments_from_url()
-
-    df = df.reset_index(drop=True)
-
-    if len(df) == 0:
-        print("ERROR: No instruments fetched!")
-        return
-
-    # Filter for options: NFO-OPT (NSE), BFO-OPT (BSE), MCX-OPT (commodities)
-    df_nfo_bfo = df[
-        (df['segment'].isin(['NFO-OPT', 'BFO-OPT'])) &
-        (df['name'].isin(ALLOWED_INDICES))
-    ].copy()
-
-    df_mcx_opt = df[
-        (df['segment'] == 'MCX-OPT') &
-        (df['name'].isin(ALLOWED_MCX))
-    ].copy()
-
-    df_options = pd.concat([df_nfo_bfo, df_mcx_opt], ignore_index=True)
-
-    print(f"\nFiltered to {len(df_options)} option instruments")
-
-    # Show counts per index/commodity
-    print("\nInstruments per underlying:")
-    for idx in ALLOWED_INDICES + ALLOWED_MCX:
-        count = len(df_options[df_options['name'] == idx])
-        if count > 0:
-            print(f"  {idx}: {count}")
-
-    # Convert expiry to datetime
-    df_options['expiry'] = pd.to_datetime(df_options['expiry'])
-
-    # Get current date
-    current_date = pd.Timestamp.now().floor('D')
-
-    # Filter for future expiries only
-    df_options = df_options[df_options['expiry'] >= current_date]
-
-    print(f"\nAfter filtering future expiries: {len(df_options)} instruments")
-
-    # Sort by name, expiry, strike
-    df_options = df_options.sort_values(['name', 'expiry', 'strike'])
-
-    # Reset index and save to CSV
-    df_options = df_options.reset_index(drop=True)
-
-    output_path = os.path.join(CURRENT_DIR, 'op_instruments.csv')
-    df_options.to_csv(output_path, index=False)
-    print(f"\nSaved {len(df_options)} instruments to {output_path}")
-
-    # Show upcoming expiries per underlying
-    print("\nUpcoming expiries:")
-    for idx in ALLOWED_INDICES + ALLOWED_MCX:
-        idx_df = df_options[df_options['name'] == idx]
-        if not idx_df.empty:
-            expiries = sorted(idx_df['expiry'].unique())[:3]
-            expiry_strs = [e.strftime('%d-%b-%Y') for e in expiries]
-            print(f"  {idx}: {', '.join(expiry_strs)}")
-
-
-def process_mcx_instruments():
-    """Fetch MCX futures for CRUDEOIL, GOLD, SILVER commodity trading"""
-    print("\n" + "="*50)
-    print("Fetching MCX futures instruments...")
-
-    # Use Kite API first (same source as options), fallback to URL
-    df = fetch_instruments_from_api()
+        df, mcx_ok = fetch_instruments_from_url()
     if df is None or df.empty:
-        df = fetch_instruments_from_url()
+        print("ERROR: No instruments fetched! Keeping the existing files.")
+        return 2
 
-    # Filter for CRUDEOIL, GOLD, SILVER futures
-    df_mcx = df[
-        (df['segment'] == 'MCX-FUT') &
-        (df['name'].isin(['CRUDEOIL', 'GOLD', 'SILVER']))
-    ].copy()
+    today = pd.Timestamp.now().floor('D')
+    out = select_rows(df.reset_index(drop=True), today)
 
-    if len(df_mcx) == 0:
-        print("No MCX futures found")
-        return
+    if not mcx_ok:
+        carried = carry_forward_mcx(today)
+        print(f"ERROR: MCX not fetched today - carrying forward {len(carried)} unexpired MCX rows")
+        out = pd.concat([out[out['exchange'] != 'MCX'], carried], ignore_index=True)
 
-    # Sort by name then expiry
-    df_mcx = df_mcx.sort_values(by=['name', 'expiry'], ascending=True)
-    df_mcx = df_mcx.reset_index(drop=True)
+    missing_nfo, missing_mcx = sanity(out)
+    if missing_nfo:
+        print(f"ERROR: required NFO names missing {missing_nfo} - NOT overwriting {OP_PATH}")
+        return 2
 
-    output_path = os.path.join(CURRENT_DIR, 'mcx_instruments.csv')
-    df_mcx.to_csv(output_path, index=False)
-    print(f"Saved {len(df_mcx)} MCX futures instruments to {output_path}")
+    write_csv(out, OP_PATH)
+    print(f"\nSaved {len(out)} instruments to {OP_PATH}")
 
-    # Show counts per commodity
-    for name in ['CRUDEOIL', 'GOLD', 'SILVER']:
-        count = len(df_mcx[df_mcx['name'] == name])
-        if count > 0:
-            nearest = df_mcx[df_mcx['name'] == name].iloc[0]['tradingsymbol']
-            print(f"  {name}: {count} contracts (nearest: {nearest})")
+    futs = out[(out['exchange'] == 'MCX') & (out['instrument_type'] == 'FUT')]
+    if not futs.empty:
+        write_csv(futs.sort_values(['name', 'expiry']).reset_index(drop=True), MCX_FUT_PATH)
+        print(f"Saved {len(futs)} MCX futures to {MCX_FUT_PATH}")
+
+    if missing_mcx or not mcx_ok:
+        print(f"ERROR: MCX incomplete (missing {missing_mcx}, fetched today={mcx_ok})")
+        return 3
+    print("\n" + "=" * 50)
+    return 0
 
 
 if __name__ == "__main__":
-    print("="*50)
-    print(f"Instrument Fetcher - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("="*50)
-
-    process_option_instruments()
-    process_mcx_instruments()
-
-    print("\n" + "="*50)
-    print("Done!")
-    print("="*50)
+    sys.exit(main())

@@ -1,0 +1,34 @@
+# events_override.yaml -- AUTHORITATIVE exceptions to the standard EIA schedule in events.yaml.
+#
+# One row per shifted release. original_date = the standard release date the shift replaces
+# (Wed for EIA_WPSR, Thu for EIA_NGS) -- that instance is removed and the release is placed on
+# `date` at `time_et` (America/New_York). The verifier never edits this file; a disagreement with
+# the EIA page opens an exception in event_exceptions.json (gate blocks the union of both times).
+#
+# Seeded 2026-10-06 from the live pages:
+#   WPSR  https://www.eia.gov/petroleum/supply/weekly/schedule.php  (keyed by data week ending;
+#         original_date = week ending Fri + 5 days)
+#   NGS   https://ir.eia.gov/ngs/schedule.html  (lists alternate dates only; original_date = the
+#         standard Thursday that release replaces)
+# No 2027 rows were published on either page at seeding time.
+#
+# acks: trust THIS file over the scraper for one exception. Each ack must repeat the exception's
+# id, event, date (= original/standard date) and yaml_time_et exactly as the Telegram summary
+# prints them; it is ignored (with a warning) if any field differs or the event date has passed.
+#   acks:
+#     - {id: "EIA_WPSR@2026-10-14", event: EIA_WPSR, date: 2026-10-14, yaml_time_et: "12:00"}
+
+overrides:
+  # ---- EIA_WPSR (crude) 2026 ----
+  - {event: EIA_WPSR, original_date: 2026-01-21, date: 2026-01-22, time_et: "12:00", reason: "Martin Luther King Jr. Day"}
+  - {event: EIA_WPSR, original_date: 2026-02-18, date: 2026-02-19, time_et: "12:00", reason: "Presidents Day"}
+  - {event: EIA_WPSR, original_date: 2026-05-27, date: 2026-05-28, time_et: "12:00", reason: "Memorial Day"}
+  - {event: EIA_WPSR, original_date: 2026-09-09, date: 2026-09-10, time_et: "12:00", reason: "Labor Day"}
+  - {event: EIA_WPSR, original_date: 2026-10-14, date: 2026-10-15, time_et: "12:00", reason: "Columbus Day"}
+  - {event: EIA_WPSR, original_date: 2026-11-11, date: 2026-11-12, time_et: "12:00", reason: "Veterans Day"}
+  # ---- EIA_NGS (natural gas storage) 2026 ----
+  - {event: EIA_NGS, original_date: 2026-01-01, date: 2025-12-31, time_et: "12:00", reason: "New Year's Day"}
+  - {event: EIA_NGS, original_date: 2026-11-12, date: 2026-11-13, time_et: "10:30", reason: "Veterans Day"}
+  - {event: EIA_NGS, original_date: 2026-11-26, date: 2026-11-25, time_et: "12:00", reason: "Thanksgiving Day"}
+
+acks: []

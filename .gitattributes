@@ -1,0 +1,2 @@
+# ETF_PI: bytes exactly as on the Pi (3 files are CRLF by design; MANIFEST.sha256 hashes the bytes)
+ETF_PI/** -text

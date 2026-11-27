@@ -1,0 +1,35 @@
+# events.yaml -- scheduled US EIA releases that gate paper option trading (spec 2026-10-06 S3).
+#
+# Rules are written in America/New_York time and converted to IST PER DATE by event_calendar.py,
+# because US DST moves 10:30 ET between 20:00 IST (EDT) and 21:00 IST (EST) -- never hardcode IST.
+#
+# The EIA schedule pages list EXCEPTIONS ONLY: a week with no row on the page releases on the
+# standard weekday/time below. Exceptions live in events_override.yaml (authoritative); the
+# verifier compares that file to the page and opens an exception on any disagreement.
+#
+# Gate timings (no entry T-TIME_SL .. T+30, flatten T-5 .. T+30, fail-closed 19:00 IST -> EOD)
+# are frozen design constants in event_calendar.py, not config, because fail_closed_windows()
+# must work when this file cannot be read.
+
+events:
+  - id: EIA_WPSR
+    name: EIA Weekly Petroleum Status Report
+    weekday: Wed
+    time_et: "10:30"
+    underlyings: [CRUDEOILM]
+    source: https://www.eia.gov/petroleum/supply/weekly/schedule.php
+    # Text that must appear on the page; its absence = page structure changed = UNVERIFIED.
+    page_marker: Weekly Petroleum Status Report
+
+  - id: EIA_NGS
+    name: EIA Weekly Natural Gas Storage Report
+    weekday: Thu
+    time_et: "10:30"
+    underlyings: [NATGASMINI]
+    source: https://ir.eia.gov/ngs/schedule.html
+    page_marker: Natural Gas Storage Report
+
+fetch:
+  timeout_s: 20
+  retry_wait_s: 5
+  user_agent: "Mozilla/5.0 (X11; Linux aarch64) ETF_PI-event_calendar/1.0"

@@ -59,6 +59,12 @@ class NeoTrader:
 
         log.info(f"NeoTrader: enabled={self.cfg.enabled}, "
                  f"log_only={self.cfg.log_only}, lots={self.cfg.num_lots}")
+        # State the guardian's posture every startup, in words. The failure this
+        # prevents is believing an interlock is protecting you when it is dormant.
+        log.info("Guardian (broker-truth interlocks G1-G4): %s"
+                 % ("ARMED — duplicate, disputed-rejection and orphan checks live"
+                    if self.guardian_armed
+                    else "DORMANT by design (log_only) — arms at go-live, no code change"))
 
     # ==================================================================
     # Properties (for option_buy.py compatibility)
@@ -123,8 +129,18 @@ class NeoTrader:
         lot_size = int(pos_dict.get('lot_size', 0))
         tick_size = float(pos_dict.get('tick_size', 0))
         if lot_size <= 0:
-            lot_size = self._mapper.get_lot_size() if self._mapper else 75
-            log.warning(f"lot_size missing in pos_dict, using fallback: {lot_size}")
+            # Never guess a lot size on a live order — a stale hardcoded default
+            # (this was 75 vs NIFTY's actual 65) silently oversizes every position
+            # by 15%. If the instrument lookup failed, refuse the entry instead.
+            lot_size = self._mapper.get_lot_size() if self._mapper else 0
+            if lot_size <= 0:
+                log.error(f"on_entry blocked: lot_size unavailable for {opt_sym} "
+                          f"(pos_dict and symbol mapper both empty) — refusing to "
+                          f"size the order rather than guess")
+                self._audit.log('ENTRY_BLOCKED',
+                                {'key': key, 'reason': 'lot_size unavailable'})
+                return
+            log.warning(f"lot_size missing in pos_dict, using mapper value: {lot_size}")
         if tick_size <= 0:
             tick_size = 0.05
             log.warning("tick_size missing in pos_dict, using fallback: 0.05")
@@ -133,7 +149,23 @@ class NeoTrader:
         # Prices (use tick_size from instruments for rounding)
         entry_price = float(round_to_tick_str(
             entry_prem + self.cfg.entry_tick_buffer, tick_size, 'up'))
-        tp_price = float(round_to_tick_str(st_val, tick_size, 'down'))
+
+        # Exchange TP target (T2 go-live fix, 2026-08-09).
+        # The exchange TP is a hard sell — whatever price sits here IS where the
+        # position exits. Placing it at T1 (st_val) when a T2 anchor exists would
+        # preempt the software T1→move-SL-to-cost→trail→T2 sequence entirely:
+        # every runner gets truncated at +5-7% while losers keep their full loss.
+        # Measured on the 137-trade post-EOD-gate ledger: TP-at-T1 would turn the
+        # 90 T2 trades from +₹9,932 to −₹3,367 (−₹13,299); on P3+P4 alone it costs
+        # ₹9,472 of ₹13,864 net profit (68%).
+        # So: TP at T2 when a valid T2 anchor exists, else at T1. Monitor still
+        # handles the T1 notification and SL tightening in software either way.
+        t2_val = float(pos_dict.get('t2_value', 0) or 0)
+        tp_target = t2_val if t2_val > st_val else st_val
+        tp_price = float(round_to_tick_str(tp_target, tick_size, 'down'))
+        if t2_val > st_val:
+            log.info(f"TP anchored at T2 {t2_val:.2f} ({pos_dict.get('t2_tf','')}) "
+                     f"instead of T1 {st_val:.2f} for {key}")
         max_hold = self.cfg.time_sl.get(signal_tf,
                                          self.cfg.time_sl.get('default', 120))
 
@@ -333,10 +365,54 @@ class NeoTrader:
                             pos.tp_order_id = tp_oid
 
                     elif status == 'rejected':
-                        pos.status = 'failed'
-                        pos.exit_type = 'ENTRY_REJECTED'
-                        modified = True
-                        log.error(f"Entry REJECTED: {key}")
+                        # G3 (2026-08-19): DO NOT make this terminal on the order
+                        # report alone. option_buy.py consumes get_rejected_entries()
+                        # and marks its own ledger closed, so a wrong 'rejected' here
+                        # abandons a REAL position with nothing watching it until the
+                        # MIS square-off. Ask the broker what it actually holds first.
+                        #
+                        # force=True: this is the one check that must never read a
+                        # snapshot taken before the fill landed.
+                        bpos = self._broker_positions(force=True)
+                        held = (bpos or {}).get((pos.symbol or '').upper(), 0)
+                        # held must be POSITIVE. This book only ever BUYS options, so a
+                        # negative net is a short — someone else's position, or the
+                        # residue of an exit that over-sold. Adopting it as our long
+                        # (the first cut tested `!= 0` and then took abs()) would mark
+                        # a short "open" and hand it to monitor_positions, which would
+                        # eventually try to SELL more of something we do not own.
+                        if bpos is not None and held > 0:
+                            # The report says rejected; the broker says we own it. The
+                            # report is wrong, or a retry filled. Keep managing it.
+                            pos.entry_filled = True
+                            pos.status = 'open'
+                            if held != pos.qty:
+                                log.error(f"Entry qty MISMATCH after disputed "
+                                          f"rejection: {key} broker={held} "
+                                          f"expected={pos.qty} — adopting broker qty")
+                                pos.qty = held
+                            modified = True
+                            log.error(f"DISPUTED REJECTION: {key} reported rejected "
+                                      f"but broker holds {held} of {pos.symbol}. "
+                                      f"Position kept OPEN and monitored — this would "
+                                      f"have become an unwatched orphan.")
+                            self._audit.log('DISPUTED_REJECTION',
+                                            {'key': key, 'symbol': pos.symbol,
+                                             'broker_qty': held})
+                        else:
+                            pos.status = 'failed'
+                            pos.exit_type = 'ENTRY_REJECTED'
+                            modified = True
+                            if bpos is None:
+                                # Rejection stands (status quo), but say plainly that
+                                # it was never verified — if it was wrong, an orphan
+                                # exists right now and find_orphans() is the next check.
+                                log.error(f"Entry REJECTED: {key} — UNVERIFIED "
+                                          f"(broker unreachable). If this rejection is "
+                                          f"wrong an orphan position now exists.")
+                            else:
+                                log.error(f"Entry REJECTED: {key} "
+                                          f"(confirmed: broker holds none)")
 
             elif pos.status == 'open':
                 # Check if TP LIMIT SELL filled on exchange
@@ -370,6 +446,15 @@ class NeoTrader:
 
         # Update circuit breaker (H4 fix)
         self._update_circuit_breaker()
+
+        # Orphan reconciliation (G4, 2026-08-19). Runs AFTER the circuit breaker so it
+        # reuses that fetch's snapshot rather than paying for a second API call. This
+        # is the only place anything asks "does the broker hold something we are not
+        # watching?" — the failure class that produced this whole workstream.
+        try:
+            self.find_orphans()
+        except Exception as e:
+            log.warning(f"Orphan check failed: {e}")
 
         if modified or filled_tps:
             self._state.save()
@@ -441,6 +526,140 @@ class NeoTrader:
     # Safety Pipeline (H4, H5)
     # ==================================================================
 
+    # ==================================================================
+    # Broker truth (G1-G4, 2026-08-19)
+    # ==================================================================
+    #
+    # WHY THIS EXISTS
+    # ---------------
+    # Every duplicate interlock in this class used to consult `self._state.positions`
+    # — a JSON file this process writes itself. That is not proof a position does or
+    # does not exist; it is proof of what we last managed to write down. A Pi reboot
+    # between placing an order and saving state, a failed write, a corrupt or
+    # hand-deleted neo/data/state.json, and the interlock is simply gone: the next
+    # signal places a SECOND order for a symbol we already hold.
+    #
+    # `client.positions()` was already being called — but only by
+    # _update_circuit_breaker, only for a P&L sum, and never when log_only. Nothing
+    # anywhere asked the broker "do I already hold this?" before sending an order.
+    #
+    # FAIL-SAFE DIRECTION: when the broker cannot be reached these checks report
+    # UNKNOWN and every caller falls through to the previous local-state behaviour.
+    # They strictly ADD protection when the broker answers and never remove any when
+    # it does not — a transient API blip must not be able to halt the strategy.
+
+    #: Seconds a broker-position snapshot stays usable. One cron run does its entry
+    #: and its sync within a second or two, so this collapses a burst of checks into
+    #: one API call; anything safety-critical passes force=True.
+    _BROKER_CACHE_SEC = 5.0
+
+    @property
+    def guardian_armed(self):
+        """Are the broker-truth interlocks (G1-G4) live?
+
+        DORMANT UNTIL GO-LIVE, by decision (2026-08-20). While `log_only` is true no
+        real order exists, so there is no broker position to duplicate, dispute or
+        orphan — every one of these checks would be asking about a book that is not
+        there. Making that an explicit, named property rather than a side effect of
+        `log_only` matters for one reason: a dormant guard and a broken guard used to
+        produce the SAME log line, and "the interlock did not run" is not something
+        that should ever be ambiguous. Flip `log_only: false` in config_trade.yaml and
+        these arm themselves with no code change.
+        """
+        return bool(self.cfg.enabled and not self.cfg.log_only)
+
+    def _broker_positions(self, force=False):
+        """{SYMBOL: net_qty} from the broker, or None if it could not be determined.
+
+        None and {} mean different things and callers MUST distinguish them:
+          {}    -> the broker answered and we hold nothing
+          None  -> we do not know (dormant, no client, or API error)
+        Collapsing the two is how a failed fetch turns into "no duplicate, proceed".
+        """
+        if not self.guardian_armed:
+            # Dormant by design, not broken. Debug level: this is the normal state of
+            # the paper book and must not read as a fault every single cycle.
+            log.debug("Guardian dormant (log_only) — broker truth not consulted")
+            return None
+        if not self._client:
+            log.warning("Guardian armed but no Neo client — broker truth unavailable")
+            return None
+
+        now = time.time()
+        cached = getattr(self, '_bpos_cache', None)
+        if (not force and cached is not None
+                and now - getattr(self, '_bpos_ts', 0.0) < self._BROKER_CACHE_SEC):
+            return cached
+
+        try:
+            self._ensure_session()
+            resp = self._client.positions()
+            rows = []
+            if isinstance(resp, dict):
+                rows = resp.get('data', []) or []
+            elif isinstance(resp, list):
+                rows = resp
+            out = {}
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                sym = fields.get_symbol(r)
+                if not sym:
+                    continue
+                qty = fields.get_net_qty(r)
+                # Sum rather than assign: the same symbol can appear on more than one
+                # row (different products/day-vs-carryforward) and taking the last one
+                # would under-report a genuine holding.
+                out[sym.upper()] = out.get(sym.upper(), 0) + qty
+            self._bpos_cache = out
+            self._bpos_ts = now
+            return out
+        except Exception as e:
+            log.warning(f"Broker position fetch failed ({e}) — duplicate and orphan "
+                        f"checks degrade to local state for this cycle")
+            return None
+
+    def broker_holds(self, symbol):
+        """(qty, known). qty is the broker's net position in `symbol`.
+
+        `known=False` means the question could not be answered — never treat that as
+        a zero.
+        """
+        pos = self._broker_positions()
+        if pos is None:
+            return 0, False
+        return pos.get((symbol or '').upper(), 0), True
+
+    def find_orphans(self):
+        """Symbols the BROKER holds that this process is not tracking as live.
+
+        The failure this catches: an entry that filled while we recorded it as
+        rejected (or crashed before recording it at all) leaves a real position with
+        no software watching it. Nothing detected that before. Returns [] when the
+        broker cannot be reached — the caller cannot distinguish "no orphans" from
+        "could not check" on the return value alone, so this also logs the difference.
+        """
+        # force=False on purpose: the circuit-breaker fetch that runs immediately
+        # before this populates the cache, and a second positions() call every cron
+        # minute buys nothing. The disputed-rejection path, which IS timing-critical,
+        # forces its own refresh.
+        bpos = self._broker_positions(force=False)
+        if bpos is None:
+            if not self.guardian_armed:
+                log.debug("Orphan check dormant (log_only) — no real positions exist")
+            else:
+                log.warning("Orphan check SKIPPED — broker unreachable")
+            return []
+        tracked = {(p.symbol or '').upper()
+                   for p in self._state.positions.values()
+                   if p.status in ('pending_entry', 'open', 'pending_exit')}
+        orphans = [(s, q) for s, q in bpos.items() if q != 0 and s not in tracked]
+        for sym, qty in orphans:
+            log.error(f"ORPHAN POSITION: broker holds {qty} of {sym} but no live "
+                      f"software position tracks it")
+            self._audit.log('ORPHAN_DETECTED', {'symbol': sym, 'qty': qty})
+        return orphans
+
     def _check_safety(self, key):
         """Pre-order safety checks. Returns (allowed, reason)."""
         # H4: Circuit breaker
@@ -465,10 +684,38 @@ class NeoTrader:
         return True, ''
 
     def _check_symbol_conflict(self, symbol):
-        """Prevent two positions for the same exchange symbol (cross-TF safety net)."""
+        """Prevent two positions for the same exchange symbol (cross-TF safety net).
+
+        G2 (2026-08-19): local state is checked FIRST because it is free and catches
+        the common case, then the BROKER is asked. The broker check is what survives a
+        lost or corrupted state file — the scenario in which the local loop above
+        happily reports "no conflict" for a symbol we are already long.
+        """
         for k, p in self._state.positions.items():
             if p.status in ('pending_entry', 'open', 'pending_exit') and p.symbol == symbol:
                 return False, f"Symbol conflict: {symbol} already active in {k}"
+
+        qty, known = self.broker_holds(symbol)
+        if known and qty != 0:
+            # The broker holds it and we do not think we do. Refusing is unambiguously
+            # right: placing a second BUY here is precisely the duplicate this check
+            # exists to stop, and the discrepancy itself needs a human.
+            log.error(f"BROKER CONFLICT: {symbol} — broker net qty {qty} but no live "
+                      f"software position. Refusing entry; state and broker disagree.")
+            self._audit.log('ENTRY_BLOCKED_BROKER_CONFLICT',
+                            {'symbol': symbol, 'broker_qty': qty})
+            return False, (f"Broker conflict: {symbol} held at broker (qty {qty}) "
+                           f"with no local record")
+        if not known:
+            # Two very different situations, deliberately logged differently: dormant
+            # is the expected paper-book state, unreachable means an armed interlock
+            # failed to run and someone should know.
+            if not self.guardian_armed:
+                log.debug(f"Symbol conflict for {symbol}: guardian dormant "
+                          f"(log_only) — local state only, as designed")
+            else:
+                log.warning(f"Symbol conflict for {symbol}: broker UNREACHABLE — "
+                            f"the duplicate interlock did not run this cycle")
         return True, ''
 
     def _update_circuit_breaker(self):
@@ -486,6 +733,23 @@ class NeoTrader:
             total_pnl = sum(fields.get_raw_pnl(p) for p in positions_list
                             if isinstance(p, dict))
             self._state.daily_pnl = total_pnl
+
+            # Populate the shared broker-position cache from THIS fetch (G4). The
+            # circuit breaker already pays for the API call every cycle; without this
+            # the orphan and duplicate checks would each pay for it again.
+            try:
+                snap = {}
+                for r in positions_list:
+                    if not isinstance(r, dict):
+                        continue
+                    sym = fields.get_symbol(r)
+                    if sym:
+                        snap[sym.upper()] = snap.get(sym.upper(), 0) + fields.get_net_qty(r)
+                self._bpos_cache = snap
+                self._bpos_ts = time.time()
+            except Exception as e:
+                log.warning(f"Broker position cache not populated from circuit "
+                            f"breaker fetch: {e}")
 
             if total_pnl < -self.cfg.max_loss_per_day:
                 self._state.circuit_breaker_active = True
