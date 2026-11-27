@@ -6,6 +6,12 @@ top of the option bots' margin: the 15:10 cash guard stops the buys otherwise. D
 demat before the first sell (1 Jan). Only the book's own kill (`kill` / `control/KILL`) stops it. The company account
 (QSK814, 50L) starts fresh from the April 2027 rebalance; it has no market-data permission, so that needs work first.
 
+**Test size (owner 2026-11-27): 2L** (`book_cash_open: 200000` in the Pi overlay; ₹9,970 per name; ARM cap 2.2L).
+Test rebalances 1 Dec, 1 Jan, 1 Feb, 1 Mar in YL6478; the 20 stocks STAY in YL6478 after the test (not sold).
+YL6478 has no option trading on Kite any more (options moved to NEO), so the book's cash sits beside positional
+holdings only. **Token dependency:** the YL6478 token is written at 08:45 by SNAIL's `main.py startup` cron line;
+that line must stay, or the book fails closed every day (no token = no orders + ALERT).
+
 Design: `SRS/MOMENTUM_FROZEN_DESIGN.md` · Build spec: `SRS/MOMENTUM_BUILD_SPEC_DEC1.md` · Log: `docs/BUILD_LOG.md`.
 
 ## 1. Install (owner at the Pi)
@@ -35,7 +41,7 @@ slice; an `approve_each` ARM places nothing (ALERT ARM_MODE).
 ```
 `control/ARM.json`:
 ```json
-{"phase": "P0", "plan_months": ["2026-12"], "mode": "automatic", "buy_cap_rupees_per_session": 550000,
+{"phase": "P0", "plan_months": ["2026-12"], "mode": "automatic", "buy_cap_rupees_per_session": 220000,
  "valid_from": "2026-11-30", "valid_to": "2026-12-31"}
 ```
 `control/fo_checked.json` (after reading the NSE F&O circulars for December additions; add any to
