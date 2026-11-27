@@ -17,8 +17,8 @@ chmod 700 secrets
 cat > momentum <<EOW
 #!/usr/bin/env bash
 export MOMENTUM_HOME="$HERE"
-export PYTHONPATH="$HERE/src"
-exec "$HERE/.venv/bin/python" -I -m momentum.cli "\$@"
+# -I (isolated: no PYTHONPATH, no user site, no cwd on sys.path) is kept; the package path is put on sys.path here.
+exec "$HERE/.venv/bin/python" -I -c "import sys; sys.path.insert(0, '$HERE/src'); from momentum.cli import main; sys.exit(main())" "\$@"
 EOW
 chmod +x momentum
 cat > momentum-poller-keepalive <<EOW
