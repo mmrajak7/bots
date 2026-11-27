@@ -19,12 +19,26 @@ log = logging.getLogger('executor.notify')
 
 class Notifier:
     def __init__(self, sender: Optional[Callable[[str, str], Any]] = None,
-                 clock: Callable[[], float] = time.time, prefix: str = 'ETF LIVE'):
+                 clock: Callable[[], float] = time.time, prefix: str = 'ETF LIVE',
+                 async_send: bool = False):
         self._send = sender
         self._clock = clock
         self._last: Dict[str, float] = {}
         self.prefix = prefix
         self.sent = []                       # (kind, text) -- tests and status
+        self._q = None
+        if async_send:                       # review M1: Telegram never blocks the loop
+            import queue
+            self._q = queue.Queue(maxsize=500)
+            threading.Thread(target=self._drain, daemon=True).start()
+
+    def _drain(self) -> None:
+        while True:
+            msg, kind = self._q.get()
+            try:
+                self._sender()(msg, kind)
+            except Exception as e:
+                log.error('telegram failed: %s', e)
 
     def _sender(self):
         if self._send is None:
@@ -37,6 +51,12 @@ class Notifier:
         (log.error if kind == 'E' else log.info)('TELEGRAM[%s] %s', kind, text)
         self.sent.append((kind, text))
         del self.sent[:-200]
+        if self._q is not None:
+            try:
+                self._q.put_nowait((msg, kind))
+            except Exception:
+                log.error('telegram queue full -- dropped: %s', text)
+            return
         try:
             self._sender()(msg, kind)
         except Exception as e:               # never let Telegram stop trading logic

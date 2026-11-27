@@ -242,3 +242,29 @@ def test_n5_auth_inside_the_chase_never_escapes(neo):
         raise C.Auth('session latched')
     O.chase_exit(etf, st, lambda: neo.quotes[SYM], p, sleep=clk.sleep, clock=clk, held_fn=dead)
     assert st.troubles == 1 and 'unreadable' in st.note and neo.placed('S') == []
+
+
+def test_h2_a_cancel_settled_on_a_later_read_still_counts_as_a_reprice(neo):
+    """Review H2: with a slow cancel the schedule stayed at step 0 forever."""
+    etf = mk(neo, 'etf', False)
+    buy(etf)
+    clk = Clock()
+    st = O.ChaseState(bot='etf', symbol=SYM, token=TOK, tick=0.05, remaining=65)
+    p = O.ChasePolicy(reprice_after_s=2, confirm_wait_s=0, max_reprices=None, max_troubles=None)
+    seen = []
+    neo.slow_cancel(1)
+    for _ in range(12):                               # the limit always rests above the bid
+        O.chase_exit(etf, st, lambda: {'bid': 100.0}, p, sleep=clk.sleep, clock=clk,
+                     held_fn=etf_held(etf), price_fn=lambda b, n, t: (seen.append(n), 200.0 - n)[1])
+        clk.t += 1
+    assert st.reprices >= 3 and seen[:3] == [0, 1, 2]
+
+
+def test_m6_positions_are_split_by_product(neo):
+    mis = C.NeoClient('etf', http=neo, exclusive=False, product='MIS', current_fn=lambda: SESS,
+                      refresh_fn=Alive())
+    btst = mk(neo, 'btst', True)
+    buy(btst)
+    buy(mis)
+    rows = {(p.symbol, p.product): p.net_qty for p in mis.positions()}
+    assert rows == {(SYM, 'NRML'): 65, (SYM, 'MIS'): 65}

@@ -7,7 +7,7 @@ P2 a symbol whose last tick is older than `price_stale_s` is refreshed by REST
    limiter, so the executor never starves the cron bots on the same API key.
 P3 tick tape: one JSONL line per received update for managed symbols.
 
-The token is the SNAIL-shared `kite_access_token.json`; on an auth error or a
+The token is the shared `kite_access_token.json` (made by `python -m kite_login`); on an auth error or a
 dead socket the ticker is rebuilt from a FRESH read of that file.
 """
 from __future__ import annotations
@@ -60,7 +60,8 @@ class PriceFeed:
 
     def __init__(self, cfg: Dict[str, Any], token_path: str, state_dir: str,
                  rest_quote: Callable[[str], Optional[Dict[str, Any]]],
-                 ticker_factory: Optional[Callable] = None, clock: Callable = time.time):
+                 ticker_factory: Optional[Callable] = None, clock: Callable = time.time,
+                 async_rest: bool = False):
         self.cfg = cfg
         self.token_path = token_path
         self.state_dir = state_dir
@@ -76,6 +77,9 @@ class PriceFeed:
         self._ws_ok = False
         self._ws_err = ''
         self._ws_started = 0.0
+        self._ws_down_since = 0.0
+        self._async_rest = async_rest
+        self._inflight: Dict[str, bool] = {}
         self.on_update: Optional[Callable[[str, Quote], None]] = None
 
     # -- subscriptions ------------------------------------------------------------
@@ -132,7 +136,7 @@ class PriceFeed:
         feed = self
 
         def on_connect(ws, response):
-            feed._ws_ok, feed._ws_err = True, ''
+            feed._ws_ok, feed._ws_err, feed._ws_down_since = True, '', 0.0
             toks = list(feed._tok2sym)
             if toks:
                 ws.subscribe(toks)
@@ -148,11 +152,13 @@ class PriceFeed:
 
         def on_close(ws, code, reason):
             feed._ws_ok = False
+            feed._ws_down_since = feed._ws_down_since or feed._clock()
             feed._ws_err = 'closed %s %s' % (code, reason)
             log.warning('kite ws %s', feed._ws_err)
 
         def on_error(ws, code, reason):
             feed._ws_ok = False
+            feed._ws_down_since = feed._ws_down_since or feed._clock()
             feed._ws_err = 'error %s %s' % (code, reason)
             log.warning('kite ws %s', feed._ws_err)
 
@@ -179,13 +185,14 @@ class PriceFeed:
     def ws_error(self) -> str:
         return self._ws_err
 
-    def maybe_restart(self, down_for_s: float = 20.0) -> bool:
+    def maybe_restart(self, down_for_s: float = 60.0) -> bool:
         """Rebuild a ticker that has been down `down_for_s` (fresh token read:
-        SNAIL may have re-logged in). True when a rebuild was attempted."""
+        kite_login may have re-logged in). True when a rebuild was attempted."""
         if self._factory is None or self._ws_ok:
             return False
-        if self._clock() - self._ws_started < down_for_s:
-            return False
+        since = self._ws_down_since or self._ws_started   # review L2: time DOWN, not built
+        if self._clock() - since < down_for_s:
+            return False                                 # let KiteTicker's own reconnect work
         log.warning('kite ws down (%s) -- rebuilding from a fresh token read', self._ws_err)
         self.start()
         return True
@@ -220,17 +227,27 @@ class PriceFeed:
             return q
         self._last_rest[sym] = now
         key = '%s:%s' % (exchange, sym)
+        if self._async_rest:                             # review M1: never block the loop
+            if not self._inflight.get(sym):
+                self._inflight[sym] = True
+                threading.Thread(target=self._rest_fetch, args=(sym, key), daemon=True).start()
+            return q
+        return self._rest_fetch(sym, key) or q
+
+    def _rest_fetch(self, sym: str, key: str) -> Optional[Quote]:
         try:
             rec = self._rest(key)
         except Exception as e:
             log.warning('REST quote %s failed: %s', key, e)
-            return q
+            return None
+        finally:
+            self._inflight[sym] = False
         if rec:
             q2 = quote_from_kite(rec, 'rest', self._clock())
             if q2.ltp > 0 or q2.bid > 0:
                 self._store(sym, q2)
                 return q2
-        return q
+        return None
 
     def _tape(self, sym: str, q: Quote) -> None:
         try:

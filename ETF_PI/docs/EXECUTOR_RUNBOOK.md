@@ -10,10 +10,17 @@ cd ~/Desktop/BOTS && git pull -q --rebase && CROCODILE/venv/bin/python -m pytest
 # b) the ETF clone: realign the April sparse clone to git WITHOUT touching files
 cd ~/Desktop/Scripts/bots && git fetch -q origin && git status --short | head   # expect the ~40 untracked files
 git reset --mixed origin/main         # HEAD+index move; working tree untouched
-git status --short                    # expect ONLY gitignored state; any M line = STOP and report
-sha256sum -c ETF_PI/MANIFEST.sha256   # before the pull this fails ONLY for option_buy.py? -> see c)
-git pull -q --rebase                  # brings executor/ + the D17 option_buy change
+git status --short ETF_PI             # EXPECT exactly: M common.py extract_data.py tracker.py
+                                      # backtest_time_to_tp.py (the Pi copies still hold inline
+                                      # secrets) + D/M of files changed since the baseline.
+                                      # Anything else = STOP and report.
+python3 -c "import json;print(sorted(json.load(open('ETF_PI/credentials.json'))))"
+                                      # must include the 5 sections: telegram_main, telegram_error,
+                                      # extract_data_telegram, tracker_telegram, backtest_kite
+git checkout -- ETF_PI                # take the repo versions (secrets via credentials.json)
+rm -f ETF_PI/kite_trade.py            # deleted in git (kite_login), untracked after the reset
 cd ETF_PI && sha256sum -c MANIFEST.sha256 && /usr/bin/python3 -m pytest executor/tests -q
+# owner: remove the now-unused tracker_kite / extract_data_kite sections from credentials.json
 # c) hide the stale copy in the main clone (owner: "remove outdated ETF_PI")
 cd ~/Desktop/BOTS && git sparse-checkout set --no-cone '/*' '!/ETF_PI/' && ls ETF_PI 2>&1 | head -1
 ```
@@ -25,15 +32,16 @@ cd ~/Desktop/Scripts/bots/ETF_PI
 cat > executor_local.yaml <<'EOF'
 mode: paper            # Monday 08:50 -> live (step 4)
 lots: 1
+bots_root: /home/trustit/Desktop/BOTS
 EOF
 /usr/bin/python3 -m executor check
 sudo cp executor/etf-executor.service /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo systemctl enable --now etf-executor && sleep 5 && python3 -m executor status
 ( crontab -l; echo '* 9-15 * * 1-5 cd /home/trustit/Desktop/Scripts/bots/ETF_PI && /usr/bin/python3 -m executor watchdog >> logs/executor_watchdog.log 2>&1' ) | crontab -
 ```
-Dead-man: create a healthchecks.io check (period 2 min, grace 2 min, Telegram integration), then add
-`"healthchecks": {"url": "https://hc-ping.com/<uuid>"}` to `credentials.json` (0600). The Pi reboots daily
-08:00 (`rs.py`), so the service restarts fresh each morning and re-reads option_buy's constants (F20).
+No external dead-man (owner 11-27: overkill; a combined 09:00 all-bots status message comes later).
+The Pi reboots daily 08:00 (`rs.py`), so the service restarts fresh each morning and re-reads
+option_buy's constants (F20).
 
 ## 3. Controls (any time)
 | want | command |
@@ -42,7 +50,9 @@ Dead-man: create a healthchecks.io check (period 2 min, grace 2 min, Telegram in
 | exit everything now | `python3 -m executor flatten` |
 | undo both | `python3 -m executor resume` |
 | what is it doing | `python3 -m executor status` · `tail -f logs/executor_$(date +%F).log` |
-| stop the daemon | `sudo systemctl stop etf-executor` (positions stay; restart resumes from the journal) |
+| stop the daemon | `python3 -m executor stop` (STOPPED flag: the watchdog leaves it down). Open lots are NOT managed while stopped -- `flatten` first |
+| start it again | `python3 -m executor start` |
+| NEVER | change `mode` or stop the daemon while a lot is open (live and paper keep separate journals; a live lot in paper mode is alerted every 5 min but NOT managed) |
 
 ## 4. Monday 11-30 — 1-lot live test (owner at the app)
 Before 09:10: `python3 -m kotak_neo status` (generation for today, no latch); `curl -4 ifconfig.me` = the whitelisted IP;
@@ -61,6 +71,8 @@ Probe trades (cheap near-ATM current weekly, premium Rs 80-200): `python3 -m exe
 | M7 | coexistence | BTST stays rehearsal; check BTST logs at each ETF fill | no BTST kill / EXTRA LOT alert |
 | M8 | restart mid-position | probe 4, then `sudo systemctl kill -s KILL etf-executor` | back ≤ 10 s, `reconciled`, position still managed, no 2nd buy/sell |
 | M9 | EOD | a real signal or probe after 14:50 | flat by 15:16 (eod 15:15); no `etf-` order live at 15:20; no broker square-off line in the app |
+| M6b | MIS position row label | `executor status` / log after a probe fill | the positions row's product reads exactly `MIS` (the account cap and the carry check depend on it, review M6) |
+| M13 | cancel latency / re-price steps | journal EXIT_STEP notes during a resting exit | re-prices count 1, 2, 3... (review H2 fix) |
 | M11 | 401 on place | count `UNCLEAR` in the log | 0, or each settled within the grace |
 | M12 | MIS on NEXT week's contract | probe on next week's ATM (12-01 is expiry: every 12-01 entry uses next week) | accepted and filled; if refused: owner decides NRML (+skip_foreign_strikes) for 12-01 |
 | real | real 10M signals | they flow by themselves | each: BOUGHT/SOLD Telegram, ladder logs, journal CLOSED, P&L = fills |

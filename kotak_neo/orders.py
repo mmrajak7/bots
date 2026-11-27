@@ -174,6 +174,7 @@ class ChaseState:
     status: str = 'active'          # active | done | needs_human
     rejects: int = 0                # N3: definite refusals in a row (reset by a fill)
     unclears: int = 0               # N4: unclear sends in a row (reset by a fill)
+    cancel_sent: bool = False       # review H2: a re-price cancel is out, not yet settled
     note: str = ''
     fills: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -260,15 +261,20 @@ def _settle_working(c: NeoClient, st: ChaseState, p: ChasePolicy, sleep, clock,
         return True
     if res.terminal:
         _apply(st, res)
+        if st.cancel_sent:                              # H2: OUR re-price cancel settled
+            st.cancel_sent = False                      # on a later read -- still a re-price
+            st.reprices += 1
         return True
     if clock() - st.working_since < p.reprice_after_s:
         return False                                    # let it work
     res = cancel_and_confirm(c, st.working_no, st.working_tag, wait_s=p.confirm_wait_s,
                              expect_qty=st.working_qty or None, sleep=sleep, clock=clock)
     if not res.terminal:
+        st.cancel_sent = True
         st.note = 'cancel of %s pending (%s)' % (st.working_no, res.reason)
         return False                                    # settle it on the next step
     _apply(st, res)
+    st.cancel_sent = False
     st.reprices += 1
     return True
 

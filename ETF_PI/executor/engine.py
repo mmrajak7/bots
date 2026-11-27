@@ -68,7 +68,9 @@ class Engine:
             self.n.send('JOURNAL CORRUPT: %s -- NO new entries; exits continue. Repair %s'
                         % (self.corrupt, journal.path), 'E')
         feed.on_update = self._on_quote
+        self.unmanaged: List[str] = []         # live lots in the LIVE journal while mode != live
         for p in self.pos.values():
+            p['floor_breach_since'] = None     # review L4: persistence restarts after a restart
             if p.get('state') in ACTIVE:
                 feed.watch(p['kite_symbol'], p.get('kite_token'))
 
@@ -122,7 +124,7 @@ class Engine:
 
     def _on_quote(self, kite_symbol: str, q: rules.Quote) -> None:
         """Every price update reaches the paper exchange (no-op live)."""
-        for p in self.pos.values():
+        for p in list(self.pos.values()):
             if p.get('kite_symbol') == kite_symbol and p.get('state') in ACTIVE:
                 self.b.on_quote(p['symbol'], q.bid, q.ask)
                 break
@@ -181,6 +183,10 @@ class Engine:
                                      '%s STILL HOLDS %d %s after the close -- carried; exits '
                                      'from %s next session' % (p['key'], p['qty'], p['symbol'],
                                                                self.cfg['carry_resume']), 'E')
+        if self.unmanaged:
+            self.n.throttled('unmanaged', 300, 'LIVE LOT(S) NOT MANAGED: %s are open in the LIVE '
+                             'journal but mode=%s. Set mode: live and restart, or exit them in the '
+                             'app.' % (', '.join(self.unmanaged), self.cfg['mode']), 'E')
         self._status(now)
 
     # -- day roll (R6 / F16) ----------------------------------------------------------------
@@ -345,7 +351,28 @@ class Engine:
         elif p['state'] == 'OPEN':
             self._open(p, now)
         elif p['state'] == 'EXIT':
+            chase = p.get('chase') or {}
+            if not self._exit_window(p, now) and not chase.get('working_tag'):
+                # review H5: no NEO reads / journal rows / alerts all night. A working sell is
+                # still settled (cancelled) above; nothing new can be placed out here anyway.
+                if now.time() >= self.cfg['stop_placing_time'] and not p.get('carry_noted') \
+                        and int(chase.get('remaining') or 0) > 0:
+                    p['carry_noted'] = True
+                    self._jrow('CARRY_OUT', p)
+                    self.n.send('%s: %d %s NOT SOLD by %s -- carried; next session it is sold '
+                                'from %s ONLY if the account still shows it (MIS: the broker may '
+                                'have squared it off)' % (p['key'], int(chase.get('remaining') or 0),
+                                                          p['symbol'], self.cfg['stop_placing'],
+                                                          self.cfg['carry_resume']), 'E')
+                return
             self._exit(p, now)
+
+    def _exit_window(self, p: Dict[str, Any], now: _dt.datetime) -> bool:
+        t = now.time()
+        sess = self.session_fn(now.date())
+        if sess is None or t < sess[0] or t >= self.cfg['stop_placing_time']:
+            return False
+        return not (p.get('carry') and t < self.cfg['carry_resume_time'])
 
     # ---- entry (E2-E7, F17, F24) ----
     def _entry(self, p: Dict[str, Any], now: _dt.datetime) -> None:
@@ -357,6 +384,12 @@ class Engine:
             if stop:
                 return self._entry_end(p, 'stopped before a send (KILL/FLATTEN/close)')
             if e['recheck_at'] is not None:              # F24: one more read after a cancel
+                return
+            max_age = (float(self.cfg['intent_max_age_s']) + 10.0 +
+                       int(self.cfg['entry_attempts']) * float(self.cfg['entry_reprice_s']))
+            if ep - float(e['first_seen']) > max_age:     # review M2 (e.g. after a restart)
+                return self._entry_end(p, 'entry %.0f s old -- too late to send' % (ep - float(e['first_seen'])))
+            if ep < float(e.get('next_try') or 0):        # review M3: 429 back-off
                 return
             remaining = p['qty_target'] - self._entry_filled(p)
             q = self._quote(p)
@@ -431,6 +464,12 @@ class Engine:
                                        % self.cfg['unclear_grace_s'])
             return
         self.n.throttled('unk_' + p['key'], 60, '%s: entry state unknown: %s' % (p['key'], res.reason), 'E')
+        if self._entry_filled(p) > 0:                     # review L1: never leave fills unmanaged
+            e.setdefault('unknown_since', ep)
+            if ep - float(e['unknown_since']) > 10:
+                self.n.send('%s: entry status unreadable but %d filled -- managing the fill'
+                            % (p['key'], self._entry_filled(p)), 'E')
+                return self._opened(p, now)
 
     def _entry_send_failed(self, p: Dict[str, Any], ex: Exception) -> None:
         e = p['entry']
@@ -448,7 +487,11 @@ class Engine:
         e['working'] = ''
         if name == 'Rejected' and code == '429':          # F22: transient, no fault
             e['attempt'] -= 1
+            e['r429'] = int(e.get('r429') or 0) + 1
+            e['next_try'] = self.epoch() + float(self.cfg['reject_backoff_s'])   # review M3
             self._jrow('ENTRY_429', p)
+            if e['r429'] > 3:
+                self._entry_end(p, 'NEO rate-limited the entry 4 times')
             return
         if name == 'Rejected':
             self._fault('entry rejected: %s' % ex)
@@ -491,6 +534,9 @@ class Engine:
                 p['key'], qty, p['lot_size']), 'E')
         e['working'] = ''
         e['recheck_at'] = None
+        if avg <= 0:                                      # review L6
+            avg = float(e.get('limit') or p['signal_ltp'])
+            self.n.send('%s: fill reported with avg price 0 -- using the limit %.2f' % (p['key'], avg), 'E')
         p['qty'] = qty
         p['entry_premium'] = round(avg, 4)                # E7: re-based on the FILL
         p['peak_premium'] = round(avg, 4)
@@ -557,10 +603,10 @@ class Engine:
         p['exit_started'] = self.epoch()
         p['chase'] = self.b.chase_state(p['symbol'], p['token'], p['tick'], int(p['qty'])).to_dict()
         self._jrow('EXIT_START', p, why=why, bid=p.get('last_bid'))
+        self._exit(p, now)                                # review M1: the sell first
         self.n.send('EXIT %s %s: %s (bid %s, entry %.2f)' % (
             p['symbol'], p['key'], why, p.get('last_bid'), p['entry_premium']),
             'E' if why in ('NO_PRICE', 'LATE_FILL', 'FLATTEN') else 'I')
-        self._exit(p, now)
 
     def _held(self, p: Dict[str, Any]) -> int:
         """F5/F6: what this position may sell. Own order-book net (+ carried
@@ -569,19 +615,30 @@ class Engine:
         own = self._carried_base(p['symbol']) + int(self.b.own_net(p['symbol']))
         if own <= 0:
             return own
+        carry = bool(p.get('carry'))
         try:
             acct = self.b.account_net(p['symbol'])
         except Exception as e:
+            if carry:
+                raise                                     # review C1: never sell a carry blind
             log.warning('%s: account net unreadable (%s) -- own net only', p['key'], e)
             return own
-        if acct is None:                                  # no row: unknown, never 0
+        if acct is None:
+            if carry:
+                # review C1: overnight the journal is NOT proof. MIS lots are squared off by
+                # the broker; selling a lot that is gone is a naked short. No row -> sell nothing.
+                p.setdefault('acct_low_since', self.epoch())
+                self.n.throttled('carry_norow_' + p['key'], 60, '%s: carried %d %s but the account '
+                                 'shows NO %s row -- nothing sold (broker square-off?)' % (
+                                     p['key'], own, p['symbol'], self.cfg['product']), 'E')
+                return 0
             log.info('%s: no positions row for %s -- own net %d', p['key'], p['symbol'], own)
-            return own
+            return own                                    # same day: unknown, never 0
         acct = int(acct)
         if acct >= own:
             p.pop('acct_low_since', None)
             return own
-        if self.epoch() - float(p.get('last_fill_epoch') or 0) < self.cfg['positions_lag_s']:
+        if not carry and self.epoch() - float(p.get('last_fill_epoch') or 0) < self.cfg['positions_lag_s']:
             return own
         p.setdefault('acct_low_since', self.epoch())
         self.n.throttled('acct_' + p['key'], 60, '%s: the ACCOUNT holds %d of %s but our own '
@@ -599,10 +656,17 @@ class Engine:
         if sess is None or t < sess[0]:
             return None
         q = self._quote(p)
+        ep = self.epoch()
         if q is not None:
             p['last_bid'] = q.bid
             p['_bids'] = q.bids
+            p.pop('exit_noprice_since', None)
             return {'bid': q.bid}
+        since = float(p.setdefault('exit_noprice_since', ep))
+        if not p.get('stale_exit') and ep - since >= self.cfg['no_price_alert_s']:
+            p['stale_exit'] = True                        # review H3: cumulative from the last bid
+            self.n.send('%s: no price for %.0f s while selling -- stepping down from the last '
+                        'bid %s' % (p['key'], ep - since, p.get('last_bid')), 'E')
         if p.get('stale_exit') and float(p.get('last_bid') or 0) > 0:
             return {'bid': float(p['last_bid'])}
         return None
@@ -625,7 +689,10 @@ class Engine:
 
         def persist(s):
             p['chase'] = s.to_dict()
-            self._jrow('EXIT_STEP', p, note=s.note)
+            sig = [s.working_tag, s.working_no, s.remaining, s.sold, s.reprices, s.status, s.note]
+            if sig != p.get('_persist_sig'):              # review H5: no 120 rows a minute
+                p['_persist_sig'] = sig
+                self._jrow('EXIT_STEP', p, note=s.note)
         ok, st2 = self._neo(lambda: self.b.chase_step(st, lambda: self._exit_quote(p, now),
                                                       lambda: self._held(p), self._exit_price(p),
                                                       persist, self.epoch), 'exit chase', p)
@@ -661,19 +728,17 @@ class Engine:
                              '%s: still selling %d %s (%s, %d re-prices; %s)' % (
                                  p['key'], st.remaining, p['symbol'], p['exit_type'],
                                  st.reprices, st.note), 'E')
-        if now.time() >= self.cfg['stop_placing_time'] and not st.working_tag and not p.get('carry_noted'):
-            p['carry_noted'] = True
-            self._jrow('CARRY_OUT', p)
-            self.n.send('%s: %d %s NOT SOLD by %s -- carried; exits from %s next session '
-                        '(NRML, no broker square-off)' % (p['key'], st.remaining, p['symbol'],
-                                                         self.cfg['stop_placing'],
-                                                         self.cfg['carry_resume']), 'E')
 
     def _closed(self, p: Dict[str, Any], now: _dt.datetime, external: bool = False) -> None:
         st = p['chase'] or {}
         sold, proceeds = int(st.get('sold') or 0), float(st.get('proceeds') or 0.0)
         entry = float(p['entry_premium'])
         p['realised'] = round(proceeds - entry * sold, 2)
+        unsold = int(st.get('remaining') if st else p.get('qty') or 0)
+        if external and unsold > 0:
+            bid = float(p.get('last_bid') or 0)          # review M5: R1 must see the loss
+            p['realised'] = round(p['realised'] + (bid - entry) * unsold, 2)
+            p['realised_estimated'] = True
         p['exit_avg'] = round(proceeds / sold, 4) if sold else 0.0
         p['state'] = 'CLOSED'
         p['qty'] = 0
@@ -745,19 +810,30 @@ class Engine:
                 continue
             self._short_reads.pop(sym, None)
             if working or held == book:
+                for p in mine:
+                    p.pop('recon_low', None)
                 continue
             if held < book:
+                ok, acct = self._neo(lambda: self.b.account_net(sym), 'reconcile positions')
                 for p in mine:
+                    if p['state'] != 'OPEN':
+                        continue
+                    p['recon_low'] = int(p.get('recon_low') or 0) + 1
+                    # review H1: one empty / wrong read never abandons a lot. Adopt only on 2
+                    # consecutive reads AND a positions row that agrees.
+                    agree = ok and acct is not None and int(acct) <= max(held, 0)
                     self.n.throttled('recon_' + p['key'], 120, '%s: own orders show %d of %s, '
-                                     'book %d -- adopting the broker figure' % (
-                                         p['key'], held, sym, book), 'E')
-                    if p['state'] == 'OPEN':
-                        p['qty'] = max(0, held)
-                        if p['qty'] == 0:
-                            p['chase'] = self.b.chase_state(p['symbol'], p['token'], p['tick'], 0).to_dict()
-                            self._closed(p, now, external=True)
-                        else:
-                            self._jrow('RECON_QTY', p, held=held)
+                                     'book %d, account %s -- %s' % (
+                                         p['key'], held, sym, book, acct,
+                                         'adopting' if agree and p['recon_low'] >= 2 else 'holding'), 'E')
+                    if not (agree and p['recon_low'] >= 2):
+                        continue
+                    p['qty'] = max(0, held)
+                    if p['qty'] == 0:
+                        p['chase'] = self.b.chase_state(p['symbol'], p['token'], p['tick'], 0).to_dict()
+                        self._closed(p, now, external=True)
+                    else:
+                        self._jrow('RECON_QTY', p, held=held)
             elif held > book:
                 self.n.throttled('recon_long_' + sym, 300, 'own etf- orders hold %d of %s but the '
                                  'book has %d -- UNEXPLAINED; check the app' % (held, sym, book), 'E')

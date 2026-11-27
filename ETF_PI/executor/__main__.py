@@ -7,6 +7,8 @@ Run from the ETF_PI directory with the SAME interpreter as option_buy (Pi: /usr/
   python3 -m executor kill       no NEW entries (file KILL); open trades keep their exits
   python3 -m executor flatten    exit everything now + no new entries (file FLATTEN)
   python3 -m executor resume     remove KILL and FLATTEN
+  python3 -m executor stop       STOPPED flag + systemctl stop (the watchdog leaves it stopped)
+  python3 -m executor start      remove STOPPED + systemctl start
   python3 -m executor check      load config + option_buy + kotak_neo, print the plan, exit
 """
 from __future__ import annotations
@@ -77,6 +79,42 @@ def consts_digest(ob) -> str:
     return '%s %s' % (hashlib.sha256(blob.encode()).hexdigest()[:12], blob)
 
 
+class RestQuoter:
+    """Kite REST quote for the executor (review H4). option_buy.get_kite() calls
+    sys.exit on a missing token and caches the client forever; this re-reads the
+    token file after any failure and raises ordinary exceptions. Calls still go
+    through option_buy's cross-process limiter (`_kite_call`)."""
+
+    def __init__(self, ob):
+        self.ob = ob
+        self.kite = None
+
+    def _client(self):
+        if self.kite is None:
+            from kiteconnect import KiteConnect
+            with io.open(self.ob.TOKEN_PATH, encoding='utf-8') as f:
+                td = json.load(f)
+            k = KiteConnect(api_key=td['api_key'])
+            k.set_access_token(td['access_token'])
+            self.kite = k
+        return self.kite
+
+    def __call__(self, key):
+        try:
+            k = self._client()
+            rec = self.ob._kite_call('quote', lambda: k.quote([key]))
+            return (rec or {}).get(key)
+        except Exception:
+            self.kite = None                  # next call re-reads the token file
+            raise
+
+
+def journal_path(mode: str) -> str:
+    """Review H1-b: LIVE and PAPER never share a book -- a paper restart must not
+    reconcile a live lot against an empty fake exchange."""
+    return os.path.join(C.STATE_DIR, 'journal_%s.jsonl' % ('live' if mode == 'live' else 'paper'))
+
+
 def build(cfg):
     import market_calendar
     from executor.broker import Broker
@@ -87,28 +125,57 @@ def build(cfg):
     ob = import_option_buy()
     os.makedirs(C.STATE_DIR, exist_ok=True)
 
-    def rest_quote(key):
-        rec = ob._kite_call('quote', lambda: ob.get_kite().quote([key]))
-        return (rec or {}).get(key)
-
     def ticker(api_key, access):
         from kiteconnect import KiteTicker
         return KiteTicker(api_key, access)
-    feed = PriceFeed(cfg, ob.TOKEN_PATH, C.STATE_DIR, rest_quote, ticker)
+    feed = PriceFeed(cfg, ob.TOKEN_PATH, C.STATE_DIR, RestQuoter(ob), ticker, async_rest=True)
     broker = Broker(cfg, paper=(cfg['mode'] != 'live'))
     cal = market_calendar.load()
-    eng = Engine(cfg, broker, feed, Notifier(prefix='ETF %s' % cfg['mode'].upper()),
-                 Journal(os.path.join(C.STATE_DIR, 'journal.jsonl')), ob, C.STATE_DIR,
+    eng = Engine(cfg, broker, feed, Notifier(prefix='ETF %s' % cfg['mode'].upper(), async_send=True),
+                 Journal(journal_path(cfg['mode'])), ob, C.STATE_DIR,
                  session_fn=lambda d: market_calendar.session(ob.U, d, cal),
                  eod_fn=lambda d: min(ob.U.eod_close(d), cfg['eod_time_t'] or ob.U.eod_close(d)),
                  deadman=DeadMan(DeadMan.url_from_creds(), cfg['deadman_every_s']))
     eng.consts_digest = consts_digest(ob)
+    if cfg['mode'] != 'live':
+        live_pos, _, _ = Journal(journal_path('live')).load()
+        eng.unmanaged = [k for k, p in live_pos.items()
+                         if p.get('state') in ('PENDING', 'ENTRY', 'OPEN', 'EXIT')]
     return eng, ob
+
+
+def _config_or_alert(what: str):
+    """Review L7: a bad config must reach Telegram, not only a log nobody reads."""
+    try:
+        return C.load()
+    except Exception as e:
+        log.error('%s: config refused: %s', what, e)
+        try:
+            import common
+            common.sendMsgTelegram('<b>ETF EXECUTOR</b> %s: CONFIG REFUSED -- %s' % (what, e), 'E')
+        except Exception:
+            pass
+        raise
+
+
+def _single_instance():
+    """Review M4: two daemons would read the same intents and buy twice."""
+    os.makedirs(C.STATE_DIR, exist_ok=True)
+    f = open(os.path.join(C.STATE_DIR, 'daemon.lock'), 'a+')
+    try:
+        import fcntl
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError:
+        return f                              # Windows dev box: no flock
+    except OSError:
+        raise SystemExit('another executor daemon holds %s' % f.name)
+    return f
 
 
 def cmd_run(args) -> int:
     _logging('executor')
-    cfg = C.load()
+    lock = _single_instance()                 # noqa: F841 (held for the process lifetime)
+    cfg = _config_or_alert('run')
     eng, ob = build(cfg)
     IST = ob.IST
     log.info('executor start: mode=%s lots=%s live_until=%s product=%s consts=%s',
@@ -124,7 +191,7 @@ def cmd_run(args) -> int:
         t0 = time.time()
         try:
             eng.step(_dt.datetime.now(IST))
-        except Exception as e:                         # the loop itself must survive
+        except (Exception, SystemExit) as e:           # review H4: even a library sys.exit
             log.exception('step failed')
             eng.n.throttled('step_bug', 60, 'executor step BUG %s: %s' % (type(e).__name__, e), 'E')
         time.sleep(max(0.05, cfg['loop_s'] - (time.time() - t0)))
@@ -153,9 +220,9 @@ def cmd_watchdog(args) -> int:
     _logging('executor_watchdog')
     import market_calendar
     import underlyings
-    cfg = C.load()
-    if cfg['mode'] == 'off':
-        return 0
+    cfg = _config_or_alert('watchdog')
+    if cfg['mode'] == 'off' or os.path.exists(os.path.join(C.STATE_DIR, 'STOPPED')):
+        return 0                              # review M4: an owner stop is respected
     import pytz
     now = _dt.datetime.now(pytz.timezone('Asia/Kolkata'))
     sess = market_calendar.session(underlyings.get('NIFTY'), now.date(), market_calendar.load())
@@ -211,6 +278,20 @@ def cmd_resume(args) -> int:
     return 0
 
 
+def cmd_stop(args) -> int:
+    _flag('STOPPED', True)
+    r = subprocess.run(['sudo', 'systemctl', 'stop', 'etf-executor'])
+    print('STOPPED set; systemctl stop rc=%s. Open lots are NOT managed while stopped.' % r.returncode)
+    return r.returncode
+
+
+def cmd_start(args) -> int:
+    _flag('STOPPED', False)
+    r = subprocess.run(['sudo', 'systemctl', 'start', 'etf-executor'])
+    print('STOPPED removed; systemctl start rc=%s' % r.returncode)
+    return r.returncode
+
+
 def cmd_check(args) -> int:
     _logging('executor_check')
     cfg = C.load()
@@ -221,7 +302,9 @@ def cmd_check(args) -> int:
         cfg['mode'], cfg['lots'], cfg['lot_ceiling'], cfg['live_until'], cfg['product'],
         cfg['bots_root']))
     print('ladder consts: %s' % consts_digest(ob))
-    print('EOD today: %s; state dir %s' % (ob.U.eod_close(_dt.date.today()), C.STATE_DIR))
+    paper_eod = ob.U.eod_close(_dt.date.today())
+    print('EOD today: live %s (paper %s); last entry %s; state dir %s' % (
+        min(paper_eod, cfg['eod_time_t'] or paper_eod), paper_eod, cfg['last_entry'], C.STATE_DIR))
     return 0
 
 
@@ -273,7 +356,7 @@ def cmd_probe(args) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog='python3 -m executor')
     sub = ap.add_subparsers(dest='cmd', required=True)
-    for name in ('run', 'watchdog', 'status', 'kill', 'flatten', 'resume', 'check'):
+    for name in ('run', 'watchdog', 'status', 'kill', 'flatten', 'resume', 'check', 'stop', 'start'):
         sub.add_parser(name)
     pp = sub.add_parser('probe')
     pp.add_argument('--symbol', required=True, help='Kite tradingsymbol, e.g. NIFTY2612026000CE')

@@ -430,7 +430,7 @@ def test_a_429_is_not_a_fault(rig, monkeypatch):
         return real(*a, **k)
     monkeypatch.setattr(rig.broker, 'place', place)
     k = rig.intent()
-    rig.step(n=4)
+    rig.step(n=14)                                    # 5 s back-off (review M3), then the buy
     assert rig.eng.faults == 0 and rig.pos(k)['state'] == 'OPEN' and len(calls) == 2
 
 
@@ -455,6 +455,7 @@ def test_unsold_lot_is_carried_and_sold_next_morning(rig):
         return held_overnight + sum(int(o['fldQty']) * (1 if o['trnsTp'] == 'B' else -1)
                                     for o in rig.fake.orders if o['trdSym'] == s)
     rig.fake.net = net
+    rig.broker.account_net = lambda s: net(s)         # the MIS row shows the carried lot
     rig.now = dt.datetime(2026, 12, 1, 9, 14, 0, tzinfo=IST)
     rig.quote(101.0, 101.1)
     rig.step(secs=1, n=40)
@@ -481,3 +482,65 @@ def test_torn_last_line_is_ignored_and_corrupt_middle_blocks_entries(rig):
     rig.intent(key='NIFTY_PE_10minute_20261130_H1')
     rig.step()
     assert 'NIFTY_PE_10minute_20261130_H1' not in rig.eng.pos
+
+
+def test_c1_a_carried_lot_with_no_positions_row_is_never_sold(rig):
+    """Review C1: the broker squared the MIS lot off overnight; the journal still says 65.
+    Selling it would be a naked short. No row -> nothing sold, closed EXTERNAL, alerted."""
+    p = open_one(rig)
+    rig.now = rig.now.replace(hour=15, minute=29, second=0)
+    p['entry_time'] = rig.now.isoformat()
+    orig = rig.fake._match
+    rig.fake._match = lambda o: None
+    rig.quote(100.5, 100.6)
+    rig.step(secs=2, n=40)
+    assert p['state'] == 'EXIT'
+    rig.fake.orders[:] = []                           # new day: empty DAY book, lot squared off
+    rig.fake._match = orig
+    rig.now = dt.datetime(2026, 12, 1, 9, 14, 0, tzinfo=IST)
+    rig.quote(101.0, 101.1)
+    rig.step(secs=1, n=150)
+    assert rig.etf_orders('S') == [] and p['state'] == 'CLOSED'
+    assert p['exit_type'].endswith('+EXTERNAL') and p.get('realised_estimated')
+    assert 'NO MIS row' in rig.texts()
+
+
+def test_h1_one_empty_book_read_never_abandons_an_open_lot(rig):
+    p = open_one(rig)
+    real = rig.broker.own_orders
+    rig.broker.own_orders = lambda: []                # one spurious 5203 "no data"
+    rig.eng._last_reconcile = 0
+    rig.step()
+    rig.broker.own_orders = real
+    rig.eng._last_reconcile = 0
+    rig.step()
+    assert p['state'] == 'OPEN' and p['qty'] == 65
+
+
+def test_h3_no_price_during_an_exit_steps_down_from_the_last_bid(rig):
+    p = open_one(rig)
+    rig.quote(100.5, 100.6)
+    rig.step()
+    orig = rig.fake._match
+    rig.fake._match = lambda o: None
+    open(os.path.join(rig.state, 'FLATTEN'), 'w').close()
+    rig.step()
+    assert p['state'] == 'EXIT'
+    rig.feed._q[SYM].bid = 0                          # quotes die mid-exit
+    rig.step(secs=2, n=25, refresh=True)
+    assert p.get('stale_exit') and 'stepping down' in rig.texts()
+    prices = [float(o['prc']) for o in rig.etf_orders('S')]
+    assert prices[-1] < prices[0]                     # cumulative step-down, not the frozen bid
+
+
+def test_h5_after_the_close_a_stuck_exit_is_not_stepped_all_night(rig):
+    p = open_one(rig)
+    rig.now = rig.now.replace(hour=15, minute=29, second=0)
+    p['entry_time'] = rig.now.isoformat()
+    rig.fake._match = lambda o: None
+    rig.quote(100.5, 100.6)
+    rig.step(secs=2, n=40)
+    calls, rows = len(rig.fake.calls), len(open(rig.eng.j.path).read().splitlines())
+    rig.step(secs=30, n=120, refresh=False)           # an hour after the close
+    assert len(rig.fake.calls) == calls               # no NEO reads
+    assert len(open(rig.eng.j.path).read().splitlines()) - rows < 5

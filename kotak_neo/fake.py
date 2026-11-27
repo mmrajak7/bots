@@ -163,14 +163,15 @@ class FakeNeo:
                     for o in self.orders if int(o['fldQty']) > 0]
             return _Resp(200, {'stat': 'Ok', 'data': rows}) if rows else _Resp(200, EMPTY)
         if url.endswith('/quick/user/positions'):
-            net: Dict[str, List[int]] = {}
+            # one row per symbol + PRODUCT, as NEO reports (review M6, 2026-11-27)
+            net: Dict[tuple, List[int]] = {}
             for o in self.orders:
                 f = int(o['fldQty'])
                 if f:
-                    b = net.setdefault(o['trdSym'], [0, 0])
+                    b = net.setdefault((o['trdSym'], o.get('prod') or 'NRML'), [0, 0])
                     b[0 if o['trnsTp'] == 'B' else 1] += f
-            rows = [{'trdSym': s, 'prod': 'NRML', 'flBuyQty': str(v[0]), 'flSellQty': str(v[1]),
-                     'cfBuyQty': '0', 'cfSellQty': '0'} for s, v in net.items()]
+            rows = [{'trdSym': k[0], 'prod': k[1], 'flBuyQty': str(v[0]), 'flSellQty': str(v[1]),
+                     'cfBuyQty': '0', 'cfSellQty': '0'} for k, v in net.items()]
             return _Resp(200, {'stat': 'Ok', 'data': rows}) if rows else _Resp(200, EMPTY)
         raise AssertionError('unscripted GET %s' % url)
 
@@ -190,7 +191,8 @@ class FakeNeo:
         o = {'nOrdNo': str(next(self._no)), 'ordSt': 'open' if j['pt'] == 'L' else 'trigger pending',
              'trdSym': j['ts'], 'trnsTp': j['tt'], 'qty': str(j['qt']), 'fldQty': '0',
              'avgPrc': '0.00', 'prc': j['pr'], 'trgPrc': j.get('tp', '0'), 'prcTp': j['pt'],
-             'rejRsn': '--', 'GuiOrdId': j['ig'], 'ordDtTm': '27-Nov-2026 13:53:11'}
+             'rejRsn': '--', 'GuiOrdId': j['ig'], 'ordDtTm': '27-Nov-2026 13:53:11',
+             'prod': j.get('pc') or 'NRML'}
         h = self._pop(('hide',))
         if h:
             o['_hide'] = h[1]
