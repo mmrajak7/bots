@@ -9,8 +9,10 @@ file this writes. The parse is the 2026-11-24 fix, unchanged:
     Day|Date|Holiday|...). The date is whichever cell PARSES as a date, and a
     row counts only if its exchanges cell names NSE. Position-based parsing
     dropped every real 2026 closure and Guru Nanak Jayanti was missed.
-  * a current-year parse with fewer than MIN_WEEKDAY_HOLIDAYS weekday closures
-    means the layout changed: the file is NOT overwritten.
+  * a year is written only when the page has at least MIN_WEEKDAY_HOLIDAYS
+    weekday closures for it (fewer = layout changed, that year is NOT
+    overwritten); the refresh fails only if neither this year nor next passes,
+    so a page that already rolled over to next year still refreshes.
   * existing years not on the page are kept (manual entries survive).
   * written atomically; a failed fetch leaves yesterday's file in place.
 """
@@ -110,17 +112,25 @@ def refresh(path: Path, force: bool = False, today: Optional[date] = None,
     except Exception as e:
         kept = ' (yesterday\'s file kept)' if path.exists() else ''
         return False, 'fetch/parse failed: %s: %s%s' % (type(e).__name__, str(e)[:120], kept)
-    this_year = [h for h in holidays if h['date'].startswith(str(today.year))
-                 and date.fromisoformat(h['date']).weekday() < 5]
-    if len(this_year) < MIN_WEEKDAY_HOLIDAYS:
-        return False, ('only %d weekday NSE closures parsed for %d (floor %d) -- page layout '
-                       'changed? %s NOT overwritten' % (len(this_year), today.year,
-                                                        MIN_WEEKDAY_HOLIDAYS, path.name))
     by_year: Dict[str, List[Dict[str, str]]] = {}
     for h in holidays:
         by_year.setdefault(h['date'][:4], []).append(h)
+
+    def weekdays(y: str) -> int:
+        return sum(date.fromisoformat(h['date']).weekday() < 5 for h in by_year.get(y, []))
+    # A year is written only if the page carries a plausible FULL year of it: a thin
+    # parse means the layout changed, and must not overwrite a good year. This year
+    # OR next year passing is enough, so a page that has already rolled over to next
+    # year (December) still refreshes instead of failing every morning.
+    good = {y: v for y, v in by_year.items() if weekdays(y) >= MIN_WEEKDAY_HOLIDAYS}
+    this_y, next_y = str(today.year), str(today.year + 1)
+    if this_y not in good and next_y not in good:
+        return False, ('only %d weekday NSE closures parsed for %s and %d for %s (floor %d) -- '
+                       'page layout changed? %s NOT overwritten'
+                       % (weekdays(this_y), this_y, weekdays(next_y), next_y,
+                          MIN_WEEKDAY_HOLIDAYS, path.name))
     data = {k: v for k, v in existing.items() if isinstance(k, str)}
-    data.update(by_year)
+    data.update(good)
     data['_comment'] = 'NSE Trading Holidays - Auto-updated from Zerodha'
     data['_last_updated'] = today.isoformat()
     data['_source'] = URL
@@ -129,4 +139,4 @@ def refresh(path: Path, force: bool = False, today: Optional[date] = None,
     except OSError as e:
         return False, 'write failed: %s' % e
     total = sum(len(v) for k, v in data.items() if not k.startswith('_'))
-    return True, 'saved %d holidays (%d this year on weekdays)' % (total, len(this_year))
+    return True, 'saved %d holidays (years refreshed: %s)' % (total, ', '.join(sorted(good)))

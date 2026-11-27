@@ -1,6 +1,6 @@
 """ETF_PI reads Kite market data through the ONE shared token (owner, 2026-11-27).
 
-`python -m kite_login` (BOTS root, Pi cron 08:40/08:46) makes the personal
+`python -m kite_login` (BOTS root, Pi cron 08:30/08:36) makes the personal
 market-data token every weekday morning. ETF_PI NEVER logs in on its own: until
 2026-11-27 tracker.py / extract_data.py each did a Kite WEB login (enctoken) to
 a third account from credentials in code; `kite_login/tests/test_login_policy.py`

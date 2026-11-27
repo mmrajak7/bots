@@ -328,3 +328,41 @@ def test_config_without_a_credentials_source_is_refused(tmp_path):
     f.write_text(json.dumps(bad))
     with pytest.raises(ValueError, match='credentials'):
         C.load_config(f)
+
+
+def test_swapped_credentials_file_refuses_both_accounts(env):
+    """Review 2026-11-27 #1: creds.env holding the COMPANY credentials passes the
+    per-account profile check (Kite answers with the id that file claims). Two
+    accounts that are one user -> neither logs in, neither file is touched."""
+    root, cfg, kite = env
+    _write_creds(root, {'personal': CREDS['company'], 'company': CREDS['company']})
+    _plant(root, 'data/kite_access_token.json', 'personal', 'OLDP', '2026-11-27T08:45:00')
+    out = _run(env)
+    assert [r.outcome for r in out] == [C.FAILED, C.FAILED]
+    assert all('SAME Kite user' in r.detail for r in out)
+    assert kite.logins == 0
+    assert _tok(root, 'data/kite_access_token.json')['access_token'] == 'OLDP'
+    assert not (root / 'FIFTY/data/kite_access_token.json').exists()
+
+
+def test_swap_is_caught_even_when_one_account_is_asked_for(env):
+    root, cfg, kite = env
+    _write_creds(root, {'personal': CREDS['company'], 'company': CREDS['company']})
+    out = _run(env, ['personal'])
+    assert out[0].outcome == C.FAILED and 'SAME Kite user' in out[0].detail
+    assert kite.logins == 0
+    assert not (root / 'data/kite_access_token.json').exists()
+
+
+def test_failed_write_leaves_no_temp_and_keeps_the_old_file(env, monkeypatch):
+    root, cfg, kite = env
+    path = root / 'data' / 'kite_access_token.json'
+    path.write_text('{"old": 1}')
+
+    def boom(*a, **k):
+        raise OSError('disk full')
+    monkeypatch.setattr(C.os, 'replace', boom)
+    with pytest.raises(OSError):
+        C.write_atomic(path, {'new': 1})
+    assert json.loads(path.read_text()) == {'old': 1}
+    assert not [p for p in (root / 'data').iterdir() if '.tmp.' in p.name]

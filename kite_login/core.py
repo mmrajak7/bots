@@ -16,7 +16,8 @@ Rules (each one is a failure we refuse to repeat):
   * the token file is replaced atomically (temp + rename): a bot never reads
     half a file.
   * Kite's answer is checked against the credentials' user_id before the file
-    is written: the company token must never land in the shared market-data
+    is written, and two accounts whose credential files name the same user are
+    both refused: the company token must never land in the shared market-data
     file (the company account has no quote permission -- every bot goes blind).
   * secrets (password, TOTP secret, api_secret, access_token) never reach a log.
 """
@@ -259,13 +260,20 @@ def token_doc(creds: Mapping[str, str], access_token: str, style: str,
 def write_atomic(path: Path, doc: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name('.%s.tmp.%d' % (path.name, os.getpid()))
-    with open(str(tmp), 'w', encoding='utf-8') as f:
-        json.dump(doc, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    if os.name != 'nt':
-        os.chmod(str(tmp), 0o644)      # same mode the old writers left; readers run as trustit
-    os.replace(str(tmp), str(path))
+    try:
+        with open(str(tmp), 'w', encoding='utf-8') as f:
+            json.dump(doc, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name != 'nt':
+            os.chmod(str(tmp), 0o644)  # same mode the old writers left; readers run as trustit
+        os.replace(str(tmp), str(path))
+    finally:
+        if tmp.exists():               # only after a failure: never leave half a temp behind
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 # -- Kite HTTP ----------------------------------------------------------------------------
@@ -424,6 +432,31 @@ def ensure_account(alias: str, cfg: Mapping[str, Any], root: Path = BOTS_ROOT,
         return Result(alias, FAILED, redact('%s: %s' % (type(e).__name__, e), creds))
 
 
+def shared_user_ids(cfg: Mapping[str, Any], root: Path = BOTS_ROOT) -> Dict[str, str]:
+    """{alias: reason} for accounts whose credential files name the SAME Kite user.
+
+    The per-account profile check cannot see a swapped file: if SNAIL's creds.env
+    held the company credentials, Kite would answer with the user_id that file
+    claims, and the company token (no quote permission) would land in the shared
+    market-data file. Two accounts that are one user means one file is wrong, so
+    neither logs in. Every configured account is compared, not just the requested
+    ones. A file that cannot be read is left to ensure_account to report."""
+    users: Dict[str, List[str]] = {}
+    for alias, acc in cfg['accounts'].items():
+        try:
+            uid = load_credentials(acc['credentials'], alias, root)['user_id'].strip().upper()
+        except Exception:
+            continue
+        users.setdefault(uid, []).append(alias)
+    out: Dict[str, str] = {}
+    for uid, aliases in users.items():
+        if len(aliases) > 1:
+            for a in aliases:
+                out[a] = ('credentials of %s are the SAME Kite user -- one file holds the wrong '
+                          'account; no login, nothing written' % ' and '.join(sorted(aliases)))
+    return out
+
+
 def run(aliases: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None,
         root: Path = BOTS_ROOT, **kw: Any) -> List[Result]:
     """Every requested account, one at a time, under one lock."""
@@ -436,9 +469,13 @@ def run(aliases: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = Non
     with file_lock('login.lock', float(cfg.get('lock_wait_s', 120))) as got:
         if not got:
             return [Result(a, FAILED, 'another kite_login run holds the lock') for a in aliases]
+        clash = shared_user_ids(cfg, root)
         out = []
         for a in aliases:
-            res = ensure_account(a, cfg, root, **kw)
+            if a in clash:
+                res = Result(a, FAILED, clash[a])
+            else:
+                res = ensure_account(a, cfg, root, **kw)
             logger.info('kite_login %s: %s %s', a, res.outcome, res.detail)
             _log_event({'at': datetime.now(IST).isoformat(timespec='seconds'), 'account': a,
                         'outcome': res.outcome, 'detail': res.detail})

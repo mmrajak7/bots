@@ -10,7 +10,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-ENDPOINTS = ('/api/twofa', '/session/token', 'generate_session(')
+# /api/login = step one of EVERY Kite login, API or web enctoken (the 2nd catches
+# a web-only login that never calls /session/token).
+ENDPOINTS = ('/api/login', '/api/twofa', '/session/token', 'generate_session(')
 OWNER = 'kite_login/core.py'
 
 #: path -> RETIRES WHEN

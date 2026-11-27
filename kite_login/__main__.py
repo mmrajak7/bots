@@ -61,7 +61,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     h.add_argument('--force', action='store_true')
     sub.add_parser('status', help='offline summary')
     a = ap.parse_args(argv)
+    try:
+        return _run(a)
+    except Exception as e:
+        # A crash before the normal report (bad config, lock dir unwritable, a broken
+        # import) must still reach the owner from the last slot -- otherwise the only
+        # signal left is each bot's own stale-token alarm after 09:00.
+        logger.exception('kite_login %s crashed', a.cmd)
+        if getattr(a, 'final', False):
+            try:
+                cfg = C.load_config()
+            except Exception:
+                cfg = {'telegram_file': 'data/telegram_config.json'}
+            send_telegram(_alert_text(['kite_login %s crashed: %s' % (a.cmd, type(e).__name__)]),
+                          cfg)
+        return 1
 
+
+def _run(a: argparse.Namespace) -> int:
     cfg = C.load_config()
     if a.cmd == 'status':
         print(json.dumps(C.status(cfg), indent=1))

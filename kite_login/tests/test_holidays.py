@@ -106,3 +106,32 @@ def test_same_answer_as_the_snail_parser_on_the_same_page():
         sys.path.remove(str(snail))
     old = [h['date'] for h in mod.parse_holidays(page())]
     assert old == [h['date'] for h in H.parse(page(), date.today().year)]
+
+
+# 2027: nine real weekdays (shifting the 2026 dates would land some on weekends)
+NEXT = [('26 Jan 2027', 'Tuesday', 'Republic Day'), ('22 Mar 2027', 'Monday', 'Holi'),
+        ('26 Mar 2027', 'Friday', 'Good Friday'), ('14 Apr 2027', 'Wednesday', 'Ambedkar Jayanti'),
+        ('15 Apr 2027', 'Thursday', 'Ram Navami'), ('03 May 2027', 'Monday', 'X'),
+        ('01 Oct 2027', 'Friday', 'Y'), ('29 Oct 2027', 'Friday', 'Diwali'),
+        ('12 Nov 2027', 'Friday', 'Z')]
+
+
+def test_page_already_rolled_to_next_year_still_refreshes(tmp_path):
+    """Review 2026-11-27 #2: in December Zerodha may show only next year. That must
+    refresh (next year written, this year kept), not fail every morning."""
+    f = tmp_path / 'h.json'
+    f.write_text('{"2026": [{"date": "2026-11-24", "name": "keep me"}]}')
+    ok, msg = H.refresh(f, today=date(2026, 12, 15), fetch=lambda: page(NEXT))
+    assert ok, msg
+    d = json.loads(f.read_text())
+    assert d['2026'][0]['name'] == 'keep me' and len(d['2027']) == 9
+
+
+def test_a_thin_year_never_overwrites_a_good_one(tmp_path):
+    """Full 2027 + three stray 2026 rows: 2027 written, the good 2026 kept."""
+    f = tmp_path / 'h.json'
+    f.write_text('{"2026": [{"date": "2026-11-24", "name": "keep me"}]}')
+    ok, msg = H.refresh(f, today=date(2026, 12, 15), fetch=lambda: page(NEXT + TRADING[:3]))
+    assert ok, msg
+    d = json.loads(f.read_text())
+    assert d['2026'] == [{'date': '2026-11-24', 'name': 'keep me'}] and len(d['2027']) == 9
