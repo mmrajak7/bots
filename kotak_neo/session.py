@@ -93,6 +93,9 @@ DEFAULTS = {
     'cap_cooldown_sec': 1800.0,     # what the cap imposes; then ONE login per period
     'network_backoff_max_sec': 300.0,
     'max_refusals': 3,              # consecutive refused logins (not network) -> latch
+    # The public IPv4 whitelisted on the NEO dashboard. Set ONLY in the Pi's
+    # ~/.kotak_neo/config.json (never in git). Empty = the morning check is off.
+    'expected_public_ipv4': '',
 }
 #: Floors a config.json cannot go below (a typo must not unleash a storm).
 FLOORS = {'cooldown_sec': 30.0, 'cap_cooldown_sec': 600.0, 'lock_wait_sec': 1.0,
@@ -832,12 +835,74 @@ def refresh(failed_generation: int, requester: str, *, wait_s: Optional[float] =
     return _run(requester, failed_generation, False, wait_s, _verify, _login, _creds, _sleep)
 
 
+IP_ALERT_EVERY_SEC = 900.0
+
+
+def ip_alert(why: str) -> None:
+    """Owner's backup plan until a static IP exists (2026-11-27): when NEO
+    refuses orders because of the IP, ALERT and let the owner trade by hand.
+    At most one alert per IP_ALERT_EVERY_SEC; delivered at once."""
+    try:
+        stamp = _p('ip_alert.last')
+        now = time.time()
+        try:
+            last = float(stamp.read_text(encoding='utf-8').strip() or 0)
+        except (OSError, ValueError):
+            last = 0.0
+        if now - last < IP_ALERT_EVERY_SEC:
+            return
+        _ensure_home()
+        stamp.write_text(str(now), encoding='utf-8')
+        _alert('static_ip', '%s -- NEO is refusing orders from this IP. Manage open trades '
+               'MANUALLY in the NEO app, then fix the whitelist (NEO dashboard > Trade API; '
+               'one change per 7 days).' % why, _now())
+        _flush_alerts()
+    except Exception as e:                           # never into a trading loop
+        logger.error('kotak_neo ip_alert failed: %s', e)
+
+
+def public_ipv4(timeout: float = 8.0) -> Optional[str]:
+    """This machine's public IPv4 as the internet sees it, or None."""
+    import requests
+    pin_ipv4()
+    for url in ('https://api.ipify.org', 'https://ifconfig.me/ip'):
+        try:
+            r = requests.get(url, timeout=timeout)
+            ip = (r.text or '').strip()
+            if r.status_code == 200 and ip.count('.') == 3:
+                return ip
+        except requests.RequestException:
+            continue
+    return None
+
+
+def check_public_ip(_ip: Optional[Callable] = None) -> Optional[str]:
+    """Morning check: alert if the public IPv4 is not the whitelisted one.
+    Returns a problem string, or None when fine / the check is off."""
+    want = str(config().get('expected_public_ipv4') or '').strip()
+    if not want:
+        return None
+    got = (_ip or public_ipv4)()
+    if got is None:
+        logger.warning('public IP check: could not read the public IPv4 of this machine')
+        return None
+    if got != want:
+        why = 'public IPv4 changed from the whitelisted one (now %s)' % got
+        ip_alert(why)
+        return why
+    return None
+
+
 def scheduled_login(*, _verify: Optional[Callable] = None, _login: Optional[Callable] = None,
                     _creds: Optional[Callable] = None,
                     _sleep: Optional[Callable] = None) -> Result:
     """The morning cron (08:40 and 08:55). NOOP when today's session verifies;
     UNAVAILABLE when NEO cannot be reached (no blind login); a session from an
     earlier day is replaced here, before the market, when nothing holds an order."""
+    try:
+        check_public_ip()
+    except Exception as e:
+        logger.error('public IP check failed: %s', e)
     return _run('scheduled', None, True, None, _verify, _login, _creds, _sleep)
 
 

@@ -670,3 +670,35 @@ def test_a_truncated_download_is_never_cached(home):
     with pytest.raises(Y.ScripMasterError, match='truncated'):
         Y.load(Src(CSV), today=date(2026, 11, 27), min_rows=1000)
     assert not list(home.glob('scrip_nse_fo_*.csv'))
+
+
+# -- static IP: alert and hand the trade to the owner (owner, 2026-11-27) -------------
+
+@pytest.mark.parametrize('code,msg,exc', [
+    (100008, 'unauthorized', C.Rejected),
+    (1037, 'session ip doesnt match with reqest ip', C.Unclear)])
+def test_an_ip_refusal_alerts_once_per_window(neo, monkeypatch, code, msg, exc):
+    sent = []
+    monkeypatch.setattr(S, '_flush_alerts', lambda: sent.append(1))
+    c = client(neo)
+    for _ in range(2):
+        neo.reject(code, msg) if code == 100008 else None
+        if code == 1037:
+            monkeypatch.setattr(neo, 'post', lambda url, **kw: _Resp(
+                400, {'stat': 'Not_Ok', 'stCode': 1037, 'errMsg': msg}))
+        with pytest.raises(exc):
+            buy(c)
+    alerts = (S.HOME / 'alerts.jsonl').read_text(encoding='utf-8').splitlines()
+    assert len(alerts) == 1 and 'static_ip' in alerts[0] and 'MANUALLY' in alerts[0]
+    assert len(sent) == 1
+
+
+def test_the_morning_ip_check(home, monkeypatch):
+    monkeypatch.setattr(S, '_flush_alerts', lambda: None)
+    S._ensure_home()
+    assert S.check_public_ip(lambda: '1.2.3.4') is None            # off: no expected IP
+    (S.HOME / 'config.json').write_text('{"expected_public_ipv4": "1.2.3.4"}', encoding='utf-8')
+    assert S.check_public_ip(lambda: '1.2.3.4') is None
+    assert S.check_public_ip(lambda: None) is None                  # cannot read: no alarm
+    assert 'changed' in S.check_public_ip(lambda: '5.6.7.8')
+    assert 'static_ip' in (S.HOME / 'alerts.jsonl').read_text(encoding='utf-8')

@@ -47,6 +47,10 @@ ORDER_SOURCE = 'NEOTRADEAPI'
 EMPTY_STCODE, EMPTY_MSG = 5203, 'no data'
 #: Placement refusals that are DEFINITE (not placed): documented + measured.
 REJECTED_STCODES = (1004, 1006, 1007, 1009, 100008)
+#: Order refusals that mean "this IP may not trade" (Kotak static-IP page:
+#: 100008 wrong IP; 1037 / "session ip doesnt match" = session from another IP).
+IP_STCODES = (100008, 1037)
+IP_TEXT = ('session ip', 'static ip', 'whitelist')
 TRANSIENT_STCODES = (1005,)
 
 TERMINAL = ('complete', 'rejected', 'cancelled')
@@ -585,6 +589,8 @@ class NeoClient:
             raise Unclear('%s: %s' % (what, type(e).__name__))
         d = self._json(r)
         body = scrub(getattr(r, 'text', '') or '')
+        if stcode(d) in IP_STCODES or any(t in neo_msg(d).lower() for t in IP_TEXT):
+            S.ip_alert('%s refused: stCode %s %s' % (what, stcode(d), neo_msg(d)[:120]))
         if is_session_dead(r.status_code, d):
             # Rule: NEVER a login on mutation evidence. Unclear; the book decides.
             logger.warning('%s: HTTP %s session rejected (gen %d) -- unclear, no login; '
