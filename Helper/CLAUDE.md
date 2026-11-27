@@ -1050,6 +1050,15 @@ the replay's own crudeness), and the window was in the top 2.7% of 294 since
 2020 — a falling market, 55 of 58 closes PE. `golive` does not compute these
 yet; read them by hand until the build adds them.
 
+**After INCONCLUSIVE at 150 — the bad-weeks stage (added 2026-11-26, at 99 of
+100, an addition, §4 unchanged and read first).** Regime condition 2 has almost
+no PASS path (window ~94th pct). So: once ≥ 40 test trades entered in
+replay-negative week × side cells have closed — PASS if live minus the replay in
+those cells ≥ 0 AND the mean reweighted to the historical good/bad-week mix > 0,
+else FAIL. No further extension. An **owner-override pilot** (1 lot, cap 4,
+≤ 25K, Rs 75K loss budget, fills only, never a PASS) is defined but NOT started.
+Full text: `docs/NAKED_100_TRADE_TEST.md` §4.
+
 The verdict reads IN PROGRESS until 100 have entered, WAITING until all of them
 have closed and the replay of their window is complete, and BLOCKED (never
 FAIL) when the replay cannot run. +12% is two standard errors at n=100 when one
@@ -1073,18 +1082,27 @@ corrected replay the fastest fifth ran −7.1% a trade vs −3.1% for the rest
 and hit the wrong-way level more often (81% vs 70%) — speed was volatility, not
 direction. The FIRST signal on a line reaches it faster but earns no more.
 
-**Live limits for the naked build — amended 2026-10-26 (owner, after Fable's
-drawdown review).** Cap 8 open, **at most 4 CE and 4 PE**, 1 lot, premium ≤
-Rs 25K per trade (skip, never resize), **Rs 5L capital** (one side gapping
-−85% at the cap ≈ 17% of it). Pause is automatic (4 stops in 3 sessions → 2
+**Live limits for the naked build — amended 2026-11-06 (owner).** Cap 8
+open **either side (the ≤ 4 CE / ≤ 4 PE side cap was DROPPED 2026-11-06 — it
+halved the replayed net for 5 points of drawdown)**, 1 lot, premium ≤ Rs 25K
+per trade (skip, never resize), **Rs 5L capital**. Accepted: a full one-sided
+book gapping −85% ≈ Rs 1.7L = 34% of it, past the kill. Other sizing ideas
+(open-premium ceiling, ≤ 20K, NIFTY hedge) are closed. Pause is automatic (4 stops in 3 sessions → 2
 sessions without entries). Kill (−25% from peak equity INCLUDING open marks,
 fills > 3% worse than paper, or the test FAILs) stops NEW entries only, and
 **only the owner restarts it** — the peak resets to equity at the restart.
 The 5-straight-stops kill is DROPPED: a 5-stop streak occurs on 96-100% of
 bootstrap paths at any edge. No regime gate on entry survived out-of-sample
 (Fable, 2024-26) — do not build one. Full table and the replay behind it:
-`docs/NAKED_100_TRADE_TEST.md` §11. The naked live path is NOT built yet
-(design frozen 2026-10-26, `docs/NAKED_LIVE_DESIGN.md`, Windows only). The
+`docs/NAKED_100_TRADE_TEST.md` §11. The naked live path is BEING BUILT,
+nothing armed (`naked_live: off`; design `docs/NAKED_LIVE_DESIGN.md`, Windows
+only): P0 structure scoping, P1 one shared exit-rule core (`zebra/naked_rules.py`),
+P2 the halt (`zebra/naked_halt.py`, `zebra halt` / `zebra resume`), P3a the entry
+hook + gates (`zebra/naked_entry.py`) are done; **`live` refuses to enter until the
+NEO order adapter (P3b) lands.** Owner 2026-11-27: naked orders go through **Kotak
+NEO** via the shared `BOTS/kotak_neo` package (quotes stay on Kite); the −50% stop
+is a MONITORED stop (SL-M is refused for options by NEO's RMS). Go-live order:
+ETF_PI, then NIFTY BTST, then naked LAST. The
 nightly digest carries a "NIFTY ±3% on the open book" section
 (`zebra/book_shock.py`) — the rupee figure that judges the accepted
 reversal exposure, measured on the uncapped paper book until live records

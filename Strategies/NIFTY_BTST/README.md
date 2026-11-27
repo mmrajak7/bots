@@ -385,9 +385,10 @@ without it). Then `execution: rehearsal` for a few sessions including an overnig
 (`state_rehearsal/`), then Stage 2 review.
 
 ### Stage 3 — the order probe (REAL, 1 lot, cheapest far-OTM weekly, inside market hours)
-**Stop the live cron first** (`crontab -e`, comment the `live-run` line; `pkill -f "nifty_btst
-live-run"`): whether a second NEO login kills the first is unmeasured, and the probe refuses to run
-while `state_live/run.lock` is held.
+The probe refuses to run while `state_live/run.lock` is held. (A second NEO login does NOT kill
+the first -- measured 2026-11-27, see below -- but the refusal stays: two processes sending orders
+on one account is still the wrong shape.) `execution` must read `live` while it runs: on a
+rehearsal box set it for the run only and restore the file after, as was done on 2026-11-27.
 ```bash
 echo 2026-MM-DD > state_live/PROBE_ARM                   # today's date; expires tonight
 ../../CROCODILE/venv/bin/python -m nifty_btst neo-order-probe --symbol <sym> --confirm-real-order
@@ -413,6 +414,30 @@ before it buys (R5-10). A positions read that fails prints `row UNKNOWN` and sen
 report at the end means the reports may be lagging: do NOT re-run; check the app. Every step journals to
 `state_live/intents.jsonl`, always reports what is held, and always sends a Telegram.
 
+### Measured on the Pi, 2026-11-27 (Stage 0 + Stage 3, owner-approved, 1 lot, account flat after)
+
+| fact | measured |
+|---|---|
+| static IP | the whitelisted primary IP is the home router's public IPv4 (Pi and laptop share it at home) |
+| empty report (order book, trades, positions) | `{"stat":"Not_Ok","stCode":5203,"errMsg":"No Data","desc":"data not found"}` at HTTP 200 -- the message key is **`errMsg`**, not `emsg` (fixed in `neo_client` K0, commit `2e54431`; config default `No Data` now matches) |
+| `GuiOrdId` | **echoes our tag** |
+| resting BUY -> cancel | visible `open` at once; cancel confirmed in 0.1-0.2 s |
+| cancel success reply | `{"result":"<order no>","stat":"Ok","stCode":200}` -- no `nOrdNo` (fixed: was read as UNCLEAR) |
+| cancel of an unknown order | HTTP 400 `{"stCode":1018,"errMsg":..,"stat":"<same text>"}` |
+| place with a bad symbol | HTTP 400 `stCode 1007` (a documented refusal) |
+| BUY at ask / SELL at bid | filled at once (8.80 / 8.75, NIFTY 26450 CE weekly) |
+| **SL-L** (`pt "SL"`, trigger + limit) | rests as `trigger pending` in 0.2 s; cancel 0.1 s |
+| **SL-M** | **REJECTED by RMS for options** after the API returned an order number: `STOP LOSS MARKET ORDER NOT ALLOWED IN OPTIONS` |
+| trade-book rows | one row per FILL: `rptTp "fill"`, `fldQty` = fill shares, `qty` 0 |
+| positions | `flBuyQty`/`flSellQty` in SHARES (130/130 for two 65-lot round trips) |
+| second login | **does NOT kill the first** (reads, 3 checks) |
+| unexplained | one HTTP 401 on PLACE at 13:32:47, 5 s after a fresh login; nothing placed; place auth fine 10 min later |
+| charges | funds 50,000 -> 49,947.80 after 2 round trips: ~Rs 42 beyond the spread on 4 fills -- check the contract note against `brokerage_per_order` 0 |
+
+The shared `kotak_neo` package (BOTS root) now owns the NEO login for every bot (one session,
+`~/.kotak_neo/`, crons 08:40/08:55). BTST still logs in itself until it migrates (plan K5); the
+measurement above is why the two can coexist meanwhile.
+
 **Measurements Stage 0/3 must produce** (the code's defaults are assumptions until then):
 1. Positions report: does a carried lot have a row at 09:00 and at 09:15, and what does the row show
    after it is sold today? -> if no row, `live-confirm-held` becomes a required morning step (the
@@ -421,7 +446,7 @@ report at the end means the reports may be lagging: do NOT re-run; check the app
 3. The empty envelope of each report separately -> `neo.empty_report_<report>`.
 4. How long the order book and positions lag after a send and after a fill -> `unknown_grace_sec`
    (600) and `positions_lag_sec` (60).
-5. Whether a second login kills the first -> whether the probe may ever run beside the cron.
+5. ~~Whether a second login kills the first~~ -- MEASURED 2026-11-27: it does not (reads).
 6. Whether `flBuyQty` and related fields are in shares or lots (`positions.md` says to divide F&O
    values by `lotSz`) -> `neo.position_qty_unit`. A wrong setting trips the kill loud, never reads flat.
 7. Which `Not_Ok` codes a placement really returns -> `neo.rejected_stcodes` / `neo.retry_stcodes`.
@@ -450,8 +475,8 @@ that touches this folder, both loops need the restart; the paper one is harmless
 
 ### Not verified against NEO (until Stage 0/3)
 Weekly `pTrdSymbol` spelling; the `pExpiryDate` epoch offset; `GuiOrdId` echo (the code falls back
-to symbol+side+qty+time); the empty-report envelopes; the limits field name; session lifetime and
-whether a second login kills the first; the `sId` query parameter; the seven measurements above;
+to symbol+side+qty+time) -- GuiOrdId, the empty envelopes, the limits field `Net` and the second
+login were MEASURED 2026-11-27 (table above); still open: session lifetime; the `sId` query parameter; the seven measurements above;
 whether `trdSym` in positions equals `pTrdSymbol`; whether Holdings lists an NRML option at all; the
 order-book status strings beyond the documented ones (`trigger pending`, `modified`,
 `cancel pending` are treated as live; anything else is alerted and treated as live).
