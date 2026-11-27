@@ -21,8 +21,8 @@ EMPTY_BOOK = {'stat': 'Not_Ok', 'stCode': 5203, 'errMsg': 'No Data',
 CANCEL_UNKNOWN = {'stCode': 1018, 'errMsg': 'please provide valid internal order number',
                   'stat': 'please provide valid internal order number'}
 PLACE_BAD_SYMBOL = {'stCode': 1007, 'errMsg': 'please provide valid symbol', 'stat': 'Not_Ok'}
-CANCEL_OK = {'result': '261127000487654', 'stat': 'Ok', 'stCode': 200}
-PLACE_OK = {'nOrdNo': '261127000487661', 'stat': 'Ok', 'stCode': 200}
+CANCEL_OK = {'result': '261127000100001', 'stat': 'Ok', 'stCode': 200}
+PLACE_OK = {'nOrdNo': '261127000100002', 'stat': 'Ok', 'stCode': 200}
 
 
 @pytest.fixture
@@ -57,7 +57,7 @@ def test_errmsg_session_dead_text_is_recognised():
 def test_cancel_success_with_result_is_a_success(http):
     t = reader(http, trader=True)
     http.script[nc.PATH_CANCEL] = R(200, CANCEL_OK)
-    assert t.cancel('261127000487654') == '261127000487654'
+    assert t.cancel('261127000100001') == '261127000100001'
 
 
 def test_cancel_with_neither_id_is_still_unclear(http):
@@ -74,7 +74,7 @@ def test_place_success_still_needs_nordno_not_result(http):
     http.script[nc.PATH_PLACE] = [R(200, PLACE_OK), R(200, {'result': '9', 'stat': 'Ok'})]
     kw = dict(symbol='s', token='1', side='B', qty=65, price='1.00', tag='t',
               segment='nse_fo', product='NRML')
-    assert t.place(**kw) == '261127000487661'
+    assert t.place(**kw) == '261127000100002'
     with pytest.raises(NeoUnclear):
         t.place(**kw)
 
