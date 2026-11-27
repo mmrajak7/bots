@@ -22,7 +22,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import util
 
@@ -136,10 +136,15 @@ class Window:
     derived: Path            # state/derived/<m>_<signal_day>
 
 
-def configure(M: Modules, w: Window, members_m: List[str]) -> None:
-    """Point the research modules at the window. In memory only (no module file is edited)."""
+def configure(M: Modules, w: Window, members_m: List[str], kite_sessions: Sequence[str] = ()) -> None:
+    """Point the research modules at the window. In memory only (no module file is edited).
+    kite_sessions: Kite's session list is the truth for which days to request. The research fetcher only asks for
+    weekdays + its frozen calendar + a hand list of weekend sessions (EXTRA_WEEKEND, ends 2024), so a weekend session
+    after that (muhurat Sun 2026-11-08) was never requested and the evening stopped on a missing CM file."""
     m = w.plan_month
     M.NF.END = w.signal_day
+    weekend = {d for d in kite_sessions if dt.date.fromisoformat(d).weekday() >= 5}
+    M.NF.EXTRA_WEEKEND = sorted(set(M.NF.EXTRA_WEEKEND) | weekend)
     orig_months, orig_raw = M.CA.months, M.CA.load_raw
     last_ca = m                                   # CA files through the plan month (current AND next, §3.2)
     if not getattr(M.CA, "_mom_wrapped", False):

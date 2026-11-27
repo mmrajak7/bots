@@ -42,6 +42,29 @@ class TestEvening(unittest.TestCase):
         self.assertEqual(P.month_add("2027-01", -1), "2026-12")
 
 
+HOME = Path(__file__).resolve().parents[1]
+NSE = (HOME / "../../NSE_DATA").resolve()
+
+
+@unittest.skipUnless((NSE / "srs_base").exists(), "NSE data not on this machine")
+class TestKiteWeekendSessions(unittest.TestCase):
+    def test_weekend_kite_session_is_requested(self) -> None:
+        """DRY-1 2026-11-27: Kite had the Sunday muhurat session 2026-11-08; the research fetcher's date list (weekdays
+        + frozen calendar + EXTRA_WEEKEND to 2024) never asked NSE for it -> 'Kite sessions without an ok CM file'."""
+        M = P.import_research(HOME / "pipeline", NSE)
+        saved = (M.NF.END, list(M.NF.EXTRA_WEEKEND))
+        try:
+            w = P.Window("2026-12", dt.date(2026, 11, 27), Path(tempfile.mkdtemp()) / "d")
+            self.assertNotIn("2026-11-08", M.NF.dates(set()))
+            P.configure(M, w, [], ["2026-11-06", "2026-11-08", "2026-11-09"])
+            ds = M.NF.dates(set())
+            self.assertIn("2026-11-08", ds)
+            self.assertNotIn("2026-11-07", ds)                # a weekend day Kite did not trade stays out
+            self.assertIn("2023-11-12", ds)                   # the hand list is kept
+        finally:
+            M.NF.END, M.NF.EXTRA_WEEKEND = saved
+
+
 class TestVetValidate(unittest.TestCase):
     ids = ["a", "b"]
 

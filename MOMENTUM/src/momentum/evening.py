@@ -97,7 +97,7 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
     w = P.Window(m, signal_day, paths.derived / f"{m}_{sd}")
     fo_today = P.fo_url_fetch(M, sd, Path(cfg["_nse_data"]) / "fo_bhav_live" / f"{sd}.zip")
     members = sorted(fo_today | P.announced_additions(M, m))
-    P.configure(M, w, members)
+    P.configure(M, w, members, sess)
     unmarked = P.unmark_sessions(M, prev_sess)
     if unmarked:
         env.journal.append("NOTE", text=f"re-requesting NSE files for Kite sessions marked missing: {unmarked}")
