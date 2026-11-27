@@ -144,12 +144,24 @@ class TestDecide(unittest.TestCase):
                              ("FAOP77200", "withdrawal", None, ["NEWCO"])), cands=cands)
         self.assertEqual((r["status"], r["entrants"]), ("ok", ["OTHERCO"]))
 
-    def test_liveness_needs_an_introduction(self) -> None:
+    def test_a_quiet_quarter_is_not_a_failure(self) -> None:
+        """No introduction in the look-back is normal (none Jan 2022 - Nov 2024): liveness is the scan's job."""
         other = "   All Members,\n\n   Exclusion of something about securities\n"
         r = F.decide(answer(("FAOP9", "other", None, [])), [cand("FAOP9", other, "2026-11-01")], SD, FS, FO_TODAY,
                      EQ, {}, "2026-08-01", 30)
-        self.assertEqual(r["status"], "failed")
-        self.assertTrue(any("scan looks broken" in p for p in r["problems"]))
+        self.assertEqual((r["status"], r["entrants"]), ("ok", []))
+
+    def test_off_menu_kind_keeps_the_codes_reading(self) -> None:
+        r = self.run_(answer(OCT, ("FAOP77100", "maybe", None, [])))
+        self.assertEqual((r["status"], r["entrants"]), ("failed", ["NEWCO", "OTHERCO"]))
+
+    def test_withdrawal_does_not_cancel_a_later_announcement(self) -> None:
+        wd = ("   All Members,\n\n   Withdrawal of introduction of Futures & Options contracts on NEWCO\n\n"
+              "   the introduction of futures and options contracts on NEWCO stands withdrawn.\n")
+        cands = self.cands + [cand("FAOP77000", wd, "2026-11-02")]          # withdrawn BEFORE the 16 Nov circular
+        r = self.run_(answer(OCT, ("FAOP77100", "introduction", "2026-12-01", ["NEWCO", "OTHERCO"]),
+                             ("FAOP77000", "withdrawal", None, ["NEWCO"])), cands=cands)
+        self.assertEqual((r["status"], r["entrants"]), ("ok", ["NEWCO", "OTHERCO"]))
 
     def test_started_but_not_in_the_bhavcopy_is_reported(self) -> None:
         r = self.run_(answer(OCT, ("FAOP77100", "introduction", "2026-12-01", ["NEWCO", "OTHERCO"])),
@@ -225,6 +237,30 @@ class TestScan(unittest.TestCase):
         with self.assertRaises(F.FoVetError):
             F.candidates(self.d, "2026-08-01", "2026-11-30", 60)
 
+    def test_unreadable_pdf_is_recorded_and_the_scan_goes_on(self) -> None:
+        def to_text(b):  # noqa: ANN001, ANN202
+            if b"BROKEN" in b:
+                raise F.UnreadablePdf("pdftotext exit 1")
+            return b[5:].decode()
+        self.nse.pdfs[77105] = "BROKEN"
+        r = F.scan(self.d, CFG, get=self.nse.get, to_text=to_text)
+        st = F.load_scan(self.d, 0)
+        self.assertTrue(r["complete"])
+        self.assertEqual((sorted(st["hits"]), sorted(st["unreadable"])), (["77103"], ["77105"]))
+
+    def test_missing_pdftotext_stops_the_scan(self) -> None:
+        def to_text(b):  # noqa: ANN001, ANN202
+            raise F.FoVetError("pdftotext: FileNotFoundError")
+        r = F.scan(self.d, CFG, get=self.nse.get, to_text=to_text)
+        self.assertFalse(r["complete"])
+        self.assertEqual(F.load_scan(self.d, 0)["next_n"], 77103)
+
+    def test_undated_circular_is_still_a_candidate(self) -> None:
+        self.nse.pdfs[77104] = intro_text(["NEWCO"], date="sometime")
+        self.scan()
+        refs = {c["ref"]: c["date"] for c in F.candidates(self.d, "2026-08-01", "2026-11-30", 60)}
+        self.assertEqual(refs.get("FAOP77104"), "undated")
+
     def test_candidate_limit(self) -> None:
         self.scan()
         with self.assertRaises(F.FoVetError):
@@ -247,7 +283,7 @@ class TestRunCheck(unittest.TestCase):
         def classify(cs):  # noqa: ANN001, ANN202
             self.calls += 1
             return ans(cs) if callable(ans) else ans
-        cfg = dict(self.cfg, fo_scan_seed=77100)
+        cfg = dict(self.cfg, fo_scan_seed=77100, fo_min_recent_circulars=self.min_recent)
         return F.run_check(cfg, self.tmp / "fo", self.scan_dir, self.tmp / "vet", "2026-12", SD, FS, FO_TODAY, EQ,
                            [], final, classify=classify,
                            do_scan=lambda: F.scan(self.scan_dir, dict(CFG), get=self.nse.get,
@@ -270,6 +306,15 @@ class TestRunCheck(unittest.TestCase):
         r = self.check(lambda cs: (_ for _ in ()).throw(F.FoVetError("CLI down")), final=True)
         self.assertEqual((r["status"], r["final"]), ("failed", True))
         self.assertTrue((self.tmp / "fo" / f"2026-12_{SD}.json").exists())
+
+    min_recent = 2
+
+    def test_too_few_recent_circulars_fails(self) -> None:
+        self.min_recent = 3
+        r = self.check(self.good())
+        self.assertEqual(r["status"], "failed")
+        self.assertTrue(any("scan looks broken" in p for p in r["problems"]))
+        self.assertEqual(self.calls, 0)
 
     def test_incomplete_scan_fails(self) -> None:
         self.nse.fail_at = 77107
@@ -390,6 +435,39 @@ class TestDay1Backstop(Harness):
         (self.paths.decisions / "d.json").write_text(json.dumps(d) + "\n", encoding="utf-8", newline="\n")
         self.assertIsNone(E.fo_day1_guard(self.env()))
         self.assertTrue(any("FO_FALSE_EXCLUSION" in t and "GHOSTCO" in t for t, _ in self.sent))
+
+
+class TestLeavers(unittest.TestCase):
+    """Monthly expiry ON the signal day: leavers have rows that day but are not members of m (Jul 2025: 10 names)."""
+
+    def zip_(self, rows):  # noqa: ANN001, ANN201
+        import zipfile
+        p = Path(tempfile.mkdtemp()) / "fo.zip"
+        lines = ["TradDt,FinInstrmTp,TckrSymb,XpryDt"] + [f"2025-07-31,{t},{s},{e}" for t, s, e in rows]
+        with zipfile.ZipFile(p, "w") as z:
+            z.writestr("fo.csv", "\n".join(lines) + "\n")
+        return p
+
+    def test_continuing_only(self) -> None:
+        from momentum import pipeline as P
+        rows = [("STF", f"S{k}", e) for k in range(120) for e in ("2025-07-31", "2025-08-28", "2025-09-25")]
+        rows += [("STF", "LEAVER", "2025-07-31"), ("IDF", "NIFTY", "2025-08-28"), ("STO", "OPTONLY", "2025-08-28")]
+        p = self.zip_(rows)
+        cont = P.fo_continuing(p, "2025-07-31")
+        self.assertEqual(len(cont), 120)
+        self.assertNotIn("LEAVER", cont)
+        self.assertNotIn("NIFTY", cont)
+
+    def test_unreadable_expiry_refused(self) -> None:
+        from momentum import pipeline as P
+        rows = [("STF", f"S{k}", "2025-08-28") for k in range(120)] + [("STF", "BAD", "")]
+        with self.assertRaises(P.PipelineError):
+            P.fo_continuing(self.zip_(rows), "2025-07-31")
+
+    def test_too_few_refused(self) -> None:
+        from momentum import pipeline as P
+        with self.assertRaises(P.PipelineError):
+            P.fo_continuing(self.zip_([("STF", "A", "2025-08-28")]), "2025-07-31")
 
 
 class TestConfig(unittest.TestCase):

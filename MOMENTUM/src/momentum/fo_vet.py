@@ -62,6 +62,10 @@ class FoVetError(Exception):
     pass
 
 
+class UnreadablePdf(FoVetError):
+    """pdftotext ran and failed on this one file (a missing pdftotext is a plain FoVetError: it stops the scan)."""
+
+
 # ---------------------------------------------------------------- network + text
 def http_get(url: str, timeout: int = 60) -> Tuple[int, bytes]:
     """-> (HTTP status, body). 404 / 403 are answers; no answer at all raises FoVetError."""
@@ -84,7 +88,7 @@ def pdf_text(pdf: bytes) -> str:
         except (OSError, subprocess.TimeoutExpired) as e:
             raise FoVetError(f"pdftotext: {type(e).__name__}: {e}") from e
     if pr.returncode != 0:
-        raise FoVetError(f"pdftotext exit {pr.returncode}: {pr.stderr[:200]!r}")
+        raise UnreadablePdf(f"pdftotext exit {pr.returncode}: {pr.stderr[:200]!r}")
     return pr.stdout.decode("utf-8", errors="replace")
 
 
@@ -163,8 +167,13 @@ def scan(d: Path, cfg: Dict[str, Any], get: Callable[[str], Tuple[int, bytes]] =
         """-> True when the number is settled (hit or 404); raises on no answer."""
         code, body = get(f"{base}FAOP{n}.pdf")
         if code == 200 and body[:5] == b"%PDF-":
-            text = to_text(body)
             (d / f"FAOP{n}.pdf").write_bytes(body)
+            try:
+                text = to_text(body)
+            except UnreadablePdf as e:                # one bad PDF must not stop the scan for good: recorded,
+                st.setdefault("unreadable", {})[str(n)] = {"error": str(e)[:200], "on": today.isoformat()}
+                st["misses"].pop(str(n), None)        # reported by every check whose look-back it falls in
+                return True
             util.write_atomic(d / f"FAOP{n}.txt", text)
             st["hits"][str(n)] = {"date": circular_date(text), "title": circular_title(text),
                                   "sha256": util.sha256_text(text)}
@@ -313,17 +322,19 @@ CAND_RE = re.compile(r"introduc|withdraw|exclu|discontinu|cancel", re.I)
 
 
 def candidates(d: Path, since: str, upto: str, limit: int) -> List[Dict[str, Any]]:
-    """FAOP circulars dated in [since, upto] whose text talks about introducing / withdrawing / excluding."""
+    """FAOP circulars dated in [since, upto] whose text talks about introducing / withdrawing / excluding. A circular
+    whose date could not be read is kept as a candidate (date "undated"): it is never silently left out."""
     st = load_scan(d, 0)
     out = []
     for n, h in sorted(st["hits"].items(), key=lambda x: int(x[0])):
-        if not h.get("date") or not since <= h["date"] <= upto:
+        if h.get("date") and not since <= h["date"] <= upto:
             continue
         text = (d / f"FAOP{n}.txt").read_text(encoding="utf-8")
         if util.sha256_text(text) != h["sha256"]:
             raise FoVetError(f"FAOP{n}.txt changed since it was downloaded")
         if CAND_RE.search(text) and re.search(r"securit|stock", text, re.I):
-            out.append({"ref": f"FAOP{n}", "date": h["date"], "title": h.get("title", ""), "text": text})
+            out.append({"ref": f"FAOP{n}", "date": h.get("date") or "undated", "title": h.get("title", ""),
+                        "text": text})
     if len(out) > limit:
         raise FoVetError(f"{len(out)} candidate circulars > limit {limit}")
     return out
@@ -385,7 +396,7 @@ def decide(answer: Any, cands: List[Dict[str, Any]], signal_day: str, first_sess
         else:
             got[ref] = r
     intro: Dict[str, Tuple[str, Set[str]]] = {}       # ref -> (effective date, symbols) validated
-    withdrawn: Set[str] = set()
+    withdrawn: Dict[str, str] = {}                    # symbol -> date of the latest withdrawal circular
     summary = []
     for ref, c in by_ref.items():
         text = c["text"]
@@ -400,6 +411,8 @@ def decide(answer: Any, cands: List[Dict[str, Any]], signal_day: str, first_sess
         syms = {str(s).strip().upper() for s in a.get("symbols") or []}
         if kind not in KINDS:
             problems.append(f"{ref}: kind {kind!r} off menu")
+            if cr and cr["effective_date"]:
+                intro[ref] = (cr["effective_date"], set(cr["symbols"]))       # the code's own reading still counts
             continue
         bad_syms = sorted(s for s in syms if not symbol_in_text(s, text))
         if bad_syms:
@@ -427,7 +440,8 @@ def decide(answer: Any, cands: List[Dict[str, Any]], signal_day: str, first_sess
                 problems.append(f"{ref}: the vet reads an introduction the code's parser does not (format change?)")
                 intro[ref] = (str(eff), syms)
         if kind == "withdrawal":
-            withdrawn |= syms
+            for s in syms:
+                withdrawn[s] = max(withdrawn.get(s, ""), c["date"])
         if kind == "exclusion" and eff and signal_day < eff <= first_session:
             # research membership (first-session bhavcopy) no longer has these, the signal-day one still does: only
             # possible when the monthly expiry is the signal day. Reported, not acted on (exclusion stays the safe side)
@@ -437,11 +451,10 @@ def decide(answer: Any, cands: List[Dict[str, Any]], signal_day: str, first_sess
             if have != key[ref]:
                 problems.append(f"{ref}: answer key fo_announced.json has {sorted(key[ref])}, read {sorted(have)}")
         summary.append({"ref": ref, "date": c["date"], "kind": kind, "effective_date": eff, "symbols": sorted(syms)})
-    if not any(c["date"] >= lookback_from for ref, c in by_ref.items() if ref in intro):
-        problems.append(f"no F&O introduction circular since {lookback_from}: the scan looks broken")
     entrants: Set[str] = set()
     for ref, (eff, syms) in intro.items():
-        live = syms - withdrawn
+        # a withdrawal cancels only introductions announced on or before it (a later re-announcement stands)
+        live = {s for s in syms if not (s in withdrawn and withdrawn[s] >= by_ref[ref]["date"])}
         if eff <= signal_day:
             missing = sorted(s for s in live if s not in fo_today and s in eq)
             if missing and by_ref[ref]["date"] >= lookback_from:
@@ -487,6 +500,13 @@ def run_check(cfg: Dict[str, Any], fo_dir: Path, scan_dir: Path, vet_dir: Path, 
         sc = (do_scan or (lambda: scan(scan_dir, cfg)))()
         if not sc["complete"]:
             raise FoVetError(f"circular scan incomplete: {sc['stopped'] or 'not through the RSS max'}")
+        st = load_scan(scan_dir, 0)
+        recent = sum(1 for h in st["hits"].values() if (h.get("date") or "") >= lookback_from)
+        if recent < int(cfg["fo_min_recent_circulars"]):
+            # liveness of the SCAN (NSE issues ~8 F&O circulars a month), not of NSE's introductions: a quiet
+            # quarter with no new F&O stocks is normal and must not fail the vet
+            raise FoVetError(f"only {recent} F&O circulars since {lookback_from}: the scan looks broken")
+        unreadable = sorted(f"FAOP{n}" for n, u in (st.get("unreadable") or {}).items())
         cands = candidates(scan_dir, lookback_from, util.today().isoformat(), int(cfg["fo_vet_max_circulars"]))
         if not cands:
             raise FoVetError(f"no candidate F&O circulars since {lookback_from}")
@@ -495,6 +515,9 @@ def run_check(cfg: Dict[str, Any], fo_dir: Path, scan_dir: Path, vet_dir: Path, 
         res = decide(ans, cands, signal_day, first_session, fo_today, eq, answer_key(announced_rows),
                      lookback_from, int(cfg["fo_vet_max_entrants"]))
         res["rss_max"] = sc["rss_max"]
+        if unreadable:
+            res["info"].append(f"F&O circulars pdftotext could not read (not checked; the day-1 check still guards): "
+                               f"{unreadable[:10]}")
     except Exception as e:  # noqa: BLE001 - any failure (a bug included) is a failed vet, never a lost plan (D47)
         log.exception("F&O vet %s %s failed", m, signal_day)
         res = {"status": "failed", "entrants": [], "problems": [f"{type(e).__name__}: {e}"], "info": [],

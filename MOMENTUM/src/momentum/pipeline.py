@@ -100,6 +100,41 @@ def fo_url_fetch(M: Modules, d: str, dest: Path) -> Set[str]:
     return set(syms)
 
 
+def fo_continuing(zpath: Path, signal_day: str) -> Set[str]:
+    """Stock futures in the signal-day F&O bhavcopy with a contract expiring AFTER the signal day. When the monthly
+    expiry IS the signal day, a stock leaving F&O still has a row that day but none on the next session, and the
+    research membership (first-session bhavcopy, fo_membership.py) does not count it. Checked on the Pi 2026-11-28:
+    continuing + vet entrants == fo_membership.json[m] exactly for 2025-08 (10 leavers), 2025-10, 2026-01, 2026-04."""
+    import csv
+    import io
+    import zipfile
+    with zipfile.ZipFile(zpath) as z:
+        text = z.read(z.namelist()[0]).decode("utf-8", errors="replace")
+    out: Set[str] = set()
+    seen = 0
+    for r in csv.DictReader(io.StringIO(text)):
+        r = {k.strip(): (v or "").strip() for k, v in r.items() if k}
+        if r.get("FinInstrmTp") == "STF":                           # UDiFF (every live signal day)
+            sym, exp = r.get("TckrSymb", ""), r.get("XpryDt", "")
+        elif r.get("INSTRUMENT") == "FUTSTK":                       # old format: 31-Jul-2025
+            sym = r.get("SYMBOL", "")
+            try:
+                exp = dt.datetime.strptime(r.get("EXPIRY_DT", ""), "%d-%b-%Y").date().isoformat()
+            except ValueError:
+                exp = ""
+        else:
+            continue
+        if len(exp) != 10:
+            raise PipelineError(f"F&O bhavcopy {zpath.name}: stock future {sym} without a readable expiry")
+        seen += 1
+        if exp > signal_day:
+            out.add(sym)
+    if len(out) < MIN_STOCK_FUTURES:
+        raise PipelineError(f"F&O bhavcopy {zpath.name}: only {len(out)} stock futures continue after "
+                            f"{signal_day} ({seen} rows)")
+    return out
+
+
 def announced_additions(M: Modules, m: str) -> Set[str]:
     """NEW F&O entrants for month m from fo_announced.json (list of {symbol, member_month, withdrawn?},
     joiner_positional.py:89). Only member_month == m: older additions are already in the signal-day F&O bhavcopy if

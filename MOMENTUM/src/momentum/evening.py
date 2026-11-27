@@ -138,7 +138,16 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
         raise EveningError(f"signal day {sd} is not Kite's last {prev} session ({prev_sess[-3:]})")
     # 2. NSE data (CM, CA current + next month, indices), then the F&O list of the signal day
     w = P.Window(m, signal_day, paths.derived / f"{m}_{sd}")
-    fo_today = P.fo_url_fetch(M, sd, Path(cfg["_nse_data"]) / "fo_bhav_live" / f"{sd}.zip")
+    fo_zip = Path(cfg["_nse_data"]) / "fo_bhav_live" / f"{sd}.zip"
+    fo_all = P.fo_url_fetch(M, sd, fo_zip)
+    # research membership of m = futures on m's first session: a stock whose last contract expires ON the signal day
+    # (monthly expiry = signal day) is not a member of m; one starting on the first session is (the F&O vet, below)
+    fo_today = P.fo_continuing(fo_zip, sd)
+    leavers = sorted(fo_all - fo_today)
+    if leavers and not any(r["type"] == "NOTE" and r.get("fo_leavers_of") == sd for r in j.read()):
+        env.journal.append("NOTE", fo_leavers_of=sd, text=f"F&O leavers on the signal day {sd} (last expiry today, "
+                           f"not members of {m}): {leavers}")
+        env.notify(f"F&O INFO {m}: {leavers} leave F&O with today's expiry: not excluded (research membership)")
     members = sorted(fo_today | P.announced_additions(M, m))
     P.configure(M, w, members, sess)
     unmarked = P.unmark_sessions(M, prev_sess)

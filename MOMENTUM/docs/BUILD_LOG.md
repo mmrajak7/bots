@@ -105,3 +105,11 @@
   30-min evening run would cost ~10 min (now once a day). New: fo_vet.py, `fo-scan` (cron 19:05), `fo-vet
   --as-of-signal`, engine.fo_day1_guard (14:45, fail closed), Paths.fo_vet / cache/fo_circulars, 12 config keys.
   tests/test_fo.py 31 tests; 122/122.
+- 2026-11-28 review (advisor) fixes: undated circulars stay candidates; one unreadable PDF no longer stops the scan
+  (recorded + reported); an off-menu vet answer keeps the code's own reading; a withdrawal cancels only earlier
+  announcements; liveness = >= 8 F&O circulars in the look-back (a quarter without introductions is normal, none
+  Jan 2022 - Nov 2024). Real-data positive test on the Pi (real vet CLI call, real F&O + CM files): entrants ==
+  announced_additions - signal-day set for 2026-04 (8), 2025-08 (2), 2025-10 (1), 2026-01 (0). The membership check
+  found the LEAVER gap (monthly expiry = signal day: 10 names in Jul 2025 still in the signal-day file): members now
+  use futures expiring after the signal day (pipeline.fo_continuing) -> continuing + entrants == fo_membership.json[m]
+  exactly in all four months. Seed scan done on the Pi: FAOP75371..77661, 55 circulars. 131/131.

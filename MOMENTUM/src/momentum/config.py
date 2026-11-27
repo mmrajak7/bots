@@ -25,7 +25,7 @@ REQUIRED_KEYS = (
     "probe_reads", "probe_wait_s",
     "fo_scan_seed", "fo_rss_url", "fo_circular_base", "fo_scan_settle_days", "fo_scan_pause_s", "fo_vet_timeout_s",
     "fo_vet_max_circulars", "fo_vet_max_entrants", "fo_lookback_days", "fo_vet_give_up", "fo_vet_fail_action",
-    "fo_min_stock_futures",
+    "fo_min_stock_futures", "fo_min_recent_circulars",
 )
 TIME_KEYS = ("step_plan_at", "place_at", "last_place_at", "cancel_at", "reconcile_at", "token_first_poll",
              "token_alert_at", "token_deadline", "plan_final")
@@ -157,7 +157,7 @@ def load(home: Optional[Path] = None, overrides: Optional[Dict[str, Any]] = None
         if not isinstance(cfg[k], int) or isinstance(cfg[k], bool) or cfg[k] <= 0:
             raise ConfigError(f"{k} must be a positive int")
     for k in ("fo_scan_seed", "fo_scan_settle_days", "fo_vet_timeout_s", "fo_vet_max_circulars", "fo_vet_max_entrants",
-              "fo_lookback_days", "fo_min_stock_futures"):
+              "fo_lookback_days", "fo_min_stock_futures", "fo_min_recent_circulars"):
         if not isinstance(cfg[k], int) or isinstance(cfg[k], bool) or cfg[k] <= 0:
             raise ConfigError(f"{k} must be a positive int")
     if not _is_hhmm(cfg["fo_vet_give_up"]) or not cfg["fo_vet_give_up"] < cfg["plan_final"]:

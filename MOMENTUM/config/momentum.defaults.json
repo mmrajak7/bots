@@ -72,5 +72,6 @@
  "fo_lookback_days": 120,
  "fo_vet_give_up": "21:30",
  "fo_vet_fail_action": "final_alert",
- "fo_min_stock_futures": 150
+ "fo_min_stock_futures": 150,
+ "fo_min_recent_circulars": 8
 }
