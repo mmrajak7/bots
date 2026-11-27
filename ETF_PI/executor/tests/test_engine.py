@@ -30,7 +30,8 @@ from executor.rules import Quote               # noqa: E402
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 SYM = 'NIFTY26DEC26000CE'
-KCN, KON, KS, KY = import_kotak_neo(os.path.dirname(ETF))
+# kotak_neo exactly where the daemon finds it (config bots_root: the Pi's ETF clone is sparse)
+KCN, KON, KS, KY = import_kotak_neo(C.load(local_path=os.path.join(ETF, 'no_such_overlay.yaml'))['bots_root'])
 
 
 class Rig:
