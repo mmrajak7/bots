@@ -101,6 +101,21 @@ def _i(v: Any, d: int = 0) -> int:
         return d
 
 
+class RowError(ValueError):
+    pass
+
+
+def _strict_int(r: Dict[str, Any], k: str) -> int:
+    v = r.get(k)
+    try:
+        n = int(float(str(v).strip()))
+    except (TypeError, ValueError):
+        raise RowError('order row %s=%r is not a number' % (k, v))
+    if n < 0:
+        raise RowError('order row %s=%r is negative' % (k, v))
+    return n
+
+
 @dataclass(frozen=True)
 class OrderView:
     order_no: str
@@ -133,20 +148,23 @@ class OrderView:
 
     @classmethod
     def from_neo(cls, r: Dict[str, Any]) -> 'OrderView':
+        """STRICT on the numbers money depends on (review F5): a row whose
+        quantity or filled quantity cannot be read is an ERROR, never a zero --
+        a `complete` order read as `filled 0` would be sold a second time.
+        Quantities are SHARES (measured: 1 lot of NIFTY 65 -> qty 65)."""
         rej = str(r.get('rejRsn') or '').strip()
+        qty, fld = _strict_int(r, 'qty'), _strict_int(r, 'fldQty')
+        if fld > qty:
+            raise RowError('order %s filled %d > qty %d' % (r.get('nOrdNo'), fld, qty))
         return cls(order_no=str(r.get('nOrdNo', '')),
                    status=str(r.get('ordSt', '')).strip().lower(),
                    symbol=str(r.get('trdSym') or r.get('sym') or ''),
-                   side=str(r.get('trnsTp', '')).upper()[:1], qty=_i(r.get('qty')),
-                   filled=_i(r.get('fldQty')), avg_price=_f(r.get('avgPrc')),
+                   side=str(r.get('trnsTp', '')).upper()[:1], qty=qty,
+                   filled=fld, avg_price=_f(r.get('avgPrc')),
                    price=_f(r.get('prc')), trigger=_f(r.get('trgPrc')),
                    kind=str(r.get('prcTp') or ''), rej_reason='' if rej == '--' else rej,
                    tag=str(r.get('GuiOrdId') or ''), placed_at=str(r.get('ordDtTm') or ''),
                    raw=r)
-
-
-class RowError(ValueError):
-    pass
 
 
 @dataclass(frozen=True)
@@ -192,27 +210,12 @@ def _owners_path():
 
 
 @contextmanager
-def _owners() -> Iterator[Dict[str, str]]:
-    """{neo symbol: bot}, read-modify-written under its own lock."""
-    lockp = S.HOME / 'owners.lock'
-    S._ensure_home()
-    fd = os.open(str(lockp), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        deadline = time.time() + 10
-        while True:
-            try:
-                if os.name == 'nt':
-                    import msvcrt
-                    os.lseek(fd, 0, 0)
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if time.time() > deadline:
-                    raise Unavailable('owners.json lock busy')
-                time.sleep(0.05)
+def _owners() -> Iterator[Dict[str, Any]]:
+    """{neo symbol: {bot, since}}, read-modify-written under its own lock.
+    Unreadable -> Unavailable (fail CLOSED for anything that adds exposure)."""
+    with S.file_lock('owners.lock', 10.0) as got:
+        if not got:
+            raise Unavailable('owners.json lock busy')
         try:
             with open(str(_owners_path()), encoding='utf-8') as f:
                 data = json.load(f)
@@ -221,30 +224,37 @@ def _owners() -> Iterator[Dict[str, str]]:
         except FileNotFoundError:
             data = {}
         except (OSError, ValueError) as e:
-            # Fail CLOSED: an unreadable ownership file must not let two bots
-            # trade one contract. Nothing is placed until a human looks.
             raise Unavailable('owners.json unreadable (%s) -- no order placed' % e)
-        before = dict(data)
+        before = json.dumps(data, sort_keys=True)
         yield data
-        if data != before:
+        if json.dumps(data, sort_keys=True) != before:
             S._write_private(_owners_path(), data)
-    finally:
-        try:
-            if os.name == 'nt':
-                import msvcrt
-                os.lseek(fd, 0, 0)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(fd)
+
+
+def _holder(v: Any) -> Optional[str]:
+    if isinstance(v, dict):
+        return v.get('bot')
+    return v or None
 
 
 def owner_of(symbol: str) -> Optional[str]:
     with _owners() as o:
-        return o.get(symbol)
+        return _holder(o.get(symbol))
+
+
+def owners() -> Dict[str, Any]:
+    with _owners() as o:
+        return dict(o)
+
+
+def assign(symbol: str, bot: Optional[str]) -> None:
+    """Owner/CLI: set (or with None clear) the holder of `symbol`."""
+    with _owners() as o:
+        if bot is None:
+            o.pop(symbol, None)
+        else:
+            o[symbol] = {'bot': bot, 'since': S._now().isoformat(timespec='seconds'),
+                         'assigned': True}
 
 
 # -- the client ---------------------------------------------------------------------------
@@ -348,13 +358,25 @@ class NeoClient:
         raise Unavailable('%s: %s (stCode %s)' % (what, neo_msg(d) or 'Not_Ok', stcode(d)))
 
     # -- reads -----------------------------------------------------------------
+    def _views(self, path: str, what: str) -> List[OrderView]:
+        try:
+            return [OrderView.from_neo(r) for r in self._rows(self._read('GET', path), what)]
+        except RowError as e:
+            raise Unavailable('%s: %s' % (what, e))
+
     def order_book(self) -> List[OrderView]:
-        return [OrderView.from_neo(r) for r in self._rows(self._read('GET', PATH_ORDER_BOOK),
-                                                          'order book')]
+        return self._views(PATH_ORDER_BOOK, 'order book')
 
     def trades(self) -> List[OrderView]:
-        return [OrderView.from_neo(r) for r in self._rows(self._read('GET', PATH_TRADES),
-                                                          'trade book')]
+        return self._views(PATH_TRADES, 'trade book')
+
+    def net_held(self, symbol: str) -> int:
+        """This account's net quantity in `symbol` (shares). Raises Unavailable."""
+        return sum(p.net_qty for p in self.positions() if p.symbol == symbol)
+
+    def live_orders(self, symbol: str, side: Optional[str] = None) -> List[OrderView]:
+        return [o for o in self.order_book() if o.symbol == symbol and not o.terminal
+                and (side is None or o.side == side)]
 
     def positions(self) -> List[PositionView]:
         out = []
@@ -365,61 +387,106 @@ class NeoClient:
                 raise Unavailable('positions: %s' % e)
         return out
 
-    def funds(self, field_name: str = 'Net') -> Optional[float]:
-        """Available rupees, or None (callers fail closed on None)."""
+    def funds(self, field_name: str = 'Net') -> float:
+        """Available rupees. Raises Unavailable when it cannot be read (one
+        failure mode, so no caller can mistake a None for a number)."""
         d = self._read('POST', PATH_LIMITS, {'seg': 'ALL', 'exch': 'ALL', 'prod': 'ALL'})
         if not is_ok(d):
             raise Unavailable('limits: %s' % (neo_msg(d) or 'Not_Ok'))
         try:
             return float(str(d.get(field_name)).replace(',', ''))
         except (TypeError, ValueError):
-            logger.error('limits has no usable %r', field_name)
-            return None
+            raise Unavailable('limits has no usable %r' % field_name)
 
     def orders_tagged(self, tag: str) -> List[OrderView]:
         return [o for o in self.order_book() if o.tag == tag]
 
     def scrip_master_paths(self) -> List[str]:
+        """Links to the per-segment scrip-master CSVs (consumer key auth, as
+        the SDK and BTST do). Every failure is Unavailable."""
+        import requests
         s = self.session()
-        r = self.http.get(s.base_url + PATH_SCRIP_MASTER,
-                          headers={'Authorization': s.consumer_key, 'accept': 'application/json'},
-                          timeout=self.timeout, allow_redirects=False)
+        S.pin_ipv4()
+        try:
+            r = self.http.get(s.base_url + PATH_SCRIP_MASTER,
+                              headers={'Authorization': s.consumer_key,
+                                       'accept': 'application/json'},
+                              timeout=self.timeout, allow_redirects=False)
+        except requests.RequestException as e:
+            raise Unavailable('scrip master paths: %s' % type(e).__name__)
         d = self._json(r)
-        paths = ((d or {}).get('data') or {}).get('filesPaths')
+        data = (d or {}).get('data')
+        paths = data.get('filesPaths') if isinstance(data, dict) else None
         if r.status_code != 200 or not isinstance(paths, list) or not paths:
             raise Unavailable('scrip master paths: HTTP %s' % r.status_code)
         return [str(p) for p in paths]
 
     def fetch_text(self, url: str, timeout: float = 60.0) -> str:
-        r = self.http.get(url, timeout=timeout)
+        import requests
+        from urllib.parse import urlparse
+        if urlparse(url).scheme != 'https':
+            raise Unavailable('download refused: not https')
+        try:
+            r = self.http.get(url, timeout=timeout, allow_redirects=False)
+        except requests.RequestException as e:
+            raise Unavailable('download: %s' % type(e).__name__)
         if r.status_code != 200:
             raise Unavailable('download: HTTP %s' % r.status_code)
         return str(r.text)
 
     # -- tags & ownership ---------------------------------------------------------
     def new_tag(self) -> str:
-        """`<bot>-<MMDDHHMMSS>-<n>`: unique per process per second, readable,
-        short (NEO echoes it as GuiOrdId; 20 chars measured fine)."""
-        return '%s-%s-%d' % (self.bot, self._clock().strftime('%m%d%H%M%S'), next(self._seq))
+        """`<bot>-<MMDDHHMMSS>-<pid36><n>`. The pid part makes it unique ACROSS
+        processes of one bot (review F3: zebra's cron and monitor collided in
+        one second and two orders merged under one tag)."""
+        pid, out = os.getpid() % 46656, ''
+        for _ in range(3):
+            pid, d = divmod(pid, 36)
+            out = '0123456789abcdefghijklmnopqrstuvwxyz'[d] + out
+        return '%s-%s-%s%d' % (self.bot, self._clock().strftime('%m%d%H%M%S'), out,
+                               next(self._seq))
 
     def claim(self, symbol: str) -> bool:
         """Take `symbol` for this bot, or raise NotOwner. Returns True when the
-        claim is NEW (so a definite rejection can hand it straight back)."""
+        claim is NEW (so a definite rejection can hand it straight back).
+
+        A NEW claim on a symbol the account already holds with no owner (e.g.
+        BTST's overnight lot from before ownership existed) is refused: that
+        position belongs to someone, and it is not provably this bot."""
         with _owners() as o:
-            holder = o.get(symbol)
+            holder = _holder(o.get(symbol))
             if holder and holder != self.bot:
                 raise NotOwner('%s is held by %s' % (symbol, holder))
-            o[symbol] = self.bot
+            if holder is None:
+                held = self.net_held(symbol)          # Unavailable -> nothing placed
+                if held != 0:
+                    raise NotOwner('%s: account holds %d with no owner -- '
+                                   '`python -m kotak_neo owners` to assign it' % (symbol, held))
+                o[symbol] = {'bot': self.bot, 'since': self._clock().isoformat(timespec='seconds')}
             return holder is None
 
-    def release(self, symbol: str) -> None:
-        """Give `symbol` up once this bot is FLAT in it (the caller knows)."""
+    def release_if_flat(self, symbol: str) -> bool:
+        """Give `symbol` up only when the account is FLAT in it and this bot has
+        no live order on it (review F9). True when released."""
+        if self.net_held(symbol) != 0:
+            return False
+        if any(o.bot() == self.bot for o in self.live_orders(symbol)):
+            return False
         with _owners() as o:
-            if o.get(symbol) == self.bot:
+            if _holder(o.get(symbol)) == self.bot:
+                del o[symbol]
+                return True
+        return False
+
+    def release(self, symbol: str) -> None:
+        """Unconditional release -- ONLY after a definite rejection of a new
+        claim's first order, when nothing was placed."""
+        with _owners() as o:
+            if _holder(o.get(symbol)) == self.bot:
                 del o[symbol]
 
     # -- mutations --------------------------------------------------------------
-    def place(self, req: OrderRequest) -> str:
+    def place(self, req: OrderRequest, reduce_only: bool = False) -> str:
         """Send ONE order. Returns NEO's order number -- which proves only that
         NEO accepted the request: RMS can reject it a moment later (measured).
         The outcome comes from `orders.resolve(tag)`."""
@@ -434,7 +501,22 @@ class NeoClient:
             raise ValueError('qty must be positive')
         if req.kind == 'SL' and _f(req.trigger) <= 0:
             raise ValueError('an SL order needs a trigger')
-        new_claim = self.claim(req.symbol)
+        if reduce_only:
+            # An EXIT. Never blocked by an unreadable owners file (review F7):
+            # the chase caps it at what the account holds. Still refused if the
+            # file is readable and names another bot.
+            if req.side != 'S':
+                raise ValueError('reduce_only is for sells of a long')
+            new_claim = False
+            try:
+                holder = owner_of(req.symbol)
+            except Unavailable as e:
+                holder = None
+                logger.warning('owners.json unreadable for an exit sell (%s) -- proceeding', e)
+            if holder and holder != self.bot:
+                raise NotOwner('%s is held by %s' % (req.symbol, holder))
+        else:
+            new_claim = self.claim(req.symbol)
         jdata = {'am': 'NO', 'dq': '0', 'es': self.segment, 'mp': '0', 'pc': self.product,
                  'pf': 'N', 'pr': req.price, 'pt': req.kind, 'qt': str(int(req.qty)),
                  'rt': 'DAY', 'tp': req.trigger if req.kind == 'SL' else '0',

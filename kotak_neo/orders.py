@@ -2,17 +2,27 @@
 
 The broker's answer to a place is a request id, not a fill: RMS rejected an
 SL-M a moment AFTER NEO returned its number (2026-11-27). So nothing here
-trusts a reply; everything reads the order BOOK, by the bot's own TAG.
+trusts a reply; outcomes are read from the BOOK by the bot's own TAG, and
+before any SELL the account's POSITION is the authority on what may be sold.
 
   resolve(c, tag)              what happened to the order(s) carrying `tag`
-  cancel_and_confirm(c, no)    cancel, then read back until terminal; the
-                               FINAL filled quantity is what counts
-  chase_exit(c, st, quote)     one step of a sell-to-flat chase. Call it every
-                               poll (5-s monitor, a long loop, or once a
-                               minute). It NEVER has two sells working at once
-                               and never sells more than is still held.
+  cancel_and_confirm(c, no)    cancel, then read back until terminal
+  chase_exit(c, st, quote)     one step of a sell-to-flat chase
 
-All waits take `sleep`/`clock` so tests run instantly.
+The chase's guarantees (independent review F1/F2/F4/F6/F7/F13, 2026-11-27):
+  * never sells more than the ACCOUNT holds (positions read before every sell;
+    unreadable -> nothing is sent);
+  * at most ONE sell working; a new one only after the last is terminal with
+    its final filled quantity applied;
+  * the tag is PERSISTED (caller's `persist`) BEFORE the send, and each step
+    holds a per-(bot, symbol) lock, so a crash or a second process (cron +
+    monitor) can never send a second sell blind;
+  * an UNCLEAR sell is never re-sent on time alone: only after `unclear_grace_s`
+    AND when the book shows no live sell on the symbol AND the position still
+    holds the lots (residual risk: an order invisible AND unfilled past the
+    grace -- see ChasePolicy);
+  * a single bad read never strands the exit: troubles are counted, and only
+    `max_troubles` in a row hand it to a human -- while nothing is sent.
 """
 from __future__ import annotations
 
@@ -21,7 +31,9 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
-from .client import NeoClient, OrderRequest, OrderView, Rejected, Unavailable, Unclear
+from . import session as S
+from .client import (Auth, NeoClient, NotOwner, OrderRequest, OrderView, Rejected,
+                     Unavailable, Unclear)
 
 logger = logging.getLogger(__name__)
 
@@ -31,24 +43,30 @@ FILLED, PARTIAL, RESTING, REJECTED, CANCELLED, ABSENT, UNKNOWN = (
 
 class Resolution(NamedTuple):
     state: str             # one of the constants above
-    filled: int            # shares filled (final when terminal)
+    filled: int            # shares filled (final only when terminal)
     avg_price: float
     order_no: str
     reason: str
-    terminal: bool
+    terminal: bool         # nothing more will happen. ABSENT is NOT terminal:
+                           # an unclear order may still surface (review F8)
 
 
-def _summarise(views: List[OrderView]) -> Resolution:
-    """One tag -> one Resolution. More than one order on a tag is legal only
-    if all but one are terminal (a resend under the same tag is a bug)."""
+def _summarise(views: List[OrderView], expect_qty: Optional[int] = None) -> Resolution:
+    last = views[-1]
     filled = sum(v.filled for v in views)
     avg = (sum(v.filled * v.avg_price for v in views) / filled) if filled else 0.0
-    live = [v for v in views if not v.terminal]
-    last = views[-1]
+    if len({(v.side, v.symbol) for v in views}) > 1:
+        return Resolution(UNKNOWN, filled, avg, last.order_no,
+                          'one tag on different sides/symbols (tag collision)', False)
+    if expect_qty is not None and any(v.qty != expect_qty for v in views):
+        return Resolution(UNKNOWN, filled, avg, last.order_no,
+                          'book qty %s != sent %d (units?)' % ([v.qty for v in views], expect_qty),
+                          False)
     unknown = [v for v in views if not v.known_status]
     if unknown:
         return Resolution(UNKNOWN, filled, avg, last.order_no,
                           'unrecognised status %r' % unknown[0].status, False)
+    live = [v for v in views if not v.terminal]
     if len(live) > 1:
         return Resolution(UNKNOWN, filled, avg, last.order_no,
                           '%d live orders share one tag' % len(live), False)
@@ -56,6 +74,10 @@ def _summarise(views: List[OrderView]) -> Resolution:
         v = live[0]
         return Resolution(PARTIAL if filled else RESTING, filled, avg, v.order_no, v.status,
                           False)
+    bad = [v for v in views if v.status == 'complete' and v.filled != v.qty]
+    if bad:
+        return Resolution(UNKNOWN, filled, avg, last.order_no,
+                          'complete with filled %d of %d' % (bad[0].filled, bad[0].qty), False)
     want = sum(v.qty for v in views if v.status != 'rejected') or last.qty
     if any(v.status == 'complete' for v in views) and filled >= want:
         return Resolution(FILLED, filled, avg, last.order_no, 'complete', True)
@@ -67,11 +89,11 @@ def _summarise(views: List[OrderView]) -> Resolution:
 
 
 def resolve(c: NeoClient, tag: str, wait_s: float = 10.0, poll_s: float = 0.5,
-            until_terminal: bool = True, sleep: Callable = time.sleep,
-            clock: Callable = time.time) -> Resolution:
-    """What happened to `tag`. Waits up to `wait_s` for the order to appear
-    and (if asked) to become terminal. ABSENT only if the book was READ and the
-    tag never showed; an unreadable book at the end is UNKNOWN -- never absent."""
+            until_terminal: bool = True, expect_qty: Optional[int] = None,
+            sleep: Callable = time.sleep, clock: Callable = time.time) -> Resolution:
+    """What happened to `tag`. ABSENT only if the book was READ and the tag
+    never showed -- and it is NOT terminal (settle it from positions); an
+    unreadable book is UNKNOWN."""
     deadline = clock() + max(0.0, wait_s)
     last: Optional[Resolution] = None
     readable = False
@@ -80,7 +102,7 @@ def resolve(c: NeoClient, tag: str, wait_s: float = 10.0, poll_s: float = 0.5,
             views = c.orders_tagged(tag)
             readable = True
             if views:
-                last = _summarise(views)
+                last = _summarise(views, expect_qty)
                 if last.terminal or not until_terminal:
                     return last
         except Unavailable as e:
@@ -92,13 +114,13 @@ def resolve(c: NeoClient, tag: str, wait_s: float = 10.0, poll_s: float = 0.5,
     if last is not None:
         return last
     if readable:
-        return Resolution(ABSENT, 0, 0.0, '', 'tag never appeared in a readable book', True)
+        return Resolution(ABSENT, 0, 0.0, '', 'tag not in a readable book', False)
     return Resolution(UNKNOWN, 0, 0.0, '', 'order book unreadable', False)
 
 
 def cancel_and_confirm(c: NeoClient, order_no: str, tag: str, wait_s: float = 10.0,
-                       poll_s: float = 0.5, sleep: Callable = time.sleep,
-                       clock: Callable = time.time) -> Resolution:
+                       poll_s: float = 0.5, expect_qty: Optional[int] = None,
+                       sleep: Callable = time.sleep, clock: Callable = time.time) -> Resolution:
     """Cancel, then read back until terminal. A cancel that NEO calls unclear
     or rejects (e.g. already filled) is still settled by the BOOK."""
     try:
@@ -107,7 +129,8 @@ def cancel_and_confirm(c: NeoClient, order_no: str, tag: str, wait_s: float = 10
         logger.info('cancel %s rejected (%s) -- reading the book', order_no, e)
     except Unclear as e:
         logger.warning('cancel %s unclear (%s) -- reading the book', order_no, e)
-    return resolve(c, tag, wait_s=wait_s, poll_s=poll_s, sleep=sleep, clock=clock)
+    return resolve(c, tag, wait_s=wait_s, poll_s=poll_s, expect_qty=expect_qty,
+                   sleep=sleep, clock=clock)
 
 
 # -- the exit chase ----------------------------------------------------------------------
@@ -115,25 +138,36 @@ def cancel_and_confirm(c: NeoClient, order_no: str, tag: str, wait_s: float = 10
 class ChasePolicy:
     reprice_after_s: float = 10.0   # a working sell older than this is cancelled + re-priced
     step_ticks: int = 1             # each re-price goes this many ticks below the bid
-    max_rounds: int = 12            # then NEEDS_HUMAN (alert: exit in the app)
-    confirm_wait_s: float = 8.0
-    unclear_grace_s: float = 20.0   # an UNCLEAR sell may surface late; never re-send before this
+    max_reprices: int = 12          # then NEEDS_HUMAN (alert: exit in the app)
+    confirm_wait_s: float = 0.0     # 0 for a 5-s monitor: settle the cancel on the next poll
+    unclear_grace_s: float = 60.0   # an UNCLEAR sell may surface late; settle it after this.
+                                    # RESIDUAL RISK, stated: an unclear sell that stays
+                                    # INVISIBLE in the book and UNFILLED for longer than
+                                    # this is re-sent. (Filled-but-invisible is caught by the
+                                    # position check.) Measured visibility: immediate.
+    max_troubles: int = 12          # consecutive unreadable/unsettled steps -> NEEDS_HUMAN
+                                    # (12 x a 5-s poll = 1 min: positions can lag a fill)
+    reject_backoff_s: float = 15.0  # after a definite refusal, wait before the next try
 
 
 @dataclass
 class ChaseState:
-    """Serialisable (asdict) so a cron caller can persist it between calls."""
+    """Serialisable (to_dict / from_dict). The caller persists it -- and MUST
+    pass `persist` so the tag is on disk before the order is sent."""
     bot: str
     symbol: str
     token: str
     tick: float
-    remaining: int                  # shares still to sell
+    remaining: int                  # shares still to sell (this chase's own count)
     sold: int = 0
     proceeds: float = 0.0
     working_tag: str = ''
     working_no: str = ''
+    working_qty: int = 0
     working_since: float = 0.0
-    rounds: int = 0
+    reprices: int = 0
+    troubles: int = 0
+    next_try_at: float = 0.0
     status: str = 'active'          # active | done | needs_human
     note: str = ''
     fills: List[Dict[str, Any]] = field(default_factory=list)
@@ -163,68 +197,134 @@ def _apply(st: ChaseState, res: Resolution) -> None:
         st.fills.append({'tag': st.working_tag, 'order_no': res.order_no, 'qty': res.filled,
                          'avg': res.avg_price})
     st.working_tag = st.working_no = ''
+    st.working_qty = 0
     st.working_since = 0.0
 
 
-def chase_exit(c: NeoClient, st: ChaseState, quote: Callable[[], Optional[Dict[str, float]]],
-               policy: Optional[ChasePolicy] = None, sleep: Callable = time.sleep,
-               clock: Callable = time.time) -> ChaseState:
-    """ONE step. Returns the (mutated) state; persist it if the caller is a cron.
+def _trouble(st: ChaseState, p: ChasePolicy, why: str) -> ChaseState:
+    st.troubles += 1
+    st.note = why
+    if st.troubles >= p.max_troubles:
+        st.status = 'needs_human'
+        st.note = '%s (%d steps in a row)' % (why, st.troubles)
+    return st
 
-    Invariants:
-      * at most ONE sell working; a new one only after the previous is TERMINAL
-        in the book with its final filled quantity applied;
-      * the next sell is for `remaining` only, so the chase can never over-sell;
-      * anything the book cannot settle -> `needs_human`, and the chase stops
-        sending (a stuck exit is alerted, never guessed through).
-    """
+
+def _settle_working(c: NeoClient, st: ChaseState, p: ChasePolicy, sleep, clock) -> bool:
+    """Settle the working sell. True = no sell is working any more (the step
+    may place); False = leave the step (still working, or trouble noted)."""
+    res = resolve(c, st.working_tag, wait_s=0, until_terminal=False,
+                  expect_qty=st.working_qty or None, sleep=sleep, clock=clock)
+    if res.order_no and not st.working_no:
+        st.working_no = res.order_no                    # an unclear send has surfaced
+    if res.state == UNKNOWN:
+        _trouble(st, p, 'working sell %s: %s' % (st.working_tag, res.reason))
+        return False
+    if res.state == ABSENT:
+        if st.working_no:
+            _trouble(st, p, 'working sell %s (%s) vanished from the book'
+                     % (st.working_tag, st.working_no))
+            return False
+        if clock() - st.working_since < p.unclear_grace_s:
+            return False                                # may still surface: never resend early
+        # F1: after the grace, re-send ONLY if no sell is live on the symbol
+        # (any tag) and the position still holds the lots.
+        try:
+            if c.live_orders(st.symbol, 'S'):
+                _trouble(st, p, 'unclear sell absent but a live sell exists on %s' % st.symbol)
+                return False
+            held = c.net_held(st.symbol)
+        except Unavailable as e:
+            _trouble(st, p, 'cannot settle unclear sell: %s' % e)
+            return False
+        if held < st.remaining:
+            _trouble(st, p, 'unclear sell absent but the position fell to %d (expected %d)'
+                     % (held, st.remaining))
+            return False
+        logger.warning('%s %s: unclear sell %s never reached the book; position holds %d',
+                       st.bot, st.symbol, st.working_tag, held)
+        _apply(st, Resolution(ABSENT, 0, 0.0, '', 'never placed', True))
+        return True
+    if res.terminal:
+        _apply(st, res)
+        return True
+    if clock() - st.working_since < p.reprice_after_s:
+        return False                                    # let it work
+    res = cancel_and_confirm(c, st.working_no, st.working_tag, wait_s=p.confirm_wait_s,
+                             expect_qty=st.working_qty or None, sleep=sleep, clock=clock)
+    if not res.terminal:
+        st.note = 'cancel of %s pending (%s)' % (st.working_no, res.reason)
+        return False                                    # settle it on the next step
+    _apply(st, res)
+    st.reprices += 1
+    return True
+
+
+def chase_exit(c: NeoClient, st: ChaseState, quote: Callable[[], Optional[Dict[str, float]]],
+               policy: Optional[ChasePolicy] = None, persist: Optional[Callable] = None,
+               sleep: Callable = time.sleep, clock: Callable = time.time) -> ChaseState:
+    """ONE step. Mutates and returns `st`; calls `persist(st)` after every
+    change that matters, and BEFORE any order is sent."""
     p = policy or ChasePolicy()
+    save = persist or (lambda s: None)
     if st.status != 'active':
         return st
-    if st.working_tag:
-        res = resolve(c, st.working_tag, wait_s=0, until_terminal=False, sleep=sleep, clock=clock)
-        if res.order_no and not st.working_no:
-            st.working_no = res.order_no                # an unclear send has surfaced
-        if res.state == UNKNOWN or (res.state == ABSENT and st.working_no):
-            st.status, st.note = 'needs_human', 'working sell %s: %s' % (st.working_tag, res.reason)
+    with S.file_lock('chase_%s_%s.lock' % (st.bot, st.symbol), 0.0) as got:
+        if not got:
+            st.note = 'another process is stepping this chase'
             return st
-        if res.state == ABSENT and clock() - st.working_since < p.unclear_grace_s:
-            return st          # an UNCLEAR send may still surface (visibility lag): never resend early
-        if res.terminal:
-            _apply(st, res)
-        elif clock() - st.working_since >= p.reprice_after_s:
-            res = cancel_and_confirm(c, st.working_no, st.working_tag, wait_s=p.confirm_wait_s,
-                                     sleep=sleep, clock=clock)
-            if not res.terminal:
-                st.status, st.note = 'needs_human', 'cancel of %s not confirmed: %s' % (
-                    st.working_no, res.reason)
+        if st.working_tag:
+            if not _settle_working(c, st, p, sleep, clock):
+                save(st)
                 return st
-            _apply(st, res)
-        else:
-            return st                                   # let it work
-    if st.remaining <= 0:
-        st.status = 'done'
+            st.troubles = 0                             # the working sell is settled
+        try:
+            held = c.net_held(st.symbol)
+        except Unavailable as e:
+            save(_trouble(st, p, 'positions unreadable: %s -- nothing sent' % e))
+            return st
+        if st.remaining <= 0:
+            st.status = 'done'
+            try:
+                c.release_if_flat(st.symbol)
+            except Unavailable as e:
+                logger.warning('release %s after exit: %s', st.symbol, e)
+            save(st)
+            return st
+        qty = min(st.remaining, held)                   # F4: never more than the account holds
+        if qty <= 0:
+            save(_trouble(st, p, 'chase expects %d but the account holds %d'
+                          % (st.remaining, held)))
+            return st
+        st.troubles = 0                                 # the book and the account agree
+        if st.reprices >= p.max_reprices:
+            st.status, st.note = 'needs_human', '%d re-prices without getting flat' % st.reprices
+            save(st)
+            return st
+        if clock() < st.next_try_at:
+            return st
+        q = quote() or {}
+        bid = float(q.get('bid') or 0)
+        if bid <= 0:
+            st.note = 'no bid -- waiting'
+            save(st)
+            return st
+        px = _round_down(bid - st.reprices * p.step_ticks * st.tick, st.tick)
+        tag = c.new_tag()
+        st.working_tag, st.working_qty, st.working_since = tag, qty, clock()
+        st.working_no, st.note = '', 'selling %d @ %.2f' % (qty, px)
+        save(st)                                        # F2: the tag is on disk BEFORE the send
+        try:
+            st.working_no = c.place(OrderRequest(st.symbol, st.token, 'S', qty, '%.2f' % px, tag),
+                                    reduce_only=True)
+        except Rejected as e:
+            _apply(st, Resolution(REJECTED, 0, 0.0, '', str(e), True))
+            st.next_try_at = clock() + p.reject_backoff_s
+            st.note = 'sell rejected: %s' % e
+        except (NotOwner, Auth, Unavailable, ValueError) as e:
+            _apply(st, Resolution(CANCELLED, 0, 0.0, '', str(e), True))   # nothing was sent
+            _trouble(st, p, 'sell not sent: %s' % e)
+        except Unclear as e:
+            st.note = 'sell unclear: %s' % e            # keep the tag; settle from the book
+        save(st)
         return st
-    if st.rounds >= p.max_rounds:
-        st.status, st.note = 'needs_human', '%d rounds without getting flat' % st.rounds
-        return st
-    q = quote() or {}
-    bid = float(q.get('bid') or 0)
-    if bid <= 0:
-        st.note = 'no bid -- waiting'                   # nothing to sell into; try next poll
-        return st
-    px = _round_down(bid - st.rounds * p.step_ticks * st.tick, st.tick)
-    tag = c.new_tag()
-    st.working_tag, st.working_since = tag, clock()
-    st.rounds += 1
-    try:
-        st.working_no = c.place(OrderRequest(st.symbol, st.token, 'S', st.remaining,
-                                             '%.2f' % px, tag))
-    except Rejected as e:
-        st.working_tag = st.working_no = ''
-        st.note = 'sell rejected: %s' % e
-    except Unclear as e:
-        # May be working at the exchange: keep the tag, settle it from the book
-        # next step. working_no unknown -> if the book never shows it, it is ABSENT.
-        st.note = 'sell unclear: %s' % e
-    return st

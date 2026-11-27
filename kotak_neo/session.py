@@ -272,15 +272,16 @@ def _append(name: str, row: Dict[str, Any]) -> None:
         logger.error('kotak_neo: could not append %s: %s', name, e)
 
 
-# -- the lock ---------------------------------------------------------------------------
+# -- locks ------------------------------------------------------------------------------
 @contextmanager
-def _lock(wait_s: float) -> Iterator[bool]:
-    """Exclusive, cross-process, released by the kernel if the holder dies.
-    Yields False when it could not be had within `wait_s`. POSIX flock on the
-    Pi; msvcrt on Windows exists ONLY so the suite runs on the laptop (which can
-    never log in: no LOGIN_HOST). The flock half is proven by the suite on the Pi."""
+def file_lock(name: str, wait_s: float) -> Iterator[bool]:
+    """Exclusive, cross-process lock on HOME/<name>, released by the kernel if
+    the holder dies. Yields False when it could not be had within `wait_s`.
+    POSIX flock on the Pi; msvcrt on Windows exists ONLY so the suite runs on
+    the laptop (which can never log in: no LOGIN_HOST). The flock half is
+    proven by running the suite on the Pi."""
     _ensure_home()
-    fd = os.open(str(_p('refresh.lock')), os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(str(_p(name)), os.O_RDWR | os.O_CREAT, 0o600)
     got = False
     try:
         deadline = time.time() + max(0.0, wait_s)
@@ -298,7 +299,7 @@ def _lock(wait_s: float) -> Iterator[bool]:
             except OSError:
                 if time.time() >= deadline:
                     break
-                time.sleep(0.1)
+                time.sleep(0.05)
         yield got
     finally:
         if got:
@@ -313,6 +314,11 @@ def _lock(wait_s: float) -> Iterator[bool]:
             except OSError:
                 pass
         os.close(fd)
+
+
+def _lock(wait_s: float):
+    """The single-flight refresh lock."""
+    return file_lock('refresh.lock', wait_s)
 
 
 # -- state ------------------------------------------------------------------------------

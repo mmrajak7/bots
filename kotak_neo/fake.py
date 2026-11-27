@@ -19,6 +19,12 @@ Scriptable faults (each applies to the NEXT place unless noted):
   partial(n)                 only n shares fill now; the rest rests
   hide(reads)                the order is invisible for `reads` book reads
   dead_reads(n)              the next n READS answer 401 (session dead)
+  slow_cancel(reads)         a cancel answers success but the order shows
+                             `cancel pending` for `reads` book reads (and can
+                             still FILL meanwhile if the book crosses)
+
+It ALLOWS shorting on purpose: an over-sell must show up as a negative
+position in a test, not be silently refused by the fake.
 """
 from __future__ import annotations
 
@@ -50,6 +56,7 @@ class FakeNeo:
         self._no = itertools.count(261127000500000)
         self._next: List[tuple] = []
         self._dead_reads = 0
+        self._slow_cancel = 0
         self.funds = 50000.0
 
     # -- scripting ---------------------------------------------------------------
@@ -79,12 +86,19 @@ class FakeNeo:
     def dead_reads(self, n: int) -> None:
         self._dead_reads = n
 
+    def slow_cancel(self, reads: int) -> None:
+        self._slow_cancel = reads
+
+    def net(self, symbol: str) -> int:
+        return sum(int(o['fldQty']) * (1 if o['trnsTp'] == 'B' else -1)
+                   for o in self.orders if o['trdSym'] == symbol)
+
     def placed(self, side: Optional[str] = None) -> List[Dict[str, Any]]:
         return [o for o in self.orders if side is None or o['trnsTp'] == side]
 
     # -- the exchange ------------------------------------------------------------
     def _match(self, o: Dict[str, Any]) -> None:
-        if o['ordSt'] not in ('open', 'trigger pending'):
+        if o['ordSt'] not in ('open', 'trigger pending', 'cancel pending'):
             return
         q = self.quotes.get(o['trdSym'])
         if not q:
@@ -131,6 +145,10 @@ class FakeNeo:
         if url.endswith('/quick/user/orders'):
             rows = []
             for o in self.orders:
+                if o['ordSt'] == 'cancel pending':
+                    o['_cp'] = o.get('_cp', 0) - 1
+                    if o['_cp'] < 0:
+                        o['ordSt'] = 'cancelled'
                 if o.get('_hide', 0) > 0:
                     o['_hide'] -= 1
                     continue
@@ -204,5 +222,8 @@ class FakeNeo:
             return _Resp(400, {'stCode': 1018, 'errMsg': msg, 'stat': msg})
         if o['ordSt'] in ('complete', 'cancelled', 'rejected'):
             return _Resp(200, {'stat': 'Not_Ok', 'stCode': 1006, 'errMsg': 'already executed'})
-        o['ordSt'] = 'cancelled'
+        if self._slow_cancel:
+            o['ordSt'], o['_cp'] = 'cancel pending', self._slow_cancel
+        else:
+            o['ordSt'] = 'cancelled'
         return _Resp(200, {'result': no, 'stat': 'Ok', 'stCode': 200})

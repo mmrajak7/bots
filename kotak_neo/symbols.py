@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 EPOCH_OFFSET_SEC = 315511200
 _EPOCH_1970 = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_IST = timezone(timedelta(hours=5, minutes=30))
+#: A full nse_fo file holds tens of thousands of option rows; fewer than this
+#: means a truncated download, which must never be cached and trusted all day.
+MIN_ROWS = 1000
 OPTION_INST = ('OPTIDX', 'OPTSTK')
 
 
@@ -51,7 +55,10 @@ class ScripRow:
 
 
 def expiry_from_epoch(value: str) -> date:
-    return (_EPOCH_1970 + timedelta(seconds=int(float(value)) + EPOCH_OFFSET_SEC)).date()
+    """The SDK's arithmetic, read on the IST calendar (the exchange's).
+    Measured: RELIANCE ...26DEC... rows -> 2026-12-29 14:00 IST."""
+    t = _EPOCH_1970 + timedelta(seconds=int(float(value)) + EPOCH_OFFSET_SEC)
+    return t.astimezone(_IST).date()
 
 
 def _col(row: Dict[str, str], *names: str) -> str:
@@ -140,26 +147,46 @@ class ScripMap:
         return None
 
 
-def load(c: Any, today: Optional[date] = None, max_age_h: float = 20.0) -> ScripMap:
-    """Today's nse_fo map from the shared cache, downloading it at most once a
-    day (any bot may be first). The text is PARSED before it is cached."""
+def load(c: Any, today: Optional[date] = None, max_age_h: float = 20.0,
+         underlyings: Optional[Iterable[str]] = None, min_rows: int = MIN_ROWS) -> ScripMap:
+    """Today's nse_fo map from the shared cache, downloading at most once a day
+    under a lock (any bot may be first; two never interleave a write). The
+    text is PARSED and checked for a sane row count before it is cached.
+    `underlyings` narrows the parse (the file stays whole on disk)."""
+    import os
     today = today or S._now().date()
     S._ensure_home()
     cache = S.HOME / ('scrip_nse_fo_%s.csv' % today.strftime('%Y%m%d'))
-    if cache.exists() and (time.time() - cache.stat().st_mtime) / 3600.0 <= max_age_h:
-        try:
-            return ScripMap(parse_scrip_master(cache.read_text(encoding='utf-8')))
-        except ScripMasterError:
-            cache.unlink()
-    fo = ScripMap.pick_fo_path(c.scrip_master_paths())
-    if not fo:
-        raise ScripMasterError('no nse_fo scrip master link')
-    text = c.fetch_text(fo)
-    smap = ScripMap(parse_scrip_master(text))
-    tmp = cache.with_name(cache.name + '.tmp')
-    tmp.write_text(text, encoding='utf-8')
-    tmp.replace(cache)
-    for old in S.HOME.glob('scrip_nse_fo_*.csv'):
-        if old != cache:
-            old.unlink()
-    return smap
+
+    def fresh() -> Optional[str]:
+        if cache.exists() and (time.time() - cache.stat().st_mtime) / 3600.0 <= max_age_h:
+            return cache.read_text(encoding='utf-8')
+        return None
+
+    with S.file_lock('scrip.lock', 120.0) as got:
+        if not got:
+            raise ScripMasterError('scrip master lock busy')
+        text = fresh()
+        if text is not None:
+            try:
+                return ScripMap(parse_scrip_master(text, underlyings))
+            except ScripMasterError:
+                cache.unlink()
+        fo = ScripMap.pick_fo_path(c.scrip_master_paths())
+        if not fo:
+            raise ScripMasterError('no nse_fo scrip master link')
+        text = c.fetch_text(fo)
+        n = len(parse_scrip_master(text))
+        if n < min_rows:
+            raise ScripMasterError('scrip master has only %d option rows (< %d): truncated?'
+                                   % (n, min_rows))
+        tmp = cache.with_name('%s.%d.tmp' % (cache.name, os.getpid()))
+        tmp.write_text(text, encoding='utf-8')
+        tmp.replace(cache)
+        for old in S.HOME.glob('scrip_nse_fo_*.csv'):
+            if old != cache:
+                try:
+                    old.unlink()
+                except FileNotFoundError:
+                    pass
+        return ScripMap(parse_scrip_master(text, underlyings))

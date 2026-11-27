@@ -5,6 +5,7 @@
   status     generation, day, logins today, latch, cooldown. Never a secret.
   refresh    a manual refresh request: --reason is required and logged
   unblock    clear a latch (credentials/MPIN) and the cooldown -- owner only
+  owners     list which bot holds which contract; --assign SYM BOT / --clear SYM
 
 Exit codes: 0 ok / nothing to do, 1 the action did not succeed, 2 usage.
 """
@@ -30,10 +31,21 @@ def main(argv=None) -> int:
     r = sub.add_parser('refresh', help='manual refresh request')
     r.add_argument('--reason', required=True)
     sub.add_parser('unblock', help='clear a latch (owner)')
+    o = sub.add_parser('owners', help='contract ownership')
+    o.add_argument('--assign', nargs=2, metavar=('SYMBOL', 'BOT'))
+    o.add_argument('--clear', metavar='SYMBOL')
     a = ap.parse_args(argv)
 
     if a.cmd == 'status':
         print(json.dumps(S.status(), indent=1, default=str))
+        return 0
+    if a.cmd == 'owners':
+        from . import client as C
+        if a.assign:
+            C.assign(a.assign[0], a.assign[1])
+        elif a.clear:
+            C.assign(a.clear, None)
+        print(json.dumps(C.owners(), indent=1, sort_keys=True))
         return 0
     if a.cmd == 'unblock':
         out = S.unblock('cli:%s' % getpass.getuser())

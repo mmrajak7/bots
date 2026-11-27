@@ -3,8 +3,12 @@
 The properties that protect money:
   * a refused order is NEVER re-sent and NEVER triggers a login;
   * the outcome of an order comes from the BOOK by tag, not from the reply;
-  * the exit chase never has two sells working and never sells more than held;
-  * one bot per contract; an unreadable ownership file places nothing.
+  * the exit chase never has two sells working, never sells more than the
+    ACCOUNT holds, persists its tag before sending, and is single-stepped;
+  * one bot per contract; an unreadable ownership file adds no exposure but
+    never blocks an exit.
+Independent review of the first cut (2026-11-27, F1-F16): each finding has a
+test below that fails on the old behaviour.
 """
 import json
 import sys
@@ -20,7 +24,7 @@ from kotak_neo import client as C        # noqa: E402
 from kotak_neo import orders as O        # noqa: E402
 from kotak_neo import session as S       # noqa: E402
 from kotak_neo import symbols as Y       # noqa: E402
-from kotak_neo.fake import FakeNeo       # noqa: E402
+from kotak_neo.fake import FakeNeo, _Resp  # noqa: E402
 
 SYM, TOK = 'RELIANCE26DEC1540CE', '144284'
 SESS = S.Session(3, '2026-11-27', 'c', 'https://cis.kotaksecurities.com', 'T', 'SID', None,
@@ -74,25 +78,21 @@ def places(neo):
     return [x for x in neo.calls if x[1].endswith('/place')]
 
 
-# ── client: reads ─────────────────────────────────────────────────────────────
+# -- client: reads ---------------------------------------------------------------
 
 def test_the_measured_empty_book_is_empty(neo):
+    """Measured at HTTP 200 (BTST's _read refuses non-200 before reading the
+    envelope, and the 13:31 probe reached the envelope check)."""
     c = client(neo)
     assert c.order_book() == [] and c.trades() == [] and c.positions() == []
 
 
 def test_an_unknown_not_ok_read_is_unavailable_never_empty(neo, monkeypatch):
     c = client(neo)
-    monkeypatch.setattr(neo, 'get', lambda url, **kw: C_resp(200, {'stat': 'Not_Ok',
-                                                                     'stCode': 5000,
-                                                                     'errMsg': 'OMS down'}))
+    monkeypatch.setattr(neo, 'get', lambda url, **kw: _Resp(200, {'stat': 'Not_Ok', 'stCode': 5000,
+                                                                   'errMsg': 'OMS down'}))
     with pytest.raises(C.Unavailable, match='OMS down'):
         c.order_book()
-
-
-def C_resp(code, body):
-    from kotak_neo.fake import _Resp
-    return _Resp(code, body)
 
 
 def test_a_dead_read_asks_the_shared_refresh_once_and_retries_on_adopt(neo):
@@ -100,12 +100,13 @@ def test_a_dead_read_asks_the_shared_refresh_once_and_retries_on_adopt(neo):
     c = client(neo, refresh=r)
     neo.dead_reads(1)
     assert c.order_book() == []
-    assert r.calls == [(3, 'zbr')]                 # the generation the failed call used
+    assert r.calls == [(3, 'zbr')]
 
 
-@pytest.mark.parametrize('outcome,exc', [(S.STILL_ALIVE, C.Unavailable),
-                                         (S.COOLDOWN, C.Unavailable),
-                                         (S.BLOCKED, C.Auth), (S.HOST_REFUSED, C.Auth)])
+@pytest.mark.parametrize('outcome,exc', [
+    (S.STILL_ALIVE, C.Unavailable), (S.COOLDOWN, C.Unavailable), (S.FAILED, C.Unavailable),
+    (S.LOCK_TIMEOUT, C.Unavailable), (S.UNAVAILABLE, C.Unavailable),
+    (S.BLOCKED, C.Auth), (S.HOST_REFUSED, C.Auth), (S.ERROR, C.Auth)])
 def test_a_dead_read_that_refresh_cannot_fix(neo, outcome, exc):
     c = client(neo, refresh=Refresh(outcome))
     neo.dead_reads(1)
@@ -113,17 +114,49 @@ def test_a_dead_read_that_refresh_cannot_fix(neo, outcome, exc):
         c.order_book()
 
 
-def test_funds(neo):
-    assert client(neo).funds() == 50000.0
+def test_still_dead_after_a_successful_refresh_is_auth(neo):
+    c = client(neo, refresh=Refresh(S.LOGGED_IN))
+    neo.dead_reads(2)
+    with pytest.raises(C.Auth, match='still rejected'):
+        c.order_book()
 
 
-# ── client: mutations ──────────────────────────────────────────────────────────
+def test_funds_and_unreadable_funds(neo, monkeypatch):
+    c = client(neo)
+    assert c.funds() == 50000.0
+    monkeypatch.setattr(neo, 'post', lambda url, **kw: _Resp(200, {'stat': 'Ok'}))
+    with pytest.raises(C.Unavailable):
+        c.funds()
+
+
+@pytest.mark.parametrize('bad', [{'fldQty': 'x'}, {'fldQty': None}, {'qty': ''},
+                                 {'fldQty': '600'}])
+def test_an_unreadable_order_row_is_unavailable_never_zero(neo, bad):
+    """Review F5: `complete` with an unreadable fldQty read as filled 0."""
+    c = client(neo)
+    buy(c)
+    neo.orders[0].update(bad)
+    with pytest.raises(C.Unavailable):
+        c.order_book()
+
+
+# -- client: mutations -------------------------------------------------------------
 
 def test_place_returns_the_number_and_the_tag_is_echoed(neo):
     c = client(neo)
     no, tag = buy(c)
     [o] = c.order_book()
     assert o.order_no == no and o.tag == tag and o.bot() == 'zbr' and o.status == 'complete'
+
+
+def test_tags_differ_across_processes_in_the_same_second(neo, monkeypatch):
+    """Review F3: cron and monitor (same bot) collided in one second."""
+    a, b = client(neo), client(neo)
+    monkeypatch.setattr(C.os, 'getpid', lambda: 1111)
+    ta = a.new_tag()
+    monkeypatch.setattr(C.os, 'getpid', lambda: 2222)
+    tb = b.new_tag()
+    assert ta != tb and ta.startswith('zbr-') and len(ta) <= 21
 
 
 def test_a_401_on_place_is_unclear_never_a_login_never_resent(neo):
@@ -161,49 +194,65 @@ def test_a_definite_rejection_releases_a_new_claim(neo):
 
 def test_cancel_success_shape_and_unknown_order(neo):
     c = client(neo)
-    no, _ = buy(c, price='9.00')                  # rests below the ask
-    c.cancel(no)                                  # {result, stat Ok}: a success
+    no, _ = buy(c, price='9.00')
+    c.cancel(no)
     assert c.order_book()[0].status == 'cancelled'
     with pytest.raises(C.Unclear, match='1018'):
         c.cancel('1')
 
 
-# ── ownership ──────────────────────────────────────────────────────────────────
+# -- ownership -----------------------------------------------------------------------
 
-def test_one_bot_per_contract(neo):
+def test_one_bot_per_contract_and_no_claim_on_an_unowned_position(neo):
     a, b = client(neo, 'zbr'), client(neo, 'btst')
     buy(a)
     with pytest.raises(C.NotOwner, match='zbr'):
         buy(b)
     assert len(places(neo)) == 1
-    a.release(SYM)
-    buy(b)
-    assert C.owner_of(SYM) == 'btst'
+    a.release(SYM)                                  # zbr lets go, but the lots are still there
+    with pytest.raises(C.NotOwner, match='no owner'):
+        buy(b)
+    assert len(places(neo)) == 1
 
 
-def test_an_unreadable_owner_file_places_nothing(neo, home):
-    home.mkdir(parents=True, exist_ok=True)
+def test_release_if_flat_only_when_flat(neo):
+    c = client(neo)
+    buy(c)
+    assert c.release_if_flat(SYM) is False and C.owner_of(SYM) == 'zbr'
+    c.place(C.OrderRequest(SYM, TOK, 'S', 500, '10.00', c.new_tag()), reduce_only=True)
+    assert c.release_if_flat(SYM) is True and C.owner_of(SYM) is None
+
+
+def test_an_unreadable_owner_file_blocks_a_buy_but_never_an_exit(neo, home):
+    c = client(neo)
+    buy(c)
     (home / 'owners.json').write_text('{broken', encoding='utf-8')
     with pytest.raises(C.Unavailable, match='owners.json'):
-        buy(client(neo))
-    assert places(neo) == []
+        buy(c)
+    c.place(C.OrderRequest(SYM, TOK, 'S', 500, '10.00', c.new_tag()), reduce_only=True)
+    assert neo.net(SYM) == 0
 
 
-# ── resolve ────────────────────────────────────────────────────────────────────
+def test_reduce_only_is_for_sells(neo):
+    c = client(neo)
+    with pytest.raises(ValueError, match='reduce_only'):
+        c.place(C.OrderRequest(SYM, TOK, 'B', 500, '10.20', c.new_tag()), reduce_only=True)
+
+
+# -- resolve -------------------------------------------------------------------------
 
 def test_resolve_filled(neo):
     c = client(neo)
     _, tag = buy(c)
-    r = O.resolve(c, tag, wait_s=0)
+    r = O.resolve(c, tag, wait_s=0, expect_qty=500)
     assert r.state == O.FILLED and r.filled == 500 and r.avg_price == 10.2
 
 
 def test_resolve_place_accepted_then_rms_rejected(neo):
-    """Measured on SL-M: an order number, then `rejected` moments later."""
     c = client(neo)
     neo.rms_reject('RMS:Blocked ... STOP LOSS MARKET ORDER NOT ALLOWED IN OPTIONS')
     no, tag = buy(c)
-    assert no                                       # the reply said nothing was wrong
+    assert no
     r = O.resolve(c, tag, wait_s=0)
     assert r.state == O.REJECTED and 'NOT ALLOWED' in r.reason
 
@@ -212,14 +261,14 @@ def test_resolve_waits_through_a_visibility_lag(neo):
     c, clk = client(neo), Clock()
     neo.hide(2)
     _, tag = buy(c)
-    r = O.resolve(c, tag, wait_s=5, poll_s=1, sleep=clk.sleep, clock=clk)
-    assert r.state == O.FILLED
+    assert O.resolve(c, tag, wait_s=5, poll_s=1, sleep=clk.sleep, clock=clk).state == O.FILLED
 
 
-def test_resolve_absent_only_after_reading_the_book(neo):
+def test_absent_is_not_terminal(neo):
+    """Review F8: an entry that trusted ABSENT.terminal would buy twice."""
     c, clk = client(neo), Clock()
     r = O.resolve(c, 'zbr-never', wait_s=2, poll_s=1, sleep=clk.sleep, clock=clk)
-    assert r.state == O.ABSENT and r.terminal
+    assert r.state == O.ABSENT and not r.terminal
 
 
 def test_resolve_unknown_when_the_book_cannot_be_read(neo):
@@ -227,6 +276,29 @@ def test_resolve_unknown_when_the_book_cannot_be_read(neo):
     neo.dead_reads(99)
     r = O.resolve(c, 'zbr-x', wait_s=2, poll_s=1, sleep=clk.sleep, clock=clk)
     assert r.state == O.UNKNOWN and not r.terminal
+
+
+def test_one_tag_on_two_sides_is_unknown_not_a_sum(neo):
+    """Review F3: a 500 buy and a 250 sell under one tag read as FILLED 750."""
+    c = client(neo)
+    tag = c.new_tag()
+    c.place(C.OrderRequest(SYM, TOK, 'B', 500, '10.20', tag))
+    c.place(C.OrderRequest(SYM, TOK, 'S', 250, '10.00', tag), reduce_only=True)
+    assert O.resolve(c, tag, wait_s=0).state == O.UNKNOWN
+
+
+def test_book_quantity_not_what_was_sent_is_unknown(neo):
+    """Review F11: shares vs lots must never be guessed."""
+    c = client(neo)
+    _, tag = buy(c)
+    assert O.resolve(c, tag, wait_s=0, expect_qty=1).state == O.UNKNOWN
+
+
+def test_complete_with_a_short_fill_is_unknown(neo):
+    c = client(neo)
+    _, tag = buy(c)
+    neo.orders[0]['fldQty'] = '200'
+    assert O.resolve(c, tag, wait_s=0).state == O.UNKNOWN
 
 
 def test_an_unclear_place_that_did_go_in_is_found_by_tag(neo):
@@ -254,21 +326,32 @@ def test_partial_then_cancel_reports_the_final_filled_quantity(neo):
     assert r.state == O.PARTIAL and r.terminal and r.filled == 200
 
 
-# ── the exit chase ─────────────────────────────────────────────────────────────
+# -- the exit chase ------------------------------------------------------------------
+
+def hold(c, neo, qty=500):
+    """Put `qty` on the account (a filled buy), as an entry would."""
+    buy(c, qty=qty)
+    assert neo.net(SYM) == qty
+
 
 def chase_state(qty=500):
     return O.ChaseState(bot='zbr', symbol=SYM, token=TOK, tick=0.05, remaining=qty)
 
 
 def live_sells(neo):
-    return [o for o in neo.placed('S') if o['ordSt'] in ('open', 'trigger pending')]
+    return [o for o in neo.placed('S') if o['ordSt'] in ('open', 'trigger pending',
+                                                         'cancel pending')]
 
 
-def run_chase(c, neo, st, clk, quote, steps=40, on_step=None):
-    pol = O.ChasePolicy(reprice_after_s=5, confirm_wait_s=0)
+POL = dict(reprice_after_s=5, confirm_wait_s=0)
+
+
+def run_chase(c, neo, st, clk, quote, steps=60, on_step=None, **pol):
+    p = O.ChasePolicy(**dict(POL, **pol))
     for i in range(steps):
-        O.chase_exit(c, st, quote, pol, sleep=clk.sleep, clock=clk)
-        assert len(live_sells(neo)) <= 1                    # never two sells working
+        O.chase_exit(c, st, quote, p, sleep=clk.sleep, clock=clk)
+        assert len(live_sells(neo)) <= 1                   # never two sells working
+        assert neo.net(SYM) >= 0                           # never short
         if on_step:
             on_step(i)
         clk.t += 5
@@ -277,96 +360,220 @@ def run_chase(c, neo, st, clk, quote, steps=40, on_step=None):
     return st
 
 
-def test_chase_sells_at_the_bid_when_it_is_there(neo):
+def test_chase_sells_at_the_bid_and_releases_the_contract(neo):
     c, clk = client(neo), Clock()
+    hold(c, neo)
     st = run_chase(c, neo, chase_state(), clk, lambda: neo.quotes[SYM])
     assert st.status == 'done' and st.sold == 500 and st.avg_exit == 10.0
+    assert neo.net(SYM) == 0 and C.owner_of(SYM) is None
 
 
 def test_chase_reprices_down_a_falling_book_and_never_oversells(neo):
     c, clk = client(neo), Clock()
+    hold(c, neo)
     neo.partial(100)
-    neo.set_quote(SYM, 10.0, 10.2)
     prices = iter([9.9, 9.7, 9.5, 9.3, 9.1, 8.9, 8.7, 8.5])
 
-    def fall(i):                     # the bid drops away from every resting sell
-        try:
-            b = next(prices)
+    def fall(i):
+        b = next(prices, None)
+        if b is not None:
             neo.set_quote(SYM, b, b + 0.2)
-        except StopIteration:
-            pass
     st = run_chase(c, neo, chase_state(), clk, lambda: neo.quotes[SYM], on_step=fall)
-    assert st.status == 'done'
-    sold = sum(int(o['fldQty']) for o in neo.placed('S'))
-    assert sold == 500 == st.sold                              # exactly what was held
+    assert st.status == 'done' and st.sold == 500 and neo.net(SYM) == 0
+
+
+def test_chase_never_sells_more_than_the_account_holds(neo):
+    """Review F4: state said 500, the account held 250 -> it went short 250."""
+    c, clk = client(neo), Clock()
+    hold(c, neo, qty=250)
+    st = run_chase(c, neo, chase_state(500), clk, lambda: neo.quotes[SYM], max_troubles=3)
+    assert neo.net(SYM) == 0 and st.sold == 250
+    assert st.status == 'needs_human' and 'holds 0' in st.note
+
+
+def test_unreadable_positions_send_nothing(neo):
+    c, clk = client(neo, refresh=Refresh(S.UNAVAILABLE)), Clock()
+    hold(c, neo)
+    neo.dead_reads(99)
+    st = chase_state()
+    O.chase_exit(c, st, lambda: neo.quotes[SYM], O.ChasePolicy(**POL), sleep=clk.sleep, clock=clk)
+    assert neo.placed('S') == [] and 'positions unreadable' in st.note and st.status == 'active'
+
+
+def test_one_bad_read_does_not_strand_the_exit(neo):
+    """Review F6: one failed read used to hand a resting stop to a human."""
+    c, clk = client(neo, refresh=Refresh(S.UNAVAILABLE)), Clock()
+    hold(c, neo)
+    neo.set_quote(SYM, 1.0, 1.2)
+    stale = {'bid': 10.0}
+    p = O.ChasePolicy(reprice_after_s=60, confirm_wait_s=0)
+    st = chase_state()
+    O.chase_exit(c, st, lambda: stale, p, sleep=clk.sleep, clock=clk)       # sell rests
+    neo.dead_reads(1)
+    clk.t += 5
+    O.chase_exit(c, st, lambda: stale, p, sleep=clk.sleep, clock=clk)       # one bad read
+    assert st.status == 'active' and st.troubles == 1
+    neo.set_quote(SYM, 10.0, 10.2)                                          # the book recovers
+    clk.t += 5
+    for _ in range(3):
+        O.chase_exit(c, st, lambda: neo.quotes[SYM], p, sleep=clk.sleep, clock=clk)
+    assert st.status == 'done' and st.troubles == 0 and neo.net(SYM) == 0
+
+
+def test_the_tag_is_persisted_before_the_order_is_sent(neo):
+    """Review F2: a crash after place lost the tag and the next run sold again."""
+    c, clk = client(neo), Clock()
+    hold(c, neo)
+    seen = []
+
+    def persist(st):
+        if st.working_tag:
+            seen.append((st.working_tag, [o['GuiOrdId'] for o in neo.placed('S')]))
+    O.chase_exit(c, chase_state(), lambda: neo.quotes[SYM], O.ChasePolicy(**POL),
+                 persist=persist, sleep=clk.sleep, clock=clk)
+    tag, sent_then = seen[0]
+    assert tag not in sent_then                      # saved while the order did not exist yet
+
+
+def test_a_restarted_process_settles_the_saved_tag_and_does_not_resell(neo):
+    c, clk = client(neo), Clock()
+    hold(c, neo)
+    neo.set_quote(SYM, 1.0, 1.2)
+    saved = {}
+    st = chase_state()
+    O.chase_exit(c, st, lambda: {'bid': 10.0}, O.ChasePolicy(**POL),
+                 persist=lambda s: saved.update(s.to_dict()), sleep=clk.sleep, clock=clk)
+    st2 = O.ChaseState.from_dict(dict(saved))        # the process died; a new one loads
+    neo.set_quote(SYM, 10.0, 10.2)                   # the resting sell now fills
+    clk.t += 1
+    O.chase_exit(c, st2, lambda: neo.quotes[SYM], O.ChasePolicy(**POL), sleep=clk.sleep, clock=clk)
+    O.chase_exit(c, st2, lambda: neo.quotes[SYM], O.ChasePolicy(**POL), sleep=clk.sleep, clock=clk)
+    assert len(neo.placed('S')) == 1 and neo.net(SYM) == 0 and st2.status == 'done'
+
+
+def test_a_second_process_cannot_step_the_same_chase(neo):
+    c, clk = client(neo), Clock()
+    hold(c, neo)
+    st = chase_state()
+    with S.file_lock('chase_zbr_%s.lock' % SYM, 1.0) as got:
+        assert got
+        O.chase_exit(c, st, lambda: neo.quotes[SYM], O.ChasePolicy(**POL), sleep=clk.sleep,
+                     clock=clk)
+    assert neo.placed('S') == [] and 'another process' in st.note
 
 
 def test_a_gap_through_with_no_bid_waits_and_does_not_send(neo):
     c, clk = client(neo), Clock()
+    hold(c, neo)
     st = chase_state()
     O.chase_exit(c, st, lambda: {'bid': 0, 'ask': 0.5}, O.ChasePolicy(), sleep=clk.sleep,
                  clock=clk)
     assert st.status == 'active' and 'no bid' in st.note and neo.placed('S') == []
 
 
-def test_an_unclear_sell_that_went_in_is_adopted_not_doubled(neo):
+@pytest.mark.parametrize('hidden', [1, 8])
+def test_an_unclear_sell_that_went_in_is_adopted_not_doubled(neo, hidden):
+    """Review F1: hide(8) outlived the grace and the old chase sold twice."""
     c, clk = client(neo), Clock()
-    neo.set_quote(SYM, 10.0, 10.2)
+    hold(c, neo)
+    neo.set_quote(SYM, 1.0, 1.2)                     # the unclear sell rests first
     neo.unclear(placed=True)
-    neo.hide(1)
-    st = run_chase(c, neo, chase_state(), clk, lambda: neo.quotes[SYM])
-    assert st.status == 'done' and len(neo.placed('S')) == 1 and st.sold == 500
-
-
-def test_an_unclear_sell_that_never_went_in_is_resent_only_after_the_grace(neo):
-    c, clk = client(neo), Clock()
-    neo.unclear(placed=False)
-    pol = O.ChasePolicy(reprice_after_s=5, confirm_wait_s=0, unclear_grace_s=16)
+    neo.hide(hidden)
     st = chase_state()
-    O.chase_exit(c, st, lambda: neo.quotes[SYM], pol, sleep=clk.sleep, clock=clk)
+    p = O.ChasePolicy(reprice_after_s=600, confirm_wait_s=0)     # default grace
+    for i in range(30):
+        O.chase_exit(c, st, lambda: {'bid': 10.0}, p, sleep=clk.sleep, clock=clk)
+        assert len(neo.placed('S')) == 1             # never a second sell
+        if i == 12:
+            neo.set_quote(SYM, 10.0, 10.2)           # then it fills
+        clk.t += 5
+        if st.status != 'active':
+            break
+    assert st.status == 'done' and neo.net(SYM) == 0
+
+
+def test_an_unclear_sell_that_never_went_in_is_resent_after_the_grace_only(neo):
+    c, clk = client(neo), Clock()
+    hold(c, neo)
+    neo.unclear(placed=False)
+    p = O.ChasePolicy(reprice_after_s=5, confirm_wait_s=0, unclear_grace_s=16)
+    st = chase_state()
+    O.chase_exit(c, st, lambda: neo.quotes[SYM], p, sleep=clk.sleep, clock=clk)
     assert neo.placed('S') == [] and st.working_tag
     clk.t += 5
-    O.chase_exit(c, st, lambda: neo.quotes[SYM], pol, sleep=clk.sleep, clock=clk)
-    assert neo.placed('S') == []                             # still inside the grace
+    O.chase_exit(c, st, lambda: neo.quotes[SYM], p, sleep=clk.sleep, clock=clk)
+    assert neo.placed('S') == []
     clk.t += 20
     for _ in range(3):
-        O.chase_exit(c, st, lambda: neo.quotes[SYM], pol, sleep=clk.sleep, clock=clk)
-    assert st.status == 'done' and len(neo.placed('S')) == 1
+        O.chase_exit(c, st, lambda: neo.quotes[SYM], p, sleep=clk.sleep, clock=clk)
+    assert st.status == 'done' and len(neo.placed('S')) == 1 and neo.net(SYM) == 0
 
 
-def test_chase_gives_up_to_a_human_after_max_rounds(neo):
-    """A quote that keeps lying above a collapsed book: every sell rests, is
-    cancelled and re-priced, and after max_rounds a human is called."""
+def test_a_rejected_sell_backs_off_and_does_not_walk_the_price(neo):
+    """Review F13: each reject re-sent every poll a tick lower."""
     c, clk = client(neo), Clock()
-    neo.set_quote(SYM, 1.0, 1.2)                         # the real book has collapsed
-    stale = {'bid': 10.0, 'ask': 10.2}                    # the feed has not caught up
-    pol = O.ChasePolicy(reprice_after_s=5, confirm_wait_s=0, max_rounds=3)
+    hold(c, neo)
+    neo.reject(1009, 'RMS check')
+    p = O.ChasePolicy(reprice_after_s=5, confirm_wait_s=0, reject_backoff_s=15)
     st = chase_state()
-    for _ in range(20):
-        O.chase_exit(c, st, lambda: stale, pol, sleep=clk.sleep, clock=clk)
+    O.chase_exit(c, st, lambda: neo.quotes[SYM], p, sleep=clk.sleep, clock=clk)
+    assert 'rejected' in st.note and st.reprices == 0
+    clk.t += 5
+    O.chase_exit(c, st, lambda: neo.quotes[SYM], p, sleep=clk.sleep, clock=clk)
+    assert len(places(neo)) == 2                     # buy + the rejected sell only
+    clk.t += 15
+    O.chase_exit(c, st, lambda: neo.quotes[SYM], p, sleep=clk.sleep, clock=clk)
+    sells = neo.placed('S')
+    assert sells and sells[-1]['prc'] == '10.00'     # same price: a reject is not a re-price
+
+
+def test_a_slow_cancel_is_settled_on_a_later_poll_not_resold(neo):
+    c, clk = client(neo), Clock()
+    hold(c, neo)
+    neo.set_quote(SYM, 1.0, 1.2)
+    neo.slow_cancel(3)
+    stale = {'bid': 10.0}
+    p = O.ChasePolicy(reprice_after_s=5, confirm_wait_s=0)
+    st = chase_state()
+    for _ in range(8):
+        O.chase_exit(c, st, lambda: stale, p, sleep=clk.sleep, clock=clk)
+        assert len(live_sells(neo)) <= 1
+        clk.t += 5
+    assert neo.net(SYM) == 500                       # nothing filled, nothing doubled
+
+
+def test_the_working_sell_is_left_to_work_until_its_reprice_time(neo):
+    c, clk = client(neo), Clock()
+    hold(c, neo)
+    neo.set_quote(SYM, 1.0, 1.2)
+    stale = {'bid': 10.0}
+    p = O.ChasePolicy(reprice_after_s=30, confirm_wait_s=0)
+    st = chase_state()
+    for _ in range(5):
+        O.chase_exit(c, st, lambda: stale, p, sleep=clk.sleep, clock=clk)
+        clk.t += 5
+    assert len(neo.placed('S')) == 1 and len(live_sells(neo)) == 1
+    clk.t += 30
+    O.chase_exit(c, st, lambda: stale, p, sleep=clk.sleep, clock=clk)
+    O.chase_exit(c, st, lambda: stale, p, sleep=clk.sleep, clock=clk)
+    assert [o['ordSt'] for o in neo.placed('S')] == ['cancelled', 'open']
+
+
+def test_chase_gives_up_to_a_human_after_max_reprices(neo):
+    c, clk = client(neo), Clock()
+    hold(c, neo)
+    neo.set_quote(SYM, 1.0, 1.2)
+    stale = {'bid': 10.0}
+    p = O.ChasePolicy(reprice_after_s=5, confirm_wait_s=0, max_reprices=3)
+    st = chase_state()
+    for _ in range(30):
+        O.chase_exit(c, st, lambda: stale, p, sleep=clk.sleep, clock=clk)
         assert len(live_sells(neo)) <= 1
         clk.t += 5
         if st.status != 'active':
             break
-    assert st.status == 'needs_human' and 'rounds' in st.note
-    assert len(neo.placed('S')) == 3 and st.sold == 0 and live_sells(neo) == []
-
-
-def test_a_resting_sell_is_left_to_work_until_its_reprice_time(neo):
-    """5-second polls on a sell that has not filled: no second sell before
-    `reprice_after_s`, and the reprice cancels BEFORE it re-sends."""
-    c, clk = client(neo), Clock()
-    neo.set_quote(SYM, 1.0, 1.2)
-    stale = {'bid': 10.0, 'ask': 10.2}
-    pol = O.ChasePolicy(reprice_after_s=30, confirm_wait_s=0)
-    st = chase_state()
-    for _ in range(5):                                   # 5 polls inside 30 s
-        O.chase_exit(c, st, lambda: stale, pol, sleep=clk.sleep, clock=clk)
-        clk.t += 5
-    assert len(neo.placed('S')) == 1 and len(live_sells(neo)) == 1
-    clk.t += 30
-    O.chase_exit(c, st, lambda: stale, pol, sleep=clk.sleep, clock=clk)
-    assert [o['ordSt'] for o in neo.placed('S')] == ['cancelled', 'open']
+    assert st.status == 'needs_human' and 're-prices' in st.note
+    assert len(neo.placed('S')) == 3 and live_sells(neo) == [] and neo.net(SYM) == 500
 
 
 def test_chase_state_round_trips(neo):
@@ -375,7 +582,7 @@ def test_chase_state_round_trips(neo):
     assert O.ChaseState.from_dict(json.loads(json.dumps(st.to_dict()))) == st
 
 
-# ── symbols ────────────────────────────────────────────────────────────────────
+# -- symbols -------------------------------------------------------------------------
 
 HDR = ('pSymbol,pGroup,pExchSeg,pInstType,pSymbolName,pTrdSymbol,pOptionType,dTickSize,'
        'lLotSize,dStrikePrice;,pExpiryDate')
@@ -383,24 +590,26 @@ HDR = ('pSymbol,pGroup,pExchSeg,pInstType,pSymbolName,pTrdSymbol,pOptionType,dTi
 
 def row(tok, inst, und, ts, opt, strike, lot, exp_epoch=1483021800, tick=5):
     return '%s,XX,nse_fo,%s,%s,%s,%s,%d,%d,%d,%d' % (tok, inst, und, ts, opt, tick, lot,
-                                                    int(strike * 100), exp_epoch)
+                                                    int(round(strike * 100)), exp_epoch)
 
 
 CSV = '\n'.join([HDR,
                  row(144284, 'OPTSTK', 'RELIANCE', 'RELIANCE26DEC1540CE', 'CE', 1540, 500),
                  row(144285, 'OPTSTK', 'RELIANCE', 'RELIANCE26DEC1540PE', 'PE', 1540, 500),
                  row(47930, 'OPTIDX', 'NIFTY', 'NIFTY26D0126450CE', 'CE', 26450, 65,
-                     exp_epoch=1482762600),
+                     exp_epoch=1480608000),                       # Tue 2026-12-01 15:30 IST
+                 row(55001, 'OPTSTK', 'NHPC', 'NHPC26DEC82.5CE', 'CE', 82.5, 6400),
                  row(1, 'FUTSTK', 'RELIANCE', 'RELIANCE26DECFUT', 'XX', 0, 500)])
 
 
 def test_stock_and_index_options_map_by_facts():
     m = Y.ScripMap(Y.parse_scrip_master(CSV))
-    r = m.find('RELIANCE', date(2026, 12, 29), 1540, 'CE')      # epoch +315511200
+    r = m.find('RELIANCE', date(2026, 12, 29), 1540, 'CE')
     assert r.trading_symbol == 'RELIANCE26DEC1540CE' and r.token == '144284'
     assert r.lot_size == 500 and r.tick_size == 0.05 and r.inst_type == 'OPTSTK'
-    assert m.find('NIFTY', date(2026, 12, 26), 26450, 'CE').lot_size == 65
-    assert len(m) == 3                                           # the future is not an option
+    assert m.find('NIFTY', date(2026, 12, 1), 26450, 'CE').lot_size == 65
+    assert m.find('NHPC', date(2026, 12, 29), 82.5, 'CE').token == '55001'   # half strikes
+    assert len(m) == 4
 
 
 def test_from_kite_cross_checks_the_lot():
@@ -418,17 +627,28 @@ def test_two_rows_for_one_key_is_fatal():
         Y.ScripMap(Y.parse_scrip_master(dup)).find('RELIANCE', date(2026, 12, 29), 1540, 'CE')
 
 
+class Src:
+    def __init__(self, text=CSV):
+        self.n, self.text = 0, text
+
+    def scrip_master_paths(self):
+        return ['https://x/nse_cm.csv', 'https://x/nse_fo.csv']
+
+    def fetch_text(self, url):
+        self.n += 1
+        assert 'nse_fo' in url
+        return self.text
+
+
 def test_load_downloads_once_a_day_into_the_shared_cache(home):
-    class Src:
-        n = 0
+    src = Src()
+    m1 = Y.load(src, today=date(2026, 11, 27), min_rows=1)
+    m2 = Y.load(src, today=date(2026, 11, 27), min_rows=1, underlyings=['NHPC'])
+    assert src.n == 1 and len(m1) == 4 and len(m2) == 1
+    assert not list(home.glob('*.tmp'))
 
-        def scrip_master_paths(self):
-            return ['https://x/nse_cm.csv', 'https://x/nse_fo.csv']
 
-        def fetch_text(self, url):
-            Src.n += 1
-            assert 'nse_fo' in url
-            return CSV
-    m1 = Y.load(Src(), today=date(2026, 11, 27))
-    m2 = Y.load(Src(), today=date(2026, 11, 27))
-    assert Src.n == 1 and len(m1) == len(m2) == 3
+def test_a_truncated_download_is_never_cached(home):
+    with pytest.raises(Y.ScripMasterError, match='truncated'):
+        Y.load(Src(CSV), today=date(2026, 11, 27), min_rows=1000)
+    assert not list(home.glob('scrip_nse_fo_*.csv'))
