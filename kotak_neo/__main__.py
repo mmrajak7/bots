@@ -7,6 +7,9 @@
   unblock    clear a latch (credentials/MPIN) and the cooldown -- owner only
   owners     list which bot holds which contract; --assign SYM BOT / --clear SYM
   measure-second-login   after hours, no bot trading: does a 2nd login kill the 1st?
+  probe      REAL 1-lot order probe through this package (armed by PROBE_ARM):
+             probe --underlying RELIANCE --expiry 2026-12-29 --strike 1540 --type CE
+                   --kite-symbol RELIANCE26DEC1540CE --kite-lot 500 --confirm-real-order
 
 Exit codes: 0 ok / nothing to do, 1 the action did not succeed, 2 usage.
 """
@@ -36,6 +39,15 @@ def main(argv=None) -> int:
     o.add_argument('--assign', nargs=2, metavar=('SYMBOL', 'BOT'))
     o.add_argument('--clear', metavar='SYMBOL')
     sub.add_parser('measure-second-login', help='after hours only (DESIGN section 10)')
+    pr = sub.add_parser('probe', help='REAL 1-lot order probe (armed by PROBE_ARM)')
+    pr.add_argument('--underlying', required=True)
+    pr.add_argument('--expiry', required=True)
+    pr.add_argument('--strike', type=float, required=True)
+    pr.add_argument('--type', required=True, choices=['CE', 'PE'])
+    pr.add_argument('--kite-symbol', required=True)
+    pr.add_argument('--kite-lot', type=int, required=True)
+    pr.add_argument('--ceiling', type=float, default=2000.0)
+    pr.add_argument('--confirm-real-order', action='store_true')
     a = ap.parse_args(argv)
 
     if a.cmd == 'status':
@@ -53,6 +65,21 @@ def main(argv=None) -> int:
         out = S.measure_second_login()
         print(json.dumps(out, indent=1))
         return 0 if not str(out.get('verdict', '')).startswith('REFUSED') else 1
+    if a.cmd == 'probe':
+        from datetime import date
+        from pathlib import Path
+        from . import probe as P, symbols as Y
+        from .client import NeoClient
+        c = NeoClient('prb')
+        smap = Y.load(c, underlyings=[a.underlying])
+        row = smap.find(a.underlying, date.fromisoformat(a.expiry), a.strike, a.type)
+        tok = Path(S.DEFAULTS['credentials_file']).parent / 'kite_access_token.json'
+        try:
+            return P.run(c, row, a.kite_lot, P.kite_quote_fn(a.kite_symbol, tok),
+                         ceiling=a.ceiling, confirm=a.confirm_real_order)
+        except P.ProbeRefused as e:
+            print('REFUSED: %s' % e)
+            return 2
     if a.cmd == 'unblock':
         out = S.unblock('cli:%s' % getpass.getuser())
         print('unblocked (was: %s)' % out['was'])
