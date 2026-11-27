@@ -24,16 +24,17 @@
  "src/momentum/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
  "src/momentum/audit.py": "c76c7cff6ea6adfc0ce4348ed820250a0c64ee04a865eae2d36d79f4b3e513b1",
  "src/momentum/broker.py": "000c45e450f71d6b82358fc816928bf902a8060d6d8789e56717463a217dfe8f",
- "src/momentum/cli.py": "ee069fc56136e03b04e1e222bf79b6173df5f50df4c1a6c2db6709eb64486e37",
- "src/momentum/config.py": "189b090b9ffc1dad5e71bb75354e3ee099e03e99fb60b5c6e4e2afa24fa2ff3d",
+ "src/momentum/cli.py": "28261014ff8469b40ee0927d3f2f55f00dfb89847764d4f597686f3c0e3a57e3",
+ "src/momentum/config.py": "bc60a9b6bc90cacf62e8b5e67197e4103ca1baa33cee13a8dee4a4b08a95a4a8",
  "src/momentum/control.py": "7b8731e5e36dc2b582bc8bbe918bf67f6068129182d8a46220b5d19fdf18e866",
- "src/momentum/engine.py": "96fcffabc3224f5a7929e77a697ba45e65b78519726333ca5d948d87ba58f7d7",
- "src/momentum/evening.py": "9bc630890421f7170d07dccc4cf60969670c688d1c8f7445eea226b3c0611875",
- "src/momentum/fakebroker.py": "a44ba9eedbfdc36bfaae9ecde193d39d5f7ceb146de442070ed4013260f336b4",
+ "src/momentum/engine.py": "d0a972fa361203df2de02aac3405c3630a8e5e1b3230b29d4354874d878d078c",
+ "src/momentum/evening.py": "bbc17e7326aa88bf3d8ad69f0441e3b5c2a8a30541ff4aac7aafcee989cbc60f",
+ "src/momentum/fakebroker.py": "8aa57f034373cb6efaff2869da3ad6ff6a98b83d44592597775d6e19aed72a7f",
+ "src/momentum/fo_vet.py": "d4b5cc025edc4d7f5ca9d3a465ab6fb35410a973ab4482e15a8d4f6e84f56622",
  "src/momentum/journal.py": "ea42995dc1bcd6271e6b47b34d6db091d9cc791ab7401c574df6d473abb72f45",
  "src/momentum/ledger.py": "f924c59dfe81af3b2fec16211a12d774f90489a871d7f6dee2942fba3f685970",
  "src/momentum/pipeline.py": "4506542f88cc14228729b69dbd2ffaef7295bfd6bde950dc1defe6dcf462d19b",
  "src/momentum/telegram.py": "5c20d1619cf438424134bc4d85d84e290e166aa43493dbe5f8e173ce59bbd026",
  "src/momentum/util.py": "9df74d03ae38ed6151ae891c2fcabaf057174e76bd015bc86ce647ad99f530c5",
- "src/momentum/vet.py": "b391af04503bdd5fe5038d6e519132ae3451c67472b863afc87b18d531cc6ed8"
+ "src/momentum/vet.py": "26db6ccfb3f4ba6d576a2c7b21a852fe3e15c4b91bb55ae53756b8d442b6d626"
 }

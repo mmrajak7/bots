@@ -57,13 +57,14 @@ def output_schema(intent_ids: List[str]) -> Dict[str, Any]:
                                "note": {"type": "string", "maxLength": 300}}}}}}
 
 
-def cli_args(cfg: Dict[str, Any], schema: Dict[str, Any]) -> List[str]:
-    """Headless call with every tool and extension off (U19 verified on the Pi; overridable in config)."""
+def cli_args(cfg: Dict[str, Any], schema: Dict[str, Any], system_prompt: str = SYSTEM_PROMPT) -> List[str]:
+    """Headless call with every tool and extension off (U19 verified on the Pi; overridable in config). The F&O
+    entrant vet (fo_vet.py) uses the same isolation with its own system prompt."""
     base = cfg.get("vet_cli_args") or [
         "-p", "--output-format", "json", "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
         "--setting-sources", "", "--no-session-persistence", "--permission-mode", "dontAsk",
     ]
-    return [cfg["claude_bin"], *base, "--system-prompt", SYSTEM_PROMPT, "--json-schema", json.dumps(schema)]
+    return [cfg["claude_bin"], *base, "--system-prompt", system_prompt, "--json-schema", json.dumps(schema)]
 
 
 KILL_GRACE_S = 5                # spec §C8 `timeout -k 5`: wait this long for the killed CLI to let go of its pipes

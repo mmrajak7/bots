@@ -63,7 +63,50 @@ def decision_path(env: Env, m: str, signal_day: str, rev: int) -> Path:
     return env.paths.decisions / f"{m}_{signal_day}_r{rev}.json"
 
 
-def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip_fetch: bool = False) -> Dict[str, Any]:
+def next_session(day: dt.date, holidays: Set[str]) -> dt.date:
+    """The next weekday after `day` that is not in the holiday file (= first session of the plan month)."""
+    n = day + dt.timedelta(days=1)
+    while n.weekday() >= 5 or n.isoformat() in holidays:
+        n += dt.timedelta(days=1)
+    return n
+
+
+def fo_entrants(env: Env, M: P.Modules, m: str, sd: str, first_session: str, fo_today: Set[str]) -> Dict[str, Any]:
+    """The evening F&O vet (fo_vet.py). Failed before `fo_vet_give_up` -> EveningError (the next 30-min run retries);
+    failed at / after it -> FINAL anyway with ALERT FO_VET_FAILED (owner D47; the day-1 backstop still guards)."""
+    from . import fo_vet as FV
+    cfg = env.cfg
+    final = util.now() >= util.at_today(cfg["fo_vet_give_up"])
+    p = Path(M.J.ANNOUNCED_FILE)
+    rows = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+    try:
+        eq = FV.eq_symbols(Path(cfg["_nse_data"]), sd)
+        fv = FV.run_check(cfg, env.paths.fo_vet, env.paths.fo_circulars, env.paths.vet, m, sd, first_session,
+                          fo_today, eq, rows, final, classify=env.fo_classify_fn, do_scan=env.fo_scan_fn)
+    except Exception as e:  # noqa: BLE001 - a bug in this step is a failed vet, never a lost plan (D47)
+        log.exception("F&O vet step crashed")
+        fv = {"status": "failed", "entrants": [], "problems": [f"{type(e).__name__}: {str(e)[:200]}"], "info": [],
+              "final": final, "fresh": True, "file": None, "sha256": None, "first_session": first_session}
+    if fv["fresh"]:
+        env.journal.append("NOTE", text=f"F&O vet {m}: {fv['status']}; entrants {fv['entrants']}; "
+                           f"problems {fv['problems'][:5]}", fo_vet_file=fv["file"] if fv["final"] else None)
+        for line in fv["info"]:
+            env.notify(f"F&O INFO {m}: {line}")
+    if fv["status"] != "ok":
+        if not fv["final"]:
+            raise EveningError(f"F&O vet failed ({'; '.join(fv['problems'])[:300]}); retrying until "
+                               f"{cfg['fo_vet_give_up']}, then the plan goes FINAL with an alert")
+        if fv["fresh"]:
+            env.alert("FO_VET_FAILED", f"{m}: {'; '.join(fv['problems'])[:300]} -> the plan goes FINAL without it "
+                      "(D47); the day-1 F&O check before the buys still applies")
+    if fv["fresh"] and fv["entrants"]:
+        env.notify(f"F&O ENTRANTS {m}: {fv['entrants']} start F&O on {first_session}: excluded from the band "
+                   "(research membership)")
+    return fv
+
+
+def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip_fetch: bool = False,
+                       first_session: Optional[str] = None) -> Dict[str, Any]:
     """Everything up to and including PLAN_FINAL. -> summary dict. Raises EveningError on a fail-closed stop."""
     cfg, paths, j = env.cfg, env.paths, env.journal
     sd = signal_day.isoformat()
@@ -106,6 +149,12 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
     missing = [d for d in prev_sess if P.cm_status(M, d) != "ok"]
     if missing:
         raise EveningError(f"Kite sessions without an ok CM file: {missing}")
+    # 2b. stocks whose F&O contracts start on m's first session (D47): research counts them as members of m
+    fv = fo_entrants(env, M, m, sd, first_session or next_session(signal_day, set()).isoformat(), fo_today)
+    extra = set(fv["entrants"]) - set(members)
+    if extra:
+        members = sorted(set(members) | extra)
+        P.configure(M, w, members, sess)
     # 3. rebuild + freeze band
     times = P.rebuild(M)
     band_sha, mem_sha = P.freeze_band(M, w, paths.bands, members, rev)
@@ -155,6 +204,9 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
     decision = {"plan_id": plan_id, "status": "FINAL", "made_at": util.now().isoformat(),
                 "code_manifest": cfg.get("_code_manifest_sha"), "band_sha256": band_sha, "members_sha256": mem_sha,
                 "announced_sha256": P.announced_sha(M), "members": members,
+                "fo_vet": {"status": fv["status"], "file": fv["file"], "sha256": fv["sha256"],
+                           "entrants": fv["entrants"], "first_session": fv["first_session"],
+                           "problems": fv["problems"][:10]},
                 "kite_sessions_prev_month": prev_sess, "signal_day_verified": True, "ledger_cash_paise": lg.cash_paise,
                 "audit": res.to_json(), "buys": buys, "holds": holds, "ranked": d["ranked"], "timings": times}
     text = json.dumps(decision, indent=1, sort_keys=True) + "\n"
@@ -171,7 +223,11 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
     m, sha = plan_id["month"], util.sha256_text(text)
     if util.now() > util.at_today(env.cfg["plan_final"]) and util.now().date().isoformat() == plan_id["signal_day"]:
         raise EveningError(f"past {env.cfg['plan_final']}: no final plan tonight (E21)")
-    if P.fo_checked_stamp(paths.control, m) is None and not plan_approved(env, plan_id, sha):
+    fv = decision.get("fo_vet")
+    # D47: a decision with an F&O vet result needs no stamp or tap (a failed vet was alerted when it failed); only a
+    # decision made before D47 (no fo_vet block) or the 'approve' fallback switch keeps the old owner gate
+    gate = fv is None or (fv.get("status") != "ok" and env.cfg["fo_vet_fail_action"] == "approve")
+    if gate and P.fo_checked_stamp(paths.control, m) is None and not plan_approved(env, plan_id, sha):
         if not any(r["type"] == "ALERT" and r.get("code") == "NO_FO_STAMP" and m in r.get("text", "")
                    for r in j.read()):
             env.alert("NO_FO_STAMP", f"control/fo_checked.json has no stamp for {m}: plan needs the owner's Approve")

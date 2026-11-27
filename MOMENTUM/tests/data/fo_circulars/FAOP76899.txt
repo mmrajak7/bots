@@ -1,0 +1,44 @@
+National Stock Exchange of India Limited
+
+
+   Circular
+    Department: FUTURES & OPTIONS
+
+    Download Ref No: NSE/FAOP/76899                          Date: October 14, 2026
+
+    Circular Ref. No: 140/2026
+
+   All Members,
+
+   Introduction of Futures & Options Contracts on Six Individual Securities
+
+   Members are advised to note that based on the stock selection criteria as prescribed by SEBI vide master
+   circular no. SEBI/HO/MRD-PoD2/CIR/P/2024/00181 dated December 30, 2024 and approval received from
+   SEBI, members are hereby notified that the futures and options contracts on following securities would be
+   available for trading w.e.f. October 28, 2026, subject to fulfilment of eligibility criteria of Quarter sigma
+   computation cycle of October 2026.
+
+    Sr. No.   Symbol                                Security Name
+       1      COROMANDEL                            Coromandel International Limited
+       2      CUB                                   City Union Bank Limited
+       3      DATAPATTNS                            Data Patterns (India) Limited
+       4      KARURVYSYA                            Karur Vysya Bank Limited
+       5      NAVINFLUOR                            Navin Fluorine International Limited
+       6      SYRMA                                 Syrma SGS Technology Limited
+
+   Other Important Points to be noted:
+      • The market lot and scheme of strikes of the above mentioned securities shall be informed to members
+          on October 27, 2026 through a separate circular.
+       •   The details of applicable quantity freeze shall be available in the contract file which shall be applicable
+           for trading on October 28, 2026.
+       •   Members are advised to load the updated contract.gz and NSE_FO_contract_ddmmyyyy.csv.gz file in
+           the trading application before trading on the effective date. This file can be obtained from the directory
+           faoftp/faocommon on the Extranet server. Additionally, members can access the MII contract file -
+           NSE_FO_contract_ddmmyyyy.csv.gz on the website path:- https://www.nseindia.com/all-reports-
+           derivatives.
+
+
+
+
+                                                                                                           Page 1 of 2
+National Stock Exchange of India Limited

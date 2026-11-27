@@ -150,7 +150,13 @@ class Ctx:
         gate = B.Gate(live=not self.dry, killed=lambda: C.killed(self.paths.kill_file), armed=armed)
         return E.Env(self.cfg, self.paths, self.journal, api, B.Broker(api, self.journal, gate), self.notify,
                      lambda step, vin, sk: V.run(self.cfg, self.paths.vet, step, vin, sk), sleep_until,
-                     arm=self.arm, dry=self.dry)
+                     arm=self.arm, dry=self.dry, fo_bhav_fn=self.fo_bhav)
+
+    def fo_bhav(self, day: str) -> Set[str]:
+        """Stock futures in the NSE F&O bhavcopy of `day` (the research membership file; day-1 backstop, D47)."""
+        from . import pipeline as P
+        M = P.import_research(resolve(self.home, self.cfg["srs_dir"]), Path(self.cfg["_nse_data"]))
+        return P.fo_url_fetch(M, day, Path(self.cfg["_nse_data"]) / "fo_bhav_live" / f"{day}.zip")
 
 
 def current_plan_month(j: Journal) -> Optional[str]:
@@ -307,7 +313,8 @@ def cmd_evening(x: Ctx, a: argparse.Namespace) -> int:
     E.ingest_inbox(env)
     M = P.import_research(resolve(x.home, x.cfg["srs_dir"]), Path(x.cfg["_nse_data"]))
     try:
-        res = EV.run_signal_evening(env, M, m, day, skip_fetch=a.skip_fetch)
+        res = EV.run_signal_evening(env, M, m, day, skip_fetch=a.skip_fetch,
+                                    first_session=EV.next_session(day, holidays(x.cfg, x.home)).isoformat())
     except (EV.EveningError, P.PipelineError) as e:
         late = util.now() >= util.at_today(x.cfg["plan_final"])
         env.alert("NO_PLAN", f"{m} (signal day {day}): {e}; "
@@ -521,7 +528,45 @@ def cmd_isolation(x: Ctx, a: argparse.Namespace) -> int:
     return 0 if ok else 5
 
 
-COMMANDS = {"evening": (cmd_evening, "order"), "morning": (cmd_morning, "order"),
+def cmd_fo_scan(x: Ctx, a: argparse.Namespace) -> int:
+    """Bring the NSE F&O circular store up to date (daily cron; the evening scans again before its vet, D47)."""
+    from . import fo_vet as FV
+    try:
+        r = FV.scan(x.paths.fo_circulars, x.cfg)
+    except FV.FoVetError as e:
+        log.warning("fo-scan: %s", e)
+        print(json.dumps({"complete": False, "stopped": str(e)}))
+        return 4
+    log.info("fo-scan: %s", {k: v for k, v in r.items() if k != "new_hits"})
+    print(json.dumps(r))
+    return 0 if r["complete"] else 4
+
+
+def cmd_fo_vet(x: Ctx, a: argparse.Namespace) -> int:
+    """Stand-alone F&O vet for a signal day (no Kite, no book state): the same scan + CLI call + checks as the
+    evening, written to a temporary folder and printed. `momentum fo-vet --as-of-signal 2026-11-27`."""
+    import tempfile
+    from . import evening as EV
+    from . import fo_vet as FV
+    from . import pipeline as P
+    if not a.as_of_signal:
+        print("fo-vet needs --as-of-signal YYYY-MM-DD", file=sys.stderr)
+        return 2
+    sd = a.as_of_signal
+    m = P.month_add(sd[:7], 1)
+    fs = EV.next_session(dt.date.fromisoformat(sd), holidays(x.cfg, x.home)).isoformat()
+    M = P.import_research(resolve(x.home, x.cfg["srs_dir"]), Path(x.cfg["_nse_data"]))
+    fo_today = P.fo_url_fetch(M, sd, Path(x.cfg["_nse_data"]) / "fo_bhav_live" / f"{sd}.zip")
+    p = Path(M.J.ANNOUNCED_FILE)
+    rows = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+    eq = FV.eq_symbols(Path(x.cfg["_nse_data"]), sd)
+    with tempfile.TemporaryDirectory(prefix="momfo_") as d:
+        res = FV.run_check(x.cfg, Path(d), x.paths.fo_circulars, x.paths.vet, m, sd, fs, fo_today, eq, rows, True)
+    print(json.dumps(res, indent=1, sort_keys=True))
+    return 0 if res["status"] == "ok" else 4
+
+
+COMMANDS = {"evening": (cmd_evening, "order"), "fo-scan": (cmd_fo_scan, "fo"), "fo-vet": (cmd_fo_vet, "fo"), "morning": (cmd_morning, "order"),
             "afternoon": (cmd_afternoon, "order"), "watch": (cmd_watch, "watch"), "canary": (cmd_canary, "canary"),
             "check-arm": (cmd_check_arm, "arm"), "kill-cancel": (cmd_kill_cancel, "kill"),
             "status": (cmd_status, None), "poller": (cmd_poller, "poller"), "manifest": (cmd_manifest, None),

@@ -1,0 +1,28 @@
+National Stock Exchange of India Limited
+
+Circular
+ Department: FUTURES & OPTIONS
+
+Download Ref No: NSE/FAOP/50414                               Date: November 25, 2021
+
+Circular Ref. No: 92/2021
+
+
+    All Members,
+
+    Introduction of Futures & Options Contracts on 2 Individual Securities
+
+    Members are advised to note that based on the stock selection criteria as prescribed by SEBI vide master
+    circular no. SEBI/HO/MRD/DP/CIR/P/2016/135 dated December 16, 2016, SEBI circular no
+    SEBI/HO/MRD/DP/CIR/P/2018/67 dated April 11, 2018 and approval received from SEBI, members are
+    hereby notified that the futures and options contracts on following 2 additional securities would be available
+    for trading w.e.f. December 31, 2021, subject to fulfilment of eligibility criteria of Quarter sigma computation
+    cycle of December 2021.
+
+                          Sr No   Security Name                                     Symbol
+                            1     ADITYA BIRLA CAPITAL LIMITED                    ABCAPITAL
+                            2     HONEYWELL AUTOMATION INDIA LIMITED              HONAUT
+
+    The market lot, scheme of strikes and quantity freeze limit of the above mentioned securities shall be informed
+    to members on December 30, 2021 through a separate circular.
+

@@ -20,7 +20,7 @@ import shutil
 from dataclasses import dataclass, field
 from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from . import broker as B
 from . import control as C
@@ -45,6 +45,9 @@ class Env:
     sleep_until: Callable[[dt.datetime], None]  # blocks until the time (tests: no-op that moves the clock)
     arm: Optional[C.Arm] = None
     dry: bool = False                           # dry run: price and record every order, send none
+    fo_bhav_fn: Optional[Callable[[str], Set[str]]] = None   # NSE F&O bhavcopy of a day -> stock futures
+    fo_classify_fn: Optional[Callable[..., Any]] = None      # F&O vet CLI call (tests inject; None = the real CLI)
+    fo_scan_fn: Optional[Callable[[], Dict[str, Any]]] = None  # circular scan (tests inject; None = NSE)
     alerts: List[str] = field(default_factory=list)
 
     def alert(self, code: str, text: str) -> None:
@@ -853,6 +856,77 @@ def reconcile(env: Env, day: str) -> None:
 
 
 # ---------------------------------------------------------------- the afternoon process
+# ---------------------------------------------------------------- F&O day-1 backstop (frozen design D47)
+NIFTY50_TOKEN = 256265
+
+
+def kite_fut_names(env: Env) -> Set[str]:
+    """Underlying names with futures in today's Kite NFO dump (probe 2026-11-27: equal to the F&O bhavcopy's stock
+    futures, 218/218, plus 6 index names that are never EQ symbols)."""
+    return {str(i["name"]) for i in env.api.instruments("NFO")
+            if i.get("instrument_type") == "FUT" and i.get("segment", "NFO-FUT") == "NFO-FUT" and i.get("name")}
+
+
+def fo_day1_names(env: Env, m: str) -> Tuple[Set[str], str, bool]:
+    """The research F&O membership of month m: names with stock futures on m's FIRST session. -> (names, source,
+    frozen now). Frozen once per month in snapshots/: a name that gains futures later in the month is still a valid
+    research buy, so a deferred buy must never be judged by a later day's list. Before m starts (a dry rehearsal)
+    today's Kite list is used and nothing is frozen. Raises when no list can be had (the caller fails closed)."""
+    f = env.paths.snapshots / f"fo_day1_{m}.json"
+    if f.exists():
+        raw = json.loads(f.read_text(encoding="utf-8"))
+        return set(raw["names"]), str(raw["source"]), False
+    today = util.today().isoformat()
+    if today[:7] < m:
+        return kite_fut_names(env), f"Kite NFO {today} (before {m}: not frozen)", False
+    rows = env.api.historical(NIFTY50_TOKEN, f"{m}-01", today, "day")
+    days = sorted({str(r["date"])[:10] for r in rows if str(r["date"])[:7] == m})
+    first = days[0] if days and days[0] < today else today
+    if first == today:
+        names, src = kite_fut_names(env), f"Kite NFO instruments {today}"
+    else:
+        if env.fo_bhav_fn is None:
+            raise RuntimeError("no F&O bhavcopy reader for a late first run")
+        names, src = set(env.fo_bhav_fn(first)), f"NSE F&O bhavcopy {first} (first run after day 1)"
+    if len(names) < int(env.cfg["fo_min_stock_futures"]):
+        raise RuntimeError(f"{src}: only {len(names)} names")
+    util.write_once(f, json.dumps({"month": m, "first_session": first, "source": src, "names": sorted(names),
+                                   "made_at": util.now().isoformat(timespec="seconds")}, indent=1) + "\n")
+    return names, src, True
+
+
+def fo_day1_guard(env: Env) -> Optional[str]:
+    """Before the step plan: a pending buy that has stock futures on m's first session is closed (research never buys
+    an F&O member). -> a problem text when the list cannot be had (no orders this session, no lock try)."""
+    lg = L.replay(env.journal.read())
+    plan = current_plan(lg)
+    pend = sorted((p for p in lg.positions.values() if p.leg == "PENDING_BUY"), key=lambda p: p.rank)
+    if plan is None or not pend:
+        return None
+    m = plan["plan_id"]["month"]
+    try:
+        names, src, frozen_now = fo_day1_names(env, m)
+    except Exception as e:  # noqa: BLE001 - any failure: fail closed for this session
+        return f"F&O day-1 list for {m} unavailable ({type(e).__name__}: {str(e)[:120]})"
+    for p in pend:
+        if p.symbol in names:
+            to = close_leg(env, p.position_id, f"F&O member of {m} ({src})")
+            env.alert("FO_ENTRANT", f"{p.symbol} has stock futures ({src}): the research excludes F&O members of "
+                      f"{m}, so it is not bought ({to}); its earmark stays in book cash")
+    if frozen_now:
+        try:
+            dec = json.loads((env.paths.decisions / plan["decision_file"]).read_text(encoding="utf-8"))
+            excluded = list((dec.get("fo_vet") or {}).get("entrants") or [])
+        except (OSError, ValueError):
+            excluded = []
+        stale = sorted(s for s in excluded if s not in names)
+        if stale:
+            env.alert("FO_FALSE_EXCLUSION", f"the {m} band excluded {stale} as F&O entrants, but they have no "
+                      f"futures on day 1 ({src}): the band was built on a stale circular; nothing to undo now")
+        env.journal.append("NOTE", text=f"F&O day-1 list {m}: {len(names)} names from {src}")
+    return None
+
+
 def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], List[str]]) -> None:
     day = util.today().isoformat()
     recs = env.journal.read()
@@ -871,6 +945,10 @@ def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], L
         problems = preflight()
         if killed_now(env):
             problems.append("KILL")
+        if not problems:
+            fp = fo_day1_guard(env)
+            if fp:
+                problems.append(fp)
         if problems:
             env.alert("PREFLIGHT", "; ".join(problems) + " -> no orders today")
             env.journal.append("STAGE", date=day, stage="PLAN", result="preflight failed")

@@ -13,6 +13,8 @@ mkdir -p state logs control secrets
 chmod 700 secrets
 [ -f secrets/telegram.json ] && chmod 600 secrets/telegram.json || echo "WARN: secrets/telegram.json missing (copy it with WinSCP)"
 [ "$(timedatectl show -p Timezone --value)" = "Asia/Kolkata" ] || echo "WARN: timezone is not Asia/Kolkata"
+command -v pdftotext >/dev/null || echo "WARN: pdftotext missing (sudo apt install poppler-utils): the F&O vet (D47) fails every evening"
+mkdir -p cache/fo_circulars
 # command wrappers
 cat > momentum <<EOW
 #!/usr/bin/env bash

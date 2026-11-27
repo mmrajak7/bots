@@ -23,6 +23,9 @@ REQUIRED_KEYS = (
     "step_plan_at", "place_at", "reconcile_at", "token_alert_at", "ladder_grace_min", "band_max",
     "arm_cap_rupees_default", "charges_rates", "srs_dir", "audit_top_n", "sell_rank", "backup_dir",
     "probe_reads", "probe_wait_s",
+    "fo_scan_seed", "fo_rss_url", "fo_circular_base", "fo_scan_settle_days", "fo_scan_pause_s", "fo_vet_timeout_s",
+    "fo_vet_max_circulars", "fo_vet_max_entrants", "fo_lookback_days", "fo_vet_give_up", "fo_vet_fail_action",
+    "fo_min_stock_futures",
 )
 TIME_KEYS = ("step_plan_at", "place_at", "last_place_at", "cancel_at", "reconcile_at", "token_first_poll",
              "token_alert_at", "token_deadline", "plan_final")
@@ -109,9 +112,20 @@ class Paths:
         """Rebuilt pipeline outputs (panel, store, band files) for the live path."""
         return self.state / "derived"
 
+    @property
+    def fo_vet(self) -> Path:
+        """Write-once F&O vet results per (month, signal day) (frozen design D47)."""
+        return self.state / "fo_vet"
+
+    @property
+    def fo_circulars(self) -> Path:
+        """NSE F&O circular store + scan state. Shared by the dry and live books (public NSE files, a cache)."""
+        return self.home / "cache" / "fo_circulars"
+
     def ensure(self) -> None:
         for d in (self.control, self.state, self.inbox, self.decisions, self.bands, self.audit, self.vet,
-                  self.locks, self.reports, self.snapshots, self.refresh, self.derived):
+                  self.locks, self.reports, self.snapshots, self.refresh, self.derived, self.fo_vet,
+                  self.fo_circulars):
             d.mkdir(parents=True, exist_ok=True)
 
 
@@ -142,6 +156,14 @@ def load(home: Optional[Path] = None, overrides: Optional[Dict[str, Any]] = None
               "audit_top_n"):
         if not isinstance(cfg[k], int) or isinstance(cfg[k], bool) or cfg[k] <= 0:
             raise ConfigError(f"{k} must be a positive int")
+    for k in ("fo_scan_seed", "fo_scan_settle_days", "fo_vet_timeout_s", "fo_vet_max_circulars", "fo_vet_max_entrants",
+              "fo_lookback_days", "fo_min_stock_futures"):
+        if not isinstance(cfg[k], int) or isinstance(cfg[k], bool) or cfg[k] <= 0:
+            raise ConfigError(f"{k} must be a positive int")
+    if not _is_hhmm(cfg["fo_vet_give_up"]) or not cfg["fo_vet_give_up"] < cfg["plan_final"]:
+        raise ConfigError("fo_vet_give_up must be HH:MM before plan_final")
+    if cfg["fo_vet_fail_action"] not in ("final_alert", "approve"):
+        raise ConfigError("fo_vet_fail_action must be final_alert|approve")
     ladder: List[str] = cfg["ladder"]
     if not isinstance(ladder, list) or not ladder:
         raise ConfigError("ladder times must be a non-empty ascending list")

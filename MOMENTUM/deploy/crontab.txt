@@ -2,6 +2,7 @@
 # M = the momentum command wrapper (venv + MOMENTUM_HOME). Every command takes its own flock.
 */30 20-23 * * *  $M evening        # signal-day evening (no-op on other days; re-runs a pending signal day; resumes)
 30 20 * * *       $M check-arm
+5 19 * * *        $M fo-scan        # NSE F&O circulars store (D47); the evening scans again before its F&O vet
 30 8 * * 1-5      $M canary
 35 8 * * 1-5      $M morning        # alive, token wait, preflight, holdings snapshot, shared-name holds
 30 14 * * 1-5     $M canary

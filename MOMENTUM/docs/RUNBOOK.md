@@ -1,4 +1,4 @@
-# MOMENTUM — Pi runbook (December 2026 slice: buys only, 5L)
+# MOMENTUM — Pi runbook (December 2026 slice: buys only, 2L test)
 
 **Account (owner 2026-11-25): the PERSONAL account YL6478, December 2026 to March 2027.** The book reads the token
 the Helper bots refresh at ~08:45 (`BOTS/data/kite_access_token.json`), never logs in. Keep the 5L as FREE cash on
@@ -46,11 +46,12 @@ slice; an `approve_each` ARM places nothing (ALERT ARM_MODE).
 {"phase": "P0", "plan_months": ["2026-12"], "mode": "automatic", "buy_cap_rupees_per_session": 220000,
  "valid_from": "2026-11-30", "valid_to": "2026-12-31"}
 ```
-`control/fo_checked.json` (after reading the NSE F&O circulars for December additions; add any to
-`SRS/data/fo_announced.json` first):
-```json
-{"2026-12": "2026-11-30"}
-```
+**F&O check is automatic (D47, 2026-11-28): nothing to read or stamp by hand.** The evening downloads NSE's F&O
+circulars (`fo-scan`, also daily at 19:05), a tool-less vet classifies them, code verifies every claim, and stocks whose
+F&O contracts start on the plan month's first session are excluded before the band. At 14:45 on day 1 the backstop
+checks Kite's real futures list: a planned buy with futures that day is not bought. `control/fo_checked.json` is only
+read for a decision made before D47. Check by hand any time: `./momentum fo-vet --as-of-signal 2026-11-27`
+(writes nothing to the book).
 
 ## 4. Daily
 | IST | What you see in Telegram |
@@ -75,3 +76,8 @@ Commands to the bot: `kill` (stops everything; cancels open book orders by tag),
 | `THREE_WAY` (16:00) / `opening holdings below the book` (preflight) | Kite and the book disagree | check Kite, then send `ack` |
 | `STALE_INTENT` / `ORPHAN` / `ORDER_MISSING` | an order was never reconciled | contract note → `filled ...` or `resolve ... absent` |
 | `CANCEL_FAILED` | the 15:28 cancel was not confirmed | look at Kite's order book; DAY orders end at the close |
+| `FO_VET_FAILED` | the evening F&O vet failed until 21:30; the plan went FINAL without it (D47) | nothing; the day-1 check still guards. Tell Claude (scan / CLI / NSE format) |
+| `F&O ENTRANTS` / `F&O INFO` | stocks starting F&O on day 1 were excluded / a circular worth knowing | nothing |
+| `FO_ENTRANT` (14:45) | a planned buy has stock futures on day 1: not bought, earmark stays cash | nothing (research never buys an F&O member) |
+| `FO_FALSE_EXCLUSION` | the band excluded a name that has no futures on day 1 (withdrawn circular) | nothing to undo; tell Claude |
+| `PREFLIGHT ... F&O day-1 list unavailable` | Kite's NFO list / the day-1 F&O bhavcopy could not be read | nothing; no buys this session (no lock try), next session retries |

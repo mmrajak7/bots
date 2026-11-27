@@ -43,6 +43,9 @@ class FakeKite:
     lose_reply_next: bool = False                                     # order IS placed, then NetworkError
     raw_error_next: Optional[BaseException] = None                    # order IS placed, then this raw exception
     fail_reads: int = 0                                               # next N read calls raise NetworkError
+    fo_futures: List[str] = field(default_factory=lambda: [f"FO{k:03d}" for k in range(1, 201)] + ["NIFTY"])
+    nfo_fail: bool = False                                            # the NFO instruments dump cannot be read
+    sessions: List[str] = field(default_factory=list)                 # NIFTY 50 daily candle dates (historical)
     on_place: Optional[Callable[[FakeOrder], None]] = None
     orders_: List[FakeOrder] = field(default_factory=list)
     trades_: List[Dict[str, Any]] = field(default_factory=list)
@@ -95,13 +98,19 @@ class FakeKite:
         return list(self.trades_)
 
     def instruments(self, exchange: str) -> List[Dict[str, Any]]:
+        if exchange == "NFO":                       # stock + index futures (day-1 F&O backstop, D47)
+            self._r("instruments_nfo")
+            if self.nfo_fail:
+                raise NetworkError("planted NFO dump failure")
+            return [{"name": s, "tradingsymbol": f"{s}26DECFUT", "instrument_type": "FUT", "segment": "NFO-FUT",
+                     "exchange": "NFO"} for s in self.fo_futures]
         self._r("instruments")
         return [{"tradingsymbol": k.split(":")[1], "exchange": "NSE", "tick_size": 0.05, "instrument_token": n}
                 for n, k in enumerate(self.ltp, 1) if k.split(":")[1] not in self.not_listed]
 
     def historical(self, token: int, frm: str, to: str, interval: str) -> List[Dict[str, Any]]:
         self._r("historical")
-        return []
+        return [{"date": d + "T00:00:00+05:30", "close": 1.0} for d in self.sessions if frm <= d <= to]
 
     # writes
     def place(self, **kw: Any) -> str:

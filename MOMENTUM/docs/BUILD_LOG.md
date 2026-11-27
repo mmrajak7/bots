@@ -90,3 +90,18 @@
   repair-journal; probe 3 x 1 s; no circuit -> no order; backup by 18 Dec; vet inputs audit_flags + freshness before Jan.
   **April company switch: data reading ALWAYS from YL6478 (quote/historical/instruments/sessions/audit); QSK814 only for
   its own orders/order book/trades/holdings/margins (two tokens, two roles).**
+- 2026-11-27 DRY-1 on the Pi stopped: "Kite sessions without an ok CM file: ['2026-11-08']" (Sunday muhurat). The
+  research fetcher asks only weekdays + its frozen calendar + EXTRA_WEEKEND (to 2024). Fix 07fc823: configure() adds
+  Kite's weekend sessions to the fetch list. DRY-1 re-run: FINAL 20 x Rs 9,970 (2L), CUPID + RATNAVEER AUDIT_HOLD.
+- 2026-11-27/28 F&O entrant vet + day-1 backstop (frozen design D47; owner: "dont bring such works manual", "fully
+  robust"; owner choice: vet failed -> FINAL + ALERT, no tap). Probes on the Pi: the isolated CLI with WebSearch /
+  WebFetch only works (tools exactly those + StructuredOutput) but Anthropic's fetcher times out on NSE, so the Pi
+  downloads the circulars itself (FAOP<n>.pdf over the global circular number range up to the RSS max; pdftotext)
+  and the Tier A vet (no tools) reads the text. Kite NFO FUT names == F&O bhavcopy STF (218/218) + 6 index names.
+  The code's own parser: 36/36 circulars cited by fo_announced.json (2020-2026, three table layouts) give the file's
+  symbols and first-contract dates. Real vet call on the 17 Jul-Sep candidates: all classified right (incl. the
+  BAJAJHLDNG, IEX/IREDA exclusions), 15 s. Found + fixed while building: withdrawal circulars quote the introduction
+  phrase (code read them as introductions); old layouts (name before symbol, names in capitals); a 404 re-try on every
+  30-min evening run would cost ~10 min (now once a day). New: fo_vet.py, `fo-scan` (cron 19:05), `fo-vet
+  --as-of-signal`, engine.fo_day1_guard (14:45, fail closed), Paths.fo_vet / cache/fo_circulars, 12 config keys.
+  tests/test_fo.py 31 tests; 122/122.

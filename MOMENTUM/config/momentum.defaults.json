@@ -59,5 +59,18 @@
  "srs_dir": "pipeline",
  "backup_dir": "backup",
  "claude_bin": "claude",
- "claude_version": "2.1.278"
+ "claude_version": "2.1.278",
+ "_fo_doc": "F&O entrant vet + day-1 backstop (frozen design D47, owner 2026-11-27). Seed FAOP75371 = 23 Jul 2026 (verified circular). give_up: a vet still failing at this time -> plan FINAL + ALERT (owner choice); 'approve' = old owner tap instead.",
+ "fo_scan_seed": 75371,
+ "fo_rss_url": "https://nsearchives.nseindia.com/content/RSS/Circulars.xml",
+ "fo_circular_base": "https://nsearchives.nseindia.com/content/circulars/",
+ "fo_scan_settle_days": 7,
+ "fo_scan_pause_s": 0.2,
+ "fo_vet_timeout_s": 300,
+ "fo_vet_max_circulars": 100,
+ "fo_vet_max_entrants": 30,
+ "fo_lookback_days": 120,
+ "fo_vet_give_up": "21:30",
+ "fo_vet_fail_action": "final_alert",
+ "fo_min_stock_futures": 150
 }
