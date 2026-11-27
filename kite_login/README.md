@@ -85,6 +85,7 @@ CROCODILE/venv/bin/python -m kite_login holidays --force
 | `FAILED ... another user ... NOT written` | that file holds another account's credentials | fix the file; nothing was overwritten |
 | `UNVERIFIED` | today's token exists but Kite could not be reached | wait for the 08:36 retry; if it still fails, check the network |
 | holidays `NOT overwritten` | Zerodha's page layout changed | yesterday's file is kept; fix `holidays.parse` |
+| token fixed by hand AFTER 09:00 | the BCS monitor loaded the bad token at 09:00 and holds it all session | also `pkill -f "bcs.spread_monitor --cron"`; the next */5 tick reloads it. zebra, st_watch, BTST, MOMENTUM and ETF_PI re-read the file on their own |
 
 ## Cutover (done 2026-11-27, owner: no SNAIL/FIFTY fallback on Monday)
 
