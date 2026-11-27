@@ -78,9 +78,11 @@ def load_config(path: Path = DEFAULTS_FILE) -> Dict[str, Any]:
     if not isinstance(cfg.get('accounts'), dict) or not cfg['accounts']:
         raise ValueError('%s: no accounts' % path)
     for alias, acc in cfg['accounts'].items():
-        if acc.get('generated_at') not in ('naive', 'aware') or not acc.get('token_file'):
-            raise ValueError('%s: account %r needs token_file and generated_at naive|aware'
-                             % (path, alias))
+        src = acc.get('credentials') or {}
+        if (acc.get('generated_at') not in ('naive', 'aware') or not acc.get('token_file')
+                or src.get('format') not in ('env', 'json') or not src.get('file')):
+            raise ValueError('%s: account %r needs token_file, generated_at naive|aware and '
+                             'credentials {format: env|json, file}' % (path, alias))
     return cfg
 
 
@@ -94,22 +96,43 @@ def home() -> Path:
     return Path(os.environ.get('KITE_LOGIN_HOME') or Path.home() / '.kite_login')
 
 
-def load_credentials(path: Path, alias: str) -> Dict[str, str]:
-    """The account's credentials, or LoginError naming what is wrong (never a value)."""
+def read_env(path: Path) -> Dict[str, str]:
+    """KEY=VALUE lines (comments, blanks, `export`, surrounding quotes handled)."""
+    out = {}
+    for line in path.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        k, v = line.split('=', 1)
+        k = k.strip()
+        if k.startswith('export '):
+            k = k[len('export '):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def load_credentials(source: Mapping[str, str], alias: str,
+                     root: Path = BOTS_ROOT) -> Dict[str, str]:
+    """The account's credentials from the file they have always lived in (owner
+    2026-11-27: SNAIL's creds.env, FIFTY's kite_credentials.json -- no copy).
+    LoginError names what is wrong, never a value."""
+    path = resolve(source['file'], root)
     try:
-        with open(str(path), encoding='utf-8') as f:
-            data = json.load(f)
+        if source['format'] == 'env':
+            env = read_env(path)
+            prefix = source.get('prefix', '')
+            acc = {k: env.get(prefix + k.upper(), '') for k in CRED_KEYS}
+        elif source['format'] == 'json':
+            with open(str(path), encoding='utf-8') as f:
+                acc = json.load(f)
+        else:
+            raise LoginError('%r: unknown credentials format %r' % (alias, source['format']))
     except FileNotFoundError:
-        raise LoginError('credentials file missing: %s' % path)
+        raise LoginError('%r credentials file missing: %s' % (alias, path))
     except (OSError, ValueError) as e:
-        raise LoginError('credentials file unreadable: %s (%s)' % (path, type(e).__name__))
-    if os.name != 'nt':
-        mode = path.stat().st_mode & 0o077
-        if mode:
-            logger.warning('kite_login: %s is readable by group/other -- chmod 600 it', path)
-    acc = data.get(alias) if isinstance(data, dict) else None
+        raise LoginError('%r credentials file unreadable: %s (%s)' % (alias, path, type(e).__name__))
     if not isinstance(acc, dict):
-        raise LoginError('credentials file has no %r account' % alias)
+        raise LoginError('%r credentials file is not an object: %s' % (alias, path))
     missing = [k for k in CRED_KEYS if not str(acc.get(k) or '').strip()]
     if missing:
         raise LoginError('%r credentials missing: %s' % (alias, ', '.join(missing)))
@@ -368,7 +391,7 @@ def ensure_account(alias: str, cfg: Mapping[str, Any], root: Path = BOTS_ROOT,
     path = resolve(acc['token_file'], root)
     creds: Optional[Dict[str, str]] = None
     try:
-        creds = load_credentials(resolve(cfg['credentials_file'], root), alias)
+        creds = load_credentials(acc['credentials'], alias, root)
         token = read_token(path)
         current, why = is_current(token, creds, now_fn())
         if current and token is not None:

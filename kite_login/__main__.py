@@ -1,12 +1,11 @@
 """`python -m kite_login <command>` -- the morning Kite tokens + holiday calendar.
 
-  morning [--final]   what the Pi cron runs (08:40, and 08:46 with --final):
+  morning [--final]   what the Pi cron runs (08:30, and 08:36 with --final):
                       every account's token (NOOP if today's works) + holiday refresh.
                       --final sends ONE Telegram alert if anything is still not right.
   login [--account personal|company] [--final]   tokens only
   holidays [--force]  refresh data/holiday_calendar.json (once a day unless --force)
   status              offline summary: which tokens are from this session. Never a secret.
-  import-legacy       ONE-TIME cutover: data/kite_credentials.json from SNAIL + FIFTY files.
 
 Exit codes: 0 all good, 1 something did not succeed, 2 usage.
 """
@@ -61,18 +60,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     h = sub.add_parser('holidays', help='refresh the NSE holiday calendar')
     h.add_argument('--force', action='store_true')
     sub.add_parser('status', help='offline summary')
-    sub.add_parser('import-legacy', help='ONE-TIME: build the credentials file from SNAIL + FIFTY')
     a = ap.parse_args(argv)
 
     cfg = C.load_config()
     if a.cmd == 'status':
         print(json.dumps(C.status(cfg), indent=1))
         return 0
-    if a.cmd == 'import-legacy':
-        from . import migrate
-        ok, msg = migrate.import_legacy(cfg)
-        print(msg)
-        return 0 if ok else 1
 
     problems: List[str] = []
     if a.cmd in ('morning', 'login'):

@@ -114,7 +114,7 @@ def check_mode(rep):
 
 
 def check_kite(rep, now, probe=True):
-    """The token kite_login refreshes each morning (08:40), and whether it actually works."""
+    """The token kite_login refreshes each morning (08:30), and whether it actually works."""
     import platform
     path = (r'C:\Users\mail2\Documents\Projects\BOTS\data\kite_access_token.json'
             if platform.system() == 'Windows'

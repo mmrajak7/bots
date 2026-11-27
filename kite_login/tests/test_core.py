@@ -81,11 +81,23 @@ class FakeKite:
         return S()
 
 
+def _write_creds(root, creds):
+    """The two places the credentials have always lived (owner 2026-11-27: no copy)."""
+    (root / 'data').mkdir(parents=True, exist_ok=True)
+    (root / 'SNAIL' / 'config').mkdir(parents=True, exist_ok=True)
+    p = creds['personal']
+    (root / 'SNAIL' / 'config' / 'creds.env').write_text(
+        '# SNAIL env\nZERODHA_API_KEY=%s\nZERODHA_API_SECRET="%s"\nZERODHA_USER_ID=%s\n'
+        "ZERODHA_PASSWORD='%s'\nZERODHA_TOTP_SECRET=%s\nANTHROPIC_API_KEY=ignored\n"
+        % (p['api_key'], p['api_secret'], p['user_id'], p['password'], p['totp_secret']))
+    (root / 'FIFTY' / 'data').mkdir(parents=True, exist_ok=True)
+    (root / 'FIFTY' / 'data' / 'kite_credentials.json').write_text(json.dumps(creds['company']))
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     root = tmp_path / 'BOTS'
-    (root / 'data').mkdir(parents=True)
-    (root / 'data' / 'kite_credentials.json').write_text(json.dumps(CREDS))
+    _write_creds(root, CREDS)
     monkeypatch.setenv('KITE_LOGIN_HOME', str(tmp_path / 'home'))
     (tmp_path / 'home').mkdir()
     (tmp_path / 'home' / 'LOGIN_HOST').write_text(socket.gethostname())
@@ -228,7 +240,8 @@ def test_login_refused_never_leaks_the_password_and_other_account_still_runs(env
 
 def test_missing_credentials_file_fails_closed(env):
     root, cfg, kite = env
-    (root / 'data' / 'kite_credentials.json').unlink()
+    (root / 'SNAIL' / 'config' / 'creds.env').unlink()
+    (root / 'FIFTY' / 'data' / 'kite_credentials.json').unlink()
     out = _run(env)
     assert all(r.outcome == C.FAILED and 'missing' in r.detail for r in out)
 
@@ -237,7 +250,7 @@ def test_missing_credential_key_named_not_valued(env):
     root, cfg, kite = env
     bad = json.loads(json.dumps(CREDS))
     bad['company']['totp_secret'] = ''
-    (root / 'data' / 'kite_credentials.json').write_text(json.dumps(bad))
+    _write_creds(root, bad)
     out = {r.account: r for r in _run(env)}
     assert out['personal'].outcome == C.LOGGED_IN
     assert out['company'].outcome == C.FAILED and 'totp_secret' in out['company'].detail
@@ -293,3 +306,25 @@ def test_tracked_defaults_carry_no_account_ids():
     text = C.DEFAULTS_FILE.read_text()
     for needle in ('QSK', 'YL6', 'api_secret"', 'password"'):
         assert needle not in text
+
+
+def test_credentials_are_read_where_they_always_lived(env):
+    """personal from SNAIL's creds.env (ZERODHA_*, quotes stripped, other keys ignored),
+    company from FIFTY's json -- and no copy is ever made."""
+    root, cfg, kite = env
+    p = C.load_credentials(cfg['accounts']['personal']['credentials'], 'personal', root)
+    c = C.load_credentials(cfg['accounts']['company']['credentials'], 'company', root)
+    assert p['api_secret'] == 'psecret99' and p['password'] == 'ppass777'
+    assert p['totp_secret'] == 'JBSWY3DPEHPK3PXP'          # spaces removed
+    assert c['user_id'] == 'CU0002'
+    _run(env)
+    assert not (root / 'data' / 'kite_credentials.json').exists()
+
+
+def test_config_without_a_credentials_source_is_refused(tmp_path):
+    bad = json.loads(C.DEFAULTS_FILE.read_text())
+    del bad['accounts']['company']['credentials']
+    f = tmp_path / 'c.json'
+    f.write_text(json.dumps(bad))
+    with pytest.raises(ValueError, match='credentials'):
+        C.load_config(f)
