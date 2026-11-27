@@ -31,6 +31,9 @@
 # Kite/Zerodha tokens
 **/kite_access_token.json
 **/kite_credentials.json
+# kite_login's atomic-write temp files (a crash mid-write must not leave a token un-ignored)
+**/.kite_access_token.json.tmp.*
+**/.holiday_calendar.json.tmp.*
 
 # Kotak Neo credentials
 Scalper/config/credentials.yaml

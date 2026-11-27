@@ -56,27 +56,14 @@ def get_historical_data(instrument_token, symbol, timeframe):
         print('Invalid timeframe')
         return None
 
-    # Initialize an empty list to store the daily data
     daily_data_list = []
-
-    # Loop through each year and get the daily data
-    for year in range(start_date.year, end_date.year + 1):
-        # Define the start and end dates for the current year
-        year_start_date = datetime(year, 1, 1).date()
-        year_end_date = datetime(year, 12, 31).date()
-
-        # print(year_start_date, year_end_date)
-
-        # Get the historical data for the current year
-        try:
-            historical_data = shared_kite.candles(instrument_token, 'day', str(year_start_date), str(year_end_date))
-        except Exception as e:
-            # print(f"Error occurred: {e}")
-            continue
-
-        # Append the historical data to the daily data list
-        daily_data_list.extend(historical_data)
-        # print(daily_data_list)
+    # Same span as the old one-call-per-calendar-year loop (from 1 Jan of the start
+    # year: the SuperTrend warm-up is unchanged), fetched in as few calls as Kite
+    # allows -- these calls now spend the SHARED API key's historical budget.
+    try:
+        daily_data_list = shared_kite.daily(instrument_token, datetime(start_date.year, 1, 1).date(), end_date)
+    except Exception as e:  # token missing -> caller sees empty data and alerts
+        print('historical %s: %s' % (symbol, e))
 
     # Create a DataFrame from the daily data list
     daily_df = pd.DataFrame(daily_data_list, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
