@@ -199,7 +199,8 @@ def diagnose(exc, token_path=None) -> dict:
                   'per-cycle request count or back off; do NOT re-auth.')
     elif cause == AUTH:
         headline = 'Kite AUTH failure — the access token was rejected'
-        advice = 'Regenerate the access token (SNAIL auth), then restart.'
+        advice = ('Regenerate the access token (`python -m kite_login '
+                  'morning` from BOTS root), then restart.')
     elif cause == NETWORK:
         headline = 'Kite NETWORK/OMS failure — neither auth nor rate limit'
         advice = ('The link or the broker backend is unavailable. Usually '

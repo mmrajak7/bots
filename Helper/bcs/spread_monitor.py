@@ -346,7 +346,8 @@ def load_kite() -> KiteConnect:
         # was a line in a file nobody opens until something has gone wrong.
         msg = (f"Token is from {generated.date()}, not today — the monitor is "
                f"starting but every Kite call may fail. Open positions would "
-               f"be UNMONITORED. Re-run SNAIL auth.")
+               f"be UNMONITORED. Re-run `python -m kite_login morning` "
+               f"(BOTS root), then restart this monitor.")
         log(f"WARNING: {msg}")
         send_telegram(f"⚠️ BCS MONITOR: STALE KITE TOKEN\n{msg}", alert_class=alert_policy.SAFETY)
 

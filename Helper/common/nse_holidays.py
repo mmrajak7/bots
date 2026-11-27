@@ -22,7 +22,8 @@ direction is "still holding when the ramp starts".
 WHERE THE DATES COME FROM (rewritten 2026-08-30)
 ------------------------------------------------
 `BOTS/data/holiday_calendar.json`, refreshed daily from Zerodha's published
-calendar by `SNAIL/src/utils/holiday_scraper.py`. Read at CALL TIME, cached on
+calendar by `kite_login morning` (BOTS root, 08:30 cron; the parser moved
+there from SNAIL's holiday_scraper on 2026-11-27). Read at CALL TIME, cached on
 the file's mtime, so a refresh lands without a restart.
 
 **It replaced a hand-written static list that was mostly wrong.** That list
@@ -72,7 +73,7 @@ logger = logging.getLogger(__name__)
 #: engine — the same rule `common/arming.py` follows and for the same reason.
 BOTS_ROOT = Path(__file__).resolve().parents[2]
 
-#: Written daily by SNAIL's startup workflow and shared by every bot, next to
+#: Written daily by `kite_login morning` (08:30) and shared by every bot, next to
 #: `kite_access_token.json`. The env override exists for tests and for a box
 #: that lays the tree out differently.
 HOLIDAY_FILE = Path(os.environ.get(
@@ -217,8 +218,8 @@ def coverage_status(today: date) -> dict:
                 'detail': '%s. Every session count is WEEKDAYS-ONLY, which '
                           'OVER-estimates the sessions remaining and fires '
                           'every delivery close LATER, into the margin ramp. '
-                          'It is written daily by SNAIL\'s startup workflow '
-                          '(holiday_scraper.py) — check that it ran.'
+                          'It is written daily by `kite_login morning` '
+                          '(08:30 cron) — check that it ran.'
                           % c['error']}
     end = coverage_end()
     if end is None:
@@ -247,7 +248,7 @@ def coverage_status(today: date) -> dict:
         return {'state': 'stale', 'days_left': (end - today).days,
                 'detail': '%s parses, but its `_last_updated` is missing or '
                           'unreadable, so this calendar has NO KNOWN AGE. It '
-                          'is scraped daily by SNAIL (holiday_scraper.py); a '
+                          'is refreshed daily by `kite_login morning`; a '
                           'calendar that cannot say when it was refreshed is '
                           'treated as one that was not. A holiday declared '
                           'since then is unknown here, and an unknown holiday '
@@ -345,7 +346,7 @@ def sessions_between(start: date, end: date, *, warn=None) -> int:
              'margin ramp. The calendar is %s.'
              % ('/'.join(str(y) for y in sorted(covered_years())) or 'NOTHING',
                 end.isoformat(),
-                'refreshed daily into %s by SNAIL' % HOLIDAY_FILE))
+                'refreshed daily into %s by kite_login' % HOLIDAY_FILE))
     sessions, cur = 0, start
     while cur < end:
         cur += timedelta(days=1)

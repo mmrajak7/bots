@@ -5,9 +5,9 @@
 # It never pulls code, restarts anything, sends Telegram, or writes on the Pi.
 #
 # WHAT LANDS WHERE
-#   tokens  -> their REAL local paths (BOTS/data, FIFTY/data, CROCODILE/data),
+#   tokens  -> their REAL local paths (BOTS/data, FIFTY/data),
 #              replaced only when the Pi's copy is NEWER.
-#              All three paths are gitignored; the script refuses to write one
+#              Both paths are gitignored; the script refuses to write one
 #              that is not.  Token VALUES are never printed.
 #   NEO     -> NEVER by default (owner, 2026-11-27: the laptop never logs in and
 #              imports the Pi's session only when it needs one):
@@ -107,7 +107,6 @@ pull_token() {
 echo "=== tokens (newer-only) ==="
 pull_token "$R_BOTS/data/kite_access_token.json"      "data/kite_access_token.json"        # personal account
 pull_token "$R_BOTS/FIFTY/data/kite_access_token.json" "FIFTY/data/kite_access_token.json"  # company account (FIFTY)
-pull_token "$R_BOTS/CROCODILE/data/kite_access_token.json" "CROCODILE/data/kite_access_token.json"
 # NEO: not here. One session lives on the Pi (~/.kotak_neo); see --neo-session.
 
 echo "=== evidence (logs: last $DAYS day(s); books/journals: all) ==="

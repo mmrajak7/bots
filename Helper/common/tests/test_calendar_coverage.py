@@ -114,7 +114,7 @@ def test_a_missing_file_is_its_own_state(tmp_path, monkeypatch):
     h.reload()
     st = h.coverage_status(TODAY)
     assert st['state'] == 'missing'
-    assert 'holiday_scraper' in st['detail'], (
+    assert 'kite_login' in st['detail'], (
         'the alert must name the job that writes the file — otherwise the '
         'reader knows something is wrong and not what to restart')
 
