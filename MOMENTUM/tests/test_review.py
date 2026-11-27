@@ -556,6 +556,17 @@ class TestPoller(unittest.TestCase):
         self.assertEqual(T.poll_once(bot, tmp / "inbox", tmp / "off", tmp / "KILL", lambda: "x"), 0)  # type: ignore
         self.assertEqual(len(list((tmp / "inbox").glob("*.json"))), 1)
 
+    def test_slash_commands_and_start(self) -> None:
+        """Telegram sends '/status', '/start', '/status@BotName': accepted; /start shows the command list."""
+        tmp = Path(tempfile.mkdtemp())
+        msg = lambda uid, text: {"update_id": uid, "message": {"chat": {"id": 42}, "text": text}}  # noqa: E731
+        bot = FakeBot([msg(1, "/start"), msg(2, "/status"), msg(3, "/status@MomBot"), msg(4, "/HELP")])
+        T.poll_once(bot, tmp / "inbox", tmp / "off", tmp / "KILL", status_fn=lambda: "book ok")  # type: ignore
+        self.assertTrue(bot.sent[0].startswith("MOM commands:"))
+        self.assertEqual(bot.sent[1:3], ["MOM book ok", "MOM book ok"])
+        self.assertTrue(bot.sent[3].startswith("MOM commands:"))
+        self.assertFalse(any("unknown command" in s for s in bot.sent))
+
 
 class TestPipelineAndVet(unittest.TestCase):
     def test_bad_fo_download_is_not_kept(self) -> None:

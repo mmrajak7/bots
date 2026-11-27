@@ -123,9 +123,15 @@ def poll_once(bot: Bot, inbox: Path, offset_file: Path, kill_file: Path,
             msg = u["message"]
             chat = str(msg.get("chat", {}).get("id", ""))
             text = str(msg.get("text", "")).strip()
+            # Telegram clients send commands as "/status" (and "/start" when a chat is opened): accept the slash form
+            # and a "@botname" suffix; /start and help only show the command list.
+            text = re.sub(r"^/(\w+)(?:@\w+)?", r"\1", text)
             mt = CMD_RE.match(text)
             if chat != bot.chat_id:
                 log.warning("ignored message from chat %s", chat)
+                continue
+            if text.lower() in ("start", "help"):
+                bot.send(f"MOM commands: {HELP}")
                 continue
             if not mt:
                 bot.send(f"unknown command: {text[:60]} ({HELP})")

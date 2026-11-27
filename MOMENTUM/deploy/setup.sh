@@ -23,7 +23,7 @@ EOW
 chmod +x momentum
 cat > momentum-poller-keepalive <<EOW
 #!/usr/bin/env bash
-pgrep -f "momentum.cli poller" >/dev/null || nohup "$HERE/momentum" poller >> "$HERE/logs/poller.out" 2>&1 &
+pgrep -f "sys.exit\(main\(\)\) poller" >/dev/null || nohup "$HERE/momentum" poller >> "$HERE/logs/poller.out" 2>&1 &
 EOW
 chmod +x momentum-poller-keepalive
 # crontab block (replaces only the MOMENTUM block)
