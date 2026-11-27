@@ -19,7 +19,7 @@ python3 -c "import json;print(sorted(json.load(open('ETF_PI/credentials.json')))
                                       # extract_data_telegram, tracker_telegram, backtest_kite
 git checkout -- ETF_PI                # take the repo versions (secrets via credentials.json)
 rm -f ETF_PI/kite_trade.py            # deleted in git (kite_login), untracked after the reset
-cd ETF_PI && sha256sum -c MANIFEST.sha256 && /usr/bin/python3 -m pytest executor/tests -q
+cd ETF_PI && sha256sum -c MANIFEST.sha256 && /usr/bin/python3 -m executor selftest
 # owner: remove the now-unused tracker_kite / extract_data_kite sections from credentials.json
 # c) hide the stale copy in the main clone (owner: "remove outdated ETF_PI")
 cd ~/Desktop/BOTS && git sparse-checkout set --no-cone '/*' '!/ETF_PI/' && ls ETF_PI 2>&1 | head -1

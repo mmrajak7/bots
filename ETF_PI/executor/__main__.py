@@ -10,6 +10,8 @@ Run from the ETF_PI directory with the SAME interpreter as option_buy (Pi: /usr/
   python3 -m executor stop       STOPPED flag + systemctl stop (the watchdog leaves it stopped)
   python3 -m executor start      remove STOPPED + systemctl start
   python3 -m executor check      load config + option_buy + kotak_neo, print the plan, exit
+  python3 -m executor selftest   the executor test suite under THIS interpreter (Pi: /usr/bin/python3
+                                 has no pytest -> the CROCODILE venv's pytest is appended to sys.path)
 """
 from __future__ import annotations
 
@@ -353,10 +355,32 @@ def cmd_probe(args) -> int:
     return 0
 
 
+def cmd_selftest(args) -> int:
+    """Run executor/tests with the daemon's own interpreter (its pandas/kiteconnect/gspread).
+    pytest is APPENDED from the CROCODILE venv when missing: appended, never prepended,
+    because ~/.local on the Pi carries an ancient `asyncio` backport that shadows the stdlib."""
+    import glob
+    try:
+        import pytest
+    except ImportError:
+        cfg = C.load()
+        sp = glob.glob(os.path.join(cfg['bots_root'], 'CROCODILE', 'venv', 'lib', 'python3*',
+                                    'site-packages'))
+        if not sp:
+            print('no pytest here and no CROCODILE venv under %s' % cfg['bots_root'])
+            return 2
+        sys.path.append(sp[0])
+        import pytest
+    os.chdir(ETF_DIR)
+    return int(pytest.main(['executor/tests', '-q', '-p', 'no:cacheprovider', '-p', 'no:asyncio',
+                            '-W', 'ignore']))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog='python3 -m executor')
     sub = ap.add_subparsers(dest='cmd', required=True)
-    for name in ('run', 'watchdog', 'status', 'kill', 'flatten', 'resume', 'check', 'stop', 'start'):
+    for name in ('run', 'watchdog', 'status', 'kill', 'flatten', 'resume', 'check', 'stop', 'start',
+                 'selftest'):
         sub.add_parser(name)
     pp = sub.add_parser('probe')
     pp.add_argument('--symbol', required=True, help='Kite tradingsymbol, e.g. NIFTY2612026000CE')
