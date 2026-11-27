@@ -68,6 +68,40 @@ CRED_KEYS = ('consumer_key', 'mobile_number', 'ucc', 'mpin', 'totp_secret')
 #: "emsg":"Invalid session","stCode":1003}` with the HTTP code unstated)
 SESSION_DEAD_EMSG = ('invalid session', 'session expired', 'session ip')
 
+#: Keys a NEO body has been SEEN to carry its message under. The docs show
+#: `emsg`; the live API (Pi, 2026-11-27) sends `errMsg` -- e.g. the empty book
+#: `{"stat":"Not_Ok","stCode":5203,"errMsg":"No Data","desc":"data not found"}`
+#: -- and a 400 on cancel put the text in `stat` itself:
+#: `{"stCode":1018,"errMsg":"please provide valid internal order number",
+#: "stat":"please provide valid internal order number"}`. Reading `emsg` alone
+#: made a genuinely empty book an ERROR and hid every session-dead text.
+MSG_KEYS = ('emsg', 'errMsg', 'message')
+
+
+def neo_msg(data: Optional[Dict[str, Any]]) -> str:
+    """The message of a NEO body, whichever key carries it ('' if none)."""
+    if not isinstance(data, dict):
+        return ''
+    for k in MSG_KEYS:
+        v = data.get(k)
+        if v not in (None, ''):
+            return str(v)
+    stat = str(data.get('stat', '')).strip()
+    return stat if stat.lower() not in ('', 'ok', 'not_ok') else ''
+
+
+def neo_not_ok(data: Dict[str, Any]) -> bool:
+    """`stat` is anything but Ok. A text in `stat` (the 1018 shape) is not Ok."""
+    return 'stat' in data and str(data.get('stat', '')).strip().lower() != 'ok'
+
+
+def _scrub(text: str) -> str:
+    """A response body made safe for a log line: long opaque runs (tokens,
+    sids, account ids) are cut. Bodies are logged because the 2026-11-27 401
+    on place could not be explained -- the client had kept only the status."""
+    import re
+    return re.sub(r'[A-Za-z0-9_\-\.=]{24,}', '<redacted>', str(text))[:300]
+
 
 class EnvelopePolicy:
     """What a report envelope must look like to be BELIEVED. Everything else
@@ -102,7 +136,7 @@ class EnvelopePolicy:
     def session_dead(self, data: Dict[str, Any]) -> bool:
         if str(data.get('stat', '')).strip().lower() != 'not_ok':
             return False
-        emsg = str(data.get('emsg') or data.get('message') or '').lower()
+        emsg = neo_msg(data).lower()
         return self._code(data) in self.auth_stcodes or any(m in emsg for m in SESSION_DEAD_EMSG)
 
     def transient(self, data: Dict[str, Any]) -> bool:
@@ -117,7 +151,7 @@ class EnvelopePolicy:
         if str(data.get('stat', '')).strip().lower() != 'not_ok':
             return False
         code, emsg_want = self.empty_per_report.get(report, (self.empty_stcode, self.empty_emsg))
-        emsg = str(data.get('emsg') or '').strip().lower()
+        emsg = neo_msg(data).strip().lower()
         code_ok = code is None or self._code(data) == code
         return code_ok and emsg == emsg_want
 
@@ -292,7 +326,7 @@ class NeoReader:
                                                    (data or {}).get('message', r.text[:120])))
         inner = data.get('data')
         if not isinstance(inner, dict):
-            raise NeoAuthError('%s: %s' % (what, data.get('message') or data.get('emsg')
+            raise NeoAuthError('%s: %s' % (what, neo_msg(data)
                                            or 'no data in response'))
         return inner
 
@@ -377,7 +411,7 @@ class NeoReader:
         if self.policy.is_empty(data, what):
             return []
         raise NeoUnavailable('%s: %s (stCode %s)' % (
-            what, data.get('emsg') or data.get('message') or stat or 'unrecognised',
+            what, neo_msg(data) or stat or 'unrecognised',
             data.get('stCode')))
 
     # -- reads ---------------------------------------------------------
@@ -418,7 +452,7 @@ class NeoReader:
         data = self._read('POST', PATH_LIMITS, {'seg': segment, 'exch': exchange,
                                                 'prod': product})
         if str(data.get('stat', 'Ok')).lower() != 'ok':
-            raise NeoUnavailable('limits: %s' % (data.get('emsg') or 'Not_Ok'))
+            raise NeoUnavailable('limits: %s' % (neo_msg(data) or 'Not_Ok'))
         return data
 
     def scrip_master_paths(self) -> List[str]:
@@ -451,7 +485,12 @@ class NeoReader:
 class NeoTrader(NeoReader):
     """Adds the two mutating calls. Never retries either."""
 
-    def _mutate(self, path: str, jdata: Dict[str, Any], what: str) -> Dict[str, Any]:
+    def _mutate(self, path: str, jdata: Dict[str, Any], what: str,
+                id_keys: Tuple[str, ...] = ('nOrdNo',)) -> Dict[str, Any]:
+        """One mutating POST, never retried. Returns the body on a definite
+        success, which is `stat: Ok` WITH an order number under one of
+        `id_keys` (place answers `nOrdNo`; a successful cancel answered
+        `{"result": "<no>", "stat": "Ok", "stCode": 200}` on 2026-11-27)."""
         url = str(self.base_url) + path
         try:
             r = self.http.post(url, headers=self._headers(), params=self._params(),
@@ -462,6 +501,11 @@ class NeoTrader(NeoReader):
             raise NeoUnclear('%s: %s' % (what, type(exc).__name__))
         data = _json_or_none(r)
         if r.status_code in (401, 403) or (data is not None and self.policy.session_dead(data)):
+            # NEO's own words, kept: a 401 on place at 13:32:47 on 2026-11-27
+            # came 5 s after a fresh login whose reads all worked, a re-login
+            # did not help, and only the status code had been kept.
+            logger.warning('%s: HTTP %s session rejected, body %s', what, r.status_code,
+                           _scrub(getattr(r, 'text', '') or ''))
             # Re-login so the NEXT call works; this one stays unclear — the
             # caller searches the book before deciding (design section 4).
             try:
@@ -478,25 +522,27 @@ class NeoTrader(NeoReader):
             raise NeoUnclear('%s: HTTP %s non-JSON body %r' % (what, r.status_code,
                                                                r.text[:120]))
         stat = str(data.get('stat', '')).strip().lower()
-        if (stat == 'not_ok' and self.policy.documented_rejection(data)
+        not_ok = neo_not_ok(data)       # includes a message carried IN `stat`
+        if (not_ok and self.policy.documented_rejection(data)
                 and not self.policy.transient(data) and not self.policy.session_dead(data)):
             # the BODY is classified before the status (R4-20): a documented
             # refusal is a refusal whatever HTTP code carries it
-            raise NeoRejected(data.get('stCode'), str(data.get('emsg') or data.get('message')))
+            raise NeoRejected(data.get('stCode'), neo_msg(data))
         if r.status_code != 200:
-            raise NeoUnclear('%s: HTTP %s %s' % (what, r.status_code,
-                                                 data.get('emsg') or data.get('message')))
-        if stat == 'ok' and data.get('nOrdNo'):
+            logger.warning('%s: HTTP %s body %s', what, r.status_code, _scrub(r.text))
+            raise NeoUnclear('%s: HTTP %s stCode %s %s' % (what, r.status_code,
+                                                         data.get('stCode'), neo_msg(data)))
+        if stat == 'ok' and any(data.get(k) for k in id_keys):
             return data
-        if stat == 'not_ok':
+        if not_ok:
             if self.policy.session_dead(data):
-                raise NeoUnclear('%s: session rejected (%s)' % (what, data.get('emsg')))
+                raise NeoUnclear('%s: session rejected (%s)' % (what, neo_msg(data)))
             if self.policy.documented_rejection(data) and not self.policy.transient(data):
-                raise NeoRejected(data.get('stCode'), str(data.get('emsg') or data.get('message')))
+                raise NeoRejected(data.get('stCode'), neo_msg(data))
             # Anything else — 1005 "Internal Error", an OMS gateway timeout, a
             # code nobody has seen — is UNCLEAR: the book decides (R2-13).
             raise NeoUnclear('%s: unrecognised Not_Ok stCode %s %s' % (
-                what, data.get('stCode'), data.get('emsg') or data.get('message')))
+                what, data.get('stCode'), neo_msg(data)))
         raise NeoUnclear('%s: unrecognised response %r' % (what, str(data)[:200]))
 
     def place(self, *, symbol: str, token: str, side: str, qty: int, price: str,
@@ -515,5 +561,5 @@ class NeoTrader(NeoReader):
 
     def cancel(self, order_no: str) -> str:
         data = self._mutate(PATH_CANCEL, {'on': str(order_no), 'am': 'NO'},
-                            'cancel %s' % order_no)
-        return str(data['nOrdNo'])
+                            'cancel %s' % order_no, id_keys=('nOrdNo', 'result'))
+        return str(data.get('nOrdNo') or data.get('result'))
