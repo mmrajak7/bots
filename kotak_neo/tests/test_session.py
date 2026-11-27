@@ -636,3 +636,76 @@ def test_measure_refuses_without_a_live_session_or_headroom(home, monkeypatch):
     monkeypatch.setattr(S, 'DEFAULTS', dict(S.DEFAULTS, max_logins_per_day=1))
     out = S.measure_second_login(_verify=lambda s: S.ALIVE, _login=lg, _creds=fake_creds)
     assert 'headroom' in out['verdict'] and lg.calls == 0
+
+
+# ── B3 (review N6-N8, 2026-11-27): streaks are per day; a morning without a session alerts ──
+
+def _alerts(home):
+    p = home / 'alerts.jsonl'
+    if not p.exists():
+        return []
+    return [json.loads(ln) for ln in p.read_text(encoding='utf-8').splitlines() if ln.strip()]
+
+
+def _as_yesterday():
+    st = S.read_state()
+    st['day'] = (S._now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    st['next_allowed_at'] = 0.0
+    S._write_state(st)
+
+
+def test_yesterdays_refusals_do_not_latch_this_morning(home, fast):
+    publish(1, day=1)
+    lg = Login('refused', 'refused')
+    assert R(1, _verify=verify_by_gen(9), _login=lg).outcome == S.FAILED
+    st = S.read_state(); st['next_allowed_at'] = 0; S._write_state(st)
+    assert R(1, _verify=verify_by_gen(9), _login=lg).outcome == S.FAILED   # 2 refusals yesterday
+    _as_yesterday()
+    lg2 = Login('refused')                                                  # today's 1st
+    assert R(1, _verify=verify_by_gen(9), _login=lg2).outcome == S.FAILED
+    assert S.read_state()['latched'] is None
+    assert S.read_state()['consecutive_refusals'] == 1
+
+
+def test_negative_control_three_refusals_on_one_day_still_latch(home, fast):
+    publish(1)
+    lg = Login('refused', 'refused', 'refused')
+    for want in (S.FAILED, S.FAILED, S.BLOCKED):
+        assert R(1, _verify=verify_by_gen(9), _login=lg).outcome == want
+        st = S.read_state(); st['next_allowed_at'] = 0; S._write_state(st)
+
+
+def test_the_first_failure_of_a_new_day_alerts_again(home, fast):
+    publish(1, day=1)
+    lg = Login('network', 'network')
+    R(1, _verify=verify_by_gen(9), _login=lg)
+    _as_yesterday()
+    before = len([a for a in _alerts(home) if a['kind'] == 'login_failed'])
+    R(1, _verify=verify_by_gen(9), _login=lg)
+    after = len([a for a in _alerts(home) if a['kind'] == 'login_failed'])
+    assert before == 1 and after == 2
+
+
+def test_a_latch_survives_the_day_roll(home, fast):
+    publish(1)
+    assert R(1, _verify=verify_by_gen(9), _login=Login('mpin')).outcome == S.BLOCKED
+    _as_yesterday()
+    lg = Login()
+    assert R(1, _verify=verify_by_gen(9), _login=lg).outcome == S.BLOCKED and lg.calls == 0
+
+
+def test_a_morning_without_todays_session_alerts(home):
+    publish(3, day=1)                                    # yesterday's session only
+    res = S.scheduled_login(_verify=lambda s: S.ALIVE, _login=Login('network'),
+                            _creds=fake_creds, _sleep=lambda x: None)
+    assert res.outcome == S.FAILED                       # the replacement login failed
+    kinds = [a['kind'] for a in _alerts(home)]
+    assert 'no_session_today' in kinds
+
+
+def test_a_good_morning_does_not_alert(home):
+    publish(3)                                           # today's session verifies
+    res = S.scheduled_login(_verify=lambda s: S.ALIVE, _login=Login(), _creds=fake_creds,
+                            _sleep=lambda x: None)
+    assert res.outcome == S.NOOP
+    assert 'no_session_today' not in [a['kind'] for a in _alerts(home)]

@@ -400,6 +400,13 @@ def _roll_day(st: Dict[str, Any], now: datetime) -> None:
         st['day'] = day
         st['logins_today'] = 0
         st['cap_until'] = 0.0
+        # Streaks are per day (review N6/N7, 2026-11-27): yesterday's refusal
+        # must not make today's two morning crons the 3rd strike and LATCH
+        # before the market, and the first failure of a day must alert again.
+        # A latch itself is NOT cleared here: it already alerted and needs
+        # the owner (`unblock`).
+        st['consecutive_failures'] = 0
+        st['consecutive_refusals'] = 0
 
 
 # -- the published session ----------------------------------------------------------------
@@ -903,7 +910,27 @@ def scheduled_login(*, _verify: Optional[Callable] = None, _login: Optional[Call
         check_public_ip()
     except Exception as e:
         logger.error('public IP check failed: %s', e)
-    return _run('scheduled', None, True, None, _verify, _login, _creds, _sleep)
+    res = _run('scheduled', None, True, None, _verify, _login, _creds, _sleep)
+    _alert_if_no_session_today(res, _now())
+    return res
+
+
+def _alert_if_no_session_today(res: Result, now: datetime) -> None:
+    """A morning cron that ends WITHOUT today's session tells the owner now,
+    not at 09:15 through a bot (review N8). Every outcome counts -- UNAVAILABLE,
+    COOLDOWN, LOCK_TIMEOUT, ERROR, HOST_REFUSED, FAILED, BLOCKED -- except the
+    two that mean today's session exists. Bots keep reading the older session
+    ("stale is not dead"), so the alert says what that means."""
+    today = now.strftime('%Y-%m-%d')
+    if res.outcome in (NOOP, LOGGED_IN, ADOPTED, STILL_ALIVE) and res.session is not None             and res.session.trading_day == today:
+        return
+    held = res.session.trading_day if res.session is not None else 'none'
+    _alert('no_session_today',
+           'NEO morning login ended %s with NO session for %s (published: %s): %s. '
+           'Bots will run on the older session if it still verifies, else fail closed. '
+           'Check `python -m kotak_neo status`; the 08:55 cron retries.'
+           % (res.outcome, today, held, res.detail[:200]), now)
+    _flush_alerts()                                  # _run already flushed: send this one too
 
 
 def unblock(who: str) -> Dict[str, Any]:

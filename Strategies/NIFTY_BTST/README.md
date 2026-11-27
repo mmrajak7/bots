@@ -184,7 +184,15 @@ to send again.
   filled overnight (at the real fill when the trade book shows it, else at the entry limit marked
   as an estimate) so the stop and the 09:25 exit run on it; it refuses while the BUY still reads
   live at the broker, and needs a running engine to read it (R4-09/14).
-- **Every SELL with a fill on the symbol today counts, ours or not (R4-02/03).** A filled SELL
+- **Other bots on the account are invisible to this book (B1, 2026-11-27).** ETF_PI (MIS) and
+  zebra trade the SAME NIFTY contracts on this NEO account. Every order-book and trade-book read
+  goes through `broker.ScopedBroker`: a row that STATES another product, or carries another bot's
+  tag (`broker.OTHER_BOT_TAG_RE`: `zbr-`/`etf-`, ETF_PI's `ENT_/TGT_/EXT_<ts>`), is dropped. Rows with
+  no tag or an unknown tag stay (a human in the app: the owner's manual sale must still block a
+  double sell). A new bot on the account adds its tag prefix there. An unclear send is never bound
+  to a row carrying a different tag. Positions stay NRML-filtered: no other bot may hold NRML on a
+  strike this book holds.
+- **Every SELL with a fill on the symbol today counts, ours or not (R4-02/03)** — among in-scope rows. A filled SELL
   this book did not send blocks our SELL on every source, naming it; more sold today than this
   book held is a real short and a loud kill at once; a negative row is the row shape without
   carried quantities only when it equals exactly the SELLs filled on a lot this book held. That

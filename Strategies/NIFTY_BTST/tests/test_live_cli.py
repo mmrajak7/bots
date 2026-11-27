@@ -629,3 +629,29 @@ def test_open_settle_is_bounded_to_seconds():
     with pytest.raises(config_mod.ConfigError, match='open_settle_max'):
         build_neo(neo_raw(open_settle_max_abs=0, open_settle_max_pct=0))
     assert build_neo(neo_raw(open_settle_sec=0)).open_settle_sec == 0
+
+
+def test_rehearsal_does_not_log_in_on_an_after_close_tick(wired, monkeypatch):
+    """B6: ticks after 15:40 only (re)send the digest; each used to do a fresh
+    real NEO login (4-6 a day on the Pi). In-session ticks still log in."""
+    logins = []
+
+    class Counting:
+        ready = False
+        creds = {'ucc': 'UCCX'}
+
+        def login(self):
+            logins.append(1)
+            self.ready = True
+
+    def build(execution, neo, sdir, clock_):
+        return FakeBroker(clock_, fill_delay=neo.fake_fill_delay_sec,
+                          path=sdir / 'fake_broker.json'), Counting()
+    monkeypatch.setattr(live_cli, 'build_broker', build)
+    _set_execution(wired, 'rehearsal')
+    assert cli.main(['live-run', '--once']) == 0                 # 09:20: in session
+    assert len(logins) == 1
+    for hhmm in ('15:45:04', '15:50:04', '15:55:05'):
+        wired['clock']['now'] = T('2026-10-26', hhmm)
+        assert cli.main(['live-run', '--once']) == 0
+    assert len(logins) == 1

@@ -312,7 +312,10 @@ def _live_session(args: argparse.Namespace, cfg: config_mod.Config, execution: s
             if rc != RETRY_CLEARED:
                 return rc
     notifier.redactions = [str(reader.creds.get('ucc', ''))]       # never in an alert (R2-18)
-    if execution == 'rehearsal':
+    close_dt = at(today, cfg.market_close)
+    # after the close a tick only (re)sends the digest: no scrip master is
+    # needed, so no NEO login (B6: 4-6 needless logins a day were seen)
+    if execution == 'rehearsal' and now <= close_dt:
         try:
             reader.login()
         except Exception as exc:                        # noqa: BLE001
@@ -330,7 +333,6 @@ def _live_session(args: argparse.Namespace, cfg: config_mod.Config, execution: s
                         arm_reader=arming.make_arm_reader(neo, sdir, paper_book),
                         mode=execution, paper_book=paper_book)
     engine.entries_enabled = not exits_only
-    close_dt = at(today, cfg.market_close)
     if now > close_dt:
         _send_digest(engine, store, notifier, today)
         return 0

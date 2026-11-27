@@ -55,7 +55,7 @@ from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from .broker import (Broker, BrokerAuth, BrokerRejected, BrokerUnavailable, BrokerUnclear,
+from .broker import (Broker, BrokerAuth, ScopedBroker, BrokerRejected, BrokerUnavailable, BrokerUnclear,
                      parse_neo_time as _parse_neo_time,
                      OrderRequest, OrderView)
 from .config import Config
@@ -211,7 +211,8 @@ class LiveEngine(Engine):
         super().__init__(cfg, store, market, notifier, session_expected=session_expected)
         self.neo = neo
         self.store: LiveStore = store
-        self.broker = broker
+        #: only this book's rows: other bots share the account and the contracts (B1)
+        self.broker = broker if isinstance(broker, ScopedBroker) else ScopedBroker(broker, neo.product)
         self.journal = journal
         self.mode = mode
         self._scrip_loader = scrip_loader
@@ -974,8 +975,10 @@ class LiveEngine(Engine):
             sent = datetime.fromisoformat(leg['sent_at'])
             side = 'B' if leg['kind'] == 'ENTRY' else 'S'
             for o in book:
+                # NEO echoes our tag: a row with a DIFFERENT tag is never this send (F2)
                 if (o.symbol != self._live(p)['neo_symbol'] or o.side != side
-                        or o.qty != int(leg['qty']) or o.order_no in known):
+                        or o.qty != int(leg['qty']) or o.order_no in known
+                        or (o.tag and o.tag != leg['tag'])):
                     continue
                 t = _parse_neo_time(o.placed_at, sent.tzinfo)
                 if t is None or not (sent - CRITERIA_WINDOW_BEFORE <= t <= sent + CRITERIA_WINDOW_AFTER):

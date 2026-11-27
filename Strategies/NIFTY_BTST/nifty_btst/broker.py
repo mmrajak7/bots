@@ -24,6 +24,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -248,6 +249,86 @@ class Broker:
             return None
         return PositionView(symbol=symbol, product=product, net_qty=sum(p.net_qty for p in rows),
                             raw=rows[0].raw, lot_size=rows[0].lot_size)
+
+
+#: tags OTHER bots on this NEO account send (GuiOrdId is echoed, measured
+#: 2026-11-27): the shared package's `<bot>-...` for every bot but us, and
+#: ETF_PI's own `ENT_/TGT_/EXT_<ts>_<n>` until it moves onto kotak_neo (K6).
+#: A bot added to the account adds its prefix HERE.
+OTHER_BOT_TAG_RE = re.compile(r'^(?:(?:zbr|etf)-|(?:ENT|TGT|EXT)_\d)')
+
+
+def in_scope(o: 'OrderView', product: str) -> bool:
+    """Is this order/trade row one this book must reason about? (owner
+    2026-11-27, B1: other bots' orders must never move this book.)
+
+    One NEO account carries other bots (ETF_PI intraday MIS from 2 Dec, zebra
+    later) on the SAME NIFTY contracts. Counting an ETF_PI MIS round trip as a
+    "foreign SELL" refused our stop and 09:25 exit all day, or tripped a false
+    SHORT kill.
+
+    OUT of scope (dropped):
+      * a row that STATES another product (an MIS row is never an NRML lot);
+      * a row tagged by another bot (`OTHER_BOT_TAG_RE`).
+    IN scope: our own tags, and every row with NO tag or a tag no bot uses —
+    that is a human in the NEO app, and the owner's manual sale must keep
+    blocking a double sell (an unknown tag fails CLOSED, never open)."""
+    if o.product and product and o.product != product:
+        return False
+    if o.tag and OTHER_BOT_TAG_RE.match(o.tag):
+        return False
+    return True
+
+
+class ScopedBroker(Broker):
+    """The engine's view of the broker: order book and trade book narrowed to
+    `in_scope` rows; everything else passes straight through (attributes too,
+    so a test rig's fake stays reachable). One filter at the read boundary
+    instead of one per consumer: a consumer added later cannot forget it.
+    Positions are product-filtered where they are read; no tag exists there."""
+
+    def __init__(self, inner: Broker, product: str):
+        self._inner = inner
+        self._product = product
+        self.name = getattr(inner, 'name', 'scoped')
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._inner, item)
+
+    def ensure_session(self) -> None:
+        self._inner.ensure_session()
+
+    def place(self, req: 'OrderRequest') -> str:
+        return self._inner.place(req)
+
+    def cancel(self, order_no: str) -> None:
+        self._inner.cancel(order_no)
+
+    def order_book(self) -> List['OrderView']:
+        rows = self._inner.order_book()
+        kept = [o for o in rows if in_scope(o, self._product)]
+        if len(kept) != len(rows):
+            logger.debug('order book: %d of %d rows belong to other bots/products',
+                         len(rows) - len(kept), len(rows))
+        return kept
+
+    def trades(self) -> List['OrderView']:
+        return [o for o in self._inner.trades() if in_scope(o, self._product)]
+
+    def positions(self) -> List['PositionView']:
+        return self._inner.positions()
+
+    def available_funds(self) -> Optional[float]:
+        return self._inner.available_funds()
+
+    def holdings(self, force: bool = False) -> Optional[List['PositionView']]:
+        return self._inner.holdings(force=force)
+
+    def net_long(self, symbol: str, product: str) -> int:
+        return self._inner.net_long(symbol, product)
+
+    def position_row(self, symbol: str, product: str) -> Optional['PositionView']:
+        return self._inner.position_row(symbol, product)
 
 
 # ------------------------------------------------------------- real NEO
