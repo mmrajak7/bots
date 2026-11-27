@@ -142,6 +142,24 @@ def test_an_unreadable_order_row_is_unavailable_never_zero(neo, bad):
 
 # -- client: mutations -------------------------------------------------------------
 
+def test_trade_rows_are_fills_not_orders(neo):
+    """Measured live: a trade row has qty 0 and the fill in fldQty. Parsing it
+    as an order raised 'filled 65 > qty 0' against the real account."""
+    c = client(neo)
+    _, tag = buy(c)
+    [f] = c.trades()
+    assert isinstance(f, C.FillView) and f.qty == 500 and f.price == 10.2 and f.tag == tag
+    assert f.bot() == 'zbr' and f.raw['qty'] == 0
+
+
+def test_a_fill_row_without_a_price_or_quantity_is_unavailable(neo, monkeypatch):
+    c = client(neo)
+    bad = {'stat': 'Ok', 'data': [{'nOrdNo': '1', 'fldQty': 0, 'qty': 0, 'avgPrc': '1'}]}
+    monkeypatch.setattr(neo, 'get', lambda url, **kw: _Resp(200, bad))
+    with pytest.raises(C.Unavailable, match='trade book'):
+        c.trades()
+
+
 def test_place_returns_the_number_and_the_tag_is_echoed(neo):
     c = client(neo)
     no, tag = buy(c)

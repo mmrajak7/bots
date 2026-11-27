@@ -155,7 +155,11 @@ class FakeNeo:
                 rows.append({k: v for k, v in o.items() if not k.startswith('_')})
             return _Resp(200, {'stat': 'Ok', 'data': rows}) if rows else _Resp(200, EMPTY)
         if url.endswith('/quick/user/trades'):
-            rows = [{k: v for k, v in o.items() if not k.startswith('_')}
+            # The live shape (measured 2026-11-27): one row per FILL, qty 0.
+            rows = [{'nOrdNo': o['nOrdNo'], 'trdSym': o['trdSym'], 'trnsTp': o['trnsTp'],
+                     'fldQty': int(o['fldQty']), 'qty': 0, 'avgPrc': o['avgPrc'],
+                     'GuiOrdId': o['GuiOrdId'], 'rptTp': 'fill', 'prcTp': o['prcTp'],
+                     'flDt': '27-Nov-2026', 'flTm': '13:45:19'}
                     for o in self.orders if int(o['fldQty']) > 0]
             return _Resp(200, {'stat': 'Ok', 'data': rows}) if rows else _Resp(200, EMPTY)
         if url.endswith('/quick/user/positions'):

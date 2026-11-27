@@ -168,6 +168,39 @@ class OrderView:
 
 
 @dataclass(frozen=True)
+class FillView:
+    """One row of the TRADE book = one FILL (measured on the live API,
+    2026-11-27: `rptTp: "fill"`, `fldQty` = this fill's shares, `qty` is 0 --
+    a trade row is NOT an order row and must never be parsed as one)."""
+    order_no: str
+    symbol: str
+    side: str
+    qty: int               # shares in THIS fill
+    price: float
+    tag: str
+    filled_at: str
+    raw: Dict[str, Any] = field(default_factory=dict, compare=False, hash=False, repr=False)
+
+    def bot(self) -> str:
+        m = re.match(r'^([a-z]{2,6})-', self.tag or '')
+        return m.group(1) if m else ''
+
+    @classmethod
+    def from_neo(cls, r: Dict[str, Any]) -> 'FillView':
+        q = _strict_int(r, 'fldQty')
+        if q <= 0:
+            raise RowError('fill %s has fldQty %r' % (r.get('nOrdNo'), r.get('fldQty')))
+        px = _f(r.get('avgPrc'), -1.0)
+        if px <= 0:
+            raise RowError('fill %s has avgPrc %r' % (r.get('nOrdNo'), r.get('avgPrc')))
+        return cls(order_no=str(r.get('nOrdNo', '')),
+                   symbol=str(r.get('trdSym') or ''),
+                   side=str(r.get('trnsTp', '')).upper()[:1], qty=q, price=px,
+                   tag=str(r.get('GuiOrdId') or ''),
+                   filled_at='%s %s' % (r.get('flDt') or '', r.get('flTm') or ''), raw=r)
+
+
+@dataclass(frozen=True)
 class PositionView:
     symbol: str
     product: str
@@ -367,8 +400,13 @@ class NeoClient:
     def order_book(self) -> List[OrderView]:
         return self._views(PATH_ORDER_BOOK, 'order book')
 
-    def trades(self) -> List[OrderView]:
-        return self._views(PATH_TRADES, 'trade book')
+    def trades(self) -> List[FillView]:
+        """Today's FILLS (one row per fill; several per order is normal)."""
+        try:
+            return [FillView.from_neo(r) for r in self._rows(self._read('GET', PATH_TRADES),
+                                                             'trade book')]
+        except RowError as e:
+            raise Unavailable('trade book: %s' % e)
 
     def net_held(self, symbol: str) -> int:
         """This account's net quantity in `symbol` (shares). Raises Unavailable."""
