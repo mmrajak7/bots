@@ -1,0 +1,19 @@
+{
+  "_doc": "kite_login: the ONE Kite (Zerodha) login for every bot (owner 2026-11-27). Tracked defaults; no secrets, no account ids. Paths are relative to the BOTS root. Credentials live ONLY in the untracked credentials_file on the Pi.",
+  "credentials_file": "data/kite_credentials.json",
+  "telegram_file": "data/telegram_config.json",
+  "holiday_file": "data/holiday_calendar.json",
+  "lock_wait_s": 120,
+  "accounts": {
+    "personal": {
+      "_doc": "Market data + options account. Every bot reads this token (zebra, BCS, BTST, ETF_PI, MOMENTUM, st_watch...). SNAIL wrote it until 2026-11-27, naive local-time generated_at.",
+      "token_file": "data/kite_access_token.json",
+      "generated_at": "naive"
+    },
+    "company": {
+      "_doc": "Company investment account: holdings, GTTs, orders (pyramid, portfolio tracker; MOMENTUM from Apr 2027). NO quote permission. The FIFTY daemon wrote it until 2026-11-27, +05:30 generated_at.",
+      "token_file": "FIFTY/data/kite_access_token.json",
+      "generated_at": "aware"
+    }
+  }
+}

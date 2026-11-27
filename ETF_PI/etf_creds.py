@@ -7,9 +7,7 @@ created on the Pi with mode 0600. Shape (values never in git):
   {
     "telegram_main":     {"token": "...", "chatid": "..."},
     "telegram_error":    {"token": "...", "chatid": "..."},
-    "extract_data_kite": {"userid": "...", "password": "...", "totp_key": "..."},
     "extract_data_telegram": {"token": "...", "chatid": "..."},
-    "tracker_kite":      {"userid": "...", "password": "...", "totp_key": "..."},
     "tracker_telegram":  {"token": "...", "chatid": "..."},
     "backtest_kite":     {"api_key": "...", "api_secret": "...", "user_id": "...",
                           "password": "...", "totp_secret": "..."}

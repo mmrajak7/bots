@@ -1,8 +1,6 @@
 import pandas as pd
-from kiteconnect import KiteConnect
-import kite_trade as app
+import shared_kite  # the ONE shared Kite token (python -m kite_login); ETF_PI never logs in
 from datetime import datetime, timedelta
-import pyotp
 import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -25,21 +23,11 @@ elif mode == 'U':
     folder = '/'
 
 # ****************************************************************
-userid = etf_creds.get('tracker_kite')['userid']
-totp_key = etf_creds.get('tracker_kite')['totp_key']
-password = etf_creds.get('tracker_kite')['password']
-path = os.path.dirname(os.path.realpath(__file__)) + str(folder) + 'token.txt'
 # ****************************************************************
 
 pd.set_option('display.max_rows', 500)
 pd.set_option('display.max_columns', 500)
 pd.set_option('display.width', 1000)
-
-
-def get_token():
-    f = open(path, "r")
-    token = f.read()
-    return token
 
 
 def send_msg(msg):
@@ -52,59 +40,6 @@ def send_msg(msg):
         'parse_mode': 'HTML'
     }
     requests.post("https://api.telegram.org/bot{token}/sendMessage".format(token=token), data=payload)
-
-
-def get_enc_token():
-    totp = pyotp.TOTP(totp_key)
-    pin = pyotp.TOTP(totp_key).now()
-    twoFA = f"{int(pin):06d}" if len(pin) <= 5 else pin
-
-    enctoken = app.get_enctoken(userid=userid, password=password, twofa=twoFA)
-    print('enctoken refreshed')
-
-    text_file = open(path, "w")
-    n = text_file.write(enctoken)
-    text_file.close()
-
-    return enctoken
-
-
-def get_header(tkn):
-    auth = 'enctoken {}'.format(tkn)
-    headers = {
-        'authority': 'https://api.kite.trade',
-        'cache-control': 'private, max-age=0, no-cache',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.163 Safari/537.36',
-        'accept': '*/*',
-        'x-kite-version': '3',
-        'authorization': auth,
-        'accept-encoding': 'gzip, deflate',
-        'accept-language': 'en-US,en;q=0.9,tr-TR;q=0.8,tr;q=0.7',
-    }
-    return headers
-
-
-def get_data_kite(tkn, instrument, ab, bis, setIndex, script, minute='5minute'):
-    time.sleep(0.3)
-    randomNo = random.randint(1000000, 9999999)
-    link = 'https://kite.zerodha.com/oms/instruments/historical/{}/{}?oi=1&from={}&to={}&ciqrandom={}'.format(
-        instrument, minute, ab, bis, randomNo)
-    headers = get_header(tkn)
-    res = requests.get(link, headers=headers)
-
-    if res.status_code == 200:
-        data = json.loads(res.text)
-        df = pd.DataFrame.from_dict(data['data']['candles'])
-        df = df.iloc[:, :-1]
-
-        if len(df) == 0:
-            df = pd.DataFrame()
-        else:
-            df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-
-        return df.values.tolist()
-    else:
-        return []
 
 
 # define function to get historical data
@@ -134,8 +69,7 @@ def get_historical_data(instrument_token, symbol, timeframe):
 
         # Get the historical data for the current year
         try:
-            historical_data = get_data_kite(enctoken, instrument_token, str(year_start_date), str(year_end_date), False,
-                                            symbol, 'day')
+            historical_data = shared_kite.candles(instrument_token, 'day', str(year_start_date), str(year_end_date))
         except Exception as e:
             # print(f"Error occurred: {e}")
             continue
@@ -178,7 +112,7 @@ def get_historical_data(instrument_token, symbol, timeframe):
     return df
 
 
-def get_index(kite):
+def get_index():
     # instruments = ['256265', '260105']
     df = get_historical_data('256265', 'NIFTY50', 'weekly')
     print(df.tail(5))
@@ -298,23 +232,17 @@ def check_run_time(from_hour, from_minutes, to_hour, to_minutes, to_seconds=0):
 # if r != 0:
 #     sys.exit('Out of time range')
 
-enctoken = get_token()
-kite = app.KiteApp(enctoken)
-
+# The ONE shared Kite token (kite_login, 2026-11-27). No login here: no data =
+# one alert and a non-zero exit, never a silent run on stale data.
 try:
-    length = get_index(kite)
-    if length == 0:
-        enctoken = get_enc_token()
-        kite = app.KiteApp(enctoken)
-        length = get_index(kite)
-        if length == 0:
-            send_msg('Tracker: Data extraction failed')
-except:
-    enctoken = get_enc_token()
-    kite = app.KiteApp(enctoken)
-    length = get_index(kite)
-    if length == 0:
-        send_msg('Tracker ex: Data extraction failed')
+    length = get_index()
+except Exception as e:  # token missing/expired, network
+    print('Tracker: data fetch failed: %s' % e)
+    length = 0
+if length == 0:
+    send_msg('Tracker: Data extraction failed (shared Kite token - run '
+             '`python -m kite_login status` on the Pi)')
+    sys.exit(1)
 
 # define list of symbols and instrument tokens
 dire, symbol_list, df = get_trade_gsheet('Track')

@@ -114,7 +114,7 @@ def check_mode(rep):
 
 
 def check_kite(rep, now, probe=True):
-    """The token SNAIL refreshes each morning, and whether it actually works."""
+    """The token kite_login refreshes each morning (08:40), and whether it actually works."""
     import platform
     path = (r'C:\Users\mail2\Documents\Projects\BOTS\data\kite_access_token.json'
             if platform.system() == 'Windows'
@@ -126,7 +126,7 @@ def check_kite(rep, now, probe=True):
     stamp = datetime.datetime.fromtimestamp(os.path.getmtime(path), IST)
     if stamp.date() != now.date():
         rep.add(FAIL, 'kite token',
-                'last refreshed %s (%.1fh ago) — SNAIL has not run today'
+                'last refreshed %s (%.1fh ago) — kite_login has not run today'
                 % (stamp.strftime('%Y-%m-%d %H:%M'), age or -1))
     else:
         rep.add(OK, 'kite token', 'refreshed %s' % stamp.strftime('%H:%M'))
