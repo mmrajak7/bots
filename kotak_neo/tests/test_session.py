@@ -602,3 +602,32 @@ def test_a_login_returning_an_off_kotak_base_url_is_not_published(home, fast):
         return {'token': 'T', 'sid': 'S', 'base_url': 'https://evil.example', 'server_id': None}
     res = R(1, _verify=verify_by_gen(9), _login=evil)
     assert res.outcome == S.FAILED and S.current().generation == 1
+
+
+# -- the second-login measurement ------------------------------------------------
+
+@pytest.mark.parametrize('a_reads,verdict,published', [
+    ([S.DEAD] * 3, 'KILLS', 2), ([S.ALIVE] * 3, 'BOTH', None), ([S.ALIVE, S.DEAD, S.DEAD], 'MIXED', None)])
+def test_measure_second_login(home, a_reads, verdict, published):
+    publish(1)
+    reads = [S.ALIVE] + list(a_reads)        # first: A verifies before the test
+
+    def verify(s):
+        return reads.pop(0) if s.generation == 1 else S.ALIVE
+    lg = Login()
+    out = S.measure_second_login(_verify=verify, _login=lg, _creds=fake_creds,
+                                 _sleep=lambda x: None)
+    assert verdict in out['verdict'] and lg.calls == 1 and out.get('published') == published
+    assert S.read_state()['logins_today'] == 1
+    if published:
+        assert S.current().generation == 2
+
+
+def test_measure_refuses_without_a_live_session_or_headroom(home, monkeypatch):
+    lg = Login()
+    out = S.measure_second_login(_verify=lambda s: S.ALIVE, _login=lg, _creds=fake_creds)
+    assert out['verdict'].startswith('REFUSED') and lg.calls == 0
+    publish(1)
+    monkeypatch.setattr(S, 'DEFAULTS', dict(S.DEFAULTS, max_logins_per_day=1))
+    out = S.measure_second_login(_verify=lambda s: S.ALIVE, _login=lg, _creds=fake_creds)
+    assert 'headroom' in out['verdict'] and lg.calls == 0

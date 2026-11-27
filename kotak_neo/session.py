@@ -860,3 +860,74 @@ def status() -> Dict[str, Any]:
             'next_allowed_in_sec': max(0, round(float(st.get('next_allowed_at') or 0)
                                                 - time.time())),
             'last_attempt': st.get('last_attempt'), 'login_host_ok': login_host_ok()}
+
+
+def measure_second_login(*, _verify: Optional[Callable] = None, _login: Optional[Callable] = None,
+                         _creds: Optional[Callable] = None,
+                         _sleep: Optional[Callable] = None) -> Dict[str, Any]:
+    """THE open question (DESIGN section 10): does a second NEO login kill a
+    session created earlier? Run AFTER HOURS with no bot trading.
+
+    Under the refresh lock and every brake: needs LOGIN_HOST, a published
+    session that verifies (A), and two logins of headroom under the daily cap.
+    Logs in ONCE more (B, never published), then reads with A twice a few
+    seconds apart, and with B. If A died, B is published so the bots are left
+    with a working session. Places no order. Returns the verdict and evidence;
+    every login is counted in state.json like any other.
+    """
+    cfg = config()
+    verify = _verify or (lambda s: _network_verify(s, cfg))
+    sleep = _sleep or time.sleep
+    login_fn = _login or _network_login
+    now = _now()
+    out: Dict[str, Any] = {'at': now.isoformat(timespec='seconds')}
+    with _lock(float(cfg['lock_wait_sec'])) as got:
+        if not got:
+            out['verdict'] = 'REFUSED: lock busy'
+            return out
+        st = _load_state_locked(cfg, now)
+        if st.get('latched'):
+            out['verdict'] = 'REFUSED: latched (%s)' % st['latched']
+            return out
+        if not login_host_ok():
+            out['verdict'] = 'REFUSED: this machine may not log in'
+            return out
+        _roll_day(st, now)
+        if st['logins_today'] + 2 > int(cfg['max_logins_per_day']):
+            out['verdict'] = 'REFUSED: not enough daily login headroom'
+            return out
+        a = _current_or_none()
+        if a is None or verify(a) != ALIVE:
+            out['verdict'] = 'REFUSED: no published session that verifies (run `login` first)'
+            return out
+        creds = (_creds or load_credentials)(cfg['credentials_file'])
+        st['logins_today'] += 1
+        st['next_allowed_at'] = time.time() + float(cfg['cooldown_sec'])
+        st['last_attempt'] = {'at': now.isoformat(timespec='seconds'),
+                              'requester': 'measure-second-login', 'outcome': 'in_flight'}
+        _write_state(st)
+        fresh = login_fn(creds, cfg)                  # session B
+        st['last_attempt']['outcome'] = 'ok'
+        _write_state(st)
+        b = Session(0, now.strftime('%Y-%m-%d'), now.isoformat(timespec='seconds'),
+                    fresh['base_url'], fresh['token'], fresh['sid'], fresh.get('server_id'),
+                    creds['consumer_key'], creds['ucc'])
+        reads = []
+        for i in range(3):
+            if i:
+                sleep(float(cfg['verify_confirm_sec']))
+            reads.append(verify(a))
+        out['a_after_b'] = reads
+        out['b'] = verify(b)
+        _alive_cache.pop(a.generation, None)
+        if all(r == DEAD for r in reads):
+            out['verdict'] = 'SECOND LOGIN KILLS THE FIRST'
+            if out['b'] == ALIVE:
+                new = _publish(st, a, fresh, creds, now)
+                out['published'] = new.generation
+        elif all(r == ALIVE for r in reads):
+            out['verdict'] = 'BOTH SESSIONS LIVE (a second login does not kill the first)'
+        else:
+            out['verdict'] = 'MIXED -- inconclusive, re-measure'
+    _log('measure-second-login', 'MEASURED', out['verdict'], now, None, out.get('published'))
+    return out

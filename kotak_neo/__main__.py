@@ -6,6 +6,7 @@
   refresh    a manual refresh request: --reason is required and logged
   unblock    clear a latch (credentials/MPIN) and the cooldown -- owner only
   owners     list which bot holds which contract; --assign SYM BOT / --clear SYM
+  measure-second-login   after hours, no bot trading: does a 2nd login kill the 1st?
 
 Exit codes: 0 ok / nothing to do, 1 the action did not succeed, 2 usage.
 """
@@ -34,6 +35,7 @@ def main(argv=None) -> int:
     o = sub.add_parser('owners', help='contract ownership')
     o.add_argument('--assign', nargs=2, metavar=('SYMBOL', 'BOT'))
     o.add_argument('--clear', metavar='SYMBOL')
+    sub.add_parser('measure-second-login', help='after hours only (DESIGN section 10)')
     a = ap.parse_args(argv)
 
     if a.cmd == 'status':
@@ -47,6 +49,10 @@ def main(argv=None) -> int:
             C.assign(a.clear, None)
         print(json.dumps(C.owners(), indent=1, sort_keys=True))
         return 0
+    if a.cmd == 'measure-second-login':
+        out = S.measure_second_login()
+        print(json.dumps(out, indent=1))
+        return 0 if not str(out.get('verdict', '')).startswith('REFUSED') else 1
     if a.cmd == 'unblock':
         out = S.unblock('cli:%s' % getpass.getuser())
         print('unblocked (was: %s)' % out['was'])
