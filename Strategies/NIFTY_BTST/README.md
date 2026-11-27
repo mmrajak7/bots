@@ -440,7 +440,7 @@ report at the end means the reports may be lagging: do NOT re-run; check the app
 | positions | `flBuyQty`/`flSellQty` in SHARES (130/130 for two 65-lot round trips) |
 | second login | **does NOT kill the first** (reads, 3 checks) |
 | unexplained | one HTTP 401 on PLACE at 13:32:47, 5 s after a fresh login; nothing placed; place auth fine 10 min later |
-| charges | funds 50,000 -> 49,947.80 after 2 round trips: ~Rs 42 beyond the spread on 4 fills -- check the contract note against `brokerage_per_order` 0 |
+| charges (contract note 11-27) | 4 fills debited **Rs 12.68**: brokerage Rs 0.01 (effectively 0 -- `brokerage_per_order` 0 confirmed), STT Rs 2.00, exchange Rs 0.78, GST Rs 0.14, SEBI/stamp ~0; price loss Rs 9.75 on top. Live size (~Rs 150 premium, 1 lot) ~Rs 23 statutory per round trip, as modelled. Funds fell Rs 52.20, so Rs 39.52 is NOT on the note (likely margin still blocked at the read) -- check the Kotak ledger 11-30 |
 
 The shared `kotak_neo` package (BOTS root) now owns the NEO login for every bot (one session,
 `~/.kotak_neo/`, crons 08:40/08:55). BTST still logs in itself until it migrates (plan K5); the
