@@ -193,7 +193,7 @@ class Engine:
         self._now = now
         today = now.date()
         if self.day != today:
-            self._new_day(today)
+            self._stage('day roll', lambda: self._new_day(today))
         sess = self.session_fn(today)
         if sess is not None and now.time() >= _dt.time(8, 58) and not self.b.map_ready(today):
             if self.epoch() - self._map_try >= 60:
@@ -208,9 +208,9 @@ class Engine:
                            self.epoch() - self._last_reconcile >= self.cfg['reconcile_s']):
             recent_fill = self.epoch() - self._last_own_fill < float(self.cfg['cover_window_s'])
             if self._active() or not self.reconciled or self._watch_tags() or recent_fill:
-                self._reconcile()
+                self._stage('reconcile', self._reconcile)
         if in_session:
-            self._intents(now)
+            self._stage('intents', lambda: self._intents(now))
         for p in list(self._active()):
             try:
                 self._advance(p, now, in_session)
@@ -230,6 +230,17 @@ class Engine:
                              'journal but mode=%s. Set mode: live and restart, or exit them in the '
                              'app.' % (', '.join(self.unmanaged), self.cfg['mode']), 'E')
         self._status(now)
+
+    def _stage(self, name: str, fn: Callable[[], Any]) -> None:
+        """Review X-E2 (2026-11-28): a bug in one housekeeping stage (a day roll, the
+        reconcile, the intents) must never stop the open positions' exits below it,
+        nor the heartbeat -- before, one bad intent raised every step, all day."""
+        try:
+            fn()
+        except Exception as e:
+            log.exception('stage %s', name)
+            self.n.throttled('stage_' + name, 60, 'executor %s BUG %s: %s -- open positions '
+                             'still managed' % (name, type(e).__name__, e), 'E')
 
     # -- day roll (R6 / F16) ----------------------------------------------------------------
     def _new_day(self, today: _dt.date) -> None:
@@ -264,8 +275,10 @@ class Engine:
             try:
                 with io.open(path, encoding='utf-8') as f:
                     it = json.load(f)
+                if not isinstance(it, dict):              # review X-E2: valid JSON, not an object
+                    raise ValueError('not a JSON object (%s)' % type(it).__name__)
                 key = str(it['key'])
-            except (OSError, ValueError, KeyError) as e:
+            except (OSError, ValueError, KeyError, TypeError) as e:
                 self.n.send('bad intent file %s (%s) -- ignored' % (os.path.basename(path), e), 'E')
                 self._done(path, '.bad')
                 continue
@@ -960,6 +973,18 @@ class Engine:
         if n < 2 or live or not p or short % lot or p.get('covered') or not recent:
             self.n.throttled('short_' + sym, 60, msg + (' -- buy-to-cover pending a second read'
                                                         if n < 2 else ' -- ALERT ONLY: cover by hand'), 'E')
+            return
+        # review X-E1 (2026-11-28): our own order sums say short -- the ACCOUNT must agree
+        # before a real BUY (else a paper-only / misread short buys an untracked lot).
+        ok, acct = self._neo(lambda: self.b.account_net(sym), 'cover positions', p)
+        if not ok or acct is None or int(acct) >= 0:
+            self.n.throttled('short_nocover_' + sym, 60, msg + ' -- but the account shows %s: NO cover '
+                             '(check the app)' % ('unreadable' if not ok else acct), 'E')
+            return
+        short = min(short, -int(acct))
+        if short % lot:
+            self.n.throttled('short_' + sym, 60, msg + ' -- account short %d is not whole lots: '
+                             'ALERT ONLY, cover by hand' % -int(acct), 'E')
             return
         q = self._quote(p)                                # fresh + valid + age-checked
         if q is None:

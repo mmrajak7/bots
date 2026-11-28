@@ -108,3 +108,49 @@ def test_t7_a_probe_rests_its_first_sells_then_exits_through_the_ladder(rig):
 def test_t7_only_a_probe_key_may_rest_sells(rig):
     p = open_one(rig, probe_rest_steps=3)             # an option_buy signal key
     assert p['probe_rest_steps'] == 0
+
+
+def test_xe2_a_non_object_intent_is_set_aside_and_exits_keep_working(rig):
+    """Review X-E2: a valid-JSON list as an intent raised TypeError on every step --
+    never moved, no exits, no heartbeat. Now it goes to done/*.bad, alerted."""
+    import json
+    p = open_one(rig)
+    bad = os.path.join(rig.state, 'intents', 'weird.json')
+    with open(bad, 'w') as f:
+        json.dump([1, 2, 3], f)
+    rig.quote(110.0, 110.1)                           # TP
+    rig.step(n=4)
+    assert not os.path.exists(bad)
+    assert os.path.exists(os.path.join(rig.eng.done_dir, 'weird.json.bad'))
+    assert p['state'] == 'CLOSED' and 'bad intent file weird.json' in rig.texts()
+
+
+def test_xe2_a_stage_bug_never_stops_an_exit(rig, monkeypatch):
+    p = open_one(rig)
+
+    def boom(now):
+        raise RuntimeError('intent bug')
+    monkeypatch.setattr(rig.eng, '_intents', boom)
+    rig.quote(110.0, 110.1)
+    rig.step(n=4)
+    assert p['state'] == 'CLOSED' and 'intents BUG' in rig.texts()
+
+
+def test_xe1_own_orders_short_but_account_not_short_sends_no_cover(rig, monkeypatch):
+    """Review X-E1: the cover was decided from our own order sums alone; a short that
+    exists only there (paper, a misread) bought a real, untracked lot."""
+    import datetime as dt
+    from test_engine import SYM
+    p = open_one(rig)
+    rig.quote(110.0, 110.1)
+    rig.step(n=3)
+    assert p['state'] == 'CLOSED'
+    rig.broker.place(SYM, '1', 'S', 65, 109.0, rig.broker.new_tag(), reduce_only=True)
+    monkeypatch.setattr(rig.broker, 'account_net', lambda sym: 0)   # the account says flat
+    for _ in range(4):
+        rig.now += dt.timedelta(seconds=16)
+        rig.feed._q[SYM].ts = rig.epoch()
+        rig.eng.step(rig.now)
+    assert not p.get('covered')
+    assert not [o for o in rig.etf_orders('B') if o['GuiOrdId'] != p['entry']['tags'][0]]
+    assert 'NO cover' in rig.texts()
