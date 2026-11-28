@@ -126,6 +126,11 @@ class PriceFeed:
         if self._factory is None:
             return
         self.stop()
+        # review B3 (2026-11-28): every build attempt -- good or failed -- restarts the
+        # back-off clock, so a feed down since the 08:00 boot (yesterday's token: 403)
+        # is rebuilt once per `down_for_s`, not on every 0.5 s loop.
+        self._ws_started = self._clock()
+        self._ws_down_since = 0.0
         try:
             api_key, access = self._read_token()
             t = self._factory(api_key, access)
@@ -135,7 +140,13 @@ class PriceFeed:
             return
         feed = self
 
+        def mine() -> bool:
+            # B3: a REPLACED ticker reporting late must not flip the live one's health
+            return feed._ticker is t
+
         def on_connect(ws, response):
+            if not mine():
+                return
             feed._ws_ok, feed._ws_err, feed._ws_down_since = True, '', 0.0
             toks = list(feed._tok2sym)
             if toks:
@@ -144,6 +155,8 @@ class PriceFeed:
             log.info('kite ws connected; %d tokens', len(toks))
 
         def on_ticks(ws, ticks):
+            if not mine():
+                return
             now = feed._clock()
             for tk in ticks or []:
                 sym = feed._tok2sym.get(int(tk.get('instrument_token') or 0))
@@ -151,12 +164,16 @@ class PriceFeed:
                     feed._store(sym, quote_from_kite(tk, 'ws', now))
 
         def on_close(ws, code, reason):
+            if not mine():
+                return
             feed._ws_ok = False
             feed._ws_down_since = feed._ws_down_since or feed._clock()
             feed._ws_err = 'closed %s %s' % (code, reason)
             log.warning('kite ws %s', feed._ws_err)
 
         def on_error(ws, code, reason):
+            if not mine():
+                return
             feed._ws_ok = False
             feed._ws_down_since = feed._ws_down_since or feed._clock()
             feed._ws_err = 'error %s %s' % (code, reason)
@@ -164,7 +181,6 @@ class PriceFeed:
 
         t.on_connect, t.on_ticks, t.on_close, t.on_error = on_connect, on_ticks, on_close, on_error
         self._ticker = t
-        self._ws_started = self._clock()
         try:
             t.connect(threaded=True)
         except Exception as e:
@@ -190,7 +206,8 @@ class PriceFeed:
         kite_login may have re-logged in). True when a rebuild was attempted."""
         if self._factory is None or self._ws_ok:
             return False
-        since = self._ws_down_since or self._ws_started   # review L2: time DOWN, not built
+        # review L2: time DOWN, not built; B3: and never less than since the last build
+        since = max(self._ws_down_since, self._ws_started)
         if self._clock() - since < down_for_s:
             return False                                 # let KiteTicker's own reconnect work
         log.warning('kite ws down (%s) -- rebuilding from a fresh token read', self._ws_err)
