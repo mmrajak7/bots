@@ -126,6 +126,15 @@ def tradingsymbol(symbol: str, series: str) -> str:
     return symbol if series == "EQ" else f"{symbol}-{series}"
 
 
+def book_held(lg: L.Ledger) -> Dict[str, int]:
+    """ISIN -> shares the journal says are in the demat (every position, TEST lot included: they share the demat)."""
+    out: Dict[str, int] = {}
+    for p in lg.positions.values():
+        if p.held_qty:
+            out[p.isin] = out.get(p.isin, 0) + p.held_qty
+    return out
+
+
 def current_plan(lg: L.Ledger) -> Optional[Dict[str, Any]]:
     return max(lg.plans.values(), key=lambda r: r["seq"]) if lg.plans else None
 
@@ -453,8 +462,8 @@ def build_step_plan(env: Env, lg: L.Ledger, holdings_open: Dict[str, int]) -> Op
             "series": p.series, "rank": p.rank, "max_rupees": p.remaining_paise // 100,
             "price_rule": "BUY_1510(1.005,1.010)", "ltp_1445": qq.get("last_price"),
             "upper_circuit": qq.get("upper_circuit_limit"), "lower_circuit": qq.get("lower_circuit_limit"),
-            "lock_tries_used": p.tries_used, "book_qty": p.filled_qty,
-            "non_book_qty": max(0, int(holdings_open.get(p.isin, 0)) - p.filled_qty),
+            "lock_tries_used": p.tries_used, "book_qty": p.held_qty,
+            "non_book_qty": max(0, int(holdings_open.get(p.isin, 0)) - book_held(lg).get(p.isin, 0)),
             "quote_missing": not qq})
     return StepPlan(step, pid, legs, attempts, sph, fh, q, vin)
 
@@ -536,8 +545,9 @@ def shared_name_holds(env: Env, holdings_open: Dict[str, int]) -> None:
     lg = L.replay(recs)
     owner_ok = {r["position_id"] for r in recs if r["type"] == "OVERLAY" and r["overlay"] == "SHARED_NAME_HOLD"
                 and not r["on"] and r.get("reason") in ("owner buy", "owner release")}
+    held = book_held(lg)
     for p in lg.positions.values():
-        extra = int(holdings_open.get(p.isin, 0)) - p.filled_qty
+        extra = int(holdings_open.get(p.isin, 0)) - held.get(p.isin, 0)
         if (p.leg == "PENDING_BUY" and extra > 0 and "SHARED_NAME_HOLD" not in p.overlays
                 and p.position_id not in owner_ok):
             hold_leg(env, p, "SHARED_NAME_HOLD", f"account holds {extra} shares outside the book")
@@ -1213,26 +1223,27 @@ def three_way(env: Env, holdings_open: Dict[str, int], day: str) -> List[str]:
     lg = L.replay(env.journal.read())
     probs: List[str] = []
     now_h = {str(r["isin"]): int(r.get("quantity", 0)) + int(r.get("t1_quantity", 0)) for r in env.api.holdings()}
-    fills_today: Dict[str, int] = {}
+    bought: Dict[str, int] = {}
+    sold: Dict[str, int] = {}
     recs = env.journal.read()
     for r in recs:
         if r["type"] == "FILL" and r["ts"][:10] == day:
             isin = lg.positions[r["position_id"]].isin
-            fills_today[isin] = fills_today.get(isin, 0) + int(r["qty"])
-    book_qty: Dict[str, int] = {}
-    for p in lg.positions.values():
-        book_qty[p.isin] = book_qty.get(p.isin, 0) + p.filled_qty
+            side = sold if r.get("side", "BUY") == "SELL" else bought
+            side[isin] = side.get(isin, 0) + int(r["qty"])
+    book_qty = book_held(lg)
     names = {p.isin: p.symbol for p in lg.positions.values()}
-    for isin, bq in sorted(book_qty.items()):
-        today = fills_today.get(isin, 0)
-        if bq == 0 and today == 0:
-            continue
+    for isin in sorted(set(book_qty) | set(bought) | set(sold)):
+        bq, b, s = book_qty.get(isin, 0), bought.get(isin, 0), sold.get(isin, 0)
         opening = holdings_open.get(isin, 0)
         have = now_h.get(isin, 0)
-        if have not in (opening, opening + today):
-            probs.append(f"{names[isin]}: Kite {have} vs opening {opening} (+ today's book fills {today})")
-        if have < bq - today:
-            probs.append(f"{names[isin]}: Kite {have} < book {bq - today} held before today")
+        # whether today's CNC buys / sells already show in holdings() is UNVERIFIED (U6): every combination of the
+        # two sides is accepted here; the next morning's snapshot is the hard check (holdings >= book)
+        ok = {opening, opening + b, opening - s, opening + b - s}
+        if have not in ok:
+            probs.append(f"{names[isin]}: Kite {have} vs opening {opening} (today's book buys {b}, sells {s})")
+        if have < bq - b:                  # held before today, less today's sells: must show whatever U6 says
+            probs.append(f"{names[isin]}: Kite {have} < book {bq - b} (held before today less today's sells)")
     open_book = [o for o in env.api.orders() if B.TAG_RE.match(str(o.get("tag") or "")) and B.order_is_live(o)]
     if open_book:
         probs.append(f"open book orders after the close: {[o['tag'] for o in open_book]}")
@@ -1247,10 +1258,7 @@ def three_way(env: Env, holdings_open: Dict[str, int], day: str) -> List[str]:
 def holdings_short(lg: L.Ledger, holdings_open: Dict[str, int]) -> List[str]:
     """Morning hard check (frozen design §7.4 'Kite >= ledger'): the opening holdings must cover every share the
     book says it owns. -> one line per short ISIN."""
-    book_qty: Dict[str, int] = {}
-    names: Dict[str, str] = {}
-    for p in lg.positions.values():
-        book_qty[p.isin] = book_qty.get(p.isin, 0) + p.filled_qty
-        names[p.isin] = p.symbol
+    book_qty = book_held(lg)
+    names = {p.isin: p.symbol for p in lg.positions.values()}
     return [f"{names[i]}: Kite holds {holdings_open.get(i, 0)} < book {q}" for i, q in sorted(book_qty.items())
             if q > 0 and holdings_open.get(i, 0) < q]

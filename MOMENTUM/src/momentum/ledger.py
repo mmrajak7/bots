@@ -3,9 +3,11 @@
 Money is integer paise everywhere in the ledger (no float drift). The ledger file is only a cache of this replay; the
 16:00 watch checks replay == file (spec §C11) and any difference stops new orders.
 
-December slice states (spec §F):
-  position: PLANNED -> HELD (first fill) ; PLANNED -> gone when the leg ends SKIPPED/EXPIRED with no fill
-  leg:      PENDING_BUY -> NONE (filled) | SKIPPED | EXPIRED
+States (December spec §F; January spec §3):
+  position: PLANNED -> HELD (first fill) ; PLANNED -> gone when the leg ends SKIPPED/EXPIRED with no fill ;
+            HELD -> CLOSED when every share is sold
+  leg:      BUY_GATED -> PENDING_BUY (BUY_AMOUNT at the gate) | EXPIRED ;
+            PENDING_BUY -> NONE (filled) | SKIPPED | EXPIRED ;  NONE -> SELLING (plan) ; SELLING -> CLOSED (sold out)
   overlays: VET_DEFERRED, OWNER_HOLD, AUDIT_HOLD, SHARED_NAME_HOLD, PRICE_FROZEN
   intent:   INTENT_WRITTEN -> SENT -> ACK -> OPEN -> PARTIAL -> COMPLETE | CANCELLED ; TIMEOUT -> FOUND | ABSENT ;
             REJECTED_{BAND,CLOSED,RMS,OTHER}
@@ -15,11 +17,14 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-LEG_STATES = frozenset({"PENDING_BUY", "NONE", "SKIPPED", "EXPIRED"})
+LEG_STATES = frozenset({"BUY_GATED", "PENDING_BUY", "NONE", "SKIPPED", "EXPIRED", "SELLING", "CLOSED"})
 OVERLAYS = frozenset({"VET_DEFERRED", "OWNER_HOLD", "AUDIT_HOLD", "SHARED_NAME_HOLD", "PRICE_FROZEN"})
 LEG_MOVES = {
+    "BUY_GATED": {"EXPIRED"},                   # -> PENDING_BUY only through BUY_AMOUNT (the gate sets the amount)
     "PENDING_BUY": {"NONE", "SKIPPED", "EXPIRED"},
+    "SELLING": {"CLOSED"},                      # normally by code when held_qty reaches 0 (a sell FILL)
 }
+SELL_REASONS = frozenset({"RANK", "NO_SCORE", "NO_CHAIN", "TEST"})
 TERMINAL_INTENT = frozenset({"COMPLETE", "CANCELLED", "ABSENT", "REJECTED_BAND", "REJECTED_CLOSED", "REJECTED_RMS",
                              "REJECTED_OTHER", "REJECTED_AUTH", "REJECTED"})
 LIVE_INTENT = frozenset({"INTENT_WRITTEN", "SENT", "ACK", "OPEN", "PARTIAL", "TIMEOUT", "FOUND"})
@@ -70,12 +75,27 @@ class Position:
     tries_used: int = 0
     defers_in_row: int = 0
     sessions_seen: List[str] = field(default_factory=list)
+    sold_qty: int = 0
+    sold_paise: int = 0
+    sell_charges_paise: int = 0
+    ca_qty_delta: int = 0                      # shares credited by splits / bonuses (CA_CREDIT)
+    sell_reason: Optional[str] = None
+    sell_no: int = 0                            # the sell's number inside its plan (tag ordinal, unique per plan)
+    sell_plan: Optional[Dict[str, Any]] = None  # plan_id of the plan that ordered the sell
+    sell_sessions: List[str] = field(default_factory=list)
+    test: bool = False                          # TEST lot (D51): outside book cash and NAV
+
+    @property
+    def held_qty(self) -> int:
+        return self.filled_qty + self.ca_qty_delta - self.sold_qty
 
     @property
     def state(self) -> str:
-        if self.filled_qty > 0:
+        if self.held_qty > 0:
             return "HELD"
-        return "PLANNED" if self.leg == "PENDING_BUY" else "GONE"
+        if self.filled_qty > 0:
+            return "CLOSED"
+        return "PLANNED" if self.leg in ("PENDING_BUY", "BUY_GATED") else "GONE"
 
     @property
     def remaining_paise(self) -> int:
@@ -88,6 +108,7 @@ class Ledger:
     cash_open_paise: int = 0
     units: int = 0
     cash_paise: int = 0
+    test_cash_paise: int = 0                    # TEST lot money (D51): never part of book cash
     positions: Dict[str, Position] = field(default_factory=dict)
     intents: Dict[str, Intent] = field(default_factory=dict)
     plans: Dict[str, Dict[str, Any]] = field(default_factory=dict)          # plan key -> PLAN_FINAL record
@@ -131,12 +152,23 @@ def replay(recs: List[Dict[str, Any]]) -> Ledger:
             if k in lg.plans:
                 raise LedgerError(f"seq {r['seq']}: PLAN_FINAL {k} twice")
             lg.plans[k] = r
+            test = r["plan_id"]["month"] == "TEST"
             for b in r["buys"]:
                 if b["position_id"] in lg.positions:
                     raise LedgerError(f"seq {r['seq']}: position {b['position_id']} already exists")
+                leg = b.get("leg", "PENDING_BUY")
+                if leg not in ("PENDING_BUY", "BUY_GATED"):
+                    raise LedgerError(f"seq {r['seq']}: new buy {b['position_id']} with leg {leg}")
                 lg.positions[b["position_id"]] = Position(
                     position_id=b["position_id"], plan_id=r["plan_id"], isin=b["isin"], symbol=b["symbol"],
-                    series=b["series"], rank=int(b["rank"]), earmark_paise=int(b["earmark_paise"]))
+                    series=b["series"], rank=int(b["rank"]), earmark_paise=int(b["earmark_paise"]), leg=leg,
+                    test=test)
+            for x in r.get("sells", []):
+                p = _pos(lg, {"seq": r["seq"], "position_id": x["position_id"]})
+                if p.leg != "NONE" or p.held_qty <= 0 or x["reason"] not in SELL_REASONS:
+                    raise LedgerError(f"seq {r['seq']}: sell of {p.position_id} (leg {p.leg}, held {p.held_qty}, "
+                                      f"reason {x['reason']})")
+                p.leg, p.sell_reason, p.sell_no, p.sell_plan = "SELLING", x["reason"], int(x["sell_no"]), r["plan_id"]
             for h in r.get("holds", []):
                 lg.positions[h["position_id"]].overlays.add(h["overlay"])
         elif t == "LEG":
@@ -144,6 +176,22 @@ def replay(recs: List[Dict[str, Any]]) -> Ledger:
             if r["from"] != p.leg or r["to"] not in LEG_MOVES.get(p.leg, set()):
                 raise LedgerError(f"seq {r['seq']}: leg {p.position_id} {r['from']}->{r['to']} invalid (is {p.leg})")
             p.leg = r["to"]
+        elif t == "BUY_AMOUNT":
+            p = _pos(lg, r)
+            if p.leg != "BUY_GATED" or int(r["earmark_paise"]) < 0:
+                raise LedgerError(f"seq {r['seq']}: BUY_AMOUNT for {p.position_id} in leg {p.leg}")
+            p.earmark_paise, p.leg = int(r["earmark_paise"]), "PENDING_BUY"
+        elif t == "CA_CREDIT":
+            p = _pos(lg, r)
+            if int(r["qty_before"]) != p.held_qty or int(r["qty_after"]) <= 0:
+                raise LedgerError(f"seq {r['seq']}: CA_CREDIT {p.position_id} before {r['qty_before']} != held "
+                                  f"{p.held_qty}")
+            p.ca_qty_delta += int(r["qty_after"]) - int(r["qty_before"])
+        elif t == "SELL_SESSION":
+            p = _pos(lg, r)
+            if r["date"] in p.sell_sessions:
+                raise LedgerError(f"seq {r['seq']}: sell session {r['date']} counted twice for {p.position_id}")
+            p.sell_sessions.append(r["date"])
         elif t == "OVERLAY":
             p = _pos(lg, r)
             if r["overlay"] not in OVERLAYS:
@@ -221,11 +269,29 @@ def replay(recs: List[Dict[str, Any]]) -> Ledger:
                 raise LedgerError(f"seq {r['seq']}: trade {r['trade_id']} counted twice")
             lg.trade_ids.add(r["trade_id"])
             p = _pos(lg, r)
-            value = int(r["qty"]) * int(r["price_paise"])
-            p.filled_qty += int(r["qty"])
-            p.filled_paise += value
-            p.charges_paise += int(r["charges_paise"])
-            lg.cash_paise -= value + int(r["charges_paise"])
+            q, ch = int(r["qty"]), int(r["charges_paise"])
+            value = q * int(r["price_paise"])
+            side = r.get("side", "BUY")              # December FILL records carry no side: they are buys
+            if side == "SELL":
+                if q > p.held_qty:
+                    raise LedgerError(f"seq {r['seq']}: sell fill {q} > held {p.held_qty} on {p.position_id}")
+                p.sold_qty += q
+                p.sold_paise += value
+                p.sell_charges_paise += ch
+                delta = value - ch
+                if p.held_qty == 0 and p.leg == "SELLING":
+                    p.leg = "CLOSED"
+            elif side == "BUY":
+                p.filled_qty += q
+                p.filled_paise += value
+                p.charges_paise += ch
+                delta = -(value + ch)
+            else:
+                raise LedgerError(f"seq {r['seq']}: bad fill side {side}")
+            if p.test:
+                lg.test_cash_paise += delta
+            else:
+                lg.cash_paise += delta
     for p in lg.positions.values():
         if p.leg not in LEG_STATES:
             raise LedgerError(f"position {p.position_id}: bad leg {p.leg}")

@@ -353,7 +353,7 @@ def cmd_morning(x: Ctx, a: argparse.Namespace) -> int:
     lg = L.replay(x.journal.read())
     plan = E.current_plan(lg)
     pend = [p for p in lg.positions.values() if p.leg == "PENDING_BUY"]
-    held = [p for p in lg.positions.values() if p.filled_qty > 0]
+    held = [p for p in lg.positions.values() if p.held_qty > 0]
     x.notify(f"ALIVE plan {L.plan_key(plan['plan_id']) if plan else 'none'}; " + E.status_text(lg))
     no_plan = missing_plan_month(x, lg)
     if no_plan:
