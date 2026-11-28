@@ -19,10 +19,10 @@ REQUIRED_KEYS = (
     "ladder", "cancel_at", "last_place_at", "lock_tries", "vet_timeout_s", "kite_rps", "kite_retry_s",
     "token_poll_s", "token_first_poll", "token_deadline", "plan_final", "audit_ret", "audit_factor", "audit_kite_pp",
     "price_freeze", "tg_retries", "tg_retry_s", "min_free_gb", "rms_max", "defer_max", "token_file",
-    "holiday_file", "nse_data", "claude_bin", "claude_version", "units_open", "nav_open",
+    "holiday_file", "nse_data", "claude_bin", "claude_version", "nav_open",
     "step_plan_at", "place_at", "reconcile_at", "token_alert_at", "ladder_grace_min", "band_max",
     "arm_cap_rupees_default", "charges_rates", "srs_dir", "audit_top_n", "sell_rank", "backup_dir",
-    "probe_reads", "probe_wait_s",
+    "probe_reads", "probe_wait_s", "probe_max",
     "fo_scan_seed", "fo_rss_url", "fo_circular_base", "fo_scan_settle_days", "fo_scan_retry_window", "fo_scan_pause_s", "fo_vet_timeout_s",
     "fo_vet_max_circulars", "fo_vet_max_entrants", "fo_lookback_days", "fo_vet_give_up", "fo_vet_fail_action",
     "fo_min_stock_futures", "fo_min_recent_circulars",
@@ -149,10 +149,10 @@ def load(home: Optional[Path] = None, overrides: Optional[Dict[str, Any]] = None
         raise ConfigError(f"config keys missing: {missing}")
     if cfg["mode"] not in ("dry", "live"):
         raise ConfigError(f"mode must be dry|live, got {cfg['mode']!r}")
-    for k in ("book_cash_open", "n_hold", "lock_tries", "rms_max", "defer_max", "units_open"):
+    for k in ("book_cash_open", "n_hold", "lock_tries", "rms_max", "defer_max", "nav_open"):
         if not isinstance(cfg[k], int) or cfg[k] <= 0:
             raise ConfigError(f"{k} must be a positive int")
-    for k in ("band_max", "probe_reads", "probe_wait_s", "ladder_grace_min", "arm_cap_rupees_default", "vet_timeout_s", "kite_rps", "tg_retries",
+    for k in ("band_max", "probe_max", "probe_reads", "probe_wait_s", "ladder_grace_min", "arm_cap_rupees_default", "vet_timeout_s", "kite_rps", "tg_retries",
               "audit_top_n"):
         if not isinstance(cfg[k], int) or isinstance(cfg[k], bool) or cfg[k] <= 0:
             raise ConfigError(f"{k} must be a positive int")

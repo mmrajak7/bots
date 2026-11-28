@@ -113,3 +113,23 @@
   found the LEAVER gap (monthly expiry = signal day: 10 names in Jul 2025 still in the signal-day file): members now
   use futures expiring after the signal day (pipeline.fo_continuing) -> continuing + entrants == fo_membership.json[m]
   exactly in all four months. Seed scan done on the Pi: FAOP75371..77661, 55 circulars. 131/131.
+- 2026-11-28 fo-scan: only misses within fo_scan_retry_window (300) of the RSS top are re-asked (the seed scan's
+  2,236 old misses were re-fetched daily: 20 min, thousands of NSE requests). 132/132.
+- 2026-11-28 GO-LIVE REVIEW (three independent reviews: architect, trader, ops). Fixed:
+  C1 a Kite refusal is final only if no order carries the tag (looked up at once, and again by settle_orphans);
+     GeneralException (5xx) = unknown outcome (TIMEOUT, settled by tag). Closes a duplicate-buy path.
+  T1/O3 book_cash_open 200000 + arm cap 220000 are the tracked defaults; a live book opens only under an ARM whose cap
+     covers it; units = cash / NAV (T16).
+  T4 a stock-specific probe rejection (BAND / OTHER; "RMS:" without funds words is OTHER) holds that name and the
+     next name becomes the probe, at most probe_max (2) a session; funds / auth / closed / unsettled still stop all.
+  M5/O9 Token/Permission errors on reads are AuthError(NetworkError): stages fail closed, no crash before 15:28.
+  O12 the starting message is retried each minute until 2 min before 15:10.
+  M1 untapped hold buttons are re-sent at 08:35; a hold with no button gets a 'release' line; `release` clears every
+     owner-clearable hold (AUDIT_HOLD too) and says what it changed.
+  O13 08:35 CASH_AM when Kite free cash < today's buys. T9 a missing 14:45 quote of a listed name = next session
+     (never a SKIP). T7 weekday 09:10-12:40 `evening --pending-only` catch-up. O6 cron output -> logs/cron.out.
+  O10 canary checks `claude --version` == claude_version; wrapper sets DISABLE_AUTOUPDATER=1. O20 NO_PLAN once a
+     day per cause. H2 check-arm alerts from 15 Dec when next year's holidays are missing. L1 owner 'filled'
+     re-ingest never books twice. RUNBOOK: whole overlay, arm deadline 19:45 Mon, pkill pattern, DRY-2 by cron.
+  NOT fixed (January build, deadline before 31 Dec): sells / decide_live / E26 expiry / corporate actions / TEST
+  sell; signal day from Kite (H3); off-box backup of all state (O8); dead-man ping (O2, owner); T5/T10/T11 frozen.

@@ -100,6 +100,12 @@ class NetworkError(Exception):
     """No definite answer from Kite. For a WRITE the order may or may not exist: TIMEOUT, settled by tag."""
 
 
+class AuthError(NetworkError):
+    """A READ refused for the session (token replaced / expired). A NetworkError subclass on purpose: every stage
+    already fails closed on NetworkError (skip, alert, next session) instead of crashing, so the 15:28 cancel and
+    the 15:35 reconcile still run on a resume once a fresh token is read (review 11-28 M5/O9)."""
+
+
 class Rejected(Exception):
     """A definite Kite rejection of a write (Kite's own error_type). Only these become REJECTED_*."""
 
@@ -135,8 +141,10 @@ class KiteApi:
             self._pace()
             try:
                 return fn(*a, **k)
-            except (kx.TokenException, kx.PermissionException, kx.InputException):
-                raise                                   # retrying cannot help; the caller fails closed
+            except (kx.TokenException, kx.PermissionException) as e:
+                raise AuthError(f"{type(e).__name__}: {e}") from e   # retrying cannot help; the caller fails closed
+            except kx.InputException:
+                raise                                   # a bad request (our bug): never retried, never hidden
             except Exception as e:  # noqa: BLE001 - network / gateway / parse errors: retry
                 errs.append(f"{type(e).__name__}: {e}")
         raise NetworkError("; ".join(errs))
@@ -147,10 +155,11 @@ class KiteApi:
         self._pace()
         try:
             return fn(*a, **k)
-        except (kx.NetworkException, kx.DataException) as e:
+        except (kx.NetworkException, kx.DataException, kx.GeneralException) as e:
+            # GeneralException is Kite's server-side error (HTTP 5xx): the order may still exist -> unknown outcome,
+            # settled by its exact tag (review 11-28 C1), never a final rejection
             raise NetworkError(f"{type(e).__name__}: {e}") from e
-        except (kx.OrderException, kx.InputException, kx.TokenException, kx.PermissionException,
-                kx.GeneralException) as e:
+        except (kx.OrderException, kx.InputException, kx.TokenException, kx.PermissionException) as e:
             raise Rejected(f"{type(e).__name__}: {e}") from e
         except Exception as e:  # noqa: BLE001 - requests.Timeout / ConnectionError / anything else
             raise NetworkError(f"{type(e).__name__}: {e}") from e
@@ -261,8 +270,22 @@ class Broker:
             oid = self.api.place(transaction_type="BUY", tradingsymbol=tradingsymbol, quantity=qty, price=limit,
                                  tag=tag)
         except Rejected as e:
-            self.j.append("RESULT", intent_id=intent_id, outcome=classify_reject(str(e)), order_id=None,
-                          message=str(e)[:500])
+            # A refusal is final only if no order carries the tag (review 11-28 C1: an exception for an order Kite
+            # did create must not leave a filled order unbooked and the leg open for a second buy).
+            try:
+                found: Optional[Dict[str, Any]] = self._today_tags().get(tag)
+                unreadable = ""
+            except Exception as e2:  # noqa: BLE001 - cannot prove absence: unknown outcome, settled by tag
+                found, unreadable = None, f"{type(e2).__name__}: {str(e2)[:200]}"
+            if found is not None:
+                self.j.append("RESULT", intent_id=intent_id, outcome="ACK", order_id=str(found["order_id"]),
+                              message=f"refusal text but the tag is in the order book: {str(e)[:400]}")
+            elif unreadable:
+                self.j.append("RESULT", intent_id=intent_id, outcome="TIMEOUT", order_id=None,
+                              message=f"refusal {str(e)[:250]}; order book unreadable: {unreadable}")
+            else:
+                self.j.append("RESULT", intent_id=intent_id, outcome=classify_reject(str(e)), order_id=None,
+                              message=str(e)[:500])
         except Exception as e:  # noqa: BLE001 - NetworkError or anything unproven: the order may exist
             self.j.append("RESULT", intent_id=intent_id, outcome="TIMEOUT", order_id=None,
                           message=f"{type(e).__name__}: {str(e)[:480]}")
@@ -316,6 +339,8 @@ def classify_reject(msg: str) -> str:
         return "REJECTED_BAND"
     if ("market" in m and ("closed" in m or "not open" in m)) or "after market order" in m or "amo" in m.split():
         return "REJECTED_CLOSED"
-    if "margin" in m or "insufficient" in m or "funds" in m or "rms" in m:
+    # Zerodha prefixes most OMS refusals with "RMS:" (scrip blocks, surveillance rules ...): only a funds / margin
+    # text is the account-wide RMS class; any other "RMS:" text is about the stock -> OTHER (review 11-28 T4)
+    if "margin" in m or "insufficient" in m or "funds" in m:
         return "REJECTED_RMS"
     return "REJECTED_OTHER"

@@ -242,10 +242,22 @@ def apply_cmd(env: Env, cmd: str, args: str) -> None:
         if not hits:
             env.notify(f"{cmd} {args}: no pending book leg with that ISIN")
             return
+        changed = []
         for p in hits:
-            env.journal.append("OVERLAY", position_id=p.position_id, overlay="OWNER_HOLD", on=(cmd == "hold"),
-                               reason=f"owner {cmd}")
-        env.notify(f"{cmd} {args}: done")
+            if cmd == "hold":
+                if "OWNER_HOLD" not in p.overlays:
+                    env.journal.append("OVERLAY", position_id=p.position_id, overlay="OWNER_HOLD", on=True,
+                                       reason="owner hold")
+                    changed.append("OWNER_HOLD")
+                continue
+            # release = the owner's Buy: every hold only the owner can clear (review 11-28 M1: AUDIT_HOLD too)
+            for ov in sorted(p.overlays & set(OWNER_CLEARABLE)):
+                env.journal.append("OVERLAY", position_id=p.position_id, overlay=ov, on=False, reason="owner release")
+                changed.append(ov)
+        left = sorted({ov for p in L.replay(env.journal.read()).positions.values() if p.isin == args.strip().upper()
+                       and p.leg == "PENDING_BUY" for ov in p.overlays})
+        env.notify(f"{cmd} {args}: " + (f"changed {changed}" if changed else "nothing to change")
+                   + (f"; still on: {left}" if left else ""))
     elif cmd == "resolve":
         parts = args.split()
         if len(parts) != 2 or parts[1] not in ("found", "absent"):
@@ -277,7 +289,7 @@ def apply_cmd(env: Env, cmd: str, args: str) -> None:
         if qty > i.qty:
             env.notify(f"filled: {qty} > the order quantity {i.qty}")
             return
-        if qty:
+        if qty and f"owner:{iid}" not in lg.trade_ids:      # a re-ingest after a crash must not book it twice (L1)
             pp = L.paise(px)
             env.journal.append("FILL", position_id=i.position_id, order_id=i.order_id or "", trade_id=f"owner:{iid}",
                                qty=qty, price_paise=pp, exch_ts="owner", charges_basis="estimate",
@@ -292,9 +304,38 @@ def apply_cmd(env: Env, cmd: str, args: str) -> None:
 
 def open_approval(env: Env, ref_type: str, ref: str, choices: Dict[str, str], text: str, **extra: Any) -> str:
     aid = new_approval_id()
-    env.journal.append("APPROVAL_OPEN", approval_id=aid, ref_type=ref_type, ref=ref, choices=sorted(choices), **extra)
+    env.journal.append("APPROVAL_OPEN", approval_id=aid, ref_type=ref_type, ref=ref, choices=sorted(choices),
+                       text=text, labels=choices, **extra)
     env.notify(text, buttons=[(label, f"a:{aid}:{c}") for c, label in choices.items()])
     return aid
+
+
+OWNER_CLEARABLE = ("OWNER_HOLD", "AUDIT_HOLD", "PRICE_FROZEN", "SHARED_NAME_HOLD", "VET_DEFERRED")
+
+
+def remind_holds(env: Env) -> int:
+    """Morning (review 11-28 M1): every pending leg held by an overlay only the owner can clear gets its buttons
+    again: the untapped approval is re-sent (a Telegram failure at the plan must not leave a name stuck), and a hold
+    with no approval at all (crash between PLAN_FINAL and the buttons) gets a 'release <isin>' line. -> reminders."""
+    recs = env.journal.read()
+    lg = L.replay(recs)
+    tapped = {r["approval_id"] for r in recs if r["type"] == "OWNER_TAP"}
+    n = 0
+    for p in lg.positions.values():
+        if p.leg != "PENDING_BUY" or not (p.overlays & set(OWNER_CLEARABLE)):
+            continue
+        aps = [r for r in recs if r["type"] == "APPROVAL_OPEN" and r.get("position_id") == p.position_id
+               and r["approval_id"] not in tapped]
+        for ap in aps:
+            labels = ap.get("labels") or {c: c for c in ap["choices"]}
+            env.notify("REMINDER " + (ap.get("text") or f"{p.symbol}: {ap['ref_type']} {ap['ref']}"),
+                       buttons=[(lab, f"a:{ap['approval_id']}:{c}") for c, lab in labels.items()])
+            n += 1
+        if not aps:
+            env.notify(f"REMINDER {p.symbol} is held ({'/'.join(sorted(p.overlays))}) with no open button: reply "
+                       f"'release {p.isin}' to buy it from the next 14:45 step, or 'hold {p.isin}' to keep it held")
+            n += 1
+    return n
 
 
 def hold_leg(env: Env, p: L.Position, overlay: str, reason: str) -> None:
@@ -402,6 +443,8 @@ def build_step_plan(env: Env, lg: L.Ledger, holdings_open: Dict[str, int]) -> Op
 
 
 def code_skip_reasons(sp: StepPlan) -> Dict[str, Optional[str]]:
+    """The SKIPs code can confirm. A missing quote is only a candidate: apply_verdict keeps a name that is still in
+    today's instruments (review 11-28 T9)."""
     out: Dict[str, Optional[str]] = {}
     for it in sp.vet_input["intents"]:
         out[it["intent_id"]] = "SKIP_NO_INSTRUMENT" if it["quote_missing"] else None
@@ -419,9 +462,21 @@ def apply_verdict(env: Env, sp: StepPlan, vd: V.Verdict, day: str) -> List[L.Pos
             session_used(env, p.position_id, day, False, "vet unavailable")
         return []
     go: List[L.Position] = []
+    qmiss = {it["intent_id"] for it in sp.vet_input["intents"] if it["quote_missing"]}
+    listed: Optional[Dict[str, Decimal]] = None
+    if qmiss:
+        try:
+            listed = instruments_ticks(env)
+        except B.NetworkError as e:
+            log.warning("instruments unreadable while a 14:45 quote is missing (%s): treated as listed", e)
     for p in sp.legs:
         iid = intent_id(sp.plan_id, p.position_id, sp.attempts[p.position_id])
         a, code, note = vd.actions.get(iid, ("HOLD", "HOLD_OTHER", "no verdict"))
+        if iid in qmiss and a != "GO" and not (listed and tradingsymbol(p.symbol, p.series) not in listed):
+            # review 11-28 T9: a quote missing at 14:45 for a name still in Kite's instruments is a read gap, not a
+            # dead stock: next session, no session used (only a name gone from the instruments may be SKIPPED)
+            env.alert("NO_QUOTE", f"{p.symbol}: no quote at {env.cfg['step_plan_at']} (still listed): next session")
+            continue
         if a == "GO":
             go.append(p)
         elif a == "SKIP":
@@ -532,6 +587,7 @@ def place_all(env: Env, sp: StepPlan, go: List[L.Position], day: str) -> List[st
                 and "max_rupees" in r)
     has_intent_today = {i.position_id for i in lg0.intents.values() if i.date == day}
     probe_ok = False
+    probes = sum(1 for i in lg0.intents.values() if i.date == day and i.status.startswith("REJECTED"))  # resumed run
     for n, p in enumerate(go):
         if p.position_id in has_intent_today:      # resumed run: this leg already has today's order (E12)
             continue
@@ -607,6 +663,14 @@ def place_all(env: Env, sp: StepPlan, go: List[L.Position], day: str) -> List[st
                 status = book_reject(env, it, in_book)
                 after_reject(env, p, status, it.intent_id)
             if status != "ACK" or state not in PROBE_GOOD_STATES:
+                probes += 1
+                # a rejection about THIS stock (price band, scrip-specific / unknown text) says nothing about the
+                # account: that leg is held by after_reject and the next leg becomes the probe, at most probe_max
+                # probes a session (review 11-28 T4). Funds / login / market-closed / unsettled -> everyone waits.
+                if status in ("REJECTED_BAND", "REJECTED_OTHER") and probes < int(env.cfg["probe_max"]):
+                    env.alert("PROBE_MOVED", f"first order {it.tag} rejected ({status}); that name waits, the next "
+                              "name is the probe")
+                    continue
                 env.alert("PROBE_FAILED", f"first order {it.tag}: reply {status}, order book: {state}; the other "
                           "buys wait for the next session")
                 break
@@ -729,7 +793,18 @@ def settle_orphans(env: Env, day: str, final: bool) -> None:
     lg = L.replay(env.journal.read())
     by_tag = {o.get("tag"): o for o in env.api.orders() if o.get("tag")}
     for i in list(lg.intents.values()):
-        if i.date != day or i.status not in ("INTENT_WRITTEN", "SENT", "TIMEOUT"):
+        if i.date != day:
+            continue
+        if i.status.startswith("REJECTED") and not i.order_id:
+            # refused at the call, yet the order appeared later under its exact tag (review 11-28 C1): adopt it so
+            # its fills are booked; absent -> the refusal stands (never an owner item)
+            if i.tag in by_tag:
+                env.journal.append("ORPHAN", intent_id=i.intent_id, resolution="FOUND",
+                                   order_id=str(by_tag[i.tag]["order_id"]), reads=["orders", "after a refusal"])
+                env.alert("REFUSED_BUT_PLACED", f"{i.tradingsymbol}: Kite refused {i.intent_id} but the order is in "
+                          "the book; adopted, its fills are booked")
+            continue
+        if i.status not in ("INTENT_WRITTEN", "SENT", "TIMEOUT"):
             continue
         if i.tag in by_tag:
             env.journal.append("ORPHAN", intent_id=i.intent_id, resolution="FOUND",
@@ -1000,6 +1075,12 @@ def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], L
                 started = False
             elif legs and env.arm is not None:
                 started = env.notify(f"starting BUY step: {len(legs)} buys, Rs {total:,}")
+                # one failed send must not cost the session (review 11-28 O12): retry each minute until 2 minutes
+                # before the place time; the step still never starts without a delivered message (D36)
+                give_up = util.at_today(env.cfg["place_at"]) - dt.timedelta(minutes=2)
+                while not started and util.now() < give_up:
+                    env.sleep_until(min(util.now() + dt.timedelta(seconds=60), give_up))
+                    started = env.notify(f"starting BUY step: {len(legs)} buys, Rs {total:,}")
                 env.journal.append("STEP_START", step="BUY", step_plan_hash=plan_rec.get("step_plan_hash"),
                                    telegram_ok=started)
                 if not started:

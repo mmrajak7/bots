@@ -19,6 +19,8 @@ mkdir -p cache/fo_circulars
 cat > momentum <<EOW
 #!/usr/bin/env bash
 export MOMENTUM_HOME="$HERE"
+# the vet CLI is version-pinned (claude_version, checked by the canary): never let it update itself mid-month
+export DISABLE_AUTOUPDATER=1
 # -I (isolated: no PYTHONPATH, no user site, no cwd on sys.path) is kept; the package path is put on sys.path here.
 exec "$HERE/.venv/bin/python" -I -c "import sys; sys.path.insert(0, '$HERE/src'); from momentum.cli import main; sys.exit(main())" "\$@"
 EOW
@@ -29,7 +31,7 @@ pgrep -f "sys.exit\(main\(\)\) poller" >/dev/null || nohup "$HERE/momentum" poll
 EOW
 chmod +x momentum-poller-keepalive
 # crontab block (replaces only the MOMENTUM block)
-BLOCK="$(sed -e "s#\$M-poller-keepalive#$HERE/momentum-poller-keepalive#" -e "s#\$M #$HERE/momentum #" deploy/crontab.txt | grep -v '^#')"
+BLOCK="$(sed -e "s#\$M-poller-keepalive#$HERE/momentum-poller-keepalive#" -e "s#\$M #$HERE/momentum #" -e "s#\$L#$HERE/logs/cron.out#g" deploy/crontab.txt | grep -v '^#')"
 ( crontab -l 2>/dev/null | sed '/# BEGIN MOMENTUM/,/# END MOMENTUM/d'; echo "# BEGIN MOMENTUM"; echo "$BLOCK"; echo "# END MOMENTUM" ) | crontab -
 echo "crontab:"; crontab -l | sed -n '/# BEGIN MOMENTUM/,/# END MOMENTUM/p'
 # checks (read-only)

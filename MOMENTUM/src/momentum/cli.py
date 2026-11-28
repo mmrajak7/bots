@@ -288,6 +288,8 @@ def cmd_evening(x: Ctx, a: argparse.Namespace) -> int:
     from . import evening as EV
     from . import pipeline as P
     pending_f = x.paths.refresh / "pending_signal.json"
+    if a.pending_only and not pending_f.exists():
+        return 0                                # the morning catch-up (review 11-28 T7) only resumes a failed evening
     if a.as_of_signal:
         day = dt.date.fromisoformat(a.as_of_signal)
     elif pending_f.exists():
@@ -309,16 +311,23 @@ def cmd_evening(x: Ctx, a: argparse.Namespace) -> int:
         return 2
     api = x.api(tok)
     env = x.env(api)
-    EV.book_open(env)
-    E.ingest_inbox(env)
     M = P.import_research(resolve(x.home, x.cfg["srs_dir"]), Path(x.cfg["_nse_data"]))
     try:
+        EV.book_open(env)
+        E.ingest_inbox(env)
         res = EV.run_signal_evening(env, M, m, day, skip_fetch=a.skip_fetch,
                                     first_session=EV.next_session(day, holidays(x.cfg, x.home)).isoformat())
     except (EV.EveningError, P.PipelineError) as e:
         late = util.now() >= util.at_today(x.cfg["plan_final"])
-        env.alert("NO_PLAN", f"{m} (signal day {day}): {e}; "
-                  + ("re-run next evening" if late else "retrying every 30 min until " + x.cfg["plan_final"]))
+        why = f"{m} (signal day {day}): {e}"
+        today_s = util.today().isoformat()
+        if any(r["type"] == "ALERT" and r.get("code") == "NO_PLAN" and r["ts"][:10] == today_s
+               and r.get("text", "").startswith(why[:120]) for r in env.journal.read()):
+            log.warning("NO_PLAN again (already alerted today): %s", why)      # review 11-28 O20: once a day per cause
+        else:
+            env.alert("NO_PLAN", why + "; " + ("the job retries each evening 20:00-23:30 and on weekday mornings "
+                                               "09:10-12:40" if late else "retrying every 30 min until "
+                                               + x.cfg["plan_final"]))
         write_ledger(x)
         return 3
     if res["status"] in ("FINAL", "already final"):
@@ -371,8 +380,28 @@ def cmd_morning(x: Ctx, a: argparse.Namespace) -> int:
             env.alert("HOLDINGS_SHORT", "; ".join(short))
     E.ingest_inbox(env)
     E.shared_name_holds(env, h)                # D38: a plan ISIN with non-book quantity in the account
+    if pend:
+        E.remind_holds(env)                    # review 11-28 M1: an untapped hold never sits silent
+        morning_cash_check(env)
     write_ledger(x)
     return 0
+
+
+def morning_cash_check(env: E.Env) -> None:
+    """Review 11-28 O13: the 15:10 cash guard is all-or-nothing; say at 08:35 if the account is short, while there is
+    still a day to fund it. Advisory only (15:10 re-reads it)."""
+    lg = L.replay(env.journal.read())
+    need = sum(p.remaining_paise for p in lg.positions.values() if p.leg == "PENDING_BUY" and not p.overlays) // 100
+    if need <= 0:
+        return
+    try:
+        avail = E.available_cash(env.api.margins())
+    except B.NetworkError as e:
+        log.warning("morning cash check: margins unreadable (%s)", e)
+        return
+    if avail < need:
+        env.alert("CASH_AM", f"Kite available Rs {avail:,.0f} < today's book buys Rs {need:,}: add funds to "
+                  f"{env.cfg['account_user_id']} before {env.cfg['place_at']} or nothing is bought today (D09)")
 
 
 def cmd_afternoon(x: Ctx, a: argparse.Namespace) -> int:
@@ -445,6 +474,11 @@ def cmd_check_arm(x: Ctx, a: argparse.Namespace) -> int:
                      f"{m} buys will not be placed")
         elif x.arm.mode != "automatic":
             x.notify(f"ALERT ARM MODE: {x.arm.mode} is not built in this slice -> the {m} buys will not be placed")
+    nxt = dt.date(today.year + 1, 1, 1)
+    if today.month == 12 and today.day >= 15 and not holiday_year_ok(x.cfg, x.home, nxt):
+        # review 11-28 H2: the preflight blocks every session of a year the holiday file does not cover
+        x.notify(f"ALERT HOLIDAYS: the holiday file has no {nxt.year} entries: every {nxt.year} session will be "
+                 "blocked by the preflight until NSE's list is loaded")
     left = (x.arm.valid_to - today).days
     if 0 <= left <= ARM_EXPIRY_WARN_DAYS:
         x.notify(f"ARM {x.arm.phase} expires in {left} days ({x.arm.valid_to})")
@@ -581,6 +615,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--as-of-signal")
     ap.add_argument("--skip-fetch", action="store_true")
+    ap.add_argument("--pending-only", action="store_true", help="evening: run only if a signal day is pending")
     a = ap.parse_args(argv)
     try:
         x = Ctx(a, open_journal=a.command != "repair-journal")

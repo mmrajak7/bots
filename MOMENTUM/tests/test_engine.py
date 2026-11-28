@@ -229,12 +229,22 @@ class TestFailures(Harness):
         self.assertEqual(lg.unresolved, [])
         self.assertEqual(self.k.orders_[0].status, "CANCELLED")   # FOUND before 15:28, so it was cancelled
 
-    def test_probe_failure_stops_rest(self) -> None:
+    def test_stock_specific_probe_reject_moves_the_probe(self) -> None:
+        """Review 11-28 T4: an unknown / stock rejection holds that name only; the next name becomes the probe."""
         self.k.reject_next = "Some unknown rejection"
         lg = self.run_day()
-        self.assertEqual(self.k.calls.count("place"), 1)
+        self.assertEqual(self.k.calls.count("place"), 2)
         self.assertIn("OWNER_HOLD", lg.positions["2612-01"].overlays)
-        self.assertEqual(lg.positions["2612-02"].leg, "PENDING_BUY")
+        self.assertEqual(lg.positions["2612-02"].tries_used, 1)
+        self.assertTrue(any("PROBE_MOVED" in t for t, _ in self.sent))
+
+    def test_probe_failure_stops_rest(self) -> None:
+        """An account-level refusal (funds) on the probe: nobody else goes."""
+        self.k.reject_next = "Insufficient funds. Required margin is 24925.00 but available margin is 12.00"
+        lg = self.run_day()
+        self.assertEqual(self.k.calls.count("place"), 1)
+        self.assertEqual(lg.positions["2612-02"].tries_used, 0)
+        self.assertTrue(any("PROBE_FAILED" in t for t, _ in self.sent))
 
     def test_unfilled_ladder_cancel_and_window(self) -> None:
         lg = self.run_day()

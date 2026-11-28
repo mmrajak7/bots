@@ -190,8 +190,22 @@ def run(cfg: Dict[str, Any], vet_dir: Path, step: str, vet_input: Dict[str, Any]
     return Verdict(True, "; ".join(probs), acts, rs)
 
 
+def cli_version(cfg: Dict[str, Any], timeout_s: int = 30) -> str:
+    """The installed CLI's version string ('2.1.278'), '' when it cannot be read."""
+    try:
+        pr = subprocess.run([cfg["claude_bin"], "--version"], capture_output=True, text=True, timeout=timeout_s)
+        return (pr.stdout.split() or [""])[0]
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def canary(cfg: Dict[str, Any], timeout_s: int = 60) -> Tuple[bool, str]:
-    """A tiny call through the same isolated path (E33)."""
+    """A tiny call through the same isolated path (E33), and the CLI version pin (E33: a changed CLI must pass
+    `momentum isolation-test` before the book trusts it; review 11-28 O10)."""
+    ver = cli_version(cfg)
+    if ver != str(cfg["claude_version"]):
+        return False, (f"Claude CLI is {ver or 'unreadable'}, config pins {cfg['claude_version']}: run "
+                       "./momentum isolation-test, then set claude_version in config/momentum.json")
     schema = {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}},
               "additionalProperties": False}
     args = cli_args(cfg, schema)

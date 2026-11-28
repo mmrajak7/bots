@@ -1,13 +1,15 @@
 # MOMENTUM book (IST; system TZ must be Asia/Kolkata). Installed by deploy/setup.sh between the BEGIN/END markers.
 # M = the momentum command wrapper (venv + MOMENTUM_HOME). Every command takes its own flock.
-*/30 20-23 * * *  $M evening        # signal-day evening (no-op on other days; re-runs a pending signal day; resumes)
-30 20 * * *       $M check-arm
-5 19 * * *        $M fo-scan        # NSE F&O circulars store (D47); the evening scans again before its F&O vet
-30 8 * * 1-5      $M canary
-35 8 * * 1-5      $M morning        # alive, token wait, preflight, holdings snapshot, shared-name holds
-30 14 * * 1-5     $M canary
-40 14 * * 1-5     $M afternoon      # 14:45 plan + vet, 15:10 place, ladder, 15:28 cancel, 15:35 reconcile
-*/5 15 * * 1-5    $M afternoon      # resume after a crash/reboot (never a new buy after 15:15)
-0 16 * * 1-5      $M watch
-10,40 16 * * 1-5  $M afternoon      # late resume: a reboot after 15:55 still reconciles from today's order book
-*/5 * * * *       $M-poller-keepalive
+# L = logs/cron.out: a job that dies before Python's own logging starts (bad pull, broken venv) still leaves a trace.
+*/30 20-23 * * *   $M evening >> $L 2>&1        # signal-day evening (no-op on other days; re-runs a pending signal day; resumes)
+10,40 9-12 * * 1-5 $M evening --pending-only >> $L 2>&1   # catch-up: a failed signal evening retries before day-1 14:45
+30 20 * * *        $M check-arm >> $L 2>&1
+5 19 * * *         $M fo-scan >> $L 2>&1        # NSE F&O circulars store (D47); the evening scans again before its F&O vet
+30 8 * * 1-5       $M canary >> $L 2>&1
+35 8 * * 1-5       $M morning >> $L 2>&1        # alive, token wait, preflight, holdings snapshot, holds reminder, cash
+30 14 * * 1-5      $M canary >> $L 2>&1
+40 14 * * 1-5      $M afternoon >> $L 2>&1      # 14:45 plan + vet, 15:10 place, ladder, 15:28 cancel, 15:35 reconcile
+*/5 15 * * 1-5     $M afternoon >> $L 2>&1      # resume after a crash/reboot (never a new buy after 15:15)
+0 16 * * 1-5       $M watch >> $L 2>&1
+10,40 16 * * 1-5   $M afternoon >> $L 2>&1      # late resume: a reboot after 15:55 still reconciles from today's order book
+*/5 * * * *        $M-poller-keepalive >> $L 2>&1

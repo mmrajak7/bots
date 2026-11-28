@@ -302,11 +302,22 @@ def ask_plan_approval(env: Env, plan_id: Dict[str, Any], sha: str, n: int) -> No
 
 
 def book_open(env: Env) -> None:
-    if not any(r["type"] == "BOOK_OPEN" for r in env.journal.read()):
-        cash = int(env.cfg["book_cash_open"]) * 100
-        env.journal.append("BOOK_OPEN", cash_paise=cash, units=int(env.cfg["units_open"]),
-                           nav_per_unit_paise=int(env.cfg["nav_open"]) * 100,
-                           config_commit=env.cfg.get("_code_manifest_sha"))
+    """The book's opening cash is written ONCE and is permanent. A live book opens only under an ARM whose session
+    cap covers it (review 11-28 T1: an overlay that lost book_cash_open must not open a bigger book unseen).
+    Units = cash / NAV, so the first NAV report reads nav_open."""
+    if any(r["type"] == "BOOK_OPEN" for r in env.journal.read()):
+        return
+    rupees, nav = int(env.cfg["book_cash_open"]), int(env.cfg["nav_open"])
+    if not env.dry:
+        if env.arm is None:
+            raise EveningError(f"no ARM: the live book (Rs {rupees:,}) is not opened")
+        if rupees > env.arm.cap_rupees:
+            raise EveningError(f"book_cash_open Rs {rupees:,} is above the ARM session cap Rs {env.arm.cap_rupees:,}: "
+                               "the live book is not opened (check config/momentum.json)")
+    if rupees % nav:
+        raise EveningError(f"book_cash_open {rupees} is not a whole number of units at NAV {nav}")
+    env.journal.append("BOOK_OPEN", cash_paise=rupees * 100, units=rupees // nav, nav_per_unit_paise=nav * 100,
+                       config_commit=env.cfg.get("_code_manifest_sha"))
 
 
 def is_signal_day(day: dt.date, holidays: Set[str]) -> bool:
