@@ -238,6 +238,32 @@ class Broker:
             raise BrokerRefused(f"qty x limit {qty * limit:.2f} > max rupees {max_rupees}")
         if limit <= 0 or limit > cap_price + 1e-6 or qty * cap_price > max_rupees + 1e-6:
             raise BrokerRefused(f"limit {limit} / cap {cap_price} x qty {qty} outside the envelope ({max_rupees})")
+        return self._place("BUY", intent_id=intent_id, key=key, tag=tag, isin=isin, tradingsymbol=tradingsymbol,
+                           qty=qty, limit=limit, extra={"ltp_1510_paise": L.paise(ltp_1510),
+                                                        "cap_price_paise": L.paise(cap_price),
+                                                        "max_rupees": max_rupees})
+
+    def place_sell(self, *, intent_id: str, key: Dict[str, Any], tag: str, isin: str, tradingsymbol: str, qty: int,
+                   limit: float, ltp: float, floor_price: float, max_qty: int) -> L.Intent:
+        """A book sell (January spec §8): never more than the position's ledger shares (max_qty, checked again here
+        from the journal) and never priced under its floor (the ladder's lowest step)."""
+        if not TAG_RE.match(tag):
+            raise BrokerRefused(f"bad tag {tag}")
+        if qty <= 0 or qty > max_qty:
+            raise BrokerRefused(f"sell qty {qty} outside 1..{max_qty}")
+        held = L.replay(self.j.read()).positions[key["position_id"]].held_qty
+        if qty > held:
+            raise BrokerRefused(f"sell qty {qty} > ledger shares {held} of {key['position_id']}")
+        if limit <= 0 or floor_price <= 0 or limit < floor_price - 1e-6:
+            raise BrokerRefused(f"sell limit {limit} under its floor {floor_price}")
+        return self._place("SELL", intent_id=intent_id, key=key, tag=tag, isin=isin, tradingsymbol=tradingsymbol,
+                           qty=qty, limit=limit, extra={"ltp_paise": L.paise(ltp),
+                                                        "floor_price_paise": L.paise(floor_price)})
+
+    def _place(self, side: str, *, intent_id: str, key: Dict[str, Any], tag: str, isin: str, tradingsymbol: str,
+               qty: int, limit: float, extra: Dict[str, Any]) -> L.Intent:
+        """Frozen design §6.6 order of operations, the same for both sides: journal checks, the order book's tags,
+        INTENT + fsync, SENT + fsync, the call (never retried), the result."""
         # step 1: the journal
         lg = L.replay(self.j.read())
         if intent_id in lg.intents:
@@ -251,7 +277,7 @@ class Broker:
         if why:
             if self.j.dry:   # a dry run records what it would have sent (DRY_INTENT, ignored by the live replay)
                 self.j.append("INTENT", intent_id=intent_id, key=key, tag=tag, isin=isin,
-                              tradingsymbol=tradingsymbol, side="BUY", qty=qty, limit_paise=L.paise(limit),
+                              tradingsymbol=tradingsymbol, side=side, qty=qty, limit_paise=L.paise(limit),
                               dry_reason=why)
             raise BrokerRefused(why)
         # step 2: the broker's own order book (a tag with this (position, leg) prefix placed today)
@@ -262,12 +288,11 @@ class Broker:
             raise BrokerRefused(f"order book already has {clash} for {pre}")
         # steps 3-6
         self.j.append("INTENT", intent_id=intent_id, key=key, tag=tag, isin=isin, tradingsymbol=tradingsymbol,
-                      side="BUY", qty=qty, limit_paise=L.paise(limit), ltp_1510_paise=L.paise(ltp_1510),
-                      cap_price_paise=L.paise(cap_price), max_rupees=max_rupees,
+                      side=side, qty=qty, limit_paise=L.paise(limit), **extra,
                       order_type="LIMIT", variety="regular", product="CNC", validity="DAY", exchange="NSE")
         self.j.append("SENT", intent_id=intent_id)
         try:
-            oid = self.api.place(transaction_type="BUY", tradingsymbol=tradingsymbol, quantity=qty, price=limit,
+            oid = self.api.place(transaction_type=side, tradingsymbol=tradingsymbol, quantity=qty, price=limit,
                                  tag=tag)
         except Rejected as e:
             # A refusal is final only if no order carries the tag (review 11-28 C1: an exception for an order Kite
@@ -302,11 +327,16 @@ class Broker:
         why = self._refuse_reason()
         if why:                                  # KILL, dry mode or no ARM: a re-price is a broker write like any other
             raise BrokerRefused(why)
-        caps = [r["cap_price_paise"] for r in self.j.read() if r["type"] == "INTENT" and r["intent_id"] == intent_id
-                and "cap_price_paise" in r]
-        if not caps or L.paise(new_limit) > int(caps[-1]) or new_limit <= 0:
+        rec = [r for r in self.j.read() if r["type"] == "INTENT" and r["intent_id"] == intent_id]
+        if not rec or new_limit <= 0:
+            raise BrokerRefused(f"re-price {new_limit} of {intent_id}: no INTENT")
+        if rec[-1].get("side") == "SELL":
+            if L.paise(new_limit) < int(rec[-1]["floor_price_paise"]):
+                raise BrokerRefused(f"re-price {new_limit} under the floor of {intent_id} "
+                                    f"({int(rec[-1]['floor_price_paise']) / 100})")
+        elif "cap_price_paise" not in rec[-1] or L.paise(new_limit) > int(rec[-1]["cap_price_paise"]):
             raise BrokerRefused(f"re-price {new_limit} above the 15:10 cap of {intent_id} "
-                                f"({caps[-1] / 100 if caps else 'no INTENT'})")
+                                f"({int(rec[-1].get('cap_price_paise', 0)) / 100})")
         self.j.append("MODIFY_INTENT", intent_id=intent_id, order_id=order_id, step_no=step_no,
                       new_limit_paise=L.paise(new_limit))
         self.j.append("MODIFY_SENT", intent_id=intent_id, order_id=order_id, step_no=step_no)
@@ -340,6 +370,8 @@ def classify_reject(msg: str) -> str:
     m = msg.lower()
     if "tokenexception" in m or "permissionexception" in m or "api_key" in m or "access_token" in m:
         return "REJECTED_AUTH"          # the session died (FIFTY re-login?): nothing was sent; next session, no hold
+    if any(w in m for w in ("tpin", "ddpi", "edis", "e-dis", "power of attorney", "authoris", "authoriz")):
+        return "REJECTED_DDPI"          # a sell the depository did not authorise: every sell waits, the owner is told
     if "circuit" in m or "price band" in m or ("outside" in m and "range" in m):
         return "REJECTED_BAND"
     if ("market" in m and ("closed" in m or "not open" in m)) or "after market order" in m or "amo" in m.split():

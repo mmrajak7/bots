@@ -286,7 +286,7 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
              audit_status=decision["audit"]["status"] if not holds else "PASSED_WITH_HOLDS",
              buys=[{k: b[k] for k in ("position_id", "isin", "symbol", "series", "rank", "earmark_paise")}
                    | {"leg": b.get("leg", "PENDING_BUY")} for b in buys],
-             sells=[{k: x[k] for k in ("position_id", "reason", "sell_no", "rank")} for x in sells],
+             sells=[{k: x[k] for k in ("position_id", "reason", "sell_no", "rank", "qty")} for x in sells],
              holds=[{"position_id": h["position_id"], "overlay": h["overlay"]} for h in holds])
     by_isin = {b["isin"]: b for b in buys + sells}
     for f in flags:

@@ -395,6 +395,9 @@ class StepPlan:
     facts_hash: str
     quotes: Dict[str, Dict[str, Any]]
     vet_input: Dict[str, Any]
+    sell_legs: List[L.Position] = field(default_factory=list)      # January slice: sells in this step plan
+    gated: List[L.Position] = field(default_factory=list)          # buys waiting for the sells (BUY_GATED)
+    envelopes: Dict[str, int] = field(default_factory=dict)        # gated buy -> max rupees the vet saw
 
 
 def decision_buys(env: Env, plan: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -535,7 +538,7 @@ def clear_vet_deferrals(env: Env, lg: L.Ledger, day: str) -> None:
     TODAY stays (a re-run of the plan stage after a crash must not re-vet a pair the vet already deferred, F29)."""
     recs = env.journal.read()
     for p in lg.positions.values():
-        if "VET_DEFERRED" in p.overlays and p.leg == "PENDING_BUY":
+        if "VET_DEFERRED" in p.overlays and p.leg in ("PENDING_BUY", "BUY_GATED", "SELLING"):
             on = [r for r in recs if r["type"] == "OVERLAY" and r["position_id"] == p.position_id
                   and r["overlay"] == "VET_DEFERRED" and r["on"]]
             if on and on[-1]["ts"][:10] == day:
@@ -619,7 +622,9 @@ def place_all(env: Env, sp: StepPlan, go: List[L.Position], day: str) -> List[st
     # the ARM cap is per SESSION: a resumed process counts what an earlier run of today already sent
     spent = sum(int(r["max_rupees"]) for r in recs if r["type"] == "INTENT" and r["ts"][:10] == day
                 and "max_rupees" in r)
-    has_intent_today = {i.position_id for i in lg0.intents.values() if i.date == day}
+    has_intent_today = {i.position_id for i in lg0.intents.values() if i.date == day and "|buy|" in i.intent_id}
+    from . import sellside as SS
+    sizes = SS.size_buys(env, [p for p in go if p.position_id not in has_intent_today], q, ticks)
     probe_ok = False
     probes = sum(1 for i in lg0.intents.values() if i.date == day and i.status.startswith("REJECTED"))  # resumed run
     for n, p in enumerate(go):
@@ -642,12 +647,8 @@ def place_all(env: Env, sp: StepPlan, go: List[L.Position], day: str) -> List[st
             env.alert("NO_CIRCUIT", f"{p.symbol}: the quote has no upper circuit limit: not placed (the limit "
                       "cannot be clamped), next session")
             continue
-        ltp = dec(qq["last_price"])
-        upper = dec(qq["upper_circuit_limit"])
-        limit = tick_down(min(ltp * dec(env.cfg["buy_ltp_mult"]), upper), tick)
-        cap_price = tick_down(min(ltp * dec(env.cfg["buy_cap_mult"]), upper), tick)
-        max_rupees = p.remaining_paise // 100
-        qty = int((Decimal(max_rupees) / (ltp * dec(env.cfg["buy_cap_mult"]))).to_integral_value(rounding=ROUND_FLOOR))
+        # D52: floor quantity, plus one share for the largest leftovers when the summed leftovers pay for it
+        qty, ltp, limit, cap_price, max_rupees = sizes[p.position_id]
         if qty <= 0 or limit <= 0:
             to = close_leg(env, p.position_id, "qty 0")
             env.alert("QTY0", f"{p.symbol}: LTP {ltp} > Rs {max_rupees}/{env.cfg['buy_cap_mult']}: "
@@ -867,6 +868,14 @@ def settle_stale(env: Env, day: str) -> None:
 
 def reconcile(env: Env, day: str) -> None:
     settle_orphans(env, day, final=True)
+    sync_orders(env, day, final=True)
+    leg_transitions(env, day)
+
+
+def sync_orders(env: Env, day: str, final: bool) -> None:
+    """Today's order book + trades -> ORDER_STATUS / FILL, both sides. final=False (the 15:06 gate) books the sell
+    fills so far without the end-of-day alerts (an order still open then is normal)."""
+    from . import sellside as SS
     orders = env.api.orders()
     trades = env.api.trades()
     by_oid = {str(o["order_id"]): o for o in orders}
@@ -877,7 +886,7 @@ def reconcile(env: Env, day: str) -> None:
             continue
         o = by_oid.get(i.order_id)
         if o is None:                              # an acknowledged order the order book does not show: never guess
-            if i.status in L.LIVE_INTENT and i.intent_id not in lg.unresolved:
+            if final and i.status in L.LIVE_INTENT and i.intent_id not in lg.unresolved:
                 env.journal.append("ORPHAN", intent_id=i.intent_id, resolution="OWNER", order_id=i.order_id,
                                    reads=["orders: order id not in today's book"])
                 env.alert("ORDER_MISSING", f"{i.intent_id}: order {i.order_id} is not in today's order book. Check "
@@ -889,10 +898,11 @@ def reconcile(env: Env, day: str) -> None:
             mapped = i.status if i.status.startswith("REJECTED_") else B.classify_reject(B.reject_text(o))
         elif st in ("COMPLETE", "CANCELLED"):
             mapped = st
-        else:                                      # still live after the cancel time
+        else:                                      # still live (after the cancel time when final)
             mapped = "PARTIAL" if filled > 0 else "OPEN"
-            env.alert("ORDER_STATUS", f"{i.intent_id}: order still {st} at the reconcile (cancel not confirmed?); "
-                      "fills so far are recorded; check the order in Kite")
+            if final:
+                env.alert("ORDER_STATUS", f"{i.intent_id}: order still {st} at the reconcile (cancel not "
+                          "confirmed?); fills so far are recorded; check the order in Kite")
         if (mapped, filled) != (i.status, i.filled_qty):
             env.journal.append("ORDER_STATUS", intent_id=i.intent_id, order_id=i.order_id, status=mapped,
                                filled_qty=filled, pending_qty=int(o.get("pending_quantity") or 0),
@@ -918,8 +928,8 @@ def reconcile(env: Env, day: str) -> None:
                 lg.trade_ids.add(str(t["trade_id"]))
                 continue
             env.journal.append("FILL", position_id=i.position_id, order_id=i.order_id, trade_id=str(t["trade_id"]),
-                               qty=q, price_paise=px, exch_ts=str(t.get("exchange_timestamp", "")),
-                               charges_paise=estimate_buy_charges_paise(env.cfg, q * px), charges_basis="estimate")
+                               qty=q, price_paise=px, exch_ts=str(t.get("exchange_timestamp", "")), side=i.side,
+                               charges_paise=charges_for(env, i, q * px, day), charges_basis="estimate")
             lg.trade_ids.add(str(t["trade_id"]))
             booked_qty += q
             booked_value += q * px
@@ -932,14 +942,49 @@ def reconcile(env: Env, day: str) -> None:
             if px > 0:
                 env.journal.append("FILL", position_id=i.position_id, order_id=i.order_id, trade_id=synth_id,
                                    qty=short, price_paise=px, exch_ts="order book", charges_basis="estimate",
-                                   charges_paise=estimate_buy_charges_paise(env.cfg, short * px))
+                                   side=i.side, charges_paise=charges_for(env, i, short * px, day))
                 lg.trade_ids.add(synth_id)
             env.alert("RECON_TRADES", f"{i.intent_id}: order book filled {filled} but trades() lists {seen_qty}; "
                       + (f"{short} shares booked at the order's average price" if px > 0 else "NOT booked (no "
                          "average price): enter by hand") + "; check the contract note")
     for i, mapped in newly_rejected:
-        after_reject(env, L.replay(env.journal.read()).positions[i.position_id], mapped, i.intent_id)
-    # sessions + leg transitions for legs that had an order today
+        p_ = L.replay(env.journal.read()).positions[i.position_id]
+        if i.side == "SELL":
+            if mapped == "REJECTED_DDPI":
+                SS.ddpi_alert(env, i)
+            SS.after_sell_reject(env, p_, mapped, i.intent_id)
+        else:
+            after_reject(env, p_, mapped, i.intent_id)
+
+
+def charges_for(env: Env, i: L.Intent, value_paise: int, day: str) -> int:
+    if i.side != "SELL":
+        return estimate_buy_charges_paise(env.cfg, value_paise)
+    from . import sellside as SS
+    lg = L.replay(env.journal.read())
+    first = not any(r["type"] == "FILL" and r.get("side") == "SELL" and r["ts"][:10] == day
+                    and lg.positions[r["position_id"]].isin == i.isin for r in env.journal.read())
+    return SS.estimate_sell_charges_paise(env.cfg, value_paise, first)
+
+
+def leg_transitions(env: Env, day: str) -> None:
+    """15:35: sessions + leg transitions for legs that had an order today (buys: lock tries and the window; sells:
+    one SELL_SESSION, a reminder when a sell stays unsold)."""
+    from . import sellside as SS
+    lg = L.replay(env.journal.read())
+    for p in lg.positions.values():
+        todays = [i for i in lg.intents.values() if i.position_id == p.position_id and i.date == day
+                  and "|sell|" in i.intent_id and i.status != "ABSENT"]
+        if not todays or day in p.sell_sessions:
+            continue
+        done = p.leg != "SELLING"
+        res = "filled" if done else ("rejected" if all(i.status.startswith("REJECTED") for i in todays) else
+                                     f"unfilled ({SS.sell_qty(p)} left)")
+        SS.sell_session(env, p.position_id, day, res)
+        n = len(L.replay(env.journal.read()).positions[p.position_id].sell_sessions)
+        if not done and n >= int(env.cfg.get("sell_stuck_sessions", 5)):
+            env.alert("SELL_STUCK", f"{p.symbol}: unsold after {n} sessions ({res}); tested rule: it is re-offered "
+                      "every session until it trades")
     lg = L.replay(env.journal.read())
     for p in lg.positions.values():
         if p.leg != "PENDING_BUY" or day in p.sessions_seen:
@@ -1046,6 +1091,8 @@ def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], L
                            facts_hash=None)
         env.alert("PLAN_LATE", f"the afternoon step first ran after {env.cfg['last_place_at']}: no buy today "
                   "(next session, no lock try)")
+        env.journal.append("STAGE", date=day, stage="SELL", result="too late")
+        env.journal.append("STAGE", date=day, stage="GATE", result="too late")
         recs = env.journal.read()
     if not stage_done(recs, day, "PLAN"):
         env.sleep_until(util.at_today(env.cfg["step_plan_at"]))
@@ -1061,6 +1108,8 @@ def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], L
         if problems:
             env.alert("PREFLIGHT", "; ".join(problems) + " -> no orders today")
             env.journal.append("STAGE", date=day, stage="PLAN", result="preflight failed")
+            env.journal.append("STAGE", date=day, stage="SELL", result="skipped")
+            env.journal.append("STAGE", date=day, stage="GATE", result="skipped")
             env.journal.append("STAGE", date=day, stage="PLACE", result="skipped")
             env.journal.append("STAGE", date=day, stage="CANCEL", result="skipped")
             env.journal.append("STAGE", date=day, stage="LADDER", result="skipped")
@@ -1071,21 +1120,34 @@ def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], L
         clear_vet_deferrals(env, lg, day)
         shared_name_holds(env, holdings_open)
         lg = L.replay(env.journal.read())
+        from . import sellside as SS
         sp = build_step_plan(env, lg, holdings_open)
+        sp = SS.extend_step_plan(env, L.replay(env.journal.read()), holdings_open, sp)
         go: List[str] = []
+        go_sell: List[str] = []
         if sp is not None:
             try:
                 instruments_ticks(env)             # today's tick sizes, read now so 15:10 does not wait on the dump
             except B.NetworkError as e:
                 log.warning("instruments not read at the step plan (%s); 15:10 reads them", e)
-            vd = env.vet_fn(sp.step, sp.vet_input, code_skip_reasons(sp))
+            vd = env.vet_fn(sp.step, sp.vet_input, SS.code_skip_reasons_all(sp))
             ok = apply_verdict(env, sp, vd, day)
-            go = [p.position_id for p in ok]
-        env.journal.append("STAGE", date=day, stage="PLAN", result="ok", go=go,
+            go_sell, go_gated = SS.apply_side_verdicts(env, sp, vd, day)
+            go = [p.position_id for p in ok] + go_gated
+        env.journal.append("STAGE", date=day, stage="PLAN", result="ok", go=go, go_sell=go_sell,
+                           envelopes=sp.envelopes if sp else {},
                            step_plan_hash=sp.step_plan_hash if sp else None, facts_hash=sp.facts_hash if sp else None)
         recs = env.journal.read()
     plan_rec = [r for r in recs if r["type"] == "STAGE" and r.get("date") == day and r.get("stage") == "PLAN"][-1]
     go_ids: List[str] = plan_rec.get("go") or []
+    if not stage_done(recs, day, "SELL"):          # January slice D49: sells before the buys, same window
+        from . import sellside as SS
+        SS.sell_step(env, day, plan_rec.get("go_sell") or [], holdings_open)
+        recs = env.journal.read()
+    if not stage_done(recs, day, "GATE"):
+        from . import sellside as SS
+        SS.gate_stage(env, day, plan_rec.get("envelopes") or {})
+        recs = env.journal.read()
 
     def cleared() -> List[L.Position]:
         lg_ = L.replay(env.journal.read())
@@ -1183,7 +1245,7 @@ def reconcile_stage(env: Env, day: str) -> None:
     reconcile(env, day)
     env.journal.append("STAGE", date=day, stage="RECON", result="ok")
     lg = L.replay(env.journal.read())
-    env.notify("BUY step done. " + status_text(lg))
+    env.notify("Order step done. " + status_text(lg))
 
 
 def rebuild_attempts(lg: L.Ledger, go_ids: List[str]) -> StepPlan:

@@ -5,6 +5,7 @@ duplicate-order trap), fills (full / partial / none), and per-day order books.
 """
 from __future__ import annotations
 
+import datetime as dt
 import itertools
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -33,6 +34,8 @@ class FakeKite:
     cash: float = 600000.0
     ltp: Dict[str, float] = field(default_factory=dict)            # "NSE:SYM" -> price
     upper: Dict[str, float] = field(default_factory=dict)
+    lower: Dict[str, float] = field(default_factory=dict)            # "NSE:SYM" -> lower circuit (default LTP x 0.8)
+    stale: List[str] = field(default_factory=list)                    # "NSE:SYM" with no trade today (last trade yday)
     holdings_qty: Dict[str, int] = field(default_factory=dict)       # isin -> qty (non-book shares too)
     reject_next: Optional[str] = None                                 # message for the next place()
     async_reject_next: Optional[str] = None                           # next place() returns an id; the order-book row
@@ -78,10 +81,11 @@ class FakeKite:
         for k in keys:
             if k in self.ltp:
                 p = self.ltp[k]
-                out[k] = {"last_price": p, "last_trade_time": f"{util.today().isoformat()} 14:45:00"}
+                day = util.today() - (dt.timedelta(days=1) if k in self.stale else dt.timedelta(0))
+                out[k] = {"last_price": p, "last_trade_time": f"{day.isoformat()} 14:45:00"}
                 if not self.no_circuit:
                     out[k]["upper_circuit_limit"] = self.upper.get(k, round(p * 1.2, 2))
-                    out[k]["lower_circuit_limit"] = round(p * 0.8, 2)
+                    out[k]["lower_circuit_limit"] = self.lower.get(k, round(p * 0.8, 2))
         return out
 
     def orders(self) -> List[Dict[str, Any]]:

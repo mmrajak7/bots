@@ -26,12 +26,15 @@ REQUIRED_KEYS = (
     "fo_scan_seed", "fo_rss_url", "fo_circular_base", "fo_scan_settle_days", "fo_scan_retry_window", "fo_scan_pause_s", "fo_vet_timeout_s",
     "fo_vet_max_circulars", "fo_vet_max_entrants", "fo_lookback_days", "fo_vet_give_up", "fo_vet_fail_action",
     "fo_min_stock_futures", "fo_min_recent_circulars",
+    "sell_place_at", "sell_ladder", "last_sell_place_at", "gate_at", "sell_ltp_mult", "sell_floor_mult",
+    "gate_wait_sessions", "buy_envelope_slack", "extra_share_max_over",
 )
 TIME_KEYS = ("step_plan_at", "place_at", "last_place_at", "cancel_at", "reconcile_at", "token_first_poll",
-             "token_alert_at", "token_deadline", "plan_final")
+             "token_alert_at", "token_deadline", "plan_final", "sell_place_at", "last_sell_place_at", "gate_at")
 CHARGE_KEYS = ("brokerage", "stt_buy", "exchange_txn", "sebi", "stamp_buy", "gst_on")
 # Hard ceiling on the buy price multipliers: a config typo (1.10 for 1.010) must never become a 10% chase.
 MAX_BUY_MULT = Decimal("1.03")
+MIN_SELL_MULT = Decimal("0.97")         # the same guard for sells: never a typo'd 0.90 dump
 
 
 class ConfigError(Exception):
@@ -152,7 +155,7 @@ def load(home: Optional[Path] = None, overrides: Optional[Dict[str, Any]] = None
     for k in ("book_cash_open", "n_hold", "lock_tries", "rms_max", "defer_max", "nav_open"):
         if not isinstance(cfg[k], int) or cfg[k] <= 0:
             raise ConfigError(f"{k} must be a positive int")
-    for k in ("band_max", "probe_max", "probe_reads", "probe_wait_s", "ladder_grace_min", "arm_cap_rupees_default", "vet_timeout_s", "kite_rps", "tg_retries",
+    for k in ("band_max", "probe_max", "gate_wait_sessions", "probe_reads", "probe_wait_s", "ladder_grace_min", "arm_cap_rupees_default", "vet_timeout_s", "kite_rps", "tg_retries",
               "audit_top_n"):
         if not isinstance(cfg[k], int) or isinstance(cfg[k], bool) or cfg[k] <= 0:
             raise ConfigError(f"{k} must be a positive int")
@@ -172,6 +175,13 @@ def load(home: Optional[Path] = None, overrides: Optional[Dict[str, Any]] = None
             raise ConfigError(f"{k}: {v!r} is not a HH:MM time")
     if ladder != sorted(ladder):
         raise ConfigError("ladder times must be a non-empty ascending list")
+    sl: List[str] = cfg["sell_ladder"]
+    if not isinstance(sl, list) or not sl or sl != sorted(sl) or not all(_is_hhmm(x) for x in sl):
+        raise ConfigError("sell_ladder must be a non-empty ascending list of HH:MM")
+    if not (cfg["step_plan_at"] < cfg["sell_place_at"] < cfg["last_sell_place_at"] < cfg["gate_at"] < cfg["place_at"]
+            and cfg["sell_place_at"] < sl[0] and sl[-1] < cfg["gate_at"]):
+        raise ConfigError("times must run step_plan_at < sell_place_at < sell_ladder / last_sell_place_at < gate_at "
+                          "< place_at")
     # the session's order of events; equal times are allowed only where the engine defines them (place cut-off =
     # first ladder slot)
     if not (cfg["step_plan_at"] < cfg["place_at"] < cfg["last_place_at"] <= ladder[0]
@@ -186,6 +196,15 @@ def load(home: Optional[Path] = None, overrides: Optional[Dict[str, Any]] = None
         raise ConfigError(f"buy multipliers / charges are not decimal numbers: {e!r}") from e
     if not (Decimal(1) <= ltp_m <= cap_m <= MAX_BUY_MULT):
         raise ConfigError(f"need 1 <= buy_ltp_mult <= buy_cap_mult <= {MAX_BUY_MULT}, got {ltp_m}, {cap_m}")
+    try:
+        s_m, f_m = Decimal(str(cfg["sell_ltp_mult"])), Decimal(str(cfg["sell_floor_mult"]))
+        slack, over = Decimal(str(cfg["buy_envelope_slack"])), Decimal(str(cfg["extra_share_max_over"]))
+    except (InvalidOperation, TypeError) as e:
+        raise ConfigError(f"sell multipliers / slack are not decimal numbers: {e!r}") from e
+    if not (MIN_SELL_MULT <= f_m <= s_m <= Decimal(1)):
+        raise ConfigError(f"need {MIN_SELL_MULT} <= sell_floor_mult <= sell_ltp_mult <= 1, got {f_m}, {s_m}")
+    if not (Decimal(1) <= slack <= Decimal("1.10")) or not (Decimal(0) <= over <= Decimal(1)):
+        raise ConfigError("buy_envelope_slack must be in 1..1.10 and extra_share_max_over in 0..1")
     if not (Decimal(0) <= reserve < Decimal("0.05")) or any(v < 0 or v >= 1 for v in rates.values()):
         raise ConfigError("charges_reserve / charges_rates out of range")
     return cfg

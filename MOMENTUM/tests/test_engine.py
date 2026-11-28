@@ -284,9 +284,15 @@ class TestFailures(Harness):
         self.assertEqual((p2.filled_qty, p2.leg, p2.tries_used), (20, "PENDING_BUY", 1))
         self.new_day(dt.date(2026, 12, 2))
         self.run_day()
-        ints = [i for i in L.replay(self.j.read()).intents.values() if i.position_id == "2612-02"]
+        lg2 = L.replay(self.j.read())
+        ints = [i for i in lg2.intents.values() if i.position_id == "2612-02"]
         self.assertEqual(len(ints), 2)
-        self.assertLessEqual(ints[1].qty * ints[1].limit_paise, p2.remaining_paise)
+        # D52 extra share: one name may take up to 25% over its amount, paid by the other buys' leftovers; the
+        # session's total never exceeds the summed amounts
+        self.assertLessEqual(ints[1].qty * ints[1].limit_paise, p2.remaining_paise * 1.25)
+        today = [i for i in lg2.intents.values() if i.date == "2026-12-02"]
+        p1 = lg.positions["2612-01"]
+        self.assertLessEqual(sum(i.qty * i.limit_paise for i in today), p1.remaining_paise + p2.remaining_paise)
 
     def test_qty_zero_skipped(self) -> None:
         self.k.ltp["NSE:SYM1"] = 30000.0

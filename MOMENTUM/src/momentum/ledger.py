@@ -22,11 +22,11 @@ OVERLAYS = frozenset({"VET_DEFERRED", "OWNER_HOLD", "AUDIT_HOLD", "SHARED_NAME_H
 LEG_MOVES = {
     "BUY_GATED": {"EXPIRED"},                   # -> PENDING_BUY only through BUY_AMOUNT (the gate sets the amount)
     "PENDING_BUY": {"NONE", "SKIPPED", "EXPIRED"},
-    "SELLING": {"CLOSED"},                      # normally by code when held_qty reaches 0 (a sell FILL)
+    "SELLING": {"CLOSED", "NONE"},              # by code at the sell target (a sell FILL), never by hand
 }
 SELL_REASONS = frozenset({"RANK", "NO_SCORE", "NO_CHAIN", "TEST"})
 TERMINAL_INTENT = frozenset({"COMPLETE", "CANCELLED", "ABSENT", "REJECTED_BAND", "REJECTED_CLOSED", "REJECTED_RMS",
-                             "REJECTED_OTHER", "REJECTED_AUTH", "REJECTED"})
+                             "REJECTED_OTHER", "REJECTED_AUTH", "REJECTED_DDPI", "REJECTED"})
 LIVE_INTENT = frozenset({"INTENT_WRITTEN", "SENT", "ACK", "OPEN", "PARTIAL", "TIMEOUT", "FOUND"})
 
 
@@ -83,6 +83,7 @@ class Position:
     sell_no: int = 0                            # the sell's number inside its plan (tag ordinal, unique per plan)
     sell_plan: Optional[Dict[str, Any]] = None  # plan_id of the plan that ordered the sell
     sell_sessions: List[str] = field(default_factory=list)
+    sell_target: int = 0                        # sold_qty at which the SELLING leg ends (a TEST sell: 1 of 2)
     test: bool = False                          # TEST lot (D51): outside book cash and NAV
 
     @property
@@ -168,7 +169,11 @@ def replay(recs: List[Dict[str, Any]]) -> Ledger:
                 if p.leg != "NONE" or p.held_qty <= 0 or x["reason"] not in SELL_REASONS:
                     raise LedgerError(f"seq {r['seq']}: sell of {p.position_id} (leg {p.leg}, held {p.held_qty}, "
                                       f"reason {x['reason']})")
+                qty = int(x.get("qty") or p.held_qty)
+                if not 0 < qty <= p.held_qty:
+                    raise LedgerError(f"seq {r['seq']}: sell qty {qty} of {p.position_id} (held {p.held_qty})")
                 p.leg, p.sell_reason, p.sell_no, p.sell_plan = "SELLING", x["reason"], int(x["sell_no"]), r["plan_id"]
+                p.sell_target, p.sell_sessions = p.sold_qty + qty, []
             for h in r.get("holds", []):
                 lg.positions[h["position_id"]].overlays.add(h["overlay"])
         elif t == "LEG":
@@ -279,8 +284,8 @@ def replay(recs: List[Dict[str, Any]]) -> Ledger:
                 p.sold_paise += value
                 p.sell_charges_paise += ch
                 delta = value - ch
-                if p.held_qty == 0 and p.leg == "SELLING":
-                    p.leg = "CLOSED"
+                if p.leg == "SELLING" and p.sold_qty >= p.sell_target:
+                    p.leg = "CLOSED" if p.held_qty == 0 else "NONE"
             elif side == "BUY":
                 p.filled_qty += q
                 p.filled_paise += value
