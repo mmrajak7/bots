@@ -1,0 +1,41 @@
+"""Fixes from the 11-28 reviews (BTST peer Review 8 'X-', ETF bug hunt 'B') that live in
+kotak_neo/orders.py, proved end to end through the ETF engine over FakeNeo."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_engine import open_one, rig  # noqa: E402,F401  (the fixture)
+
+
+def test_xk1_a_sell_rejected_in_the_book_backs_off_and_says_why(rig):
+    """Accepted, then RMS-REJECTED in the book: before the fix ~2 sells/s for as long as
+    RMS refused (241 in 2 min). Now each refusal waits reject_backoff_s, is counted and
+    the alert carries the reason."""
+    p = open_one(rig)
+    for _ in range(400):
+        rig.fake.rms_reject('RMS:MIS orders not allowed')
+    rig.quote(80.0, 80.1)                             # PREM_SL fires
+    rig.step(n=60)                                    # 30 s
+    sells = rig.etf_orders('S')
+    limit = 30.0 / rig.cfg['reject_backoff_s'] + 2
+    assert 1 <= len(sells) <= limit, len(sells)
+    assert p['chase']['rejects'] >= 2
+    assert 'rejected in the book' in rig.texts() and 'RMS:MIS orders not allowed' in rig.texts()
+    rig.fake._next.clear()                            # RMS relents: the exit completes
+    rig.step(secs=1, n=20)
+    assert p['state'] == 'CLOSED' and rig.fake.net(p['symbol']) == 0
+
+
+def test_b6_a_pending_cancel_is_not_resent_every_loop(rig):
+    """A slow cancel ('cancel pending' for many reads): before the fix the cancel POST
+    went out on every 0.5 s loop (17 in 10 s)."""
+    p = open_one(rig)
+    orig = rig.fake._match
+    rig.fake._match = lambda o: None                  # nothing fills: the chase must re-price
+    rig.fake.slow_cancel(reads=40)
+    rig.quote(80.0, 80.1)                             # PREM_SL: the first sell rests
+    rig.step(n=20)                                    # 10 s
+    assert rig.etf_orders('S'), 'no sell went out'
+    cancels = [c for c in rig.fake.calls if c[0] == 'POST' and c[1].endswith('/quick/order/cancel')]
+    rig.fake._match = orig
+    assert 1 <= len(cancels) <= 10.0 / rig.cfg['exit_step_s'] + 1, len(cancels)

@@ -175,6 +175,7 @@ class ChaseState:
     rejects: int = 0                # N3: definite refusals in a row (reset by a fill)
     unclears: int = 0               # N4: unclear sends in a row (reset by a fill)
     cancel_sent: bool = False       # review H2: a re-price cancel is out, not yet settled
+    cancel_at: float = 0.0          # review B6/X-K6: when that cancel went out
     note: str = ''
     fills: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -260,17 +261,28 @@ def _settle_working(c: NeoClient, st: ChaseState, p: ChasePolicy, sleep, clock,
         _apply(st, Resolution(ABSENT, 0, 0.0, '', 'never placed', True))
         return True
     if res.terminal:
+        booked_reject = res.state == REJECTED and not st.cancel_sent
         _apply(st, res)
         if st.cancel_sent:                              # H2: OUR re-price cancel settled
             st.cancel_sent = False                      # on a later read -- still a re-price
             st.reprices += 1
+        if booked_reject:
+            # review X-K1 (2026-11-28): accepted, then REJECTED in the book (RMS did this
+            # to the 11-27 SL-M) is a refusal like a refused send: counted, backed off,
+            # the reason shown -- never a new sell on the same step, twice a second.
+            st.rejects += 1
+            st.next_try_at = clock() + p.reject_backoff_s
+            st.note = 'sell rejected in the book (%d in a row): %s' % (st.rejects, res.reason)
         return True
     if clock() - st.working_since < p.reprice_after_s:
         return False                                    # let it work
+    if st.cancel_sent and clock() - st.cancel_at < p.reprice_after_s:
+        return False                                    # B6: our cancel is out -- read, don't resend
     res = cancel_and_confirm(c, st.working_no, st.working_tag, wait_s=p.confirm_wait_s,
                              expect_qty=st.working_qty or None, sleep=sleep, clock=clock)
     if not res.terminal:
         st.cancel_sent = True
+        st.cancel_at = clock()
         st.note = 'cancel of %s pending (%s)' % (st.working_no, res.reason)
         return False                                    # settle it on the next step
     _apply(st, res)
