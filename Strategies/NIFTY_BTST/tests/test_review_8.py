@@ -41,7 +41,7 @@ class _Resp:
 
 
 class _LoginHttp:
-    """Answers tradeApiLogin / tradeApiValidate from a script of
+    """Answers the two login steps (nc.LOGIN_PATH, nc.VALIDATE_PATH) from a script of
     ('ok' | 'mpin' | 'refused' | 'network' | 'ip')."""
 
     def __init__(self, *outcomes):
@@ -50,7 +50,7 @@ class _LoginHttp:
 
     def post(self, url, **kw):
         import requests
-        if 'tradeApiLogin' in url:
+        if url.endswith(nc.LOGIN_PATH):
             self.login_posts += 1
             self.cur = self.outcomes.pop(0) if self.outcomes else self.cur
             if self.cur == 'network':
@@ -61,7 +61,7 @@ class _LoginHttp:
                 return _Resp(400, {'stat': 'Not_Ok', 'stCode': 100008,
                                    'errMsg': 'request from non-whitelisted static ip'})
             return _Resp(200, {'data': {'token': 't', 'sid': 's'}})
-        if 'tradeApiValidate' in url:
+        if url.endswith(nc.VALIDATE_PATH):
             if self.cur == 'mpin':
                 return _Resp(200, {'data': None, 'errMsg': 'Invalid MPIN'})
             return _Resp(200, {'data': {'token': 'T', 'sid': 'S', 'baseUrl': 'https://b'}})
@@ -179,7 +179,7 @@ def test_the_attempt_is_written_before_the_wire(tmp_path):
 
     class Spy(_LoginHttp):
         def post(self, url, **kw):
-            if 'tradeApiLogin' in url:
+            if url.endswith(nc.LOGIN_PATH):
                 seen['attempts'] = json.loads(path.read_text())['attempts']
             return super().post(url, **kw)
 
