@@ -49,11 +49,14 @@ class Broker:
             self.c = self.C.NeoClient(cfg['neo_bot'], exclusive=False, http=self.fake,
                                       product=cfg['product'],
                                       timeout=cfg['neo_timeout_s'], current_fn=lambda: sess,
-                                      refresh_fn=lambda gen, who: self.S.Result(
+                                      refresh_fn=lambda gen, who, **kw: self.S.Result(
                                           self.S.STILL_ALIVE, sess, 'paper'))
         else:
+            # K8: a dead session found by a read waits at most neo_refresh_wait_s
+            # for another bot's refresh, then this step is "unreadable" (F9)
             self.c = self.C.NeoClient(cfg['neo_bot'], exclusive=False, product=cfg['product'],
-                                      timeout=cfg['neo_timeout_s'])
+                                      timeout=cfg['neo_timeout_s'],
+                                      refresh_wait_s=cfg['neo_refresh_wait_s'])
         if self.c.exclusive:
             raise ValueError('ETF must use a NON-exclusive client (spec O6)')
         self._map = None
@@ -118,9 +121,11 @@ class Broker:
         could be ours). None = NO row for the symbol at all: UNKNOWN, never 0
         (a carried lot's row is unmeasured, Monday M10) -- the caller then
         trusts its own journal + order book."""
-        prod = str(self.cfg['product']).upper()
+        prod = str(self.cfg['product']).strip().upper()
         rows = [p for p in self.c.positions()
-                if p.symbol == symbol and (not p.product or p.product.upper() == prod)]
+                if p.symbol == symbol
+                and (not str(p.product or '').strip()
+                     or str(p.product).strip().upper() == prod)]
         if not rows:
             return None
         return sum(p.net_qty for p in rows)

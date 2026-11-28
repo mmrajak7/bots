@@ -170,7 +170,17 @@ def load(c: Any, today: Optional[date] = None, max_age_h: float = 20.0,
         if text is not None:
             try:
                 return ScripMap(parse_scrip_master(text, underlyings))
-            except ScripMasterError:
+            except ScripMasterError as e:
+                # K12 (review 2026-11-28): only a BAD FILE is deleted. When the
+                # whole file is fine, the caller's filter is what matched
+                # nothing (an unknown underlying) -- say so, keep the shared
+                # cache every bot reads, and do not download it again.
+                try:
+                    whole_ok = len(parse_scrip_master(text)) >= min_rows
+                except ScripMasterError:
+                    whole_ok = False
+                if whole_ok and underlyings:
+                    raise ScripMasterError('%s (the cached file itself is fine)' % e)
                 cache.unlink()
         fo = ScripMap.pick_fo_path(c.scrip_master_paths())
         if not fo:

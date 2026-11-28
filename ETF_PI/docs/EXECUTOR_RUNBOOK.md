@@ -63,7 +63,7 @@ Probe trades (cheap near-ATM current weekly, premium Rs 80-200): `python3 -m exe
 
 | # | test | how | pass mark |
 |---|---|---|---|
-| M0 | charges (11-27 contract note) | owner reads the note | brokerage 0 for intraday option round trips |
+| M0 | charges (11-27 contract note) | **CLOSED 11-28**: brokerage Rs0.01, statutory Rs12.68; Saturday funds 49,987.32 = 50,000 − 12.68 (the Friday Rs39.52 was a released intraday hold) | brokerage 0 ✔ |
 | M2 | lag after a fill | probe 1; journal ENTRY_FILL ts vs order time; positions MIS row | order book ≤ 1 s, positions ≤ 3 s |
 | M3 | place → visible by tag | journal ENTRY_SEND vs ENTRY_FILL / book | ≤ 1 s on every place |
 | M5 | no-modify step | probe 2, then `flatten` while the bid is moving | at most one ETF sell live at any read; no-order gap ≤ 1 s; exactly 65 sold |
@@ -73,7 +73,7 @@ Probe trades (cheap near-ATM current weekly, premium Rs 80-200): `python3 -m exe
 | M9 | EOD | a real signal or probe after 14:50 | flat by 15:16 (eod 15:15); no `etf-` order live at 15:20; no broker square-off line in the app |
 | M6b | MIS position row label | `executor status` / log after a probe fill | the positions row's product reads exactly `MIS` (the account cap and the carry check depend on it, review M6) |
 | M13 | cancel latency / re-price steps | journal EXIT_STEP notes during a resting exit | re-prices count 1, 2, 3... (review H2 fix) |
-| M11 | 401 on place | count `UNCLEAR` in the log | 0, or each settled within the grace |
+| M11 | 401 on place | count `UNCLEAR` in the log; kotak_neo alert `orders_auth` fires on 2 in 5 min (K1) | 0, or each settled within the grace; no `orders_auth` |
 | M12 | MIS on NEXT week's contract | probe on next week's ATM (12-01 is expiry: every 12-01 entry uses next week) | accepted and filled; if refused: owner decides NRML (+skip_foreign_strikes) for 12-01 |
 | real | real 10M signals | they flow by themselves | each: BOUGHT/SOLD Telegram, ladder logs, journal CLOSED, P&L = fills |
 
@@ -90,3 +90,10 @@ cron line. option_buy keeps trading paper (its only live change is the intent fi
   could be re-sent (measured visibility: immediate). The account cap catches it on a single-bot strike.
 - A carried MIS lot should not exist (broker square-off) — if one does, it is sold from 09:15:05 next session.
 - `Tests/test_confirm_shadow.py` fails 2 checks on the baseline too (record-only shadow; pre-existing).
+- A dead session found by a read (review K8, 11-28): ETF waits at most `neo_refresh_wait_s` (2 s) for ANOTHER bot's
+  refresh, then the step is unreadable and the loop goes on. If ETF itself holds the refresh lock it does the
+  verify + login inline (normally ~4-6 s: a 3 s confirm gap + two login calls; worst case with NEO hanging ~60 s,
+  when no order could work anyway).
+- An IP refusal (stCode 100008 / 1037 / "session ip") on any call (K5): the `static_ip` alert, NO login; reads are
+  unavailable and orders refused until the whitelist matches. Manage the open lot in the NEO app (runbook of
+  kotak_neo, README "you see" table).

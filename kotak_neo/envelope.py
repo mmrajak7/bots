@@ -15,7 +15,25 @@ MSG_KEYS = ('emsg', 'errMsg', 'message')
 
 #: stCodes and message fragments that mean "this session is dead".
 AUTH_STCODES = (1003,)
-SESSION_DEAD_TEXT = ('invalid session', 'session expired', 'session ip')
+SESSION_DEAD_TEXT = ('invalid session', 'session expired')
+
+#: Refusals that mean "this IP may not use the API" (Kotak static-IP page:
+#: 100008 wrong IP; 1037 / "session ip doesnt match" = the session was made
+#: from another IP). NOT a dead session (review K5, 2026-11-28): a login cannot
+#: whitelist an IP, and refused logins latch the day. Checked BEFORE
+#: `is_session_dead`, whose 401/403 rule would otherwise claim them.
+IP_STCODES = (100008, 1037)
+IP_TEXT = ('session ip', 'static ip', 'whitelist')
+
+
+def is_ip_refusal(data: Optional[Dict[str, Any]]) -> bool:
+    """NEO refused the call because of the caller's IP (code or text)."""
+    if not isinstance(data, dict) or is_ok(data):
+        return False
+    if stcode(data) in IP_STCODES:
+        return True
+    m = neo_msg(data).lower()
+    return any(t in m for t in IP_TEXT)
 
 
 def neo_msg(data: Optional[Dict[str, Any]]) -> str:

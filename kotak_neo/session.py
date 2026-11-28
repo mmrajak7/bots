@@ -63,7 +63,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, NamedTuple, Optional
 from urllib.parse import urlparse
 
-from .envelope import is_ok, is_session_dead, neo_msg, scrub, stcode
+from .envelope import is_ip_refusal, is_ok, is_session_dead, neo_msg, scrub, stcode
 
 logger = logging.getLogger(__name__)
 
@@ -654,7 +654,15 @@ def _network_verify(s: Session, cfg: Dict[str, Any], http: Any = None) -> str:
     d = _json(r)
     if r.status_code == 200 and is_ok(d):
         return ALIVE
-    verdict = DEAD if is_session_dead(r.status_code, d) else UNAVAILABLE
+    if is_ip_refusal(d):
+        # K5 (review 2026-11-28): the IP, not the session -- never DEAD, so no
+        # login (which cannot whitelist an IP, and refused logins latch the
+        # day). Queued under the lock; `_run` delivers it after the lock.
+        ip_alert('session verify refused: stCode %s %s' % (stcode(d), neo_msg(d)[:120]),
+                 flush=False)
+        verdict = UNAVAILABLE
+    else:
+        verdict = DEAD if is_session_dead(r.status_code, d) else UNAVAILABLE
     logger.warning('NEO verify gen %d: %s HTTP %s body %s', s.generation, verdict,
                    r.status_code, scrub(getattr(r, 'text', '') or ''))
     return verdict
@@ -874,10 +882,11 @@ def refresh(failed_generation: int, requester: str, *, wait_s: Optional[float] =
 IP_ALERT_EVERY_SEC = 900.0
 
 
-def ip_alert(why: str) -> None:
+def ip_alert(why: str, flush: bool = True) -> None:
     """Owner's backup plan until a static IP exists (2026-11-27): when NEO
     refuses orders because of the IP, ALERT and let the owner trade by hand.
-    At most one alert per IP_ALERT_EVERY_SEC; delivered at once."""
+    At most one alert per IP_ALERT_EVERY_SEC; delivered at once unless
+    `flush=False` (a caller holding the refresh lock: `_run` delivers it)."""
     try:
         stamp = _p('ip_alert.last')
         now = time.time()
@@ -892,7 +901,8 @@ def ip_alert(why: str) -> None:
         _alert('static_ip', '%s -- NEO is refusing orders from this IP. Manage open trades '
                'MANUALLY in the NEO app, then fix the whitelist (NEO dashboard > Trade API; '
                'one change per 7 days).' % why, _now())
-        _flush_alerts()
+        if flush:
+            _flush_alerts()
     except Exception as e:                           # never into a trading loop
         logger.error('kotak_neo ip_alert failed: %s', e)
 

@@ -94,6 +94,9 @@ def validate(cfg: Dict[str, Any]) -> Dict[str, Any]:
             raise ConfigError('%s must be > 0' % k)
     if not (0 < float(c['no_price_alert_s']) < float(c['no_price_flatten_s'])):
         raise ConfigError('no_price_alert_s must be below no_price_flatten_s')
+    # K8: below the exit step, so one stuck refresh costs at most one chase step
+    if not (0 <= float(c['neo_refresh_wait_s']) <= float(c['exit_step_s'])):
+        raise ConfigError('neo_refresh_wait_s must be 0..exit_step_s (%s)' % c['exit_step_s'])
     steps = c['exit_steps_pct']
     if not isinstance(steps, list) or any(float(x) <= 0 for x in steps):
         raise ConfigError('exit_steps_pct must be a list of positive percents')
