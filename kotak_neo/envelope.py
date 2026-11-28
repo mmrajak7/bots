@@ -35,6 +35,10 @@ IP_WHITELIST_TEXT = ('static ip',)
 IP_TEXT = IP_SESSION_TEXT + IP_WHITELIST_TEXT + ('whitelist',)
 
 
+#: 'ip', 'ips', 'ip address', 'ipaddress' as words (review F4)
+_IP_WORD = re.compile(r'\bips?\b|\bip[\s_-]?address')
+
+
 def _refused(data: Optional[Dict[str, Any]]) -> bool:
     return isinstance(data, dict) and not is_ok(data)
 
@@ -43,7 +47,10 @@ def is_session_ip_refusal(data: Optional[Dict[str, Any]]) -> bool:
     """The session was made from another IP: dead, a login from here fixes it."""
     if not _refused(data):
         return False
-    if stcode(data) in IP_SESSION_STCODES:
+    code = stcode(data)
+    if code in IP_WHITELIST_STCODES:
+        return False                    # F4: the never-login code beats any text
+    if code in IP_SESSION_STCODES:
         return True
     m = neo_msg(data).lower()
     return any(t in m for t in IP_SESSION_TEXT)
@@ -59,7 +66,7 @@ def is_ip_whitelist_refusal(data: Optional[Dict[str, Any]]) -> bool:
         return True
     m = neo_msg(data).lower()
     return (any(t in m for t in IP_WHITELIST_TEXT)
-            or ('whitelist' in m and re.search(r'\bip\b', m) is not None))
+            or ('whitelist' in m and _IP_WORD.search(m) is not None))
 
 
 def is_ip_refusal(data: Optional[Dict[str, Any]]) -> bool:

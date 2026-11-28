@@ -61,6 +61,9 @@ TRANSIENT_STCODES = (1005,)
 #: ONE generation. 30 min, not 5 (review R5): entries are sent once, and 10-min
 #: signals would never put two refused entries inside 5 minutes.
 ORDERS_AUTH_COUNT, ORDERS_AUTH_WINDOW_SEC, ORDERS_AUTH_EVERY_SEC = 2, 1800.0, 900.0
+#: F5: after a failed refresh, reads on that generation fail fast at most this long
+DEAD_HOLD_MAX_SEC = 10.0
+DEAD_HOLD_OUTCOMES = (S.COOLDOWN, S.BLOCKED, S.FAILED, S.LOCK_TIMEOUT, S.HOST_REFUSED)
 #: NEO's product labels (Kotak API docs). A position row naming anything else
 #: for a symbol makes a product-filtered read UNKNOWN, never 0 (review K10).
 KNOWN_PRODUCTS = ('NRML', 'MIS', 'CNC', 'MTF', 'CO', 'BO')
@@ -334,13 +337,15 @@ def note_orders_auth(bot: str, what: str, status: int, generation: int,
             except (OSError, ValueError) as e:
                 logger.warning('orders_auth.json unreadable (%s) -- starting over', e)
                 st = {}
-            # only refusals of THIS generation count (R5): a refresh since then
-            # replaced the session they were about
-            ev = [e for e in st.get('events') or [] if isinstance(e, dict)
-                  and isinstance(e.get('t'), (int, float)) and t - e['t'] <= ORDERS_AUTH_WINDOW_SEC
-                  and e.get('gen') == generation]
-            ev.append({'t': t, 'bot': bot, 'what': what[:80], 'http': status, 'gen': generation})
-            st['events'] = ev[-20:]
+            kept = [e for e in st.get('events') or [] if isinstance(e, dict)
+                    and isinstance(e.get('t'), (int, float))
+                    and t - e['t'] <= ORDERS_AUTH_WINDOW_SEC]
+            kept.append({'t': t, 'bot': bot, 'what': what[:80], 'http': status, 'gen': generation})
+            st['events'] = kept[-40:]
+            # only refusals of THIS generation COUNT (R5): a refresh since then
+            # replaced the session they were about. Others are kept, not erased
+            # (F7): two processes briefly on different generations both count.
+            ev = [e for e in kept if e.get('gen') == generation]
             last = st.get('alerted_at')
             last = float(last) if isinstance(last, (int, float)) else None
             if len(ev) >= ORDERS_AUTH_COUNT and (last is None or t - last >= ORDERS_AUTH_EVERY_SEC):
@@ -385,6 +390,9 @@ class NeoClient:
         self.exclusive = bool(exclusive)
         self.timeout = timeout
         self.refresh_wait_s = None if refresh_wait_s is None else float(refresh_wait_s)
+        #: (generation, until): a refresh for this generation just failed --
+        #: reads on it fail fast without HTTP until then (review F5)
+        self._dead_hold: Optional[Tuple[int, float]] = None
         self._http = http
         self._current = current_fn or S.current
         self._refresh = refresh_fn or S.refresh
@@ -437,6 +445,12 @@ class NeoClient:
               retried: bool = False) -> Dict[str, Any]:
         import requests
         s = self.session()
+        hold = self._dead_hold
+        if not retried and hold is not None and hold[0] == s.generation and time.time() < hold[1]:
+            # F5: a refresh for this very generation failed a moment ago; another
+            # dead read + refresh + log line per 0.5 s loop changes nothing
+            raise Unavailable('%s %s: session generation %d is dead; refresh retried in %.0fs'
+                              % (method, path, s.generation, hold[1] - time.time()))
         try:
             r = self._send(s, method, path, jdata)
         except requests.RequestException as e:
@@ -466,7 +480,14 @@ class NeoClient:
             else:
                 res = self._refresh(s.generation, self.bot, wait_s=self.refresh_wait_s)
             if res.outcome in (S.ADOPTED, S.LOGGED_IN):
+                self._dead_hold = None
                 return self._read(method, path, jdata, retried=True)
+            ra = float(getattr(res, 'retry_after', 0.0) or 0.0)
+            if res.outcome in DEAD_HOLD_OUTCOMES or (res.outcome == S.UNAVAILABLE and ra > 0):
+                # F5: only where a re-read surely fails (a login is waiting, or
+                # barred); STILL_ALIVE / a plain UNAVAILABLE may read fine next loop
+                self._dead_hold = (s.generation,
+                                   time.time() + min(max(ra or 2.0, 1.0), DEAD_HOLD_MAX_SEC))
             if res.outcome in (S.BLOCKED, S.HOST_REFUSED, S.ERROR):
                 raise Auth('session refresh %s: %s' % (res.outcome, res.detail))
             raise Unavailable('%s %s: session refresh %s (%s)' % (method, path, res.outcome,

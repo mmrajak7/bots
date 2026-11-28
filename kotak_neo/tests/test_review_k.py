@@ -154,9 +154,9 @@ def test_k5_a_whitelist_refused_verify_is_unavailable_and_alerts_without_flushin
 
 
 @pytest.mark.parametrize('status', [200, 401])
-def test_r1_a_session_ip_verify_is_dead_so_a_login_can_fix_it(home, flushed, status):
+def test_r1_a_session_ip_verify_says_so_so_a_login_can_fix_it(home, flushed, status):
     v = S._network_verify(SESS, dict(S.DEFAULTS), http=_VerifyHTTP(_Resp(status, IP_BODY)))
-    assert v == S.DEAD                                 # at 200: neither code nor text was dead
+    assert v == S.SESSION_IP                           # F1: _decide_locked gates the login
     assert [a['kind'] for a in alerts(home)] == ['static_ip'] and flushed == []
 
 
@@ -443,3 +443,169 @@ def test_k12_a_bad_cache_is_still_replaced(home):            # regression guard
     src = Src()
     assert len(Y.load(src, today=date(2026, 11, 30), min_rows=1, underlyings=['NIFTY'])) == 5
     assert src.n == 1
+
+
+# -- second review of the round-2 fixes (F1-F7) ------------------------------------------
+
+from kotak_neo.tests.test_session import CREDS, Login, fake_creds, publish  # noqa: E402
+
+
+@pytest.fixture
+def pi(home, monkeypatch, flushed):
+    """A HOME where logins are allowed (LOGIN_HOST), floors off, cooldown 0."""
+    import socket
+    S._ensure_home()
+    (home / 'LOGIN_HOST').write_text(socket.gethostname(), encoding='utf-8')
+    monkeypatch.setattr(S, 'FLOORS', {})
+    monkeypatch.setattr(S, 'DEFAULTS', dict(S.DEFAULTS, cooldown_sec=0.0, verify_confirm_sec=0.0))
+    S._alive_cache.clear()
+    return home
+
+
+def _refresh(gen, verify, login):
+    return S.refresh(gen, 'etf', _verify=verify, _login=login, _creds=fake_creds,
+                     _sleep=lambda s: None)
+
+
+def test_f1_a_session_ip_verdict_allows_one_login_a_day(pi):
+    publish(1)
+    lg = Login()
+    sess_ip = lambda s: S.SESSION_IP                    # noqa: E731  1037 that a login won't cure
+    assert _refresh(1, sess_ip, lg).outcome == S.LOGGED_IN
+    for g in (2, 2, 2):
+        res = _refresh(g, sess_ip, lg)
+        assert res.outcome == S.UNAVAILABLE and 'already ran' in res.detail
+    assert lg.calls == 1 and S.current().generation == 2   # no churn of the shared session
+    S.unblock('owner')                                      # the owner fixed the IP
+    assert _refresh(2, sess_ip, lg).outcome == S.LOGGED_IN and lg.calls == 2
+
+
+def test_f2_a_login_refused_for_the_ip_never_latches(pi):
+    publish(1)
+    lg = Login('ip', 'ip', 'ip', 'ip', 'ip')
+    for _ in range(5):
+        st = S.read_state()
+        st['next_allowed_at'] = 0.0                        # skip the long cooldown in the test
+        S._write_state(st)
+        res = _refresh(1, lambda s: S.DEAD, lg)
+        assert res.outcome == S.FAILED and res.detail.startswith('ip:')
+    st = S.read_state()
+    assert not st['latched'] and st['consecutive_refusals'] == 0
+    assert 'static_ip' in [a['kind'] for a in alerts(pi)]
+
+
+def test_f2_the_long_cooldown_follows_an_ip_refused_login(pi):
+    publish(1)
+    _refresh(1, lambda s: S.DEAD, Login('ip'))
+    res = _refresh(1, lambda s: S.DEAD, Login())
+    assert res.outcome == S.COOLDOWN and res.retry_after > 600
+
+
+def test_f2_the_login_reads_an_ip_refusal_as_kind_ip(monkeypatch):
+    monkeypatch.setattr(S, 'clock_synced', lambda: True)
+
+    class H:
+        def post(self, url, **kw):
+            return _Resp(400, WL_BODY)
+
+    with pytest.raises(S.LoginFailed) as ei:
+        S._network_login(dict(CREDS), dict(S.DEFAULTS), http=H())
+    assert ei.value.kind == 'ip'
+
+
+def test_f3_a_failed_refetch_does_not_use_up_the_days_attempt(home):
+    src = Src()
+    Y.load(src, today=date(2026, 11, 30), min_rows=1)
+
+    class Down(Src):
+        def fetch_text(self, url):
+            raise Y.ScripMasterError('download: ConnectTimeout')
+
+    with pytest.raises(Y.ScripMasterError, match='ConnectTimeout'):
+        Y.load(Down(), today=date(2026, 11, 30), min_rows=1, underlyings=['NOPE'])
+    with pytest.raises(Y.ScripMasterError, match='no option rows'):
+        Y.load(src, today=date(2026, 11, 30), min_rows=1, underlyings=['NOPE'])
+    assert src.n == 2                                      # the retry still re-downloaded
+
+
+def test_f3_one_bots_filter_does_not_use_up_anothers_attempt(home):
+    src = Src()
+    Y.load(src, today=date(2026, 11, 30), min_rows=1)
+    for _ in range(2):
+        with pytest.raises(Y.ScripMasterError):
+            Y.load(src, today=date(2026, 11, 30), min_rows=1, underlyings=['TYPO'])
+    n = src.n
+    with pytest.raises(Y.ScripMasterError):
+        Y.load(src, today=date(2026, 11, 30), min_rows=1, underlyings=['BANKNIFTY'])
+    assert src.n == n + 1
+
+
+@pytest.mark.parametrize('body,session_ip,whitelist', [
+    ({'stat': 'Not_Ok', 'stCode': 100008, 'errMsg': 'Session IP is not whitelisted'}, False, True),
+    ({'stat': 'Not_Ok', 'errMsg': 'non-whitelisted IPs are blocked'}, False, True),
+    ({'stat': 'Not_Ok', 'errMsg': 'ipaddress not in whitelist'}, False, True),
+    ({'stat': 'Not_Ok', 'errMsg': 'IP address not in whitelist'}, False, True),
+    ({'stat': 'Not_Ok', 'errMsg': 'tip: whitelist the scrip'}, False, False)])
+def test_f4_the_never_login_code_wins_and_ip_words_are_found(body, session_ip, whitelist):
+    assert E.is_session_ip_refusal(body) is session_ip
+    assert E.is_ip_whitelist_refusal(body) is whitelist
+
+
+def test_f5_after_a_failed_refresh_reads_fail_fast_on_that_generation(neo):
+    r = Refresh(S.COOLDOWN)
+    c = mk(neo, refresh=r)
+    neo.dead_reads(100)
+    with pytest.raises(C.Unavailable, match='COOLDOWN'):
+        c.order_book()
+    n_http = len(neo.calls)
+    for _ in range(5):
+        with pytest.raises(C.Unavailable, match='is dead'):
+            c.order_book()
+    assert len(neo.calls) == n_http and len(r.calls) == 1  # no HTTP, no refresh, no log
+
+
+def test_f5_a_new_generation_is_read_at_once(neo):
+    sess = {'s': SESS}
+    c = C.NeoClient('etf', http=neo, exclusive=False, product='MIS',
+                    current_fn=lambda: sess['s'], refresh_fn=Refresh(S.COOLDOWN))
+    neo.dead_reads(1)
+    with pytest.raises(C.Unavailable):
+        c.order_book()
+    sess['s'] = SESS._replace(generation=4)                 # another process logged in
+    assert c.order_book() == []
+
+
+def test_f5_still_alive_does_not_hold(neo):
+    c = mk(neo, refresh=Refresh(S.STILL_ALIVE))
+    neo.dead_reads(1)
+    with pytest.raises(C.Unavailable):
+        c.order_book()
+    assert c.order_book() == []                             # a blip: the next read works
+
+
+def test_f6_a_flush_that_raises_does_not_silence_later_alerts(monkeypatch):
+    monkeypatch.setattr(S, 'ASYNC_ALERTS', True)
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise KeyboardInterrupt('simulated BaseException in a pass')
+
+    monkeypatch.setattr(S, '_flush_alerts', boom)
+    S.flush_alerts_soon()
+    for th in list(S._pending_flush):
+        th.join(5)
+    assert S._pending_flush == []
+    monkeypatch.setattr(S, '_flush_alerts', lambda: calls.append(2))
+    S.flush_alerts_soon()
+    for th in list(S._pending_flush):
+        th.join(5)
+    assert calls == [1, 2]
+
+
+def test_f7_other_generations_are_kept_not_erased(home, flushed):
+    assert not C.note_orders_auth('etf', 'place', 401, 3, now=1000.0)
+    assert not C.note_orders_auth('btst', 'place', 401, 4, now=1001.0)
+    assert C.note_orders_auth('zbr', 'cancel', 401, 3, now=1002.0)   # gen 3's first was kept
+    st = json.loads((home / 'orders_auth.json').read_text(encoding='utf-8'))
+    assert sorted(e['gen'] for e in st['events']) == [3, 3, 4]

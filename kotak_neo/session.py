@@ -132,6 +132,10 @@ FAILED = 'FAILED'              # the login itself failed (detail says why)
 ERROR = 'ERROR'                # a bug or a state this code must not touch (detail)
 
 ALIVE, DEAD = 'ALIVE', 'DEAD'
+#: verify verdict: the session was made from ANOTHER IP (stCode 1037). A login
+#: from here is its only fix -- allowed ONCE a day (review F1, 2026-11-28): a
+#: 1037 that a login does not cure must not churn the shared session all day.
+SESSION_IP = 'SESSION_IP'
 LATCH_KINDS = ('mpin', 'credentials')
 
 
@@ -613,7 +617,9 @@ def _network_login(creds: Dict[str, str], cfg: Dict[str, Any], http: Any = None)
             return inner
         msg = redact(neo_msg(d) or (r.text or '')[:160], creds)
         kind = 'refused'
-        if step == 2 and any(w in (' ' + msg.lower()) for w in _MPIN_WORDS):
+        if is_ip_whitelist_refusal(d) or is_session_ip_refusal(d):
+            kind = 'ip'                                   # F2: never latches (see _on_failure)
+        elif step == 2 and any(w in (' ' + msg.lower()) for w in _MPIN_WORDS):
             kind = 'mpin'                                 # NEO named the MPIN: latch
         raise LoginFailed(kind, 'step %d: HTTP %s stCode %s %s'
                           % (step, r.status_code, stcode(d), msg))
@@ -666,10 +672,10 @@ def _network_verify(s: Session, cfg: Dict[str, Any], http: Any = None) -> str:
         verdict = UNAVAILABLE
     elif is_session_ip_refusal(d):
         # R1: the session was made from ANOTHER IP (the public IP changed). Only
-        # a login from here fixes it: DEAD, through the normal brakes, + alert.
-        ip_alert('session made from another IP (stCode %s %s) -- logging in again from '
-                 'this IP' % (stcode(d), neo_msg(d)[:120]), flush=False)
-        verdict = DEAD
+        # a login from here fixes it; `_decide_locked` allows that once a day.
+        ip_alert('session made from another IP (stCode %s %s) -- one login from this IP '
+                 'is allowed today' % (stcode(d), neo_msg(d)[:120]), flush=False)
+        verdict = SESSION_IP
     else:
         verdict = DEAD if is_session_dead(r.status_code, d) else UNAVAILABLE
     logger.warning('NEO verify gen %d: %s HTTP %s body %s', s.generation, verdict,
@@ -805,6 +811,15 @@ def _on_failure(st: Dict[str, Any], cur: Optional[Session], kind: str, msg: str,
     if kind in ('network', 'clock'):
         # Never reached NEO: it does not count toward the daily cap.
         st['logins_today'] = max(0, int(st['logins_today']) - 1)
+    elif kind == 'ip':
+        # Review F2 (2026-11-28): NEO refused the LOGIN for this IP. Not evidence
+        # against the credentials, so never toward the 3-refusal latch (a latch
+        # outlives the day and would block the bots after the owner fixes the
+        # IP); it counts toward the cap and waits the long cooldown.
+        st['next_allowed_at'] = t + float(cfg['cap_cooldown_sec'])
+        _write_state(st)
+        ip_alert('NEO refused the LOGIN from this IP: %s' % msg[:160], flush=False)
+        return Result(FAILED, cur, 'ip: %s' % msg, float(cfg['cap_cooldown_sec']))
     else:
         st['consecutive_refusals'] = int(st.get('consecutive_refusals') or 0) + 1
     if kind in LATCH_KINDS or st['consecutive_refusals'] >= int(cfg['max_refusals']):
@@ -846,6 +861,14 @@ def _decide_locked(cfg: Dict[str, Any], verify: Callable, sleep: Callable,
             if v == UNAVAILABLE:
                 return Result(UNAVAILABLE, cur, 'verify read failed: NEO unreachable or '
                               'answered an unknown body (see the log)')
+            if v == SESSION_IP:
+                marker = _p('session_ip_login_%s' % now.strftime('%Y%m%d'))
+                if marker.exists():
+                    return Result(UNAVAILABLE, cur, 'session made from another IP and the '
+                                  "day's one login for that already ran -- fix the IP / "
+                                  'whitelist, then `python -m kotak_neo unblock`', 60.0)
+                _ensure_home()
+                marker.write_text(now.isoformat(timespec='seconds'), encoding='utf-8')
     return _login_locked(st, cur, requester, cfg, login_fn, creds_fn)
 
 
@@ -925,13 +948,18 @@ def _flush_loop() -> None:
     # An alert queued while a send is in flight is sent by the next pass; the
     # "nothing more wanted -> leave" decision is taken under the same guard as
     # a new request, so no request can fall between the last pass and the exit.
-    while True:
+    try:
+        while True:
+            with _flush_guard:
+                if not _flush_wanted.is_set():
+                    _pending_flush.clear()
+                    return
+                _flush_wanted.clear()
+            _flush_alerts()
+    finally:
+        # F6: whatever ended the loop, the next request must be able to start one
         with _flush_guard:
-            if not _flush_wanted.is_set():
-                _pending_flush.clear()
-                return
-            _flush_wanted.clear()
-        _flush_alerts()
+            _pending_flush.clear()
 
 
 def _join_pending_flush() -> None:
@@ -1061,6 +1089,11 @@ def unblock(who: str) -> Dict[str, Any]:
         st.update(latched=None, next_allowed_at=0.0, cap_until=0.0, consecutive_failures=0,
                   consecutive_refusals=0, logins_today=0)
         _write_state(st)
+        for m in HOME.glob('session_ip_login_*'):     # F1: the owner fixed the IP
+            try:
+                m.unlink()
+            except OSError:
+                pass
     _log(who, 'UNBLOCKED', 'was: %s' % was, _now(), None, None)
     return {'was': was}
 
