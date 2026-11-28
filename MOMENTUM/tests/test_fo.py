@@ -418,7 +418,7 @@ class TestDay1Backstop(Harness):
         self.k.nfo_fail = True
         lg = self.run_day()
         self.assertEqual(self.k.calls.count("place"), 0)
-        self.assertTrue(any("PREFLIGHT" in t and "F&O day-1 list" in t for t, _ in self.sent))
+        self.assertTrue(any("FO_DAY1" in t and "F&O day-1 list" in t for t, _ in self.sent))   # buys only
         self.assertTrue(all(p.tries_used == 0 and p.leg == "PENDING_BUY" for p in lg.positions.values()))
 
     def test_late_first_run_reads_the_day1_bhavcopy(self) -> None:

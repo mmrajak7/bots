@@ -63,6 +63,16 @@ checks Kite's real futures list: a planned buy with futures that day is not boug
 read for a decision made before D47. Check by hand any time: `./momentum fo-vet --as-of-signal 2026-11-27`
 (writes nothing to the book).
 
+## 3b. Deploying a code change (Claude does this; outside 14:40-16:40, best 20:00-23:00)
+1. On the PC: tests green; `momentum manifest` on the exact commit; commit + push.
+2. Pi: `git pull -q --rebase`; `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`.
+3. Pi: `bash deploy/setup.sh` EVERY time (a pull never changes the installed crontab: new jobs would not run).
+4. Pi: restart the poller EVERY time (it is long-running and keeps the old code: new owner commands would
+   be "unknown"): `pkill -f 'sys.exit\(main\(\)\) poller'`, then `./momentum-poller-keepalive`.
+5. Read `logs/cron.out` after the next job.
+Rollback to a version before the January slice is safe only before the first TEST sell (old code ignores
+EARMARK_MOVE and would book a SELL fill as a buy).
+
 ## 4. Daily
 | IST | What you see in Telegram |
 |---|---|

@@ -125,6 +125,15 @@ def extend_step_plan(env: Any, lg: L.Ledger, holdings_open: Dict[str, int], sp: 
     plan = E.current_plan(lg)
     sells = sellable_legs(lg)
     gated = [p for p in gated_legs(lg, plan["plan_id"] if plan else None) if not p.overlays]
+    if gated and plan is not None:
+        dbuy = E.decision_buys(env, plan)
+        today = util.today().isoformat()
+        for p in list(gated):
+            if any(r["ex_date"] == today for r in dbuy.get(p.position_id, {}).get("ca_rows", [])):
+                env.journal.append("OVERLAY", position_id=p.position_id, overlay="VET_DEFERRED", on=True,
+                                   reason="CA ex-date today")
+                env.notify(f"DEFER {p.symbol}: corporate action ex-date today; next session")
+                gated.remove(p)
     if sp is None and not sells and not gated:
         return None
     try:
@@ -426,7 +435,8 @@ def sell_ladder_step(env: Any, step_no: int) -> None:
         tick = ticks.get(ts)
         if not qq.get("last_price") or not qq.get("lower_circuit_limit") or tick is None:
             continue
-        new = tick_up(max(dec(qq["last_price"]) * dec(env.cfg["sell_ltp_mult"]), Decimal(floors[iid]) / 100,
+        mult = dec(env.cfg["sell_ladder_mults"][step_no - 1])   # trader review: step THROUGH the spread
+        new = tick_up(max(dec(qq["last_price"]) * mult, Decimal(floors[iid]) / 100,
                           dec(qq["lower_circuit_limit"])), tick)
         if new >= dec(o.get("price") or 0):
             continue                            # a sell is only ever re-priced DOWN toward the market
@@ -548,6 +558,14 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
     recs = env.journal.read()
     closed_before = len({r["date"] for r in recs if r["type"] == "GATE" and r.get("plan") == pk
                          and r.get("result") in ("CLOSED", "UNREAD") and r["date"] != day})
+    tried = any(i.date == day and "|sell|" in i.intent_id and i.position_id in {p.position_id for p in mine}
+                for i in lg.intents.values())
+    if reasons and not tried:                   # vet down / KILL / no start message: not a session the sells had
+        env.journal.append("GATE", date=day, plan=pk, result="CLOSED_UNTRIED", reasons=reasons, margins=margins)
+        env.alert("BUY_GATED", f"{len(gated)} buys wait: no sell was tried today ({'; '.join(reasons)[:250]}); "
+                  "this session does not count toward the 2-session wait")
+        env.journal.append("STAGE", date=day, stage="GATE", result="closed (untried)")
+        return
     if reasons and closed_before < int(env.cfg["gate_wait_sessions"]):
         env.journal.append("GATE", date=day, plan=pk, result="CLOSED", reasons=reasons, margins=margins)
         env.alert("BUY_GATED", f"{len(gated)} buys wait for the sells ({'; '.join(reasons)[:300]}); gated session "
@@ -556,7 +574,10 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
         return
     from .evening import earmark_paise
     free = lg.cash_paise - lg.earmarked_paise()
-    em = earmark_paise(max(0, free), len(gated), Decimal(env.cfg["charges_reserve"]))
+    # trader review: divide by the PLAN's number of new buys, not the ones left: a buy expired by the F&O guard or
+    # skipped by the owner keeps its share in book cash (spec), the others are not over-weighted
+    n_plan = max(len(gated), sum(1 for b in plan["buys"] if b.get("leg") == "BUY_GATED"))
+    em = earmark_paise(max(0, free), n_plan, Decimal(env.cfg["charges_reserve"]))
     if em < 100:
         env.journal.append("GATE", date=day, plan=pk, result="NO_CASH", reasons=reasons, margins=margins)
         env.alert("IDLE_BUYS", f"{len(gated)} gated buys but only Rs {free / 100:,.0f} free: no buy (tested F3)")
@@ -573,7 +594,7 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
                        margins=margins, amounts=amounts)
     for p in gated:
         env.journal.append("BUY_AMOUNT", position_id=p.position_id, earmark_paise=amounts[p.position_id], date=day,
-                           basis=f"gate {'OPEN' if not reasons else 'FORCED'}: free {free} / {len(gated)}")
+                           basis=f"gate {'OPEN' if not reasons else 'FORCED'}: free {free} / {n_plan}")
     if reasons:
         env.alert("GATE_FORCED", f"sells still open after {closed_before} gated sessions ({'; '.join(reasons)[:200]}):"
                   f" the {len(gated)} buys go with the cash there (D32)")
@@ -624,14 +645,16 @@ def size_buys(env: Any, legs: List[L.Position], q: Dict[str, Any], ticks: Dict[s
         cap = E.tick_down(min(ltp * dec(env.cfg["buy_cap_mult"]), upper), tick)
         amount = Decimal(p.remaining_paise // 100)
         qty = int((amount / (ltp * dec(env.cfg["buy_cap_mult"]))).to_integral_value(rounding=ROUND_FLOOR))
-        if qty <= 0 or limit <= 0 or cap <= 0:
+        if limit <= 0 or cap <= 0:
             out[p.position_id] = (0, ltp, limit, cap, int(amount))
             continue
-        out[p.position_id] = (qty, ltp, limit, cap, int(amount))
+        out[p.position_id] = (max(0, qty), ltp, limit, cap, int(amount))
         if not p.test:                                 # the TEST lot buys exactly its quantity
-            rem[p.position_id] = amount - qty * cap
+            rem[p.position_id] = amount - max(0, qty) * cap
     left = {k: v for k, v in rem.items()}                # leftover each buy can still give, rupees
     moves: List[Tuple[str, str, int]] = []
+    if not env.cfg.get("extra_share_enabled", True):
+        return out, moves
     for pid in sorted(rem, key=lambda x: -(rem[x] / out[x][3])):
         qty, ltp, limit, cap, amount = out[pid]
         need = cap - left[pid]                         # what the others must give for one more share

@@ -51,9 +51,9 @@ class Env:
     alerts: List[str] = field(default_factory=list)
 
     def alert(self, code: str, text: str) -> None:
-        self.journal.append("ALERT", code=code, text=text)
         self.alerts.append(f"{code}: {text}")
-        self.notify(f"ALERT {code}: {text}")
+        ok = self.notify(f"ALERT {code}: {text}")
+        self.journal.append("ALERT", code=code, text=text, delivered=bool(ok))
 
 
 # ---------------------------------------------------------------- helpers
@@ -453,6 +453,17 @@ def hold_leg(env: Env, p: L.Position, overlay: str, reason: str) -> None:
                       f"HOLD {p.symbol} ({overlay}): {reason}", position_id=p.position_id)
 
 
+def undelivered_alerts(recs: List[Dict[str, Any]]) -> str:
+    """Alerts Telegram did not deliver since the last delivered ALIVE / HEARTBEAT (review: an alert raised while
+    Telegram was down was otherwise lost). -> '' or a short line for the next message."""
+    last = max((r["seq"] for r in recs if r["type"] == "NOTE" and r.get("carried_alerts_upto")), default=0)
+    lost = [r for r in recs if r["type"] == "ALERT" and r.get("delivered") is False and r["seq"] > last]
+    if not lost:
+        return ""
+    codes = sorted({r["code"] for r in lost})
+    return f"; {len(lost)} ALERTS NOT DELIVERED earlier: {', '.join(codes)} (journal has the text)"
+
+
 def status_text(lg: L.Ledger) -> str:
     held = sum(1 for p in lg.positions.values() if p.state == "HELD")
     pend = sum(1 for p in lg.positions.values() if p.leg == "PENDING_BUY")
@@ -705,7 +716,8 @@ def place_all(env: Env, sp: StepPlan, go: List[L.Position], day: str) -> List[st
     from . import sellside as SS
     sizes, moves = SS.size_buys(env, [p for p in go if p.position_id not in has_intent_today], q, ticks)
     probe_ok = False
-    probes = sum(1 for i in lg0.intents.values() if i.date == day and i.status.startswith("REJECTED"))  # resumed run
+    probes = sum(1 for i in lg0.intents.values() if i.date == day and i.status.startswith("REJECTED")
+                 and "|buy|" in i.intent_id)  # resumed run; a rejected SELL is not a buy probe
     for n, p in enumerate(go):
         if p.position_id in has_intent_today:      # resumed run: this leg already has today's order (E12)
             continue
@@ -738,7 +750,7 @@ def place_all(env: Env, sp: StepPlan, go: List[L.Position], day: str) -> List[st
             env.alert("ARM_CAP", f"{p.symbol}: session cap Rs {cap} reached (next session)")
             continue
         att = sp.attempts[p.position_id]
-        if att > 9:
+        if att > 9:                     # a buy lives 6 sessions; 9 attempts covers those plus the same-day retries
             hold_leg(env, p, "OWNER_HOLD", "attempt > 9")
             continue
         iid = intent_id(p.plan_id, p.position_id, att)
@@ -1188,12 +1200,17 @@ def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], L
         ingest_inbox(env)
         settle_stale(env, day)
         problems = preflight()
+        retry_until = util.at_today(env.cfg["step_plan_at"]) + dt.timedelta(minutes=3)
+        while problems and util.now() < retry_until and not C.killed(env.paths.kill_file):
+            env.sleep_until(min(util.now() + dt.timedelta(seconds=30), retry_until))
+            problems = preflight()
         if killed_now(env):
             problems.append("KILL")
+        fo_problem = None
         if not problems:
-            fp = fo_day1_guard(env)
-            if fp:
-                problems.append(fp)
+            fo_problem = fo_day1_guard(env)            # trader review: it guards buys only; sells still go
+            if fo_problem:
+                env.alert("FO_DAY1", fo_problem + " -> no buys today; sells go")
         if problems:
             env.alert("PREFLIGHT", "; ".join(problems) + " -> no orders today")
             env.journal.append("STAGE", date=day, stage="PLAN", result="preflight failed")
@@ -1222,7 +1239,7 @@ def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], L
             vd = env.vet_fn(sp.step, sp.vet_input, SS.code_skip_reasons_all(sp))
             ok = apply_verdict(env, sp, vd, day)
             go_sell, go_gated = SS.apply_side_verdicts(env, sp, vd, day)
-            go = [p.position_id for p in ok] + go_gated
+            go = [] if fo_problem else [p.position_id for p in ok] + go_gated
         env.journal.append("STAGE", date=day, stage="PLAN", result="ok", go=go, go_sell=go_sell,
                            envelopes=sp.envelopes if sp else {},
                            step_plan_hash=sp.step_plan_hash if sp else None, facts_hash=sp.facts_hash if sp else None)
@@ -1364,7 +1381,14 @@ def reconcile_stage(env: Env, day: str) -> None:
     if stage_done(recs, day, "RECON"):
         return
     env.sleep_until(util.at_today(env.cfg["reconcile_at"]))
-    reconcile(env, day)
+    try:
+        reconcile(env, day)
+    except B.NetworkError as e:
+        if not any(r["type"] == "ALERT" and r.get("code") == "RECON_RETRY" and r["ts"][:10] == day
+                   for r in env.journal.read()):
+            env.alert("RECON_RETRY", f"Kite unreadable at the reconcile ({str(e)[:150]}): the next cron slot "
+                      "retries (to 16:40)")
+        return
     env.journal.append("STAGE", date=day, stage="RECON", result="ok")
     lg = L.replay(env.journal.read())
     env.notify("Order step done. " + status_text(lg))

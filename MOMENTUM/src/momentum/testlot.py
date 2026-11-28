@@ -64,7 +64,13 @@ def write_plan(env: Any, day: str, buys: List[Dict[str, Any]], sells: List[Dict[
            "holds": [], "kind": "TEST lot (D51)"}
     text = json.dumps(dec, indent=1, sort_keys=True) + "\n"
     name = f"TEST_{day}_r0.json"
-    util.write_once(env.paths.decisions / name, text)
+    f = env.paths.decisions / name
+    if f.exists():                              # a crash between the file and its PLAN_FINAL: use the file as written
+        text = f.read_text(encoding="utf-8")
+        dec = json.loads(text)
+        buys, sells = dec["buys"], dec["sells"]
+    else:
+        util.write_once(f, text)
     env.journal.append("PLAN_FINAL", plan_id=plan_id, decision_file=name, decision_sha256=util.sha256_text(text),
                        audit_status="PASSED", holds=[],
                        buys=[{k: b[k] for k in ("position_id", "isin", "symbol", "series", "rank", "earmark_paise")}

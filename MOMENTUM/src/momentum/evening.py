@@ -113,6 +113,10 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
     sd = signal_day.isoformat()
     lg = L.replay(j.read())
     if any(k.startswith(f"{m}|") for k in lg.plans):
+        for k in [k for k in lg.plans if k.startswith(f"{m}|")]:
+            if not any(r["type"] == "NOTE" and r.get("plan_announced") == k for r in j.read()):
+                dpf = paths.decisions / lg.plans[k]["decision_file"]
+                announce(env, json.loads(dpf.read_text(encoding="utf-8")), dpf)   # resumed after a crash
         return {"status": "already final", "plan": [k for k in lg.plans if k.startswith(f"{m}|")]}
     if any(p.leg in ("SELLING", "PENDING_BUY") and lg.open_intents(p.position_id) for p in lg.positions.values()):
         raise EveningError("a book order is still live (reconcile not done?): no decision on an unsettled book")
@@ -131,7 +135,8 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
             env.alert("PLAN_REBUILD", f"decision r{revs[-1]} no longer fits the book (a sale / quantity changed "
                       "since it was made): rebuilding")
         rev = revs[-1] + 1
-        env.alert("PLAN_REBUILD", f"fo_announced.json changed after decision r{revs[-1]}: rebuilding as r{rev}")
+        if fits:
+            env.alert("PLAN_REBUILD", f"fo_announced.json changed after decision r{revs[-1]}: rebuilding as r{rev}")
     # 1. sessions (Kite) and the signal-day check (§3.3)
     prev = P.month_add(m, -1)
     frm = dt.date.fromisoformat(P.month_add(prev, -1) + "-01")
@@ -294,6 +299,19 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
                    | {"leg": b.get("leg", "PENDING_BUY")} for b in buys],
              sells=[{k: x[k] for k in ("position_id", "reason", "sell_no", "rank", "qty")} for x in sells],
              holds=[{"position_id": h["position_id"], "overlay": h["overlay"]} for h in holds])
+    return announce(env, decision, dp)
+
+
+def announce(env: Env, decision: Dict[str, Any], dp: Path) -> Dict[str, Any]:
+    """After PLAN_FINAL: the audit-flag buttons, the hold messages and the PLAN line. Re-runnable: a button already
+    opened is not opened again, and a NOTE marks the end (a crash in between resumes here, review #12)."""
+    j = env.journal
+    plan_id, buys, holds = decision["plan_id"], decision["buys"], decision["holds"]
+    m = plan_id["month"]
+    sells = decision.get("sells", [])
+    flags = [f for f in decision["audit"]["flags"] if f["touched"]]
+    lg = L.replay(j.read())
+    opened = {(r["ref_type"], r["ref"]) for r in j.read() if r["type"] == "APPROVAL_OPEN"}
     by_chain = {b["chain"]: b for b in buys + sells if b.get("chain") is not None}
     by_isin = {b["isin"]: b for b in buys + sells}
     for f in flags:
@@ -302,6 +320,8 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
             env.alert("FLAG_UNMATCHED", f"audit flag {f['flag_id']} on {f['symbol']} matches no plan row")
             continue
         others = [x["flag_id"] for x in flags if x["isin"] == f["isin"] and x["flag_id"] != f["flag_id"]]
+        if ("flag", f["flag_id"]) in opened:
+            continue
         open_approval(env, "flag", f["flag_id"], {"real": "Real - clear", "hold": "Hold name",
                                                   "data_error": "Data error - stop plan"},
                       f"AUDIT FLAG {f['symbol']} {f['check']}: {f['value']} (tol {f['threshold']}) {f['detail']}"
@@ -309,6 +329,8 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
                       other_open_flags=others)
     buy_ids = {b["position_id"] for b in buys}
     for h in holds:
+        if ("leg", h["position_id"]) in opened:
+            continue
         if h["position_id"] not in buy_ids:     # a sell or written-off hold: its own message and the 08:35 reminder
             x = next((x for x in sells if x["position_id"] == h["position_id"]), None)
             name = x["symbol"] if x else h["position_id"]
@@ -327,6 +349,7 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
     env.notify(f"PLAN {m} r{plan_id['data_rev']} FINAL: sells {len(sells)}{': ' + sold if sells else ''}; "
                f"{len(buys)} buys x {amount}; expired {len(decision.get('expire', []))}; holds {len(holds)}; "
                f"signal day {plan_id['signal_day']} verified on Kite")
+    j.append("NOTE", plan_announced=L.plan_key(plan_id))
     return {"status": "FINAL", "decision": str(dp), "buys": len(buys), "sells": len(sells), "holds": len(holds),
             "flags": len(flags)}
 

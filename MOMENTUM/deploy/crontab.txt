@@ -10,7 +10,8 @@
 35 8 * * 1-5       $M morning >> $L 2>&1        # alive, token wait, preflight, holdings snapshot, holds reminder, cash
 30 14 * * 1-5      $M canary >> $L 2>&1
 35 14 * * 1-5      $M test-plan >> $L 2>&1      # TEST lot (D51): acts only on its configured days
-40 14 * * 1-5      $M afternoon >> $L 2>&1      # 14:45 plan + vet, 15:10 place, ladder, 15:28 cancel, 15:35 reconcile
+40 14 * * 1-5      $M afternoon >> $L 2>&1      # 14:45 plan + vet, 14:50 sells, 15:06 gate, 15:10 buys, 15:28 cancel, 15:35 reconcile
+45,50,55 14 * * 1-5 $M afternoon >> $L 2>&1     # resume after a reboot before the 14:50 sells (exits at once if 14:40 runs)
 */5 15 * * 1-5     $M afternoon >> $L 2>&1      # resume after a crash/reboot (never a new buy after 15:15)
 0 16 * * 1-5       $M watch >> $L 2>&1
 10,40 16 * * 1-5   $M afternoon >> $L 2>&1      # late resume: a reboot after 15:55 still reconciles from today's order book

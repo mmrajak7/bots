@@ -137,7 +137,7 @@ class TestRebalance(SellHarness):
         lg = self.afternoon(fill=fill_all(self.k))
         self.assertEqual([o.transaction_type for o in self.k.orders_], [])
         self.assertIn("VET_DEFERRED", lg.positions["2612-02"].overlays)
-        self.assertEqual(self.gate()["result"], "CLOSED")
+        self.assertEqual(self.gate()["result"], "CLOSED_UNTRIED")
 
     def test_vet_sees_both_sides_in_one_call(self) -> None:
         seen = []
@@ -219,7 +219,7 @@ class TestSellSafety(SellHarness):
         self.afternoon(fill=None)
         mods = [r for r in self.j.read() if r["type"] == "MODIFY_RESULT" and r["outcome"] == "OK"]
         self.assertTrue(mods)
-        self.assertEqual(min(int(r["new_limit_paise"]) for r in mods), 49_500)    # 500 x 0.990
+        self.assertEqual(min(int(r["new_limit_paise"]) for r in mods), 49_000)    # floor 500 x 0.980
         self.assertTrue(lg0)
 
     def test_broker_refuses_more_than_the_ledger_holds(self) -> None:

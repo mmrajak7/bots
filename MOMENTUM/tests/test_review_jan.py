@@ -212,5 +212,53 @@ class TestEarmarkMoveOnlyForPlacedOrders(Harness):
             self.assertIn(L.replay(self.j.read()).positions[m_["to"]].symbol, placed)
 
 
+class TestArchitectReview(SellHarness):
+    def test_alert_lost_to_telegram_is_carried_by_the_next_message(self) -> None:
+        env = self.env()
+        env.notify = lambda text, buttons=None: False                   # Telegram down
+        env.alert("PLANTED", "x")
+        recs = self.j.read()
+        self.assertIn("1 ALERTS NOT DELIVERED", E.undelivered_alerts(recs))
+        self.j.append("NOTE", carried_alerts_upto=recs[-1]["seq"])
+        self.assertEqual(E.undelivered_alerts(self.j.read()), "")
+
+    def test_a_rejected_sell_does_not_use_the_buy_probe_budget(self) -> None:
+        def reject_sell(o):  # noqa: ANN001, ANN202
+            if o.transaction_type == "SELL":
+                o.status, o.status_message = "REJECTED", "RMS: scrip blocked"
+        self.k.lower["NSE:SYM2"] = 500.0                                 # so the gate opens with the sell stuck
+        lg = self.afternoon(fill=reject_sell)
+        self.assertNotIn("PROBE_FAILED", [r["code"] for r in self.j.read() if r["type"] == "ALERT"
+                                          and "first order" in r.get("text", "")])
+        self.assertTrue(lg)
+
+    def test_kite_down_at_the_reconcile_retries_on_the_next_slot(self) -> None:
+        orig = E.reconcile
+        calls = []
+
+        def flaky(env, day):  # noqa: ANN001, ANN202
+            calls.append(day)
+            if len(calls) == 1:
+                raise E.B.NetworkError("planted")
+            return orig(env, day)
+        E.reconcile = flaky
+        try:
+            self.afternoon(fill=fill_all(self.k))
+            self.assertFalse(E.stage_done(self.j.read(), "2027-01-01", "RECON"))
+            self.afternoon(fill=fill_all(self.k))
+        finally:
+            E.reconcile = orig
+        self.assertTrue(E.stage_done(self.j.read(), "2027-01-01", "RECON"))
+        self.assertEqual([r["code"] for r in self.j.read() if r["type"] == "ALERT"].count("RECON_RETRY"), 1)
+
+    def test_kite_blip_at_1445_is_retried(self) -> None:
+        seq = [["profile read failed"], []]
+        lg = None
+        self.k.on_place = fill_all(self.k)
+        E.afternoon(self.env(), dict(self.held), lambda: seq.pop(0) if seq else [])
+        lg = L.replay(self.j.read())
+        self.assertEqual(lg.positions["2612-02"].leg, "CLOSED")         # the day went ahead after the retry
+
+
 if __name__ == "__main__":
     unittest.main()

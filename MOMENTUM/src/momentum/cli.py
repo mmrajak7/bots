@@ -366,7 +366,7 @@ def cmd_morning(x: Ctx, a: argparse.Namespace) -> int:
     plan = E.current_plan(lg)
     pend = [p for p in lg.positions.values() if p.leg in ORDER_LEGS]
     held = [p for p in lg.positions.values() if p.held_qty > 0]
-    x.notify(f"ALIVE plan {L.plan_key(plan['plan_id']) if plan else 'none'}; " + E.status_text(lg))
+    carry_alerts(x, f"ALIVE plan {L.plan_key(plan['plan_id']) if plan else 'none'}; " + E.status_text(lg))
     no_plan = missing_plan_month(x, lg)
     if no_plan:
         x.journal.append("ALERT", code="NO_PLAN", text=f"no FINAL plan for {no_plan}")
@@ -405,6 +405,10 @@ def morning_cash_check(env: E.Env) -> None:
     still a day to fund it. Advisory only (15:10 re-reads it)."""
     lg = L.replay(env.journal.read())
     need = sum(p.remaining_paise for p in lg.positions.values() if p.leg == "PENDING_BUY" and not p.overlays) // 100
+    if any(p.leg == "BUY_GATED" for p in lg.positions.values()):
+        # a rebalance day: the buys use the book's free cash now plus today's sale money; Kite must at least hold
+        # the free cash the book already has (the sales add to it at 14:50)
+        need = max(need, (lg.cash_paise - lg.earmarked_paise()) // 100)
     if need <= 0:
         return
     try:
@@ -508,11 +512,20 @@ def cmd_watch(x: Ctx, a: argparse.Namespace) -> int:
     lg = L.replay(x.journal.read())
     write_ledger(x)
     backed_up = backup_state(x)
-    x.notify("HEARTBEAT " + E.status_text(lg) + (f"; THREE-WAY PROBLEMS {len(probs)}" if probs else
-                                                 ("; three-way OK" if checked else "; three-way not run (no "
-                                                  "opening snapshot today or nothing in the book)"))
-             + ("" if backed_up else "; BACKUP NOT SENT"))
+    carry_alerts(x, "HEARTBEAT " + E.status_text(lg) + (f"; THREE-WAY PROBLEMS {len(probs)}" if probs else
+                                                        ("; three-way OK" if checked else "; three-way not run (no "
+                                                         "opening snapshot today or nothing in the book)"))
+                 + ("" if backed_up else "; BACKUP NOT SENT"))
     return 0
+
+
+def carry_alerts(x: Ctx, text: str) -> None:
+    """Send ALIVE / HEARTBEAT with the alerts Telegram missed since the last such message; mark them carried only
+    when this message is delivered (review: an alert raised while Telegram was down was lost)."""
+    recs = x.journal.read()
+    extra = E.undelivered_alerts(recs)
+    if x.notify(text + extra) and extra:
+        x.journal.append("NOTE", carried_alerts_upto=max(r["seq"] for r in recs))
 
 
 def cmd_canary(x: Ctx, a: argparse.Namespace) -> int:

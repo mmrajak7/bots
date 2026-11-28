@@ -28,7 +28,7 @@ REQUIRED_KEYS = (
     "fo_min_stock_futures", "fo_min_recent_circulars",
     "sell_place_at", "sell_ladder", "last_sell_place_at", "gate_at", "sell_ltp_mult", "sell_floor_mult",
     "gate_wait_sessions", "buy_envelope_slack", "extra_share_max_over", "test_lot",
-    "ca_lookback_days", "ca_ahead_days", "ca_lag_days",
+    "ca_lookback_days", "ca_ahead_days", "ca_lag_days", "sell_ladder_mults", "extra_share_enabled",
 )
 TIME_KEYS = ("step_plan_at", "place_at", "last_place_at", "cancel_at", "reconcile_at", "token_first_poll",
              "token_alert_at", "token_deadline", "plan_final", "sell_place_at", "last_sell_place_at", "gate_at")
@@ -204,6 +204,15 @@ def load(home: Optional[Path] = None, overrides: Optional[Dict[str, Any]] = None
         raise ConfigError(f"sell multipliers / slack are not decimal numbers: {e!r}") from e
     if not (MIN_SELL_MULT <= f_m <= s_m <= Decimal(1)):
         raise ConfigError(f"need {MIN_SELL_MULT} <= sell_floor_mult <= sell_ltp_mult <= 1, got {f_m}, {s_m}")
+    try:
+        lm = [Decimal(str(x)) for x in cfg["sell_ladder_mults"]]
+    except (InvalidOperation, TypeError) as e:
+        raise ConfigError(f"sell_ladder_mults are not decimals: {e!r}") from e
+    if len(lm) != len(cfg["sell_ladder"]) or not all(f_m <= x <= s_m for x in lm) or lm != sorted(lm, reverse=True):
+        raise ConfigError("sell_ladder_mults: one per sell_ladder time, descending, between the floor and the "
+                          "first price")
+    if not isinstance(cfg["extra_share_enabled"], bool):
+        raise ConfigError("extra_share_enabled must be true or false")
     if not (Decimal(1) <= slack <= Decimal("1.10")) or not (Decimal(0) <= over <= Decimal(1)):
         raise ConfigError("buy_envelope_slack must be in 1..1.10 and extra_share_max_over in 0..1")
     if not (Decimal(0) <= reserve < Decimal("0.05")) or any(v < 0 or v >= 1 for v in rates.values()):
