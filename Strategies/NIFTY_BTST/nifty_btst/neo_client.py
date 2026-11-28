@@ -68,6 +68,14 @@ CRED_KEYS = ('consumer_key', 'mobile_number', 'ucc', 'mpin', 'totp_secret')
 #: "emsg":"Invalid session","stCode":1003}` with the HTTP code unstated)
 SESSION_DEAD_EMSG = ('invalid session', 'session expired', 'session ip')
 
+#: the static-IP WHITELIST refusal (static-IP page: stCode 100008). A login
+#: cannot cure it -- only the right public IP can -- so it NEVER triggers one:
+#: a read is Unavailable, a mutation a definite refusal (review K5/R2,
+#: 2026-11-28, as kotak_neo does). 'session ip' (1037) is NOT this: that one
+#: is a session bound to an old IP, and a login from the new IP is its fix.
+IP_WHITELIST_CODES = (100008,)
+IP_WHITELIST_EMSG = ('static ip', 'whitelist')
+
 #: Keys a NEO body has been SEEN to carry its message under. The docs show
 #: `emsg`; the live API (Pi, 2026-11-27) sends `errMsg` -- e.g. the empty book
 #: `{"stat":"Not_Ok","stCode":5203,"errMsg":"No Data","desc":"data not found"}`
@@ -133,8 +141,16 @@ class EnvelopePolicy:
         except (TypeError, ValueError):
             return None
 
+    def ip_refused(self, data: Dict[str, Any]) -> bool:
+        if self._code(data) in IP_WHITELIST_CODES:
+            return True
+        emsg = neo_msg(data).lower()
+        return 'session ip' not in emsg and any(m in emsg for m in IP_WHITELIST_EMSG)
+
     def session_dead(self, data: Dict[str, Any]) -> bool:
         if str(data.get('stat', '')).strip().lower() != 'not_ok':
+            return False
+        if self.ip_refused(data):
             return False
         emsg = neo_msg(data).lower()
         return self._code(data) in self.auth_stcodes or any(m in emsg for m in SESSION_DEAD_EMSG)
@@ -281,6 +297,7 @@ class NeoReader:
         self.server_id: Optional[str] = None
         self.logged_in_at: Optional[float] = None
         self.relogins = 0
+        self.mutation_auth_rejections = 0
 
     # -- session -------------------------------------------------------
     @property
@@ -359,6 +376,12 @@ class NeoReader:
         except requests.RequestException as exc:
             raise NeoUnavailable('%s %s: %s' % (method, path, type(exc).__name__))
         data = _json_or_none(r)
+        if data is not None and self.policy.ip_refused(data):
+            logger.error('%s %s: NEO refused our public IP (HTTP %s stCode %s %s) -- no login '
+                         'can fix this; check the whitelisted static IP', method, path,
+                         r.status_code, data.get('stCode'), neo_msg(data))
+            raise NeoUnavailable('%s %s: public IP not whitelisted (stCode %s)'
+                                 % (method, path, data.get('stCode')))
         dead = r.status_code in (401, 403) or (data is not None and self.policy.session_dead(data))
         if dead:
             # The documented invalid-session body (stCode 1003) can come with
@@ -500,21 +523,26 @@ class NeoTrader(NeoReader):
         except requests.RequestException as exc:
             raise NeoUnclear('%s: %s' % (what, type(exc).__name__))
         data = _json_or_none(r)
+        if data is not None and self.policy.ip_refused(data):
+            # the documented wrong-IP refusal: NOT placed, and no login (K5)
+            logger.error('%s: NEO refused our public IP (HTTP %s stCode %s %s)', what,
+                         r.status_code, data.get('stCode'), neo_msg(data))
+            raise NeoRejected(data.get('stCode') or '100008', neo_msg(data) or 'static IP')
         if r.status_code in (401, 403) or (data is not None and self.policy.session_dead(data)):
             # NEO's own words, kept: a 401 on place at 13:32:47 on 2026-11-27
             # came 5 s after a fresh login whose reads all worked, a re-login
             # did not help, and only the status code had been kept.
             logger.warning('%s: HTTP %s session rejected, body %s', what, r.status_code,
                            _scrub(getattr(r, 'text', '') or ''))
-            # Re-login so the NEXT call works; this one stays unclear — the
-            # caller searches the book before deciding (design section 4).
-            try:
-                self._relogin()
-            except NeoAuthError as exc:
-                raise NeoAuthError('%s: HTTP %s and re-login failed: %s'
-                                   % (what, r.status_code, exc))
-            raise NeoUnclear('%s: session rejected (HTTP %s), re-established'
-                             % (what, r.status_code))
+            # NO re-login on mutation evidence (review R2, 2026-11-28): on
+            # 11-27 a fresh login did not cure it, and one login per refused
+            # order is a login storm. This call stays UNCLEAR (the caller
+            # searches the book); the next READ decides -- a truly dead
+            # session fails the read too, and the read logs in once.
+            self.mutation_auth_rejections += 1
+            raise NeoUnclear('%s: session rejected (HTTP %s) on an order call; not re-logged '
+                             'in -- the next read decides (%d so far)'
+                             % (what, r.status_code, self.mutation_auth_rejections))
         if r.status_code == 429:
             # throttled at the gateway: documented as not placed (R3-09)
             raise NeoRejected('429', 'rate limited (HTTP 429)')
