@@ -244,12 +244,18 @@ def apply_tap(env: Env, ap: Dict[str, Any], choice: str) -> None:
         env.notify(f"plan {ap['ref']}: {choice} recorded (the evening job finalises an approved plan)")
 
 
+def owner_leg(p: L.Position) -> bool:
+    """A leg the owner's hold / release acts on: a buy not yet done, a sell under way, or a held name (a hold on it
+    stops a later sell; release clears a written-off / audit hold)."""
+    return p.leg in ("PENDING_BUY", "BUY_GATED", "SELLING") or (p.leg == "NONE" and p.held_qty > 0)
+
+
 def apply_cmd(env: Env, cmd: str, args: str) -> None:
     lg = L.replay(env.journal.read())
     if cmd in ("hold", "release"):
-        hits = [p for p in lg.positions.values() if p.isin == args.strip().upper() and p.leg == "PENDING_BUY"]
+        hits = [p for p in lg.positions.values() if p.isin == args.strip().upper() and owner_leg(p)]
         if not hits:
-            env.notify(f"{cmd} {args}: no pending book leg with that ISIN")
+            env.notify(f"{cmd} {args}: no open book leg (buy, sell or held name) with that ISIN")
             return
         changed = []
         for p in hits:
@@ -264,7 +270,7 @@ def apply_cmd(env: Env, cmd: str, args: str) -> None:
                 env.journal.append("OVERLAY", position_id=p.position_id, overlay=ov, on=False, reason="owner release")
                 changed.append(ov)
         left = sorted({ov for p in L.replay(env.journal.read()).positions.values() if p.isin == args.strip().upper()
-                       and p.leg == "PENDING_BUY" for ov in p.overlays})
+                       and owner_leg(p) for ov in p.overlays})
         env.notify(f"{cmd} {args}: " + (f"changed {changed}" if changed else "nothing to change")
                    + (f"; still on: {left}" if left else ""))
     elif cmd == "resolve":

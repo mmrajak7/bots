@@ -114,9 +114,8 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
     lg = L.replay(j.read())
     if any(k.startswith(f"{m}|") for k in lg.plans):
         return {"status": "already final", "plan": [k for k in lg.plans if k.startswith(f"{m}|")]}
-    if any(p.state != "GONE" for p in lg.positions.values()):
-        raise EveningError("the book holds or is buying names: decide_live with the ledger mapping is the January "
-                           "build (frozen design §4.1); this evening refuses")
+    if any(p.leg in ("SELLING", "PENDING_BUY") and lg.open_intents(p.position_id) for p in lg.positions.values()):
+        raise EveningError("a book order is still live (reconcile not done?): no decision on an unsettled book")
     # A re-run finalises the latest decision for this signal day unless its F&O inputs changed since (the owner added
     # an entrant after reading the circulars): then the decision is rebuilt as the next data revision.
     rev = 0
@@ -171,14 +170,22 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
     c = P.load_context(M, w)
     if not c.ca_ok:
         raise EveningError("P3-CA verdict NO: " + " | ".join(c.ca_lines[:5]))
-    # 4. decide (empty book)
-    d = P.decide_from_cash(M, c, m, lg.cash_paise / 100, int(cfg["n_hold"]))
+    # 4. decide. Month 1 (nothing held, nothing pending) = decide_from_cash with the evening earmark (December spec);
+    #    a live book = decide_live on the ledger (frozen design §4.1, January spec §4.1), after plan expiry (E26)
+    expiring = plan_expiry(lg)
+    holdings, pending = live_book(lg, expiring)
+    first_month = not holdings and not pending
+    if first_month:
+        d = P.decide_from_cash(M, c, m, lg.cash_paise / 100, int(cfg["n_hold"]))
+        d.update(sells=[], written_off=[])
+        if len(d["buys"]) != int(cfg["n_hold"]):
+            raise EveningError(f"{len(d['buys'])} buys, expected {cfg['n_hold']}")
+    else:
+        d = P.decide_live(M, c, m, holdings, pending, int(cfg["n_hold"]))
     if d["signal_day"] != sd:
         raise EveningError(f"panel signal day {d['signal_day']} != {sd}")
-    if len(d["buys"]) != int(cfg["n_hold"]):
-        raise EveningError(f"{len(d['buys'])} buys, expected {cfg['n_hold']}")
-    # 5. audit layers 1-2
-    touched = {b["chain"] for b in d["buys"]}
+    # 5. audit layers 1-2 (a sell is a touched name too: a data error must not sell a name, FD §3.5)
+    touched = {b["chain"] for b in d["buys"]} | {x["chain"] for x in d["sells"] if x["chain"] is not None}
     top = [r["chain"] for r in d["ranked"][: int(cfg["audit_top_n"])]]
     ca_raw = M.CA.load_raw() or []
     res = A.run(c, m, sd, touched, top, cfg, kite_close_fn(env.api), ca_raw,
@@ -191,14 +198,28 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
         j.append("AUDIT_RESULT", status="FAILED", problem=res.problem, counts=res.counts)
         raise EveningError(f"audit FAILED: {res.problem}")
     # 6. decision file (write-once)
-    em = earmark_paise(lg.cash_paise, int(cfg["n_hold"]), Decimal(cfg["charges_reserve"]))
+    # month 1: the earmark is set tonight (empty book). Later months: the buys wait for the sells (BUY_GATED) and
+    # their amount is set at the 15:06 gate from the cash the sells brought (January spec §4.2, D49)
+    em = earmark_paise(lg.cash_paise, int(cfg["n_hold"]), Decimal(cfg["charges_reserve"])) if first_month else 0
     yymm = m[2:4] + m[5:7]
     s_idx = c.mk.sig(m)
+    if any(p.position_id.startswith(f"{yymm}-") for p in lg.positions.values()):
+        raise EveningError(f"positions {yymm}-* already exist: a plan for {m} was finalised before")
     buys = [{"position_id": f"{yymm}-{k:02d}", "isin": b["isin"], "symbol": b["symbol"], "series": b["series"],
              "rank": b["rank"], "score_milli": b["score_milli"], "chain": b["chain"], "earmark_paise": em,
+             "leg": "PENDING_BUY" if first_month else "BUY_GATED",
              "signal_close_paise": L.paise(float(c.p.close[b["chain"], s_idx])),
              "ca_rows": ca_rows_ahead(ca_raw, b["symbol"], b["isin"], sd, P.month_add(m, 1) + "-01")}
             for k, b in enumerate(sorted(d["buys"], key=lambda x: x["rank"]), 1)]
+    # worst rank first (unranked last): the order the 14:50 step sells in
+    sells = []
+    for k, x in enumerate(sorted(d["sells"], key=lambda x: (x["rank"] is None, -(x["rank"] or 0))), 1):
+        pos = lg.positions[x["position_id"]]
+        sells.append({"position_id": x["position_id"], "isin": pos.isin, "symbol": pos.symbol, "series": pos.series,
+                      "reason": x["reason"], "rank": x["rank"], "score_milli": x["score_milli"], "chain": x["chain"],
+                      "sell_no": k, "qty": pos.held_qty,
+                      "signal_close_paise": L.paise(float(c.p.close[x["chain"], s_idx])) if x["chain"] is not None
+                      else None})
     touched_flags: Dict[str, List[A.Flag]] = {}
     for f in res.flags:
         if f.touched:
@@ -209,6 +230,16 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
             holds.append({"position_id": b["position_id"], "overlay": "AUDIT_HOLD", "reason": "audit flag"})
         if b["series"] != "EQ":
             holds.append({"position_id": b["position_id"], "overlay": "OWNER_HOLD", "reason": f"{b['series']} series"})
+    for x in sells:
+        if x["reason"] in ("NO_SCORE", "NO_CHAIN"):            # D40: only a RANK sell is automatic
+            holds.append({"position_id": x["position_id"], "overlay": "AUDIT_HOLD",
+                          "reason": f"sell reason {x['reason']}: sell or data fix (owner)"})
+        elif x["isin"] in touched_flags:
+            holds.append({"position_id": x["position_id"], "overlay": "AUDIT_HOLD", "reason": "audit flag"})
+    for w_ in d["written_off"]:                                # D-L19: no row for > DEAD_GAP sessions
+        holds.append({"position_id": w_["position_id"], "overlay": "OWNER_HOLD",
+                      "reason": f"no NSE row since {w_['last_row']}: written off as tested; the shares are yours "
+                                "to decide"})
     status = "PASSED_WITH_HOLDS" if holds else "PASSED"
     plan_id = {"month": m, "signal_day": sd, "data_rev": rev}
     decision = {"plan_id": plan_id, "status": "FINAL", "made_at": util.now().isoformat(),
@@ -218,7 +249,8 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
                            "entrants": fv["entrants"], "first_session": fv["first_session"],
                            "problems": fv["problems"][:10]},
                 "kite_sessions_prev_month": prev_sess, "signal_day_verified": True, "ledger_cash_paise": lg.cash_paise,
-                "audit": res.to_json(), "buys": buys, "holds": holds, "ranked": d["ranked"], "timings": times}
+                "audit": res.to_json(), "buys": buys, "sells": sells, "expire": expiring,
+                "written_off": d["written_off"], "holds": holds, "ranked": d["ranked"], "timings": times}
     text = json.dumps(decision, indent=1, sort_keys=True) + "\n"
     dp = decision_path(env, m, sd, rev)
     util.write_once(dp, text)
@@ -244,12 +276,19 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
         ask_plan_approval(env, plan_id, sha, len(buys))
         return {"status": "waiting for owner approval", "decision": str(dp)}
     flags = [f for f in decision["audit"]["flags"] if f["touched"]]
+    sells = decision.get("sells", [])
+    lg = L.replay(j.read())
+    for pid in decision.get("expire", []):     # E26: last month's never-placed buys end when this plan is final
+        p = lg.positions[pid]
+        if p.leg in ("BUY_GATED", "PENDING_BUY"):
+            j.append("LEG", position_id=pid, reason=f"plan expiry ({m} decided)", **{"from": p.leg, "to": "EXPIRED"})
     j.append("PLAN_FINAL", plan_id=plan_id, decision_file=dp.name, decision_sha256=sha,
              audit_status=decision["audit"]["status"] if not holds else "PASSED_WITH_HOLDS",
              buys=[{k: b[k] for k in ("position_id", "isin", "symbol", "series", "rank", "earmark_paise")}
-                   for b in buys],
+                   | {"leg": b.get("leg", "PENDING_BUY")} for b in buys],
+             sells=[{k: x[k] for k in ("position_id", "reason", "sell_no", "rank")} for x in sells],
              holds=[{"position_id": h["position_id"], "overlay": h["overlay"]} for h in holds])
-    by_isin = {b["isin"]: b for b in buys}
+    by_isin = {b["isin"]: b for b in buys + sells}
     for f in flags:
         b = by_isin[f["isin"]]
         others = [x["flag_id"] for x in flags if x["isin"] == f["isin"] and x["flag_id"] != f["flag_id"]]
@@ -258,16 +297,58 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
                       f"AUDIT FLAG {f['symbol']} {f['check']}: {f['value']} (tol {f['threshold']}) {f['detail']}"
                       f"{' Kite ' + f['kite_value'] if f.get('kite_value') else ''}", position_id=b["position_id"],
                       other_open_flags=others)
-    for h in holds:                             # a name held at the plan (BE/BZ series, G14) gets its Buy / Skip
-        if h["overlay"] == "OWNER_HOLD":
+    buy_ids = {b["position_id"] for b in buys}
+    for h in holds:
+        if h["position_id"] not in buy_ids:     # a sell or written-off hold: its own message and the 08:35 reminder
+            x = next((x for x in sells if x["position_id"] == h["position_id"]), None)
+            name = x["symbol"] if x else h["position_id"]
+            isin = lg.positions[h["position_id"]].isin
+            env.alert("PLAN_HOLD", f"{name} ({h['overlay']}): {h.get('reason') or 'held at the plan'}; reply "
+                      f"'release {isin}' to let the code sell it, or leave it held")
+            continue
+        if h["overlay"] == "OWNER_HOLD":       # a buy held at the plan (BE/BZ series, G14) gets its Buy / Skip
             b = next(x for x in buys if x["position_id"] == h["position_id"])
             open_approval(env, "leg", b["position_id"], {"buy": "Buy", "skip": "Skip"},
                           f"HOLD {b['symbol']} (OWNER_HOLD): {h.get('reason') or 'held at the plan'}",
                           position_id=b["position_id"])
     em = buys[0]["earmark_paise"] // 100 if buys else 0
-    env.notify(f"PLAN {m} r{plan_id['data_rev']} FINAL: {len(buys)} buys x Rs {em:,}; holds {len(holds)}; "
+    amount = f"Rs {em:,}" if em else "the sale money (set at 15:06)"
+    sold = ", ".join(f"{x['symbol']}({x['reason']}{' r' + str(x['rank']) if x['rank'] else ''})" for x in sells)
+    env.notify(f"PLAN {m} r{plan_id['data_rev']} FINAL: sells {len(sells)}{': ' + sold if sells else ''}; "
+               f"{len(buys)} buys x {amount}; expired {len(decision.get('expire', []))}; holds {len(holds)}; "
                f"signal day {plan_id['signal_day']} verified on Kite")
-    return {"status": "FINAL", "decision": str(dp), "buys": len(buys), "holds": len(holds), "flags": len(flags)}
+    return {"status": "FINAL", "decision": str(dp), "buys": len(buys), "sells": len(sells), "holds": len(holds),
+            "flags": len(flags)}
+
+
+def plan_expiry(lg: L.Ledger) -> List[str]:
+    """E26 (frozen design §5.5): when the next plan is decided, every buy that was never placed ends: BUY_GATED legs
+    and PENDING_BUY legs with no order ever (held for the owner, deferred, gated). A buy with an order inside its
+    lock-try window stays pending (tested: pending buys carry across a rebalance). -> position ids."""
+    out = []
+    for p in lg.positions.values():
+        if p.test:
+            continue
+        if p.leg == "BUY_GATED" or (p.leg == "PENDING_BUY" and not any(i.position_id == p.position_id
+                                                                         for i in lg.intents.values())):
+            out.append(p.position_id)
+    return sorted(out)
+
+
+def live_book(lg: L.Ledger, expiring: List[str]) -> Tuple[List[P.LiveHolding], List[P.LivePending]]:
+    """Ledger -> decide_live input (frozen design §4.1 mapping). A partly filled buy still inside its window is ONE
+    pending buy (not held); a SELLING leg is `selling`; the TEST lot is outside the book."""
+    hold: List[P.LiveHolding] = []
+    pend: List[P.LivePending] = []
+    for p in lg.positions.values():
+        if p.test or p.position_id in expiring:
+            continue
+        if p.leg == "PENDING_BUY":
+            pend.append(P.LivePending(p.position_id, p.isin))
+        elif p.leg in ("NONE", "SELLING") and p.held_qty > 0:
+            hold.append(P.LiveHolding(p.position_id, p.isin, "selling" if p.leg == "SELLING" else "held",
+                                      p.plan_id["signal_day"]))
+    return hold, pend
 
 
 def ca_rows_ahead(ca_raw: List[Dict[str, Any]], symbol: str, isin: str, after: str, before: str) -> List[Dict[str, str]]:
