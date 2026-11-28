@@ -518,14 +518,8 @@ class NeoClient:
         raise Unavailable('%s: %s (stCode %s)' % (what, neo_msg(d) or 'Not_Ok', stcode(d)))
 
     # -- reads -----------------------------------------------------------------
-    def _views(self, path: str, what: str) -> List[OrderView]:
-        try:
-            return [OrderView.from_neo(r) for r in self._rows(self._read('GET', path), what)]
-        except RowError as e:
-            raise Unavailable('%s: %s' % (what, e))
-
     def order_book(self) -> List[OrderView]:
-        return self._views(PATH_ORDER_BOOK, 'order book')
+        return self._views_where(lambda r: True, 'order book')   # X-K2: one view per order
 
     def trades(self) -> List[FillView]:
         """Today's FILLS (one row per fill; several per order is normal)."""
@@ -613,15 +607,29 @@ class NeoClient:
     def _views_where(self, keep: Callable[[Dict[str, Any]], bool], what: str) -> List[OrderView]:
         """Order-book rows that `keep` selects, parsed STRICTLY; rows it does
         not select are never parsed (review F11, 2026-11-27: one unparsable row
-        of ANOTHER bot or a manual order must not blind this bot's own reads)."""
-        out = []
+        of ANOTHER bot or a manual order must not blind this bot's own reads).
+
+        ONE view per order number (review X-K2, 2026-11-28): a book that lists an
+        order twice must not count its fill twice -- 130 read for a 65 fill sells
+        65 short. The copy with the larger filled quantity wins (the later state;
+        fills only grow). Rows without an order number are kept as they are."""
+        out: List[OrderView] = []
+        at: Dict[str, int] = {}
         for r in self._rows(self._read('GET', PATH_ORDER_BOOK), 'order book'):
             if not keep(r):
                 continue
             try:
-                out.append(OrderView.from_neo(r))
+                v = OrderView.from_neo(r)
             except RowError as e:
                 raise Unavailable('%s: %s' % (what, e))
+            if v.order_no and v.order_no in at:
+                i = at[v.order_no]
+                if (v.filled, v.terminal) > (out[i].filled, out[i].terminal):
+                    out[i] = v
+                continue
+            if v.order_no:
+                at[v.order_no] = len(out)
+            out.append(v)
         return out
 
     def orders_tagged(self, tag: str) -> List[OrderView]:

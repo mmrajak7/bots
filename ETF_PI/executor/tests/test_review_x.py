@@ -66,3 +66,25 @@ def test_b5_a_recovered_feed_prices_off_the_live_bid_again(rig):
     assert not p.get('stale_exit')
     tail = float(rig.cfg['exit_tail_pct'])
     assert float(last['prc']) >= 100.0 * (1 - tail / 100.0) - 0.05, last['prc']
+
+
+def test_xk2_a_book_listing_every_order_twice_never_sells_short(rig):
+    """Every order-book row duplicated: before the fix the entry read 130 for a 65 fill
+    and the exit sold 130 (account short 65)."""
+    from test_engine import KCN
+    orig = rig.fake.get
+
+    def get(url, **kw):
+        resp = orig(url, **kw)
+        if url.endswith('/quick/user/orders'):
+            b = resp.json()
+            if isinstance(b.get('data'), list):
+                resp = type(resp)(200, dict(b, data=b['data'] + [dict(x) for x in b['data']]))
+        return resp
+    rig.fake.get = get
+    p = open_one(rig)
+    assert p['qty'] == 65
+    rig.quote(80.0, 80.1)                             # PREM_SL inside positions_lag_s
+    rig.step(n=10)                                    # Rig.check(): never short
+    assert p['state'] == 'CLOSED' and rig.fake.net(p['symbol']) == 0
+    assert sum(int(o['qty']) for o in rig.etf_orders('S')) == 65
