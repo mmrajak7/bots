@@ -7,7 +7,7 @@ Run from the ETF_PI directory with the SAME interpreter as option_buy (Pi: /usr/
   python3 -m executor kill       no NEW entries (file KILL); open trades keep their exits
   python3 -m executor flatten    exit everything now + no new entries (file FLATTEN)
   python3 -m executor resume     remove KILL and FLATTEN
-  python3 -m executor stop       STOPPED flag + systemctl stop (the watchdog leaves it stopped)
+  python3 -m executor stop       STOPPED flag + systemctl stop (stays stopped: watchdog AND reboot, B2)
   python3 -m executor start      remove STOPPED + systemctl start
   python3 -m executor check      load config + option_buy + kotak_neo, print the plan, exit
   python3 -m executor selftest   the executor test suite under THIS interpreter (Pi: /usr/bin/python3
@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import Dict
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 ETF_DIR = os.path.dirname(HERE)
@@ -177,20 +178,53 @@ def _single_instance():
     return f
 
 
+def _alert(msg: str) -> None:
+    try:
+        import common
+        common.sendMsgTelegram('<b>ETF EXECUTOR</b> ' + msg, 'E')
+    except Exception as e:
+        log.error('telegram failed: %s', e)
+
+
+def wait_while_stopped(state_dir: str, stop: Dict[str, bool], alert=None,
+                       sleep=time.sleep, poll_s: float = 5.0) -> bool:
+    """Review B2 (2026-11-28): an owner `stop` must survive the 08:00 reboot. The unit
+    is enabled with Restart=always, so `run` itself honours STOPPED: it IDLES (no
+    config, no NEO, no orders, no heartbeat -- the watchdog skips STOPPED too) and
+    alerts ONCE, until `executor start` removes the flag. Idling, never exiting,
+    because an exit would be restarted every 5 s. True = go on, False = signalled."""
+    flag = os.path.join(state_dir, 'STOPPED')
+    if not os.path.exists(flag):
+        return True
+    msg = ('STOPPED flag present -- the daemon is IDLE: no orders, open lots NOT managed. '
+           '`python3 -m executor start` resumes')
+    log.warning(msg)
+    (alert or _alert)(msg)
+    while os.path.exists(flag):
+        if stop['flag']:
+            return False
+        sleep(poll_s)
+    log.info('STOPPED removed -- starting')
+    return not stop['flag']
+
+
 def cmd_run(args) -> int:
     _logging('executor')
     lock = _single_instance()                 # noqa: F841 (held for the process lifetime)
-    cfg = _config_or_alert('run')
-    eng, ob = build(cfg)
-    IST = ob.IST
-    log.info('executor start: mode=%s lots=%s live_until=%s product=%s consts=%s',
-             cfg['mode'], cfg['lots'], cfg['live_until'], cfg['product'], eng.consts_digest)
     stop = {'flag': False}
 
     def on_term(signum, frame):
         stop['flag'] = True
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
+    if not wait_while_stopped(C.STATE_DIR, stop):
+        log.info('executor stop (signal while STOPPED)')
+        return 0
+    cfg = _config_or_alert('run')
+    eng, ob = build(cfg)
+    IST = ob.IST
+    log.info('executor start: mode=%s lots=%s live_until=%s product=%s consts=%s',
+             cfg['mode'], cfg['lots'], cfg['live_until'], cfg['product'], eng.consts_digest)
     eng.feed.start()
     while not stop['flag']:
         t0 = time.time()
