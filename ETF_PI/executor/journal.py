@@ -83,7 +83,9 @@ class Journal:
         note = None
         if not os.path.exists(self.path):
             return positions, rows, None
-        with io.open(self.path, encoding='utf-8', newline='\n') as f:
+        # fix review F5: never crash on SD-card garbage -- a bad tail fails JSON below
+        # (torn, then cut on the next append); a bad middle line is `corrupt`
+        with io.open(self.path, encoding='utf-8', errors='replace', newline='\n') as f:
             lines = f.read().split('\n')
         if lines and lines[-1] == '':
             lines.pop()

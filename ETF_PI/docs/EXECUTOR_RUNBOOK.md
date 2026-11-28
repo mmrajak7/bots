@@ -77,8 +77,10 @@ The daemon has never run through a market session (installed 11-27 night). So: *
 `curl -4 ifconfig.me` = the whitelisted IP; `etf status` shows a fresh heartbeat, `mode: paper`.
 
 **09:15:30** `etf status`: `reconciled: true` (reconcile starts at 09:15, not before), `ws_ok: true`, and
-`state/executor/tape_<today>.jsonl` growing. If `ws_ok` is false: check the Kite token (08:30 kite_login), the
-feed rebuilds itself once a minute (review B3).
+`state/executor/tape_<today>.jsonl` growing. If `ws_ok` is still false at **09:17**: check the Kite token (08:30
+kite_login) and `sudo systemctl restart etf-executor` (the feed rebuilds itself once a minute, review B3, but after
+the 08:00 boot on yesterday's token KiteTicker may have spent its retries — fix review F2; prices then come from the
+2 s REST poll only). Record what you saw: 12-01 has no cutover restart.
 
 **09:15–~09:30 paper smoke**: `etf probe --symbol <KITE_SYM>` (paper: no `--confirm-real-order` needed), watch
 BOUGHT, then `etf flatten` → SOLD, journal CLOSED; `etf resume`.
@@ -92,6 +94,12 @@ Probe trades (cheap near-ATM current weekly, premium Rs 80-200):
 `--rest-steps N` (0-5, review T7) makes the flatten's first N sells rest 3% ABOVE the bid, so cancel → confirm →
 re-place really runs N times; without it the first sell fills at once and M5/M6/M13 test nothing.
 
+**After EVERY `flatten`: `etf resume`, then `etf status` shows `flatten: false`** — while the FLATTEN file exists every
+new intent (the next probe, M8, M9, M12 and real signals) is SKIPPED (fix review F12).
+**If M6b fails** (the MIS row is missing, mislabelled, or not 65 within ~3 s): STOP the live probes, `etf flatten`
+→ `etf resume`, and treat 12-01 as NO-GO — while the row reads low the bot sells nothing, a stop-loss included (B1:
+never a naked short; fix review F3). Do not hand-trade a strike the bot is probing (fix review F1).
+
 | # | test | how | pass mark |
 |---|---|---|---|
 | M0 | charges (11-27 contract note) | **CLOSED 11-28**: brokerage Rs0.01, statutory Rs12.68; Saturday funds 49,987.32 = 50,000 − 12.68 (the Friday Rs39.52 was a released intraday hold) | brokerage 0 ✔ |
@@ -104,7 +112,7 @@ re-place really runs N times; without it the first sell fills at once and M5/M6/
 | M7 | coexistence | BTST stays rehearsal; check BTST logs at each ETF fill | no BTST kill / EXTRA LOT alert |
 | M8 | restart mid-position | probe 4, then `sudo systemctl kill -s KILL etf-executor` | back ≤ 10 s, `reconciled`, position still managed, no 2nd buy/sell |
 | M9 | EOD | a probe between **14:45 and 14:50** (entries are refused 14:15–14:45 and from 14:51) on **next week's** contract | flat by 15:16 (eod 15:15); no `etf-` order live after 15:19:30 (`stop_placing`, A12); no broker square-off line in the app |
-| M11 | 401 on place | count `UNCLEAR` in the log; kotak_neo alert `orders_auth` fires on 2 in 5 min (K1) | 0, or each settled within the grace; no `orders_auth` |
+| M11 | 401 on place | count `UNCLEAR` in the log; kotak_neo alert `orders_auth` fires on 2 on one session generation within 30 min (K1) | 0, or each settled within the grace; no `orders_auth` |
 | M12 | MIS on NEXT week's contract | probe on next week's ATM (12-01 is expiry: every 12-01 entry uses next week) | accepted and filled; if refused: **NO-GO for 12-01** (ETF is MIS-only in code since A7'; NRML would be a code change + review) |
 | lat | trigger → fill | journal EXIT_FILL `trigger_to_fill_s` on every exit | record it; > 10 s on a stop-type exit = finding for the T3 change (first stop sell at bid −1%) |
 | real | real 10M signals | they flow by themselves | each: BOUGHT/SOLD Telegram, ladder logs, journal CLOSED, P&L = fills |

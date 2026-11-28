@@ -186,3 +186,47 @@ def test_b4_a_whole_row_missing_only_its_newline_is_kept(tmp_path):
     j.append({'ev': 'C', 'key': 'k3', 'pos': {'x': 3}})
     pos, rows, note = j.load()
     assert note is None and set(pos) == {'k1', 'k2', 'k3'}
+
+
+# -- Fable review of the 11-28 fixes (F1, F4, F5) ------------------------------------------
+
+def test_f1_an_outside_sell_before_our_open_never_confirms_a_low_row(rig, monkeypatch):
+    """BTST / the owner sold 65 of the strike BEFORE ETF bought it. At exit the MIS row
+    misreads 0: that earlier sell must not count -- nothing sold, nothing closed."""
+    from test_engine import SYM, KCN
+    rig.fake._new_order({'pt': 'L', 'ts': SYM, 'tt': 'B', 'qt': 65, 'pr': '100.10', 'ig': '',
+                         'pc': 'NRML'})
+    rig.fake._new_order({'pt': 'L', 'ts': SYM, 'tt': 'S', 'qt': 65, 'pr': '99.00', 'ig': '',
+                         'pc': 'NRML'})                 # an outside round trip, earlier today
+    rig.eng.cfg['skip_foreign_strikes'] = False
+    p = open_one(rig)
+    assert p['outside_base'] == 65
+    monkeypatch.setattr(rig.broker.c, 'positions_for',
+                        lambda sym: [KCN.PositionView(symbol=SYM, product='MIS', net_qty=0)])
+    rig.step(secs=15)
+    open(os.path.join(rig.state, 'FLATTEN'), 'w').close()
+    rig.step(n=200)
+    assert p['state'] == 'EXIT' and 'NOT closing' in rig.texts()
+
+
+def test_f4_stop_placing_must_leave_the_eod_exit_a_minute(tmp_path):
+    import pytest
+    from executor import config as C
+    none = str(tmp_path / 'none.yaml')
+    for bad in ({'eod_time': ''}, {'stop_placing': '15:15:30'}):
+        with pytest.raises(C.ConfigError, match='stop_placing'):
+            C.load(local_path=none, override=bad)
+    assert C.load(local_path=none, override={'eod_time': '', 'stop_placing': '15:29:50'})
+
+
+def test_f5_a_non_utf8_tail_never_crashes_the_load(tmp_path):
+    from executor.journal import Journal
+    j = Journal(str(tmp_path / 'j.jsonl'))
+    j.append({'ev': 'A', 'key': 'k1', 'pos': {'x': 1}})
+    with open(j.path, 'ab') as f:
+        f.write(b'\xff\xfe\x80garbage')
+    pos, rows, note = j.load()
+    assert note is None and set(pos) == {'k1'}
+    j.append({'ev': 'B', 'key': 'k2', 'pos': {'x': 2}})
+    pos, rows, note = j.load()
+    assert note is None and set(pos) == {'k1', 'k2'}

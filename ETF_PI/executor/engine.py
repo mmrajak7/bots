@@ -617,6 +617,11 @@ class Engine:
         p['state'] = 'OPEN'
         p['last_sample_min'] = None
         p['entry_slip'] = round(avg - float(p['signal_ltp']), 4)          # per unit, vs signal LTP
+        # fix review F1 (2026-11-28): the B1 check counts only outside sells AFTER this
+        # open -- BTST's morning sell of the same strike is not a sale of OUR lot.
+        # Unreadable now -> None -> a low row is never "confirmed" (safe side).
+        okb, base = self._neo(lambda: self.b.outside_sold(p['symbol']), 'outside sells', p)
+        p['outside_base'] = int(base) if okb else None
         self._jrow('OPEN', p)
         slip = avg - p['signal_ltp']
         self.n.send('BOUGHT %d %s @ %.2f (signal %.2f, slip %+.2f) | T1 %.2f%s%s' % (
@@ -723,13 +728,18 @@ class Engine:
             # says we hold. Only an outside SELL in today's order book confirms it.
             # Unconfirmed: sell nothing (never a naked short), never close, keep re-reading
             # -- the lot stays managed and sells the moment the row agrees again.
+            base = p.get('outside_base')
             try:
                 outside = int(self.b.outside_sold(p['symbol']))
             except Exception as e:
                 outside, why = -1, 'order book unreadable (%s)' % e
             else:
-                why = 'the order book shows %d sold outside the bot' % outside
-            if outside < own - max(acct, 0):
+                if base is None:
+                    why = 'there is no outside-sell baseline from the open'
+                else:
+                    outside -= int(base)                  # F1: only sells since OUR open
+                    why = 'the order book shows %d sold outside the bot since the open' % outside
+            if base is None or outside < own - max(acct, 0):
                 p.pop('acct_low_since', None)
                 self.n.throttled('acct_unconf_' + p['key'], 60, '%s: the ACCOUNT row shows %d of '
                                  '%s but our own orders say %d and %s -- NOT selling, NOT closing; '

@@ -87,9 +87,14 @@ def validate(cfg: Dict[str, Any]) -> Dict[str, Any]:
             c[k + '_time'] = _dt.time.fromisoformat(str(c[k]))
         except ValueError:
             raise ConfigError('%s=%r is not HH:MM:SS' % (k, c[k]))
-    if c['eod_time_t'] and c['stop_placing_time'] <= c['eod_time_t']:
-        raise ConfigError('stop_placing %s must be after eod_time %s (the EOD exit needs time '
-                          'to sell)' % (c['stop_placing'], c['eod_time']))
+    # fix review F4: with eod_time "" the EOD is paper's 15:25 -- after the default
+    # stop_placing, so no EOD sell could ever be placed. The EOD exit needs >= 60 s.
+    eod_eff = c['eod_time_t'] or _dt.time(15, 25)
+    day = _dt.date(2000, 1, 1)
+    if (_dt.datetime.combine(day, c['stop_placing_time'])
+            - _dt.datetime.combine(day, eod_eff)) < _dt.timedelta(seconds=60):
+        raise ConfigError('stop_placing %s must be at least 60 s after the EOD exit %s (eod_time %r)'
+                          % (c['stop_placing'], eod_eff.strftime('%H:%M'), c['eod_time']))
     for k in ('intent_max_age_s', 'entry_reprice_s', 'floor_persist_s', 'exit_step_s',
               'price_stale_s', 'rest_poll_s', 'no_price_alert_s', 'no_price_flatten_s',
               'unclear_grace_s', 'loop_s', 'reconcile_s'):
