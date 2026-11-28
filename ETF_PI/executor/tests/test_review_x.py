@@ -39,3 +39,30 @@ def test_b6_a_pending_cancel_is_not_resent_every_loop(rig):
     cancels = [c for c in rig.fake.calls if c[0] == 'POST' and c[1].endswith('/quick/order/cancel')]
     rig.fake._match = orig
     assert 1 <= len(cancels) <= 10.0 / rig.cfg['exit_step_s'] + 1, len(cancels)
+
+
+def test_b5_a_recovered_feed_prices_off_the_live_bid_again(rig):
+    """The feed dies while a sell rests (stale stepping from the last bid), then comes
+    back at 100.00: before the fix the limit kept falling 2% a re-price (82.00)."""
+    from test_engine import SYM
+    from executor.rules import Quote
+    p = open_one(rig)
+
+    def feedq(bid):
+        rig.feed._q[SYM] = Quote(ltp=bid, bid=bid, ask=bid + 0.1, bids=[(bid, 1000)],
+                                 asks=[(bid + 0.1, 1000)], ts=rig.epoch(), source='ws')
+    rig.fake.set_quote(SYM, 40.0, 40.1)               # our sells rest: nobody bids near them
+    feedq(100.0)
+    open(os.path.join(rig.state, 'FLATTEN'), 'w').close()
+    rig.step(refresh=False)
+    for _ in range(90):                               # 45 s with no price at all
+        rig.feed._q.pop(SYM, None)
+        rig.step(refresh=False)
+    assert p.get('stale_exit')
+    for _ in range(20):                               # back: live bid 100.00 for 10 s
+        feedq(100.0)
+        rig.step(refresh=False)
+    last = [o for o in rig.fake.orders if o['trnsTp'] == 'S'][-1]
+    assert not p.get('stale_exit')
+    tail = float(rig.cfg['exit_tail_pct'])
+    assert float(last['prc']) >= 100.0 * (1 - tail / 100.0) - 0.05, last['prc']

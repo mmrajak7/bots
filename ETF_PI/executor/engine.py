@@ -736,6 +736,12 @@ class Engine:
             p['last_bid'] = q.bid
             p['_bids'] = q.bids
             p.pop('exit_noprice_since', None)
+            if p.get('stale_exit'):
+                # review B5 (2026-11-28): a live bid is back -- price off IT again. Left set,
+                # the cumulative stale tail went on stepping 2% a re-price below the live
+                # bid (82.00 against 100.00 in the probe) into price-band rejects.
+                p['stale_exit'] = False
+                log.warning('%s: price back (bid %.2f) -- stale stepping off', p['key'], q.bid)
             return {'bid': q.bid}
         since = float(p.setdefault('exit_noprice_since', ep))
         if not p.get('stale_exit') and ep - since >= self.cfg['no_price_alert_s']:
