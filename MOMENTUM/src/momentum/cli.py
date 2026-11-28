@@ -277,8 +277,10 @@ def holdings_snapshot(x: Ctx, api: Any) -> Dict[str, int]:
     for r in reversed(x.journal.read()):
         if r["type"] == "HOLDINGS_SNAPSHOT" and r["ts"][:10] == day:
             return {k: int(v) for k, v in r["holdings"].items()}
-    h = {str(r["isin"]): int(r.get("quantity", 0)) + int(r.get("t1_quantity", 0)) for r in api.holdings()}
-    x.journal.append("HOLDINGS_SNAPSHOT", holdings=h)
+    rows = api.holdings()
+    h = {str(r["isin"]): int(r.get("quantity", 0)) + int(r.get("t1_quantity", 0)) for r in rows}
+    settled = {str(r["isin"]): int(r.get("quantity", 0)) for r in rows}
+    x.journal.append("HOLDINGS_SNAPSHOT", holdings=h, settled=settled)
     return h
 
 

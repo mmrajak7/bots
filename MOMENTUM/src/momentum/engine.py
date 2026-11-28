@@ -1275,8 +1275,10 @@ def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], L
                     avail = None
                     env.alert("KITE_DOWN", f"margins unreadable at {env.cfg['place_at']} ({str(e)[:150]}): no buy "
                               "(next session)")
-                if avail is not None and avail < total:
-                    env.alert("CASH", f"Kite available Rs {avail:,.0f} < book buys Rs {total:,}: no buy (D09)")
+                credit = todays_sale_money(env, day)
+                if avail is not None and avail + credit < total:
+                    env.alert("CASH", f"Kite available Rs {avail:,.0f} (+ today's book sales Rs {credit:,}) < book "
+                              f"buys Rs {total:,}: no buy (D09)")
                 elif avail is not None:
                     place_all(env, rebuild_attempts(L.replay(env.journal.read()), go_ids), legs, day)
                     try:
@@ -1337,6 +1339,19 @@ def rebuild_attempts(lg: L.Ledger, go_ids: List[str]) -> StepPlan:
     assert plan is not None
     att = {x: attempts_so_far(lg, x) + 1 for x in go_ids}
     return StepPlan("BUY", plan["plan_id"], [lg.positions[x] for x in go_ids], att, "", "", {}, {})
+
+
+def todays_sale_money(env: Env, day: str) -> int:
+    """Rupees of today's book sell fills (net of charges). Kite's margins field may not show the same-day credit
+    yet (which field, how fast: UNVERIFIED, January spec §11), so the 15:10 guard adds it. Counting it when Kite
+    already shows it cannot overspend: Kite rejects a buy the account cannot pay (RMS), and the first-order probe
+    then stops the other buys until the next session."""
+    recs = env.journal.read()
+    lg = L.replay(recs)
+    sold = sum(int(r["qty"]) * int(r["price_paise"]) - int(r["charges_paise"]) for r in recs
+               if r["type"] == "FILL" and r.get("side") == "SELL" and r["ts"][:10] == day
+               and not lg.positions[r["position_id"]].test)
+    return max(0, sold) // 100
 
 
 def available_cash(m: Dict[str, Any]) -> float:

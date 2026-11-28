@@ -117,6 +117,29 @@ class TestL1GateJudgedOnce(SellHarness):
         self.assertEqual((p.leg, p.earmark_paise), ("PENDING_BUY", 123_400))
 
 
+class TestSaleMoneyAndSettlement(SellHarness):
+    def test_buys_go_when_kite_does_not_show_the_sale_money_yet(self) -> None:
+        c0 = L.replay(self.j.read()).cash_paise / 100
+        self.k.cash = c0 - 500.0              # the book's cash before the sale; Kite's field has not caught up
+        lg = self.afternoon(fill=fill_all(self.k))
+        buy = L.replay(self.j.read()).positions["2701-01"].earmark_paise / 100
+        self.assertGreater(buy, self.k.cash)  # without the sale money the guard would have refused
+        self.assertEqual(lg.positions["2701-01"].leg, "NONE")
+
+    def test_without_the_sale_money_the_cash_guard_still_holds(self) -> None:
+        self.k.cash = 1000.0
+        lg = self.afternoon(fill=fill_only(self.k, "BUY"))      # the sell did not fill: no sale money
+        self.assertNotEqual(lg.positions["2701-01"].leg, "NONE")
+        self.assertNotIn("BUY", [o.transaction_type for o in self.k.orders_])
+
+    def test_unsettled_shares_are_not_sold(self) -> None:
+        self.j.append("HOLDINGS_SNAPSHOT", holdings=dict(self.held),
+                      settled={"INE000000001": 12, "INE000000002": 0})
+        self.afternoon(fill=fill_all(self.k))
+        self.assertNotIn("SELL", [o.transaction_type for o in self.k.orders_])
+        self.assertIn("SELL_UNSETTLED", [r["code"] for r in self.j.read() if r["type"] == "ALERT"])
+
+
 class TestCATiming(SellHarness):
     def test_announced_split_does_not_stop_a_sell_before_its_ex_date(self) -> None:
         div = rec("INE999999999", "OTHER", "2027-01-05", "Dividend - Rs 2 Per Share")

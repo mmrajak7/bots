@@ -283,6 +283,9 @@ def place_sells(env: Any, go_ids: List[str], day: str, holdings_open: Dict[str, 
                   "placed today (next session)")
         return placed
     held = book_held(lg0)
+    snap = [r for r in env.journal.read() if r["type"] == "HOLDINGS_SNAPSHOT" and r["ts"][:10] == day
+            and "settled" in r]
+    settled = {k: int(v) for k, v in snap[-1]["settled"].items()} if snap else None
     probe_ok = False
     probes = 0
     syms = {p.position_id: live_symbol(p, ticks) for p in legs}
@@ -311,6 +314,13 @@ def place_sells(env: Any, go_ids: List[str], day: str, holdings_open: Dict[str, 
         if held.get(p.isin, 0) > int(holdings_open.get(p.isin, 0)):
             E.hold_leg(env, p, "OWNER_HOLD", f"Kite holds {holdings_open.get(p.isin, 0)} < book "
                        f"{held.get(p.isin, 0)}: no sell until the owner checks")
+            continue
+        if settled is not None and not p.test and sell_qty(p) > int(settled.get(p.isin, 0)):
+            # review L4: a book sell only from SETTLED shares (a T1 sale gets no same-day credit and risks a short
+            # delivery); the TEST lot is bought days before its sells
+            sell_session(env, p.position_id, day, "shares not settled yet")
+            env.alert("SELL_UNSETTLED", f"{p.symbol}: only {settled.get(p.isin, 0)} settled shares for a sell of "
+                      f"{sell_qty(p)}: next session")
             continue
         if int(holdings_open.get(p.isin, 0)) > held.get(p.isin, 0):
             env.alert("SHARED_SELL", f"{p.symbol}: the account holds {int(holdings_open[p.isin]) - held[p.isin]} "
