@@ -44,42 +44,76 @@ The Pi reboots daily 08:00 (`rs.py`), so the service restarts fresh each morning
 option_buy's constants (F20).
 
 ## 3. Controls (any time)
+**Always run executor commands from the LIVE folder**: `cd ~/Desktop/Scripts/bots/ETF_PI && python3 -m executor …`.
+The state folder follows the code, so a command run from another copy (e.g. `~/Desktop/BOTS/ETF_PI`, until §1c
+hides it) "succeeds" and does nothing (review A7). Suggested alias: `alias etf='cd ~/Desktop/Scripts/bots/ETF_PI && python3 -m executor'`.
+
 | want | command |
 |---|---|
-| no new entries | `python3 -m executor kill` |
-| exit everything now | `python3 -m executor flatten` |
-| undo both | `python3 -m executor resume` |
-| what is it doing | `python3 -m executor status` · `tail -f state/executor/logs/executor_$(date +%F).log` (journal: `state/executor/journal_<mode>.jsonl`, tape: `tape_YYYYMMDD.jsonl`) |
-| stop the daemon | `python3 -m executor stop` (STOPPED flag: the watchdog leaves it down). Open lots are NOT managed while stopped -- `flatten` first |
-| start it again | `python3 -m executor start` |
+| no new entries | `etf kill` — open trades keep their exits (it does NOT stop a sell already chasing) |
+| exit everything now | `etf flatten` — exits REAL trades too and blocks entries until `resume`; run `etf status` first |
+| undo both | `etf resume` |
+| what is it doing | `etf status` · `tail -f state/executor/logs/executor_$(date +%F).log` (journal: `state/executor/journal_<mode>.jsonl`, tape: `tape_YYYYMMDD.jsonl`) |
+| stop the daemon | `etf stop` (STOPPED flag). It stays stopped through the watchdog AND the 08:00 reboot (review B2): the daemon idles, sends one "IDLE" Telegram, places nothing. Open lots are NOT managed while stopped — `flatten` first |
+| start it again | `etf start` |
 | NEVER | change `mode` or stop the daemon while a lot is open (live and paper keep separate journals; a live lot in paper mode is alerted every 5 min but NOT managed) |
+| NEVER, 09:00–15:30 | `git pull` in EITHER clone (`~/Desktop/BOTS` holds the kotak_neo the daemon imports; other sessions pull it for other bots — review A5) |
+
+**Taking over by hand (review T5)** — in THIS order, never "cancel in the app first":
+1. `etf stop` (otherwise the bot re-places a sell you cancel in the app within a second);
+2. in the NEO app cancel any open `etf-` order on the strike;
+3. exit the lot in the app with product **MIS**;
+4. leave the daemon stopped for the day; `etf start` only after checking the app is flat.
+
+If the positions row and the bot disagree the bot now alerts `… NOT selling, NOT closing … Check the NEO app` every
+minute and keeps the lot managed (review B1); it closes a lot as "outside the bot" only when the order book shows a
+sell it did not place.
 
 ## 4. Monday 11-30 — 1-lot live test (owner at the app)
-Before 09:10: `python3 -m kotak_neo status` (generation for today, no latch); `curl -4 ifconfig.me` = the whitelisted IP;
-set `executor_local.yaml` to `mode: live`, `lots: 1`, `live_until: 2026-11-30` (live ends tonight unless extended);
-`sudo systemctl restart etf-executor`; `executor status` shows `reconciled: true`, `ws_ok: true`.
+The daemon has never run through a market session (installed 11-27 night). So: **paper first, then live while flat.**
 
-Probe trades (cheap near-ATM current weekly, premium Rs 80-200): `python3 -m executor probe --symbol <KITE_SYM> --confirm-real-order`.
+**08:45–09:10** (paper, unchanged `executor_local.yaml`):
+`cd ~/Desktop/BOTS && CROCODILE/venv/bin/python -m kotak_neo status` (generation for today, no latch);
+`curl -4 ifconfig.me` = the whitelisted IP; `etf status` shows a fresh heartbeat, `mode: paper`.
+
+**09:15:30** `etf status`: `reconciled: true` (reconcile starts at 09:15, not before), `ws_ok: true`, and
+`state/executor/tape_<today>.jsonl` growing. If `ws_ok` is false: check the Kite token (08:30 kite_login), the
+feed rebuilds itself once a minute (review B3).
+
+**09:15–~09:30 paper smoke**: `etf probe --symbol <KITE_SYM>` (paper: no `--confirm-real-order` needed), watch
+BOUGHT, then `etf flatten` → SOLD, journal CLOSED; `etf resume`.
+
+**~09:30–09:40, flat** (`etf status` → `active: []`): set `executor_local.yaml` to `mode: live`, `lots: 1`,
+`live_until: 2026-11-30` (live ends tonight unless extended); `sudo systemctl restart etf-executor`; re-check
+`etf status` (`mode: live`, `reconciled: true`, `ws_ok: true`). Finish the live probes before the 10:30 blackout.
+
+Probe trades (cheap near-ATM current weekly, premium Rs 80-200):
+`etf probe --symbol <KITE_SYM> --confirm-real-order [--rest-steps N]`.
+`--rest-steps N` (0-5, review T7) makes the flatten's first N sells rest 3% ABOVE the bid, so cancel → confirm →
+re-place really runs N times; without it the first sell fills at once and M5/M6/M13 test nothing.
 
 | # | test | how | pass mark |
 |---|---|---|---|
 | M0 | charges (11-27 contract note) | **CLOSED 11-28**: brokerage Rs0.01, statutory Rs12.68; Saturday funds 49,987.32 = 50,000 − 12.68 (the Friday Rs39.52 was a released intraday hold) | brokerage 0 ✔ |
 | M2 | lag after a fill | probe 1; journal ENTRY_FILL ts vs order time; positions MIS row | order book ≤ 1 s, positions ≤ 3 s |
 | M3 | place → visible by tag | journal ENTRY_SEND vs ENTRY_FILL / book | ≤ 1 s on every place |
-| M5 | no-modify step | probe 2, then `flatten` while the bid is moving | at most one ETF sell live at any read; no-order gap ≤ 1 s; exactly 65 sold |
-| M6 | deep limit accepted | `flatten` probe 3 with `exit_steps_pct` reached (watch re-prices) | no RMS / price-band reject at −2% |
+| M6b | MIS position row | log / app after probe 1's fill, and again after its exit | product reads exactly `MIS`; net quantity **65** within ~3 s of the fill and **0** after the exit (B1/T5: every hand-exit and restart case depends on this row) |
+| M5 | no-modify step | probe 2 with `--rest-steps 3`, then `flatten` | at most one ETF sell live at any read; 3 cancels then a fill; exactly 65 sold |
+| M13 | cancel latency / re-price steps | journal EXIT_STEP notes during M5 | re-prices count 1, 2, 3; each cancel confirmed ≤ 2 s; no repeated cancel POSTs (B6) |
+| M6 | deep limit accepted | probe 3 with `--rest-steps 0` while the bid drifts, or a real exit reaching −1%/−2% | no RMS / price-band reject (if one: the bot backs off 5 s and alerts the reason, X-K1) |
 | M7 | coexistence | BTST stays rehearsal; check BTST logs at each ETF fill | no BTST kill / EXTRA LOT alert |
 | M8 | restart mid-position | probe 4, then `sudo systemctl kill -s KILL etf-executor` | back ≤ 10 s, `reconciled`, position still managed, no 2nd buy/sell |
-| M9 | EOD | a real signal or probe after 14:50 | flat by 15:16 (eod 15:15); no `etf-` order live at 15:20; no broker square-off line in the app |
-| M6b | MIS position row label | `executor status` / log after a probe fill | the positions row's product reads exactly `MIS` (the account cap and the carry check depend on it, review M6) |
-| M13 | cancel latency / re-price steps | journal EXIT_STEP notes during a resting exit | re-prices count 1, 2, 3... (review H2 fix) |
+| M9 | EOD | a probe between **14:45 and 14:50** (entries are refused 14:15–14:45 and from 14:51) on **next week's** contract | flat by 15:16 (eod 15:15); no `etf-` order live after 15:19:30 (`stop_placing`, A12); no broker square-off line in the app |
 | M11 | 401 on place | count `UNCLEAR` in the log; kotak_neo alert `orders_auth` fires on 2 in 5 min (K1) | 0, or each settled within the grace; no `orders_auth` |
-| M12 | MIS on NEXT week's contract | probe on next week's ATM (12-01 is expiry: every 12-01 entry uses next week) | accepted and filled; if refused: owner decides NRML (+skip_foreign_strikes) for 12-01 |
+| M12 | MIS on NEXT week's contract | probe on next week's ATM (12-01 is expiry: every 12-01 entry uses next week) | accepted and filled; if refused: **NO-GO for 12-01** (ETF is MIS-only in code since A7'; NRML would be a code change + review) |
+| lat | trigger → fill | journal EXIT_FILL `trigger_to_fill_s` on every exit | record it; > 10 s on a stop-type exit = finding for the T3 change (first stop sell at bid −1%) |
 | real | real 10M signals | they flow by themselves | each: BOUGHT/SOLD Telegram, ladder logs, journal CLOSED, P&L = fills |
 
 ## 5. Go / no-go for 12-01 (owner)
-GO only if: M0 brokerage 0 · M2/M3/M5/M8/M9/M12 pass · zero orphan lots at 15:30 (`executor status`, app) ·
-no unexplained `etf-` order. Then `live_until: 2026-12-31` (re-arm monthly) and the lot ceiling stays 1 lot.
+GO only if: M0 brokerage 0 · M2/M3/M5/M6b/M8/M9/M12/M13 pass · zero orphan lots at 15:30 (`etf status`, app) ·
+no unexplained `etf-` order · no NEO 429s that stalled an exit. Then `live_until: 2026-12-31` (re-arm monthly)
+and the lot ceiling stays 1 lot. Judge the first weeks on slippage and latency, not P&L (review T2: the paper record
+books TPs past the target; the live edge's sign is unknown).
 
 ## 6. Rollback
 `python3 -m executor flatten` → wait flat → `sudo systemctl disable --now etf-executor` → remove the watchdog
