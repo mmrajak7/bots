@@ -709,3 +709,49 @@ def test_a_good_morning_does_not_alert(home):
                             _sleep=lambda x: None)
     assert res.outcome == S.NOOP
     assert 'no_session_today' not in [a['kind'] for a in _alerts(home)]
+
+
+# -- review 2026-11-28: K3 clock before the TOTP, K13 measure's failed login ------
+
+def test_an_unsynced_clock_sends_nothing_and_says_clock(monkeypatch):
+    monkeypatch.setattr(S, 'clock_synced', lambda: False)
+    h = _HTTP()
+    with pytest.raises(S.LoginFailed) as ei:
+        S._network_login(CREDS, CFG, http=h)
+    assert ei.value.kind == 'clock' and h.calls == []       # no TOTP went to NEO
+
+
+@pytest.mark.parametrize('synced', [True, None])
+def test_a_synced_or_unreadable_clock_does_not_block(monkeypatch, synced):
+    monkeypatch.setattr(S, 'clock_synced', lambda: synced)
+    h = _HTTP(_R(200, {'data': {'token': 'v', 'sid': 's'}}),
+              _R(200, {'data': {'token': 'T', 'sid': 'S', 'baseUrl': 'https://x.kotaksecurities.com',
+                                'hsServerId': 'H'}}))
+    assert S._network_login(CREDS, CFG, http=h)['token'] == 'T'
+
+
+def test_clock_failures_never_latch_the_day(home, fast):
+    publish(1)
+    lg = Login('clock', 'clock', 'clock', 'clock')
+    for _ in range(4):
+        res = R(1, _verify=verify_by_gen(1), _login=lg)
+        assert res.outcome == S.FAILED
+    st = S.read_state()
+    assert not st['latched'] and st['consecutive_refusals'] == 0 and st['logins_today'] == 0
+
+
+def test_negative_control_refusals_still_latch(home, fast):
+    publish(1)
+    lg = Login('refused', 'refused', 'refused')
+    outs = [R(1, _verify=verify_by_gen(1), _login=lg).outcome for _ in range(3)]
+    assert outs[-1] == S.BLOCKED and S.read_state()['latched']
+
+
+def test_measure_second_login_books_a_failed_login_b(home):
+    publish(1)
+    out = S.measure_second_login(_verify=lambda s: S.ALIVE, _login=Login('refused'),
+                                 _creds=fake_creds, _sleep=lambda x: None)
+    st = S.read_state()
+    assert out['verdict'].startswith('REFUSED: login B failed (refused)')
+    assert st['last_attempt']['outcome'] == 'failed:refused'   # was stuck at in_flight
+    assert st['consecutive_refusals'] == 1

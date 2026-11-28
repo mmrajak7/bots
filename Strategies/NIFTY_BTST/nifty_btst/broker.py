@@ -26,11 +26,12 @@ import logging
 import os
 import re
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from .journal import parse_tag
 from .neo_client import NeoAuthError, NeoRejected, NeoTrader, NeoUnavailable, NeoUnclear
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,13 @@ def parse_neo_time(s: str, tz: Any) -> Optional[datetime]:
     return None
 
 
+def _prod(r: Dict[str, Any]) -> str:
+    """The row's product, normalised ('nrml ' -> 'NRML'). The spelling NEO
+    uses on order and trade rows is not yet measured (review H2, 2026-11-28);
+    every product comparison in this package goes through this one reading."""
+    return str(r.get('prod') or '').strip().upper()
+
+
 @dataclass(frozen=True)
 class OrderView:
     order_no: str
@@ -141,7 +149,7 @@ class OrderView:
                    filled=_i(r.get('fldQty')), avg_price=_f(r.get('avgPrc')),
                    price=_f(r.get('prc')), rej_reason='' if rej == '--' else rej,
                    tag=str(r.get('GuiOrdId') or ''), placed_at=str(r.get('ordDtTm') or ''),
-                   product=str(r.get('prod') or ''), raw=r)
+                   product=_prod(r), raw=r)
 
 
 class RowError(ValueError):
@@ -184,7 +192,7 @@ class PositionView:
                 raise RowError('qty_unit is lots but the row has no lotSz')
             net *= lot
         return cls(symbol=str(r.get('trdSym') or r.get('sym') or ''),
-                   product=str(r.get('prod') or ''), net_qty=net, raw=r, lot_size=lot)
+                   product=_prod(r), net_qty=net, raw=r, lot_size=lot)
 
 
 @dataclass(frozen=True)
@@ -273,7 +281,12 @@ def in_scope(o: 'OrderView', product: str) -> bool:
     IN scope: our own tags, and every row with NO tag or a tag no bot uses —
     that is a human in the NEO app, and the owner's manual sale must keep
     blocking a double sell (an unknown tag fails CLOSED, never open)."""
-    if o.product and product and o.product != product:
+    if o.tag and parse_tag(o.tag) is not None:
+        # OUR tag (GuiOrdId is echoed, measured): always ours, whatever the
+        # product field says -- a spelling we did not foresee must never
+        # make this book blind to its own order (review H2, 2026-11-28)
+        return True
+    if o.product and product and o.product != product.strip().upper():
         return False
     if o.tag and OTHER_BOT_TAG_RE.match(o.tag):
         return False
@@ -329,6 +342,41 @@ class ScopedBroker(Broker):
 
     def position_row(self, symbol: str, product: str) -> Optional['PositionView']:
         return self._inner.position_row(symbol, product)
+
+
+def per_order(fills: 'Iterable[OrderView]') -> List[OrderView]:
+    """NEO's trade book has one row PER FILL (`rptTp "fill"`, `fldQty` = that
+    fill's shares, `qty` 0 -- measured 2026-11-27). Every reader in this
+    package wants one row per ORDER (the fake broker's shape): the summed
+    fill at the size-weighted price, the order's earliest time. A 40 + 25
+    fill read as its first row booked 40 of 65 (review M1, 2026-11-28).
+    A row without an order number is kept as it is."""
+    out: List[OrderView] = []
+    by_no: Dict[str, int] = {}
+    for f in fills:
+        if not f.order_no:
+            out.append(f)
+            continue
+        i = by_no.get(f.order_no)
+        if i is None:
+            by_no[f.order_no] = len(out)
+            out.append(f)
+            continue
+        a = out[i]
+        n = a.filled + f.filled
+        px = ((a.avg_price * a.filled + f.avg_price * f.filled) / n) if n > 0 else 0.0
+        out[i] = replace(a, filled=n, avg_price=round(px, 4), qty=max(a.qty, f.qty),
+                         tag=a.tag or f.tag, product=a.product or f.product,
+                         placed_at=min(a.placed_at, f.placed_at, key=_time_key))
+    return out
+
+
+def _time_key(stamp: str) -> Any:
+    # ordDtTm is '27-Nov-2026 13:45:19'; an unparsable stamp sorts last
+    try:
+        return (0, datetime.strptime(stamp, '%d-%b-%Y %H:%M:%S'))
+    except (TypeError, ValueError):
+        return (1, datetime.max)
 
 
 # ------------------------------------------------------------- real NEO
@@ -391,7 +439,7 @@ class NeoBroker(Broker):
             try:
                 out.append(PositionView.from_neo(r, self.qty_unit))
             except RowError as exc:
-                prod = str(r.get('prod') or '')
+                prod = _prod(r)
                 if prod and prod != self.product:
                     # another product's row with a placeholder value must not
                     # make OUR report unavailable (R3-21)
@@ -418,7 +466,7 @@ class NeoBroker(Broker):
         return out
 
     def trades(self) -> List[OrderView]:
-        return [OrderView.from_neo(r) for r in self._read(self.t.trades)]
+        return per_order(OrderView.from_neo(r) for r in self._read(self.t.trades))
 
     def available_funds(self) -> Optional[float]:
         data = self._read(self.t.limits)

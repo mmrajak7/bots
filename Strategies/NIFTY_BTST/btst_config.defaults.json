@@ -60,6 +60,7 @@
     "exit_retry_slow_sec": 60,
     "unknown_recheck_sec": 3,
     "unknown_grace_sec": 600,
+    "exit_unknown_grace_sec": 90,
     "kill_drawdown_rs": 75000,
     "max_premium_rs": 15000,
     "max_entry_orders_per_day": 10,

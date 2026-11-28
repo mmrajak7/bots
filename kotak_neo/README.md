@@ -59,6 +59,7 @@ CROCODILE/venv/bin/python -m kotak_neo measure-second-login          # after hou
 | `ERROR ... upgrade this clone` | a session written by a newer schema | `git pull` the clone that printed it; never delete the session |
 | a bot says `needs_human` on an exit | the exit chase could not settle an order from the book | **exit in the NEO app**, then tell the bot |
 | alert `no_session_today` | a morning cron (08:40 / 08:55) ended without today's session (NEO down, cooldown, login failed, latched...) | `status`; if 08:55 also alerts, `refresh --reason` once NEO answers, or trade manually. Refusal/failure streaks restart each day; a latch does not |
+| `login_failed` / `refresh_log` says `clock` | the Pi's clock was not NTP-synchronised (after the 08:00 reboot), so no TOTP was sent; never counts toward the cap or the 3-refusal latch | `timedatectl` (wait for `System clock synchronized: yes`), then `refresh --reason clock`. Off switch: `require_clock_sync: false` in `~/.kotak_neo/config.json` |
 | `HOST_REFUSED` | a login was asked for on a machine without `LOGIN_HOST` | expected on the laptop; on the Pi, recreate the file |
 | alert `static_ip` | NEO refused an order for the IP (stCode 100008 / "session ip"), or the morning check saw the public IPv4 change | **manage open trades MANUALLY in the NEO app**; update the whitelist on the NEO dashboard (one change per 7 days). Backup plan until a static IP exists. The expected IP lives only in the Pi's `~/.kotak_neo/config.json` (`expected_public_ipv4`). |
 

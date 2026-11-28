@@ -32,7 +32,8 @@ KNOWN_NEO_KEYS = frozenset((
     'login_timeout_sec', 'poll_seconds', 'entry_cap_pct', 'entry_timeout_sec',
     'max_entry_attempts', 'exit_chase_sec', 'open_settle_sec',
     'open_settle_max_abs', 'open_settle_max_pct', 'exit_chase_fast_max', 'exit_retry_slow_sec',
-    'unknown_recheck_sec', 'unknown_grace_sec', 'kill_drawdown_rs', 'max_premium_rs',
+    'unknown_recheck_sec', 'unknown_grace_sec', 'exit_unknown_grace_sec', 'kill_drawdown_rs',
+    'max_premium_rs',
     'max_entry_orders_per_day', 'max_orders_per_day', 'funds_margin_pct', 'limits_net_field',
     'reconcile_sec', 'order_poll_sec', 'expiry_backstop_time', 'sell_refused_alert_sec',
     'exit_defer_alert_sec', 'brokerage_per_order', 'scrip_master_max_age_hours',
@@ -73,6 +74,7 @@ class NeoConfig:
     exit_retry_slow_sec: float
     unknown_recheck_sec: float
     unknown_grace_sec: float
+    exit_unknown_grace_sec: float
     kill_drawdown_rs: float
     max_premium_rs: float
     max_entry_orders_per_day: int
@@ -211,6 +213,7 @@ def build_neo(raw: Any) -> NeoConfig:
         exit_retry_slow_sec=_pos(raw, 'exit_retry_slow_sec'),
         unknown_recheck_sec=_pos(raw, 'unknown_recheck_sec'),
         unknown_grace_sec=_pos(raw, 'unknown_grace_sec'),
+        exit_unknown_grace_sec=_pos(raw, 'exit_unknown_grace_sec'),
         kill_drawdown_rs=_pos(raw, 'kill_drawdown_rs'),
         max_premium_rs=_pos(raw, 'max_premium_rs'),
         max_entry_orders_per_day=_int(raw, 'max_entry_orders_per_day'),
@@ -261,6 +264,11 @@ def build_neo(raw: Any) -> NeoConfig:
         raise ConfigError('neo.exit_retry_slow_sec must be >= exit_chase_sec')
     if cfg.unknown_grace_sec < cfg.unknown_recheck_sec:
         raise ConfigError('neo.unknown_grace_sec must be >= unknown_recheck_sec')
+    if cfg.exit_unknown_grace_sec < max(cfg.unknown_recheck_sec, cfg.positions_lag_sec):
+        # inside the positions lag a filled SELL can still read as held: a
+        # re-send then would sell twice
+        raise ConfigError('neo.exit_unknown_grace_sec must be >= unknown_recheck_sec and '
+                          '>= positions_lag_sec')
     if cfg.position_qty_unit not in QTY_UNITS:
         raise ConfigError('neo.position_qty_unit must be one of %s' % (QTY_UNITS,))
     if cfg.poll_seconds < 1:

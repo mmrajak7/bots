@@ -102,6 +102,10 @@ class Store:
         path = self.dir / ('events_%s.jsonl' % when.strftime('%Y%m%d'))
         with open(path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(line, sort_keys=True, default=str) + '\n')
+            # events are the incident record: a power cut (the Pi showed
+            # under-voltage) must not lose the last ones (review L2, 2026-11-28)
+            f.flush()
+            os.fsync(f.fileno())
 
     def heartbeat(self, when: datetime, **fields: Any) -> None:
         hb = {'t': when.isoformat(timespec='seconds')}

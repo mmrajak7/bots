@@ -162,6 +162,13 @@ to send again.
 - A send with no clear answer stays **UNKNOWN** until the broker shows it (by tag, then by
   symbol/side/qty/time), or until `neo.unknown_grace_sec` (600 s) has passed with at least two
   positively valid reads AND positions agree nothing happened. Alerts every minute meanwhile.
+  An unclear **SELL** (a stop in a falling market) waits its own `neo.exit_unknown_grace_sec`
+  (90 s, never below `positions_lag_sec`) and needs THREE valid reads (review H1, 2026-11-28):
+  NEO shows a placed order at once and echoes our tag (measured 11-27).
+- NEO's trade book has one row per FILL; the broker layer sums them into one row per order
+  (size-weighted price) before anything reads them (review M1). The `prod` field is read
+  upper-cased and trimmed, and a row carrying OUR tag is in scope whatever its product says
+  (review H2): the real order/trade-row spelling is measured on 30 Nov (B1c).
 - An order we hold a NUMBER for is never dropped on its day. The next day it is resolved against
   positions and the trade book: a fill the book never showed is **adopted** (booked at the limit,
   price flagged, the leg's own day as entry date); a flat broker means the DAY order died.
@@ -332,7 +339,7 @@ overlay `btst_config.json` is not read by live at all — rule keys such as `nex
 `lots` placed in the LIVE overlay apply to live only). Keys: `credentials_file` (relative to `BOTS/`),
 `poll_seconds` 3, `entry_cap_pct` 5, `entry_timeout_sec` 5, `max_entry_attempts` 5,
 `exit_chase_sec` 3, `exit_chase_fast_max` 10, `exit_retry_slow_sec` 60, `unknown_recheck_sec` 3,
-`unknown_grace_sec` 600, `kill_drawdown_rs` 75000, `max_premium_rs` 15000,
+`unknown_grace_sec` 600, `exit_unknown_grace_sec` 90, `kill_drawdown_rs` 75000, `max_premium_rs` 15000,
 `max_entry_orders_per_day` 10, `max_orders_per_day` 100, `funds_margin_pct` 10,
 `limits_net_field` "Net", `reconcile_sec` 300, `order_poll_sec` 1, `expiry_backstop_time`
 09:30:00, `sell_refused_alert_sec` 60, `exit_defer_alert_sec` 60, `brokerage_per_order` 0 (NEO API

@@ -29,8 +29,9 @@ from .notify import Notifier
 logger = logging.getLogger(__name__)
 
 QUEUE_MAX = 200
-POST_RETRIES = 3            # attempts per message, RETRY_WAIT_SEC apart
-RETRY_WAIT_SEC = 1.0
+POST_RETRIES = 6            # attempts per message on the worker, backing off
+RETRY_WAIT_SEC = 1.0        # first wait; doubles per attempt (1+2+4+8+16 s), capped
+RETRY_WAIT_MAX_SEC = 30.0   # also the cap on Telegram's own 429 `retry_after`
 SYNC_TIMEOUT_SEC = 3.0      # the dead-worker fallback: short, and after any order
 
 
@@ -94,12 +95,20 @@ class AsyncNotifier(Notifier):
                     return True
                 logger.error('Telegram %s (attempt %d/%d): %s | message: %s', r.status_code,
                              attempt, retries, r.text[:300], msg[:300])
+                if 400 <= r.status_code < 500 and r.status_code != 429:
+                    break                   # a bad token / chat: retrying cannot help
+                wait = _retry_after(r) if r.status_code == 429 else None
             except Exception as exc:                        # noqa: BLE001
                 logger.error('Telegram send failed (attempt %d/%d): %s | message: %s',
                              attempt, retries, type(exc).__name__, msg[:300])
+                wait = None
             if attempt < retries:
-                time.sleep(RETRY_WAIT_SEC)
+                # back off (review L1, 2026-11-28): three tries 1 s apart lost a
+                # one-shot KILL alert to a 429 or a few seconds' outage
+                time.sleep(min(RETRY_WAIT_MAX_SEC,
+                               wait if wait is not None else RETRY_WAIT_SEC * 2 ** (attempt - 1)))
         self.failed += 1
+        logger.error('Telegram GAVE UP after %d attempts | message: %s', retries, msg[:300])
         return False
 
     def _run(self) -> None:
@@ -128,3 +137,11 @@ class AsyncNotifier(Notifier):
             if self._worker is None or not self._worker.is_alive():
                 return
             time.sleep(0.02)
+
+
+def _retry_after(r: Any) -> Optional[float]:
+    """Telegram's 429 says how long to wait: `parameters.retry_after` (s)."""
+    try:
+        return float(r.json()['parameters']['retry_after'])
+    except Exception:                                       # noqa: BLE001
+        return None

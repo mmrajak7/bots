@@ -998,11 +998,18 @@ class LiveEngine(Engine):
         leg['valid_reads'] = min(3, int(leg.get('valid_reads', 0)) + 1)   # capped: no save per tick (R4-21)
         leg.setdefault('unknown_first_at', _iso(now))
         age = (now - datetime.fromisoformat(leg['sent_at'])).total_seconds()
-        if age < self.neo.unknown_grace_sec or leg['valid_reads'] < 2:
+        # an unclear SELL is usually a stop in a falling market: it gets its
+        # own, shorter wait (review H1, 2026-11-28). Safe because NEO shows a
+        # placed order in the book at once and echoes our tag (measured
+        # 2026-11-27), the wait is past `positions_lag_sec`, and an exit needs
+        # 3 valid reads and positions agreeing before it may be re-sent.
+        exit_leg = leg['kind'] == 'EXIT'
+        grace = self.neo.exit_unknown_grace_sec if exit_leg else self.neo.unknown_grace_sec
+        if age < grace or leg['valid_reads'] < (3 if exit_leg else 2):
             self._throttled('unknown_' + leg['tag'], now, 60,
                             '#%d: %s is UNKNOWN (sent %.0fs ago, not in the book). Nothing is '
                             're-sent for %.0fs. Check the app.' % (p['id'], leg['tag'], age,
-                                                                    self.neo.unknown_grace_sec))
+                                                                    grace))
             return
         verdict = self._corroborate(p, leg, now)
         if verdict == 'absent':

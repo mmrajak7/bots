@@ -54,6 +54,8 @@ import logging
 import os
 import socket
 import struct
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -93,6 +95,7 @@ DEFAULTS = {
     'cap_cooldown_sec': 1800.0,     # what the cap imposes; then ONE login per period
     'network_backoff_max_sec': 300.0,
     'max_refusals': 3,              # consecutive refused logins (not network) -> latch
+    'require_clock_sync': True,     # Linux: no TOTP until timedatectl says synced (K3)
     # The public IPv4 whitelisted on the NEO dashboard. Set ONLY in the Pi's
     # ~/.kotak_neo/config.json (never in git). Empty = the morning check is off.
     'expected_public_ipv4': '',
@@ -138,8 +141,10 @@ class CredentialsError(ValueError):
 
 
 class LoginFailed(RuntimeError):
-    """kind: 'network' (never reached NEO), 'refused' (NEO said no, cause not
-    proven), 'mpin' (NEO named the MPIN), 'credentials' (our file/secret is bad)."""
+    """kind: 'network' (never reached NEO), 'clock' (the system clock is not
+    NTP-synchronised, so the TOTP would be wrong: nothing sent), 'refused' (NEO
+    said no, cause not proven), 'mpin' (NEO named the MPIN), 'credentials'
+    (our file/secret is bad)."""
 
     def __init__(self, kind: str, msg: str):
         super().__init__(msg)
@@ -562,6 +567,24 @@ def _json(r: Any) -> Optional[Dict[str, Any]]:
 _MPIN_WORDS = ('mpin', ' pin')
 
 
+def _clock_synced() -> Optional[bool]:
+    """True/False from systemd's `NTPSynchronized` on Linux (the Pi), None
+    where it cannot be read (the laptop): None never blocks a login."""
+    if not sys.platform.startswith('linux'):
+        return None
+    try:
+        out = subprocess.run(['timedatectl', 'show', '-p', 'NTPSynchronized', '--value'],
+                             capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    v = (out.stdout or '').strip().lower()
+    return True if v == 'yes' else False if v == 'no' else None
+
+
+#: replaced in tests
+clock_synced: Callable[[], Optional[bool]] = _clock_synced
+
+
 def _network_login(creds: Dict[str, str], cfg: Dict[str, Any], http: Any = None) -> Dict[str, Any]:
     """TOTP login then MPIN validate. Returns {token, sid, base_url, server_id}.
     Raises LoginFailed. Messages carry status, stCode and a REDACTED text only."""
@@ -592,6 +615,12 @@ def _network_login(creds: Dict[str, str], cfg: Dict[str, Any], http: Any = None)
         raise LoginFailed(kind, 'step %d: HTTP %s stCode %s %s'
                           % (step, r.status_code, stcode(d), msg))
 
+    if cfg.get('require_clock_sync', True) and clock_synced() is False:
+        # the Pi reboots at 08:00 and has no RTC: a TOTP from an unsynced clock
+        # is refused, and three refusals latch the day (review K3, 2026-11-28).
+        # Nothing is sent, so it never counts toward the cap or the latch.
+        raise LoginFailed('clock', 'system clock not NTP-synchronised (timedatectl); '
+                                   'the TOTP would be refused -- nothing sent')
     s1 = call(LOGIN_PATH, hdr, {'mobileNumber': creds['mobile_number'], 'ucc': creds['ucc'],
                                 'totp': totp_now(creds['totp_secret'])}, 1)
     if not s1.get('token') or not s1.get('sid'):
@@ -746,7 +775,7 @@ def _on_failure(st: Dict[str, Any], cur: Optional[Session], kind: str, msg: str,
                 cfg: Dict[str, Any], now: datetime, t: float) -> Result:
     st['consecutive_failures'] = int(st.get('consecutive_failures') or 0) + 1
     st['last_attempt']['outcome'] = 'failed:%s' % kind
-    if kind == 'network':
+    if kind in ('network', 'clock'):
         # Never reached NEO: it does not count toward the daily cap.
         st['logins_today'] = max(0, int(st['logins_today']) - 1)
     else:
@@ -1008,7 +1037,16 @@ def measure_second_login(*, _verify: Optional[Callable] = None, _login: Optional
         st['last_attempt'] = {'at': now.isoformat(timespec='seconds'),
                               'requester': 'measure-second-login', 'outcome': 'in_flight'}
         _write_state(st)
-        fresh = login_fn(creds, cfg)                  # session B
+        try:
+            fresh = login_fn(creds, cfg)              # session B
+        except LoginFailed as exc:
+            # the same bookkeeping as any login (review K13, 2026-11-28): a
+            # stuck `in_flight` and uncounted refusals would hide the failure
+            _on_failure(st, a, exc.kind, str(exc), cfg, now, time.time())
+            out['verdict'] = 'REFUSED: login B failed (%s): %s' % (exc.kind, exc)
+            _log('measure-second-login', 'FAILED', out['verdict'], now, None, None)
+            _flush_alerts()
+            return out
         st['last_attempt']['outcome'] = 'ok'
         _write_state(st)
         b = Session(0, now.strftime('%Y-%m-%d'), now.isoformat(timespec='seconds'),

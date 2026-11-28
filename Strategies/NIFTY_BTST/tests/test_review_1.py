@@ -57,14 +57,16 @@ def test_neo01_late_visible_exit_never_doubles_and_never_goes_short(cfg, tmp_pat
 
 
 def test_neo01_a_tag_written_off_that_later_appears_trips_the_kill_loud(cfg, tmp_path, market):
-    rig = marked(cfg, tmp_path, market, neo_overrides={'unknown_grace_sec': 60})
+    # an EXIT leg: its own grace (H1, 2026-11-28) and 3 valid reads
+    rig = marked(cfg, tmp_path, market, neo_overrides={'exit_unknown_grace_sec': 60})
     holding(rig)
     rig.broker.visibility_lag_sec = 600.0                           # beyond the grace
     rig.broker.positions_lag_sec = 600.0
     rig.broker.place_faults = ['timeout_reached']
     rig.market.set(CE_MON, 70.0, bid=69.8, ask=70.2)
     rig.go(T(MON, '11:00:00'))
-    rig.go(T(MON, '11:00:30'))
+    rig.go(T(MON, '11:00:20'))
+    rig.go(T(MON, '11:00:40'))
     rig.go(T(MON, '11:01:01'))                                      # written off, re-sent
     assert any(ln['ev'] == 'NOT_PLACED' for ln in rig.journal.lines())
     assert len(sells(rig)) == 2
