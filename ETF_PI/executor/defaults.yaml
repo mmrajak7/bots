@@ -34,7 +34,9 @@ positions_lag_s: 10         # F6: account net may trail our own fill this long
 reject_backoff_s: 5         # F15
 exit_fault_s: 60            # F22: an exit chasing longer than this is a fault
 trouble_alert_after: 3      # X12: consecutive troubled steps before an alert
-stop_placing: "15:29:50"    # F16: no order placed after this; open lots -> CARRY
+stop_placing: "15:19:30"    # F16: no order placed after this; open lots -> CARRY. Review A12 (11-28):
+                            # BEFORE the broker's MIS square-off (15:20 earliest), never a sell
+                            # on a lot the broker already sold. Must be after eod_time.
 carry_resume: "09:15:05"    # F16: a carried lot is exited from this time
 neo_timeout_s: 3            # F10
 neo_refresh_wait_s: 2       # K8: a dead-session read waits <= this for ANOTHER bot's refresh (<= exit_step_s)

@@ -38,7 +38,8 @@ class Rig:
     def __init__(self, tmp, **over):
         self.tmp = tmp
         self.now = dt.datetime(2026, 11, 30, 10, 0, 0, tzinfo=IST)
-        cfg = dict(mode='paper')
+        # the rig's paper EOD is 15:25 (eod_fn), so orders may go out until the old 15:29:50
+        cfg = dict(mode='paper', stop_placing='15:29:50')
         cfg.update(over)
         self.cfg = C.load(local_path=str(tmp / 'none.yaml'), override=cfg)
         self.state = str(tmp / 'state')

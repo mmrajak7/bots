@@ -88,3 +88,23 @@ def test_xk2_a_book_listing_every_order_twice_never_sells_short(rig):
     rig.step(n=10)                                    # Rig.check(): never short
     assert p['state'] == 'CLOSED' and rig.fake.net(p['symbol']) == 0
     assert sum(int(o['qty']) for o in rig.etf_orders('S')) == 65
+
+
+def test_t7_a_probe_rests_its_first_sells_then_exits_through_the_ladder(rig):
+    """Review T7: `probe --rest-steps 3` -> the flatten's first 3 sells rest 3% above
+    the bid, so cancel -> confirm -> re-place runs 3 times for real; then the normal
+    ladder sells. Never two sells working, never short (Rig.check)."""
+    p = open_one(rig, key='PROBE_NIFTYX_20261130_100000', probe_rest_steps=3)
+    assert p['probe_rest_steps'] == 3
+    open(os.path.join(rig.state, 'FLATTEN'), 'w').close()
+    rig.step(n=60)                                    # 30 s
+    sells = rig.etf_orders('S')
+    assert p['state'] == 'CLOSED' and rig.fake.net(p['symbol']) == 0
+    assert len(sells) == 4 and [o['ordSt'] for o in sells[:3]] == ['cancelled'] * 3
+    assert all(float(o['prc']) > 99.95 for o in sells[:3])
+    assert float(sells[3]['prc']) <= 99.95
+
+
+def test_t7_only_a_probe_key_may_rest_sells(rig):
+    p = open_one(rig, probe_rest_steps=3)             # an option_buy signal key
+    assert p['probe_rest_steps'] == 0

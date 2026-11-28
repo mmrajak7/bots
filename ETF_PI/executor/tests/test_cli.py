@@ -38,3 +38,17 @@ def test_b2_a_signal_while_stopped_exits_without_starting(tmp_path):
     def nap(s):
         stop['flag'] = True                           # systemctl stop / reboot
     assert M.wait_while_stopped(str(tmp_path), stop, alert=lambda m: None, sleep=nap) is False
+
+
+def test_a12_stop_placing_defaults_before_the_broker_square_off(tmp_path):
+    import datetime as dt
+    from executor import config as C
+    cfg = C.load(local_path=str(tmp_path / 'none.yaml'))
+    assert cfg['stop_placing_time'] < dt.time(15, 20) and cfg['stop_placing_time'] > cfg['eod_time_t']
+
+
+def test_a12_stop_placing_before_eod_is_refused(tmp_path):
+    import pytest
+    from executor import config as C
+    with pytest.raises(C.ConfigError, match='stop_placing'):
+        C.load(local_path=str(tmp_path / 'none.yaml'), override={'stop_placing': '15:10:00'})
