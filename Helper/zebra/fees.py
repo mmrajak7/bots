@@ -195,7 +195,10 @@ def round_trip_for_trade(t: dict, exit_debit: Optional[float]) -> dict:
     # (measured zero, 2026-11-27 contract note) and the entry is the FILL, not
     # the quoted ask. Every other record keeps the Kite rate it was modelled on.
     naked = str(t.get('structure') or '') == 'naked_long'
-    rates = (dict(cfg.FEE_RATES, brokerage_per_order=cfg.NAKED_BROKERAGE_PER_ORDER)
+    # STT too: NEO's options contract note charges 0.15% of the sell premium
+    # (2026-11-28); the Kite paper model is left as it was for the test.
+    rates = (dict(cfg.FEE_RATES, brokerage_per_order=cfg.NAKED_BROKERAGE_PER_ORDER,
+                  stt_sell_pct=cfg.NAKED_STT_SELL_PCT)
              if naked else cfg.FEE_RATES)
     # A zebra back-ratio holds TWO longs per short; BCS holds one of each.
     mult = 2 if str(t.get('structure') or 'zebra') == 'zebra' else 1

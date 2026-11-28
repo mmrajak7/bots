@@ -204,7 +204,7 @@ def test_documented_invalid_session_body_relogs_in_on_any_http_code(http):
     with pytest.raises(NeoUnclear, match='session rejected'):
         r.place(symbol='S', token='1', side='S', qty=65, price='1.00', tag='t',
                 segment='nse_fo', product='NRML')
-    assert r.relogins == 3 and r.ready
+    assert r.relogins == 2 and r.ready          # an order call never logs in (R2, 11-28)
 
 
 def test_transient_1005_on_a_mutation_is_unclear_not_rejected(http):
@@ -320,18 +320,52 @@ def test_place_failures_are_classified_and_never_retried(http, resp, exc, match)
     assert len(http.calls) == before + 1         # exactly one wire call
 
 
-def test_place_403_relogins_but_stays_unclear(http):
+def test_place_403_stays_unclear_and_never_logs_in(http):
+    """Review R2 (2026-11-28): a re-login on order evidence did not cure the
+    11-27 401 and costs one TOTP login per refused order. The call stays
+    UNCLEAR; the next READ decides (and logs in once if it is dead too)."""
     t = reader(http, trader=True)
-    http.script[nc.PATH_PLACE] = [R(403, {'emsg': 'Invalid session'})]
-    with pytest.raises(NeoUnclear, match='re-established'):
-        t.place(symbol='s', token='1', side='B', qty=65, price='1.00', tag='t',
+    logins = lambda: sum(1 for c in http.calls if c[1].endswith(nc.LOGIN_PATH))
+    n0 = logins()
+    for _ in range(3):
+        http.script[nc.PATH_PLACE] = [R(403, {'emsg': 'Invalid session'})]
+        with pytest.raises(NeoUnclear, match='not re-logged'):
+            t.place(symbol='s', token='1', side='B', qty=65, price='1.00', tag='t',
+                    segment='nse_fo', product='NRML')
+    assert logins() == n0 and t.relogins == 0 and t.ready
+    assert t.mutation_auth_rejections == 3
+    # the next read finds the session really dead: it logs in ONCE
+    http.script[nc.PATH_ORDER_BOOK] = [R(403, {}), R(200, {'stat': 'Ok', 'data': []})]
+    assert t.order_book() == [] and t.relogins == 1
+
+
+@pytest.mark.parametrize('body,status', [
+    ({'stat': 'Not_Ok', 'stCode': 100008, 'errMsg': 'Static IP not registered'}, 200),
+    ({'stat': 'Not_Ok', 'stCode': 100008, 'errMsg': 'x'}, 401),
+    ({'stat': 'Not_Ok', 'errMsg': 'Request IP is not in whitelist'}, 403),
+])
+def test_an_ip_whitelist_refusal_never_logs_in(http, body, status):
+    """Review K5/R2: no login can fix a wrong public IP."""
+    t = reader(http, trader=True)
+    logins = lambda: sum(1 for c in http.calls if c[1].endswith(nc.LOGIN_PATH))
+    n0 = logins()
+    http.script[nc.PATH_ORDER_BOOK] = [R(status, body)]
+    with pytest.raises(NeoUnavailable, match='whitelisted'):
+        t.order_book()
+    http.script[nc.PATH_PLACE] = [R(status, body)]
+    with pytest.raises(NeoRejected):                     # documented: NOT placed
+        t.place(symbol='s', token='1', side='S', qty=65, price='1.00', tag='t',
                 segment='nse_fo', product='NRML')
-    assert t.relogins == 1 and t.ready
-    http.script[nc.PATH_PLACE] = [R(403, {})]
-    http.script[nc.LOGIN_PATH] = R(401, {'message': 'Invalid TOTP'})
-    with pytest.raises(NeoAuthError, match='re-login failed'):
-        t.place(symbol='s', token='1', side='B', qty=65, price='1.00', tag='t',
-                segment='nse_fo', product='NRML')
+    assert logins() == n0 and t.relogins == 0
+
+
+def test_negative_control_a_session_ip_refusal_is_still_a_dead_session(http):
+    """1037 'session ip': a session bound to an old IP -- a login IS the fix."""
+    r = reader(http)
+    http.script[nc.PATH_ORDER_BOOK] = [
+        R(200, {'stat': 'Not_Ok', 'stCode': 1037, 'errMsg': 'Session IP mismatch'}),
+        R(200, {'stat': 'Ok', 'data': []})]
+    assert r.order_book() == [] and r.relogins == 1
 
 
 def test_cancel_shapes(http):

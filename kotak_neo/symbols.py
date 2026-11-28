@@ -147,6 +147,14 @@ class ScripMap:
         return None
 
 
+def _refetch_marker(today: date, underlyings: Iterable[str]):
+    """One re-download a day PER underlying set (review F3: a typo in another
+    bot's filter must not use up ETF's attempt)."""
+    key = '-'.join(sorted({str(u).upper() for u in underlyings}))
+    key = ''.join(ch for ch in key if ch.isalnum() or ch == '-')[:60]
+    return S.HOME / ('scrip_refetch_%s_%s' % (today.strftime('%Y%m%d'), key))
+
+
 def load(c: Any, today: Optional[date] = None, max_age_h: float = 20.0,
          underlyings: Optional[Iterable[str]] = None, min_rows: int = MIN_ROWS) -> ScripMap:
     """Today's nse_fo map from the shared cache, downloading at most once a day
@@ -163,6 +171,7 @@ def load(c: Any, today: Optional[date] = None, max_age_h: float = 20.0,
             return cache.read_text(encoding='utf-8')
         return None
 
+    refetch = None
     with S.file_lock('scrip.lock', 120.0) as got:
         if not got:
             raise ScripMasterError('scrip master lock busy')
@@ -170,8 +179,25 @@ def load(c: Any, today: Optional[date] = None, max_age_h: float = 20.0,
         if text is not None:
             try:
                 return ScripMap(parse_scrip_master(text, underlyings))
-            except ScripMasterError:
-                cache.unlink()
+            except ScripMasterError as e:
+                # K12 (review 2026-11-28): only a BAD FILE is deleted. When the
+                # whole file is fine, the caller's filter matched nothing: an
+                # unknown underlying, or a file that lacks it (review R10). ONE
+                # re-download a day settles which -- the good cache stays until
+                # a good replacement lands -- then it is the filter's fault.
+                try:
+                    whole_ok = len(parse_scrip_master(text)) >= min_rows
+                except ScripMasterError:
+                    whole_ok = False
+                if whole_ok and underlyings:
+                    marker = _refetch_marker(today, underlyings)
+                    if marker.exists():
+                        raise ScripMasterError('%s (the cached file itself is fine; '
+                                               're-downloaded once today already)' % e)
+                    refetch = marker                  # written only after a good download (F3)
+                    logger.warning('scrip master: %s -- re-downloading once today', e)
+                else:
+                    cache.unlink()
         fo = ScripMap.pick_fo_path(c.scrip_master_paths())
         if not fo:
             raise ScripMasterError('no nse_fo scrip master link')
@@ -183,8 +209,11 @@ def load(c: Any, today: Optional[date] = None, max_age_h: float = 20.0,
         tmp = cache.with_name('%s.%d.tmp' % (cache.name, os.getpid()))
         tmp.write_text(text, encoding='utf-8')
         tmp.replace(cache)
-        for old in S.HOME.glob('scrip_nse_fo_*.csv'):
-            if old != cache:
+        if refetch is not None:
+            refetch.write_text('done', encoding='utf-8')
+        today_tag = 'scrip_refetch_%s_' % today.strftime('%Y%m%d')
+        for old in list(S.HOME.glob('scrip_nse_fo_*.csv')) + list(S.HOME.glob('scrip_refetch_*')):
+            if old != cache and not old.name.startswith(today_tag):
                 try:
                     old.unlink()
                 except FileNotFoundError:

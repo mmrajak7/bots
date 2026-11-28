@@ -644,7 +644,7 @@ class FakeBroker(Broker):
         self.sent.append(req)
         fault = self._take(self.place_faults)
         if fault == '403':
-            raise BrokerUnclear('place: HTTP 403 (session re-established)')
+            raise BrokerUnclear('place: HTTP 403 (session rejected; not re-logged in)')
         if fault == 'auth':
             raise BrokerAuth('place: HTTP 403 and re-login failed')
         if fault == '502':

@@ -129,3 +129,79 @@ def test_the_heartbeat_says_whether_the_naked_engine_runs(monkeypatch, tmp_path)
     monkeypatch.setattr(sm, '_NAKED_ENGINE', None)
     sm.write_heartbeat('polling', False)
     assert json.loads((tmp_path / sm.HEARTBEAT_NAME).read_text())['naked_engine'] is False
+
+
+# ── review fixes P7e (2026-11-28) ─────────────────────────────────────────────
+
+def _beat_file():
+    import json
+    return json.loads((sm.LOG_DIR / sm.HEARTBEAT_NAME).read_text())
+
+
+def test_every_way_out_releases_the_naked_engine_in_the_beat(monkeypatch):
+    """Review A4/F3. RETIRES WHEN: never as a source guard -- it reads the
+    heartbeat DATA file the monitor writes; it retires with that format."""
+    eng = FakeEngine()
+    _install(monkeypatch, eng)
+    run_session(monkeypatch, sm, TRADE, calm(), DAY, POSITIONS)
+    beat = _beat_file()
+    assert beat['naked_engine'] is False and beat.get('naked_engine_released')
+    assert sm._NAKED_ENGINE is None
+
+
+def test_a_crash_releases_the_beat_and_is_said_out_loud(monkeypatch):
+    """RETIRES WHEN: never as a source guard -- reads the heartbeat DATA file."""
+    sent = []
+    monkeypatch.setattr(sm, 'send_telegram', lambda m, **k: sent.append(m))
+
+    def boom(kite, dry_run):
+        sm._NAKED_ENGINE = FakeEngine()
+        sm.write_heartbeat('polling', False)
+        raise RuntimeError('disk on fire')
+    import pytest
+    with pytest.raises(RuntimeError):
+        sm._releases_naked_engine(boom)(None, False)
+    assert sm.monitor_all.__wrapped__                 # the real loop carries the guarantee
+    assert _beat_file()['naked_engine'] is False
+    assert any('CRASHED' in m for m in sent)
+
+
+def test_sigterm_becomes_systemexit_so_the_release_runs():
+    import pytest
+    import signal
+    with pytest.raises(SystemExit):
+        sm._sigterm_to_exit(signal.SIGTERM, None)
+
+
+def test_an_armed_naked_mode_keeps_an_empty_monitor_alive(monkeypatch):
+    """Review A9/F7: with nothing open but `naked_live` armed, the monitor stays
+    up so the next live entry finds an exit engine."""
+    from zebra import config as zcfg
+    monkeypatch.setattr(zcfg, 'NAKED_LIVE', 'rehearsal')
+    eng = FakeEngine(open_n=0)
+    _install(monkeypatch, eng)
+    closed = dict(TRADE, status='closed')
+    run_session(monkeypatch, sm, closed, calm(), DAY, [])
+    assert eng.polls
+
+
+def test_the_naked_poll_reads_the_kill_switch_itself(monkeypatch):
+    eng = FakeEngine()
+    _install(monkeypatch, eng)
+    monkeypatch.setattr(sm, 'trading_enabled', lambda: False)
+    run_session(monkeypatch, sm, TRADE, calm(), DAY, POSITIONS)
+    assert eng.dry and eng.dry[0] is True          # the FIRST poll already refuses to sell
+
+
+def test_an_engine_that_failed_to_build_cannot_hide_live_records(monkeypatch):
+    _install(monkeypatch, None)
+    monkeypatch.setattr(sm, '_live_naked_open_locally', lambda: True)
+    seen = []
+    real = arming.check
+
+    def spy_check(**kw):
+        seen.append(set(kw.get('population') or ()))
+        return real(**kw)
+    monkeypatch.setattr(arming, 'check', spy_check)
+    run_session(monkeypatch, sm, TRADE, calm(), DAY, POSITIONS)
+    assert seen and arming.LIVE_RECORD in seen[0]

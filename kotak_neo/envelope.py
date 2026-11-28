@@ -15,7 +15,63 @@ MSG_KEYS = ('emsg', 'errMsg', 'message')
 
 #: stCodes and message fragments that mean "this session is dead".
 AUTH_STCODES = (1003,)
-SESSION_DEAD_TEXT = ('invalid session', 'session expired', 'session ip')
+SESSION_DEAD_TEXT = ('invalid session', 'session expired')
+
+#: Refusals because of the caller's IP (Kotak static-IP page), two kinds
+#: (review K5 + its review R1, 2026-11-28):
+#:   WHITELIST -- 100008 / "static ip" / "ip ... whitelist": this IP may not
+#:     trade. A login cannot fix it (and refused logins latch the day): NEVER a
+#:     login; reads are unknown; the owner fixes the whitelist.
+#:   SESSION IP -- 1037 / "session ip doesnt match": the session was MADE from
+#:     another IP (the Pi's public IP changed). A login from this IP is the only
+#:     fix, so it stays a dead session -- through the normal brakes -- and the
+#:     owner is alerted as well.
+#: Both are checked BEFORE `is_session_dead`, whose 401/403 rule claims bodies.
+IP_WHITELIST_STCODES = (100008,)
+IP_SESSION_STCODES = (1037,)
+IP_STCODES = IP_WHITELIST_STCODES + IP_SESSION_STCODES
+IP_SESSION_TEXT = ('session ip',)
+IP_WHITELIST_TEXT = ('static ip',)
+IP_TEXT = IP_SESSION_TEXT + IP_WHITELIST_TEXT + ('whitelist',)
+
+
+#: 'ip', 'ips', 'ip address', 'ipaddress' as words (review F4)
+_IP_WORD = re.compile(r'\bips?\b|\bip[\s_-]?address')
+
+
+def _refused(data: Optional[Dict[str, Any]]) -> bool:
+    return isinstance(data, dict) and not is_ok(data)
+
+
+def is_session_ip_refusal(data: Optional[Dict[str, Any]]) -> bool:
+    """The session was made from another IP: dead, a login from here fixes it."""
+    if not _refused(data):
+        return False
+    code = stcode(data)
+    if code in IP_WHITELIST_STCODES:
+        return False                    # F4: the never-login code beats any text
+    if code in IP_SESSION_STCODES:
+        return True
+    m = neo_msg(data).lower()
+    return any(t in m for t in IP_SESSION_TEXT)
+
+
+def is_ip_whitelist_refusal(data: Optional[Dict[str, Any]]) -> bool:
+    """This IP may not use the API: no login can fix it. A bare 'whitelist'
+    counts only next to 'ip' (review R9: a non-IP refusal naming a whitelist
+    must not hand the trade to the owner)."""
+    if not _refused(data) or is_session_ip_refusal(data):
+        return False
+    if stcode(data) in IP_WHITELIST_STCODES:
+        return True
+    m = neo_msg(data).lower()
+    return (any(t in m for t in IP_WHITELIST_TEXT)
+            or ('whitelist' in m and _IP_WORD.search(m) is not None))
+
+
+def is_ip_refusal(data: Optional[Dict[str, Any]]) -> bool:
+    """Either kind of IP refusal (the owner's static-IP alert fires on both)."""
+    return is_session_ip_refusal(data) or is_ip_whitelist_refusal(data)
 
 
 def neo_msg(data: Optional[Dict[str, Any]]) -> str:

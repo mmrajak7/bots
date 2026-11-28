@@ -283,18 +283,25 @@ def equity(records: list, marks: dict, last_marks: dict,
 def fill_slippages(records: list, since: Optional[str] = None) -> list:
     """G14: per-fill slippage as % of the ENTRY premium, in fill order.
 
-    Buy: (fill - touch ask at order time). Sell: (touch bid - fill). Positive
-    is worse than paper, which fills at the touch. Keys: entry
-    `entry_long_price` vs `long_ask_entry`; exit `exit_debit` vs `exit_touch`
-    (written by the P4 exit path). A fill without its touch is skipped -- it
-    cannot be measured, and inventing a touch would invent the answer.
+    Buy: (fill - the PAPER ask). Sell: (touch bid - fill). Positive is worse
+    than paper, which fills at the touch. Keys: entry `entry_long_price` vs
+    `entry_signal_ask` -- the ask when the signal was taken, before the entry
+    chase re-quoted (review M1, 2026-11-28: against the re-quoted ask an entry
+    read ~0 by construction and diluted the mean to half its real size) --
+    falling back to `long_ask_entry` on older records; exit `exit_debit` vs
+    `exit_touch` (written by the P4 exit path). A fill without its touch is
+    skipped -- it cannot be measured, and inventing a touch would invent the
+    answer.
     """
     rows = []
     for t in records:
         prem = _f(t.get('debit'))
         if not prem or prem <= 0:
             continue
-        fill, touch = _f(t.get('entry_long_price')), _f(t.get('long_ask_entry'))
+        fill = _f(t.get('entry_long_price'))
+        touch = _f(t.get('entry_signal_ask'))
+        if touch is None:
+            touch = _f(t.get('long_ask_entry'))
         if fill is not None and touch is not None:
             rows.append(('%s %s' % (t.get('entry_date'), t.get('entry_time')),
                          (fill - touch) / prem * 100.0))

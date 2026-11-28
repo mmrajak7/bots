@@ -37,6 +37,7 @@ trouble_alert_after: 3      # X12: consecutive troubled steps before an alert
 stop_placing: "15:29:50"    # F16: no order placed after this; open lots -> CARRY
 carry_resume: "09:15:05"    # F16: a carried lot is exited from this time
 neo_timeout_s: 3            # F10
+neo_refresh_wait_s: 2       # K8: a dead-session read waits <= this for ANOTHER bot's refresh (<= exit_step_s)
 neo_slow_ms: 300            # a NEO call slower than this is logged (lag study)
 
 # statutory charges ESTIMATE per round trip (contract note 2026-11-27 matched these rates;

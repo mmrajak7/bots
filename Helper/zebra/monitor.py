@@ -4148,7 +4148,14 @@ def _cohort_population(trades) -> set:
     for t in trades or ():
         # ANY structure: a live naked record is exactly the LIVE cohort record
         # whose missing engine this verdict exists to announce (design Q9).
-        if t.get('status') != 'entered' or not in_cohort(t, None, ANY_STRUCTURE):
+        # A live naked record MID-EXIT (`closing`) is still a real position
+        # whose engine must be alive (review F5) -- a monitor dying while it
+        # sells the only one must not read as "no live record". Naked only:
+        # the BCS `closing` state belongs to the bridge's own recovery.
+        naked_closing = (t.get('status') == 'closing'
+                         and t.get('structure') == 'naked_long')
+        if (t.get('status') != 'entered' and not naked_closing) \
+                or not in_cohort(t, None, ANY_STRUCTURE):
             continue
         # A REHEARSAL naked record holds fake fills and belongs to no broker
         # (design G18): the 5-second monitor books it in dry run too. Counting
@@ -5475,6 +5482,16 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
     finally:
         end_entry_phase()
         naked_entry.end_cycle()
+    # Review L3: an entry THIS cycle that ended unclear is settled now, not in
+    # five minutes -- a lot that filled is unwatched until it is adopted.
+    if not dry_run:
+        try:
+            # WHOLE BOOK: liveness -- any parent carrying an unresolved naked order.
+            if naked_entry.unresolved_twins(store.load_trades()):
+                from . import naked_adopt
+                naked_adopt.sweep(store, dry_run=dry_run)
+        except Exception as e:
+            logger.error("Naked end-of-cycle adoption sweep failed: %s", e, exc_info=True)
     # Everything below is OBSERVATION, never trading. It runs last and each
     # piece is independently caught, so a failure in the learning/monitoring
     # half can never stop the half that trades.

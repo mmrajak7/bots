@@ -426,7 +426,10 @@ def test_r3_06_telegram_posts_from_a_worker_and_never_delays_the_caller(tmp_path
     for i in range(total):
         n.send('m%d' % i)
     assert _time.monotonic() - t0 < 1.0 and len(n.sent) == total
-    assert 4 <= n.dropped <= 5 and n.pending <= QUEUE_MAX
+    # the worker may already hold ONE message in flight: it counts in `pending`
+    # beside a full queue (a race this test lost ~1 run in 3, review 11-28)
+    assert 4 <= n.dropped <= 5 and n.pending <= QUEUE_MAX + 1
+    assert n.dropped + n.pending == total
     gate.set()
     deadline = _time.monotonic() + 10
     while n.posted + n.dropped < total and _time.monotonic() < deadline:
@@ -437,7 +440,11 @@ def test_r3_06_telegram_posts_from_a_worker_and_never_delays_the_caller(tmp_path
     assert idx == sorted(idx)
 
 
-def test_r3_06_live_uses_the_worker_notifier_with_its_own_switch(cfg):
+def test_r3_06_live_uses_the_worker_notifier_with_its_own_switch(cfg, tmp_path, monkeypatch):
+    # never the owner's real Telegram file: it starts a live worker (review 11-28)
+    tg = tmp_path / 'tg.json'
+    tg.write_text(json.dumps({'bot_token': 'T', 'chat_id': '1'}))
+    monkeypatch.setattr(live_cli.config_mod, 'TELEGRAM_CONFIG', tg)
     neo = build_neo(neo_raw())
     n = live_cli._notifier(cfg, 'live', neo)
     assert isinstance(n, AsyncNotifier) and n.prefix == neo.telegram_prefix_live

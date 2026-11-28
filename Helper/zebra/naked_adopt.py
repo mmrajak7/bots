@@ -22,10 +22,18 @@ This sweep reads NEO's book by the parent's TAG and settles each one:
 `unrecorded` (filled, store write failed) needs no broker: the fill price is on
 the stamp, so the record is rebuilt from it.
 
-Runs from zebra's 5-minute cycle (`monitor.run_cycle`), never from the 5-second
-exit monitor -- WHATEVER `naked_live` says now: an order sent in `live` is
+Runs from zebra's 5-minute cycle (`monitor.run_cycle`) -- at its START, and
+again at its END when an entry in that cycle left an order unclear (review L3:
+a filled-but-unclear lot is watched minutes sooner) -- never from the 5-second
+exit monitor, WHATEVER `naked_live` says now: an order sent in `live` is
 settled as a live order even after the switch moved to `rehearsal` or `off`.
 Each stamp carries the mode it was sent in, and that mode decides. NEVER raises.
+
+ESCALATION (review F6, 2026-11-28). An order still unresolved
+`naked_adopt_escalate_sec` after it was sent -- the book unreadable, the NEO
+session dead, a young ABSENT that never settles -- is said out loud, then
+again every `naked_adopt_repeat_sec`: a filled lot may be sitting with NO
+STOP. The alert names the hand command, `zebra naked-resolve` (below).
 """
 from __future__ import annotations
 
@@ -63,6 +71,9 @@ def _file_record(store, parent, twin, fill: float, order_id, now, m) -> dict:
                              rehearsal=(m == 'rehearsal'), override=cfg.NAKED_OVERRIDE,
                              order_ids=[order_id] if order_id else [])
     rec['adopted'] = True
+    ref = twin.get('first_ask') or twin.get('ask') or twin.get('limit')
+    if ref:
+        rec['entry_signal_ask'] = float(ref)
     for k in ('tag', 'neo_symbol', 'neo_token'):
         if twin.get(k):
             rec['entry_tag' if k == 'tag' else k] = twin[k]
@@ -83,19 +94,102 @@ def sweep(store: ZebraStore, *, now: Optional[datetime] = None, client=None,
         return ['store unreadable: %s' % e]
     for parent in stuck:
         try:
-            m = (parent.get(TWIN_FIELD) or {}).get('mode') or cfg.NAKED_LIVE
-            if m not in ('live', 'rehearsal'):
-                # A stamp with no usable mode: assume the dangerous one -- a
-                # live book is READ, never assumed empty.
-                m = 'live'
+            m = _mode_of(parent)
             line = _settle(store, parent, now, m, client, send, dry_run)
         except Exception as e:                       # one parent never blocks the rest
             logger.error('naked adopt #%s raised: %s', parent.get('id'), e, exc_info=True)
             line = '#%s raised: %s' % (parent.get('id'), e)
+        try:
+            _escalate(store, parent['id'], now, send, dry_run, line)
+        except Exception as e:
+            logger.error('naked adopt #%s escalation failed: %s', parent.get('id'), e)
         if line:
             logger.warning('NAKED ADOPT %s', line)
             out.append(line)
     return out
+
+
+def _mode_of(parent: dict) -> str:
+    m = (parent.get(TWIN_FIELD) or {}).get('mode') or cfg.NAKED_LIVE
+    # A stamp with no usable mode: assume the dangerous one -- a live book is
+    # READ, never assumed empty.
+    return m if m in ('live', 'rehearsal') else 'live'
+
+
+def _escalate(store, pid, now, send, dry_run, line) -> None:
+    """Review F6: an order unresolved past the escalation age is alerted, then
+    re-alerted every repeat interval. The stamp is written BEFORE the send."""
+    parent = store.find(pid) or {}
+    twin = dict(parent.get(TWIN_FIELD) or {})
+    if twin.get('state') not in UNRESOLVED_STATES:
+        return
+    age = _age_s(twin, now)
+    if age is None or age < float(cfg.NAKED_ADOPT_ESCALATE_SEC):
+        return
+    last = twin.get('escalated_at')
+    try:
+        since = (now.replace(tzinfo=None)
+                 - datetime.strptime(str(last), '%Y-%m-%d %H:%M:%S')).total_seconds()
+    except (TypeError, ValueError):
+        since = None
+    if since is not None and since < float(cfg.NAKED_ADOPT_REPEAT_SEC):
+        return
+    _stamp(store, pid, twin, escalated_at=_ts(now))
+    send('🚨 NAKED %s #%s %s: an order has been UNRESOLVED for %.0f min (%s; %s). '
+         'If it filled, a lot may be held with NO STOP. Check the NEO app, then: '
+         'python -m zebra naked-resolve %s --filled <avg price>  |  --none'
+         % (_mode_of(parent).upper(), pid, parent.get('stock'), age / 60.0,
+            twin.get('state'), (line or 'book could not settle it')[:120], pid),
+         dry_run=dry_run)
+
+
+def resolve_by_hand(store: ZebraStore, pid: int, *, filled: Optional[float] = None,
+                    none: bool = False, force: bool = False, client=None,
+                    now: Optional[datetime] = None) -> str:
+    """`zebra naked-resolve`: the owner settles an unresolved naked order.
+
+    --filled PRICE  files the naked_long record at PRICE (a real position, now
+                    watched by the exit engine)
+    --none          nothing was bought: clears the block. For a LIVE stamp the
+                    account must be FLAT in the contract unless --force.
+    Raises ValueError with the reason when it refuses."""
+    now = now or datetime.now(cfg.IST)
+    if (filled is None) == (not none):
+        raise ValueError('give exactly one of --filled PRICE or --none')
+    parent = store.find(pid)
+    if not parent:
+        raise ValueError('#%s not found' % pid)
+    twin = dict(parent.get(TWIN_FIELD) or {})
+    if twin.get('state') not in UNRESOLVED_STATES:
+        raise ValueError('#%s has no unresolved naked order (state %r)'
+                         % (pid, twin.get('state')))
+    if _existing_twin(store, pid) is not None:
+        raise ValueError('#%s already has a naked record' % pid)
+    m = _mode_of(parent)
+    if filled is not None:
+        if float(filled) <= 0:
+            raise ValueError('--filled needs a positive price')
+        stored = _file_record(store, parent, twin, float(filled), twin.get('order_id'), now, m)
+        _stamp(store, pid, twin, state='entered', id=stored['id'], adopted=True,
+               settled_at=_ts(now), reason='filed by hand @ %.2f' % float(filled))
+        return 'filed #%s @ %.2f -- its exits are now watched' % (stored['id'], float(filled))
+    if m == 'live' and not force:
+        sym = twin.get('neo_symbol')
+        if not sym:
+            raise ValueError('no NEO symbol on the stamp: cannot check the account '
+                             '(--force if you have checked the NEO app)')
+        from . import naked_neo
+        c = client or naked_neo.default_client()
+        try:
+            held = int(c.net_held(sym))
+        except Exception as e:
+            raise ValueError('cannot read the NEO position (%s); --force if you have '
+                             'checked the NEO app' % e)
+        if held:
+            raise ValueError('the account HOLDS %d of %s -- use --filled <price>' % (held, sym))
+    _stamp(store, pid, twin, state='resolved_none', settled_at=_ts(now),
+           reason='resolved by hand: nothing bought%s' % (' (--force)' if force else ''))
+    return 'cleared: nothing bought -- new entries resume'
 
 
 def _send_default(msg: str, dry_run: bool = False) -> bool:
@@ -174,6 +268,8 @@ def _settle(store, parent, now, m, client, send, dry_run) -> str:
     if res.state in (orders.REJECTED, orders.CANCELLED) and res.terminal and res.filled == 0:
         _stamp(store, pid, twin, state='resolved_none', settled_at=_ts(now),
                order_id=res.order_no, reason='book: %s (%s)' % (res.state, res.reason))
+        if twin.get('neo_symbol'):
+            naked_neo._release(c, twin['neo_symbol'])
         return '#%s: %s -- nothing bought' % (pid, res.state)
 
     if res.state == orders.PARTIAL and res.terminal:
@@ -212,6 +308,7 @@ def _settle(store, parent, now, m, client, send, dry_run) -> str:
             return '#%s: absent tag but the account holds %d of %s -- human' % (pid, held, sym)
         _stamp(store, pid, twin, state='resolved_none', settled_at=_ts(now),
                reason='tag never reached the book in %.0fs; nothing held' % age)
+        naked_neo._release(c, sym)
         return '#%s: absent after %.0fs -- nothing bought' % (pid, age)
 
     return ''                                          # UNKNOWN: leave the block

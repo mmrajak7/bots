@@ -217,3 +217,66 @@ def test_an_absent_tag_with_the_lot_still_held_goes_to_a_human(store, neo, live)
     na.sweep(store, now=NOW, client=c, send=sent)
     assert twin(store, p['id'])['state'] == 'unclear'
     assert any('HOLDS' in m for m in sent)
+
+
+# -- review fixes P7e (2026-11-28) ------------------------------------------------
+
+def test_an_unresolved_order_is_escalated_then_repeated_hourly(store, neo, live, monkeypatch):
+    monkeypatch.setattr(cfg, 'NAKED_ADOPT_ESCALATE_SEC', 600)
+    monkeypatch.setattr(cfg, 'NAKED_ADOPT_REPEAT_SEC', 3600)
+    c = client(neo)
+    p = parent(store)
+    stuck(store, p, 'unclear', tag='zbr-x1')
+    monkeypatch.setattr(c, 'orders_tagged', lambda tag: (_ for _ in ()).throw(
+        C.Unavailable('OMS down')))
+    sent = Sent()
+    na.sweep(store, now=NOW + timedelta(minutes=5), client=c, send=sent)
+    assert not any('UNRESOLVED' in m for m in sent)            # young: quiet
+    na.sweep(store, now=NOW + timedelta(minutes=11), client=c, send=sent)
+    na.sweep(store, now=NOW + timedelta(minutes=16), client=c, send=sent)
+    esc = [m for m in sent if 'UNRESOLVED' in m]
+    assert len(esc) == 1 and 'NO STOP' in esc[0] and 'naked-resolve %s' % p['id'] in esc[0]
+    na.sweep(store, now=NOW + timedelta(minutes=72), client=c, send=sent)
+    assert sum('UNRESOLVED' in m for m in sent) == 2
+
+
+def test_resolve_by_hand_filled_files_a_watched_record(store, live):
+    p = parent(store)
+    stuck(store, p, 'unclear', tag='zbr-x1', first_ask=21.5)
+    line = na.resolve_by_hand(store, p['id'], filled=21.6)
+    rec = naked(store)[0]
+    assert rec['entry_long_price'] == 21.6 and rec['adopted'] and rec['status'] == 'entered'
+    assert rec['entry_signal_ask'] == 21.5
+    assert twin(store, p['id'])['state'] == 'entered' and 'watched' in line
+
+
+def test_resolve_by_hand_none_needs_a_flat_account(store, neo, live):
+    c = client(neo)
+    p = parent(store)
+    place(c)                                               # the lot IS held
+    stuck(store, p, 'unclear', tag='zbr-x1')
+    with pytest.raises(ValueError, match='HOLDS'):
+        na.resolve_by_hand(store, p['id'], none=True, client=c)
+    na.resolve_by_hand(store, p['id'], none=True, force=True, client=c)
+    assert twin(store, p['id'])['state'] == 'resolved_none'
+
+
+def test_resolve_by_hand_refuses_nonsense(store, live):
+    p = parent(store)
+    with pytest.raises(ValueError, match='no unresolved'):
+        na.resolve_by_hand(store, p['id'], none=True, force=True)
+    stuck(store, p, 'unclear', tag='zbr-x1')
+    with pytest.raises(ValueError, match='exactly one'):
+        na.resolve_by_hand(store, p['id'])
+    with pytest.raises(ValueError, match='positive'):
+        na.resolve_by_hand(store, p['id'], filled=0.0)
+
+
+def test_a_rejected_unclear_order_gives_the_claim_back(store, neo, live):
+    c = client(neo)
+    p = parent(store)
+    neo.rms_reject('RMS:Margin Exceeds')
+    tag = place(c)
+    stuck(store, p, 'unclear', tag=tag)
+    na.sweep(store, now=NOW + timedelta(minutes=1), client=c, send=Sent())
+    assert twin(store, p['id'])['state'] == 'resolved_none' and C.owner_of(NSYM) is None

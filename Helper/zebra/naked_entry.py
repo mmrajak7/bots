@@ -20,7 +20,7 @@ reaches a broker before every one has passed):
   5. fewer than `naked_max_open` open naked records
   6. no open naked record on this stock
   7. before `naked_entry_cutoff`                   (G1: late -> `skipped: late`)
-  8. a fresh, reliable quote with ask x lot <= `naked_max_premium` (skip, never resize)
+  8. a fresh, reliable quote with LIMIT x lot <= `naked_max_premium` (skip, never resize)
   9. dry-construct the record and validate it      (F4: BEFORE any order)
  10. a broker exists for this mode                 (live: the NEO adapter)
 
@@ -37,6 +37,19 @@ THE TAG IS THE WITNESS. Before a live order is sent the broker calls
 reply, gate 4 refuses every new entry and `naked_adopt` resolves the order from
 NEO's book by that tag.
 
+THE ENTRY CHASES UP, BOUNDED (owner 2026-11-28: "never miss entry -- as we
+tested 100 trades we should do live as well"; the price rule was delegated to
+the trader). The test's population is every signal at the ask, so a live
+entry that rests at the ask and cancels misses exactly the trades that run
+away -- the winners. So each order is MARKETABLE: limit = the current ask +
+`naked_entry_buffer_ticks`. Unfilled after `naked_entry_wait_sec` (cancel read
+back), it re-quotes and goes again, up to `naked_entry_chase_rounds` orders in
+all, never above the FIRST ask x (1 + `naked_entry_max_chase_pct`%) and never
+with limit x lot over the premium cap. Past the bound it skips and says so:
+"never miss" means never miss for want of a tick, not at any price. The first
+ask is kept on the record (`entry_signal_ask`) as the paper reference the
+slippage kill measures against.
+
 A BuyResult says one of four things, and each has exactly one handling:
 
   filled    -> write the record (premium over the cap after the fill: record
@@ -45,7 +58,8 @@ A BuyResult says one of four things, and each has exactly one handling:
                send ONE more order. `retry=False` (margin/funds/RMS/permission/
                IP/unknown): STOP and alert red. Never more than
                `naked_max_orders_per_signal` orders for one signal.
-  unfilled  -> the broker CONFIRMED nothing filled and nothing rests. Skip.
+  unfilled  -> the broker CONFIRMED nothing filled and nothing rests. Chase
+               (above) while rounds and the bound allow, else skip.
   unclear   -> the order MAY be at the broker. The journal intent is left
                WITHOUT a result on purpose (that is the witness), the parent is
                stamped `unclear`, and gate 4 then refuses EVERY new naked entry
@@ -91,6 +105,7 @@ class BuyResult:
     neo_symbol: Optional[str] = None # the broker's trading symbol for the leg
     neo_token: Optional[str] = None  # the broker's instrument token (the exit needs it)
     filled_qty: int = 0              # shares the book shows filled (unclear only)
+    neo_tick: Optional[float] = None # the contract's tick from NEO's scrip row
 
     STATUSES = ('filled', 'rejected', 'unfilled', 'unclear')
 
@@ -119,7 +134,12 @@ class RehearsalBroker:
         n = len(self.orders) + 1
         self.orders.append({'symbol': symbol, 'qty': qty, 'limit': limit,
                             'ctx': dict(ctx)})
-        return BuyResult('filled', fill_price=float(limit),
+        # A marketable limit fills at the ASK, not at the limit (advisor): a
+        # rehearsal that paid the buffer tick every time would show slippage
+        # the market never charged.
+        ask = ctx.get('ask')
+        px = float(ask) if ask and 0 < float(ask) <= float(limit) else float(limit)
+        return BuyResult('filled', fill_price=px,
                          order_id='REHEARSAL-%s-%d' % (ctx.get('trade_id'), n),
                          message='rehearsal fill at the ask')
 
@@ -279,12 +299,34 @@ def _quote(kite, symbol: str) -> tuple:
     return q, ''
 
 
-def _premium_problem(ask: float, lot: int) -> str:
-    prem = ask * lot
+def _premium_problem(limit: float, lot: int) -> str:
+    """Checked on the LIMIT, the most the order can pay, so the cap holds on
+    the fill whatever the chase does."""
+    prem = limit * lot
     if prem > cfg.NAKED_MAX_PREMIUM + 1e-9:
-        return 'premium Rs %.0f (ask %.2f x %d) over the Rs %.0f cap -- skip, never resize' % (
-            prem, ask, lot, cfg.NAKED_MAX_PREMIUM)
+        return 'premium Rs %.0f (limit %.2f x %d) over the Rs %.0f cap -- skip, never resize' % (
+            prem, limit, lot, cfg.NAKED_MAX_PREMIUM)
     return ''
+
+
+def _tick() -> float:
+    return float(cfg.NAKED_OPTION_TICK)
+
+
+def chase_bound(first_ask: float) -> float:
+    """The most any order for this signal may pay: the FIRST ask plus
+    `naked_entry_max_chase_pct`, on the tick grid (rounded DOWN)."""
+    t = _tick()
+    n = int(first_ask * (1.0 + float(cfg.NAKED_ENTRY_MAX_CHASE_PCT) / 100.0) / t + 1e-9)
+    return round(max(n * t, first_ask), 2)
+
+
+def entry_limit(ask: float, first_ask: float) -> float:
+    """A MARKETABLE limit: the current ask + `naked_entry_buffer_ticks`,
+    capped at the chase bound."""
+    t = _tick()
+    n = int(round(ask / t)) + int(cfg.NAKED_ENTRY_BUFFER_TICKS)
+    return round(min(n * t, chase_bound(first_ask)), 2)
 
 
 def exit_engine_problem(m: str) -> str:
@@ -296,6 +338,23 @@ def exit_engine_problem(m: str) -> str:
     Rehearsal fills are fake, so a dry-run monitor may book them -- it must
     still be alive and running the engine.
     """
+    import time
+    deadline = time.time() + float(cfg.NAKED_ENTRY_HEARTBEAT_WAIT_SEC)
+    while True:
+        why = _beat_problem(m)
+        # Wait briefly in-cycle (advisor): at 09:15 the monitor's beat can still
+        # read 'waiting' for a few seconds, and a refused entry is never retried.
+        if not why or time.time() >= deadline:
+            return why
+        _sleep(2.0)
+
+
+def _sleep(s: float) -> None:          # a seam: tests never wait
+    import time
+    time.sleep(s)
+
+
+def _beat_problem(m: str) -> str:
     from .monitor import read_exit_engine_heartbeat     # lazy: monitor imports us
     hb = read_exit_engine_heartbeat()
     beat = hb.get('beat') or {}
@@ -304,10 +363,17 @@ def exit_engine_problem(m: str) -> str:
         return 'no exit engine able to sell it: %s (%s)' % (hb.get('state'), hb.get('detail'))
     if not beat.get('naked_engine'):
         return 'the exit monitor is running without the naked exit engine'
+    # Review A4/F3: the beat must say POLLING and be recent. The reader's own
+    # 15-minute staleness window let a monitor dead at 11:02 certify entries
+    # at 11:05 and 11:10, and a startup crash loop rewrote a fresh 'startup'
+    # beat every five minutes without ever polling.
+    if beat.get('state') != 'polling':
+        return 'the exit monitor is not polling (beat state %r)' % beat.get('state')
+    age = hb.get('age')
+    if age is None or float(age) > float(cfg.NAKED_ENTRY_HEARTBEAT_MAX_AGE_SEC):
+        return 'the exit monitor last polled %s s ago (max %.0f)' % (
+            '?' if age is None else '%.0f' % float(age), cfg.NAKED_ENTRY_HEARTBEAT_MAX_AGE_SEC)
     return ''
-
-
-_real_exit_engine_problem = exit_engine_problem
 
 
 def _gates(store: ZebraStore, kite, parent: dict, now: datetime, m: str):
@@ -352,13 +418,14 @@ def _gates(store: ZebraStore, kite, parent: dict, now: datetime, m: str):
     q, prob = _quote(kite, sym)
     if q is None:
         return Outcome('skipped', prob), None
-    prob = _premium_problem(float(q['ask']), lot)
+    limit = entry_limit(float(q['ask']), float(q['ask']))
+    prob = _premium_problem(limit, lot)
     if prob:
         return Outcome('skipped', prob, extra={'ask': q['ask']}), None
 
     dry = build_naked_record(parent, long_symbol=sym,
                              long_strike=parent.get('long_strike'), lot_size=lot,
-                             fill_price=float(q['ask']), now=now, quote=q,
+                             fill_price=limit, now=now, quote=q,
                              rehearsal=(m == 'rehearsal'),
                              override=cfg.NAKED_OVERRIDE)
     probs = validate_naked_record(dry)
@@ -432,12 +499,17 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
         return out
 
     sym, lot = parent['long_symbol'], int(parent['lot_size'])
-    orders = 0
+    first_ask = float(q['ask'])
+    orders = rejects = 0
+    import time as _time
+    # A wall-clock budget for the whole chase (ops re-review N3): several
+    # signals in one 5-minute cycle must not overrun it.
+    chase_deadline = _time.time() + float(cfg.NAKED_ENTRY_CHASE_MAX_SEC)
     while True:
-        limit = float(q['ask'])
+        limit = entry_limit(float(q['ask']), first_ask)
         ctx = {'trade_id': parent['id'], 'stock': parent.get('stock'),
                'strategy': 'NAKED', 'reason': 'ENTRY', 'leg': 'naked_long',
-               'mode': m, 'order': orders + 1}
+               'mode': m, 'order': orders + 1, 'ask': float(q['ask'])}
         intent = order_journal.record_intent(
             symbol=sym, txn_type='BUY', qty=lot, price=limit, exchange='NFO',
             dry_run=(m != 'live'), context=ctx, log=logger)
@@ -452,7 +524,7 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
             store.update_trade_fields(parent['id'], **{TWIN_FIELD: {
                 'state': 'sending', 'mode': m, 'tag': tag, 'neo_symbol': neo_symbol,
                 'limit': _limit, 'qty': lot, 'orders': _n, 'intent_id': intent,
-                'at': now.strftime('%Y-%m-%d %H:%M:%S'),
+                'first_ask': first_ask, 'at': now.strftime('%Y-%m-%d %H:%M:%S'),
                 'reason': 'order %d being sent' % _n}})
         ctx = dict(ctx, parent=parent, on_tag=on_tag)
         try:
@@ -471,11 +543,13 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
                 dry_run=(m != 'live'), log=logger)
 
         if res.status == 'filled':
-            return _record_fill(store, parent, res, q, now, m, orders, send, dry_run)
+            return _record_fill(store, parent, res, q, now, m, orders, send, dry_run,
+                                first_ask=first_ask)
         if res.status == 'unclear':
             out = Outcome('unclear', 'order may be at the broker: %s' % res.message,
                           orders=orders, extra=dict(tag_extra, intent_id=intent,
                                                     qty=lot, limit=limit,
+                                                    first_ask=first_ask,
                                                     filled_qty=res.filled_qty))
             send('\U0001F534 NAKED %s #%s %s: ORDER STATE UNKNOWN (%s). No new '
                  'naked entries until it is resolved against the order book.'
@@ -483,10 +557,27 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
                  dry_run=dry_run)
             return out
         if res.status == 'unfilled':
-            return Outcome('skipped', 'not filled at %.2f (%s)' % (limit, res.message),
-                           orders=orders, extra=tag_extra)
+            if orders >= cfg.NAKED_ENTRY_CHASE_ROUNDS or _time.time() >= chase_deadline:
+                return Outcome('skipped', 'not filled in %d orders (last %.2f, first ask '
+                               '%.2f)' % (orders, limit, first_ask), orders=orders,
+                               extra=dict(tag_extra, first_ask=first_ask))
+            q, prob = _quote(kite, sym)
+            if q is None:
+                return Outcome('skipped', 'chase re-quote: %s' % prob, orders=orders,
+                               extra=dict(tag_extra, first_ask=first_ask))
+            if float(q['ask']) > chase_bound(first_ask) + 1e-9:
+                return Outcome('skipped', 'ran away: ask %.2f past the chase bound %.2f '
+                               '(first ask %.2f + %.1f%%)' % (
+                                   float(q['ask']), chase_bound(first_ask), first_ask,
+                                   cfg.NAKED_ENTRY_MAX_CHASE_PCT), orders=orders,
+                               extra=dict(tag_extra, first_ask=first_ask))
+            prob = _premium_problem(entry_limit(float(q['ask']), first_ask), lot)
+            if prob:
+                return Outcome('skipped', 'chase: %s' % prob, orders=orders)
+            continue
         # rejected
-        if not res.retry or orders >= cfg.NAKED_MAX_ORDERS_PER_SIGNAL:
+        rejects += 1
+        if not res.retry or rejects >= cfg.NAKED_MAX_ORDERS_PER_SIGNAL:
             out = Outcome('refused', 'rejected: %s' % res.message, orders=orders,
                           extra=tag_extra)
             send('\U0001F534 NAKED %s #%s %s REJECTED: %s%s'
@@ -497,12 +588,16 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
         q, prob = _quote(kite, sym)
         if q is None:
             return Outcome('skipped', 'retry re-quote: %s' % prob, orders=orders)
-        prob = _premium_problem(float(q['ask']), lot)
+        if float(q['ask']) > chase_bound(first_ask) + 1e-9:
+            return Outcome('skipped', 'retry: ask %.2f past the chase bound %.2f'
+                           % (float(q['ask']), chase_bound(first_ask)), orders=orders)
+        prob = _premium_problem(entry_limit(float(q['ask']), first_ask), lot)
         if prob:
             return Outcome('skipped', 'retry: %s' % prob, orders=orders)
 
 
-def _record_fill(store, parent, res, q, now, m, orders, send, dry_run) -> Outcome:
+def _record_fill(store, parent, res, q, now, m, orders, send, dry_run,
+                 first_ask=None) -> Outcome:
     lot = int(parent['lot_size'])
     rec = build_naked_record(parent, long_symbol=parent['long_symbol'],
                              long_strike=parent.get('long_strike'), lot_size=lot,
@@ -512,9 +607,13 @@ def _record_fill(store, parent, res, q, now, m, orders, send, dry_run) -> Outcom
                              order_ids=[res.order_id] if res.order_id else [])
     # What the EXIT needs to sell this exact contract on the same broker.
     for k, v in (('entry_tag', res.tag), ('neo_symbol', res.neo_symbol),
-                 ('neo_token', res.neo_token)):
+                 ('neo_token', res.neo_token), ('neo_tick', res.neo_tick)):
         if v:
             rec[k] = v
+    # The PAPER reference for the G14 slippage kill: the ask when the signal
+    # was taken, before any chase (review M1).
+    rec['entry_signal_ask'] = float(first_ask if first_ask else q['ask'])
+    rec['entry_orders'] = orders
     try:
         stored = store.add_naked_live(rec)
     except Exception as e:

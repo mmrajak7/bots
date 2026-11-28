@@ -34,7 +34,9 @@ from datetime import datetime
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from . import session as S
-from .envelope import is_ok, is_session_dead, neo_msg, scrub, stcode
+from .envelope import (IP_STCODES, IP_TEXT, is_ip_refusal,  # noqa: F401
+                       is_ip_whitelist_refusal, is_ok, is_session_dead,
+                       is_session_ip_refusal, neo_msg, scrub, stcode)
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +53,20 @@ ORDER_SOURCE = 'NEOTRADEAPI'
 EMPTY_STCODE, EMPTY_MSG = 5203, 'no data'
 #: Placement refusals that are DEFINITE (not placed): documented + measured.
 REJECTED_STCODES = (1004, 1006, 1007, 1009, 100008)
-#: Order refusals that mean "this IP may not trade" (Kotak static-IP page:
-#: 100008 wrong IP; 1037 / "session ip doesnt match" = session from another IP).
-IP_STCODES = (100008, 1037)
-IP_TEXT = ('session ip', 'static ip', 'whitelist')
+#: IP_STCODES / IP_TEXT ("this IP may not trade") live in envelope.py now:
+#: reads, mutations and the session verify share one reading (review K5).
 TRANSIENT_STCODES = (1005,)
+#: K1 (review 2026-11-28): mutations refused as "session dead" while reads work
+#: get NO login (rule above) -- so they ALERT: this many inside the window, on
+#: ONE generation. 30 min, not 5 (review R5): entries are sent once, and 10-min
+#: signals would never put two refused entries inside 5 minutes.
+ORDERS_AUTH_COUNT, ORDERS_AUTH_WINDOW_SEC, ORDERS_AUTH_EVERY_SEC = 2, 1800.0, 900.0
+#: F5: after a failed refresh, reads on that generation fail fast at most this long
+DEAD_HOLD_MAX_SEC = 10.0
+DEAD_HOLD_OUTCOMES = (S.COOLDOWN, S.BLOCKED, S.FAILED, S.LOCK_TIMEOUT, S.HOST_REFUSED)
+#: NEO's product labels (Kotak API docs). A position row naming anything else
+#: for a symbol makes a product-filtered read UNKNOWN, never 0 (review K10).
+KNOWN_PRODUCTS = ('NRML', 'MIS', 'CNC', 'MTF', 'CO', 'BO')
 
 TERMINAL = ('complete', 'rejected', 'cancelled')
 LIVE_STATES = ('put order req received', 'validation pending', 'open pending', 'open',
@@ -298,6 +309,63 @@ def assign(symbol: str, bot: Optional[str]) -> None:
                          'assigned': True}
 
 
+# -- K1: orders refused as "session dead" -------------------------------------------------
+def note_orders_auth(bot: str, what: str, status: int, generation: int,
+                     now: Optional[float] = None) -> bool:
+    """Count one mutation that NEO refused as "session dead" (review K1,
+    2026-11-28). The package never logs in on mutation evidence, so if reads
+    keep working nothing else would ever notice that orders do not: after
+    ORDERS_AUTH_COUNT of them on one session generation inside
+    ORDERS_AUTH_WINDOW_SEC, across ALL bots (the session is shared), queue an
+    `orders_auth` alert -- at most one per ORDERS_AUTH_EVERY_SEC -- and deliver
+    it off the caller's thread. Returns True when it alerted. Never raises."""
+    alerted = False
+    try:
+        t = time.time() if now is None else float(now)
+        path = S.HOME / 'orders_auth.json'
+        with S.file_lock('orders_auth.lock', 2.0) as got:
+            if not got:
+                logger.warning('orders_auth lock busy -- this refusal is not counted')
+                return False
+            try:
+                with open(str(path), encoding='utf-8') as f:
+                    st = json.load(f)
+                if not isinstance(st, dict):
+                    raise ValueError('not an object')
+            except FileNotFoundError:
+                st = {}
+            except (OSError, ValueError) as e:
+                logger.warning('orders_auth.json unreadable (%s) -- starting over', e)
+                st = {}
+            kept = [e for e in st.get('events') or [] if isinstance(e, dict)
+                    and isinstance(e.get('t'), (int, float))
+                    and t - e['t'] <= ORDERS_AUTH_WINDOW_SEC]
+            kept.append({'t': t, 'bot': bot, 'what': what[:80], 'http': status, 'gen': generation})
+            st['events'] = kept[-40:]
+            # only refusals of THIS generation COUNT (R5): a refresh since then
+            # replaced the session they were about. Others are kept, not erased
+            # (F7): two processes briefly on different generations both count.
+            ev = [e for e in kept if e.get('gen') == generation]
+            last = st.get('alerted_at')
+            last = float(last) if isinstance(last, (int, float)) else None
+            if len(ev) >= ORDERS_AUTH_COUNT and (last is None or t - last >= ORDERS_AUTH_EVERY_SEC):
+                st['alerted_at'] = t
+                bots = sorted({str(e.get('bot')) for e in ev})
+                S._alert('orders_auth',
+                         '%d NEO orders/cancels refused as "session dead" within %.0f min (bots %s; '
+                         'last: %s, HTTP %s, generation %s). Reads may still work, and NO login '
+                         'is made on order evidence. Check open trades in the NEO app now.'
+                         % (len(ev), ORDERS_AUTH_WINDOW_SEC / 60.0, ','.join(bots), what[:80],
+                            status, generation), S._now())
+                alerted = True
+            S._write_private(path, st)
+    except Exception as e:                            # never into a trading loop
+        logger.error('kotak_neo orders_auth note failed: %s', e)
+    if alerted:
+        S.flush_alerts_soon()                         # never block the exit loop (R4)
+    return alerted
+
+
 # -- the client ---------------------------------------------------------------------------
 class NeoClient:
     """One per bot process. Cheap: it re-reads the published session per call."""
@@ -306,14 +374,25 @@ class NeoClient:
                  exclusive: bool = True, timeout: float = 10.0, http: Any = None,
                  current_fn: Callable[[], S.Session] = None,
                  refresh_fn: Callable[..., S.Result] = None,
-                 clock: Callable[[], datetime] = None):
+                 clock: Callable[[], datetime] = None,
+                 refresh_wait_s: Optional[float] = None):
+        """`refresh_wait_s`: how long a READ that found the session dead waits
+        for ANOTHER process's refresh lock (None = the package's lock_wait_sec,
+        75 s). A bot with a fast exit loop passes a few seconds (review K8): a
+        busy lock is then `Unavailable` for this step, and the loop moves on."""
         if not BOT_RE.match(bot or ''):
             raise ValueError('bot must be 2-6 lowercase letters, got %r' % bot)
+        if refresh_wait_s is not None and not float(refresh_wait_s) >= 0:
+            raise ValueError('refresh_wait_s must be >= 0, got %r' % refresh_wait_s)
         self.bot = bot
         self.segment = segment
         self.product = product
         self.exclusive = bool(exclusive)
         self.timeout = timeout
+        self.refresh_wait_s = None if refresh_wait_s is None else float(refresh_wait_s)
+        #: (generation, until): a refresh for this generation just failed --
+        #: reads on it fail fast without HTTP until then (review F5)
+        self._dead_hold: Optional[Tuple[int, float]] = None
         self._http = http
         self._current = current_fn or S.current
         self._refresh = refresh_fn or S.refresh
@@ -366,17 +445,49 @@ class NeoClient:
               retried: bool = False) -> Dict[str, Any]:
         import requests
         s = self.session()
+        hold = self._dead_hold
+        if not retried and hold is not None and hold[0] == s.generation and time.time() < hold[1]:
+            # F5: a refresh for this very generation failed a moment ago; another
+            # dead read + refresh + log line per 0.5 s loop changes nothing
+            raise Unavailable('%s %s: session generation %d is dead; refresh retried in %.0fs'
+                              % (method, path, s.generation, hold[1] - time.time()))
         try:
             r = self._send(s, method, path, jdata)
         except requests.RequestException as e:
             raise Unavailable('%s %s: %s' % (method, path, type(e).__name__))
         d = self._json(r)
-        if is_session_dead(r.status_code, d):
+        if is_ip_whitelist_refusal(d):
+            # K5: this IP may not use the API. A login cannot fix it (and
+            # refused logins latch the day): the owner's alert, book unknown.
+            if S.ip_alert('%s %s refused: stCode %s %s' % (method, path, stcode(d),
+                                                         neo_msg(d)[:120]), flush=False):
+                S.flush_alerts_soon()
+            raise Unavailable('%s %s: IP refused (stCode %s) -- no login'
+                              % (method, path, stcode(d)))
+        session_ip = is_session_ip_refusal(d)
+        if session_ip:
+            # R1: the session was made from another IP (the public IP changed):
+            # a login from HERE is the fix, so it is a dead session -- the owner
+            # is told as well (orders may still need the whitelist).
+            if S.ip_alert('%s %s: session made from another IP (stCode %s) -- refreshing'
+                          % (method, path, stcode(d)), flush=False):
+                S.flush_alerts_soon()
+        if session_ip or is_session_dead(r.status_code, d):
             if retried:
                 raise Auth('%s %s: session still rejected after refresh' % (method, path))
-            res = self._refresh(s.generation, self.bot)
+            if self.refresh_wait_s is None:
+                res = self._refresh(s.generation, self.bot)
+            else:
+                res = self._refresh(s.generation, self.bot, wait_s=self.refresh_wait_s)
             if res.outcome in (S.ADOPTED, S.LOGGED_IN):
+                self._dead_hold = None
                 return self._read(method, path, jdata, retried=True)
+            ra = float(getattr(res, 'retry_after', 0.0) or 0.0)
+            if res.outcome in DEAD_HOLD_OUTCOMES or (res.outcome == S.UNAVAILABLE and ra > 0):
+                # F5: only where a re-read surely fails (a login is waiting, or
+                # barred); STILL_ALIVE / a plain UNAVAILABLE may read fine next loop
+                self._dead_hold = (s.generation,
+                                   time.time() + min(max(ra or 2.0, 1.0), DEAD_HOLD_MAX_SEC))
             if res.outcome in (S.BLOCKED, S.HOST_REFUSED, S.ERROR):
                 raise Auth('session refresh %s: %s' % (res.outcome, res.detail))
             raise Unavailable('%s %s: session refresh %s (%s)' % (method, path, res.outcome,
@@ -417,9 +528,28 @@ class NeoClient:
         except RowError as e:
             raise Unavailable('trade book: %s' % e)
 
-    def net_held(self, symbol: str) -> int:
-        """This account's net quantity in `symbol` (shares). Raises Unavailable."""
-        return sum(p.net_qty for p in self.positions() if p.symbol == symbol)
+    def net_held(self, symbol: str, product: Optional[str] = '') -> int:
+        """This account's net quantity in `symbol` (shares) for ONE product row
+        -- `product` '' (default) = this client's product, None = every product.
+        NEO reports positions per product: BTST's NRML lot and ETF's MIS lot on
+        one strike are two rows, and neither bot's cap may count the other's
+        (review K10, 2026-11-28). Rows with no product label are counted
+        (unknown = could be ours); a row naming a product NEO does not document
+        raises Unavailable -- a spelling nobody foresaw must never read as 0,
+        or an exit would be capped at nothing. Raises Unavailable."""
+        want = (self.product if product == '' else product)
+        want = None if want is None else str(want).strip().upper()
+        total = 0
+        for p in self.positions():
+            if p.symbol != symbol:
+                continue
+            got = str(p.product or '').strip().upper()
+            if want is None or not got or got == want:
+                total += p.net_qty
+            elif got not in KNOWN_PRODUCTS:
+                raise Unavailable('positions: %s has product %r (not one of %s) -- unknown'
+                                  % (symbol, p.product, '/'.join(KNOWN_PRODUCTS)))
+        return total
 
     def own_net(self, symbol: str, fills: Optional[List[FillView]] = None) -> int:
         """Shares THIS bot holds in `symbol` from TODAY's trade book: its own
@@ -539,17 +669,28 @@ class NeoClient:
         A NEW claim on a symbol the account already holds with no owner (e.g.
         BTST's overnight lot from before ownership existed) is refused: that
         position belongs to someone, and it is not provably this bot."""
+        # The positions read happens OUTSIDE the owners lock (review K9,
+        # 2026-11-28): a slow NEO must not hold every bot's owners file. Peek,
+        # read, then re-check under the lock: an exclusive bot can only add
+        # exposure after claiming, so "no holder" seen twice around the read
+        # means nobody else claimed in between.
+        holder = owner_of(symbol)
+        if holder and holder != self.bot:
+            raise NotOwner('%s is held by %s' % (symbol, holder))
+        if holder == self.bot:
+            return False
+        held = self.net_held(symbol)                  # Unavailable -> nothing placed
+        if held != 0:
+            raise NotOwner('%s: account holds %d with no owner -- '
+                           '`python -m kotak_neo owners` to assign it' % (symbol, held))
         with _owners() as o:
             holder = _holder(o.get(symbol))
             if holder and holder != self.bot:
                 raise NotOwner('%s is held by %s' % (symbol, holder))
-            if holder is None:
-                held = self.net_held(symbol)          # Unavailable -> nothing placed
-                if held != 0:
-                    raise NotOwner('%s: account holds %d with no owner -- '
-                                   '`python -m kotak_neo owners` to assign it' % (symbol, held))
-                o[symbol] = {'bot': self.bot, 'since': self._clock().isoformat(timespec='seconds')}
-            return holder is None
+            if holder == self.bot:
+                return False
+            o[symbol] = {'bot': self.bot, 'since': self._clock().isoformat(timespec='seconds')}
+            return True
 
     def release_if_flat(self, symbol: str) -> bool:
         """Give `symbol` up only when the account is FLAT in it and this bot has
@@ -623,6 +764,9 @@ class NeoClient:
             raise
         return str(d['nOrdNo'])
 
+    def _note_orders_auth(self, what: str, status: int, generation: int) -> None:
+        note_orders_auth(self.bot, what, status, generation)
+
     def cancel(self, order_no: str) -> None:
         self._mutate(PATH_CANCEL, {'on': str(order_no), 'am': 'NO'}, 'cancel %s' % order_no,
                      ('nOrdNo', 'result'))
@@ -639,12 +783,16 @@ class NeoClient:
             raise Unclear('%s: %s' % (what, type(e).__name__))
         d = self._json(r)
         body = scrub(getattr(r, 'text', '') or '')
-        if stcode(d) in IP_STCODES or any(t in neo_msg(d).lower() for t in IP_TEXT):
-            S.ip_alert('%s refused: stCode %s %s' % (what, stcode(d), neo_msg(d)[:120]))
-        if is_session_dead(r.status_code, d):
+        ip = is_ip_refusal(d)
+        if ip:
+            if S.ip_alert('%s refused: stCode %s %s' % (what, stcode(d), neo_msg(d)[:120]),
+                          flush=False):
+                S.flush_alerts_soon()                 # never block the exit loop (R4)
+        if not ip and is_session_dead(r.status_code, d):
             # Rule: NEVER a login on mutation evidence. Unclear; the book decides.
             logger.warning('%s: HTTP %s session rejected (gen %d) -- unclear, no login; '
                            'body %s', what, r.status_code, s.generation, body)
+            self._note_orders_auth(what, r.status_code, s.generation)
             raise Unclear('%s: session rejected (HTTP %s)' % (what, r.status_code))
         if r.status_code == 429:
             raise Rejected('429', 'rate limited (HTTP 429)')

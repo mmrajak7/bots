@@ -1125,6 +1125,31 @@ def _entry_ownership(args, entry_data, positions, pos_err):
                   'is not an ownership answer' % ', '.join(sorted(hit)))
 
 
+def cmd_naked_check(args):
+    """Read-only morning check of the live naked path (ops review runbook 1)."""
+    from .trade_store import get_store
+    from . import naked_exit
+    from . import config as zcfg
+    # WHOLE BOOK: health -- every open naked record and unresolved order, any cohort.
+    from datetime import datetime as _dt
+    for line in naked_exit.health_lines(get_store().load_trades(), zcfg.NAKED_LIVE,
+                                        _dt.now(zcfg.IST).date()):
+        print(line)
+
+
+def cmd_naked_resolve(args):
+    """Settle an unresolved naked order by hand (`naked_adopt.resolve_by_hand`)."""
+    from .trade_store import get_store
+    from . import naked_adopt
+    try:
+        print('  ' + naked_adopt.resolve_by_hand(
+            get_store(), args.id, filled=args.filled, none=bool(args.none),
+            force=bool(args.force)))
+    except ValueError as e:
+        print(f"  REFUSED: {e}")
+        sys.exit(1)
+
+
 def cmd_close(args):
     from .trade_store import get_store
     store = get_store()
@@ -1139,6 +1164,18 @@ def cmd_close(args):
         if args.exit_debit is None:
             print("  A naked long needs --exit-debit <average sell price per share>.")
             sys.exit(1)
+        # Review A2: never book while the bot's sell still works at NEO or the
+        # account still holds the lot -- the engine stops watching an exited
+        # record, and an orphaned sell filling later leaves the account SHORT.
+        from .naked_exit import hand_close_problem
+        why = hand_close_problem(trade)
+        if why:
+            if not getattr(args, 'force', False):
+                print(f"  REFUSED: {why}")
+                print("  (--force books it anyway; only when you have "
+                      "checked the NEO app yourself.)")
+                sys.exit(1)
+            print(f"  --force: booking despite: {why}")
         try:
             t = store.mark_exited(args.id, args.exit_spot or trade.get('entry_spot', 0),
                                   args.exit_debit, args.reason or 'manual',
@@ -2470,7 +2507,24 @@ def main():
                        help='Closing net debit per share (struct value)')
     p_cls.add_argument('--exit-spot', type=float, default=None)
     p_cls.add_argument('--reason', default=None)
+    p_cls.add_argument('--force', action='store_true',
+                       help='naked long: book even if a NEO sell is working or the lot is held')
     p_cls.set_defaults(func=cmd_close)
+
+    p_nc = sub.add_parser('naked-check',
+                          help='read-only: is the live naked path safe right now')
+    p_nc.set_defaults(func=cmd_naked_check)
+
+    p_nr = sub.add_parser('naked-resolve',
+                          help='settle an UNRESOLVED naked order by hand (it blocks entries)')
+    p_nr.add_argument('id', type=int, help='the PAPER parent id named in the alert')
+    g = p_nr.add_mutually_exclusive_group(required=True)
+    g.add_argument('--filled', type=float, default=None,
+                   help='it filled at this average price: file the naked record')
+    g.add_argument('--none', action='store_true', help='nothing was bought')
+    p_nr.add_argument('--force', action='store_true',
+                      help='--none without the NEO flat check (you checked the app)')
+    p_nr.set_defaults(func=cmd_naked_resolve)
 
     p_cnc = sub.add_parser('cancel', help='Cancel watching/triggered signal')
     p_cnc.add_argument('id', type=int)

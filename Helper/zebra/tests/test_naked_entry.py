@@ -78,6 +78,7 @@ def _iso(tmp_path, monkeypatch):
     # An armed exit engine is assumed; its own gate is tested below with a
     # real heartbeat file.
     monkeypatch.setattr(ne, 'exit_engine_problem', lambda m: '')
+    monkeypatch.setattr(ne, '_sleep', lambda s: None)
     ne.end_cycle()
     yield
     ne.end_cycle()
@@ -243,7 +244,8 @@ def test_cutoff_boundary(store, hm, state):
         assert out.reason.startswith('late')
 
 
-@pytest.mark.parametrize('ask,state', [(250.0, 'entered'), (250.01, 'skipped')])
+# The cap is checked on the LIMIT (ask + 1 tick since P7e): the most the order can pay.
+@pytest.mark.parametrize('ask,state', [(249.95, 'entered'), (250.0, 'skipped')])
 def test_premium_cap_boundary_skips_never_resizes(store, ask, state):
     QUOTES['TESTCO26DEC1000CE'] = _q(ask=ask, bid=ask - 0.5)
     out, _ = go(store, parent(store))
@@ -296,7 +298,7 @@ def test_price_reject_requotes_and_retries_once(store):
                  ne.BuyResult('filled', fill_price=22.0, order_id='X2'))
     out, _ = go(store, parent(store), broker=b)
     assert out.state == 'entered' and out.orders == 2
-    assert [o[2] for o in b.orders] == [21.5, 22.0]
+    assert [o[2] for o in b.orders] == [21.55, 22.05]   # marketable: ask + 1 tick
     assert naked(store)[0]['long_ask_entry'] == 22.0     # the touch of the order that filled
 
 
@@ -322,10 +324,62 @@ def test_retry_requote_over_the_cap_skips(store):
     assert out.state == 'skipped' and 'retry' in out.reason and len(b.orders) == 1
 
 
-def test_unfilled_skips_quietly(store):
-    b = Scripted(ne.BuyResult('unfilled', message='cancelled, nothing filled'))
+def test_unfilled_chases_then_skips_quietly(store, monkeypatch):
+    monkeypatch.setattr(cfg, 'NAKED_ENTRY_CHASE_ROUNDS', 6)
+    b = Scripted(*[ne.BuyResult('unfilled', message='cancelled, nothing filled')] * 6)
     out, _ = go(store, parent(store), broker=b)
-    assert out.state == 'skipped' and not naked(store)
+    assert out.state == 'skipped' and 'not filled in 6 orders' in out.reason
+    assert len(b.orders) == 6 and not naked(store)
+
+
+# -- the entry chase (P7e, owner 2026-11-28: "never miss entry") ---------------------
+
+def test_the_chase_follows_the_ask_up_and_fills(store, monkeypatch):
+    monkeypatch.setattr(cfg, 'NAKED_ENTRY_MAX_CHASE_PCT', 5.0)
+    QUOTES['TESTCO26DEC1000CE'] = [_q(ask=21.5), _q(ask=21.8), _q(ask=22.1)]
+    b = Scripted(ne.BuyResult('unfilled', message='x'), ne.BuyResult('unfilled', message='x'),
+                 ne.BuyResult('filled', fill_price=22.1, order_id='X3'))
+    out, _ = go(store, parent(store), broker=b)
+    assert out.state == 'entered' and out.orders == 3
+    assert [o[2] for o in b.orders] == [21.55, 21.85, 22.15]
+    rec = naked(store)[0]
+    assert rec['entry_signal_ask'] == 21.5 and rec['entry_orders'] == 3
+
+
+def test_the_chase_never_pays_past_the_bound(store, monkeypatch):
+    monkeypatch.setattr(cfg, 'NAKED_ENTRY_MAX_CHASE_PCT', 5.0)
+    monkeypatch.setattr(cfg, 'NAKED_ENTRY_CHASE_ROUNDS', 2)
+    # 21.5 x 1.05 = 22.575 -> bound 22.55 on the tick grid
+    QUOTES['TESTCO26DEC1000CE'] = [_q(ask=21.5), _q(ask=22.5)]
+    b = Scripted(ne.BuyResult('unfilled', message='x'), ne.BuyResult('unfilled', message='x'))
+    go(store, parent(store), broker=b)
+    assert [o[2] for o in b.orders] == [21.55, 22.55]   # capped at the bound, not 22.55+tick
+
+
+def test_a_signal_that_ran_away_is_skipped_and_says_so(store, monkeypatch):
+    monkeypatch.setattr(cfg, 'NAKED_ENTRY_MAX_CHASE_PCT', 5.0)
+    QUOTES['TESTCO26DEC1000CE'] = [_q(ask=21.5), _q(ask=23.0)]
+    b = Scripted(ne.BuyResult('unfilled', message='x'))
+    out, _ = go(store, parent(store), broker=b)
+    assert out.state == 'skipped' and 'ran away' in out.reason and len(b.orders) == 1
+
+
+def test_rehearsal_fills_at_the_ask_not_the_buffered_limit(store):
+    out, _ = go(store, parent(store))                  # the real RehearsalBroker
+    assert out.state == 'entered'
+    rec = naked(store)[0]
+    assert rec['entry_long_price'] == 21.5 and rec['entry_signal_ask'] == 21.5
+
+
+def test_slippage_is_measured_against_the_signal_ask():
+    from zebra import naked_halt
+    rec = {'debit': 22.0, 'entry_long_price': 22.0, 'entry_signal_ask': 21.0,
+           'long_ask_entry': 22.0, 'entry_date': '2026-12-02', 'entry_time': '10:00:00',
+           'status': 'entered'}
+    assert naked_halt.fill_slippages([rec]) == [pytest.approx(100.0 / 22.0)]
+    old = dict(rec)
+    old.pop('entry_signal_ask')
+    assert naked_halt.fill_slippages([old]) == [0.0]   # older records: the order's own ask
 
 
 @pytest.mark.parametrize('res', [ne.BuyResult('unclear', message='timeout'),
@@ -414,6 +468,9 @@ def test_the_hook_runs_after_the_paper_entry_and_never_breaks_it(store, monkeypa
 
 # ── the exit-engine gate (fail-closed backstop for `live`) ─────────────────────
 
+_REAL_GATE = ne.exit_engine_problem
+
+
 def _beat(tmp_path, **kw):
     import time as _t
     b = {'schema': 1, 'ts': _t.time(), 'at': 'now', 'state': 'polling',
@@ -429,20 +486,50 @@ def _beat(tmp_path, **kw):
     ({'naked_engine': False}, 'live', False),
     ({'naked_engine': False}, 'rehearsal', False),
     ({'ts': 0}, 'live', False),                    # stale
+    # review A4/F3: the beat must say POLLING and be recent
+    ({'state': 'startup'}, 'live', False),         # a startup crash loop never polls
+    ({'state': 'idle'}, 'live', False),
+    ({'state': 'waiting'}, 'live', False),
+    ({'ts_ago': 200}, 'live', False),              # inside the old 15-min window, too old now
+    ({'ts_ago': 60}, 'live', True),
 ])
 def test_exit_engine_gate(tmp_path, beat, mode, ok):
-    real = ne._real_exit_engine_problem
+    import time as _t
+    beat = dict(beat)
+    if 'ts_ago' in beat:
+        beat['ts'] = _t.time() - beat.pop('ts_ago')
     _beat(tmp_path, **beat)
-    assert (real(mode) == '') is ok
+    assert (ne._beat_problem(mode) == '') is ok
 
 
 def test_exit_engine_gate_missing_heartbeat_refuses(tmp_path):
-    assert ne._real_exit_engine_problem('live') != ''
+    assert ne._beat_problem('live') != ''
+
+
+def test_the_gate_waits_in_cycle_for_a_polling_beat(tmp_path, monkeypatch):
+    _beat(tmp_path, state='waiting')
+    calls = []
+
+    def sleep(sec):                                # the monitor starts polling meanwhile
+        calls.append(sec)
+        _beat(tmp_path)
+    monkeypatch.setattr(ne, '_sleep', sleep)
+    monkeypatch.setattr(cfg, 'NAKED_ENTRY_HEARTBEAT_WAIT_SEC', 20)
+    assert ne._beat_problem('live') != ''
+    assert _REAL_GATE('live') == '' and calls       # waited, then the beat qualified
+
+
+def test_the_gate_gives_up_after_the_wait(tmp_path, monkeypatch):
+    _beat(tmp_path, state='waiting')
+    monkeypatch.setattr(cfg, 'NAKED_ENTRY_HEARTBEAT_WAIT_SEC', 0)
+    assert 'not polling' in _REAL_GATE('live')
 
 
 def test_live_entry_is_refused_without_an_armed_exit_engine(store, tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, 'NAKED_LIVE', 'live')
-    monkeypatch.setattr(ne, 'exit_engine_problem', ne._real_exit_engine_problem)
+    real = _REAL_GATE
+    monkeypatch.setattr(ne, 'exit_engine_problem', real)
+    monkeypatch.setattr(cfg, 'NAKED_ENTRY_HEARTBEAT_WAIT_SEC', 0)
     _beat(tmp_path, dry_run=True)
     b = Scripted(ne.BuyResult('filled', fill_price=21.5, order_id='X'))
     out, sent = go(store, parent(store), broker=b)

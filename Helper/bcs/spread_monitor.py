@@ -439,7 +439,7 @@ def _live_naked_open_locally() -> bool:
 #: F&O continuous trading ends 15:40 (closing-auction session, live since
 #: 2026-08-03); only a live naked exit ALREADY CHASING keeps the loop alive
 #: past MARKET_CLOSE, and only until this.
-NAKED_FO_CLOSE = dtime(15, 40)
+NAKED_FO_CLOSE = market_session.FNO_CLOSE
 
 #: The day Kite's own prints DISPROVED a listed holiday (set by
 #: `holiday_standdown`). `is_market_open` reads the same calendar, so without
@@ -8079,7 +8079,10 @@ def _arming_preflight(dry_run: bool, all_trades) -> dict:
     # Live naked records are LIVE cohort records this engine books (design
     # Q9); the adapter does not return them, so they are added here.
     # Rehearsal records are fake fills and belong to no broker (G18).
-    if _NAKED_ENGINE is not None and _NAKED_ENGINE.live_population():
+    # Engine absent (it failed to build): count from the FILE (review A12),
+    # so an engine that could not start cannot hide the positions it owns.
+    if ((_NAKED_ENGINE is not None and _NAKED_ENGINE.live_population())
+            or (_NAKED_ENGINE is None and _live_naked_open_locally())):
         population.add(arming.LIVE_RECORD)
     state = arming.check(
         paper_mode=paper_mode, exits_external=exits_external,
@@ -8134,6 +8137,48 @@ def _open_naked_engine(dry_run: bool, zebra_store=None):
         return None
 
 
+def _naked_keeps_alive(engine) -> int:
+    """Non-zero while the naked engine has a reason to keep this process up:
+    an open naked record, or `naked_live` armed (review A9/F7) -- a monitor that
+    exits on an empty book leaves no exit engine for the NEXT entry, and the
+    live entry gate then refuses it, so the live sample loses its first trade
+    after every flat spell."""
+    if engine is None:
+        return 0
+    n = engine.open_count()
+    if n:
+        return n
+    try:
+        from zebra import config as zcfg
+        return 1 if zcfg.NAKED_LIVE != 'off' else 0
+    except Exception:
+        return 0
+
+
+def _unclaim_naked_engine() -> None:
+    """Rewrite the LAST beat with `naked_engine: false` (review A4/F3).
+
+    Every way out of `monitor_all` -- a clean return, a FATAL return, a crash,
+    SIGTERM -- passes here, so no beat can keep telling the live entry gate an
+    exit engine is running after this process stopped. Only that field
+    changes: the beat's time and counts stay what they were, so zebra's own
+    reading of the BCS engine is untouched. Never raises."""
+    global _NAKED_ENGINE
+    _NAKED_ENGINE = None
+    try:
+        path = heartbeat_path()
+        beat = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(beat, dict) or not beat.get('naked_engine'):
+            return
+        beat['naked_engine'] = False
+        beat['naked_engine_released'] = now_ist().isoformat(timespec='seconds')
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(beat), encoding='utf-8')
+        os.replace(tmp, path)
+    except Exception as e:
+        log(f"  WARNING: could not release the naked engine in the heartbeat: {e}")
+
+
 def _naked_unmonitored(engine) -> str:
     """The naked positions a dying monitor leaves behind, for its FATAL alert."""
     if engine is None:
@@ -8145,6 +8190,68 @@ def _naked_unmonitored(engine) -> str:
     return ''.join(f", NAKED:{t.get('stock')}#{t.get('id')}" for t in recs)
 
 
+def _releases_naked_engine(fn):
+    """One guarantee on EVERY way out of `monitor_all` (review A4/F3): the
+    heartbeat stops claiming a naked exit engine, and a crash is said out loud
+    with what it leaves unwatched. A decorator, not a wrapper function, so the
+    loop keeps its name and its source for the tests that read it."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(*a, **k):
+        try:
+            return fn(*a, **k)
+        except BaseException as e:
+            if isinstance(e, Exception) and _crash_alert_due(e):
+                try:
+                    send_telegram(f"SPREAD MONITOR CRASHED ({type(e).__name__}: "
+                                  f"{str(e)[:150]}){_naked_unmonitored(_NAKED_ENGINE)} -- the "
+                                  f"next cron tick restarts it; until then nothing is watched.",
+                                  alert_class=alert_policy.SAFETY)
+                except Exception:
+                    pass
+            raise
+        finally:
+            _unclaim_naked_engine()
+    return run
+
+
+#: A startup crash loop re-runs every 5 minutes; one alert per exception type
+#: per this many seconds (ops re-review N2).
+CRASH_ALERT_REPEAT_SEC = 3600
+
+
+def _crash_alert_due(e: BaseException) -> bool:
+    """True at most once per exception type per CRASH_ALERT_REPEAT_SEC, kept
+    on disk (the process does not survive its own crash). Unreadable -> True."""
+    path = LOG_DIR / 'spread_monitor_crash_alert.json'
+    key, now = type(e).__name__, time.time()
+    try:
+        seen = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(seen, dict):
+            seen = {}
+    except Exception:
+        seen = {}
+    try:
+        if now - float(seen.get(key, 0)) < CRASH_ALERT_REPEAT_SEC:
+            return False
+    except (TypeError, ValueError):
+        pass
+    seen[key] = now
+    try:
+        path.write_text(json.dumps(seen), encoding='utf-8')
+    except Exception:
+        pass
+    return True
+
+
+def _sigterm_to_exit(signum, frame):
+    """`pkill` is the documented restart: turn SIGTERM into SystemExit so the
+    decorator's `finally` runs and the beat is released (advisor, 2026-11-28)."""
+    raise SystemExit(128 + int(signum))
+
+
+@_releases_naked_engine
 def monitor_all(kite: KiteConnect, dry_run: bool):
     """
     Monitor ALL open trades (BCS + BPS + Fallen Hero) in a single loop.
@@ -8221,7 +8328,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
         except Exception:
             pass
 
-    naked_n = naked_engine.open_count() if naked_engine is not None else 0
+    naked_n = _naked_keeps_alive(naked_engine)
     if not all_trades and not wl_active and not frozen_n and not naked_n:
         if corrupt:
             log("Book is empty because a store was QUARANTINED — NOT exiting "
@@ -8427,7 +8534,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     # F&O trades to 15:40 while the cash session (and this
                     # monitor's clock) ends at 15:30. A live naked exit already
                     # selling must not be abandoned overnight mid-chase.
-                    naked_engine.dry_run = dry_run
+                    naked_engine.dry_run = (dry_run or naked_engine.dry_run
+                                            or not trading_enabled())
                     try:
                         naked_engine.poll(kite, closing_only=True)
                     except Exception as e:
@@ -8473,7 +8581,13 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             # in the loop body can never starve it. `dry_run` is re-read every
             # poll so a tripped kill switch stops naked sells too.
             if naked_engine is not None:
-                naked_engine.dry_run = dry_run
+                # The kill switch is read HERE too (review F12): this poll runs
+                # before the loop's own kill-switch block, and a sell placed on
+                # the very poll the switch tripped is a sell the owner refused.
+                # ONE-WAY for the session, like the loop's own kill switch: once
+                # tripped, re-arming means a restart (ops re-review N4).
+                naked_engine.dry_run = (dry_run or naked_engine.dry_run
+                                        or not trading_enabled())
                 try:
                     naked_engine.poll(kite)
                 except Exception as e:
@@ -8508,7 +8622,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 except Exception:
                     pass
 
-            naked_n = naked_engine.open_count() if naked_engine is not None else 0
+            naked_n = _naked_keeps_alive(naked_engine)
             if not all_trades and not wl_active and not frozen_n and not naked_n:
                 # A book that went empty MID-SESSION is far more suspicious
                 # than one that started empty: the trades were there at 09:15.
@@ -9338,6 +9452,11 @@ def main():
         if holiday_standdown(probe_naked=True):
             return
         # Log file is set inside monitor_all()
+        try:
+            import signal
+            signal.signal(signal.SIGTERM, _sigterm_to_exit)
+        except Exception as e:                      # not in the main thread, etc.
+            log(f"  (SIGTERM handler not installed: {e})")
         kite = load_kite()
         log("Kite authenticated.")
         monitor_all(kite, args.dry_run)
