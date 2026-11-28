@@ -316,7 +316,10 @@ def _clock_synced() -> Optional[bool]:
     return True if v == 'yes' else False if v == 'no' else None
 
 
-#: replaced in tests
+#: replaced in tests: the HTTP session a reader builds when none is given.
+#: The test suite swaps in one that RAISES, so no test can reach NEO from
+#: the Pi, where LOGIN_HOST allows a real login (zebra did, 28-Nov 07:44)
+new_http: Callable[[], Any] = requests.Session
 login_host_ok: Callable[[], bool] = _login_host_ok
 clock_synced: Callable[[], Optional[bool]] = _clock_synced
 
@@ -444,7 +447,7 @@ class NeoReader:
         self.login_url = login_url.rstrip('/')
         self.timeout = timeout
         self.login_timeout = login_timeout
-        self.http = session or requests.Session()
+        self.http = session or new_http()
         self._totp = totp_fn
         self.policy = policy or EnvelopePolicy()
         #: set when a re-login did not restore the session: `ready` turns

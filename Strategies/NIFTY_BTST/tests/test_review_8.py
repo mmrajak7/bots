@@ -243,6 +243,14 @@ def test_build_broker_gives_every_btst_process_one_shared_brake_file(monkeypatch
     assert live_cli._brake_path() != REAL_BRAKE_PATH()   # conftest keeps tests off it
 
 
+def test_no_test_can_reach_the_real_neo(tmp_path):
+    """The rail: a reader built WITHOUT a fake session (as zebra's test did,
+    making a real login from the Pi on 28-Nov) cannot send anything."""
+    r = NeoReader(CREDS, 'https://x', 5, 5, brake=LoginBrake(tmp_path / 'b.json'))
+    with pytest.raises(AssertionError, match='REAL NEO'):
+        r.login()
+
+
 # ------------------------------------------------- R8-2 exit sends failing
 def test_two_failed_exit_sends_tell_the_owner_to_sell_in_the_app(cfg, tmp_path, market):
     rig = marked(cfg, tmp_path, market)

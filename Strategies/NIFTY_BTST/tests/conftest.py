@@ -130,6 +130,18 @@ def _login_allowed_here(monkeypatch):
     from nifty_btst import neo_client
     monkeypatch.setattr(neo_client, 'login_host_ok', lambda: True)
     monkeypatch.setattr(neo_client, 'clock_synced', lambda: None)
+    # ...and that is safe only because no test can reach the REAL NEO: a
+    # reader built without a fake session gets one that refuses every call
+    monkeypatch.setattr(neo_client, 'new_http', _NoNetwork)
+
+
+class _NoNetwork:
+    """The HTTP session a test gets when it forgot to inject a fake one."""
+
+    def _refuse(self, *a, **kw):
+        raise AssertionError('a test tried to reach the REAL NEO (no fake session injected)')
+
+    post = get = put = delete = request = _refuse
 
 
 @pytest.fixture(autouse=True)
