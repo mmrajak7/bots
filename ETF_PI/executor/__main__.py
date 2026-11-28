@@ -380,15 +380,16 @@ def cmd_probe(args) -> int:
           'opt_type': str(r['instrument_type']), 'signal_tf': '10minute',
           'signal_ltp': float(q.get('ltp') or ask), 'st_value': round(ask * 1.09, 2),
           't2_value': 0, 't2_tf': '', 'lot_size': info['lot_size'], 'tick_size': info['tick_size'],
-          'entry_bid': q.get('bid'), 'entry_ask': ask, 'probe': True}
+          'entry_bid': q.get('bid'), 'entry_ask': ask, 'probe': True,
+          'probe_rest_steps': int(args.rest_steps)}
     d = os.path.join(C.STATE_DIR, 'intents')
     os.makedirs(d, exist_ok=True)
     tmp = os.path.join(d, key + '.json.tmp')
     with io.open(tmp, 'w', encoding='utf-8') as f:
         json.dump(it, f)
     os.replace(tmp, os.path.join(d, key + '.json'))
-    print('probe intent written: %s (ask %.2f, T1 %.2f). End it with: python3 -m executor flatten'
-          % (key, ask, it['st_value']))
+    print('probe intent written: %s (ask %.2f, T1 %.2f, %d resting exit sells). End it with: '
+          'python3 -m executor flatten' % (key, ask, it['st_value'], it['probe_rest_steps']))
     return 0
 
 
@@ -422,6 +423,9 @@ def main(argv=None) -> int:
     pp = sub.add_parser('probe')
     pp.add_argument('--symbol', required=True, help='Kite tradingsymbol, e.g. NIFTY2612026000CE')
     pp.add_argument('--confirm-real-order', action='store_true')
+    pp.add_argument('--rest-steps', type=int, default=0, choices=range(0, 6),
+                    help='T7: the first N exit sells rest 3%% ABOVE the bid, so the flatten '
+                         'exercises cancel -> confirm -> re-place N times (0-5, default 0)')
     args = ap.parse_args(argv)
     return globals()['cmd_' + args.cmd](args)
 

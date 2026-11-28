@@ -25,6 +25,10 @@ from .config import live_allowed
 
 log = logging.getLogger('executor.engine')
 
+#: review T7: a probe's resting exit sells sit this far ABOVE the bid (never fill at once)
+PROBE_REST_PCT = 3.0
+PROBE_REST_MAX = 5
+
 ACTIVE = ('PENDING', 'ENTRY', 'OPEN', 'EXIT')
 TERMINAL = ('CLOSED', 'SKIPPED', 'UNFILLED')
 
@@ -379,6 +383,10 @@ class Engine:
             'sold': 0, 'proceeds': 0.0, 'realised': 0.0, 'carried_qty': 0, 'carry_day': None,
             'carry': False, 'no_price_since': None, 'stale_exit': False, 'last_fill_epoch': 0.0,
             'exit_fault': False, 'note': '', 'signal_at': it.get('created_at'),
+            # review T7 (2026-11-28): a PROBE may rest its first N sells ABOVE the bid so
+            # Monday exercises cancel -> confirm -> re-place for real. Never a signal's.
+            'probe_rest_steps': (max(0, min(int(it.get('probe_rest_steps') or 0), PROBE_REST_MAX))
+                                 if str(it['key']).startswith('PROBE_') else 0),
         }
         self.pos[p['key']] = p
         self.feed.watch(p['kite_symbol'], p['kite_token'])
@@ -753,7 +761,12 @@ class Engine:
         return None
 
     def _exit_price(self, p: Dict[str, Any]) -> Callable[[float, int, float], float]:
+        rest = int(p.get('probe_rest_steps') or 0)
+
         def price(bid: float, n: int, tick: float) -> float:
+            if n < rest:                                  # T7: a probe's resting sells
+                return rules.round_up(bid * (1 + PROBE_REST_PCT / 100.0), tick)
+            n -= rest
             first = None
             if n == 0:
                 if p.get('exit_type') == 'TP':
