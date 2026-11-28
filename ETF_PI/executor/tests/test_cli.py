@@ -52,3 +52,13 @@ def test_a12_stop_placing_before_eod_is_refused(tmp_path):
     from executor import config as C
     with pytest.raises(C.ConfigError, match='stop_placing'):
         C.load(local_path=str(tmp_path / 'none.yaml'), override={'stop_placing': '15:10:00'})
+
+
+def test_a7_product_is_mis_only_and_the_bot_is_etf(tmp_path):
+    import pytest
+    from executor import config as C
+    none = str(tmp_path / 'none.yaml')
+    assert C.load(local_path=none)['product'] == 'MIS'
+    for bad in ({'product': 'NRML'}, {'product': 'CNC'}, {'neo_bot': 'btst'}, {'neo_bot': 'etfx'}):
+        with pytest.raises(C.ConfigError):
+            C.load(local_path=none, override=bad)

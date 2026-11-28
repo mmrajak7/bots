@@ -339,12 +339,13 @@ def test_flatten_file_exits_everything(rig):
 
 # -- shared strike (O6) --------------------------------------------------------------------------
 def test_a_strike_another_bot_holds_is_not_entered(tmp_path, monkeypatch):
-    """Same-product collision guard (the gate matters only when ETF shares BTST's NRML)."""
+    """Same-product collision guard: another bot's MIS lot on the strike (ETF is MIS-only
+    since review A7'; BTST's NRML row is never ETF's)."""
     monkeypatch.setattr(KS, 'HOME', tmp_path / 'neo')
-    rig = Rig(tmp_path, product='NRML')
+    rig = Rig(tmp_path)
     rig.quote(99.95, 100.0)
     rig.step()
-    btst = KCN.NeoClient('btst', http=rig.fake, current_fn=lambda: KS.Session(
+    btst = KCN.NeoClient('btst', http=rig.fake, product='MIS', current_fn=lambda: KS.Session(
         1, '', '', 'https://x.kotaksecurities.com', 'T', 'S', None, 'C', 'U'))
     btst.place(KCN.OrderRequest(SYM, '1', 'B', 65, '100.00', btst.new_tag()))
     k = rig.intent()

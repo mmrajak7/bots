@@ -105,10 +105,16 @@ def validate(cfg: Dict[str, Any]) -> Dict[str, Any]:
         raise ConfigError('exit_steps_pct must be a list of positive percents')
     if int(c['entry_attempts']) < 1:
         raise ConfigError('entry_attempts must be >= 1')
-    if c['product'] not in ('NRML', 'MIS'):
-        raise ConfigError('product=%r: NRML or MIS' % c['product'])
-    if not str(c['neo_bot']).isalpha():
-        raise ConfigError('neo_bot must be letters')
+    # review A7' (2026-11-28): MIS and the `etf` tag are fixed in CODE, not just yaml
+    # defaults. An overlay flipping to NRML would put ETF lots in BTST's NRML rows
+    # (BTST would read them as EXTRA LOT / SHORT) and lose the broker's MIS square-off;
+    # another bot name would put ETF orders outside every `etf-` ownership check.
+    # A NRML fallback is a code change + review, never a config edit.
+    if str(c['product']).strip().upper() != 'MIS':
+        raise ConfigError('product=%r: ETF trades MIS only' % c['product'])
+    c['product'] = 'MIS'
+    if str(c['neo_bot']) != 'etf':
+        raise ConfigError('neo_bot=%r: must be "etf"' % c['neo_bot'])
     if not c.get('bots_root'):
         here_bots = os.path.dirname(ETF_DIR)
         pi_default = '/home/trustit/Desktop/BOTS'
