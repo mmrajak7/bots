@@ -124,8 +124,12 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
         dp_last = decision_path(env, m, sd, revs[-1])
         text = dp_last.read_text(encoding="utf-8")
         dec_old = json.loads(text)
-        if M is None or dec_old.get("announced_sha256") == P.announced_sha(M):
+        fits = decision_fits(L.replay(j.read()), dec_old)
+        if fits and (M is None or dec_old.get("announced_sha256") == P.announced_sha(M)):
             return finalise(env, dec_old, text, dp_last)
+        if not fits:
+            env.alert("PLAN_REBUILD", f"decision r{revs[-1]} no longer fits the book (a sale / quantity changed "
+                      "since it was made): rebuilding")
         rev = revs[-1] + 1
         env.alert("PLAN_REBUILD", f"fo_announced.json changed after decision r{revs[-1]}: rebuilding as r{rev}")
     # 1. sessions (Kite) and the signal-day check (§3.3)
@@ -278,6 +282,8 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
     flags = [f for f in decision["audit"]["flags"] if f["touched"]]
     sells = decision.get("sells", [])
     lg = L.replay(j.read())
+    if not decision_fits(lg, decision):
+        raise EveningError("the decision no longer fits the book: not finalised (the next run rebuilds it)")
     for pid in decision.get("expire", []):     # E26: last month's never-placed buys end when this plan is final
         p = lg.positions[pid]
         if p.leg in ("BUY_GATED", "PENDING_BUY"):
@@ -323,6 +329,16 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
                f"signal day {plan_id['signal_day']} verified on Kite")
     return {"status": "FINAL", "decision": str(dp), "buys": len(buys), "sells": len(sells), "holds": len(holds),
             "flags": len(flags)}
+
+
+def decision_fits(lg: L.Ledger, decision: Dict[str, Any]) -> bool:
+    """The PLAN_FINAL this decision would write must replay on today's journal (review: a sell qty above what is
+    held now would make every later replay raise)."""
+    for x in decision.get("sells", []):
+        p = lg.positions.get(x["position_id"])
+        if p is None or p.leg != "NONE" or not 0 < int(x.get("qty") or p.held_qty) <= p.held_qty:
+            return False
+    return not any(b["position_id"] in lg.positions for b in decision.get("buys", []))
 
 
 def plan_expiry(lg: L.Ledger) -> List[str]:

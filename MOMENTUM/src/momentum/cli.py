@@ -248,9 +248,19 @@ def ledger_cache_problem(x: Ctx, recs: List[Dict[str, Any]]) -> Optional[str]:
         return "ledger.json unreadable"
     if not isinstance(n, int) or n > last:
         return f"ledger.json was written at journal seq {n} but the journal ends at {last} (journal lost records?)"
-    if stored != L.replay([r for r in recs if r["seq"] <= n]).to_json():
+    if not same_ledger(stored, L.replay([r for r in recs if r["seq"] <= n]).to_json()):
         return f"ledger.json != journal replay at seq {n} (file edited or damaged?)"
     return None
+
+
+def same_ledger(stored: Any, replay: Any) -> bool:
+    """Equal, ignoring fields the replay has and the file lacks (a file written by an older code version before a
+    pull: a new field is not damage). Every field both have must match."""
+    if isinstance(stored, dict) and isinstance(replay, dict):
+        if set(stored) - set(replay):
+            return False
+        return all(same_ledger(stored[k], replay[k]) for k in stored)
+    return stored == replay
 
 
 def backup_state(x: Ctx) -> bool:
@@ -521,7 +531,7 @@ def cmd_check_arm(x: Ctx, a: argparse.Namespace) -> int:
     from . import pipeline as P
     today = util.today()
     lg = L.replay(x.journal.read())
-    months = {p.plan_id["month"] for p in lg.positions.values() if p.leg == "PENDING_BUY"}
+    months = {p.plan_id["month"] for p in lg.positions.values() if p.leg == "PENDING_BUY" and not p.test}
     if (x.paths.refresh / "pending_signal.json").exists() or EV.is_signal_day(today, holidays(x.cfg, x.home)):
         months.add(P.month_add(today.isoformat()[:7], 1))
     for m in sorted(months):

@@ -4,8 +4,8 @@
 */30 20-23 * * *   $M evening >> $L 2>&1        # signal-day evening (no-op on other days; re-runs a pending signal day; resumes)
 10,40 9-12 * * 1-5 $M evening --pending-only >> $L 2>&1   # catch-up: a failed signal evening retries before day-1 14:45
 30 20 * * *        $M check-arm >> $L 2>&1
-5 19 * * *         $M fo-scan >> $L 2>&1
-25 19 * * *        $M ca-scan >> $L 2>&1        # corporate actions on book names (January spec §7)        # NSE F&O circulars store (D47); the evening scans again before its F&O vet
+5 19 * * *         $M fo-scan >> $L 2>&1        # NSE F&O circulars store (D47); the evening scans again before its F&O vet
+25 19 * * *        $M ca-scan >> $L 2>&1        # corporate actions on book names (January spec s7)
 30 8 * * 1-5       $M canary >> $L 2>&1
 35 8 * * 1-5       $M morning >> $L 2>&1        # alive, token wait, preflight, holdings snapshot, holds reminder, cash
 30 14 * * 1-5      $M canary >> $L 2>&1

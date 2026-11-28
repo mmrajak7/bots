@@ -149,5 +149,68 @@ class TestCATiming(SellHarness):
         self.assertEqual(lg.positions["2612-02"].leg, "CLOSED")       # sold on 1 Jan, 19 days before the ex-date
 
 
+class TestPreMergeReview(SellHarness):
+    """Independent review 2 (pre-merge)."""
+
+    def test_split_that_went_ex_before_the_buy_does_nothing(self) -> None:
+        div = rec("INE999999999", "OTHER", "2027-01-05", "Dividend - Rs 2 Per Share")
+        body = json.dumps([div, rec("INE000000002", "SYM2", "2026-11-30", "Bonus 1:1")]).encode()   # ex before 1 Dec
+        CA.scan(self.env(), M.CA, get=lambda u: (200, body, ""))
+        CA.activate_due(self.env())
+        self.assertNotIn("PENDING_CA", L.replay(self.j.read()).positions["2612-02"].overlays)
+
+    def test_credit_while_selling_sells_the_credited_shares(self) -> None:
+        self.j.append("CA_CREDIT", position_id="2612-02", ca_id="b", factor_num=2, factor_den=1, qty_before=50,
+                      qty_after=100)
+        p = L.replay(self.j.read()).positions["2612-02"]
+        self.assertEqual((p.held_qty, p.sell_target), (100, 100))
+        lg = self.afternoon(fill=fill_all(self.k), holdings={"INE000000001": 12, "INE000000002": 100})
+        self.assertEqual((lg.positions["2612-02"].held_qty, lg.positions["2612-02"].leg), (0, "CLOSED"))
+
+    def test_decision_that_no_longer_fits_is_refused(self) -> None:
+        from momentum import evening as EV
+        lg = L.replay(self.j.read())
+        self.assertFalse(EV.decision_fits(lg, {"sells": [{"position_id": "2612-01", "qty": 999}], "buys": []}))
+        self.assertTrue(EV.decision_fits(lg, {"sells": [{"position_id": "2612-01", "qty": 12}], "buys": []}))
+
+    def test_ledger_file_from_older_code_is_not_damage(self) -> None:
+        new = L.replay(self.j.read()).to_json()
+        old = json.loads(json.dumps(new))
+        for p in old["positions"].values():
+            p.pop("sold_qty")
+        old.pop("test_cash_paise")
+        self.assertTrue(cli.same_ledger(old, new))
+        old["cash_paise"] += 1
+        self.assertFalse(cli.same_ledger(old, new))
+
+
+class TestBuyOnlyDayStartsAt1446(Harness):
+    def test_telegram_down_1505_to_1509_still_buys(self) -> None:
+        """On main the START went at ~14:46; the sell / gate stages must not delay it on a buy-only day."""
+        def notify_window(text, buttons=None):  # noqa: ANN001, ANN202
+            t = util.now().strftime("%H:%M")
+            self.sent.append((text, buttons))
+            return not ("15:05" <= t <= "15:09")
+        env = self.env()
+        env.notify = notify_window
+        self.k.on_place = fill_all(self.k)
+        E.afternoon(env, {}, lambda: [])
+        self.assertEqual(self.k.calls.count("place"), 2)
+        starts = [r for r in self.j.read() if r["type"] == "STEP_START" and r.get("step") == "DAY"]
+        self.assertTrue(starts and starts[0]["telegram_ok"] and starts[0]["ts"][11:16] < "14:50")
+
+
+class TestEarmarkMoveOnlyForPlacedOrders(Harness):
+    prices = {1: 1800.0, 2: 990.0}
+
+    def test_refused_receiver_moves_nothing(self) -> None:
+        self.k.reject_next = "OrderException: something about the scrip"      # the first buy (SYM1) is refused
+        self.run_day(fill=None)
+        moves = [r for r in self.j.read() if r["type"] == "EARMARK_MOVE"]
+        placed = {o.tradingsymbol for o in self.k.orders_}
+        for m_ in moves:                         # every move belongs to an order that exists
+            self.assertIn(L.replay(self.j.read()).positions[m_["to"]].symbol, placed)
+
+
 if __name__ == "__main__":
     unittest.main()

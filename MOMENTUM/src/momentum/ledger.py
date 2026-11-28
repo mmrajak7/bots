@@ -200,6 +200,9 @@ def replay(recs: List[Dict[str, Any]]) -> Ledger:
             if int(r["qty_before"]) != p.held_qty or int(r["qty_after"]) <= 0:
                 raise LedgerError(f"seq {r['seq']}: CA_CREDIT {p.position_id} before {r['qty_before']} != held "
                                   f"{p.held_qty}")
+            if p.leg == "SELLING":                 # the open sell must sell the credited shares too
+                left = p.sell_target - p.sold_qty
+                p.sell_target = p.sold_qty + left * int(r["qty_after"]) // int(r["qty_before"])
             p.ca_qty_delta += int(r["qty_after"]) - int(r["qty_before"])
             if r.get("new_isin"):                  # a split that changed the ISIN: the book follows the shares
                 p.isin = str(r["new_isin"])

@@ -214,7 +214,7 @@ def apply_tap(env: Env, ap: Dict[str, Any], choice: str) -> None:
     lg = L.replay(env.journal.read())
     if ap["ref_type"] == "leg":
         p = lg.positions.get(ap["ref"])
-        if p is not None and p.leg == "SELLING":
+        if p is not None and (p.leg == "SELLING" or (p.leg == "NONE" and p.held_qty > 0)):
             if choice == "sell":
                 for ov in sorted(p.overlays & set(OWNER_CLEARABLE)):
                     env.journal.append("OVERLAY", position_id=p.position_id, overlay=ov, on=False,
@@ -366,6 +366,10 @@ def apply_cmd(env: Env, cmd: str, args: str) -> None:
             env.notify(f"sold {isin}: needs one held book position with >= {qty} shares and no live book order")
             return
         tid = f"owner:sold:{isin}:{util.today().isoformat()}:{qty}"
+        if tid in lg.trade_ids:
+            env.notify(f"sold {isin} {qty}: a hand sale of {qty} today is already booked; a second one of the same "
+                       f"size: send it with the quantity split (e.g. 'sold {isin} {qty - 1} {px}' + 1)")
+            return
         if tid not in lg.trade_ids:
             pp = L.paise(px)
             from . import sellside as SS
@@ -437,6 +441,10 @@ def remind_holds(env: Env) -> int:
 
 def hold_leg(env: Env, p: L.Position, overlay: str, reason: str) -> None:
     env.journal.append("OVERLAY", position_id=p.position_id, overlay=overlay, on=True, reason=reason)
+    if p.leg == "NONE":                          # a held name (corporate action, written off): release or keep
+        open_approval(env, "leg", p.position_id, {"sell": "Release", "keep": "Keep held"},
+                      f"HOLD {p.symbol} ({overlay}): {reason}", position_id=p.position_id)
+        return
     if p.leg == "SELLING":                       # a sell is never skipped: release it or keep it held
         open_approval(env, "leg", p.position_id, {"sell": "Sell", "keep": "Keep held"},
                       f"HOLD SELL {p.symbol} ({overlay}): {reason}", position_id=p.position_id)
@@ -696,10 +704,6 @@ def place_all(env: Env, sp: StepPlan, go: List[L.Position], day: str) -> List[st
     has_intent_today = {i.position_id for i in lg0.intents.values() if i.date == day and "|buy|" in i.intent_id}
     from . import sellside as SS
     sizes, moves = SS.size_buys(env, [p for p in go if p.position_id not in has_intent_today], q, ticks)
-    for frm, to_, paise_ in moves:              # D52: the leftovers that pay an extra share leave their givers
-        env.journal.append("EARMARK_MOVE", **{"from": frm, "to": to_}, paise=paise_, date=day)
-    if moves:
-        go = [L.replay(env.journal.read()).positions[p.position_id] for p in go]
     probe_ok = False
     probes = sum(1 for i in lg0.intents.values() if i.date == day and i.status.startswith("REJECTED"))  # resumed run
     for n, p in enumerate(go):
@@ -786,6 +790,12 @@ def place_all(env: Env, sp: StepPlan, go: List[L.Position], day: str) -> List[st
             probe_ok = True
         if status == "ACK":
             placed.append(iid)
+            # D52: the leftovers that paid this buy's extra share leave their givers (only for an order that exists)
+            lgm = L.replay(env.journal.read())
+            for frm, to_, paise_ in [m_ for m_ in moves if m_[1] == p.position_id]:
+                g = lgm.positions[frm]
+                if g.leg == "PENDING_BUY" and g.remaining_paise >= paise_:
+                    env.journal.append("EARMARK_MOVE", **{"from": frm, "to": to_}, paise=paise_, date=day)
     return placed
 
 
@@ -1219,6 +1229,8 @@ def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], L
         recs = env.journal.read()
     plan_rec = [r for r in recs if r["type"] == "STAGE" and r.get("date") == day and r.get("stage") == "PLAN"][-1]
     go_ids: List[str] = plan_rec.get("go") or []
+    day_start(env, day, plan_rec)                 # D36: one "starting" message right after the plan (~14:46)
+    recs = env.journal.read()
     if not stage_done(recs, day, "SELL"):          # January slice D49: sells before the buys, same window
         from . import sellside as SS
         SS.sell_step(env, day, plan_rec.get("go_sell") or [], holdings_open)
@@ -1248,6 +1260,8 @@ def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], L
                 env.alert("ARM_MODE", f"ARM mode {env.arm.mode} is not built in this slice: no order placed. "
                           "Write an ARM with mode automatic to trade.")
                 started = False
+            elif legs and env.arm is not None and started_today(env, day):
+                started = True                     # the day's START was delivered right after the plan
             elif legs and env.arm is not None:
                 started = env.notify(f"starting BUY step: {len(legs)} buys, Rs {total:,}")
                 # one failed send must not cost the session (review 11-28 O12): retry each minute until 2 minutes
@@ -1318,6 +1332,33 @@ def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], L
     reconcile_stage(env, day)
 
 
+def started_today(env: Env, day: str) -> bool:
+    return any(r["type"] == "STEP_START" and r.get("step") == "DAY" and r.get("telegram_ok")
+               and r["ts"][:10] == day for r in env.journal.read())
+
+
+def day_start(env: Env, day: str, plan_rec: Dict[str, Any]) -> None:
+    """The automatic step starts only after a DELIVERED message (D36). Sent once, right after the plan, retried each
+    minute until 2 minutes before the first order (14:48 with sells, else 15:08). Not delivered -> each step's own
+    check (the buys keep retrying to 15:08 in PLACE)."""
+    if env.arm is None or env.arm.mode != "automatic":
+        return
+    recs = env.journal.read()
+    if any(r["type"] == "STEP_START" and r.get("step") == "DAY" and r["ts"][:10] == day for r in recs):
+        return
+    n_s, n_b = len(plan_rec.get("go_sell") or []), len(plan_rec.get("go") or [])
+    if not n_s and not n_b:
+        return
+    first = env.cfg["sell_place_at"] if n_s else env.cfg["place_at"]
+    give_up = util.at_today(first) - dt.timedelta(minutes=2)
+    text = f"starting: {n_s} sells, {n_b} buys"
+    ok = util.now() < give_up and env.notify(text)
+    while not ok and util.now() < give_up:
+        env.sleep_until(min(util.now() + dt.timedelta(seconds=60), give_up))
+        ok = env.notify(text)
+    env.journal.append("STEP_START", step="DAY", step_plan_hash=plan_rec.get("step_plan_hash"), telegram_ok=ok)
+
+
 def reconcile_stage(env: Env, day: str) -> None:
     recs = env.journal.read()
     if stage_done(recs, day, "RECON"):
@@ -1350,7 +1391,8 @@ def todays_sale_money(env: Env, day: str) -> int:
     lg = L.replay(recs)
     sold = sum(int(r["qty"]) * int(r["price_paise"]) - int(r["charges_paise"]) for r in recs
                if r["type"] == "FILL" and r.get("side") == "SELL" and r["ts"][:10] == day
-               and not lg.positions[r["position_id"]].test)
+               and not lg.positions[r["position_id"]].test and r.get("order_id")
+               and any(i.order_id == r["order_id"] and i.date == day for i in lg.intents.values()))
     return max(0, sold) // 100
 
 

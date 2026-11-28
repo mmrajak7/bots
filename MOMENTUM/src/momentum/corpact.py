@@ -29,6 +29,19 @@ def book_positions(lg: L.Ledger) -> List[L.Position]:
     return [p for p in lg.positions.values() if p.held_qty > 0]
 
 
+def first_buy_day(recs: List[Dict[str, Any]], position_id: str) -> Optional[str]:
+    """The day the position's first buy filled (journal FILL time). Shares bought ON or after an ex-date are
+    already the new shares: no credit will come for them."""
+    days = [r["ts"][:10] for r in recs if r["type"] == "FILL" and r.get("position_id") == position_id
+            and r.get("side", "BUY") == "BUY"]
+    return min(days) if days else None
+
+
+def held_before(recs: List[Dict[str, Any]], p: L.Position, ex: str) -> bool:
+    d = first_buy_day(recs, p.position_id)
+    return d is not None and d < ex
+
+
 def events_seen(recs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {r["ca_event"]: r for r in recs if r["type"] == "NOTE" and "ca_event" in r}
 
@@ -64,8 +77,8 @@ def scan(env: Any, M_CA: Any, get: Optional[Callable[[str], Tuple[int, Optional[
         by_isin.setdefault(p.isin, []).append(p)
     acted: List[str] = []
     for ev in sorted({id(e): e for e in fac + zero + owner}.values(), key=lambda e: (e.ex, e.isin)):
-        ps = by_isin.get(ev.isin)
-        if not ps:
+        ps = [p for p in by_isin.get(ev.isin, []) if held_before(recs, p, ev.ex)]
+        if not ps:                             # not held, or bought on / after the ex-date: nothing to do
             continue
         eid = f"{ev.isin}|{ev.ex}"
         if eid in seen:
@@ -110,7 +123,7 @@ def activate_due(env: Any) -> List[str]:
         if not ev.get("mult") or eid in on_for or str(ev.get("ex", "")) > horizon:
             continue
         for p in lg.positions.values():
-            if p.isin == ev["isin"] and p.held_qty > 0:
+            if p.isin == ev["isin"] and p.held_qty > 0 and held_before(recs, p, str(ev["ex"])):
                 env.journal.append("OVERLAY", position_id=p.position_id, overlay="PENDING_CA", on=True,
                                    reason=f"ca {eid} x{ev['mult']}")
                 out.append(p.position_id)

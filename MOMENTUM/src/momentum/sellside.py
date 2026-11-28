@@ -444,13 +444,14 @@ def sell_step(env: Any, day: str, go_ids: List[str], holdings_open: Dict[str, in
     """The SELL stage: start message, place at sell_place_at, ladder. A resumed run never places a sell twice
     (broker guard + one intent per leg per day) and skips ladder slots that have passed."""
     from . import engine as E
+    lg = L.replay(env.journal.read())
+    live_sells = any(i.date == day and "|sell|" in i.intent_id and i.status in L.LIVE_INTENT
+                     for i in lg.intents.values())
+    if not go_ids and not live_sells:          # nothing to sell today: no waits (a buy-only day runs as before)
+        env.journal.append("STAGE", date=day, stage="SELL", result="nothing to sell")
+        return
     if go_ids and util.now() < util.at_today(env.cfg["last_sell_place_at"]):
-        started = env.notify(f"starting SELL step: {len(go_ids)} sells")
-        give_up = util.at_today(env.cfg["sell_place_at"]) - dt.timedelta(minutes=2)
-        while not started and util.now() < give_up:
-            env.sleep_until(min(util.now() + dt.timedelta(seconds=60), give_up))
-            started = env.notify(f"starting SELL step: {len(go_ids)} sells")
-        env.journal.append("STEP_START", step="SELL", step_plan_hash=None, telegram_ok=started)
+        started = E.started_today(env, day) or env.arm is None or env.arm.mode != "automatic"
         if started:
             env.sleep_until(util.at_today(env.cfg["sell_place_at"]))
             if not E.killed_now(env):
@@ -484,6 +485,12 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
     """D32 gate (frozen design §6.3, judged at gate_at). Writes GATE and, when the buys may go, one BUY_AMOUNT per
     gated buy of the plan (held ones too: their share stays earmarked until released or expired)."""
     from . import engine as E
+    lg0 = L.replay(env.journal.read())
+    pl0 = E.current_plan(lg0)
+    if not gated_legs(lg0, pl0["plan_id"] if pl0 else None) and not any(
+            i.date == day and "|sell|" in i.intent_id for i in lg0.intents.values()):
+        env.journal.append("STAGE", date=day, stage="GATE", result="nothing to gate")
+        return                                 # a buy-only day: no wait for 15:06
     env.sleep_until(util.at_today(env.cfg["gate_at"]))
     done = [r for r in env.journal.read() if r["type"] == "GATE" and r["date"] == day
             and r.get("result") in ("OPEN", "FORCED")]
@@ -499,8 +506,8 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
         E.settle_orphans(env, day, final=False)
         E.sync_orders(env, day, final=False)          # sell fills so far: the cash the buys may use
     except B.NetworkError as e:
-        env.alert("KITE_DOWN", f"order book unreadable at the gate ({str(e)[:150]}): the gated buys wait (no "
-                  "session counted)")
+        env.alert("KITE_DOWN", f"order book unreadable at the gate ({str(e)[:150]}): the gated buys wait (this "
+                  "counts as a gated session)")
         pl = E.current_plan(L.replay(env.journal.read()))
         env.journal.append("GATE", date=day, plan=L.plan_key(pl["plan_id"]) if pl else None, result="UNREAD",
                            reasons=[str(e)[:200]])
