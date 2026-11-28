@@ -560,9 +560,11 @@ def cmd_live_status(args: argparse.Namespace) -> int:
     else:
         print('no heartbeat yet')
     k = store.kill()
-    print('kill: %s | equity %s peak %s drawdown %s'
+    print('kill: %s | booked %s peak %s drawdown %s (trips at the configured kill_drawdown_rs) '
+          '| marked equity %s'
           % ('TRIPPED (%s at %s)' % (k.get('reason'), k.get('at')) if k.get('tripped') else 'ok',
-             k.get('equity'), k.get('peak'), k.get('drawdown')))
+             k.get('realised'), k.get('realised_peak'), k.get('realised_drawdown'),
+             k.get('equity')))
     day = store.data['days'].get(now.date().isoformat())
     if day:
         for side, m in (day.get('marks') or {}).items():

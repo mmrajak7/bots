@@ -294,7 +294,10 @@ to send again.
 - The order ceiling (`max_orders_per_day`) never stops an exit: past it the kill trips (no new
   entries) and exits keep their minimum interval. Probe sends and definite gateway refusals do
   not count.
-- Kill: **Rs 75,000 drawdown from peak equity, open marks included** — stops NEW entries only, exits
+- Kill: **Rs 15,000 drawdown of BOOKED (closed, net) P&L from its own peak, starting at 0 when live
+  starts** (owner 2026-11-28, review 8 T3/A8; was 75,000 on marked equity -- 15K on marks would
+  have tripped in a normal rehearsal month). Marked equity is still shown, never trips it.
+  `live-resume` restarts the booked peak at today's booked P&L. It stops NEW entries only, exits
   always run. A non-finite equity (a NaN price in the book) trips it loud rather than disabling it;
   `live-book-external` refuses a price that is not finite, positive and within 1/50..20x of the
   entry. `live-resume --yes` writes a RESUME request that the running loop applies (peak resets
@@ -348,7 +351,7 @@ overlay `btst_config.json` is not read by live at all — rule keys such as `nex
 `lots` placed in the LIVE overlay apply to live only). Keys: `credentials_file` (relative to `BOTS/`),
 `poll_seconds` 3, `entry_cap_pct` 5, `entry_timeout_sec` 5, `max_entry_attempts` 5,
 `exit_chase_sec` 3, `exit_chase_fast_max` 10, `exit_retry_slow_sec` 60, `unknown_recheck_sec` 3,
-`unknown_grace_sec` 600, `exit_unknown_grace_sec` 90, `kill_drawdown_rs` 75000, `max_premium_rs` 15000,
+`unknown_grace_sec` 600, `exit_unknown_grace_sec` 90, `kill_drawdown_rs` 15000 (booked), `max_premium_rs` 15000,
 `max_entry_orders_per_day` 10, `max_orders_per_day` 100, `funds_margin_pct` 10,
 `limits_net_field` "Net", `reconcile_sec` 300, `order_poll_sec` 1, `expiry_backstop_time`
 09:30:00, `sell_refused_alert_sec` 60, `exit_defer_alert_sec` 60, `brokerage_per_order` 0 (NEO API

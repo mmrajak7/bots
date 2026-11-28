@@ -30,7 +30,7 @@ def test_paper_config_carries_no_live_keys_and_the_defaults_validate():
     cfg = config_mod.build(_raw())
     assert not hasattr(cfg, 'execution') and not hasattr(cfg, 'neo')          # NEO-13/22
     neo = build_neo(neo_raw())
-    assert neo.product == 'NRML' and neo.entry_cap_pct == 5.0 and neo.kill_drawdown_rs == 75000
+    assert neo.product == 'NRML' and neo.entry_cap_pct == 5.0 and neo.kill_drawdown_rs == 15000
     assert neo.unknown_grace_sec == 600 and neo.poll_seconds == 3 and neo.arm_max_days == 35
     assert neo.position_qty_unit == 'shares' and neo.empty_report_stcode == 5203
     assert neo.auth_stcodes == (1003,) and neo.transient_stcodes == (1005,)

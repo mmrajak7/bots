@@ -541,22 +541,41 @@ def test_cancel_unclear_is_repeated_not_followed_by_a_new_order(cfg, tmp_path, m
 
 
 # ------------------------------------------------------------------- kill
-def test_kill_trips_exactly_at_75000_and_blocks_entries_only(cfg, tmp_path, market):
+def test_kill_trips_exactly_at_the_booked_drawdown_and_blocks_entries_only(cfg, tmp_path, market):
+    """Owner 2026-11-28: the kill is 15K of BOOKED (closed, net) drawdown
+    from the booked peak; open marks are shown, never trip it."""
     rig = marked(cfg, tmp_path, market)
     holding(rig, symbol=PE_MON, side='PE', strike=22700.0, entry_price=100.0, qty=1000)
-    rig.store.kill()['peak'] = 55000.0                          # an earlier high
-    rig.market.set(PE_MON, 80.05, bid=80.05, ask=80.15)         # unreal -19,950 -> dd 74,950
+    closed = [{'net_pnl': 10000.0}]
+    rig.store.closed_positions = lambda: list(closed)
+    rig.market.set(PE_MON, 60.0, bid=60.0, ask=60.1)            # open -40,000: marks never trip
     rig.go(T(MON, '11:00:00'))
-    k = rig.store.kill()
-    assert k['drawdown'] == 74950.0 and not k['tripped']
-    rig.market.set(PE_MON, 80.0, bid=80.0, ask=80.1)            # dd 75,000 exactly
+    assert not rig.store.kill().get('tripped') and rig.store.kill()['realised_peak'] == 10000.0
+    closed.append({'net_pnl': -24950.0})                        # booked 10,000 -> -14,950
     rig.go(T(MON, '11:00:03'))
     k = rig.store.kill()
-    assert k['tripped'] and 'drawdown Rs 75000' in k['reason']
-    assert not rig.broker.sent
+    assert k['realised_peak'] == 10000.0 and k['realised'] == -14950.0
+    assert k['realised_drawdown'] == 24950.0 and k['tripped']   # 24,950 >= 15,000
+    assert 'booked drawdown Rs 24950' in k['reason']
+
+
+def test_kill_boundary_and_marks_never_trip(cfg, tmp_path, market):
+    rig = marked(cfg, tmp_path, market)
+    holding(rig, symbol=PE_MON, side='PE', strike=22700.0, entry_price=100.0, qty=1000)
+    closed = [{'net_pnl': 2000.0}, {'net_pnl': -16999.0}]       # dd 14,999
+    rig.store.closed_positions = lambda: list(closed)
+    rig.market.set(PE_MON, 50.0, bid=50.0, ask=50.1)            # open -50,000
+    rig.go(T(MON, '11:00:00'))
+    k = rig.store.kill()
+    assert k['realised_drawdown'] == 14999.0 and not k.get('tripped')
+    assert k['drawdown'] > 15000                                 # marked dd shown, ignored
+    closed[-1]['net_pnl'] = -17000.0                            # dd 15,000 exactly
     rig.market.set(PE_MON, 40.0, bid=39.9, ask=40.1)            # the stop: exits still run
-    rig.go(T(MON, '11:00:06'))
+    rig.go(T(MON, '11:00:03'))
+    k = rig.store.kill()
+    assert k['tripped'] and 'booked drawdown Rs 15000' in k['reason']
     assert rig.broker.sent and rig.broker.sent[-1].side == 'S'
+    rig.go(T(MON, '11:00:06'))
     trigger_ce(rig, when=T(MON, '11:01:00'))
     p2 = state(rig, 2)                  # R3-24: abandoned at the trigger, never bought later
     assert p2['live']['state'] == 'ABANDONED' and p2['never_filled']
@@ -581,6 +600,21 @@ def test_kill_peak_only_advances_on_fresh_marks_and_resume_resets_it(cfg, tmp_pa
     rig.engine.resume(T(MON, '11:02:00'))
     k = rig.store.kill()
     assert not k['tripped'] and k['peak'] == k['equity'] and k['resets'][0]['was'] == 'test'
+
+
+def test_resume_restarts_the_booked_peak_so_the_kill_does_not_retrip(cfg, tmp_path, market):
+    rig = marked(cfg, tmp_path, market)
+    closed = [{'net_pnl': -15000.0}]
+    rig.store.closed_positions = lambda: list(closed)
+    rig.go(T(MON, '11:00:00'))
+    assert rig.store.kill()['tripped']
+    rig.engine.resume(T(MON, '11:01:00'))
+    rig.go(T(MON, '11:01:03'))
+    k = rig.store.kill()
+    assert not k['tripped'] and k['realised_peak'] == -15000.0 and k['realised_drawdown'] == 0
+    closed.append({'net_pnl': -15000.0})                        # another 15K booked: trips again
+    rig.go(T(MON, '11:01:06'))
+    assert rig.store.kill()['tripped']
 
 
 def test_restart_keeps_a_tripped_kill(cfg, tmp_path, market):

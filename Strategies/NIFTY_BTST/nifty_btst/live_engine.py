@@ -382,8 +382,13 @@ class LiveEngine(Engine):
         k = self.store.kill()
         k.setdefault('resets', []).append({'at': _iso(now), 'by': who, 'was': k.get('reason'),
                                            'peak_before': k.get('peak'),
-                                           'equity': k.get('equity')})
+                                           'equity': k.get('equity'),
+                                           'realised_peak_before': k.get('realised_peak'),
+                                           'realised': k.get('realised')})
+        # the booked peak restarts at today's booked P&L, or the kill would
+        # trip again on the next tick (it is measured on booked P&L)
         k.update({'tripped': False, 'reason': None, 'at': None, 'peak': k.get('equity'),
+                  'realised_peak': k.get('realised'),
                   'loud': False, 'reasons': [], 'latest': None})
         self.store.event(now, 'KILL_RESET', by=who)
         self._rejection_streak = 0
@@ -2153,11 +2158,20 @@ class LiveEngine(Engine):
         # the bar the kill is measured from.
         if k.get('peak') is None or (fresh and equity > float(k['peak'])):
             k['peak'] = equity
-        dd = float(k['peak']) - equity
-        k['drawdown'] = round(dd, 2)
-        if not k.get('tripped') and dd >= self.neo.kill_drawdown_rs:
-            self._trip(now, 'drawdown Rs %.0f from peak Rs %.0f (equity Rs %.0f)'
-                       % (dd, float(k['peak']), equity))
+        k['drawdown'] = round(float(k['peak']) - equity, 2)     # marked: shown, never trips
+        # The kill is measured on BOOKED (closed, net) P&L from its own peak,
+        # starting at 0 when live starts (owner 2026-11-28, review 8 T3/A8):
+        # with open marks a winner given back overnight counted as a loss,
+        # and 15K on marks would have tripped in a normal rehearsal month.
+        prev = k.get('realised_peak')
+        rpeak = max(0.0 if prev is None else float(prev), realised)   # 0 at go-live; resume resets
+        k['realised'] = round(realised, 2)
+        k['realised_peak'] = round(rpeak, 2)
+        rdd = rpeak - realised
+        k['realised_drawdown'] = round(rdd, 2)
+        if not k.get('tripped') and rdd >= self.neo.kill_drawdown_rs:
+            self._trip(now, 'booked drawdown Rs %.0f from booked peak Rs %.0f (booked Rs %.0f)'
+                       % (rdd, rpeak, realised))
 
     # -------------------------------------------------------- reconcile
     def _reconcile(self, now: datetime, startup: bool) -> None:
@@ -2735,8 +2749,9 @@ class LiveEngine(Engine):
                 if kind == 'resume':
                     if self.store.kill().get('tripped'):
                         self.resume(now, who='owner (request file)')
-                        result = {'applied': True, 'text': 'KILL CLEARED by the owner. Peak reset to '
-                                  'equity Rs %s. Entries may resume.' % self.store.kill().get('peak')}
+                        result = {'applied': True, 'text': 'KILL CLEARED by the owner. The booked '
+                                  'peak restarts at booked Rs %s. Entries may resume.'
+                                  % self.store.kill().get('realised_peak')}
                     else:
                         result = {'applied': False, 'text': 'the kill was not tripped'}
                 else:
@@ -2847,8 +2862,10 @@ class LiveEngine(Engine):
         text = '\n'.join(out)
         k = self.store.kill()
         pend = self.store.pending()
-        lines = [text, 'LIVE (%s): equity Rs %s peak Rs %s dd Rs %s kill %s'
-                 % (self.mode, k.get('equity'), k.get('peak'), k.get('drawdown'),
+        lines = [text, 'LIVE (%s): booked Rs %s peak Rs %s dd Rs %s (kill at %.0f) | marked '
+                 'equity Rs %s | kill %s'
+                 % (self.mode, k.get('realised'), k.get('realised_peak'),
+                    k.get('realised_drawdown'), self.neo.kill_drawdown_rs, k.get('equity'),
                     'TRIPPED: %s' % k['reason'] if k.get('tripped') else 'ok'),
                  'sends today %d (entries %d) | session %s | reconcile %s'
                  % (self.journal.sends_today(today), self.journal.sends_today(today, 'ENTRY'),
