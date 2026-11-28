@@ -111,6 +111,11 @@ class Broker:
         """F5: order-book filled qty of own tagged orders, B - S (today)."""
         return self.c.own_order_net(symbol)
 
+    def outside_sold(self, symbol: str) -> int:
+        """Review B1: filled SELL shares in today's order book on `symbol` that
+        are NOT etf- tagged (an app exit, the broker's square-off)."""
+        return self.c.foreign_filled(symbol, 'S')
+
     def own_orders(self) -> List[Any]:
         return self.c.own_orders()
 

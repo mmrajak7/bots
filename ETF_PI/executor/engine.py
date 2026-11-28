@@ -696,6 +696,25 @@ class Engine:
             return own
         if not carry and self.epoch() - float(p.get('last_fill_epoch') or 0) < self.cfg['positions_lag_s']:
             return own
+        if not carry:
+            # review B1 (2026-11-28): a low positions row ALONE (lag, or an MIS quantity
+            # read we never measured) must not end management of a lot our own book
+            # says we hold. Only an outside SELL in today's order book confirms it.
+            # Unconfirmed: sell nothing (never a naked short), never close, keep re-reading
+            # -- the lot stays managed and sells the moment the row agrees again.
+            try:
+                outside = int(self.b.outside_sold(p['symbol']))
+            except Exception as e:
+                outside, why = -1, 'order book unreadable (%s)' % e
+            else:
+                why = 'the order book shows %d sold outside the bot' % outside
+            if outside < own - max(acct, 0):
+                p.pop('acct_low_since', None)
+                self.n.throttled('acct_unconf_' + p['key'], 60, '%s: the ACCOUNT row shows %d of '
+                                 '%s but our own orders say %d and %s -- NOT selling, NOT closing; '
+                                 'still managing it. Check the NEO app' % (
+                                     p['key'], acct, p['symbol'], own, why), 'E')
+                return max(acct, 0)
         p.setdefault('acct_low_since', self.epoch())
         self.n.throttled('acct_' + p['key'], 60, '%s: the ACCOUNT holds %d of %s but our own '
                          'orders say %d -- someone sold our lots? selling at most %d' % (

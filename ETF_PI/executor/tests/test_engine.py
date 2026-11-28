@@ -633,3 +633,40 @@ def test_r7_an_unknown_product_label_raises_so_every_caller_fails_closed(rig, mo
     monkeypatch.setattr(rig.broker.c, 'positions', lambda: [row])
     with pytest.raises(KCN.Unavailable, match='unknown label'):
         rig.broker.account_net('NIFTYX')
+
+
+# -- review B1 (2026-11-28): a low positions row alone never ends management of a lot --
+
+def test_b1_a_lagging_positions_row_never_closes_a_lot_we_still_hold(rig, monkeypatch):
+    """The MIS row reads net 0 (lag / a quantity read never measured) while our own book
+    says we bought 65 and nothing sold outside. Nothing is sold (never a naked short),
+    the lot is NOT closed, the owner is told; when the row agrees again it sells."""
+    p = open_one(rig)
+    real = rig.broker.c.positions
+    monkeypatch.setattr(rig.broker.c, 'positions',
+                        lambda: [KCN.PositionView(symbol=SYM, product='MIS', net_qty=0)])
+    rig.step(secs=15)                                 # past positions_lag_s
+    open(os.path.join(rig.state, 'FLATTEN'), 'w').close()
+    rig.step(n=200)                                   # 100 s: far past the old 30 s close
+    assert p['state'] == 'EXIT' and rig.etf_orders('S') == []
+    assert rig.fake.net(SYM) == 65
+    assert 'NOT closing' in rig.texts()
+    monkeypatch.setattr(rig.broker.c, 'positions', real)
+    rig.step(n=10)
+    assert p['state'] == 'CLOSED' and not p['exit_type'].endswith('+EXTERNAL')
+    assert rig.fake.net(SYM) == 0
+
+
+def test_b1_a_sell_in_the_app_is_confirmed_by_the_book_and_closed_external(rig):
+    """The owner exits by hand in the NEO app (an untagged MIS sell). The row AND the
+    book agree: ETF sells nothing and closes the lot as EXTERNAL."""
+    p = open_one(rig)
+    rig.step(secs=15)
+    rig.fake._new_order({'pt': 'L', 'ts': SYM, 'tt': 'S', 'qt': 65, 'pr': '99.00',
+                         'ig': '', 'pc': p.get('product') or rig.cfg['product']})
+    assert rig.fake.net(SYM) == 0
+    open(os.path.join(rig.state, 'FLATTEN'), 'w').close()
+    rig.step(n=100)
+    assert rig.etf_orders('S') == [] and p['state'] == 'CLOSED'
+    assert p['exit_type'].endswith('+EXTERNAL')
+    assert 'NOT closing' not in rig.texts()

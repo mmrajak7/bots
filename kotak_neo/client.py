@@ -617,6 +617,21 @@ class NeoClient:
         return sum((o.filled if o.side == 'B' else -o.filled) for o in rows
                    if o.symbol == symbol and o.side in ('B', 'S'))
 
+    def foreign_filled(self, symbol: str, side: str) -> int:
+        """Filled shares of TODAY's order-book rows in `symbol` on `side` that
+        do NOT carry this bot's tag: a manual app order, the broker's RMS
+        square-off, another bot. The evidence an account row lower than this
+        bot's own orders really means someone else sold (ETF review B1,
+        2026-11-28). Only that symbol's rows are parsed. Raises Unavailable."""
+        pre = self.bot + '-'
+        side = side.upper()[:1]
+
+        def keep(r: Dict[str, Any]) -> bool:
+            return (str(r.get('trdSym') or r.get('sym') or '') == symbol
+                    and str(r.get('trnsTp', '')).upper()[:1] == side
+                    and not str(r.get('GuiOrdId') or '').startswith(pre))
+        return sum(o.filled for o in self._views_where(keep, 'order book (%s, others)' % symbol))
+
     def scrip_master_paths(self) -> List[str]:
         """Links to the per-segment scrip-master CSVs (consumer key auth, as
         the SDK and BTST do). Every failure is Unavailable."""
