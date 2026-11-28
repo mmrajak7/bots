@@ -129,9 +129,9 @@ class Broker:
         prod = str(self.cfg['product']).strip().upper()
         known = getattr(self.C, 'KNOWN_PRODUCTS', ('NRML', 'MIS', 'CNC', 'MTF', 'CO', 'BO'))
         rows = []
-        for p in self.c.positions():
-            if p.symbol != symbol:
-                continue
+        # Only THIS symbol's rows are parsed (BTST review X-K5): a malformed row
+        # of another contract must not make ETF's own position unreadable.
+        for p in self.c.positions_for(symbol):
             got = str(p.product or '').strip().upper()
             if not got or got == prod:
                 rows.append(p)

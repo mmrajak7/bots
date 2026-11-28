@@ -624,13 +624,13 @@ def test_q7_short_after_the_last_close_is_still_watched(rig):
 @pytest.mark.parametrize('prod,want', [('MIS', 65), (' mis ', 65), ('', 65), ('NRML', None)])
 def test_r7_account_net_reads_our_product_row(rig, monkeypatch, prod, want):
     row = KCN.PositionView(symbol='NIFTYX', product=prod, net_qty=65)
-    monkeypatch.setattr(rig.broker.c, 'positions', lambda: [row])
+    monkeypatch.setattr(rig.broker.c, 'positions_for', lambda symbol: [row])
     assert rig.broker.account_net('NIFTYX') == want
 
 
 def test_r7_an_unknown_product_label_raises_so_every_caller_fails_closed(rig, monkeypatch):
     row = KCN.PositionView(symbol='NIFTYX', product='XYZ', net_qty=65)
-    monkeypatch.setattr(rig.broker.c, 'positions', lambda: [row])
+    monkeypatch.setattr(rig.broker.c, 'positions_for', lambda symbol: [row])
     with pytest.raises(KCN.Unavailable, match='unknown label'):
         rig.broker.account_net('NIFTYX')
 
@@ -642,16 +642,16 @@ def test_b1_a_lagging_positions_row_never_closes_a_lot_we_still_hold(rig, monkey
     says we bought 65 and nothing sold outside. Nothing is sold (never a naked short),
     the lot is NOT closed, the owner is told; when the row agrees again it sells."""
     p = open_one(rig)
-    real = rig.broker.c.positions
-    monkeypatch.setattr(rig.broker.c, 'positions',
-                        lambda: [KCN.PositionView(symbol=SYM, product='MIS', net_qty=0)])
+    real = rig.broker.c.positions_for
+    monkeypatch.setattr(rig.broker.c, 'positions_for',
+                        lambda symbol: [KCN.PositionView(symbol=SYM, product='MIS', net_qty=0)])
     rig.step(secs=15)                                 # past positions_lag_s
     open(os.path.join(rig.state, 'FLATTEN'), 'w').close()
     rig.step(n=200)                                   # 100 s: far past the old 30 s close
     assert p['state'] == 'EXIT' and rig.etf_orders('S') == []
     assert rig.fake.net(SYM) == 65
     assert 'NOT closing' in rig.texts()
-    monkeypatch.setattr(rig.broker.c, 'positions', real)
+    monkeypatch.setattr(rig.broker.c, 'positions_for', real)
     rig.step(n=10)
     assert p['state'] == 'CLOSED' and not p['exit_type'].endswith('+EXTERNAL')
     assert rig.fake.net(SYM) == 0

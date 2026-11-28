@@ -309,27 +309,27 @@ def test_k10_a_row_without_a_label_is_counted(neo, monkeypatch):
 
 def test_k9_claim_reads_positions_outside_the_owners_lock(neo, monkeypatch):
     btst = mk(neo, 'btst', True, 'NRML')
-    real, free = btst.positions, []
+    real, free = btst.positions_for, []
 
-    def positions():
+    def positions_for(symbol):
         with S.file_lock('owners.lock', 0.0) as got:
             free.append(got)
-        return real()
+        return real(symbol)
 
-    monkeypatch.setattr(btst, 'positions', positions)
+    monkeypatch.setattr(btst, 'positions_for', positions_for)
     buy(btst)
     assert free == [True] and C.owner_of(SYM) == 'btst'
 
 
 def test_k9_a_claim_taken_during_the_read_wins(neo, monkeypatch):
     btst = mk(neo, 'btst', True, 'NRML')
-    real = btst.positions
+    real = btst.positions_for
 
-    def positions():
+    def positions_for(symbol):
         C.assign(SYM, 'zbr')                           # another bot claimed meanwhile
-        return real()
+        return real(symbol)
 
-    monkeypatch.setattr(btst, 'positions', positions)
+    monkeypatch.setattr(btst, 'positions_for', positions_for)
     with pytest.raises(C.NotOwner, match='zbr'):
         buy(btst)
     assert neo.placed() == []
@@ -609,3 +609,62 @@ def test_f7_other_generations_are_kept_not_erased(home, flushed):
     assert C.note_orders_auth('zbr', 'cancel', 401, 3, now=1002.0)   # gen 3's first was kept
     st = json.loads((home / 'orders_auth.json').read_text(encoding='utf-8'))
     assert sorted(e['gen'] for e in st['events']) == [3, 3, 4]
+
+
+# -- zebra review N1/R3 + BTST X-K5: per-symbol reads ---------------------------------------
+# One unparsable row of ANOTHER contract (a manual order, another bot) must not
+# blind a read about THIS one; a bad row on THIS symbol still fails closed.
+
+OTHER = 'BANKNIFTY26DEC50000PE'
+
+
+def _book(neo, monkeypatch, orders=(), positions=()):
+    ob = {'stat': 'Ok', 'data': list(orders)}
+    pos = {'stat': 'Ok', 'data': list(positions)}
+
+    def get(url, **kw):
+        return _Resp(200, pos if url.endswith(C.PATH_POSITIONS) else ob)
+    monkeypatch.setattr(neo, 'get', get)
+
+
+def _order(sym, qty='65', fld='0', st='open', side='S', tag='zbr-1'):
+    return {'nOrdNo': '9%s' % len(sym), 'ordSt': st, 'trdSym': sym, 'trnsTp': side,
+            'qty': qty, 'fldQty': fld, 'avgPrc': '0', 'prc': '10.00', 'GuiOrdId': tag}
+
+
+def _pos(sym, buy='65'):
+    return {'trdSym': sym, 'prod': 'NRML', 'flBuyQty': buy, 'flSellQty': '0',
+            'cfBuyQty': '0', 'cfSellQty': '0'}
+
+
+def test_a_bad_row_of_another_contract_does_not_blind_live_orders(neo, monkeypatch):
+    _book(neo, monkeypatch, orders=[_order(SYM), _order(OTHER, qty='--')])
+    c = mk(neo, 'zbr', True, 'NRML')
+    assert [o.symbol for o in c.live_orders(SYM, 'S')] == [SYM]
+    assert [o.symbol for o in c.orders_for(SYM)] == [SYM]
+    with pytest.raises(C.Unavailable):
+        c.order_book()                                 # the whole-book read stays strict
+
+
+def test_a_bad_row_on_the_same_contract_still_raises(neo, monkeypatch):
+    _book(neo, monkeypatch, orders=[_order(SYM, fld='')])
+    with pytest.raises(C.Unavailable):
+        mk(neo, 'zbr', True, 'NRML').live_orders(SYM, 'S')
+
+
+def test_a_bad_position_row_of_another_contract_does_not_blind_net_held(neo, monkeypatch):
+    _book(neo, monkeypatch, positions=[_pos(SYM), _pos(OTHER, buy='x')])
+    c = mk(neo, 'zbr', True, 'NRML')
+    assert c.net_held(SYM) == 65
+    assert [p.symbol for p in c.positions_for(SYM)] == [SYM]
+    with pytest.raises(C.Unavailable):
+        c.positions()
+    _book(neo, monkeypatch, positions=[_pos(SYM, buy='x')])
+    with pytest.raises(C.Unavailable):
+        c.net_held(SYM)
+
+
+def test_row_symbol_matches_the_views(neo):
+    r = _order(SYM)
+    assert C.row_symbol(r) == C.OrderView.from_neo(r).symbol
+    assert C.row_symbol({'sym': SYM}) == SYM and C.row_symbol({}) == ''

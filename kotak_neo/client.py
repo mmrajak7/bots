@@ -124,6 +124,13 @@ class RowError(ValueError):
     pass
 
 
+def row_symbol(r: Dict[str, Any]) -> str:
+    """The trading symbol of a raw order-book / positions row -- the SAME
+    expression the views use, so a per-symbol filter never disagrees with
+    the parsed view's `symbol`."""
+    return str(r.get('trdSym') or r.get('sym') or '')
+
+
 def _strict_int(r: Dict[str, Any], k: str) -> int:
     v = r.get(k)
     try:
@@ -540,9 +547,7 @@ class NeoClient:
         want = (self.product if product == '' else product)
         want = None if want is None else str(want).strip().upper()
         total = 0
-        for p in self.positions():
-            if p.symbol != symbol:
-                continue
+        for p in self.positions_for(symbol):
             got = str(p.product or '').strip().upper()
             if want is None or not got or got == want:
                 total += p.net_qty
@@ -561,8 +566,16 @@ class NeoClient:
                    if f.symbol == symbol and f.bot() == self.bot and f.side in ('B', 'S'))
 
     def live_orders(self, symbol: str, side: Optional[str] = None) -> List[OrderView]:
-        return [o for o in self.order_book() if o.symbol == symbol and not o.terminal
-                and (side is None or o.side == side)]
+        """Working orders in `symbol`. Only that symbol's rows are parsed
+        (zebra review N1/R3, 2026-11-28): one unparsable row of ANOTHER
+        contract -- a manual order, another bot -- must not stop an exit
+        selling. A bad row on THIS symbol still raises Unavailable."""
+        return [o for o in self.orders_for(symbol)
+                if not o.terminal and (side is None or o.side == side)]
+
+    def orders_for(self, symbol: str) -> List[OrderView]:
+        """Today's order-book rows in `symbol`, parsed strictly; other rows unparsed."""
+        return self._views_where(lambda r: row_symbol(r) == symbol, 'order book %s' % symbol)
 
     def positions(self) -> List[PositionView]:
         out = []
@@ -571,6 +584,19 @@ class NeoClient:
                 out.append(PositionView.from_neo(r))
             except RowError as e:
                 raise Unavailable('positions: %s' % e)
+        return out
+
+    def positions_for(self, symbol: str) -> List[PositionView]:
+        """Position rows in `symbol` only, parsed strictly; a malformed row of
+        ANOTHER contract never blinds this one (zebra review N1/R3, BTST X-K5)."""
+        out = []
+        for r in self._rows(self._read('GET', PATH_POSITIONS), 'positions'):
+            if row_symbol(r) != symbol:
+                continue
+            try:
+                out.append(PositionView.from_neo(r))
+            except RowError as e:
+                raise Unavailable('positions %s: %s' % (symbol, e))
         return out
 
     def funds(self, field_name: str = 'Net') -> float:
@@ -627,7 +653,7 @@ class NeoClient:
         side = side.upper()[:1]
 
         def keep(r: Dict[str, Any]) -> bool:
-            return (str(r.get('trdSym') or r.get('sym') or '') == symbol
+            return (row_symbol(r) == symbol
                     and str(r.get('trnsTp', '')).upper()[:1] == side
                     and not str(r.get('GuiOrdId') or '').startswith(pre))
         return sum(o.filled for o in self._views_where(keep, 'order book (%s, others)' % symbol))
