@@ -408,9 +408,14 @@ def morning_cash_check(env: E.Env) -> None:
 ORDER_LEGS = ("PENDING_BUY", "BUY_GATED", "SELLING")    # legs that need an afternoon (January slice: sells too)
 
 
+def order_work(lg: L.Ledger) -> bool:
+    """The afternoon and morning have work when any leg can still trade (review C1: sells and gated buys too)."""
+    return any(p.leg in ORDER_LEGS for p in lg.positions.values())
+
+
 def cmd_afternoon(x: Ctx, a: argparse.Namespace) -> int:
     lg = L.replay(x.journal.read())
-    if not any(p.leg in ORDER_LEGS for p in lg.positions.values()):
+    if not order_work(lg):
         return 0
     tok = x.wait_token(util.at_today(x.cfg["token_deadline"]))
     if tok is None:

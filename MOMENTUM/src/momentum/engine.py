@@ -342,13 +342,38 @@ def apply_cmd(env: Env, cmd: str, args: str) -> None:
         if qty > i.qty:
             env.notify(f"filled: {qty} > the order quantity {i.qty}")
             return
+        if i.side == "SELL" and qty > lg.positions[i.position_id].held_qty:
+            env.notify(f"filled: a sell of {qty} > the book's {lg.positions[i.position_id].held_qty} shares")
+            return
         if qty and f"owner:{iid}" not in lg.trade_ids:      # a re-ingest after a crash must not book it twice (L1)
             pp = L.paise(px)
             env.journal.append("FILL", position_id=i.position_id, order_id=i.order_id or "", trade_id=f"owner:{iid}",
-                               qty=qty, price_paise=pp, exch_ts="owner", charges_basis="estimate",
-                               charges_paise=estimate_buy_charges_paise(env.cfg, qty * pp))
+                               qty=qty, price_paise=pp, exch_ts="owner", charges_basis="estimate", side=i.side,
+                               charges_paise=charges_for(env, i, qty * pp, util.today().isoformat()))
         env.journal.append("ORPHAN", intent_id=iid, resolution="CLOSED", order_id=i.order_id, reads=["owner filled"])
         env.notify(f"{iid}: {qty} filled at {px} recorded; the leg continues for any remainder")
+    elif cmd == "sold":                             # a book sale the owner made by hand in Kite
+        parts = args.split()
+        try:
+            isin, qty, px = parts[0].upper(), int(parts[1]), Decimal(parts[2])
+            if qty <= 0 or px <= 0:
+                raise ValueError
+        except (IndexError, ValueError, ArithmeticError):
+            env.notify("usage: sold <isin> <qty> <avg_price>")
+            return
+        ps = [p for p in lg.positions.values() if p.isin == isin and p.held_qty > 0]
+        if len(ps) != 1 or qty > ps[0].held_qty or lg.open_intents(ps[0].position_id):
+            env.notify(f"sold {isin}: needs one held book position with >= {qty} shares and no live book order")
+            return
+        tid = f"owner:sold:{isin}:{util.today().isoformat()}:{qty}"
+        if tid not in lg.trade_ids:
+            pp = L.paise(px)
+            from . import sellside as SS
+            env.journal.append("FILL", side="SELL", position_id=ps[0].position_id, order_id="", trade_id=tid,
+                               qty=qty, price_paise=pp, exch_ts="owner", charges_basis="estimate",
+                               charges_paise=SS.estimate_sell_charges_paise(env.cfg, qty * pp, True))
+        env.notify(f"sold {ps[0].symbol}: {qty} @ {px} booked (owner); book shares now "
+                   f"{L.replay(env.journal.read()).positions[ps[0].position_id].held_qty}")
     elif cmd == "status":
         env.notify(status_text(lg))
     elif cmd == "ack":
@@ -603,7 +628,7 @@ def shared_name_holds(env: Env, holdings_open: Dict[str, int]) -> None:
     held = book_held(lg)
     for p in lg.positions.values():
         extra = int(holdings_open.get(p.isin, 0)) - held.get(p.isin, 0)
-        if (p.leg == "PENDING_BUY" and extra > 0 and "SHARED_NAME_HOLD" not in p.overlays
+        if (p.leg in ("PENDING_BUY", "BUY_GATED") and extra > 0 and "SHARED_NAME_HOLD" not in p.overlays
                 and p.position_id not in owner_ok):
             hold_leg(env, p, "SHARED_NAME_HOLD", f"account holds {extra} shares outside the book")
 
@@ -670,7 +695,11 @@ def place_all(env: Env, sp: StepPlan, go: List[L.Position], day: str) -> List[st
                 and "max_rupees" in r)
     has_intent_today = {i.position_id for i in lg0.intents.values() if i.date == day and "|buy|" in i.intent_id}
     from . import sellside as SS
-    sizes = SS.size_buys(env, [p for p in go if p.position_id not in has_intent_today], q, ticks)
+    sizes, moves = SS.size_buys(env, [p for p in go if p.position_id not in has_intent_today], q, ticks)
+    for frm, to_, paise_ in moves:              # D52: the leftovers that pay an extra share leave their givers
+        env.journal.append("EARMARK_MOVE", **{"from": frm, "to": to_}, paise=paise_, date=day)
+    if moves:
+        go = [L.replay(env.journal.read()).positions[p.position_id] for p in go]
     probe_ok = False
     probes = sum(1 for i in lg0.intents.values() if i.date == day and i.status.startswith("REJECTED"))  # resumed run
     for n, p in enumerate(go):
@@ -1099,7 +1128,7 @@ def fo_day1_guard(env: Env) -> Optional[str]:
     an F&O member). -> a problem text when the list cannot be had (no orders this session, no lock try)."""
     lg = L.replay(env.journal.read())
     plan = current_plan(lg)
-    pend = sorted((p for p in lg.positions.values() if p.leg == "PENDING_BUY"), key=lambda p: p.rank)
+    pend = sorted((p for p in lg.positions.values() if p.leg in ("PENDING_BUY", "BUY_GATED")), key=lambda p: p.rank)
     if plan is None or not pend:
         return None
     m = plan["plan_id"]["month"]
@@ -1109,7 +1138,12 @@ def fo_day1_guard(env: Env) -> Optional[str]:
         return f"F&O day-1 list for {m} unavailable ({type(e).__name__}: {str(e)[:120]})"
     for p in pend:
         if p.symbol in names:
-            to = close_leg(env, p.position_id, f"F&O member of {m} ({src})")
+            if p.leg == "BUY_GATED":           # never had an amount: it simply expires
+                env.journal.append("LEG", position_id=p.position_id, reason=f"F&O member of {m} ({src})",
+                                   **{"from": "BUY_GATED", "to": "EXPIRED"})
+                to = "EXPIRED"
+            else:
+                to = close_leg(env, p.position_id, f"F&O member of {m} ({src})")
             env.alert("FO_ENTRANT", f"{p.symbol} has stock futures ({src}): the research excludes F&O members of "
                       f"{m}, so it is not bought ({to}); its earmark stays in book cash")
     if frozen_now:

@@ -187,6 +187,14 @@ def replay(recs: List[Dict[str, Any]]) -> Ledger:
             if p.leg != "BUY_GATED" or int(r["earmark_paise"]) < 0:
                 raise LedgerError(f"seq {r['seq']}: BUY_AMOUNT for {p.position_id} in leg {p.leg}")
             p.earmark_paise, p.leg = int(r["earmark_paise"]), "PENDING_BUY"
+        elif t == "EARMARK_MOVE":                   # D52 extra share: earmark from a giver to a receiver
+            a, b = _pos(lg, {"seq": r["seq"], "position_id": r["from"]}), _pos(lg, {"seq": r["seq"],
+                                                                                     "position_id": r["to"]})
+            n = int(r["paise"])
+            if n <= 0 or a.leg != "PENDING_BUY" or b.leg != "PENDING_BUY" or a.remaining_paise < n:
+                raise LedgerError(f"seq {r['seq']}: earmark move {n} {a.position_id}->{b.position_id} invalid")
+            a.earmark_paise -= n
+            b.earmark_paise += n
         elif t == "CA_CREDIT":
             p = _pos(lg, r)
             if int(r["qty_before"]) != p.held_qty or int(r["qty_after"]) <= 0:

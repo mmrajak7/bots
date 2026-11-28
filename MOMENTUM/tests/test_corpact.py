@@ -62,7 +62,11 @@ class CAHarness(Harness):
     def test_bonus_waits_then_the_credit_is_booked(self) -> None:
         self.scan(rec("INE000000002", "SYM2", "2026-12-15", "Bonus 1:1"))
         p = self.lg().positions["2612-02"]
-        self.assertIn("PENDING_CA", p.overlays)
+        self.assertNotIn("PENDING_CA", p.overlays)          # 5 days before the ex-date the name still trades as is
+        self.new_day(dt.date(2026, 12, 14))                  # the evening before: its orders start to wait
+        CA.activate_due(self.env())
+        self.assertIn("PENDING_CA", self.lg().positions["2612-02"].overlays)
+        self.new_day(dt.date(2026, 12, 15))
         self.assertEqual(CA.credit_check(self.env(), self.rows()), ["SYM2: waiting for the credit (50 of 100)"])
         CA.credit_check(self.env(), self.rows(SYM2=100))
         p = self.lg().positions["2612-02"]
@@ -72,6 +76,7 @@ class CAHarness(Harness):
     def test_split_with_a_new_isin_follows_the_shares(self) -> None:
         self.scan(rec("INE000000002", "SYM2", "2026-12-15",
                       "Face Value Split (Sub-Division) - From Rs 10/- Per Share To Re 1/- Per Share"))
+        self.new_day(dt.date(2026, 12, 16))
         CA.credit_check(self.env(), self.rows(SYM2=0, INE00000002B=500))
         p = self.lg().positions["2612-02"]
         self.assertEqual((p.held_qty, p.isin, p.overlays), (500, "INE00000002B", set()))
@@ -96,18 +101,22 @@ class CAHarness(Harness):
 
     def test_a_rescan_never_acts_twice(self) -> None:
         r1 = self.scan(rec("INE000000002", "SYM2", "2026-12-15", "Bonus 1:1"))
+        self.new_day(dt.date(2026, 12, 15))
         r2 = self.scan(rec("INE000000002", "SYM2", "2026-12-15", "Bonus 1:1"))
+        CA.activate_due(self.env())
         self.assertEqual((len(r1["acted"]), r2["acted"]), (1, []))
         ons = [r for r in self.j.read() if r["type"] == "OVERLAY" and r["overlay"] == "PENDING_CA" and r["on"]]
         self.assertEqual(len(ons), 1)
 
     def test_unreadable_holdings_judge_nothing(self) -> None:
         self.scan(rec("INE000000002", "SYM2", "2026-12-15", "Bonus 1:1"))
+        self.new_day(dt.date(2026, 12, 15))
         self.assertEqual(CA.credit_check(self.env(), []), [])
         self.assertEqual(self.lg().positions["2612-02"].overlays, {"PENDING_CA"})
 
     def test_mismatch_goes_to_the_owner(self) -> None:
         self.scan(rec("INE000000002", "SYM2", "2026-12-15", "Bonus 1:1"))
+        self.new_day(dt.date(2026, 12, 15))
         CA.credit_check(self.env(), self.rows(SYM2=75))
         p = self.lg().positions["2612-02"]
         self.assertEqual((p.held_qty, p.overlays), (50, {"OWNER_HOLD"}))
@@ -125,8 +134,10 @@ class CAHarness(Harness):
 
     def test_three_way_accepts_a_credit_after_the_opening(self) -> None:
         self.scan(rec("INE000000002", "SYM2", "2026-12-15", "Bonus 1:1"))
+        self.new_day(dt.date(2026, 12, 15))
+        CA.activate_due(self.env())
         self.k.holdings_qty.update({"INE000000001": 12, "INE000000002": 100})
-        probs = E.three_way(self.env(), {"INE000000001": 12, "INE000000002": 50}, "2026-12-10")
+        probs = E.three_way(self.env(), {"INE000000001": 12, "INE000000002": 50}, "2026-12-15")
         self.assertEqual(probs, [])
 
 

@@ -152,8 +152,10 @@ class TestBrokerGuard(Base):
 
     def test_tags(self) -> None:
         self.assertEqual(B.make_tag("2612", "buy", 7, 1), "M2612B07A1")
+        self.assertEqual(B.make_tag("2612", "sell", 7, 10), "M2612S07AA")   # attempts 10..35 as letters (review M3)
+        self.assertTrue(B.TAG_RE.match(B.make_tag("2612", "sell", 7, 35)))
         with self.assertRaises(ValueError):
-            B.make_tag("2612", "buy", 7, 10)
+            B.make_tag("2612", "buy", 7, 36)
 
 
 class TestControl(Base):

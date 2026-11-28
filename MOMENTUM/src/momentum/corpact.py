@@ -76,24 +76,52 @@ def scan(env: Any, M_CA: Any, get: Optional[Callable[[str], Tuple[int, Optional[
         env.journal.append("NOTE", ca_event=eid, isin=ev.isin, symbol=ev.symbol, ex=ev.ex, kinds=list(ev.kinds),
                            factor=ev.factor, mult=mult if clean else None, subjects=list(ev.subjects)[:4])
         for p in ps:
-            if clean:
-                env.journal.append("OVERLAY", position_id=p.position_id, overlay="PENDING_CA", on=True,
-                                   reason=f"ca {eid} x{mult}")
-                env.notify(f"CA {p.symbol}: {'/'.join(ev.kinds)} x{mult}, ex {ev.ex}: its orders wait until Kite "
-                           f"shows {p.held_qty * mult} shares (booked by code)")
+            if clean:                              # the overlay goes on near the ex-date (activate_due, below)
+                env.notify(f"CA {p.symbol}: {'/'.join(ev.kinds)} x{mult}, ex {ev.ex}: from the ex-date its orders "
+                           f"wait until Kite shows {p.held_qty * mult} shares (booked by code)")
             else:
                 E.hold_leg(env, p, "OWNER_HOLD", f"corporate action {'/'.join(ev.kinds)} ex {ev.ex} "
                            f"({E.quote_text(' | '.join(ev.subjects))[:100]}): the code does not handle it")
                 env.alert("CA_OWNER", f"{p.symbol}: {'/'.join(ev.kinds)} ex {ev.ex}: held for you (sell it, or "
                           f"fix the quantity with 'ca {p.isin} <new qty>' once Kite shows it)")
         acted.append(eid)
+    activate_due(env)
     return {"ok": True, "records": len(records), "acted": acted}
+
+
+def next_weekday(d: dt.date) -> dt.date:
+    n = d + dt.timedelta(days=1)
+    while n.weekday() >= 5:
+        n += dt.timedelta(days=1)
+    return n
+
+
+def activate_due(env: Any) -> List[str]:
+    """PENDING_CA goes on the evening before the ex-date (or later): before it the name sells its old shares at
+    the old price as tested; from the ex-date until the credit its orders wait (the sell would be the old quantity
+    at the new price). Run by the scan and by the morning / afternoon credit check. -> position ids switched on."""
+    recs = env.journal.read()
+    lg = L.replay(recs)
+    horizon = next_weekday(util.today()).isoformat()
+    on_for = {str(r.get("reason", "")).split()[1] for r in recs if r["type"] == "OVERLAY"
+              and r["overlay"] == "PENDING_CA" and r["on"] and str(r.get("reason", "")).startswith("ca ")}
+    out = []
+    for eid, ev in events_seen(recs).items():
+        if not ev.get("mult") or eid in on_for or str(ev.get("ex", "")) > horizon:
+            continue
+        for p in lg.positions.values():
+            if p.isin == ev["isin"] and p.held_qty > 0:
+                env.journal.append("OVERLAY", position_id=p.position_id, overlay="PENDING_CA", on=True,
+                                   reason=f"ca {eid} x{ev['mult']}")
+                out.append(p.position_id)
+    return out
 
 
 def credit_check(env: Any, rows: List[Dict[str, Any]]) -> List[str]:
     """Kite holdings rows (isin, tradingsymbol, quantity, t1_quantity) against every PENDING_CA position.
     -> lines describing what happened."""
     from . import engine as E
+    activate_due(env)
     if not rows:                                   # holdings unreadable (or empty): never judge a credit on it
         return []
     recs = env.journal.read()

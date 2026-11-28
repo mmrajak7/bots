@@ -101,6 +101,17 @@ def estimate_sell_charges_paise(cfg: Dict[str, Any], value_paise: int, first_sel
     return int((stt + txn + sebi + gst + dp).to_integral_value())
 
 
+def live_symbol(p: L.Position, ticks: Dict[str, Any]) -> str:
+    """The name's trading symbol today: its plan series first, else the same symbol in another series (NSE moved it
+    to BE / BZ or back to EQ). Unknown -> the plan's symbol (the caller treats it as not listed)."""
+    from . import engine as E
+    for s in [p.series] + [x for x in ("EQ", "BE", "BZ") if x != p.series]:
+        ts = E.tradingsymbol(p.symbol, s)
+        if ts in ticks:
+            return ts
+    return E.tradingsymbol(p.symbol, p.series)
+
+
 def traded_today(q: Dict[str, Any]) -> bool:
     t = str(q.get("last_trade_time") or "")
     return t[:10] == util.today().isoformat()
@@ -116,7 +127,13 @@ def extend_step_plan(env: Any, lg: L.Ledger, holdings_open: Dict[str, int], sp: 
     gated = [p for p in gated_legs(lg, plan["plan_id"] if plan else None) if not p.overlays]
     if sp is None and not sells and not gated:
         return None
-    keys = sorted({f"NSE:{E.tradingsymbol(p.symbol, p.series)}" for p in sells + gated})
+    try:
+        ticks_now = E.instruments_ticks(env)
+    except B.NetworkError:
+        ticks_now = {}
+    sym_of = {p.position_id: (live_symbol(p, ticks_now) if p.leg == "SELLING" else E.tradingsymbol(p.symbol, p.series))
+              for p in sells + gated}
+    keys = sorted({f"NSE:{s}" for s in sym_of.values()})
     q = env.api.quote(keys) if keys else {}
     pid = plan["plan_id"] if plan else (sells[0].sell_plan if sells else None)
     if sp is None:
@@ -132,9 +149,10 @@ def extend_step_plan(env: Any, lg: L.Ledger, holdings_open: Dict[str, int], sp: 
     for p in sells:
         att = sell_attempts(lg, p) + 1
         sp.attempts[p.position_id] = att
-        qq = q.get(f"NSE:{E.tradingsymbol(p.symbol, p.series)}", {})
+        qq = q.get(f"NSE:{sym_of[p.position_id]}", {})
         rows.append({"intent_id": sell_intent_id(p, att), "leg": "sell", "isin": p.isin, "symbol": p.symbol,
-                     "series": p.series, "rank": p.rank, "sell_reason": p.sell_reason, "qty": sell_qty(p),
+                     "series": p.series, "trading_symbol_today": sym_of[p.position_id], "rank": p.rank,
+                     "sell_reason": p.sell_reason, "qty": sell_qty(p),
                      "book_qty": p.held_qty, "holdings_qty": int(holdings_open.get(p.isin, 0)),
                      "non_book_qty": max(0, int(holdings_open.get(p.isin, 0)) - held.get(p.isin, 0)),
                      "price_rule": f"SELL_1450({env.cfg['sell_ltp_mult']},{env.cfg['sell_floor_mult']})",
@@ -144,7 +162,7 @@ def extend_step_plan(env: Any, lg: L.Ledger, holdings_open: Dict[str, int], sp: 
     if gated:
         proceeds = Decimal(0)
         for p in sells:
-            qq = q.get(f"NSE:{E.tradingsymbol(p.symbol, p.series)}", {})
+            qq = q.get(f"NSE:{sym_of[p.position_id]}", {})
             if qq.get("last_price"):
                 proceeds += dec(qq["last_price"]) * sell_qty(p) * 100
         free = Decimal(lg.cash_paise - lg.earmarked_paise()) + proceeds
@@ -206,8 +224,13 @@ def apply_side_verdicts(env: Any, sp: Any, vd: V.Verdict, day: str) -> Tuple[Lis
         elif a == "GO":
             go_s.append(p.position_id)
         elif a == "DEFER":
-            n = sum(1 for r in env.journal.read() if r["type"] == "SELL_SESSION"
-                    and r["position_id"] == p.position_id and str(r.get("result", "")).startswith("vet DEFER"))
+            res = [str(r.get("result", "")) for r in env.journal.read() if r["type"] == "SELL_SESSION"
+                   and r["position_id"] == p.position_id]
+            n = 0
+            for x in reversed(res):            # only the deferrals in a row
+                if not x.startswith("vet DEFER"):
+                    break
+                n += 1
             sell_session(env, p.position_id, day, f"vet DEFER {code}")
             if n + 1 >= int(env.cfg["defer_max"]):
                 E.hold_leg(env, p, "OWNER_HOLD", f"sell deferred by the vet {n + 1} sessions ({code}: {note})")
@@ -262,14 +285,19 @@ def place_sells(env: Any, go_ids: List[str], day: str, holdings_open: Dict[str, 
     held = book_held(lg0)
     probe_ok = False
     probes = 0
+    syms = {p.position_id: live_symbol(p, ticks) for p in legs}
+    if any(syms[p.position_id] != E.tradingsymbol(p.symbol, p.series) for p in legs):
+        q.update(env.api.quote([f"NSE:{s}" for s in syms.values()]))
     for n, p in enumerate(legs):
         if util.now() >= cutoff:
             env.alert("SELL_LATE", f"{len(legs) - n} sells not placed: past {env.cfg['last_sell_place_at']} "
                       "(next session)")
             break
-        ts = E.tradingsymbol(p.symbol, p.series)
+        ts = syms[p.position_id]
         tick = ticks.get(ts)
         qq = q.get(f"NSE:{ts}") or {}
+        if ts != E.tradingsymbol(p.symbol, p.series) and tick is not None:
+            env.alert("SERIES_CHANGED", f"{p.symbol}: trades today as {ts} (book series {p.series}); sold as {ts}")
         if tick is None or tick <= 0:
             sell_session(env, p.position_id, day, "not in today's instruments")
             env.alert("SELL_NOT_LISTED", f"{ts} is not in today's Kite instruments (suspended / renamed?): the sell "
@@ -291,8 +319,9 @@ def place_sells(env: Any, go_ids: List[str], day: str, holdings_open: Dict[str, 
         limit = tick_up(max(ltp * dec(env.cfg["sell_ltp_mult"]), lower), tick)
         floor = tick_up(max(ltp * dec(env.cfg["sell_floor_mult"]), lower), tick)
         att = sell_attempts(L.replay(env.journal.read()), p) + 1
-        if att > 9:
-            E.hold_leg(env, p, "OWNER_HOLD", "sell attempt > 9")
+        if att > B.MAX_ATTEMPT:
+            E.hold_leg(env, p, "OWNER_HOLD", f"sell attempt > {B.MAX_ATTEMPT}: sell it by hand, then 'sold <isin> "
+                       "<qty> <avg_price>'")
             continue
         iid = sell_intent_id(p, att)
         qty = sell_qty(p)
@@ -446,13 +475,25 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
     gated buy of the plan (held ones too: their share stays earmarked until released or expired)."""
     from . import engine as E
     env.sleep_until(util.at_today(env.cfg["gate_at"]))
+    done = [r for r in env.journal.read() if r["type"] == "GATE" and r["date"] == day
+            and r.get("result") in ("OPEN", "FORCED")]
+    if done:                                   # resumed after a crash inside the gate: finish the SAME judgement
+        lg = L.replay(env.journal.read())
+        for pid, a in (done[-1].get("amounts") or {}).items():
+            if lg.positions[pid].leg == "BUY_GATED":
+                env.journal.append("BUY_AMOUNT", position_id=pid, earmark_paise=int(a), date=day,
+                                   basis="gate resumed")
+        env.journal.append("STAGE", date=day, stage="GATE", result="ok (resumed)")
+        return
     try:
         E.settle_orphans(env, day, final=False)
         E.sync_orders(env, day, final=False)          # sell fills so far: the cash the buys may use
     except B.NetworkError as e:
         env.alert("KITE_DOWN", f"order book unreadable at the gate ({str(e)[:150]}): the gated buys wait (no "
                   "session counted)")
-        env.journal.append("GATE", date=day, plan=None, result="UNREAD", reasons=[str(e)[:200]])
+        pl = E.current_plan(L.replay(env.journal.read()))
+        env.journal.append("GATE", date=day, plan=L.plan_key(pl["plan_id"]) if pl else None, result="UNREAD",
+                           reasons=[str(e)[:200]])
         env.journal.append("STAGE", date=day, stage="GATE", result="unread")
         return
     lg = L.replay(env.journal.read())
@@ -473,12 +514,12 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
     if mine:
         try:
             ticks = E.instruments_ticks(env)
-            q = env.api.quote([f"NSE:{E.tradingsymbol(p.symbol, p.series)}" for p in mine])
+            q = env.api.quote([f"NSE:{live_symbol(p, ticks)}" for p in mine])
         except B.NetworkError as e:
             ticks, q = {}, {}
             reasons.append(f"quotes unreadable at the gate ({str(e)[:100]})")
         for p in mine:
-            ts = E.tradingsymbol(p.symbol, p.series)
+            ts = live_symbol(p, ticks)
             qq = q.get(f"NSE:{ts}") or {}
             if ticks and ts not in ticks:
                 continue                                   # not listed today: outside the engine
@@ -489,7 +530,7 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
             reasons.append(f"{p.symbol} {why}")
     recs = env.journal.read()
     closed_before = len({r["date"] for r in recs if r["type"] == "GATE" and r.get("plan") == pk
-                         and r.get("result") == "CLOSED" and r["date"] != day})
+                         and r.get("result") in ("CLOSED", "UNREAD") and r["date"] != day})
     if reasons and closed_before < int(env.cfg["gate_wait_sessions"]):
         env.journal.append("GATE", date=day, plan=pk, result="CLOSED", reasons=reasons, margins=margins)
         env.alert("BUY_GATED", f"{len(gated)} buys wait for the sells ({'; '.join(reasons)[:300]}); gated session "
@@ -510,10 +551,12 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
         if p.position_id in envelopes:                     # never above what the vet saw at 14:45
             a = min(a, int(envelopes[p.position_id]) * 100)
         amounts[p.position_id] = a
-        env.journal.append("BUY_AMOUNT", position_id=p.position_id, earmark_paise=a, date=day,
-                           basis=f"gate {'OPEN' if not reasons else 'FORCED'}: free {free} / {len(gated)}")
+    # the judgement first, then its amounts: a crash in between resumes from this record (judged once)
     env.journal.append("GATE", date=day, plan=pk, result="OPEN" if not reasons else "FORCED", reasons=reasons,
                        margins=margins, amounts=amounts)
+    for p in gated:
+        env.journal.append("BUY_AMOUNT", position_id=p.position_id, earmark_paise=amounts[p.position_id], date=day,
+                           basis=f"gate {'OPEN' if not reasons else 'FORCED'}: free {free} / {len(gated)}")
     if reasons:
         env.alert("GATE_FORCED", f"sells still open after {closed_before} gated sessions ({'; '.join(reasons)[:200]}):"
                   f" the {len(gated)} buys go with the cash there (D32)")
@@ -542,12 +585,13 @@ def margins_log(env: Any) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- 15:10 sizing: the extra share (D52)
 def size_buys(env: Any, legs: List[L.Position], q: Dict[str, Any], ticks: Dict[str, Decimal]
-              ) -> Dict[str, Tuple[int, Decimal, Decimal, Decimal, int]]:
+              ) -> Tuple[Dict[str, Tuple[int, Decimal, Decimal, Decimal, int]], List[Tuple[str, str, int]]]:
     """-> position_id -> (qty, ltp, limit, cap_price, max_rupees for the broker). floor(amount / cap price) for each
     buy, then one more share for the buys with the largest fraction of a share left over, paid from the summed
     leftovers of the buys placed together, never above amount x (1 + extra_share_max_over) for one name. The total
     never exceeds the sum of the amounts (January spec §6). Legs without a usable quote are left out (the caller
-    alerts as before)."""
+    alerts as before). -> (sizes, earmark moves (giver, receiver, paise)): the share's cost above the receiver's own
+    amount is moved out of the givers' earmarks, so a giver that does not fill cannot spend it again on a retry."""
     from . import engine as E
     out: Dict[str, Tuple[int, Decimal, Decimal, Decimal, int]] = {}
     rem: Dict[str, Decimal] = {}
@@ -569,14 +613,36 @@ def size_buys(env: Any, legs: List[L.Position], q: Dict[str, Any], ticks: Dict[s
         out[p.position_id] = (qty, ltp, limit, cap, int(amount))
         if not p.test:                                 # the TEST lot buys exactly its quantity
             rem[p.position_id] = amount - qty * cap
-    pool = sum(rem.values(), Decimal(0))
+    left = {k: v for k, v in rem.items()}                # leftover each buy can still give, rupees
+    moves: List[Tuple[str, str, int]] = []
     for pid in sorted(rem, key=lambda x: -(rem[x] / out[x][3])):
         qty, ltp, limit, cap, amount = out[pid]
-        if pool < cap:                                 # its own leftover + the others' must pay a whole share
+        need = cap - left[pid]                         # what the others must give for one more share
+        others = sorted((k for k in left if k != pid and left[k] > 0), key=lambda k: -left[k])
+        if need <= 0 or sum((left[k] for k in others), Decimal(0)) < need:
             continue
         if (qty + 1) * cap > Decimal(amount) * (1 + over):
             continue
-        pool -= cap
-        new_max = int(((qty + 1) * cap).to_integral_value(rounding=ROUND_CEILING))
+        got = Decimal(0)
+        for k in others:
+            take = min(left[k], need - got)
+            # whole paise, rounded UP for the receiver so it can always pay; never more than the giver has left
+            pz = min(int((take * 100).to_integral_value(rounding=ROUND_CEILING)), int(left[k] * 100))
+            if pz <= 0:
+                continue
+            moves.append((k, pid, pz))
+            left[k] -= Decimal(pz) / 100
+            got += Decimal(pz) / 100
+            if got >= need:
+                break
+        if got < need:                                 # rounding left it short: undo, no extra share
+            for m_ in [m_ for m_ in moves if m_[1] == pid]:
+                left[m_[0]] += Decimal(m_[2]) / 100
+                moves.remove(m_)
+            continue
+        left[pid] = Decimal(0)
+        new_max = int((Decimal(amount) + got).to_integral_value(rounding=ROUND_FLOOR))
+        if (qty + 1) * cap > new_max:
+            new_max = int(((qty + 1) * cap).to_integral_value(rounding=ROUND_CEILING))
         out[pid] = (qty + 1, ltp, limit, cap, new_max)
-    return out
+    return out, moves

@@ -26,7 +26,9 @@ from .journal import Journal
 
 log = logging.getLogger("momentum.broker")
 
-TAG_RE = re.compile(r"^M\d{4}[SBURPX]\d{2}A\d$")
+TAG_RE = re.compile(r"^M\d{4}[SBURPX]\d{2}A[1-9A-Z]$")
+ATTEMPT_CHARS = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"   # attempt 1..35 (a sell locked for weeks keeps going)
+MAX_ATTEMPT = len(ATTEMPT_CHARS)
 LEG_LETTER = {"sell": "S", "buy": "B", "topup": "U", "residual": "R", "piece": "P", "test": "X"}
 
 # Kite order states that can never trade again. Every other state (OPEN, OPEN PENDING, MODIFY PENDING, VALIDATION
@@ -66,9 +68,9 @@ def patch_ipv4() -> None:
 def make_tag(yymm: str, leg: str, ordinal: int, attempt: int) -> str:
     if not (1 <= ordinal <= 99):
         raise ValueError(f"ordinal {ordinal} out of 1..99")
-    if not (1 <= attempt <= 9):
-        raise ValueError(f"attempt {attempt} out of 1..9 (owner hold)")
-    tag = f"M{yymm}{LEG_LETTER[leg]}{ordinal:02d}A{attempt}"
+    if not (1 <= attempt <= MAX_ATTEMPT):
+        raise ValueError(f"attempt {attempt} out of 1..{MAX_ATTEMPT} (owner hold)")
+    tag = f"M{yymm}{LEG_LETTER[leg]}{ordinal:02d}A{ATTEMPT_CHARS[attempt - 1]}"
     assert TAG_RE.match(tag), tag
     return tag
 

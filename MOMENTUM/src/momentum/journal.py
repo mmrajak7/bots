@@ -20,7 +20,7 @@ RECORD_TYPES = frozenset({
     "VET", "STEP_START", "STEP_END", "INTENT", "SENT", "RESULT", "MODIFY_INTENT", "MODIFY_SENT", "MODIFY_RESULT",
     "CANCEL_INTENT", "CANCEL_SENT", "CANCEL_RESULT", "ORDER_STATUS", "FILL", "ORPHAN", "HOLDINGS_SNAPSHOT",
     "SESSION_USED", "ALERT", "NOTE", "APPROVAL_OPEN", "STAGE",
-    "BUY_AMOUNT", "CA_CREDIT", "SELL_SESSION", "GATE",                       # January slice (spec §3, §5)
+    "BUY_AMOUNT", "CA_CREDIT", "SELL_SESSION", "GATE", "EARMARK_MOVE",                       # January slice (spec §3, §5)
 })
 
 

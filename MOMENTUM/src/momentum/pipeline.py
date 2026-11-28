@@ -370,8 +370,11 @@ def decide_live(M: Modules, c: Context, m: str, holdings: Sequence[LiveHolding],
         by_chain.setdefault(ch, []).append(h)
     for b in pending:
         ch = chain_for(mk, b.isin, s)
-        if ch is None:
-            raise PipelineError(f"pending buy {b.position_id} {b.isin}: no chain (a pending buy must map)")
+        if ch is None:                         # still a slot (tested: pending buys count); reported, never fatal
+            written_off.append({"position_id": b.position_id, "isin": b.isin, "chain": None, "last_row": None,
+                                "pending_no_chain": True})
+            book.pending_buys.append([-1, 0.0, s, 1, m])
+            continue
         book.pending_buys.append([ch, 0.0, s, 1, m])
     sells, buys, off = book._decide(m)
     if off:

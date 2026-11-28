@@ -273,7 +273,7 @@ class TestExtraShare(unittest.TestCase):
     def sizes(self, legs, prices):  # noqa: ANN001, ANN201
         q = {f"NSE:{s}": {"last_price": p, "upper_circuit_limit": p * 1.2} for s, p in prices.items()}
         ticks = {s: Decimal("0.05") for s in prices}
-        return SS.size_buys(self.Env(self.cfg), legs, q, ticks)
+        return SS.size_buys(self.Env(self.cfg), legs, q, ticks)[0]
 
     def test_largest_leftover_gets_the_extra_share_and_the_total_stays_inside(self) -> None:
         legs = [self.leg("a", "A", 10_000), self.leg("b", "B", 10_000), self.leg("c", "C", 10_000)]

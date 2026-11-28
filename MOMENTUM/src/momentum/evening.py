@@ -220,13 +220,13 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
                       "sell_no": k, "qty": pos.held_qty,
                       "signal_close_paise": L.paise(float(c.p.close[x["chain"], s_idx])) if x["chain"] is not None
                       else None})
-    touched_flags: Dict[str, List[A.Flag]] = {}
+    touched_flags: Dict[Any, List[A.Flag]] = {}        # keyed by research chain: a ledger ISIN may be older
     for f in res.flags:
         if f.touched:
-            touched_flags.setdefault(f.isin, []).append(f)
+            touched_flags.setdefault(f.chain, []).append(f)
     holds = []
     for b in buys:
-        if b["isin"] in touched_flags:
+        if b["chain"] in touched_flags:
             holds.append({"position_id": b["position_id"], "overlay": "AUDIT_HOLD", "reason": "audit flag"})
         if b["series"] != "EQ":
             holds.append({"position_id": b["position_id"], "overlay": "OWNER_HOLD", "reason": f"{b['series']} series"})
@@ -234,7 +234,7 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
         if x["reason"] in ("NO_SCORE", "NO_CHAIN"):            # D40: only a RANK sell is automatic
             holds.append({"position_id": x["position_id"], "overlay": "AUDIT_HOLD",
                           "reason": f"sell reason {x['reason']}: sell or data fix (owner)"})
-        elif x["isin"] in touched_flags:
+        elif x["chain"] is not None and x["chain"] in touched_flags:
             holds.append({"position_id": x["position_id"], "overlay": "AUDIT_HOLD", "reason": "audit flag"})
     for w_ in d["written_off"]:                                # D-L19: no row for > DEAD_GAP sessions
         holds.append({"position_id": w_["position_id"], "overlay": "OWNER_HOLD",
@@ -288,9 +288,13 @@ def finalise(env: Env, decision: Dict[str, Any], text: str, dp: Path) -> Dict[st
                    | {"leg": b.get("leg", "PENDING_BUY")} for b in buys],
              sells=[{k: x[k] for k in ("position_id", "reason", "sell_no", "rank", "qty")} for x in sells],
              holds=[{"position_id": h["position_id"], "overlay": h["overlay"]} for h in holds])
+    by_chain = {b["chain"]: b for b in buys + sells if b.get("chain") is not None}
     by_isin = {b["isin"]: b for b in buys + sells}
     for f in flags:
-        b = by_isin[f["isin"]]
+        b = by_chain.get(f.get("chain")) or by_isin.get(f["isin"])
+        if b is None:                           # never raise after PLAN_FINAL: the buttons would be lost
+            env.alert("FLAG_UNMATCHED", f"audit flag {f['flag_id']} on {f['symbol']} matches no plan row")
+            continue
         others = [x["flag_id"] for x in flags if x["isin"] == f["isin"] and x["flag_id"] != f["flag_id"]]
         open_approval(env, "flag", f["flag_id"], {"real": "Real - clear", "hold": "Hold name",
                                                   "data_error": "Data error - stop plan"},
