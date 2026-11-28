@@ -164,14 +164,17 @@ def credit_check(env: Any, rows: List[Dict[str, Any]]) -> List[str]:
                 new_isin, have = str(r["isin"]), int(r.get("quantity", 0)) + int(r.get("t1_quantity", 0))
         if have == expected:
             env.journal.append("CA_CREDIT", position_id=p.position_id, ca_id=eid, factor_num=mult, factor_den=1,
-                               qty_before=p.held_qty, qty_after=expected, new_isin=new_isin)
+                               qty_before=p.held_qty, qty_after=expected, new_isin=new_isin,
+                               isin_before=p.isin)
             env.journal.append("OVERLAY", position_id=p.position_id, overlay="PENDING_CA", on=False,
                                reason=f"credited {expected}")
             msg = f"CA {p.symbol}: credited, book now {expected} shares" + (f" (new ISIN {new_isin})"
                                                                              if new_isin else "")
             env.notify(msg)
             out.append(msg)
-        elif have == p.held_qty:                   # not credited yet
+        elif have == p.held_qty or (have == 0 and new_isin is None):
+            # not credited yet; or (review 11-28 F4) a split changing the ISIN in transit: the old ISIN debited, the
+            # new one not credited yet (Zerodha shows neither for a day or two): keep waiting, CA_LATE after the lag
             ex = str(ev.get("ex", ""))
             late = ex and (util.today() - dt.date.fromisoformat(ex)).days > int(env.cfg["ca_lag_days"])
             if late and not any(r["type"] == "ALERT" and r.get("code") == "CA_LATE" and r["ts"][:10]
@@ -190,19 +193,25 @@ def credit_check(env: Any, rows: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
-def owner_set_qty(env: Any, isin: str, new_qty: int) -> str:
-    """Owner command `ca <isin> <qty>`: book a corporate-action credit the code could not (journalled)."""
+def owner_set_qty(env: Any, isin: str, new_qty: int, new_isin: Optional[str] = None) -> str:
+    """Owner command `ca <isin> <qty> [<new isin>]`: book a corporate-action credit the code could not (journalled);
+    the optional new ISIN moves the book to it (review 11-28 F4: a split that changed the ISIN)."""
     lg = L.replay(env.journal.read())
     ps = [p for p in lg.positions.values() if p.isin == isin and p.held_qty > 0]
     if len(ps) != 1 or new_qty <= 0:
         return f"ca {isin}: needs exactly one held book position and a positive quantity"
+    if new_isin is not None and (len(new_isin) != 12 or not new_isin.isalnum() or new_isin == isin
+                                 or any(q.isin == new_isin for q in lg.positions.values())):
+        return f"ca {isin}: new ISIN {new_isin} must be 12 letters/digits, different, and not already in the book"
     p = ps[0]
     env.journal.append("CA_CREDIT", position_id=p.position_id, ca_id="owner", factor_num=new_qty,
-                       factor_den=p.held_qty, qty_before=p.held_qty, qty_after=new_qty, new_isin=None)
+                       factor_den=p.held_qty, qty_before=p.held_qty, qty_after=new_qty, new_isin=new_isin,
+                       isin_before=p.isin)
     for ov in ("PENDING_CA",):
         if ov in p.overlays:
             env.journal.append("OVERLAY", position_id=p.position_id, overlay=ov, on=False, reason="owner ca")
-    return f"ca {p.symbol}: book quantity {p.held_qty} -> {new_qty} (owner); other holds stay until released"
+    return (f"ca {p.symbol}: book quantity {p.held_qty} -> {new_qty} (owner)"
+            + (f", ISIN {isin} -> {new_isin}" if new_isin else "") + "; other holds stay until released")
 
 
 def holdings_rows(api: Any) -> List[Dict[str, Any]]:

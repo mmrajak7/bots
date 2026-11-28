@@ -19,6 +19,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import broker as B
+from . import control as C
 from . import ledger as L
 from . import util
 from . import vet as V
@@ -110,6 +111,31 @@ def live_symbol(p: L.Position, ticks: Dict[str, Any]) -> str:
         if ts in ticks:
             return ts
     return E.tradingsymbol(p.symbol, p.series)
+
+
+def held_by_name_today(recs: List[Dict[str, Any]], p: L.Position, day: str) -> bool:
+    """Review 11-28 H1: is this unsold sell stopped today by something about THIS name (an overlay: audit / owner / vet
+    DEFER or HOLD / pending CA / shared name; or its own SELL_SESSION today: no quote, unsettled, not listed)? A stop
+    of the whole step (vet unavailable, Kite down, KILL, no start message) leaves no per-name mark and is untried."""
+    if p.overlays:
+        return True
+    return any(r["type"] == "SELL_SESSION" and r["position_id"] == p.position_id and r.get("date") == day
+               and str(r.get("result", "")) != "vet unavailable" for r in recs)
+
+
+def market_traded_today(env: Any) -> Optional[bool]:
+    """Kite's proof the market is open today (review 11-28 H2/T2: the holiday file has missed real closures): any of
+    market_probe_keys (very liquid stocks: a stock quote carries last_trade_time, which the engine already relies on;
+    an index quote may not) last traded today. None = unreadable or no usable field (excuses nothing, never
+    MARKET_SHUT)."""
+    try:
+        q = env.api.quote(list(env.cfg["market_probe_keys"]))
+    except B.NetworkError:
+        return None
+    stamps = [str((v or {}).get("last_trade_time") or "") for v in q.values()]
+    if not any(stamps):
+        return None
+    return any(t[:10] == util.today().isoformat() for t in stamps)
 
 
 def traded_today(q: Dict[str, Any]) -> bool:
@@ -292,9 +318,10 @@ def place_sells(env: Any, go_ids: List[str], day: str, holdings_open: Dict[str, 
                   "placed today (next session)")
         return placed
     held = book_held(lg0)
-    snap = [r for r in env.journal.read() if r["type"] == "HOLDINGS_SNAPSHOT" and r["ts"][:10] == day
-            and "settled" in r]
-    settled = {k: int(v) for k, v in snap[-1]["settled"].items()} if snap else None
+    recs_s = env.journal.read()
+    snap = [r for r in recs_s if r["type"] == "HOLDINGS_SNAPSHOT" and r["ts"][:10] == day and "settled" in r]
+    settled = ({k: int(v) for k, v in E.with_todays_credits(recs_s, snap[-1]["settled"], day).items()}
+               if snap else None)                  # F2: a bonus / split credit is settled stock too
     probe_ok = False
     probes = 0
     syms = {p.position_id: live_symbol(p, ticks) for p in legs}
@@ -462,6 +489,19 @@ def sell_step(env: Any, day: str, go_ids: List[str], holdings_open: Dict[str, in
         return
     if go_ids and util.now() < util.at_today(env.cfg["last_sell_place_at"]):
         started = E.started_today(env, day) or env.arm is None or env.arm.mode != "automatic"
+        if not started:
+            # review 11-28 H3: the day message was not delivered (or the run resumed after 14:48, when day_start does
+            # not try): retry each minute to last_sell_place_at; the sells still never go without a delivered message
+            text = f"starting SELL step: {len(go_ids)} sells"
+            give_up = util.at_today(env.cfg["last_sell_place_at"])
+            started = env.notify(text)
+            while not started and util.now() < give_up:
+                env.sleep_until(min(util.now() + dt.timedelta(seconds=60), give_up))
+                started = env.notify(text)
+            if started:
+                env.journal.append("STEP_START", step="DAY", step_plan_hash=None, telegram_ok=True)
+        if started and util.now() >= util.at_today(env.cfg["last_sell_place_at"]) + dt.timedelta(minutes=1):
+            started = False                        # delivered too late to place a sell today
         if started:
             env.sleep_until(util.at_today(env.cfg["sell_place_at"]))
             if not E.killed_now(env):
@@ -471,8 +511,12 @@ def sell_step(env: Any, day: str, go_ids: List[str], holdings_open: Dict[str, in
                 except B.NetworkError as e:
                     log.warning("orphans not settled after the sells (%s)", e)
         else:
-            env.journal.append("NOTE", text="starting message not delivered: SELL step did not start")
-    elif go_ids:
+            env.journal.append("NOTE", text="starting message not delivered: SELL step did not start",
+                               sells_blocked=day)
+            env.alert("SELL_NOT_STARTED", f"the starting message was not delivered by {env.cfg['last_sell_place_at']}:"
+                      " no sell today (next session)")
+    elif go_ids and not any(i.date == day and "|sell|" in i.intent_id for i in lg.intents.values()):
+        # (a resume after the sells were placed is not late: review 11-28)
         env.alert("SELL_LATE", f"the afternoon reached the sell step after {env.cfg['last_sell_place_at']}: no sell "
                   "today (next session)")
     for k, hhmm in enumerate(env.cfg["sell_ladder"], 1):
@@ -538,6 +582,7 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
     reasons: List[str] = []
     mine = [p for p in lg.positions.values() if p.sell_plan == plan["plan_id"] and p.leg == "SELLING"
             and sell_qty(p) > 0]
+    waiting: List[L.Position] = []                 # the unsold sells that hold the gate today
     if mine:
         try:
             ticks = E.instruments_ticks(env)
@@ -545,22 +590,40 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
         except B.NetworkError as e:
             ticks, q = {}, {}
             reasons.append(f"quotes unreadable at the gate ({str(e)[:100]})")
+        market_ok: Optional[bool] = None
         for p in mine:
             ts = live_symbol(p, ticks)
             qq = q.get(f"NSE:{ts}") or {}
             if ticks and ts not in ticks:
                 continue                                   # not listed today: outside the engine
-            if qq and (not traded_today(qq) or (qq.get("lower_circuit_limit") and qq.get("last_price")
-                                                and dec(qq["last_price"]) <= dec(qq["lower_circuit_limit"]))):
-                continue                                   # locked at the lower circuit / no trade today
+            locked = bool(qq.get("lower_circuit_limit") and qq.get("last_price")
+                          and dec(qq["last_price"]) <= dec(qq["lower_circuit_limit"]))
+            if qq and not traded_today(qq) and not locked:
+                if market_ok is None:
+                    market_ok = market_traded_today(env)
+                if market_ok:
+                    continue                               # no trade in this name today while the market traded
+            elif qq and locked:
+                continue                                   # locked at the lower circuit
             why = ("held: " + "/".join(sorted(p.overlays))) if p.overlays else f"{sell_qty(p)} shares unsold"
             reasons.append(f"{p.symbol} {why}")
+            waiting.append(p)
+        if market_ok is False:                     # the probe stocks did not trade today: not a session
+            env.journal.append("GATE", date=day, plan=pk, result="MARKET_SHUT", reasons=reasons, margins=margins)
+            env.alert("MARKET_SHUT", f"{env.cfg['market_probe_keys']} have no trade today: the market looks shut "
+                      f"although the holiday file lists a session; {len(gated)} buys wait (not counted)")
+            env.journal.append("STAGE", date=day, stage="GATE", result="market shut")
+            return
     recs = env.journal.read()
     closed_before = len({r["date"] for r in recs if r["type"] == "GATE" and r.get("plan") == pk
                          and r.get("result") in ("CLOSED", "UNREAD") and r["date"] != day})
     tried = any(i.date == day and "|sell|" in i.intent_id and i.position_id in {p.position_id for p in mine}
                 for i in lg.intents.values())
-    if reasons and not tried:                   # vet down / KILL / no start message: not a session the sells had
+    # review 11-28 H1/T1: a hold on one name (audit, owner, vet DEFER/HOLD, pending CA, Kite short) is a gated session:
+    # the buys go after gate_wait_sessions (D32), never wait all month. Untried (the safe default) = no sell placed and
+    # some unsold sell has no per-name reason today, i.e. the whole step stopped (vet down, Kite down, KILL, no start).
+    blocked = not tried and not all(held_by_name_today(recs, p, day) for p in waiting)
+    if reasons and blocked:                     # vet down / KILL / no start message: not a session the sells had
         env.journal.append("GATE", date=day, plan=pk, result="CLOSED_UNTRIED", reasons=reasons, margins=margins)
         env.alert("BUY_GATED", f"{len(gated)} buys wait: no sell was tried today ({'; '.join(reasons)[:250]}); "
                   "this session does not count toward the 2-session wait")
@@ -648,8 +711,10 @@ def size_buys(env: Any, legs: List[L.Position], q: Dict[str, Any], ticks: Dict[s
         if limit <= 0 or cap <= 0:
             out[p.position_id] = (0, ltp, limit, cap, int(amount))
             continue
+        if p.test:                                     # the TEST lot buys exactly its quantity (never more)
+            qty = min(qty, int(env.cfg["test_lot"]["qty"]))
         out[p.position_id] = (max(0, qty), ltp, limit, cap, int(amount))
-        if not p.test:                                 # the TEST lot buys exactly its quantity
+        if not p.test:
             rem[p.position_id] = amount - max(0, qty) * cap
     left = {k: v for k, v in rem.items()}                # leftover each buy can still give, rupees
     moves: List[Tuple[str, str, int]] = []

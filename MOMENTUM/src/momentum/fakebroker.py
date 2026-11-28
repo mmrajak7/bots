@@ -35,6 +35,7 @@ class FakeKite:
     ltp: Dict[str, float] = field(default_factory=dict)            # "NSE:SYM" -> price
     upper: Dict[str, float] = field(default_factory=dict)
     lower: Dict[str, float] = field(default_factory=dict)            # "NSE:SYM" -> lower circuit (default LTP x 0.8)
+    market_shut: bool = False                                          # probe stocks last traded yesterday
     stale: List[str] = field(default_factory=list)                    # "NSE:SYM" with no trade today (last trade yday)
     holdings_qty: Dict[str, int] = field(default_factory=dict)       # isin -> qty (non-book shares too)
     reject_next: Optional[str] = None                                 # message for the next place()
@@ -79,7 +80,10 @@ class FakeKite:
         self._r("quote")
         out = {}
         for k in keys:
-            if k in self.ltp:
+            if k in ("NSE:RELIANCE", "NSE:HDFCBANK", "NSE:INFY") and k not in self.ltp:   # market probe
+                d = util.today() - dt.timedelta(days=1 if self.market_shut else 0)
+                out[k] = {"last_price": 22000.0, "last_trade_time": f"{d.isoformat()} 14:45:00"}
+            elif k in self.ltp:
                 p = self.ltp[k]
                 day = util.today() - (dt.timedelta(days=1) if k in self.stale else dt.timedelta(0))
                 out[k] = {"last_price": p, "last_trade_time": f"{day.isoformat()} 14:45:00"}

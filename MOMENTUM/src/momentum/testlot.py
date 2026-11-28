@@ -93,8 +93,9 @@ def run(env: Any, holdings: Dict[str, int]) -> str:
         if n is None:
             return "no TEST name"
         qty = int(cfg["qty"])
-        # enough for qty shares at the 15:10 cap price (LTP x 1.010) with room for a 1% move by then
-        em = int((Decimal(str(n["ltp"])) * qty * Decimal("1.010") * Decimal("1.02") * 100)
+        # enough for qty shares at the 15:10 cap price (LTP x 1.010) with room for a 10% move by then (review 11-28
+        # T5: with 2% a rise by 15:10 bought 1 share and lost the second sell); sizing never buys more than qty
+        em = int((Decimal(str(n["ltp"])) * qty * Decimal("1.010") * Decimal("1.10") * 100)
                  .to_integral_value(rounding=ROUND_CEILING))
         write_plan(env, day, [{"position_id": "TEST-01", "isin": n["isin"], "symbol": n["symbol"], "series": "EQ",
                                "rank": 0, "earmark_paise": em, "signal_close_paise": int(n["ltp"] * 100),

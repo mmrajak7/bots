@@ -53,9 +53,11 @@ Audit-flag buttons tapped in the dry chat do not carry over: the live evening se
 re-sends any untapped hold button every morning; `release <ISIN>` clears any owner-clearable hold).
 `control/ARM.json`:
 ```json
-{"phase": "P0", "plan_months": ["2026-12"], "mode": "automatic", "buy_cap_rupees_per_session": 220000,
- "valid_from": "2026-11-30", "valid_to": "2026-12-31"}
+{"phase": "P0", "plan_months": ["2026-12", "2027-01", "2027-02", "2027-03"], "mode": "automatic",
+ "buy_cap_rupees_per_session": 220000, "valid_from": "2026-11-30", "valid_to": "2027-03-31"}
 ```
+D48 (fully automatic Dec-Mar): ONE ARM covers all four plan months (review 11-28 L1: a December-only ARM blocks the
+1 Jan preflight and the first rebalance).
 **F&O check is automatic (D47, 2026-11-28): nothing to read or stamp by hand.** The evening downloads NSE's F&O
 circulars (`fo-scan`, also daily at 19:05), a tool-less vet classifies them, code verifies every claim, and stocks whose
 F&O contracts start on the plan month's first session are excluded before the band. At 14:45 on day 1 the backstop
@@ -63,7 +65,7 @@ checks Kite's real futures list: a planned buy with futures that day is not boug
 read for a decision made before D47. Check by hand any time: `./momentum fo-vet --as-of-signal 2026-11-27`
 (writes nothing to the book).
 
-## 3b. Deploying a code change (Claude does this; outside 14:40-16:40, best 20:00-23:00)
+## 3b. Deploying a code change (Claude does this; outside 14:40-16:40 and outside the 19:00-20:30 evening jobs; best 17:00-19:00 or after 21:00)
 1. On the PC: tests green; `momentum manifest` on the exact commit; commit + push.
 2. Pi: `git pull -q --rebase`; `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests`.
 3. Pi: `bash deploy/setup.sh` EVERY time (a pull never changes the installed crontab: new jobs would not run).

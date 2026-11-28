@@ -148,7 +148,7 @@ class TestPendingCAHoldsTheSell(SellHarness):
         CA.scan(self.env(), M.CA, get=lambda u: (200, body, ""))
         lg = self.afternoon(fill=fill_all(self.k))
         self.assertNotIn("SELL", [o.transaction_type for o in self.k.orders_])
-        self.assertEqual(self.gate()["result"], "CLOSED_UNTRIED")   # never tried: not a D32 session
+        self.assertEqual(self.gate()["result"], "CLOSED")   # a hold on one name: a D32 session (H1)
         self.assertEqual(lg.positions["2701-01"].leg, "BUY_GATED")
 
 

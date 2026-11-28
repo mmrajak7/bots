@@ -210,7 +210,8 @@ def preflight(x: Ctx, api: Any, full: bool) -> List[str]:
         p.append(why_ledger)
     snap = [r for r in recs if r["type"] == "HOLDINGS_SNAPSHOT" and r["ts"][:10] == day.isoformat()]
     if snap:                                   # frozen design §7.4: opening Kite holdings >= the book's quantity
-        short = E.holdings_short(lg, {k: int(v) for k, v in snap[0]["holdings"].items()})
+        short = E.holdings_short(lg, E.with_todays_credits(recs, {k: int(v) for k, v in snap[0]["holdings"].items()},
+                                                           day.isoformat()))
         if short and not any(r["type"] == "OWNER_CMD" and r["cmd"] == "ack" and r["seq"] > snap[0]["seq"]
                              for r in recs):
             p.append("opening holdings below the book: " + "; ".join(short) + " (owner: check Kite, then send 'ack')")

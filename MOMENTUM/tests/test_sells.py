@@ -137,7 +137,7 @@ class TestRebalance(SellHarness):
         lg = self.afternoon(fill=fill_all(self.k))
         self.assertEqual([o.transaction_type for o in self.k.orders_], [])
         self.assertIn("VET_DEFERRED", lg.positions["2612-02"].overlays)
-        self.assertEqual(self.gate()["result"], "CLOSED_UNTRIED")
+        self.assertEqual(self.gate()["result"], "CLOSED")          # a hold on one name is a gated session (H1)
 
     def test_vet_sees_both_sides_in_one_call(self) -> None:
         seen = []
@@ -164,6 +164,102 @@ class TestRebalance(SellHarness):
             SS.gate_stage = orig
         self.assertTrue(rec[0])
         self.assertEqual(lg.positions["2701-01"].earmark_paise, 100_000)
+
+
+class TestReview1128Gate(SellHarness):
+    """Review 11-28: H1 (a held sell never forced the buys), H2 (a closure the holiday file missed opened the gate on
+    the pre-sale cash), H3 (the sell start message given up at 14:48)."""
+
+    def hold_vet(self, step, vin, skips):  # noqa: ANN001, ANN201
+        return V.Verdict(True, "", {i["intent_id"]: (("HOLD", "HOLD_OTHER", "x") if i.get("leg") == "sell"
+                                                     else ("GO", "GO_OK", "")) for i in vin["intents"]}, "s")
+
+    def test_a_held_sell_closes_the_gate_and_the_buys_go_on_the_third_session(self) -> None:
+        self.vet = self.hold_vet
+        lg = self.afternoon(fill=fill_only(self.k, "BUY"))
+        self.assertIn("OWNER_HOLD", lg.positions["2612-02"].overlays)
+        self.assertNotIn("SELL", [o.transaction_type for o in self.k.orders_])
+        self.assertEqual(self.gate()["result"], "CLOSED")
+        self.new_day(dt.date(2027, 1, 4))
+        self.afternoon(fill=fill_only(self.k, "BUY"))
+        self.assertEqual(self.gate()["result"], "CLOSED")
+        self.new_day(dt.date(2027, 1, 5))
+        lg = self.afternoon(fill=fill_only(self.k, "BUY"))
+        self.assertEqual(self.gate()["result"], "FORCED")
+        self.assertEqual(lg.positions["2701-01"].leg, "NONE")
+        self.assertIn("OWNER_HOLD", lg.positions["2612-02"].overlays)   # the held sell stays with the owner
+
+    def test_vet_down_is_still_an_untried_session(self) -> None:
+        self.vet = lambda s, vin, sk: V.Verdict(False, "down", {}, "")
+        self.afternoon(fill=fill_all(self.k))
+        self.assertEqual(self.gate()["result"], "CLOSED_UNTRIED")
+
+    def test_kite_down_at_1450_is_an_untried_session_twice(self) -> None:
+        orig = SS.place_sells
+
+        def down(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+            self.k.fail_reads = 1                      # the 14:50 instruments / quote read fails
+            return orig(*a, **kw)
+        SS.place_sells = down
+        try:
+            for d in (dt.date(2027, 1, 1), dt.date(2027, 1, 4), dt.date(2027, 1, 5)):
+                self.new_day(d)
+                lg = self.afternoon(fill=fill_all(self.k))
+                self.assertEqual(self.gate()["result"], "CLOSED_UNTRIED", d)
+        finally:
+            SS.place_sells = orig
+        self.assertIn("KITE_DOWN", self.alerts())
+        self.assertNotIn("SELL", [o.transaction_type for o in self.k.orders_])
+        self.assertEqual(lg.positions["2701-01"].leg, "BUY_GATED")      # never forced from the pre-sale cash
+        self.assertFalse([r for r in self.j.read() if r["type"] == "BUY_AMOUNT"])
+
+    def test_probe_without_a_trade_time_never_says_market_shut(self) -> None:
+        self.k.stale.append("NSE:SYM2")
+        orig = self.k.quote
+
+        def quote(keys):  # noqa: ANN001, ANN202
+            out = orig(keys)
+            for k in ("NSE:RELIANCE", "NSE:HDFCBANK", "NSE:INFY"):
+                if k in out:
+                    out[k].pop("last_trade_time", None)
+            return out
+        self.k.quote = quote
+        self.afternoon(fill=None)
+        self.assertNotEqual(self.gate()["result"], "MARKET_SHUT")
+
+    def test_market_shut_with_the_file_open_writes_no_amount_and_does_not_count(self) -> None:
+        self.k.market_shut = True
+        self.k.stale.extend(["NSE:SYM1", "NSE:SYM2", "NSE:SYM3"])
+        lg = self.afternoon(fill=None)
+        self.assertEqual(self.gate()["result"], "MARKET_SHUT")
+        self.assertIn("MARKET_SHUT", self.alerts())
+        self.assertEqual(lg.positions["2701-01"].leg, "BUY_GATED")
+        self.assertFalse([r for r in self.j.read() if r["type"] == "BUY_AMOUNT"])
+
+    def test_no_trade_in_one_name_while_the_market_trades_still_opens(self) -> None:
+        self.k.stale.append("NSE:SYM2")
+        self.afternoon(fill=fill_only(self.k, "BUY"))
+        self.assertEqual(self.gate()["result"], "OPEN")
+
+    def test_start_message_delivered_after_1448_still_places_the_sells(self) -> None:
+        orig = self.env
+        late = util.at_today("14:51")
+
+        def env():  # noqa: ANN202
+            e = orig()
+            e.notify = lambda text, buttons=None: self.clock() >= late
+            return e
+        self.env = env
+        lg = self.afternoon(fill=fill_all(self.k))
+        self.assertIn("SELL", [o.transaction_type for o in self.k.orders_])
+        self.assertEqual(lg.positions["2612-02"].leg, "CLOSED")
+
+    def test_start_message_never_delivered_alerts_and_is_untried(self) -> None:
+        self.tg_ok = False
+        self.afternoon(fill=fill_all(self.k))
+        self.assertNotIn("SELL", [o.transaction_type for o in self.k.orders_])
+        self.assertIn("SELL_NOT_STARTED", self.alerts())
+        self.assertEqual(self.gate()["result"], "CLOSED_UNTRIED")
 
 
 class TestSellSafety(SellHarness):

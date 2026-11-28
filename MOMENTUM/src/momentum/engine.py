@@ -219,9 +219,13 @@ def apply_tap(env: Env, ap: Dict[str, Any], choice: str) -> None:
                 for ov in sorted(p.overlays & set(OWNER_CLEARABLE)):
                     env.journal.append("OVERLAY", position_id=p.position_id, overlay=ov, on=False,
                                        reason="owner release")
-                env.notify(f"{p.symbol}: released, sold from the next 14:45 step plan")
+                if p.leg == "SELLING":
+                    env.notify(f"{p.symbol}: released, sold from the next 14:45 step plan")
+                else:                                  # review 11-28 F5: a held name is not a sell
+                    env.notify(f"{p.symbol}: hold cleared; the book keeps it and sells it only when a plan ranks it "
+                               "out (or sell it by hand and send 'sold')")
             elif choice == "keep":
-                env.notify(f"{p.symbol}: the sell stays held; reminded each morning until you release it")
+                env.notify(f"{p.symbol}: stays held; reminded each morning until you release it")
             return
         if p is not None and p.leg == "BUY_GATED":
             if choice == "buy":
@@ -307,10 +311,11 @@ def apply_cmd(env: Env, cmd: str, args: str) -> None:
     elif cmd == "ca":                               # owner books a corporate-action quantity (January spec §7)
         from . import corpact as CA
         parts = args.split()
-        if len(parts) != 2 or not parts[1].isdigit():
-            env.notify("usage: ca <isin> <new qty>")
+        if len(parts) not in (2, 3) or not parts[1].isdigit():
+            env.notify("usage: ca <isin> <new qty> [<new isin>]")
             return
-        env.notify(CA.owner_set_qty(env, parts[0].upper(), int(parts[1])))
+        env.notify(CA.owner_set_qty(env, parts[0].upper(), int(parts[1]),
+                                    parts[2].upper() if len(parts) == 3 else None))
     elif cmd == "resolve":
         parts = args.split()
         if len(parts) != 2 or parts[1] not in ("found", "absent"):
@@ -410,9 +415,9 @@ def remind_holds(env: Env) -> int:
             continue
         ons = [r for r in recs if r["type"] == "OVERLAY" and r["position_id"] == p.position_id
                and r["overlay"] in waiting and r["on"]]
-        if all(str(r.get("reason", "")).startswith("owner") for r in ons[-len(waiting):]):
+        if ons and all(str(r.get("reason", "")).startswith("owner") for r in ons[-len(waiting):]):
             continue                                    # the owner put it on hold (hold <isin> / data error)
-        on_seq = ons[-1]["seq"]
+        on_seq = ons[-1]["seq"] if ons else 0          # review 11-28 F3: a hold written by PLAN_FINAL has no OVERLAY
         # the owner already decided after the hold went on (tapped Hold / Buy, or sent hold / release): no reminder
         decided = any((r["type"] == "OWNER_TAP" and r["seq"] > on_seq and
                        any(a["approval_id"] == r["approval_id"] and a.get("position_id") == p.position_id
@@ -431,10 +436,15 @@ def remind_holds(env: Env) -> int:
                        buttons=[(lab, f"a:{ap['approval_id']}:{c}") for c, lab in labels.items()])
             n += 1
         if not aps:
-            what = "sell" if p.leg == "SELLING" else "buy"
-            env.notify(f"REMINDER {p.symbol} is held ({'/'.join(sorted(p.overlays))}) with no open button: reply "
-                       f"'release {p.isin}' to {what} it from the next 14:45 step, or 'hold {p.isin}' to keep it "
-                       "held")
+            if p.leg == "NONE":                         # a held name: code sells it only when a plan ranks it out
+                env.notify(f"REMINDER {p.symbol} is held ({'/'.join(sorted(p.overlays))}): reply 'release {p.isin}' "
+                           "to clear the hold (it is then sold only if a plan ranks it out; or sell it by hand and "
+                           f"send 'sold'), or 'hold {p.isin}' to keep it held")
+            else:
+                what = "sell" if p.leg == "SELLING" else "buy"
+                env.notify(f"REMINDER {p.symbol} is held ({'/'.join(sorted(p.overlays))}) with no open button: reply "
+                           f"'release {p.isin}' to {what} it from the next 14:45 step, or 'hold {p.isin}' to keep it "
+                           "held")
             n += 1
     return n
 
@@ -1185,6 +1195,7 @@ def fo_day1_guard(env: Env) -> Optional[str]:
 def afternoon(env: Env, holdings_open: Dict[str, int], preflight: Callable[[], List[str]]) -> None:
     day = util.today().isoformat()
     recs = env.journal.read()
+    holdings_open = with_todays_credits(recs, holdings_open, day)      # F2: a credit booked after the snapshot
     last_place = util.at_today(env.cfg["last_place_at"])
     if not stage_done(recs, day, "PLAN") and util.now() >= last_place:
         # the first run of the day came after the last placing time (Pi was down): no plan, no vet call, no order
@@ -1454,6 +1465,7 @@ def three_way(env: Env, holdings_open: Dict[str, int], day: str) -> List[str]:
     is the hard check (holdings >= book). Also: no live book order after the close; book cash not negative.
     -> problems (each also an ALERT; any problem blocks new orders until the owner sends `ack`)."""
     lg = L.replay(env.journal.read())
+    holdings_open = with_todays_credits(env.journal.read(), holdings_open, day)
     probs: List[str] = []
     now_h = {str(r["isin"]): int(r.get("quantity", 0)) + int(r.get("t1_quantity", 0)) for r in env.api.holdings()}
     bought: Dict[str, int] = {}
@@ -1466,10 +1478,13 @@ def three_way(env: Env, holdings_open: Dict[str, int], day: str) -> List[str]:
             side[isin] = side.get(isin, 0) + int(r["qty"])
     book_qty = book_held(lg)
     names = {p.isin: p.symbol for p in lg.positions.values()}
+    in_transit = {p.isin for p in lg.positions.values() if "PENDING_CA" in p.overlays}
     for isin in sorted(set(book_qty) | set(bought) | set(sold)):
         bq, b, s = book_qty.get(isin, 0), bought.get(isin, 0), sold.get(isin, 0)
         opening = holdings_open.get(isin, 0)
         have = now_h.get(isin, 0)
+        if isin in in_transit and have == 0:
+            continue                       # review 11-28 F4: an ISIN-changing split in transit (CA_LATE after the lag)
         # whether today's CNC buys / sells already show in holdings() is UNVERIFIED (U6): every combination of the
         # two sides is accepted here; the next morning's snapshot is the hard check (holdings >= book)
         ok = {opening, opening + b, opening - s, opening + b - s}
@@ -1490,6 +1505,31 @@ def three_way(env: Env, holdings_open: Dict[str, int], day: str) -> List[str]:
     return probs
 
 
+def with_todays_credits(recs: List[Dict[str, Any]], holdings: Dict[str, int], day: str) -> Dict[str, int]:
+    """Review 11-28 F2: a split / bonus booked today AFTER the opening snapshot (the 14:40 ca_credits) moves the
+    snapshot with it: the ISIN's qty_before becomes qty_after (on the new ISIN when it changed). A snapshot that
+    already shows the credit (the old ISIN no longer holds qty_before) is left as it is."""
+    out = dict(holdings)
+    snaps = [r["seq"] for r in recs if r["type"] == "HOLDINGS_SNAPSHOT" and r["ts"][:10] == day]
+    first = snaps[0] if snaps else 0
+    for r in recs:
+        if r["type"] != "CA_CREDIT" or r["ts"][:10] != day or r["seq"] < first or not r.get("isin_before"):
+            continue
+        old_isin, before, after = str(r["isin_before"]), int(r["qty_before"]), int(r["qty_after"])
+        new_isin = str(r.get("new_isin") or "")
+        if new_isin and new_isin != old_isin:
+            # the shares moved ISIN: the snapshot shows them on the old ISIN (before), or in transit on neither (0)
+            if out.get(new_isin, 0) != 0 or out.get(old_isin, 0) not in (0, before):
+                continue        # the snapshot already shows the new ISIN
+            out[old_isin] = 0
+            out[new_isin] = after
+            continue
+        if out.get(old_isin, 0) != before:
+            continue            # the snapshot already shows the credit (credit_check books only when Kite == exact)
+        out[old_isin] = after
+    return out
+
+
 def ca_multiples(recs: List[Dict[str, Any]], lg: L.Ledger, isin: str) -> List[int]:
     """The share multiple of each PENDING_CA on this ISIN, from the overlay's reason 'ca <isin>|<ex> x<mult>'."""
     out = []
@@ -1505,8 +1545,11 @@ def ca_multiples(recs: List[Dict[str, Any]], lg: L.Ledger, isin: str) -> List[in
 
 def holdings_short(lg: L.Ledger, holdings_open: Dict[str, int]) -> List[str]:
     """Morning hard check (frozen design §7.4 'Kite >= ledger'): the opening holdings must cover every share the
-    book says it owns. -> one line per short ISIN."""
+    book says it owns. -> one line per short ISIN. An ISIN waiting for a split / bonus credit (PENDING_CA) is left to
+    the CA credit check (review 11-28 F4: an ISIN-changing split shows 0 shares for a day or two; CA_LATE alerts after
+    the lag, and its orders wait on the overlay)."""
     book_qty = book_held(lg)
+    waiting = {p.isin for p in lg.positions.values() if "PENDING_CA" in p.overlays}
     names = {p.isin: p.symbol for p in lg.positions.values()}
     return [f"{names[i]}: Kite holds {holdings_open.get(i, 0)} < book {q}" for i, q in sorted(book_qty.items())
-            if q > 0 and holdings_open.get(i, 0) < q]
+            if q > 0 and holdings_open.get(i, 0) < q and i not in waiting]

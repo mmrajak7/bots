@@ -46,6 +46,7 @@
  "sell_ltp_mult": "0.995",
  "sell_floor_mult": "0.980",
  "gate_wait_sessions": 2,
+ "market_probe_keys": ["NSE:RELIANCE", "NSE:HDFCBANK", "NSE:INFY"],
  "buy_envelope_slack": "1.02",
  "extra_share_max_over": "0.25",
  "extra_share_enabled": true,

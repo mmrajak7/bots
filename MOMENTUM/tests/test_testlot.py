@@ -65,6 +65,18 @@ class TestLot(Harness):
         self.assertEqual([o.tag for o in self.k.orders_ if o.transaction_type == "SELL"], ["M2612X03A1"])
         self.assertEqual(lg.cash_paise, self.book_cash)
 
+    def test_a_rise_by_1510_still_buys_exactly_qty(self) -> None:
+        # review 11-28 T5: plan at 14:35 at 640, the price is 5% higher by 15:10: still 2 shares, never 3
+        self.new_day(dt.date(2026, 12, 9))
+        T.run(self.env(), self.holdings())
+        self.k.ltp["NSE:B50"] = 672.0
+        self.k.on_place = fill_all(self.k)
+        E.afternoon(self.env(), self.holdings(), lambda: [])
+        self.k.on_place = None
+        buy = [o for o in self.k.orders_ if o.tradingsymbol == "B50"][0]
+        self.assertEqual(buy.quantity, 2)
+        self.k.ltp["NSE:B50"] = 640.0
+
     def test_unfilled_test_sell_retries_next_session_by_itself(self) -> None:
         self.session(dt.date(2026, 12, 9), fill=fill_all(self.k))
         self.session(dt.date(2026, 12, 14), fill=None)                    # nothing fills
