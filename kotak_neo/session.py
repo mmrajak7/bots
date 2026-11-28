@@ -47,6 +47,7 @@ Review of the first cut (Fable, 2026-11-27, F1-F12) is what rules 3, 6, 7 and
 from __future__ import annotations
 
 import base64
+import atexit
 import hashlib
 import hmac
 import json
@@ -56,6 +57,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -63,7 +65,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, NamedTuple, Optional
 from urllib.parse import urlparse
 
-from .envelope import is_ip_refusal, is_ok, is_session_dead, neo_msg, scrub, stcode
+from .envelope import (is_ip_whitelist_refusal, is_ok, is_session_dead,
+                       is_session_ip_refusal, neo_msg, scrub, stcode)
 
 logger = logging.getLogger(__name__)
 
@@ -654,13 +657,19 @@ def _network_verify(s: Session, cfg: Dict[str, Any], http: Any = None) -> str:
     d = _json(r)
     if r.status_code == 200 and is_ok(d):
         return ALIVE
-    if is_ip_refusal(d):
-        # K5 (review 2026-11-28): the IP, not the session -- never DEAD, so no
-        # login (which cannot whitelist an IP, and refused logins latch the
+    if is_ip_whitelist_refusal(d):
+        # K5 (review 2026-11-28): this IP may not use the API -- never DEAD, so
+        # no login (it cannot whitelist an IP, and refused logins latch the
         # day). Queued under the lock; `_run` delivers it after the lock.
         ip_alert('session verify refused: stCode %s %s' % (stcode(d), neo_msg(d)[:120]),
                  flush=False)
         verdict = UNAVAILABLE
+    elif is_session_ip_refusal(d):
+        # R1: the session was made from ANOTHER IP (the public IP changed). Only
+        # a login from here fixes it: DEAD, through the normal brakes, + alert.
+        ip_alert('session made from another IP (stCode %s %s) -- logging in again from '
+                 'this IP' % (stcode(d), neo_msg(d)[:120]), flush=False)
+        verdict = DEAD
     else:
         verdict = DEAD if is_session_dead(r.status_code, d) else UNAVAILABLE
     logger.warning('NEO verify gen %d: %s HTTP %s body %s', s.generation, verdict,
@@ -671,6 +680,10 @@ def _network_verify(s: Session, cfg: Dict[str, Any], http: Any = None) -> str:
 #: generation -> time of the last ALIVE verdict, per process (rule: a 5-s loop
 #: must not hit the verify endpoint every poll while something else is wrong).
 _alive_cache: Dict[int, float] = {}
+#: generation -> time of the last CONFIRMED DEAD verdict, per process (review
+#: R3, 2026-11-28): while a login waits on its cooldown or a latch, every read
+#: of a fast loop would otherwise re-verify (two calls + the confirm gap).
+_dead_cache: Dict[int, float] = {}
 
 
 def _verified(s: Session, verify: Callable, cfg: Dict[str, Any], sleep: Callable) -> str:
@@ -678,6 +691,9 @@ def _verified(s: Session, verify: Callable, cfg: Dict[str, Any], sleep: Callable
     t = _alive_cache.get(s.generation)
     if t is not None and time.time() - t < float(cfg['verify_cache_sec']):
         return ALIVE
+    t = _dead_cache.get(s.generation)
+    if t is not None and time.time() - t < float(cfg['verify_cache_sec']):
+        return DEAD
     v = verify(s)
     if v == DEAD:
         sleep(float(cfg['verify_confirm_sec']))
@@ -688,6 +704,9 @@ def _verified(s: Session, verify: Callable, cfg: Dict[str, Any], sleep: Callable
             v = v2
     if v == ALIVE:
         _alive_cache[s.generation] = time.time()
+        _dead_cache.pop(s.generation, None)
+    elif v == DEAD:
+        _dead_cache[s.generation] = time.time()
     return v
 
 
@@ -855,7 +874,10 @@ def _run(requester: str, failed_generation: Optional[int], scheduled: bool,
     lvl = logging.INFO if res.outcome in (LOGGED_IN, ADOPTED, STILL_ALIVE, NOOP) \
         else logging.WARNING
     logger.log(lvl, 'NEO session %s for %s (%s)', res.outcome, requester, res.detail)
-    _flush_alerts()
+    if scheduled:
+        _flush_alerts()                              # cron: deliver before the process ends
+    else:
+        flush_alerts_soon()                          # a bot's read: never block its loop (R4)
     return res
 
 
@@ -866,6 +888,59 @@ def _flush_alerts() -> None:
         alerts.flush()
     except Exception as e:                           # never into a trading loop
         logger.error('kotak_neo alert flush failed: %s', e)
+
+
+#: False = flush_alerts_soon() delivers inline (the test suite sets this).
+ASYNC_ALERTS = True
+_pending_flush: list = []
+_flush_wanted = threading.Event()
+_flush_guard = threading.Lock()
+ALERT_EXIT_WAIT_SEC = 20.0
+
+
+def flush_alerts_soon() -> None:
+    """Deliver queued alerts on a background thread (review R4, 2026-11-28): a
+    Telegram send (5 s timeout, up to 5 per flush) must never stall a bot's
+    exit loop. Delivery stays at-least-once: what this thread does not send
+    stays queued for the next flush. A short-lived process waits for it at
+    exit (atexit, at most ALERT_EXIT_WAIT_SEC). Never raises."""
+    if not ASYNC_ALERTS:
+        _flush_alerts()
+        return
+    try:
+        with _flush_guard:
+            _flush_wanted.set()
+            if _pending_flush:
+                return                               # the running one makes one more pass
+            t = threading.Thread(target=_flush_loop, name='kotak_neo-alerts', daemon=True)
+            _pending_flush.append(t)
+        t.start()
+    except Exception as e:                           # never into a trading loop
+        with _flush_guard:
+            _pending_flush.clear()
+        logger.error('kotak_neo async alert flush failed to start: %s', e)
+
+
+def _flush_loop() -> None:
+    # An alert queued while a send is in flight is sent by the next pass; the
+    # "nothing more wanted -> leave" decision is taken under the same guard as
+    # a new request, so no request can fall between the last pass and the exit.
+    while True:
+        with _flush_guard:
+            if not _flush_wanted.is_set():
+                _pending_flush.clear()
+                return
+            _flush_wanted.clear()
+        _flush_alerts()
+
+
+def _join_pending_flush() -> None:
+    deadline = time.time() + ALERT_EXIT_WAIT_SEC
+    for t in list(_pending_flush):
+        t.join(max(0.0, deadline - time.time()))
+
+
+atexit.register(_join_pending_flush)
 
 
 def refresh(failed_generation: int, requester: str, *, wait_s: Optional[float] = None,
@@ -882,11 +957,12 @@ def refresh(failed_generation: int, requester: str, *, wait_s: Optional[float] =
 IP_ALERT_EVERY_SEC = 900.0
 
 
-def ip_alert(why: str, flush: bool = True) -> None:
+def ip_alert(why: str, flush: bool = True) -> bool:
     """Owner's backup plan until a static IP exists (2026-11-27): when NEO
     refuses orders because of the IP, ALERT and let the owner trade by hand.
     At most one alert per IP_ALERT_EVERY_SEC; delivered at once unless
-    `flush=False` (a caller holding the refresh lock: `_run` delivers it)."""
+    `flush=False` (a caller holding the refresh lock, or a hot path that
+    delivers it off-thread). True when an alert was queued."""
     try:
         stamp = _p('ip_alert.last')
         now = time.time()
@@ -895,7 +971,7 @@ def ip_alert(why: str, flush: bool = True) -> None:
         except (OSError, ValueError):
             last = 0.0
         if now - last < IP_ALERT_EVERY_SEC:
-            return
+            return False
         _ensure_home()
         stamp.write_text(str(now), encoding='utf-8')
         _alert('static_ip', '%s -- NEO is refusing orders from this IP. Manage open trades '
@@ -903,8 +979,10 @@ def ip_alert(why: str, flush: bool = True) -> None:
                'one change per 7 days).' % why, _now())
         if flush:
             _flush_alerts()
+        return True
     except Exception as e:                           # never into a trading loop
         logger.error('kotak_neo ip_alert failed: %s', e)
+        return False
 
 
 def public_ipv4(timeout: float = 8.0) -> Optional[str]:

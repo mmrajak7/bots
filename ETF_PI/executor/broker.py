@@ -122,10 +122,20 @@ class Broker:
         (a carried lot's row is unmeasured, Monday M10) -- the caller then
         trusts its own journal + order book."""
         prod = str(self.cfg['product']).strip().upper()
-        rows = [p for p in self.c.positions()
-                if p.symbol == symbol
-                and (not str(p.product or '').strip()
-                     or str(p.product).strip().upper() == prod)]
+        known = getattr(self.C, 'KNOWN_PRODUCTS', ('NRML', 'MIS', 'CNC', 'MTF', 'CO', 'BO'))
+        rows = []
+        for p in self.c.positions():
+            if p.symbol != symbol:
+                continue
+            got = str(p.product or '').strip().upper()
+            if not got or got == prod:
+                rows.append(p)
+            elif got not in known:
+                # review R7 (2026-11-28): a label nobody documented may BE our MIS
+                # row -- unreadable (fail closed: no foreign-check entry, no carry
+                # sale, no adoption; a same-day exit falls back to its own net)
+                raise self.C.Unavailable('positions: %s has product %r -- unknown label'
+                                         % (symbol, p.product))
         if not rows:
             return None
         return sum(p.net_qty for p in rows)

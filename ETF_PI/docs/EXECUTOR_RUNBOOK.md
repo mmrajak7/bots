@@ -94,6 +94,9 @@ cron line. option_buy keeps trading paper (its only live change is the intent fi
   refresh, then the step is unreadable and the loop goes on. If ETF itself holds the refresh lock it does the
   verify + login inline (normally ~4-6 s: a 3 s confirm gap + two login calls; worst case with NEO hanging ~60 s,
   when no order could work anyway).
-- An IP refusal (stCode 100008 / 1037 / "session ip") on any call (K5): the `static_ip` alert, NO login; reads are
-  unavailable and orders refused until the whitelist matches. Manage the open lot in the NEO app (runbook of
-  kotak_neo, README "you see" table).
+- An IP refusal (K5/R1): the `static_ip` alert. 100008 / "static ip" (this IP not whitelisted): NO login, reads
+  unavailable, orders refused until the whitelist matches -- manage the open lot in the NEO app. 1037 / "session ip"
+  (the session was made from another IP: the public IP changed): the next read logs in again from the new IP;
+  orders then work only if that IP is whitelisted (kotak_neo README "you see" table).
+- Package alerts raised inside the exit loop (static_ip, orders_auth) are sent on a background thread (R4), so a
+  hung Telegram never stalls an exit; a confirmed DEAD verify is cached 15 s (R3), so a cooldown costs no 3 s per read.

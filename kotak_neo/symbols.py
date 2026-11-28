@@ -172,16 +172,24 @@ def load(c: Any, today: Optional[date] = None, max_age_h: float = 20.0,
                 return ScripMap(parse_scrip_master(text, underlyings))
             except ScripMasterError as e:
                 # K12 (review 2026-11-28): only a BAD FILE is deleted. When the
-                # whole file is fine, the caller's filter is what matched
-                # nothing (an unknown underlying) -- say so, keep the shared
-                # cache every bot reads, and do not download it again.
+                # whole file is fine, the caller's filter matched nothing: an
+                # unknown underlying, or a file that lacks it (review R10). ONE
+                # re-download a day settles which -- the good cache stays until
+                # a good replacement lands -- then it is the filter's fault.
                 try:
                     whole_ok = len(parse_scrip_master(text)) >= min_rows
                 except ScripMasterError:
                     whole_ok = False
                 if whole_ok and underlyings:
-                    raise ScripMasterError('%s (the cached file itself is fine)' % e)
-                cache.unlink()
+                    marker = S.HOME / ('scrip_refetch_%s' % today.strftime('%Y%m%d'))
+                    if marker.exists():
+                        raise ScripMasterError('%s (the cached file itself is fine; '
+                                               're-downloaded once today already)' % e)
+                    marker.write_text(str(sorted(u.upper() for u in underlyings)),
+                                      encoding='utf-8')
+                    logger.warning('scrip master: %s -- re-downloading once today', e)
+                else:
+                    cache.unlink()
         fo = ScripMap.pick_fo_path(c.scrip_master_paths())
         if not fo:
             raise ScripMasterError('no nse_fo scrip master link')
@@ -193,8 +201,9 @@ def load(c: Any, today: Optional[date] = None, max_age_h: float = 20.0,
         tmp = cache.with_name('%s.%d.tmp' % (cache.name, os.getpid()))
         tmp.write_text(text, encoding='utf-8')
         tmp.replace(cache)
-        for old in S.HOME.glob('scrip_nse_fo_*.csv'):
-            if old != cache:
+        keep = S.HOME / ('scrip_refetch_%s' % today.strftime('%Y%m%d'))
+        for old in list(S.HOME.glob('scrip_nse_fo_*.csv')) + list(S.HOME.glob('scrip_refetch_*')):
+            if old not in (cache, keep):
                 try:
                     old.unlink()
                 except FileNotFoundError:

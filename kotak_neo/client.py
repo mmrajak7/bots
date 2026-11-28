@@ -34,8 +34,9 @@ from datetime import datetime
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from . import session as S
-from .envelope import (IP_STCODES, IP_TEXT, is_ip_refusal, is_ok, is_session_dead,  # noqa: F401
-                       neo_msg, scrub, stcode)
+from .envelope import (IP_STCODES, IP_TEXT, is_ip_refusal,  # noqa: F401
+                       is_ip_whitelist_refusal, is_ok, is_session_dead,
+                       is_session_ip_refusal, neo_msg, scrub, stcode)
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +57,10 @@ REJECTED_STCODES = (1004, 1006, 1007, 1009, 100008)
 #: reads, mutations and the session verify share one reading (review K5).
 TRANSIENT_STCODES = (1005,)
 #: K1 (review 2026-11-28): mutations refused as "session dead" while reads work
-#: get NO login (rule above) -- so they ALERT: this many inside the window.
-ORDERS_AUTH_COUNT, ORDERS_AUTH_WINDOW_SEC, ORDERS_AUTH_EVERY_SEC = 2, 300.0, 900.0
+#: get NO login (rule above) -- so they ALERT: this many inside the window, on
+#: ONE generation. 30 min, not 5 (review R5): entries are sent once, and 10-min
+#: signals would never put two refused entries inside 5 minutes.
+ORDERS_AUTH_COUNT, ORDERS_AUTH_WINDOW_SEC, ORDERS_AUTH_EVERY_SEC = 2, 1800.0, 900.0
 #: NEO's product labels (Kotak API docs). A position row naming anything else
 #: for a symbol makes a product-filtered read UNKNOWN, never 0 (review K10).
 KNOWN_PRODUCTS = ('NRML', 'MIS', 'CNC', 'MTF', 'CO', 'BO')
@@ -309,10 +312,10 @@ def note_orders_auth(bot: str, what: str, status: int, generation: int,
     """Count one mutation that NEO refused as "session dead" (review K1,
     2026-11-28). The package never logs in on mutation evidence, so if reads
     keep working nothing else would ever notice that orders do not: after
-    ORDERS_AUTH_COUNT of them inside ORDERS_AUTH_WINDOW_SEC, across ALL bots
-    (the session is shared), queue an `orders_auth` alert -- at most one per
-    ORDERS_AUTH_EVERY_SEC -- and deliver it. Returns True when it alerted.
-    Never raises into a trading loop."""
+    ORDERS_AUTH_COUNT of them on one session generation inside
+    ORDERS_AUTH_WINDOW_SEC, across ALL bots (the session is shared), queue an
+    `orders_auth` alert -- at most one per ORDERS_AUTH_EVERY_SEC -- and deliver
+    it off the caller's thread. Returns True when it alerted. Never raises."""
     alerted = False
     try:
         t = time.time() if now is None else float(now)
@@ -331,8 +334,11 @@ def note_orders_auth(bot: str, what: str, status: int, generation: int,
             except (OSError, ValueError) as e:
                 logger.warning('orders_auth.json unreadable (%s) -- starting over', e)
                 st = {}
+            # only refusals of THIS generation count (R5): a refresh since then
+            # replaced the session they were about
             ev = [e for e in st.get('events') or [] if isinstance(e, dict)
-                  and isinstance(e.get('t'), (int, float)) and t - e['t'] <= ORDERS_AUTH_WINDOW_SEC]
+                  and isinstance(e.get('t'), (int, float)) and t - e['t'] <= ORDERS_AUTH_WINDOW_SEC
+                  and e.get('gen') == generation]
             ev.append({'t': t, 'bot': bot, 'what': what[:80], 'http': status, 'gen': generation})
             st['events'] = ev[-20:]
             last = st.get('alerted_at')
@@ -341,7 +347,7 @@ def note_orders_auth(bot: str, what: str, status: int, generation: int,
                 st['alerted_at'] = t
                 bots = sorted({str(e.get('bot')) for e in ev})
                 S._alert('orders_auth',
-                         '%d NEO orders/cancels refused as "session dead" in %.0f min (bots %s; '
+                         '%d NEO orders/cancels refused as "session dead" within %.0f min (bots %s; '
                          'last: %s, HTTP %s, generation %s). Reads may still work, and NO login '
                          'is made on order evidence. Check open trades in the NEO app now.'
                          % (len(ev), ORDERS_AUTH_WINDOW_SEC / 60.0, ','.join(bots), what[:80],
@@ -351,7 +357,7 @@ def note_orders_auth(bot: str, what: str, status: int, generation: int,
     except Exception as e:                            # never into a trading loop
         logger.error('kotak_neo orders_auth note failed: %s', e)
     if alerted:
-        S._flush_alerts()
+        S.flush_alerts_soon()                         # never block the exit loop (R4)
     return alerted
 
 
@@ -436,14 +442,23 @@ class NeoClient:
         except requests.RequestException as e:
             raise Unavailable('%s %s: %s' % (method, path, type(e).__name__))
         d = self._json(r)
-        if is_ip_refusal(d):
-            # K5: the IP, not the session. A login cannot fix it (and refused
-            # logins latch the day): the owner's static-IP alert, book unknown.
-            S.ip_alert('%s %s refused: stCode %s %s' % (method, path, stcode(d),
-                                                      neo_msg(d)[:120]))
+        if is_ip_whitelist_refusal(d):
+            # K5: this IP may not use the API. A login cannot fix it (and
+            # refused logins latch the day): the owner's alert, book unknown.
+            if S.ip_alert('%s %s refused: stCode %s %s' % (method, path, stcode(d),
+                                                         neo_msg(d)[:120]), flush=False):
+                S.flush_alerts_soon()
             raise Unavailable('%s %s: IP refused (stCode %s) -- no login'
                               % (method, path, stcode(d)))
-        if is_session_dead(r.status_code, d):
+        session_ip = is_session_ip_refusal(d)
+        if session_ip:
+            # R1: the session was made from another IP (the public IP changed):
+            # a login from HERE is the fix, so it is a dead session -- the owner
+            # is told as well (orders may still need the whitelist).
+            if S.ip_alert('%s %s: session made from another IP (stCode %s) -- refreshing'
+                          % (method, path, stcode(d)), flush=False):
+                S.flush_alerts_soon()
+        if session_ip or is_session_dead(r.status_code, d):
             if retried:
                 raise Auth('%s %s: session still rejected after refresh' % (method, path))
             if self.refresh_wait_s is None:
@@ -749,7 +764,9 @@ class NeoClient:
         body = scrub(getattr(r, 'text', '') or '')
         ip = is_ip_refusal(d)
         if ip:
-            S.ip_alert('%s refused: stCode %s %s' % (what, stcode(d), neo_msg(d)[:120]))
+            if S.ip_alert('%s refused: stCode %s %s' % (what, stcode(d), neo_msg(d)[:120]),
+                          flush=False):
+                S.flush_alerts_soon()                 # never block the exit loop (R4)
         if not ip and is_session_dead(r.status_code, d):
             # Rule: NEVER a login on mutation evidence. Unclear; the book decides.
             logger.warning('%s: HTTP %s session rejected (gen %d) -- unclear, no login; '

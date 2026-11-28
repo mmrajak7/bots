@@ -617,3 +617,19 @@ def test_q7_short_after_the_last_close_is_still_watched(rig):
         rig.feed._q[SYM].ts = rig.epoch()
         rig.eng.step(rig.now)
     assert p.get('covered') and rig.fake.net(SYM) == 0
+
+
+# -- review R7 (2026-11-28): an undocumented product label is UNREADABLE, not "no row" --
+
+@pytest.mark.parametrize('prod,want', [('MIS', 65), (' mis ', 65), ('', 65), ('NRML', None)])
+def test_r7_account_net_reads_our_product_row(rig, monkeypatch, prod, want):
+    row = KCN.PositionView(symbol='NIFTYX', product=prod, net_qty=65)
+    monkeypatch.setattr(rig.broker.c, 'positions', lambda: [row])
+    assert rig.broker.account_net('NIFTYX') == want
+
+
+def test_r7_an_unknown_product_label_raises_so_every_caller_fails_closed(rig, monkeypatch):
+    row = KCN.PositionView(symbol='NIFTYX', product='XYZ', net_qty=65)
+    monkeypatch.setattr(rig.broker.c, 'positions', lambda: [row])
+    with pytest.raises(KCN.Unavailable, match='unknown label'):
+        rig.broker.account_net('NIFTYX')
