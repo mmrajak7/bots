@@ -326,8 +326,15 @@ def _prow(k, net_pct=None, resolved=True, partial=False, priced=True, costed=Tru
             'stress': 0.0, 'ctx': {}}
 
 
-def _sel(mean, open_=0):
-    return lambda tests: {'replay': mean, 'open': open_, 'n': 50}
+def _sel(mean, open_=0, se=0.0):
+    return lambda tests: {'replay': mean, 'open': open_, 'n': 50, 'replay_se': se}
+
+
+def _reg_ok(tests):
+    """Both regime conditions met -- the old three-condition tests isolate
+    the return bars; the regime and gap rules have their own tests in
+    test_golive_gate.py."""
+    return {'one': {'met': True}, 'two': {'met': True}}
 
 
 def test_the_population_is_fixed_by_ENTRY_not_by_first_close():
@@ -378,10 +385,10 @@ def _hundred(mean, n=100, start=0):
 
 
 def test_pass_needs_all_three_conditions():
-    assert golive.verdict(_hundred(15.0), _sel(0.0))['state'] == 'PASS'
-    assert golive.verdict(_hundred(15.0), _sel(20.0))['state'] != 'PASS'    # does not beat the replay
+    assert golive.verdict(_hundred(15.0), _sel(0.0), _reg_ok)['state'] == 'PASS'
+    assert golive.verdict(_hundred(15.0), _sel(20.0), _reg_ok)['state'] != 'PASS'    # does not beat the replay
     carried = [_prow(k, 600.0) for k in range(3)] + [_prow(k, -5.0) for k in range(3, 100)]
-    assert golive.verdict(carried, _sel(0.0))['state'] != 'PASS'           # all of it 3 trades
+    assert golive.verdict(carried, _sel(0.0), _reg_ok)['state'] != 'PASS'           # all of it 3 trades
 
 
 def test_below_the_fail_line_fails():
@@ -389,11 +396,11 @@ def test_below_the_fail_line_fails():
 
 
 def test_between_the_lines_extends_to_150_and_waits_for_it():
-    v = golive.verdict(_hundred(8.0), _sel(0.0))
-    assert v['state'] == 'INCONCLUSIVE -> IN PROGRESS'
+    v = golive.verdict(_hundred(8.0), _sel(0.0), _reg_ok)
+    assert v['state'] == 'EXTENDED -> IN PROGRESS'
     # 100 at +8% then 50 at +16%: the 150 average is +10.7%, over the extension bar
-    assert golive.verdict(_hundred(8.0) + _hundred(16.0, 50, 100), _sel(0.0))['state'] == 'PASS'
-    assert golive.verdict(_hundred(8.0) + _hundred(8.0, 50, 100), _sel(0.0))['state'] == 'FAIL'
+    assert golive.verdict(_hundred(8.0) + _hundred(16.0, 50, 100), _sel(0.0), _reg_ok)['state'] == 'PASS'
+    assert golive.verdict(_hundred(8.0) + _hundred(8.0, 50, 100), _sel(0.0), _reg_ok)['state'] == 'FAIL'
 
 
 def test_a_late_winner_cannot_flip_a_verdict_already_reached():

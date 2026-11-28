@@ -1893,17 +1893,22 @@ class ZebraStore:
                            trade_id)
             return True
 
-    def update_trade_fields(self, trade_id: int, **fields) -> dict:
+    def update_trade_fields(self, trade_id: int, _drive: bool = True, **fields) -> dict:
         """Patch arbitrary fields on a record. Used for trail state.
 
         Refuses to write `status` — that has dedicated transitions which do
         the version bump and the logging, and letting it through here would
         make the state machine editable from anywhere.
+
+        `_drive=False` writes the LOCAL book only (both processes on the box
+        read it under the same lock); the next Drive-bound write carries the
+        change up. For per-poll state -- the naked exit chase steps every 5 s,
+        and a 3.6 MB upload per step would stall the loop that sells.
         """
         if 'status' in fields:
             raise ValueError("use the status transitions, not "
                              "update_trade_fields, to change status")
-        with self._mutate():
+        with self._mutate(drive=_drive):
             t = self._must_find(trade_id)
             t.update(fields)
             t['version'] = t.get('version', 0) + 1

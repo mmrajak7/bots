@@ -17,7 +17,9 @@ State (G16 + what G11 needs to be computed at all):
 
     killed            bool -- set by a trigger or by hand (`zebra halt`)
     kill_code         one-time restart code, printed in the kill alert;
-                      `zebra resume <code>` (or FIFTY `/nresume <code>`) clears
+                      `zebra resume <code>` at the box, or Telegram
+                      `/nresume [mode] <code>` (read by zebra's 5-minute
+                      cycle while a kill is active, `naked_tg.py`) clears
     kill_kind         drawdown | slippage | loss_budget | manual
     reason, tripped_at
     pause_through     ISO date: no entries up to and including that session
@@ -51,7 +53,7 @@ CALLER CONTRACT (P3/P4 must keep it):
   * the ENTRY HOOK gates on the `allowed` returned by `evaluate()` in the SAME
     cycle, never on `entries_allowed()` alone: a file that says "clear" cannot
     tell that the evaluation behind it has stopped running.
-    `entries_allowed()` is for display, the CLI and FIFTY.
+    `entries_allowed()` is for display and the CLI.
 
 Interpretations (flagged, owner-visible, change in config or here):
   * pause = the rest of the tripping session plus the next
@@ -478,7 +480,7 @@ def _evaluate_locked(state: dict, trades: list, marks: dict, now: datetime,
         out['reason'] = 'clear'
 
 
-# -- owner actions (CLI; FIFTY /nresume calls `resume`) -------------------------------
+# -- owner actions (CLI; zebra's cycle calls `resume` for Telegram /nresume) ---------
 
 def halt(mode: str, reason: str, now: datetime, sender: str) -> dict:
     """Trip the kill by hand (G13: e.g. the test reads FAIL). Returns the kill

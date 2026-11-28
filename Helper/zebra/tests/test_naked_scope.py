@@ -209,6 +209,15 @@ def test_arming_population_still_sees_the_live_record(store):
     assert arming.LIVE_RECORD in pop
 
 
+def test_arming_population_ignores_a_rehearsal_record(store):
+    """G18: rehearsal fills are fake; counting them LIVE would raise NO ENGINE
+    against the crontab's --dry-run on every cycle of the rehearsal week."""
+    from zebra import monitor
+    from common import arming
+    _naked(store, rehearsal=True)
+    assert arming.LIVE_RECORD not in monitor._cohort_population(store.load_trades())
+
+
 def test_status_dashboard_prints_a_naked_record(store, monkeypatch, capsys):
     from zebra import __main__ as cli
     _naked(store)

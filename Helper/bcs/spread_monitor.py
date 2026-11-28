@@ -419,8 +419,41 @@ def ist_epoch(stamp: str) -> float:
 
 # ── Market & Price ───────────────────────────────────────────────────────────
 
-def holiday_standdown() -> bool:
+def _live_naked_open_locally() -> bool:
+    """Any open LIVE naked record in zebra's local book? A plain file read,
+    for the pre-startup holiday check (no Drive, no Kite). Unreadable -> True:
+    an unknown book must not let a calendar entry blind the exits."""
+    try:
+        from zebra import config as zcfg
+        data = json.loads(zcfg.LOCAL_FILE.read_text(encoding='utf-8'))
+        rows = data.get('trades', data) if isinstance(data, dict) else data
+        return any(isinstance(t, dict) and t.get('structure') == 'naked_long'
+                   and not t.get('rehearsal') and t.get('status') in ('entered', 'closing')
+                   for t in rows)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+
+
+#: F&O continuous trading ends 15:40 (closing-auction session, live since
+#: 2026-08-03); only a live naked exit ALREADY CHASING keeps the loop alive
+#: past MARKET_CLOSE, and only until this.
+NAKED_FO_CLOSE = dtime(15, 40)
+
+#: The day Kite's own prints DISPROVED a listed holiday (set by
+#: `holiday_standdown`). `is_market_open` reads the same calendar, so without
+#: this the loop would wait all session for a market it was just shown is open.
+_CALENDAR_WRONG_DAY = None
+
+
+def holiday_standdown(kite=None, naked_engine=None, probe_naked=False) -> bool:
     """True on a declared NSE holiday: log it, Telegram it ONCE per day.
+
+    With LIVE naked positions open the calendar is not trusted alone: Kite's
+    own NIFTY prints decide (`zebra.naked_exit.market_really_open`). Today's
+    prints = the calendar is wrong -> do NOT stand down, alert. Unreadable ->
+    stand down as before (the calendar is the only evidence left).
 
     WHY loud: the calendar can now switch this exit engine off for a whole
     session, and that file was wrong for most of 2026. A wrong weekday entry
@@ -431,6 +464,35 @@ def holiday_standdown() -> bool:
     today = now_ist().date()
     if nse_holidays.is_session(today) or today.weekday() >= 5:
         return False
+    live_naked = (naked_engine.live_population() if naked_engine is not None
+                  else (probe_naked and _live_naked_open_locally()))
+    if live_naked and kite is None:
+        try:
+            kite = load_kite()
+        except BaseException as e:            # load_kite sys.exits on a dead token
+            log(f"  holiday probe: Kite unavailable ({e}) -- trusting the calendar")
+            kite = None
+    if live_naked and kite is not None:
+        try:
+            from zebra.naked_exit import market_really_open
+            really = market_really_open(kite)
+        except Exception as e:
+            really = None
+            log(f"  holiday probe failed: {e}")
+        if really:
+            global _CALENDAR_WRONG_DAY
+            _CALENDAR_WRONG_DAY = today       # `is_market_open` now trusts the prints
+            wrong = LOG_DIR / f'holiday_calendar_wrong_{today:%Y%m%d}.alerted'
+            if not wrong.exists():
+                send_telegram(f"BCS monitor: the calendar calls {today} a holiday but "
+                              f"NIFTY is printing today -- the calendar is WRONG. Exits "
+                              f"stay ON for the live naked positions.",
+                              alert_class=alert_policy.SAFETY)
+                try:
+                    wrong.touch()
+                except OSError:
+                    pass
+            return False
     marker = LOG_DIR / f'holiday_standdown_{today:%Y%m%d}.alerted'
     log(f"NSE holiday per {nse_holidays.HOLIDAY_FILE.name} ({today}) -- "
         f"not a session, monitor standing down.")
@@ -455,7 +517,7 @@ def is_market_open() -> bool:
     behaviour -- so a broken file can make the monitor noisy, never blind.
     """
     now = now_ist()
-    if not nse_holidays.is_session(now.date()):
+    if not nse_holidays.is_session(now.date()) and _CALENDAR_WRONG_DAY != now.date():
         return False
     return MARKET_OPEN <= now.time() < MARKET_CLOSE
 
@@ -1399,6 +1461,9 @@ def write_heartbeat(state: str, dry_run: bool, *, open_trades: int = 0,
         # catastrophic in combination with a stood-down zebra.
         'dry_run': bool(dry_run),
         'kill_switch': bool(kill_switch),
+        # The live naked entry gate (`zebra.naked_entry.exit_engine_problem`)
+        # refuses to buy unless THIS process is running the naked exit engine.
+        'naked_engine': _NAKED_ENGINE is not None,
         'open_trades': int(open_trades),
         'cohort_trades': int(cohort_trades),
         # False = the fourth book could not be opened, so cohort positions are
@@ -8011,6 +8076,11 @@ def _arming_preflight(dry_run: bool, all_trades) -> dict:
             continue
         population.add(arming.PAPER_RECORD if _record_says_paper(t)
                        else arming.LIVE_RECORD)
+    # Live naked records are LIVE cohort records this engine books (design
+    # Q9); the adapter does not return them, so they are added here.
+    # Rehearsal records are fake fills and belong to no broker (G18).
+    if _NAKED_ENGINE is not None and _NAKED_ENGINE.live_population():
+        population.add(arming.LIVE_RECORD)
     state = arming.check(
         paper_mode=paper_mode, exits_external=exits_external,
         auto_entry=auto_entry, dry_run=bool(dry_run),
@@ -8018,6 +8088,61 @@ def _arming_preflight(dry_run: bool, all_trades) -> dict:
         log=lambda line: log('  ' + line),
         telegram=lambda m: send_telegram(m, alert_class=alert_policy.SAFETY))
     return state
+
+
+#: The live naked-long exit engine for this session (naked live build P4,
+#: `zebra/naked_exit.py`), or None. Module-level so the arming preflight can
+#: count the live naked records it owns -- they are NOT in the cohort adapter's
+#: book, which is BCS-only by design.
+_NAKED_ENGINE = None
+
+
+def _open_naked_engine(dry_run: bool, zebra_store=None):
+    """The naked exit engine, or None when there is nothing it could own.
+
+    Built whenever the store HAS naked records or `naked_live` is not off --
+    never gated on `naked_live` alone: switching entries off must not orphan an
+    open position. Never raises; an engine that cannot start is said out loud.
+    """
+    try:
+        from zebra import config as zcfg
+        from zebra.naked_exit import NakedExitEngine
+        from zebra.trade_store import ZebraStore
+        # ONE ZebraStore per process: the cohort adapter's, when it opened.
+        # A cohort book that is some other object (a test double) owns no
+        # naked records; only when the cohort store could not open at all
+        # does the engine open its own -- naked positions must not go
+        # unwatched because the BCS adapter failed.
+        shared = getattr(zebra_store, '_store', None)
+        if zebra_store is not None and not isinstance(shared, ZebraStore):
+            return None
+        if shared is None and zcfg.NAKED_LIVE == 'off' and not _live_naked_open_locally():
+            return None                     # nothing to own, and no store to open
+        eng = NakedExitEngine(dry_run=dry_run, log=log, store=shared,
+                              send=lambda m: send_telegram(m, alert_class=alert_policy.SAFETY))
+        n = eng.open_count()
+        if n == 0 and zcfg.NAKED_LIVE == 'off':
+            return None
+        log(f"  Naked exit engine: {n} open naked record(s), naked_live={zcfg.NAKED_LIVE}"
+            f"{' (DRY RUN: live records will NOT be sold)' if dry_run else ''}.")
+        return eng
+    except Exception as e:
+        log(f"  WARNING: naked exit engine unavailable ({e}). Live naked positions, "
+            f"if any, are NOT being monitored this session.")
+        send_telegram(f"Naked exit engine unavailable ({str(e)[:120]}) - live naked "
+                      f"positions, if any, are NOT monitored.", alert_class=alert_policy.SAFETY)
+        return None
+
+
+def _naked_unmonitored(engine) -> str:
+    """The naked positions a dying monitor leaves behind, for its FATAL alert."""
+    if engine is None:
+        return ''
+    try:
+        recs = engine.records()
+    except Exception:
+        return ', NAKED: book unreadable'
+    return ''.join(f", NAKED:{t.get('stock')}#{t.get('id')}" for t in recs)
 
 
 def monitor_all(kite: KiteConnect, dry_run: bool):
@@ -8035,6 +8160,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     wl_store = get_watchlist_store()
     zebra_store = _open_zebra_store()
     set_log_file(LOG_DIR / f"spread_monitor_cron_{today_ist().strftime('%Y%m%d')}.log")
+    global _NAKED_ENGINE
+    _NAKED_ENGINE = naked_engine = _open_naked_engine(dry_run, zebra_store)
 
     # ── Recover trades stuck in 'closing' from a previous crash ─────────
     for label, store in [('BCS', bcs_store), ('BPS', bps_store), ('FH', fh_store),
@@ -8094,12 +8221,17 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
         except Exception:
             pass
 
-    if not all_trades and not wl_active and not frozen_n:
+    naked_n = naked_engine.open_count() if naked_engine is not None else 0
+    if not all_trades and not wl_active and not frozen_n and not naked_n:
         if corrupt:
             log("Book is empty because a store was QUARANTINED — NOT exiting "
                 "quietly. Alert sent; fix the store before the next session.")
             return
         log("No open trades and no active watchlist alerts. Nothing to monitor.")
+        # This process is about to EXIT: its last beat must not tell the naked
+        # entry gate that an exit engine is running (review R11).
+        _NAKED_ENGINE = None
+        _beat_all('idle', dry_run, all_trades, zebra_store)
         return
     if frozen_n:
         log(f"  {frozen_n} FROZEN record(s) at partial_close — legs may be "
@@ -8290,7 +8422,23 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
         try:
             if not is_market_open():
                 now_t = now_ist().time()
+                if (now_t > MARKET_CLOSE and naked_engine is not None
+                        and now_t < NAKED_FO_CLOSE and naked_engine.has_active_chase()):
+                    # F&O trades to 15:40 while the cash session (and this
+                    # monitor's clock) ends at 15:30. A live naked exit already
+                    # selling must not be abandoned overnight mid-chase.
+                    naked_engine.dry_run = dry_run
+                    try:
+                        naked_engine.poll(kite, closing_only=True)
+                    except Exception as e:
+                        log(f"  Naked exit poll raised after the close: {e}")
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
                 if now_t > MARKET_CLOSE:
+                    if naked_engine is not None:
+                        # No working sell may rest into the next session.
+                        for line in naked_engine.end_of_session():
+                            log(f"  NAKED {line}")
                     log("Market closed for the day. Cron monitor exiting.")
                     for (store_key, strat_key, tid_key), ts in trail_state.items():
                         if ts['active']:
@@ -8302,7 +8450,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                     _beat_all('closed', dry_run, all_trades, zebra_store,
                               kill_switch=kill_switch_announced)
                     return
-                if holiday_standdown():
+                if holiday_standdown(kite, naked_engine):
                     # Same stamp as a finished session: the peer must read
                     # 'closed', not a crash, and zebra's heartbeat check is
                     # itself gated off on a holiday.
@@ -8318,6 +8466,18 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                           kill_switch=kill_switch_announced)
                 time.sleep(30)
                 continue
+
+            # -- P4 . live naked-long exits, FIRST (review R5) ---------------
+            # Its own engine and its own book (`zebra/naked_exit.py`); polled
+            # before anything else in the iteration so an exception elsewhere
+            # in the loop body can never starve it. `dry_run` is re-read every
+            # poll so a tripped kill switch stops naked sells too.
+            if naked_engine is not None:
+                naked_engine.dry_run = dry_run
+                try:
+                    naked_engine.poll(kite)
+                except Exception as e:
+                    log(f"  Naked exit poll raised, continuing: {e}")
 
             # Periodic Drive sync (picks up trades added from other machines)
             bcs_store.maybe_sync()
@@ -8348,7 +8508,8 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 except Exception:
                     pass
 
-            if not all_trades and not wl_active and not frozen_n:
+            naked_n = naked_engine.open_count() if naked_engine is not None else 0
+            if not all_trades and not wl_active and not frozen_n and not naked_n:
                 # A book that went empty MID-SESSION is far more suspicious
                 # than one that started empty: the trades were there at 09:15.
                 if alert_store_corruption([('BCS', bcs_store),
@@ -8360,6 +8521,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                               kill_switch=kill_switch_announced)
                     return
                 log("All trades closed and no active watchlist alerts. Cron monitor exiting.")
+                _NAKED_ENGINE = None          # exiting: the beat must not claim an engine
                 _beat_all('idle', dry_run, all_trades, zebra_store,
                           kill_switch=kill_switch_announced)
                 return
@@ -9021,6 +9183,7 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             except Exception as e:
                 log(f"  Residue sweep raised, continuing: {e}")
 
+
             # ── Watchlist price alerts (after trade checks) ──────────
             if wl_active:
                 check_watchlist_alerts(kite, log_fn=log, telegram_fn=send_telegram,
@@ -9049,12 +9212,14 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
                 log("FATAL: Kite token appears expired. Cannot continue.")
                 remaining = _load_all_trades(bcs_store, fh_store, bps_store, zebra_store)
                 stocks = ', '.join(f"{t['_strategy']}:{t['stock']}" for t in remaining)
+                stocks += _naked_unmonitored(naked_engine)
                 send_telegram(f"SPREAD MONITOR FATAL: Kite token expired! Unmonitored: {stocks}", alert_class=alert_policy.SAFETY)
                 return
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 log(f"FATAL: {MAX_CONSECUTIVE_ERRORS} consecutive errors. Exiting.")
                 remaining = _load_all_trades(bcs_store, fh_store, bps_store, zebra_store)
                 stocks = ', '.join(f"{t['_strategy']}:{t['stock']}" for t in remaining)
+                stocks += _naked_unmonitored(naked_engine)
                 send_telegram(f"SPREAD MONITOR FATAL: {MAX_CONSECUTIVE_ERRORS} errors. Unmonitored: {stocks}", alert_class=alert_policy.SAFETY)
                 return
             if consecutive_errors == 10:
@@ -9170,7 +9335,7 @@ def main():
         # A holiday is decided BEFORE startup: cron relaunches this every 5
         # minutes, and the startup path (Drive sync, Kite auth, preflight)
         # has no business running 75 times into a closed market.
-        if holiday_standdown():
+        if holiday_standdown(probe_naked=True):
             return
         # Log file is set inside monitor_all()
         kite = load_kite()

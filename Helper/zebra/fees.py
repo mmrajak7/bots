@@ -92,14 +92,14 @@ def _leg_orders(structure: str, debit: float, quantity: int,
     return out
 
 
-def estimate(orders: List[dict]) -> dict:
+def estimate(orders: List[dict], rates: Optional[dict] = None) -> dict:
     """Total charges for a list of executed orders, with the breakdown.
 
     Never raises and never returns a negative total: this runs inside the exit
     path, and a costing error must not be able to stop a position being closed
     or to manufacture a profit.
     """
-    r = cfg.FEE_RATES
+    r = rates if rates is not None else cfg.FEE_RATES
     out = {'brokerage': 0.0, 'stt': 0.0, 'exchange': 0.0, 'sebi': 0.0,
            'stamp': 0.0, 'gst': 0.0, 'total': 0.0, 'orders': 0,
            'model': MODEL_VERSION, 'rates': dict(r)}
@@ -191,14 +191,24 @@ def round_trip_for_trade(t: dict, exit_debit: Optional[float]) -> dict:
     The fallback is flagged so the post-mortem can tell them apart.
     """
     qty = int(t.get('quantity') or 0)
+    # A LIVE naked long trades on Kotak NEO: brokerage is the NEO rate
+    # (measured zero, 2026-11-27 contract note) and the entry is the FILL, not
+    # the quoted ask. Every other record keeps the Kite rate it was modelled on.
+    naked = str(t.get('structure') or '') == 'naked_long'
+    rates = (dict(cfg.FEE_RATES, brokerage_per_order=cfg.NAKED_BROKERAGE_PER_ORDER)
+             if naked else cfg.FEE_RATES)
     # A zebra back-ratio holds TWO longs per short; BCS holds one of each.
     mult = 2 if str(t.get('structure') or 'zebra') == 'zebra' else 1
     legs = t.get('exit_legs') if isinstance(t.get('exit_legs'), dict) else {}
     xl = _exit_leg_price(legs.get('long'), 'SELL')
     xs = _exit_leg_price(legs.get('short'), 'BUY')
-    approx = xl is None or xs is None
+    # A naked long has ONE leg: its exit is fully known from the long's sale,
+    # and no short buy-back may be modelled into it (design F11).
+    approx = xl is None or (xs is None and not naked)
     entry_long = (t.get('long_ask_entry') if t.get('long_ask_entry') is not None
                   else t.get('long_mid_entry'))
+    if naked and t.get('entry_long_price') is not None:
+        entry_long = t.get('entry_long_price')
     entry_short = (t.get('short_bid_entry') if t.get('short_bid_entry') is not None
                    else t.get('short_mid_entry'))
     if approx:
@@ -216,11 +226,11 @@ def round_trip_for_trade(t: dict, exit_debit: Optional[float]) -> dict:
         k = (float(exit_debit) / debit0) if (debit0 > 0 and exit_debit is not None) else 0.0
         k = max(0.0, min(k, 5.0))        # a vertical cannot 5x; clamp the tail
         xl = float(entry_long or 0) * k
-        xs = float(entry_short or 0) * k
+        xs = None if naked else float(entry_short or 0) * k
     orders = _leg_orders(
         t.get('structure') or 'zebra', float(t.get('debit') or 0), qty,
         entry_long, entry_short, xl, xs, long_qty_mult=mult)
-    est = estimate(orders)
+    est = estimate(orders, rates)
     # ORDER COUNT IS KNOWN EVEN WHEN PRICES ARE NOT. A two-leg debit structure
     # is four executed orders round trip whatever the book did, so brokerage
     # and its GST are never in doubt. The first cut skipped an order whenever a
@@ -229,7 +239,7 @@ def round_trip_for_trade(t: dict, exit_debit: Optional[float]) -> dict:
     # cohort's net P&L look better than it can be. Charge the floor.
     expected = 4 if (t.get('long_symbol') and t.get('short_symbol')) else 2
     if est['orders'] < expected:
-        r = cfg.FEE_RATES
+        r = rates
         missing = expected - est['orders']
         extra = missing * float(r['brokerage_per_order'])
         est['brokerage'] = round(est['brokerage'] + extra, 2)

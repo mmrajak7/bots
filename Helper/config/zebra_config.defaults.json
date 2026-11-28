@@ -71,5 +71,11 @@
   "naked_loss_budget": 0,
   "naked_override": false,
   "naked_entry_cutoff": "15:20",
-  "naked_max_orders_per_signal": 2
+  "naked_max_orders_per_signal": 2,
+  "naked_brokerage_per_order": 0.0,
+  "naked_entry_wait_sec": 10,
+  "naked_exit_reprice_sec": 10,
+  "naked_exit_max_reprices": 12,
+  "naked_adopt_absent_grace_sec": 600,
+  "naked_option_tick": 0.05
 }

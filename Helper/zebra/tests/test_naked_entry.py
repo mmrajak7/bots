@@ -75,6 +75,9 @@ def _iso(tmp_path, monkeypatch):
         return q
     monkeypatch.setattr(strikes_mod, '_quote_option', quote)
     monkeypatch.setattr(strikes_mod, 'prefetch_quotes', lambda kite, syms: 0)
+    # An armed exit engine is assumed; its own gate is tested below with a
+    # real heartbeat file.
+    monkeypatch.setattr(ne, 'exit_engine_problem', lambda m: '')
     ne.end_cycle()
     yield
     ne.end_cycle()
@@ -263,10 +266,18 @@ def test_a_bad_quote_skips(store, q, needle):
 
 
 def test_live_without_a_broker_fails_closed_and_alerts(store, monkeypatch):
+    # The fail-closed branch stays: any mode with no broker refuses loudly.
     monkeypatch.setattr(cfg, 'NAKED_LIVE', 'live')
+    monkeypatch.setattr(ne, 'broker_for', lambda m: None)
     out, sent = go(store, parent(store))
-    assert out.state == 'refused' and 'NEO' in out.reason and not naked(store)
+    assert out.state == 'refused' and 'broker' in out.reason and not naked(store)
     assert any('not entered' in m for m in sent)
+
+
+def test_live_mode_is_wired_to_the_neo_broker():
+    from zebra.naked_neo import NeoBroker
+    assert isinstance(ne.broker_for('live'), NeoBroker)
+    assert ne.broker_for('off') is None
 
 
 def test_validation_runs_before_any_order(store):
@@ -399,3 +410,69 @@ def test_the_hook_runs_after_the_paper_entry_and_never_breaks_it(store, monkeypa
                                   bcs=_bcs('HOOK'))
     assert built is not None and built[1]['status'] == 'entered'
     assert calls == [sig['id']]
+
+
+# ── the exit-engine gate (fail-closed backstop for `live`) ─────────────────────
+
+def _beat(tmp_path, **kw):
+    import time as _t
+    b = {'schema': 1, 'ts': _t.time(), 'at': 'now', 'state': 'polling',
+         'dry_run': False, 'kill_switch': False, 'naked_engine': True, 'cohort_store': True}
+    b.update(kw)
+    (tmp_path / monitor.HEARTBEAT_NAME).write_text(json.dumps(b))
+
+
+@pytest.mark.parametrize('beat,mode,ok', [
+    ({}, 'live', True),
+    ({'dry_run': True}, 'live', False),            # the crontab still has --dry-run
+    ({'dry_run': True}, 'rehearsal', True),        # fake fills: a dry monitor may book them
+    ({'naked_engine': False}, 'live', False),
+    ({'naked_engine': False}, 'rehearsal', False),
+    ({'ts': 0}, 'live', False),                    # stale
+])
+def test_exit_engine_gate(tmp_path, beat, mode, ok):
+    real = ne._real_exit_engine_problem
+    _beat(tmp_path, **beat)
+    assert (real(mode) == '') is ok
+
+
+def test_exit_engine_gate_missing_heartbeat_refuses(tmp_path):
+    assert ne._real_exit_engine_problem('live') != ''
+
+
+def test_live_entry_is_refused_without_an_armed_exit_engine(store, tmp_path, monkeypatch):
+    monkeypatch.setattr(cfg, 'NAKED_LIVE', 'live')
+    monkeypatch.setattr(ne, 'exit_engine_problem', ne._real_exit_engine_problem)
+    _beat(tmp_path, dry_run=True)
+    b = Scripted(ne.BuyResult('filled', fill_price=21.5, order_id='X'))
+    out, sent = go(store, parent(store), broker=b)
+    assert out.state == 'refused' and 'dry_run' in out.reason and b.orders == []
+
+
+def test_an_exception_after_the_send_keeps_the_tag_witness(store):
+    """The witness must survive an ORDINARY exception raised after the order
+    reached the broker -- it must stay unresolved with its tag."""
+    p = parent(store)
+
+    class SendsThenRaises:
+        def buy(self, symbol, qty, limit, ctx):
+            ctx['on_tag']('zbr-1202110000-abc1', 'TESTCO26DEC1000CE')
+            raise RuntimeError('reply parse blew up')
+    out, _ = go(store, p, broker=SendsThenRaises())
+    t = twin(store, p['id'])
+    assert out.state == 'unclear' and t['state'] == 'unclear'
+    assert t['tag'] == 'zbr-1202110000-abc1'
+
+
+def test_an_exception_outside_the_broker_after_the_send_keeps_the_tag(store, monkeypatch):
+    p = parent(store)
+
+    class Sends:
+        def buy(self, symbol, qty, limit, ctx):
+            ctx['on_tag']('zbr-1202110000-abc2', 'TESTCO26DEC1000CE')
+            return ne.BuyResult('filled', fill_price=21.5, order_id='X', tag='zbr-1202110000-abc2')
+    monkeypatch.setattr(ne, '_record_fill', lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError('boom after fill')))
+    out, _ = go(store, p, broker=Sends())
+    t = twin(store, p['id'])
+    assert out.state == 'unclear' and t['tag'] == 'zbr-1202110000-abc2'

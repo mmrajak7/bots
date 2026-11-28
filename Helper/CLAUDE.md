@@ -1047,8 +1047,9 @@ the replay over the test's dates at or below the 75th percentile of all
 same-length replay windows since 2020. Why: at 57 paired trades live's +22.9%
 split into replay of every signal +12.6, selection +4.1, pricing +6.2 (mostly
 the replay's own crudeness), and the window was in the top 2.7% of 294 since
-2020 — a falling market, 55 of 58 closes PE. `golive` does not compute these
-yet; read them by hand until the build adds them.
+2020 — a falling market, 55 of 58 closes PE. `golive` computes both regime
+conditions, the 2 SE gap and the bad-weeks stage since 2026-11-28 (P5); its
+VERDICT line is the registered §4 rule.
 
 **After INCONCLUSIVE at 150 — the bad-weeks stage (added 2026-11-26, at 99 of
 100, an addition, §4 unchanged and read first).** Regime condition 2 has almost
@@ -1094,14 +1095,20 @@ fills > 3% worse than paper, or the test FAILs) stops NEW entries only, and
 The 5-straight-stops kill is DROPPED: a 5-stop streak occurs on 96-100% of
 bootstrap paths at any edge. No regime gate on entry survived out-of-sample
 (Fable, 2024-26) — do not build one. Full table and the replay behind it:
-`docs/NAKED_100_TRADE_TEST.md` §11. The naked live path is BEING BUILT,
-nothing armed (`naked_live: off`; design `docs/NAKED_LIVE_DESIGN.md`, Windows
-only): P0 structure scoping, P1 one shared exit-rule core (`zebra/naked_rules.py`),
-P2 the halt (`zebra/naked_halt.py`, `zebra halt` / `zebra resume`), P3a the entry
-hook + gates (`zebra/naked_entry.py`) are done; **`live` refuses to enter until the
-NEO order adapter (P3b) lands.** Owner 2026-11-27: naked orders go through **Kotak
-NEO** via the shared `BOTS/kotak_neo` package (quotes stay on Kite); the −50% stop
-is a MONITORED stop (SL-M is refused for options by NEO's RMS). Go-live order:
+`docs/NAKED_100_TRADE_TEST.md` §11. The naked live path is BUILT (P0-P6,
+2026-11-28) and NOT ARMED (`naked_live: off`; design `docs/NAKED_LIVE_DESIGN.md`,
+Windows only, status box at the top): entry `zebra/naked_entry.py` +
+`zebra/naked_neo.py` (NEO broker, tag persisted before the send), adoption
+`zebra/naked_adopt.py` (zebra cycle), exits `zebra/naked_exit.py` (polled from
+`bcs/spread_monitor.py` every 5 s, NEO `chase_exit`), halt `zebra/naked_halt.py`,
+`/nresume <code>` on Telegram via `zebra/naked_tg.py` (zebra cycle, only while
+killed). **A live entry is refused unless the monitor's heartbeat shows an
+armed exit engine** (`exit_engine_problem`): with `--dry-run` on the crontab,
+`live` cannot buy. A stuck exit is booked by hand with `zebra close ID
+--exit-debit <avg fill> --reason <tp|stop|time>`. Owner 2026-11-27: naked orders
+go through **Kotak NEO** via the shared `BOTS/kotak_neo` package (quotes stay on
+Kite); the −50% stop is a MONITORED stop (SL-M is refused for options by NEO's
+RMS). Go-live order:
 ETF_PI, then NIFTY BTST, then naked LAST. The
 nightly digest carries a "NIFTY ±3% on the open book" section
 (`zebra/book_shock.py`) — the rupee figure that judges the accepted

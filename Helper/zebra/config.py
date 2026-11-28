@@ -656,6 +656,17 @@ _DEFAULTS = {
     # Orders one signal may send: the first, plus ONE re-quoted retry after a
     # price/band/stale reject (design Q8). Anything else stops the signal.
     'naked_max_orders_per_signal': 2,
+    # ── NEO execution (P3b/P3c/P4, owner 2026-11-27: orders via Kotak NEO,
+    # quotes stay on Kite). Brokerage per order measured ZERO on the 11-27
+    # contract note (Rs 0.01 on 4 fills); statutory charges still apply and
+    # come from FEE_RATES. The paper shadow keeps the Kite Rs 20 (unchanged
+    # mid-test), so live and paper fees differ BY DESIGN.
+    'naked_brokerage_per_order': 0.0,
+    'naked_entry_wait_sec': 10,        # read the book back this long before cancelling
+    'naked_exit_reprice_sec': 10,      # a working exit sell older than this is re-priced
+    'naked_exit_max_reprices': 12,     # then the exit is handed to a human (red alert)
+    'naked_adopt_absent_grace_sec': 600,  # an unclear entry absent this long + no position = nothing
+    'naked_option_tick': 0.05,         # NSE stock-option tick
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
     'time_sl_days_before_expiry': 6,
@@ -1505,6 +1516,12 @@ NAKED_LOSS_BUDGET = _non_negative_num('naked_loss_budget')
 NAKED_OVERRIDE = _strict_bool('naked_override')
 NAKED_ENTRY_CUTOFF = _hhmm('naked_entry_cutoff')
 NAKED_MAX_ORDERS_PER_SIGNAL = _int('naked_max_orders_per_signal')
+NAKED_BROKERAGE_PER_ORDER = _non_negative_num('naked_brokerage_per_order')
+NAKED_ENTRY_WAIT_SEC = _num('naked_entry_wait_sec')
+NAKED_EXIT_REPRICE_SEC = _num('naked_exit_reprice_sec')
+NAKED_EXIT_MAX_REPRICES = _int('naked_exit_max_reprices')
+NAKED_ADOPT_ABSENT_GRACE_SEC = _num('naked_adopt_absent_grace_sec')
+NAKED_OPTION_TICK = _num('naked_option_tick')
 
 
 def _stop_ladder() -> tuple:

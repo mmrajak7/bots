@@ -283,6 +283,87 @@ def _cohort(store_rows: List[dict], day: Optional[str] = None) -> dict:
             'fee_basis': dict(basis)}
 
 
+#: The naked books, in the order they are printed. Each is its OWN book and
+#: none is ever pooled with another or with the BCS cohort: `live` is real
+#: money under the go-live rules, `rehearsal` is the rehearsal week, and
+#: `override` is the owner-override pilot, which §4 of the 100-trade test
+#: says must never be mixed into any verdict.
+NAKED_BOOKS = ('live', 'rehearsal', 'override')
+
+
+def _naked_book_of(t: dict) -> str:
+    """Which naked book a record belongs to. Override first: an override
+    rehearsal is still an override trade and must not reach the rehearsal
+    numbers either."""
+    if t.get('override'):
+        return 'override'
+    return 'rehearsal' if t.get('rehearsal') else 'live'
+
+
+def _naked_books(naked_rows: List[dict], day: Optional[str] = None) -> dict:
+    """Live naked records (`structure == 'naked_long'`, `paper: False`), split
+    into their own books and bounded by `day` the way `_cohort` is.
+
+    The BCS cohort numbers never see these: `decided`/`scored` default to
+    structure 'bcs'. This is the other half -- without it a real-money result
+    would simply be absent from the dated record. A record that claims paper
+    is not a live naked record and is counted in `skipped_paper`, not booked.
+    """
+    out = {k: {'opened': 0, 'open': 0, 'closed': 0, 'unpriced': 0, 'wins': 0, 'gross': 0.0,
+               'net': 0.0, 'capital_open': 0.0} for k in NAKED_BOOKS}
+    out['skipped_paper'] = 0
+    for t in naked_rows:
+        if t.get('paper') is not False:
+            out['skipped_paper'] += 1
+            continue
+        b = out[_naked_book_of(t)]
+        entry = str(t.get('entry_date') or '')[:10]
+        if day is not None and entry and entry > day:
+            continue                       # entered after the day described
+        if entry == day:
+            b['opened'] += 1
+        ex = str(t.get('exit_date') or '')[:10]
+        exited = t.get('status') == 'exited' and (day is None or (ex and ex <= day))
+        if exited and t.get('pnl') is None:
+            # Closed without a price: over, but no number to add. Counted,
+            # never booked as open (its capital is not deployed) nor as zero.
+            b['unpriced'] += 1
+            continue
+        if exited:
+            net = float(t.get('pnl_net', t['pnl']))
+            b['closed'] += 1
+            b['wins'] += 1 if net > 0 else 0
+            b['gross'] += float(t['pnl'])
+            b['net'] += net
+        elif t.get('status') in ('entered', 'exited'):
+            # Exited after `day` was still open on `day`.
+            b['open'] += 1
+            b['capital_open'] += float(t.get('capital') or 0)
+    return out
+
+
+def _render_naked(nb: Optional[dict]) -> List[str]:
+    L = ['## Naked long — own books (never pooled with the BCS cohort)']
+    if not nb:
+        return L + ['_could not be read_']
+    rows = [k for k in NAKED_BOOKS
+            if any(nb[k][f] for f in ('opened', 'open', 'closed', 'unpriced'))]
+    if not rows:
+        L.append('_none — no live, rehearsal or override naked record_')
+    for k in rows:
+        b = nb[k]
+        L.append(f"**{k}** opened {b['opened']} today, {b['open']} open "
+                 f"(Rs{b['capital_open']:,.0f}), {b['closed']} closed, "
+                 f"{b['wins']} net-positive, gross Rs{b['gross']:,.0f} → "
+                 f"net Rs{b['net']:,.0f}"
+                 + (f", {b['unpriced']} closed UNPRICED (not in the totals)"
+                    if b['unpriced'] else ''))
+    if nb.get('skipped_paper'):
+        L.append(f"_{nb['skipped_paper']} naked record(s) not marked `paper: False` — "
+                 f"not live, left out of every book_")
+    return L
+
+
 def _warnings(rows: List[tuple]) -> dict:
     c: Counter = Counter()
     for _, lvl, name, m in rows:
@@ -439,7 +520,7 @@ def build(day: Optional[str] = None) -> dict:
     day = day or datetime.now(cfg.IST).strftime('%Y-%m-%d')
     rows = _read_log(day)
     try:
-        from .trade_store import ZebraStore, decided
+        from .trade_store import STRUCTURE_NAKED, ZebraStore, decided, scored
         store = ZebraStore(config={})
         store._load_local()          # LOCAL ONLY: read-only, no Drive, no lock
         # SCOPED AT THE SOURCE. The digest is the paper run's dated record and
@@ -451,7 +532,16 @@ def build(day: Optional[str] = None) -> dict:
         store_rows = decided(store.load_trades())
     except Exception as e:
         logger.warning('digest could not read the store: %s', e)
-        store_rows = []
+        store_rows, store = [], None
+    naked = None
+    try:
+        # The live naked records, as their OWN books (live / rehearsal /
+        # override). `decided` above is BCS-only by default, so without this
+        # a real-money result would be missing from the dated record.
+        if store is not None:
+            naked = _naked_books(scored(store.load_trades(), structure=STRUCTURE_NAKED), day)
+    except Exception as e:                        # pragma: no cover - guard
+        logger.warning('digest could not read the naked books: %s', e)
     prev = None
     try:
         pp = cfg.LOG_DIR / 'eod' / f"{(datetime.strptime(day, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')}.json"
@@ -500,7 +590,7 @@ def build(day: Optional[str] = None) -> dict:
             'trades': {k: (v if not isinstance(v, list) else len(v))
                        for k, v in tr.items()},
             'cohort': coh, 'warnings': warn, 'engines': eng, 'tp_latch': tpl,
-            'book_shock': shock,
+            'book_shock': shock, 'naked_books': naked,
             'flags': _flags(cyc, vet, tr, warn, coh, prev, eng, tpl),
             '_detail': tr}
 
@@ -698,6 +788,8 @@ def render(d: dict) -> str:
         A(f"_{coh['undated']} exited cohort record(s) carry no usable "
           f"`exit_date` and are excluded from that total — they cannot be "
           f"placed in time._")
+    A('')
+    L.extend(_render_naked(d.get('naked_books')))
     A('')
     L.extend(_render_tp_latch(d.get('tp_latch') or {}))
     A('')

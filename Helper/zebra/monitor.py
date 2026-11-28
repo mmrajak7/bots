@@ -4150,6 +4150,11 @@ def _cohort_population(trades) -> set:
         # whose missing engine this verdict exists to announce (design Q9).
         if t.get('status') != 'entered' or not in_cohort(t, None, ANY_STRUCTURE):
             continue
+        # A REHEARSAL naked record holds fake fills and belongs to no broker
+        # (design G18): the 5-second monitor books it in dry run too. Counting
+        # it as LIVE would announce NO ENGINE every cycle of the rehearsal week.
+        if t.get('structure') == 'naked_long' and t.get('rehearsal') is True:
+            continue
         # The UNSTAMPED class is read from the RAW field, deliberately not
         # through `is_paper_record` -- that helper answers "may zebra book
         # this at mid", and its whole job is to resolve an absent flag to
@@ -5441,6 +5446,27 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
     # The live naked halt is evaluated ONCE per cycle, here, before any entry
     # can ask it (the `naked_halt` caller contract). `end_cycle` drops the
     # verdict so no later cycle can read a stale one. Never raises.
+    # P3c: settle any naked order that MAY be at the broker with no record
+    # BEFORE the halt and the entry gates read the book -- an adopted position
+    # must count against this cycle's cap. Runs whatever `naked_live` says now
+    # (an order sent in `live` stays a live order); a no-op scan when nothing
+    # is unresolved. Never raises.
+    if not dry_run:
+        try:
+            from . import naked_adopt
+            naked_adopt.sweep(store, dry_run=dry_run)
+        except Exception as e:
+            logger.error("Naked adoption sweep failed: %s", e, exc_info=True)
+    # P6: `/nresume <code>` from the owner's Telegram, read ONLY while a naked
+    # halt is killed (no network otherwise), and BEFORE `begin_cycle` so this
+    # cycle's evaluation sees a cleared kill. Never under --dry-run: a dry
+    # cycle must not consume the owner's messages or clear a real kill.
+    if not dry_run:
+        try:
+            from . import naked_tg
+            naked_tg.poll_resume(datetime.now(cfg.IST), naked_entry._send_default)
+        except Exception as e:
+            logger.error("Naked /nresume poll failed: %s", e, exc_info=True)
     naked_entry.begin_cycle(store, kite, dry_run=dry_run)
     try:
         check_watching(store, kite, dry_run=dry_run)

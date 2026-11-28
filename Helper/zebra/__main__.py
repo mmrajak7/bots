@@ -1132,6 +1132,23 @@ def cmd_close(args):
     if not trade:
         print(f"#{args.id} not found")
         sys.exit(1)
+    if trade.get('structure') == 'naked_long' and trade['status'] in ('entered', 'closing'):
+        # A HAND exit of a live naked long (the chase stopped, or it was sold
+        # in the NEO app). No structure mid applies to one leg: the average
+        # fill per share is required, never guessed.
+        if args.exit_debit is None:
+            print("  A naked long needs --exit-debit <average sell price per share>.")
+            sys.exit(1)
+        try:
+            t = store.mark_exited(args.id, args.exit_spot or trade.get('entry_spot', 0),
+                                  args.exit_debit, args.reason or 'manual',
+                                  exit_legs={'long': {'side': 'SELL', 'price': args.exit_debit,
+                                                      'manual': True}})
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        print(f"Closed naked #{t['id']} P&L=Rs{t['pnl']:,.0f} ({t['pnl_pct']:.1f}%)")
+        return
     if trade['status'] == 'entered':
         exit_debit = args.exit_debit
         exit_spot = args.exit_spot
@@ -1910,10 +1927,7 @@ def cmd_status(args):
         for label, group in (
                 ('Zebra', [t for t in exited
                            if t.get('structure') not in ('bcs', 'naked_long')]),
-                ('BCS  ', [t for t in exited if t.get('structure') == 'bcs']),
-                # Real money, its own book -- never pooled with paper.
-                ('Naked', [t for t in exited if t.get('structure') == 'naked_long'
-                           and not t.get('rehearsal')])):
+                ('BCS  ', [t for t in exited if t.get('structure') == 'bcs'])):
             if not group:
                 continue
             wins = sum(1 for t in group if t.get('pnl', 0) > 0)
@@ -1921,6 +1935,33 @@ def cmd_status(args):
             win_rate = wins / len(group) * 100
             print(f"  {label}  P&L: Rs {total_pnl:,.0f}  "
                   f"WR {win_rate:.0f}% ({wins}W / {len(group)-wins}L)")
+
+    # ── NAKED LONG: its own books, never pooled ──────────────────────────
+    #
+    # Live naked records (structure 'naked_long', paper False) are real money
+    # and are shown as THREE separate books -- live, rehearsal, override --
+    # never folded into the BCS lines above. Override trades are the
+    # owner-override pilot and must not reach any other number (§4 of the
+    # 100-trade test). Printed even when empty, so "none" is a stated fact.
+    naked = [t for t in trades if t.get('structure') == 'naked_long'
+             and t.get('paper') is False]
+    print("\n  --- Naked long: own books (never pooled with BCS) ---")
+    if not naked:
+        print("  none")
+    for label in ('live', 'rehearsal', 'override'):
+        grp = [t for t in naked
+               if ('override' if t.get('override') else
+                   'rehearsal' if t.get('rehearsal') else 'live') == label]
+        if not grp:
+            if naked:
+                print(f"  {label:<9} none")
+            continue
+        n_open = sum(1 for t in grp if t.get('status') == 'entered')
+        done = [t for t in grp if t.get('status') == 'exited' and t.get('pnl') is not None]
+        wins = sum(1 for t in done if (t.get('pnl_net', t['pnl']) or 0) > 0)
+        net = sum(float(t.get('pnl_net', t['pnl']) or 0) for t in done)
+        print(f"  {label:<9} open {n_open}  closed {len(done)}  "
+              f"net Rs {net:,.0f}  ({wins}W / {len(done) - wins}L)")
     _print_vet_status(trades)
     print()
 

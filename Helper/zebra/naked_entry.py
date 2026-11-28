@@ -27,10 +27,15 @@ reaches a broker before every one has passed):
 THE BROKER IS A SEAM, NOT A BRANCH. Orders go through an object with one
 method, `buy(symbol, qty, limit, ctx) -> BuyResult`. `RehearsalBroker` fills at
 the limit. The live broker is Kotak NEO (owner, 2026-11-27: zero brokerage,
-same broker as BTST) and is NOT wired yet -- it waits on the shared NEO session
-design, because a second NEO login may kill BTST's session. Until it is wired,
-`live` FAILS CLOSED at gate 10 with one alert per signal. Nothing here names a
-broker beyond `broker_for`.
+same broker as BTST) and is NOT wired yet -- it waits on the shared `BOTS/kotak_neo`
+package via `zebra/naked_neo.NeoBroker` (P3b, 2026-11-27). Nothing here names
+a broker beyond `broker_for`.
+
+THE TAG IS THE WITNESS. Before a live order is sent the broker calls
+`ctx['on_tag']`, which stamps the parent `naked_twin = {state: 'sending', tag}`.
+`sending` is an UNRESOLVED state: if the process dies between the send and the
+reply, gate 4 refuses every new entry and `naked_adopt` resolves the order from
+NEO's book by that tag.
 
 A BuyResult says one of four things, and each has exactly one handling:
 
@@ -68,7 +73,7 @@ logger = logging.getLogger(__name__)
 
 #: `naked_twin.state` values that mean an order MAY exist at the broker with
 #: no record. Gate 4 refuses every new entry while any parent carries one.
-UNRESOLVED_STATES = ('unclear', 'unrecorded')
+UNRESOLVED_STATES = ('sending', 'unclear', 'unrecorded')
 
 TWIN_FIELD = 'naked_twin'
 
@@ -82,6 +87,10 @@ class BuyResult:
     order_id: Optional[str] = None
     message: str = ''
     retry: bool = False              # rejected for a price/band/stale reason
+    tag: Optional[str] = None        # the broker's order tag (NEO GuiOrdId)
+    neo_symbol: Optional[str] = None # the broker's trading symbol for the leg
+    neo_token: Optional[str] = None  # the broker's instrument token (the exit needs it)
+    filled_qty: int = 0              # shares the book shows filled (unclear only)
 
     STATUSES = ('filled', 'rejected', 'unfilled', 'unclear')
 
@@ -118,11 +127,14 @@ class RehearsalBroker:
 def broker_for(mode: str):
     """The broker for this mode, or None when none is wired.
 
-    'live' returns None until the Kotak NEO adapter lands (it reuses BTST's
-    audited `neo_client`, behind the shared NEO session). Tests inject theirs.
+    'live' is Kotak NEO on the shared session (`naked_neo.NeoBroker`). Tests
+    inject theirs.
     """
     if mode == 'rehearsal':
         return RehearsalBroker()
+    if mode == 'live':
+        from .naked_neo import NeoBroker
+        return NeoBroker()
     return None
 
 
@@ -168,9 +180,11 @@ def _marks(kite, records: list) -> dict:
 def _format_event(m: str, ev: dict) -> str:
     if ev.get('event') == 'kill':
         return ('\U0001F6D1 NAKED %s KILLED (%s)\n%s\nNo NEW entries. Open '
-                'positions keep their exits.\nRestart: python -m zebra resume '
-                '%s --mode %s' % (m.upper(), ev.get('kind'), ev.get('reason'),
-                                  ev.get('code'), m))
+                'positions keep their exits.\nRestart (Telegram, read by the '
+                'zebra cycle while killed): /nresume %s %s\nor at the box: '
+                'python -m zebra resume %s --mode %s'
+                % (m.upper(), ev.get('kind'), ev.get('reason'),
+                   m, ev.get('code'), ev.get('code'), m))
     return ('⏸ NAKED %s PAUSED\n%s\nNo new entries through %s.'
             % (m.upper(), ev.get('reason'), ev.get('through') or '?'))
 
@@ -273,6 +287,29 @@ def _premium_problem(ask: float, lot: int) -> str:
     return ''
 
 
+def exit_engine_problem(m: str) -> str:
+    """Why no exit engine could SELL a position this mode would buy, or ''.
+
+    The fail-closed backstop that `broker_for('live') -> None` used to be
+    (design Q9: live needs the monitor's --dry-run removed). Read from the
+    5-second monitor's heartbeat: fresh, armed, and running the naked engine.
+    Rehearsal fills are fake, so a dry-run monitor may book them -- it must
+    still be alive and running the engine.
+    """
+    from .monitor import read_exit_engine_heartbeat     # lazy: monitor imports us
+    hb = read_exit_engine_heartbeat()
+    beat = hb.get('beat') or {}
+    ok_states = ('ok',) if m == 'live' else ('ok', 'dry_run')
+    if hb.get('state') not in ok_states:
+        return 'no exit engine able to sell it: %s (%s)' % (hb.get('state'), hb.get('detail'))
+    if not beat.get('naked_engine'):
+        return 'the exit monitor is running without the naked exit engine'
+    return ''
+
+
+_real_exit_engine_problem = exit_engine_problem
+
+
 def _gates(store: ZebraStore, kite, parent: dict, now: datetime, m: str):
     """Gates 2-9. Returns (Outcome, None) to stop, or (None, (quote, dry_rec))."""
     from .monitor import _entry_already_in_flight, entry_budget_open   # lazy
@@ -280,6 +317,9 @@ def _gates(store: ZebraStore, kite, parent: dict, now: datetime, m: str):
     v = _verdict
     if v is None:
         return Outcome('refused', 'halt not evaluated this cycle (fails closed)'), None
+    why = exit_engine_problem(m)
+    if why:
+        return Outcome('refused', why), None
     if not v.get('allowed'):
         return Outcome('refused', 'halt: %s' % v.get('reason')), None
     if not entry_budget_open():
@@ -349,12 +389,27 @@ def after_paper_entry(store: ZebraStore, kite, parent: dict, *,
         out = _attempt(store, kite, parent, now, m, broker, send, dry_run)
     except Exception as e:
         logger.error('NAKED entry on #%s raised: %s', pid, e, exc_info=True)
-        out = Outcome('refused', 'raised: %s' % e)
+        out = _after_raise(store, pid, e)
     _stamp(store, pid, out, now)
     level = logging.WARNING if out.state in ('refused', 'unclear', 'unrecorded') else logging.INFO
     logger.log(level, 'NAKED %s #%s %s: %s -- %s', m.upper(), pid,
                parent.get('stock'), out.state.upper(), out.reason)
     return out
+
+
+def _after_raise(store, pid, e) -> Outcome:
+    """The outcome when the attempt raised. If the `sending` witness is on the
+    parent, an order MAY exist: keep it UNRESOLVED with its tag, never turn
+    it into a resolved `refused` (the sweep would then never look)."""
+    try:
+        twin = dict((store.find(pid) or {}).get(TWIN_FIELD) or {})
+    except Exception:
+        twin = {}
+    if twin.get('state') == 'sending' and twin.get('tag'):
+        extra = {k: v for k, v in twin.items() if k not in ('state', 'reason', 'at')}
+        return Outcome('unclear', 'raised after the send: %s' % e,
+                       orders=int(twin.get('orders') or 0), extra=extra)
+    return Outcome('refused', 'raised: %s' % e)
 
 
 def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
@@ -370,7 +425,7 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
     q, _dry = ok
     broker = broker if broker is not None else broker_for(m)
     if broker is None:
-        out = Outcome('refused', 'no %s broker wired (Kotak NEO adapter pending)' % m)
+        out = Outcome('refused', 'no %s broker wired' % m)
         send('\U0001F534 NAKED %s #%s %s not entered: %s'
              % (m.upper(), parent.get('id'), parent.get('stock'), out.reason),
              dry_run=dry_run)
@@ -387,12 +442,28 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
             symbol=sym, txn_type='BUY', qty=lot, price=limit, exchange='NFO',
             dry_run=(m != 'live'), context=ctx, log=logger)
         orders += 1
+        n_order = orders
+        sent_tag = {}
+
+        def on_tag(tag, neo_symbol, _n=n_order, _limit=limit, _sent=sent_tag):
+            _sent.update(tag=tag, neo_symbol=neo_symbol)
+            # Persisted BEFORE the send; raises if it cannot be written, and
+            # the broker then sends nothing.
+            store.update_trade_fields(parent['id'], **{TWIN_FIELD: {
+                'state': 'sending', 'mode': m, 'tag': tag, 'neo_symbol': neo_symbol,
+                'limit': _limit, 'qty': lot, 'orders': _n, 'intent_id': intent,
+                'at': now.strftime('%Y-%m-%d %H:%M:%S'),
+                'reason': 'order %d being sent' % _n}})
+        ctx = dict(ctx, parent=parent, on_tag=on_tag)
         try:
             res = broker.buy(sym, lot, limit, ctx)
         except Exception as e:
             # The broker raised: we cannot know whether the order reached the
             # exchange. That IS unclear -- never retried, intent left open.
-            res = BuyResult('unclear', message='broker raised: %s' % e)
+            res = BuyResult('unclear', message='broker raised: %s' % e,
+                            tag=sent_tag.get('tag'), neo_symbol=sent_tag.get('neo_symbol'))
+        tag_extra = {k: v for k, v in (('tag', res.tag), ('neo_symbol', res.neo_symbol),
+                                        ('order_id', res.order_id)) if v}
         if res.status != 'unclear':
             order_journal.record_result(
                 intent, order_id=res.order_id,
@@ -403,8 +474,9 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
             return _record_fill(store, parent, res, q, now, m, orders, send, dry_run)
         if res.status == 'unclear':
             out = Outcome('unclear', 'order may be at the broker: %s' % res.message,
-                          orders=orders, extra={'intent_id': intent,
-                                                'order_id': res.order_id})
+                          orders=orders, extra=dict(tag_extra, intent_id=intent,
+                                                    qty=lot, limit=limit,
+                                                    filled_qty=res.filled_qty))
             send('\U0001F534 NAKED %s #%s %s: ORDER STATE UNKNOWN (%s). No new '
                  'naked entries until it is resolved against the order book.'
                  % (m.upper(), parent['id'], parent.get('stock'), res.message),
@@ -412,10 +484,11 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
             return out
         if res.status == 'unfilled':
             return Outcome('skipped', 'not filled at %.2f (%s)' % (limit, res.message),
-                           orders=orders)
+                           orders=orders, extra=tag_extra)
         # rejected
         if not res.retry or orders >= cfg.NAKED_MAX_ORDERS_PER_SIGNAL:
-            out = Outcome('refused', 'rejected: %s' % res.message, orders=orders)
+            out = Outcome('refused', 'rejected: %s' % res.message, orders=orders,
+                          extra=tag_extra)
             send('\U0001F534 NAKED %s #%s %s REJECTED: %s%s'
                  % (m.upper(), parent['id'], parent.get('stock'), res.message,
                     '' if res.retry else ' -- not a price reject, stopped'),
@@ -437,6 +510,11 @@ def _record_fill(store, parent, res, q, now, m, orders, send, dry_run) -> Outcom
                              rehearsal=(m == 'rehearsal'),
                              override=cfg.NAKED_OVERRIDE,
                              order_ids=[res.order_id] if res.order_id else [])
+    # What the EXIT needs to sell this exact contract on the same broker.
+    for k, v in (('entry_tag', res.tag), ('neo_symbol', res.neo_symbol),
+                 ('neo_token', res.neo_token)):
+        if v:
+            rec[k] = v
     try:
         stored = store.add_naked_live(rec)
     except Exception as e:
@@ -449,7 +527,9 @@ def _record_fill(store, parent, res, q, now, m, orders, send, dry_run) -> Outcom
                         parent['long_symbol'], res.fill_price, lot, e),
              dry_run=dry_run)
         return Outcome('unrecorded', 'filled but not recorded: %s' % e, orders=orders,
-                       extra={'order_id': res.order_id, 'fill': res.fill_price})
+                       extra={'order_id': res.order_id, 'fill': res.fill_price,
+                              'tag': res.tag, 'neo_symbol': res.neo_symbol,
+                              'neo_token': res.neo_token, 'ask': q.get('ask')})
     prem = float(res.fill_price) * lot
     over = prem > cfg.NAKED_MAX_PREMIUM + 1e-9
     send('%s NAKED %s #%d %s %s BOUGHT %s @ %.2f x %d = Rs %.0f (ask %.2f)%s'

@@ -1,7 +1,11 @@
 """The go-live decision pack: everything the owner must choose, from the shadows.
 
-`python -m zebra golive`. READ-ONLY -- reads the shadow book and the trade
-book, writes nothing, places nothing, alerts nothing.
+`python -m zebra golive`. READ-ONLY on every book -- reads the shadow book
+and the trade book, places nothing, alerts nothing. Its ONE write is a cache
+of its own: the every-signal replay since 2020 (`replay_history`), which takes
+minutes on the Pi, saved under the log dir keyed by the candle-cache end date
+so a second run the same day is fast. A failed cache read or write is logged
+and the pack runs on regardless.
 
 Owner, 2026-09-24, on what must be settled before going live: *"strategy -
 naked or spread, capital needed, max positions, any change to SL, max capital
@@ -49,9 +53,12 @@ engine -- then this is rebuilt around the new control.
 """
 from __future__ import annotations
 
+import json
+import logging
 import math
+import os
 import statistics
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from . import config as cfg
@@ -60,18 +67,20 @@ from . import replay
 from . import structure_shadow as ss
 from . import veto_naked
 
+logger = logging.getLogger(__name__)
+
 #: One tick, the smallest price step on NSE stock options. The stress line
 #: prices every order one tick worse than the touch it was measured at.
 TICK = 0.05
 #: Below this many rows a group is printed but marked thin.
 THIN_N = 10
 #: The 100-trade test, fixed IN ADVANCE on 2026-09-25 so the result cannot
-#: move the bar. Population: fully watched (not partial), closed, priced and
-#: costed naked_long shadows. PASS needs all three of: mean net >= PASS_PCT,
-#: mean net above the replay of every signal over the same dates, and the
-#: mean still positive with the TOP_K best trades removed. FAIL below
-#: FAIL_PCT. In between: extend once to EXTEND_N, where PASS needs
-#: EXTEND_PASS_PCT with the same two conditions, and anything else FAILS.
+#: move the bar (amended 2026-10-26 -- gap in SE, regime conditions -- and
+#: 2026-11-26 -- the bad-weeks stage; see `verdict`). Population: the first
+#: TEST_N fully watched naked_long shadows by entry. PASS needs mean net >=
+#: PASS_PCT, the gap over the replay >= GAP_SE_MULT SE, the mean still positive
+#: without the TOP_K best, and both regime conditions. FAIL below FAIL_PCT.
+#: Otherwise extend once to EXTEND_N (bar EXTEND_PASS_PCT).
 #: Why 12: two standard errors at n=100 when one trade's net swings ~59%
 #: (the replay's measured spread) -- 2 x 59 / sqrt(100).
 TEST_N, PASS_PCT, FAIL_PCT = 100, 12.0, 5.0
@@ -109,6 +118,34 @@ FAST_APPROACH_PCT = 7.6
 #: premium. Unpriceable books correlate with bad outcomes, so dropping them
 #: would flatter the mean; this is the conservative booking, fixed in advance.
 UNPRICED_NET_PCT = -100.0
+#: "Beats the replay" (amendment 2026-10-26): live mean - replay mean over the
+#: same entry dates >= GAP_SE_MULT x SE of the gap, SE_gap = sqrt(SE_live^2 +
+#: SE_replay^2), each SE = sample sd / sqrt(n). Exactly 2 SE is MET.
+GAP_SE_MULT = 2.0
+#: Regime condition 1 ("not one market", 2026-10-26): among the CLOSED test
+#: trades, at least this many entered in a week NIFTY rose (the week's last
+#: close over the previous week's last close -- Friday over Friday, the last
+#: session when Friday is a holiday) OR at least this many CE.
+REGIME_MIN_N = 25
+#: Regime condition 2 ("not a lucky window"): the every-signal replay mean over
+#: the test's entry days must sit AT OR BELOW this percentile of every rolling
+#: window of the same number of replay entry days, REGIME_HISTORY_FROM to the
+#: test start. Percentile by linear interpolation (numpy's default).
+REGIME_PCTL = 75.0
+REGIME_HISTORY_FROM = '2020-01-01'
+#: The NIFTY 50 daily series in the shared candle cache -- the same file
+#: `book_shock` reads. `golive --refresh` does NOT top it up.
+NIFTY_CANDLES = '_nifty50_daily'
+#: The bad-weeks stage (registered 2026-11-26, after INCONCLUSIVE at 150).
+#: A cell is ISO entry week x side; it is replay-negative when the every-signal
+#: replay of that cell has a mean net < 0 over at least BADWEEK_CELL_MIN closed
+#: replay trades (fewer = unclassified, counted nowhere). Evaluated once, when
+#: at least BADWEEK_MIN_CLOSED population trades in replay-negative cells have
+#: closed.
+BADWEEK_MIN_CLOSED, BADWEEK_CELL_MIN = 40, 3
+#: The replay-history cache (see the module docstring). Bump the version when
+#: the slim row shape changes, so an old file is ignored rather than misread.
+REPLAY_CACHE_NAME, REPLAY_CACHE_VERSION = 'golive_replay_history.json', 1
 DEFAULT_CAPS = (6, 8, 10, 12)
 DEFAULT_CUTS = (15000, 20000, 25000, 30000, 40000)
 PLAN_MULT = 1.5          # owner, 2026-09-24: "plan 1.5x peak capital needed"
@@ -433,6 +470,271 @@ def _stats(nets: list) -> dict:
             'ex_top': _mean(sorted(nets)[:-TOP_K]) if len(nets) > TOP_K else None}
 
 
+def _se(xs: list) -> Optional[float]:
+    """Sample sd / sqrt(n); None below two values."""
+    sd = _sd(xs)
+    return None if sd is None else sd / math.sqrt(len(xs))
+
+
+# -- the registered gate (amendments 2026-10-26, bad-weeks stage 2026-11-26) ---
+
+def gap_test(live_mean, live_se, replay_mean, replay_se) -> dict:
+    """"Beats the replay": gap = live - replay >= GAP_SE_MULT x sqrt(SE_live^2 +
+    SE_replay^2). `met` is None -- UNKNOWN, never a pass or a fail -- when any
+    input is missing: the old `mean > replay` rule is not a fallback."""
+    out = {'gap': None, 'se': None, 'need': None, 'met': None}
+    if live_mean is None or replay_mean is None:
+        return out
+    out['gap'] = live_mean - replay_mean
+    if live_se is None or replay_se is None:
+        return out
+    out['se'] = math.sqrt(live_se ** 2 + replay_se ** 2)
+    out['need'] = GAP_SE_MULT * out['se']
+    # A hair of float tolerance so "exactly 2 SE" reads MET, as registered.
+    out['met'] = out['gap'] >= out['need'] - 1e-9
+    return out
+
+
+def nifty_weeks(daily: Optional[list]) -> dict:
+    """{'YYYY-WW': (last session date, close)} plus '_end' = the series' last
+    date. The last session of each ISO week -- Friday, or the day before a
+    Friday holiday."""
+    out = {}
+    for c in daily or []:
+        try:
+            d = date.fromisoformat(str(c['date'])[:10])
+            k = week_of(d)
+            if k not in out or out[k][0] < d:
+                out[k] = (d, float(c['close']))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if out:
+        out['_end'] = max(v[0] for v in out.values())
+    return out
+
+
+def nifty_week_up(weeks: dict, day) -> Optional[bool]:
+    """Did NIFTY rise over the ISO week containing `day`? None = UNKNOWN: the
+    series has no close for this week or the one before, or it ends before
+    this week's Friday (a mid-week candle must not stand in for the close)."""
+    d = day if isinstance(day, date) else date.fromisoformat(str(day)[:10])
+    monday = d - timedelta(days=d.weekday())
+    end = weeks.get('_end')
+    this, prev = weeks.get(week_of(monday)), weeks.get(week_of(monday - timedelta(days=7)))
+    if end is None or this is None or prev is None or end < monday + timedelta(days=4):
+        return None
+    return this[1] > prev[1]
+
+
+def regime_one(tests: list, weeks: dict) -> dict:
+    """Condition 1 over CLOSED test rows: >= REGIME_MIN_N entered in a NIFTY-up
+    week OR >= REGIME_MIN_N CE. `met` None = undecidable today (CE short and
+    the unknown NIFTY weeks could still carry the up count over the line)."""
+    out = {'n': len(tests), 'ce': 0, 'pe': 0, 'up': 0, 'down': 0, 'unknown': 0,
+           'nifty_end': weeks.get('_end')}
+    for r in tests:
+        out['ce' if r.get('dir') == 'CE' else 'pe'] += 1
+        up = nifty_week_up(weeks, r['start'].date())
+        out['unknown' if up is None else ('up' if up else 'down')] += 1
+    if out['ce'] >= REGIME_MIN_N or out['up'] >= REGIME_MIN_N:
+        out['met'] = True
+    elif out['up'] + out['unknown'] < REGIME_MIN_N:
+        out['met'] = False
+    else:
+        out['met'] = None
+    return out
+
+
+def quantile(xs: list, q: float) -> Optional[float]:
+    """Linear-interpolation quantile (numpy's default), q in [0, 1]."""
+    if not xs:
+        return None
+    v = sorted(xs)
+    pos = q * (len(v) - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, len(v) - 1)
+    return v[lo] + (v[hi] - v[lo]) * (pos - lo)
+
+
+def regime_two(hist_rows: list, since: str, until: str) -> dict:
+    """Condition 2: is the replay over the test's entry days an ordinary window?
+
+    `hist_rows` = CLOSED every-signal replay trades since REGIME_HISTORY_FROM
+    ({'entry_date', 'net_pct'}), from ONE run (`replay_history`), so the
+    current window and the history are scored identically. Entry days = the
+    distinct replay entry dates; L = how many fall in [since, until]; the
+    history is every run of L consecutive entry days strictly before `since`,
+    each scored as the mean net of the trades entered in it. MET when the
+    current window's mean is at or below the REGIME_PCTL-th percentile of
+    those (linear interpolation). `met` None when either side is empty.
+    `rank` = % of history windows at or below the current one."""
+    by_day = {}
+    for t in hist_rows:
+        d = str(t.get('entry_date') or '')[:10]
+        if t.get('net_pct') is None or not d or d > until:
+            continue
+        s_n = by_day.setdefault(d, [0.0, 0])
+        s_n[0] += float(t['net_pct'])
+        s_n[1] += 1
+    days = sorted(by_day)
+    cur = [d for d in days if since <= d <= until]
+    prior = [d for d in days if d < since]
+    out = {'days': len(cur), 'windows': 0, 'current': None, 'p75': None, 'rank': None,
+           'trades': sum(by_day[d][1] for d in cur), 'met': None}
+    if not cur:
+        return out
+    out['current'] = sum(by_day[d][0] for d in cur) / out['trades']
+    L = len(cur)
+    if len(prior) < L:
+        return out
+    # Rolling sums over prefix arrays: O(days), not O(days x L).
+    cs, cn = [0.0], [0]
+    for d in prior:
+        cs.append(cs[-1] + by_day[d][0])
+        cn.append(cn[-1] + by_day[d][1])
+    means = [(cs[j + L] - cs[j]) / (cn[j + L] - cn[j]) for j in range(len(prior) - L + 1)]
+    out['windows'] = len(means)
+    out['p75'] = quantile(means, REGIME_PCTL / 100.0)
+    out['rank'] = 100.0 * sum(m <= out['current'] for m in means) / len(means)
+    out['met'] = out['current'] <= out['p75'] + 1e-9
+    return out
+
+
+def cell_of(day, side) -> tuple:
+    """A bad-weeks cell: (ISO entry week, side)."""
+    return (week_of(day), side)
+
+
+def classify_cells(hist_rows: list, open_rows=()) -> dict:
+    """{cell: {'n', 'mean', 'neg', 'open'}} for every cell with at least
+    BADWEEK_CELL_MIN closed replay trades -- the only cells that are classified.
+    neg = mean < 0 (a mean of exactly 0 is NOT negative). `open` counts replay
+    trades of that cell still running: its class may still move. The key
+    '_open' maps EVERY cell (classified or not) to its open replay count."""
+    acc = {}
+    for t in hist_rows:
+        if t.get('net_pct') is None or not t.get('entry_date'):
+            continue
+        acc.setdefault(cell_of(t['entry_date'], t.get('dir')), []).append(float(t['net_pct']))
+    opn = {}
+    for t in open_rows:
+        if t.get('entry_date'):
+            k = cell_of(t['entry_date'], t.get('dir'))
+            opn[k] = opn.get(k, 0) + 1
+    out = {}
+    for k, v in acc.items():
+        if len(v) >= BADWEEK_CELL_MIN:
+            m = sum(v) / len(v)
+            out[k] = {'n': len(v), 'mean': m, 'neg': m < 0, 'open': opn.get(k, 0)}
+    out['_open'] = opn
+    return out
+
+
+def historical_neg_share(hist_rows: list, cells: dict, before: str) -> Optional[float]:
+    """Share of CLASSIFIED replay trades entered before `before` (the test
+    start) that sit in replay-negative cells. None when there are none."""
+    neg = tot = 0
+    for t in hist_rows:
+        d = str(t.get('entry_date') or '')[:10]
+        if t.get('net_pct') is None or not d or d >= before:
+            continue
+        c = cells.get(cell_of(d, t.get('dir')))
+        if c is None:
+            continue
+        tot += 1
+        neg += 1 if c['neg'] else 0
+    return (neg / tot) if tot else None
+
+
+def bad_weeks(pop: list, hist: Optional[dict], min_n: int = EXTEND_N) -> dict:
+    """The bad-weeks stage over the CONTINUING population (`population` with no
+    cap: every fully watched naked_long shadow by entry, the first 150 included).
+
+    Its population is the PREFIX by entry that ends at the BADWEEK_MIN_CLOSED-th
+    trade entered in a replay-negative cell (never shorter than the first
+    `min_n`): the §3 rule -- fixed by entry, so fast closes cannot stand in
+    for slow ones -- applied to this stage's own count. Evaluated once every
+    row of that prefix has closed and none of its cells has a replay trade
+    still open. PASS needs (1) >= BADWEEK_MIN_CLOSED closed in replay-negative
+    cells, (2) selection gap in those cells >= 0 (each live trade minus its
+    cell's replay mean, averaged over live trades = cells weighted by live
+    trades), (3) mix-reweighted mean > 0: live mean in replay-positive and in
+    replay-negative cells, weighted by their historical shares of classified
+    replay trades REGIME_HISTORY_FROM -> test start. Unclassified cells count
+    nowhere. Anything else FAILS; no replay history is BLOCKED."""
+    out = {'state': None, 'why': '', 'n_neg': 0, 'n_neg_closed': 0, 'prefix': None,
+           'gap': None, 'mean_neg': None, 'mean_pos': None, 'share_neg': None,
+           'mix': None, 'unclassified': 0}
+    if not hist or hist.get('rows') is None:
+        out.update(state='BLOCKED', why='no every-signal replay history (needs the candle cache)')
+        return out
+    cells = classify_cells(hist['rows'], hist.get('open') or ())
+
+    def cell(r):
+        return cells.get(cell_of(r['start'].date(), r.get('dir')))
+    since = min(r['start'] for r in pop).strftime('%Y-%m-%d') if pop else None
+    out['share_neg'] = historical_neg_share(hist['rows'], cells, since) if since else None
+    k_end, seen = None, 0
+    for k, r in enumerate(pop):
+        c = cell(r)
+        if c is not None and c['neg']:
+            seen += 1
+            if seen == BADWEEK_MIN_CLOSED:
+                k_end = k
+                break
+    pre = pop[:max(min_n, k_end + 1)] if k_end is not None else pop
+    closed = [r for r in pre if r['net_pct'] is not None]
+    neg = [r for r in closed if cell(r) is not None and cell(r)['neg']]
+    pos = [r for r in closed if cell(r) is not None and not cell(r)['neg']]
+    out.update(prefix=len(pre), n_neg=sum(1 for r in pre if cell(r) is not None and cell(r)['neg']),
+               n_neg_closed=len(neg), unclassified=sum(1 for r in closed if cell(r) is None),
+               mean_neg=_mean([r['net_pct'] for r in neg]), mean_pos=_mean([r['net_pct'] for r in pos]),
+               gap=_mean([r['net_pct'] - cell(r)['mean'] for r in neg]))
+    if out['mean_neg'] is not None and out['mean_pos'] is not None and out['share_neg'] is not None:
+        out['mix'] = out['share_neg'] * out['mean_neg'] + (1 - out['share_neg']) * out['mean_pos']
+    if k_end is None:
+        out.update(state='IN PROGRESS', why='%d of %d entered in replay-negative cells (%d closed)'
+                   % (out['n_neg'], BADWEEK_MIN_CLOSED, out['n_neg_closed']))
+        return out
+    still = len(pre) - len(closed)
+    if still:
+        out.update(state='WAITING', why='the first %d by entry hold the %d; %d still open'
+                   % (len(pre), BADWEEK_MIN_CLOSED, still))
+        return out
+    pending = sum(cells['_open'].get(cell_of(r['start'].date(), r.get('dir')), 0) for r in pre)
+    if pending:
+        out.update(state='WAITING', why='%d replay trades in the cells of the first %d still open'
+                   % (pending, len(pre)))
+        return out
+    # The cache must reach the FRIDAY of the last prefix week: a cell read on
+    # Monday-Tuesday signals alone can flip once the week's later signals
+    # land, and move which trade is the 40th -- "evaluated once" would not hold.
+    last = max(r['start'] for r in pre).date()
+    friday = (last + timedelta(days=4 - last.weekday())).isoformat()
+    if hist.get('cache_end') and hist['cache_end'] < friday:
+        out.update(state='BLOCKED', why='candle cache ends %s, before the end of the last prefix week '
+                   '(%s) -- run --refresh' % (hist['cache_end'], friday))
+        return out
+    if out['share_neg'] is None:
+        out.update(state='BLOCKED', why='no classified replay history before the test start')
+        return out
+    fails = []
+    if out['n_neg_closed'] < BADWEEK_MIN_CLOSED:
+        fails.append('only %d closed in replay-negative cells' % out['n_neg_closed'])
+    if out['gap'] is None or out['gap'] < 0:
+        fails.append('selection gap in bad cells %s < 0' % _f(out['gap'], '%+.1f'))
+    if out['mix'] is None:
+        fails.append('mix-reweighted mean undefined (no live trade in a replay-%s cell)'
+                     % ('positive' if out['mean_pos'] is None else 'negative'))
+    elif out['mix'] <= 0:
+        fails.append('mix-reweighted mean %+.1f%% <= 0' % out['mix'])
+    out['state'] = 'FAIL' if fails else 'PASS'
+    out['why'] = ('; '.join(fails) if fails else
+                  '%d closed in replay-negative cells, gap %+.1f >= 0, mix-reweighted %+.1f%% > 0'
+                  % (out['n_neg_closed'], out['gap'], out['mix']))
+    return out
+
+
 def _stage(pop: list, need: int, sel: Optional[dict]) -> dict:
     """Where one stage (100, or the extension to 150) stands. EVAL only when
     all `need` have entered AND closed AND the replay of their window is
@@ -447,41 +749,150 @@ def _stage(pop: list, need: int, sel: Optional[dict]) -> dict:
     if sel.get('open'):
         return {'state': 'WAITING', 'why': '%d replay trades in the window still open -- refresh later' % sel['open']}
     st = _stats([r['net_pct'] for r in pop])
-    st.update(state='EVAL', replay=sel['replay'], beats=st['mean'] > sel['replay'])
+    gap = gap_test(st['mean'], st['se'], sel['replay'], sel.get('replay_se'))
+    st.update(state='EVAL', replay=sel['replay'], gap=gap, beats=gap['met'])
     return st
 
 
-def verdict(rows: list, sel_fn) -> dict:
-    """The pre-registered verdict over the naked_long rows. `sel_fn(tests)`
-    returns the selection dict for a set of closed test rows (the replay of the
-    same window), or None when the replay cannot be run.
+def _regime(regime_fn, tests: list) -> dict:
+    """Both regime conditions for a stage, or UNKNOWN when they cannot be read.
+    Never raises: an unreadable regime is BLOCKED by the caller, never FAIL."""
+    try:
+        r = regime_fn(tests) if regime_fn else None
+    except Exception as e:                       # the gate must not crash the pack
+        logger.warning('golive regime conditions failed: %s', e)
+        r = None
+    r = r or {}
+    return {'one': r.get('one') or {'met': None}, 'two': r.get('two') or {'met': None}}
 
-    100: PASS = mean >= PASS_PCT, beats the replay, positive without the top
-    TOP_K. FAIL = mean < FAIL_PCT. Otherwise extend ONCE to EXTEND_N, where
-    PASS needs EXTEND_PASS_PCT and the same two conditions; anything else
-    FAILS. A missing replay is BLOCKED, never a FAIL."""
+
+def verdict(rows: list, sel_fn, regime_fn=None, bad_fn=None) -> dict:
+    """The pre-registered verdict over the naked_long rows (§4).
+
+    `sel_fn(tests)` -> the selection dict for a set of closed test rows (the
+    replay of the same window, with `replay_se`), or None when it cannot run.
+    `regime_fn(tests)` -> {'one': regime_one(...), 'two': regime_two(...)}.
+    `bad_fn(pop)` -> bad_weeks(pop, ...) over the uncapped population.
+
+    100:  FAIL if mean < FAIL_PCT. PASS needs mean >= PASS_PCT, gap >= 2 SE,
+          positive without the top TOP_K, and both regime conditions.
+          Anything else extends ONCE to EXTEND_N.
+    150:  FAIL if mean < EXTEND_PASS_PCT, the gap is unmet or the top TOP_K
+          carry it. Regime unmet -> INCONCLUSIVE -> the bad-weeks stage
+          (PASS or FAIL, no further extension). All met -> PASS.
+    An UNKNOWN condition that would decide the outcome (no SE, no NIFTY
+    series, no replay history) is BLOCKED -- never FAIL, never INCONCLUSIVE."""
     p100 = population(rows, TEST_N)
     s100 = _stage(p100, TEST_N, sel_fn([r for r in p100 if r['net_pct'] is not None])
                   if len(p100) == TEST_N and all(r['net_pct'] is not None for r in p100) else None)
     if s100['state'] != 'EVAL':
-        return s100
-    if s100['mean'] >= PASS_PCT and s100['beats'] and (s100['ex_top'] or 0) > 0:
-        return dict(s100, state='PASS', why='at %d: mean %+.1f%% >= %.0f%%, beats the replay (%+.1f%%), '
-                    'holds without the top %d' % (TEST_N, s100['mean'], PASS_PCT, s100['replay'], TOP_K))
+        return dict(s100, stage=TEST_N)
+    s100['regime'] = rg = _regime(regime_fn, p100)
+    s100['stage'] = TEST_N
     if s100['mean'] < FAIL_PCT:
         return dict(s100, state='FAIL', why='at %d: mean %+.1f%% < %.0f%%' % (TEST_N, s100['mean'], FAIL_PCT))
+    returns = s100['mean'] >= PASS_PCT and (s100['ex_top'] or 0) > 0
+    conds = (('gap >= 2 SE', s100['beats']), ('regime 1', rg['one']['met']),
+             ('regime 2', rg['two']['met']))
+    if returns and all(v is True for _, v in conds):
+        return dict(s100, state='PASS', why='at %d: mean %+.1f%% >= %.0f%%, gap %+.1f >= %.1f (2 SE), '
+                    'holds without the top %d, both regime conditions met'
+                    % (TEST_N, s100['mean'], PASS_PCT, s100['gap']['gap'], s100['gap']['need'], TOP_K))
+    if returns and not any(v is False for _, v in conds):
+        return dict(s100, state='BLOCKED', why='at %d: returns clear the bar but %s cannot be read -- '
+                    'PASS or extend depends on it'
+                    % (TEST_N, ', '.join(k for k, v in conds if v is None)))
+    unmet100 = [k for k, ok in (('mean >= %.0f%%' % PASS_PCT, s100['mean'] >= PASS_PCT),
+                                ('ex-top-%d > 0' % TOP_K, (s100['ex_top'] or 0) > 0)) if not ok]
+    unmet100 += [('%s unknown' % k) if v is None else k for k, v in conds if v is not True]
     p150 = population(rows, EXTEND_N)
     s150 = _stage(p150, EXTEND_N, sel_fn([r for r in p150 if r['net_pct'] is not None])
                   if len(p150) == EXTEND_N and all(r['net_pct'] is not None for r in p150) else None)
     if s150['state'] != 'EVAL':
-        return dict(s150, state='INCONCLUSIVE -> ' + s150['state'],
-                    why='at %d: %+.1f%%, between %.0f%% and %.0f%% -- extending to %d: %s'
-                    % (TEST_N, s100['mean'], FAIL_PCT, PASS_PCT, EXTEND_N, s150['why']))
-    ok = s150['mean'] >= EXTEND_PASS_PCT and s150['beats'] and (s150['ex_top'] or 0) > 0
-    return dict(s150, state='PASS' if ok else 'FAIL',
-                why='at %d: mean %+.1f%% (bar %.0f%%), beats the replay: %s, without the top %d: %s'
-                % (EXTEND_N, s150['mean'], EXTEND_PASS_PCT, s150['beats'], TOP_K,
-                   _f(s150['ex_top'], '%+.1f%%')))
+        return dict(s150, stage=EXTEND_N, at100=s100, state='EXTENDED -> ' + s150['state'],
+                    why='at %d: %+.1f%%, unmet: %s -- extending to %d: %s'
+                    % (TEST_N, s100['mean'], ', '.join(unmet100), EXTEND_N, s150['why']))
+    s150['regime'] = rg = _regime(regime_fn, p150)
+    s150.update(stage=EXTEND_N, at100=s100)
+    fails = []
+    if s150['mean'] < EXTEND_PASS_PCT:
+        fails.append('mean %+.1f%% < %.0f%%' % (s150['mean'], EXTEND_PASS_PCT))
+    if s150['beats'] is False:
+        fails.append('gap %+.1f < %.1f (2 SE)' % (s150['gap']['gap'], s150['gap']['need']))
+    if (s150['ex_top'] or 0) <= 0:
+        fails.append('carried by the top %d (%s without them)' % (TOP_K, _f(s150['ex_top'], '%+.1f%%')))
+    if fails:
+        return dict(s150, state='FAIL', why='at %d: %s' % (EXTEND_N, '; '.join(fails)))
+    if s150['beats'] is None:
+        return dict(s150, state='BLOCKED', why='at %d: returns clear the bar but the gap SE cannot be '
+                    'read' % EXTEND_N)
+    r1, r2 = rg['one']['met'], rg['two']['met']
+    if r1 is True and r2 is True:
+        return dict(s150, state='PASS', why='at %d: mean %+.1f%% >= %.0f%%, gap %+.1f >= %.1f, holds '
+                    'without the top %d, both regime conditions met'
+                    % (EXTEND_N, s150['mean'], EXTEND_PASS_PCT, s150['gap']['gap'],
+                       s150['gap']['need'], TOP_K))
+    if r1 is not False and r2 is not False:
+        return dict(s150, state='BLOCKED', why='at %d: returns clear the bar but %s cannot be read'
+                    % (EXTEND_N, ', '.join(k for k, v in (('regime 1', r1), ('regime 2', r2))
+                                           if v is None)))
+    unmet = ', '.join(k for k, v in (('regime 1', r1), ('regime 2', r2)) if v is False)
+    incon = 'at %d: returns met, %s unmet -> INCONCLUSIVE' % (EXTEND_N, unmet)
+    try:
+        bw = bad_fn(population(rows, len(rows))) if bad_fn else None
+    except Exception as e:
+        logger.warning('golive bad-weeks stage failed: %s', e)
+        bw = None
+    bw = bw or {'state': 'BLOCKED', 'why': 'bad-weeks stage could not be computed'}
+    if bw['state'] in ('PASS', 'FAIL'):
+        return dict(s150, state=bw['state'], stage='bad_weeks', bad_weeks=bw,
+                    why='%s; bad-weeks stage: %s' % (incon, bw['why']))
+    return dict(s150, state='INCONCLUSIVE -> BAD WEEKS ' + bw['state'], stage='bad_weeks',
+                bad_weeks=bw, why='%s; bad-weeks stage: %s' % (incon, bw['why']))
+
+
+# -- the replay history: one every-signal run since 2020, cached ------------------
+
+def _slim(t: dict) -> dict:
+    return {'entry_date': t.get('entry_date'), 'dir': t.get('dir'), 'net_pct': t.get('net_pct')}
+
+
+def replay_history(cache_end: Optional[str], n_symbols: int, path=None, run=None) -> Optional[dict]:
+    """The every-signal replay from REGIME_HISTORY_FROM to `cache_end`, slim:
+    {'rows': closed [{'entry_date','dir','net_pct'}], 'open': [...], 'cached': bool}.
+
+    One run serves regime 2 (current window and history alike) and the
+    bad-weeks cells. Running to the cache end and filtering by entry date
+    gives the same trades as a run to any earlier `until` (one position per
+    stock depends only on earlier signals). Cached under the log dir, keyed
+    by (cache_end, n_symbols, version): a second pack the same day reads the
+    file. A bad cache file is ignored and rebuilt; a failed write is logged.
+    The replay itself may raise -- the caller reports it as unavailable."""
+    if not cache_end:
+        return None
+    path = path or (cfg.LOG_DIR / REPLAY_CACHE_NAME)
+    key = {'version': REPLAY_CACHE_VERSION, 'from': REGIME_HISTORY_FROM,
+           'cache_end': cache_end, 'n_symbols': int(n_symbols)}
+    try:
+        with open(str(path), encoding='utf-8') as fh:
+            got = json.load(fh)
+        if isinstance(got, dict) and got.get('key') == key and isinstance(got.get('rows'), list):
+            return {'rows': got['rows'], 'open': got.get('open') or [], 'cached': True,
+                    'cache_end': cache_end}
+    except (OSError, ValueError):
+        pass
+    trades = (run or replay.replay_window)(REGIME_HISTORY_FROM, cache_end)
+    rows = [_slim(t) for t in trades if t.get('net_pct') is not None]
+    opn = [_slim(t) for t in trades if t.get('net_pct') is None]
+    if rows:
+        tmp = '%s.tmp' % path
+        try:
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump({'key': key, 'rows': rows, 'open': opn}, fh)
+            os.replace(tmp, str(path))
+        except OSError as e:
+            logger.warning('golive: replay history cache not written (%s) -- next run recomputes', e)
+    return {'rows': rows, 'open': opn, 'cached': False, 'cache_end': cache_end}
 
 
 def selection(tests: list, replayed: Optional[list] = None,
@@ -491,7 +902,8 @@ def selection(tests: list, replayed: Optional[list] = None,
     window's last entry -- a stale cache would silently turn late replay
     trades into 'open' and drop them. `replayed` is injectable for tests."""
     out = {'since': None, 'until': None, 'live': None, 'live_win': None, 'replay': None,
-           'replay_win': None, 'open': 0, 'n': 0, 'blocked': None}
+           'replay_win': None, 'open': 0, 'n': 0, 'blocked': None, 'live_se': None,
+           'replay_se': None}
     if not tests:
         return out
     out['since'] = min(r['start'] for r in tests).strftime('%Y-%m-%d')
@@ -505,7 +917,9 @@ def selection(tests: list, replayed: Optional[list] = None,
             return out
         replayed = replay.replay_window(out['since'], out['until'])
     closed = [t['net_pct'] for t in replayed if t.get('net_pct') is not None]
-    out.update(replay=_mean(closed), n=len(closed), open=len(replayed) - len(closed),
+    out['live_se'] = _se([r['net_pct'] for r in tests])
+    out.update(replay=_mean(closed), replay_se=_se(closed), n=len(closed),
+               open=len(replayed) - len(closed),
                replay_win=(100.0 * sum(x > 0 for x in closed) / len(closed)) if closed else None)
     # Descriptive (Fable review 2026-11-19): the gap with week x side removed,
     # in total (live price) and as SELECTION only (the live trade's own replay
@@ -761,6 +1175,27 @@ def _veto_naked_lines(state: dict, by_id: dict, now: datetime) -> list:
     return lines
 
 
+def by_side_and_week(tests: list, weeks: dict) -> list:
+    """Regime item 3 -- REPORTED, never gated: (label, n, mean, win%) by side
+    and by NIFTY week up / down / unknown."""
+    groups = {}
+    for r in tests:
+        up = nifty_week_up(weeks, r['start'].date())
+        for g in (r.get('dir') or '?', 'NIFTY ' + ('?' if up is None else ('up' if up else 'down'))):
+            groups.setdefault(g, []).append(r['net_pct'])
+    order = ['CE', 'PE', 'NIFTY up', 'NIFTY down', 'NIFTY ?']
+    out = []
+    for g in order + sorted(k for k in groups if k not in order):
+        if g in groups:
+            xs = groups[g]
+            out.append((g, len(xs), _mean(xs), 100.0 * sum(x > 0 for x in xs) / len(xs)))
+    return out
+
+
+def _met(v) -> str:
+    return 'MET' if v is True else ('NOT MET' if v is False else 'UNKNOWN')
+
+
 def _f(x, fmt='%.0f', dash='-'):
     return dash if x is None else fmt % x
 
@@ -787,13 +1222,24 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
     rows = {k: [r for r in v if not r['partial']] for k, v in every.items()}
     # The replay reads the candle cache and the options CSV; neither may take
     # the whole pack down with it (review 2026-09-25) -- sections 1-6 need neither.
-    replay_err, cache_end = None, None
+    replay_err, cache_end, n_symbols = None, None, 0
     try:
-        cache_end = replay.cache_last_date([s for s, _ in replay.universe()])
+        uni = [s for s, _ in replay.universe()]
+        n_symbols = len(uni)
+        cache_end = replay.cache_last_date(uni)
     except Exception as e:
         replay_err = '%s: %s' % (type(e).__name__, e)
+    sel_memo, hist_memo = {}, {}
 
     def sel_fn(t):
+        # Memoised on the trade ids: the 'now' line and the stage of the same
+        # rows would otherwise run the window replay twice.
+        key = tuple(str(r['id']) for r in t)
+        if key not in sel_memo:
+            sel_memo[key] = _sel_uncached(t)
+        return sel_memo[key]
+
+    def _sel_uncached(t):
         if replay_err:
             return None
         try:
@@ -810,13 +1256,60 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
         except Exception as e:
             return {'replay': None, 'blocked': 'replay failed: %s' % e}
 
+    def history():
+        # ONE every-signal run since 2020 for the whole pack (cached on disk by
+        # candle-cache end). Its failure is reported, never raised.
+        if 'h' not in hist_memo:
+            hist_memo['h'], hist_memo['err'] = None, None
+            if replay_err or not cache_end:
+                hist_memo['err'] = replay_err or 'no candle cache'
+            else:
+                try:
+                    hist_memo['h'] = replay_history(cache_end, n_symbols)
+                except Exception as e:
+                    hist_memo['err'] = '%s: %s' % (type(e).__name__, e)
+                    logger.warning('golive: replay history failed: %s', hist_memo['err'])
+        return hist_memo['h']
+    try:
+        weeks = nifty_weeks(replay.load_daily(NIFTY_CANDLES))
+    except Exception as e:                     # a bad NIFTY file is UNKNOWN, not a crash
+        logger.warning('golive: NIFTY series unreadable: %s', e)
+        weeks = {}
+
+    def regime_fn(t):
+        closed = [r for r in t if r['net_pct'] is not None]
+        out = {'one': regime_one(closed, weeks), 'two': None}
+        if not closed:
+            return out
+        since = min(r['start'] for r in closed).strftime('%Y-%m-%d')
+        until = max(r['start'] for r in closed).strftime('%Y-%m-%d')
+        if not cache_end or cache_end < until:
+            # Same rule as `selection`: a cache short of the window silently
+            # drops its last days from the current mean. UNKNOWN, not a reading.
+            out['two'] = {'met': None, 'current': None, 'blocked': 'candle cache ends %s, before '
+                          'the window (%s) -- run --refresh' % (cache_end, until)}
+            return out
+        h = history()
+        if h is not None:
+            out['two'] = regime_two(h['rows'], since, until)
+        return out
+
+    def bad_fn(all_pop):
+        return bad_weeks(all_pop, history())
+
     pop = population(every['naked_long'], TEST_N)
     tests = [r for r in pop if r['net_pct'] is not None]
     st_now = _stats([r['net_pct'] for r in tests])
     sel = sel_fn(tests) or {'replay': None, 'live': None, 'n': 0, 'open': 0, 'since': None,
                             'until': None, 'live_win': None, 'replay_win': None,
                             'blocked': replay_err}
-    vd = verdict(every['naked_long'], sel_fn)
+    vd = verdict(every['naked_long'], sel_fn, regime_fn, bad_fn)
+    gap_now = gap_test(st_now['mean'], st_now['se'], sel.get('replay'), sel.get('replay_se'))
+    rg_now = _regime(regime_fn, tests)
+    try:
+        bw_now = bad_weeks(population(every['naked_long'], len(every['naked_long'])), history())
+    except Exception as e:
+        bw_now = {'state': 'BLOCKED', 'why': 'bad-weeks read failed: %s' % e}
     booked = {k: sum(1 for r in pop if r['booked'] == k) for k in ('net', 'uncosted', 'unpriced', 'open')}
 
     p('GO-LIVE DECISION PACK -- measures only, from the structure shadow')
@@ -836,12 +1329,46 @@ def report(store, caps=DEFAULT_CAPS, cuts=DEFAULT_CUTS, now=None) -> str:
     p('  vs replay of every signal, same dates: live %s vs replay %s (%d replayed, %d open)%s' % (
         _f(sel['live'], '%+.1f%%'), _f(sel['replay'], '%+.1f%%'), sel['n'], sel['open'],
         ('  !! ' + sel['blocked']) if sel.get('blocked') else ''))
+    p('  GAP (gated): live %s - replay %s = %s; SE_gap %s = sqrt(%s^2 + %s^2); need >= %s (%.0f SE) -> %s'
+      % (_f(st_now['mean'], '%+.1f'), _f(sel.get('replay'), '%+.1f'), _f(gap_now['gap'], '%+.1f'),
+         _f(gap_now['se'], '%.1f'), _f(st_now['se'], '%.1f'), _f(sel.get('replay_se'), '%.1f'),
+         _f(gap_now['need'], '%.1f'), GAP_SE_MULT, _met(gap_now['met'])))
+    r1 = rg_now['one']
+    p('  REGIME 1 (not one market, gated): of %d closed, CE %d / PE %d; entered in a NIFTY-up week %d, '
+      'down %d, unknown %d -> %s (needs >= %d CE or >= %d up-week)'
+      % (r1.get('n', 0), r1.get('ce', 0), r1.get('pe', 0), r1.get('up', 0), r1.get('down', 0),
+         r1.get('unknown', 0), _met(r1['met']), REGIME_MIN_N, REGIME_MIN_N))
+    p('    NIFTY series (%s) ends %s -- `--refresh` does NOT top it up; a week it does not reach '
+      'is UNKNOWN' % (NIFTY_CANDLES, r1.get('nifty_end') or 'MISSING'))
+    p('    by side / NIFTY week (reported, not gated): %s' % ('; '.join(
+        '%s n %d %+.1f%% win %.0f%%' % g for g in by_side_and_week(tests, weeks)) or '-'))
+    r2 = rg_now['two']
+    if r2.get('current') is None:
+        p('  REGIME 2 (not a lucky window, gated): UNKNOWN -- %s'
+          % (r2.get('blocked') or hist_memo.get('err') or 'no replay history for the window'))
+    else:
+        p('  REGIME 2 (not a lucky window, gated): replay %+.1f%% over %d entry days (%d trades) sits at '
+          'the %s pct of %d same-length windows since %s; p%.0f %s -> %s (needs <= p%.0f)'
+          % (r2['current'], r2['days'], r2['trades'], _f(r2['rank'], '%.0f'), r2['windows'],
+             REGIME_HISTORY_FROM[:4], REGIME_PCTL, _f(r2['p75'], '%+.1f'), _met(r2['met']), REGIME_PCTL))
+    p('  BAD WEEKS (only after INCONCLUSIVE at %d): %d entered / %d closed in replay-negative cells '
+      '(evaluated at %d closed); gap there %s, live bad %s / good %s, hist bad share %s, '
+      'mix-reweighted %s; %d closed unclassified -- %s'
+      % (EXTEND_N, bw_now.get('n_neg', 0), bw_now.get('n_neg_closed', 0), BADWEEK_MIN_CLOSED,
+         _f(bw_now.get('gap'), '%+.1f'), _f(bw_now.get('mean_neg'), '%+.1f%%'),
+         _f(bw_now.get('mean_pos'), '%+.1f%%'),
+         _f(None if bw_now.get('share_neg') is None else 100 * bw_now['share_neg'], '%.0f%%'),
+         _f(bw_now.get('mix'), '%+.1f%%'), bw_now.get('unclassified', 0),
+         'descriptive until then' if vd.get('stage') != 'bad_weeks' else bw_now['state']))
     p('  VERDICT: %s -- %s' % (vd['state'], vd['why']))
-    p('  PASS at %d: mean >= %.0f%% AND beats the replay AND positive without the top %d.'
-      % (TEST_N, PASS_PCT, TOP_K))
-    p('  FAIL below %.0f%%. In between: extend once to %d (bar %.0f%%). No early stop; the verdict'
+    p('  PASS at %d: mean >= %.0f%% AND gap >= %.0f SE AND positive without the top %d AND both regime'
+      % (TEST_N, PASS_PCT, GAP_SE_MULT, TOP_K))
+    p('  conditions. FAIL below %.0f%%. Otherwise extend once to %d: FAIL below %.0f%%, gap unmet or'
       % (FAIL_PCT, EXTEND_N, EXTEND_PASS_PCT))
-    p('  waits until every one of them has closed and the replay of their window is complete.')
+    p('  carried by the top %d; regime unmet -> INCONCLUSIVE -> the bad-weeks stage (PASS/FAIL, no'
+      % TOP_K)
+    p('  more extension). An unreadable condition is BLOCKED. No early stop; the verdict waits until')
+    p('  every one has closed and the replay of their window is complete.')
     p('  candle cache ends %s -- `python -m zebra golive --refresh` fetches from Kite first.'
       % (cache_end or 'MISSING'))
     if replay_err:
