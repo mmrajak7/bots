@@ -1849,13 +1849,18 @@ class ZebraStore:
     # which is the intended behaviour everywhere: the paper monitor must not
     # re-alert on a position the order path is already unwinding.
 
-    def begin_close(self, trade_id: int, reason: str) -> bool:
+    def begin_close(self, trade_id: int, reason: str, _drive: bool = True) -> bool:
         """Take the close lock. True if acquired, False if not ours to take.
 
         False is the normal, expected answer when another process got there
         first. It is not an error and must not be logged as one.
+
+        `_drive=False` takes the lock in the LOCAL book only (the naked exit
+        engine, review A5: a stop must not wait on a 3.6 MB upload before its
+        first sell). Safe because the lock is a version bump: a Drive copy
+        made before it carries a LOWER version and loses every merge.
         """
-        with self._mutate():
+        with self._mutate(drive=_drive):
             t = self._must_find(trade_id)
             if not store_contract.allows(store_contract.BEGIN_CLOSE,
                                          t['status'], store_contract.ZEBRA_STATUSES):

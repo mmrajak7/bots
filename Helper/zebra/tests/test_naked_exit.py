@@ -260,22 +260,26 @@ def test_dry_run_never_sells_a_live_record_and_says_so_once(store, neo, monkeypa
     assert sum('dry-run' in m for m in sent) == 1
 
 
-def test_a_position_sold_by_hand_hands_the_chase_to_a_human(store, neo, monkeypatch):
+def test_a_position_sold_by_hand_never_stops_the_chase_and_alerts_once(store, neo, monkeypatch):
+    """Review H1 (2026-11-28): the chase never hands itself to a human. A lot
+    already sold in the app reads as 'account holds 0': nothing is sent, the
+    chase stays active, and the owner is told ONCE (then every repeat interval)."""
     monkeypatch.setattr(cfg, 'NAKED_LIVE', 'live')
-    monkeypatch.setattr(cfg, 'NAKED_EXIT_MAX_REPRICES', 12)
     c = client_for(neo)
     r = live_record(store, neo, c)
     neo.set_quote(SYM, 40.0, 40.5)
     c.place(C.OrderRequest(SYM, TOK, 'S', LOT, '40.00', c.new_tag()), reduce_only=True)
     assert neo.net(SYM) == 0                       # flat already (sold in the app)
     QUOTES[SYM] = _q(ask=40.5, bid=40.0)
-    e, sent = engine(store, spot=1041.0, client=c)
-    for k in range(13):
+    clk = Clock()
+    e, sent = engine(store, spot=1041.0, client=c, clock=clk)
+    for k in range(40):
+        clk.t += 5
         e.poll(None, now=T0 + timedelta(seconds=5 * k))
     t = store.find(r['id'])
-    assert t['status'] == 'closing' and t['exit_chase']['status'] == 'needs_human'
+    assert t['status'] == 'closing' and t['exit_chase']['status'] == 'active'
     assert len(neo.placed('S')) == 1               # only the hand sale; the engine sold nothing
-    assert any('STOPPED' in m for m in sent)
+    assert sum('STUCK' in m for m in sent) == 1
 
 
 def test_live_population_and_active_chase_flags(store, neo, monkeypatch):
@@ -339,7 +343,7 @@ def test_a_chase_with_no_bid_is_said_out_loud(store, neo, monkeypatch):
         clk.t += 5
         e.poll(None, now=T0 + timedelta(seconds=5 * k))
     assert store.find(r['id'])['status'] == 'closing'
-    assert sum('NO usable bid' in m for m in sent) == 1
+    assert sum('NO sellable bid' in m for m in sent) == 1   # repeats only after 15 min
 
 
 
@@ -406,8 +410,9 @@ def test_a_stuck_exit_is_nagged_once_a_day_with_the_booking_command(store, neo, 
     c = client_for(neo)
     r = live_record(store, neo, c)
     store.begin_close(r['id'], 'naked:stop')
-    store.update_trade_fields(r['id'], exit_chase={'status': 'needs_human', 'note': 'x',
-                                                    'sold': 0, 'remaining': LOT})
+    # the engine's only hand-off now: the account went flat with nothing sold
+    store.update_trade_fields(r['id'], exit_chase={'status': 'done', 'note': 'x',
+                                                    'sold': 0, 'remaining': 0})
     e, sent = engine(store, spot=1000.0, client=c)
     monkeypatch.setattr(e, '_step_closing', lambda kite, t, now: '')
     e.poll(None, now=T0)
@@ -439,6 +444,10 @@ def test_zebra_close_books_a_hand_exit_of_a_stuck_naked_record(store, neo, monke
     c = client_for(neo)
     r = live_record(store, neo, c)
     store.begin_close(r['id'], 'naked:stop')
+    c.place(C.OrderRequest(SYM, TOK, 'S', LOT, '9.50', c.new_tag()), reduce_only=True)
+    neo.set_quote(SYM, 9.5, 10.0)                  # sold by hand in the app: flat
+    from zebra import naked_neo
+    monkeypatch.setattr(naked_neo, 'default_client', lambda: c)
     monkeypatch.setattr('zebra.trade_store.get_store', lambda *a, **k: store)
     args = type('A', (), {'id': r['id'], 'exit_debit': 9.5, 'exit_spot': None,
                           'reason': 'stop'})()

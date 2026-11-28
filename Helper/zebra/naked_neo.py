@@ -159,12 +159,17 @@ class NeoBroker:
             except Exception as e:
                 return BuyResult('rejected', message='not sent: tag not persisted (%s)' % e,
                                  retry=False)
-        px = '%.2f' % float(limit)
+        tick = float(getattr(row, 'tick_size', 0) or 0)
+        lim = float(limit)
+        if tick > 0:
+            lim = round(int(lim / tick + 1e-9) * tick, 2)    # on NEO's grid, never above
+        px = '%.2f' % lim
         req = client_mod.OrderRequest(row.trading_symbol, row.token, 'B', int(qty), px, tag)
         unclear_reply = ''
         try:
             c.place(req)
         except client_mod.Rejected as e:
+            _release(c, row.trading_symbol)
             return BuyResult('rejected', message=str(e), retry=classify_reject(str(e)),
                              tag=tag)
         except (client_mod.NotOwner, client_mod.Auth, client_mod.Unavailable,
@@ -180,13 +185,17 @@ class NeoBroker:
             res = orders.cancel_and_confirm(c, res.order_no, tag, wait_s=self.wait_s,
                                             expect_qty=int(qty), sleep=self._sleep,
                                             clock=self._clock)
-        return self._result(res, orders, tag, row, unclear_reply)
+        out = self._result(res, orders, tag, row, unclear_reply)
+        if out.status in ('rejected', 'unfilled'):
+            _release(c, row.trading_symbol)       # review A8/L2: hold nothing, claim nothing
+        return out
 
     @staticmethod
     def _result(res, orders, tag, row, unclear_reply):
         from .naked_entry import BuyResult
         extra = dict(tag=tag, order_id=res.order_no or None, neo_symbol=row.trading_symbol,
-                     neo_token=str(row.token))
+                     neo_token=str(row.token),
+                     neo_tick=float(getattr(row, 'tick_size', 0) or 0) or None)
         if res.state == orders.FILLED and res.avg_price > 0:
             return BuyResult('filled', fill_price=round(float(res.avg_price), 2),
                              message='filled', **extra)
@@ -203,14 +212,26 @@ class NeoBroker:
         return BuyResult('unclear', message=why, filled_qty=int(res.filled or 0), **extra)
 
 
+def _release(c, symbol: str) -> None:
+    """Give the contract claim back when the account holds nothing in it.
+    Best effort: a stale claim only reserves the contract to zebra."""
+    try:
+        c.release_if_flat(symbol)
+    except Exception as e:                          # noqa: BLE001
+        logger.warning('release %s: %s', symbol, e)
+
+
 def quote_bid_fn(kite, kite_symbol: str,
                  floor: Optional[float] = None) -> Callable[[], Optional[dict]]:
     """{bid, ask} of the long from Kite -- the bots' quote source. None on any failure.
 
+    A `floor` of 0 (two sessions from expiry) takes ANY positive bid.
+
     The SALE after a fired exit takes a reliable bid, or -- because the book is
     often wide right after a stop collapse (review R9) -- an unreliable one at
-    or above `floor` (half the bid that fired the exit). Below the floor a wide
-    book's bid is treated as garbage, and the chase waits (and alerts at 60 s).
+    or above `floor` (by exit reason: `naked_exit.NakedExitEngine._floor`).
+    Below the floor a wide book's bid is treated as garbage, and the chase
+    waits (and alerts).
     """
     from . import strikes as strikes_mod
 
@@ -223,7 +244,7 @@ def quote_bid_fn(kite, kite_symbol: str,
         if not d or d.get('error'):
             return None
         bid = float(d.get('bid') or 0)
-        if not d.get('reliable') and not (floor and bid >= floor > 0):
+        if not d.get('reliable') and not (floor is not None and bid >= floor and bid > 0):
             return None
         return {'bid': bid, 'ask': float(d.get('ask') or 0)}
     return q

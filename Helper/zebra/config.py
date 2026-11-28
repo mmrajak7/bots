@@ -662,11 +662,32 @@ _DEFAULTS = {
     # come from FEE_RATES. The paper shadow keeps the Kite Rs 20 (unchanged
     # mid-test), so live and paper fees differ BY DESIGN.
     'naked_brokerage_per_order': 0.0,
-    'naked_entry_wait_sec': 10,        # read the book back this long before cancelling
+    'naked_entry_wait_sec': 5,         # read the book back this long before cancelling
     'naked_exit_reprice_sec': 10,      # a working exit sell older than this is re-priced
-    'naked_exit_max_reprices': 12,     # then the exit is handed to a human (red alert)
     'naked_adopt_absent_grace_sec': 600,  # an unclear entry absent this long + no position = nothing
-    'naked_option_tick': 0.05,         # NSE stock-option tick
+    'naked_option_tick': 0.05,         # fallback only: the tick comes from the NEO scrip row
+    # STT on an option SELL as NEO's options contract note charges it (BTST
+    # session, 2026-11-28: 0.15% of sell premium). Applied to LIVE naked
+    # records only; the paper book keeps `fee_rates` unchanged mid-test.
+    'naked_stt_sell_pct': 0.15,
+    'naked_entry_chase_max_sec': 45,   # wall-clock budget for one signal's whole chase
+    'naked_entry_chase_rounds': 6,     # unfilled entry: re-quote and re-send this many times in all
+    'naked_entry_buffer_ticks': 1,     # entry limit = current ask + this many ticks (marketable)
+    'naked_entry_max_chase_pct': 5.0,  # never pay more than the FIRST ask x (1 + this %)
+    'naked_entry_heartbeat_max_age_sec': 120, # a live entry needs a POLLING monitor beat this fresh
+    'naked_entry_heartbeat_wait_sec': 20, # wait this long in-cycle for such a beat before refusing
+    'naked_exit_alert_steps': 12,      # troubles or re-prices in a row before the chase alerts (it never stops)
+    'naked_exit_alert_repeat_sec': 900, # a still-troubled chase re-alerts this often
+    'naked_exit_max_offset_ticks': 5,  # a re-priced sell goes at most this many ticks under the bid
+    'naked_exit_floor_stop': 0.5,      # STOP: a wide book is sold into at >= this x the trigger bid
+    'naked_exit_floor_target': 0.9,    # TP/TIME: a wide book is sold into at >= this x the trigger bid
+    'naked_exit_floor_decay_sec': 600, # after this long unsold, TP/TIME take the STOP floor
+    'naked_blind_alert_sec': 300,      # an open position with no usable bid/spot this long is alerted
+    'naked_no_bid_alert_sec': 60,      # a chase with no usable bid this long is alerted
+    'naked_raise_alert_polls': 3,      # a record raising this many polls in a row is alerted unwatched
+    'naked_delivery_alert_sessions': 4, # an open naked long this close to expiry is alerted daily
+    'naked_adopt_escalate_sec': 600,   # an unresolved naked order older than this is alerted ...
+    'naked_adopt_repeat_sec': 3600,    # ... and re-alerted this often
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
     'time_sl_days_before_expiry': 6,
@@ -1013,7 +1034,11 @@ _DEFAULTS = {
         # stored leg prices instead of guessed at later.
         # VERIFY AGAINST A LIVE CONTRACT NOTE BEFORE ANY GO-LIVE DECISION.
         'brokerage_per_order': 20.0,   # flat, per executed order
-        'stt_sell_pct': 0.10,          # SELL side only, on premium
+        # 0.10 -> 0.15 on 2026-11-28 (owner): an NEO options contract note
+        # (BTST, 11-27) charged 0.15% of sell premium; STT is statutory, so the
+        # same at Kite. Logged as a dated change in NAKED_100_TRADE_TEST.md.
+        # Fees are STAMPED at exit: records closed before keep their 0.10.
+        'stt_sell_pct': 0.15,          # SELL side only, on premium
         'exchange_pct': 0.03503,       # NSE options, both sides
         'sebi_pct': 0.0001,            # Rs 10 per crore
         'stamp_buy_pct': 0.003,        # BUY side only
@@ -1519,9 +1544,27 @@ NAKED_MAX_ORDERS_PER_SIGNAL = _int('naked_max_orders_per_signal')
 NAKED_BROKERAGE_PER_ORDER = _non_negative_num('naked_brokerage_per_order')
 NAKED_ENTRY_WAIT_SEC = _num('naked_entry_wait_sec')
 NAKED_EXIT_REPRICE_SEC = _num('naked_exit_reprice_sec')
-NAKED_EXIT_MAX_REPRICES = _int('naked_exit_max_reprices')
 NAKED_ADOPT_ABSENT_GRACE_SEC = _num('naked_adopt_absent_grace_sec')
 NAKED_OPTION_TICK = _num('naked_option_tick')
+NAKED_STT_SELL_PCT = _non_negative_num('naked_stt_sell_pct')
+NAKED_ENTRY_CHASE_MAX_SEC = _num('naked_entry_chase_max_sec')
+NAKED_ENTRY_CHASE_ROUNDS = _int('naked_entry_chase_rounds')
+NAKED_ENTRY_BUFFER_TICKS = _int('naked_entry_buffer_ticks')
+NAKED_ENTRY_MAX_CHASE_PCT = _num('naked_entry_max_chase_pct')
+NAKED_ENTRY_HEARTBEAT_MAX_AGE_SEC = _num('naked_entry_heartbeat_max_age_sec')
+NAKED_ENTRY_HEARTBEAT_WAIT_SEC = _num('naked_entry_heartbeat_wait_sec')
+NAKED_EXIT_ALERT_STEPS = _int('naked_exit_alert_steps')
+NAKED_EXIT_ALERT_REPEAT_SEC = _num('naked_exit_alert_repeat_sec')
+NAKED_EXIT_MAX_OFFSET_TICKS = _int('naked_exit_max_offset_ticks')
+NAKED_EXIT_FLOOR_STOP = _num('naked_exit_floor_stop')
+NAKED_EXIT_FLOOR_TARGET = _num('naked_exit_floor_target')
+NAKED_EXIT_FLOOR_DECAY_SEC = _num('naked_exit_floor_decay_sec')
+NAKED_BLIND_ALERT_SEC = _num('naked_blind_alert_sec')
+NAKED_NO_BID_ALERT_SEC = _num('naked_no_bid_alert_sec')
+NAKED_RAISE_ALERT_POLLS = _int('naked_raise_alert_polls')
+NAKED_DELIVERY_ALERT_SESSIONS = _int('naked_delivery_alert_sessions')
+NAKED_ADOPT_ESCALATE_SEC = _num('naked_adopt_escalate_sec')
+NAKED_ADOPT_REPEAT_SEC = _num('naked_adopt_repeat_sec')
 
 
 def _stop_ladder() -> tuple:

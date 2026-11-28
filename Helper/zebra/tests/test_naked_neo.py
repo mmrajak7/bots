@@ -192,3 +192,26 @@ def test_reject_classification(msg, retry):
 
 def test_ip_is_matched_as_a_word_not_a_substring():
     assert nn.classify_reject('price outside band for SHIPPING') is True
+
+
+# -- review fixes P7e (2026-11-28) -----------------------------------------------
+
+def test_a_fill_carries_the_contract_tick_from_the_scrip_row(neo):
+    r = broker(neo).buy(SYM, LOT, 10.2, ctx())
+    assert r.status == 'filled' and r.neo_tick == 0.05
+
+
+def test_an_unfilled_order_gives_the_contract_claim_back(neo):
+    r = broker(neo).buy(SYM, LOT, 9.5, ctx())          # rests, cancelled
+    assert r.status == 'unfilled' and C.owner_of(SYM) is None
+
+
+def test_a_book_rejected_order_gives_the_contract_claim_back(neo):
+    neo.rms_reject('RMS:Margin Exceeds')
+    r = broker(neo).buy(SYM, LOT, 10.2, ctx())
+    assert r.status == 'rejected' and C.owner_of(SYM) is None
+
+
+def test_a_fill_keeps_the_claim(neo):
+    broker(neo).buy(SYM, LOT, 10.2, ctx())
+    assert C.owner_of(SYM) == 'zbr'

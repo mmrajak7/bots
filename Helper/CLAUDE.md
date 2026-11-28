@@ -1108,7 +1108,35 @@ armed exit engine** (`exit_engine_problem`): with `--dry-run` on the crontab,
 --exit-debit <avg fill> --reason <tp|stop|time>`. Owner 2026-11-27: naked orders
 go through **Kotak NEO** via the shared `BOTS/kotak_neo` package (quotes stay on
 Kite); the −50% stop is a MONITORED stop (SL-M is refused for options by NEO's
-RMS). Go-live order:
+RMS).
+
+**Naked live -- review fixes P7e (2026-11-28, three independent reviews:
+architect, trader, ops; all said rehearsal GO / live NO-GO before them).** The
+exit chase NEVER hands itself to a human (troubles and re-prices alert, then
+re-alert every 15 min, while it keeps selling, at most 5 ticks under the bid).
+A wide book is sold into by exit reason (STOP >= 50% of the trigger bid,
+TP/TIME >= 90%, decaying to 50% after 10 min or in the delivery window); a
+reliable book always sells at its bid. A chase carried overnight waits out the
+opening buffer. Dry run / kill switch mid-exit CANCELS the working sell. A
+live entry needs the monitor's beat to say `polling`, <= 120 s old (it waits up
+to 20 s); every way out of `monitor_all` (return, crash, SIGTERM) releases the
+beat's naked-engine claim. The ENTRY chases up: ask + 1 tick, re-quoted when
+unfilled, up to 6 orders, never past the first ask + 5% (owner: "never miss
+entry"; the bound is the trader's). The slippage kill measures entries against
+that first ask (`entry_signal_ask`).
+
+**Naked live runbook (Pi, `../CROCODILE/venv/bin/python -m zebra ...`):**
+
+| situation | do |
+|---|---|
+| morning, or anything looks wrong | `naked-check` -- monitor beat + gate, NEO session day, halt, every open naked position and its chase, unresolved orders |
+| "order UNRESOLVED ... NO STOP" | look in the NEO app. Filled: `naked-resolve <parent id> --filled <avg>` (files the record; exits watch it). Not filled: `naked-resolve <parent id> --none` (refuses if the account holds the lot; `--force` only after checking the app) |
+| "exit is STUCK" / "re-prices without getting flat" | the engine is STILL selling. To take over by hand: cancel the WORKING order the alert names, sell in the app, then `close <id> --exit-debit <avg> --reason <tp/stop/time>` (it refuses while a sell works or the lot is held; `--force` only after checking the app) |
+| "account no longer holds it ... sold NOTHING" | it left the account (hand sale / overnight): `close <id> --exit-debit <avg> --reason ...` |
+| NEO session not today at 09:00 | the shared `kotak_neo` login owns it (`python -m kotak_neo status` from BOTS/); entries refuse cleanly; open exits cannot sell -- sell in the app |
+| monitor restart needed while a chase works | do not: wait for flat or the close (see the pull rule) |
+
+Go-live order:
 ETF_PI, then NIFTY BTST, then naked LAST. The
 nightly digest carries a "NIFTY ±3% on the open book" section
 (`zebra/book_shock.py`) — the rupee figure that judges the accepted
@@ -2062,14 +2090,25 @@ and ages out on its own; nothing is lost.
 15:35 — Would start but exits immediately (market closed)
 ```
 
-### ⚠ AFTER EVERY `git pull`: restart the monitor if the diff left `bcs/`
+### ⚠ AFTER EVERY `git pull`: restart the monitor if the diff touched code it runs
 
 **The rule, one line:**
 
 ```bash
-git pull --rebase && git diff --name-only HEAD@{1} HEAD | grep -qv '^Helper/bcs/' \
+git pull --rebase && git diff --name-only HEAD@{1} HEAD \
+  | grep -qE '^(Helper/(bcs|zebra|common|config)/|kotak_neo/)' \
   && pkill -f "bcs.spread_monitor --cron"   # next */5 tick restarts it
 ```
+
+> **CORRECTED 2026-11-28 (ops review F9).** The old line was
+> `grep -qv '^Helper/bcs/'` -- "restart if any file OUTSIDE `bcs/` changed" --
+> so a pull that touched ONLY the monitor's own code skipped the restart. The
+> monitor runs `bcs/`, `zebra/`, `common/`, the config defaults and (for naked
+> exits) `BOTS/kotak_neo`; any of them changing means a restart. `pkill` sends
+> SIGTERM, which the monitor turns into a clean exit that releases its
+> heartbeat's naked-engine claim. **Once naked exits are live, check
+> `python -m zebra naked-check` first: never restart while a chase is
+> working** -- restart in a market-closed window instead.
 
 **Why only this one process.** `python -m zebra run` is ONE-SHOT — a cycle runs
 18-46s and exits — so zebra picks up new code on the next tick with no

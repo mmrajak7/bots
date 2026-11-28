@@ -46,3 +46,12 @@ def test_the_adoption_sweep_does_not_depend_on_the_entry_switch():
     src = _body()
     i = src.index('naked_adopt.sweep(')
     assert "NAKED_LIVE != 'off'" not in src[max(0, i - 400):i]
+
+
+def test_an_unclear_entry_is_swept_again_at_the_end_of_the_same_cycle():
+    """Review L3: a second sweep after the entries, under the same guards."""
+    src = _body()
+    b = src.index('naked_entry.end_cycle()')
+    j = src.index('naked_adopt.sweep(', b)
+    window = src[b:j]
+    assert 'if not dry_run:' in window and 'try:' in window and 'unresolved_twins' in window
