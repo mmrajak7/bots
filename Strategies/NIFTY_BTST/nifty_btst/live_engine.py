@@ -475,6 +475,13 @@ class LiveEngine(Engine):
                     return p, h
         return None
 
+    def _booked_qty(self, p: Dict[str, Any], tag: str) -> int:
+        """Lots this record booked as FILLED by the send carrying `tag`."""
+        lv = p.get('live') or {}
+        n = int(p.get('qty') or 0) if lv.get('entry_tag') == tag else 0
+        return n + sum(int(f.get('qty') or 0) for f in lv.get('exit_fills', [])
+                       if f.get('tag') == tag)
+
     def _search_orphan(self, now: datetime, intent: Dict[str, Any]) -> None:
         tag = str(intent.get('tag'))
         try:
@@ -485,11 +492,13 @@ class LiveEngine(Engine):
             return
         hits = [o for o in book if o.tag == tag]
         owner = self._leg_by_tag(tag)
-        if hits and owner is not None and hits[0].terminal:
+        if (hits and owner is not None and hits[0].terminal
+                and self._booked_qty(owner[0], tag) == hits[0].filled):
             # the send belongs to a record that was already settled another way
-            # (trade book, positions, the owner's confirm-held) and the order is
-            # FINAL: accounted for, not untracked (review 8, F1/F1b). A WORKING
-            # order still trips the kill below: nothing may stay live unseen.
+            # (trade book, positions, the owner's confirm-held), the order is
+            # FINAL and the record booked exactly what it filled: accounted for,
+            # not untracked (review 8, F1/F1b). A WORKING order, or a fill the
+            # record did not book, still trips the loud kill below.
             p, leg = owner
             if not leg.get('order_no'):
                 leg['order_no'] = hits[0].order_no
@@ -1402,8 +1411,9 @@ class LiveEngine(Engine):
         self.store.event(now, 'EXIT_SENDS_FAILING', id=p['id'], count=n, why=why)
         self._throttled('exit_failing_%d' % p['id'], now, 120,
                         'EXIT #%d %s: NEO did not take our last %d SELLs (%s). SELL IN THE APP '
-                        'NOW -- first look at Orders: if a BTST SELL is working there, leave it. '
-                        'After selling: `live-book-external %d --price X --yes`.'
+                        'NOW -- first look at Orders and CANCEL any BTST SELL working there (two '
+                        'SELLs would leave the account SHORT). After selling: '
+                        '`live-book-external %d --price X --yes`.'
                         % (p['id'], p['symbol'], n, why, p['id']))
 
     def _retryable(self, code: Any) -> bool:
@@ -2545,6 +2555,10 @@ class LiveEngine(Engine):
         if True:
             trade = self._trade_for(leg)
             if trade is not None:
+                if trade.order_no and not leg.get('order_no'):
+                    # journalled, or a restart reads our own order as an orphan
+                    # (review 8, F1b)
+                    self.journal.bound(now, leg['tag'], trade.order_no, 'trade')
                 self._on_fill(p, leg, trade, now, trade.filled)
             else:
                 view = OrderView(order_no=str(leg.get('order_no') or 'CONFIRMED-' + leg['tag']),

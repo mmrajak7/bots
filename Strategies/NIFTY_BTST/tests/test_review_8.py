@@ -22,6 +22,7 @@ from nifty_btst.broker import NeoBroker, OrderView, in_scope
 from nifty_btst.journal import Journal
 from nifty_btst.live_engine import LiveEngine
 from nifty_btst.neo_client import LoginBrake, NeoAuthError, NeoReader, NeoTrader
+from nifty_btst.live_cli import _brake_path as REAL_BRAKE_PATH   # bound before conftest patches
 
 CREDS = {'consumer_key': 'k', 'mobile_number': '+910000000000', 'ucc': 'U',
          'mpin': '0000', 'totp_secret': 'JBSWY3DPEHPK3PXP'}
@@ -238,7 +239,8 @@ def test_f2_engine_with_a_refused_mpin_logs_in_once_not_all_day(cfg, tmp_path, m
 def test_build_broker_gives_every_btst_process_one_shared_brake_file(monkeypatch, tmp_path):
     from nifty_btst import live_cli
     monkeypatch.setenv('BTST_LIVE_STATE_DIR', str(tmp_path / 'sl'))
-    assert live_cli._brake_path() == tmp_path / 'sl' / live_cli.LOGIN_BRAKE_FILE
+    assert REAL_BRAKE_PATH() == tmp_path / 'sl' / live_cli.LOGIN_BRAKE_FILE
+    assert live_cli._brake_path() != REAL_BRAKE_PATH()   # conftest keeps tests off it
 
 
 # ------------------------------------------------- R8-2 exit sends failing
@@ -360,8 +362,7 @@ def test_f1b_confirm_held_on_an_unclear_buy_then_restart_binds_not_kills(cfg, tm
     rig.restart()
     rig.start(T(MON, '10:05:00'))
     assert not rig.store.kill().get('tripped'), rig.store.kill()
-    assert any('already settled on #1' in m for m in rig.notifier.sent)
-    tag = state(rig)['live']['leg_history'][-1]['tag']
+    tag = state(rig)['live']['leg_history'][-1]['tag']      # journalled at the confirm
     assert tag not in [u['tag'] for u in rig.journal.unresolved()]
 
 
@@ -377,6 +378,62 @@ def test_negative_control_a_working_order_under_a_settled_tag_still_trips(cfg, t
     rig.broker.blank_book = False
     rig.restart()
     rig.start(T(MON, '10:05:00'))
+    k = rig.store.kill()
+    assert k.get('tripped') and k.get('loud') and 'UNTRACKED' in k['reason'], k
+
+
+def test_an_orphan_that_is_a_settled_final_order_is_bound_not_killed(cfg, tmp_path, market):
+    """The belt behind the journalling: a settled leg whose BOUND line is
+    missing (an older journal) and whose FINAL order filled exactly what the
+    record booked is bound with a note, never a loud kill."""
+    rig = marked(cfg, tmp_path, market)
+    holding(rig)
+    rig.engine.reconcile_ok = True
+    rig.broker.place_faults = ['timeout_reached']
+    rig.broker.blank_book = True
+    rig.market.set(CE_MON, 70.0, bid=69.8, ask=70.2)
+    rig.go(T(MON, '11:00:00'))
+    for i in range(1, 100):
+        rig.service(T(MON, '11:00:00') + timedelta(seconds=i))
+        if state(rig)['status'] == 'closed':
+            break
+    tag = _sells(rig)[0].tag
+    lines = [ln for ln in rig.journal.path.read_text().splitlines()
+             if not ('"BOUND"' in ln and tag in ln)]
+    rig.journal.path.write_text(''.join(ln + chr(10) for ln in lines))
+    rig.broker.blank_book = False
+    rig.restart()
+    rig.start(T(MON, '11:05:00'))
+    assert not rig.store.kill().get('tripped'), rig.store.kill()
+    assert any('already settled on #1' in m for m in rig.notifier.sent)
+
+
+def test_negative_control_a_fill_the_record_did_not_book_still_trips(cfg, tmp_path, market):
+    """A FINAL order under a settled leg's tag whose fill differs from what
+    the record booked is not accounted for: loud kill, not a silent bind."""
+    rig = marked(cfg, tmp_path, market)
+    holding(rig)
+    rig.engine.reconcile_ok = True
+    rig.broker.place_faults = ['timeout_reached']
+    rig.broker.blank_book = True
+    rig.market.set(CE_MON, 70.0, bid=69.8, ask=70.2)
+    rig.go(T(MON, '11:00:00'))
+    for i in range(1, 100):
+        rig.service(T(MON, '11:00:00') + timedelta(seconds=i))
+        if state(rig)['status'] == 'closed':
+            break
+    tag = _sells(rig)[0].tag
+    # the journal lost the BOUND line, and the broker's row shows MORE filled
+    lines = [ln for ln in rig.journal.path.read_text().splitlines()
+             if not ('"BOUND"' in ln and tag in ln)]
+    rig.journal.path.write_text(''.join(ln + chr(10) for ln in lines))
+    for o in rig.broker.orders:
+        if o['GuiOrdId'] == tag:
+            o.update({'qty': str(2 * LOT), 'fldQty': str(2 * LOT)})
+    rig.broker._save()
+    rig.broker.blank_book = False
+    rig.restart()
+    rig.start(T(MON, '11:05:00'))
     k = rig.store.kill()
     assert k.get('tripped') and k.get('loud') and 'UNTRACKED' in k['reason'], k
 

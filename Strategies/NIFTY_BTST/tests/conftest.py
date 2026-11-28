@@ -130,3 +130,11 @@ def _login_allowed_here(monkeypatch):
     from nifty_btst import neo_client
     monkeypatch.setattr(neo_client, 'login_host_ok', lambda: True)
     monkeypatch.setattr(neo_client, 'clock_synced', lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _brake_file_never_the_real_one(monkeypatch, tmp_path):
+    """No test may write the REAL state_live/neo_login.json: on the Pi a
+    refused fake login there would latch the live BTST login (review 8)."""
+    from nifty_btst import live_cli
+    monkeypatch.setattr(live_cli, '_brake_path', lambda: tmp_path / 'neo_login_test.json')
