@@ -65,6 +65,7 @@
  "fo_rss_url": "https://nsearchives.nseindia.com/content/RSS/Circulars.xml",
  "fo_circular_base": "https://nsearchives.nseindia.com/content/circulars/",
  "fo_scan_settle_days": 7,
+ "fo_scan_retry_window": 300,
  "fo_scan_pause_s": 0.2,
  "fo_vet_timeout_s": 300,
  "fo_vet_max_circulars": 100,

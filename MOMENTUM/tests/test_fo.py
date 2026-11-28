@@ -190,7 +190,7 @@ class FakeNSE:
 
 
 CFG = {"fo_scan_seed": 77100, "fo_rss_url": "https://x/Circulars.xml", "fo_circular_base": "https://x/circulars/",
-       "fo_scan_settle_days": 7, "fo_scan_pause_s": 0}
+       "fo_scan_settle_days": 7, "fo_scan_retry_window": 300, "fo_scan_pause_s": 0}
 
 
 class TestScan(unittest.TestCase):
@@ -223,6 +223,16 @@ class TestScan(unittest.TestCase):
         self.assertEqual((st["next_n"], sorted(st["hits"])), (77111, ["77103", "77104"]))
         self.assertEqual(st["hits"]["77103"]["date"], "2026-10-14")
         self.assertEqual(F.candidates(self.d, "2026-08-01", "2026-11-30", 60)[0]["ref"], "FAOP77103")
+
+    def test_old_misses_are_not_asked_again(self) -> None:
+        cfg = dict(CFG, fo_scan_retry_window=5)                       # top 77110: only 77106..77110 count as recent
+        F.scan(self.d, cfg, get=self.nse.get, to_text=lambda b: b[5:].decode())
+        util.set_clock(lambda: dt.datetime(2026, 12, 1, 19, 5, tzinfo=util.IST))
+        n_calls = len(self.nse.calls)
+        F.scan(self.d, cfg, get=self.nse.get, to_text=lambda b: b[5:].decode())
+        asked = sorted(int(u.split("FAOP")[1][:5]) for u in self.nse.calls[n_calls:] if "FAOP" in u)
+        self.assertEqual(asked, [77106, 77107, 77108, 77109, 77110])
+        self.assertEqual(sorted(F.load_scan(self.d, 0)["misses"]), ["77106", "77107", "77108", "77109", "77110"])
 
     def test_html_200_is_not_a_circular(self) -> None:
         def get(url):  # noqa: ANN001, ANN202

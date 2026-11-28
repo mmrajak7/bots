@@ -188,9 +188,12 @@ def scan(d: Path, cfg: Dict[str, Any], get: Callable[[str], Tuple[int, bytes]] =
 
     stopped = ""
     try:
-        # a recent 404 is asked again at most once a day (the 30-min evening re-runs only fetch new numbers)
+        # a recent 404 is asked again at most once a day (the 30-min evening re-runs only fetch new numbers).
+        # "Recent" = first missed within the settle window AND within the last fo_scan_retry_window numbers below
+        # the RSS top: a seed scan's ~2,000 old misses are other departments' circulars, never re-asked.
+        window = int(cfg["fo_scan_retry_window"])
         for k, (first, last) in sorted(((int(k), v) for k, v in st["misses"].items()), key=lambda x: x[0]):
-            if dt.date.fromisoformat(first) + settle >= today and last < today.isoformat():
+            if k > top - window and dt.date.fromisoformat(first) + settle >= today and last < today.isoformat():
                 fetch(k)
                 time.sleep(pause)
         n = int(st["next_n"])
@@ -202,7 +205,8 @@ def scan(d: Path, cfg: Dict[str, Any], get: Callable[[str], Tuple[int, bytes]] =
                 save()
             time.sleep(pause)
         # misses older than the settle window are final: drop them so the state file stays small
-        st["misses"] = {k: v for k, v in st["misses"].items() if dt.date.fromisoformat(v[0]) + settle >= today}
+        st["misses"] = {k: v for k, v in st["misses"].items()
+                        if int(k) > top - window and dt.date.fromisoformat(v[0]) + settle >= today}
     except FoVetError as e:
         stopped = str(e)
     st["rss_max"] = top
