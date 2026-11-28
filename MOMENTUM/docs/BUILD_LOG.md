@@ -133,3 +133,17 @@
      re-ingest never books twice. RUNBOOK: whole overlay, arm deadline 19:45 Mon, pkill pattern, DRY-2 by cron.
   NOT fixed (January build, deadline before 31 Dec): sells / decide_live / E26 expiry / corporate actions / TEST
   sell; signal day from Kite (H3); off-box backup of all state (O8); dead-man ping (O2, owner); T5/T10/T11 frozen.
+
+## 2026-11-28 — January slice starts (branch momentum-jan, worktree BOTS_jan; spec SRS/MOMENTUM_BUILD_SPEC_JAN.md)
+- Deployed 6075d99 + e30a779 to the Pi at 09:40: 153/153 Pi tests, setup.sh re-run (pending-only catch-up + cron.out
+  lines in), poller restarted on the new code. Pi CLI 2.1.278 = claude_version pin.
+- Owner decisions: D48 fully automatic Dec-Mar; D49 SELLS IN THE AFTERNOON (14:50, ladder to 15:05, gate 15:06, buys
+  15:10 from the sale money; pre-open dropped); D50 DDPI active on YL6478; D51 automatic TEST lot outside the 2L
+  (buy ~9 Dec, sells 14 + 17 Dec); D52 extra share (January slice, never before 1 Dec); dead-man ping later.
+- Research: Zerodha credits 100% of a settled-holdings sale the same day since 7 Oct 2024 (T1 shares: next day). The
+  margins() field showing it is UNVERIFIED -> the TEST sell logs the fields each minute.
+- Built `pipeline.decide_live` (ledger -> research Book state, Book._decide unchanged; NO_CHAIN / NO_SCORE / RANK
+  reasons; D-L19 written-off after > DEAD_GAP sessions without a row). KA test: 83 months 2020-01..2026-11, 83 equal
+  (312 sells, 332 buys); negative control (drop a holding) caught 82/82 months. The KA run never meets a stuck sell, a
+  pending buy or a stopped name at a rebalance, so 7 planted tests cover them against the research Book built
+  directly. Suite 161/161 on the PC.

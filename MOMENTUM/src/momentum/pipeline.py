@@ -306,6 +306,106 @@ def decide_from_cash(M: Modules, c: Context, m: str, cash: float, n: int) -> Dic
     return {"signal_day": c.mk.sessions[s], "buys": out, "ranked": ranked}
 
 
+@dataclass
+class LiveHolding:
+    """One live position as decide_live sees it (January spec §4.1). state: held | selling. bought: the first buy
+    date (ISO), used to find the chain the ledger ISIN belonged to at the buy."""
+    position_id: str
+    isin: str
+    state: str
+    bought: str
+
+
+@dataclass
+class LivePending:
+    position_id: str
+    isin: str
+
+
+def chain_for(mk: Any, isin: str, s: int) -> Optional[int]:
+    """The research chain that carried the ISIN on a row at or before the signal session (Market.chain_of_isin, the
+    lookup the research merger swap uses). None -> NO_CHAIN."""
+    return mk.chain_of_isin(isin, s)
+
+
+def decide_live(M: Modules, c: Context, m: str, holdings: Sequence[LiveHolding], pending: Sequence[LivePending],
+                n: int) -> Dict[str, Any]:
+    """Month m's decision from the REAL book (frozen design §4.1; January spec §4.1). The ledger is mapped onto a
+    research Book state and Book._decide runs UNCHANGED (busy filter, frozen count incl. pending buys):
+      held                               -> Pos(state held)
+      selling                            -> Pos(state selling)       (busy: no slot, never a buy candidate)
+      pending buy                        -> pending_buys entry       (counts in frozen)
+      held, no CM row for > DEAD_GAP sessions up to the signal day -> left out, reported WRITTEN_OFF (D-L19: the
+          research freezes from the last row with look-ahead and releases the slot at t_gap + DEAD_GAP; the live
+          book cannot know a gap will last, so a shorter gap stays held)
+      ISIN maps to no chain               -> left out (slot freed, FD §4.1), sell reason NO_CHAIN
+    Sell reason: RANK when the chain is ranked (rank > sell_rank), NO_SCORE when it has no score (absent from the
+    order). -> {signal_day, sells, buys, written_off, ranked}."""
+    N = M.N
+    spec = N.Spec(account=1.0)
+    if spec.gate is not None or spec.arm != "BLEND" or spec.n != n or spec.mode != "buffer":
+        raise PipelineError(f"unexpected Spec defaults: gate={spec.gate} arm={spec.arm} n={spec.n} mode={spec.mode}")
+    mk = c.mk
+    s = mk.sig(m)
+    book = N.Book(mk, c.sc, spec, mk.G)
+    by_chain: Dict[int, List[LiveHolding]] = {}
+    no_chain: List[LiveHolding] = []
+    written_off: List[Dict[str, Any]] = []
+    pid = 0
+    for h in holdings:
+        if h.state not in ("held", "selling"):
+            raise PipelineError(f"{h.position_id}: bad live state {h.state}")
+        ch = chain_for(mk, h.isin, s)
+        if ch is None:
+            if h.state == "held":                  # a sell already under way needs no decision (it is no buy candidate)
+                no_chain.append(h)
+            continue
+        last = mk.last_row(ch, s)
+        if h.state == "held" and (last < 0 or s - last > N.DEAD_GAP):
+            written_off.append({"position_id": h.position_id, "isin": h.isin, "chain": int(ch),
+                                "last_row": mk.sessions[last] if last >= 0 else None})
+            continue
+        pid += 1
+        book.pos[pid] = N.Pos(pid, ch, 0, h.bought[:7], [], state=h.state, chains=[ch])
+        by_chain.setdefault(ch, []).append(h)
+    for b in pending:
+        ch = chain_for(mk, b.isin, s)
+        if ch is None:
+            raise PipelineError(f"pending buy {b.position_id} {b.isin}: no chain (a pending buy must map)")
+        book.pending_buys.append([ch, 0.0, s, 1, m])
+    sells, buys, off = book._decide(m)
+    if off:
+        raise PipelineError("the gate is off in a gate-less Spec")
+    held_chains = [q.c for q in book.pos.values() if q.state == "held"]
+    order = c.sc.order(spec.arm, m, spec.pool, held_chains)
+    rank = {ch: k + 1 for k, ch in enumerate(order)}
+
+    def score(ch: int) -> Optional[int]:
+        v = c.sc.score(spec.arm, ch, m, spec.pool)
+        return None if v is None else int(round(1000 * v))
+    out_sells: List[Dict[str, Any]] = []
+    left = list(sells)
+    for ch in sorted(set(sells)):
+        for h in [h for h in by_chain.get(ch, []) if h.state == "held"]:
+            if ch not in left:
+                break
+            left.remove(ch)
+            out_sells.append({"position_id": h.position_id, "isin": h.isin, "chain": int(ch),
+                              "symbol": mk.sym_at(ch, s), "reason": "RANK" if ch in rank else "NO_SCORE",
+                              "rank": rank.get(ch), "score_milli": score(ch)})
+    if left:
+        raise PipelineError(f"sell chains not matched to a live position: {left}")
+    for h in no_chain:
+        out_sells.append({"position_id": h.position_id, "isin": h.isin, "chain": None, "symbol": None,
+                          "reason": "NO_CHAIN", "rank": None, "score_milli": None})
+    out_buys = [{"chain": int(ch), "symbol": mk.sym_at(ch, s), "isin": c.p.isins[int(c.p.isin_idx[ch, s])],
+                 "series": series_name(M, c.p, ch, s), "rank": rank[ch], "score_milli": score(ch)} for ch in buys]
+    ranked = [{"chain": int(ch), "symbol": mk.sym_at(ch, s), "rank": k + 1, "score_milli": score(ch)}
+              for k, ch in enumerate(order)]
+    return {"signal_day": mk.sessions[s], "sells": sorted(out_sells, key=lambda x: x["position_id"]),
+            "buys": out_buys, "written_off": written_off, "ranked": ranked}
+
+
 def series_name(M: Modules, p: Any, ch: int, s: int) -> str:
     code = int(p.series[ch, s])
     names = {v: k for k, v in M.J.SERIES.items()}
