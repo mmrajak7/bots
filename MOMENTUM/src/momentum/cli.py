@@ -370,6 +370,7 @@ def cmd_morning(x: Ctx, a: argparse.Namespace) -> int:
     api = x.api(tok)
     env = x.env(api)
     h = holdings_snapshot(x, api)
+    ca_credits(env, api)                       # January spec §7: book split / bonus credits before any check
     if pend:
         probs = preflight(x, api, full=True)
         if probs:
@@ -423,9 +424,35 @@ def cmd_afternoon(x: Ctx, a: argparse.Namespace) -> int:
     api = x.api(tok)
     env = x.env(api)
     h = holdings_snapshot(x, api)
+    ca_credits(env, api)                       # a split / bonus credited since the morning: booked before 14:45
     E.afternoon(env, h, lambda: preflight(x, api, full=True))
     write_ledger(x)
     return 0
+
+
+def ca_credits(env: E.Env, api: Any) -> None:
+    from . import corpact as CA
+    try:
+        for line in CA.credit_check(env, CA.holdings_rows(api)):
+            log.info("ca: %s", line)
+    except Exception as e:  # noqa: BLE001 - a CA check bug must not stop the order steps; the holdings checks still run
+        log.exception("ca credit check failed")
+        env.alert("CA_CHECK", f"corporate-action credit check failed ({type(e).__name__}: {str(e)[:120]})")
+
+
+def cmd_ca_scan(x: Ctx, a: argparse.Namespace) -> int:
+    """Daily: NSE corporate actions for the book's names (January spec §7)."""
+    from . import corpact as CA
+    from . import pipeline as P
+    lg = L.replay(x.journal.read())
+    if not CA.book_positions(lg):
+        return 0
+    M = P.import_research(resolve(x.home, x.cfg["srs_dir"]), Path(x.cfg["_nse_data"]))
+    env = x.env(None)
+    r = CA.scan(env, M.CA)
+    log.info("ca-scan: %s", r)
+    print(json.dumps(r))
+    return 0 if r.get("ok") else 4
 
 
 def cmd_test_plan(x: Ctx, a: argparse.Namespace) -> int:
@@ -623,7 +650,8 @@ def cmd_fo_vet(x: Ctx, a: argparse.Namespace) -> int:
 
 
 COMMANDS = {"evening": (cmd_evening, "order"), "fo-scan": (cmd_fo_scan, "fo"), "fo-vet": (cmd_fo_vet, "fo"), "morning": (cmd_morning, "order"),
-            "afternoon": (cmd_afternoon, "order"), "test-plan": (cmd_test_plan, "order"), "watch": (cmd_watch, "watch"), "canary": (cmd_canary, "canary"),
+            "afternoon": (cmd_afternoon, "order"), "test-plan": (cmd_test_plan, "order"),
+            "ca-scan": (cmd_ca_scan, "order"), "watch": (cmd_watch, "watch"), "canary": (cmd_canary, "canary"),
             "check-arm": (cmd_check_arm, "arm"), "kill-cancel": (cmd_kill_cancel, "kill"),
             "status": (cmd_status, None), "poller": (cmd_poller, "poller"), "manifest": (cmd_manifest, None),
             "isolation-test": (cmd_isolation, None), "repair-journal": (cmd_repair_journal, "order")}

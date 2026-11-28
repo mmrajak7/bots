@@ -304,6 +304,13 @@ def apply_cmd(env: Env, cmd: str, args: str) -> None:
                        and owner_leg(p) for ov in p.overlays})
         env.notify(f"{cmd} {args}: " + (f"changed {changed}" if changed else "nothing to change")
                    + (f"; still on: {left}" if left else ""))
+    elif cmd == "ca":                               # owner books a corporate-action quantity (January spec §7)
+        from . import corpact as CA
+        parts = args.split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            env.notify("usage: ca <isin> <new qty>")
+            return
+        env.notify(CA.owner_set_qty(env, parts[0].upper(), int(parts[1])))
     elif cmd == "resolve":
         parts = args.split()
         if len(parts) != 2 or parts[1] not in ("found", "absent"):
@@ -1351,6 +1358,8 @@ def three_way(env: Env, holdings_open: Dict[str, int], day: str) -> List[str]:
         # whether today's CNC buys / sells already show in holdings() is UNVERIFIED (U6): every combination of the
         # two sides is accepted here; the next morning's snapshot is the hard check (holdings >= book)
         ok = {opening, opening + b, opening - s, opening + b - s}
+        for m in ca_multiples(recs, lg, isin):   # a split / bonus credited after the opening snapshot
+            ok |= {x * m for x in list(ok)}
         if have not in ok:
             probs.append(f"{names[isin]}: Kite {have} vs opening {opening} (today's book buys {b}, sells {s})")
         if have < bq - b:                  # held before today, less today's sells: must show whatever U6 says
@@ -1364,6 +1373,19 @@ def three_way(env: Env, holdings_open: Dict[str, int], day: str) -> List[str]:
         env.alert("THREE_WAY", x)
     env.journal.append("NOTE", three_way=day, problems=probs)
     return probs
+
+
+def ca_multiples(recs: List[Dict[str, Any]], lg: L.Ledger, isin: str) -> List[int]:
+    """The share multiple of each PENDING_CA on this ISIN, from the overlay's reason 'ca <isin>|<ex> x<mult>'."""
+    out = []
+    for p in lg.positions.values():
+        if p.isin == isin and "PENDING_CA" in p.overlays:
+            on = [r for r in recs if r["type"] == "OVERLAY" and r["position_id"] == p.position_id
+                  and r["overlay"] == "PENDING_CA" and r["on"]]
+            m = re.search(r" x(\d+)$", str(on[-1].get("reason", ""))) if on else None
+            if m:
+                out.append(int(m.group(1)))
+    return out
 
 
 def holdings_short(lg: L.Ledger, holdings_open: Dict[str, int]) -> List[str]:

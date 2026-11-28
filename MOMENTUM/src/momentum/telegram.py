@@ -20,7 +20,7 @@ from . import util
 
 log = logging.getLogger("momentum.telegram")
 
-CMD_RE = re.compile(r"^(kill|hold|release|resolve|filled|ack|status)(?:\s+(.*))?$", re.I)
+CMD_RE = re.compile(r"^(kill|hold|release|resolve|filled|ack|status|ca)(?:\s+(.*))?$", re.I)
 CB_RE = re.compile(r"^a:([A-Za-z0-9]{8}):([a-z_]{1,16})$")
 
 
@@ -93,6 +93,7 @@ def new_approval_id() -> str:
 
 
 HELP = ("kill | hold <isin> | release <isin> | resolve <intent> found|absent | filled <intent> <qty> <avg_price> | "
+        "ca <isin> <new qty> | "
         "ack | status")
 
 

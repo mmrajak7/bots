@@ -28,6 +28,7 @@ REQUIRED_KEYS = (
     "fo_min_stock_futures", "fo_min_recent_circulars",
     "sell_place_at", "sell_ladder", "last_sell_place_at", "gate_at", "sell_ltp_mult", "sell_floor_mult",
     "gate_wait_sessions", "buy_envelope_slack", "extra_share_max_over", "test_lot",
+    "ca_lookback_days", "ca_ahead_days", "ca_lag_days",
 )
 TIME_KEYS = ("step_plan_at", "place_at", "last_place_at", "cancel_at", "reconcile_at", "token_first_poll",
              "token_alert_at", "token_deadline", "plan_final", "sell_place_at", "last_sell_place_at", "gate_at")
@@ -155,7 +156,7 @@ def load(home: Optional[Path] = None, overrides: Optional[Dict[str, Any]] = None
     for k in ("book_cash_open", "n_hold", "lock_tries", "rms_max", "defer_max", "nav_open"):
         if not isinstance(cfg[k], int) or cfg[k] <= 0:
             raise ConfigError(f"{k} must be a positive int")
-    for k in ("band_max", "probe_max", "gate_wait_sessions", "probe_reads", "probe_wait_s", "ladder_grace_min", "arm_cap_rupees_default", "vet_timeout_s", "kite_rps", "tg_retries",
+    for k in ("band_max", "probe_max", "gate_wait_sessions", "ca_lookback_days", "ca_ahead_days", "ca_lag_days", "probe_reads", "probe_wait_s", "ladder_grace_min", "arm_cap_rupees_default", "vet_timeout_s", "kite_rps", "tg_retries",
               "audit_top_n"):
         if not isinstance(cfg[k], int) or isinstance(cfg[k], bool) or cfg[k] <= 0:
             raise ConfigError(f"{k} must be a positive int")

@@ -18,7 +18,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 LEG_STATES = frozenset({"BUY_GATED", "PENDING_BUY", "NONE", "SKIPPED", "EXPIRED", "SELLING", "CLOSED"})
-OVERLAYS = frozenset({"VET_DEFERRED", "OWNER_HOLD", "AUDIT_HOLD", "SHARED_NAME_HOLD", "PRICE_FROZEN"})
+OVERLAYS = frozenset({"VET_DEFERRED", "OWNER_HOLD", "AUDIT_HOLD", "SHARED_NAME_HOLD", "PRICE_FROZEN",
+                      "PENDING_CA"})
 LEG_MOVES = {
     "BUY_GATED": {"EXPIRED"},                   # -> PENDING_BUY only through BUY_AMOUNT (the gate sets the amount)
     "PENDING_BUY": {"NONE", "SKIPPED", "EXPIRED"},
@@ -192,6 +193,8 @@ def replay(recs: List[Dict[str, Any]]) -> Ledger:
                 raise LedgerError(f"seq {r['seq']}: CA_CREDIT {p.position_id} before {r['qty_before']} != held "
                                   f"{p.held_qty}")
             p.ca_qty_delta += int(r["qty_after"]) - int(r["qty_before"])
+            if r.get("new_isin"):                  # a split that changed the ISIN: the book follows the shares
+                p.isin = str(r["new_isin"])
         elif t == "SELL_SESSION":
             p = _pos(lg, r)
             if r["date"] in p.sell_sessions:
