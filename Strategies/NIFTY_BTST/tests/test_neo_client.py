@@ -131,9 +131,13 @@ def test_login_failures_raise_auth_error(http):
     http.script[nc.LOGIN_PATH] = R(401, {'status': 'error', 'message': 'Invalid TOTP'})
     with pytest.raises(NeoAuthError, match='Invalid TOTP'):
         r.login()
+    # a refused login backs the brake off 5 min (review 8): each case below
+    # gets a fresh reader -- this test is about what each failure RAISES
+    r = NeoReader(CREDS, 'https://mis.example', 5, 5, session=http, totp_fn=lambda s: '1')
     http.script[nc.LOGIN_PATH] = requests.ConnectionError('down')
     with pytest.raises(NeoAuthError, match='ConnectionError'):
         r.login()
+    r = NeoReader(CREDS, 'https://mis.example', 5, 5, session=http, totp_fn=lambda s: '1')
     http.script[nc.LOGIN_PATH] = R(200, {'data': {'token': 'VIEW', 'sid': 'S1'}})
     http.script[nc.VALIDATE_PATH] = R(200, {'data': {'token': 'T', 'sid': 'S'}})   # no baseUrl
     with pytest.raises(NeoAuthError, match='baseUrl'):

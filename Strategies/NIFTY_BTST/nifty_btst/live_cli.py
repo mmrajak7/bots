@@ -39,7 +39,7 @@ from .journal import Journal
 from .kite_io import KiteMarket, Market, TokenError, load_token
 from .live_config import LIVE_OVERLAY_FILE, NeoConfig, load_live
 from .live_engine import RESUME_FILE, LiveEngine, LiveStore
-from .neo_client import (CredentialsError, EnvelopePolicy, NeoReader, NeoTrader,
+from .neo_client import (CredentialsError, EnvelopePolicy, LoginBrake, NeoReader, NeoTrader,
                          NeoUnavailable, load_credentials, pin_ipv4)
 from .neo_order_probe import PROBE_MAX_PREMIUM_RS, OrderProbe, ProbeRefused
 from .neo_probe import run_probe
@@ -161,11 +161,22 @@ def _policy(neo: NeoConfig) -> EnvelopePolicy:
                           neo.rejected_stcodes, neo.empty_per_report)
 
 
+#: the BTST login brake's per-day state (review 8, F2). ONE file for every BTST
+#: process -- live, rehearsal and the probes all log in to the same account,
+#: so their refusals count together.
+LOGIN_BRAKE_FILE = 'neo_login.json'
+
+
+def _brake_path() -> Path:
+    return state_dir('live') / LOGIN_BRAKE_FILE
+
+
 def _reader(neo: NeoConfig, trader: bool) -> NeoReader:
     creds = load_credentials(neo.credentials_file)
     cls = NeoTrader if trader else NeoReader
+    brake = LoginBrake(_brake_path())
     return cls(creds, neo.login_url, neo.http_timeout_sec, neo.login_timeout_sec,
-               policy=_policy(neo))
+               policy=_policy(neo), brake=brake)
 
 
 def build_broker(execution: str, neo: NeoConfig, sdir: Path, clock: Callable[[], datetime]

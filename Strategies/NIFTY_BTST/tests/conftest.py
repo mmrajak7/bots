@@ -120,3 +120,13 @@ def market():
 @pytest.fixture
 def notifier():
     return NullNotifier()
+
+
+@pytest.fixture(autouse=True)
+def _login_allowed_here(monkeypatch):
+    """Tests log in against fakes on a laptop that has no LOGIN_HOST (which
+    the real login refuses, review 8 A3): every test runs as the login host
+    with an unknown (never blocking) clock. Brake tests override these."""
+    from nifty_btst import neo_client
+    monkeypatch.setattr(neo_client, 'login_host_ok', lambda: True)
+    monkeypatch.setattr(neo_client, 'clock_synced', lambda: None)

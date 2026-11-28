@@ -164,7 +164,16 @@ to send again.
   positively valid reads AND positions agree nothing happened. Alerts every minute meanwhile.
   An unclear **SELL** (a stop in a falling market) waits its own `neo.exit_unknown_grace_sec`
   (90 s, never below `positions_lag_sec`) and needs THREE valid reads (review H1, 2026-11-28):
-  NEO shows a placed order at once and echoes our tag (measured 11-27).
+  NEO shows a placed order at once and echoes our tag (measured 11-27). Residual (review 8, F3):
+  a SELL hidden from the book for over 90 s would be sent twice (account SHORT if both fill), so
+  its UNKNOWN alert says: a BTST SELL working in the app -> CANCEL it there. The worst
+  place-to-visible lag is measured on 30 Nov.
+- From the 2nd EXIT send in a row that NEO does not take (refused, rejected, accepted then
+  rejected, unclear, session dead) the owner gets "SELL IN THE APP NOW" every 2 minutes; a placed
+  SELL or a fill resets the count (review 8, T8/A4). With no quotes and an exit due, the alert
+  says the bot CANNOT sell and names `live-book-external` (T2/A5). Any fill resets the
+  2-rejections kill streak (F7). An orphan intent that is a settled record's own FINAL order is
+  bound, not a loud kill; a WORKING one still trips it (F1).
 - NEO's trade book has one row per FILL; the broker layer sums them into one row per order
   (size-weighted price) before anything reads them (review M1). The `prod` field is read
   upper-cased and trimmed, and a row carrying OUR tag is in scope whatever its product says
@@ -377,7 +386,15 @@ nothing.
 ```json
 {"consumer_key": "", "mobile_number": "+91...", "ucc": "", "mpin": "", "totp_secret": ""}
 ```
-TOTP is computed in the stdlib from the base32 secret; nothing else is installed. Tokens are never
+TOTP is computed in the stdlib from the base32 secret; nothing else is installed.
+
+**Login brake (review 8, F2/A2/A3).** BTST's own login (until K5 moves it onto `kotak_neo`)
+carries the same brakes as the shared package, so a refused login can never hammer -- and lock --
+the shared account: nothing is sent unless `~/.kotak_neo/LOGIN_HOST` names this machine (the
+laptop never logs in) and the clock is NTP-synced; a refused login waits 5 minutes; a refused
+MPIN, or 3 refusals in a row, LATCHES the day (network failures and IP refusals never count).
+State is ONE file for every BTST process, `state_live/neo_login.json` (attempt written before the
+wire, last 30 attempts kept). To unblock after fixing the credentials: delete that file. Tokens are never
 logged; the UCC, account name and the `actId`/`usrId` keys of broker rows are redacted from probe
 output and from every Telegram text. Local logs under `state_live/` and `logs/` are git-ignored and
 may still carry broker text verbatim (RMS rejection strings): do not paste them anywhere public.

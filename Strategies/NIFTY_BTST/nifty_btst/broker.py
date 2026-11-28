@@ -262,8 +262,9 @@ class Broker:
 #: tags OTHER bots on this NEO account send (GuiOrdId is echoed, measured
 #: 2026-11-27): the shared package's `<bot>-...` for every bot but us, and
 #: ETF_PI's own `ENT_/TGT_/EXT_<ts>_<n>` until it moves onto kotak_neo (K6).
-#: A bot added to the account adds its prefix HERE.
-OTHER_BOT_TAG_RE = re.compile(r'^(?:(?:zbr|etf)-|(?:ENT|TGT|EXT)_\d)')
+#: A bot added to the account adds its prefix HERE. `prb` = kotak_neo's own
+#: place+cancel probe (`python -m kotak_neo`; review 8, A9).
+OTHER_BOT_TAG_RE = re.compile(r'^(?:(?:zbr|etf|prb)-|(?:ENT|TGT|EXT)_\d)')
 
 
 def in_scope(o: 'OrderView', product: str) -> bool:

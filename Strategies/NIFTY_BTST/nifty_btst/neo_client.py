@@ -32,9 +32,14 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import socket
 import struct
+import subprocess
+import sys
 import time
+from datetime import date
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests  # type: ignore[import-untyped,unused-ignore]
@@ -264,6 +269,158 @@ def load_credentials(path: Any) -> Dict[str, str]:
     return out
 
 
+# ------------------------------------------------------------ login brake
+#: The same host binding kotak_neo uses: only the box whose hostname this file
+#: holds may log in. The laptop has no such file, so a BTST rehearsal or probe
+#: run there can never make a real login on the shared account (review 8, A3).
+LOGIN_HOST_FILE = Path.home() / '.kotak_neo' / 'LOGIN_HOST'
+#: consecutive REFUSED logins (not network) that latch the day, as kotak_neo
+LOGIN_MAX_REFUSALS = 3
+#: after a refused login, no new attempt before this (the engine's own
+#: throttle is 60 s: ~360 refused logins a day could lock the account, F2/A2)
+LOGIN_REFUSAL_BACKOFF_SEC = 300.0
+#: NEO named the MPIN at the validate step: retrying cannot help, latch at once
+LOGIN_MPIN_WORDS = ('mpin', ' pin')
+LOGIN_LOG_KEEP = 30
+
+
+class NeoLoginFailed(NeoAuthError):
+    """A login that failed, with its KIND: 'network' (never reached a verdict:
+    no brake), 'refused' (NEO said no), 'mpin' (NEO named the MPIN), 'ip'
+    (whitelist / session-IP refusal: a login cannot cure it, never latches)."""
+
+    def __init__(self, kind: str, msg: str):
+        super().__init__(msg)
+        self.kind = kind
+
+
+def _login_host_ok() -> bool:
+    try:
+        want = LOGIN_HOST_FILE.read_text(encoding='utf-8').strip()
+    except OSError:
+        return False
+    return bool(want) and want == socket.gethostname()
+
+
+def _clock_synced() -> Optional[bool]:
+    """True/False from systemd's NTPSynchronized on Linux (the Pi: no RTC,
+    reboots at 08:00), None where unreadable -- None never blocks a login."""
+    if not sys.platform.startswith('linux'):
+        return None
+    try:
+        out = subprocess.run(['timedatectl', 'show', '-p', 'NTPSynchronized', '--value'],
+                             capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    v = (out.stdout or '').strip().lower()
+    return True if v == 'yes' else False if v == 'no' else None
+
+
+#: replaced in tests
+login_host_ok: Callable[[], bool] = _login_host_ok
+clock_synced: Callable[[], Optional[bool]] = _clock_synced
+
+
+class LoginBrake:
+    """Brakes on BTST's OWN NEO login (review 8, F2/A2/A3), mirroring
+    kotak_neo's: a refused login waits `LOGIN_REFUSAL_BACKOFF_SEC`; a refused
+    MPIN, or `LOGIN_MAX_REFUSALS` refusals in a row, LATCHES the day -- no
+    more logins until tomorrow or until the owner deletes the state file.
+    Network failures and IP refusals never count. State is per calendar day
+    and, with a `path`, persisted BEFORE the login call (a crash mid-login
+    keeps its count) and re-read before every attempt, so a restart or a
+    second BTST process sees the same latch. Every attempt and outcome is
+    kept in `logins` (no secrets)."""
+
+    def __init__(self, path: Optional[Path] = None,
+                 clock: Callable[[], float] = time.time,
+                 today: Callable[[], str] = lambda: date.today().isoformat()):
+        self.path = Path(path) if path else None
+        self._clock = clock
+        self._today = today
+        self.state: Dict[str, Any] = self._fresh()
+
+    def _fresh(self) -> Dict[str, Any]:
+        return {'day': self._today(), 'refusals': 0, 'latched': '', 'next_try_at': 0.0,
+                'attempts': 0, 'logins': []}
+
+    def _load(self) -> None:
+        if self.path is not None:
+            try:
+                raw = json.loads(self.path.read_text(encoding='utf-8'))
+                if isinstance(raw, dict):
+                    self.state = dict(self._fresh(), **raw)
+                else:
+                    self.state = self._fresh()
+            except FileNotFoundError:
+                self.state = self._fresh()      # deleted by the owner = unblocked
+            except (OSError, ValueError):
+                # unreadable state must not unlock a latch silently: keep memory
+                logger.error('NEO login brake state %s unreadable; using the in-memory one',
+                             self.path)
+        if self.state.get('day') != self._today():
+            self.state = self._fresh()
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + '.tmp')
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self.state, f, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            logger.error('NEO login brake state %s not written: %s', self.path, exc)
+
+    def _where(self) -> str:
+        return ('delete %s' % self.path) if self.path else 'restart the process'
+
+    def check(self) -> None:
+        """Raise NeoAuthError (nothing sent) while latched or backing off."""
+        self._load()
+        if self.state.get('latched'):
+            raise NeoAuthError('NEO LOGIN LATCHED for today (%s) -- no more BTST logins, '
+                               'retrying could lock the account. Fix the credentials/MPIN, '
+                               'then %s.' % (self.state['latched'], self._where()))
+        left = float(self.state.get('next_try_at') or 0.0) - self._clock()
+        if left > 0:
+            raise NeoAuthError('NEO login refused earlier (%d in a row); next attempt in %.0fs '
+                               '-- nothing sent' % (int(self.state.get('refusals') or 0), left))
+
+    def _log(self, outcome: str, detail: str) -> None:
+        logs = list(self.state.get('logins') or [])
+        logs.append({'at': time.strftime('%H:%M:%S', time.localtime(self._clock())),
+                     'outcome': outcome, 'detail': detail[:200]})
+        self.state['logins'] = logs[-LOGIN_LOG_KEEP:]
+
+    def attempt(self) -> int:
+        self.state['attempts'] = int(self.state.get('attempts') or 0) + 1
+        self._log('attempt', 'host %s' % socket.gethostname())
+        self._save()                            # BEFORE the wire
+        return int(self.state['attempts'])
+
+    def ok(self) -> None:
+        self.state['refusals'] = 0
+        self.state['next_try_at'] = 0.0
+        self._log('ok', '')
+        self._save()
+
+    def failed(self, kind: str, msg: str) -> None:
+        self._log(kind, msg)
+        if kind in ('refused', 'mpin'):
+            self.state['refusals'] = int(self.state.get('refusals') or 0) + 1
+            self.state['next_try_at'] = self._clock() + LOGIN_REFUSAL_BACKOFF_SEC
+            if kind == 'mpin':
+                self.state['latched'] = 'MPIN refused: %s' % msg[:120]
+            elif self.state['refusals'] >= LOGIN_MAX_REFUSALS:
+                self.state['latched'] = '%d refused logins in a row; last: %s' % (
+                    self.state['refusals'], msg[:120])
+        self._save()
+
+
 # ---------------------------------------------------------------- client
 def _json_or_none(resp: Any) -> Optional[Dict[str, Any]]:
     try:
@@ -280,8 +437,10 @@ class NeoReader:
                  timeout: float, login_timeout: float,
                  session: Optional[Any] = None,
                  totp_fn: Callable[[str], str] = totp_now,
-                 policy: Optional[EnvelopePolicy] = None):
+                 policy: Optional[EnvelopePolicy] = None,
+                 brake: Optional[LoginBrake] = None):
         self.creds = creds
+        self.brake = brake or LoginBrake()
         self.login_url = login_url.rstrip('/')
         self.timeout = timeout
         self.login_timeout = login_timeout
@@ -305,7 +464,34 @@ class NeoReader:
         return bool(self.base_url and self.sid and self.token)
 
     def login(self) -> Dict[str, Any]:
-        """TOTP login, then MPIN validate. Returns a SAFE summary (no tokens)."""
+        """TOTP login, then MPIN validate. Returns a SAFE summary (no tokens).
+
+        Braked (review 8, F2/A2/A3): refused on a machine without LOGIN_HOST,
+        while the brake is latched or backing off, and on an unsynced clock
+        (the TOTP would be refused) -- in all three NOTHING is sent."""
+        if not login_host_ok():
+            raise NeoAuthError('this machine may not log in to NEO (%s missing or not this '
+                               'host) -- nothing sent' % LOGIN_HOST_FILE)
+        self.brake.check()
+        if clock_synced() is False:
+            raise NeoAuthError('system clock not NTP-synchronised; the TOTP would be refused '
+                               '-- nothing sent')
+        n = self.brake.attempt()
+        logger.warning('NEO login attempt #%d today', n)
+        try:
+            summary = self._login_steps()
+        except NeoLoginFailed as exc:
+            self.brake.failed(exc.kind, str(exc))
+            logger.error('NEO login #%d FAILED (%s): %s', n, exc.kind, exc)
+            raise
+        except NeoAuthError as exc:
+            self.brake.failed('refused', str(exc))
+            logger.error('NEO login #%d FAILED (refused): %s', n, exc)
+            raise
+        self.brake.ok()
+        return summary
+
+    def _login_steps(self) -> Dict[str, Any]:
         hdr = {'Authorization': self.creds['consumer_key'],
                'neo-fin-key': NEO_FIN_KEY, 'Content-Type': 'application/json'}
         body = {'mobileNumber': self.creds['mobile_number'],
@@ -336,16 +522,21 @@ class NeoReader:
             r = self.http.post(url, headers=hdr, data=json.dumps(body),
                                timeout=self.login_timeout)
         except requests.RequestException as exc:
-            raise NeoAuthError('%s: %s' % (what, type(exc).__name__))
+            raise NeoLoginFailed('network', '%s: %s' % (what, type(exc).__name__))
+        if r.status_code >= 500 or r.status_code == 429:
+            raise NeoLoginFailed('network', '%s: HTTP %s' % (what, r.status_code))
         data = _json_or_none(r)
-        if r.status_code != 200 or data is None:
-            raise NeoAuthError('%s: HTTP %s %s' % (what, r.status_code,
-                                                   (data or {}).get('message', r.text[:120])))
-        inner = data.get('data')
-        if not isinstance(inner, dict):
-            raise NeoAuthError('%s: %s' % (what, neo_msg(data)
-                                           or 'no data in response'))
-        return inner
+        inner = (data or {}).get('data')
+        if r.status_code == 200 and isinstance(inner, dict):
+            return inner
+        msg = (neo_msg(data) if data is not None else '') or r.text[:120] or 'no data in response'
+        kind = 'refused'
+        if data is not None and (self.policy.ip_refused(data) or 'session ip' in msg.lower()):
+            kind = 'ip'                 # a login cannot cure it: never latches
+        elif what == 'tradeApiValidate' and any(w in ' ' + msg.lower() for w in LOGIN_MPIN_WORDS):
+            kind = 'mpin'               # NEO named the MPIN: latch at once
+        raise NeoLoginFailed(kind, '%s: HTTP %s stCode %s %s'
+                             % (what, r.status_code, (data or {}).get('stCode'), _scrub(msg)))
 
     def _headers(self) -> Dict[str, str]:
         if not self.ready:

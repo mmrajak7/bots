@@ -90,6 +90,9 @@ RESUME_FILE = 'RESUME'
 #: refusals, and an overlay must not be able to raise it.
 REFUSAL_BACKOFF_START_SEC = 3.0
 REFUSAL_BACKOFF_MAX_SEC = 60.0
+#: EXIT sends in a row NEO did not take before the owner is told to sell in the
+#: app (review 8, T8/A4)
+EXIT_SEND_FAILURES_ALERT = 2
 
 ZERO_PNL = {'gross_pnl': 0.0, 'net_pnl': 0.0, 'net_ex_brokerage': 0.0, 'exit_price': None,
             'charges': {'total': 0.0}, 'held_sessions': 0, 'never_filled': True}
@@ -463,6 +466,15 @@ class LiveEngine(Engine):
                              're-sent.' % tag)
             self._search_orphan(now, intent)
 
+    def _leg_by_tag(self, tag: str) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """(record, leg) of the SETTLED send carrying `tag` (a leg in a
+        record's history), or None."""
+        for p in self.store.data['positions']:
+            for h in (p.get('live') or {}).get('leg_history', []):
+                if str(h.get('tag')) == tag:
+                    return p, h
+        return None
+
     def _search_orphan(self, now: datetime, intent: Dict[str, Any]) -> None:
         tag = str(intent.get('tag'))
         try:
@@ -472,6 +484,23 @@ class LiveEngine(Engine):
                             'JOURNAL: cannot search the book for %s (%s)' % (tag, exc))
             return
         hits = [o for o in book if o.tag == tag]
+        owner = self._leg_by_tag(tag)
+        if hits and owner is not None and hits[0].terminal:
+            # the send belongs to a record that was already settled another way
+            # (trade book, positions, the owner's confirm-held) and the order is
+            # FINAL: accounted for, not untracked (review 8, F1/F1b). A WORKING
+            # order still trips the kill below: nothing may stay live unseen.
+            p, leg = owner
+            if not leg.get('order_no'):
+                leg['order_no'] = hits[0].order_no
+            self.journal.bound(now, tag, hits[0].order_no, 'recovered')
+            self.store.event(now, 'BOUND', id=p['id'], tag=tag, order_no=hits[0].order_no,
+                             how='recovered', status=hits[0].status)
+            self.notify.send('JOURNAL: intent %s is order %s (%s), already settled on #%d. '
+                             'Bound; nothing to do.' % (tag, hits[0].order_no, hits[0].status,
+                                                        p['id']))
+            self.store.save()
+            return
         if hits:
             self.journal.bound(now, tag, hits[0].order_no, 'orphan')
             self._trip(now, 'UNTRACKED own-tag order %s (%s %s x%d, %s)' % (
@@ -665,6 +694,12 @@ class LiveEngine(Engine):
         already been booked (adopted) when this returns."""
         trade = self._trade_for(leg)
         if trade is not None:
+            if trade.order_no and not leg.get('order_no'):
+                # resolve the INTENT in the journal: unresolved, a restart would
+                # find our own order as an orphan and trip a LOUD kill (review 8, F1)
+                leg['order_no'] = trade.order_no
+                leg['bound_by'] = 'trade'
+                self.journal.bound(now, leg['tag'], trade.order_no, 'trade')
             self._on_fill(p, leg, trade, now, trade.filled, partial=trade.filled < int(leg['qty']))
             return 'filled'
         sym = self._live(p)['neo_symbol']
@@ -988,6 +1023,8 @@ class LiveEngine(Engine):
         if hit is not None:
             leg['order_no'] = hit.order_no
             leg['bound_by'] = how
+            if leg['kind'] == 'EXIT':
+                self._live(p)['exit_send_failures'] = 0
             self.journal.bound(now, leg['tag'], hit.order_no, how)
             self._set_state(p, ENTRY_OPEN if leg['kind'] == 'ENTRY' else EXIT_OPEN, now)
             self.store.event(now, 'BOUND', id=p['id'], tag=leg['tag'], order_no=hit.order_no, how=how)
@@ -1006,10 +1043,20 @@ class LiveEngine(Engine):
         exit_leg = leg['kind'] == 'EXIT'
         grace = self.neo.exit_unknown_grace_sec if exit_leg else self.neo.unknown_grace_sec
         if age < grace or leg['valid_reads'] < (3 if exit_leg else 2):
-            self._throttled('unknown_' + leg['tag'], now, 60,
-                            '#%d: %s is UNKNOWN (sent %.0fs ago, not in the book). Nothing is '
-                            're-sent for %.0fs. Check the app.' % (p['id'], leg['tag'], age,
-                                                                    grace))
+            if exit_leg:
+                # an unclear SELL that the book has not shown yet may still be
+                # working: a second one could leave the account SHORT (review
+                # 8, F3). The owner sees it in the app before the book does.
+                self._throttled('unknown_' + leg['tag'], now, 60,
+                                '#%d: SELL %s is UNKNOWN (sent %.0fs ago, not in the book). If a '
+                                'BTST SELL is WORKING in the app, CANCEL it there -- '
+                                'the bot re-sends after %.0fs and two SELLs would leave the '
+                                'account SHORT.' % (p['id'], leg['tag'], age, grace))
+            else:
+                self._throttled('unknown_' + leg['tag'], now, 60,
+                                '#%d: %s is UNKNOWN (sent %.0fs ago, not in the book). Nothing is '
+                                're-sent for %.0fs. Check the app.' % (p['id'], leg['tag'], age,
+                                                                        grace))
             return
         verdict = self._corroborate(p, leg, now)
         if verdict == 'absent':
@@ -1191,6 +1238,10 @@ class LiveEngine(Engine):
                                             leg['limit'], p['trigger'], p['slip_vs_trigger'],
                                             p['stop_level'], p['cls'], p['dte_sessions']))
         else:
+            # any fill ends a rejection "streak": an exit rejected at 09:25 and
+            # an entry rejected hours later are not consecutive (review 8, F7)
+            self._rejection_streak = 0
+            lv['exit_send_failures'] = 0
             lv.setdefault('exit_fills', []).append({'qty': filled, 'price': price,
                                                     'order_no': o.order_no, 'tag': leg['tag'],
                                                     'at': _iso(now)})
@@ -1254,6 +1305,8 @@ class LiveEngine(Engine):
                              % (p['id'], p['symbol'], reason, p['side']))
         else:
             lv['exit_rejections'] = int(lv.get('exit_rejections', 0)) + 1
+            if placed:                  # accepted, then rejected in the book (RMS)
+                self._exit_send_failed(p, 'EXIT', now, reason)
             self._set_state(p, EXIT_DUE, now)
             self.notify.send('EXIT #%d %s REJECTED: %s\nRetrying (%s). If this persists, '
                              'EXIT IN THE APP.' % (p['id'], p['symbol'], reason,
@@ -1298,6 +1351,7 @@ class LiveEngine(Engine):
         except BrokerRejected as exc:
             refused = self._retryable(exc.code)
             self.journal.not_placed(now, tag, '%s %s' % (exc.code, exc.msg), refused=refused)
+            self._exit_send_failed(p, kind, now, 'stCode %s: %s' % (exc.code, exc.msg))
             if not refused:
                 self._clear_refusal_backoff(lv)
             self._on_rejected(p, leg, now, 'stCode %s: %s' % (exc.code, exc.msg), placed=False,
@@ -1309,6 +1363,7 @@ class LiveEngine(Engine):
             self.store.event(now, 'UNCLEAR', id=p['id'], tag=tag, error=str(exc))
             self.notify.send('#%d: %s send UNCLEAR (%s). Searching the book before anything '
                              'else.' % (p['id'], tag, exc))
+            self._exit_send_failed(p, kind, now, 'unclear: %s' % exc)
             self.store.save()
             return False
         except BrokerAuth as exc:
@@ -1316,9 +1371,12 @@ class LiveEngine(Engine):
             self.session_ok, self.session_error = False, str(exc)
             self.store.event(now, 'UNCLEAR', id=p['id'], tag=tag, error=str(exc))
             self.notify.send('#%d: %s send UNCLEAR, session dead (%s).' % (p['id'], tag, exc))
+            self._exit_send_failed(p, kind, now, 'session dead: %s' % exc)
             self.store.save()
             return False
         self._clear_refusal_backoff(lv)
+        if kind == 'EXIT':
+            lv['exit_send_failures'] = 0
         leg['order_no'] = order_no
         self.journal.placed(now, tag, order_no)
         self._set_state(p, ENTRY_OPEN if kind == 'ENTRY' else EXIT_OPEN, now)
@@ -1326,6 +1384,27 @@ class LiveEngine(Engine):
                          side=side, qty=int(qty), limit=pstr)
         self.store.save()
         return True
+
+    def _exit_send_failed(self, p: Dict[str, Any], kind: str, now: datetime, why: str) -> None:
+        """Count EXIT sends NEO did not take (refused, rejected at the gateway,
+        unclear, session dead). From the 2nd in a row the owner is told,
+        loudly and every 2 minutes, to sell in the app: reads may work while
+        orders are refused (the 11-27 401 on place), and then the engine alone
+        can never get out (review 8, T8/A4). Reset by a placed or found SELL
+        and by any fill."""
+        if kind != 'EXIT':
+            return
+        lv = self._live(p)
+        n = int(lv.get('exit_send_failures', 0) or 0) + 1
+        lv['exit_send_failures'] = n
+        if n < EXIT_SEND_FAILURES_ALERT:
+            return
+        self.store.event(now, 'EXIT_SENDS_FAILING', id=p['id'], count=n, why=why)
+        self._throttled('exit_failing_%d' % p['id'], now, 120,
+                        'EXIT #%d %s: NEO did not take our last %d SELLs (%s). SELL IN THE APP '
+                        'NOW -- first look at Orders: if a BTST SELL is working there, leave it. '
+                        'After selling: `live-book-external %d --price X --yes`.'
+                        % (p['id'], p['symbol'], n, why, p['id']))
 
     def _retryable(self, code: Any) -> bool:
         """A definite gateway refusal (`neo.retry_stcodes`): not placed."""
@@ -1443,12 +1522,17 @@ class LiveEngine(Engine):
                                 'engine can see (quotes out, no NEO activity). Not latching the '
                                 'exit; an unlisted holiday? It applies from 09:25 the moment the '
                                 'day proves itself.' % (p['id'], p['symbol']))
-            self._throttled('outage_%d' % p['id'], now, 60,
-                            'NO QUOTES (%s): #%d %s is %s. Stop not watched; %s. Exit in the '
-                            'app if needed.' % (why, p['id'], p['symbol'],
-                                                'DUE TO EXIT (%s)' % due if due else 'open',
-                                                'the exit fires on the first usable book'
-                                                if due else 'no exit is due yet'))
+            if due:
+                # with no quotes the bot cannot price a SELL at all (review 8, T2/A5)
+                self._throttled('outage_%d' % p['id'], now, 60,
+                                'NO QUOTES (%s): #%d %s is DUE TO EXIT (%s) and the bot CANNOT '
+                                'SELL. SELL IN THE APP NOW, then `live-book-external %d --price X '
+                                '--yes`. (If quotes return first the bot sells on the first '
+                                'usable book.)' % (why, p['id'], p['symbol'], due, p['id']))
+            else:
+                self._throttled('outage_%d' % p['id'], now, 60,
+                                'NO QUOTES (%s): #%d %s is open. Stop not watched; no exit is due '
+                                'yet. Exit in the app if needed.' % (why, p['id'], p['symbol']))
         self.store.save()
 
     def _exit_time(self, p: Dict[str, Any]) -> dtime:
