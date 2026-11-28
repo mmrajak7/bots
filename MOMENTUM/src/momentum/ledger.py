@@ -139,7 +139,11 @@ def plan_key(plan_id: Dict[str, Any]) -> str:
 
 def replay(recs: List[Dict[str, Any]]) -> Ledger:
     """Rebuild the ledger from live (non-DRY) journal records. Raises on an impossible transition."""
-    lg = Ledger()
+    return replay_into(Ledger(), recs)
+
+
+def replay_into(lg: Ledger, recs: List[Dict[str, Any]]) -> Ledger:
+    """Apply more journal records to a ledger already replayed up to them (replay == replay_into(Ledger(), all))."""
     for r in recs:
         t = r["type"]
         if t.startswith("DRY_"):
