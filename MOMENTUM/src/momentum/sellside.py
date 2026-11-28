@@ -652,6 +652,29 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
         if p.position_id in envelopes:                     # never above what the vet saw at 14:45
             a = min(a, int(envelopes[p.position_id]) * 100)
         amounts[p.position_id] = a
+    waiting_buys: List[str] = []
+    if reasons:
+        # owner 11-28 (D32 amended): a FORCED buy whose amount cannot pay one share (a fully invested book, the sale
+        # money still in a held sell) is not dropped for the month: it stays gated, told each session, and goes
+        # once the money is there (or the next plan expires it)
+        from . import engine as E
+        try:
+            qb = env.api.quote([f"NSE:{E.tradingsymbol(p.symbol, p.series)}" for p in gated])
+        except B.NetworkError:
+            qb = None
+        for p in gated:
+            qq = (qb or {}).get(f"NSE:{E.tradingsymbol(p.symbol, p.series)}") or {}
+            one = (dec(qq["last_price"]) * dec(env.cfg["buy_cap_mult"]) * 100) if qq.get("last_price") else None
+            if one is None or Decimal(amounts[p.position_id]) < one:
+                waiting_buys.append(p.symbol)
+                del amounts[p.position_id]
+        if not amounts:
+            env.journal.append("GATE", date=day, plan=pk, result="FORCED_WAIT", reasons=reasons, margins=margins)
+            env.alert("BUYS_WAIT_CASH", f"{len(gated)} forced buys wait: Rs {em / 100:,.0f} each cannot pay one "
+                      f"share ({', '.join(waiting_buys)[:150]}); they go once the held sells bring the money")
+            env.journal.append("STAGE", date=day, stage="GATE", result="forced wait")
+            return
+        gated = [p for p in gated if p.position_id in amounts]
     # the judgement first, then its amounts: a crash in between resumes from this record (judged once)
     env.journal.append("GATE", date=day, plan=pk, result="OPEN" if not reasons else "FORCED", reasons=reasons,
                        margins=margins, amounts=amounts)
@@ -660,7 +683,9 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
                            basis=f"gate {'OPEN' if not reasons else 'FORCED'}: free {free} / {n_plan}")
     if reasons:
         env.alert("GATE_FORCED", f"sells still open after {closed_before} gated sessions ({'; '.join(reasons)[:200]}):"
-                  f" the {len(gated)} buys go with the cash there (D32)")
+                  f" the {len(gated)} buys go with the cash there (D32)"
+                  + (f"; {', '.join(waiting_buys)[:120]} wait (one share costs more than the amount)"
+                     if waiting_buys else ""))
     env.journal.append("STAGE", date=day, stage="GATE", result="ok")
 
 

@@ -368,7 +368,9 @@ def cmd_evening(x: Ctx, a: argparse.Namespace) -> int:
         # review 11-28 M2: the holiday file missed a closure on the computed signal day. Once that day's evening has
         # come (Kite's day candle exists by 20:00 when the market traded), Kite's last session of the month is the
         # signal day: re-point the pending day; the next slot (30 min / the morning catch-up) builds the plan.
-        late_enough = util.today() > day or util.now() >= util.at_today(x.cfg["kite_signal_check_at"])
+        # only from the NEXT day: on the signal day itself a late / partial Kite candle must never move the plan to
+        # an earlier day (the evening retries every 30 min); the 09:10 catch-up still makes day-1 buys
+        late_enough = util.today() > day
         if e.kite_last and e.kite_last < day.isoformat() and late_enough:
             util.write_json_atomic(pending_f, {"signal_day": e.kite_last, "since": util.now().isoformat(),
                                                "was": day.isoformat()})
@@ -586,8 +588,12 @@ def cmd_watch(x: Ctx, a: argparse.Namespace) -> int:
     ran_today = any(r["type"] == "STAGE" and r.get("date") == day for r in recs)
     recon = E.stage_done(recs, day, "RECON")
     done = any(r["type"] == "NOTE" and r.get("three_way") == day for r in recs)
-    if a.resume and (done or not recon or not ran_today):
+    if a.resume and (done or not ran_today):
         return 0                                # 16:50: only a three-way the 16:00 run had to leave for the reconcile
+    if a.resume and not recon:
+        x.notify("ALERT THREE_WAY_NOT_RUN: the reconcile never finished today (see RECON_RETRY): the 16:00 three-way "
+                 "did not run; tomorrow's 08:35 holdings check is the hard check")
+        return 0
     waits = ran_today and not recon             # review 11-28 M5: fills not booked yet -> a false THREE_WAY
     if waits:
         pass
@@ -862,7 +868,9 @@ def lock_busy_alert(x: Ctx, command: str) -> None:
         if command != "afternoon" or x.journal is None:
             return
         day = util.today().isoformat()
-        if util.now() < util.at_today(x.cfg["step_plan_at"]) + dt.timedelta(minutes=3):
+        # the 14:45-14:55 slots find the lock held by the 14:40 run itself while its preflight retry / vet runs: only
+        # from the last slot before the sells' last placing time is a missing PLAN a lost day
+        if util.now() < util.at_today(x.cfg["last_sell_place_at"]) - dt.timedelta(minutes=6):
             return
         recs = x.journal.read()
         if not order_work(L.replay(recs)) or E.stage_done(recs, day, "PLAN"):

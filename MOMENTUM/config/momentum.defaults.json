@@ -26,7 +26,6 @@
  "refresh_retry_min": 30,
  "refresh_last": "22:00",
  "plan_final": "23:30",
- "kite_signal_check_at": "20:00",
  "audit_ret": "0.20",
  "audit_factor": "0.10",
  "audit_kite_pp": "3.0",

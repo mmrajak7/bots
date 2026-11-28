@@ -189,6 +189,23 @@ class TestReview1128Gate(SellHarness):
         self.assertEqual(lg.positions["2701-01"].leg, "NONE")
         self.assertIn("OWNER_HOLD", lg.positions["2612-02"].overlays)   # the held sell stays with the owner
 
+    def test_a_forced_buy_that_cannot_pay_one_share_waits_instead_of_being_dropped(self) -> None:
+        # owner 11-28: the money is still in the held sell; one SYM3 share costs more than the forced amount
+        self.vet = self.hold_vet
+        self.k.ltp["NSE:SYM3"] = 900_000.0
+        for d in (dt.date(2027, 1, 1), dt.date(2027, 1, 4), dt.date(2027, 1, 5)):
+            self.new_day(d)
+            lg = self.afternoon(fill=fill_only(self.k, "BUY"))
+        self.assertEqual(self.gate()["result"], "FORCED_WAIT")
+        self.assertIn("BUYS_WAIT_CASH", self.alerts())
+        self.assertEqual(lg.positions["2701-01"].leg, "BUY_GATED")
+        self.assertFalse([r for r in self.j.read() if r["type"] == "BUY_AMOUNT"])
+        self.k.ltp["NSE:SYM3"] = 1000.0                       # affordable again: forced the next session
+        self.new_day(dt.date(2027, 1, 6))
+        lg = self.afternoon(fill=fill_only(self.k, "BUY"))
+        self.assertEqual(self.gate()["result"], "FORCED")
+        self.assertEqual(lg.positions["2701-01"].leg, "NONE")
+
     def test_vet_down_is_still_an_untried_session(self) -> None:
         self.vet = lambda s, vin, sk: V.Verdict(False, "down", {}, "")
         self.afternoon(fill=fill_all(self.k))

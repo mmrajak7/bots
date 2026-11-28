@@ -201,7 +201,7 @@ class TestM2SignalDay(unittest.TestCase):
         from momentum import evening as EV
         from momentum import pipeline as P
         from momentum.fakebroker import FakeKite
-        self.at(2026, 12, 31, 20, 0)
+        self.at(2026, 12, 31, 20, 30)
         x = self.ctx()
         orig = (self.cli.check_manifest, P.import_research, EV.book_open, EV.run_signal_evening)
         x.token = lambda: object()
@@ -212,12 +212,19 @@ class TestM2SignalDay(unittest.TestCase):
             raise EV.SignalDayMismatch("signal day 2026-12-31 is not Kite's last", "2026-12-30")
         self.cli.check_manifest, P.import_research = (lambda h, c: []), (lambda *a: None)
         EV.book_open, EV.run_signal_evening = (lambda env: None), mismatch
+        ns = self.argparse.Namespace(pending_only=False, as_of_signal=None, skip_fetch=True)
         try:
-            rc = self.cli.cmd_evening(x, self.argparse.Namespace(pending_only=False, as_of_signal=None,
-                                                                 skip_fetch=True))
+            self.assertEqual(self.cli.cmd_evening(x, ns), 3)           # the signal evening itself: never moved
+            pend = json.loads((x.paths.refresh / "pending_signal.json").read_text(encoding="utf-8"))
+            self.assertEqual(pend["signal_day"], "2026-12-31")
+            self.at(2027, 1, 1, 9, 10)                                 # the morning catch-up: moved
+            x = self.ctx()
+            x.token, x.api = (lambda: object()), (lambda tok: FakeKite())
+            x.notify = lambda text, buttons=None: True
+            self.assertEqual(self.cli.cmd_evening(x, self.argparse.Namespace(pending_only=True, as_of_signal=None,
+                                                                             skip_fetch=True)), 3)
         finally:
             self.cli.check_manifest, P.import_research, EV.book_open, EV.run_signal_evening = orig
-        self.assertEqual(rc, 3)
         pend = json.loads((x.paths.refresh / "pending_signal.json").read_text(encoding="utf-8"))
         self.assertEqual(pend["signal_day"], "2026-12-30")
         self.assertIn("SIGNAL_DAY_MOVED", [r["code"] for r in x.journal.read() if r["type"] == "ALERT"])
@@ -351,6 +358,66 @@ class TestL8RejectHandledAfterACrash(TE.Harness):
                     and str(r["status"]).startswith("REJECTED_")]
         self.assertTrue(sync_rej, "the planted rejection never reached the sync path: the test proves nothing")
         self.assertEqual(len(notes), len(sync_rej))
+
+
+class TestM4M5L5CliJobs(TestM2SignalDay):
+    """M4 LOCK_BUSY, M5 the watch waits for the reconcile, L5 holiday early exit."""
+
+    def live_ctx(self, sent):  # noqa: ANN001, ANN201
+        from momentum.fakebroker import FakeKite
+        x = self.ctx()
+        x.token, x.api = (lambda: object()), (lambda tok: FakeKite())
+        x.notify = lambda text, buttons=None: sent.append(text) or True
+        x._bot = type("B", (), {"send_document": lambda self, path, caption: True})()
+        return x
+
+    def test_m5_watch_waits_for_the_reconcile_then_1650_runs_it(self) -> None:
+        import test_core
+        self.at(2026, 12, 1, 16, 0)
+        sent = []
+        x = self.live_ctx(sent)
+        test_core.opened(x.journal)
+        x.journal.append("HOLDINGS_SNAPSHOT", holdings={}, settled={})
+        x.journal.append("STAGE", date="2026-12-01", stage="PLAN", result="ok", go=[], step_plan_hash=None,
+                         facts_hash=None)
+        ns = self.argparse.Namespace(resume=False)
+        self.assertEqual(self.cli.cmd_watch(x, ns), 0)
+        self.assertTrue(any("waits for the reconcile" in t for t in sent), sent)
+        self.assertFalse([r for r in x.journal.read() if r["type"] == "NOTE" and "three_way" in r])
+        self.at(2026, 12, 1, 16, 50)
+        sent.clear()
+        self.assertEqual(self.cli.cmd_watch(self.live_ctx(sent), self.argparse.Namespace(resume=True)), 0)
+        self.assertTrue(sent and "THREE_WAY_NOT_RUN" in sent[0], sent)   # the reconcile never finished: told
+        sent.clear()
+        x = self.live_ctx(sent)
+        x.journal.append("STAGE", date="2026-12-01", stage="RECON", result="ok")
+        self.assertEqual(self.cli.cmd_watch(x, self.argparse.Namespace(resume=True)), 0)
+        self.assertTrue(any(t.startswith("16:50 three-way") for t in sent), sent)
+        sent.clear()
+        self.assertEqual(self.cli.cmd_watch(self.live_ctx(sent), self.argparse.Namespace(resume=True)), 0)
+        self.assertEqual(sent, [])                                 # done once: never twice
+
+    def test_m4_lock_busy_alerts_once_after_1454_only(self) -> None:
+        import test_core
+        sent = []
+        self.at(2026, 12, 1, 14, 50)
+        x = self.live_ctx(sent)
+        test_core.opened(x.journal)
+        self.cli.lock_busy_alert(x, "afternoon")
+        self.assertEqual(sent, [])                                 # the 14:40 run may still be planning
+        self.at(2026, 12, 1, 14, 55)
+        x = self.live_ctx(sent)
+        self.cli.lock_busy_alert(x, "afternoon")
+        self.cli.lock_busy_alert(x, "afternoon")
+        self.assertEqual(len([t for t in sent if "LOCK_BUSY" in t]), 1)
+
+    def test_l5_holiday_afternoon_exits_without_waiting_for_a_token(self) -> None:
+        import test_core
+        self.at(2026, 12, 25, 14, 40)
+        x = self.ctx()
+        test_core.opened(x.journal)
+        x.wait_token = lambda until: self.fail("waited for a token on a holiday")
+        self.assertEqual(self.cli.cmd_afternoon(x, self.argparse.Namespace()), 0)
 
 
 if __name__ == "__main__":
