@@ -352,7 +352,7 @@ def missing_plan_month(x: Ctx, lg: L.Ledger) -> Optional[str]:
 def cmd_morning(x: Ctx, a: argparse.Namespace) -> int:
     lg = L.replay(x.journal.read())
     plan = E.current_plan(lg)
-    pend = [p for p in lg.positions.values() if p.leg == "PENDING_BUY"]
+    pend = [p for p in lg.positions.values() if p.leg in ORDER_LEGS]
     held = [p for p in lg.positions.values() if p.held_qty > 0]
     x.notify(f"ALIVE plan {L.plan_key(plan['plan_id']) if plan else 'none'}; " + E.status_text(lg))
     no_plan = missing_plan_month(x, lg)
@@ -404,9 +404,12 @@ def morning_cash_check(env: E.Env) -> None:
                   f"{env.cfg['account_user_id']} before {env.cfg['place_at']} or nothing is bought today (D09)")
 
 
+ORDER_LEGS = ("PENDING_BUY", "BUY_GATED", "SELLING")    # legs that need an afternoon (January slice: sells too)
+
+
 def cmd_afternoon(x: Ctx, a: argparse.Namespace) -> int:
     lg = L.replay(x.journal.read())
-    if not any(p.leg == "PENDING_BUY" for p in lg.positions.values()):
+    if not any(p.leg in ORDER_LEGS for p in lg.positions.values()):
         return 0
     tok = x.wait_token(util.at_today(x.cfg["token_deadline"]))
     if tok is None:
@@ -421,6 +424,25 @@ def cmd_afternoon(x: Ctx, a: argparse.Namespace) -> int:
     env = x.env(api)
     h = holdings_snapshot(x, api)
     E.afternoon(env, h, lambda: preflight(x, api, full=True))
+    write_ledger(x)
+    return 0
+
+
+def cmd_test_plan(x: Ctx, a: argparse.Namespace) -> int:
+    """TEST lot (D51): on the configured buy / sell days write the TEST plan the 14:40 afternoon then trades."""
+    from . import testlot as T
+    day = util.today().isoformat()
+    cfg = x.cfg["test_lot"]
+    if day != cfg["buy_day"] and day not in cfg["sell_days"]:
+        return 0
+    tok = x.wait_token(util.at_today(x.cfg["token_deadline"]))
+    if tok is None:
+        x.notify("ALERT TEST_LOT: no Kite token: no TEST plan today")
+        return 2
+    api = x.api(tok)
+    env = x.env(api)
+    res = T.run(env, holdings_snapshot(x, api))
+    log.info("test-plan: %s", res)
     write_ledger(x)
     return 0
 
@@ -601,7 +623,7 @@ def cmd_fo_vet(x: Ctx, a: argparse.Namespace) -> int:
 
 
 COMMANDS = {"evening": (cmd_evening, "order"), "fo-scan": (cmd_fo_scan, "fo"), "fo-vet": (cmd_fo_vet, "fo"), "morning": (cmd_morning, "order"),
-            "afternoon": (cmd_afternoon, "order"), "watch": (cmd_watch, "watch"), "canary": (cmd_canary, "canary"),
+            "afternoon": (cmd_afternoon, "order"), "test-plan": (cmd_test_plan, "order"), "watch": (cmd_watch, "watch"), "canary": (cmd_canary, "canary"),
             "check-arm": (cmd_check_arm, "arm"), "kill-cancel": (cmd_kill_cancel, "kill"),
             "status": (cmd_status, None), "poller": (cmd_poller, "poller"), "manifest": (cmd_manifest, None),
             "isolation-test": (cmd_isolation, None), "repair-journal": (cmd_repair_journal, "order")}

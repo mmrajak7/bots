@@ -47,6 +47,7 @@
  "gate_wait_sessions": 2,
  "buy_envelope_slack": "1.02",
  "extra_share_max_over": "0.25",
+ "test_lot": {"_doc": "D51 automatic TEST lot outside the book: bought on buy_day at 15:10, 1 share sold on each sell day at 14:50 (an unfilled sell retries each session). Name from the current band: liquidity rank band_rank_from..band_rank_to, LTP ltp_min..ltp_max, held by nobody.", "buy_day": "2026-12-09", "sell_days": ["2026-12-14", "2026-12-17"], "qty": 2, "ltp_min": 200, "ltp_max": 1500, "band_rank_from": 38, "band_rank_to": 112},
  "probe_reads": 3,
  "probe_wait_s": 1,
  "defer_max": 2,

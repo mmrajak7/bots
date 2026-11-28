@@ -27,7 +27,7 @@ REQUIRED_KEYS = (
     "fo_vet_max_circulars", "fo_vet_max_entrants", "fo_lookback_days", "fo_vet_give_up", "fo_vet_fail_action",
     "fo_min_stock_futures", "fo_min_recent_circulars",
     "sell_place_at", "sell_ladder", "last_sell_place_at", "gate_at", "sell_ltp_mult", "sell_floor_mult",
-    "gate_wait_sessions", "buy_envelope_slack", "extra_share_max_over",
+    "gate_wait_sessions", "buy_envelope_slack", "extra_share_max_over", "test_lot",
 )
 TIME_KEYS = ("step_plan_at", "place_at", "last_place_at", "cancel_at", "reconcile_at", "token_first_poll",
              "token_alert_at", "token_deadline", "plan_final", "sell_place_at", "last_sell_place_at", "gate_at")

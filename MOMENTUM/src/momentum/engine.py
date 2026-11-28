@@ -214,6 +214,26 @@ def apply_tap(env: Env, ap: Dict[str, Any], choice: str) -> None:
     lg = L.replay(env.journal.read())
     if ap["ref_type"] == "leg":
         p = lg.positions.get(ap["ref"])
+        if p is not None and p.leg == "SELLING":
+            if choice == "sell":
+                for ov in sorted(p.overlays & set(OWNER_CLEARABLE)):
+                    env.journal.append("OVERLAY", position_id=p.position_id, overlay=ov, on=False,
+                                       reason="owner release")
+                env.notify(f"{p.symbol}: released, sold from the next 14:45 step plan")
+            elif choice == "keep":
+                env.notify(f"{p.symbol}: the sell stays held; reminded each morning until you release it")
+            return
+        if p is not None and p.leg == "BUY_GATED":
+            if choice == "buy":
+                for ov in sorted(p.overlays & {"OWNER_HOLD", "SHARED_NAME_HOLD", "VET_DEFERRED"}):
+                    env.journal.append("OVERLAY", position_id=p.position_id, overlay=ov, on=False,
+                                       reason="owner buy")
+                env.notify(f"{p.symbol}: released; bought once the sells have brought the money")
+            elif choice == "skip":
+                env.journal.append("LEG", position_id=p.position_id, reason="owner skip",
+                                   **{"from": "BUY_GATED", "to": "EXPIRED"})
+                env.notify(f"{p.symbol}: skipped; its share stays in book cash")
+            return
         if p is None or p.leg != "PENDING_BUY":
             env.notify(f"{ap['ref']}: no pending buy (tap {choice} has no effect)")
             return
@@ -245,11 +265,11 @@ def apply_tap(env: Env, ap: Dict[str, Any], choice: str) -> None:
         elif choice == "hold":
             env.notify(f"flag {ap['ref']}: the name stays held (AUDIT_HOLD)")
         elif choice == "data_error":
-            for q in lg.positions.values():
-                if q.leg == "PENDING_BUY" and "OWNER_HOLD" not in q.overlays:
+            for q in lg.positions.values():               # a data error stops the sells too
+                if q.leg in ("PENDING_BUY", "BUY_GATED", "SELLING") and "OWNER_HOLD" not in q.overlays:
                     env.journal.append("OVERLAY", position_id=q.position_id, overlay="OWNER_HOLD", on=True,
                                        reason=f"owner: data error on {ap['ref']}")
-            env.alert("DATA_ERROR", f"owner marked {ap['ref']} a data error: every pending buy is held; fix the "
+            env.alert("DATA_ERROR", f"owner marked {ap['ref']} a data error: every pending buy and sell is held; fix the "
                       "data at the PC, then release with 'release <isin>' or a fresh plan")
     elif ap["ref_type"] == "plan":
         env.notify(f"plan {ap['ref']}: {choice} recorded (the evening job finalises an approved plan)")
@@ -350,7 +370,7 @@ def remind_holds(env: Env) -> int:
     n = 0
     for p in lg.positions.values():
         waiting = p.overlays & {"OWNER_HOLD", "AUDIT_HOLD", "SHARED_NAME_HOLD"}   # VET_DEFERRED lifts by itself
-        if p.leg != "PENDING_BUY" or not waiting:
+        if not owner_leg(p) or not waiting:
             continue
         ons = [r for r in recs if r["type"] == "OVERLAY" and r["position_id"] == p.position_id
                and r["overlay"] in waiting and r["on"]]
@@ -375,16 +395,22 @@ def remind_holds(env: Env) -> int:
                        buttons=[(lab, f"a:{ap['approval_id']}:{c}") for c, lab in labels.items()])
             n += 1
         if not aps:
+            what = "sell" if p.leg == "SELLING" else "buy"
             env.notify(f"REMINDER {p.symbol} is held ({'/'.join(sorted(p.overlays))}) with no open button: reply "
-                       f"'release {p.isin}' to buy it from the next 14:45 step, or 'hold {p.isin}' to keep it held")
+                       f"'release {p.isin}' to {what} it from the next 14:45 step, or 'hold {p.isin}' to keep it "
+                       "held")
             n += 1
     return n
 
 
 def hold_leg(env: Env, p: L.Position, overlay: str, reason: str) -> None:
     env.journal.append("OVERLAY", position_id=p.position_id, overlay=overlay, on=True, reason=reason)
-    open_approval(env, "leg", p.position_id, {"buy": "Buy", "skip": "Skip"},
-                  f"HOLD {p.symbol} ({overlay}): {reason}", position_id=p.position_id)
+    if p.leg == "SELLING":                       # a sell is never skipped: release it or keep it held
+        open_approval(env, "leg", p.position_id, {"sell": "Sell", "keep": "Keep held"},
+                      f"HOLD SELL {p.symbol} ({overlay}): {reason}", position_id=p.position_id)
+    else:
+        open_approval(env, "leg", p.position_id, {"buy": "Buy", "skip": "Skip"},
+                      f"HOLD {p.symbol} ({overlay}): {reason}", position_id=p.position_id)
 
 
 def status_text(lg: L.Ledger) -> str:
@@ -1258,6 +1284,11 @@ def reconcile_stage(env: Env, day: str) -> None:
     env.journal.append("STAGE", date=day, stage="RECON", result="ok")
     lg = L.replay(env.journal.read())
     env.notify("Order step done. " + status_text(lg))
+    from . import testlot as T
+    res = T.result_text(env, day)
+    if res:
+        env.journal.append("NOTE", test_result=day, text=res)
+        env.notify(res)
 
 
 def rebuild_attempts(lg: L.Ledger, go_ids: List[str]) -> StepPlan:

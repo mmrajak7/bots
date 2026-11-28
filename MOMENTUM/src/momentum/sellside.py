@@ -39,6 +39,13 @@ def leg_attempts(lg: L.Ledger, position_id: str, leg: str) -> int:
     return sum(1 for i in lg.intents.values() if i.position_id == position_id and f"|{leg}|" in i.intent_id)
 
 
+def sell_attempts(lg: L.Ledger, p: L.Position) -> int:
+    """Attempts of THIS sell leg: the intents under the plan that ordered it (a position can have more than one sell
+    leg in its life: the TEST lot sells 1 share twice)."""
+    pre = sell_intent_id(p, 0)[:-1]
+    return sum(1 for i in lg.intents.values() if i.intent_id.startswith(pre))
+
+
 def sell_intent_id(p: L.Position, attempt: int) -> str:
     sp = p.sell_plan or p.plan_id
     return f"{sp['month']}|{sp['signal_day']}|r{sp['data_rev']}|{p.position_id}|sell|{attempt}"
@@ -123,7 +130,7 @@ def extend_step_plan(env: Any, lg: L.Ledger, holdings_open: Dict[str, int], sp: 
     rows: List[Dict[str, Any]] = []
     sp.sell_legs, sp.gated, sp.envelopes = sells, gated, {}
     for p in sells:
-        att = leg_attempts(lg, p.position_id, "sell") + 1
+        att = sell_attempts(lg, p) + 1
         sp.attempts[p.position_id] = att
         qq = q.get(f"NSE:{E.tradingsymbol(p.symbol, p.series)}", {})
         rows.append({"intent_id": sell_intent_id(p, att), "leg": "sell", "isin": p.isin, "symbol": p.symbol,
@@ -283,7 +290,7 @@ def place_sells(env: Any, go_ids: List[str], day: str, holdings_open: Dict[str, 
         ltp, lower = dec(qq["last_price"]), dec(qq["lower_circuit_limit"])
         limit = tick_up(max(ltp * dec(env.cfg["sell_ltp_mult"]), lower), tick)
         floor = tick_up(max(ltp * dec(env.cfg["sell_floor_mult"]), lower), tick)
-        att = leg_attempts(L.replay(env.journal.read()), p.position_id, "sell") + 1
+        att = sell_attempts(L.replay(env.journal.read()), p) + 1
         if att > 9:
             E.hold_leg(env, p, "OWNER_HOLD", "sell attempt > 9")
             continue
@@ -452,6 +459,10 @@ def gate_stage(env: Any, day: str, envelopes: Dict[str, int]) -> None:
     plan = E.current_plan(lg)
     gated = gated_legs(lg, plan["plan_id"] if plan else None)
     if not gated:
+        if any(i.date == day and "|sell|" in i.intent_id for i in lg.intents.values()):
+            # a sell ran today (a TEST sell): keep the sale-credit fields for the record (January spec §11)
+            env.journal.append("GATE", date=day, plan=None, result="NO_GATED_BUYS", reasons=[],
+                               margins=margins_log(env))
         env.journal.append("STAGE", date=day, stage="GATE", result="no gated buys")
         return
     pk = L.plan_key(plan["plan_id"])
@@ -556,7 +567,8 @@ def size_buys(env: Any, legs: List[L.Position], q: Dict[str, Any], ticks: Dict[s
             out[p.position_id] = (0, ltp, limit, cap, int(amount))
             continue
         out[p.position_id] = (qty, ltp, limit, cap, int(amount))
-        rem[p.position_id] = amount - qty * cap
+        if not p.test:                                 # the TEST lot buys exactly its quantity
+            rem[p.position_id] = amount - qty * cap
     pool = sum(rem.values(), Decimal(0))
     for pid in sorted(rem, key=lambda x: -(rem[x] / out[x][3])):
         qty, ltp, limit, cap, amount = out[pid]
