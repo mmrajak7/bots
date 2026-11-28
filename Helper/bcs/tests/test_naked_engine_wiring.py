@@ -205,3 +205,101 @@ def test_an_engine_that_failed_to_build_cannot_hide_live_records(monkeypatch):
     monkeypatch.setattr(arming, 'check', spy_check)
     run_session(monkeypatch, sm, TRADE, calm(), DAY, POSITIONS)
     assert seen and arming.LIVE_RECORD in seen[0]
+
+
+# ── review fixes P7f (2026-11-28, second round) ───────────────────────────────
+
+def test_a_live_record_filed_mid_session_gets_an_engine(monkeypatch):
+    """Review A3: the monitor started with no engine (nothing to own); a live
+    naked record then appears (adoption / naked-resolve). It must be watched
+    this session, not tomorrow."""
+    eng = FakeEngine()
+    calls = []
+
+    def opener(dry_run, zebra_store=None):
+        calls.append(1)
+        return None if len(calls) == 1 else eng
+    monkeypatch.setattr(sm, '_open_naked_engine', opener)
+    monkeypatch.setattr(sm, '_live_naked_open_locally', lambda: True)
+    monkeypatch.setattr(sm, 'NAKED_ENGINE_RECHECK_SEC', 0)
+    run_session(monkeypatch, sm, TRADE, calm(), DAY, POSITIONS)
+    assert len(calls) >= 2 and eng.polls
+
+
+def test_a_second_monitor_runs_without_the_engine_and_writes_no_beat(monkeypatch, tmp_path):
+    """Review A6: only one process on the box may hold the naked engine; a
+    second monitor must not cancel the first one's sell or flip its beat."""
+    from common import filelock
+    from zebra import config as zcfg
+    monkeypatch.setattr(sm, 'LOG_DIR', tmp_path)
+    monkeypatch.setattr(zcfg, 'LOG_DIR', tmp_path)
+    monkeypatch.setattr(zcfg, 'NAKED_LIVE', 'live')
+    monkeypatch.setattr(sm, '_BEAT_SUPPRESSED', False)
+    monkeypatch.setattr(sm, '_NAKED_LOCK_ALERTED', False)
+    sent = []
+    monkeypatch.setattr(sm, 'send_telegram', lambda m, **k: sent.append(m))
+    monkeypatch.setattr(filelock, 'try_hold', lambda path: False)     # the FIRST monitor has it
+    assert sm._open_naked_engine(False, None) is None
+    assert sm._BEAT_SUPPRESSED is True and len(sent) == 1
+    assert sm.write_heartbeat('polling', True) is False
+    assert not (tmp_path / sm.HEARTBEAT_NAME).exists()
+    sm._open_naked_engine(False, None)
+    assert len(sent) == 1                                              # said once per process
+
+
+def test_the_engine_lock_is_exclusive_across_processes_and_idempotent_within(tmp_path):
+    import os
+    from common import filelock
+    p = tmp_path / 'naked_exit_engine.lock'
+    assert filelock.try_hold(p) and filelock.try_hold(p)
+    fd = os.open(str(p), os.O_RDWR)                   # another holder
+    try:
+        assert not filelock._try_acquire(fd)
+    finally:
+        os.close(fd)
+    filelock.release_held(p)
+    fd = os.open(str(p), os.O_RDWR)
+    try:
+        assert filelock._try_acquire(fd)
+        filelock._release(fd)
+    finally:
+        os.close(fd)
+
+
+def test_an_engine_without_the_neo_package_does_not_claim_to_be_armed(monkeypatch, tmp_path):
+    """Review A3: the beat's `naked_engine` is what the live entry gate trusts.
+
+    RETIRES WHEN: never as a source guard -- it reads a DATA file this code writes, not source;
+    it retires with that file format.
+    """
+    import json
+    monkeypatch.setattr(sm, 'LOG_DIR', tmp_path)
+    monkeypatch.setattr(sm, '_BEAT_SUPPRESSED', False)
+    eng = FakeEngine()
+    eng.neo_error = 'No module named kotak_neo'
+    monkeypatch.setattr(sm, '_NAKED_ENGINE', eng)
+    sm.write_heartbeat('polling', False)
+    assert json.loads((tmp_path / sm.HEARTBEAT_NAME).read_text())['naked_engine'] is False
+
+
+def test_a_monitor_that_lost_the_lock_takes_the_engine_when_it_frees(monkeypatch, tmp_path):
+    """Re-review F4: a hand-run monitor started first holds the lock; the cron
+    monitor must take the engine (and resume its beat) once that one exits."""
+    from common import filelock
+    from zebra import config as zcfg
+    monkeypatch.setattr(sm, 'LOG_DIR', tmp_path)
+    monkeypatch.setattr(zcfg, 'LOG_DIR', tmp_path)
+    monkeypatch.setattr(zcfg, 'NAKED_LIVE', 'live')
+    monkeypatch.setattr(sm, '_BEAT_SUPPRESSED', False)
+    monkeypatch.setattr(sm, '_NAKED_LOCK_ALERTED', False)
+    monkeypatch.setattr(sm, 'send_telegram', lambda m, **k: None)
+    from zebra import naked_exit
+    monkeypatch.setattr(naked_exit.NakedExitEngine, 'open_count', lambda self: 0)  # no book
+    free = [False]
+    monkeypatch.setattr(filelock, 'try_hold', lambda path: free[0])
+    monkeypatch.setattr(sm, '_live_naked_open_locally', lambda: False)
+    assert sm._open_naked_engine(False, None) is None and sm._BEAT_SUPPRESSED
+    free[0] = True                                    # the hand-run monitor exited
+    eng = sm._open_naked_engine(False, None)
+    assert eng is not None and sm._BEAT_SUPPRESSED is False
+    filelock.release_held(sm._naked_engine_lock_path())

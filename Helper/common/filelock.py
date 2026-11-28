@@ -137,3 +137,47 @@ def exclusive(lock_path: Path, timeout: float = DEFAULT_TIMEOUT) -> Iterator[Non
         if acquired:
             _release(fd)
         os.close(fd)
+
+
+# -- a lock held for a PROCESS's lifetime ------------------------------------------
+#: path -> fd of every lock this process holds via `try_hold`.
+_HELD: dict = {}
+
+
+def try_hold(lock_path: Path) -> bool:
+    """Take an exclusive lock on `lock_path` and KEEP it until `release_held`
+    or process exit (the OS drops it then, so a crash never leaves it stuck).
+    Non-blocking: False when another process holds it. Idempotent within one
+    process -- a second call for the same path is True without a second fd
+    (two fds of one process would conflict with each other).
+
+    For a role exactly one process may play at a time -- the naked exit engine
+    (review A6, 2026-11-28): a second monitor started by hand must not cancel
+    the first one's working sell."""
+    key = str(Path(lock_path).resolve())
+    if key in _HELD:
+        return True
+    Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(key, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        ok = _try_acquire(fd)
+    except Exception:
+        os.close(fd)
+        raise
+    if not ok:
+        os.close(fd)
+        return False
+    _HELD[key] = fd
+    return True
+
+
+def release_held(lock_path: Path) -> None:
+    """Give back a `try_hold` lock. Never raises."""
+    fd = _HELD.pop(str(Path(lock_path).resolve()), None)
+    if fd is None:
+        return
+    _release(fd)
+    try:
+        os.close(fd)
+    except OSError:
+        pass

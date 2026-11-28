@@ -89,9 +89,16 @@ def classify_reject(message: str) -> bool:
 
 
 def default_client():
-    """The shared-session client for zebra's orders (exclusive: one bot per contract)."""
+    """The shared-session client for zebra's orders (exclusive: one bot per contract).
+
+    `refresh_wait_s` (review K8/A7, 2026-11-28): a read that finds the
+    session dead waits at most `naked_neo_refresh_wait_sec` for the refresh,
+    not the session lock's 75 s -- the exit engine runs inline in a 5-second
+    loop, and a stall there blinds every position and ages the heartbeat the
+    live entry gate needs. The read then fails as unreadable; the next poll
+    tries again."""
     client, _, _ = neo()
-    return client.NeoClient(BOT)
+    return client.NeoClient(BOT, refresh_wait_s=float(cfg.NAKED_NEO_REFRESH_WAIT_SEC))
 
 
 def scrip_row(c, parent: dict, scrip_map=None):
@@ -155,7 +162,8 @@ class NeoBroker:
             # write fails we do not send: an order nobody recorded is the one
             # outcome this module exists to prevent.
             try:
-                on_tag(tag, row.trading_symbol)
+                on_tag(tag, row.trading_symbol, neo_token=str(row.token),
+                       neo_tick=float(getattr(row, 'tick_size', 0) or 0) or None)
             except Exception as e:
                 return BuyResult('rejected', message='not sent: tag not persisted (%s)' % e,
                                  retry=False)

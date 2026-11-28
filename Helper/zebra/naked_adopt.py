@@ -74,7 +74,7 @@ def _file_record(store, parent, twin, fill: float, order_id, now, m) -> dict:
     ref = twin.get('first_ask') or twin.get('ask') or twin.get('limit')
     if ref:
         rec['entry_signal_ask'] = float(ref)
-    for k in ('tag', 'neo_symbol', 'neo_token'):
+    for k in ('tag', 'neo_symbol', 'neo_token', 'neo_tick'):
         if twin.get(k):
             rec['entry_tag' if k == 'tag' else k] = twin[k]
     return store.add_naked_live(rec)
@@ -169,10 +169,44 @@ def resolve_by_hand(store: ZebraStore, pid: int, *, filled: Optional[float] = No
     if filled is not None:
         if float(filled) <= 0:
             raise ValueError('--filled needs a positive price')
+        held = None
+        if m == 'live' and not twin.get('neo_symbol') and not force:
+            # Re-review F11: without the symbol the account cannot be checked.
+            raise ValueError('no NEO symbol on the stamp: cannot check the account '
+                             '(--force if you have checked the NEO app)')
+        if m == 'live' and twin.get('neo_symbol'):
+            # Review R1: file what the ACCOUNT holds, never assume a whole lot.
+            from . import naked_neo
+            c = client or naked_neo.default_client()
+            try:
+                held = int(c.net_held(twin['neo_symbol']))
+                # Another OPEN zebra record on the same contract owns its own lot.
+                # WHOLE BOOK: dedup -- every open naked record on this contract.
+                held -= sum(int(t.get('quantity') or 0) for t in store.load_trades()
+                            if is_naked(t) and not t.get('rehearsal')
+                            and t.get('status') in ('entered', 'closing')
+                            and t.get('neo_symbol') == twin['neo_symbol'])
+            except Exception as e:
+                if not force:
+                    raise ValueError('cannot read the NEO position (%s); --force files a '
+                                     'whole lot if you have checked the NEO app' % e)
+            lot = int(parent.get('lot_size') or 0)
+            if held is not None and held <= 0 and not force:
+                raise ValueError('the account holds %d of %s -- nothing to file (use --none, '
+                                 'or --force after checking the NEO app)'
+                                 % (held, twin['neo_symbol']))
+            if held is not None and held > 0 and lot and held != lot:
+                # The book holds whole lots only; a part (or a double) cannot be
+                # filed as one lot -- the exit would chase shares that do not
+                # exist, or leave some unwatched. --force does not change that.
+                raise ValueError('the account holds %d of %s, not exactly 1 lot (%d). Square it '
+                                 'to a whole lot or to 0 in the NEO app, then resolve again'
+                                 % (held, twin['neo_symbol'], lot))
         stored = _file_record(store, parent, twin, float(filled), twin.get('order_id'), now, m)
         _stamp(store, pid, twin, state='entered', id=stored['id'], adopted=True,
                settled_at=_ts(now), reason='filed by hand @ %.2f' % float(filled))
-        return 'filed #%s @ %.2f -- its exits are now watched' % (stored['id'], float(filled))
+        return 'filed #%s @ %.2f x %d -- its exits are now watched' % (
+            stored['id'], float(filled), int(stored['quantity']))
     if m == 'live' and not force:
         sym = twin.get('neo_symbol')
         if not sym:

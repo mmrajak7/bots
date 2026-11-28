@@ -1882,7 +1882,10 @@ def cmd_status(args):
         lst = by_status.get(st, [])
         print(f"  {st:<10} {len(lst)}")
 
-    entered = by_status.get('entered', [])
+    # A naked record mid-exit (`closing`, possibly carried overnight) is still
+    # an open position -- shown here too (review A11).
+    entered = by_status.get('entered', []) + [
+        t for t in by_status.get('closing', []) if t.get('structure') == 'naked_long']
     if entered:
         from . import config as cfg
         print(f"\n  --- Open Trades ---")
@@ -1890,9 +1893,10 @@ def cmd_status(args):
             if t.get('structure') == 'naked_long':
                 # One long leg: no short strike, no debit/width. Printed on
                 # its own line shape so the dashboard cannot KeyError on it.
-                tags = ' [NAKED LIVE%s%s]' % (
+                tags = ' [NAKED LIVE%s%s%s]' % (
                     ' rehearsal' if t.get('rehearsal') else '',
-                    ' override' if t.get('override') else '')
+                    ' override' if t.get('override') else '',
+                    ' CLOSING' if t.get('status') == 'closing' else '')
                 print(f"  #{t['id']} {t['stock']:<12} {t['direction']:<3} "
                       f"{t.get('long_symbol')} entry={t.get('entry_long_price')} "
                       f"TP={t.get('tp_spot')} exp={t.get('expiry')} "
@@ -2098,6 +2102,20 @@ def cmd_reset(args):
     all_trades = store.load_trades()
     open_states = ('watching', 'triggered', 'entered')
     in_flight = [t for t in all_trades if t.get('status') in open_states]
+
+    # Review A2 (2026-11-28): reset books every `entered` record at -100% and
+    # stops anything watching it. A LIVE naked record is a real lot at NEO --
+    # never. Refused outright, with or without --confirm; close it first.
+    from .trade_store import is_naked
+    live_naked = [t for t in all_trades if is_naked(t) and not t.get('rehearsal')
+                  and t.get('status') in ('entered', 'closing')]
+    if live_naked:
+        print("REFUSED: live naked position(s) are open -- reset would book a real lot "
+              "at -100% and stop its exit engine watching it:")
+        for t in live_naked:
+            print(f"  #{t['id']} {t.get('stock')} {t.get('long_symbol')} {t.get('status')}")
+        print("Close them first (the exit engine, or the NEO app + zebra close).")
+        sys.exit(1)
 
     if not in_flight:
         print("No in-flight signals to reset (0 watching/triggered/entered).")

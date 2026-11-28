@@ -5464,6 +5464,8 @@ def run_cycle(store: ZebraStore, kite, dry_run: bool = False,
             naked_adopt.sweep(store, dry_run=dry_run)
         except Exception as e:
             logger.error("Naked adoption sweep failed: %s", e, exc_info=True)
+        # Review A4: an open live naked lot needs an engine that is POLLING.
+        naked_entry.engine_liveness_check(store, dry_run=dry_run)
     # P6: `/nresume <code>` from the owner's Telegram, read ONLY while a naked
     # halt is killed (no network otherwise), and BEFORE `begin_cycle` so this
     # cycle's evaluation sees a cleared kill. Never under --dry-run: a dry

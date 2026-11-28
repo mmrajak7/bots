@@ -95,5 +95,7 @@
   "naked_delivery_alert_sessions": 4,
   "naked_adopt_escalate_sec": 600,
   "naked_adopt_repeat_sec": 3600,
+  "naked_exit_zero_held_sec": 600,
+  "naked_neo_refresh_wait_sec": 2.0,
   "naked_stt_sell_pct": 0.15
 }

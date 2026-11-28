@@ -1125,6 +1125,26 @@ unfilled, up to 6 orders, never past the first ask + 5% (owner: "never miss
 entry"; the bound is the trader's). The slippage kill measures entries against
 that first ask (`entry_signal_ask`).
 
+**P7f (2026-11-28, second three-way review: trader, architect, flow; all said
+rehearsal GO / live NO-GO before it).** NEO reads on the exit path parse ONLY
+the contract's own rows (`live_orders`, `positions_for`, `foreign_filled`): one
+bad row of another bot or a hand order used to stop every naked sell. Refused /
+unclear exit sells re-alert every 15 min; a SHORT account is alerted red and
+never read as flat (and never booked as a normal exit); an account that READS 0
+while the exit still has shares is alerted after 10 min ("verify in the app") and
+NEVER settled by the engine -- a 0 can be a bad read of a held lot; hand sales
+count every non-bot sale of the contract that day (no baseline: the safe error); two sessions from expiry there is no floor even with
+no saved trigger bid. A store save is ONE write of one-record-per-line JSON
+(was ~2-3 s of `indent=2` streaming) and the close lock + trigger is one write.
+`zebra reset` refuses while a live naked lot is open. The monitor ALWAYS builds
+the exit engine when the cohort store opened (a record filed mid-session is
+watched at once), holds `logs/naked_exit_engine.lock` (a second monitor runs
+without the engine and writes no beat), and an engine that cannot import NEO
+says `naked_engine: false`. zebra's cycle alerts when a live naked lot has no
+polling engine. zebra's NEO client waits 2 s, not 75 s, on a dead session.
+**A test logged in to the real NEO account on the Pi (07:44, 28-Nov)**: both
+test conftests now make the real `kotak_neo.session` raise.
+
 **Naked live runbook (Pi, `../CROCODILE/venv/bin/python -m zebra ...`):**
 
 | situation | do |

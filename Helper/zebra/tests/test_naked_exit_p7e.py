@@ -380,7 +380,7 @@ def test_an_unreadable_book_sends_nothing(store, neo, monkeypatch):
     clk = Clock()
     r, e, _ = _fire_tp(store, neo, c, clk)
     n = len(neo.placed('S'))
-    monkeypatch.setattr(c, 'order_book', lambda *a, **k: (_ for _ in ()).throw(
+    monkeypatch.setattr(c, '_views_where', lambda *a, **k: (_ for _ in ()).throw(
         C.Unavailable('book down')))
     for k in range(1, 10):
         clk.t += 11

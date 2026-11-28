@@ -125,10 +125,15 @@ class NakedExitEngine:
         self._nagged: Dict[int, str] = {}    # record id -> day the stuck-exit nag went out
         # Import the NEO code NOW (review F9): a process started before a pull
         # must not meet newer NEO code for the first time at the day's first stop.
+        self.neo_error = None
         try:
             from . import naked_neo
             naked_neo.neo()
         except Exception as e:
+            # Review A3: remembered, so the heartbeat can say this engine
+            # CANNOT sell (the live entry gate then refuses) instead of
+            # claiming an armed engine.
+            self.neo_error = str(e) or type(e).__name__
             self.log('  NAKED: NEO package not importable (%s) -- live exits cannot sell' % e)
 
     # -- store ------------------------------------------------------------------
@@ -152,6 +157,10 @@ class NakedExitEngine:
         """Re-read the local book when another process (zebra's cron) wrote it.
         A stat per poll; the 3.6 MB parse only on change."""
         m = self._file_mtime()
+        if m is not None and m != self._mtime and m == getattr(self.store, 'saved_mtime', None):
+            # Our OWN last save (review A1): the cache already holds it.
+            self._mtime = m
+            return
         if m is not None and m != self._mtime:
             try:
                 self.store.reload()
@@ -361,6 +370,11 @@ class NakedExitEngine:
         # The flag FIRST (review F12): a failing write must not re-send every poll.
         self.store.update_trade_fields(t['id'], _drive=False,
                                        delivery_alerted=today.isoformat())
+        if t.get('rehearsal'):
+            # Review L3: a rehearsal record holds nothing at a broker.
+            self.log('  NAKED REHEARSAL #%s %s inside the delivery window (%d left; logged)'
+                     % (t['id'], t['stock'], left))
+            return
         self.send('\U0001F6A8 NAKED #%s %s %s is still OPEN %d session(s) from expiry -- '
                   'past its TIME exit and inside the physical-delivery window. Close it.'
                   % (t['id'], t['stock'], t['long_symbol'], left))
@@ -378,34 +392,36 @@ class NakedExitEngine:
                           '-- NOTHING is selling a real position. Exit it in the NEO app '
                           'or take --dry-run off the crontab.' % (tag, reason.upper()))
             return '%s %s WOULD exit (dry-run)' % (tag, reason)
-        # LOCAL writes only, up to the first sell (review A5). The Drive copy
-        # catches up on the booking write.
-        if not self.store.begin_close(t['id'], 'naked:%s' % reason, _drive=False):
-            return '%s: close lock not taken' % tag
+        # ONE local write up to the first sell (reviews A5, A1): the close lock,
+        # the trigger and the chase state together. The Drive copy catches up
+        # on the booking write.
         touch = value if value is not None else (q or {}).get('bid')
         trig = {'reason': reason, 'at': now.strftime('%Y-%m-%d %H:%M:%S'),
                 'value': value, 'spot': spot, 'touch_bid': touch,
                 'touch_ask': (q or {}).get('ask')}
         fields = dict(exit_rule=rule, exit_trigger=trig, exit_touch=touch,
                       exit_chase_day=now.date().isoformat())
+        alert = None
+        if live:
+            try:
+                fields['exit_chase'] = self._new_chase(t).to_dict()
+            except Exception as e:
+                # Cannot even name the contract at NEO. The close lock is held,
+                # so nothing else will try; a human must sell it.
+                fields['exit_chase_error'] = str(e)[:200]
+                fields['exit_chase_alerted'] = True
+                alert = ('\U0001F6A8 NAKED %s %s fired but the NEO contract cannot be '
+                         'resolved (%s). SELL %s x %s IN THE NEO APP.'
+                         % (tag, reason.upper(), e, t['long_symbol'], t['quantity']))
+        if not self.store.begin_close(t['id'], 'naked:%s' % reason, _drive=False,
+                                      fields=fields):
+            return '%s: close lock not taken' % tag
         if not live:
-            self.store.update_trade_fields(t['id'], _drive=False, **fields)
             return self._book(t, reason, value, spot, {'side': 'SELL', 'price': value,
                                                        'bid': touch, 'rehearsal': True})
-        try:
-            st = self._new_chase(t)
-        except Exception as e:
-            # Cannot even name the contract at NEO. The close lock is held, so
-            # nothing else will try; a human must sell it.
-            fields['exit_chase_error'] = str(e)[:200]
-            fields['exit_chase_alerted'] = True
-            self.store.update_trade_fields(t['id'], _drive=False, **fields)
-            self.send('\U0001F6A8 NAKED %s %s fired but the NEO contract cannot be '
-                      'resolved (%s). SELL %s x %s IN THE NEO APP.'
-                      % (tag, reason.upper(), e, t['long_symbol'], t['quantity']))
-            return '%s: chase could not start: %s' % (tag, e)
-        fields['exit_chase'] = st.to_dict()
-        self.store.update_trade_fields(t['id'], _drive=False, **fields)
+        if alert:
+            self.send(alert)
+            return '%s: chase could not start: %s' % (tag, fields['exit_chase_error'])
         fresh = self.store.find(t['id'])
         line = self._step_closing(kite, fresh, now)     # the first sell, before any alert
         self.send('⚠ NAKED %s %s fired @ bid %s (spot %s) -- selling %s x %s on NEO'
@@ -443,6 +459,12 @@ class NakedExitEngine:
 
     def _floor(self, t: dict, now: datetime) -> Optional[float]:
         """The lowest WIDE-book bid this exit may sell into (module docstring)."""
+        left = naked_rules.sessions_left(t.get('expiry'), now.date())
+        if left is not None and left <= 2:
+            # Trader re-review: two sessions from a physically settled expiry
+            # any bid beats delivery. No floor at all -- checked FIRST (review
+            # N4/A10): a missing trigger bid must not block an expiry-day sale.
+            return 0.0
         touch = t.get('exit_touch')
         try:
             touch = float(touch)
@@ -450,15 +472,9 @@ class NakedExitEngine:
             return None
         if touch <= 0:
             return None
-        left = naked_rules.sessions_left(t.get('expiry'), now.date())
-        if left is not None and left <= 2:
-            # Trader re-review: two sessions from a physically settled expiry
-            # any bid beats delivery. No floor at all.
-            return 0.0
         frac = float(cfg.NAKED_EXIT_FLOOR_STOP)
         if _reason_of(t) != 'stop':
             frac = float(cfg.NAKED_EXIT_FLOOR_TARGET)
-            left = naked_rules.sessions_left(t.get('expiry'), now.date())
             try:
                 at = datetime.strptime((t.get('exit_trigger') or {}).get('at', ''),
                                        '%Y-%m-%d %H:%M:%S')
@@ -532,6 +548,17 @@ class NakedExitEngine:
                                            exit_chase=st.to_dict())
             t = self.store.find(t['id'])
         tid = t['id']
+        if t.get('exit_touch') in (None, 0, 0.0):
+            # Review N4: no bid was saved at the trigger (an unpriced backstop,
+            # or a crash before the trigger was written). Anchor the wide-book
+            # floor on the first RELIABLE bid seen (re-review F6: a stub bid of
+            # a dead book would set a floor of nothing), so it can sell at all.
+            # Until then only a reliable book is sold (`_floor` is None).
+            bid0 = self._value(self._quote(kite, t['long_symbol'])) or 0.0
+            if bid0 > 0:
+                self.store.update_trade_fields(tid, _drive=False, exit_touch=bid0,
+                                               exit_touch_late=True)
+                t = self.store.find(tid)
         try:
             hand = self._hand_sales(t, st, today, orders, tag)
         except Exception as e:
@@ -540,24 +567,69 @@ class NakedExitEngine:
             self.store.update_trade_fields(tid, _drive=False, exit_chase=st.to_dict())
             self._trouble_watch(self.store.find(tid), st, tag)
             return '%s: book unreadable -- nothing sent' % tag
+        t = self.store.find(tid)
         was = (st.status, st.rejects, st.unclears)
         quote = naked_neo.quote_bid_fn(kite, t['long_symbol'], floor=self._floor(t, now))
+        seen_held = []
+
+        def held_fn():
+            # The chase's own position read, captured (no extra NEO call) so
+            # a SHORT account and a lot that already left are seen below.
+            h = int(self.client.net_held(st.symbol))
+            seen_held.append(h)
+            return h
 
         def persist(s):
             # Local book only: both processes on the box read it under the
             # store lock, and it is written BEFORE every send (the tag).
             self.store.update_trade_fields(tid, _drive=False, exit_chase=s.to_dict())
         st = orders.chase_exit(self.client, st, quote, self._policy(), persist=persist,
-                               clock=self._clock, price_fn=self._price_fn)
+                               clock=self._clock, price_fn=self._price_fn, held_fn=held_fn)
+        held = seen_held[-1] if seen_held else None
+        if held is not None and held < 0:
+            self._short_watch(self.store.find(tid), tag, held, st)
+        self._zero_held_watch(self.store.find(tid), st, held, tag)
         if st.status == 'done':
-            if st.sold <= 0 or hand:
+            t = self.store.find(tid)
+            if t.get('exit_needs_human'):
+                # STICKY: once handed to a human (short, hand sale, nothing
+                # sold) a later poll -- which reads no position, the chase
+                # being done -- must never book it as a normal exit.
+                return '%s: chase done -- waiting for a human to book it' % tag
+            short = held is not None and held < 0
+            # Only when a HAND count took shares off: positions LAG a fill, so
+            # on an ordinary exit the step that settles the last fill can still
+            # read the lot as held, and that must book normally.
+            still = bool(hand) and held is not None and held > 0
+            # Re-review F3: a SHORT account is never booked as a normal exit,
+            # and (F2) neither is one that still HOLDS shares after the hand
+            # count took them off: both go to a human, said plainly.
+            if st.sold <= 0 or hand or short or still:
+                why = []
+                if hand:
+                    why.append('%d counted as sold BY HAND' % hand)
+                if st.sold <= 0 and not hand:
+                    why.append('the rest left the account (by hand, or overnight)')
+                if short:
+                    state = 'the account is SHORT %d -- BUY IT BACK FIRST' % -held
+                elif still:
+                    # Positions LAG fills: this may be a lot the owner already
+                    # sold. Never "sell it" -- CHECK first, or a second sale
+                    # makes the account short.
+                    state = ('the account still READS %d held after a hand sale -- the bot '
+                             'stopped. CHECK THE NEO APP: sell only what it really holds'
+                             % held)
+                elif held is None:
+                    state = 'the account position could not be read -- check the NEO app'
+                else:
+                    state = 'the position is flat'
                 if not t.get('exit_zero_alerted'):
-                    self.store.update_trade_fields(tid, _drive=False, exit_zero_alerted=True)
-                    self.send('\U0001F6A8 NAKED %s: the position is flat -- the engine sold %d, '
-                              '%s. Book it at the true average: python -m zebra close %s '
-                              '--exit-debit <avg fill per share> --reason %s'
-                              % (tag, st.sold, ('%d were sold BY HAND' % hand) if hand
-                                 else 'the rest left the account (by hand, or overnight)',
+                    self.store.update_trade_fields(tid, _drive=False, exit_zero_alerted=True,
+                                                   exit_needs_human=True)
+                    self.send('\U0001F6A8 NAKED %s: %s -- the engine sold %d, %s. Book it at '
+                              'the true average: python -m zebra close %s --exit-debit <avg '
+                              'fill per share> --reason %s'
+                              % (tag, state, st.sold, '; '.join(why) or 'nothing else',
                                  tid, _reason_of(t)))
                 return '%s: chase done (bot sold %d, hand %d) -- human books it' % (
                     tag, st.sold, hand)
@@ -567,26 +639,93 @@ class NakedExitEngine:
                               {'side': 'SELL', 'price': round(st.avg_exit, 2),
                                'bid': t.get('exit_touch'), 'fills': st.fills,
                                'reprices': st.reprices})
+        t = self.store.find(tid)
         self._no_bid_watch(t, st, tag)
         self._trouble_watch(t, st, tag)
-        if st.rejects >= 3 and was[1] < 3:
-            self.send('\U0001F534 NAKED %s: 3 exit sells refused in a row (%s). Still trying.'
-                      % (tag, st.note))
-        elif st.unclears >= 3 and was[2] < 3:
-            self.send('\U0001F534 NAKED %s: 3 exit sells UNCLEAR in a row (%s). Check the '
-                      'NEO order book.' % (tag, st.note))
+        self._refusal_watch(t, st, tag, was)
         return '%s: chase %s (%s)' % (tag, st.status, st.note)
+
+    def _refusal_watch(self, t, st, tag, was) -> None:
+        """Review R2: refused / unclear exit sells alert at 3 in a row and then
+        AGAIN every repeat interval while they last -- a stop every sell of
+        which is refused must never go quiet after one message."""
+        clk = self._clock()
+        for n, before, key, text in (
+                (st.rejects, was[1], 'exit_reject_alert_at',
+                 'exit sells REFUSED in a row (%s). Still trying -- if it keeps refusing, '
+                 'sell in the NEO app (cancel the bot order first).'),
+                (st.unclears, was[2], 'exit_unclear_alert_at',
+                 'exit sells UNCLEAR in a row (%s). Check the NEO order book.')):
+            if n < 3 or (st.working_tag and key == 'exit_reject_alert_at'):
+                # Re-review F10: a sell now WORKING was accepted; the refusal
+                # run is over even though `rejects` only resets on a fill.
+                if t.get(key) is not None:
+                    self.store.update_trade_fields(t['id'], _drive=False, **{key: None})
+                continue
+            if before < 3 or _due(t.get(key), clk):
+                self.store.update_trade_fields(t['id'], _drive=False, **{key: clk})
+                self.send('\U0001F534 NAKED %s: %d %s' % (tag, n, text % st.note))
+
+    def _short_watch(self, t, tag, held, st) -> None:
+        """Trader review N3: a hand sale and a bot sale that fill within one poll
+        leave the account SHORT an option -- unlimited risk on a call. Never
+        read as 'flat'; red, and again every repeat interval."""
+        clk = self._clock()
+        if not _due(t.get('exit_short_alert_at'), clk):
+            return
+        self.store.update_trade_fields(t['id'], _drive=False, exit_short_alert_at=clk)
+        self.send('\U0001F6A8\U0001F6A8 NAKED %s: the NEO ACCOUNT IS SHORT %d of %s -- BUY IT '
+                  'BACK NOW in the app. (bot sold %d; a hand sale probably filled too.)'
+                  % (tag, -held, st.symbol, st.sold))
+
+    def _zero_held_watch(self, t, st, held, tag) -> None:
+        """Flow review R4, re-review F1: the account READS 0 while the chase
+        still has shares to sell and no bot sell is working -- sold in the app
+        on an earlier day, squared off, or a positions row that does not show
+        a carried lot (unmeasured until the Monday probe). It is NEVER settled
+        here: a 0 can be a bad read of a lot still held. After
+        `naked_exit_zero_held_sec` of continuous zero reads it says so (and
+        again every repeat interval) and the chase keeps going, so a row that
+        comes back is sold. Replaces the generic STUCK alert for this case."""
+        zero = (st.status == 'active' and not st.working_tag and held == 0
+                and st.remaining > 0)
+        since = t.get('exit_zero_held_since')
+        clk = self._clock()
+        if not zero:
+            if since is not None or t.get('exit_zero_held_alert_at') is not None:
+                self.store.update_trade_fields(t['id'], _drive=False,
+                                               exit_zero_held_since=None,
+                                               exit_zero_held_alert_at=None)
+            return
+        if since is None:
+            self.store.update_trade_fields(t['id'], _drive=False, exit_zero_held_since=clk)
+            return
+        if clk - float(since) < float(cfg.NAKED_EXIT_ZERO_HELD_SEC):
+            return
+        if not _due(t.get('exit_zero_held_alert_at'), clk):
+            return
+        self.store.update_trade_fields(t['id'], _drive=False, exit_zero_held_alert_at=clk)
+        self.send('\U0001F6A8 NAKED %s: the NEO account READS 0 of %s for %.0f min while the '
+                  'exit still has %d to sell (bot sold %d). VERIFY IN THE NEO APP: if it was '
+                  'sold by hand / squared off, book it: python -m zebra close %s --exit-debit '
+                  '<avg fill> --reason %s. If the app shows it HELD, sell it there. The engine '
+                  'keeps watching.' % (tag, st.symbol, (clk - float(since)) / 60.0,
+                                       st.remaining, st.sold, t['id'], _reason_of(t)))
 
     def _hand_sales(self, t, st, today: str, orders, tag) -> int:
         """Shares of this contract sold TODAY by orders zebra did not tag (the
-        NEO app, another tool), from the ORDER BOOK. New ones come off
-        `remaining` and cancel any working bot sell. Returns the total hand-sold
-        quantity over the record's life. Raises when the book is unreadable."""
-        from . import naked_neo
+        NEO app, another tool), from the ORDER BOOK (only this contract's rows
+        are parsed). New ones come off `remaining` and cancel any working bot
+        sell. Returns the total hand-sold quantity over the record's life.
+        Raises when the book is unreadable.
+
+        NO BASELINE (re-review F2): a hand sale of an EARLIER record on the same
+        contract the same day is counted here too (review A5). That is the
+        SAFE error -- the bot stops short and the done-branch says the account
+        still holds the lot -- while any baseline can swallow a hand sale of
+        THIS lot and send the bot selling into a short."""
         c = self.client
-        today_hand = sum(int(o.filled or 0) for o in c.order_book()
-                         if o.symbol == st.symbol and o.side == 'S'
-                         and o.bot() != naked_neo.BOT)
+        today_hand = int(c.foreign_filled(st.symbol, 'S'))
         seen = dict(t.get('exit_hand_sold') or {})
         new = today_hand - int(seen.get(today, 0))
         if new > 0:
@@ -661,7 +800,8 @@ class NakedExitEngine:
         clk = self._clock()
         working = (' Order %s is WORKING -- if you sell by hand, cancel it first.'
                    % st.working_no) if st.working_no else ''
-        if st.troubles >= cfg.NAKED_EXIT_ALERT_STEPS:
+        zero_case = 'account holds 0' in str(st.note) and not st.working_tag
+        if st.troubles >= cfg.NAKED_EXIT_ALERT_STEPS and not zero_case:
             if _due(t.get('exit_trouble_alert_at'), clk):
                 self.store.update_trade_fields(t['id'], _drive=False,
                                                exit_trouble_alert_at=clk)
@@ -759,7 +899,8 @@ class NakedExitEngine:
         ch = t.get('exit_chase') or {}
         stuck = t.get('status') == 'closing' and not t.get('rehearsal') and (
             (t.get('exit_chase_error') and not ch)
-            or (ch.get('status') == 'done' and not ch.get('sold')))
+            or (ch.get('status') == 'done'
+                and (not ch.get('sold') or t.get('exit_needs_human'))))
         if not stuck:
             return
         day = now.strftime('%Y-%m-%d')

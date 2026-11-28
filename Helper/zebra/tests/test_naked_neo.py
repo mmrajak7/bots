@@ -75,7 +75,7 @@ def broker(neo, lot=LOT, wait=10.0):
 def ctx(log=None, fail=False):
     seen = log if log is not None else []
 
-    def on_tag(tag, neo_symbol):
+    def on_tag(tag, neo_symbol, **kw):
         if fail:
             raise OSError('disk full')
         seen.append((tag, neo_symbol))
@@ -83,17 +83,19 @@ def ctx(log=None, fail=False):
 
 
 def test_fill_at_the_ask_reads_the_book_and_carries_the_tag(neo):
-    seen = []
+    seen, extra = [], {}
     placed_at_tag_time = []
     c = ctx(seen)
     inner = c['on_tag']
 
-    def on_tag(tag, s):
+    def on_tag(tag, s, **kw):
         placed_at_tag_time.append(len(neo.placed()))
+        extra.update(kw)
         inner(tag, s)
     c['on_tag'] = on_tag
     r = broker(neo).buy('RELIANCE26DEC1540CE', LOT, 10.2, c)
     assert r.status == 'filled' and r.fill_price == 10.2
+    assert extra.get('neo_token')            # review A9: the stamp carries the token
     assert r.tag and r.tag.startswith('zbr-') and r.neo_symbol == SYM and r.neo_token == TOK
     assert seen == [(r.tag, SYM)]
     assert placed_at_tag_time == [0]            # the witness existed before the order

@@ -441,6 +441,10 @@ def _live_naked_open_locally() -> bool:
 #: past MARKET_CLOSE, and only until this.
 NAKED_FO_CLOSE = market_session.FNO_CLOSE
 
+#: How often a monitor running WITHOUT a naked engine re-checks the local book
+#: for a live naked record that appeared mid-session (review A3).
+NAKED_ENGINE_RECHECK_SEC = 60
+
 #: The day Kite's own prints DISPROVED a listed holiday (set by
 #: `holiday_standdown`). `is_market_open` reads the same calendar, so without
 #: this the loop would wait all session for a market it was just shown is open.
@@ -1451,6 +1455,11 @@ def write_heartbeat(state: str, dry_run: bool, *, open_trades: int = 0,
     health file must not be able to stop the monitoring the file describes.
     """
     now = time.time() if now is None else now
+    if _BEAT_SUPPRESSED:
+        # Review A6: a SECOND monitor (another holds the naked engine lock)
+        # must not overwrite the shared beat -- it would flip `dry_run` and
+        # `naked_engine` under the first one, which is the armed engine.
+        return False
     payload = {
         'schema': HEARTBEAT_SCHEMA,
         'ts': now,
@@ -1463,7 +1472,9 @@ def write_heartbeat(state: str, dry_run: bool, *, open_trades: int = 0,
         'kill_switch': bool(kill_switch),
         # The live naked entry gate (`zebra.naked_entry.exit_engine_problem`)
         # refuses to buy unless THIS process is running the naked exit engine.
-        'naked_engine': _NAKED_ENGINE is not None,
+        # An engine that cannot import the NEO package cannot sell (review A3).
+        'naked_engine': (_NAKED_ENGINE is not None
+                         and not getattr(_NAKED_ENGINE, 'neo_error', None)),
         'open_trades': int(open_trades),
         'cohort_trades': int(cohort_trades),
         # False = the fourth book could not be opened, so cohort positions are
@@ -8100,14 +8111,42 @@ def _arming_preflight(dry_run: bool, all_trades) -> dict:
 _NAKED_ENGINE = None
 
 
+def _naked_engine_lock_path():
+    from zebra import config as zcfg
+    return zcfg.LOG_DIR / 'naked_exit_engine.lock'
+
+
+#: The "another monitor holds the naked engine" alert goes out once per process.
+_NAKED_LOCK_ALERTED = False
+
+#: When the "naked exit engine unavailable" alert last went out (re-review F9).
+_NAKED_UNAVAILABLE_ALERT_AT = None
+
+#: True in a process that found the naked engine lock held by ANOTHER monitor:
+#: it writes no heartbeat (review A6). Reset at every `monitor_all` start.
+_BEAT_SUPPRESSED = False
+
+
 def _open_naked_engine(dry_run: bool, zebra_store=None):
     """The naked exit engine, or None when there is nothing it could own.
 
-    Built whenever the store HAS naked records or `naked_live` is not off --
-    never gated on `naked_live` alone: switching entries off must not orphan an
-    open position. Never raises; an engine that cannot start is said out loud.
+    Built whenever the shared ZebraStore opened -- ALWAYS, not only when a
+    naked record is open at startup (review A3, 2026-11-28): a live record
+    filed LATER in the session (the adoption sweep, `zebra naked-resolve`)
+    must have an engine the moment it exists, and the monitor stays alive
+    for the cohort anyway. Without the shared store, only when `naked_live`
+    is armed or a live record is already open; `_maybe_open_naked_engine`
+    re-checks during the session. Never gated on `naked_live` alone:
+    switching entries off must not orphan an open position.
+
+    ONE engine on the box (review A6): it takes a process-lifetime lock, and
+    a second monitor (started by hand, `--dry-run`) runs WITHOUT one rather
+    than cancelling the first one's working sell. Never raises; an engine
+    that cannot start is said out loud.
     """
+    global _NAKED_LOCK_ALERTED, _BEAT_SUPPRESSED
     try:
+        from common import filelock
         from zebra import config as zcfg
         from zebra.naked_exit import NakedExitEngine
         from zebra.trade_store import ZebraStore
@@ -8121,19 +8160,41 @@ def _open_naked_engine(dry_run: bool, zebra_store=None):
             return None
         if shared is None and zcfg.NAKED_LIVE == 'off' and not _live_naked_open_locally():
             return None                     # nothing to own, and no store to open
+        if not filelock.try_hold(_naked_engine_lock_path()):
+            _BEAT_SUPPRESSED = True
+            log("  Naked exit engine NOT started: another monitor process holds it "
+                "(logs/naked_exit_engine.lock). This one does not touch naked exits.")
+            if not _NAKED_LOCK_ALERTED:
+                _NAKED_LOCK_ALERTED = True
+                send_telegram("A second spread monitor started; the naked exit engine stays "
+                              "with the first one (this one will not touch naked exits).",
+                              alert_class=alert_policy.SAFETY)
+            return None
+        # Re-review F4: the lock is ours now (the first holder may have exited).
+        _BEAT_SUPPRESSED = False
         eng = NakedExitEngine(dry_run=dry_run, log=log, store=shared,
                               send=lambda m: send_telegram(m, alert_class=alert_policy.SAFETY))
         n = eng.open_count()
-        if n == 0 and zcfg.NAKED_LIVE == 'off':
-            return None
+        if getattr(eng, 'neo_error', None) and (n or zcfg.NAKED_LIVE == 'live'):
+            send_telegram(f"Naked exit engine started WITHOUT the NEO package "
+                          f"({str(eng.neo_error)[:120]}) - live naked exits CANNOT sell. "
+                          f"The live entry gate refuses until this is fixed.",
+                          alert_class=alert_policy.SAFETY)
         log(f"  Naked exit engine: {n} open naked record(s), naked_live={zcfg.NAKED_LIVE}"
             f"{' (DRY RUN: live records will NOT be sold)' if dry_run else ''}.")
         return eng
     except Exception as e:
+        global _NAKED_UNAVAILABLE_ALERT_AT
         log(f"  WARNING: naked exit engine unavailable ({e}). Live naked positions, "
             f"if any, are NOT being monitored this session.")
-        send_telegram(f"Naked exit engine unavailable ({str(e)[:120]}) - live naked "
-                      f"positions, if any, are NOT monitored.", alert_class=alert_policy.SAFETY)
+        # Re-review F9: the mid-session recheck retries every minute; the
+        # alert does not.
+        if (_NAKED_UNAVAILABLE_ALERT_AT is None
+                or time.time() - _NAKED_UNAVAILABLE_ALERT_AT >= 3600):
+            _NAKED_UNAVAILABLE_ALERT_AT = time.time()
+            send_telegram(f"Naked exit engine unavailable ({str(e)[:120]}) - live naked "
+                          f"positions, if any, are NOT monitored.",
+                          alert_class=alert_policy.SAFETY)
         return None
 
 
@@ -8165,6 +8226,13 @@ def _unclaim_naked_engine() -> None:
     reading of the BCS engine is untouched. Never raises."""
     global _NAKED_ENGINE
     _NAKED_ENGINE = None
+    try:
+        from common import filelock
+        filelock.release_held(_naked_engine_lock_path())
+    except Exception as e:
+        log(f"  WARNING: could not release the naked engine lock: {e}")
+    if _BEAT_SUPPRESSED:
+        return                              # the beat is the OTHER monitor's (review A6)
     try:
         path = heartbeat_path()
         beat = json.loads(path.read_text(encoding='utf-8'))
@@ -8267,8 +8335,10 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
     wl_store = get_watchlist_store()
     zebra_store = _open_zebra_store()
     set_log_file(LOG_DIR / f"spread_monitor_cron_{today_ist().strftime('%Y%m%d')}.log")
-    global _NAKED_ENGINE
+    global _NAKED_ENGINE, _BEAT_SUPPRESSED
+    _BEAT_SUPPRESSED = False
     _NAKED_ENGINE = naked_engine = _open_naked_engine(dry_run, zebra_store)
+    naked_recheck_at = time.time()
 
     # ── Recover trades stuck in 'closing' from a previous crash ─────────
     for label, store in [('BCS', bcs_store), ('BPS', bps_store), ('FH', fh_store),
@@ -8580,6 +8650,19 @@ def monitor_all(kite: KiteConnect, dry_run: bool):
             # before anything else in the iteration so an exception elsewhere
             # in the loop body can never starve it. `dry_run` is re-read every
             # poll so a tripped kill switch stops naked sells too.
+            if naked_engine is None and time.time() >= naked_recheck_at:
+                # Review A3: a live naked record filed MID-SESSION (adoption,
+                # `zebra naked-resolve`) while this process started without an
+                # engine gets one within NAKED_ENGINE_RECHECK_SEC. Re-review F4:
+                # a monitor that LOST the engine lock to another process (a
+                # hand-run `--dry-run` started first) retries it too, so the
+                # cron monitor takes over the moment that process exits.
+                naked_recheck_at = time.time() + NAKED_ENGINE_RECHECK_SEC
+                if _BEAT_SUPPRESSED or _live_naked_open_locally():
+                    _NAKED_ENGINE = naked_engine = _open_naked_engine(dry_run, zebra_store)
+                    if naked_engine is not None:
+                        log("  Naked exit engine started MID-SESSION: a live naked record "
+                            "appeared.")
             if naked_engine is not None:
                 # The kill switch is read HERE too (review F12): this poll runs
                 # before the loop's own kill-switch block, and a sell placed on

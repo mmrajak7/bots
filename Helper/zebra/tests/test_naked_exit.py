@@ -164,14 +164,25 @@ def test_time_exit_fires_on_the_bucket(store, monkeypatch):
     assert t['status'] == 'exited' and t['exit_reason'] == 'time'
 
 
-def test_delivery_window_alerts_once_a_day(store, monkeypatch):
-    rehearsal_record(store)
+def test_delivery_window_alerts_once_a_day(store, neo, monkeypatch):
+    c = client_for(neo)
+    live_record(store, neo, c)
     monkeypatch.setattr(naked_rules, 'sessions_left', lambda exp, today: 3)
     QUOTES[SYM] = _q(ask=25.5, bid=25.0, reliable=False)    # cannot be sold: stays open
-    e, sent = engine(store, spot=1010.0)
+    e, sent = engine(store, spot=1010.0, client=c)
     e.poll(None, now=T0)
     e.poll(None, now=T0 + timedelta(minutes=5))
     assert sum('delivery' in m for m in sent) == 1
+
+
+def test_a_rehearsal_record_in_the_delivery_window_is_logged_not_alerted(store, monkeypatch):
+    r = rehearsal_record(store)                       # review L3: it holds nothing anywhere
+    monkeypatch.setattr(naked_rules, 'sessions_left', lambda exp, today: 3)
+    QUOTES[SYM] = _q(ask=25.5, bid=25.0, reliable=False)
+    e, sent = engine(store, spot=1010.0)
+    e.poll(None, now=T0)
+    assert not any('delivery' in m for m in sent)
+    assert store.find(r['id'])['delivery_alerted'] == T0.date().isoformat()
 
 
 def test_exits_run_even_when_entries_are_switched_off(store, monkeypatch):
@@ -260,11 +271,16 @@ def test_dry_run_never_sells_a_live_record_and_says_so_once(store, neo, monkeypa
     assert sum('dry-run' in m for m in sent) == 1
 
 
-def test_a_position_sold_by_hand_never_stops_the_chase_and_alerts_once(store, neo, monkeypatch):
-    """Review H1 (2026-11-28): the chase never hands itself to a human. A lot
-    already sold in the app reads as 'account holds 0': nothing is sent, the
-    chase stays active, and the owner is told ONCE (then every repeat interval)."""
+def test_an_account_that_reads_zero_is_alerted_never_settled(store, neo, monkeypatch):
+    """Review H1: the chase never hands itself off on troubles. Flow review R4
+    + re-review F1 (2026-11-28): a lot that READS 0 (sold in the app, squared
+    off -- or a positions row that does not show a carried lot) is NEVER
+    settled by the engine: a 0 can be a bad read of a lot still held. After
+    `naked_exit_zero_held_sec` it says VERIFY IN THE NEO APP, repeats, and
+    keeps watching; the generic STUCK alert does not pile on."""
     monkeypatch.setattr(cfg, 'NAKED_LIVE', 'live')
+    monkeypatch.setattr(cfg, 'NAKED_EXIT_ZERO_HELD_SEC', 60)
+    monkeypatch.setattr(cfg, 'NAKED_EXIT_ALERT_REPEAT_SEC', 300)
     c = client_for(neo)
     r = live_record(store, neo, c)
     neo.set_quote(SYM, 40.0, 40.5)
@@ -273,13 +289,15 @@ def test_a_position_sold_by_hand_never_stops_the_chase_and_alerts_once(store, ne
     QUOTES[SYM] = _q(ask=40.5, bid=40.0)
     clk = Clock()
     e, sent = engine(store, spot=1041.0, client=c, clock=clk)
-    for k in range(40):
+    for k in range(80):                            # 400 s
         clk.t += 5
         e.poll(None, now=T0 + timedelta(seconds=5 * k))
     t = store.find(r['id'])
     assert t['status'] == 'closing' and t['exit_chase']['status'] == 'active'
     assert len(neo.placed('S')) == 1               # only the hand sale; the engine sold nothing
-    assert sum('STUCK' in m for m in sent) == 1
+    zero = [m for m in sent if 'READS 0' in m]
+    assert len(zero) == 2 and 'VERIFY IN THE NEO APP' in zero[0]     # at 60 s, again at 360 s
+    assert not any('STUCK' in m for m in sent)
 
 
 def test_live_population_and_active_chase_flags(store, neo, monkeypatch):

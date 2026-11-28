@@ -11,6 +11,7 @@ import copy
 import json
 import logging
 import os
+import pickle
 import platform
 import tempfile
 import time
@@ -797,6 +798,43 @@ def _lots_from(bcs: dict) -> int:
         return 1
 
 
+def _dump_book(trades: list) -> str:
+    """The book's on-disk text: a JSON list, one compact record per line."""
+    if not trades:
+        return '[]\n'
+    return '[\n' + ',\n'.join(json.dumps(t, default=str) for t in trades) + '\n]\n'
+
+
+def _pickled(trades: list) -> Optional[bytes]:
+    try:
+        return pickle.dumps(trades, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        return None
+
+
+def _changed(trades: list, snapshot: list, snap_bytes: Optional[bytes]) -> bool:
+    """Did the mutation change anything? Compared as pickled BYTES (re-review
+    F7): a copied NaN never equals itself, so `!=` would call every no-op
+    mutation a change and rewrite (and upload) the book. A false "changed"
+    from object sharing only costs one write; equality is the fallback."""
+    if snap_bytes is not None:
+        now = _pickled(trades)
+        if now is not None:
+            return now != snap_bytes
+    return trades != snapshot
+
+
+def _snapshot(trades: list) -> list:
+    """A deep copy for `_mutate`'s rollback and change test. pickle round-trips
+    the JSON-shaped book several times faster than `copy.deepcopy` (review
+    A1: the copy was a third of every save); anything pickle refuses falls
+    back to deepcopy, so the semantics never change."""
+    try:
+        return pickle.loads(pickle.dumps(trades, protocol=pickle.HIGHEST_PROTOCOL))
+    except Exception:
+        return copy.deepcopy(trades)
+
+
 class ZebraStore:
     """Zebra trades with local JSON + Drive sync."""
 
@@ -806,6 +844,7 @@ class ZebraStore:
         self._drive_service = None
         self._drive_file_id: Optional[str] = None
         self._drive_enabled = False
+        self.saved_mtime = None          # mtime of this process's last local save
         self._last_sync_time = 0.0
         self._sync_interval = (
             self._config.get('google_drive', {}).get('sync_interval_sec', 300)
@@ -926,7 +965,8 @@ class ZebraStore:
             # self._trades — get_entered() would report a position that was
             # never persisted. Snapshot post-refresh state and restore it on
             # any exception; disk is untouched either way (save is skipped).
-            snapshot = copy.deepcopy(self._trades)
+            snapshot = _snapshot(self._trades)
+            snap_bytes = _pickled(self._trades)
             try:
                 yield
             except BaseException:
@@ -940,7 +980,7 @@ class ZebraStore:
             # cross-process lock for each, on a Pi that also runs the
             # live-money monitor. The snapshot already exists for rollback;
             # comparing against it is far cheaper than serialising to disk.
-            changed = self._trades != snapshot
+            changed = _changed(self._trades, snapshot, snap_bytes)
             if persist and changed:
                 # THE SAVE ROLLS BACK TOO (fixed 2026-08-31). The rollback
                 # above covered only exceptions from `yield`; a `_save_local`
@@ -1849,7 +1889,8 @@ class ZebraStore:
     # which is the intended behaviour everywhere: the paper monitor must not
     # re-alert on a position the order path is already unwinding.
 
-    def begin_close(self, trade_id: int, reason: str, _drive: bool = True) -> bool:
+    def begin_close(self, trade_id: int, reason: str, _drive: bool = True,
+                    fields: Optional[dict] = None) -> bool:
         """Take the close lock. True if acquired, False if not ours to take.
 
         False is the normal, expected answer when another process got there
@@ -1859,7 +1900,13 @@ class ZebraStore:
         engine, review A5: a stop must not wait on a 3.6 MB upload before its
         first sell). Safe because the lock is a version bump: a Drive copy
         made before it carries a LOWER version and loses every merge.
+
+        `fields` are written in the SAME write as the lock (review A1: the exit
+        engine's trigger fields used to cost a second full-book save before
+        the first sell). Never `status`.
         """
+        if fields and 'status' in fields:
+            raise ValueError('begin_close sets status itself')
         with self._mutate(drive=_drive):
             t = self._must_find(trade_id)
             if not store_contract.allows(store_contract.BEGIN_CLOSE,
@@ -1870,6 +1917,8 @@ class ZebraStore:
             t['status'] = 'closing'
             t['close_reason'] = reason
             t['close_started'] = datetime.now().isoformat()
+            if fields:
+                t.update(fields)
             t['version'] = t.get('version', 0) + 1
             logger.info("#%d close lock acquired: %s", trade_id, reason)
             return True
@@ -2663,9 +2712,15 @@ class ZebraStore:
             fd, tmp_path = tempfile.mkstemp(
                 dir=str(cfg.LOG_DIR), suffix='.tmp', prefix='zebra_'
             )
+            # ONE RECORD PER LINE, ONE write (review A1, 2026-11-28). `indent=2`
+            # forces json's pure-Python encoder and streamed ~450,000 small
+            # writes: 2-3 s a save on this book, inside the 5-second loop that
+            # sells. Each record is encoded by the C encoder instead. Still
+            # valid JSON (a list), still one record per line for grep.
+            text = _dump_book(self._trades)
             with os.fdopen(fd, 'w') as f:
                 fd = None
-                json.dump(self._trades, f, indent=2, default=str)
+                f.write(text)
                 f.flush()
                 os.fsync(f.fileno())
             # POSIX rename is indifferent to open handles, but on Windows a
@@ -2681,6 +2736,12 @@ class ZebraStore:
                         raise
                     time.sleep(0.05)
             tmp_path = None
+            try:
+                # Review A1: a reader in THIS process (the naked exit engine)
+                # must not re-parse the book because of its own write.
+                self.saved_mtime = cfg.LOCAL_FILE.stat().st_mtime
+            except OSError:
+                self.saved_mtime = None
         except Exception:
             if fd is not None:
                 os.close(fd)

@@ -688,6 +688,8 @@ _DEFAULTS = {
     'naked_delivery_alert_sessions': 4, # an open naked long this close to expiry is alerted daily
     'naked_adopt_escalate_sec': 600,   # an unresolved naked order older than this is alerted ...
     'naked_adopt_repeat_sec': 3600,    # ... and re-alerted this often
+    'naked_exit_zero_held_sec': 600,   # exit has shares to sell but the account reads 0 this long -> alert (never settled)
+    'naked_neo_refresh_wait_sec': 2.0, # a NEO read that finds the session dead waits this long, not 75 s
     'spot_sl_pct': 0.03,          # adverse spot move from entry that triggers SL (only if enabled)
     'debit_sl_pct': 0.50,         # exit if option mid drops to this fraction of entry debit
     'time_sl_days_before_expiry': 6,
@@ -1565,6 +1567,8 @@ NAKED_RAISE_ALERT_POLLS = _int('naked_raise_alert_polls')
 NAKED_DELIVERY_ALERT_SESSIONS = _int('naked_delivery_alert_sessions')
 NAKED_ADOPT_ESCALATE_SEC = _num('naked_adopt_escalate_sec')
 NAKED_ADOPT_REPEAT_SEC = _num('naked_adopt_repeat_sec')
+NAKED_NEO_REFRESH_WAIT_SEC = _num('naked_neo_refresh_wait_sec')
+NAKED_EXIT_ZERO_HELD_SEC = _num('naked_exit_zero_held_sec')
 
 
 def _stop_ladder() -> tuple:

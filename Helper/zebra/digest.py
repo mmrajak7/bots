@@ -335,8 +335,9 @@ def _naked_books(naked_rows: List[dict], day: Optional[str] = None) -> dict:
             b['wins'] += 1 if net > 0 else 0
             b['gross'] += float(t['pnl'])
             b['net'] += net
-        elif t.get('status') in ('entered', 'exited'):
-            # Exited after `day` was still open on `day`.
+        elif t.get('status') in ('entered', 'closing', 'exited'):
+            # Exited after `day` was still open on `day`. `closing` (mid-exit,
+            # or carried overnight) is still open -- review A11.
             b['open'] += 1
             b['capital_open'] += float(t.get('capital') or 0)
     return out

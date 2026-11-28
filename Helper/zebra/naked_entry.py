@@ -57,7 +57,9 @@ A BuyResult says one of four things, and each has exactly one handling:
   rejected  -> `retry=True` (price/band/stale): re-quote, re-gate the premium,
                send ONE more order. `retry=False` (margin/funds/RMS/permission/
                IP/unknown): STOP and alert red. Never more than
-               `naked_max_orders_per_signal` orders for one signal.
+               `naked_max_orders_per_signal` REJECTED orders for one signal,
+               and never more than `naked_entry_chase_rounds` orders of any
+               kind, inside `naked_entry_chase_max_sec` (review E1).
   unfilled  -> the broker CONFIRMED nothing filled and nothing rests. Chase
                (above) while rounds and the bound allow, else skip.
   unclear   -> the order MAY be at the broker. The journal intent is left
@@ -376,6 +378,57 @@ def _beat_problem(m: str) -> str:
     return ''
 
 
+#: When the naked-engine liveness alert last went out (review A4).
+LIVENESS_ALERT_FILE = 'naked_liveness_alert.json'
+
+
+def engine_liveness_check(store: ZebraStore, now: Optional[datetime] = None,
+                          send: Optional[Callable] = None, dry_run: bool = False) -> str:
+    """Review A4 (2026-11-28): while a LIVE naked record is open, zebra's own
+    cycle checks that an armed exit engine is really polling -- the same test
+    the live entry gate applies (`_beat_problem('live')`). The arming fault
+    alone needed a 15-minute-stale beat and never looked at the naked engine,
+    so a hung or engine-less monitor went unsaid for 15-20 minutes. Alerts,
+    then again every `naked_exit_alert_repeat_sec` while it lasts. Inside the
+    session only (09:20-15:30): the beat says 'closed' outside it by design.
+    Returns the problem ('' when healthy or nothing is open). Never raises."""
+    import json
+    import time as _time
+    now = now or datetime.now(cfg.IST)
+    send = _send_default if send is None else send
+    try:
+        hm = now.strftime('%H:%M')
+        if now.weekday() >= 5 or not ('09:20' <= hm <= '15:30'):
+            return ''
+        from .trade_store import is_naked
+        # WHOLE BOOK: liveness -- any open live naked record needs the engine.
+        live = [t for t in store.load_trades() if is_naked(t) and not t.get('rehearsal')
+                and t.get('status') in ('entered', 'closing')]
+        if not live:
+            return ''
+        why = _beat_problem('live')
+        path = cfg.LOG_DIR / LIVENESS_ALERT_FILE
+        if not why:
+            if path.exists():
+                path.unlink()
+            return ''
+        try:
+            last = float(json.loads(path.read_text(encoding='utf-8')).get('at'))
+        except Exception:
+            last = None
+        clk = _time.time()
+        if last is None or clk - last >= float(cfg.NAKED_EXIT_ALERT_REPEAT_SEC):
+            path.write_text(json.dumps({'at': clk, 'why': why}), encoding='utf-8')
+            send('\U0001F6A8 NAKED LIVE: %d open position(s) (%s) but %s -- their exits may NOT '
+                 'be watched. Check the spread monitor (zebra naked-check).'
+                 % (len(live), ', '.join('#%s %s' % (t['id'], t.get('stock')) for t in live),
+                    why), dry_run=dry_run)
+        return why
+    except Exception as e:
+        logger.error('naked liveness check failed: %s', e, exc_info=True)
+        return ''
+
+
 def _gates(store: ZebraStore, kite, parent: dict, now: datetime, m: str):
     """Gates 2-9. Returns (Outcome, None) to stop, or (None, (quote, dry_rec))."""
     from .monitor import _entry_already_in_flight, entry_budget_open   # lazy
@@ -517,15 +570,23 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
         n_order = orders
         sent_tag = {}
 
-        def on_tag(tag, neo_symbol, _n=n_order, _limit=limit, _sent=sent_tag):
+        def on_tag(tag, neo_symbol, neo_token=None, neo_tick=None,
+                   _n=n_order, _limit=limit, _sent=sent_tag):
             _sent.update(tag=tag, neo_symbol=neo_symbol)
             # Persisted BEFORE the send; raises if it cannot be written, and
-            # the broker then sends nothing.
-            store.update_trade_fields(parent['id'], **{TWIN_FIELD: {
-                'state': 'sending', 'mode': m, 'tag': tag, 'neo_symbol': neo_symbol,
-                'limit': _limit, 'qty': lot, 'orders': _n, 'intent_id': intent,
-                'first_ask': first_ask, 'at': now.strftime('%Y-%m-%d %H:%M:%S'),
-                'reason': 'order %d being sent' % _n}})
+            # the broker then sends nothing. LOCAL only (reviews N6/A8): a Drive
+            # upload here sat between the quote and the order. The token and
+            # tick ride along (review A9) so an ADOPTED record can be sold
+            # without a scrip-master download inside the 5-second exit loop.
+            stamp = {'state': 'sending', 'mode': m, 'tag': tag, 'neo_symbol': neo_symbol,
+                     'limit': _limit, 'qty': lot, 'orders': _n, 'intent_id': intent,
+                     'first_ask': first_ask, 'at': now.strftime('%Y-%m-%d %H:%M:%S'),
+                     'reason': 'order %d being sent' % _n}
+            if neo_token:
+                stamp['neo_token'] = str(neo_token)
+            if neo_tick:
+                stamp['neo_tick'] = float(neo_tick)
+            store.update_trade_fields(parent['id'], _drive=False, **{TWIN_FIELD: stamp})
         ctx = dict(ctx, parent=parent, on_tag=on_tag)
         try:
             res = broker.buy(sym, lot, limit, ctx)
@@ -534,8 +595,12 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
             # exchange. That IS unclear -- never retried, intent left open.
             res = BuyResult('unclear', message='broker raised: %s' % e,
                             tag=sent_tag.get('tag'), neo_symbol=sent_tag.get('neo_symbol'))
+        # Re-review F5: the token and tick ride on EVERY outcome stamp, so an
+        # `unclear` order that later proves filled is adopted with them.
         tag_extra = {k: v for k, v in (('tag', res.tag), ('neo_symbol', res.neo_symbol),
-                                        ('order_id', res.order_id)) if v}
+                                        ('order_id', res.order_id),
+                                        ('neo_token', res.neo_token),
+                                        ('neo_tick', res.neo_tick)) if v}
         if res.status != 'unclear':
             order_journal.record_result(
                 intent, order_id=res.order_id,
@@ -577,7 +642,11 @@ def _attempt(store, kite, parent, now, m, broker, send, dry_run) -> Outcome:
             continue
         # rejected
         rejects += 1
-        if not res.retry or rejects >= cfg.NAKED_MAX_ORDERS_PER_SIGNAL:
+        if (not res.retry or rejects >= cfg.NAKED_MAX_ORDERS_PER_SIGNAL
+                or orders >= cfg.NAKED_ENTRY_CHASE_ROUNDS
+                or _time.time() >= chase_deadline):
+            # Review E1/N7: the order count and the chase budget hold on THIS
+            # path too -- one signal never sends more than the chase rounds.
             out = Outcome('refused', 'rejected: %s' % res.message, orders=orders,
                           extra=tag_extra)
             send('\U0001F534 NAKED %s #%s %s REJECTED: %s%s'

@@ -462,3 +462,13 @@ def _fresh_quote_cache():
     yield
     _sm.reset_quote_cache()
     _sm.reset_quote_cooldown()
+
+
+# 7. No real Kotak NEO session (`_no_real_neo_session`), 2026-11-28: a zebra
+#    test with no fake client made a REAL login on the Pi (see the same rail in
+#    `zebra/tests/conftest.py` for the incident). The monitor runs the naked
+#    exit engine, so this package can reach NEO too.
+@pytest.fixture(autouse=True)
+def _no_real_neo_session(monkeypatch):
+    from zebra.tests.conftest import _neo_session_rail
+    _neo_session_rail(monkeypatch)

@@ -415,3 +415,42 @@ def real_spawn(monkeypatch):
     """
     monkeypatch.setattr(vet_mod, 'resolve_cli', lambda refresh=False: None)
     return _REAL_SPAWN_GENERIC
+
+
+# -- No test may reach the REAL Kotak NEO session ------------------------------------
+#
+# Found 2026-11-28: the BTST session saw an unexplained real NEO LOGIN by `zbr`
+# at 07:44 on the Pi (`~/.kotak_neo/refresh_log.jsonl`, generation 2). It was
+# this suite: `test_naked_adopt.py::test_off_mode_does_nothing` ran the
+# adoption sweep with no client, `naked_neo.default_client()` built a REAL
+# NeoClient, its order-book read found Friday's session stale and REFRESHED it
+# -- a real login on the live account, spending the daily cap, on a morning
+# when BTST goes live two sessions later. On the laptop the same call is
+# refused by LOGIN_HOST, which is why nobody saw it.
+#
+# Same shape as the Telegram and spawn rails above: blocked package-wide,
+# RAISING, so the next test that forgets a fake client fails here instead of
+# logging in. Tests build clients with `current_fn=` / `refresh_fn=` fakes
+# (and FakeNeo for HTTP), none of which touch these.
+
+def _neo_session_rail(monkeypatch):
+    try:
+        from zebra import naked_neo
+        naked_neo._ensure_path()
+        from kotak_neo import session as neo_session
+    except Exception:
+        return                                     # no NEO package: nothing to reach
+
+    def refuse(name):
+        def _f(*a, **k):
+            raise RuntimeError('TEST RAIL: a test reached the REAL Kotak NEO session '
+                               '(kotak_neo.session.%s). Pass a fake client.' % name)
+        return _f
+    for name in ('current', 'refresh', '_network_login', '_network_verify', '_http'):
+        if hasattr(neo_session, name):
+            monkeypatch.setattr(neo_session, name, refuse(name))
+
+
+@pytest.fixture(autouse=True)
+def _no_real_neo_session(monkeypatch):
+    _neo_session_rail(monkeypatch)

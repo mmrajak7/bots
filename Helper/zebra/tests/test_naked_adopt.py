@@ -74,11 +74,17 @@ def place(c, price='21.50', side='B'):
     return tag
 
 
-def test_off_mode_does_nothing(store, monkeypatch):
+def test_a_stamp_with_no_usable_mode_is_read_as_live_never_assumed_empty(store, neo,
+                                                                          monkeypatch):
+    """An order stamped while `naked_live` read 'off' (no usable mode) is
+    settled as LIVE: its book is READ, never assumed empty (`_mode_of`). A
+    young ABSENT tag leaves the block in place. With a FAKE client: this test
+    used to pass none and, on the Pi, logged in to the real NEO account
+    (2026-11-28 07:44) -- see the NEO rail in conftest.py."""
     monkeypatch.setattr(cfg, 'NAKED_LIVE', 'off')
     p = parent(store)
     stuck(store, p, 'unclear', tag='zbr-x')
-    assert na.sweep(store, now=NOW) == []
+    assert na.sweep(store, now=NOW, client=client(neo)) == []
     assert twin(store, p['id'])['state'] == 'unclear'
 
 
@@ -240,14 +246,41 @@ def test_an_unresolved_order_is_escalated_then_repeated_hourly(store, neo, live,
     assert sum('UNRESOLVED' in m for m in sent) == 2
 
 
-def test_resolve_by_hand_filled_files_a_watched_record(store, live):
+def test_resolve_by_hand_filled_files_a_watched_record(store, neo, live):
+    c = client(neo)
     p = parent(store)
-    stuck(store, p, 'unclear', tag='zbr-x1', first_ask=21.5)
-    line = na.resolve_by_hand(store, p['id'], filled=21.6)
+    place(c)                                               # the lot IS held
+    stuck(store, p, 'unclear', tag='zbr-x1', first_ask=21.5, neo_tick=0.05)
+    line = na.resolve_by_hand(store, p['id'], filled=21.6, client=c)
     rec = naked(store)[0]
     assert rec['entry_long_price'] == 21.6 and rec['adopted'] and rec['status'] == 'entered'
-    assert rec['entry_signal_ask'] == 21.5
+    assert rec['entry_signal_ask'] == 21.5 and rec['quantity'] == LOT
+    assert rec['neo_token'] == TOK and rec['neo_tick'] == 0.05     # review A9
     assert twin(store, p['id'])['state'] == 'entered' and 'watched' in line
+
+
+def test_resolve_by_hand_never_files_a_part_lot_as_a_whole_one(store, neo, live, monkeypatch):
+    """Flow review R1: what the account holds decides; a part-lot is refused
+    (the exit would chase shares that do not exist), even with --force."""
+    c = client(neo)
+    p = parent(store)
+    stuck(store, p, 'unclear', tag='zbr-x1')
+    monkeypatch.setattr(c, 'net_held', lambda sym, *a, **k: LOT // 2)
+    for force in (False, True):
+        with pytest.raises(ValueError, match='not exactly 1 lot'):
+            na.resolve_by_hand(store, p['id'], filled=21.6, client=c, force=force)
+    assert naked(store) == []
+
+
+def test_resolve_by_hand_filled_refuses_when_nothing_is_held(store, neo, live):
+    c = client(neo)
+    p = parent(store)
+    stuck(store, p, 'unclear', tag='zbr-x1')
+    with pytest.raises(ValueError, match='nothing to file'):
+        na.resolve_by_hand(store, p['id'], filled=21.6, client=c)
+    assert naked(store) == []
+    na.resolve_by_hand(store, p['id'], filled=21.6, force=True, client=c)
+    assert naked(store)[0]['quantity'] == LOT              # --force: the owner checked the app
 
 
 def test_resolve_by_hand_none_needs_a_flat_account(store, neo, live):
