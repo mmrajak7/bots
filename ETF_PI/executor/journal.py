@@ -5,7 +5,8 @@ FULL position dict after the change, so a rebuild is "last pos per key" -- no ev
 replay logic that could drift from the engine.
 
 Rebuild rules (Fable F23):
-  * an unparsable FINAL line is a torn write (power cut mid-append): ignored, logged;
+  * an unparsable FINAL line is a torn write (power cut mid-append): ignored, logged,
+    and cut from the file into `<journal>.torn` before the next append (review B4);
   * an unparsable line in the MIDDLE is corruption: rebuild continues from the good
     lines (exits must go on) but `corrupt` is set -> the engine allows NO new entries
     and alerts until the owner repairs the file.
@@ -25,12 +26,51 @@ class Journal:
         if d:
             os.makedirs(d, exist_ok=True)
 
+    def cut_torn_tail(self) -> int:
+        """Review B4 / X-E3 (2026-11-28): bytes after the last newline are a torn
+        write (power cut mid-append). They are moved to `<journal>.torn` and the
+        journal is truncated to its last complete line -- left in place, the next
+        row glued onto them, became a corrupt MIDDLE line after the next restart
+        (no new entries) and that row was lost. Returns the bytes cut."""
+        try:
+            if os.path.getsize(self.path) == 0:
+                return 0
+        except OSError:
+            return 0
+        with io.open(self.path, 'rb+') as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) == b'\n':
+                return 0
+            f.seek(0)
+            data = f.read()
+            keep = data.rfind(b'\n') + 1                  # 0 = no complete line at all
+            try:
+                whole = isinstance(json.loads(data[keep:].decode('utf-8')), dict)
+            except ValueError:                            # (UnicodeDecodeError included)
+                whole = False
+            if whole:                                     # only the newline was lost
+                f.seek(0, os.SEEK_END)
+                f.write(b'\n')
+                f.flush()
+                os.fsync(f.fileno())
+                return 0
+            with io.open(self.path + '.torn', 'ab') as t:
+                t.write(data[keep:] + b'\n')
+                t.flush()
+                os.fsync(t.fileno())
+            f.seek(keep)
+            f.truncate()
+            f.flush()
+            os.fsync(f.fileno())
+            return len(data) - keep
+
     def append(self, row: Dict[str, Any]) -> None:
         """One line, flushed and fsync'd before returning (the tag of an order is
-        on disk BEFORE the order is sent)."""
+        on disk BEFORE the order is sent). A torn tail is cut first (B4)."""
         line = json.dumps(row, sort_keys=True, default=str, separators=(',', ':'))
         if '\n' in line:
             raise ValueError('journal row would span lines')
+        self.cut_torn_tail()
         with io.open(self.path, 'a', encoding='utf-8', newline='\n') as f:
             f.write(line + '\n')
             f.flush()

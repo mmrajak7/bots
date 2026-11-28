@@ -154,3 +154,35 @@ def test_xe1_own_orders_short_but_account_not_short_sends_no_cover(rig, monkeypa
     assert not p.get('covered')
     assert not [o for o in rig.etf_orders('B') if o['GuiOrdId'] != p['entry']['tags'][0]]
     assert 'NO cover' in rig.texts()
+
+
+def test_b4_a_torn_tail_is_cut_so_the_next_row_survives_and_entries_go_on(rig):
+    """Review B4 / X-E3: power cut mid-append, restart, more rows, restart again. Before
+    the fix the next row glued onto the torn bytes -> corrupt middle line -> no entries,
+    and that row lost."""
+    open_one(rig)
+    path = rig.eng.j.path
+    with open(path, 'a') as f:
+        f.write('{"ev": "EXIT_ST')                     # power cut mid-append
+    rig.restart()
+    assert rig.eng.corrupt is None
+    rig.quote(110.0, 110.1)                           # TP -> new rows appended
+    rig.step(n=3)
+    assert rig.pos()['state'] == 'CLOSED'
+    rig.restart()
+    assert rig.eng.corrupt is None and rig.pos()['state'] == 'CLOSED'
+    assert '{"ev": "EXIT_ST' in open(path + '.torn').read()
+    rig.intent(key='NIFTY_PE_10minute_20261130_H2')
+    rig.step()
+    assert 'NIFTY_PE_10minute_20261130_H2' in rig.eng.pos
+
+
+def test_b4_a_whole_row_missing_only_its_newline_is_kept(tmp_path):
+    from executor.journal import Journal
+    j = Journal(str(tmp_path / 'j.jsonl'))
+    j.append({'ev': 'A', 'key': 'k1', 'pos': {'x': 1}})
+    with open(j.path, 'a') as f:
+        f.write('{"ev":"B","key":"k2","pos":{"x":2}}')   # the newline was lost
+    j.append({'ev': 'C', 'key': 'k3', 'pos': {'x': 3}})
+    pos, rows, note = j.load()
+    assert note is None and set(pos) == {'k1', 'k2', 'k3'}
