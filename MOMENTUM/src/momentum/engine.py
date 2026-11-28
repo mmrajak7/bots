@@ -18,7 +18,7 @@ import logging
 import re
 import shutil
 from dataclasses import dataclass, field
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -195,6 +195,11 @@ def ingest_item(env: Env, name: str, item: Dict[str, Any]) -> None:
         ap = opened.get(aid)
         if ap is None:
             env.notify(f"tap {aid}: unknown approval (ignored)")
+        elif any(r["type"] == "OWNER_TAP" and r["approval_id"] == aid and r.get("inbox_file") == name
+                 for r in recs):
+            # review 11-28 L3: this very file was journalled, then the run died before its effect (the file is moved
+            # only after): apply it again; apply_tap re-checks the leg, and an overlay off twice changes nothing
+            apply_tap(env, ap, item["choice"])
         elif any(r["type"] == "OWNER_TAP" and r["approval_id"] == aid for r in recs):
             env.notify(f"tap {aid}: already done")
         elif item["choice"] not in ap["choices"]:
@@ -381,6 +386,8 @@ def apply_cmd(env: Env, cmd: str, args: str) -> None:
             env.journal.append("FILL", side="SELL", position_id=ps[0].position_id, order_id="", trade_id=tid,
                                qty=qty, price_paise=pp, exch_ts="owner", charges_basis="estimate",
                                charges_paise=SS.estimate_sell_charges_paise(env.cfg, qty * pp, True))
+        if L.replay(env.journal.read()).positions[ps[0].position_id].leg == "PENDING_BUY":
+            close_leg(env, ps[0].position_id, "owner sold by hand")   # review 11-28: never buy the rest again
         env.notify(f"sold {ps[0].symbol}: {qty} @ {px} booked (owner); book shares now "
                    f"{L.replay(env.journal.read()).positions[ps[0].position_id].held_qty}")
     elif cmd == "status":
@@ -787,7 +794,9 @@ def place_all(env: Env, sp: StepPlan, go: List[L.Position], day: str) -> List[st
             env.alert("KITE_DOWN", f"{p.symbol}: order book unreadable before the order ({str(e)[:150]}); the "
                       "remaining buys wait for the next session")
             break
-        spent += max_rupees
+        # review 11-28: the cap counts what the order can cost (qty x cap price): max_rupees of a receiver includes
+        # the leftovers its givers also still count
+        spent += min(max_rupees, int((qty * cap_price).to_integral_value(rounding=ROUND_CEILING)))
         status = it.status
         if status != "ACK":
             after_reject(env, p, status, it.intent_id)
@@ -953,9 +962,19 @@ def settle_orphans(env: Env, day: str, final: bool) -> None:
         elif final and i.status == "INTENT_WRITTEN":         # crash between INTENT and SENT: the call was never made
             env.journal.append("ORPHAN", intent_id=i.intent_id, resolution="ABSENT", order_id=None, reads=["orders"])
         elif final and i.intent_id not in lg.unresolved:
-            env.journal.append("ORPHAN", intent_id=i.intent_id, resolution="OWNER", order_id=None, reads=["orders"])
-            env.alert("ORPHAN", f"{i.intent_id}: no reply and no order with tag {i.tag}; reply "
-                      f"'resolve {i.intent_id} found|absent'")
+            # review 11-28 M1 (D48 fully automatic): after the close Kite's order book holds every order of the day,
+            # rejected ones too, each under its tag. A second read 2 s later that still has no such tag proves the
+            # call never reached Kite (a power cut / crash between SENT and the call): ABSENT, told, not an owner item
+            # that blocks the book. A read failure here raises (the reconcile retries next slot).
+            env.sleep_until(util.now() + dt.timedelta(seconds=2))
+            again = {o.get("tag") for o in env.api.orders() if o.get("tag")}
+            if i.tag in again:
+                continue                                 # appeared on the second read: FOUND by the next pass
+            env.journal.append("ORPHAN", intent_id=i.intent_id, resolution="ABSENT", order_id=None,
+                               reads=["orders after the close", "orders again"])
+            env.alert("ORPHAN_ABSENT", f"{i.intent_id}: no reply and no order with tag {i.tag} in the full day's "
+                      "order book (read twice after the close): booked as never placed; the leg retries next "
+                      "session")
 
 
 def settle_stale(env: Env, day: str) -> None:
@@ -1013,7 +1032,7 @@ def sync_orders(env: Env, day: str, final: bool) -> None:
             env.journal.append("ORDER_STATUS", intent_id=i.intent_id, order_id=i.order_id, status=mapped,
                                filled_qty=filled, pending_qty=int(o.get("pending_quantity") or 0),
                                avg_price_paise=L.paise(o.get("average_price") or 0),
-                               message=B.reject_text(o)[:300] if st == "REJECTED" else "")
+                               message=B.reject_text(o)[:300] if st == "REJECTED" else "", via="sync")
             if mapped.startswith("REJECTED_") and not i.status.startswith("REJECTED"):
                 newly_rejected.append((i, mapped))
         # Quantity already booked for this order (real trades AND any stand-in fill from an earlier reconcile). The
@@ -1023,7 +1042,9 @@ def sync_orders(env: Env, day: str, final: bool) -> None:
         booked_qty = sum(int(r["qty"]) for r in prior)
         booked_value = sum(int(r["qty"]) * int(r["price_paise"]) for r in prior)
         for t in trades:
-            if str(t.get("order_id")) != i.order_id or str(t["trade_id"]) in lg.trade_ids:
+            # review 11-28 L7: NSE trade numbers are unique per exchange day only: key on (order, trade)
+            tkey = f"{i.order_id}:{t['trade_id']}"
+            if str(t.get("order_id")) != i.order_id or tkey in lg.trade_ids:
                 continue
             px = L.paise(t["average_price"])
             q = int(t["quantity"])
@@ -1031,12 +1052,12 @@ def sync_orders(env: Env, day: str, final: bool) -> None:
                 env.alert("RECON_TRADES", f"{i.intent_id}: trade {t['trade_id']} ({q} @ {px / 100}) would exceed the "
                           f"order's filled {filled} (already booked {booked_qty}, incl. a stand-in?): NOT booked; "
                           "check the contract note")
-                lg.trade_ids.add(str(t["trade_id"]))
+                lg.trade_ids.add(tkey)
                 continue
-            env.journal.append("FILL", position_id=i.position_id, order_id=i.order_id, trade_id=str(t["trade_id"]),
+            env.journal.append("FILL", position_id=i.position_id, order_id=i.order_id, trade_id=tkey,
                                qty=q, price_paise=px, exch_ts=str(t.get("exchange_timestamp", "")), side=i.side,
                                charges_paise=charges_for(env, i, q * px, day), charges_basis="estimate")
-            lg.trade_ids.add(str(t["trade_id"]))
+            lg.trade_ids.add(tkey)
             booked_qty += q
             booked_value += q * px
         seen_qty, seen_value = booked_qty, booked_value
@@ -1053,7 +1074,19 @@ def sync_orders(env: Env, day: str, final: bool) -> None:
             env.alert("RECON_TRADES", f"{i.intent_id}: order book filled {filled} but trades() lists {seen_qty}; "
                       + (f"{short} shares booked at the order's average price" if px > 0 else "NOT booked (no "
                          "average price): enter by hand") + "; check the contract note")
+    # review 11-28 L8: a crash between a rejection's ORDER_STATUS and its hold / alert left it unhandled for good: every
+    # sync-path rejection of today without its handled NOTE is handled (once)
+    recs = env.journal.read()
+    handled = {r["reject_handled"] for r in recs if r["type"] == "NOTE" and r.get("reject_handled")}
+    queued = {i.intent_id for i, _m in newly_rejected}
+    for r in recs:
+        if (r["type"] == "ORDER_STATUS" and r.get("via") == "sync" and str(r["status"]).startswith("REJECTED_")
+                and r["ts"][:10] == day and r["intent_id"] not in handled and r["intent_id"] not in queued):
+            newly_rejected.append((lg.intents[r["intent_id"]], str(r["status"])))
+            queued.add(r["intent_id"])
     for i, mapped in newly_rejected:
+        if i.intent_id in handled:
+            continue
         p_ = L.replay(env.journal.read()).positions[i.position_id]
         if i.side == "SELL":
             if mapped == "REJECTED_DDPI":
@@ -1061,6 +1094,7 @@ def sync_orders(env: Env, day: str, final: bool) -> None:
             SS.after_sell_reject(env, p_, mapped, i.intent_id)
         else:
             after_reject(env, p_, mapped, i.intent_id)
+        env.journal.append("NOTE", reject_handled=i.intent_id)
 
 
 def charges_for(env: Env, i: L.Intent, value_paise: int, day: str) -> int:

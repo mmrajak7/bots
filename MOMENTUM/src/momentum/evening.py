@@ -30,6 +30,15 @@ class EveningError(Exception):
     pass
 
 
+class SignalDayMismatch(EveningError):
+    """The computed signal day is not Kite's last session of the month (review 11-28 M2). kite_last = Kite's last
+    session of that month so far (None when Kite has none)."""
+
+    def __init__(self, text: str, kite_last: Optional[str]) -> None:
+        super().__init__(text)
+        self.kite_last = kite_last
+
+
 def kite_sessions(api: Any, frm: dt.date, to: dt.date) -> List[str]:
     rows = api.historical(NIFTY50_TOKEN, frm.isoformat(), to.isoformat(), "day")
     out = sorted({str(r["date"])[:10] for r in rows})
@@ -144,7 +153,8 @@ def run_signal_evening(env: Env, M: P.Modules, m: str, signal_day: dt.date, skip
     util.write_json_atomic(paths.sessions, {"fetched_at": util.now().isoformat(), "sessions": sess})
     prev_sess = [d for d in sess if d.startswith(prev)]
     if not prev_sess or prev_sess[-1] != sd:
-        raise EveningError(f"signal day {sd} is not Kite's last {prev} session ({prev_sess[-3:]})")
+        raise SignalDayMismatch(f"signal day {sd} is not Kite's last {prev} session ({prev_sess[-3:]})",
+                                prev_sess[-1] if prev_sess else None)
     # 2. NSE data (CM, CA current + next month, indices), then the F&O list of the signal day
     w = P.Window(m, signal_day, paths.derived / f"{m}_{sd}")
     fo_zip = Path(cfg["_nse_data"]) / "fo_bhav_live" / f"{sd}.zip"

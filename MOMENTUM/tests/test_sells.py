@@ -385,6 +385,17 @@ class TestExtraShare(unittest.TestCase):
         self.assertEqual(out["a"][0], 1)                     # pool 3,941 < one 6,060 share (and 2 x 6,060 > 12,500)
         self.assertLessEqual(sum(v[0] * v[3] for v in out.values()), 20_000)
 
+    def test_a_zero_share_buy_gives_nothing_to_the_others(self) -> None:
+        # review 11-28: B (one share costs more than its amount) is skipped; its money stays in book cash, it does not
+        # pay for A's extra share. A: 10,000 / 1,818 = 5 shares (910 left; with B's 10,000 it would get a 6th)
+        out = self.sizes([self.leg("a", "A", 10_000), self.leg("b", "B", 10_000)], {"A": 1800.0, "B": 20000.0})
+        self.assertEqual((out["a"][0], out["b"][0]), (5, 0))
+        moves = SS.size_buys(self.Env(self.cfg), [self.leg("a", "A", 10_000), self.leg("b", "B", 10_000)],
+                             {"NSE:A": {"last_price": 1800.0, "upper_circuit_limit": 2160.0},
+                              "NSE:B": {"last_price": 20000.0, "upper_circuit_limit": 24000.0}},
+                             {"A": Decimal("0.05"), "B": Decimal("0.05")})[1]
+        self.assertEqual(moves, [])
+
     def test_a_lone_buy_never_gets_more_than_its_amount(self) -> None:
         out = self.sizes([self.leg("a", "A", 10_000)], {"A": 1800.0})
         self.assertEqual(out["a"][0], 5)

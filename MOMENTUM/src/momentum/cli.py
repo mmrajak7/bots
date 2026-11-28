@@ -49,7 +49,9 @@ def resolve(home: Path, p: str) -> Path:
 # ---------------------------------------------------------------- manifest (frozen design §11.2)
 def manifest_files(home: Path, cfg: Dict[str, Any]) -> List[Path]:
     srs = resolve(home, cfg["srs_dir"])
-    return sorted((home / "src" / "momentum").glob("*.py")) + [srs / f"{m}.py" for m in SRS_MODULES]
+    # review 11-28 M7: the tracked defaults and the crontab change behaviour as much as code does
+    return (sorted((home / "src" / "momentum").glob("*.py")) + [srs / f"{m}.py" for m in SRS_MODULES]
+            + [home / "config" / "momentum.defaults.json", home / "deploy" / "crontab.txt"])
 
 
 def compute_manifest(home: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
@@ -116,7 +118,10 @@ class Ctx:
     def notify(self, text: str, buttons: Any = None) -> bool:
         prefix = "[DRY] " if self.dry else ""
         try:
-            return self.bot().send(prefix + "MOM " + text, buttons)
+            bot = self.bot()
+            bot.fast = (util.at_today(self.cfg["step_plan_at"]) <= util.now()
+                        <= util.at_today(self.cfg["reconcile_at"]))     # M6: never stall the order steps
+            return bot.send(prefix + "MOM " + text, buttons)
         except Exception as e:  # noqa: BLE001 - no Telegram = automatic steps do not start (D36)
             log.error("telegram unavailable: %s", e)
             return False
@@ -274,13 +279,40 @@ def backup_state(x: Ctx) -> bool:
         for f in (x.paths.journal, x.paths.ledger):
             if f.exists():
                 shutil.copy2(f, dst / f.name)
+        # review 11-28 M8: the decision files (hash-checked every afternoon), bands and snapshots are needed too
+        for d in (x.paths.decisions, x.paths.bands, x.paths.snapshots):
+            if d.exists():
+                shutil.copytree(d, dst / d.name, dirs_exist_ok=True)
         if not x.paths.journal.exists():
             return False
-        return bool(x.bot().send_document(x.paths.journal, f"{'[DRY] ' if x.dry else ''}MOM journal "
-                                          f"{util.today().isoformat()} (backup)"))
+        ok = bool(x.bot().send_document(x.paths.journal, f"{'[DRY] ' if x.dry else ''}MOM journal "
+                                        f"{util.today().isoformat()} (backup)"))
+        send_decisions_zip(x, dst)
+        return ok
     except Exception as e:  # noqa: BLE001 - reported by the caller's heartbeat text
         log.error("backup failed: %s: %s", type(e).__name__, e)
         return False
+
+
+def send_decisions_zip(x: Ctx, dst: Path) -> None:
+    """M8: the decision files and bands off the SD card too: a zip to Telegram whenever the set of decision files
+    changed since the last one sent (a new plan, a TEST plan). Never raises."""
+    import zipfile
+    try:
+        names = sorted(p.name for p in x.paths.decisions.glob("*.json")) if x.paths.decisions.exists() else []
+        mark = resolve(x.home, x.cfg["backup_dir"]) / ("dry" if x.dry else "live") / "decisions_sent.json"
+        if not names or (mark.exists() and json.loads(mark.read_text(encoding="utf-8")) == names):
+            return
+        z = dst / "decisions_bands.zip"
+        with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+            for d in (x.paths.decisions, x.paths.bands):
+                for f in sorted(d.glob("*.json")) if d.exists() else []:
+                    zf.write(f, f"{d.name}/{f.name}")
+        if x.bot().send_document(z, f"{'[DRY] ' if x.dry else ''}MOM decisions + bands {util.today().isoformat()} "
+                                    "(backup: restore = RUNBOOK 3c)"):
+            util.write_json_atomic(mark, names)
+    except Exception as e:  # noqa: BLE001 - reported in the log; the journal backup is the main one
+        log.error("decisions backup failed: %s: %s", type(e).__name__, e)
 
 
 def holdings_snapshot(x: Ctx, api: Any) -> Dict[str, int]:
@@ -301,14 +333,16 @@ def cmd_evening(x: Ctx, a: argparse.Namespace) -> int:
     from . import evening as EV
     from . import pipeline as P
     pending_f = x.paths.refresh / "pending_signal.json"
-    if a.pending_only and not pending_f.exists():
-        return 0                                # the morning catch-up (review 11-28 T7) only resumes a failed evening
+    if a.pending_only and not pending_f.exists() and missed_signal_day(x) is None:
+        return 0                                # the morning catch-up (review 11-28 T7): a failed or missed evening only
     if a.as_of_signal:
         day = dt.date.fromisoformat(a.as_of_signal)
     elif pending_f.exists():
         day = dt.date.fromisoformat(json.loads(pending_f.read_text(encoding="utf-8"))["signal_day"])
-    elif EV.is_signal_day(util.today(), holidays(x.cfg, x.home)):
+    elif EV.is_signal_day(util.today(), holidays(x.cfg, x.home)) and not a.pending_only:
         day = util.today()
+    elif missed_signal_day(x) is not None:
+        day = missed_signal_day(x)             # review 11-28 M2: the Pi was off (or the file wrong) on the signal day
     else:
         return 0
     util.write_json_atomic(pending_f, {"signal_day": day.isoformat(), "since": util.now().isoformat()})
@@ -330,6 +364,20 @@ def cmd_evening(x: Ctx, a: argparse.Namespace) -> int:
         E.ingest_inbox(env)
         res = EV.run_signal_evening(env, M, m, day, skip_fetch=a.skip_fetch,
                                     first_session=EV.next_session(day, holidays(x.cfg, x.home)).isoformat())
+    except EV.SignalDayMismatch as e:
+        # review 11-28 M2: the holiday file missed a closure on the computed signal day. Once that day's evening has
+        # come (Kite's day candle exists by 20:00 when the market traded), Kite's last session of the month is the
+        # signal day: re-point the pending day; the next slot (30 min / the morning catch-up) builds the plan.
+        late_enough = util.today() > day or util.now() >= util.at_today(x.cfg["kite_signal_check_at"])
+        if e.kite_last and e.kite_last < day.isoformat() and late_enough:
+            util.write_json_atomic(pending_f, {"signal_day": e.kite_last, "since": util.now().isoformat(),
+                                               "was": day.isoformat()})
+            env.alert("SIGNAL_DAY_MOVED", f"{m}: Kite's last {day.isoformat()[:7]} session is {e.kite_last}, not "
+                      f"{day} (the holiday file missed a closure): the plan is built for {e.kite_last}")
+        else:
+            env.alert("NO_PLAN", f"{m} (signal day {day}): {e}")
+        write_ledger(x)
+        return 3
     except (EV.EveningError, P.PipelineError) as e:
         today_s = util.today().isoformat()
         late = util.now() >= util.at_today(x.cfg["plan_final"]) or today_s > day.isoformat()
@@ -353,6 +401,28 @@ def cmd_evening(x: Ctx, a: argparse.Namespace) -> int:
     return 0
 
 
+def missed_signal_day(x: Ctx) -> Optional[dt.date]:
+    """Review 11-28 M2: an armed month with no plan and no pending signal day (the Pi was off the whole signal evening,
+    or the holiday file made is_signal_day false on the real last session): the last weekday non-holiday of the
+    previous month, for the evening / morning catch-up to build (the Kite check corrects it if the file is wrong)."""
+    if x.arm is None:
+        return None
+    m = util.today().isoformat()[:7]
+    nxt = (util.today().replace(day=28) + dt.timedelta(days=4)).isoformat()[:7]
+    hol = holidays(x.cfg, x.home)
+    lg = L.replay(x.journal.read())
+    for month in (m, nxt):                      # this month's plan (missed), or next month's after its signal day
+        if month not in x.arm.plan_months or any(k.startswith(month + "|") for k in lg.plans):
+            continue
+        first = dt.date.fromisoformat(month + "-01")
+        d = first - dt.timedelta(days=1)
+        while d.weekday() >= 5 or d.isoformat() in hol:
+            d -= dt.timedelta(days=1)
+        if d < util.today():
+            return d
+    return None
+
+
 def missing_plan_month(x: Ctx, lg: L.Ledger) -> Optional[str]:
     """The 08:40 plan check (spec §C7, §J 'no FINAL at 08:40'): the ARM says this month is to be traded but the
     journal holds no FINAL plan for it (the signal evening never ran or never finished). -> the month, or None."""
@@ -374,7 +444,7 @@ def cmd_morning(x: Ctx, a: argparse.Namespace) -> int:
         x.notify(f"ALERT NO_PLAN: the ARM covers {no_plan} but there is no FINAL plan for it (signal evening missed "
                  "or failed). Nothing is bought. The evening job re-runs a pending signal day by itself; if it never "
                  "started: ./momentum evening --as-of-signal <last session of last month>")
-    if not pend and not held:
+    if (not pend and not held) or market_holiday_today(x):
         return 0
     tok = x.wait_token(util.at_today(x.cfg["token_alert_at"]))
     if tok is None:
@@ -430,9 +500,18 @@ def order_work(lg: L.Ledger) -> bool:
     return any(p.leg in ORDER_LEGS for p in lg.positions.values())
 
 
+def market_holiday_today(x: Ctx) -> bool:
+    """Review 11-28 L5: a weekend or a listed NSE holiday: the order jobs exit at once (no token wait, no TOKEN /
+    PREFLIGHT noise). A closure missing from the file is still caught by the preflight / the gate's Kite check."""
+    try:
+        return util.today().weekday() >= 5 or util.today().isoformat() in holidays(x.cfg, x.home)
+    except Exception:  # noqa: BLE001 - an unreadable file: let the preflight report it
+        return False
+
+
 def cmd_afternoon(x: Ctx, a: argparse.Namespace) -> int:
     lg = L.replay(x.journal.read())
-    if not order_work(lg):
+    if not order_work(lg) or market_holiday_today(x):
         return 0
     tok = x.wait_token(util.at_today(x.cfg["token_deadline"]))
     if tok is None:
@@ -502,8 +581,17 @@ def cmd_watch(x: Ctx, a: argparse.Namespace) -> int:
     day = util.today().isoformat()
     probs: List[str] = []
     checked = False
-    snap = [r for r in x.journal.read() if r["type"] == "HOLDINGS_SNAPSHOT" and r["ts"][:10] == day]
-    if snap and any(p.filled_qty or p.leg == "PENDING_BUY" for p in lg.positions.values()):
+    recs = x.journal.read()
+    snap = [r for r in recs if r["type"] == "HOLDINGS_SNAPSHOT" and r["ts"][:10] == day]
+    ran_today = any(r["type"] == "STAGE" and r.get("date") == day for r in recs)
+    recon = E.stage_done(recs, day, "RECON")
+    done = any(r["type"] == "NOTE" and r.get("three_way") == day for r in recs)
+    if a.resume and (done or not recon or not ran_today):
+        return 0                                # 16:50: only a three-way the 16:00 run had to leave for the reconcile
+    waits = ran_today and not recon             # review 11-28 M5: fills not booked yet -> a false THREE_WAY
+    if waits:
+        pass
+    elif snap and any(p.filled_qty or p.held_qty or p.leg == "PENDING_BUY" for p in lg.positions.values()):
         tok = x.token()
         if tok is None:
             probs.append("no token for the 16:00 check")
@@ -512,10 +600,16 @@ def cmd_watch(x: Ctx, a: argparse.Namespace) -> int:
             checked = True
     lg = L.replay(x.journal.read())
     write_ledger(x)
+    if a.resume:
+        x.notify("16:50 three-way after the late reconcile: " + (f"{len(probs)} PROBLEMS" if probs else "OK"))
+        return 0
     backed_up = backup_state(x)
-    carry_alerts(x, "HEARTBEAT " + E.status_text(lg) + (f"; THREE-WAY PROBLEMS {len(probs)}" if probs else
-                                                        ("; three-way OK" if checked else "; three-way not run (no "
-                                                         "opening snapshot today or nothing in the book)"))
+    stages = sorted({str(r["stage"]) for r in x.journal.read() if r["type"] == "STAGE" and r.get("date") == day})
+    three = (f"; THREE-WAY PROBLEMS {len(probs)}" if probs else "; three-way OK" if checked else
+             "; three-way waits for the reconcile (16:50)" if waits else
+             "; three-way not run (no opening snapshot today or nothing in the book)")
+    carry_alerts(x, "HEARTBEAT " + E.status_text(lg) + three
+                 + (f"; stages today {stages}" if stages else "; no order stage ran today")
                  + ("" if backed_up else "; BACKUP NOT SENT"))
     return 0
 
@@ -570,9 +664,27 @@ def cmd_kill_cancel(x: Ctx, a: argparse.Namespace) -> int:
     if tok is None:
         x.notify("ALERT KILL: no token, cannot cancel open orders")
         return 2
+    if x.journal is None:                      # review 11-28 M3: the journal is damaged; KILL must still work
+        n = raw_kill_cancel(x.api(tok))
+        x.notify(f"KILL (journal unreadable): cancelled {n} open book orders by tag straight from Kite; the journal "
+                 "does not record these cancels (repair it, then the reconcile reads the order book)")
+        return 0
     n = E.kill_cancel(x.env(x.api(tok)))
     x.notify(f"KILL: cancelled {n} open book orders")
     return 0
+
+
+def raw_kill_cancel(api: Any) -> int:
+    """Cancel every live order carrying a momentum tag, from Kite's order book alone (no journal)."""
+    n = 0
+    for o in api.orders():
+        if B.TAG_RE.match(str(o.get("tag") or "")) and B.order_is_live(o):
+            try:
+                api.cancel(str(o["order_id"]))
+                n += 1
+            except Exception as e:  # noqa: BLE001 - try every order; the count says how many went
+                log.error("raw kill cancel %s: %s", o.get("order_id"), e)
+    return n
 
 
 def cmd_status(x: Ctx, a: argparse.Namespace) -> int:
@@ -592,12 +704,23 @@ def cmd_poller(x: Ctx, a: argparse.Namespace) -> int:
             return ("[DRY] " if x.dry else "") + E.status_text(L.replay(Journal(x.paths.journal).read()))
         except Exception as e:  # noqa: BLE001 - a damaged journal must still answer, with the reason
             return f"status unavailable: {type(e).__name__}: {str(e)[:200]}"
+    killed_at: Dict[str, float] = {}
     while True:
         try:
             if (CF.load(x.home)["mode"] == "live") != (x.cfg["mode"] == "live"):
                 log.info("poller: config mode changed; exiting so the keep-alive restarts it on the new state root")
                 return 0
             poll_once(x.bot(), x.paths.inbox, off, x.paths.kill_file, status_fn=status)
+            if x.journal is None and x.paths.kill_file.exists():
+                # review 11-28 M3: the journal is damaged, so no order run starts to act on KILL: cancel the book's
+                # open orders by tag from here, once per KILL file
+                mt = x.paths.kill_file.stat().st_mtime
+                if mt != killed_at.get("mt"):
+                    tok = x.token()
+                    if tok is not None:
+                        n = raw_kill_cancel(x.api(tok))
+                        x.notify(f"KILL (journal unreadable): cancelled {n} open book orders by tag from Kite")
+                        killed_at["mt"] = mt
         except Exception as e:  # noqa: BLE001 - keep polling; logged
             log.error("poller: %s", e)
             time.sleep(POLLER_ERROR_SLEEP_S)
@@ -701,7 +824,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         x = Ctx(a, open_journal=a.command != "repair-journal")
     except Exception as e:  # noqa: BLE001 - config / journal damage: every command would die silently in cron
-        return startup_failure(a, e)
+        if a.command not in ("poller", "kill-cancel"):
+            return startup_failure(a, e)
+        try:                                    # review 11-28 M3: Telegram kill / status and kill-cancel must work
+            x = Ctx(a, open_journal=False)      # with a damaged journal (the poller's status reports the damage)
+        except Exception:  # noqa: BLE001 - config itself is broken: report as before
+            return startup_failure(a, e)
+        startup_failure(a, e)                   # still tell the owner what is wrong
     fn, lock = COMMANDS[a.command]
     if lock is None:
         return fn(x, a)
@@ -717,11 +846,35 @@ def main(argv: Optional[List[str]] = None) -> int:
                         log.exception("ledger cache not written")
     except LockBusy:
         log.info("%s: another run holds the %s lock; exiting", a.command, lock)
+        lock_busy_alert(x, a.command)
         return 0
     except Exception as e:  # noqa: BLE001 - last resort: never a silent failure
         log.exception("%s crashed", a.command)
         x.notify(f"ALERT CRASH {a.command}: {type(e).__name__}: {str(e)[:300]}")
         return 9
+
+
+def lock_busy_alert(x: Ctx, command: str) -> None:
+    """Review 11-28 M4: an afternoon slot that finds the order lock busy (a hung evening catch-up, test-plan or
+    ca-scan) after the 14:45 plan time, while today's PLAN stage has not run, is a trading day being lost: say so
+    once a day (the journal has its own append lock)."""
+    try:
+        if command != "afternoon" or x.journal is None:
+            return
+        day = util.today().isoformat()
+        if util.now() < util.at_today(x.cfg["step_plan_at"]) + dt.timedelta(minutes=3):
+            return
+        recs = x.journal.read()
+        if not order_work(L.replay(recs)) or E.stage_done(recs, day, "PLAN"):
+            return
+        if any(r["type"] == "ALERT" and r.get("code") == "LOCK_BUSY" and r["ts"][:10] == day for r in recs):
+            return
+        x.journal.append("ALERT", code="LOCK_BUSY", text="the afternoon step could not start: another job holds "
+                         "the order lock")
+        x.notify("ALERT LOCK_BUSY: the afternoon step could not start (another job holds the order lock): the next "
+                 "slots retry; if it is still stuck after 15:00 no order goes today")
+    except Exception:  # noqa: BLE001 - the alert itself must never crash the exit path
+        log.exception("lock busy alert failed")
 
 
 def startup_failure(a: argparse.Namespace, e: BaseException) -> int:

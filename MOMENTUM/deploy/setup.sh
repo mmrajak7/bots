@@ -35,6 +35,7 @@ BLOCK="$(sed -e "s#\$M-poller-keepalive#$HERE/momentum-poller-keepalive#" -e "s#
 ( crontab -l 2>/dev/null | sed '/# BEGIN MOMENTUM/,/# END MOMENTUM/d'; echo "# BEGIN MOMENTUM"; echo "$BLOCK"; echo "# END MOMENTUM" ) | crontab -
 echo "crontab:"; crontab -l | sed -n '/# BEGIN MOMENTUM/,/# END MOMENTUM/p'
 # checks (read-only)
-./momentum status || true
+# review 11-28 M7: the live journal must replay under the code just pulled (a replay error bricks the book)
+./momentum status || { echo "STATUS FAILED: the journal does not replay under this code: roll back (RUNBOOK 3b)"; exit 1; }
 echo "manifest check:"; .venv/bin/python -I -c "import sys;sys.path.insert(0,'src');from momentum import cli,config as CF;from pathlib import Path;h=Path('$HERE');print(cli.check_manifest(h,CF.load(h)) or 'OK')"
 echo "setup done. NOT armed. Next: ./momentum isolation-test ; then the dry runs (docs/RUNBOOK.md)."

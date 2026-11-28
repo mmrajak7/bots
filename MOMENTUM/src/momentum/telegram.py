@@ -46,18 +46,22 @@ class Bot:
         self.base = f"https://api.telegram.org/bot{token}"
         self.chat_id, self.retries, self.retry_s = str(chat_id), retries, retry_s
         self.http = session or requests.Session()
+        self.fast = False                # review 11-28 M6: inside the order window one short try (the step's own
+        #                                  retry loops and the undelivered-alert carry cover a miss)
 
     def _call(self, method: str, files: Any = None, **data: Any) -> Optional[Dict[str, Any]]:
-        for k in range(self.retries):
+        tries, wait = (1, 8) if self.fast and method != "getUpdates" else (self.retries, 30)
+        for k in range(tries):
             try:
-                r = self.http.post(f"{self.base}/{method}", data=data, files=files, timeout=30)
+                r = self.http.post(f"{self.base}/{method}", data=data, files=files,
+                                   timeout=wait if method != "getUpdates" else 30 + int(data.get("timeout", 0)))
                 js = r.json()
                 if js.get("ok"):
                     return js
                 log.warning("telegram %s not ok: %s", method, str(js)[:200])
             except Exception as e:  # noqa: BLE001 - network; retried, then reported to the caller
                 log.warning("telegram %s failed: %s", method, type(e).__name__)
-            if k + 1 < self.retries:
+            if k + 1 < tries:
                 time.sleep(self.retry_s)
         return None
 

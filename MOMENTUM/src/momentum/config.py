@@ -145,7 +145,17 @@ def _read(p: Path) -> Dict[str, Any]:
 def load(home: Optional[Path] = None, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     h = home or HOME
     cfg = _read(h / "config" / "momentum.defaults.json")
-    cfg.update(_read(h / "config" / "momentum.json"))
+    overlay = _read(h / "config" / "momentum.json")
+    # review 11-28 L4: a typo in the overlay was silently ignored, and a nested block (test_lot, charges_rates)
+    # replaced the whole default block: unknown keys are refused, nested blocks are merged key by key
+    unknown = sorted(k for k in overlay if not k.startswith("_") and k not in cfg)
+    if unknown:
+        raise ConfigError(f"config/momentum.json: unknown keys {unknown} (typo? see momentum.defaults.json)")
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+            cfg[k] = {**cfg[k], **v}
+        else:
+            cfg[k] = v
     if overrides:
         cfg.update(overrides)
     missing = [k for k in REQUIRED_KEYS if k not in cfg]

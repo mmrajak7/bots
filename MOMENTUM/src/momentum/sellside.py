@@ -714,7 +714,7 @@ def size_buys(env: Any, legs: List[L.Position], q: Dict[str, Any], ticks: Dict[s
         if p.test:                                     # the TEST lot buys exactly its quantity (never more)
             qty = min(qty, int(env.cfg["test_lot"]["qty"]))
         out[p.position_id] = (max(0, qty), ltp, limit, cap, int(amount))
-        if not p.test:
+        if not p.test and qty > 0:                     # a 0-share buy is skipped: its money stays in book cash
             rem[p.position_id] = amount - max(0, qty) * cap
     left = {k: v for k, v in rem.items()}                # leftover each buy can still give, rupees
     moves: List[Tuple[str, str, int]] = []

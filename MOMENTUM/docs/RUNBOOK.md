@@ -75,6 +75,17 @@ read for a decision made before D47. Check by hand any time: `./momentum fo-vet 
 Rollback to a version before the January slice is safe only before the first TEST sell (old code ignores
 EARMARK_MOVE and would book a SELL fill as a buy).
 
+
+## 3c. Restore after a dead SD card (review 11-28 M8)
+The book is the journal plus the decision files it hash-checks. Copies: `backup/live/<day>/` on the Pi (journal,
+ledger, decisions/, bands/, snapshots/) and on Telegram (journal every evening; `decisions_bands.zip` whenever a plan
+is added).
+1. New card: install as in section 1 (`git clone`, venv, secrets, token login), `bash deploy/setup.sh`.
+2. Put the latest `journal.jsonl` into `state/`, unzip `decisions_bands.zip` into `state/` (gives `state/decisions/`,
+   `state/bands/`). Do NOT copy `ledger.json`: it is rebuilt from the journal.
+3. `./momentum status` must print the book (a replay error = wrong journal copy); the next morning's snapshot and
+   reconcile compare it with Kite. Any intent left live from the dead day becomes an owner item (`filled` / `resolve`).
+
 ## 4. Daily
 | IST | What you see in Telegram |
 |---|---|
@@ -106,5 +117,11 @@ Commands to the bot: `kill` (stops everything; cancels open book orders by tag),
 | `FO_VET_FAILED` | the evening F&O vet failed until 21:30; the plan went FINAL without it (D47) | nothing; the day-1 check still guards. Tell Claude (scan / CLI / NSE format) |
 | `F&O ENTRANTS` / `F&O INFO` | stocks starting F&O on day 1 were excluded / a circular worth knowing | nothing |
 | `FO_ENTRANT` (14:45) | a planned buy has stock futures on day 1: not bought, earmark stays cash | nothing (research never buys an F&O member) |
+| `MARKET_SHUT` (15:06) | the probe stocks did not trade today although the holiday file lists a session | nothing: no buy amounts, the day does not count; tell Claude to fix the holiday file |
+| `SIGNAL_DAY_MOVED` | the holiday file missed a closure on the month's last weekday: the plan uses Kite's last session | nothing (the plan is built at the next slot) |
+| `SELL_NOT_STARTED` | the day's start message never reached Telegram by 15:00: no sell today | nothing (next session); check Telegram |
+| `ORPHAN_ABSENT` | an order call never reached Kite (crash / power cut between the journal and the call): booked as never placed | nothing (the leg retries next session) |
+| `LOCK_BUSY` | the afternoon could not start: another job holds the order lock | tell Claude if it repeats (a hung job) |
+| `CA_LATE` | a split / bonus credit is later than ca_lag_days (an ISIN change can show 0 shares for a day or two) | check Kite holdings; `ca <isin> <qty> [<new isin>]` once it shows |
 | `FO_FALSE_EXCLUSION` | the band excluded a name that has no futures on day 1 (withdrawn circular) | nothing to undo; tell Claude |
 | `PREFLIGHT ... F&O day-1 list unavailable` | Kite's NFO list / the day-1 F&O bhavcopy could not be read | nothing; no buys this session (no lock try), next session retries |

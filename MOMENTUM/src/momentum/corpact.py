@@ -86,8 +86,6 @@ def scan(env: Any, M_CA: Any, get: Optional[Callable[[str], Tuple[int, Optional[
         mult = round(1 / ev.factor) if ev.factor > 0 else 0
         clean = (set(ev.kinds) <= {"split", "bonus"} and ev.factor < 1 and mult >= 2
                  and abs(1 / ev.factor - mult) < 1e-9 and len(ps) == 1)
-        env.journal.append("NOTE", ca_event=eid, isin=ev.isin, symbol=ev.symbol, ex=ev.ex, kinds=list(ev.kinds),
-                           factor=ev.factor, mult=mult if clean else None, subjects=list(ev.subjects)[:4])
         for p in ps:
             if clean:                              # the overlay goes on near the ex-date (activate_due, below)
                 env.notify(f"CA {p.symbol}: {'/'.join(ev.kinds)} x{mult}, ex {ev.ex}: from the ex-date its orders "
@@ -97,6 +95,10 @@ def scan(env: Any, M_CA: Any, get: Optional[Callable[[str], Tuple[int, Optional[
                            f"({E.quote_text(' | '.join(ev.subjects))[:100]}): the code does not handle it")
                 env.alert("CA_OWNER", f"{p.symbol}: {'/'.join(ev.kinds)} ex {ev.ex}: held for you (sell it, or "
                           f"fix the quantity with 'ca {p.isin} <new qty>' once Kite shows it)")
+        # review 11-28: the NOTE (which makes a re-scan skip this event) only AFTER the holds: a crash in between
+        # re-acts on the next scan instead of losing the hold for good
+        env.journal.append("NOTE", ca_event=eid, isin=ev.isin, symbol=ev.symbol, ex=ev.ex, kinds=list(ev.kinds),
+                           factor=ev.factor, mult=mult if clean else None, subjects=list(ev.subjects)[:4])
         acted.append(eid)
     activate_due(env)
     return {"ok": True, "records": len(records), "acted": acted}
