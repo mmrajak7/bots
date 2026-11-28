@@ -271,7 +271,12 @@ class Broker:
                                  tag=tag)
         except Rejected as e:
             # A refusal is final only if no order carries the tag (review 11-28 C1: an exception for an order Kite
-            # did create must not leave a filled order unbooked and the leg open for a second buy).
+            # did create must not leave a filled order unbooked and the leg open for a second buy). A token /
+            # permission refusal is decided before the order system, so it is final at once (no read on a dead token).
+            if classify_reject(str(e)) == "REJECTED_AUTH":
+                self.j.append("RESULT", intent_id=intent_id, outcome="REJECTED_AUTH", order_id=None,
+                              message=str(e)[:500])
+                return L.replay(self.j.read()).intents[intent_id]
             try:
                 found: Optional[Dict[str, Any]] = self._today_tags().get(tag)
                 unreadable = ""

@@ -319,14 +319,31 @@ def remind_holds(env: Env) -> int:
     with no approval at all (crash between PLAN_FINAL and the buttons) gets a 'release <isin>' line. -> reminders."""
     recs = env.journal.read()
     lg = L.replay(recs)
+    today = util.today().isoformat()
     tapped = {r["approval_id"] for r in recs if r["type"] == "OWNER_TAP"}
     n = 0
     for p in lg.positions.values():
-        if p.leg != "PENDING_BUY" or not (p.overlays & set(OWNER_CLEARABLE)):
+        waiting = p.overlays & {"OWNER_HOLD", "AUDIT_HOLD", "SHARED_NAME_HOLD"}   # VET_DEFERRED lifts by itself
+        if p.leg != "PENDING_BUY" or not waiting:
+            continue
+        ons = [r for r in recs if r["type"] == "OVERLAY" and r["position_id"] == p.position_id
+               and r["overlay"] in waiting and r["on"]]
+        if all(str(r.get("reason", "")).startswith("owner") for r in ons[-len(waiting):]):
+            continue                                    # the owner put it on hold (hold <isin> / data error)
+        on_seq = ons[-1]["seq"]
+        # the owner already decided after the hold went on (tapped Hold / Buy, or sent hold / release): no reminder
+        decided = any((r["type"] == "OWNER_TAP" and r["seq"] > on_seq and
+                       any(a["approval_id"] == r["approval_id"] and a.get("position_id") == p.position_id
+                           for a in recs if a["type"] == "APPROVAL_OPEN"))
+                      or (r["type"] == "OWNER_CMD" and r["seq"] > on_seq and r["cmd"] in ("hold", "release")
+                          and r.get("args", "").strip().upper() == p.isin) for r in recs)
+        if decided:
             continue
         aps = [r for r in recs if r["type"] == "APPROVAL_OPEN" and r.get("position_id") == p.position_id
                and r["approval_id"] not in tapped]
-        for ap in aps:
+        if aps and aps[-1]["ts"][:10] == today:
+            continue                                    # sent this morning already
+        for ap in aps[-1:]:
             labels = ap.get("labels") or {c: c for c in ap["choices"]}
             env.notify("REMINDER " + (ap.get("text") or f"{p.symbol}: {ap['ref_type']} {ap['ref']}"),
                        buttons=[(lab, f"a:{ap['approval_id']}:{c}") for c, lab in labels.items()])
@@ -475,6 +492,7 @@ def apply_verdict(env: Env, sp: StepPlan, vd: V.Verdict, day: str) -> List[L.Pos
         if iid in qmiss and a != "GO" and not (listed and tradingsymbol(p.symbol, p.series) not in listed):
             # review 11-28 T9: a quote missing at 14:45 for a name still in Kite's instruments is a read gap, not a
             # dead stock: next session, no session used (only a name gone from the instruments may be SKIPPED)
+            session_used(env, p.position_id, day, False, "no quote at the step plan")   # window still ends
             env.alert("NO_QUOTE", f"{p.symbol}: no quote at {env.cfg['step_plan_at']} (still listed): next session")
             continue
         if a == "GO":
@@ -517,7 +535,7 @@ def shared_name_holds(env: Env, holdings_open: Dict[str, int]) -> None:
     recs = env.journal.read()
     lg = L.replay(recs)
     owner_ok = {r["position_id"] for r in recs if r["type"] == "OVERLAY" and r["overlay"] == "SHARED_NAME_HOLD"
-                and not r["on"] and r.get("reason") == "owner buy"}
+                and not r["on"] and r.get("reason") in ("owner buy", "owner release")}
     for p in lg.positions.values():
         extra = int(holdings_open.get(p.isin, 0)) - p.filled_qty
         if (p.leg == "PENDING_BUY" and extra > 0 and "SHARED_NAME_HOLD" not in p.overlays
@@ -798,11 +816,11 @@ def settle_orphans(env: Env, day: str, final: bool) -> None:
         if i.status.startswith("REJECTED") and not i.order_id:
             # refused at the call, yet the order appeared later under its exact tag (review 11-28 C1): adopt it so
             # its fills are booked; absent -> the refusal stands (never an owner item)
-            if i.tag in by_tag:
+            if i.tag in by_tag and B.order_state(by_tag[i.tag]) != "REJECTED":     # a rejected row changes nothing
                 env.journal.append("ORPHAN", intent_id=i.intent_id, resolution="FOUND",
                                    order_id=str(by_tag[i.tag]["order_id"]), reads=["orders", "after a refusal"])
                 env.alert("REFUSED_BUT_PLACED", f"{i.tradingsymbol}: Kite refused {i.intent_id} but the order is in "
-                          "the book; adopted, its fills are booked")
+                          "the book; adopted (its fills are booked at the reconcile)")
             continue
         if i.status not in ("INTENT_WRITTEN", "SENT", "TIMEOUT"):
             continue

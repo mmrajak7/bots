@@ -318,10 +318,10 @@ def cmd_evening(x: Ctx, a: argparse.Namespace) -> int:
         res = EV.run_signal_evening(env, M, m, day, skip_fetch=a.skip_fetch,
                                     first_session=EV.next_session(day, holidays(x.cfg, x.home)).isoformat())
     except (EV.EveningError, P.PipelineError) as e:
-        late = util.now() >= util.at_today(x.cfg["plan_final"])
-        why = f"{m} (signal day {day}): {e}"
         today_s = util.today().isoformat()
-        if any(r["type"] == "ALERT" and r.get("code") == "NO_PLAN" and r["ts"][:10] == today_s
+        late = util.now() >= util.at_today(x.cfg["plan_final"]) or today_s > day.isoformat()
+        why = f"{m} (signal day {day}): {e}"
+        if any(r["type"] in ("ALERT", "DRY_ALERT") and r.get("code") == "NO_PLAN" and r["ts"][:10] == today_s
                and r.get("text", "").startswith(why[:120]) for r in env.journal.read()):
             log.warning("NO_PLAN again (already alerted today): %s", why)      # review 11-28 O20: once a day per cause
         else:

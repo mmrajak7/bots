@@ -76,7 +76,8 @@ def fo_entrants(env: Env, M: P.Modules, m: str, sd: str, first_session: str, fo_
     failed at / after it -> FINAL anyway with ALERT FO_VET_FAILED (owner D47; the day-1 backstop still guards)."""
     from . import fo_vet as FV
     cfg = env.cfg
-    final = util.now() >= util.at_today(cfg["fo_vet_give_up"])
+    # past the give-up time, or a catch-up run on a later day (review 11-28: the morning catch-up must reach FINAL)
+    final = util.now() >= util.at_today(cfg["fo_vet_give_up"]) or util.today().isoformat() > sd
     p = Path(M.J.ANNOUNCED_FILE)
     rows = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
     try:

@@ -84,6 +84,26 @@ class TestRefusedButPlaced(Harness):
         i = next(i for i in lg.intents.values() if i.position_id == "2612-01")
         self.assertNotIn(i.status, ("REJECTED_OTHER", "REJECTED_RMS", "REJECTED_BAND"))
 
+    def test_token_refusal_is_final_without_a_read(self) -> None:
+        """A token refusal never becomes an owner item (the order system never saw it)."""
+        self.k.reject_next = "TokenException: Incorrect `api_key` or `access_token`."
+        lg = self.run_day()
+        i = next(i for i in lg.intents.values() if i.position_id == "2612-01")
+        self.assertEqual(i.status, "REJECTED_AUTH")
+        self.assertEqual(lg.unresolved, [])
+
+    def test_refused_and_rejected_in_the_book_is_not_adopted(self) -> None:
+        def on_place(o):  # noqa: ANN001
+            if o.tradingsymbol == "SYM1":
+                o.status, o.status_message = "REJECTED", "some reason"
+                self.k.raw_error_next = B.Rejected("OrderException: some reason")
+        lg = self.run_day(fill=on_place)
+        i = next(i for i in lg.intents.values() if i.position_id == "2612-01")
+        self.assertTrue(i.status.startswith("REJECTED"))
+        self.assertFalse(any("REFUSED_BUT_PLACED" in t for t, _ in self.sent))
+        holds = [r for r in self.j.read() if r["type"] == "APPROVAL_OPEN" and r.get("position_id") == "2612-01"]
+        self.assertLessEqual(len(holds), 1)
+
     def test_kite_general_exception_is_unknown_outcome(self) -> None:
         from kiteconnect import exceptions as kx
         api = B.KiteApi.__new__(B.KiteApi)
@@ -144,6 +164,8 @@ class TestHoldsNeverSilent(Harness):
                         position_id=p.position_id, other_open_flags=[])
         self.tg_ok = True
         self.sent.clear()
+        self.assertEqual(E.remind_holds(env), 0)               # opened today: not re-sent the same morning
+        self.new_day(self.day + dt.timedelta(days=1))
         self.assertEqual(E.remind_holds(env), 1)
         self.assertTrue(self.sent[0][0].startswith("REMINDER AUDIT FLAG SYM1"))
         self.assertEqual(len(self.sent[0][1]), 2)
@@ -155,6 +177,22 @@ class TestHoldsNeverSilent(Harness):
         E.apply_cmd(env, "release", p.isin)
         self.assertIn("nothing to change", self.sent[-1][0])
         self.assertEqual(E.remind_holds(env), 0)
+
+    def test_owner_decisions_and_vet_defers_are_not_reminded(self) -> None:
+        env = self.env()
+        self.j.append("OVERLAY", position_id="2612-01", overlay="VET_DEFERRED", on=True, reason="vet")
+        E.apply_cmd(env, "hold", "INE000000002")
+        self.new_day(self.day + dt.timedelta(days=1))
+        self.sent.clear()
+        self.assertEqual(E.remind_holds(env), 0)
+
+    def test_release_sticks_for_a_shared_name_hold(self) -> None:
+        env = self.env()
+        E.shared_name_holds(env, {"INE000000001": 5})
+        self.assertIn("SHARED_NAME_HOLD", L.replay(self.j.read()).positions["2612-01"].overlays)
+        E.apply_cmd(env, "release", "INE000000001")
+        E.shared_name_holds(env, {"INE000000001": 5})
+        self.assertNotIn("SHARED_NAME_HOLD", L.replay(self.j.read()).positions["2612-01"].overlays)
 
     def test_hold_without_any_button_gets_a_release_line(self) -> None:
         env = self.env()
@@ -203,6 +241,7 @@ class TestMissingQuote(Harness):
         lg = self.run_missing(listed=True)
         p = lg.positions["2612-01"]
         self.assertEqual((p.leg, p.tries_used), ("PENDING_BUY", 0))
+        self.assertIn(self.day.isoformat(), p.sessions_seen)  # the 6-session window still runs out
         self.assertTrue(any("ALERT NO_QUOTE" in t for t, _ in self.sent))
 
     def test_name_gone_from_the_instruments_is_skipped(self) -> None:

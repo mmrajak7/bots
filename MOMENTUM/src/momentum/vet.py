@@ -200,8 +200,9 @@ def cli_version(cfg: Dict[str, Any], timeout_s: int = 30) -> str:
 
 
 def canary(cfg: Dict[str, Any], timeout_s: int = 60) -> Tuple[bool, str]:
-    """A tiny call through the same isolated path (E33), and the CLI version pin (E33: a changed CLI must pass
-    `momentum isolation-test` before the book trusts it; review 11-28 O10)."""
+    """A tiny call through the same isolated path (E33), and the CLI version pin (review 11-28 O10). The pin is an
+    ALERT, not a gate: the 14:45 vet still runs (its answer is schema- and hash-bound); a changed CLI should pass
+    `momentum isolation-test` and then get its version written to claude_version."""
     ver = cli_version(cfg)
     if ver != str(cfg["claude_version"]):
         return False, (f"Claude CLI is {ver or 'unreadable'}, config pins {cfg['claude_version']}: run "
