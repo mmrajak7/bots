@@ -41,7 +41,10 @@ LADDER_CONSTS = ('PREMIUM_SL_PCT', 'TRAIL_PCT', 'TRAIL_MIN_GAIN_PCT', 'T1_BUFFER
 
 
 def _logging(name: str) -> None:
-    d = os.path.join(ETF_DIR, 'logs')
+    # state/executor/logs, NOT logs/: the 06:00 cron deletes logs/*.log after 30 days and the
+    # executor's logs are study material (traceability review, logging gap 1). pull_pi.sh
+    # fetches state/executor/ in full.
+    d = os.path.join(C.STATE_DIR, 'logs')
     os.makedirs(d, exist_ok=True)
     day = _dt.date.today().strftime('%Y-%m-%d')
     fmt = logging.Formatter('%(asctime)s | %(levelname)-7s | %(name)s | %(message)s', '%H:%M:%S')

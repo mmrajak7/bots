@@ -177,3 +177,13 @@ def test_config_refuses_bad_values(tmp_path):
     c = C.load(local_path=lp, override={'mode': 'live', 'live_until': '2026-12-31'})
     import datetime as dt
     assert C.live_allowed(c, dt.date(2026, 12, 31)) and not C.live_allowed(c, dt.date(2027, 1, 1))
+
+
+def test_time_sl_is_not_masked_by_an_ltp_tp_print():
+    """Traceability review: _ladder returns TP first on an LTP print at/above the target;
+    the minute sample discards TP (the bid rule decides) -- TIME_SL must still fire."""
+    import datetime as dt
+    now = dt.datetime.fromisoformat('2026-11-30T10:31:00+05:30')
+    p = pos()
+    assert R.minute_sample('k', p, q(109.5, 110.5, ltp=110.2), now, ob._ladder, ob) == 'TIME_SL'
+    assert p['exit_detail']['how'] == 'minute_ltp'

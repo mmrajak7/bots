@@ -245,14 +245,23 @@ pf.check_instruments(rep, now)
 check(any('not today' in r['detail'] for r in rep.failures),
       "a dump that did not refresh today FAILS")
 
-# Neo is not checked on paper.
+# The live path (2026-11-28): the executor daemon + the shared kotak_neo session. The old
+# neo/ bridge and trade_enabled are retired, so the executor's config decides what is checked.
+import executor.config as _xc
+_real_load = _xc.load
+_base = _real_load(local_path=os.path.join(tmp, 'no_overlay.yaml'))
+_xc.load = lambda *a, **k: dict(_base, mode='off')
 rep = pf.Report()
-pf.check_neo(rep, now, {'trade_enabled': False, 'log_only': True})
-check(rep.ready and any('paper mode' in r['detail'] for r in rep.rows),
-      "neo session is not demanded on the paper book")
+pf.check_neo(rep, now, {})
+check(rep.ready and any('mode off' in r['detail'] for r in rep.rows),
+      "executor off: no session demanded, preflight stays ready")
+_xc.load = lambda *a, **k: dict(_base, mode='live', live_until='2099-12-31',
+                                live_until_date=datetime.date(2099, 12, 31))
 rep = pf.Report()
-pf.check_neo(rep, now, {'trade_enabled': True, 'log_only': False})
-check(rep.failures, "but once LIVE, a missing neo session FAILS")
+pf.check_neo(rep, now, {})                      # tmp has no state/executor/status.json
+check(any('NOT RUNNING' in r['detail'] for r in rep.failures),
+      "executor LIVE but not running FAILS")
+_xc.load = _real_load
 
 # Observer silence. Set the state explicitly rather than inheriting whatever an
 # earlier section left on disk — the earlier torn-line test leaves the file non-empty.

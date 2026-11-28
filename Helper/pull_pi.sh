@@ -116,10 +116,13 @@ pull_tree "$R_BOTS/Helper/logs" helper -maxdepth 2 \( \
     \( -name 'cron_*.log' $M \) -o \( -name 'spread_monitor_cron_*.log' $M \) -o \( -name 'vet_cli_*.log' $M \) \
     -o -name '*_trades.json' -o -name 'shadow_*.json' -o -path './eod/*' \)
 # ETF_PI (live checkout under Scripts/): state + journals in full, logs by age.
-pull_tree "$R_ETF" etf_pi -maxdepth 2 \( \
+pull_tree "$R_ETF" etf_pi -maxdepth 4 \( \
     -name 'st_opt_positions.json' -o -name 'st_opt_state.json' -o \( -name 'st_opt_levels_*.json' $M \) \
     -o -path './logs/*.jsonl' -o -path './logs/*state*.json' -o -path './logs/digest*' \
-    -o \( -path './logs/*.log' $M \) \)
+    -o \( -path './logs/*.log' $M \) \
+    -o -path './state/executor/journal_*.jsonl' -o -path './state/executor/status.json' \
+    -o -path './state/executor/tape_*.jsonl' -o -path './state/executor/logs/*' \)
+# ^ the live executor's book + tick tape + logs in full (2026-11-28: study material, Pi-only before)
 # NIFTY BTST: paper, rehearsal and live books + intents + event journals in full; logs by age.
 pull_tree "$R_BOTS/Strategies/NIFTY_BTST" btst -maxdepth 2 \( \
     -path './state*/book.json' -o -path './state*/heartbeat.json' -o -path './state*/intents.jsonl' \

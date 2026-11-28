@@ -16,6 +16,7 @@ decisions. Where they differ, this file wins. Every rule below has an ID used by
 | O7 | Live location stays `~/Desktop/Scripts/bots/ETF_PI` (cron paths unchanged). Code from git. |
 | O8 | Dead-man = healthchecks.io ping URL (Pi `credentials.json` section `healthchecks.url`). |
 | O9 | Arming = executor config `mode: live`, `lots`, `live_until` (date) + KILL file. No daily ARM file. |
+| O10 | (2026-11-28) Live LAST ENTRY 14:50 (whole minute) = paper's 25-min runway before the live EOD 15:15. Executor also refuses NO_ENTRY_WINDOWS itself. Journal records which sub-rule fired (`exit_detail`), quote snapshots, NEO call ms, entry slip, charges_est/net_est; logs in `state/executor/logs/` (not the 30-day cleanup); digest shows executor vs paper per key. |
 
 ## 1. Processes
 | Piece | Runs | Owns | Never |

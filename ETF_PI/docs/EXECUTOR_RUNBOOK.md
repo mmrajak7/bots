@@ -49,7 +49,7 @@ option_buy's constants (F20).
 | no new entries | `python3 -m executor kill` |
 | exit everything now | `python3 -m executor flatten` |
 | undo both | `python3 -m executor resume` |
-| what is it doing | `python3 -m executor status` · `tail -f logs/executor_$(date +%F).log` |
+| what is it doing | `python3 -m executor status` · `tail -f state/executor/logs/executor_$(date +%F).log` (journal: `state/executor/journal_<mode>.jsonl`, tape: `tape_YYYYMMDD.jsonl`) |
 | stop the daemon | `python3 -m executor stop` (STOPPED flag: the watchdog leaves it down). Open lots are NOT managed while stopped -- `flatten` first |
 | start it again | `python3 -m executor start` |
 | NEVER | change `mode` or stop the daemon while a lot is open (live and paper keep separate journals; a live lot in paper mode is alerted every 5 min but NOT managed) |

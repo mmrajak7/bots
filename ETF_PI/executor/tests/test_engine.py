@@ -545,3 +545,75 @@ def test_h5_after_the_close_a_stuck_exit_is_not_stepped_all_night(rig):
     rig.step(secs=30, n=120, refresh=False)           # an hour after the close
     assert len(rig.fake.calls) == calls               # no NEO reads
     assert len(open(rig.eng.j.path).read().splitlines()) - rows < 5
+
+
+# -- traceability review (2026-11-28) -------------------------------------------------------------
+@pytest.mark.parametrize('kw,why', [({'signal_tf': '15minute'}, 'not a NIFTY 10M intent'),
+                                    ({'underlying': 'BANKNIFTY'}, 'not a NIFTY 10M intent')])
+def test_only_nifty_10m_reaches_orders(rig, kw, why):
+    rig.intent(**kw)
+    rig.step()
+    assert rig.etf_orders() == [] and why in json.dumps(rig.eng.j.load()[1][-1])
+
+
+@pytest.mark.parametrize('hhmm', [(10, 30, 5), (11, 29, 50), (14, 15, 5), (14, 44, 50)])
+def test_no_entry_inside_a_blocked_window(rig, hhmm):
+    rig.now = rig.now.replace(hour=hhmm[0], minute=hhmm[1], second=hhmm[2])
+    rig.intent()
+    rig.step()
+    assert rig.etf_orders() == [] and 'blocked entry window' in json.dumps(rig.eng.j.load()[1][-1])
+
+
+def test_last_entry_1450_allows_the_whole_minute_then_stops(rig):
+    rig.now = rig.now.replace(hour=14, minute=50, second=30)
+    k = rig.intent()
+    rig.step(n=2)
+    assert rig.pos(k)['state'] == 'OPEN'
+    rig.now = rig.now.replace(hour=14, minute=51, second=5)
+    rig.intent(key='NIFTY_PE_10minute_20261130_H2')
+    rig.step()
+    assert 'NIFTY_PE_10minute_20261130_H2' not in rig.eng.pos
+
+
+def test_live_eod_1515_exits_before_the_broker(rig):
+    rig.eng.eod_fn = lambda d: dt.time(15, 15)        # what __main__ wires: min(15:25, eod_time)
+    p = open_one(rig)
+    rig.now = rig.now.replace(hour=15, minute=14, second=58)
+    p['entry_time'] = rig.now.isoformat()
+    rig.quote(100.5, 100.6)
+    rig.step(n=6)
+    assert p['state'] == 'CLOSED' and p['exit_type'] == 'EOD'
+
+
+def test_journal_records_rule_quote_slippage_and_charges(rig):
+    p = open_one(rig)
+    rows = rig.eng.j.load()[1]
+    send = [r for r in rows if r.get('ev') == 'ENTRY_SEND'][-1]
+    assert send['quote']['ask'] == 100.0 and send['signal_age_s'] is not None
+    assert [r for r in rows if r.get('ev') == 'ENTRY_PLACED'][-1]['place_ms'] >= 0
+    assert p['entry_slip'] == pytest.approx(0.0)
+    rig.quote(110.0, 110.1)
+    rig.step(n=3)
+    rows = rig.eng.j.load()[1]
+    start = [r for r in rows if r.get('ev') == 'EXIT_START'][-1]
+    assert start['pos']['exit_detail']['rule'] == 'TP' and start['pos']['exit_detail']['how'] == 'bid_touch'
+    assert start['quote']['bid'] == 110.0
+    c = rig.pos()
+    assert c['charges_est'] > 0 and c['net_est'] == pytest.approx(c['realised'] - c['charges_est'])
+    assert c['exit_slip_vs_level'] == pytest.approx(0.0)
+    assert 'place buy' in rig.eng.neo_stats
+
+
+def test_q7_short_after_the_last_close_is_still_watched(rig):
+    p = open_one(rig)
+    rig.quote(110.0, 110.1)
+    rig.step(n=3)
+    assert p['state'] == 'CLOSED' and rig.eng._active() == []
+    # a stray own sell fills AFTER the close (e.g. an unclear sell surfacing late)
+    rig.broker.place(SYM, '1', 'S', 65, 109.0, rig.broker.new_tag(), reduce_only=True)
+    assert rig.fake.net(SYM) == -65
+    for _ in range(4):                                # no check(): the account IS short here
+        rig.now += dt.timedelta(seconds=16)
+        rig.feed._q[SYM].ts = rig.epoch()
+        rig.eng.step(rig.now)
+    assert p.get('covered') and rig.fake.net(SYM) == 0

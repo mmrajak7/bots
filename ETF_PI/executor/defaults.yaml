@@ -11,7 +11,8 @@ max_open: 2                 # open + working positions at once (one CE + one PE)
 
 # entry (spec §4)
 intent_max_age_s: 20        # I1
-last_entry: "15:00"         # E1 (paper: MIN_MINUTES_TO_EOD=25 before 15:25)
+last_entry: "14:50"         # owner 2026-11-28: keep paper's 25-min runway to the live EOD 15:15
+                            # (paper: 15:00 before 15:25). Whole minute allowed, as paper.
 entry_cap_ticks: 3          # E2: cap = signal_ltp + max(3 ticks, 0.3%)
 entry_cap_pct: 0.3
 entry_reprice_s: 2.0        # E5
@@ -36,6 +37,16 @@ trouble_alert_after: 3      # X12: consecutive troubled steps before an alert
 stop_placing: "15:29:50"    # F16: no order placed after this; open lots -> CARRY
 carry_resume: "09:15:05"    # F16: a carried lot is exited from this time
 neo_timeout_s: 3            # F10
+neo_slow_ms: 300            # a NEO call slower than this is logged (lag study)
+
+# statutory charges ESTIMATE per round trip (contract note 2026-11-27 matched these rates;
+# brokerage is zero on NEO). Booked as charges_est / net_est on every CLOSED row.
+charges:
+  stt_sell_pct: 0.15        # of sell premium turnover
+  exch_pct: 0.0356          # of total turnover (NSE txn + IPFT), measured 0.78 on Rs2,194
+  stamp_buy_pct: 0.003      # of buy turnover
+  sebi_per_crore: 10
+  gst_pct: 18               # on exchange + SEBI + brokerage
 
 # prices (spec §8)
 price_stale_s: 5.0          # P2: older tick -> REST

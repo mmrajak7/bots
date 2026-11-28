@@ -119,30 +119,37 @@ def tick_exit(pos: Dict[str, Any], q: Quote, now_epoch: float, cfg: Dict[str, An
     st = float(pos.get('st_value') or 0)
     t2 = float(pos.get('t2_value') or 0)
     target = t2 if t2 > 0 else st
+    def fire(rule, how, level):
+        # WHICH sub-rule fired, at what level, on what price -- the evidence the Q2/Q3
+        # trigger decisions are reviewed on (traceability review, logging gap 3).
+        pos['exit_detail'] = {'rule': rule, 'how': how, 'level': round(float(level), 2),
+                              'bid': bid, 'ask': q.ask, 'ltp': q.ltp,
+                              'quote_age_s': round(max(0.0, now_epoch - q.ts), 2) if q.ts else None}
+        return rule
     if target > 0 and bid >= target:                                   # X2
         pos['floor_breach_since'] = None
-        return 'TP'
+        return fire('TP', 'bid_touch', target)
     if entry > 0 and bid <= entry * (1 - consts.PREMIUM_SL_PCT / 100.0):   # X4
-        return 'PREM_SL'
+        return fire('PREM_SL', 'bid_tick', entry * (1 - consts.PREMIUM_SL_PCT / 100.0))
     peak = float(pos.get('peak_premium') or entry)
     if entry > 0:
         peak_gain = (peak - entry) / entry * 100.0
-        if peak_gain < consts.ADV_SL_PEAK_PCT and \
-                bid <= entry * (1 - cfg['adv_backstop_pct'] / 100.0):     # X5
-            return 'ADV_SL'
+        lvl = entry * (1 - cfg['adv_backstop_pct'] / 100.0)
+        if peak_gain < consts.ADV_SL_PEAK_PCT and bid <= lvl:             # X5
+            return fire('ADV_SL', 'backstop_%g%%' % cfg['adv_backstop_pct'], lvl)
     level, kind = floor_level(pos)                                      # X3
     if level <= 0:
         pos['floor_breach_since'] = None
         return None
     if bid <= level * (1 - cfg['floor_instant_pct'] / 100.0):
-        return kind
+        return fire(kind, 'instant_-%g%%' % cfg['floor_instant_pct'], level)
     if bid <= level:
         since = pos.get('floor_breach_since')
         if since is None:
             pos['floor_breach_since'] = now_epoch
             return None
         if now_epoch - float(since) >= cfg['floor_persist_s']:
-            return kind
+            return fire(kind, 'persist_%gs' % cfg['floor_persist_s'], level)
         return None
     pos['floor_breach_since'] = None
     return None
@@ -160,7 +167,27 @@ def minute_sample(key: str, pos: Dict[str, Any], q: Quote, now: _dt.datetime,
     exit_type, _ = ladder(key, pos, ltp, now, cap='config', flatten=False, say=say)
     pos['trail_level'] = trail_level(pos, consts)
     pos['last_sample_min'] = now.strftime('%Y%m%d%H%M')
-    return exit_type if exit_type in MINUTE_EXITS else None
+    if exit_type not in MINUTE_EXITS and _time_sl_due(pos, now, consts):
+        # The ladder returns ONE exit: a TP on an LTP print (discarded here: TP is the bid
+        # rule) masked TIME_SL for that minute (traceability review). Check it on its own.
+        exit_type = 'TIME_SL'
+    if exit_type in MINUTE_EXITS:
+        pos['exit_detail'] = {'rule': exit_type, 'how': 'minute_ltp', 'ltp': ltp,
+                              'bid': q.bid, 'ask': q.ask}
+        return exit_type
+    return None
+
+
+def _time_sl_due(pos: Dict[str, Any], now: _dt.datetime, consts: Any) -> bool:
+    caps = getattr(consts, 'TF_TIME_SL', None) or {}
+    cap = caps.get(pos.get('signal_tf'), caps.get('default'))
+    if not cap:
+        return False
+    try:
+        t0 = _dt.datetime.fromisoformat(str(pos.get('entry_time')))
+    except ValueError:
+        return False
+    return (now - t0).total_seconds() / 60.0 > float(cap)
 
 
 def tick_arm(key: str, pos: Dict[str, Any], q: Quote, now: _dt.datetime,

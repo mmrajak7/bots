@@ -64,6 +64,8 @@ class Engine:
         self._map_try = 0.0
         self._now: Optional[_dt.datetime] = None
         self._short_reads: Dict[str, int] = {}
+        self._last_own_fill = 0.0                # Q7: reconcile keeps watching after a close
+        self.neo_stats: Dict[str, List[float]] = {}   # what -> [n, total_ms, max_ms]
         if self.corrupt:
             self.n.send('JOURNAL CORRUPT: %s -- NO new entries; exits continue. Repair %s'
                         % (self.corrupt, journal.path), 'E')
@@ -138,14 +140,49 @@ class Engine:
     def _neo(self, fn: Callable, what: str, p: Optional[Dict[str, Any]] = None):
         """Every broker call (F9): (ok, value). Any NeoError / bug = (False, None) +
         a throttled alert. Never raises into the loop."""
+        t0 = time.time()
         try:
-            return True, fn()
+            out = fn()
+            self._neo_time(what, t0)
+            return True, out
         except Exception as e:
+            self._neo_time(what + '!', t0)
             key = 'neo_%s_%s' % (what, p['key'] if p else '')
             self.n.throttled(key, 60, '%s%s: %s: %s' % (
                 (p['key'] + ' ') if p else '', what, type(e).__name__, e), 'E')
             log.warning('%s failed: %s', what, e, exc_info=not hasattr(e, 'code'))
             return False, None
+
+    def _neo_time(self, what: str, t0: float) -> float:
+        """Lag study (traceability review Part C): every NEO call's wall time, aggregated
+        per kind in status.json; a slow one is logged on its own."""
+        ms = (time.time() - t0) * 1000.0
+        st = self.neo_stats.setdefault(what, [0, 0.0, 0.0])
+        st[0] += 1
+        st[1] += ms
+        st[2] = max(st[2], ms)
+        if ms >= float(self.cfg.get('neo_slow_ms', 300)):
+            log.info('NEO slow: %s %.0f ms', what, ms)
+        return ms
+
+    def _qsnap(self, q: Optional[rules.Quote]) -> Optional[Dict[str, Any]]:
+        if q is None:
+            return None
+        ep = self.epoch()
+        return {'bid': q.bid, 'ask': q.ask, 'ltp': q.ltp, 'src': q.source,
+                'age_s': round(max(0.0, ep - q.ts), 2) if q.ts else None,
+                'exch_lag_s': round(q.ts - q.exch_ts, 2) if q.ts and q.exch_ts else None,
+                'bid_qty': q.bids[0][1] if q.bids else None,
+                'ask_qty': q.asks[0][1] if q.asks else None}
+
+    def _charges(self, buy_turnover: float, sell_turnover: float) -> float:
+        c = self.cfg.get('charges') or {}
+        stt = sell_turnover * float(c.get('stt_sell_pct', 0)) / 100.0
+        exch = (buy_turnover + sell_turnover) * float(c.get('exch_pct', 0)) / 100.0
+        sebi = (buy_turnover + sell_turnover) * float(c.get('sebi_per_crore', 0)) / 1e7
+        stamp = buy_turnover * float(c.get('stamp_buy_pct', 0)) / 100.0
+        gst = (exch + sebi) * float(c.get('gst_pct', 0)) / 100.0
+        return round(stt + exch + sebi + stamp + gst, 2)
 
     # -- the loop ------------------------------------------------------------------------------
     def step(self, now: _dt.datetime) -> None:
@@ -165,7 +202,8 @@ class Engine:
             self.feed.maybe_restart()
         if in_session and (not self.reconciled or
                            self.epoch() - self._last_reconcile >= self.cfg['reconcile_s']):
-            if self._active() or not self.reconciled or self._watch_tags():
+            recent_fill = self.epoch() - self._last_own_fill < float(self.cfg['cover_window_s'])
+            if self._active() or not self.reconciled or self._watch_tags() or recent_fill:
                 self._reconcile()
         if in_session:
             self._intents(now)
@@ -276,8 +314,10 @@ class Engine:
         if len(self._active()) >= int(cfg['max_open']):
             return 'max_open %d reached' % cfg['max_open']
         t = now.time()
-        if t > cfg['last_entry_time']:
+        if t.replace(second=0, microsecond=0) > cfg['last_entry_time']:     # whole minute, as paper
             return 'after last entry %s' % cfg['last_entry']
+        if self.ob._in_no_entry_window(t):                # belt and braces: paper blocks it too
+            return 'inside a blocked entry window'
         try:
             created = _dt.datetime.fromisoformat(str(it['created_at']))
             age = (now - created).total_seconds()
@@ -338,7 +378,7 @@ class Engine:
             'floor_breach_since': None, 'entry_time': None, 'exit_type': None, 'chase': None,
             'sold': 0, 'proceeds': 0.0, 'realised': 0.0, 'carried_qty': 0, 'carry_day': None,
             'carry': False, 'no_price_since': None, 'stale_exit': False, 'last_fill_epoch': 0.0,
-            'exit_fault': False, 'note': '',
+            'exit_fault': False, 'note': '', 'signal_at': it.get('created_at'),
         }
         self.pos[p['key']] = p
         self.feed.watch(p['kite_symbol'], p['kite_token'])
@@ -383,6 +423,8 @@ class Engine:
                 or self._file('FLATTEN')
             if stop:
                 return self._entry_end(p, 'stopped before a send (KILL/FLATTEN/close)')
+            if self.ob._in_no_entry_window(now.time()):    # a retry must not cross into a window
+                return self._entry_end(p, 'a blocked entry window began')
             if e['recheck_at'] is not None:              # F24: one more read after a cancel
                 return
             max_age = (float(self.cfg['intent_max_age_s']) + 10.0 +
@@ -411,11 +453,20 @@ class Engine:
             e['working'], e['order_no'], e['since'], e['unclear_since'] = tag, '', ep, None
             e['limit'] = lim
             p['state'] = 'ENTRY'
-            self._jrow('ENTRY_SEND', p, tag=tag, limit=lim, qty=remaining)   # E4: on disk first
+            try:
+                sig_age = round(now.timestamp() - _dt.datetime.fromisoformat(
+                    str(p.get('signal_at'))).timestamp(), 2)
+            except (TypeError, ValueError):
+                sig_age = None
+            self._jrow('ENTRY_SEND', p, tag=tag, limit=lim, qty=remaining,      # E4: on disk first
+                       quote=self._qsnap(q), signal_age_s=sig_age)
+            t0 = time.time()
             try:
                 e['order_no'] = self.b.place(p['symbol'], p['token'], 'B', remaining, lim, tag)
-                self._jrow('ENTRY_PLACED', p, tag=tag, order_no=e['order_no'])
+                self._jrow('ENTRY_PLACED', p, tag=tag, order_no=e['order_no'],
+                           place_ms=round(self._neo_time('place buy', t0)))
             except Exception as ex:
+                self._neo_time('place buy!', t0)
                 self._entry_send_failed(p, ex)
             return
         ok, res = self._neo(lambda: self.b.resolve(e['working'], expect_qty=None), 'entry read', p)
@@ -505,6 +556,7 @@ class Engine:
         if res.filled > prev[0] or (res.filled == prev[0] and res.avg_price and not prev[1]):
             f[tag] = [int(res.filled), float(res.avg_price)]
             p['last_fill_epoch'] = self.epoch()
+            self._last_own_fill = self.epoch()
             self._jrow('ENTRY_FILL', p, tag=tag, filled=res.filled, avg=res.avg_price)
 
     @staticmethod
@@ -543,6 +595,7 @@ class Engine:
         p['entry_time'] = now.isoformat()
         p['state'] = 'OPEN'
         p['last_sample_min'] = None
+        p['entry_slip'] = round(avg - float(p['signal_ltp']), 4)          # per unit, vs signal LTP
         self._jrow('OPEN', p)
         slip = avg - p['signal_ltp']
         self.n.send('BOUGHT %d %s @ %.2f (signal %.2f, slip %+.2f) | T1 %.2f%s%s' % (
@@ -602,7 +655,10 @@ class Engine:
         p['exit_type'] = why
         p['exit_started'] = self.epoch()
         p['chase'] = self.b.chase_state(p['symbol'], p['token'], p['tick'], int(p['qty'])).to_dict()
-        self._jrow('EXIT_START', p, why=why, bid=p.get('last_bid'))
+        if why in ('EOD', 'FLATTEN', 'NO_PRICE', 'LATE_FILL', 'CARRIED') or not p.get('exit_detail'):
+            p['exit_detail'] = {'rule': why, 'how': 'clock_or_control'}
+        p['exit_detail']['at'] = now.isoformat()
+        self._jrow('EXIT_START', p, why=why, bid=p.get('last_bid'), quote=self._qsnap(self._quote(p)))
         self._exit(p, now)                                # review M1: the sell first
         self.n.send('EXIT %s %s: %s (bid %s, entry %.2f)' % (
             p['symbol'], p['key'], why, p.get('last_bid'), p['entry_premium']),
@@ -693,6 +749,7 @@ class Engine:
             if sig != p.get('_persist_sig'):              # review H5: no 120 rows a minute
                 p['_persist_sig'] = sig
                 self._jrow('EXIT_STEP', p, note=s.note)
+        t_step = time.time()
         ok, st2 = self._neo(lambda: self.b.chase_step(st, lambda: self._exit_quote(p, now),
                                                       lambda: self._held(p), self._exit_price(p),
                                                       persist, self.epoch), 'exit chase', p)
@@ -702,10 +759,13 @@ class Engine:
         p['chase'] = st.to_dict()
         if st.sold > before_sold:
             p['last_fill_epoch'] = self.epoch()
+            self._last_own_fill = self.epoch()
             p['sold'] = st.sold
             p['proceeds'] = st.proceeds
             p['qty'] = st.remaining
-            self._jrow('EXIT_FILL', p, sold=st.sold, avg=st.avg_exit)
+            self._jrow('EXIT_FILL', p, sold=st.sold, avg=st.avg_exit,
+                       step_ms=round((time.time() - t_step) * 1000.0),
+                       trigger_to_fill_s=round(self.epoch() - float(p.get('exit_started') or self.epoch()), 2))
         ep = self.epoch()
         started = float(p.get('exit_started') or ep)
         if st.status == 'done' or st.remaining <= 0:
@@ -740,6 +800,12 @@ class Engine:
             p['realised'] = round(p['realised'] + (bid - entry) * unsold, 2)
             p['realised_estimated'] = True
         p['exit_avg'] = round(proceeds / sold, 4) if sold else 0.0
+        buy_t = entry * (sold + (unsold if external else 0))
+        p['charges_est'] = self._charges(buy_t, proceeds)
+        p['net_est'] = round(p['realised'] - p['charges_est'], 2)
+        lvl = (p.get('exit_detail') or {}).get('level')
+        if sold and lvl:
+            p['exit_slip_vs_level'] = round(p['exit_avg'] - float(lvl), 4)   # per unit
         p['state'] = 'CLOSED'
         p['qty'] = 0
         p['closed_day'] = now.date().isoformat()
@@ -857,9 +923,9 @@ class Engine:
             self.n.throttled('short_' + sym, 60, msg + (' -- buy-to-cover pending a second read'
                                                         if n < 2 else ' -- ALERT ONLY: cover by hand'), 'E')
             return
-        q = self.feed.fresh(p['kite_symbol'])
-        if q is None or not q.valid():
-            self.n.throttled('short_' + sym, 60, msg + ' -- no price to cover', 'E')
+        q = self._quote(p)                                # fresh + valid + age-checked
+        if q is None:
+            self.n.throttled('short_' + sym, 60, msg + ' -- no fresh price to cover', 'E')
             return
         tag = self.b.new_tag()
         p['covered'] = tag
@@ -882,6 +948,8 @@ class Engine:
               'journal_corrupt': self.corrupt, 'reconciled': self.reconciled,
               'ws_ok': self.feed.ws_healthy(), 'ws_error': self.feed.ws_error(),
               'consts': getattr(self, 'consts_digest', ''),
+              'neo_ms': {k: {'n': v[0], 'avg': round(v[1] / v[0]) if v[0] else 0, 'max': round(v[2])}
+                         for k, v in self.neo_stats.items()},
               'active': [{k: p.get(k) for k in ('key', 'state', 'symbol', 'qty', 'entry_premium',
                                                  'exit_type', 'carry')} for p in self._active()]}
         tmp = os.path.join(self.state_dir, 'status.json.tmp')

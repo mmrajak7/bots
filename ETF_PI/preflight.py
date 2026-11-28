@@ -32,6 +32,7 @@ import argparse
 import datetime
 import json
 import os
+import time
 import shutil
 import sys
 
@@ -166,23 +167,50 @@ def check_instruments(rep, now):
 
 
 def check_neo(rep, now, cfg):
-    """Only meaningful once the guardian is armed; stated as dormant otherwise."""
-    enabled = bool((cfg or {}).get('trade_enabled', False))
-    log_only = bool((cfg or {}).get('log_only', True))
-    session = os.path.join(CURRENT_DIR, 'neo', 'data', 'session.json')
-    if not (enabled and not log_only):
-        rep.add(INFO, 'neo session',
-                'not checked — paper mode, no Neo session required')
+    """The live path since 2026-11-28: the executor daemon + the SHARED kotak_neo session
+    (the old neo/ bridge and its session file are retired). `cfg` is unused (kept for the
+    call site)."""
+    try:
+        from executor import config as XC
+        x = XC.load()
+    except Exception as e:
+        rep.add(FAIL, 'executor config', 'unreadable: %s' % e)
         return
-    if not os.path.exists(session):
-        rep.add(FAIL, 'neo session', 'missing — neo_login has not run today')
+    if x['mode'] == 'off':
+        rep.add(INFO, 'executor', 'mode off — paper only, no live orders')
         return
-    stamp = datetime.datetime.fromtimestamp(os.path.getmtime(session), IST)
-    if stamp.date() != now.date():
-        rep.add(FAIL, 'neo session', 'dated %s — neo_login has not run today'
-                % stamp.strftime('%Y-%m-%d %H:%M'))
+    st_path = os.path.join(CURRENT_DIR, 'state', 'executor', 'status.json')
+    try:
+        with open(st_path) as fh:
+            st = json.load(fh)
+        age = time.time() - float(st.get('epoch') or 0)
+    except (OSError, ValueError):
+        st, age = {}, float('inf')
+    if age > 120:
+        rep.add(FAIL, 'executor', 'NOT RUNNING (status %s) — sudo systemctl status etf-executor'
+                % ('missing' if not st else '%.0f s old' % age))
     else:
-        rep.add(OK, 'neo session', 'refreshed %s' % stamp.strftime('%H:%M'))
+        rep.add(OK, 'executor', 'running, mode %s, %d lot(s), ws %s' % (
+            st.get('mode'), st.get('lots') or 0, 'ok' if st.get('ws_ok') else 'DOWN'))
+    if x['mode'] != 'live':
+        rep.add(INFO, 'neo session', 'not checked — executor in %s mode' % x['mode'])
+        return
+    if x['live_until_date'] is None or now.date() > x['live_until_date']:
+        rep.add(FAIL, 'executor live_until', '%s has passed — no live entries today'
+                % x['live_until'])
+    try:
+        import sys as _sys
+        if x['bots_root'] not in _sys.path:
+            _sys.path.insert(0, x['bots_root'])
+        from kotak_neo import session as NS
+        cur = NS.current()
+        if cur.trading_day == now.date().isoformat():
+            rep.add(OK, 'neo session', "shared kotak_neo session for today (gen %s)" % cur.generation)
+        else:
+            rep.add(FAIL, 'neo session', 'shared session is for %s, not today — '
+                    'python -m kotak_neo status' % cur.trading_day)
+    except Exception as e:
+        rep.add(FAIL, 'neo session', 'shared kotak_neo session unusable: %s' % str(e)[:120])
 
 
 def check_positions(rep, now):

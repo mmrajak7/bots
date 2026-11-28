@@ -135,25 +135,87 @@ def _read_jsonl(path, day=None):
 # Sections
 # ---------------------------------------------------------------------------
 
+def _executor_cfg():
+    """The executor's merged config (defaults + the box's executor_local.yaml), or None."""
+    try:
+        from executor import config as XC
+        return XC.load()
+    except Exception:
+        return None
+
+
 @_safe
 def _mode():
-    """PAPER or LIVE, in words. E5: a half-flipped config must be impossible to miss."""
-    import yaml
-    path = os.path.join(CURRENT_DIR, 'config_trade.yaml')
-    with open(path) as fh:
-        cfg = yaml.safe_load(fh) or {}
-    enabled = bool(cfg.get('trade_enabled', False))
-    log_only = bool(cfg.get('log_only', True))
-    if not enabled:
-        word = 'PAPER (trade_enabled: false — no orders placed)'
-    elif log_only:
-        word = 'PAPER (log_only: true — orders logged, not placed)'
+    """PAPER or LIVE, in words. E5: a half-flipped config must be impossible to miss.
+
+    2026-11-28: the old neo/ bridge (trade_enabled) is retired; live orders come ONLY from the
+    executor daemon, so its config decides the word. The paper ledger below is always paper."""
+    x = _executor_cfg()
+    if x is None:
+        return {'mode': 'UNKNOWN (executor config unreadable)', 'guardian': '?'}
+    if x['mode'] == 'live':
+        word = 'LIVE — executor, %d lot(s), %s, live_until %s' % (x['lots'], x['product'],
+                                                                 x['live_until'])
+    elif x['mode'] == 'paper':
+        word = 'PAPER — executor simulating fills on live prices (no real orders)'
     else:
-        word = 'LIVE — REAL ORDERS'
-    return {'trade_enabled': enabled, 'log_only': log_only, 'mode': word,
-            'guardian': 'ARMED' if (enabled and not log_only) else 'DORMANT',
-            'max_loss_per_day': cfg.get('max_loss_per_day'),
-            'num_lots': cfg.get('num_lots')}
+        word = 'PAPER only — executor off'
+    return {'mode': word, 'executor_mode': x['mode'], 'lots': x['lots'],
+            'guardian': 'ARMED' if x['mode'] == 'live' else 'DORMANT'}
+
+
+@_safe
+def _executor(day):
+    """The executor's book for `day` beside the paper ledger, per key (the same key).
+
+    Per closed trade: live entry/exit fills, the rule that fired and how, P&L gross and net of
+    estimated charges, and the gap to the PAPER row of the same signal -- the number the
+    'study and improve' loop is run on. Plus every SKIP with its reason."""
+    x = _executor_cfg()
+    if x is None or x['mode'] == 'off':
+        return {'mode': (x or {}).get('mode', '?'), 'trades': [], 'skips': []}
+    jp = os.path.join(CURRENT_DIR, 'state', 'executor',
+                      'journal_%s.jsonl' % ('live' if x['mode'] == 'live' else 'paper'))
+    iso = '%s-%s-%s' % (day[:4], day[4:6], day[6:8])
+    last, skips = {}, []
+    if os.path.exists(jp):
+        with open(jp, encoding='utf-8') as fh:
+            for ln in fh:
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if not str(r.get('ts') or '').startswith(iso):
+                    continue
+                if r.get('ev') == 'SKIP':
+                    skips.append({'key': r.get('key'), 'why': r.get('why')})
+                if isinstance(r.get('pos'), dict) and r.get('key'):
+                    last[r['key']] = r['pos']
+    try:
+        with open(os.path.join(CURRENT_DIR, 'st_opt_positions%s.json' % SFX)) as fh:
+            paper = json.load(fh)
+    except (OSError, ValueError):
+        paper = {}
+    out = []
+    for k, p in sorted(last.items()):
+        pp = paper.get(k) or {}
+        lot = int(p.get('lot_size') or 65)
+        row = {'key': k, 'state': p.get('state'), 'exit_type': p.get('exit_type'),
+               'how': (p.get('exit_detail') or {}).get('how'),
+               'qty': p.get('sold') or p.get('qty'), 'entry': p.get('entry_premium'),
+               'exit': p.get('exit_avg'), 'realised': p.get('realised'),
+               'charges': p.get('charges_est'), 'net': p.get('net_est'),
+               'entry_slip': p.get('entry_slip'), 'note': p.get('note'),
+               'paper_entry': pp.get('entry_premium'), 'paper_exit': pp.get('exit_premium'),
+               'paper_exit_type': pp.get('exit_type')}
+        if pp.get('exit_premium') is not None and pp.get('entry_premium') is not None:
+            row['paper_pnl'] = round((float(pp['exit_premium']) - float(pp['entry_premium'])) * lot, 2)
+        out.append(row)
+    closed = [r for r in out if r['state'] == 'CLOSED']
+    return {'mode': x['mode'], 'trades': out, 'skips': skips,
+            'gross': round(sum(float(r['realised'] or 0) for r in closed), 2),
+            'net': round(sum(float(r['net'] or 0) for r in closed), 2),
+            'paper_same_keys': round(sum(float(r.get('paper_pnl') or 0) for r in closed), 2)}
 
 
 @_safe
@@ -413,6 +475,7 @@ def build(day=None):
         'mode': _mode(),
         'cycles': _cycles(rows, day),
         'trades': _trades(day),
+        'executor': _executor(day),
         'conformance': _conformance(day),
         'gates': _gates(rows),
         'guardian': _guardian(rows, day),
@@ -453,6 +516,30 @@ def render(d):
     else:
         L.append('- None. Nothing today departed from what the rules describe.')
     L.append('')
+
+    # --- Executor (live or paper-executor) beside the paper ledger, per key
+    ex = d.get('executor') or {}
+    if ex.get('mode') not in (None, 'off') and not ex.get('error'):
+        L.append('## Executor (%s)' % ex['mode'].upper())
+        if not ex.get('trades'):
+            L.append('No executor trades today.')
+        else:
+            L.append('gross Rs %+.0f · net of est. charges Rs %+.0f · paper on the same keys Rs %+.0f'
+                     % (ex.get('gross', 0), ex.get('net', 0), ex.get('paper_same_keys', 0)))
+            L.append('')
+            L.append('| key | state | exit | how | qty | entry (slip) | exit | P&L | net | paper entry/exit | paper P&L |')
+            L.append('|---|---|---|---|---|---|---|---|---|---|---|')
+            for r in ex['trades']:
+                L.append('| %s | %s | %s | %s | %s | %s (%s) | %s | %s | %s | %s / %s | %s |' % (
+                    r['key'], r['state'], r.get('exit_type') or '-', r.get('how') or '-',
+                    r.get('qty') or '-', r.get('entry') or '-', r.get('entry_slip'),
+                    r.get('exit') or '-', r.get('realised'), r.get('net'),
+                    r.get('paper_entry'), r.get('paper_exit'), r.get('paper_pnl')))
+        if ex.get('skips'):
+            L.append('')
+            L.append('Skipped intents: ' + '; '.join('%s (%s)' % (s_['key'], s_['why'])
+                                                    for s_ in ex['skips']))
+        L.append('')
 
     # --- Trades
     L.append('## Trades')
@@ -582,6 +669,11 @@ def summary_line(d):
     flags = d.get('flags') or []
     head = ('<b>📋 Digest %s%s</b> · %s\n%d trade(s), Rs %+.0f'
             % ((UNDERLYING + ' ') if SFX else '', d['day'], mode.get('mode', '?'), n, gross))
+    ex = d.get('executor') or {}
+    if ex.get('trades'):
+        head += ('\nExecutor (%s): %d trade(s), gross Rs %+.0f, net Rs %+.0f (paper same keys Rs %+.0f)'
+                 % (ex.get('mode'), len([r for r in ex['trades'] if r['state'] == 'CLOSED']),
+                    ex.get('gross', 0), ex.get('net', 0), ex.get('paper_same_keys', 0)))
     if SFX and tr.get('by_half'):   # the MCX session rule is decided on this split (2026-10-27)
         head += '\n' + _half_text(tr['by_half'])
     if not flags:
