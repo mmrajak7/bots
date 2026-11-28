@@ -236,6 +236,30 @@ class TestSellSafety(SellHarness):
         self.assertGreaterEqual(f[0]["charges_paise"], 1593)                  # Rs 15.93 DP + STT etc.
 
 
+class TestCarriedBuyTags(Harness):
+    prices = {1: 2000.0, 2: 500.0}
+
+    def test_december_buy_retrying_in_january_keeps_its_own_tag(self) -> None:
+        """A December buy still inside its lock-try window when January starts (E26 keeps it) and January's new
+        position with the same number must not share a tag prefix: the order-book guard would refuse one."""
+        def only1(o):  # noqa: ANN001, ANN202
+            if o.tradingsymbol == "SYM1":
+                fill_all(self.k)(o)
+        self.run_day(fill=only1)                          # SYM2 (2612-02) unfilled: still pending
+        self.new_day(dt.date(2027, 1, 1))
+        buys = [{"position_id": "2701-02", "isin": "INE000000009", "symbol": "SYM1", "series": "EQ", "rank": 2,
+                 "earmark_paise": 1_000_000, "signal_close_paise": 200_000, "ca_rows": []}]
+        text = json.dumps({"buys": buys}) + "\n"
+        (self.paths.decisions / "j.json").write_text(text, encoding="utf-8", newline="\n")
+        self.j.append("PLAN_FINAL", plan_id=JAN, decision_file="j.json", decision_sha256=util.sha256_text(text),
+                      audit_status="PASSED", holds=[], sells=[],
+                      buys=[{k: b[k] for k in ("position_id", "isin", "symbol", "series", "rank", "earmark_paise")}
+                            for b in buys])
+        self.run_day(fill=None)
+        tags = sorted(o.tag for o in self.k.orders_)
+        self.assertEqual(tags, ["M2612B02A2", "M2701B02A1"])
+
+
 class TestExtraShare(unittest.TestCase):
     cfg = {"buy_ltp_mult": "1.005", "buy_cap_mult": "1.010", "extra_share_max_over": "0.25"}
 

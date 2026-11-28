@@ -136,7 +136,10 @@ def book_held(lg: L.Ledger) -> Dict[str, int]:
 
 
 def current_plan(lg: L.Ledger) -> Optional[Dict[str, Any]]:
-    return max(lg.plans.values(), key=lambda r: r["seq"]) if lg.plans else None
+    """The latest REBALANCE plan. A TEST plan (D51) is never the current plan: the book's buys, the gate and the
+    plan month the ARM must cover all come from the rebalance plan."""
+    plans = [r for r in lg.plans.values() if r["plan_id"]["month"] != "TEST"]
+    return max(plans, key=lambda r: r["seq"]) if plans else None
 
 
 def eligible_legs(lg: L.Ledger) -> List[L.Position]:
@@ -151,6 +154,14 @@ def ordinal(position_id: str) -> int:
 
 def intent_id(plan_id: Dict[str, Any], position_id: str, attempt: int) -> str:
     return f"{plan_id['month']}|{plan_id['signal_day']}|r{plan_id['data_rev']}|{position_id}|buy|{attempt}"
+
+
+def buy_tag(p: L.Position, attempt: int) -> str:
+    """M + yymm of the position's OWN plan + B + position number + A + attempt (TEST lot: leg X, yymm of its day)."""
+    pl = p.plan_id
+    if pl["month"] == "TEST":
+        return B.make_tag(pl["signal_day"][2:4] + pl["signal_day"][5:7], "test", ordinal(p.position_id), attempt)
+    return B.make_tag(pl["month"][2:4] + pl["month"][5:7], "buy", ordinal(p.position_id), attempt)
 
 
 def attempts_so_far(lg: L.Ledger, position_id: str) -> int:
@@ -428,7 +439,9 @@ def build_step_plan(env: Env, lg: L.Ledger, holdings_open: Dict[str, int]) -> Op
     pid = plan["plan_id"]
     step = "BUY_1510" if not any(p.sessions_seen for p in legs) else "RETRY_BUY"
     attempts = {p.position_id: attempts_so_far(lg, p.position_id) + 1 for p in legs}
-    intents = [{"intent_id": intent_id(pid, p.position_id, attempts[p.position_id]), "isin": p.isin, "leg": "buy",
+    # a buy's intent id and tag come from ITS plan: a December buy still retrying in January must not take a
+    # January tag (M2701B05 would collide with January's own position 05)
+    intents = [{"intent_id": intent_id(p.plan_id, p.position_id, attempts[p.position_id]), "isin": p.isin, "leg": "buy",
                 "max_qty": None, "max_rupees": p.remaining_paise // 100,
                 "price_rule": "BUY_1510(1.005,1.010)"} for p in legs]
     sp_obj = {"plan_id": pid, "step": step, "intents": sorted(intents, key=lambda x: x["intent_id"])}
@@ -467,7 +480,7 @@ def build_step_plan(env: Env, lg: L.Ledger, holdings_open: Dict[str, int]) -> Op
             "signal_close": sc / 100 if sc else None,
             "gap_pct": round((float(ltp) / (sc / 100) - 1) * 100, 2) if sc and ltp else None,
             "ca_rows": [{"ex_date": r["ex_date"]} for r in db.get("ca_rows", [])],   # free text: nse_text only
-            "intent_id": intent_id(pid, p.position_id, attempts[p.position_id]), "isin": p.isin, "symbol": p.symbol,
+            "intent_id": intent_id(p.plan_id, p.position_id, attempts[p.position_id]), "isin": p.isin, "symbol": p.symbol,
             "series": p.series, "rank": p.rank, "max_rupees": p.remaining_paise // 100,
             "price_rule": "BUY_1510(1.005,1.010)", "ltp_1445": qq.get("last_price"),
             "upper_circuit": qq.get("upper_circuit_limit"), "lower_circuit": qq.get("lower_circuit_limit"),
@@ -505,7 +518,7 @@ def apply_verdict(env: Env, sp: StepPlan, vd: V.Verdict, day: str) -> List[L.Pos
         except B.NetworkError as e:
             log.warning("instruments unreadable while a 14:45 quote is missing (%s): treated as listed", e)
     for p in sp.legs:
-        iid = intent_id(sp.plan_id, p.position_id, sp.attempts[p.position_id])
+        iid = intent_id(p.plan_id, p.position_id, sp.attempts[p.position_id])
         a, code, note = vd.actions.get(iid, ("HOLD", "HOLD_OTHER", "no verdict"))
         if iid in qmiss and a != "GO" and not (listed and tradingsymbol(p.symbol, p.series) not in listed):
             # review 11-28 T9: a quote missing at 14:45 for a name still in Kite's instruments is a read gap, not a
@@ -662,13 +675,12 @@ def place_all(env: Env, sp: StepPlan, go: List[L.Position], day: str) -> List[st
         if att > 9:
             hold_leg(env, p, "OWNER_HOLD", "attempt > 9")
             continue
-        iid = intent_id(sp.plan_id, p.position_id, att)
+        iid = intent_id(p.plan_id, p.position_id, att)
         try:
             it = env.broker.place_buy(
-                intent_id=iid, key={"plan_id": sp.plan_id, "position_id": p.position_id, "leg": "buy",
+                intent_id=iid, key={"plan_id": p.plan_id, "position_id": p.position_id, "leg": "buy",
                                     "attempt": att},
-                tag=B.make_tag(sp.plan_id["month"][2:4] + sp.plan_id["month"][5:7], "buy", ordinal(p.position_id),
-                               att),
+                tag=buy_tag(p, att),
                 isin=p.isin, tradingsymbol=ts, qty=qty, limit=float(limit), ltp_1510=float(ltp),
                 cap_price=float(cap_price), max_rupees=max_rupees)
         except B.BrokerRefused as e:

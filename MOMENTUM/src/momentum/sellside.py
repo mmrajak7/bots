@@ -148,7 +148,7 @@ def extend_step_plan(env: Any, lg: L.Ledger, holdings_open: Dict[str, int], sp: 
             env_rupees = max(0, int(each / 100))
             sp.envelopes[p.position_id] = env_rupees
             qq = q.get(f"NSE:{E.tradingsymbol(p.symbol, p.series)}", {})
-            rows.append({"intent_id": E.intent_id(pid, p.position_id, att), "leg": "buy", "isin": p.isin,
+            rows.append({"intent_id": E.intent_id(p.plan_id, p.position_id, att), "leg": "buy", "isin": p.isin,
                          "symbol": p.symbol, "series": p.series, "rank": p.rank, "max_rupees": env_rupees,
                          "price_rule": "BUY_1510(1.005,1.010)", "gated_on_sells": True,
                          "ltp_1445": qq.get("last_price"), "upper_circuit": qq.get("upper_circuit_limit"),
@@ -212,7 +212,7 @@ def apply_side_verdicts(env: Any, sp: Any, vd: V.Verdict, day: str) -> Tuple[Lis
             sell_session(env, p.position_id, day, f"vet {code}")
             E.hold_leg(env, p, "OWNER_HOLD", f"sell held by the vet {code}: {note}")
     for p in sp.gated:
-        iid = E.intent_id(sp.plan_id, p.position_id, sp.attempts[p.position_id])
+        iid = E.intent_id(p.plan_id, p.position_id, sp.attempts[p.position_id])
         a, code, note = vd.actions.get(iid, ("HOLD", "HOLD_OTHER", "no verdict"))
         if a == "GO":
             go_b.append(p.position_id)
